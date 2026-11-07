@@ -2673,6 +2673,7 @@ describe("mobile Extension catalog authority", () => {
   });
   it("settles only the exact permission opened by the current plugin retry without selecting its task", async () => {
     const network = fakeNetwork(), extension = mobileExtensionFixture();
+    const emit = eventFeed(network);
     network.getExtension = vi.fn(async () => extension);
     const task = create(SessionSchema, { ...runtimeSession, sessionId: "plugin-task" });
     const subject = create(PermissionSubjectSchema, { kind: { case: "customTool", value: create(CustomToolPermissionSubjectSchema,
@@ -2682,8 +2683,10 @@ describe("mobile Extension catalog authority", () => {
         allowedDecisions: [PermissionDecisionKind.ALLOW_ONCE, PermissionDecisionKind.DENY_ONCE],
       }) } });
     const existing = create(InteractionSchema, { ...approval, interactionId: "extension-write-old" });
-    let owner = create(SnapshotSchema, { ...offlineOwnerProjection([runtimeSession, task]), interactions: [existing] });
+    let owner = create(SnapshotSchema, { ...runtimeControlProjection(), sessions: [runtimeSession, task], interactions: [existing] });
+    let detail = runtimeControlProjection(runtimeSession, true);
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => detail);
     const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: extension.extensionId, permissionMode: PermissionMode.AUTO });
     const response = create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences });
     let finish!: () => void;
@@ -2696,24 +2699,28 @@ describe("mobile Extension catalog authority", () => {
     const selected = app.state.selectedId;
     const controller = new AbortController();
     const pending = app.extensionCatalogTransport()!.retryTaskWriteAccess!(extension, task.sessionId, controller.signal);
-    await vi.waitFor(() => expect(retryWriteAccess).toHaveBeenCalledOnce());
-    expect(pending.interaction()).toBeUndefined();
-    const other = create(InteractionSchema, { ...approval, interactionId: "extension-write-other", sessionId: runtimeSession.sessionId });
-    owner = create(SnapshotSchema, { ...owner, interactions: [existing, other, approval] });
-    await app.refresh();
-
     const allow = { kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE } as const;
-    expect(pending.interaction()).toEqual(approval);
-    await expect(pending.resolve(other, allow)).resolves.toBe(false);
-    await expect(pending.dismiss(existing)).resolves.toBe(false);
-    expect(network.submit).not.toHaveBeenCalled();
-    await expect(pending.resolve(approval, allow)).resolves.toBe(true);
-    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
-      preconditions: [{ entity: { kind: EntityKind.INTERACTION, id: approval.interactionId }, expectedRevision: { value: 44n }, expectedGeneration: 8n }],
-      payload: { case: "resolveInteraction", value: { interactionId: approval.interactionId, interactionGeneration: 8n } }
-    });
-    expect(app.state.selectedId).toBe(selected);
-    finish();
+    try {
+      await vi.waitFor(() => expect(retryWriteAccess).toHaveBeenCalledOnce());
+      expect(pending.interaction()).toBeUndefined();
+      const other = create(InteractionSchema, { ...approval, interactionId: "extension-write-other", sessionId: runtimeSession.sessionId });
+      const cursor = create(EventCursorSchema, { ...owner.resumeCursor!, opaqueToken: "plugin-approval-cursor", sequence: owner.resumeCursor!.sequence + 1n });
+      owner = create(SnapshotSchema, { ...owner, resumeCursor: cursor, interactions: [existing, other, approval] });
+      detail = create(SnapshotSchema, { ...detail, resumeCursor: cursor });
+      emit(create(EventSchema, { eventId: "plugin-approval-opened", identity: { sessionId: task.sessionId }, cursor,
+        payload: { kind: { case: "interactionChanged", value: { interaction: approval } } } }));
+      await vi.waitFor(() => expect(pending.interaction()).toEqual(approval));
+      await expect(pending.resolve(other, allow)).resolves.toBe(false);
+      await expect(pending.dismiss(existing)).resolves.toBe(false);
+      expect(network.submit).not.toHaveBeenCalled();
+      await expect(pending.resolve(approval, allow)).resolves.toBe(true);
+      expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+        preconditions: [{ entity: { kind: EntityKind.INTERACTION, id: approval.interactionId }, expectedRevision: { value: 44n }, expectedGeneration: 8n }],
+        payload: { case: "resolveInteraction", value: { interactionId: approval.interactionId, interactionGeneration: 8n } }
+      });
+      expect(app.state.selectedId).toBe(selected);
+      expect(network.streamOwner).toHaveBeenCalledOnce();
+    } finally { finish?.(); }
     await expect(pending.result).resolves.toEqual({ granted: true, preferences });
     expect(pending.interaction()).toBeUndefined();
     await expect(pending.resolve(approval, allow)).resolves.toBe(false);
