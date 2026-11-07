@@ -640,6 +640,31 @@ describe("ExtensionCatalogManager", () => {
     }
   });
 
+  it("projects a withdrawn setup confirmation as incomplete and allows confirming the same attempt", async () => {
+    const { store, catalog } = await fixture();
+    try {
+      const runtime = parseExtensionRuntime({ html: "ui/runtime/index.html", tools: [{ name: "read", description: "Read", inputSchema: { type: "object" }, readOnly: true }],
+        network: { hosts: ["api.example.test"] } });
+      const installed = resource({ kind: "package", resourceDetails: [{ ...resource().resourceDetails[0]!, entryPath: "extension.ts", runtime }] });
+      const entry = catalog.reconcile([installed], []).entries[0]!;
+      let setup = catalog.beginSetup(entry.id, entry.revision);
+      const attemptId = setup.setup.attemptId!;
+      expect(setup.setup.fields).toEqual([expect.objectContaining({ id: "permission-confirmation", kind: "confirmation", required: true, configured: false })]);
+      const confirm = (value: boolean) => catalog.submitSetupInteraction({ extensionId: entry.id, attemptId,
+        fieldId: "permission-confirmation", value, expectedRevision: setup.revision });
+
+      setup = confirm(true);
+      expect(setup.setup.fields[0]?.configured).toBe(true);
+      setup = confirm(false);
+      expect(setup.setup.fields[0]?.configured).toBe(false);
+      expect(catalog.snapshot().entries[0]?.setup).toMatchObject({ attemptId, state: "in_progress", fields: [{ configured: false }] });
+      expect(() => catalog.completeSetup(entry.id, attemptId, setup.revision)).toThrow(/incomplete/u);
+
+      setup = confirm(true);
+      expect(catalog.completeSetup(entry.id, attemptId, setup.revision).setup.state).toBe("ready");
+    } finally { store.close(); }
+  });
+
   it("keeps setup secrets in the Credential owner, fences mutations, and preserves authorization across enable changes", async () => {
     const { store, credentials, catalog } = await fixture();
     const secret = "extension-private-token-with-entropy";
