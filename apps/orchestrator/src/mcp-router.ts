@@ -962,6 +962,8 @@ export class McpRouter {
     };
     /** Session-frozen ordinary policy resolver. Product defaults apply when omitted. */
     readonly includeToolPolicy?: (policyId: string) => boolean;
+    /** Launch-only filter for internal Bridge Tool Providers. Existing grants retain their catalog. */
+    readonly includeBridgeProvider?: (providerId: string) => boolean;
   }): PiMcpBridgeSnapshot {
     this.#assertInitialized();
     validateMcpEndpoint(input.endpoint);
@@ -1042,6 +1044,7 @@ export class McpRouter {
     }
     for (const provider of this.#bridgeToolProviders.values()) {
       if (!provider.available || provider.includeInSnapshot === false) continue;
+      if (input.includeBridgeProvider?.(provider.id) === false) continue;
       if (provider.canonicalPartnerOnly === true && input.sessionId !== undefined && this.#isGroupSession?.(input.sessionId) === true) continue;
       if (provider.configurablePolicy !== undefined) {
         const enabled = references?.toolsetIds === undefined

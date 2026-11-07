@@ -174,7 +174,7 @@ import {
   languageToolsEnabled,
   resolveAuthenticatedLspTarget
 } from "./lsp-tool-bridge.js";
-import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { MAKER_MEMORY_PROVIDER_ID, MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
 import { PartnerMemoryPreferences } from "./partner-memory-preferences.js";
 import { PartnerConnectionPreferences, PartnerConnectionsManager } from "./partner-connections.js";
 import { PartnerRuntimePromptResolver } from "./partner-runtime-prompt.js";
@@ -1222,6 +1222,12 @@ export async function createOrchestratorApplication(
     partnerProfiles: partnerStore,
     onSettingsChanged: () => refreshPiGenerationImpl()
   });
+  const includePiBridgeProvider = (context: AdapterContext, providerId: string): boolean => {
+    if (providerId !== MAKER_MEMORY_PROVIDER_ID || context.target.remoteWorkspace !== undefined) return true;
+    if (makerMemory.enabledForBackend(context.target.backendId)) return true;
+    const kind = (store.getTarget(context.target.id).metadata as { kind?: unknown } | null)?.kind;
+    return kind === "partner_home" || kind === "partner_workbench" || kind === "partner_session_task" || kind === "partner_group";
+  };
   const unregisterMakerMemoryBridge = mcpRouter.registerBridgeToolProvider(
     new MakerMemoryBridgeProvider(makerMemory)
   );
@@ -1328,6 +1334,7 @@ export async function createOrchestratorApplication(
         authenticatedProviderIds: providerSnapshot.nativeAuthenticatedProviderIds
       },
       (context, policyId) => toolPolicies.enabledForSession(context.sessionId, context.target.id, policyId),
+      includePiBridgeProvider,
       (retryInMs) => store.appendDiagnostic({
         severity: "warning",
         component: "mcp",
@@ -1386,7 +1393,9 @@ export async function createOrchestratorApplication(
     resolveProjectExtensionExclusions: (context) => extensionProjects.excludedNativeEntries(globalExtensionEntries, resourceSnapshot.resources, context.target.id),
     resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(piBackendId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
     resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
-    resolveMakerMemoryPrompt: (context) => makerMemory.runtimePrompt(context.target.id),
+    resolveMakerMemoryPrompt: (context, bridge) => bridge?.tools.some(tool => tool.serverId === MAKER_MEMORY_PROVIDER_ID)
+      ? makerMemory.runtimePrompt(context.target.id)
+      : undefined,
     isCompactionMemoryEnabled: (context) => makerMemory.enabledForBackend(context.target.backendId),
     onCompactionDigest: (input) => { makerMemory.writeCompactionDigest(input); },
     mcpBridge: bridgeGeneration.baseSnapshot,
@@ -2852,6 +2861,7 @@ export async function createOrchestratorApplication(
         authenticatedProviderIds: nextProviderSnapshot.nativeAuthenticatedProviderIds
       },
       (context, policyId) => toolPolicies.enabledForSession(context.sessionId, context.target.id, policyId),
+      includePiBridgeProvider,
       (retryInMs) => store.appendDiagnostic({
         severity: "warning",
         component: "mcp",
@@ -4287,6 +4297,7 @@ function createTargetAwarePiBridgeGeneration(
     readonly authenticatedProviderIds: readonly string[];
   },
   toolPolicyEnabled: (context: AdapterContext, policyId: string) => boolean,
+  includeBridgeProvider: (context: AdapterContext, providerId: string) => boolean,
   onRenewalFailure: (retryInMs: number) => void
 ): {
   readonly baseSnapshot: PiMcpBridgeOptions;
@@ -4311,7 +4322,8 @@ function createTargetAwarePiBridgeGeneration(
         publishCompleteOutput: context.target.remoteWorkspace === undefined && context.hostedExecution === undefined
           && context.runtimePolicy !== "review_read_only",
         nativeAuthLease,
-        includeToolPolicy: (policyId) => toolPolicyEnabled(context, policyId)
+        includeToolPolicy: (policyId) => toolPolicyEnabled(context, policyId),
+        includeBridgeProvider: (providerId) => includeBridgeProvider(context, providerId)
       }), onRenewalFailure);
       scoped.set(key, lease);
       return lease.snapshot.mcpBridge;

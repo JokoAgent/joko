@@ -377,7 +377,7 @@ export interface PiAdapterOptions {
   readonly secretEnvironmentNames?: readonly string[];
   readonly appendSystemPrompt?: string;
   /** Service-owned private Maker Memory prompt snapshot resolved for this Target at runtime start. */
-  readonly resolveMakerMemoryPrompt?: (context: AdapterContext) => string | undefined;
+  readonly resolveMakerMemoryPrompt?: (context: AdapterContext, bridge: PiMcpBridgeOptions | undefined) => string | undefined;
   /** Captured once per runtime; active runtimes do not hot-change this setting. */
   readonly isCompactionMemoryEnabled?: (context: AdapterContext) => boolean;
   /** Best-effort private sink; implementations must not log or event the summary. */
@@ -4964,6 +4964,7 @@ export class PiBackendAdapter implements
     const nativeSkills = nativeSkillsEnabled ? await snapshotNativeSkills(await options.resolveNativeSkills!(context, context.signal),
       context.signal, join(runtimeDirectory, "resources", "native"), nativeSkillPolicy) : undefined;
 
+    const compactionMemoryEnabled = !hosted && options.isCompactionMemoryEnabled?.(context) === true;
     const mcpBridge = profile.runtimePolicy === "review_read_only"
       ? undefined
       : hosted ? options.mcpBridge : await options.resolveMcpBridge?.(context) ?? options.mcpBridge;
@@ -5031,7 +5032,7 @@ export class PiBackendAdapter implements
     if (profile.effort) args.push("--thinking", profile.effort);
     const makerMemoryPrompt = profile.runtimePolicy === "review_read_only" || hosted
       ? undefined
-      : options.resolveMakerMemoryPrompt?.(context);
+      : options.resolveMakerMemoryPrompt?.(context, mcpBridge);
     const appendPrompt = [DEFAULT_APPEND_SYSTEM_PROMPT, hosted?.trust === "guest" ? undefined : options.appendSystemPrompt,
       makerMemoryPrompt, context.appendSystemPrompt ?? profile.appendSystemPrompt].filter(Boolean).join("\n\n");
     if (appendPrompt) {
@@ -5318,7 +5319,7 @@ export class PiBackendAdapter implements
         control,
         autoRetry: profile.autoRetry ?? options.settings?.retry?.enabled ?? true,
         autoCompaction: profile.autoCompaction ?? options.settings?.compaction?.enabled ?? true,
-        compactionMemoryEnabled: !hosted && options.isCompactionMemoryEnabled?.(context) === true,
+        compactionMemoryEnabled,
         autoCompactionThresholdPercent: profile.compactionThresholdPercent ?? configuredAutoCompactionThresholdPercent(options.settings),
         workingContextWindow,
         workingContextSelection: profile.providerId === undefined || profile.modelId === undefined ? undefined : `${profile.providerId}\0${profile.modelId}`,
