@@ -1381,6 +1381,12 @@ export async function createOrchestratorApplication(
       await remotePiProcesses.validate(binding, signal);
     },
     providers: providerSnapshot.providers,
+    canRefreshIdleModelEndpoint: sessionId => {
+      const session = store.findSession(sessionId)?.descriptor;
+      return session !== undefined && !session.archived && session.deletedAt === undefined
+        && store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length === 0
+        && store.listRuns({ sessionId, states: ["queued", "running", "waiting", "retrying", "dispatch_unknown"], limit: 1 }).length === 0;
+    },
     nativeModels: providerAuth.listNativeModels().filter((model) =>
       availableNativeProviderIds.has(model.providerId)
       && modelRoutingEnabled(store, piBackendId, model.providerId, model.modelId)),

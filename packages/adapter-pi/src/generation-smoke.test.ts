@@ -12,6 +12,77 @@ import { createPiAdapter } from "./adapter.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("real Pi managed generation smoke", () => {
+  it("adopts a saved same-origin Messages path on the original idle task before its next prompt", { timeout: 60_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-real-pi-endpoint-"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const modelId = "endpoint-model";
+    const apiKey = "fixture-messages-key";
+    const requests: Array<{ readonly path: string; readonly body: string; readonly authorized: boolean }> = [];
+    const server = createServer(async (request, response) => {
+      const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+      if (request.method !== "POST" || !["/old/v1/messages", "/saved/v1/messages"].includes(path)) {
+        response.writeHead(404).end();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      requests.push({ path, body: Buffer.concat(chunks).toString("utf8"), authorized: request.headers["x-api-key"] === apiKey });
+      response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+      const events = [
+        { type: "message_start", message: { id: `message-${requests.length}`, type: "message", role: "assistant", content: [],
+          model: modelId, stop_reason: null, stop_sequence: null, usage: { input_tokens: 4, output_tokens: 0 } } },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `Reply via ${path}` } },
+        { type: "content_block_stop", index: 0 },
+        { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } },
+        { type: "message_stop" }
+      ];
+      response.end(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+    });
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const provider = (path: string) => ({ id: "endpoint-fixture", baseUrl: `${origin}${path}`, api: "anthropic-messages" as const,
+      apiKeyEnv: "JOKO_FIXTURE_MESSAGES_KEY", models: [{ id: modelId, contextWindow: 16_384, maxTokens: 1_024 }] });
+    const environment = { JOKO_FIXTURE_MESSAGES_KEY: apiKey };
+    const adapter = createPiAdapter({ agentHome: join(root, "initial"), sessionRoot: join(root, "sessions"),
+      providers: [provider("/old")], environment, canRefreshIdleModelEndpoint: sessionId => sessionId === "idle-endpoint" });
+    const target: TargetDescriptor = { id: "endpoint-target", backendId: adapter.id, displayName: "Endpoint fixture", workspaceRoot: workspace, managed: true, trusted: false };
+    const sink = new EventSink(), queuedSink = new EventSink();
+    const context = { ...smokeContext(target, 1, sink), sessionId: "idle-endpoint", resolveModelWorkingContext: () => 12_000 };
+    const queuedContext = { ...smokeContext(target, 1, queuedSink), sessionId: "already-queued" };
+    const create = { target, providerId: "endpoint-fixture", modelId, fastMode: false, permissionMode: "ask" as const };
+    const send = (text: string, bound: AdapterContext) => adapter.send({ text, images: [], files: [], mentions: [], disposition: "prompt" }, bound);
+    try {
+      const binding = await adapter.createSession(create, context);
+      const queuedBinding = await adapter.createSession(create, queuedContext);
+      const bound = { ...context, binding };
+      await send("Original task input", bound);
+      await sink.waitForDone(1);
+      await adapter.updateManagedGeneration({ agentHome: join(root, "saved"), providers: [provider("/saved")], environment });
+      expect((await adapter.getState(bound)).model?.baseUrl).toBe(`${origin}/old`);
+      await send("Previously queued input", { ...queuedContext, binding: queuedBinding });
+      await queuedSink.waitForDone(1);
+      await send("New task input after settings save", bound);
+      await sink.waitForDone(2);
+      expect(requests.map(({ path, authorized }) => [path, authorized])).toEqual([
+        ["/old/v1/messages", true], ["/old/v1/messages", true], ["/saved/v1/messages", true]
+      ]);
+      expect(requests[2]!.body).toContain("Original task input");
+      expect(requests[2]!.body).toContain("New task input after settings save");
+      expect(await adapter.getState(bound)).toMatchObject({ sessionId: binding.nativeSessionId,
+        model: { provider: "endpoint-fixture", id: modelId, baseUrl: `${origin}/saved` } });
+      expect(sink.text).toContain("Reply via /saved/v1/messages");
+    } finally {
+      await adapter.dispose().catch(() => undefined);
+      await closeServer(server);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rechecks the approved command policy after waiting for capacity", { timeout: 45_000 }, async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-real-pi-command-policy-"));
     const home = join(directory, "home");
