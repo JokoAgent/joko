@@ -3079,15 +3079,25 @@ describe("McpRouter", () => {
       router.registerBridgeToolProvider(provider);
       const granted = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", targetId: "target-1" });
       const scope = bridgeScope(1);
-      const call = (prompt = "A test image") => router.executeBridgeCall({ ...scope, generation: 1, authorization: `Bearer ${granted.mcpBridge.token}`,
-        serverId: provider.id, toolName: "image_generate", arguments: { prompt } });
+      const exactOptions = scenario === "result saved" ? { size: "2048×1024", quality: "high" } : {};
+      const call = (prompt = "A test image", options: Readonly<Record<string, unknown>> = exactOptions) =>
+        router.executeBridgeCall({ ...scope, generation: 1, authorization: `Bearer ${granted.mcpBridge.token}`,
+          serverId: provider.id, toolName: "image_generate", arguments: { prompt, ...options } });
       const imageOperations = () => store.listOperations().filter(operation => operation.kind === "mcp_image_generate");
       await expect(call("")).resolves.toMatchObject({ isError: true });
+      if (scenario === "result saved") {
+        await expect(call(undefined, { size: "2049x1024" })).resolves.toMatchObject({ isError: true });
+        await expect(call(undefined, { size: "3840x3840" })).resolves.toMatchObject({ isError: true });
+        await expect(call(undefined, { size: "2048x1024", aspect_ratio: "3:2" })).resolves.toMatchObject({ isError: true });
+        await expect(call(undefined, { quality: "max" })).resolves.toMatchObject({ isError: true });
+      }
       expect(imageOperations()).toHaveLength(0);
       expect(fetch).not.toHaveBeenCalled();
       const generating = call();
       await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
       expect(fetch.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/images/generations");
+      expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({ model: modelId, prompt: "A test image", n: 1,
+        ...(scenario === "result saved" ? { size: "2048x1024", quality: "high" } : { size: "auto" }) });
       const [claim] = imageOperations();
       expect(claim).toMatchObject({ status: "started" });
       expect(JSON.stringify(claim?.body)).not.toContain("A test image");
@@ -3112,6 +3122,7 @@ describe("McpRouter", () => {
         if (scenario === "result saved") {
           await expect(call()).resolves.toEqual(result);
           await expect(call("Different prompt on the original request ID")).resolves.toMatchObject({ isError: true });
+          await expect(call(undefined, { size: "2048x1024", quality: "low" })).resolves.toMatchObject({ isError: true });
           expect(ingest).toHaveBeenCalledOnce();
         } else await expect(call()).resolves.toMatchObject({ isError: true });
       } else if (scenario === "credential replaced") {
