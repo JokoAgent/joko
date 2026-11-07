@@ -18,7 +18,7 @@ import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsR
   GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
 import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
 import { ExtensionTaskPreferencesSchema, ExtensionTaskServiceGetPreferencesResponseSchema, ExtensionTaskServiceUpdatePreferencesResponseSchema, ExtensionTaskServiceRetryWriteAccessResponseSchema } from "@joko/contracts";
-import { ExtensionAuthorizationPhase, ExtensionOAuthFlowSchema, type ExtensionSettingsHost } from "@joko/contracts";
+import { ExtensionAuthorizationPhase, ExtensionMainViewSurfaceSchema, ExtensionOAuthFlowSchema, type ExtensionSettingsHost } from "@joko/contracts";
 import { rebalanceSuggestionFixture } from "./test/provider-group-rebalance";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
@@ -3231,6 +3231,50 @@ describe("mobile Extension catalog authority", () => {
     await expect(pending).rejects.toThrow(/owner changed|cancelled/u);
     expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "package-late", extensionResourceId: "resource-1", state: "unknown" })]);
     expect(network.listExtensions).not.toHaveBeenCalled();
+  });
+
+  it.each(["before", "after"] as const)("keeps a routing receipt only when author settings close %s dispatch", async timing => {
+    const f = mobileSettingsOAuthFixture(), saved = memoryStorage(credential);
+    if (f.surface.owner.kind !== "resource") throw new Error("Settings require an installed Resource.");
+    const openSettings = vi.fn(async () => ({ surface: create(ExtensionMainViewSurfaceSchema, {
+      surfaceId: f.surface.surfaceId, extensionId: f.surface.extensionId,
+      owner: { resourceId: f.surface.owner.resourceId, discoveredRevision: f.surface.owner.discoveredRevision,
+        resourceVersion: { value: f.surface.owner.resourceRevision } }, endpoint: new URL(f.surface.url).pathname,
+      backendId: f.surface.backendId, backendRevision: { value: f.surface.backendRevision }, backendGeneration: BigInt(f.surface.backendGeneration),
+      expiresAt: { seconds: BigInt(Math.floor(f.surface.expiresAt / 1000)), nanos: f.surface.expiresAt % 1000 * 1_000_000 },
+      title: f.surface.title, settings: true, mobileSettings: true
+    }) }));
+    f.network.extensionSettingsApi = vi.fn(() => ({ openExtensionSettings: openSettings }) as unknown as ReturnType<NonNullable<MobileNetwork["extensionSettingsApi"]>>);
+    const app = client(f.network, saved.storage, undefined, undefined, () => "original-routing-write");
+    await app.start();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const entered = vi.fn(), signal = new AbortController();
+    if (timing === "before") {
+      const persist = saved.storage.savePending;
+      vi.mocked(persist).mockImplementationOnce(async items => { entered(); await gate; await persist(items); });
+    } else {
+      vi.mocked(f.network.submit).mockImplementationOnce(async () => { entered(); await gate; throw new Error("Original result lost."); });
+    }
+    const write = app.extensionCatalogTransport()!.callSettings!(f.surface,
+      { kind: "routing.set", revision: "4", dataJson: '{"folder":"inbox"}' }, f.host, signal.signal);
+    try {
+      await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+      signal.abort(); release();
+      await expect(write).rejects.toThrow();
+      const reopen = app.extensionCatalogTransport()!.openSettings!(f.extension, new AbortController().signal);
+      if (timing === "before") {
+        expect(f.network.submit).not.toHaveBeenCalled();
+        expect(saved.pending()).toEqual([]); expect(app.state.pending).toEqual([]);
+        await expect(reopen).resolves.toMatchObject({ surfaceId: f.surface.surfaceId, purpose: "settings" });
+        expect(openSettings).toHaveBeenCalledOnce();
+      } else {
+        expect(f.network.submit).toHaveBeenCalledOnce();
+        expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "original-routing-write", state: "unknown" })]);
+        await expect(reopen).rejects.toThrow(/unavailable/u);
+        expect(openSettings).not.toHaveBeenCalled();
+      }
+    } finally { release(); await write.catch(() => undefined); app.dispose(); }
   });
 
   it.each(["replacement", "completed"] as const)("uses a ready projection for credential replacement only after adopting the new attempt %s", async attempt => {
