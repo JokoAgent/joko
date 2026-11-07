@@ -6,9 +6,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PartnerLearningTurnSource, PolicySnapshot, ProviderModel, TargetDescriptor } from "@joko/core";
+import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { describe, expect, it, vi } from "vitest";
 import { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { appendVisionBridgeDescriptions, createPiAdapter, escapePiComposerSlashCommand, isRuntimeResourceProvenLoaded, mergeManagedResourceSnapshots, projectPiTreeNodes, resolvePiComposerSlashCommand } from "./adapter.js";
+import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableStore } from "./managed-durable-store.js";
 import {
@@ -2636,6 +2638,54 @@ describe("PiBackendAdapter", () => {
       await adapter.closeSession(binding, context);
     } finally {
       await adapter.dispose().catch(() => undefined);
+    }
+  });
+
+  it("releases root Pi capacity while the next tool is waiting on the same RPC transport", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-command-gate-"));
+    const gate = createCommandConcurrencyGate({ readMaximum: () => 1, maximumWaitMs: 60_000 });
+    let child!: ScriptedPiProcess;
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1",
+      commandConcurrencyGate: gate, processFactory: (spec) => {
+        child = new ScriptedPiProcess(spec);
+        return child as unknown as PiProcessHandle;
+      }
+    });
+    const target: TargetDescriptor = { id: "gate-target", backendId: adapter.id, displayName: "Gate fixture",
+      workspaceRoot: directory, managed: true, trusted: true };
+    const owner = new AbortController();
+    const request = (id: string, action: "acquire" | "release", callId: string) =>
+      child.emitExtensionInput(id, `${COMMAND_GATE_REQUEST_PREFIX}${action}/${Buffer.from(callId).toString("base64url")}`);
+    const reply = (id: string) => child.commands.find((entry) => entry.type === "extension_ui_response" && entry.id === id);
+    try {
+      await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" },
+        { ...makeContext(target, []), signal: owner.signal });
+      request("admit-first", "acquire", "tool-one");
+      request("admit-second", "acquire", "tool-two");
+      await vi.waitFor(() => {
+        expect(reply("admit-first")).toMatchObject({ value: "admitted" });
+        expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      });
+      expect(reply("admit-second")).toBeUndefined();
+      request("release-first", "release", "tool-one");
+      await vi.waitFor(() => {
+        expect(reply("release-first")).toMatchObject({ value: "released" });
+        expect(reply("admit-second")).toMatchObject({ value: "admitted" });
+        expect(gate.snapshot()).toEqual({ running: 1, queued: 0 });
+      });
+      request("cancel-third", "acquire", "tool-three");
+      await vi.waitFor(() => expect(gate.snapshot()).toEqual({ running: 1, queued: 1 }));
+      owner.abort();
+      request("release-second", "release", "tool-two");
+      await vi.waitFor(() => {
+        expect(reply("cancel-third")).toMatchObject({ cancelled: true });
+        expect(reply("release-second")).toMatchObject({ value: "released" });
+        expect(gate.snapshot()).toEqual({ running: 0, queued: 0 });
+      });
+    } finally {
+      gate.close();
+      await adapter.dispose();
+      await rm(directory, { recursive: true, force: true });
     }
   });
 

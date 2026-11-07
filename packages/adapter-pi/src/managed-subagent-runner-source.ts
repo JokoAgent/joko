@@ -9,6 +9,7 @@ import {
   MAXIMUM_POLICY_DECISION_TITLE_BYTES,
   POLICY_DECISION_REQUEST_PREFIX
 } from "./policy-decision-bridge.js";
+import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
 
 export const MANAGED_SUBAGENT_RUNNER_FILE_NAME = "joko-managed-subagent-runner.cjs";
 export const MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS = {
@@ -31,6 +32,7 @@ const MAX_JSON_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 256 * 1024;
 const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024;
 const POLICY_DECISION_REQUEST_PREFIX = ${JSON.stringify(POLICY_DECISION_REQUEST_PREFIX)};
+const COMMAND_GATE_REQUEST_PREFIX = ${JSON.stringify(COMMAND_GATE_REQUEST_PREFIX)};
 const MAX_POLICY_DECISION_TITLE_BYTES = ${MAXIMUM_POLICY_DECISION_TITLE_BYTES};
 const MAX_POLICY_DECISION_REPLY_CHARACTERS = ${MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS};
 const MAX_APPROVAL_CONTROL_BYTES = ${MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS.controlFileBytes};
@@ -783,7 +785,7 @@ async function main() {
   let lastControlSeq = 0;
   let lastControl;
   let lastApprovalControl;
-  let pendingApproval;
+  const pendingApprovals = [];
   let handledApprovalRequestId;
   let abortReason;
   let nativeLeaseFailure = false;
@@ -845,7 +847,10 @@ async function main() {
       transcriptPath: config.transcriptPath,
       resultPath: endedAt ? resultPath : undefined,
       lastControl: lastControl,
-      pendingApproval: pendingApproval,
+      // A running command may be releasing the slot a queued acquire needs.
+      pendingApproval: state === "running" ? pendingApprovals.find(function (approval) {
+        return approval.method === "input" && approval.title.startsWith(COMMAND_GATE_REQUEST_PREFIX + "release/");
+      }) || pendingApprovals[0] : undefined,
       lastApprovalControl: lastApprovalControl
     };
   }
@@ -928,7 +933,7 @@ async function main() {
         requestedAt: Date.now()
       };
     }
-    if (method === "input" && (title.startsWith("joko:command-gate/v1/") || title.startsWith(POLICY_DECISION_REQUEST_PREFIX))) {
+    if (method === "input" && (title.startsWith(COMMAND_GATE_REQUEST_PREFIX) || title.startsWith(POLICY_DECISION_REQUEST_PREFIX))) {
       return {
         id: id,
         childId: config.childId,
@@ -1002,11 +1007,8 @@ async function main() {
         sendNotification({ type: "extension_ui_response", id: approval.id, cancelled: true });
         return;
       }
-      if (pendingApproval && pendingApproval.id !== approval.id) {
-        sendNotification({ type: "extension_ui_response", id: approval.id, cancelled: true });
-        return;
-      }
-      pendingApproval = approval;
+      if (pendingApprovals.some(function (pending) { return pending.id === approval.id; })) return;
+      pendingApprovals.push(approval);
       appendTranscript({
         type: "joko.subagent.approval_requested",
         approvalId: approval.id,
@@ -1119,9 +1121,13 @@ async function main() {
     const receipt = { requestId: control.requestId, action: "approval", accepted: false, observedAt: Date.now() };
     try {
       if (abortReason || state !== "running" || stopControlWaiting()) throw new Error("approval denied because the child is stopping");
-      if (!pendingApproval || pendingApproval.id !== control.approvalId || pendingApproval.childId !== control.childId) {
+      const approvalIndex = pendingApprovals.findIndex(function (approval) {
+        return approval.id === control.approvalId && approval.childId === control.childId;
+      });
+      if (approvalIndex < 0) {
         throw new Error("approval request is no longer pending");
       }
+      const pendingApproval = pendingApprovals[approvalIndex];
       const policyRequest = pendingApproval.method === "input" && pendingApproval.title.startsWith(POLICY_DECISION_REQUEST_PREFIX);
       if (!policyRequest && Buffer.byteLength(JSON.stringify(control)) > 64 * 1024) {
         throw new Error("approval control exceeds its bounded envelope");
@@ -1147,7 +1153,7 @@ async function main() {
         cancelled: response.cancelled === true,
         at: Date.now()
       });
-      pendingApproval = undefined;
+      pendingApprovals.splice(approvalIndex, 1);
       receipt.accepted = true;
     } catch (failure) {
       receipt.error = truncateUtf8(redact(failure && failure.message ? failure.message : failure), 2000);

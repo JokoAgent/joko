@@ -11,37 +11,57 @@ export interface CommandGateExtensionTransport {
   notify(message: CommandGateExtensionResponse): Promise<void>;
 }
 
+export function readCommandGateExtensionRequest(event: Readonly<Record<string, unknown>>): {
+  readonly id: string;
+  readonly command: ReturnType<typeof parseRequest>;
+} | undefined {
+  if (event["method"] !== "input" || typeof event["title"] !== "string"
+      || !event["title"].startsWith(COMMAND_GATE_REQUEST_PREFIX)) return undefined;
+  return { id: typeof event["id"] === "string" ? event["id"] : "", command: parseRequest(event["title"]) };
+}
+
 export async function handleCommandGateExtensionRequest(
   event: Readonly<Record<string, unknown>>,
   options: {
     readonly gate?: CommandConcurrencyGate;
     readonly sessionId: string;
     readonly generation: number;
+    readonly runId?: string;
     readonly signal?: AbortSignal;
     readonly transport: CommandGateExtensionTransport;
     readonly isCurrent: () => boolean;
+    readonly onAdmitted?: (releaseBeforeDispatch: () => void) => void;
   }
 ): Promise<boolean> {
-  if (event["method"] !== "input" || typeof event["title"] !== "string"
-      || !event["title"].startsWith(COMMAND_GATE_REQUEST_PREFIX)) return false;
-  const requestId = typeof event["id"] === "string" ? event["id"] : "";
-  const parsed = parseRequest(event["title"]);
-  if (requestId === "" || parsed === undefined) {
+  const request = readCommandGateExtensionRequest(event);
+  if (request === undefined) return false;
+  const { id: requestId, command } = request;
+  if (requestId === "" || command === undefined || !options.isCurrent() || options.transport.closed) {
     await respond(options, requestId, { cancelled: true });
     return true;
   }
-  const commandId = `${options.sessionId}:${options.generation}:${parsed.toolCallId}`;
-  if (parsed.action === "release") {
+  // Native tool call IDs cannot contain NUL, so a parent tool cannot alias a
+  // delegated run's lease even if its provider uses predictable IDs.
+  const scope = options.runId === undefined ? "" : `\u0000${options.runId}:`;
+  const commandId = `${options.sessionId}:${options.generation}:${scope}${command.toolCallId}`;
+  if (command.action === "release") {
     options.gate?.release(commandId, "tool_terminal");
     await respond(options, requestId, { value: "released" });
     return true;
   }
-  const admission = await options.gate?.acquire({
+  const admission = options.signal?.aborted ? "aborted" : await options.gate?.acquire({
     commandId,
     sessionId: options.sessionId,
     ...(options.signal === undefined ? {} : { signal: options.signal })
   }) ?? "immediate";
-  await respond(options, requestId, admission === "aborted" ? { cancelled: true } : { value: "admitted" });
+  const releaseBeforeDispatch = () => options.gate?.release(commandId, "approval_retired_before_dispatch");
+  if (admission === "aborted" || options.signal?.aborted || !options.isCurrent() || options.transport.closed) {
+    if (admission !== "aborted") releaseBeforeDispatch();
+    await respond(options, requestId, { cancelled: true });
+    return true;
+  }
+  options.onAdmitted?.(releaseBeforeDispatch);
+  await options.transport.notify({ type: "extension_ui_response", id: requestId, value: "admitted" });
   return true;
 }
 

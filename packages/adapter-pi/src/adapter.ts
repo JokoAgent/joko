@@ -83,7 +83,7 @@ import {
 } from "@joko/runtime-governance";
 import { provisionManagedBridge } from "./bridge.js";
 import { assertPiHostedModel, provisionPiHostedExecution, restrictPiHostedGuestHome } from "./hosted-execution.js";
-import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
+import { handleCommandGateExtensionRequest, readCommandGateExtensionRequest } from "./command-gate-bridge.js";
 import { capturePartnerLearningExtensionRequest, consumePartnerLearningNativeReply } from "./partner-learning-bridge.js";
 import { PiNativeRootTools } from "./native-root-tools.js";
 import {
@@ -5496,6 +5496,21 @@ export class PiBackendAdapter implements
 
   #wireRuntime(runtime: PiRuntime): void {
     const isCurrent = () => this.#runtimes.get(runtime.key) === runtime && runtime.transport.generation === runtime.context.generation;
+    const reportEventFailure = async (context: AdapterContext, error: unknown): Promise<void> => {
+      if (!isCurrent()) return;
+      await context.emit({
+        type: "error",
+        error: {
+          code: "PI_EVENT_TRANSLATION_FAILED",
+          message: redactedDiagnostic(error),
+          phase: "stream",
+          retryable: true,
+          stateMayHaveChanged: false,
+          recovery: "Reload the session projection from its last durable event cursor."
+        },
+        terminal: false
+      }, piMetadata("adapter_translation_error"));
+    };
     runtime.transport.onEvent((event) => {
       const rawEvent = event as unknown as Record<string, unknown>;
       if (event.type === "compaction_end" && runtime.compactionMemoryEnabled) {
@@ -5533,6 +5548,19 @@ export class PiBackendAdapter implements
         runningExtensionCommand !== undefined && isExtensionUiRequest(event) ? runningExtensionCommand.context
           : lifecycle === undefined ? runtime.context : routeLifecycleEvent(lifecycle, event)
       );
+      if (isExtensionUiRequest(event) && readCommandGateExtensionRequest(rawEvent) !== undefined) {
+        // A command finishing on this same transport can release the slot an
+        // earlier request is waiting for. Keep both off the ordered event chain.
+        void handleCommandGateExtensionRequest(rawEvent, {
+          gate: runtime.generationLease.generation.options.commandConcurrencyGate,
+          sessionId: runtime.key,
+          generation: runtime.transport.generation,
+          signal: capturedEventContext.signal,
+          transport: runtime.transport,
+          isCurrent
+        }).catch((error: unknown) => reportEventFailure(capturedEventContext, error)).catch(() => undefined);
+        return;
+      }
       const capturedUserOccurrence = event.type === "message_end" && isRecord(rawEvent.message) && rawEvent.message.role === "user"
         ? lifecycle?.currentUserOccurrence : undefined;
       if (capturedUserOccurrence !== undefined) {
@@ -5615,17 +5643,6 @@ export class PiBackendAdapter implements
               transport: runtime.transport,
               isCurrent
             })) return;
-            if (await handleCommandGateExtensionRequest(
-              event as unknown as Record<string, unknown>,
-              {
-                gate: runtime.generationLease.generation.options.commandConcurrencyGate,
-                sessionId: runtime.key,
-                generation: runtime.transport.generation,
-                signal: eventContext.signal,
-                transport: runtime.transport,
-                isCurrent
-              }
-            )) return;
             if (await handlePolicyDecisionExtensionRequest(
               event as unknown as Record<string, unknown>,
               {
@@ -5697,24 +5714,7 @@ export class PiBackendAdapter implements
             }
           }
         })
-        .catch(async (error) => {
-          if (!isCurrent()) return;
-          await failureContext.emit(
-            {
-              type: "error",
-              error: {
-                code: "PI_EVENT_TRANSLATION_FAILED",
-                message: redactedDiagnostic(error),
-                phase: "stream",
-                retryable: true,
-                stateMayHaveChanged: false,
-                recovery: "Reload the session projection from its last durable event cursor."
-              },
-              terminal: false
-            },
-            piMetadata("adapter_translation_error")
-          );
-        });
+        .catch((error: unknown) => reportEventFailure(failureContext, error));
     });
     runtime.transport.onExit((exit) => {
       const lifecycle = runtime.lifecycle;
@@ -6174,6 +6174,8 @@ export class PiBackendAdapter implements
 
   async #finalizeRuntimeMaterial(runtime: PiRuntime): Promise<void> {
     try {
+    const observer = this.#subagentObservers.get(runtime.key);
+    if (observer?.generation === runtime.transport.generation) observer.retireCommandGateApprovals();
     runtime.generationLease.generation.options.commandConcurrencyGate?.releaseSession(runtime.key, "runtime_closed");
     let updates: readonly { readonly providerId: string; readonly credential: PiNativeCredential }[] = [];
     let readError: unknown;
