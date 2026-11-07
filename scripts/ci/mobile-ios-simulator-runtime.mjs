@@ -658,7 +658,10 @@ async function captureStartupFramebuffer(file, startupLabel, timeout = 30_000) {
 }
 
 async function readAppearance(startupLabel) {
-  const appearance = await command("xcrun", ["simctl", "ui", udid, "appearance"], { startupLabel });
+  // The full run can still be CPU-bound after a successful first framebuffer.
+  // Keep the short diagnostic's original deadline and require real readback.
+  const timeout = startupDiagnosticsOnly ? 30_000 : 90_000;
+  const appearance = await command("xcrun", ["simctl", "ui", udid, "appearance"], { startupLabel, timeout });
   if (!["light", "dark", "unknown", "unsupported"].includes(appearance)) {
     throw new Error("The owned Simulator returned an unrecognized appearance value.");
   }
