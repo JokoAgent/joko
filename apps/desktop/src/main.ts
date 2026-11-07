@@ -1074,7 +1074,6 @@ if (!app.requestSingleInstanceLock()) {
     nativeArtifactSourceRevealer?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
-    desktopLinkspan.dispose();
     desktopRemoteDesktopViewerPrewarm.cancel();
     desktopRemoteDesktopViewers.dispose();
     // Route authority ends at quit admission, before renderer beforeunload can
@@ -1191,6 +1190,9 @@ if (!app.requestSingleInstanceLock()) {
       disposeDesktopUpdateLifecycle();
     }
   });
+  // Both a renderer and the update handoff can prevent quit. Keep the native
+  // connection host usable if either leaves this process running.
+  app.once("quit", () => desktopLinkspan.dispose());
 
   // Do not top-level await Electron readiness from the ESM entry module. On
   // some packaged hosts Electron waits for entry-module evaluation before it
