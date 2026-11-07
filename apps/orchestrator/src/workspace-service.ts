@@ -1873,9 +1873,10 @@ export class WorkspaceService {
         paths,
         input.ignoreWhitespace === true
       );
-      const fenceComparison = paths.length === 0
+      // Preview reads use the complete comparison even when the UI filters its patch.
+      const fenceComparison = paths.length === 0 && input.ignoreWhitespace !== true
         ? comparison
-        : await this.#readCommitDiff(workspace, parentOid, commitOid, [], input.ignoreWhitespace === true);
+        : await this.#readCommitDiff(workspace, parentOid, commitOid, [], false);
       return {
         index: "",
         workingTree: "",
@@ -1898,9 +1899,9 @@ export class WorkspaceService {
     const headOid = await this.#requireHeadRevision(workspace);
     const mergeBaseOid = await this.#readMergeBase(workspace, baseOid, headOid);
     const comparison = await this.#readComparisonDiff(workspace, mergeBaseOid, headOid, paths, input.ignoreWhitespace === true);
-    const fenceComparison = paths.length === 0
+    const fenceComparison = paths.length === 0 && input.ignoreWhitespace !== true
       ? comparison
-      : await this.#readComparisonDiff(workspace, mergeBaseOid, headOid, [], input.ignoreWhitespace === true);
+      : await this.#readComparisonDiff(workspace, mergeBaseOid, headOid, [], false);
     return {
       index: "",
       workingTree: "",
