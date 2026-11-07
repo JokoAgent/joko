@@ -47,7 +47,7 @@ import {
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionDerivationKind, SessionDerivationOriginSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  SessionWorktreeSchema, TargetState, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
+  SessionWorktreeSchema, TargetState, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -8223,6 +8223,41 @@ describe("mobile Home search and task mutations", () => {
     });
     expect(network.previewTaskTagDeletion).toHaveBeenCalledWith(credential, "tag-release", undefined);
     expect(saved.pending()).toEqual([]);
+  });
+
+  it("adopts a contiguous task-tag catalog event and returns a tag edit conflict without reconnecting", async () => {
+    const network = fakeNetwork();
+    const emit = eventFeed(network);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    const statuses: string[] = [];
+    const unsubscribe = app.subscribe(state => statuses.push(state.status));
+    try {
+      const catalog = create(TaskTagCatalogSchema, { revision: { value: 6n }, taskTags: [{ taskTagId: "tag-release",
+        name: "Release", color: TaskTagColor.ORANGE, revision: { value: 6n } }] });
+      const changed = create(EventSchema, { ...event("tags-changed", 11n), identity: undefined,
+        payload: { kind: { case: "taskTagCatalogChanged", value: { catalog } } } });
+      const current = create(SnapshotSchema, { ...snapshot, taskTagCatalog: catalog, resumeCursor: changed.cursor });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: current });
+      vi.mocked(network.readSession).mockResolvedValue(current);
+      emit(changed);
+      await vi.waitFor(() => expect(app.state.detail?.taskTagCatalog).toEqual(catalog));
+      expect(app.state.owner?.taskTagCatalog).toEqual(catalog);
+      vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
+        operationId: "operation-1", connectionId: credential.connectionId, state: OperationState.CONFLICT,
+        error: { code: "REVISION_CONFLICT", message: "The task tag changed on another client." }
+      }));
+
+      await expect(app.updateTaskTag("session", "tag-release", 5n, { name: "Launch" })).resolves.toBe(false);
+
+      expect(app.state.error).toBe("The task tag changed on another client.");
+      expect(app.state.detail?.taskTagCatalog).toEqual(catalog);
+      expect(statuses.length).toBeGreaterThan(0);
+      expect(new Set(statuses)).toEqual(new Set(["connected"]));
+      expect(network.streamOwner).toHaveBeenCalledTimes(1);
+      expect(saved.pending()).toEqual([]);
+    } finally { unsubscribe(); app.dispose(); }
   });
 
   it("persists an unknown task action before dispatch and never resends it", async () => {

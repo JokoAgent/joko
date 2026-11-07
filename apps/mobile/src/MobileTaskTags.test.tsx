@@ -10,6 +10,7 @@ import { SessionSchema, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreview
 import { MobileTaskTagDots, MobileTaskTagsSheet, mobileTaskTagName } from "./MobileTaskTags";
 import type { MobileTaskTagsNativeProps } from "./MobileTaskTagsNative";
 import type { MobileClient } from "./mobile-client";
+import { mobileMessage } from "./mobile-messages";
 
 vi.mock("react-native", async () => {
   const { createElement: element } = await import("react");
@@ -32,8 +33,12 @@ vi.mock("react-native", async () => {
 });
 vi.mock("./MobileTaskTagsNative", async () => {
   const { createElement: element } = await import("react");
-  return { mobileTaskTagsNativeAvailable: true, MobileTaskTagsNative: ({ visible, items, edit, onDelete }: MobileTaskTagsNativeProps) =>
-    visible ? element("div", {}, edit ? element("button", { onClick: onDelete }, "Delete tag")
+  return { mobileTaskTagsNativeAvailable: true, MobileTaskTagsNative: ({ visible, items, edit, onDelete, error }: MobileTaskTagsNativeProps) =>
+    visible ? element("div", {}, edit ? element("div", {},
+      element("button", { onClick: onDelete }, "Delete tag"),
+      element("input", { value: edit.name, "aria-label": "Tag name", onInput: (event: { currentTarget: HTMLInputElement }) => edit.onName(event.currentTarget.value) }),
+      element("button", { disabled: !edit.canSave, onClick: edit.onSave, "aria-label": "Save tag" }, "Save tag"),
+      error && element("span", { role: "alert" }, error))
       : items.map(item => element("button", { key: item.id, onClick: item.onEdit }, item.name))) : null };
 });
 vi.mock("react-native-safe-area-context", async () => {
@@ -90,6 +95,39 @@ it.each([false, true])("deletes from the Home tag sheet only while its row is cu
     await act(async () => confirm!());
     if (retired) expect(deleteTaskTag).not.toHaveBeenCalled();
     else expect(deleteTaskTag).toHaveBeenCalledExactlyOnceWith("home-task", preview);
+  } finally { await act(async () => root.unmount()); }
+});
+
+it.each([true, false])("keeps the name draft through a same-owner catalog update with a color change=%s", async colorChanged => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const original = tag("release", "Release", TaskTagColor.TEAL);
+  const updateTaskTag = vi.fn(async () => !colorChanged);
+  const client = { state: { status: "connected", selectedId: "session" }, taskHeaderSourceKey: () => "task-owner",
+    updateTaskTag } as unknown as MobileClient;
+  const session = create(SessionSchema, { sessionId: "session", displayName: "Task" });
+  const colors = { background: "white", surface: "white", ink: "black", muted: "gray", border: "gray", accent: "blue", brandBackground: "white", negative: "red" };
+  const host = document.body.appendChild(document.createElement("div")), root = createRoot(host);
+  const render = (taskTag: TaskTag) => root.render(createElement(MobileTaskTagsSheet, { visible: true, session,
+    catalog: create(TaskTagCatalogSchema, { taskTags: [taskTag] }), client, colors, locale: "en", onClose() {} }));
+  try {
+    await act(async () => render(original));
+    await act(async () => host.querySelector("button")!.click());
+    const input = host.querySelector("input")!;
+    await act(async () => {
+      input.value = "Launch";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => render(create(TaskTagSchema, { ...original, revision: { value: 2n }, sortOrder: 1,
+      color: colorChanged ? TaskTagColor.ORANGE : original.color })));
+    expect(host.querySelector("input")?.value).toBe("Launch");
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Save tag"]')!.click());
+    expect(updateTaskTag).toHaveBeenCalledExactlyOnceWith("session", "release", colorChanged ? 1n : 2n, { name: "Launch" });
+    if (colorChanged) {
+      expect(host.querySelector("input")?.value).toBe("Launch");
+      expect(host.querySelector('[role="alert"]')?.textContent).toBe(mobileMessage("en", "taskTags.changeFailed"));
+    } else {
+      expect(host.querySelector("input")).toBeNull();
+    }
   } finally { await act(async () => root.unmount()); }
 });
 
