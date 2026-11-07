@@ -2835,6 +2835,8 @@ export interface ScheduleRunHistoryView {
   readonly preRun?: SchedulePreRunResultView;
   readonly readAt?: number;
   readonly error?: string;
+  readonly errorCode?: string;
+  readonly errorPhase?: string;
 }
 
 export interface ScheduleHistoryPageView {
