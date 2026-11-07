@@ -587,7 +587,7 @@ export function assertMobileExtensionLibraryCallResult(result: MobileExtensionLi
         || call.kind === "writeBegin" && (result.receivedBytes !== 0n || result.nextSequence !== 0 || result.aborted)
         || call.kind !== "writeBegin" && result.streamId !== call.streamId
         || call.kind === "writeChunk" && (result.nextSequence !== call.sequence + 1 || result.aborted)
-        || call.kind === "writeAbort" && !result.aborted) invalid();
+        || call.kind === "writeAbort" && (result.receivedBytes !== 0n || result.nextSequence !== 0 || result.expiresAt !== undefined)) invalid();
       return;
     case "writeCommit":
       if (result.kind !== "write" || result.bytes < 0n || result.bytes > 8n * 1024n ** 3n) invalid();
