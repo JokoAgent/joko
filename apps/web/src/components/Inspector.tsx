@@ -2699,6 +2699,7 @@ function ReviewFileJump({ files, selectedKey, onSelect, t }: {
   readonly t: Translator;
 }): JSX.Element {
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -2715,8 +2716,11 @@ function ReviewFileJump({ files, selectedKey, onSelect, t }: {
       if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
     };
     document.addEventListener("pointerdown", handlePointerDown);
-    requestAnimationFrame(() => inputRef.current?.focus());
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
+    const focusFrame = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => {
+      cancelAnimationFrame(focusFrame);
+      document.removeEventListener("pointerdown", handlePointerDown);
+    };
   }, [open]);
 
   const choose = (index: number): void => {
@@ -2735,11 +2739,12 @@ function ReviewFileJump({ files, selectedKey, onSelect, t }: {
     } else if (event.key === "Escape") {
       event.preventDefault();
       setOpen(false);
+      triggerRef.current?.focus();
     }
   };
 
   return <div ref={rootRef} className="review-file-jump">
-    <button type="button" disabled={files.length === 0} aria-expanded={open} aria-label={t("workspace.reviewJumpToFile")} onClick={() => { setQuery(""); setOpen((current) => !current); }}><FileSearch aria-hidden="true" />{t("workspace.reviewJumpToFile")}</button>
+    <button ref={triggerRef} type="button" disabled={files.length === 0} aria-expanded={open} aria-label={t("workspace.reviewJumpToFile")} onClick={() => { setQuery(""); setOpen((current) => !current); }}><FileSearch aria-hidden="true" />{t("workspace.reviewJumpToFile")}</button>
     {open && <div className="review-file-jump__popover" onKeyDown={handleKeyDown}>
       <label><Search aria-hidden="true" /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("workspace.reviewFilterFiles")} aria-label={t("workspace.reviewFilterFiles")} /></label>
       <div className="review-file-jump__results" role="listbox" aria-label={t("workspace.reviewJumpToFile")}>
