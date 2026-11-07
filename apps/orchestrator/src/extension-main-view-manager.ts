@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { EXTENSION_SETTINGS_SDK_SOURCE } from "@joko/contracts";
+import { extensionSettingsSdkSource } from "@joko/contracts";
 
 import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor, ExtensionSettingsDescriptor, ExtensionRoutineEventsDescriptor, ExtensionRuntimeDescriptor } from "./extension-surface-manifest.js";
 import { EXTENSION_VIEW_LIFECYCLE_ASSET, EXTENSION_VIEW_LIFECYCLE_SCRIPT } from "./extension-view-lifecycle.js";
@@ -92,6 +92,7 @@ interface ActiveSurface {
   readonly endpoint: string;
   readonly authority: ExtensionMainViewAuthority;
   readonly connectionId: string;
+  readonly settingsBridgeScript?: Buffer;
   readonly root: string;
   readonly viewRoot: string;
   readonly lease: PiInstalledPackageLease;
@@ -109,7 +110,6 @@ const DEFAULT_MAXIMUM_SURFACES = 32;
 const DEFAULT_MAXIMUM_ASSET_BYTES = 256 * 1024 * 1024;
 const LIBRARY_BRIDGE_ASSET = "__joko_extension_library_bridge__.js";
 const SETTINGS_BRIDGE_ASSET = "__joko_extension_settings_bridge__.js";
-const SETTINGS_BRIDGE_SCRIPT = Buffer.from(EXTENSION_SETTINGS_SDK_SOURCE, "utf8");
 const LIBRARY_BRIDGE_SCRIPT = Buffer.from(String.raw`(() => {
   "use strict";
   const pending = new Map();
@@ -282,6 +282,9 @@ export class ExtensionMainViewManager {
         await assertContainedCanonicalDirectory(packageRoot, viewRoot, "Extension main-view directory");
         const expiresAt = this.#now() + this.#ttlMs;
         const endpoint = `/v1/extensions/main-views/${id}/${token}/${encodeURIComponent(basename(input.authority.mainView.html))}`;
+        const settingsBridgeScript = input.authority.settings === undefined ? undefined : Buffer.from(extensionSettingsSdkSource(
+          (extension.runtime?.network?.secrets ?? []).filter(secret => secret.source !== "oauth" && secret.check !== undefined).map(secret => secret.key)
+        ), "utf8");
         for (const previous of previousViews) await this.#destroy(previous);
         this.#surfaces.set(id, {
           id,
@@ -289,6 +292,7 @@ export class ExtensionMainViewManager {
           endpoint,
           authority: copyAuthority(input.authority),
           connectionId: input.connectionId,
+          ...(settingsBridgeScript === undefined ? {} : { settingsBridgeScript }),
           root,
           viewRoot,
           lease,
@@ -402,10 +406,10 @@ export class ExtensionMainViewManager {
           lifetime: surface.lifetime.signal
         };
       }
-      if (input.assetPath === SETTINGS_BRIDGE_ASSET && surface.authority.settings !== undefined) {
+      if (input.assetPath === SETTINGS_BRIDGE_ASSET && surface.settingsBridgeScript !== undefined) {
         if (input.method !== "GET" && input.method !== "HEAD" || input.isolatedDocument === true || input.materializeAsset === "style") throw new ExtensionMainViewError(404, "Settings asset transform is invalid.");
-        return { status: 200, mimeType: MIME_TYPES[".js"]!, contentLength: SETTINGS_BRIDGE_SCRIPT.byteLength,
-          ...(input.method === "HEAD" ? {} : { body: Buffer.from(SETTINGS_BRIDGE_SCRIPT) }), headers: surfaceHeaders(), lifetime: surface.lifetime.signal };
+        return { status: 200, mimeType: MIME_TYPES[".js"]!, contentLength: surface.settingsBridgeScript.byteLength,
+          ...(input.method === "HEAD" ? {} : { body: Buffer.from(surface.settingsBridgeScript) }), headers: surfaceHeaders(), lifetime: surface.lifetime.signal };
       }
       const candidate = safeAssetPath(surface.viewRoot, input.assetPath);
       const mimeType = MIME_TYPES[extname(candidate).toLowerCase()];
@@ -450,7 +454,7 @@ export class ExtensionMainViewManager {
           ...(input.materializeAsset === undefined ? {} : { output: input.materializeAsset }),
           assertCurrent, ...(input.signal === undefined ? {} : { signal: input.signal }), read: async path => {
             if (path === LIBRARY_BRIDGE_ASSET && surface.authority.library !== undefined) return { body: LIBRARY_BRIDGE_SCRIPT, mimeType: MIME_TYPES[".js"]! };
-            if (path === SETTINGS_BRIDGE_ASSET && surface.authority.settings !== undefined) return { body: SETTINGS_BRIDGE_SCRIPT, mimeType: MIME_TYPES[".js"]! };
+            if (path === SETTINGS_BRIDGE_ASSET && surface.settingsBridgeScript !== undefined) return { body: surface.settingsBridgeScript, mimeType: MIME_TYPES[".js"]! };
             if (path === EXTENSION_VIEW_LIFECYCLE_ASSET && injectLifecycle) return { body: EXTENSION_VIEW_LIFECYCLE_SCRIPT, mimeType: MIME_TYPES[".js"]! };
             let pending = read.get(path);
             if (pending === undefined) {

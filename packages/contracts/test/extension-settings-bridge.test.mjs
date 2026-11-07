@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Script, createContext } from "node:vm";
 import { webcrypto } from "node:crypto";
-import { EXTENSION_SETTINGS_SDK_SOURCE, parseExtensionSettingsBridgeRequest } from "../dist/index.js";
+import { EXTENSION_SETTINGS_SDK_SOURCE, extensionSettingsSdkSource, parseExtensionSettingsBridgeRequest } from "../dist/index.js";
 
 test("author settings only accepts declared commands and bounded private input", () => {
   const request = command => ({ type: "joko:extension-settings-request", version: 1, id: "settings-one", command });
@@ -20,7 +20,7 @@ test("author settings only accepts declared commands and bounded private input",
   assert.equal(parseExtensionSettingsBridgeRequest({ ...request({ kind: "context.get" }), sourceSession: "foreign" }), undefined);
 });
 
-function page() {
+function page(source = EXTENSION_SETTINGS_SDK_SOURCE) {
   const listeners = new Map(), requests = [];
   const parent = { postMessage: value => requests.push(value) };
   const context = { parent, navigator: {}, location: { origin: "null" }, crypto: webcrypto, URL, Response, DOMException,
@@ -28,7 +28,7 @@ function page() {
     addEventListener: (name, callback) => { const values = listeners.get(name) ?? new Set(); values.add(callback); listeners.set(name, values); },
     removeEventListener: (name, callback) => listeners.get(name)?.delete(callback) };
   context.window = context;
-  new Script(EXTENSION_SETTINGS_SDK_SOURCE).runInContext(createContext(context));
+  new Script(source).runInContext(createContext(context));
   const dispatch = (name, event) => { for (const callback of listeners.get(name) ?? []) callback(event); };
   const respond = (id, result, source = parent) => dispatch("message", { source, data: { type: "joko:extension-settings-response", version: 1, id, ok: true, result } });
   return { context, requests, dispatch, respond };
@@ -121,4 +121,34 @@ test("progressive password input keeps the complete candidate savable through th
   assert.equal((await (await pending).json()).configured, true);
   await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "0", dataJson: JSON.stringify({ parameter: value }) }), /Secrets/u);
   assert.equal(current.requests.length, 1);
+});
+
+test("default connection selection and readback return a lossless JSON revision", { timeout: 2_000 }, async t => {
+  const current = page();
+  t.after(() => current.dispatch("pagehide", {}));
+  const state = { extensionId: "fixture-extension", revision: { value: 9007199254740993n }, slots: [{ key: "gitlab", connections: [
+    { connectionId: "a", isDefault: false, configured: true }, { connectionId: "b", isDefault: true, configured: true }
+  ] }] };
+  const saved = current.context.fetch("/connections/gitlab/default", { method: "POST", body: JSON.stringify({ connectionId: "b" }) });
+  assert.deepEqual(JSON.parse(JSON.stringify(current.requests[0].command)), { kind: "connections.change", key: "gitlab", action: "default", connectionId: "b" });
+  current.respond(current.requests[0].id, state);
+  const expected = { ...state, revision: { value: "9007199254740993" } };
+  assert.deepEqual(await (await saved).json(), expected);
+  const read = current.context.fetch("/connections");
+  assert.equal(current.requests[1].command.kind, "connections.get");
+  current.respond(current.requests[1].id, state);
+  assert.deepEqual(await (await read).json(), expected);
+});
+
+test("the installed settings SDK exposes checks only for matching current secret slots", { timeout: 2_000 }, async t => {
+  const current = page(extensionSettingsSdkSource(["token", "retired"]));
+  t.after(() => current.dispatch("pagehide", {}));
+  const read = current.context.fetch("/secrets");
+  assert.equal(current.requests[0].command.kind, "setup.get");
+  const result = { extensionId: "fixture-extension", secrets: { token: { configured: false }, optional: { configured: true } } };
+  current.respond(current.requests[0].id, result);
+  assert.deepEqual(await (await read).json(), { ...result, secrets: {
+    token: { configured: false, checkSupported: true }, optional: { configured: true }
+  } });
+  assert.equal(result.secrets.token.checkSupported, undefined);
 });

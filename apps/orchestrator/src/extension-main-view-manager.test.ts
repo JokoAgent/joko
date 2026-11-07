@@ -45,6 +45,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
   let surfaceManifest = authority.mainView;
   let surfaceLibrary: ExtensionMainViewAuthority["library"];
   let surfaceSettings: ExtensionMainViewAuthority["settings"];
+  let surfaceRuntime: ExtensionMainViewAuthority["runtime"];
   const acquireInstalledPackage = vi.fn(async (): Promise<PiInstalledPackageLease> => ({
     resource: {} as PiInstalledPackageLease["resource"],
     snapshotTo: async (destination) => {
@@ -61,6 +62,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
               entry: authority.extensionEntry,
               mainView: surfaceManifest,
               ...(surfaceSettings === undefined ? {} : { settings: surfaceSettings }),
+              ...(surfaceRuntime === undefined ? {} : { runtime: surfaceRuntime }),
               ...(surfaceLibrary === undefined ? {} : { library: surfaceLibrary })
             }]
           }
@@ -91,6 +93,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
     setSurfaceManifest(value: typeof surfaceManifest) { surfaceManifest = value; },
     setSurfaceLibrary(value: typeof surfaceLibrary) { surfaceLibrary = value; },
     setSurfaceSettings(value: typeof surfaceSettings) { surfaceSettings = value; },
+    setSurfaceRuntime(value: typeof surfaceRuntime) { surfaceRuntime = value; },
     releases: () => releases
   };
 }
@@ -101,6 +104,13 @@ describe("ExtensionMainViewManager", () => {
     try {
       const settings = { html: "ui/review/index.html", mobileHtml: "ui/review/secondary.html", title: "Configuration", height: 320 };
       f.setSurfaceSettings(settings);
+      f.setSurfaceRuntime({ html: "ui/review/secondary.html", tools: [{ name: "lookup", description: "Lookup", inputSchema: { type: "object" }, readOnly: true }],
+        network: { hosts: ["api.example.test"], secrets: [
+          { key: "checkable", label: "Checkable", inject: { header: "X-Checkable", format: "{value}" }, check: {
+            url: "https://api.example.test/check", bodyFormat: '{"value":"{value}"}', validPath: "active", validValue: true
+          } },
+          { key: "plain", label: "Plain", inject: { header: "X-Plain", format: "{value}" } }
+        ] } });
       const view = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
       const configuration = { ...authority, mainView: { html: settings.mobileHtml, title: settings.title }, settings, mobileSettings: true as const };
       const page = await f.manager.open({ authority: configuration, connectionId: "connection-a", assertAuthorityCurrent: () => undefined });
@@ -111,6 +121,9 @@ describe("ExtensionMainViewManager", () => {
       const html = await f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET", isolatedDocument: true });
       const programs = [...html.body!.toString().matchAll(/data:text\/javascript;base64,([A-Za-z0-9+/=]+)/gu)]
         .map(match => Buffer.from(match[1]!, "base64").toString()).join("\n");
+      const sdk = await f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: "__joko_extension_settings_bridge__.js", method: "GET" });
+      expect(sdk.body!.toString()).toMatch(/\)\(\["checkable"\]\);$/u);
+      expect(programs).toContain(sdk.body!.toString());
       expect(programs).toContain("joko:extension-settings-request");
       expect(programs).not.toContain("joko:extension-library-request");
       expect(html.headers["content-security-policy"]).toContain("connect-src 'none'");
