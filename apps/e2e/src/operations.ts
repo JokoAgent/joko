@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { create } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import type { Client } from "@connectrpc/connect";
 import {
   AbortRunMutationSchema,
@@ -442,6 +442,7 @@ export function createManualScheduleMutation(input: {
   readonly targetId: string;
   readonly sessionId: string;
   readonly text: string;
+  readonly execution?: MessageInitShape<typeof ScheduleExecutionSnapshotSchema>;
 }): OperationMutation {
   const recurrence = create(ScheduleRecurrenceSchema, {
     kind: { case: "manual", value: create(ManualRecurrenceSchema, {}) }
@@ -454,7 +455,7 @@ export function createManualScheduleMutation(input: {
     recurrence,
     timeZone: "UTC",
     input: textInput(input.text),
-    execution: create(ScheduleExecutionSnapshotSchema, { permissionMode: PermissionMode.ASK }),
+    execution: create(ScheduleExecutionSnapshotSchema, { permissionMode: PermissionMode.ASK, ...input.execution }),
     overlapPolicy: ScheduleOverlapPolicy.QUEUE,
     misfirePolicy: ScheduleMisfirePolicy.RUN_ONCE,
     enabled: true
