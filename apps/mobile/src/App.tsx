@@ -99,6 +99,7 @@ import {
   mobileUpdates
 } from "./storage";
 import nativeNotifications from "./native-notifications";
+import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
 import { MobilePushController } from "./mobile-push-controller";
 import {
   MobileAppLifecycleCoordinator,
@@ -287,7 +288,7 @@ import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
   type MobileHomeStatusFilter
 } from "./home-navigation";
-import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewState,
+import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
   type MobileTaskHomeNavigationScope } from "./mobile-task-home-navigation";
 import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import {
@@ -630,17 +631,14 @@ export function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [homeDrawerMounted, setHomeDrawerMounted] = useState(false);
   const [homeSearchFocusRequest, setHomeSearchFocusRequest] = useState(0);
-  const [storedHomeView, setStoredHomeView] = useState(() => ({ sourceKey: mobileHomeSourceKey(state),
-    view: { search: "", statusFilter: "active" } as MobileHomeViewState }));
   const taskHomeNavigationRef = useRef<TaskHomeNavigationPort | undefined>(undefined);
   const registerTaskHomeNavigation = useCallback((port: TaskHomeNavigationPort) => {
     taskHomeNavigationRef.current = port;
     return () => { if (taskHomeNavigationRef.current === port) taskHomeNavigationRef.current = undefined; };
   }, []);
   const homeSourceKey = mobileHomeSourceKey(state);
-  const homeViewState = storedHomeView.sourceKey === homeSourceKey ? storedHomeView.view
-    : { search: "", statusFilter: "active" } as const;
-  const setHomeViewState = (view: MobileHomeViewState): void => setStoredHomeView({ sourceKey: homeSourceKey, view });
+  const { view: homeViewState, change: setHomeViewState } = useMobileHomeViewPreference(homeSourceKey,
+    state.saved.some(profile => profile.profileId === state.activeProfileId) ? mobilePlainStorage : undefined);
   const [focusTaskComposer, setFocusTaskComposer] = useState(false);
   const [incomingShareRequestRevision, setIncomingShareRequestRevision] = useState(0);
   const [nativeIntentRevision, setNativeIntentRevision] = useState(0);
@@ -1244,7 +1242,7 @@ type ScreenProps = { colors: Colors; state: MobileClient["state"]; locale: Mobil
 export type TaskHomeNavigationPort = (intent: MobileHomeNavigationIntent, deferred?: boolean) => (() => void) | undefined;
 export interface TaskHomeNavigationProps {
   readonly viewState: MobileHomeViewState;
-  readonly onViewStateChange: (next: MobileHomeViewState) => void;
+  readonly onViewStateChange: MobileHomeViewChange;
   readonly incomingShare: MobileIncomingShareSnapshot;
   readonly menuButtonRef: RefObject<View | null>;
   readonly searchFocusRequest: number;
@@ -1306,7 +1304,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   onNew: () => void; onSelect: () => void; onMenu: () => void;
   incomingShare: MobileIncomingShareSnapshot; onOpenShare: () => void;
   menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
-  viewState?: MobileHomeViewState; onViewStateChange?: (next: MobileHomeViewState) => void;
+  viewState?: MobileHomeViewState; onViewStateChange?: MobileHomeViewChange;
   currentSessionId?: string; runNavigation?: (intent: MobileHomeNavigationIntent) => void;
   foreground?: boolean; host?: "home" | "drawer" | "persistent";
   newTaskInSystemBar?: boolean;
@@ -1314,9 +1312,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
 }) {
   const [localViewState, setLocalViewState] = useState<MobileHomeViewState>({ search: "", statusFilter: "active" });
   const { search, statusFilter } = viewState ?? localViewState;
-  const setViewState = onViewStateChange ?? setLocalViewState;
+  const setViewState: MobileHomeViewChange = onViewStateChange ?? setLocalViewState;
   const setSearch = (search: string): void => setViewState({ search, statusFilter });
-  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => setViewState({ search, statusFilter });
+  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => setViewState({ search, statusFilter }, true);
   const [localError, setLocalError] = useState("");
   const [copyNotice, setCopyNotice] = useState("");
   const [copyBusy, setCopyBusy] = useState(false);

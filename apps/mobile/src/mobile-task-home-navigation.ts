@@ -3,6 +3,8 @@ export interface MobileHomeViewState {
   readonly statusFilter: "active" | "archived" | "all";
 }
 
+export type MobileHomeViewChange = (next: MobileHomeViewState, chooseStatus?: boolean) => void;
+
 export type MobileHomeNavigationIntent =
   | { readonly kind: "session"; readonly sessionId: string }
   | { readonly kind: "new-task" | "incoming-share" | "home" | "menu" | "search" }
