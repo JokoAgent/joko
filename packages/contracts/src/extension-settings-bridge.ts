@@ -19,7 +19,7 @@ export interface ExtensionSettingsHost {
 }
 
 export type ExtensionSettingsCall =
-  | { readonly kind: "context.get" | "routing.get" | "setup.get" | "setup.begin" | "setup.complete" | "oauth.get" | "connections.get" | "library.open" }
+  | { readonly kind: "context.get" | "agent-models.get" | "routing.get" | "setup.get" | "setup.begin" | "setup.complete" | "oauth.get" | "connections.get" | "library.open" }
   | { readonly kind: "routing.set"; readonly revision: string; readonly dataJson: string }
   | { readonly kind: "directory.pick"; readonly title?: string }
   | { readonly kind: "setup.field"; readonly fieldId: string; readonly value: string | boolean }
@@ -49,7 +49,7 @@ export function parseExtensionSettingsBridgeRequest(value: unknown): ExtensionSe
   let valid = false;
   switch (call.kind) {
     case "directory.pick": valid = keys(call, ["kind", "title"]) && (call.title === undefined || typeof call.title === "string" && call.title.length <= 160 && !/[\u0000-\u001f]/u.test(call.title)); break;
-    case "context.get": case "routing.get": case "setup.get": case "setup.begin": case "setup.complete": case "oauth.get": case "connections.get": case "library.open":
+    case "context.get": case "agent-models.get": case "routing.get": case "setup.get": case "setup.begin": case "setup.complete": case "oauth.get": case "connections.get": case "library.open":
       valid = keys(call, ["kind"]); break;
     case "routing.set": valid = keys(call, ["kind", "revision", "dataJson"]) && typeof call.revision === "string" && /^(?:0|[1-9][0-9]{0,19})$/u.test(call.revision)
       && typeof call.dataJson === "string" && call.dataJson.length <= 65_536; break;
@@ -133,7 +133,7 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
   const settingsFetch = window.fetch = async (input, init) => {
     const target = typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
     const url = settingsUrl(target);
-    if (!url || !/^\/(kv|app-context|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
+    if (!url || !/^\/(kv|app-context|agent-models|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
     if (url.username || url.password) throw new Error("Settings URL credentials are not allowed.");
     const signal = init && init.signal !== undefined ? init.signal : input && input.signal;
     const assertNotAborted = () => {
@@ -142,6 +142,20 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
     const dispatch = command => { assertNotAborted(); return call(command); };
     assertNotAborted();
     const method = String(init && init.method || input && input.method || "GET").toUpperCase();
+    if (url.pathname === "/agent-models") {
+      const headers = { "cache-control": "no-store", "content-type": "application/json" };
+      if (method !== "GET") return new Response(null, { status: 405, headers });
+      if (url.search || url.hash) return new Response(null, { status: 400, headers });
+      try {
+        const result = await dispatch({ kind: "agent-models.get" });
+        assertNotAborted();
+        const status = result.ok ? 200 : result.errorCode === "PERMISSION_DENIED" ? 403 : 503;
+        return new Response(JSON.stringify(result), { status, headers });
+      } catch {
+        assertNotAborted();
+        return new Response(JSON.stringify({ ok: false, errorCode: "NOT_AVAILABLE", message: "Model catalog unavailable." }), { status: 503, headers });
+      }
+    }
     let body = init && init.body, command, authorConnectionHost, deleteConnection = false;
     if (body === undefined && input && typeof input.clone === "function" && method !== "GET" && method !== "HEAD") body = await input.clone().text();
     if (typeof body === "string" && body.length > 65536) throw new Error("Settings request is too large.");

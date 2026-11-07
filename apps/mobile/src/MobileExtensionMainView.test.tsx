@@ -281,23 +281,25 @@ describe("MobileExtensionMainView", () => {
     active.callSettings = vi.fn(async () => ({ context: { locale: "en" } }));
     await render(active, extension, true);
     const old = native.web!;
-    const deliver = (web: Record<string, unknown>, id: string, frameId: string, url: string) => (web.onMessage as (event: unknown) => void)({
+    const deliver = (web: Record<string, unknown>, id: string, frameId: string, url: string, kind = "context.get") => (web.onMessage as (event: unknown) => void)({
       nativeEvent: { url, data: JSON.stringify({ surfaceId: surface.surfaceId, frameId,
-        request: { type: "joko:extension-settings-request", version: 1, id, command: { kind: "context.get" } } }) }
+        request: { type: "joko:extension-settings-request", version: 1, id, command: { kind } } }) }
     });
     await act(async () => deliver(old, "first", `${surface.surfaceId}:0`, native.documents[0]!.documentUrl));
     expect(active.callSettings).toHaveBeenCalledOnce();
     const reload = container.querySelector('button[aria-label="Reload main view"]') as HTMLButtonElement;
     await act(async () => reload.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     await act(async () => {
-      deliver(old, "retired", `${surface.surfaceId}:0`, native.documents[0]!.documentUrl);
+      deliver(old, "retired", `${surface.surfaceId}:0`, native.documents[0]!.documentUrl, "agent-models.get");
       deliver(native.web!, "wrong-frame", `${surface.surfaceId}:0`, native.documents[1]!.documentUrl);
       deliver(native.web!, "wrong-document", `${surface.surfaceId}:1`, native.documents[0]!.documentUrl);
       deliver(native.web!, "wrong-origin", `${surface.surfaceId}:1`, "https://attacker.example/index.html");
     });
     expect(active.callSettings).toHaveBeenCalledOnce();
-    await act(async () => deliver(native.web!, "second", `${surface.surfaceId}:1`, native.documents[1]!.documentUrl));
-    expect(active.callSettings).toHaveBeenCalledTimes(2); expect(active.callLibrary).not.toHaveBeenCalled();
+    await act(async () => deliver(native.web!, "second", `${surface.surfaceId}:1`, native.documents[1]!.documentUrl, "agent-models.get"));
+    expect(active.callSettings).toHaveBeenCalledTimes(2);
+    expect(active.callSettings).toHaveBeenLastCalledWith(surface, { kind: "agent-models.get" }, expect.any(Object), expect.any(AbortSignal));
+    expect(active.callLibrary).not.toHaveBeenCalled();
   });
 
   it("keeps a replacement native authorization owned when the retired authorization finishes late", async () => {

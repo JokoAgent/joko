@@ -1164,6 +1164,54 @@ describe("Connect Extension catalog boundary", () => {
     revoked?.();
     await vi.waitFor(() => expect(closeConnection).toHaveBeenCalledWith(connection.id));
   });
+
+  it("projects only local text routes for the original enabled settings surface", async () => {
+    const discoveredRevision = `sha256:${"a".repeat(64)}`;
+    const settings = { html: "settings/index.html", extensionEntry: "extensions/main.ts" };
+    let entry = extensionEntry({ owner: { kind: "resource", resourceId: "resource-package", resourceVersion: 5n, discoveredRevision }, settings });
+    const resource = { id: "resource-package", backendId: "pi", kind: "package", scope: "managed", state: "loaded", enabled: true,
+      version: entry.version, versionNumber: 5n, discoveredRevision, packageIdentity: "@sample/settings",
+      resourceDetails: [{ kind: "extension", entryPath: settings.extensionEntry, settings: { html: settings.html } }] };
+    const backend = { revision: 9n, descriptor: { id: "pi", adapterKind: "pi", instanceGeneration: 3,
+      capabilities: new Map([["model.effort", { supported: true }]]),
+      providers: [{ providerId: "test", displayName: "Local Provider" }] } };
+    const surface = { id: `extension_surface_${"a".repeat(32)}`, authority: {
+      extensionId: entry.id, resourceId: resource.id, backendId: "pi", backendRevision: 9n, backendGeneration: 3, resourceRevision: 5n,
+      discoveredRevision, packageName: resource.packageIdentity, packageVersion: entry.version, extensionEntry: settings.extensionEntry,
+      mainView: { html: settings.html }, settings: { html: settings.html }, mobileSettings: true
+    } };
+    let live = true;
+    const getSurface = vi.fn(async () => surface), fence = vi.fn();
+    const select = vi.fn(() => [
+      { providerId: "test", modelId: "text", displayName: "Hidden Text", thinkingLevels: ["low", "high"], defaultEffort: "low", defaultVisible: false },
+      { providerId: "test", modelId: "image", displayName: "Image Only", declaredOutputModalities: ["image"], thinkingLevels: [] },
+      { providerId: "group-member", modelId: "group-text", displayName: "Grouped Text", thinkingLevels: [] }
+    ]);
+    const services = createConnectServices(stubApplication({
+      store: { getBackend: () => backend, listBackends: () => [backend, { descriptor: { id: "remote", adapterKind: "hosted" } }] },
+      connections: { authenticate: () => connection, fence },
+      piResources: { get: () => resource },
+      extensionCatalog: { get: () => entry }, extensionSettings: {},
+      extensionMainViews: { getSurface, isSurfaceCurrent: () => live },
+      sessionHost: { listSelectableTaskModels: select },
+      providerGroups: { store: { snapshot: () => ({}), list: () => [{ backendId: "other", providerId: "group",
+        config: { members: [{ backendId: "pi", providerId: "group-member" }] } }] } }
+    }));
+    const read = () => invoke<contract.ListExtensionSettingsAgentModelsResponse>(services.extension.listExtensionSettingsAgentModels, { surfaceId: surface.id });
+    const result = await read();
+    expect(result.models).toEqual([create(contract.ExtensionSettingsAgentModelSchema, {
+      backendId: "pi", id: "text", name: "Hidden Text", agent: "pi", providerId: "test", providerName: "Local Provider",
+      efforts: ["low", "high"], defaultEffort: "low", defaultVisible: false
+    })]);
+    expect(getSurface).toHaveBeenCalledExactlyOnceWith(surface.id, connection.id);
+    expect(fence).toHaveBeenCalledWith(connection);
+    expect(select).toHaveBeenCalledExactlyOnceWith("pi");
+    entry = { ...entry, enabled: false };
+    await expect(read()).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    live = false;
+    await expect(read()).rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(select).toHaveBeenCalledOnce();
+  });
 });
 
 function catalog(entry: ExtensionCatalogDescriptor) {

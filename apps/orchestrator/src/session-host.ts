@@ -1556,6 +1556,16 @@ export class SessionHost {
     });
   }
 
+  /** Read only routes accepted by ordinary new-task admission for this Backend. */
+  listSelectableTaskModels(backendId: string): readonly ProviderModel[] {
+    const backend = this.#store.getBackend(backendId).descriptor;
+    if (!this.#backendEnabled(backendId) || backend.health === "unavailable"
+      || !["installed", "update_available"].includes(backend.installationState)
+      || backend.capabilities.get("input.text")?.supported !== true) return [];
+    return backend.models.filter(model => this.providerAuthenticationAvailable(backendId, model.providerId)
+      && this.#modelRoutingEnabled(backendId, model.providerId, model.modelId));
+  }
+
   async registerTarget(target: TargetDescriptor, metadata: unknown = {}): Promise<void> {
     this.#assertOpen();
     const adapter = this.requireAdapter(target.backendId);

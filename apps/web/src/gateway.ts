@@ -2,6 +2,7 @@ import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/p
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
 import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
+import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
   parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
 import { readSessionArchivePreview } from "@joko/contracts";
@@ -5730,8 +5731,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           await fresh(surface, active); return result;
         }
         const after = async (work: () => Promise<void>) => { current(); active.throwIfAborted(); await work(); current(); return { extension: await fresh(surface, active) }; };
+        let modelPreferences: ReturnType<typeof readModelPickerOwnerPreferences> | undefined;
         return executeExtensionSettingsCall({ surface: { surfaceId: surface.id }, api, oauth: createClient(ExtensionOAuthService, scope.transport),
           connections: createClient(ExtensionNetworkService, scope.transport), fresh: signal => fresh(surface, signal), current,
+          modelVisible: model => isModelVisible(modelPreferences ??= readModelPickerOwnerPreferences(modelPreferenceOwnerId(profile.serverId)),
+            model.backendId, model.providerId, model.id, model.defaultVisible),
           upload: (ticket, value, signal) => this.uploadCredentialTicket(value, ticket, { ...scope, signal }),
           submit: async (extension, mutation, _kind, signal) => { current(); await submitSettings(extension, mutation.payload, signal); current(); },
           pickDirectory: async (extension, mutation, signal) => {
