@@ -84,7 +84,7 @@ export class ContactSyncManagerError extends Error {
 interface ContactSyncTransportPort {
   start(): Promise<void>;
   stop(): void;
-  send(nodeId: string, frame: NodeSyncCipherChunkFrame): Promise<boolean>;
+  send(nodeId: string, frame: NodeSyncCipherChunkFrame, delivery: NodeSyncDeliveryContext): Promise<boolean>;
   candidates(now?: number): readonly NodeSyncLanCandidate[];
   onlinePeerIds(now?: number): readonly string[];
 }
@@ -316,12 +316,11 @@ export class ContactSyncManager {
       for (const peerId of peerIds) await this.#sendState(peerId, true, generation);
       this.#errorCode = undefined;
     } catch (error) {
-      this.#setError(error);
+      if (generation === this.#generation) this.#setError(error);
       throw error instanceof ContactSyncManagerError ? error
         : new ContactSyncManagerError("UNAVAILABLE", "Contacts sync failed.", { cause: error });
     } finally {
-      this.#activeSyncs = Math.max(0, this.#activeSyncs - 1);
-      this.#emitChanged();
+      this.#finishSync(generation);
     }
     return this.status();
   }
@@ -386,6 +385,10 @@ export class ContactSyncManager {
     if (!configuration.enabled || privateKey === undefined || transport === undefined) {
       throw new ContactSyncManagerError("DISABLED", "Contacts sync is not active.");
     }
+    const delivery: NodeSyncDeliveryContext = {
+      signal: this.#abortController.signal,
+      isCurrent: () => generation === this.#generation && this.#store.contactSyncConfiguration()?.revision === configuration.revision
+    };
     const local = this.#store.readContactSyncState(configuration.nodeId);
     if (local.materialized) this.#emitChanged();
     const state = createContactSyncDelta(local.state, this.#peerKnownClocks.get(peerId) ?? []);
@@ -396,10 +399,10 @@ export class ContactSyncManager {
       peerPublicKey: peer.publicKey,
       sourceNodeId: configuration.nodeId,
       destinationNodeId: peer.peerId
-    }, this.#abortController.signal);
+    }, delivery.signal);
     this.#assertGeneration(generation);
     for (const frame of frames) {
-      if (!await transport.send(peer.peerId, frame)) {
+      if (!await transport.send(peer.peerId, frame, delivery)) {
         throw new ContactSyncManagerError("OFFLINE", "The Contacts sync peer could not be reached over the authenticated LAN route.");
       }
       this.#assertGeneration(generation);
@@ -436,14 +439,25 @@ export class ContactSyncManager {
       this.#store.recordContactSyncSuccess(peer.peerId, "lan", this.#now());
       this.#errorCode = undefined;
       if (merged.materialized) this.#emitChanged();
-      if (message.requestReply === true) await this.#sendState(peer.peerId, false, generation);
+      if (message.requestReply === true) {
+        // The authenticated incoming receipt covers its own merge. A reply uses a separate delivery.
+        this.#activeSyncs += 1;
+        void this.#sendState(peer.peerId, false, generation).catch((error: unknown) => {
+          if (generation === this.#generation) this.#setError(error);
+        }).finally(() => this.#finishSync(generation));
+      }
     } catch (error) {
-      this.#setError(error);
+      if (generation === this.#generation) this.#setError(error);
       throw error;
     } finally {
-      this.#activeSyncs = Math.max(0, this.#activeSyncs - 1);
-      this.#emitChanged();
+      this.#finishSync(generation);
     }
+  }
+
+  #finishSync(generation: number): void {
+    if (generation !== this.#generation) return;
+    this.#activeSyncs = Math.max(0, this.#activeSyncs - 1);
+    this.#emitChanged();
   }
 
   #peerView(peer: ContactSyncPeerRecord, online: boolean): ContactSyncPeerView {
