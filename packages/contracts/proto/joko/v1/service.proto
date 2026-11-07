@@ -2005,6 +2005,8 @@ message SearchWorkspaceRequest {
   bool case_sensitive = 4;
   bool regular_expression = 5;
   PageRequest page = 6;
+  // Include the file version used by directory, preview and attachment actions.
+  bool include_entry_revisions = 7;
 }
 
 message SearchWorkspaceResponse {
