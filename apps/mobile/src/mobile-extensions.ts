@@ -7,6 +7,7 @@ import {
   type ExtensionCatalogEntry,
   type ExtensionMainViewSurface
 } from "@joko/contracts";
+import type { ExtensionLibraryFileMatch } from "@joko/connection-transport";
 import type {
   MobileExtensionLibraryLocationValidation,
   MobileExtensionLibraryMutation,
@@ -233,7 +234,7 @@ export interface MobileExtensionTransport {
   closeMainView(expected: MobileExtensionMainViewSurface): Promise<boolean>;
   openLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibrarySession>;
   callLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,
-    call: MobileExtensionLibraryCall, signal: AbortSignal): Promise<MobileExtensionLibraryCallResult>;
+    call: MobileExtensionLibraryCall, signal: AbortSignal, source?: ExtensionLibraryFileMatch): Promise<MobileExtensionLibraryCallResult>;
   closeLibrary(session: MobileExtensionLibrarySession): Promise<boolean>;
   libraryStatus(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibraryOverview>;
   loadLibrary(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionLibrarySnapshot>;

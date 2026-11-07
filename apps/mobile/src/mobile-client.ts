@@ -4,7 +4,7 @@ import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionPackageAction } from "@joko/contracts";
 import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
-import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
+import { executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
 import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
@@ -3043,7 +3043,7 @@ export class MobileClient {
     };
     const callLibrary = async (
       expected: MobileExtension, surface: MobileExtensionMainViewSurface, session: MobileExtensionLibrarySession,
-      call: MobileExtensionLibraryCall, signal: AbortSignal
+      call: MobileExtensionLibraryCall, signal: AbortSignal, source?: ExtensionLibraryFileMatch
     ): Promise<MobileExtensionLibraryCallResult> => {
       try {
         return await owned(signal, async (current) => {
@@ -3055,7 +3055,8 @@ export class MobileClient {
           await requireLibrarySurface(expected, surface, current);
           requireCurrent(current);
           if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library session was closed.");
-          const result = await this.network.callExtensionLibrary(context.credential, session.id, call, current);
+          const result = await (source === undefined ? this.network.callExtensionLibrary(context.credential, session.id, call, current)
+            : this.network.callExtensionLibrary(context.credential, session.id, call, current, source));
           requireCurrent(current);
           if (libraryLeases.get(session) !== lease) throw new Error("The Extension Library call result was retired.");
           return result;
