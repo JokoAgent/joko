@@ -1131,7 +1131,13 @@ export async function createOrchestratorApplication(
   await extensionPackagePublisher.initialize();
   const extensionLibraries = new ExtensionLibraryManager({
     rootDirectory: join(config.dataDirectory, "extension-libraries"),
-    managedRoots: [config.dataDirectory]
+    managedRoots: [config.dataDirectory],
+    onOrphanMarkerWriteFailure: action => store.appendDiagnostic({
+      severity: "warning",
+      component: "extension-library",
+      code: action === "mark" ? "EXTENSION_LIBRARY_ORPHAN_MARK_FAILED" : "EXTENSION_LIBRARY_ORPHAN_CLEAR_FAILED",
+      message: action === "mark" ? "The Library could not be marked after plugin removal." : "The Library orphan marker could not be cleared."
+    })
   });
   await extensionLibraries.initialize();
   const stopExtensionLibraryAuthorityNotifications = extensionCatalog.onAuthorityChanged((extensionIds) => {

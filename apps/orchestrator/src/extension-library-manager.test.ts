@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } fro
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ExtensionLibraryManager,
@@ -27,8 +27,26 @@ const authority: ExtensionLibraryAuthority = {
   library: { schemaVersion: 1, extensionEntry: "extensions/canvas.ts" }
 };
 const cleanups: Array<() => Promise<void>> = [];
+const filesystem = vi.hoisted(() => ({ orphanMarkerTempPrefix: undefined as string | undefined }));
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    open: async (...args: unknown[]) => {
+      const [path, flags] = args;
+      if (filesystem.orphanMarkerTempPrefix && typeof path === "string"
+        && path.startsWith(filesystem.orphanMarkerTempPrefix) && path.endsWith(".tmp") && flags === "wx") {
+        filesystem.orphanMarkerTempPrefix = undefined;
+        throw Object.assign(new Error("Injected Library orphan marker staging error"), { code: "EIO" });
+      }
+      return Reflect.apply(actual.open, undefined, args);
+    }
+  };
+});
 
 afterEach(async () => {
+  filesystem.orphanMarkerTempPrefix = undefined;
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -209,6 +227,49 @@ describe("ExtensionLibraryManager", () => {
 
     await expect(queued).resolves.toMatchObject({ orphaned: true, usage: { files: 1, bytes: 4 } });
     await expect(manager.closeSession(opened.sessionId, "web-authority-change")).resolves.toBe(false);
+  });
+
+  it("releases uninstall authority and reopens the original Library after isolated orphan marker staging failures", async () => {
+    const report = vi.fn();
+    const { manager } = await fixture({ onOrphanMarkerWriteFailure: report });
+    const sibling = { ...authority, extensionId: `extension_${"d".repeat(32)}` };
+    const originalOwner = { authority, assertAuthorityCurrent: currentAuthority() };
+    const siblingOwner = { authority: sibling, assertAuthorityCurrent: currentAuthority(sibling) };
+    const connectionId = "local-library-owner";
+    const open = (owner: typeof originalOwner, suffix: string) => manager.openSession({
+      ...owner, connectionId, surfaceId: `extension_surface_${suffix.repeat(32)}`, surfaceExpiresAt: Date.now() + 60_000
+    });
+    const original = await open(originalOwner, "0");
+    const other = await open(siblingOwner, "1");
+    const cover = Buffer.from("original cover");
+    await manager.write(original.sessionId, connectionId, { path: "cover.png", bytes: cover });
+    await manager.write(other.sessionId, connectionId, { path: "kept.txt", bytes: Buffer.from("sibling") });
+    const overview = await manager.overview(originalOwner);
+    const markerTempPrefix = join(overview.location!.path, ".joko-library", "metadata.json.");
+    const lease = await manager.acquireAuthorityChanges([authority.extensionId, sibling.extensionId]);
+    filesystem.orphanMarkerTempPrefix = markerTempPrefix;
+    await expect(lease.release({ orphaned: [
+      { extensionId: authority.extensionId, name: authority.name },
+      { extensionId: sibling.extensionId, name: sibling.name }
+    ] })).resolves.toBeUndefined();
+    expect(report.mock.calls).toEqual([["mark"]]);
+    await expect(manager.read(original.sessionId, connectionId, { path: "cover.png" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(manager.overview(originalOwner)).resolves.toMatchObject({ orphaned: false, usage: { files: 1, bytes: cover.length } });
+    await expect(manager.overview(siblingOwner)).resolves.toMatchObject({ orphaned: true, usage: { files: 1 } });
+
+    await manager.revokeExtension(authority.extensionId, authority.name);
+    const reinstalled = { authority: { ...authority, extensionRevision: 2n, resourceRevision: 2n },
+      assertAuthorityCurrent: async () => undefined };
+    await expect(manager.overview(reinstalled)).resolves.toMatchObject({ orphaned: true });
+    filesystem.orphanMarkerTempPrefix = markerTempPrefix;
+    const next = await open(reinstalled, "2");
+    expect(report.mock.calls).toEqual([["mark"], ["clear"]]);
+    expect(next.bindingGeneration).toBe(original.bindingGeneration);
+    await expect(manager.read(next.sessionId, connectionId, { path: "cover.png" })).resolves.toMatchObject({ bytes: cover });
+    await expect(manager.overview(reinstalled)).resolves.toMatchObject({ orphaned: true });
+    await manager.closeSession(next.sessionId, connectionId);
+    await open(reinstalled, "3");
+    await expect(manager.overview(reinstalled)).resolves.toMatchObject({ orphaned: false });
   });
 
   it("rolls back an in-flight SQLite mutation when its connection is revoked", async () => {

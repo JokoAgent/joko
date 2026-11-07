@@ -34,6 +34,7 @@ import {
 import {
   EXTENSION_LIBRARY_LIMITS,
   ExtensionLibraryError,
+  ExtensionLibraryOrphanMarkerWriteError,
   ExtensionLibraryVault,
   filesystemFreeBytes,
   type ExtensionLibraryEntry,
@@ -65,6 +66,7 @@ export interface ExtensionLibraryManagerOptions {
   readonly maximumSessions?: number;
   readonly renameDirectory?: (from: string, to: string) => Promise<void>;
   readonly copyLibrary?: typeof copyExtensionLibrary;
+  readonly onOrphanMarkerWriteFailure?: (action: "mark" | "clear") => void;
 }
 
 export interface ExtensionLibrarySessionDescriptor {
@@ -333,6 +335,7 @@ export class ExtensionLibraryManager {
   readonly #maximumSessions: number;
   readonly #renameDirectory: (from: string, to: string) => Promise<void>;
   readonly #copyLibrary: typeof copyExtensionLibrary;
+  readonly #onOrphanMarkerWriteFailure: ExtensionLibraryManagerOptions["onOrphanMarkerWriteFailure"];
   readonly #sessions = new Map<string, ActiveSession>();
   readonly #streams = new Map<string, ActiveStream>();
   #state: StoredManagerState = emptyState();
@@ -357,6 +360,7 @@ export class ExtensionLibraryManager {
     this.#maximumSessions = positiveInteger(options.maximumSessions ?? DEFAULT_MAXIMUM_SESSIONS, "Library session limit");
     this.#renameDirectory = options.renameDirectory ?? rename;
     this.#copyLibrary = options.copyLibrary ?? copyExtensionLibrary;
+    this.#onOrphanMarkerWriteFailure = options.onOrphanMarkerWriteFailure;
   }
 
   async initialize(): Promise<void> {
@@ -501,7 +505,10 @@ export class ExtensionLibraryManager {
       if (status.state === "unavailable") throw new ExtensionLibraryError("CORRUPT", "Extension Library metadata is unavailable.");
       const migrating = this.#hasOperation(input.authority.extensionId);
       if (migrating) vault.setReadonly(true);
-      else await vault.clearOrphaned();
+      else if (!await this.#updateOrphanMarker("clear", () => vault.clearOrphaned())) {
+        const stillBound = await this.#resolveBinding(binding);
+        if (!stillBound.ok) throw unavailableBinding(stillBound.reason);
+      }
       const sessionId = `library_session_${randomUUID().replaceAll("-", "")}`;
       await input.assertAuthorityCurrent();
       if (input.surfaceExpiresAt <= this.#now()) throw new ExtensionLibraryError("UNAVAILABLE", "Library surface expired while opening.");
@@ -1702,7 +1709,18 @@ export class ExtensionLibraryManager {
     if (binding === undefined || !(await this.#resolveBinding(binding)).ok) return;
     const vault = this.#createVault(binding.root, extensionId);
     const status = await vault.open({ create: false });
-    if (status.state !== "unavailable") await vault.markOrphaned(orphanedName);
+    if (status.state !== "unavailable") await this.#updateOrphanMarker("mark", () => vault.markOrphaned(orphanedName));
+  }
+
+  async #updateOrphanMarker(action: "mark" | "clear", write: () => Promise<void>): Promise<boolean> {
+    try {
+      await write();
+      return true;
+    } catch (error) {
+      if (!(error instanceof ExtensionLibraryOrphanMarkerWriteError)) throw error;
+      try { this.#onOrphanMarkerWriteFailure?.(action); } catch { /* A diagnostic cannot own the Library operation. */ }
+      return false;
+    }
   }
 
   #assertStateTopology(): void {

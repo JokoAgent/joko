@@ -856,11 +856,12 @@ describe("Connect Extension catalog boundary", () => {
       case: "removeResource",
       value: { resourceId }
     } });
-    await invoke(services.operation.submitOperation, {
+    const removedReceipt = await invoke<contract.SubmitOperationResponse>(services.operation.submitOperation, {
       operationId: "generic-package-remove",
       connectionId: connection.id,
       mutation: remove
     });
+    expect(removedReceipt.operation?.state).toBe(contract.OperationState.COMPLETED);
     expect(events).toEqual([
       `acquire:${first.id},${second.id}`,
       "commit:remove",
