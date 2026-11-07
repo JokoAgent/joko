@@ -215,6 +215,10 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
     try {
       const result = await dispatch(command);
       if (command.kind === "routing.set") revision = result.revision;
+      if (command.kind === "secret.set") {
+        assertNotAborted();
+        return new Response(null, { status: 204 });
+      }
       if (deleteConnection) return new Response(null, { status: 204 });
       if (authorConnectionHost !== undefined) {
         const slot = result?.slots?.find(slot => slot.key === command.key);
