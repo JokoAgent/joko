@@ -3674,16 +3674,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     readonly ownerKey?: string; readonly ids: ReadonlySet<string>;
   }>({ ids: new Set() });
   const [imageViewportPulse, setImageViewportPulse] = useState(0);
-  const [visibleImageRows, setVisibleImageRows] = useState<ReadonlySet<string>>(new Set());
-  const imageViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
-  const onImageRowsVisible = useMemo(() => ({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
-    const rowIds = (item: MobileWorkItem<TimelineRow>): string[] => isWorkGroup(item) ? item.children.flatMap(rowIds) : [item.id];
-    const next = new Set(viewableItems.filter((item) => item.isViewable).flatMap((item) => rowIds(item.item)));
-    setVisibleImageRows((previous) => previous.size === next.size && [...next].every((id) => previous.has(id)) ? previous : next);
-    setVisiblePartnerRows((previous) => previous.ownerKey === partnerConversationTransport?.ownerKey
-      && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous
-      : { ownerKey: partnerConversationTransport?.ownerKey, ids: next });
-  }, [partnerConversationTransport?.ownerKey]);
+  const [timelineVisibility, setTimelineVisibility] = useState<{ key: string; ids: ReadonlySet<string> }>();
+  const timelineViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
   const screenshotMessageViewsRef = useRef(new Map<string, View>());
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
@@ -3710,6 +3702,17 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? { profileId: taskDraftProfileId!, sessionId: state.selectedId }
     : undefined;
   const draftIdentityKey = draftIdentity ? mobileComposerDraftIdentityKey(draftIdentity) : undefined;
+  const timelineListKey = `${draftIdentityKey ?? ""}\u001f${partnerConversationTransport?.ownerKey ?? ""}`;
+  const visibleTimelineRows = timelineVisibility?.key === timelineListKey ? timelineVisibility.ids : undefined;
+  const onTimelineRowsVisible = useMemo(() => ({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
+    const rowIds = (item: MobileWorkItem<TimelineRow>): string[] => isWorkGroup(item) ? item.children.flatMap(rowIds) : [item.id];
+    const next = new Set(viewableItems.filter((item) => item.isViewable).flatMap((item) => rowIds(item.item)));
+    setTimelineVisibility((previous) => previous?.key === timelineListKey
+      && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous : { key: timelineListKey, ids: next });
+    setVisiblePartnerRows((previous) => previous.ownerKey === partnerConversationTransport?.ownerKey
+      && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous
+      : { ownerKey: partnerConversationTransport?.ownerKey, ids: next });
+  }, [timelineListKey, partnerConversationTransport?.ownerKey]);
   draftIdentityRef.current = draftIdentity;
   useEffect(() => {
     copyGenerationRef.current += 1;
@@ -6211,7 +6214,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     runNavigation={(intent) => { requestTaskHomeNavigation(intent, host === "drawer"); }} />;
   const renderTimelineImage = (item: TimelineRow, image: NonNullable<TimelineRow["images"]>[number], index: number): ReactNode => <MobileTimelineImage key={image.pageId} client={client} page={image}
             eventId={image.sourceEventId ?? item.eventId} ownerKey={client.timelineImagePreviewOwnerKey()}
-            eligible={visibleImageRows.has(item.id) && client.timelineImagePreviewOwnerKey() !== undefined && !drawerOpen && !messageActionsVisible && !taskActionsVisible
+            eligible={visibleTimelineRows?.has(item.id) === true && client.timelineImagePreviewOwnerKey() !== undefined && !drawerOpen && !messageActionsVisible && !taskActionsVisible
               && !interactionVisible && !contextVisible && imageGallery.view === undefined && imageEditorLease === undefined && photoLibraryLease === undefined}
             viewportRef={timelineViewportRef} viewportPulse={imageViewportPulse} maximumWidth={Math.max(1, homeLayout.detailWidth - 64)}
             colors={colors} locale={locale} openLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: (item.images?.length ?? 1), name: image.title })}
@@ -6262,10 +6265,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     if (!taskMountedRef.current || AppState.currentState !== "active" || client.state.taskSource !== state.taskSource) return false;
     return client.sendRichAnswer(richAnswerSourceKey, text, receiptKey);
   };
-  const renderTimelineItem = (item: MobileWorkItem<TimelineRow>, compactThinking = false): ReactElement => {
+  const renderTimelineItem = (item: MobileWorkItem<TimelineRow>, focused: boolean, compactThinking = false): ReactElement => {
     if (isWorkGroup(item)) return <MobileWorkGroupCard blockKey={item.id} ownerKey={blockOwnerKey} streaming={item.streaming}
       enabled={state.status === "connected" || state.status === "offline"} colors={colors} locale={locale}>
-      {item.children.map((child) => <Fragment key={child.id}>{renderTimelineItem(child, true)}</Fragment>)}
+      {item.children.map((child) => <Fragment key={child.id}>{renderTimelineItem(child, focused, true)}</Fragment>)}
     </MobileWorkGroupCard>;
     if (item.pendingSend && state.activeProfileId) {
       const record = item.pendingSend.outboxId ? localOutbox.find(record => record.id === item.pendingSend!.outboxId) : undefined;
@@ -6376,6 +6379,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             requestTaskHomeNavigation({ kind: "session", sessionId: target }, drawerMountedRef.current);
           }} /> : delegatedOnly ? undefined : item.extensionCard ? <MobileExtensionCard card={item.extensionCard} colors={colors} locale={locale}
             enabled={state.status === "connected" && !conversationShare.active} readOnly={state.taskSource?.kind === "joined"} /> : item.mcpApp ? <MobileMcpAppCard card={item.mcpApp} colors={colors} locale={locale}
+            visible={focused || visibleTimelineRows?.has(item.id) === true}
             enabled={state.status === "connected" && !conversationShare.active} readOnly={state.taskSource?.kind === "joined"} /> : item.messageParts ? item.messageParts.map((part) => {
           if (part.kind === "thinking") return <MobileThinkingCard key={part.thinking.key} thinking={part.thinking}
             ownerKey={blockOwnerKey} colors={colors} locale={locale} enabled={state.status === "connected" || state.status === "offline"}
@@ -6608,9 +6612,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     </View>}
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
     <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
-    <FlatList key={`${draftIdentityKey ?? ""}\u001f${partnerConversationTransport?.ownerKey ?? ""}`} ref={timelineListRef} data={displayRows}
-      extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => !isWorkGroup(row) && row.kind === "user" && row.operationId ? `local-send:${row.operationId}` : row.id} style={styles.fill} contentContainerStyle={styles.list}
-      viewabilityConfig={imageViewability} onViewableItemsChanged={onImageRowsVisible}
+    <FlatList key={timelineListKey} ref={timelineListRef} data={displayRows}
+      extraData={{ selection: conversationShare.selectedIds, visibleTimelineRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => !isWorkGroup(row) && row.kind === "user" && row.operationId ? `local-send:${row.operationId}` : row.id} style={styles.fill} contentContainerStyle={styles.list}
+      viewabilityConfig={timelineViewability} onViewableItemsChanged={onTimelineRowsVisible}
       scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
         const search = searchScrollRef.current;
@@ -6664,11 +6668,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           <Action label={mobileDelegatedTaskMessage(locale, "retry")} colors={colors} compact onPress={delegated.retry} />
         </View>}
       </View> : undefined}
-      renderItem={({ item }) => <View style={searchVisible && searchFocus?.scope === searchScope && searchFocus.itemKey === item.id ? { borderLeftWidth: 2, borderLeftColor: colors.accent } : undefined}>{partnerIdentity.partner && !isWorkGroup(item) ? <MobilePartnerConversationRow row={item}
-        ownerKey={partnerConversationTransport!.ownerKey} preset={partnerIdentity.partner.avatar} partner={partnerIdentity.partner} timestamp={partnerTimeGroups.get(item.id)}
-        colors={colors} locale={locale} animate={state.status === "connected" && state.window === undefined && !state.historyBusy}>
-        {renderTimelineItem(item)}
-      </MobilePartnerConversationRow> : renderTimelineItem(item)}</View>} />
+      renderItem={({ item }) => {
+        const focused = searchVisible && searchFocus?.scope === searchScope && searchFocus.itemKey === item.id;
+        const content = renderTimelineItem(item, focused);
+        return <View style={focused ? { borderLeftWidth: 2, borderLeftColor: colors.accent } : undefined}>{partnerIdentity.partner && !isWorkGroup(item) ? <MobilePartnerConversationRow row={item}
+          ownerKey={partnerConversationTransport!.ownerKey} preset={partnerIdentity.partner.avatar} partner={partnerIdentity.partner} timestamp={partnerTimeGroups.get(item.id)}
+          colors={colors} locale={locale} animate={state.status === "connected" && state.window === undefined && !state.historyBusy}>
+          {content}
+        </MobilePartnerConversationRow> : content}</View>;
+      }} />
     </View>
     <View testID="task.controls-viewport" pointerEvents="box-none" style={controlsRegion}>
     {state.window !== undefined && localOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
