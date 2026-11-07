@@ -47,10 +47,10 @@ mountedIt("updates the selected branch through the production page and recovers 
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
     for (const width of [1280, 390]) {
       await page.setViewportSize({ width, height: 900 });
-      const closeNavigation = page.getByRole("button", { name: "Close navigation", exact: true });
-      if (width === 390 && await closeNavigation.isVisible()) {
-        await closeNavigation.press("Enter");
-        await closeNavigation.waitFor({ state: "hidden" });
+      const navigationScrim = page.locator(".panel-scrim--navigation");
+      if (width === 390 && await navigationScrim.isVisible()) {
+        await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();
+        await navigationScrim.waitFor({ state: "hidden" });
       }
       const button = page.getByRole("button", { name: "Update selected branch", exact: true });
       await button.focus(); expect(await button.evaluate(value => value === value.ownerDocument.activeElement)).toBe(true);
