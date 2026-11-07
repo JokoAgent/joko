@@ -16183,7 +16183,9 @@ function mapScheduleRunHistory(run: ScheduleRunHistory): ScheduleView["history"]
     ...(run.estimatedValue === undefined ? {} : { estimatedValue: scheduleRunMoney(run.estimatedValue) }),
     ...(run.preRun === undefined ? {} : { preRun: schedulePreRunResult(run.preRun) }),
     ...(run.readAt === undefined ? {} : { readAt: timestampMs(run.readAt) }),
-    ...(run.error?.message ? { error: presentJokoServiceTerminology(run.error.message) } : {})
+    ...(run.error?.message ? { error: presentJokoServiceTerminology(run.error.message) } : {}),
+    ...(run.error?.code ? { errorCode: run.error.code } : {}),
+    ...(run.error?.phase ? { errorPhase: run.error.phase } : {})
   };
 }
 

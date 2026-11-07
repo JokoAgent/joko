@@ -1,9 +1,12 @@
-import type { ScheduleRunHistoryView, ScheduleView } from "./model.js";
+import type { ScheduleHistoryPageView, ScheduleRunHistoryView, ScheduleView } from "./model.js";
+
+const OWNER_SNAPSHOT_HISTORY_LIMIT = 100;
 
 export interface ScheduleNotificationCandidate {
   readonly title: string;
   readonly kind: "done" | "error";
   readonly sessionId?: string;
+  readonly failureHistory?: { readonly scheduleId: string; readonly run: ScheduleRunHistoryView };
 }
 
 export interface ScheduleNotificationObservation {
@@ -55,10 +58,15 @@ export class ScheduleNotificationTracker {
         if (isNewerScheduleRun(run, latestRecency)) latestRecency = scheduleRunRecency(run);
         if (!newlyTerminal || !schedule.notifyDesktop || run.state === "skipped") continue;
         if (run.state === "completed" && run.readAt !== undefined) continue;
+        const checkFailure = schedule.silentWhenIdle && run.state === "failed" && failureSignature(run) !== undefined;
+        const repeated = checkFailure ? repeatedFailureInHistory(run, schedule.history) : false;
+        if (repeated === true) continue;
         notifications.push({
           title: schedule.name,
           kind: run.state === "completed" ? "done" : "error",
-          ...(run.sessionId.trim() === "" ? {} : { sessionId: run.sessionId })
+          ...(run.sessionId.trim() === "" ? {} : { sessionId: run.sessionId }),
+          ...(repeated === undefined && schedule.history.length >= OWNER_SNAPSHOT_HISTORY_LIMIT
+            ? { failureHistory: { scheduleId: schedule.id, run } } : {})
         });
       }
       this.#observedScheduleIds.add(schedule.id);
@@ -78,6 +86,51 @@ export class ScheduleNotificationTracker {
     this.#observedScheduleIds.clear();
     this.#recencyByScheduleId.clear();
   }
+}
+
+/** Resolve a failure outside the bounded owner snapshot through the original history pages. */
+export async function hasUnrecoveredScheduleFailure(
+  run: ScheduleRunHistoryView,
+  readPage: (pageToken: string) => Promise<ScheduleHistoryPageView>,
+  signal: AbortSignal
+): Promise<boolean> {
+  let token = "";
+  const requested = new Set<string>();
+  while (!requested.has(token)) {
+    signal.throwIfAborted();
+    requested.add(token);
+    const page = await readPage(token);
+    signal.throwIfAborted();
+    const repeated = repeatedFailureInHistory(run, page.history);
+    if (repeated !== undefined) return repeated;
+    if (page.nextPageToken === undefined) return false;
+    token = page.nextPageToken;
+  }
+  return false;
+}
+
+function repeatedFailureInHistory(run: ScheduleRunHistoryView, history: readonly ScheduleRunHistoryView[]): boolean | undefined {
+  const signature = failureSignature(run);
+  if (signature === undefined) return false;
+  const preCheckFailure = run.preRun?.decision === "block";
+  let latest: ScheduleRunRecency | undefined;
+  let repeated: boolean | undefined;
+  for (const prior of history) {
+    if (!isNewerScheduleRun(run, scheduleRunRecency(prior)) || !isNewerScheduleRun(prior, latest)) continue;
+    const recovered = prior.state === "completed" || (preCheckFailure && (prior.state === "failed" || prior.state === "skipped") &&
+      (prior.preRun?.decision === "run" || prior.preRun?.decision === "skip"));
+    const matches = (prior.state === "failed" || prior.state === "interrupted") && failureSignature(prior) === signature;
+    if (recovered || matches) {
+      latest = scheduleRunRecency(prior);
+      repeated = !recovered;
+    }
+  }
+  return repeated;
+}
+
+function failureSignature(run: ScheduleRunHistoryView): string | undefined {
+  if (!run.error?.trim() || run.error === "Schedule execution failed." || run.preRun?.stderrTruncated === true) return undefined;
+  return JSON.stringify([run.preRun?.decision === "block", run.errorCode ?? "", run.errorPhase ?? "", run.error, run.preRun?.stderr ?? ""]);
 }
 
 interface ScheduleRunRecency {

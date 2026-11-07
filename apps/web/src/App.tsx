@@ -75,7 +75,7 @@ import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
 import { useDocumentForeground } from "./document-foreground.js";
 import { deleteScheduleWithGeneratedSessions, prepareScheduleDeletion } from "./schedule-deletion.js";
 import { SessionNotificationTracker, shouldDispatchSessionNotifications } from "./session-notifications.js";
-import { ScheduleNotificationTracker } from "./schedule-notifications.js";
+import { hasUnrecoveredScheduleFailure, ScheduleNotificationTracker } from "./schedule-notifications.js";
 import { projectDesktopNotificationTitle } from "./desktop-notification-projection.js";
 import {
   reconcileSessionAttentionBadgeProjection,
@@ -550,6 +550,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, [auxiliaryApplicationWindow, desktopLayoutResetAvailable]);
   const sessionNotificationTrackerRef = useRef(new SessionNotificationTracker());
   const scheduleNotificationTrackerRef = useRef(new ScheduleNotificationTracker());
+  const scheduleNotificationReadScopeRef = useRef<AbortController | undefined>(undefined);
   const notificationOwnerId = state.activeProfile?.serverId;
   const notificationProfileId = state.activeProfile?.id;
   const attentionBadgeProjectionRef = useRef<ReadonlyMap<string, SessionAttentionBadgeKey>>(new Map());
@@ -590,6 +591,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     });
   }, []);
   useEffect(() => {
+    const scope = new AbortController();
+    scheduleNotificationReadScopeRef.current = scope;
+    return () => scope.abort();
+  }, [auxiliaryApplicationWindow, notificationOwnerId, notificationProfileId, state.connectionGeneration,
+    state.connectionState, state.preferences.sessionNotificationsEnabled]);
+  useEffect(() => {
     const tracker = sessionNotificationTrackerRef.current;
     if (
       auxiliaryApplicationWindow
@@ -624,7 +631,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         : notification.kind === "awaiting"
           ? t("desktop.sessionNotification.awaiting")
           : t("desktop.sessionNotification.error");
-      void desktop.notify({
+      const send = () => desktop.notify({
         title,
         body,
         ...(notification.sessionId === undefined || notificationProfileId === undefined ? {} : {
@@ -635,10 +642,25 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           }
         })
       }).catch(() => undefined);
+      const history = "failureHistory" in notification ? notification.failureHistory : undefined;
+      const scope = scheduleNotificationReadScopeRef.current;
+      if (history === undefined || scope === undefined) {
+        void send();
+        continue;
+      }
+      const readPage = (token: string) => controllerRef.current.listScheduleRunHistory(history.scheduleId, token, 100);
+      void hasUnrecoveredScheduleFailure(history.run, readPage, scope.signal).catch(() => false).then(repeated => {
+        const current = controllerRef.current.state;
+        if (repeated || scope.signal.aborted || current.connectionGeneration !== state.connectionGeneration ||
+          current.activeProfile?.id !== notificationProfileId || current.activeProfile?.serverId !== notificationOwnerId ||
+          current.connectionState !== "connected" || !current.preferences.sessionNotificationsEnabled || document.hasFocus()) return;
+        void send();
+      });
     }
   }, [
     notificationOwnerId,
     notificationProfileId,
+    state.connectionGeneration,
     state.connectionState,
     state.preferences.sessionNotificationsEnabled,
     state.snapshot.revision,
