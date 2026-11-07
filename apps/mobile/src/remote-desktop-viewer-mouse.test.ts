@@ -14,7 +14,7 @@ afterEach(() => {
   document.documentElement.innerHTML = "<head></head><body></body>";
 });
 
-function viewer(nativeControls = false, desktop = { width: 800, height: 600 }) {
+function viewer(nativeControls = false, desktop = { width: 800, height: 600 }, viewport = { width: 800, height: 600 }) {
   vi.useFakeTimers();
   let resized!: () => void;
   vi.stubGlobal("ResizeObserver", class { constructor(callback: () => void) { resized = callback; } observe() {} disconnect() {} });
@@ -23,7 +23,7 @@ function viewer(nativeControls = false, desktop = { width: 800, height: 600 }) {
   const html = remoteDesktopViewerHtml("#111111", "#eeeeee", nativeControls);
   document.documentElement.innerHTML = html;
   const stage = document.getElementById("stage")!, rail = document.getElementById("mouse-buttons")!;
-  Object.defineProperties(stage, { clientWidth: { value: 800 }, clientHeight: { value: 600 } });
+  Object.defineProperties(stage, { clientWidth: { value: viewport.width }, clientHeight: { value: viewport.height } });
   for (const element of [stage, ...Array.from(rail.querySelectorAll("button"))]) {
     Object.assign(element, { setPointerCapture: vi.fn() });
   }
@@ -134,6 +134,40 @@ describe("actual floating mouse controls viewer", () => {
       { kind: "move", x: .375, y: 85 / 450 },
       { kind: "scroll", dx: 0, dy: -20 }
     ]);
+  });
+
+  it("keeps the picture point under an off-center pinch", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    const image = document.getElementById("image")!;
+    value.pointer(value.stage, "pointerdown", 8, 60, 300);
+    value.pointer(value.stage, "pointerdown", 9, 100, 300);
+    value.pointer(value.stage, "pointermove", 8, 40, 300);
+    value.pointer(value.stage, "pointermove", 9, 120, 300);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(image.style.width).toBe("720px");
+    expect(Number.parseFloat(image.style.left)).toBeCloseTo(-80);
+    expect(value.packets()).toHaveLength(0);
+  });
+
+  it("applies a queued pinch frame before removing the first released pointer", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    const image = document.getElementById("image")!;
+    value.pointer(value.stage, "pointerdown", 8, 160, 300);
+    value.pointer(value.stage, "pointerdown", 9, 200, 300);
+    value.pointer(value.stage, "pointermove", 8, 140, 300);
+    value.pointer(value.stage, "pointermove", 9, 220, 300);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(image.style.width).toBe("720px");
+
+    value.pointer(value.stage, "pointermove", 8, 128, 300);
+    value.pointer(value.stage, "pointermove", 9, 232, 300);
+    value.pointer(value.stage, "pointerup", 8, 128, 300);
+    value.pointer(value.stage, "pointerup", 9, 232, 300);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(Number.parseFloat(image.style.width)).toBeCloseTo(936);
+    expect(value.packets()).toHaveLength(0);
   });
 
   it("uses bounded displacement ticks and skips ACK time without accumulating a scroll backlog", async () => {
