@@ -37,6 +37,7 @@ export interface UseMobileVoiceInputOptions {
   readonly transport?: MobileVoiceTransport;
   readonly draftOwnerKey?: string;
   readonly enabled: boolean;
+  readonly permissionPromptConnection?: "connected" | "connecting";
   readonly readDraft: () => MobileComposerDraft;
   readonly readSelection: () => MobileComposerSelection;
   readonly writeDraft: (draft: MobileComposerDraft, selection: MobileComposerSelection, persist: boolean) => void;
@@ -62,6 +63,14 @@ export interface MobileVoiceInputBinding {
   prewarm(): void;
 }
 
+interface PendingMicrophonePrompt {
+  readonly ownerKey: string;
+  readonly draftOwnerKey: string;
+  readonly ready: Promise<boolean>;
+  readonly finish: (ready: boolean) => void;
+  backgrounded: boolean;
+}
+
 export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): MobileVoiceInputBinding {
   const capture = options.capture ?? mobileVoiceCaptureRuntime;
   const preferencesStore = options.preferencesStore ?? mobileVoicePreferences;
@@ -81,6 +90,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
   const localeRef = useRef(options.locale);
   const composingRef = useRef(options.isComposing ?? false);
   const runRef = useRef<MobileVoiceInputRun | undefined>(undefined);
+  const permissionPromptRef = useRef<PendingMicrophonePrompt | undefined>(undefined);
   const insertionRef = useRef<MobileVoiceDraftInsertionContext | undefined>(undefined);
   const baseDraftRef = useRef<MobileComposerDraft | undefined>(undefined);
   const baseSelectionRef = useRef<MobileComposerSelection | undefined>(undefined);
@@ -111,6 +121,12 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
   requestIdRef.current = options.requestId;
   localeRef.current = options.locale;
   composingRef.current = options.isComposing ?? false;
+
+  const finishPermissionPrompt = useCallback((ready: boolean): void => {
+    const prompt = permissionPromptRef.current;
+    permissionPromptRef.current = undefined;
+    prompt?.finish(ready);
+  }, []);
 
   const rollbackInsertion = useCallback((persist = false): void => {
     const context = insertionRef.current;
@@ -242,9 +258,17 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
 
   useEffect(() => {
     const run = runRef.current;
+    const prompt = permissionPromptRef.current;
+    if (prompt && AppState.currentState === "background") prompt.backgrounded = true;
+    if (prompt?.backgrounded && options.permissionPromptConnection !== undefined && options.draftOwnerKey === prompt.draftOwnerKey) {
+      if (ownerKey === undefined && (AppState.currentState === "background" || options.permissionPromptConnection === "connecting")) return;
+      if (AppState.currentState === "active" && ownerKey === prompt.ownerKey && options.enabled) {
+        finishPermissionPrompt(true);
+        return;
+      }
+    }
+    finishPermissionPrompt(false);
     if (run !== undefined) {
-      // The actual owner comparison is enforced by the transport. Dispose on
-      // every owner-key transition so no old recorder survives the new surface.
       runRef.current = undefined;
       void run.dispose();
     }
@@ -255,7 +279,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     recognitionContextSupportedRef.current = false;
     setState("idle");
     setError(undefined);
-  }, [learning, ownerKey, options.draftOwnerKey, options.enabled, rollbackInsertion]);
+  }, [finishPermissionPrompt, learning, ownerKey, options.draftOwnerKey, options.enabled, options.permissionPromptConnection, rollbackInsertion]);
 
   useEffect(() => {
     if (state !== "listening") { setElapsedSeconds(0); return; }
@@ -271,16 +295,19 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       const run = runRef.current;
       if (run?.shouldCancelForBackground) {
         void run.cancel();
+      } else if (permissionPromptRef.current) {
+        permissionPromptRef.current.backgrounded = true;
       }
     });
     return () => subscription.remove();
   }, [learning]);
 
   useEffect(() => () => {
+    finishPermissionPrompt(false);
     const run = runRef.current;
     runRef.current = undefined;
     void run?.dispose();
-  }, []);
+  }, [finishPermissionPrompt]);
 
   const start = useCallback(async (): Promise<void> => {
     const transport = transportRef.current;
@@ -306,9 +333,32 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       ...(dictionary.document.refinementInstructions === ""
         ? {} : { instructions: dictionary.document.refinementInstructions })
     } : undefined;
+    const runCapture: MobileVoiceCaptureRuntime = options.permissionPromptConnection === "connected" ? {
+      isAvailable: () => capture.isAvailable(),
+      ensurePermission: async (signal) => {
+        let prompt: PendingMicrophonePrompt | undefined;
+        try {
+          const permission = await capture.ensurePermission(signal, () => {
+            let finish!: (ready: boolean) => void;
+            const ready = new Promise<boolean>(resolve => { finish = resolve; });
+            prompt = { ownerKey: transport.surfaceOwnerKey, draftOwnerKey, ready, finish, backgrounded: false };
+            permissionPromptRef.current = prompt;
+          });
+          // The system sheet may resume before the original task's authenticated
+          // transport and composer controls are usable again.
+          if (permission.granted && prompt?.backgrounded && !await prompt.ready) throw new MobileVoiceRunError("ownerChanged");
+          signal.throwIfAborted();
+          return permission;
+        } finally {
+          if (prompt && permissionPromptRef.current === prompt) finishPermissionPrompt(false);
+        }
+      },
+      start: (...args) => capture.start(...args),
+      release: () => capture.release()
+    } : capture;
     const run = new MobileVoiceInputRun({
       transport,
-      capture,
+      capture: runCapture,
       requestId: () => requestIdRef.current(),
       locale: localeRef.current,
       ...(refinement === undefined ? {} : { refinement }),
@@ -322,7 +372,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     });
     runRef.current = run;
     await run.start().catch(() => undefined);
-  }, [available, capture, preferencesStore, handleUpdate, learning, rollbackInsertion]);
+  }, [available, capture, finishPermissionPrompt, handleUpdate, learning, options.permissionPromptConnection, preferencesStore, rollbackInsertion]);
 
   const stop = useCallback(async (): Promise<void> => {
     await runRef.current?.stop().catch(() => undefined);
@@ -331,10 +381,11 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
   const cancel = useCallback(async (): Promise<void> => {
     const run = runRef.current;
     if (!run) return;
+    finishPermissionPrompt(false);
     await run.cancel();
     learning.clear();
     rollbackInsertion(false);
-  }, [learning, rollbackInsertion]);
+  }, [finishPermissionPrompt, learning, rollbackInsertion]);
 
   const toggle = useCallback(async (): Promise<void> => {
     const current = runRef.current?.currentState;

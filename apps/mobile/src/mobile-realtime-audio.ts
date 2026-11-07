@@ -85,7 +85,7 @@ export function prewarmMobileRealtimeAudio(): void {
   void binding.prewarm().catch(() => undefined);
 }
 
-export async function ensureMobileMicrophonePermission(signal: AbortSignal): Promise<MobileVoicePermission> {
+export async function ensureMobileMicrophonePermission(signal: AbortSignal, onPrompt?: () => void): Promise<MobileVoicePermission> {
   throwIfAborted(signal);
   if (AppState.currentState !== "active") throw abortError();
   const audio = await import("expo-audio");
@@ -95,6 +95,7 @@ export async function ensureMobileMicrophonePermission(signal: AbortSignal): Pro
   let openedPrompt = false;
   if (!permission.granted && permission.canAskAgain) {
     openedPrompt = true;
+    onPrompt?.();
     permission = await audio.requestRecordingPermissionsAsync();
     throwIfAborted(signal);
   }

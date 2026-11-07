@@ -4598,6 +4598,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const voice = useMobileVoiceInput({
     transport: voiceTransport,
     draftOwnerKey: draftIdentityKey,
+    permissionPromptConnection: Platform.OS === "android" && state.taskSource?.kind !== "joined"
+      && (state.status === "connected" || state.status === "connecting") ? state.status : undefined,
     enabled: composerOwnerReady && queueEdit === undefined && interactions.length === 0 && !conversationShare.active
       && state.status === "connected" && !state.busy && !composerOperationPending && !attachmentBusy,
     readDraft: () => composerDraftRef.current,
