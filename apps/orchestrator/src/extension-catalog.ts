@@ -817,6 +817,11 @@ function runtimeSetup(extensionId: string, runtime: ExtensionRuntimeDescriptor |
     { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${[...network.hosts, ...(network.connections?.length ? ["addresses explicitly configured in connection settings"] : [])].join(", ")}.`, kind: "confirmation", required: true }, ...pick];
 }
 
+/** Uses the same identity as the Catalog for an installed resource's facets. */
+export function resourceExtensionIds(resource: PiResourceDescriptor): ReadonlySet<string> {
+  return new Set(projectDefinitions([resource], [], []).map(definition => definition.id));
+}
+
 function projectDefinitions(
   resources: readonly PiResourceDescriptor[],
   mcpServers: readonly McpServerDescriptor[],
