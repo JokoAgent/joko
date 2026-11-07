@@ -180,17 +180,17 @@ describe("actual floating mouse controls viewer", () => {
       .toEqual(Array.from({ length: integerScroll ? 20 : 40 }, () => ({ kind: "scroll", dx: 0, dy: integerScroll ? 1 : .5 })));
   });
 
-  it("keeps the picture point under an off-center pinch", async () => {
+  it.each([80, 280])("keeps the picture point under an off-center pinch at x=%s", async midpoint => {
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
     const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
     const image = document.getElementById("image")!;
-    value.pointer(value.stage, "pointerdown", 8, 60, 300);
-    value.pointer(value.stage, "pointerdown", 9, 100, 300);
-    value.pointer(value.stage, "pointermove", 8, 40, 300);
-    value.pointer(value.stage, "pointermove", 9, 120, 300);
+    value.pointer(value.stage, "pointerdown", 8, midpoint - 20, 300);
+    value.pointer(value.stage, "pointerdown", 9, midpoint + 20, 300);
+    value.pointer(value.stage, "pointermove", 8, midpoint - 40, 300);
+    value.pointer(value.stage, "pointermove", 9, midpoint + 40, 300);
     await vi.advanceTimersByTimeAsync(17);
     expect(image.style.width).toBe("720px");
-    expect(Number.parseFloat(image.style.left)).toBeCloseTo(-80);
+    expect(Number.parseFloat(image.style.left)).toBeCloseTo(-midpoint);
     expect(value.packets()).toHaveLength(0);
   });
 

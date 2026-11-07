@@ -77,7 +77,18 @@ const VIEWER_SCRIPT = String.raw`
   const clamp=value=>Math.max(0,Math.min(1,value));
   function viewport(){const sw=Math.max(1,stage.clientWidth),sh=Math.max(1,stage.clientHeight),top=fitToInsets?Math.min(sh-1,topInset):0,bottom=fitToInsets?Math.min(sh-top-1,bottomInset):0;return{width:sw,height:Math.max(1,sh-top-bottom),top,bottom};}
   function layout(){const v=viewport(),scale=Math.min(v.width/dw,v.height/dh)*zoom,w=dw*scale,h=dh*scale;return{w,h,x:(v.width-w)/2+panX,y:v.top+(v.height-h)/2+panY};}
-  function boundPan(){const r=layout(),v=viewport(),margin=zoom>1?80:0;const minX=Math.min(0,v.width-r.w)-margin,maxX=Math.max(0,v.width-r.w)+margin;const minY=Math.min(0,v.height-r.h)-margin,maxY=Math.max(0,v.height-r.h)+margin;panX=Math.max(minX,Math.min(maxX,panX));panY=Math.max(minY,Math.min(maxY,panY));}
+  function boundPan(){
+    const r=layout(),v=viewport();
+    if(zoom===1){
+      panX=bounded(panX,0,Math.max(0,v.width-r.w));
+      panY=bounded(panY,0,Math.max(0,v.height-r.h));
+      return;
+    }
+    // Pan offsets start at the centered layout, so half the overflow lies on either side.
+    const travelX=Math.max(0,(r.w-v.width)/2)+80,travelY=Math.max(0,(r.h-v.height)/2)+80;
+    panX=bounded(panX,-travelX,travelX);
+    panY=bounded(panY,-travelY,travelY);
+  }
   function render(){const r=layout();if(nativeMedia&&epoch&&r.w>0&&r.h>0&&[r.x,r.y,r.w,r.h].every(Number.isFinite))post({type:'nativeViewport',x:r.x,y:r.y,width:r.w,height:r.h,fillHeight:false});for(const el of [image,video]){el.style.width=r.w+'px';el.style.height=r.h+'px';el.style.left=r.x+'px';el.style.top=r.y+'px';}if(remoteCursor){cursor.style.width=remoteCursor.width+'px';cursor.style.height=remoteCursor.height+'px';cursor.style.border='0';cursor.style.borderRadius='0';cursor.style.transform='none';cursor.style.left=(r.x+cx*r.w-remoteCursor.hotX)+'px';cursor.style.top=(r.y+cy*r.h-remoteCursor.hotY)+'px';cursor.style.display='block';cursor.style.opacity=(remoteCursor.visible||(control&&localCursorAwake))?'1':'0';}else{cursor.style.opacity='1';cursor.style.width='18px';cursor.style.height='18px';cursor.style.border='';cursor.style.borderRadius='';cursor.style.transform='';cursor.style.left=(r.x+cx*r.w)+'px';cursor.style.top=(r.y+cy*r.h)+'px';cursor.style.display=!cursorOverlay&&control&&(mode==='trackpad'||nativeTouchpad!==null||localCursorAwake)?'block':'none';}paintBackground();}
   function backgroundSegments(vw,vh){const scale=Math.min(vw/dw,vh/dh),w=dw*scale,h=dh*scale;if(w<vw){const centerW=w*.9,centerX=vw/2-centerW/2,sideW=centerX,top=(vh-h)/2;return{axis:'x',rects:[{x:0,y:top,w:sideW,h},{x:centerX,y:top,w:centerW,h},{x:centerX+centerW,y:top,w:sideW,h}]};}if(h<vh){const centerH=h*.9,centerY=vh/2-centerH/2,sideH=centerY,left=(vw-w)/2;return{axis:'y',rects:[{x:left,y:0,w,h:sideH},{x:left,y:centerY,w,h:centerH},{x:left,y:centerY+centerH,w,h:sideH}]};}return null;}
   function stopBackgroundLoop(){if(bgLoopFrame!==null)video.cancelVideoFrameCallback?.(bgLoopFrame);bgLoopFrame=null;}
