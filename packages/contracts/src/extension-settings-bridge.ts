@@ -124,12 +124,16 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
   const originalFetch = window.fetch.bind(window);
   const jsonResponse = (result, status = 200) => new Response(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? value.toString(10) : value),
     { status, headers: { "content-type": "application/json" } });
-  window.fetch = async (input, init) => {
-    const target = typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
-    if (typeof target !== "string" || target.startsWith("//")) return originalFetch(input, init);
+  const settingsUrl = target => {
+    if (typeof target !== "string" || target.startsWith("//")) return;
     const base = globalThis[Symbol.for("joko.extension.surface.base")] || "https://settings.joko.invalid/";
     const url = new URL(target, base);
-    if ((url.origin !== new URL(base).origin && url.origin !== location.origin) || !/^\/(kv|app-context|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
+    if (url.origin === new URL(base).origin || url.origin === location.origin) return url;
+  };
+  const settingsFetch = window.fetch = async (input, init) => {
+    const target = typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
+    const url = settingsUrl(target);
+    if (!url || !/^\/(kv|app-context|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
     if (url.username || url.password) throw new Error("Settings URL credentials are not allowed.");
     const signal = init && init.signal !== undefined ? init.signal : input && input.signal;
     const assertNotAborted = () => {
@@ -150,7 +154,12 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
       command = { kind: "directory.pick", ...(request.title === undefined ? {} : { title: request.title }) };
     }
     else if (url.pathname === "/kv") {
-      if (method === "GET") { const result = await dispatch({ kind: "routing.get" }); revision = result.revision; return new Response(result.dataJson, { headers: { "content-type": "application/json" } }); }
+      if (method === "GET") {
+        const result = await dispatch({ kind: "routing.get" });
+        assertNotAborted();
+        revision = result.revision;
+        return new Response(result.dataJson, { headers: { "content-type": "application/json" } });
+      }
       if (method === "PUT") { if (revision === undefined) revision = (await dispatch({ kind: "routing.get" })).revision; command = { kind: "routing.set", revision, dataJson: JSON.stringify(json()) }; }
     } else if (url.pathname === "/secrets" && method === "GET") {
       const result = await dispatch({ kind: "setup.get" });
@@ -209,6 +218,98 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
       throw error;
     }
   };
+  if (window.ReactNativeWebView && typeof window.XMLHttpRequest === "function") {
+    // Only the asynchronous parameter read shares the guarded Fetch path. All
+    // other requests keep the native XHR behavior under the document CSP.
+    window.XMLHttpRequest = class extends window.XMLHttpRequest {
+      #read;
+      open(method, input, ...options) {
+        const previous = this.#read;
+        clearTimeout(previous?.timer);
+        previous?.controller?.abort();
+        let url;
+        try { url = settingsUrl(String(input)); } catch (_) {}
+        const allowed = String(method).toUpperCase() === "GET" && (options[0] === undefined || Boolean(options[0]))
+          && options[1] == null && options[2] == null && url?.pathname === "/kv" && !url.search && !url.hash && !url.username && !url.password;
+        const read = allowed ? { url: url.href, state: 1, text: "", json: null } : undefined;
+        this.#read = read;
+        const wasOpened = super.readyState === 1;
+        try { super.open(method, read?.url ?? input, ...options); }
+        catch (error) { this.#read = undefined; throw error; }
+        if (read && this.#read === read && wasOpened && previous?.state !== 1) this.dispatchEvent(new Event("readystatechange"));
+      }
+      get readyState() { return this.#read?.state ?? super.readyState; }
+      get status() { return this.#read ? this.#read.response?.status ?? 0 : super.status; }
+      get statusText() { return this.#read ? this.#read.response?.statusText ?? "" : super.statusText; }
+      get responseURL() { return this.#read ? this.#read.response ? this.#read.url : "" : super.responseURL; }
+      get responseText() {
+        if (!this.#read) return super.responseText;
+        if (this.responseType !== "" && this.responseType !== "text") throw new DOMException("Response is not text.", "InvalidStateError");
+        return this.#read.text;
+      }
+      get response() {
+        const read = this.#read;
+        if (!read) return super.response;
+        if (this.responseType === "json") return read.state === 4 ? read.json : null;
+        return read.text;
+      }
+      getResponseHeader(name) { return this.#read ? this.#read.response?.headers.get(name) ?? null : super.getResponseHeader(name); }
+      getAllResponseHeaders() {
+        if (!this.#read) return super.getAllResponseHeaders();
+        return Array.from(this.#read.response?.headers ?? [], ([name, value]) => name + ": " + value + "\r\n").join("");
+      }
+      send(body) {
+        const read = this.#read;
+        if (!read) return super.send(body);
+        if (read.state !== 1 || read.controller) throw new DOMException("Request is not open.", "InvalidStateError");
+        if (!["", "text", "json"].includes(this.responseType)) {
+          this.#read = undefined;
+          return super.send(body);
+        }
+        read.controller = new AbortController();
+        if (this.timeout > 0) read.timer = setTimeout(() => this.#finish(read, "timeout"), this.timeout);
+        this.dispatchEvent(new ProgressEvent("loadstart"));
+        if (!this.#active(read)) return;
+        void settingsFetch(read.url, { signal: read.controller.signal }).then(async response => {
+          if (!this.#active(read)) return;
+          read.response = response;
+          read.state = 2; this.dispatchEvent(new Event("readystatechange"));
+          if (!this.#active(read)) return;
+          const text = await response.text();
+          if (!this.#active(read)) return;
+          read.text = text;
+          if (this.responseType === "json") try { read.json = JSON.parse(text); } catch (_) {}
+          read.state = 3; this.dispatchEvent(new Event("readystatechange"));
+          if (!this.#active(read)) return;
+          read.loaded = new TextEncoder().encode(text).byteLength;
+          this.dispatchEvent(new ProgressEvent("progress", { loaded: read.loaded }));
+          this.#finish(read, "load");
+        }).catch(() => this.#finish(read, "error"));
+      }
+      abort() {
+        const read = this.#read;
+        if (!read) return super.abort();
+        if (read.controller) this.#finish(read, "abort");
+        if (this.#read === read && read.state === 4) {
+          Object.assign(read, { state: 0, response: undefined, text: "", json: null });
+        }
+      }
+      #active(read) { return this.#read === read && read.state > 0 && read.state < 4; }
+      #finish(read, type) {
+        if (!this.#active(read)) return;
+        clearTimeout(read.timer);
+        if (type !== "load") {
+          read.controller.abort();
+          Object.assign(read, { response: undefined, text: "", json: null });
+        }
+        read.state = 4; this.dispatchEvent(new Event("readystatechange"));
+        if (this.#read !== read || read.state !== 4) return;
+        const progress = { loaded: type === "load" ? read.loaded : 0 };
+        this.dispatchEvent(new ProgressEvent(type, progress));
+        if (this.#read === read && read.state === 4) this.dispatchEvent(new ProgressEvent("loadend", progress));
+      }
+    };
+  }
 })`;
 
 /** It runs before the author's first script, with keys from the installed settings surface. */

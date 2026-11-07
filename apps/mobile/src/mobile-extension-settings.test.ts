@@ -118,11 +118,12 @@ describe("Mobile author settings document bridge", () => {
     }
   });
 
-  it("connects the exact shipped SDK through native bootstrap readiness once and rejects foreign responses", async () => {
+  it("connects the shipped SDK and asynchronous parameter XHR through the native settings bridge", async () => {
     const active = harness(), hostWebSocket = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
     const dom = new JSDOM("<!doctype html>", { url: documentUrl, runScripts: "outside-only" });
     const page = dom.window as Window & typeof globalThis;
     Object.assign(page, { TextEncoder, Response });
+    const nativeSend = vi.spyOn(page.XMLHttpRequest.prototype, "send").mockImplementation(() => undefined);
     Object.defineProperty(page, "ReactNativeWebView", { configurable: true, value: { postMessage: vi.fn((raw: string) => active.bridge.receive(raw, documentUrl)) } });
     page.fetch = vi.fn(async () => new Response("unavailable"));
     page.postMessage = ((data: unknown) => page.dispatchEvent(new page.MessageEvent("message", { source: page, origin: page.location.origin, data }))) as typeof page.postMessage;
@@ -150,10 +151,46 @@ describe("Mobile author settings document bridge", () => {
       await expect(sdk.settings({ kind: "directory.pick" })).resolves.toEqual({ name: "Reports", dir_deposit: {
         token: "sdk-deposit", file_count: 500, total_bytes: 12, rel_paths: paths } });
       expect(delivered).toHaveLength(2); expect(new TextEncoder().encode(delivered[1]!).byteLength).toBeGreaterThan(192 * 1024);
+
+      active.call.mockResolvedValueOnce({ revision: "8", dataJson: '{"folder":"收件箱"}' });
+      const read = new page.XMLHttpRequest(), states: number[] = [];
+      read.onreadystatechange = () => { states.push(read.readyState); };
+      const loaded = new Promise<void>((resolve, reject) => {
+        read.onload = () => resolve();
+        read.onerror = () => reject(new Error("Parameter XHR failed."));
+      });
+      read.open("GET", "/kv", true);
+      read.send();
+      await loaded;
+      expect(states).toEqual([1, 2, 3, 4]);
+      expect(read.status).toBe(200);
+      expect(read.getResponseHeader("Content-Type")).toBe("application/json");
+      expect(JSON.parse(read.responseText)).toEqual({ folder: "收件箱" });
+      expect(nativeSend).not.toHaveBeenCalled();
+
+      let finishRead!: (value: unknown) => void;
+      active.call.mockImplementationOnce(() => new Promise(resolve => { finishRead = resolve; }));
+      const retired = new page.XMLHttpRequest(), lateLoad = vi.fn(), aborted = vi.fn();
+      retired.onload = lateLoad; retired.onabort = aborted;
+      retired.open("GET", "/kv"); retired.send();
+      await vi.waitFor(() => expect(active.call).toHaveBeenCalledTimes(4));
+      retired.abort();
+      finishRead({ revision: "9", dataJson: '{"folder":"stale"}' });
+      await settle();
+      expect(aborted).toHaveBeenCalledOnce(); expect(lateLoad).not.toHaveBeenCalled();
+      expect(retired.status).toBe(0); expect(retired.readyState).toBe(0);
+
+      active.call.mockResolvedValueOnce({ revision: "10", dataJson: '{"folder":"archive"}' });
+      await page.fetch("/kv", { method: "PUT", body: '{"folder":"archive"}' });
+      expect(active.call.mock.calls[4]?.[1]).toEqual({ kind: "routing.set", revision: "8", dataJson: '{"folder":"archive"}' });
+      const foreign = new page.XMLHttpRequest();
+      foreign.open("GET", "https://foreign.example/kv", true); foreign.send();
+      expect(nativeSend).toHaveBeenCalledOnce();
       page.dispatchEvent(new page.Event("pagehide"));
       await expect(sdk.settings({ kind: "routing.get" })).rejects.toThrow(/closed|unavailable/u);
-      expect(native.postMessage).toHaveBeenCalledTimes(2);
+      expect(native.postMessage).toHaveBeenCalledTimes(5);
     } finally {
+      nativeSend.mockRestore();
       dom.window.close();
       expect(Object.getOwnPropertyDescriptor(globalThis, "WebSocket")).toEqual(hostWebSocket);
     }
