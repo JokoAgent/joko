@@ -1,6 +1,10 @@
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  NodeWorkspaceWatcherProvider,
   OperationalWorkspaceChangeJournal,
   WorkspaceChangeStream,
   type WorkspaceChangeJournal,
@@ -11,6 +15,7 @@ import {
   type WorkspaceWatcherSubscription
 } from "./workspace-change-stream.js";
 import type { WorkspaceRegistration } from "./workspace-service.js";
+import { mkdtemp } from "./test-paths.js";
 
 const WORKSPACE: WorkspaceRegistration = {
   id: "workspace-a",
@@ -18,6 +23,53 @@ const WORKSPACE: WorkspaceRegistration = {
   displayName: "Workspace A",
   trusted: true
 };
+
+describe("local workspace watcher", () => {
+  it.each(["expires", "returns at another path"] as const)("keeps a replacement when the original file %s", async disposition => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-workspace-replacement-"));
+    const root = join(directory, "workspace");
+    const prior = join(directory, "original.txt");
+    const path = "selected.txt";
+    await mkdir(root);
+    await writeFile(join(root, path), "Original");
+    const events: Array<Parameters<WorkspaceWatcherObserver["change"]>[0]> = [];
+    const overflow = vi.fn();
+    const realTimer = setTimeout;
+    const waitForObservation = async (observed: () => boolean): Promise<void> => {
+      const deadline = Date.now() + 2_000;
+      while (!observed() && Date.now() < deadline) await new Promise<void>(resolve => realTimer(resolve, 5));
+      expect(observed()).toBe(true);
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let subscription: WorkspaceWatcherSubscription | undefined;
+    try {
+      subscription = await new NodeWorkspaceWatcherProvider().watch({ ...WORKSPACE, root }, {
+        change: event => { events.push(event); }, overflow
+      });
+      await rename(join(root, path), prior);
+      await waitForObservation(() => vi.getTimerCount() === 1);
+      await writeFile(join(root, path), "A replacement with different bytes");
+      await waitForObservation(() => events.some(event => event.kind === "created" && event.path === path));
+      if (disposition === "returns at another path") {
+        await rename(prior, join(root, "moved.txt"));
+        await waitForObservation(() => events.some(event => event.path === "moved.txt"));
+        expect(events).toContainEqual(expect.objectContaining({ kind: "created", path: "moved.txt" }));
+      }
+      await vi.runAllTimersAsync();
+      expect(events.some(event => event.kind === "deleted" && event.path === path || event.previousPath === path)).toBe(false);
+
+      await rm(join(root, path));
+      await waitForObservation(() => vi.getTimerCount() === 1);
+      await vi.runAllTimersAsync();
+      expect(events.at(-1)).toMatchObject({ kind: "deleted", path });
+      expect(overflow).not.toHaveBeenCalled();
+    } finally {
+      await subscription?.close();
+      vi.useRealTimers();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
 
 class FakeWatcherProvider implements WorkspaceWatcherProvider {
   readonly observers = new Map<string, WorkspaceWatcherObserver>();
