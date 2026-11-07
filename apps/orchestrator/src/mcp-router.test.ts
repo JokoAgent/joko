@@ -8,7 +8,9 @@ import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { create } from "@bufbuild/protobuf";
 import { managedSubagentRunRoot, managedSubagentSessionKey } from "@joko/adapter-pi";
+import { BackendModelAccessUpdateSchema } from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import {
   ANDROID_TOOL_NAMES,
@@ -3074,8 +3076,11 @@ describe("McpRouter", () => {
       const generating = call();
       await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
       expect(fetch.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/images/generations");
-      if (change === "model disabled") writeBackendModelAccess(store, identity.backendId, { providerId: identity.providerId, modelId, enabled: false });
-      else await setKey("replacement-synthetic-image-key");
+      if (change === "model disabled") {
+        writeBackendModelAccess(store, identity.backendId, create(BackendModelAccessUpdateSchema, { providerId: identity.providerId, modelId, enabled: false }));
+      } else {
+        await setKey("replacement-synthetic-image-key");
+      }
       response.resolve(Response.json({ data: [{ b64_json: AUDIO_ARTWORK_PNG }] }));
       const result = await generating;
       if (change === "model disabled") {
