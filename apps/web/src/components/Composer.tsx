@@ -349,8 +349,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const effectiveBashMode = shellDraft !== null && browserComments.length === 0;
   const bashPermitted = bashCapable;
   const turnRunning = session.state === "running" || session.state === "waiting" || session.state === "retrying";
-  const stopCapability = session.state === "retrying" ? "context.auto_retry" : "turn.abort";
-  const canStop = turnRunning && session.activeRunId !== undefined && backend?.capabilities.get(stopCapability)?.supported === true && onStop !== undefined;
+  const canStop = turnRunning && session.activeRunId !== undefined && onStop !== undefined;
 
   const sendShortcut = controller.state.preferences.composerSendShortcut;
   const composerPlatform = currentComposerPlatform();

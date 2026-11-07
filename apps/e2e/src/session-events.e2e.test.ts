@@ -639,6 +639,57 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(fixture.adapter().abortCalls).toBe(0);
   });
 
+  mountedTimelineIt("keeps Stop and composer Escape available during a native Claude retry wait", { timeout: 75_000 }, async () => {
+    let activeTurn: AdapterContext | undefined;
+    fixture = await OrchestratorE2eFixture.start({
+      webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
+      profiles: [{ ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.filter(item => item.key !== "context.auto_retry") }],
+      createAdapter: profile => new class extends InstrumentedFakeAdapter {
+        override async send(_input: PromptInput, context: AdapterContext): Promise<void> { activeTurn = context; }
+        override async abort(context: AdapterContext): Promise<void> {
+          this.abortCalls += 1;
+          await context.emit({ type: "done", outcome: "aborted" });
+        }
+        override async abortRetry(): Promise<void> { throw new Error("The native retry can only be stopped through its active turn."); }
+      }(profile)
+    });
+    const { store } = fixture.application;
+    const manager = await fixture.pair("Native retry manager");
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName: "Native retry task" })));
+    const generation = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+    const send = async (text: string) => queueItemFrom(await submit(manager.clients.operation, manager.connectionId,
+      sendInputMutation(sessionId, generation, text)));
+    const first = await send("Wait inside the native request");
+    await waitFor(async () => store.getQueueItem(first.queueItemId).state, state => state === "backend_accepted", "the native input to be accepted");
+    if (activeTurn === undefined) throw new Error("No active native turn was captured.");
+    await activeTurn.emit({ type: "retry", state: "waiting", attempt: 1, maxAttempts: 2, delayMs: 60_000,
+      error: { code: "CLAUDE_CODE_API_RETRY", message: "Claude Code is retrying the native request.", phase: "turn",
+        retryable: true, stateMayHaveChanged: false, recovery: "Wait for the native retry result." } });
+    const waiting = await send("Keep this later input queued");
+    expect(store.getRun(first.runId).descriptor.state).toBe("retrying");
+    expect(store.getQueueItem(waiting.queueItemId).state).toBe("accepted");
+
+    const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Native retry Web" });
+    if (challenge.challenge === undefined) throw new Error("Native retry pairing returned no challenge.");
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
+    await page.getByLabel("Device name").fill("Native retry Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+    await page.locator(".session-header__abort").waitFor({ state: "visible" });
+    await page.locator(".send-button--stop").waitFor({ state: "visible" });
+    await page.getByRole("textbox", { name: "Message", exact: true }).press("Escape");
+    await waitFor(async () => store.getRun(first.runId).descriptor.state, state => state === "aborted", "the original native Run to stop");
+    expect(fixture.adapter().abortCalls).toBe(1);
+    expect(store.getQueueControl(sessionId).paused).toBe(true);
+    expect(store.getQueueItem(waiting.queueItemId).state).toBe("accepted");
+  });
+
   mountedTimelineIt("preserves real scrollbar ownership and durable unread through pre-ACK input and reconnect", { timeout: 120_000 }, async () => {
     fixture = await OrchestratorE2eFixture.start({
       webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,

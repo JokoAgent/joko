@@ -55,7 +55,7 @@ import { SessionScopedRequestGuard, type SessionScopedRequest } from "./compact-
 import { resolveActiveCompaction } from "./compaction-status-behavior.js";
 import { hasPendingComposerQueueItems, pauseQueueThenAbort, pauseQueueThenAbortRetry, resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, resolveErrorTail } from "./error-tail-behavior.js";
-import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
+import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
@@ -610,7 +610,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   // isolated task that is currently running.
   const canAbort = backend?.capabilities.get("turn.abort")?.supported === true;
   const canAbortRetry = backend?.capabilities.get("context.auto_retry")?.supported === true;
-  const canStop = session.state === "retrying" ? canAbortRetry && activeRetry?.source === "auto" : canAbort;
+  const retryStopAction = resolveRetryStopAction(activeRetry, { canAbortRetry, canAbortRun: canAbort });
+  const canStop = session.state === "retrying" ? retryStopAction !== undefined : canAbort;
   const canSwitchModel = !reviewReadOnly && !nativeRuntimeLocked && backend?.capabilities.get("model.switch")?.supported === true;
   const canSetEffort = !reviewReadOnly && !nativeRuntimeLocked && backend?.capabilities.get("model.effort")?.supported === true;
   const canSetFast = !reviewReadOnly && !nativeRuntimeLocked && backend?.capabilities.get("model.fast_mode")?.supported === true;
@@ -1135,7 +1136,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       try {
         if (guest) { await controller.abort(runId); return; }
         const hasPendingQueueItems = hasPendingComposerQueueItems(queue, sourceSessionId);
-        if (session.state === "retrying") {
+        if (retryStopAction === "abortRetry") {
           await pauseQueueThenAbortRetry(controller, sourceSessionId, runId, hasPendingQueueItems, queueControl?.state === "paused");
         } else {
           await pauseQueueThenAbort(controller, sourceSessionId, runId, hasPendingQueueItems, queueControl?.state === "paused");
@@ -2057,7 +2058,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         sessionState: session.state,
         ...(session.activeRunId === undefined ? {} : { activeRunId: session.activeRunId }),
         ...(activeRetry === undefined ? {} : { retry: activeRetry }),
-        canAbortRetry
+        canAbortRetry,
+        canAbortRun: canAbort
       });
       if (retryEscape !== null) {
         const sourceSessionId = session.id;
@@ -2072,7 +2074,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           sessionState: latestSession.state,
           ...(latestSession.activeRunId === undefined ? {} : { activeRunId: latestSession.activeRunId }),
           ...(latestRetry === undefined ? {} : { retry: latestRetry }),
-          canAbortRetry: latestBackend?.capabilities.get("context.auto_retry")?.supported === true
+          canAbortRetry: latestBackend?.capabilities.get("context.auto_retry")?.supported === true,
+          canAbortRun: latestBackend?.capabilities.get("turn.abort")?.supported === true
         });
         if (
           !routeStillCurrent ||

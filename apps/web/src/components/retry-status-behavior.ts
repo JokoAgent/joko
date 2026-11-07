@@ -25,11 +25,18 @@ export interface RetryEscapeInput {
 export interface RetryEscapeContext {
   readonly sessionState: SessionView["state"];
   readonly activeRunId?: string;
-  readonly retry?: Pick<ActiveRetryProjection, "runId" | "source">;
+  readonly retry?: Pick<ActiveRetryProjection, "runId" | "source" | "error">;
   readonly canAbortRetry: boolean;
+  readonly canAbortRun?: boolean;
 }
 
 export type RetryEscapeIntent = { readonly kind: "abortRetry"; readonly runId: string } | null;
+
+export function resolveRetryStopAction(retry: RetryEscapeContext["retry"], capabilities: Pick<RetryEscapeContext, "canAbortRetry" | "canAbortRun">): "abortRetry" | "abort" | undefined {
+  if (capabilities.canAbortRetry && retry?.source === "auto") return "abortRetry";
+  if (capabilities.canAbortRun && retry?.source === "unknown" && retry.error?.code === "CLAUDE_CODE_API_RETRY") return "abort";
+  return undefined;
+}
 
 /**
  * Session-level Escape is intentionally narrower than Composer Escape: it only
@@ -44,10 +51,9 @@ export function resolveRetryEscapeIntent(input: RetryEscapeInput, context: Retry
     input.modalOpen ||
     input.target !== "other" ||
     context.sessionState !== "retrying" ||
-    !context.canAbortRetry ||
     context.activeRunId === undefined ||
-    context.retry?.source !== "auto" ||
-    context.retry.runId !== context.activeRunId
+    context.retry?.runId !== context.activeRunId ||
+    resolveRetryStopAction(context.retry, context) === undefined
   ) return null;
   return { kind: "abortRetry", runId: context.activeRunId };
 }
