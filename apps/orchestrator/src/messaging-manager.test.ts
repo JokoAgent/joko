@@ -42,7 +42,7 @@ import {
   type WeChatTransportOptions
 } from "@joko/messaging";
 import type { AdapterContext, BlobRef, DurableNativeDispatchPreparation, EventPayload, InteractionDecision, MessageBlock, NativeHistoryProjection, PromptInput } from "@joko/core";
-import { OperationalStore } from "@joko/store";
+import { OperationalStore, PartnerStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -62,6 +62,8 @@ import {
   type WeComMessagingConfiguration
 } from "./messaging-manager.js";
 import { SessionHost } from "./session-host.js";
+import { PartnerManager } from "./partner-manager.js";
+import { PartnerMessagingRuntime } from "./partner-messaging.js";
 import { mkdtempSync } from "./test-paths.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -659,6 +661,44 @@ describe("MessagingManager", () => {
       .toEqual(["private-context-a", "rotated-context-a"]);
     expect(fixture.store.getMessagingDelivery(otherPeer.id)).toEqual(otherPeer);
     expect(fixture.store.getMessagingDelivery(unknown.id)).toEqual(unknown);
+  });
+
+  it("keeps the canonical Partner task open when its WeChat owner sends /new", async () => {
+    const batch = weChatDirectBatch(), base = batch.events[0]!;
+    if (base.kind !== "message") throw new Error("Expected a WeChat message.");
+    const userId = "wx-account";
+    const transport = new FakeWeChatTransport({ ...batch, events: [{ ...base, text: "/new",
+      address: { ...base.address, providerConversationId: userId }, speaker: { ...base.speaker, providerUserId: userId, isOwner: true }
+    }], privateContexts: [{ ...batch.privateContexts[0]!, providerConversationId: userId }] });
+    const f = await createFixture(undefined, undefined, undefined, undefined, undefined, undefined, () => transport);
+    const profiles = new PartnerStore(join(f.root, "partners.db"));
+    cleanups.push(async () => { try { await f.manager.close(); } finally { profiles.close(); } });
+    const partners = new PartnerManager({ store: profiles, operationalStore: f.store, sessionHost: f.host, homesRoot: join(f.root, "homes"),
+      workspaceService: { register: async input => input, unregister: () => undefined } });
+    const partner = await partners.createPartner({ requestId: "wechat-partner", expectedDirectoryRevision: profiles.directoryState().revision,
+      displayName: "Ada", avatar: "orbit", identitySource: "A Partner who shares this private WeChat conversation.", templateId: "general", usesDirectoryDefaults: false,
+      capabilities: { modelChain: [{ backendId: f.adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
+    expect(partner.initializationState).toBe("ready");
+    const sessionId = partner.canonicalSessionId!;
+    const runtime = new PartnerMessagingRuntime({ store: f.store, profiles, partners, host: f.host, messaging: f.manager, pauseGoal: async () => undefined });
+    f.manager.setPartnerRuntime(runtime);
+    const owner = f.store.createConnection({ id: "wechat-ui-owner", name: "Owner", authKeyDigest: "wechat-ui-auth" });
+    const created = f.manager.createWeChatConnection();
+    const bound = await runtime.setBinding({ operationId: "wechat-partner-bind", owner, connectionId: created.id, partnerId: partner.id,
+      expectedBindingRevision: 0, expectedConnectionRevision: created.revision, expectedConnectionGeneration: created.generation, expectedPartnerRevision: partner.revision });
+    const original = f.store.getSession(sessionId).descriptor;
+    expect(f.host.canRestartPartnerSession(sessionId)).toBe(true);
+    const restart = vi.spyOn(f.host, "restartPartnerSession"), close = vi.spyOn(f.adapter, "closeSession");
+    const enabled = await f.manager.commitWeChatAuthorization({ clientConnectionId: owner.id, connectionId: created.id,
+      expectedRevision: bound.connection.revision, expectedGeneration: bound.connection.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false, credentials: { token: "weChat-private-token", botId: "wx-bot", userId, baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    await vi.waitFor(() => expect(transport.sentText).toMatchObject([{ text: expect.stringContaining("shares the Partner's long-running task") }]), { timeout: 5_000 });
+    expect(runtime.lanes(enabled.id)).toMatchObject([{ kind: "owner_dm", sessionId, generation: original.binding.generation }]);
+    expect(f.store.getSession(sessionId).descriptor.binding).toEqual(original.binding);
+    expect(f.store.findPendingContextRebuild(sessionId)).toBeUndefined();
+    expect(f.store.listSettings("service", "partner.messaging.v1").filter(row => row.key.startsWith("restart:"))).toEqual([]);
+    expect(restart).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
   });
 
   it("runs WeChat commands through one peer's durable task and keeps the previous task on /new", async () => {
