@@ -940,7 +940,7 @@ export class MobileClient {
           if (!this.#connectionAttemptCurrent(generation, controller)) return;
           combined.throwIfAborted();
           this.#profiles = upsertProfile(this.#profiles, profileFromCredential(credential));
-          if (automatic !== undefined) {
+          if (!draft.entryId && automatic !== undefined) {
             await this.storage.saveAutomaticProfile(automatic ? credential.profileId : undefined);
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
             combined.throwIfAborted();
@@ -4980,16 +4980,6 @@ export class MobileClient {
         const detail = selected ? await this.network.readSession(credential, selected, controller.signal) : undefined;
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         if (selected !== selection) await this.storage.saveSelection(profileId, selected);
-        let preferenceError: string | undefined;
-        if (automatic !== undefined) {
-          try {
-            await this.storage.saveAutomaticProfile(automatic ? profileId : undefined);
-            this.#automaticProfileId = automatic ? profileId : undefined;
-          } catch (error) {
-            preferenceError = `Connected, but the automatic-entry preference could not be saved: ${message(error)}`;
-          }
-        }
-        preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
         if (savedEntries && entryOwner) {
           const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
           await this.storage.writeConnectionEntries?.(profile, next);
@@ -5000,6 +4990,18 @@ export class MobileClient {
           this.#set({ connectionEntries: { profileId, entries: entryApi.connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred,
             ...(resolved?.entry.id !== next.preferredId ? { notice: 'Using a prepared backup. Your preferred entrance has not changed.' } : {}) } });
         }
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        let preferenceError: string | undefined;
+        if (automatic !== undefined) {
+          try {
+            await this.storage.saveAutomaticProfile(automatic ? profileId : undefined);
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            this.#automaticProfileId = automatic ? profileId : undefined;
+          } catch (error) {
+            preferenceError = `Connected, but the automatic-entry preference could not be saved: ${message(error)}`;
+          }
+        }
+        preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
         entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt);
         await this.#adoptConnection(generation, controller, credential, node, owner, selected, detail, preferenceError);
       } catch (error) {
