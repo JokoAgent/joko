@@ -52,7 +52,7 @@ describe("PersonalizationMemorySettings", () => {
     expect(onSuccess).toHaveBeenCalledWith("Restored default settings");
   });
 
-  it("confirms curated Maker reset and Backend-only digest reset with distinct typed scopes", async () => {
+  it("confirms ordinary local Maker reset and Backend-only digest reset with distinct typed scopes", async () => {
     const reset = vi.fn(async () => ({ removedEntries: 2, removedTargets: 1 }));
     const controller = {
       updateMemorySettings: vi.fn(async () => undefined),
@@ -77,8 +77,9 @@ describe("PersonalizationMemorySettings", () => {
 
     await act(async () => resetButtons[0]!.click());
     expect(document.body.textContent).toContain("Reset Maker Memory?");
+    expect(document.body.textContent).toContain("curated Maker Memory and compression digests from ordinary local workspaces");
     await act(async () => document.body.querySelector<HTMLButtonElement>(".modal .button--primary")!.click());
-    expect(reset).toHaveBeenCalledWith("curated");
+    expect(reset).toHaveBeenCalledWith("ordinary_local");
     expect(onSuccess).toHaveBeenCalledWith("Maker Memory reset — removed 2 entries");
     expect(container.querySelector(".memory-settings__notice")).toBeNull();
   });

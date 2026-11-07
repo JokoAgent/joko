@@ -10605,14 +10605,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
-  async resetMemory(scope: "curated" | "backend", backendId?: string): Promise<{
+  async resetMemory(scope: "curated" | "ordinary_local" | "backend", backendId?: string): Promise<{
     readonly removedEntries?: number;
     readonly removedTargets?: number;
   }> {
+    const resetScope = {
+      curated: MemoryResetScope.CURATED,
+      ordinary_local: MemoryResetScope.ORDINARY_LOCAL_WORKSPACES,
+      backend: MemoryResetScope.BACKEND
+    }[scope];
     const operation = await this.submit({
       case: "resetMemory",
       value: {
-        scope: scope === "curated" ? MemoryResetScope.CURATED : MemoryResetScope.BACKEND,
+        scope: resetScope,
         backendId: backendId ?? ""
       }
     }, true);

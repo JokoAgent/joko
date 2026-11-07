@@ -1131,6 +1131,8 @@ enum MemoryResetScope {
   MEMORY_RESET_SCOPE_CURATED = 1;
   // Memory owned by backend_id; curated Maker Memory and other Backends are retained.
   MEMORY_RESET_SCOPE_BACKEND = 2;
+  // Curated Maker Memory and compaction digests in ordinary local workspaces.
+  MEMORY_RESET_SCOPE_ORDINARY_LOCAL_WORKSPACES = 3;
 }
 
 message ResetMemoryMutation {

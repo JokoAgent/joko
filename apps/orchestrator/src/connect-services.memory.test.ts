@@ -239,6 +239,58 @@ describe("Connect Maker Memory owner and reset scopes", () => {
     expect(reset).toHaveBeenCalledTimes(2);
   });
 
+  it("clears ordinary local curated memory and digests in one receipt that an existing tool grant can observe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-ordinary-memory-reset-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const memory = new MakerMemoryController({ store });
+    const host = new SessionHost(store, {} as never, []);
+    const vault = await CredentialVault.open(join(root, "vault.key"));
+    const credentials = new CredentialManager({ vault, storagePath: join(root, "credentials.json") });
+    const router = new McpRouter({ store, credentials });
+    try {
+      await credentials.initialize(); await router.initialize();
+      router.registerBridgeToolProvider(new MakerMemoryBridgeProvider(memory));
+      const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      const backendId = "pi", targetId = "ordinary-workspace", sessionId = "ordinary-session";
+      store.upsertBackend({ id: backendId, displayName: "Pi", adapterKind: "pi", version: "test", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required", capabilities: new Map(),
+        models: [], tools: [], diagnostics: [] });
+      const protectedTargets = ["partner-home", "partner-task", "ssh-workspace"];
+      const put = (id: string) => memory.write(id, { kind: "project", name: "preference", title: "Preference",
+        description: "Stored preference", body: "Compassneedle stays aligned." });
+      for (const id of [targetId, ...protectedTargets]) {
+        const remoteWorkspace = id === "ssh-workspace" ? { kind: "ssh" as const, hostTargetId: id, hostId: "ssh-host", workspaceRoot: "/workspace" } : undefined;
+        const metadata = id === "partner-home" ? { kind: "partner_home" } : id === "partner-task" ? { kind: "partner_session_task", partnerId: "partner" } : {};
+        store.upsertTarget({ id, backendId, displayName: id, trusted: true, managed: false,
+          workspaceRoot: remoteWorkspace?.workspaceRoot ?? root, ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }) }, metadata);
+        put(id);
+        expect(memory.writeCompactionDigest({ backendId, targetId: id, sessionId, reason: "auto", summary: "Compassneedle summary." })).toBe(true);
+      }
+      store.createSession({ id: sessionId, backendId, targetId, title: "Memory reader", binding: { opaqueRef: sessionId, generation: 1 },
+        pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+      const bridge = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId, targetId, expectedPiGeneration: 1 });
+      const list = () => router.executeBridgeCall({ authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: randomUUID(), sessionId, targetId,
+        generation: 1, serverId: MAKER_MEMORY_PROVIDER_ID, toolName: "memory_list", arguments: {} });
+      expect((await list()).details?.mcpStructuredContent).toMatchObject({ entries: [expect.any(Object), expect.any(Object)] });
+
+      const services = createConnectServices(stubApplication({ store, makerMemory: memory, sessionHost: host, connections: { authenticate: () => connection } }));
+      const submit = () => submitReset<contract.SubmitOperationResponse>(services.operation.submitOperation, {
+        operationId: "clear-local-memory", connectionId: connection.id, scope: contract.MemoryResetScope.ORDINARY_LOCAL_WORKSPACES
+      });
+      const result = await submit();
+      expect(result.operation?.result?.payload).toMatchObject({ case: "memoryReset", value: { removedEntries: 2n, removedTargets: 1n } });
+      expect((await list()).details?.mcpStructuredContent).toMatchObject({ entries: [] });
+      expect(memory.search(targetId, "Compassneedle")).toEqual([]);
+      for (const id of protectedTargets) expect(memory.search(id, "Compassneedle")).toHaveLength(2);
+      const late = put(targetId);
+      expect((await submit()).operation?.result?.payload).toEqual(result.operation?.result?.payload);
+      expect(memory.read(targetId, late.id)).toEqual(late);
+    } finally {
+      await router.dispose(); await host.dispose(); memory.dispose(); store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a stale native-memory toggle while Maker Memory is enabled and accepts an atomic switch", async () => {
     let current = { format: 1 as const, makerEnabled: true, backendEnabled: {} as Readonly<Record<string, boolean>> };
     const setSetting = vi.fn((_scope: string, _scopeId: string, _key: string, value: typeof current) => { current = value; });
