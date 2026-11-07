@@ -1291,6 +1291,44 @@ windowsProcessFingerprint(process.pid).then(async (value) => {
     15_000
   );
 
+  it.runIf(process.platform === "linux")("waits for the exact Linux process when its first post-signal identity read is inconclusive", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-broker-exit-transition-"));
+    const harnessPath = join(directory, "exit-transition.mjs");
+    const harness = REMOTE_PI_BROKER_SOURCE.replace("main().catch(() => process.exit(1));", String.raw`
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+const exited = new Promise((resolveExit, rejectExit) => {
+  child.once("exit", (_code, signal) => resolveExit(signal));
+  child.once("error", rejectExit);
+});
+try {
+  const fingerprint = await waitForFingerprint(child.pid);
+  const observe = recordedProcessFingerprint;
+  let observations = 0;
+  recordedProcessFingerprint = async (expected) => {
+    if (++observations === 2) throw new ProcessIdentityUnconfirmed("fixture exit transition");
+    return observe(expected);
+  };
+  const stopped = await stopExactProcess(fingerprint);
+  const signal = await exited;
+  process.stdout.write(JSON.stringify({ stopped, observations, signal }));
+} finally {
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+}
+`);
+    try {
+      expect(harness).not.toBe(REMOTE_PI_BROKER_SOURCE);
+      await writeFile(harnessPath, harness, { mode: 0o600 });
+      const result = spawnSync(process.execPath, [harnessPath], { encoding: "utf8", timeout: 10_000, maxBuffer: 16 * 1024 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      const output = JSON.parse(result.stdout);
+      expect(output).toMatchObject({ stopped: true, signal: "SIGTERM" });
+      expect(output.observations).toBeGreaterThanOrEqual(3);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it.runIf(process.platform === "linux" || process.platform === "win32")(
     "keeps the exact child and replay alive across manager crash, then rotates relay authority",
     async () => {
