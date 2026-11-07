@@ -173,6 +173,85 @@ it("stops setup revocation after the original device loses authority between cre
   } finally { await host.dispose(); store.close(); }
 });
 
+it.each(["sidebar", "setup"] as const)("fences a credential clear against a concurrent %s change through the settings operation", async change => {
+  const { root, store, credentials, catalog } = await fixture();
+  const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+  const host = new SessionHost(store, artifacts, []);
+  try {
+    await artifacts.initialize();
+    await host.initialize();
+    const originalKey = "settings-clear-original", observerKey = "settings-clear-observer";
+    const original = store.createConnection({ id: "clear-original", name: "Original", authKeyDigest: digestAuthKey(originalKey) });
+    store.createConnection({ id: "clear-observer", name: "Observer", authKeyDigest: digestAuthKey(observerKey) });
+    store.upsertBackend({ id: "pi", displayName: "Pi", version: "fixture", health: "healthy", adapterKind: "fixture", instanceGeneration: 1,
+      installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+    const secret = { key: "token", label: "Token", inject: { header: "X-Token", format: "{value}" } };
+    const network = { hosts: ["api.example.test"], secrets: [secret] };
+    const settings = { html: "ui/settings/index.html" }, extensionEntry = "extension.ts", packageName = "@fixture/settings";
+    const runtime = parseExtensionRuntime({ html: "ui/runtime/index.html", tools: [{ name: "read", description: "Read", inputSchema: { type: "object" }, readOnly: true }], network });
+    const installed = resource({ kind: "package", packageIdentity: packageName, resourceDetails: [{ ...resource().resourceDetails[0]!,
+      entryPath: extensionEntry, mainView: { html: "ui/index.html" }, settings, runtime }] });
+    const entry = catalog.reconcile([installed], []).entries[0]!;
+    const backend = store.getBackend(installed.backendId);
+    const surface: ExtensionMainViewSurface = { id: `extension_surface_${"b".repeat(32)}`, extensionId: entry.id, endpoint: "/private", expiresAt: NOW + 600_000,
+      authority: { extensionId: entry.id, resourceId: installed.id, resourceRevision: installed.versionNumber,
+        discoveredRevision: installed.discoveredRevision, backendId: installed.backendId, backendRevision: backend.revision,
+        backendGeneration: backend.descriptor.instanceGeneration, packageName, packageVersion: installed.version, extensionEntry, mainView: settings, settings } };
+    const fieldId = "network-secret:token", attempt = catalog.beginSetup(entry.id, entry.revision);
+    const upload = catalog.beginSetupCredentialUpload({ extensionId: entry.id, attemptId: attempt.setup.attemptId!, fieldId, kind: "header_secret", connectionId: original.id });
+    credentials.upload(upload.credentialUploadTicketId, "fixture-header-token", original.id);
+    const saved = await catalog.commitSetupCredential({ extensionId: entry.id, attemptId: attempt.setup.attemptId!, fieldId,
+      credentialUploadTicketId: upload.credentialUploadTicketId, connectionId: original.id, expectedRevision: attempt.revision });
+    const reference = extensionNetworkCredentialReference(entry.id, network, secret);
+    const generation = credentials.find(reference)?.generation;
+    expect(generation).toBeTruthy();
+    const retire = credentials.retireManagedCredential.bind(credentials);
+    let resume!: () => void, reachedPause!: () => void;
+    const paused = new Promise<void>(resolve => { resume = resolve; });
+    const atPause = new Promise<void>(resolve => { reachedPause = resolve; });
+    const retireCall = vi.spyOn(credentials, "retireManagedCredential").mockImplementation(async (...input) => {
+      if (change === "sidebar") {
+        const deleted = await retire(...input);
+        reachedPause(); await paused;
+        return deleted;
+      }
+      reachedPause(); await paused;
+      return retire(...input);
+    });
+    const vault = await CredentialVault.open(join(root, "vault.key"));
+    const application = { config: { publicOrigin: "https://orchestrator.example.test" }, store, adapters: [], sessionHost: host,
+      extensionCatalog: catalog, connections: new ConnectionManager(store), piResources: { list: () => [installed], get: () => installed },
+      extensionSettings: new ExtensionSettingsManager({ store, vault, credentials, catalog }),
+      extensionMainViews: { getSurface: async () => surface, isSurfaceCurrent: (id: string, connection: string) => id === surface.id && connection === original.id }
+    } as unknown as OrchestratorApplication;
+    const transport = createRouterTransport(router => registerConnectServices(router, application));
+    const operations = createClient(contract.OperationService, transport), extensions = createClient(contract.ExtensionService, transport);
+    const originalAuth = { headers: { authorization: `Bearer ${originalKey}` } };
+    const observerAuth = { headers: { authorization: `Bearer ${observerKey}` } };
+    const revision = { extensionId: entry.id, expectedRevision: { value: saved.revision } };
+    const clear = { operationId: "settings-clear-secret", mutation: { payload: {
+      case: "clearExtensionSetupCredential" as const, value: { ...revision, surfaceId: surface.id, fieldId }
+    } } };
+    const clearing = operations.submitOperation(clear, originalAuth);
+    try {
+      await Promise.race([atPause, clearing.then(() => { throw new Error("Clear finished before the Vault interleaving."); })]);
+      const payload = change === "sidebar" ? { case: "setExtensionSidebarVisible" as const, value: { ...revision, visible: true } }
+        : { case: "beginExtensionSetup" as const, value: revision };
+      await expect(operations.submitOperation({ operationId: "settings-concurrent-edit", mutation: { payload } }, observerAuth))
+        .resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+    } finally { resume(); }
+    const result = change === "sidebar" ? contract.OperationState.SUCCEEDED : contract.OperationState.FAILED;
+    await expect(clearing).resolves.toMatchObject({ operation: { state: result } });
+    await expect(operations.getOperation({ operationId: clear.operationId }, originalAuth)).resolves.toMatchObject({ operation: { state: result } });
+    await expect(operations.submitOperation(clear, originalAuth)).resolves.toMatchObject({ operation: { state: result } });
+    expect(retireCall).toHaveBeenCalledOnce();
+    expect(credentials.find(reference)?.generation).toBe(change === "sidebar" ? undefined : generation);
+    await expect(extensions.getExtension({ extensionId: entry.id }, observerAuth)).resolves.toMatchObject({ extension: {
+      sidebarVisible: change === "sidebar", setup: { fields: expect.arrayContaining([expect.objectContaining({ fieldId, configured: change === "setup" })]) }
+    } });
+  } finally { await host.dispose(); store.close(); }
+});
+
 function resource(overrides: Partial<PiResourceDescriptor> = {}): PiResourceDescriptor {
   return {
     id: "resource-extension-a",

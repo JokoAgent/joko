@@ -22033,11 +22033,12 @@ async function dispatchMutation(
       const surface = await requireExtensionSettingsSurface(dependencies, payload.value.surfaceId, connection.id);
       if (surface.extensionId !== payload.value.extensionId) throw invalidArgument("Settings document belongs to another plugin.");
       const assertCurrent = () => {
-        dependencies.connections.fence(connection); requireCurrentExtensionMutation(dependencies, surface.extensionId, expectedRevision);
+        dependencies.connections.fence(connection);
         if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
         assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
       };
       assertCurrent();
+      requireCurrentExtensionMutation(dependencies, surface.extensionId, expectedRevision);
       return effectOperation(dependencies, operationId, connection, mutation, payload.case,
         { accepted: true, resultCase: "acknowledgement", entityId: surface.extensionId }, async () => {
           assertCurrent(); await dependencies.extensionCatalog!.clearSetupCredential(surface.extensionId, payload.value.fieldId, expectedRevision, assertCurrent);
