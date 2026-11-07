@@ -68,6 +68,7 @@ const VIEWER_SCRIPT = String.raw`
   let seq=0,sequenceLimit=Number.MAX_SAFE_INTEGER,pending=[],sending=false,drag=false,hold=null,start=null,last=null,multi=null,gestureFrame=null;
   let congestionAt=null,integerScroll=false;
   const pointers=new Map();let cx=.5,cy=.5,composing=false,keyboardEnabled=false;
+  const heldKeyCodes=new Set();
   const heldMouse=new Map(),mouseControlHandlers=new Map();let showMouseButtons=false,nativeMouseControls=false,wheelY=null;
   let nativeTouchpad=null,fitToInsets=false,topInset=0,bottomInset=0,cursorNeedsEntry=true;
   let bgContext=null,bgRects=null,bgAxis='x',bgDpr=1,bgDrawFrame=null,bgLoopFrame=null;
@@ -123,7 +124,7 @@ const VIEWER_SCRIPT = String.raw`
   function click(button=0){queue({kind:'button',button,down:true,x:cx,y:cy});queue({kind:'button',button,down:false,x:cx,y:cy});flush();}
   function resetWheel(){wheelY=null;wheelGrip.style.transform='translateY(0px)';}
   function updateMouseButtons(){mouseButtons.style.display=showMouseButtons&&control&&!nativeMouseControls?'block':'none';for(const[name,button]of[['left',0],['right',2]])document.getElementById('mouse-'+name).setAttribute('aria-pressed',String(heldMouse.has(button)));}
-  function release(send=true){clearTimeout(hold);if(gestureFrame!==null)cancelAnimationFrame(gestureFrame);gestureFrame=null;if(control&&send){queue({kind:'release'});flush();}nativeTouchpad=null;heldMouse.clear();resetWheel();updateMouseButtons();drag=false;pointers.clear();start=last=multi=null;}
+  function release(send=true){clearTimeout(hold);if(gestureFrame!==null)cancelAnimationFrame(gestureFrame);gestureFrame=null;if(control&&send){queue({kind:'release'});flush();}nativeTouchpad=null;heldMouse.clear();heldKeyCodes.clear();resetWheel();updateMouseButtons();drag=false;pointers.clear();start=last=multi=null;}
   function listenMouse(element,type,handler){element.addEventListener(type,handler);mouseControlHandlers.set(element.id+':'+type,handler);}
   for(const[name,button]of[['left',0],['right',2]]){
     const element=document.getElementById('mouse-'+name);
@@ -243,7 +244,19 @@ const VIEWER_SCRIPT = String.raw`
   function commitKeyboard(){if(!keyboardEnabled||!control||composing)return;const text=keyboard.value.replace(sentinel,'');if(text){for(let index=0;index<text.length;index+=4096)queue({kind:'text',text:text.slice(index,index+4096)});flush();}resetKeyboard();}
   keyboard.addEventListener('compositionstart',()=>{composing=true;});keyboard.addEventListener('compositionend',()=>{composing=false;commitKeyboard();});keyboard.addEventListener('input',event=>{if(!event.isComposing)commitKeyboard();});keyboard.addEventListener('beforeinput',event=>{if(composing||event.isComposing)return;if(event.inputType==='deleteContentBackward'){event.preventDefault();keyboardKey('Backspace');}else if(event.inputType==='insertLineBreak'||event.inputType==='insertParagraph'){event.preventDefault();keyboardKey('Enter');}});
   const normalizedKey=code=>/^(Shift|Control|Alt|Meta)Right$/.test(code)?code.replace(/Right$/,'Left'):code;
-  document.addEventListener('keydown',event=>{if(mouseButtons.contains(event.target))return;const code=normalizedKey(event.code);if(control&&validKeys.has(code)){event.preventDefault();queue({kind:'key',code,down:true});}});document.addEventListener('keyup',event=>{if(mouseButtons.contains(event.target))return;const code=normalizedKey(event.code);if(control&&validKeys.has(code)){event.preventDefault();queue({kind:'key',code,down:false});}});window.addEventListener('blur',()=>{release();if(epoch)post({type:'mouseControlsRetired'});});new ResizeObserver(()=>{release();if(epoch)post({type:'mouseControlsRetired'});cursorNeedsEntry=true;boundPan();render();}).observe(stage);
+  document.addEventListener('keydown',event=>{
+    const code=normalizedKey(event.code);
+    if(!control||!validKeys.has(code)||mouseButtons.contains(event.target))return;
+    const localText=keyboardEnabled&&document.activeElement===keyboard&&!event.ctrlKey&&!event.metaKey&&!event.altKey
+      &&Array.from(event.key).length===1;
+    if(localText&&!heldKeyCodes.has(event.code))return;
+    event.preventDefault();heldKeyCodes.add(event.code);queue({kind:'key',code,down:true});
+  });
+  document.addEventListener('keyup',event=>{
+    if(!heldKeyCodes.delete(event.code)||!control)return;
+    event.preventDefault();queue({kind:'key',code:normalizedKey(event.code),down:false});
+  });
+  window.addEventListener('blur',()=>{release();if(epoch)post({type:'mouseControlsRetired'});});new ResizeObserver(()=>{release();if(epoch)post({type:'mouseControlsRetired'});cursorNeedsEntry=true;boundPan();render();}).observe(stage);
   function retainFrame(){if(!videoPresented||video.readyState<2||!video.videoWidth||!video.videoHeight)return;const canvas=document.createElement('canvas');try{const scale=Math.min(1,1280/Math.max(video.videoWidth,video.videoHeight));canvas.width=Math.max(1,Math.round(video.videoWidth*scale));canvas.height=Math.max(1,Math.round(video.videoHeight*scale));const context=canvas.getContext('2d');if(context){context.drawImage(video,0,0,canvas.width,canvas.height);image.src=canvas.toDataURL('image/jpeg',.7);}}catch{}finally{canvas.width=canvas.height=0;}}
   function presentationActive(){return video.webkitPresentationMode==='picture-in-picture'||document.pictureInPictureElement===video;}
   function presentationSupported(){try{return video.webkitSupportsPresentationMode?.('picture-in-picture')===true||document.pictureInPictureEnabled===true;}catch{return false;}}

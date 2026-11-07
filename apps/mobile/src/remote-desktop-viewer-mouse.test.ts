@@ -305,6 +305,29 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[3]).toMatchObject({ events: [{ kind: "button", button: 1, down: true }, { kind: "button", button: 1, down: false }] });
   });
 
+  it("sends the focused phone keyboard character and keeps physical keys available after blur", async () => {
+    const value = viewer();
+    value.receive({ type: "keyboard", enabled: true });
+    const keyboard = document.querySelector("textarea")!;
+    expect(document.activeElement).toBe(keyboard);
+    const key = (type: string) => new KeyboardEvent(type, { code: "KeyY", key: "z", bubbles: true, cancelable: true });
+    const down = key("keydown");
+    keyboard.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(false);
+    keyboard.value = "z";
+    keyboard.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+    keyboard.dispatchEvent(key("keyup"));
+    await vi.advanceTimersByTimeAsync(33);
+    expect(value.packets()[0]?.events).toEqual([{ kind: "text", text: "z" }]);
+    value.ack();
+
+    value.receive({ type: "keyboard", enabled: false });
+    document.dispatchEvent(key("keydown"));
+    document.dispatchEvent(key("keyup"));
+    await vi.advanceTimersByTimeAsync(33);
+    expect(value.packets()[1]?.events).toEqual([{ kind: "key", code: "KeyY", down: true }, { kind: "key", code: "KeyY", down: false }]);
+  });
+
   it.each(["hide", "blur", "resize"] as const)("clears held buttons and wheel on %s without bypassing input ACK", async reason => {
     const value = viewer(); value.pointer(value.button("left"), "pointerdown");
     value.pointer(value.button("wheel"), "pointerdown", 9, 0, 100); value.pointer(value.button("wheel"), "pointermove", 9, 0, 124);
