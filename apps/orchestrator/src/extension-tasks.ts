@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, realpath } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
+import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import type { OperationalStore, QueueItemRecord, StoredSession, StoredRun } from "@joko/store";
 import { resourceExtensionIds, type ExtensionCatalogManager } from "./extension-catalog.js";
@@ -468,16 +468,42 @@ export class ExtensionTasks {
         }
         const route = this.#resolve(owner, request.route), preferences = this.preferences(owner.extensionId), stamp = hash(preferences.config);
         let targetId = target?.targetId ?? preferences.config.targetId;
+        const isolatedDirectory = request.isolatedWorkspace === true && targetId === undefined;
+        let directoryIdentity: { readonly path: string; readonly dev: number; readonly ino: number } | undefined;
         if (!targetId) {
-          const root = join(this.options.rootDirectory, hash([owner.extensionId, route.backendId]));
+          const directoryKey = isolatedDirectory ? `isolated-${hash([operationId, route.backendId])}` : hash([owner.extensionId, route.backendId]);
+          let parent = this.options.rootDirectory;
+          if (isolatedDirectory) {
+            await mkdir(parent, { recursive: true, mode: 0o700 });
+            parent = await realpath(parent);
+          }
+          const root = join(parent, directoryKey);
           await mkdir(root, { recursive: true, mode: 0o700 }); this.#assert(owner, hidden);
           const workspaceRoot = await realpath(root);
-          targetId = `extension-target-${hash([owner.extensionId, route.backendId])}`;
+          if (isolatedDirectory) {
+            const info = await lstat(root);
+            if (!info.isDirectory() || info.isSymbolicLink() || workspaceRoot !== root || (await readdir(root)).length > 0) {
+              return failure("PERMISSION_DENIED", "The isolated task requires an empty managed directory.");
+            }
+            directoryIdentity = { path: workspaceRoot, dev: info.dev, ino: info.ino };
+          }
+          targetId = `extension-target-${directoryKey}`;
           if (!this.options.store.listTargets().some(target => target.descriptor.id === targetId)) await this.options.host.registerTarget({ id: targetId, backendId: route.backendId,
             displayName: this.options.catalog.get(owner.extensionId).name, workspaceRoot, managed: true, trusted: true });
         }
         this.#target(targetId, route.backendId);
-        const current = () => { target?.assertCurrent(); this.#assert(owner, hidden); this.#target(targetId!, route.backendId);
+        const current = () => { target?.assertCurrent(); this.#assert(owner, hidden); const registered = this.#target(targetId!, route.backendId);
+          if (directoryIdentity !== undefined) {
+            let sameDirectory = false;
+            try {
+              const info = lstatSync(directoryIdentity.path);
+              sameDirectory = info.isDirectory() && info.dev === directoryIdentity.dev && info.ino === directoryIdentity.ino
+                && realpathSync(directoryIdentity.path) === directoryIdentity.path;
+            } catch { /* An unavailable directory cannot be adopted. */ }
+            if (!sameDirectory || !registered.descriptor.managed || registered.descriptor.workspaceRoot !== directoryIdentity.path) {
+              failure("STALE_REVISION", "The isolated task directory changed.");
+            }
+          }
           if (this.options.projects?.enabledForTarget(owner.extensionId, targetId!) === false) failure("PERMISSION_DENIED", "Plugin is disabled for this project.");
           if (stamp !== hash(this.preferences(owner.extensionId).config)) failure("STALE_REVISION", "Plugin task settings changed during creation."); this.#route(route); };
         current();
@@ -485,7 +511,7 @@ export class ExtensionTasks {
         this.options.store.setSetting("service", TASKS, operationId, receipt);
         const created = await this.options.host.createServiceSession({ operationId, serviceKind: "extension", targetId, title, ...route,
           permissionMode: preferences.config.permissionMode, planMode: false, hidden, assertServiceScope: current,
-          ...(request.isolatedWorkspace ? { worktree: { refreshRemote: false } } : {}),
+          ...(request.isolatedWorkspace === true && !isolatedDirectory ? { worktree: { refreshRemote: false } } : {}),
           onExtensionAdmitted: (store, session) => {
             current(); const adopted = { ...receipt, sessionId: session.descriptor.id };
             store.setSetting("service", TASKS, operationId, adopted); store.setSetting("service", TASKS, session.descriptor.id, adopted);

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -77,6 +77,30 @@ it("checks project exceptions for new plugin tasks and subsequent access to an e
   expect(f.store.listSessions()).toHaveLength(count);
   f.projects.setEnabled(project.id, "connection", f.descriptor(), true, f.projects.state(project.id, "connection").revision);
   expect(await f.request({ kind: "get", taskId: task.taskId })).toMatchObject({ taskId: task.taskId });
+});
+it("creates an isolated plugin task in a fresh managed directory without a Git project", async () => {
+  const f = await fixture();
+  const createNative = vi.spyOn(f.adapter, "createSession");
+  const request = { kind: "create", requestKey: "isolated-first", title: "Isolated task", isolatedWorkspace: true };
+  const first = await f.request(request) as { taskId: string };
+  const firstSession = f.store.getSession(first.taskId).descriptor;
+  const firstTarget = f.store.getTarget(firstSession.targetId).descriptor;
+  expect(firstTarget.managed).toBe(true);
+  expect(firstSession.worktree).toBeUndefined();
+  const managedRoot = await realpath(join(f.root, "tasks"));
+  expect(firstTarget.workspaceRoot).toBe(join(managedRoot, firstTarget.id.slice("extension-target-".length)));
+  expect(await readdir(firstTarget.workspaceRoot)).toEqual([]);
+  await writeFile(join(firstTarget.workspaceRoot, "first-task.txt"), "Only the first task");
+
+  const second = await f.request({ ...request, requestKey: "isolated-second" }) as { taskId: string };
+  const secondSession = f.store.getSession(second.taskId).descriptor;
+  const secondTarget = f.store.getTarget(secondSession.targetId).descriptor;
+  expect(secondSession.worktree).toBeUndefined();
+  expect(secondTarget.workspaceRoot).not.toBe(firstTarget.workspaceRoot);
+  expect(await readdir(secondTarget.workspaceRoot)).toEqual([]);
+  expect(await f.request(request)).toMatchObject({ taskId: first.taskId });
+  expect(createNative.mock.calls.map(([input, context]) => [input.target.workspaceRoot, context.target.workspaceRoot]))
+    .toEqual([[firstTarget.workspaceRoot, firstTarget.workspaceRoot], [secondTarget.workspaceRoot, secondTarget.workspaceRoot]]);
 });
 it("adopts hidden ordinary Sessions atomically, dispatches one durable Run, and replays original input keys", async () => {
   const f = await fixture();
