@@ -7089,17 +7089,17 @@ export class SessionHost {
     if (
       overrides.permissionMode !== undefined &&
       overrides.permissionMode !== "ask" &&
+      overrides.permissionMode !== "acceptEdits" &&
       overrides.permissionMode !== "auto" &&
       overrides.permissionMode !== "bypassPermissions"
     ) {
       throw turnOverrideError("TURN_OVERRIDE_PERMISSION_INVALID", "Per-turn permission mode is invalid.");
     }
-    if (overrides.permissionMode !== undefined && overrides.permissionMode !== stored.descriptor.permissionMode) {
-      const change = backend.capabilities.get("permission.change");
-      const modes = backend.capabilities.get("permission.modes");
+    if (overrides.permissionMode !== undefined) {
+      const changed = overrides.permissionMode !== stored.descriptor.permissionMode;
       if (
-        change?.supported !== true || modes?.supported !== true ||
-        !modes.options?.includes(overrides.permissionMode)
+        (changed && backend.capabilities.get("permission.change")?.supported !== true)
+        || ((changed || overrides.permissionMode === "acceptEdits") && !supportsPermissionMode(backend, overrides.permissionMode))
       ) {
         throw turnOverrideError(
           "TURN_OVERRIDE_PERMISSION_UNSUPPORTED",
@@ -11901,6 +11901,10 @@ export class SessionHost {
             { version: 1, operationId: claim.operation.id, phase: "creating" } satisfies PrivateCreationReceipt);
           if ("serviceKind" in input && (input.serviceKind === "personal_development" || input.workerWorkspace !== undefined)) personalNativeCreationDispatched = true;
           for (;;) {
+            if (operationKind === "create_scheduled_session" && input.permissionMode === "acceptEdits"
+              && !supportsPermissionMode(this.#store.getBackend(runtimeTarget.backendId).descriptor, input.permissionMode)) {
+              throw turnOverrideError("SESSION_PERMISSION_MODE_UNSUPPORTED", "The selected Backend does not support the scheduled task permission mode.");
+            }
             try {
               if (groupAssignment) {
                 groupAssignment.assertCurrent();
@@ -19211,6 +19215,11 @@ function extraDirectoryCapabilityInvariant(backendId: string): JokoError {
     stateMayHaveChanged: false,
     recovery: "Refresh or replace the Backend before changing approved extra directories."
   });
+}
+
+function supportsPermissionMode(backend: BackendDescriptor, mode: PermissionMode): boolean {
+  const capability = backend.capabilities.get("permission.modes");
+  return capability?.supported === true && capability.options?.includes(mode) === true;
 }
 
 function turnOverrideError(code: string, message: string): JokoError {

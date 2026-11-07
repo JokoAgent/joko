@@ -1513,7 +1513,8 @@ function scheduleCreationSnapshot(value: unknown): {
   const effort = typeof record["effort"] === "string" && record["effort"].length > 0
     ? record["effort"]
     : undefined;
-  const permissionMode = record["permissionMode"] === "auto" || record["permissionMode"] === "bypassPermissions"
+  const permissionMode = record["permissionMode"] === "acceptEdits"
+    || record["permissionMode"] === "auto" || record["permissionMode"] === "bypassPermissions"
     ? record["permissionMode"]
     : "ask";
   return {
