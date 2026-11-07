@@ -45,6 +45,37 @@ test("directory selection only sends a native choice request and requires a read
   const response = await pending; assert.equal((await response.json()).dir_deposit.token, "receipt");
 });
 
+test("author connection token and deletion path use the protected v1 commands", async () => {
+  const current = page();
+  const token = "private-synthetic-connection-token", id = "7f33bd64-4853-47a7-816a-f566432c946d";
+  const row = { connectionId: id, host: "gitlab.example.com", label: "Office", configured: true, isDefault: true };
+  const state = { extensionId: "extension", revision: { value: "8" }, slots: [{ key: "gitlab", connections: [row] }] };
+  const add = current.context.fetch("/connections/gitlab", { method: "POST",
+    body: JSON.stringify({ host: "Gitlab.example.com", token, label: "Office" }) });
+  const setting = parseExtensionSettingsBridgeRequest(current.requests[0]);
+  assert.deepEqual(JSON.parse(JSON.stringify(setting?.command)), { kind: "connections.set", key: "gitlab",
+    host: "Gitlab.example.com", value: token, label: "Office" });
+  current.respond(setting.id, state);
+  const saved = await (await add).json();
+  assert.deepEqual(saved, { ...state, ok: true, connection: { id, host: row.host, label: row.label, isDefault: true } });
+  assert.doesNotMatch(JSON.stringify(saved), /private-synthetic-connection-token/u);
+  await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "0", dataJson: JSON.stringify({ token }) }), /Secrets/u);
+
+  const legacy = current.context.fetch("/connections/gitlab", { method: "POST",
+    body: JSON.stringify({ host: row.host, value: "replacement" }) });
+  current.respond(current.requests[1].id, state);
+  assert.deepEqual(await (await legacy).json(), state);
+
+  const remove = current.context.fetch(`/connections/gitlab/${id}`, { method: "DELETE" });
+  const deletion = parseExtensionSettingsBridgeRequest(current.requests[2]);
+  assert.deepEqual(JSON.parse(JSON.stringify(deletion?.command)), { kind: "connections.change", key: "gitlab", action: "remove", connectionId: id });
+  current.respond(deletion.id, { ...state, slots: [{ key: "gitlab", connections: [] }] });
+  const removed = await remove;
+  assert.equal(removed.status, 204);
+  assert.equal(await removed.text(), "");
+  assert.equal(current.requests.length, 3);
+});
+
 test("the real settings SDK binds responses and keeps entered secrets out of routing parameters", async () => {
   const current = page();
   const pending = current.context.joko.settings({ kind: "secret.set", fieldId: "network-secret:token", value: "private-$&-candidate" });
