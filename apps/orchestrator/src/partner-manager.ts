@@ -1076,11 +1076,13 @@ export class PartnerManager {
     };
     try {
       assertCurrent();
-      await this.#sessionHost.restartPartnerSession({ sessionId: restart.sessionId, operationId, assertCurrent,
+      await this.#sessionHost.restartPartnerSession({ sessionId: restart.sessionId, operationId, pauseEmptyQueue: false, assertCurrent,
         pauseGoal: () => this.#pauseGoal?.(restart.sessionId, `${operationId}:goal`) ?? Promise.resolve() });
       assertCurrent();
-      return this.#store.settlePartnerRestart(restart.requestId, true);
     } catch { return this.#store.settlePartnerRestart(restart.requestId, false); }
+    const ready = this.#store.settlePartnerRestart(restart.requestId, true);
+    void this.#resumeIndependentReturns?.(restart.partnerId).catch(() => undefined);
+    return ready;
   }
 
   listPendingDeletions(): readonly PartnerDeletionRecord[] { return this.#store.listPendingPartnerDeletions(); }
