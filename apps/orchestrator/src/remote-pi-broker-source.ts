@@ -755,25 +755,32 @@ async function waitForFingerprint(pid, deadline = Date.now() + START_TIMEOUT_MS)
   }
   fail();
 }
+async function waitForRecordedProcessExit(fingerprint, deadline) {
+  for (;;) {
+    try {
+      if (!fingerprintsMatch(await recordedProcessFingerprint(fingerprint), fingerprint)) return true;
+    } catch (error) {
+      // Linux can clear cmdline/exe before publishing the exit state. This
+      // interval proves neither a different owner nor a completed shutdown.
+      if (!(error instanceof ProcessIdentityUnconfirmed)) throw error;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+}
 async function stopExactProcess(fingerprint, requestedSignal = "SIGTERM") {
-  let current = await recordedProcessFingerprint(fingerprint);
+  const current = await recordedProcessFingerprint(fingerprint);
   if (current === undefined) return true;
   if (!fingerprintsMatch(current, fingerprint)) return false;
   try { process.kill(fingerprint.pid, signalName(requestedSignal)); } catch {}
   if (requestedSignal !== "SIGKILL") {
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      current = await recordedProcessFingerprint(fingerprint);
-      if (current === undefined || !fingerprintsMatch(current, fingerprint)) return true;
-      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
-    }
-    current = await recordedProcessFingerprint(fingerprint);
-    if (fingerprintsMatch(current, fingerprint)) {
-      try { process.kill(fingerprint.pid, "SIGKILL"); } catch {}
-    }
+    if (await waitForRecordedProcessExit(fingerprint, Date.now() + 5_000)) return true;
+    const remaining = await recordedProcessFingerprint(fingerprint);
+    if (!fingerprintsMatch(remaining, fingerprint)) return true;
+    try { process.kill(fingerprint.pid, "SIGKILL"); } catch {}
   }
-  while (fingerprintsMatch(await recordedProcessFingerprint(fingerprint), fingerprint)) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  if (!(await waitForRecordedProcessExit(fingerprint, Date.now() + 5_000))) {
+    throw new ProcessIdentityUnconfirmed("The exact process did not confirm exit.");
   }
   return true;
 }
