@@ -58,14 +58,15 @@ mountedIt("wraps a long staged Review line and keeps word emphasis opt-in", { ti
 
   await page.getByRole("button", { name: "Add tab", exact: true }).click();
   await page.getByRole("menuitem", { name: "Changes", exact: true }).click();
-  await page.getByRole("button", { name: "Review source", exact: true }).click();
+  await page.getByRole("combobox", { name: "Review source", exact: true }).click();
   await page.getByRole("option", { name: "Staged changes", exact: true }).click();
   const added = page.locator(".review-diff-line--added").filter({ hasText: "word word word" });
   await added.waitFor({ state: "visible" });
   const metrics = () => added.evaluate(row => {
     const code = row.querySelector("code")!;
+    const table = row.closest(".review-diff-table")!;
     return { lineHeight: Number.parseFloat(getComputedStyle(code).lineHeight),
-      height: code.getBoundingClientRect().height, overflow: row.scrollWidth - row.clientWidth };
+      height: code.getBoundingClientRect().height, overflow: table.scrollWidth - table.clientWidth };
   });
   const wordDiff = page.getByRole("button", { name: "Word diff", exact: true });
   expect(await wordDiff.getAttribute("aria-pressed")).toBe("false");
