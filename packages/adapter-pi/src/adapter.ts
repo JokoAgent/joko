@@ -370,6 +370,8 @@ export interface PiAdapterOptions {
   readonly command?: string;
   readonly commandArgs?: readonly string[];
   readonly providers?: readonly PiManagedProvider[];
+  /** Checks for already admitted work before an idle process can adopt a saved endpoint. */
+  readonly canRefreshIdleModelEndpoint?: (sessionId: string) => boolean;
   readonly settings?: PiManagedSettings;
   /** Host-owned recovery for invalid Responses reasoning ciphertext. */
   readonly silentEncryptedRetryEnabled?: boolean;
@@ -555,6 +557,12 @@ interface SessionSpawnProfile {
   readonly runtimePolicy: "standard" | "review_read_only";
 }
 
+interface PiManagedModelEndpoint {
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly baseUrl: string;
+}
+
 interface PiResetContextReceipt {
   readonly version: typeof RESET_CONTEXT_RECEIPT_VERSION;
   readonly operationId: string;
@@ -635,6 +643,7 @@ interface PiRuntime {
   workingContextWindow: number | undefined;
   workingContextSelection: string | undefined;
   workingContextUnconfirmed?: boolean;
+  pendingModelEndpoint?: PiManagedModelEndpoint;
   thresholdCheck?: Promise<void>;
   thresholdCompaction?: { readonly id: string; readonly context: AdapterContext; nativeIdentity?: NativeMessageIdentity };
   ready: boolean;
@@ -810,7 +819,8 @@ export class PiBackendAdapter implements
   readonly #runtimeStarts = new Map<string, Promise<PiRuntime>>();
   readonly #spawnProfiles = new Map<string, SessionSpawnProfile>();
   readonly #workingContextRecoveries = new Map<string, { readonly binding: NativeSessionBinding; readonly profile: SessionSpawnProfile;
-    readonly targetId: string; readonly workspaceRoot: string; readonly backendInstanceGeneration: number | undefined }>();
+    readonly targetId: string; readonly workspaceRoot: string; readonly backendInstanceGeneration: number | undefined;
+    readonly endpoint?: PiManagedModelEndpoint }>();
   readonly #artifactRefsBySession = new Map<string, Map<string, BlobRef>>();
   readonly #subagentObservers = new Map<string, ManagedSubagentObserver>();
   readonly #unresolvedRemoteSubagentOwners = new Map<string, number>();
@@ -1163,10 +1173,15 @@ export class PiBackendAdapter implements
     await this.#stopRuntime(context.sessionId, context.generation);
   }
 
-  async closeSession(_binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+  async closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     const runtime = this.#runtimes.get(context.sessionId);
-    if (runtime === undefined || !samePath(runtime.binding.opaqueRef, _binding.opaqueRef)) return;
-    await this.#stopRuntime(context.sessionId, context.generation);
+    if (runtime !== undefined) {
+      if (!samePath(runtime.binding.opaqueRef, binding.opaqueRef)) return;
+      await this.#stopRuntime(context.sessionId, context.generation);
+    }
+    const retained = this.#workingContextRecoveries.get(context.sessionId);
+    if (retained?.endpoint !== undefined && retained.binding.generation === context.generation
+      && samePath(retained.binding.opaqueRef, binding.opaqueRef)) this.#workingContextRecoveries.delete(context.sessionId);
   }
 
   async inspectNativeSessionDeletion(
@@ -1367,7 +1382,9 @@ export class PiBackendAdapter implements
     // settles. An admitted extension command can run on that same runtime.
     if (input.disposition === "prompt" && (attached === undefined || attached.lifecycle === undefined
       && attached.thresholdCompaction === undefined && attached.runningExtensionCommand === undefined && attached.userShell === undefined)) {
-      await this.refreshModelWorkingContext(context);
+      const ordinaryText = !input.text.trimStart().startsWith("/") && input.images.length === 0 && input.files.length === 0
+        && input.mentions.length === 0 && input.automaticContinuation === undefined && input.objectiveContinuation === undefined;
+      await this.refreshModelWorkingContext(context, ordinaryText);
     }
     const runtime = this.#runtime(context);
     await runtime.nativeSkills?.assertFilesCurrent(context.signal);
@@ -2112,12 +2129,13 @@ export class PiBackendAdapter implements
     return model;
   }
 
-  async refreshModelWorkingContext(context: AdapterContext): Promise<void> {
+  async refreshModelWorkingContext(context: AdapterContext, adoptSavedEndpoint = false): Promise<void> {
     this.#assertNotDisposed();
     context.signal.throwIfAborted();
     const retained = this.#workingContextRecoveries.get(context.sessionId);
     let runtime = this.#runtimes.get(context.sessionId);
-    if (retained === undefined && runtime?.workingContextWindow === undefined && !runtime?.workingContextUnconfirmed
+    if (retained === undefined && (!adoptSavedEndpoint || runtime?.pendingModelEndpoint === undefined)
+      && runtime?.workingContextWindow === undefined && !runtime?.workingContextUnconfirmed
       && context.resolveModelWorkingContext === undefined) return;
     if (runtime === undefined && retained === undefined) return;
     if (retained !== undefined) {
@@ -2127,9 +2145,10 @@ export class PiBackendAdapter implements
         throw piError("PI_STALE_GENERATION", "The model context recovery belongs to another native binding", "dispatch");
       }
       if (runtime !== undefined) await this.#stopRuntime(context.sessionId, context.generation);
-      runtime = await this.#ensureRuntime(retained.binding, retained.profile, context);
+      runtime = await this.#ensureRuntime(retained.binding, retained.profile, context, this.#modelEndpointStartupFence(retained.endpoint));
       await this.#confirmNativeSessionSwitch(runtime, retained.binding, context);
       runtime.workingContextUnconfirmed = true;
+      if (retained.endpoint !== undefined) await this.#confirmModelEndpoint(runtime, context, retained.endpoint);
       await runtime.transport.request({ type: "set_auto_compaction", enabled: retained.profile.autoCompaction ?? runtime.autoCompaction }, { signal: context.signal, stateMayHaveChanged: true });
       await runtime.transport.request({ type: "set_auto_retry", enabled: retained.profile.autoRetry ?? runtime.autoRetry }, { signal: context.signal, stateMayHaveChanged: true });
       this.#workingContextRecoveries.delete(context.sessionId);
@@ -2146,7 +2165,10 @@ export class PiBackendAdapter implements
       const desired = readPiWorkingContext(context, providerId, modelId);
       const threshold = desired === undefined ? undefined : this.#modelAutoCompactionThreshold(context, providerId, modelId);
       const selection = providerId === undefined || modelId === undefined ? undefined : `${providerId}\0${modelId}`;
-      if (desired === runtime!.workingContextWindow && !runtime!.workingContextUnconfirmed
+      const pendingEndpoint = runtime!.pendingModelEndpoint;
+      const endpoint = adoptSavedEndpoint && pendingEndpoint?.providerId === providerId && pendingEndpoint?.modelId === modelId
+        ? pendingEndpoint : undefined;
+      if (endpoint === undefined && desired === runtime!.workingContextWindow && !runtime!.workingContextUnconfirmed
         && threshold === runtime!.modelAutoCompactionThresholdPercent
         && (desired === undefined || selection === runtime!.workingContextSelection)) return;
       const profile = { ...(this.#spawnProfiles.get(context.sessionId) ?? restoredSpawnProfile(context)), providerId, modelId,
@@ -2157,13 +2179,14 @@ export class PiBackendAdapter implements
       const binding = runtime!.binding;
       const policy = { autoCompaction: runtime!.autoCompaction, autoRetry: runtime!.autoRetry };
       this.#workingContextRecoveries.set(context.sessionId, { binding, profile, targetId: context.target.id,
-        workspaceRoot: context.target.workspaceRoot, backendInstanceGeneration: context.backendInstanceGeneration });
+        workspaceRoot: context.target.workspaceRoot, backendInstanceGeneration: context.backendInstanceGeneration, endpoint });
       runtime!.workingContextUnconfirmed = true;
       await this.#stopRuntime(context.sessionId, context.generation);
       context.signal.throwIfAborted();
-      const next = await this.#ensureRuntime(binding, profile, context);
+      const next = await this.#ensureRuntime(binding, profile, context, this.#modelEndpointStartupFence(endpoint));
       await this.#confirmNativeSessionSwitch(next, binding, context);
       next.workingContextUnconfirmed = true;
+      if (endpoint !== undefined) await this.#confirmModelEndpoint(next, context, endpoint);
       await next.transport.request({ type: "set_auto_compaction", enabled: policy.autoCompaction }, { signal: context.signal, stateMayHaveChanged: true });
       await next.transport.request({ type: "set_auto_retry", enabled: policy.autoRetry }, { signal: context.signal, stateMayHaveChanged: true });
       next.autoCompaction = policy.autoCompaction;
@@ -2172,6 +2195,22 @@ export class PiBackendAdapter implements
       this.#workingContextRecoveries.delete(context.sessionId);
       next.workingContextUnconfirmed = false;
     });
+  }
+
+  #modelEndpointStartupFence(endpoint: PiManagedModelEndpoint | undefined): (() => void) | undefined {
+    if (endpoint === undefined) return undefined;
+    return () => {
+      if (managedMessagesEndpoint(this.#managedGeneration.options.providers, endpoint.providerId, endpoint.modelId) !== endpoint.baseUrl) {
+        throw piError("PI_MODEL_ENDPOINT_CHANGED", "The saved Pi model endpoint changed while opening this task", "dispatch", { retryable: true });
+      }
+    };
+  }
+
+  async #confirmModelEndpoint(runtime: PiRuntime, context: AdapterContext, endpoint: PiManagedModelEndpoint): Promise<void> {
+    const { model } = await this.#requestState(runtime, context);
+    if (model?.provider !== endpoint.providerId || model.id !== endpoint.modelId || model.baseUrl !== endpoint.baseUrl) {
+      throw piError("PI_MODEL_ENDPOINT_UNCONFIRMED", "Pi did not confirm the saved endpoint for the original model", "dispatch", { stateMayHaveChanged: true });
+    }
   }
 
   async setEffort(level: string, context: AdapterContext): Promise<void> {
@@ -3649,6 +3688,8 @@ export class PiBackendAdapter implements
         });
       }
       const previous = this.#managedGeneration;
+      // Capture eligibility in the same synchronous turn that publishes the route.
+      this.#captureIdleModelEndpointRefreshes(nextOptions);
       this.#managedGeneration = nextGeneration;
       this.#agentHome = nextAgentHome;
       this.#options = nextOptions;
@@ -3672,6 +3713,30 @@ export class PiBackendAdapter implements
 
   async reconfigure(options: PiManagedGenerationOptions): Promise<void> {
     return this.updateManagedGeneration(options);
+  }
+
+  #captureIdleModelEndpointRefreshes(options: PiAdapterOptions): void {
+    for (const [sessionId, runtime] of this.#runtimes) {
+      const { target, hostedExecution, runtimePolicy } = runtime.context;
+      const { providerId, modelId } = this.#spawnProfiles.get(sessionId) ?? {};
+      if (target.remoteWorkspace !== undefined || hostedExecution !== undefined || runtimePolicy === "review_read_only"
+        || providerId === undefined || modelId === undefined) continue;
+      const previousEndpoint = managedMessagesEndpoint(runtime.generationLease.generation.options.providers, providerId, modelId);
+      const baseUrl = managedMessagesEndpoint(options.providers, providerId, modelId);
+      const before = previousEndpoint === undefined ? undefined : new URL(previousEndpoint);
+      const after = baseUrl === undefined ? undefined : new URL(baseUrl);
+      if (before === undefined || after === undefined || baseUrl === undefined
+        || before.origin !== after.origin || before.pathname === after.pathname) {
+        runtime.pendingModelEndpoint = undefined;
+        continue;
+      }
+      const pending = runtime.pendingModelEndpoint;
+      if (pending?.providerId === providerId && pending.modelId === modelId && pending.baseUrl === baseUrl) continue;
+      const idle = runtime.ready && !runtime.transport.closed && runtime.lifecycle === undefined
+        && runtime.runningExtensionCommand === undefined && runtime.thresholdCompaction === undefined && runtime.userShell === undefined;
+      runtime.pendingModelEndpoint = idle && options.canRefreshIdleModelEndpoint?.(sessionId) === true
+        ? { providerId, modelId, baseUrl } : undefined;
+    }
   }
 
   beginProviderAuthenticationReconciliation(
@@ -4811,7 +4876,8 @@ export class PiBackendAdapter implements
     });
   }
 
-  async #ensureRuntime(binding: NativeSessionBinding, profile: SessionSpawnProfile, context: AdapterContext): Promise<PiRuntime> {
+  async #ensureRuntime(binding: NativeSessionBinding, profile: SessionSpawnProfile, context: AdapterContext,
+    assertStartupCurrent?: () => void): Promise<PiRuntime> {
     const active = this.#runtimes.get(context.sessionId);
     if (active) {
       this.#touchRuntime(active, context);
@@ -4820,7 +4886,7 @@ export class PiBackendAdapter implements
       }
       return active;
     }
-    return this.#startRuntime(binding, profile, context);
+    return this.#startRuntime(binding, profile, context, assertStartupCurrent);
   }
 
   async #startRuntime(binding: NativeSessionBinding | undefined, profile: SessionSpawnProfile, context: AdapterContext,
@@ -8706,6 +8772,12 @@ function validateManagedSubagentProviderAuthenticationOptions(options: PiAdapter
 function providerAuthenticationRouteExists(options: PiAdapterOptions, providerId: string): boolean {
   return (options.nativeAuthProviderIds ?? []).includes(providerId)
     || (options.providers ?? []).some((provider) => provider.id === providerId);
+}
+
+function managedMessagesEndpoint(providers: readonly PiManagedProvider[] | undefined, providerId: string, modelId: string): string | undefined {
+  const provider = providers?.find(candidate => candidate.id === providerId);
+  const model = provider?.models.find(candidate => candidate.id === modelId);
+  return model !== undefined && (model.api ?? provider?.api) === "anthropic-messages" ? provider?.baseUrl : undefined;
 }
 
 function providerRequiresAuthentication(options: PiAdapterOptions, providerId: string): boolean {
