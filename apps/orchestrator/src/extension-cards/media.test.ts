@@ -127,3 +127,27 @@ it("sniffs media response bytes, returns only source-owned metadata and retains 
   await expect(f.manager.describeMedia({ ...input, sessionId: "other" }, () => {})).rejects.toThrow();
   expect(await network.request(scope, request)).toMatchObject({ ok: true, body: '{"result":1}' }); expect(await network.request(scope, request)).toMatchObject({ ok: false });
 });
+
+it("recovers a PNG declared as plain text only for explicit media downloads", async () => {
+  const f = await fixture();
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+  const hash = createHash("sha256").update(png).digest("hex"), uri = `joko-media://blobs/${hash}.png`;
+  const headers = { "content-type": "text/plain; charset=utf-8", "content-length": String(png.length) };
+  const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(png, { headers }))
+    .mockResolvedValueOnce(new Response("ordinary text", { headers: { "content-type": "text/plain" } }))
+    .mockResolvedValueOnce(new Response(png, { headers }));
+  const network = new ExtensionNetwork({ fetch: fetchMock, media: f.media, resolveCredential: () => "", redact: value => value });
+  const task = { extensionId: "extension", authorityKey: f.authority.key, sessionId: "task", sessionCreatedAt: 1, targetId: "target", toolUseId: null };
+  const scope = { extensionId: "extension", authorityKey: f.authority.key, declaration: { hosts: ["api.example.test"] }, task,
+    readOnly: true, signal: new AbortController().signal, assertCurrent: () => {} };
+  const request = { url: "https://api.example.test/image", as: "media" };
+
+  expect(await network.request(scope, request)).toMatchObject({ ok: true, media: { url: uri, hash, ext: ".png", bytes: png.length } });
+  const id = f.manager.registerCall("extension", f.authority.key, "task", null);
+  expect(await f.manager.cards.handleCardUpdate("extension", f.authority.key, { type: "card-update", version: 1, callId: id,
+    html: `<img src="${uri}">` }, () => {})).toEqual({ accepted: true });
+  await expect(f.manager.describeMedia({ sessionId: "task", cardId: id, extensionId: "", uri }, () => {}))
+    .resolves.toMatchObject({ sha256: hash, mimeType: "image/png", byteLength: png.length });
+  expect(await network.request(scope, request)).toMatchObject({ ok: true, body: "ordinary text" });
+  expect(await network.request(scope, { ...request, as: "text" })).toMatchObject({ ok: true, body: new TextDecoder().decode(png) });
+});
