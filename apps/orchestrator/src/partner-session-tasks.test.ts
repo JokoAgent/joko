@@ -300,6 +300,57 @@ describe("Partner independent Session tasks", () => {
     const resumedAgain = await f.tasks.message(f.parent, created.id, "task:resume-again", { mode: "resume" }, () => undefined);
     expect(resumedAgain.deadlineAt).toBe(created.deadlineAt + 13_000); expect(resumedAgain.pauseAt).toBeUndefined();
   });
+
+  it("rolls back an interrupted task resume and accepts the original keyed message once after recovery", async () => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:resume-rollback", { instruction: "Original task input" }, () => undefined);
+    const parent = f.store.getSession(f.parent).descriptor;
+    const context = { sessionId: parent.id, targetId: parent.targetId, generation: parent.binding.generation, providerGeneration: 1 };
+    const request = { task_id: task.id, mode: "resume", message: "Continue with this exact input.", idempotency_key: "original-resume" };
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    const held = await f.tasks.stop(f.parent, task.id, "task:resume-rollback:hold", "pause", () => undefined);
+    expect(held.control).toBe("paused");
+    expect(f.store.getRun(task.runId!).descriptor.state).toBe("aborted");
+    const originalRestore = f.host.restorePartnerQueue.bind(f.host);
+    let operationId = "";
+    let interruptedState: unknown;
+    const restore = vi.spyOn(f.host, "restorePartnerQueue").mockImplementationOnce(input => {
+      operationId = input.operationId;
+      const inputState = f.store.findOperation(`${operationId}:resume-input`)?.status;
+      const heldBeforeRestore = f.tasks.isHeld(task.sessionId!);
+      originalRestore(input);
+      interruptedState = { inputState, heldBeforeRestore, queuePaused: f.store.getQueueControl(task.sessionId!).paused };
+      throw new Error("Controlled interruption before the resume transaction commits.");
+    });
+    const call = (args = request) => new PartnerSessionTaskTools(f.tasks).callTool("message_session_task", args, undefined, context);
+    try {
+      await expect(call()).resolves.toMatchObject({ isError: true });
+      expect(restore).toHaveBeenCalledOnce();
+    } finally { restore.mockRestore(); }
+    expect(interruptedState).toEqual({ inputState: "completed", heldBeforeRestore: true, queuePaused: false });
+    expect(f.store.findOperation(`${operationId}:resume-input`)).toBeUndefined();
+    expect(f.store.findOperation(`${operationId}:resume-queue`)).toBeUndefined();
+    expect(f.store.findOperation(`${operationId}:resume-task`)).toBeUndefined();
+    expect(f.store.getQueueControl(task.sessionId!).paused).toBe(true);
+
+    await f.tasks.close();
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now);
+    await f.tasks.initialize();
+    expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ control: "paused", status: "waiting" });
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toHaveLength(0);
+    const resumed = await call();
+    expect(resumed.isError).toBe(false);
+    const receipt = JSON.parse(resumed.content[0]!.text).message_receipt;
+    expect(receipt?.queued_message_id).toEqual(expect.any(String));
+    expect(f.store.getQueueItem(receipt.queued_message_id).body.text).toBe(request.message);
+    expect(f.store.getQueueControl(task.sessionId!).paused).toBe(false);
+    const replay = await call();
+    expect(replay.isError).toBe(false);
+    expect(JSON.parse(replay.content[0]!.text).message_receipt.queued_message_id).toBe(receipt.queued_message_id);
+    await expect(call({ ...request, message: "Different input with the same key." })).resolves.toMatchObject({ isError: true });
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === task.sessionId).map(item => item.input.text))
+      .toEqual(["Original task input", request.message]));
+  });
   it("uses the owned queue boundary for edits and rejects consuming input and unavailable steer", async () => {
     const f = await fixture(), created = await f.tasks.start(f.parent, "task:queue", { instruction: "Do work" }, () => undefined);
     await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
