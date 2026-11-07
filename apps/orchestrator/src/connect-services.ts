@@ -11314,9 +11314,7 @@ function localExtensionSettingsAgentModels(dependencies: ConnectServiceDependenc
     return dependencies.sessionHost.listSelectableTaskModels(backend.id).flatMap(model => {
       const outputs = model.declaredOutputModalities;
       if (outputs?.length && !outputs.some(output => output.toLowerCase() === "text")) return [];
-      const source = projectModelSource(dependencies, create(contract.ModelDescriptorSchema, {
-        backendId: backend.id, key: create(contract.ModelKeySchema, { providerId: model.providerId, modelId: model.modelId }), available: true
-      }));
+      const source = projectModelSource(dependencies, toProtoModelDescriptor(backend.id, model));
       if (!source.available || source.source?.kind !== contract.ModelSourceKind.LOCAL || source.source.grouped) return [];
       const efforts = backend.capabilities.get("model.effort")?.supported === true ? [...model.thinkingLevels] : [];
       return [create(contract.ExtensionSettingsAgentModelSchema, {
