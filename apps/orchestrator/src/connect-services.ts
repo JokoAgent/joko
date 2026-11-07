@@ -4802,6 +4802,18 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const connection = authenticate(context);
       return { closed: dependencies.extensionDirectoryPicker?.close(request.pickerId, connection.id) ?? false };
     },
+    setDesktopExtensionHostLocale: (request, context) => {
+      const connection = authenticate(context);
+      requireDesktopHostAuthentication(dependencies, connection, context.requestHeader.get(DESKTOP_HOST_AUTHORIZATION_HEADER) ?? undefined);
+      const host = application.desktopExtensionContext;
+      if (!host) throw new ConnectError("The managed Desktop host context is unavailable.", Code.FailedPrecondition);
+      if (!contract.isExtensionHostLocale(request.locale) || request.changeSequence <= 0n) {
+        throw invalidArgument("A supported Desktop locale and positive change sequence are required.");
+      }
+      context.signal.throwIfAborted();
+      host.setDesktopHostLocale(request.locale, request.changeSequence);
+      return {};
+    },
     getExtensionSettingsRoutingData: async (request, context) => {
       const connection = authenticate(context);
       const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
@@ -4857,7 +4869,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const surface = await extensionMainViewEffect(() => renew
         ? views.getSurface(surfaceId, connection.id, "visible", context.signal)
         : views.getSurface(surfaceId, connection.id));
-      return { surface: mapExtensionMainViewSurface(surface) };
+      const projected = mapExtensionMainViewSurface(surface);
+      if (projected.settings && projected.mobileSettings) {
+        context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+        projected.hostLocale = application.desktopExtensionContext?.desktopHostLocale;
+      }
+      return { surface: projected };
     },
     closeExtensionMainView: async (request, context) => {
       const connection = authenticate(context);

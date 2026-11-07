@@ -97,6 +97,7 @@ async function main(): Promise<void> {
       process.env[MANAGED_OUTBOUND_PROXY_SNAPSHOT_ENV]
     );
     application = await createOrchestratorApplication(config, {
+      desktopManagedExtensionContext: desktopHostedEphemeral,
       resolveOutboundProxy: (upstreamUrl) => resolveOutboundProxy(upstreamUrl)
     });
   } catch (error) {

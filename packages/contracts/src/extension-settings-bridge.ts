@@ -3,6 +3,10 @@ import type { ExtensionDirectoryPickerPage } from "./gen/joko/v1/extension_pb.js
 
 export const EXTENSION_SECRET_CHECK_FAILED = "SECRET_CHECK_FAILED";
 
+export function isExtensionHostLocale(value: unknown): value is "en" | "zh-CN" | "en-XA" {
+  return value === "en" || value === "zh-CN" || value === "en-XA";
+}
+
 export interface ExtensionSettingsDirectoryChoice {
   readonly name: string; readonly title?: string; readonly initialPage: ExtensionDirectoryPickerPage;
   browse(input: { readonly entryId?: string; readonly pageToken?: string; readonly directoryPath?: string }): Promise<ExtensionDirectoryPickerPage>;

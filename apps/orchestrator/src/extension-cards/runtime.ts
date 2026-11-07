@@ -67,6 +67,7 @@ interface Options {
 export class ExtensionCardRuntime {
   readonly #instances = new Map<string, Instance>();
   #browser?: Browser; #browserOpening?: Promise<Browser>; #stopped = true; #generation = 0;
+  #desktopLocale?: { readonly value: string; readonly sequence: bigint };
   #tail = Promise.resolve(); #unsubscribe?: () => void; #timer?: NodeJS.Timeout;
   readonly #network: ExtensionNetwork | undefined;
   readonly #files = new ExtensionFileDeposits();
@@ -77,6 +78,22 @@ export class ExtensionCardRuntime {
   authority(id: string): ExtensionCardAuthority | undefined {
     try { return this.#capture(id); } catch { return; }
   }
+
+  get desktopHostLocale(): string | undefined { return this.#desktopLocale?.value; }
+
+  setDesktopHostLocale(value: string, sequence: bigint): void {
+    if (sequence <= (this.#desktopLocale?.sequence ?? 0n)) return;
+    const previous = this.#contextLocale();
+    this.#desktopLocale = { value, sequence };
+    if (previous === value) return;
+    for (const instance of this.#instances.values()) {
+      if (!instance.page || instance.page.isClosed()) continue;
+      try { this.#assert(instance); } catch { continue; }
+      this.#postHostEvent(instance.page, "host-context-changed");
+    }
+  }
+
+  #contextLocale(): string { return this.desktopHostLocale ?? this.options.locale?.() ?? "en"; }
 
   captureDirectorySelection(extensionId: string) {
     const authority = this.#capture(extensionId);
@@ -280,7 +297,7 @@ export class ExtensionCardRuntime {
   }
   #localRequest(instance: Instance, path: string, method: string, body: string): unknown {
     this.#assert(instance);
-    if (path === "/app-context" && method === "GET") return { context: { locale: this.options.locale?.() ?? "en" } };
+    if (path === "/app-context" && method === "GET") return { context: { locale: this.#contextLocale() } };
     if (path !== "/kv" || !["GET", "PUT"].includes(method)) throw new Error("Extension local request denied.");
     const id = instance.authority.surface.extensionId;
     if (method === "PUT") {
@@ -514,10 +531,13 @@ export class ExtensionCardRuntime {
       || installed.packageName !== authority.packageName || installed.packageVersion !== authority.packageVersion
       || installed.extensionEntry !== authority.extensionEntry) return;
     assertCaller(); this.#assert(instance);
-    void instance.page.evaluate(() => {
+    this.#postHostEvent(instance.page, "settings-changed");
+  }
+  #postHostEvent(page: Page, type: "settings-changed" | "host-context-changed"): void {
+    void page.evaluate(type => {
       const runtime = (window as unknown as { __jokoRuntime: { event(event: { type: string }): void } }).__jokoRuntime;
-      runtime.event({ type: "settings-changed" });
-    }).catch(() => undefined);
+      runtime.event({ type });
+    }, type).catch(() => undefined);
   }
   async #close(instance: Instance): Promise<void> {
     this.#files.retire(instance.authority.key);
