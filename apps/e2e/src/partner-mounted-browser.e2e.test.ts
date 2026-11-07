@@ -131,7 +131,7 @@ describe("mounted Partner collaboration product chain", () => {
     const child = required(fixture.application.partnerSessionTasks!.list(partner.partnerId).find(task => task.title === title)?.sessionId,
       "the independent child session");
     await outcome.getByRole("button", { name: "Open task", exact: true }).click();
-    await waitFor(async () => page.url(), url => new URL(url).hash === `#/tasks/${encodeURIComponent(child)}`, "the original independent child task");
+    await page.locator(`.timeline[data-timeline-session-id="${child}"]`).waitFor({ state: "visible", timeout: 30_000 });
   }, 120_000);
 
   mountedIt("starts and controls an independent Pi task only from the original owner's active topic input", async () => {
@@ -158,12 +158,16 @@ describe("mounted Partner collaboration product chain", () => {
     const makeTopic = async (suffix: string) => {
       const seed = `TOPIC_SEED_FIXTURE_${suffix}`, sessionId = partner.canonicalSessionId;
       await sendPartnerPrompt(active, manager, sessionId, seed);
-      const event = required(store.listEvents({ sessionId }).find(event => event.payload.type === "message_complete"
-        && event.payload.role === "assistant" && event.payload.blocks.some(block => block.kind === "text" && block.text === `Root for ${seed}`)), "the visible original message");
-      const origin = required(store.findVisibleSessionMessageOrigin({ sessionId, eventId: event.id }), "the original message identity");
+      const root = required(await waitFor(async () => {
+        const event = store.listEvents({ sessionId, activeNativeTimeline: true, order: "desc", limit: 60 }).find(event => event.payload.type === "message_complete"
+          && event.payload.role === "assistant" && event.payload.blocks.some(block => block.kind === "text" && block.text === `Root for ${seed}`));
+        if (!event) return undefined;
+        const origin = store.findVisibleSessionMessageOrigin({ sessionId, eventId: event.id });
+        return origin && { sessionId, eventId: event.id, messageId: origin.messageId, generation: BigInt(event.generation) };
+      }, value => value !== undefined, "the settled native topic root", 30_000), "the original message identity");
       const profile = required((await manager.clients.partner.getPartner({ partnerId: partner.partnerId })).partner, "the current Partner");
       const topic = await manager.clients.partner.ensurePartnerTopic({ operationId: `owned-topic-${suffix}`, partnerId: partner.partnerId,
-        expectedPartnerRevision: profile.revision, root: { sessionId, eventId: event.id, messageId: origin.messageId, generation: BigInt(event.generation) } });
+        expectedPartnerRevision: profile.revision, root });
       return required(topic.topic?.sessionId, "the original topic task");
     };
     const topic = await makeTopic("A"), sibling = await makeTopic("B");
