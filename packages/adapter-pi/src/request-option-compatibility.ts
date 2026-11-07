@@ -136,6 +136,12 @@ export function encodePiCacheCompatibilityRequest(request: PiCacheCompatibilityR
   return PI_CACHE_COMPATIBILITY_REQUEST_PREFIX + Buffer.from(JSON.stringify({ version: 1, ...request }), "utf8").toString("base64url");
 }
 
+export function isPiCacheCompatibilityRequest(event: Readonly<Record<string, unknown>>): event is
+  Readonly<Record<string, unknown>> & { readonly title: string } {
+  return event.method === "input" && typeof event.title === "string"
+    && event.title.startsWith(PI_CACHE_COMPATIBILITY_REQUEST_PREFIX);
+}
+
 export async function handlePiCacheCompatibilityRequest(
   event: Readonly<Record<string, unknown>>,
   options: {
@@ -146,8 +152,7 @@ export async function handlePiCacheCompatibilityRequest(
     readonly isCurrent: () => boolean;
   }
 ): Promise<boolean> {
-  if (event.method !== "input" || typeof event.title !== "string"
-    || !event.title.startsWith(PI_CACHE_COMPATIBILITY_REQUEST_PREFIX)) return false;
+  if (!isPiCacheCompatibilityRequest(event)) return false;
   const id = typeof event.id === "string" ? event.id : "";
   let result: Readonly<Record<string, unknown>> = {};
   try {

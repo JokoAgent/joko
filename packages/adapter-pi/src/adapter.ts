@@ -181,6 +181,7 @@ import { PiRpcTransport, spawnPiProcess, type PiProcessFactory, type PiProcessSp
 import { PiEventTranslator, readCompactionNativeIdentity } from "./translator.js";
 import {
   handlePiCacheCompatibilityRequest,
+  isPiCacheCompatibilityRequest,
   PiCacheCompatibilityStore,
   piCacheRouteKey,
   type PiCacheCompatibilityRequest,
@@ -629,7 +630,7 @@ interface PiRuntime {
   workingContextSelection: string | undefined;
   workingContextUnconfirmed?: boolean;
   thresholdCheck?: Promise<void>;
-  thresholdCompaction?: { readonly id: string; nativeIdentity?: NativeMessageIdentity };
+  thresholdCompaction?: { readonly id: string; readonly context: AdapterContext; nativeIdentity?: NativeMessageIdentity };
   ready: boolean;
   abortRequested: boolean;
   lifecycle?: PiNativeLifecycle;
@@ -2463,7 +2464,7 @@ export class PiBackendAdapter implements
     const crossesThreshold = () => runtime.autoCompaction && contextTokens / contextWindow >= runtime.autoCompactionThresholdPercent / 100;
     if (!crossesThreshold()) return;
 
-    const operation: NonNullable<PiRuntime["thresholdCompaction"]> = { id: randomUUID() };
+    const operation: NonNullable<PiRuntime["thresholdCompaction"]> = { id: randomUUID(), context };
     let started = false;
     try {
       const response = await this.#runExclusiveSessionMutation(
@@ -5419,12 +5420,14 @@ export class PiBackendAdapter implements
   async #resolveCacheCompatibility(
     runtime: PiRuntime,
     context: AdapterContext,
-    request: PiCacheCompatibilityRequest
+    request: PiCacheCompatibilityRequest,
+    compaction?: NonNullable<PiRuntime["thresholdCompaction"]>
   ): Promise<Readonly<Record<string, unknown>>> {
     const currentRuntime = () => !this.#disposed && this.#runtimes.get(runtime.key) === runtime
       && !runtime.transport.closed && !runtime.abortRequested && !context.signal.aborted
       && runtime.context.generation === context.generation && runtime.context.target.remoteWorkspace === undefined
-      && runtime.control.runtimePolicy === "standard";
+      && runtime.control.runtimePolicy === "standard"
+      && (compaction === undefined || runtime.thresholdCompaction === compaction);
     const exactModel = async (route: PiCacheRoute) => {
       if (!currentRuntime()) return false;
       const model = (await this.#requestState(runtime, context)).model;
@@ -5437,7 +5440,7 @@ export class PiBackendAdapter implements
       const applied = await this.#cacheCompatibility.has(request.route);
       if (!currentRuntime()) return {};
       const lifecycle = runtime.lifecycle;
-      if (applied || !request.hasCacheOptions || lifecycle === undefined || lifecycle.settlementReceived) {
+      if (applied || !request.hasCacheOptions || compaction !== undefined || lifecycle === undefined || lifecycle.settlementReceived) {
         return { current: true, applied };
       }
       const lease = randomUUID();
@@ -5447,6 +5450,7 @@ export class PiBackendAdapter implements
       }
       return { current: true, applied: false, lease };
     }
+    if (compaction !== undefined) return {};
     const receipt = runtime.cacheCompatibilityLeases.get(request.lease);
     // Consume before disk IO. Failed persistence cannot re-arm the same rejection.
     runtime.cacheCompatibilityLeases.delete(request.lease);
@@ -5498,6 +5502,17 @@ export class PiBackendAdapter implements
         const receipt = readCompactionNativeIdentity(rawEvent);
         if (receipt?.reason === "manual") {
           thresholdCompaction.nativeIdentity = receipt.identity;
+          return;
+        }
+        if (isPiCacheCompatibilityRequest(rawEvent)) {
+          // Settlement waits for compact on the event chain. The summary's
+          // fetch needs its private route reply before compact can finish.
+          const context = thresholdCompaction.context;
+          void handlePiCacheCompatibilityRequest(rawEvent, {
+            resolve: request => this.#resolveCacheCompatibility(runtime, context, request, thresholdCompaction),
+            transport: runtime.transport,
+            isCurrent
+          }).catch((error: unknown) => reportEventFailure(context, error)).catch(() => undefined);
           return;
         }
       }
