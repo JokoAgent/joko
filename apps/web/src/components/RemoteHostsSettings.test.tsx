@@ -44,6 +44,26 @@ it("uses one authoritative catalog stream and keeps an edited root through snaps
   expect(root.value).toBe("/home/joko/unsaved");
 });
 
+it("shows both SSH fingerprints and submits the observed key only after confirmation", async () => {
+  const fixture = await mountSettings();
+  const trusted = { ...host(), trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:old-key", pinnedAt: 1 } };
+  const observedHostKey = { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:new-key" };
+  const failed = { ...trusted, revision: 3n,
+    status: { state: "failed" as const, changedAt: 4, failure: { code: "hostKeyChanged", retryable: false } } };
+  vi.mocked(fixture.controller.testRemoteHostConnection).mockResolvedValue({ ...failed, observedHostKey });
+  await fixture.publish([trusted]);
+  await act(async () => button("Test").click());
+  expect(document.querySelector("[role=alertdialog]")?.textContent).toContain(trusted.trust.sha256Fingerprint);
+  expect(document.querySelector("[role=alertdialog]")?.textContent).toContain(observedHostKey.sha256Fingerprint);
+  await act(async () => button("Cancel").click());
+  expect(fixture.controller.clearRemoteHostTrust).not.toHaveBeenCalled();
+
+  await fixture.publish([failed]);
+  await act(async () => button("Test").click());
+  await act(async () => button("Trust observed key").click());
+  expect(fixture.controller.clearRemoteHostTrust).toHaveBeenCalledExactlyOnceWith("target-one", "build-box", 3n, observedHostKey);
+});
+
 it("submits the startup auto-connect preference once and waits for Watch truth", async () => {
   const fixture = await mountSettings();
   const current = host();

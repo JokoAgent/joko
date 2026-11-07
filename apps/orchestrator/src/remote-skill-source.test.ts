@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix } from "node:path";
 import type { RemoteWorkspaceBinding } from "@joko/core";
-import type { RemoteDirectoryEntry, RemoteFileReadRequest, RemoteFileStat, RemoteFileTransportPort } from "@joko/remote-ssh";
+import { RemoteSshError, type RemoteDirectoryEntry, type RemoteFileReadRequest, type RemoteFileStat, type RemoteFileTransportPort } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
 import { describe, expect, it } from "vitest";
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
@@ -27,7 +27,7 @@ class SourceFiles implements RemoteFileTransportPort {
     this.entries.set(path, { kind: "file", content: typeof content === "string" ? Buffer.from(content) : content.slice(),
       modifiedAt: (this.entries.get(path)?.modifiedAt ?? 10) + 1, mode });
   }
-  node(path: string) { const node = this.entries.get(path); if (!node) throw Object.assign(new Error("Missing file"), { code: 2 }); return node; }
+  node(path: string) { const node = this.entries.get(path); if (!node) throw new RemoteSshError("FILE_TRANSFER_FAILED", "Missing file", true, { sftpStatus: 2 }); return node; }
   async realpath(path: string): Promise<string> { this.node(path); return path; }
   async stat(path: string): Promise<RemoteFileStat> {
     const node = this.node(path); return { kind: node.kind, size: node.content.length, modifiedAt: node.modifiedAt, mode: node.mode };
@@ -92,15 +92,15 @@ async function fixture(options: { maximumEntries?: number; maximumBytes?: number
 }
 
 describe("registered project Skill source", () => {
-  it("stages a full immutable binary tree, reviews before approval, and leases exact enabled content", async () => {
+  it.each([false, true])("stages and approves valid skills with the other optional SSH root present=%s", async secondRoot => {
     const f = await fixture();
     try {
       f.files.file("/workspace/.agents/skills/README.md", "ordinary index");
       f.files.directory("/workspace/.agents/skills/not-a-skill");
-      f.files.file("/workspace/.codex/skills/report/SKILL.md", skillBody);
+      if (secondRoot) f.files.file("/workspace/.codex/skills/report/SKILL.md", skillBody);
       f.files.file("/workspace/elsewhere/SKILL.md", "# Not a declared root");
       const rows = await f.manager.discoverProjectResources({ backendId: "native", targetId: "project", kinds: ["skill"] });
-      expect(rows).toHaveLength(2); expect(new Set(rows.map(row => row.id)).size).toBe(2);
+      expect(rows).toHaveLength(secondRoot ? 2 : 1); expect(new Set(rows.map(row => row.id)).size).toBe(rows.length);
       const row = rows[0]!;
       expect(row).toMatchObject({ sourceKind: "remote_project", scope: "project", targetId: "project", state: "awaiting_approval", enabled: false });
       expect(JSON.stringify(row, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).not.toContain("/workspace");

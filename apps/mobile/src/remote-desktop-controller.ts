@@ -1,5 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { LinkspanError } from "@jokoagent/linkspan-core";
 import { parseMobileRemoteDesktopNativeEvent, parseMobileRemoteDesktopNativeInputBatch, parseMobileRemoteDesktopNativeViewport,
   type MobileRemoteDesktopNativeInputBatch, type MobileRemoteDesktopNativeCommand } from "./remote-desktop-native-bridge";
 import { RTC_NETWORK } from "./remote-desktop-viewer";
@@ -81,10 +82,11 @@ import type {
   MobileRemoteDesktopHostMutePreferences,
   MobileRemoteDesktopPreferenceOwner
 } from "./mobile-remote-desktop-host-mute-preference";
+import type { MobileRemoteDesktopDisplayModePreferences } from "./mobile-remote-desktop-display-mode-preference";
 import type { MobileRemoteDesktopLockIdentity, MobileRemoteDesktopLockPreferences } from "./mobile-remote-desktop-lock-preference";
 import type { MobileRemoteDesktopClipboardSyncPreferences } from "./mobile-remote-desktop-clipboard-sync-preference";
 import type { MobileRemoteDesktopPrivacyIdentity, MobileRemoteDesktopPrivacyPreferences } from "./mobile-remote-desktop-privacy-preference";
-import { ClipboardSync, ClipboardSyncError, getClipboardSyncFailure,
+import { ClipboardSync, ClipboardSyncError, clipboardChunkEnd, getClipboardSyncFailure,
   type ClipboardSyncBaseline, type LocalClipboardReadCache } from "@joko/remote-desktop-sync";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
@@ -240,7 +242,7 @@ export interface MobileRemoteDesktopTransport {
     lockOnExit: boolean, signal?: AbortSignal): Promise<RemoteDesktopPrivacyScreenResult>;
   presentation(host: DevicePeerDescriptor, leaseId: string, enabled: boolean,
     signal?: AbortSignal): Promise<RemoteDesktopControlState>;
-  input(host: DevicePeerDescriptor, leaseId: string, sequence: bigint,
+  input(host: DevicePeerDescriptor, leaseId: string, controlGeneration: bigint, sequence: bigint,
     events: readonly RemoteDesktopInputEvent[], signal?: AbortSignal): Promise<void>;
   iceConfiguration(host: DevicePeerDescriptor, leaseId: string,
     signal?: AbortSignal): Promise<readonly RemoteDesktopIceServer[]>;
@@ -527,6 +529,7 @@ export class MobileRemoteDesktopController {
     readonly keys: readonly MobileRemoteDesktopKeyCode[]; readonly scope: MobileKeyboardScope }>();
   #displayModeOperation?: { readonly request: AbortController };
   #displayModeReconnect?: DisplayModeReconnect;
+  readonly #rememberedDisplayAttempts = new Set<string>();
   #displaySwitch?: DisplaySwitch;
   #displaySwitchCompletion?: Promise<void>;
   #permissionGuideVisible = false;
@@ -586,7 +589,8 @@ export class MobileRemoteDesktopController {
     private readonly clipboardSyncPreferences?: MobileRemoteDesktopClipboardSyncPreferences,
     private readonly privacyPreferences?: MobileRemoteDesktopPrivacyPreferences,
     private readonly credentialEnvironment?: { readonly native: MobileRemoteDesktopCredentialsNative;
-      readonly locale: () => string; readonly theme: () => "light" | "dark" }
+      readonly locale: () => string; readonly theme: () => "light" | "dark" },
+    private readonly displayModePreferences?: MobileRemoteDesktopDisplayModePreferences
   ) {
     const channelTransport: Pick<MobileRemoteDesktopTransport, "control" | "presentation" | "setHostMute" | "setPrivacyScreen" | "systemAction" | "listDisplayModes" | "setClipboardSync" | "clipboardVersion"> = {
       control: (host, lease, enabled, signal) => this.#smallRequest(host, { op: "control", lease, enabled }, signal,
@@ -738,6 +742,7 @@ export class MobileRemoteDesktopController {
     this.#permissionBlocked = false;
     this.#displayModeReconnect = undefined;
     this.#temporaryModeUncertain = false;
+    this.#rememberedDisplayAttempts.clear();
     const generation = this.#newRequest();
     this.#lease = undefined;
     this.#resumeEligible = false;
@@ -1418,6 +1423,12 @@ export class MobileRemoteDesktopController {
     this.#displayModeOperation = undefined;
     if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId || peerKey(this.#snapshot.host) !== peerKey(host)) return;
     if (temporary && error === undefined && result?.lease) {
+      const targetDeviceId = host.route?.targetDeviceId;
+      const display = result.lease.display;
+      if (!viewerDisplay && mode && targetDeviceId && capabilities?.platform === "darwin" && this.displayModePreferences
+        && display && display.displayId === this.#snapshot.selectedDisplayId && display.width === mode.width && display.height === mode.height) {
+        void this.displayModePreferences.save({ ...this.transport.preferenceOwner, targetDeviceId, displayId: display.displayId }, mode).catch(() => undefined);
+      }
       const stillWanted = this.#snapshot.wantedControl;
       const nextGeneration = this.#newRequest();
       this.#lease = result.lease; this.#adoptControlGeneration(result.lease.controlGeneration);
@@ -2204,6 +2215,7 @@ export class MobileRemoteDesktopController {
     else if (message.type === "offer") void this.#offer(message.attemptId, message.sdp);
     else if (message.type === "ice") void this.#ice(message);
     else if (message.type === "input" && this.#interactive
+      && BigInt(message.controlGeneration) === this.#controlGeneration
       && message.sequence > this.#viewerSequenceBase && message.sequence <= this.#viewerSequenceLimit) {
       void this.#input(message.sequence, message.events);
     }
@@ -2331,17 +2343,25 @@ export class MobileRemoteDesktopController {
           this.#markClipboardProgress(context);
           transferId = validTransferId(started.transferId) ? started.transferId : undefined;
           if (!transferId) throw new MobileRemoteClipboardError("unsupported");
-          for (let offset = 0; offset < json.length; offset += MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS) {
+          for (let offset = 0; offset < json.length;) {
             this.#assertClipboardCurrent(context);
-            await this.transport.clipboardContent(context.host,
-              create(RemoteDesktopClipboardContentRequestSchema, {
-                leaseId: context.lease.leaseId,
-                controlGeneration: context.controlGeneration,
-                action: { case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, {
-                  transferId, offset, data: json.slice(offset, offset + MOBILE_REMOTE_CLIPBOARD_CHUNK_CHARS)
-                }) }
-              }), context.operation.request.signal);
+            const end = clipboardChunkEnd(json, offset);
+            const chunk = create(RemoteDesktopClipboardContentRequestSchema, {
+              leaseId: context.lease.leaseId,
+              controlGeneration: context.controlGeneration,
+              action: { case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+                transferId, offset, data: json.slice(offset, end)
+              }) }
+            });
+            try {
+              await this.transport.clipboardContent(context.host, chunk, context.operation.request.signal);
+            } catch (error) {
+              if (!clipboardChunkReceiptLost(error)) throw error;
+              this.#assertClipboardCurrent(context);
+              await this.transport.clipboardContent(context.host, chunk, context.operation.request.signal);
+            }
             this.#markClipboardProgress(context);
+            offset = end;
           }
           this.#assertClipboardCurrent(context);
           // Commit atomically consumes the staged item before the host injects
@@ -2549,6 +2569,46 @@ export class MobileRemoteDesktopController {
     }
   }
 
+  async #restoreRememberedDisplayMode(host: DevicePeerDescriptor, displayId: string, lease: RemoteDesktopLease,
+    isCurrent: () => boolean): Promise<RemoteDesktopLease> {
+    const preferences = this.displayModePreferences, capabilities = this.#snapshot.capabilities;
+    const targetDeviceId = host.route?.targetDeviceId;
+    const current = () => isCurrent() && this.#interactive && this.#routeFocused;
+    if (!preferences || !targetDeviceId || !lease.controlling || lease.display?.displayId !== displayId
+      || capabilities?.platform !== "darwin" || !capabilities.canControl || !capabilities.resolutionRestore || !capabilities.displayModes
+      || this.#rememberedDisplayAttempts.has(displayId) || !current()) return lease;
+    const signal = this.#request.signal;
+    const remembered = await preferences.load({ ...this.transport.preferenceOwner, targetDeviceId, displayId }).catch(() => undefined);
+    if (!remembered || !current()) return lease;
+    const modes = await this.transport.listDisplayModes(host, lease.leaseId, signal).catch((error: unknown) => {
+      const reason = remoteDesktopFailure(error)?.reason;
+      if (error instanceof MobileRemoteDesktopAuthorityError || reason === RemoteDesktopFailureReason.AUTHORITY_CHANGED
+        || reason === RemoteDesktopFailureReason.LEASE_EXPIRED || reason === RemoteDesktopFailureReason.STOPPED) throw error;
+      return undefined;
+    });
+    if (!modes || !validDisplayModes(modes) || !current()) return lease;
+    const sameSize = (mode: RemoteDesktopDisplayMode) => mode.width === remembered.width && mode.height === remembered.height;
+    const mode = modes.find(mode => mode.modeId === remembered.modeId && sameSize(mode)) ?? modes.find(sameSize);
+    if (!mode || mode.current) return lease;
+    this.#rememberedDisplayAttempts.add(displayId);
+    const autoControl = capabilities.autoControl === true;
+    let result: RemoteDesktopDisplayModeResult;
+    try {
+      result = await this.transport.setDisplayMode(host, lease.leaseId, lease.controlGeneration, mode.modeId, true, signal, ...autoControl ? [true] as const : []);
+    } catch (error) {
+      const reason = remoteDesktopFailure(error)?.reason;
+      if (reason === RemoteDesktopFailureReason.DISPLAY_BUSY || reason === RemoteDesktopFailureReason.DISPLAY_MODE_MISSING) return lease;
+      throw error;
+    }
+    const adopted = result?.lease, display = adopted?.display;
+    if (!adopted || adopted.leaseId !== lease.leaseId || !validControlGeneration(adopted.controlGeneration)
+      || adopted.controlGeneration <= lease.controlGeneration || adopted.controlling && !autoControl
+      || !display || display.displayId !== displayId || display.width !== mode.width || display.height !== mode.height) {
+      throw new Error("Remembered display mode changed its captured occurrence.");
+    }
+    return adopted;
+  }
+
   async #start(
     mode: RemoteDesktopStartMode,
     generation: number,
@@ -2602,17 +2662,28 @@ export class MobileRemoteDesktopController {
         }
       }
       this.#controlRecoveryWanted = this.#snapshot.capabilities?.canControl === true;
-      const lease = this.#snapshot.capabilities?.autoControl
+      let lease = this.#snapshot.capabilities?.autoControl
         ? await this.transport.start(host, displayId, mode, this.#request.signal, this.#controlRecoveryWanted)
         : await this.transport.start(host, displayId, mode, this.#request.signal);
-      if (!this.#ready(generation) || peerKey(this.#snapshot.host) !== peerKey(host)
-        || this.#snapshot.selectedDisplayId !== displayId) {
-        if (this.transport.canStop()) void this.transport.stop(host, lease.leaseId, { lockScreen: false, controlGeneration: 0n }).catch(() => undefined);
-        return;
-      }
+      const current = () => this.#ready(generation) && peerKey(this.#snapshot.host) === peerKey(host) && this.#snapshot.selectedDisplayId === displayId;
+      let retired = false;
+      const retire = () => {
+        if (retired || !this.transport.canStop()) return;
+        retired = true;
+        void this.transport.stop(host, lease.leaseId, { lockScreen: false, controlGeneration: 0n }).catch(() => undefined);
+      };
+      if (!current()) { retire(); return; }
       if (!validControlGeneration(lease.controlGeneration)) {
-        if (this.transport.canStop()) void this.transport.stop(host, lease.leaseId, { lockScreen: false, controlGeneration: 0n }).catch(() => undefined);
+        retire();
         throw new Error("Invalid Remote Desktop control generation.");
+      }
+      if (this.displayModePreferences && mode === RemoteDesktopStartMode.NEW && this.#displayModeReconnect === undefined) {
+        const signal = this.#request.signal;
+        signal.addEventListener("abort", retire, { once: true });
+        try { lease = await this.#restoreRememberedDisplayMode(host, displayId, lease, current); }
+        catch (error) { retire(); throw error; }
+        finally { signal.removeEventListener("abort", retire); }
+        if (!current()) { retire(); return; }
       }
       this.#lease = lease;
       this.#controlRecoveryWanted = lease.controlling || this.#snapshot.capabilities?.canControl === true;
@@ -2692,13 +2763,14 @@ export class MobileRemoteDesktopController {
       if (!this.#ready(generation) || this.#displayModeOperation
         || this.#lease?.leaseId !== lease.leaseId) return;
       if (!validControlGeneration(state.controlGeneration)) throw new Error("Invalid Remote Desktop control generation.");
+      const controlGenerationChanged = state.controlGeneration !== this.#controlGeneration;
       if (!this.#adoptControlGeneration(state.controlGeneration)) return;
       if (state.controlling !== this.#snapshot.controlling) {
         this.#set({ ...this.#snapshot, controlling: state.controlling,
           wantedControl: state.controlling && this.#snapshot.wantedControl });
         this.#emit({ type: "control", enabled: state.controlling });
         if (!state.controlling) this.#emit({ type: "releaseInput" });
-      }
+      } else if (controlGenerationChanged && state.controlling) this.#emit({ type: "control", enabled: true });
       this.#syncHostMute();
       if (!state.controlling) this.#restoreForegroundControl();
     } catch (error) {
@@ -3052,7 +3124,7 @@ export class MobileRemoteDesktopController {
         nativeDispatched = false;
       }
       if (!current()) return;
-      await this.transport.input(host, lease.leaseId, BigInt(sequence), events, this.#request.signal);
+      await this.transport.input(host, lease.leaseId, controlGeneration, BigInt(sequence), events, this.#request.signal);
       if (current()) this.#emit({ type: "ack", epoch, sequence });
     } catch (error) {
       if (current()) {
@@ -3411,10 +3483,11 @@ export class MobileRemoteDesktopController {
     const release = create(RemoteDesktopInputEventSchema, {
       event: { case: "release", value: create(RemoteDesktopReleaseInputSchema, {}) }
     });
+    const controlGeneration = this.#controlGeneration;
     try {
-      await this.transport.input(host, lease.leaseId, BigInt(sequence), [release], this.#request.signal);
+      await this.transport.input(host, lease.leaseId, controlGeneration, BigInt(sequence), [release], this.#request.signal);
     } catch (error) {
-      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
+      if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId || this.#controlGeneration !== controlGeneration) return;
       try {
         const state = await this.transport.control(host, lease.leaseId, false, this.#request.signal);
         if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId) return;
@@ -3446,6 +3519,8 @@ export class MobileRemoteDesktopController {
     // response reopen an older control authority for a later clipboard call.
     if (this.#controlGeneration !== 0n && value < this.#controlGeneration) return false;
     if (this.#controlGeneration !== 0n && value > this.#controlGeneration) {
+      this.#inputBatch = undefined;
+      this.#inputPending = false;
       if (this.#keyboardScope || this.#snapshot.keyboardOpen || this.#mouseGrants.size > 0) {
         this.#emit({ type: "releaseInput" });
         this.#retireKeyboardTools(true);
@@ -3476,7 +3551,11 @@ export class MobileRemoteDesktopController {
   }
 
   #emit(message: MobileRemoteDesktopViewerCommand): void {
-    if (message.type === "control" && message.enabled && this.#viewOnlySelected) message = { ...message, enabled: false };
+    if (message.type === "control" && message.enabled === true) {
+      const controlGeneration = Number(this.#controlGeneration);
+      message = !this.#viewOnlySelected && Number.isSafeInteger(controlGeneration) && controlGeneration > 0
+        ? { ...message, controlGeneration } : { ...message, enabled: false };
+    }
     if (message.type === "releaseInput" || message.type === "mode" || message.type === "init"
       || message.type === "stop" || (message.type === "control" && message.enabled !== true)) {
       this.#retireTouchpad();
@@ -3957,6 +4036,14 @@ export class MobileRemoteDesktopController {
   }
 }
 
+function clipboardChunkReceiptLost(error: unknown): boolean {
+  for (let remaining = 8; remaining > 0 && error instanceof Error; remaining--) {
+    if (error instanceof LinkspanError) return error.code === "transport_error";
+    error = error.cause;
+  }
+  return false;
+}
+
 function mobileClipboardSyncError(error: unknown): ClipboardSyncError {
   if (error instanceof ClipboardSyncError) return error;
   if (error instanceof MobileRemoteClipboardError) {
@@ -3995,7 +4082,7 @@ type ViewerMessage =
   | { readonly type: "offer"; readonly epoch: string; readonly attemptId: string; readonly sdp: string }
   | { readonly type: "ice"; readonly epoch: string; readonly attemptId: string; readonly candidates: readonly RemoteDesktopIceCandidate[];
       readonly after: number; readonly exchangeId: number }
-  | { readonly type: "input"; readonly epoch: string; readonly sequence: number; readonly events: unknown };
+  | { readonly type: "input"; readonly epoch: string; readonly controlGeneration: number; readonly sequence: number; readonly events: unknown };
 
 function channelGeneration(value: unknown): bigint {
   if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
@@ -4031,8 +4118,10 @@ function parseViewerMessage(raw: unknown): ViewerMessage | undefined {
     && value.frameId.length >= 1 && value.frameId.length <= 512 && typeof value.presented === "boolean") {
     return { type: "framePresented", epoch: value.epoch, frameId: value.frameId, presented: value.presented };
   }
-  if (value.type === "input" && Number.isSafeInteger(value.sequence) && (value.sequence as number) > 0) {
-    return { type: "input", epoch: value.epoch, sequence: value.sequence as number, events: value.events };
+  if (value.type === "input" && Number.isSafeInteger(value.sequence) && (value.sequence as number) > 0
+    && Number.isSafeInteger(value.controlGeneration) && (value.controlGeneration as number) > 0) {
+    return { type: "input", epoch: value.epoch, controlGeneration: value.controlGeneration as number,
+      sequence: value.sequence as number, events: value.events };
   }
   if (value.type === "fallback" && value.attemptId === null) {
     return { type: "fallback", epoch: value.epoch, attemptId: null };

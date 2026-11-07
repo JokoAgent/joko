@@ -1,6 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { LinkspanError } from "@jokoagent/linkspan-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DeviceKind,
@@ -10,6 +11,7 @@ import {
   DevicePeerWorkspaceLocationSchema,
   DevicePresenceState,
   RemoteDesktopCapabilitiesSchema,
+  RemoteDesktopClipboardContentRequestSchema,
   RemoteDesktopClipboardContentResultSchema,
   RemoteDesktopClipboardTextResultSchema,
   RemoteDesktopClipboardSyncResultSchema,
@@ -53,6 +55,7 @@ vi.mock("@joko/connection-transport", async importOriginal => {
 });
 import { createMobileRemoteDesktopHostMutePreferenceStore,
   type MobileRemoteDesktopHostMutePreferences } from "./mobile-remote-desktop-host-mute-preference";
+import { createMobileRemoteDesktopDisplayModePreferenceStore } from "./mobile-remote-desktop-display-mode-preference";
 import { createMobileRemoteDesktopLockPreferenceStore } from "./mobile-remote-desktop-lock-preference";
 import { createMobileRemoteDesktopClipboardSyncPreferenceStore } from "./mobile-remote-desktop-clipboard-sync-preference";
 import { createMobileRemoteDesktopPrivacyPreferenceStore, type MobileRemoteDesktopPrivacyPreferences } from "./mobile-remote-desktop-privacy-preference";
@@ -437,11 +440,11 @@ describe("Mobile native media and background presentation", () => {
     expect(value.controller.snapshot).toMatchObject({ controlling: generation, wantedControl: false, viewOnly: true });
     expect(value.control).not.toHaveBeenCalled();
     expect(value.commands.findLast(command => command.type === "inputAuthority")).toMatchObject({ grant: null });
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 3, events: [{ kind: "key", code: "KeyA", down: true }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 3, events: [{ kind: "key", code: "KeyA", down: true }] });
     await vi.advanceTimersByTimeAsync(3_000);
     expect(value.controller.snapshot).toMatchObject({ controlling: true, viewOnly: true, wantedControl: false });
     expect(value.sendInput).not.toHaveBeenCalled(); expect(value.input).not.toHaveBeenCalled();
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 4, events: [{ kind: "release" }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 4, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.sendInput).toHaveBeenCalledOnce();
     await value.controller.setControl(true);
     expect(value.control).not.toHaveBeenCalled();
@@ -469,6 +472,74 @@ describe("Mobile native media and background presentation", () => {
     expect(value.setDisplayMode).toHaveBeenCalledWith(value.host, "lease-1", 1n, "20", true, expect.any(AbortSignal), true);
     expect(controller.snapshot).toMatchObject({ controlling: true, wantedControl: true, status: "live" });
     expect(value.control).not.toHaveBeenCalled(); await controller.close();
+  });
+
+  it("remembers the chosen physical mode across a normal disconnect and applies it before the reopened viewer initializes", async () => {
+    const disk = new Map<string, string>();
+    const storage = { getItem: async (key: string) => disk.get(key) ?? null,
+      setItem: async (key: string, value: string) => { disk.set(key, value); } };
+    const build = (value: ReturnType<typeof fixture>) => {
+      value.capabilities.autoControl = true;
+      value.capabilities.resolutionRestore = true;
+      return new MobileRemoteDesktopController(value.transport, undefined, undefined, undefined,
+        undefined, undefined, undefined, undefined, undefined, createMobileRemoteDesktopDisplayModePreferenceStore(storage));
+    };
+    const receipt = (value: ReturnType<typeof fixture>) => create(RemoteDesktopDisplayModeResultSchema, { lease: {
+      ...value.lease, controlling: true, controlGeneration: 2n, display: { ...value.lease.display!, width: 1280, height: 720 }
+    } });
+    const initial = fixture(true, true, false, true), first = build(initial);
+    initial.setDisplayMode.mockResolvedValue(receipt(initial));
+    try {
+      await first.open(); await flushAsync();
+      await first.setDisplayMode("20");
+      await vi.waitFor(() => expect(disk.size).toBe(1));
+      expect(JSON.parse([...disk.values()][0]!)).toEqual({ version: 1, modeId: "20", width: 1280, height: 720 });
+    } finally { await first.close(); }
+    expect(initial.stop).toHaveBeenCalledOnce();
+
+    const next = fixture(true, true, false, true), reopened = build(next);
+    let resolveMode!: (response: ReturnType<typeof receipt>) => void;
+    const modeResult = new Promise<ReturnType<typeof receipt>>(resolve => { resolveMode = resolve; });
+    next.setDisplayMode.mockReturnValueOnce(modeResult);
+    const commands: Record<string, unknown>[] = [];
+    reopened.setViewerSink(command => commands.push(command as Record<string, unknown>));
+    reopened.viewerMessage({ type: "ready" });
+    const opening = reopened.open();
+    try {
+      await vi.waitFor(() => expect(next.setDisplayMode).toHaveBeenCalledExactlyOnceWith(next.host, next.lease.leaseId,
+        1n, "20", true, expect.any(AbortSignal), true));
+      expect(commands.filter(command => command.type === "init")).toEqual([]);
+      resolveMode(receipt(next)); await opening;
+      expect(commands.filter(command => command.type === "init")).toMatchObject([{ width: 1280, height: 720 }]);
+      expect(reopened.snapshot).toMatchObject({ status: "live", controlling: true });
+      expect(next.control).not.toHaveBeenCalled();
+    } finally { resolveMode(receipt(next)); await opening; await reopened.close(); }
+  });
+
+  it("retires a newly opened lease if the viewer closes while reading a remembered mode", async () => {
+    const value = fixture(true, true, false, true);
+    value.capabilities.resolutionRestore = true;
+    const identityRead = vi.fn();
+    let finishRead!: (value: string | null) => void;
+    const preferences = createMobileRemoteDesktopDisplayModePreferenceStore({ getItem: async () => {
+      identityRead(); return new Promise(resolve => { finishRead = resolve; });
+    }, setItem: async () => {} });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, preferences);
+    const commands: Record<string, unknown>[] = [];
+    controller.setViewerSink(command => commands.push(command as Record<string, unknown>));
+    controller.viewerMessage({ type: "ready" });
+    const opening = controller.open();
+    try {
+      await vi.waitFor(() => expect(identityRead).toHaveBeenCalledOnce());
+      await controller.close();
+      expect(value.stop).toHaveBeenCalledExactlyOnceWith(value.host, value.lease.leaseId,
+        { lockScreen: false, controlGeneration: 0n });
+      finishRead(JSON.stringify({ version: 1, modeId: "20", width: 1280, height: 720 })); await opening;
+      expect(value.setDisplayMode).not.toHaveBeenCalled();
+      expect(value.stop).toHaveBeenCalledOnce();
+      expect(commands.filter(command => command.type === "init")).toEqual([]);
+    } finally { finishRead?.(null); await opening; await controller.close(); }
   });
 
   it("sends small native control requests over the current media channel and adopts only its matched reply", async () => {
@@ -624,7 +695,7 @@ describe("Mobile native media and background presentation", () => {
 
   it("uses native accepted input exactly once with the complete captured grant", async () => {
     const value = await nativeFixture(true); value.input.mockClear();
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
     await flushAsync();
     expect(value.sendInput).toHaveBeenCalledWith({ epoch: value.epoch, attemptId, controlGeneration: "1",
       sequenceBase: value.init.sequenceBase, sequenceLimit: value.init.sequenceLimit,
@@ -656,7 +727,7 @@ describe("Mobile native media and background presentation", () => {
     controller.setViewerSink(command => commands.push({ ...command }));
     await controller.open(); controller.viewerMessage({ type: "ready" }); await flushAsync();
     const init = commands.findLast(command => command.type === "init")!;
-    controller.viewerMessage(JSON.stringify({ type: "input", epoch: init.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] }));
+    controller.viewerMessage(JSON.stringify({ type: "input", controlGeneration: 1, epoch: init.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] }));
     await flushAsync(); expect(value.input).toHaveBeenCalledTimes(1);
     expect(commands.at(-1)).toEqual({ type: "ack", epoch: init.epoch, sequence: 1 }); await controller.close();
   });
@@ -709,16 +780,16 @@ describe("Mobile native media and background presentation", () => {
     const value = await nativeFixture(true); value.input.mockClear();
     if (outcome === "throw") value.sendInput.mockRejectedValueOnce(new Error("unknown native receipt"));
     else value.sendInput.mockResolvedValueOnce(undefined as unknown as boolean);
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.input).not.toHaveBeenCalled(); expect(value.stop).toHaveBeenCalled();
     expect(value.controller.snapshot.controlling).toBe(false); await value.controller.close();
   });
 
   it("falls back once only for a false native receipt in the original control context", async () => {
     const value = await nativeFixture(true); value.sendInput.mockResolvedValueOnce(false); value.input.mockClear();
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.input).toHaveBeenCalledTimes(1);
-    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, expect.any(Array), expect.any(AbortSignal));
+    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, 1n, expect.any(Array), expect.any(AbortSignal));
     expect(value.commands.at(-1)).toEqual({ type: "ack", epoch: value.epoch, sequence: 1 }); await value.controller.close();
   });
 
@@ -726,7 +797,7 @@ describe("Mobile native media and background presentation", () => {
     const value = await nativeFixture(true); value.input.mockClear();
     let resolve!: (accepted: boolean) => void;
     value.sendInput.mockImplementationOnce(() => new Promise(receipt => { resolve = receipt; }));
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
     if (retirement === "attempt") value.event("iceConfig", { attemptId: nextAttemptId });
     else if (retirement === "control") await value.controller.setControl(false);
     else if (retirement === "route") value.controller.setRouteFocused(false);
@@ -1232,7 +1303,7 @@ describe("Mobile online display selection", () => {
     let httpInputSettled!: () => void;
     if (nativeVideo) value.sendInput.mockImplementationOnce(async () => new Promise<boolean>(resolve => { inputSettled = resolve; }));
     else value.input.mockImplementationOnce(async () => new Promise<void>(resolve => { httpInputSettled = resolve; }));
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "move", x: .3, y: .2 }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 1, events: [{ kind: "move", x: .3, y: .2 }] });
     await flushAsync();
     const caps = vi.mocked(value.transport.capabilities).mock.calls.length;
     const switching = value.controller.selectDisplay("display-2");
@@ -1253,7 +1324,7 @@ describe("Mobile online display selection", () => {
     expect(nextEpoch).not.toBe(value.epoch);
     if (nativeVideo) inputSettled(false); else httpInputSettled();
     const count = value.commands.length;
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 2, events: [{ kind: "move", x: .1, y: .2 }] });
+    value.controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: value.epoch, sequence: 2, events: [{ kind: "move", x: .1, y: .2 }] });
     value.controller.viewerMessage({ type: "streaming", epoch: value.epoch, attemptId: value.attemptId });
     value.controller.nativeMessage(JSON.stringify({ type: "videoFrameReady", epoch: value.epoch, attemptId: value.attemptId }));
     await flushAsync(); expect(value.commands).toHaveLength(count);
@@ -2173,7 +2244,7 @@ describe("MobileRemoteDesktopController", () => {
     controller.setInteractive(false);
     await flushAsync();
     expect(value.stop).not.toHaveBeenCalled();
-    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 999_999_999n,
+    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, 999_999_999n,
       [expect.objectContaining({ event: expect.objectContaining({ case: "release" }) })], expect.any(AbortSignal));
     controller.setForeground(false);
     expect(value.stop).toHaveBeenCalledTimes(1);
@@ -2329,7 +2400,7 @@ describe("MobileRemoteDesktopController", () => {
     const oldInit = commands.filter(command => command.type === "init").at(-1)!;
     await controller.fitViewerDisplay(390, 844); await flushAsync();
     expect(value.fitViewerDisplay).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, 888, 1920, expect.any(AbortSignal));
-    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, expect.any(BigInt),
+    expect(value.input).toHaveBeenCalledWith(value.host, value.lease.leaseId, 1n, expect.any(BigInt),
       [expect.objectContaining({ event: { case: "release", value: expect.any(Object) } })], expect.any(AbortSignal));
     expect(value.input.mock.invocationCallOrder[0]).toBeLessThan(value.fitViewerDisplay.mock.invocationCallOrder[0]!);
     expect(controller.snapshot).toMatchObject({ status: "live", selectedDisplayId: "display-1", viewerDisplayFitted: true,
@@ -2521,7 +2592,7 @@ describe("MobileRemoteDesktopController", () => {
     expect(nextInit).toMatchObject({ width: 1280, height: 720 }); expect(nextInit.epoch).not.toBe(oldInit.epoch);
     expect(nextInit.sequenceBase).toBeGreaterThan(oldInit.sequenceBase as number);
     controller.viewerMessage({ type: "framePresented", epoch: oldInit.epoch, attemptId: null, frameId: 1 });
-    controller.viewerMessage({ type: "input", epoch: oldInit.epoch, sequence: (oldInit.sequenceBase as number) + 1, events: [{ kind: "release" }] });
+    controller.viewerMessage({ type: "input", controlGeneration: 1, epoch: oldInit.epoch, sequence: (oldInit.sequenceBase as number) + 1, events: [{ kind: "release" }] });
     await flushAsync(); expect(value.input).not.toHaveBeenCalled(); expect(controller.snapshot.hasFrame).toBe(false);
     await controller.close();
     expect(value.stop).toHaveBeenCalledWith(value.host, value.lease.leaseId, { lockScreen: false, controlGeneration: 0n });
@@ -3027,7 +3098,7 @@ describe("MobileRemoteDesktopController", () => {
       }
       if (request.action.case === "commit") {
         commitCalls += 1;
-        throw new Error("response lost after consume");
+        throw new LinkspanError("transport_error", "response lost after consume");
       }
       return create(RemoteDesktopClipboardContentResultSchema, {});
     });
@@ -3036,6 +3107,69 @@ describe("MobileRemoteDesktopController", () => {
     expect(value.clipboardContent.mock.calls.map((call) => call[1].action.case))
       .toEqual(["begin", "write", "commit", "cancel"]);
     expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "failed" });
+    await controller.close();
+  });
+
+  it.each(["transport_error", "authentication_failed"] as const)("retries an exact staged chunk only for a lost transport receipt (%s)", async code => {
+    const value = fixture(true, true), phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174000";
+    const text = "a".repeat(70_000), json = JSON.stringify({ text });
+    phone.readPortable.mockImplementationOnce(async check => { check(); return { text }; });
+    let staged = "", lost = false;
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      const action = request.action;
+      if (action.case === "begin") return create(RemoteDesktopClipboardContentResultSchema, { transferId });
+      if (action.case === "write") {
+        const { offset, data } = action.value;
+        if (offset === staged.length) staged += data;
+        else expect({ offset, data }).toEqual({ offset: 0, data: staged });
+        if (!lost) {
+          lost = true;
+          throw ConnectError.from(new Error("Clipboard response unavailable", { cause: new LinkspanError(code, "test transport") }));
+        }
+      }
+      if (action.case === "commit") expect(staged).toBe(json);
+      return create(RemoteDesktopClipboardContentResultSchema);
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+    await controller.pasteFromPhone();
+    const requests = value.clipboardContent.mock.calls.map(([, request]) => request);
+    if (code === "transport_error") {
+      expect(requests.map(request => request.action.case)).toEqual(["begin", "write", "write", "write", "commit", "cancel"]);
+      expect(requests[2]).toEqual(requests[1]);
+      expect(controller.snapshot.clipboardNotice).toBe("pasted");
+    } else {
+      expect(requests.map(request => request.action.case)).toEqual(["begin", "write", "cancel"]);
+      expect(controller.snapshot.clipboardNotice).toBe("failed");
+    }
+    await controller.close();
+  });
+
+  it("preserves an emoji crossing the rich paste chunk boundary through binary Connect", async () => {
+    const value = fixture(true, true);
+    const phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174000";
+    const text = "a".repeat(65_526) + "😀b";
+    const json = JSON.stringify({ text });
+    phone.readPortable.mockImplementationOnce(async check => { check(); return { text }; });
+    const received: { offset: number; data: string }[] = [];
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      const { action } = fromBinary(RemoteDesktopClipboardContentRequestSchema, toBinary(RemoteDesktopClipboardContentRequestSchema, request));
+      if (action.case === "begin") {
+        expect(action.value.length).toBe(json.length);
+        return create(RemoteDesktopClipboardContentResultSchema, { transferId });
+      }
+      if (action.case === "write") received.push(action.value);
+      return create(RemoteDesktopClipboardContentResultSchema, {});
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+    await controller.pasteFromPhone();
+
+    expect(received.map(({ offset, data }) => [offset, data.length])).toEqual([[0, 65_535], [65_535, json.length - 65_535]]);
+    expect(received.map(({ data }) => data).join("")).toBe(json);
+    expect(controller.snapshot.clipboardNotice).toBe("pasted");
     await controller.close();
   });
 

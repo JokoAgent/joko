@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import { CODEX_PROJECT_SKILL_ROOTS } from "@joko/adapter-codex";
-import type { RemoteFileStat } from "@joko/remote-ssh";
+import { isRemoteFileMissing, type RemoteFileStat } from "@joko/remote-ssh";
 import type { OperationalStore } from "@joko/store";
 import { isSensitiveSkillPath } from "./skill-content-policy.js";
 import type { RemoteSkillSourceAuthority } from "./remote-workspace-service.js";
@@ -281,11 +281,11 @@ async function exactStat(authority: RemoteSkillSourceAuthority, path: string, si
 
 async function optionalDirectory(authority: RemoteSkillSourceAuthority, path: string, signal?: AbortSignal): Promise<boolean> {
   try { return (await exactStat(authority, path, signal)).kind === "directory"; }
-  catch (error) { authority.assertFilesCurrent(); signal?.throwIfAborted(); if ((error as NodeJS.ErrnoException)?.code === "ENOENT" || (error as { code?: unknown })?.code === 2) return false; throw error; }
+  catch (error) { authority.assertFilesCurrent(); signal?.throwIfAborted(); if (isRemoteFileMissing(error)) return false; throw error; }
 }
 async function optionalSkillFile(authority: RemoteSkillSourceAuthority, path: string, signal?: AbortSignal): Promise<boolean> {
   try { return (await exactStat(authority, path, signal)).kind === "file"; }
-  catch (error) { authority.assertFilesCurrent(); signal?.throwIfAborted(); if ((error as NodeJS.ErrnoException)?.code === "ENOENT" || (error as { code?: unknown })?.code === 2) return false; throw error; }
+  catch (error) { authority.assertFilesCurrent(); signal?.throwIfAborted(); if (isRemoteFileMissing(error)) return false; throw error; }
 }
 function portableKey(value: string): void {
   if (typeof value !== "string" || value.length === 0 || value.length > 512 || value.split("/").length > 32

@@ -162,7 +162,7 @@ describe("remote desktop portable protocol", () => {
     const lease = await fixture.controller.request(authority, { op: "start", displayId: "display-1" }) as RemoteDesktopLease;
     await fixture.controller.request(authority, { op: "control", lease: lease.lease, enabled: true });
     proof = null;
-    expect(() => fixture.controller.input(AUTHORITY, lease.lease, 1, [{ kind: "release" }]))
+    expect(() => fixture.controller.input(AUTHORITY, lease.lease, fixture.controller.state!.controlGeneration, 1, [{ kind: "release" }]))
       .toThrow("REMOTE_DESKTOP_AUTHENTICATION_REQUIRED");
     expect(fixture.dependencies.input).not.toHaveBeenCalled();
     proof = "session-b";
@@ -216,14 +216,18 @@ describe("remote desktop portable protocol", () => {
     expect(() => parseRemoteDesktopRequest({
       op: "input",
       lease: "lease-1",
+      controlGeneration: 1,
       sequence: 1,
       events: [{ kind: "scroll", dx: 0, dy: 2_001 }]
     })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
     expect(() => parseRemoteDesktopRequest({
-      op: "input", lease: "lease-1", sequence: 0, events: [{ kind: "release" }]
+      op: "input", lease: "lease-1", controlGeneration: 1, sequence: 0, events: [{ kind: "release" }]
     })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
     expect(() => parseRemoteDesktopRequest({
-      op: "input", lease: "lease-1", sequence: 1, events: []
+      op: "input", lease: "lease-1", controlGeneration: 1, sequence: 1, events: []
+    })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
+    expect(() => parseRemoteDesktopRequest({
+      op: "input", lease: "lease-1", sequence: 1, events: [{ kind: "release" }]
     })).toThrowError("INVALID_REMOTE_DESKTOP_REQUEST");
     expect(parseRemoteDesktopRequest({
       op: "resolution", lease: "lease-1", controlGeneration: 2, modeId: "101", temporary: false
@@ -613,6 +617,7 @@ describe("remote desktop finite authority controller", () => {
     await expect(fixture.controller.request(AUTHORITY, {
       op: "input",
       lease: lease.lease,
+      controlGeneration: firstGeneration,
       sequence: 1,
       events: [{ kind: "button", button: 0, down: true, x: 0.5, y: 0.5 }]
     })).rejects.toThrowError("native input unavailable");
@@ -623,14 +628,35 @@ describe("remote desktop finite authority controller", () => {
     await fixture.controller.request(AUTHORITY, {
       op: "control", lease: lease.lease, enabled: true
     });
-    expect(fixture.controller.state!.controlGeneration).toBeGreaterThan(firstGeneration);
+    const recoveredGeneration = fixture.controller.state!.controlGeneration;
+    expect(recoveredGeneration).toBeGreaterThan(firstGeneration);
     await fixture.controller.request(AUTHORITY, {
-      op: "input", lease: lease.lease, sequence: 2, events: [{ kind: "release" }]
+      op: "input", lease: lease.lease, controlGeneration: recoveredGeneration, sequence: 2, events: [{ kind: "release" }]
     });
     await fixture.controller.request(AUTHORITY, {
-      op: "input", lease: lease.lease, sequence: 2, events: [{ kind: "release" }]
+      op: "input", lease: lease.lease, controlGeneration: recoveredGeneration, sequence: 2, events: [{ kind: "release" }]
     });
     expect(fixture.dependencies.input).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops delayed button input from the previous control generation on the same lease", async () => {
+    const fixture = controllerFixture(), lease = await start(fixture);
+    await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true });
+    const original = fixture.controller.state!.controlGeneration;
+    const mouse = { kind: "button" as const, button: 0, x: 0.5, y: 0.5, down: true };
+    fixture.controller.input(AUTHORITY, lease.lease, original, 1, [mouse]);
+    await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: false });
+    await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true });
+    const current = fixture.controller.state!.controlGeneration;
+    expect(current).toBeGreaterThan(original);
+
+    fixture.controller.input(AUTHORITY, lease.lease, original, 20, [mouse]);
+    fixture.controller.input(AUTHORITY, lease.lease, original, 21, [{ ...mouse, down: false }]);
+    expect(fixture.dependencies.input).toHaveBeenCalledTimes(1);
+    fixture.controller.input(AUTHORITY, lease.lease, current, 2, [{ ...mouse, x: 0.2 }]);
+    expect(fixture.dependencies.input).toHaveBeenLastCalledWith([{ ...mouse, x: 0.2 }], AUTHORITY);
+    expect(fixture.dependencies.input).toHaveBeenCalledTimes(2);
+    expect(fixture.dependencies.stopVideo).not.toHaveBeenCalled();
   });
 
   it("repairs one native input failure while retaining privacy and mute, then fences an idle crash loop", async () => {
@@ -643,7 +669,7 @@ describe("remote desktop finite authority controller", () => {
     expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: true });
     expect(fixture.dependencies.startInput).toHaveBeenCalledTimes(2);
     expect(fixture.dependencies.stopPrivacyScreen).not.toHaveBeenCalled(); expect(fixture.dependencies.stopHostMute).not.toHaveBeenCalled();
-    fixture.controller.input(AUTHORITY, lease.lease, 1, [{ kind: "release" }]);
+    fixture.controller.input(AUTHORITY, lease.lease, fixture.controller.state!.controlGeneration, 1, [{ kind: "release" }]);
     await fixture.controller.releaseControl(true); expect(fixture.dependencies.startInput).toHaveBeenCalledTimes(3);
     await fixture.controller.releaseControl(true);
     expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
@@ -1495,7 +1521,7 @@ describe("temporary display modes and captured restoration", () => {
     await vi.waitFor(() => expect(complete).toBeTypeOf("function"));
     expect(nativeCurrent()).toBe(true);
     expect(fixture.controller.isControlCurrent(AUTHORITY, lease.lease, control.controlGeneration)).toBe(false);
-    expect(() => fixture.controller.input(AUTHORITY, lease.lease, 1, [{ kind: "release" }])).toThrowError("REMOTE_DESKTOP_DISPLAY_BUSY");
+    expect(() => fixture.controller.input(AUTHORITY, lease.lease, fixture.controller.state!.controlGeneration, 1, [{ kind: "release" }])).toThrowError("REMOTE_DESKTOP_DISPLAY_BUSY");
     let ended = false; const ending = fixture.controller.stopAndRestore().then(() => { ended = true; });
     expect(nativeCurrent()).toBe(false);
     await Promise.resolve(); expect(ended).toBe(false);
@@ -1758,6 +1784,31 @@ describe("managed viewer display ownership", () => {
     expect(restored.lease.controlGeneration).toBeGreaterThan(restoredControl.controlGeneration);
     expect(fixture.controller.managedViewerDisplay).toBeUndefined();
     await fixture.controller.stopAndRestore(); expect(fixture.handle.restore).toHaveBeenCalledOnce();
+  });
+
+  it("restores the first physical mode in the same lease after explicitly restoring its virtual display", async () => {
+    const fixture = viewerFixture(); const lease = await start(fixture); const control = await takeControl(fixture, lease);
+    const temporary = { ...fixture.source, width: 1024, height: 640 };
+    vi.mocked(fixture.dependencies.setDisplayMode!).mockImplementation(async (_id, _mode, beforeChange) => {
+      await beforeChange(); return temporary;
+    });
+    fixture.handle.restore.mockResolvedValueOnce(temporary);
+    const changed = await fixture.controller.request(AUTHORITY, { op: "resolution", lease: lease.lease,
+      controlGeneration: control.controlGeneration, modeId: "102", temporary: true }) as { lease: RemoteDesktopLease };
+    expect(changed.lease.display).toEqual(temporary);
+    const modeControl = await takeControl(fixture, changed.lease);
+    const fitted = await fit(fixture, lease, modeControl.controlGeneration);
+    const mirrorControl = await takeControl(fixture, fitted.lease);
+    const restored = await fixture.controller.request(AUTHORITY, { op: "restoreViewerDisplay", lease: lease.lease,
+      controlGeneration: mirrorControl.controlGeneration }) as { lease: RemoteDesktopLease };
+    expect(restored.lease).toMatchObject({ lease: lease.lease, controlling: false, display: fixture.source });
+    expect(restored.lease.controlGeneration).toBeGreaterThan(mirrorControl.controlGeneration);
+    const restore = vi.mocked(fixture.dependencies.restoreDisplayMode!);
+    expect(restore).toHaveBeenCalledExactlyOnceWith("display-1", "101", expect.any(Function),
+      expect.objectContaining({ width: 1280, height: 800 }), expect.objectContaining(AUTHORITY));
+    expect(fixture.handle.restore.mock.invocationCallOrder[0]).toBeLessThan(restore.mock.invocationCallOrder[0]!);
+    await fixture.controller.stopAndRestore();
+    expect(restore).toHaveBeenCalledOnce();
   });
 
   it("restores the mirror before changing physical modes and retains the first physical original for stop", async () => {

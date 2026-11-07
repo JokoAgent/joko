@@ -172,6 +172,7 @@ export async function installRemoteClaude(
   options: {
     readonly reinstall: boolean;
     readonly assertCurrent: () => void;
+    readonly beginEffect?: () => void;
     readonly signal?: AbortSignal;
     readonly onPhase?: (phase: RemoteClaudeInstallPhase) => void;
   }
@@ -200,6 +201,7 @@ export async function installRemoteClaude(
     args: ["-s", "--", options.reinstall ? "1" : "0"],
     cwd: "/",
     input: script,
+    beforeInput: options.beginEffect ?? options.assertCurrent,
     timeoutMs: INSTALL_TIMEOUT_MS,
     signal: options.signal,
     onStdout: acceptOutput
@@ -478,6 +480,7 @@ interface RemoteCommandInput {
   readonly args: readonly string[];
   readonly cwd: string;
   readonly input?: string | Buffer;
+  readonly beforeInput?: () => void;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
   readonly onStdout?: (chunk: Buffer) => void;
@@ -519,7 +522,7 @@ async function runRemoteCommand(
       handle.stderr.removeListener("error", onStreamError);
       handle.stdin.removeListener("error", onStreamError);
     };
-    const fail = (error: RemoteClaudeInstallationError): void => {
+    const fail = (error: unknown): void => {
       if (settled) return;
       settled = true;
       cleanup();
@@ -550,6 +553,9 @@ async function runRemoteCommand(
       cleanup();
       resolvePromise(Object.freeze({ stdout: Buffer.concat(chunks, bytes), exitCode }));
     });
+    if (input.signal?.aborted) { abort(); return; }
+    try { input.beforeInput?.(); }
+    catch (error) { fail(error); return; }
     try { handle.stdin.end(input.input); }
     catch { fail(installationFault("The remote Claude command stream failed.", true)); }
     if (input.signal?.aborted) abort();

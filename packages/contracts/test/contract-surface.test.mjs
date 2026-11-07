@@ -673,6 +673,7 @@ test("Remote Desktop keeps public controller identity implicit and target comman
       routeGeneration: 9n
     },
     leaseId: "lease-1",
+    controlGeneration: 11n,
     sequence: 10n,
     events: [
       { event: { case: "move", value: { x: 0.25, y: 0.75 } } },
@@ -680,6 +681,7 @@ test("Remote Desktop keeps public controller identity implicit and target comman
     ]
   });
   assert.equal(input.sequence, 10n);
+  assert.equal(input.controlGeneration, 11n);
   assert.deepEqual(input.events.map((event) => event.event.case), ["move", "release"]);
 });
 

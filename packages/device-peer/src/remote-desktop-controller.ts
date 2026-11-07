@@ -540,12 +540,14 @@ export class RemoteDesktopController {
   input(
     authority: RemoteDesktopAuthority,
     lease: string,
+    controlGeneration: number,
     sequence: number,
     events: unknown
   ): void {
-    const request = parseRemoteDesktopRequest({ op: "input", lease, sequence, events });
+    const request = parseRemoteDesktopRequest({ op: "input", lease, controlGeneration, sequence, events });
     if (request.op !== "input") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
     const active = this.#require(authority, lease);
+    if (controlGeneration !== active.controlGeneration) return;
     if (this.#displayModePending) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
     if (!active.controlling) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (sequence <= active.sequence) return;
@@ -556,9 +558,10 @@ export class RemoteDesktopController {
       if (++this.#handoffInputPending > 64) { this.#handoffInputPending--; this.stop(authority); return; }
       this.#handoffInputTail = this.#handoffInputTail.then(async () => {
         await this.#ensureHandoff(active);
-        if (this.#active !== active || !active.controlling) return;
+        if (this.#active !== active || !active.controlling || active.controlGeneration !== controlGeneration) return;
         this.#dependencies.input(request.events, authority);
-      }).catch(() => { if (this.#active === active) this.stop(authority); }).finally(() => { this.#handoffInputPending--; });
+      }).catch(() => { if (this.#active === active && active.controlGeneration === controlGeneration) this.stop(authority); })
+        .finally(() => { this.#handoffInputPending--; });
       return;
     }
     try {
@@ -689,7 +692,7 @@ export class RemoteDesktopController {
         return Object.freeze({ version });
       }
       case "input":
-        this.input(authority, request.lease, request.sequence, request.events);
+        this.input(authority, request.lease, request.controlGeneration, request.sequence, request.events);
         return Object.freeze({ ok: true });
       case "frame":
         if (request.cursorOverlay && !active.cursorOverlay) {
@@ -1456,6 +1459,23 @@ export class RemoteDesktopController {
           if (display.id !== active.sourceDisplayId) throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
           this.#viewerDisplay = undefined;
           this.#viewerDisplayRevision += 1;
+          const original = this.#originalResolution;
+          if (original !== undefined) {
+            const restore = this.#dependencies.restoreDisplayMode;
+            const originalCurrent = () => current() && this.#originalResolution === original;
+            try {
+              if (!restore || original.displayId !== active.sourceDisplayId || !sameAuthority(original.authority, authority)
+                || (await this.#dependencies.displayPresent?.(original.displayId)) === false || !originalCurrent()) throw new Error();
+              const restored = await restore.call(this.#dependencies, original.displayId, original.modeId, originalCurrent, original, original.authority);
+              if (!originalCurrent()) throw new Error();
+              const observed = restored ?? parseRemoteDesktopHostCapabilities(
+                await this.#dependencies.capabilities(original.authority)).displays.find(candidate => candidate.id === original.displayId);
+              if (!originalCurrent() || observed === undefined) throw new Error();
+              display = parseRemoteDesktopDisplay(observed);
+              if (display.id !== original.displayId || display.width !== original.width || display.height !== original.height) throw new Error();
+            } catch { throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE"); }
+            this.#originalResolution = undefined;
+          }
         }
       }
       requireCurrent();

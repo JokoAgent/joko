@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
-import { Download, Fingerprint, Link2, Package, Pencil, Plug, PlugZap, RefreshCw, Server, ShieldX, Trash2 } from "lucide-react";
+import { Download, Fingerprint, Link2, Package, Pencil, Plug, PlugZap, RefreshCw, Server, Trash2 } from "lucide-react";
 
 import type { AppController } from "../controller.js";
 import type {
@@ -10,6 +10,7 @@ import type {
   RemoteHostCapabilitiesView,
   RemoteHostDirectoryListingView,
   RemoteHostDraft,
+  RemoteHostKeyIdentityView,
   RemoteHostView
 } from "../model.js";
 import { randomUuid } from "../web-crypto.js";
@@ -72,6 +73,12 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
   const activeScopeRef = useRef<CatalogScope | undefined>(undefined);
   const [occurrence, setOccurrence] = useState(0);
   const [editing, setEditing] = useState<HostEditorInstance>();
+  const [trustReview, setTrustReview] = useState<{
+    readonly scope: CatalogScope;
+    readonly host: RemoteHostView;
+    readonly replacement: RemoteHostKeyIdentityView;
+    readonly returnFocus: HTMLElement;
+  }>();
   const editorSequence = useRef(0);
   const bindingDrafts = useRef(new WeakMap<RemoteHostApi, Map<string, BindingDraft>>());
   const api = useMemo<RemoteHostApi>(() => ({
@@ -180,6 +187,8 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
     if (isCurrent() && ready && capabilities.management) setEditing({ id: ++editorSequence.current, scope, api, targetId, host, returnFocus });
   };
   const editIsCurrent = (): boolean => editing !== undefined && isCurrent(editing.scope);
+  const review = ready && trustReview?.scope === scope && hosts.some(host => host.id === trustReview.host.id
+    && host.revision <= trustReview.host.revision) ? trustReview : undefined;
 
   return <div ref={rootRef} style={{ display: "contents" }}>
     {targets.length === 0 ? <>{showHeading && <SettingsHeading t={t} />}<section className="settings-card"><p className="muted">{t("settings.remoteHosts.noTargets")}</p></section></> : <>
@@ -255,10 +264,15 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
           </Pill>
           {capabilities.connectionTest && <Button
             disabled={!ready || scope.pending.has(host.id) || host.status.state === "connecting" || host.status.state === "authenticating"}
-            onClick={() => perform(
-              host.id,
-              () => api.testRemoteHostConnection(targetId, host.id, host.revision)
-            )}
+            onClick={(event) => {
+              const returnFocus = event.currentTarget;
+              perform(host.id, async () => {
+                const result = await api.testRemoteHostConnection(targetId, host.id, host.revision);
+                if (isCurrent() && capabilities.trustReset && result.trust && result.observedHostKey) {
+                  setTrustReview({ scope, host: result, replacement: result.observedHostKey, returnFocus });
+                }
+              });
+            }}
           ><PlugZap aria-hidden="true" />{t("settings.remoteHosts.test")}</Button>}
           {capabilities.connectionControl && <Button
             disabled={!ready || scope.pending.has(host.id) || host.status.state === "connecting" || host.status.state === "authenticating"}
@@ -269,14 +283,6 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
                 : api.connectRemoteHost(targetId, host.id, host.revision)
             )}
           ><Plug aria-hidden="true" />{t(host.status.state === "ready" ? "settings.remoteHosts.disconnect" : "settings.remoteHosts.connect")}</Button>}
-          {host.trust !== undefined && capabilities.trustReset && <IconButton
-            label={t("settings.remoteHosts.clearTrust")}
-            disabled={!ready || scope.pending.has(host.id)}
-            onClick={() => perform(
-              host.id,
-              () => api.clearRemoteHostTrust(targetId, host.id, host.revision)
-            )}
-          ><ShieldX aria-hidden="true" /></IconButton>}
           {capabilities.management && <IconButton label={t("common.edit")} disabled={!ready || scope.pending.has(host.id)} onClick={(event) => openEditor(event.currentTarget, host)}><Pencil aria-hidden="true" /></IconButton>}
           {capabilities.management && <IconButton
             label={t("common.delete")}
@@ -308,6 +314,23 @@ export function RemoteHostsSettings({ controller, snapshot, activeTargetId, show
       onClose={() => setEditing(undefined)}
       t={t}
     />}
+    {review !== undefined && <Modal open title={t("settings.remoteHosts.trustReviewTitle")} dialogRole="alertdialog"
+      description={t("settings.remoteHosts.trustReviewBody", { host: review.host.hostname, port: review.host.port })}
+      restoreFocusFallback={() => review.returnFocus} onClose={() => setTrustReview(undefined)}>
+      <dl>
+        <dt>{t("settings.remoteHosts.trustReviewOriginal")}</dt>
+        <dd>{review.host.trust?.algorithm} · {review.host.trust?.sha256Fingerprint}</dd>
+        <dt>{t("settings.remoteHosts.trustReviewObserved")}</dt>
+        <dd>{review.replacement.algorithm} · {review.replacement.sha256Fingerprint}</dd>
+      </dl>
+      <div className="modal__actions">
+        <Button onClick={() => setTrustReview(undefined)}>{t("common.cancel")}</Button>
+        <Button tone="danger" onClick={() => {
+          setTrustReview(undefined);
+          perform(review.host.id, () => api.clearRemoteHostTrust(review.host.targetId, review.host.id, review.host.revision, review.replacement));
+        }}>{t("settings.remoteHosts.trustReviewConfirm")}</Button>
+      </div>
+    </Modal>}
   </div>;
 }
 

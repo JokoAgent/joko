@@ -949,11 +949,11 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
   async rename(sourcePath: string, destinationPath: string, signal?: AbortSignal): Promise<void> {
     const source = absoluteRemotePath(sourcePath);
     const destination = absoluteRemotePath(destinationPath);
-    await this.withSftp(signal, (sftp) => atomicSftpRename(
-      sftp,
-      source,
-      destination,
+    // A move to a new name uses SFTP's no-overwrite request. Atomic text
+    // replacement explicitly selects the OpenSSH extension in write().
+    await this.withSftp(signal, (sftp) => callbackOperation<void>(
       signal,
+      (done) => sftp.rename(source, destination, done),
       this.#invalidate
     ));
   }
@@ -1077,7 +1077,7 @@ function callbackOperation<T>(
         if (settled) return;
         settled = true;
         cleanup();
-        if (error) reject(fileFailure());
+        if (error) reject(fileFailure(error));
         else resolve(value as T);
       });
     } catch {
@@ -1210,8 +1210,9 @@ function abortedError(): RemoteSshError {
   return new RemoteSshError("ABORTED", "The SSH operation was aborted.", true);
 }
 
-function fileFailure(): RemoteSshError {
-  return new RemoteSshError("FILE_TRANSFER_FAILED", "The SSH file operation failed safely.", true);
+function fileFailure(sftpError?: Error): RemoteSshError {
+  const missing = sftpError !== undefined && "code" in sftpError && sftpError.code === 2;
+  return new RemoteSshError("FILE_TRANSFER_FAILED", "The SSH file operation failed safely.", true, missing ? { sftpStatus: 2 } : undefined);
 }
 
 function safeProcessError(_error: unknown): RemoteSshError {

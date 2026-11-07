@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } fro
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, resolve } from "node:path";
 import type { ApprovedSkillSeed, NativeSkillSnapshot } from "@joko/core";
-import type { RemoteFileStat, RemoteFileTransportPort } from "@joko/remote-ssh";
+import { RemoteSshError, type RemoteFileStat, type RemoteFileTransportPort } from "@joko/remote-ssh";
 import { afterEach, describe, expect, it } from "vitest";
 import { RemoteNativeSkillOwner } from "./remote-native-skills.js";
 import type { RemoteSkillSourceAuthority } from "./remote-workspace-service.js";
@@ -162,7 +162,7 @@ class MemoryRemoteFiles implements RemoteFileTransportPort {
   constructor() { this.putDirectory("/srv"); this.putDirectory("/srv/profile"); }
   putDirectory(path: string): void { this.entries.set(path, { kind: "directory", content: Buffer.alloc(0), mode: 0o700, modifiedAt: 1 }); }
   putFile(path: string, content: Uint8Array, mode = 0o600): void { this.entries.set(path, { kind: "file", content: Buffer.from(content), mode, modifiedAt: 1 }); }
-  entry(path: string): Entry { const entry = this.entries.get(path); if (!entry) throw Object.assign(Error("Remote path is absent."), { code: "ENOENT" }); return entry; }
+  entry(path: string): Entry { const entry = this.entries.get(path); if (!entry) throw new RemoteSshError("FILE_TRANSFER_FAILED", "Remote path is absent.", true, { sftpStatus: 2 }); return entry; }
   bytes(path: string): Buffer { return Buffer.from(this.entry(path).content); }
   async realpath(path: string, signal?: AbortSignal): Promise<string> { signal?.throwIfAborted(); this.entry(path); return path; }
   async stat(path: string, signal?: AbortSignal): Promise<RemoteFileStat> { signal?.throwIfAborted(); const entry = this.entry(path);

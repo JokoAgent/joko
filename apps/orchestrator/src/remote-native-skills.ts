@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { JokoError, snapshotNativeSkills, type ApprovedSkillSeed, type NativeSkillPolicy, type NativeSkillSnapshot } from "@joko/core";
-import type { RemoteFileStat } from "@joko/remote-ssh";
+import { isRemoteFileMissing, type RemoteFileStat } from "@joko/remote-ssh";
 import type { RemoteSkillSourceAuthority } from "./remote-workspace-service.js";
 
 interface TreeEntry {
@@ -70,7 +70,7 @@ export class RemoteNativeSkillOwner {
       const parent = posix.dirname(record.remoteRoot);
       try { await directory(authority, parent, signal); }
       catch (error) {
-        if (!missing(error)) throw error;
+        if (!isRemoteFileMissing(error)) throw error;
         assertLive(); await authority.files.mkdir(parent, { mode: 0o700, signal });
         await directory(authority, parent, signal);
       }
@@ -138,7 +138,7 @@ export class RemoteNativeSkillOwner {
       await directory(record.authority, posix.dirname(record.remoteRoot));
       let present = true;
       try { await directory(record.authority, record.remoteRoot); }
-      catch (error) { if (!missing(error)) throw error; present = false; }
+      catch (error) { if (!isRemoteFileMissing(error)) throw error; present = false; }
       if (present) {
         const marker = await record.authority.files.read({ path: posix.join(record.remoteRoot, ".joko-owner"), maximumBytes: 64 });
         if (Buffer.from(marker).toString("utf8") !== record.id) throw unavailable();
@@ -244,7 +244,6 @@ function canonicalPath(path: string): boolean { return path.startsWith("/") && p
 function portableKey(key: string): boolean { return key.length > 0 && key.length <= 512 && key.split("/").length <= 32 && key.split("/").every(segment => segment !== "" && segment !== "." && segment !== ".." && !/[\\:\u0000-\u001f\u007f]/u.test(segment)); }
 function hash(content: Uint8Array): string { return createHash("sha256").update(content).digest("hex"); }
 function sameStat(a: RemoteFileStat, b: RemoteFileStat): boolean { return a.kind === b.kind && a.size === b.size && a.mode === b.mode && a.modifiedAt === b.modifiedAt; }
-function missing(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && (error.code === "ENOENT" || error.code === 2); }
 function unavailable(): JokoError { return new JokoError({ code: "remote_skill_mount_unavailable", phase: "prepare_input",
   message: "The approved remote Skill mount authority is unavailable.", recovery: "Refresh the approved project resources and reconnect the Target.",
   retryable: false, stateMayHaveChanged: false }); }

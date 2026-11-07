@@ -1,23 +1,32 @@
+import { EventEmitter } from "node:events";
 import { rmSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { PassThrough, Writable } from "node:stream";
 
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import {
   AgentAuthConnectorFailure,
-  RemoteSshError
+  RemoteSshError,
+  parseSshConfig,
+  sshHostKeyFingerprint,
+  type RemoteProcessHandle,
+  type RemoteProcessTransportPort,
+  type SshConfigFilePort
 } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { toProtoRevision } from "./proto-mapper.js";
-import type {
-  RemoteBackendRuntimeInstallEvent,
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
+import {
+  createRemoteCodexRuntimeSetupProvider,
   RemoteBackendRuntimeSetupManager,
-  RemoteBackendRuntimeSnapshot
+  type RemoteBackendRuntimeInstallEvent,
+  type RemoteBackendRuntimeSnapshot
 } from "./remote-backend-runtime-setup.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
 import {
@@ -408,6 +417,188 @@ describe("RemoteHostService", () => {
     expect(credentialViews.every((value) => [...value].every((byte) => byte === 0))).toBe(true);
   });
 
+  it("replaces a trusted key only with the original Owner's exact rejected handshake observation", async () => {
+    const oldKey = Uint8Array.of(1), newKey = Uint8Array.of(2), laterKey = Uint8Array.of(3);
+    const algorithm = "ssh-ed25519";
+    let presented = oldKey;
+    const authenticateSsh = vi.fn();
+    const capabilities = { commandExecution: false, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities, async connect(request) {
+      await request.verifyHostKey({ algorithm, key: presented });
+      authenticateSsh();
+      request.onAuthenticating();
+      return { close: async () => undefined };
+    } } });
+    const host = fixture.registry.create({ targetId: "target-a", id: "build-box", hostname: "build.example.test", user: "maker", source: "manual" });
+    const ready = await fixture.registry.connect(host.targetId, host.id, host.revision);
+    expect(ready.ok).toBe(true);
+    const { service, original, observer } = pairedOwners(fixture);
+    const input = { targetId: host.targetId, hostId: host.id };
+    presented = newKey;
+    const testRequest = create(contract.TestRemoteHostConnectionRequestSchema, {
+      ...input, expectedRevision: toProtoRevision(ready.host.revision)
+    });
+    const failed = create(contract.TestRemoteHostConnectionResponseSchema, await service.testRemoteHostConnection(testRequest, original));
+    const revision = failed.result?.host?.revision;
+    const observed = failed.result?.observedHostKey;
+    expect(observed).toMatchObject({ algorithm, sha256Fingerprint: sshHostKeyFingerprint(newKey) });
+    const confirm = (replacement?: contract.RemoteHostKeyIdentity, caller = original) => service.clearRemoteHostTrust(
+      create(contract.ClearRemoteHostTrustRequestSchema, { ...input, expectedRevision: revision, replacement }), caller);
+    await expect(confirm()).rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+    await expect(confirm(observed, observer)).rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+    await expect(confirm(create(contract.RemoteHostKeyIdentitySchema, { algorithm, sha256Fingerprint: sshHostKeyFingerprint(laterKey) })))
+      .rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+    expect(fixture.registry.get(host.targetId, host.id).trust).toEqual(ready.host.trust);
+    expect(authenticateSsh).toHaveBeenCalledOnce();
+
+    presented = laterKey;
+    const replaced = create(contract.ClearRemoteHostTrustResponseSchema, await confirm(observed));
+    expect(replaced.host?.trust?.sha256Fingerprint).toBe(sshHostKeyFingerprint(newKey));
+    const refused = await fixture.registry.connect(host.targetId, host.id, replaced.host!.revision!.value);
+    expect(refused.failure?.code).toBe("host_key_changed");
+    expect(refused.host.trust?.fingerprint).toBe(sshHostKeyFingerprint(newKey));
+    expect(authenticateSsh).toHaveBeenCalledOnce();
+    presented = newKey;
+    expect((await fixture.registry.connect(host.targetId, host.id, refused.host.revision)).ok).toBe(true);
+    expect(authenticateSsh).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["handshake", "verification"] as const)("prevents a revoked Owner from pinning the first SSH key during %s", async (stage) => {
+    let release!: () => void;
+    const delayedKey = new Promise<void>((resolve) => { release = resolve; });
+    let attempts = 0;
+    const connect = vi.fn<ResolvedAgentAuthConnectorPort["connect"]>(async (request) => {
+      const original = ++attempts === 1;
+      if (original && stage === "handshake") await delayedKey;
+      const verification = request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1, 3, 5, 7) });
+      if (original && stage === "verification") owners.manager.revokeDevice(owners.originalDeviceId);
+      await verification;
+      request.onAuthenticating();
+      return { close: async () => undefined };
+    });
+    const capabilities = { commandExecution: false, processStreaming: false, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities, connect }, resolve: () => EPHEMERAL_SECRET });
+    const owners = pairedOwners(fixture);
+    const host = fixture.registry.create({ targetId: "target-a", id: "first-key", hostname: "first.example.test",
+      user: "maker", source: "manual", credentialReferenceId: "agent:first-key" });
+    const { service, original, observer } = owners;
+    const fields = { targetId: host.targetId, hostId: host.id, expectedRevision: toProtoRevision(host.revision) };
+    const pending = stage === "handshake"
+      ? service.testRemoteHostConnection(create(contract.TestRemoteHostConnectionRequestSchema, fields), original)
+      : service.connectRemoteHost(create(contract.ConnectRemoteHostRequestSchema, fields), original);
+    const denied = expect(pending).rejects.toSatisfy(connectCode(Code.Unauthenticated));
+    if (stage === "handshake") {
+      await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
+      owners.manager.revokeDevice(owners.originalDeviceId);
+      release();
+    }
+    await denied;
+    expect(original.signal.aborted).toBe(false);
+    const after = fixture.registry.get(host.targetId, host.id);
+    expect(after.trust).toBeUndefined();
+    expect(after.status.state).not.toBe("ready");
+
+    const retried = await service.testRemoteHostConnection(create(contract.TestRemoteHostConnectionRequestSchema, {
+      ...fields, expectedRevision: toProtoRevision(after.revision)
+    }), observer);
+    expect(retried.result?.host).toMatchObject({ trust: { algorithm: "ssh-ed25519" },
+      status: { state: contract.RemoteHostStatus.READY } });
+  });
+
+  it("keeps an in-flight SSH config import from creating entries for a revoked Owner", async () => {
+    let release!: () => void;
+    const reading = new Promise<void>((resolve) => { release = resolve; });
+    const document = parseSshConfig("Host new-project\n  HostName new.example.test\n");
+    const importHosts = vi.fn<SshConfigFilePort["importHosts"]>(async (options) => {
+      await reading;
+      return document.concreteHosts(options);
+    });
+    const fixture = createFixture({ sshConfig: { importHosts, read: async () => document, upsert: vi.fn(), remove: vi.fn() } });
+    const owners = pairedOwners(fixture);
+    const refresh = (requestId: string, caller: HandlerContext) => owners.service.refreshRemoteHostCatalog(
+      create(contract.RefreshRemoteHostCatalogRequestSchema, { requestId, targetId: "target-a" }), caller);
+    const pending = refresh("original-refresh", owners.original);
+    const denied = expect(pending).rejects.toSatisfy(connectCode(Code.Unauthenticated));
+    await vi.waitFor(() => expect(importHosts).toHaveBeenCalledOnce());
+    owners.manager.revokeDevice(owners.originalDeviceId);
+    release();
+    await denied;
+    expect(owners.original.signal.aborted).toBe(false);
+    expect(fixture.registry.list("target-a")).toEqual([]);
+    await expect(refresh("new-refresh", owners.observer)).resolves.toMatchObject({ hosts: [{ hostId: "new-project" }] });
+  });
+
+  it.each(["probe", "launch"] as const)("keeps a revoked installer from dispatching its script during %s", async (stage) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const waiting = vi.fn();
+    const installBytes = vi.fn();
+    const kill = vi.fn(() => true);
+    const probeOutput = Buffer.from(["/srv/project", "/home/test/.joko/runtime/v1/codex-home",
+      "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex", "codex-cli 9.9.9", "not_installed", ""].join("\0"));
+    const open = vi.fn<RemoteProcessTransportPort["open"]>(async (request) => {
+      const probe = request.args[0] === "-c";
+      if (!probe && stage === "launch") { waiting(); await gate; }
+      const handle = Object.assign(new EventEmitter(), {
+        pid: 42, exitCode: null as number | null, signalCode: null,
+        stdout: new PassThrough(), stderr: new PassThrough(), kill
+      });
+      const stdin = new Writable({
+        write(chunk, _encoding, callback) { if (!probe) installBytes(chunk); callback(); },
+        final(callback) {
+          const finish = () => {
+            if (probe) handle.stdout.write(probeOutput);
+            handle.exitCode = 0;
+            handle.emit("exit", 0, null);
+          };
+          if (probe && stage === "probe") { waiting(); void gate.then(finish); }
+          else queueMicrotask(finish);
+          callback();
+        }
+      });
+      return Object.assign(handle, { stdin }) satisfies RemoteProcessHandle;
+    });
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: false, tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities, async connect(request) {
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(2, 4, 6, 8) });
+      request.onAuthenticating();
+      return { capabilities, processes: { open }, close: async () => undefined };
+    } }, resolve: () => EPHEMERAL_SECRET });
+    const host = fixture.registry.create({ targetId: "target-a", id: "runtime-box", hostname: "runtime.example.test",
+      user: "maker", source: "manual", credentialReferenceId: "agent:runtime" });
+    const connected = await fixture.registry.connect(host.targetId, host.id, host.revision);
+    expect(connected.ok).toBe(true);
+    const runtime = new RemoteBackendRuntimeSetupManager({ store: fixture.store, registry: fixture.registry,
+      providers: [createRemoteCodexRuntimeSetupProvider("pi")], now: fixture.now });
+    cleanups.push(() => runtime.close());
+    const owners = pairedOwners(fixture, runtime);
+    const request = create(contract.InstallRemoteBackendRuntimeRequestSchema, {
+      requestId: "original-install", targetId: host.targetId, hostId: host.id,
+      expectedTargetRevision: toProtoRevision(fixture.registry.targetRevision(host.targetId)),
+      expectedHostRevision: toProtoRevision(connected.host.revision), reinstall: false
+    });
+    const original = owners.service.installRemoteBackendRuntime(request, owners.original)[Symbol.asyncIterator]();
+    await expect(original.next()).resolves.toMatchObject({ done: false });
+    const observed = (async () => {
+      const events: contract.InstallRemoteBackendRuntimeResponse[] = [];
+      for await (const event of owners.service.installRemoteBackendRuntime(request, owners.observer)) {
+        events.push(create(contract.InstallRemoteBackendRuntimeResponseSchema, event));
+      }
+      return events;
+    })();
+    await vi.waitFor(() => expect(waiting).toHaveBeenCalledOnce());
+    const denied = expect(original.next()).rejects.toSatisfy(connectCode(Code.Unauthenticated));
+    owners.manager.revokeDevice(owners.originalDeviceId);
+    release();
+    await denied;
+    const events = await observed;
+    expect(events.at(-1)?.runtime).toMatchObject({ state: contract.RemoteBackendRuntimeState.FAILED,
+      failure: { code: contract.RemoteBackendRuntimeFailureCode.AUTHORITY_CHANGED } });
+    expect(open.mock.calls.map(([input]) => input.args[0])).toEqual(stage === "probe" ? ["-c"] : ["-c", "-s"]);
+    expect(installBytes).not.toHaveBeenCalled();
+    expect(kill).toHaveBeenCalledTimes(stage === "probe" ? 0 : 1);
+  });
+
   it("streams an initial snapshot and ordered target-local changes until authorization is revoked", async () => {
     const fixture = createFixture();
     let revoke = (): void => undefined;
@@ -581,7 +772,7 @@ describe("RemoteHostService", () => {
       expectedTargetRevision: targetRevision,
       expectedHostRevision: hostRecord.revision,
       reinstall: false
-    }, installSignal);
+    }, installSignal, expect.any(Function));
     expect(streamed.map((event) => [event.sequence, event.phase, event.runtime?.state])).toEqual([
       [1n, contract.RemoteBackendRuntimeInstallPhase.DOWNLOADING, contract.RemoteBackendRuntimeState.INSTALLING],
       [2n, contract.RemoteBackendRuntimeInstallPhase.COMPLETE, contract.RemoteBackendRuntimeState.READY]
@@ -600,7 +791,7 @@ describe("RemoteHostService", () => {
       hostId: "build-box",
       expectedTargetRevision: targetRevision,
       expectedHostRevision: hostRecord.revision
-    });
+    }, expect.any(Function));
     expect(uninstalled.runtime?.state).toBe(contract.RemoteBackendRuntimeState.NOT_INSTALLED);
     expect(safeJson({ probed, streamed, uninstalled })).not.toContain("backendId");
   });
@@ -691,6 +882,7 @@ interface Fixture {
 function createFixture(options: {
   readonly connector?: ResolvedAgentAuthConnectorPort;
   readonly resolve?: (credentialReferenceId: string) => string;
+  readonly sshConfig?: SshConfigFilePort;
 } = {}): Fixture {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-remote-host-rpc-"));
   let clock = 10_000;
@@ -725,7 +917,8 @@ function createFixture(options: {
     ownerId: "owner-a",
     now,
     ...(options.resolve === undefined ? {} : { credentials: { resolve: options.resolve } }),
-    ...(options.connector === undefined ? {} : { connector: options.connector })
+    ...(options.connector === undefined ? {} : { connector: options.connector }),
+    ...(options.sshConfig === undefined ? {} : { sshConfig: options.sshConfig, defaultSshUser: "maker" })
   });
   cleanups.push(async () => {
     await registry.close();
@@ -733,6 +926,22 @@ function createFixture(options: {
     rmSync(directory, { recursive: true, force: true });
   });
   return { store, registry, now };
+}
+
+function pairedOwners(fixture: Fixture, runtimeSetup?: RemoteBackendRuntimeSetupManager) {
+  const manager = new ConnectionManager(fixture.store);
+  const pair = (name: string) => {
+    const key = `remote-host-${name}-key`;
+    const connection = fixture.store.createConnection({ id: name, name, authKeyDigest: digestAuthKey(key) });
+    const caller = { ...context(), requestHeader: new Headers({ authorization: `Bearer ${key}` }) };
+    return { connection, caller };
+  };
+  const original = pair("original-owner"), observer = pair("current-owner");
+  const service = createRemoteHostConnectService(fixture.registry, (caller) => {
+    try { return { connectionId: manager.authenticate(caller.requestHeader.get("authorization") ?? undefined).id }; }
+    catch { throw new ConnectError("The original connection was revoked.", Code.Unauthenticated); }
+  }, (connectionId, listener) => manager.onRevoked(connectionId, listener), fixture.now, runtimeSetup);
+  return { manager, service, original: original.caller, observer: observer.caller, originalDeviceId: original.connection.deviceId };
 }
 
 function context(signal = new AbortController().signal): HandlerContext {

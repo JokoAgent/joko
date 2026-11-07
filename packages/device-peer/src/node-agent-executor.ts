@@ -775,6 +775,7 @@ export class NodeDevicePeerAgentExecutor {
         await this.#requireRemoteDesktop().sendInput({
           controllerDeviceId: command.controllerDeviceId,
           leaseId: command.action.value.leaseId,
+          controlGeneration: command.action.value.controlGeneration,
           sequence: command.action.value.sequence,
           events: command.action.value.events.map((event) => clone(RemoteDesktopInputEventSchema, event)),
           signal
@@ -1027,12 +1028,11 @@ export class NodeDevicePeerAgentExecutor {
           throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
         }
         this.#refreshRemoteDesktopClipboardTransfer(state);
-        return remoteDesktopClipboardContentResult({
-          data: state.data.slice(
-            request.action.value.offset,
-            request.action.value.offset + REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS
-          )
-        });
+        const { offset } = request.action.value;
+        let end = Math.min(state.length, offset + REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS);
+        // The response is a UTF-8 protobuf string, so stop before a split surrogate pair.
+        if ((state.data.codePointAt(end - 1) ?? 0) > 0xffff) end--;
+        return remoteDesktopClipboardContentResult({ data: state.data.slice(offset, end) });
       }
       case "write": {
         const state = this.#requireRemoteDesktopClipboardTransfer(
@@ -1041,11 +1041,16 @@ export class NodeDevicePeerAgentExecutor {
           request.action.value.transferId,
           "paste"
         );
-        if (request.action.value.offset !== state.data.length
-          || state.data.length + request.action.value.data.length > state.length) {
+        const { offset, data } = request.action.value;
+        const exactRetry = offset === state.lastWriteOffset && offset + data.length === state.data.length
+          && state.data.endsWith(data);
+        if (!exactRetry && (offset !== state.data.length || offset + data.length > state.length)) {
           throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
         }
-        state.data += request.action.value.data;
+        if (!exactRetry) {
+          state.lastWriteOffset = offset;
+          state.data += data;
+        }
         this.#refreshRemoteDesktopClipboardTransfer(state);
         return remoteDesktopClipboardContentResult({});
       }
@@ -1898,6 +1903,7 @@ interface RemoteDesktopClipboardTransferState {
   readonly direction: "copy" | "paste";
   readonly length: number;
   data: string;
+  lastWriteOffset?: number;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -2167,6 +2173,7 @@ function validateCommandInput(command: DevicePeerCommand): void {
     case "sendRemoteDesktopInput":
       remoteDesktopControllerId(command.controllerDeviceId);
       remoteDesktopLeaseId(command.action.value.leaseId);
+      remoteDesktopControlGeneration(command.action.value.controlGeneration);
       remoteDesktopSequence(command.action.value.sequence);
       remoteDesktopInput(command.action.value);
       return;

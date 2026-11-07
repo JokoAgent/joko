@@ -2860,11 +2860,15 @@ describe("Connect security and protocol audit", () => {
       getBackend: () => ({ descriptor: { id: "pi" } }), upsertTarget
     };
     let directoryCreated = false;
+    let revokeOnParentRead = false, revoked = false;
     const files = {
       realpath: vi.fn(async (path: string) => path),
       stat: vi.fn(async () => ({ kind: "directory" as const, size: 0, modifiedAt: 0, mode: 0o755 })),
-      list: vi.fn(async (path: string) => path === "/" ? [{ name: "srv", kind: "directory" as const }]
-        : path === "/srv" && directoryCreated ? [{ name: "new", kind: "directory" as const }] : []),
+      list: vi.fn(async (path: string) => {
+        if (path === "/srv" && revokeOnParentRead) revoked = true;
+        return path === "/" ? [{ name: "srv", kind: "directory" as const }]
+          : path === "/srv" && directoryCreated ? [{ name: "new", kind: "directory" as const }] : [];
+      }),
       mkdir: vi.fn(async () => { directoryCreated = true; })
     };
     const hostRecord = { targetId: sourceDescriptor.id, id: "build-box", revision: 9n,
@@ -2893,7 +2897,10 @@ describe("Connect security and protocol audit", () => {
     const services = createConnectServices(stubApplication({
       config: { publicOrigin: "https://orchestrator.example.test", dataDirectory: directory },
       store, remoteHosts, workspaces: { register, unregister }, sessionHost: { mutate, validateTarget },
-      connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }
+      connections: {
+        authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }),
+        fence: () => { if (revoked) throw new ConnectError("Original connection revoked", Code.Unauthenticated); }
+      }
     }));
     const submit = (createIfMissing: boolean, hostRevision = 9n, suffix = "") => invoke(services.operation.submitOperation, {
       operationId: `operation-remote-${createIfMissing}-${hostRevision}${suffix}`,
@@ -2912,6 +2919,11 @@ describe("Connect security and protocol audit", () => {
     await expect(submit(false)).rejects.toMatchObject({ code: Code.NotFound });
     expect(files.mkdir).not.toHaveBeenCalled();
     expect(upsertTarget).not.toHaveBeenCalled();
+    revokeOnParentRead = true;
+    await expect(submit(true, 9n, "-retired-controller")).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(files.mkdir).not.toHaveBeenCalled();
+    expect(upsertTarget).not.toHaveBeenCalled();
+    revokeOnParentRead = false; revoked = false;
     await expect(submit(true, 8n)).rejects.toMatchObject({ code: Code.Aborted });
     expect(files.mkdir).not.toHaveBeenCalled();
     await submit(true);

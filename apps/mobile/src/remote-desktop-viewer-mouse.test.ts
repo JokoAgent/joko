@@ -30,7 +30,7 @@ function viewer(nativeControls = false) {
   new Function(html.match(/<script>([\s\S]*?)<\/script>/u)![1]!)();
   const receive = (value: object) => scope.__jokoRemoteDesktop.receive(value);
   receive({ type: "init", epoch: "current-mouse", width: 800, height: 600, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
-  receive({ type: "control", enabled: true });
+  receive({ type: "control", enabled: true, controlGeneration: 1 });
   const config = (enabled: boolean, native = nativeControls) => receive({ type: "mouseButtons", epoch: "current-mouse", enabled, nativeControls: native, labels });
   config(true);
   const packets = () => posted.filter(message => message.type === "input");
@@ -73,7 +73,7 @@ describe("actual floating mouse controls viewer", () => {
   it("keeps touch movement while a floating button suppresses stage taps and the 400 ms hold", async () => {
     const value = viewer(); value.pointer(value.button("right"), "pointerdown");
     value.pointer(value.stage, "pointerdown", 12);
-    value.receive({ type: "control", enabled: true });
+    value.receive({ type: "control", enabled: true, controlGeneration: 1 });
     expect(value.button("right").getAttribute("aria-pressed")).toBe("true");
     await vi.advanceTimersByTimeAsync(450);
     value.pointer(value.stage, "pointerup", 12);
@@ -87,6 +87,25 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()).toHaveLength(2);
     value.pointer(value.button("right"), "pointerup");
     expect(value.packets()[2]).toMatchObject({ events: [{ kind: "button", button: 2, down: false, x: .6, y: .6 }] });
+  });
+
+  it("does not click after moving away and back to the same touch point", async () => {
+    const value = viewer();
+    value.config(false);
+    value.pointer(value.stage, "pointerdown");
+    value.pointer(value.stage, "pointermove", 7, 420, 300);
+    value.pointer(value.stage, "pointermove");
+    await vi.advanceTimersByTimeAsync(100);
+    value.pointer(value.stage, "pointerup");
+    expect(value.packets()).toEqual([]);
+
+    value.pointer(value.stage, "pointerdown", 8);
+    value.pointer(value.stage, "pointerup", 8);
+    expect(value.packets()).toHaveLength(1);
+    expect(value.packets()[0]).toMatchObject({ events: [
+      { kind: "button", button: 0, down: true, x: .5, y: .5 },
+      { kind: "button", button: 0, down: false, x: .5, y: .5 }
+    ] });
   });
 
   it("uses bounded displacement ticks and skips ACK time without accumulating a scroll backlog", async () => {
@@ -135,13 +154,12 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[3]).toMatchObject({ events: [{ kind: "button", button: 1, down: true }, { kind: "button", button: 1, down: false }] });
   });
 
-  it.each(["hide", "blur", "resize", "control"] as const)("clears held buttons and wheel on %s without bypassing input ACK", async reason => {
+  it.each(["hide", "blur", "resize"] as const)("clears held buttons and wheel on %s without bypassing input ACK", async reason => {
     const value = viewer(); value.pointer(value.button("left"), "pointerdown");
     value.pointer(value.button("wheel"), "pointerdown", 9, 0, 100); value.pointer(value.button("wheel"), "pointermove", 9, 0, 124);
     if (reason === "hide") value.config(false);
     else if (reason === "blur") window.dispatchEvent(new Event("blur"));
-    else if (reason === "resize") value.resized();
-    else value.receive({ type: "control", enabled: false });
+    else value.resized();
     expect(value.button("left").getAttribute("aria-pressed")).toBe("false");
     expect(value.grip.style.transform).toBe("translateY(0px)");
     if (reason === "blur" || reason === "resize") expect(value.posted.find(message => message.type === "mouseControlsRetired"))
@@ -151,6 +169,24 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[1]).toMatchObject({ events: reason === "hide"
       ? [{ kind: "button", button: 0, down: false }] : [{ kind: "release" }] });
     value.ack(); await vi.advanceTimersByTimeAsync(99); expect(value.packets()).toHaveLength(2);
+  });
+
+  it.each([true, false])("drops retired mouse input with an outstanding ACK of %s", async outstanding => {
+    const value = viewer();
+    value.pointer(value.button("left"), "pointerdown");
+    value.pointer(value.button("wheel"), "pointerdown", 9, 0, 100);
+    value.pointer(value.button("wheel"), "pointermove", 9, 0, 124);
+    if (!outstanding) value.ack();
+    value.receive({ type: "control", enabled: false });
+    expect(value.button("left").getAttribute("aria-pressed")).toBe("false");
+    expect(value.grip.style.transform).toBe("translateY(0px)");
+    value.receive({ type: "control", enabled: true, controlGeneration: 3 });
+    value.ack();
+    value.pointer(value.button("left"), "pointerup");
+    await vi.advanceTimersByTimeAsync(165);
+    expect(value.packets()).toHaveLength(1);
+    value.pointer(value.button("left"), "pointerdown", 8);
+    expect(value.packets()[1]).toMatchObject({ controlGeneration: 3, events: [{ kind: "button", button: 0, down: true }] });
   });
 
   it("uses the same native mouse math with original epochs and rejects retired or malformed commands", async () => {

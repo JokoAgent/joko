@@ -103,15 +103,17 @@ describe("clipboard sync", () => {
     expect(f.remote.paste).not.toHaveBeenCalled();
   });
 
-  it("preserves both simultaneous content changes and resumes only after another actual copy", async () => {
+  it("preserves both simultaneous changes and accepts an explicit re-copy of the same remote content", async () => {
     const f = fixture(); await f.sync.tick();
     f.setLocal(item("new local")); f.setRemote(item("new remote"));
     await expect(f.sync.tick()).rejects.toMatchObject({ reason: "conflict" });
     expect(f.local()).toBe(item("new local")); expect(f.remoteValue()).toBe(item("new remote"));
     expect(f.writeLocal).not.toHaveBeenCalled(); expect(f.remote.paste).not.toHaveBeenCalled();
-    await f.sync.tick(); expect(f.remote.paste).not.toHaveBeenCalled();
-    f.setLocal(item("next deliberate copy")); await f.sync.tick();
-    expect(f.remoteValue()).toBe(item("next deliberate copy"));
+    await f.sync.tick();
+    expect(f.writeLocal).not.toHaveBeenCalled(); expect(f.remote.paste).not.toHaveBeenCalled();
+    f.setRemote(item("new remote")); await f.sync.tick();
+    expect(f.writeLocal).toHaveBeenCalledExactlyOnceWith(item("new remote"), "2");
+    expect(f.local()).toBe(f.remoteValue());
   });
 
   it.each(["empty", "unsupported", "too-large"] as const)("skips one %s version while preserving the proven other baseline", async reason => {
@@ -123,6 +125,34 @@ describe("clipboard sync", () => {
     expect(f.remote.paste).not.toHaveBeenCalled();
     f.setLocal(item("next readable copy")); await f.sync.tick();
     expect(f.remoteValue()).toBe(item("next readable copy"));
+  });
+
+  it("copies the phone's new value over a confirmed empty remote clipboard in the same tick", async () => {
+    const f = fixture(); await f.sync.tick();
+    f.setLocal(item("new phone copy")); f.setRemote(item(""));
+    f.remote.copy.mockRejectedValueOnce(new ClipboardSyncError("empty"));
+
+    await f.sync.tick();
+
+    expect(f.remote.paste).toHaveBeenCalledExactlyOnceWith(item("new phone copy"), "2");
+    expect(f.remoteValue()).toBe(f.local());
+    expect(f.writeLocal).not.toHaveBeenCalled();
+    await f.sync.tick();
+    expect(f.remote.paste).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks the empty remote version again before overwriting it", async () => {
+    const f = fixture(); await f.sync.tick();
+    f.setLocal(item("new phone copy")); f.setRemote(item(""));
+    f.remote.copy.mockImplementationOnce(async () => {
+      f.setRemote(item("new host copy"));
+      throw new ClipboardSyncError("empty");
+    });
+
+    await expect(f.sync.tick()).rejects.toMatchObject({ reason: "changed" });
+    expect(f.remoteValue()).toBe(item("new host copy"));
+    expect(f.remote.paste).not.toHaveBeenCalled();
+    expect(f.writeLocal).not.toHaveBeenCalled();
   });
 
   it("does not cache a denied permission read as a successful baseline", async () => {
@@ -156,6 +186,7 @@ describe("clipboard sync", () => {
     });
     await expect(f.sync.tick()).rejects.toMatchObject({ reason: "unknown" });
     expect(f.remote.write.mock.calls.every(([, , data]) => data.length <= CLIPBOARD_SYNC_CHUNK_CHARS)).toBe(true);
+    expect(f.remote.write.mock.calls.map(([, , data]) => Buffer.from(data, "utf8").toString("utf8")).join("")).toBe(f.local());
     await f.sync.tick();
     expect(f.remote.commit).toHaveBeenCalledTimes(1);
     expect(f.remote.paste).toHaveBeenCalledTimes(1); expect(f.transfers.size).toBe(0);

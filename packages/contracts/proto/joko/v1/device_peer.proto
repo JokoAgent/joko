@@ -411,6 +411,7 @@ message DevicePeerSendRemoteDesktopInputAction {
   string lease_id = 1;
   uint64 sequence = 2;
   repeated RemoteDesktopInputEvent events = 3;
+  uint64 control_generation = 4;
 }
 
 message DevicePeerCreateRemoteDesktopOfferAction {

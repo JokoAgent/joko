@@ -3,6 +3,12 @@ import { ClipboardSyncError } from "./clipboard-sync-failure.js";
 export const CLIPBOARD_SYNC_CHUNK_CHARS = 64 * 1_024;
 export const CLIPBOARD_SYNC_MAX_CHARS = 32 * 1_024 * 1_024;
 
+export function clipboardChunkEnd(json: string, offset: number): number {
+  const end = Math.min(json.length, offset + CLIPBOARD_SYNC_CHUNK_CHARS);
+  // Each chunk becomes its own UTF-8 protobuf string. Keep a surrogate pair together.
+  return (json.codePointAt(end - 1) ?? 0) > 0xffff ? end - 1 : end;
+}
+
 export interface ClipboardSyncRemote {
   version(): Promise<string>;
   copy(version: string, inline: boolean): Promise<{ readonly length: number; readonly id?: string; readonly data?: string }>;
@@ -35,6 +41,11 @@ export interface ClipboardSyncDeps {
 function skippableContent(error: unknown): boolean {
   return error instanceof ClipboardSyncError &&
     (error.reason === "empty" || error.reason === "unsupported" || error.reason === "too-large");
+}
+
+function skipEmptyClipboard(error: unknown): null {
+  if (error instanceof ClipboardSyncError && error.reason === "empty") return null;
+  throw error;
 }
 
 /** Serial sync: opaque versions trigger reads; proven content changes trigger writes. */
@@ -119,9 +130,11 @@ export class ClipboardSync {
         id = await this.deps.remote.begin(json.length, remote);
         this.check();
         if (typeof id !== "string" || !id) throw new ClipboardSyncError("unsupported");
-        for (let offset = 0; offset < json.length; offset += CLIPBOARD_SYNC_CHUNK_CHARS) {
+        for (let offset = 0; offset < json.length;) {
           this.check();
-          await this.deps.remote.write(id, offset, json.slice(offset, offset + CLIPBOARD_SYNC_CHUNK_CHARS));
+          const end = clipboardChunkEnd(json, offset);
+          await this.deps.remote.write(id, offset, json.slice(offset, end));
+          offset = end;
         }
         if ((await this.deps.localVersion()) !== local) throw new ClipboardSyncError("changed");
         this.check();
@@ -165,22 +178,21 @@ export class ClipboardSync {
       }
       let localChanged = local !== this.baseline.local, remoteChanged = remote !== this.baseline.remote;
       if (!localChanged && !remoteChanged) return;
-      const localContent = localChanged ? await this.readLocal(local).then(content => {
-        readLocalDigest = content.digest; return content;
-      }) : undefined;
-      const remoteContent = remoteChanged ? await this.readRemote(remote).then(content => {
-        readRemoteDigest = content.digest; return content;
-      }) : undefined;
+      const localContent = localChanged ? await this.readLocal(local).catch(skipEmptyClipboard) : undefined;
+      readLocalDigest = localContent?.digest;
+      const remoteContent = remoteChanged ? await this.readRemote(remote).catch(skipEmptyClipboard) : undefined;
+      readRemoteDigest = remoteContent?.digest;
       this.check();
       if ((await this.deps.localVersion()) !== local) throw new ClipboardSyncError("changed");
+      if (remoteContent === null && (await this.remoteVersion()) !== remote) throw new ClipboardSyncError("changed");
       this.check();
-      if (localContent?.digest === this.baseline.localDigest) localChanged = false;
-      if (remoteContent?.digest === this.baseline.remoteDigest) remoteChanged = false;
-      const localDigest = localContent?.digest ?? this.baseline.localDigest;
-      const remoteDigest = remoteContent?.digest ?? this.baseline.remoteDigest;
+      if (localContent == null || localContent.digest === this.baseline.localDigest) localChanged = false;
+      if (remoteContent == null || remoteContent.digest === this.baseline.remoteDigest) remoteChanged = false;
+      const localDigest = localContent === undefined ? this.baseline.localDigest : localContent?.digest;
+      const remoteDigest = remoteContent === undefined ? this.baseline.remoteDigest : remoteContent?.digest;
       if (localDigest && localDigest === remoteDigest) { localChanged = false; remoteChanged = false; }
       if (localChanged && remoteChanged) {
-        Object.assign(this.baseline, { local, remote, localDigest, remoteDigest });
+        Object.assign(this.baseline, { local, remote, localDigest: undefined, remoteDigest: undefined });
         throw new ClipboardSyncError("conflict");
       }
       if (localChanged && localContent) {
@@ -196,7 +208,7 @@ export class ClipboardSync {
         this.deps.trace?.("remote-to-local-complete");
       } else {
         Object.assign(this.baseline, { local, remote, localDigest, remoteDigest });
-        this.deps.trace?.("unchanged-content");
+        this.deps.trace?.(localContent === null || remoteContent === null ? "content-skipped" : "unchanged-content");
       }
     } catch (error) {
       if (local !== undefined && remote !== undefined && skippableContent(error)) {
