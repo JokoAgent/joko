@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -96,31 +96,7 @@ packagedIt("converges conversation settings across real application windows and 
       createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId, displayName }))));
   }
   console.info("Packaged settings: fixture and both tasks ready.");
-  const challenge = await activeFixture.anonymous.connection.beginPairing({ deviceDisplayName: "Settings Desktop" });
-  if (challenge.challenge === undefined) throw new Error("Settings Desktop pairing returned no challenge.");
-  const executablePath = resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!);
-  profileDirectory = await mkdtemp(join(tmpdir(), "joko-settings-desktop-"));
-  desktop = await _electron.launch({
-    executablePath,
-    env: {
-      ...process.env,
-      JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
-      JOKO_DESKTOP_PACKAGED_SMOKE: "1",
-      JOKO_DESKTOP_SMOKE_SCOPE: "external",
-      ...startupEvidence.environment(profileDirectory),
-      JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
-    },
-    timeout: 60_000
-  });
-  console.info("Packaged settings: Desktop launch returned.");
-  const application = desktop;
-  const launcherPid = application.process().pid;
-  if (launcherPid === undefined) throw new Error("Settings Desktop returned no spawned process ID.");
-  desktopIdentity = await readLaunchedProcess(launcherPid, executablePath);
-  if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
-    throw new Error("Settings Desktop launched an unexpected executable.");
-  }
-  console.info("Packaged settings: owned process confirmed.");
+  const application = await launchSettingsDesktop();
   const main = await application.firstWindow({ timeout: 60_000 });
   const pageErrors: string[] = [];
   const observe = (page: Page): void => {
@@ -148,18 +124,7 @@ packagedIt("converges conversation settings across real application windows and 
     throw new Error("Settings Desktop did not use its isolated profile.");
   }
   console.info("Packaged settings: isolated profile confirmed.");
-  const pairingTabBounds = await main.locator(".connection-tabs > button").nth(2).boundingBox();
-  if (pairingTabBounds === null) throw new Error("Settings Desktop pairing tab has no visible bounds.");
-  await main.mouse.click(pairingTabBounds.x + pairingTabBounds.width / 2,
-    pairingTabBounds.y + pairingTabBounds.height / 2);
-  await main.locator('details.device-authorization__manual > summary').click();
-  await main.locator("form.pair-form").waitFor({ state: "visible", timeout: 30_000 });
-  await main.locator('form.pair-form input[type="url"]').fill(activeFixture.baseUrl);
-  await main.locator('form.pair-form input[autocomplete="one-time-code"]')
-    .fill(activeFixture.pairingCode(challenge.challenge.challengeId));
-  await main.locator('form.pair-form input[autocomplete="off"]').fill("Settings Desktop");
-  await main.locator("form.pair-form button[type=submit]").click();
-  await main.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
+  await pairSettingsDesktop(main, activeFixture);
   console.info("Packaged settings: authenticated application visible.");
   await main.evaluate(() => { location.hash = "/settings/general"; });
   await main.locator(".settings-page").waitFor({ state: "visible", timeout: 30_000 });
@@ -295,6 +260,135 @@ packagedIt("converges conversation settings across real application windows and 
   console.info("Packaged settings: reload and default restores verified.");
   await closeDesktop();
 });
+
+packagedIt("uses the original native CONNECT host after a real file draft blocks complete exit", { timeout: 150_000 }, async () => {
+  const profile = { ...PI_LIKE_PROFILE, capabilities: [
+    ...PI_LIKE_PROFILE.capabilities,
+    { key: capabilityNames.workspaceFiles, supported: true as const },
+    { key: capabilityNames.workspaceFilesWrite, supported: true as const }
+  ] };
+  const direct = await OrchestratorE2eFixture.start({ profiles: [profile] });
+  fixture = direct;
+  const proxy = await OrchestratorE2eFixture.start({ httpConnect: true });
+  try {
+    const locator = proxy.httpConnectTransport;
+    if (locator === undefined) throw new Error("The separate native CONNECT fixture did not start.");
+    const fileName = "quit-draft.txt";
+    const file = join(direct.workspaceDirectory, fileName);
+    await writeFile(file, "Original text");
+    const owner = await direct.pair("Draft fixture owner");
+    const sessionId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId,
+      createSessionMutation({ backendId: profile.id, targetId: direct.targetId(), displayName: "Draft fixture task" })));
+    const application = await launchSettingsDesktop();
+    const main = await application.firstWindow({ timeout: 60_000 });
+    main.setDefaultTimeout(30_000);
+    await pairSettingsDesktop(main, direct);
+    const windowId = await (await application.browserWindow(main)).evaluate(window => window.id);
+    const connect = () => main.evaluate(async address => {
+      type Request = (kind: "http-connect", input: { method: "connect" | "close"; streamId: string; args?: typeof address }) => Promise<{ success: boolean }>;
+      const { linkspan } = (window as unknown as { jokoDesktop: { linkspan: { request: Request } } }).jokoDesktop;
+      const streamId = crypto.randomUUID().replaceAll("-", "");
+      const result = await linkspan.request("http-connect", { method: "connect", streamId, args: address });
+      if (result.success) await linkspan.request("http-connect", { method: "close", streamId });
+      return result;
+    }, { proxyOrigin: locator.proxyOrigin, authority: locator.authority });
+    expect(await connect()).toMatchObject({ success: true });
+    const beforeQuit = proxy.httpConnectRequests;
+    expect(beforeQuit).toBe(1);
+
+    await main.evaluate(hash => { location.hash = hash; }, `#/files/${encodeURIComponent(sessionId)}?file=${fileName}`);
+    const pane = main.locator(".workspace-file-editor-pane");
+    const editor = pane.locator(".cm-content");
+    await editor.click();
+    await editor.press("Control+a");
+    await editor.pressSequentially("Draft survived quit");
+    await pane.locator(".is-dirty").waitFor({ state: "visible" });
+
+    const vetoed = await application.evaluate(({ app, BrowserWindow, dialog }, id) => {
+      const contents = BrowserWindow.fromId(id)?.webContents;
+      if (contents === undefined) return false;
+      return new Promise<boolean>(resolve => {
+        let veto = false;
+        const observeVeto = () => { veto = true; };
+        const showMessageBox = dialog.showMessageBox;
+        const finish = (result: boolean) => {
+          clearTimeout(timeout);
+          contents.removeListener("will-prevent-unload", observeVeto);
+          dialog.showMessageBox = showMessageBox;
+          resolve(result);
+        };
+        // Keep the real renderer veto and recovery. Dismiss only the final
+        // informational dialog so the same window can save its draft.
+        dialog.showMessageBox = (...args: unknown[]) => {
+          if (veto && (args.at(-1) as { title?: string } | undefined)?.title === "Joko could not quit") {
+            finish(true);
+            return Promise.resolve({ response: 0, checkboxChecked: false });
+          }
+          return Reflect.apply(showMessageBox, dialog, args);
+        };
+        const timeout = setTimeout(() => finish(false), 20_000);
+        contents.once("will-prevent-unload", observeVeto);
+        try { app.quit(); } catch { finish(false); }
+      });
+    }, windowId);
+    expect(vetoed).toBe(true);
+    expect(await readFile(file, "utf8")).toBe("Original text");
+    expect(await pane.getAttribute("data-dirty")).toBe("true");
+    await editor.press("Control+s");
+    await waitFor(() => readFile(file, "utf8"), text => text === "Draft survived quit", "the vetoed window's file save");
+    await main.locator(".workspace-file-editor-pane[data-dirty=false]").waitFor({ state: "visible" });
+    expect(await connect()).toMatchObject({ success: true });
+    expect(proxy.httpConnectRequests).toBe(beforeQuit + 1);
+    expect(await (await application.browserWindow(main)).evaluate(window => window.id)).toBe(windowId);
+    await closeDesktop();
+  } finally {
+    await proxy.close();
+  }
+});
+
+async function launchSettingsDesktop(): Promise<ElectronApplication> {
+  const executablePath = resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!);
+  profileDirectory = await mkdtemp(join(tmpdir(), "joko-settings-desktop-"));
+  desktop = await _electron.launch({
+    executablePath,
+    env: {
+      ...process.env,
+      JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
+      JOKO_DESKTOP_PACKAGED_SMOKE: "1",
+      JOKO_DESKTOP_SMOKE_SCOPE: "external",
+      ...startupEvidence.environment(profileDirectory),
+      JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
+    },
+    timeout: 60_000
+  });
+  console.info("Packaged settings: Desktop launch returned.");
+  const launcherPid = desktop.process().pid;
+  if (launcherPid === undefined) throw new Error("Settings Desktop returned no spawned process ID.");
+  desktopIdentity = await readLaunchedProcess(launcherPid, executablePath);
+  if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
+    throw new Error("Settings Desktop launched an unexpected executable.");
+  }
+  console.info("Packaged settings: owned process confirmed.");
+  return desktop;
+}
+
+async function pairSettingsDesktop(main: Page, activeFixture: OrchestratorE2eFixture): Promise<void> {
+  const challenge = await activeFixture.anonymous.connection.beginPairing({ deviceDisplayName: "Settings Desktop" });
+  if (challenge.challenge === undefined) throw new Error("Settings Desktop pairing returned no challenge.");
+  await main.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
+  const pairingTabBounds = await main.locator(".connection-tabs > button").nth(2).boundingBox();
+  if (pairingTabBounds === null) throw new Error("Settings Desktop pairing tab has no visible bounds.");
+  await main.mouse.click(pairingTabBounds.x + pairingTabBounds.width / 2,
+    pairingTabBounds.y + pairingTabBounds.height / 2);
+  await main.locator('details.device-authorization__manual > summary').click();
+  await main.locator("form.pair-form").waitFor({ state: "visible", timeout: 30_000 });
+  await main.locator('form.pair-form input[type="url"]').fill(activeFixture.baseUrl);
+  await main.locator('form.pair-form input[autocomplete="one-time-code"]')
+    .fill(activeFixture.pairingCode(challenge.challenge.challengeId));
+  await main.locator('form.pair-form input[autocomplete="off"]').fill("Settings Desktop");
+  await main.locator("form.pair-form button[type=submit]").click();
+  await main.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
+}
 
 async function settings(page: Page, section: "general" | "personalization"): Promise<void> {
   await page.evaluate((next) => { location.hash = "/settings/" + next; }, section);
