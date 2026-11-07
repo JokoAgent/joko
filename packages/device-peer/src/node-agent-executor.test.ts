@@ -1209,14 +1209,22 @@ describe("Node Device peer Remote Desktop host ownership", () => {
       throw new Error("Expected a rich clipboard paste transfer.");
     }
     const pasteId = beginPayload.value.transferId;
-    await execute(executor, remoteDesktopClipboardContentCommand({
+    const write = remoteDesktopClipboardContentCommand({
       case: "write",
       value: create(RemoteDesktopClipboardContentWriteActionSchema, {
         transferId: pasteId,
         offset: 0,
         data: json
       })
+    });
+    expect((await execute(executor, write)).at(-1)?.payload.case).toBe("remoteDesktopClipboardContent");
+    expect((await execute(executor, write)).at(-1)?.payload.case).toBe("remoteDesktopClipboardContent");
+    const changedWrite = await execute(executor, remoteDesktopClipboardContentCommand({
+      case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+        transferId: pasteId, offset: 0, data: json.replace("portable", "modified")
+      })
     }));
+    expect(changedWrite.at(-1)?.payload).toMatchObject({ case: "failure", value: { code: DevicePeerFailureCode.INVALID_REQUEST } });
     await execute(executor, remoteDesktopClipboardContentCommand({
       case: "commit",
       value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId: pasteId })

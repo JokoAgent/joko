@@ -1041,11 +1041,16 @@ export class NodeDevicePeerAgentExecutor {
           request.action.value.transferId,
           "paste"
         );
-        if (request.action.value.offset !== state.data.length
-          || state.data.length + request.action.value.data.length > state.length) {
+        const { offset, data } = request.action.value;
+        const exactRetry = offset === state.lastWriteOffset && offset + data.length === state.data.length
+          && state.data.endsWith(data);
+        if (!exactRetry && (offset !== state.data.length || offset + data.length > state.length)) {
           throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
         }
-        state.data += request.action.value.data;
+        if (!exactRetry) {
+          state.lastWriteOffset = offset;
+          state.data += data;
+        }
         this.#refreshRemoteDesktopClipboardTransfer(state);
         return remoteDesktopClipboardContentResult({});
       }
@@ -1900,6 +1905,7 @@ interface RemoteDesktopClipboardTransferState {
   readonly direction: "copy" | "paste";
   readonly length: number;
   data: string;
+  lastWriteOffset?: number;
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
 }
