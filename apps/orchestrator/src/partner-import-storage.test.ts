@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -31,18 +31,24 @@ describe("Partner import persistence", () => {
     data.env.REPORT_TOKEN = original; data.documents.memory = " Complete original\n" + original; data.memoryFiles.original = Buffer.from([0, 255, 17]).toString("base64");
     data.documents.full = "Full native document.\n".repeat(25_000);
     try {
-      const storage = new PartnerImportStorage(store, await CredentialVault.open(keyPath)); await storage.environment.write("partner_1", data, assertOwner);
+      const storage = new PartnerImportStorage(store, await CredentialVault.open(keyPath), root); await storage.environment.write("partner_1", data, assertOwner);
+      const abandoned = await storage.createExecutionDirectory("partner_1", assertOwner);
+      const abandonedFile = join(abandoned.directory, "script.py");
+      await writeFile(abandonedFile, original, { mode: 0o600 });
       expect(await storage.environment.read("partner_1", assertOwner)).toEqual(data);
       storage.saveReceipt(receipt()); expect(JSON.stringify(storage.readReceipt(receipt().result.requestId))).not.toContain(original);
       for (const file of [database, database + "-wal"]) expect((await readFile(file)).includes(Buffer.from(original))).toBe(false);
       const events = store.listEvents(); expect(JSON.stringify(events, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain(original);
       store.close(); store = new OperationalStore(database);
-      const restarted = new PartnerImportStorage(store, await CredentialVault.open(keyPath));
+      const restarted = new PartnerImportStorage(store, await CredentialVault.open(keyPath), root);
       expect(await restarted.environment.read("partner_1", assertOwner)).toEqual(data);
       expect(restarted.readReceipt(receipt().result.requestId)).toEqual(receipt());
       expect(restarted.listReceipts()).toEqual([receipt()]);
+      expect(await readFile(abandonedFile, "utf8")).toBe(original);
+      await restarted.removeExecutionDirectories("partner_1", assertOwner);
+      await expect(readFile(abandonedFile)).rejects.toMatchObject({ code: "ENOENT" });
       await restarted.environment.remove("partner_1", assertOwner);
-      const reopened = new PartnerImportStorage(store, await CredentialVault.open(keyPath)); expect(await reopened.environment.read("partner_1", assertOwner)).toBeUndefined();
+      const reopened = new PartnerImportStorage(store, await CredentialVault.open(keyPath), root); expect(await reopened.environment.read("partner_1", assertOwner)).toBeUndefined();
       expect(reopened.readReceipt(receipt().result.requestId)?.result.saved).toBe(true);
     } finally { store.close(); }
   });
@@ -50,7 +56,7 @@ describe("Partner import persistence", () => {
     const root = await mkdtemp(join(temporaryBase, "joko-import-storage-")); roots.push(root);
     const store = new OperationalStore(join(root, "operational.sqlite"));
     try {
-      const storage = new PartnerImportStorage(store, await CredentialVault.open(join(root, "vault.key")));
+      const storage = new PartnerImportStorage(store, await CredentialVault.open(join(root, "vault.key")), root);
       const current = receipt(); const older: Record<string, unknown> = { ...current }; delete older.deferSetup;
       store.setSetting("service", "orchestrator", "partner-import.receipt." + fingerprint(current.result.requestId), older);
       expect(() => storage.readReceipt(current.result.requestId)).toThrow("IMPORT_RECEIPT_INVALID");

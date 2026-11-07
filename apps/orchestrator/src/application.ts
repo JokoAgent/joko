@@ -1217,7 +1217,7 @@ export async function createOrchestratorApplication(
     }
   });
   const unregisterLspBridge = mcpRouter.registerBridgeToolProvider(lspBridge);
-  const partnerImportStorage = new PartnerImportStorage(store, credentialVault);
+  const partnerImportStorage = new PartnerImportStorage(store, credentialVault, config.dataDirectory);
   const partnerMemoryPreferences = new PartnerMemoryPreferences(store, credentialVault, async (partnerId, assertCurrent) => {
     const environment = await partnerImportStorage.environment.read(partnerId, assertCurrent); assertCurrent();
     return environment?.profileProjection.user ?? "";

@@ -184,7 +184,8 @@ export class PartnerImportRuntime implements BridgeToolProvider, PartnerImported
     return updated.revision;
   };
   prepare: PartnerImportedRoutineRuntime["prepare"] = (routine, runId, signal, owner) => prepareImportedAutomation(routine, runId, signal, owner,
-    { environment: this.options.storage.environment, appendMessage: this.#append });
+    { environment: this.options.storage.environment, appendMessage: this.#append,
+      createExecutionDirectory: (partnerId, assertOwner) => this.options.storage.createExecutionDirectory(partnerId, assertOwner) });
   finish: PartnerImportedRoutineRuntime["finish"] = (routine, sessionId, runId, content, direct, signal, owner) => finishImportedAutomation(routine, sessionId, runId, content, direct, signal, owner,
     { environment: this.options.storage.environment, appendMessage: this.#append });
   readonly #append = async (sessionId: string, requestId: string, content: string, assertOwner: () => void) => {

@@ -10,7 +10,7 @@ import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema,
   DeletePartnerMemoryRequestSchema, DeletePartnerSkillRequestSchema, UpdatePartnerMemoryRequestSchema, UpdatePartnerSkillRequestSchema,
   PermissionRisk, PolicyEffect, PolicySettingsSchema, PolicySubjectKind } from "@joko/contracts";
-import { readImportTree, createImportBudget } from "@joko/agent-import";
+import { readImportTree, createImportBudget, prepareImportedAutomation } from "@joko/agent-import";
 import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -52,7 +52,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     partnerSessionRetiring: id => profiles.isPartnerSessionRetiring(id) || profiles.isPartnerTargetRetiring(store.getSession(id).descriptor.targetId),
     partnerTargetRetired: id => profiles.isPartnerTargetRetired(id),
     partnerSessionPaused: id => profiles.isPartnerSessionPaused(id), partnerSessionRestarting: id => profiles.isPartnerSessionRestarting(id) }); await host.initialize();
-  const vault = await CredentialVault.open(join(root, "credentials", "master.key")); const storage = new PartnerImportStorage(store, vault);
+  const vault = await CredentialVault.open(join(root, "credentials", "master.key")); const storage = new PartnerImportStorage(store, vault, root);
   const resources = new PiResourceManager({ store, managedRoot: join(root, "resources"), maximumFiles: options.resourceFiles ?? 2 }); await resources.initialize();
   const memory = new MakerMemoryController({ store }); const scheduler = new ScheduleCoordinator(store, host);
   let imports: PartnerImportManager; let routines: PartnerRoutineManager;
@@ -378,7 +378,7 @@ describe("native import service and owning effects", () => {
     expect(f.routines.list(profile.id)).toHaveLength(1); expect(f.routines.list(profile.id)[0]!.enabled).toBe(false);
     const receipt = f.storage.readReceipt(result.requestId)!;
     expect(receipt.nativePackage?.packageId).toBe(entry.packageId); expect(receipt.checkpointCleared).toBe(true);
-    const restored = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
+    const restored = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")), f.root);
     expect(restored.readReceipt(result.requestId)?.nativePackage?.packageHash).toBe(entry.packageHash);
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.partnerId).toBe(profile.id);
     canonical = "new-main-canonical-session";
@@ -457,7 +457,7 @@ describe("native import service and owning effects", () => {
     expect((await restoredResources.runtimeTextSnapshot(profile.capabilities.modelChain[0]!.backendId, profile.homeTargetId, signal))[0]!.content).toBe(text[0]!.content);
     const routine = f.routines.list(profile.id)[0]!; expect(routine.enabled).toBe(false); expect(environment?.automations[routine.id]?.handover).toBe("ready");
     advance("receipt-recovery");
-    const receipts = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
+    const receipts = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")), f.root);
     expect(receipts.readReceipt(selection.requestId)?.result).toEqual(saved);
     expect((await receipts.environment.read(profile.id, () => {}))?.skillFiles).toEqual(environment?.skillFiles);
     advance("persistence");
@@ -488,9 +488,37 @@ describe("native import service and owning effects", () => {
     expect(saved.saved).toBe(true); expect(saved.status).toBe("complete");
     phase = "private-environment";
     const partner = f.partners.getPartner(saved.partnerId); expect(await f.storage.environment.read(partner.id, () => {})).toBeDefined();
+    const assertOwner = () => { if (f.partners.getPartner(partner.id).lifecycle !== "active") throw new Error("The test Partner retired."); };
+    const sourceScript = join(f.native, "scripts", "review.py");
+    await mkdir(dirname(sourceScript), { recursive: true });
+    const bytes = Buffer.from("print('original source')\n");
+    await writeFile(sourceScript, bytes);
+    await f.storage.environment.update(partner.id, assertOwner, environment => {
+      environment.files["scripts/review.py"] = bytes.toString("base64");
+      environment.automations["prepared-routine"] = { kind: "hermes", original: {}, sourceRoot: f.native, sourceWorkspace: f.native,
+        sourceId: "original-script", handover: "ready", issues: [], deliveries: [], completed: 0 };
+    });
+    let abandoned = "";
+    await prepareImportedAutomation({ id: "prepared-routine", partnerId: partner.id, prompt: "Review the workspace" }, "abandoned-run", signal, assertOwner, {
+      environment: f.storage.environment, appendMessage: async () => { throw new Error("No delivery was requested."); },
+      createExecutionDirectory: async (partnerId, owner) => {
+        const allocated = await f.storage.createExecutionDirectory(partnerId, owner);
+        abandoned = allocated.directory;
+        return { directory: allocated.directory, cleanup: async () => undefined };
+      }
+    });
+    const abandonedScript = join(abandoned, "scripts", "review.py");
+    expect(await readFile(abandonedScript)).toEqual(bytes);
+    const otherOwner = await f.storage.createExecutionDirectory("unrelated-partner", () => undefined);
+    const unrelated = join(otherOwner.directory, "keep.txt");
+    await writeFile(unrelated, "Other owner");
     phase = "delete";
     const deletion = await f.partners.deletePartner({ requestId: "owner_import_delete_0002", partnerId: partner.id, expectedRevision: partner.revision, confirmName: partner.displayName });
     expect(deletion.phase).toBe("completed");
+    await expect(readFile(abandonedScript)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(sourceScript)).toEqual(bytes);
+    expect(await readFile(unrelated, "utf8")).toBe("Other owner");
+    await otherOwner.cleanup();
     expect(f.storage.readReceipt(selection.requestId)?.cancelled).toBe(true);
     phase = "retired-storage";
     await expect(f.storage.environment.read(partner.id, () => {})).rejects.toMatchObject({ code: "IMPORT_OWNER_RETIRED" });
