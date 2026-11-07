@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { create } from "@bufbuild/protobuf";
-import { ExtensionLibrarySessionSchema } from "@joko/contracts";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { ExtensionLibraryCallResultSchema, ExtensionLibrarySessionSchema, ExtensionLibraryStreamResultSchema } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   MobileExtensionLibraryBridge, decodeMobileLibraryMessage, encodeMobileLibraryMessage,
@@ -8,7 +8,7 @@ import {
 } from "./mobile-extension-library-bridge";
 import {
   EXTENSION_LIBRARY_BRIDGE_REQUEST, assertMobileExtensionLibraryCallResult, extensionLibraryBridgeCapabilities,
-  mapMobileExtensionLibraryCall, parseMobileExtensionLibraryRequest, projectMobileExtensionLibrarySession,
+  mapMobileExtensionLibraryCall, parseMobileExtensionLibraryRequest, projectMobileExtensionLibraryCallResult, projectMobileExtensionLibrarySession,
   type MobileExtensionLibraryCall, type MobileExtensionLibraryCallResult, type MobileExtensionLibrarySession
 } from "./mobile-extension-library-runtime";
 import type { MobileExtension, MobileExtensionMainViewSurface, MobileExtensionTransport } from "./mobile-extensions";
@@ -151,6 +151,30 @@ describe("Mobile Library wire and authority", () => {
     expect(active.transport.callLibrary).toHaveBeenCalledTimes(1);
     active.bridge.dispose();
     expect(active.transport.closeLibrary).toHaveBeenCalledWith(session);
+  });
+
+  it("keeps the Library bridge open after an already-cleared stream is cancelled again", async () => {
+    const active = harness();
+    let first = true;
+    vi.mocked(active.transport.callLibrary!).mockImplementation(async (_extension, _surface, _session, call) => {
+      const response = create(ExtensionLibraryCallResultSchema, { result: { case: "stream",
+        value: create(ExtensionLibraryStreamResultSchema, { streamId, receivedBytes: 0n, nextSequence: 0, aborted: first })
+      } });
+      first = false;
+      const result = projectMobileExtensionLibraryCallResult(fromBinary(ExtensionLibraryCallResultSchema, toBinary(ExtensionLibraryCallResultSchema, response)));
+      assertMobileExtensionLibraryCallResult(result, call);
+      return result;
+    });
+    active.send("cancel-first", { kind: "writeAbort", streamId });
+    active.send("cancel-again", { kind: "writeAbort", streamId });
+    active.send("status-after-cancel", { kind: "status" });
+    await vi.waitFor(() => expect(active.replies).toHaveLength(3));
+    expect(active.replies.map(({ response }) => response)).toMatchObject([
+      { id: "cancel-first", ok: true, result: { kind: "stream", streamId, aborted: true } },
+      { id: "cancel-again", ok: true, result: { kind: "stream", streamId, aborted: false } },
+      { id: "status-after-cancel", ok: true, result: { state: "ready" } }
+    ]);
+    expect(active.transport.closeLibrary).not.toHaveBeenCalled();
   });
 
   it("closes late opens and drops old-document responses after owner or document retirement", async () => {
