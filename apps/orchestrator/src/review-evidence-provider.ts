@@ -466,10 +466,11 @@ function changeSetEvidenceItem(change: WorkspaceChange): ReviewSourceDiffEvidenc
 
 async function hashSelectedFiles(root: string, paths: readonly string[], readGitlink: (path: string) => Promise<string | undefined>): Promise<ReviewSourceFileSnapshot[]> {
   const result: ReviewSourceFileSnapshot[] = [];
+  const fileIdentities = new Set<string>();
   let totalBytes = 0;
   for (const path of paths) {
     if (isSensitiveReviewPath(path)) continue;
-    const snapshot = await stableFileSnapshot(root, path, readGitlink);
+    const snapshot = await stableFileSnapshot(root, path, readGitlink, fileIdentities);
     totalBytes += snapshot.byteLength;
     if (totalBytes > MAX_SELECTED_TOTAL_BYTES) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review selected files exceed the aggregate byte limit.");
@@ -479,7 +480,12 @@ async function hashSelectedFiles(root: string, paths: readonly string[], readGit
   return result;
 }
 
-async function stableFileSnapshot(root: string, path: string, readGitlink: (path: string) => Promise<string | undefined>): Promise<ReviewSourceFileSnapshot> {
+async function stableFileSnapshot(
+  root: string,
+  path: string,
+  readGitlink: (path: string) => Promise<string | undefined>,
+  fileIdentities: Set<string>
+): Promise<ReviewSourceFileSnapshot> {
   const canonical = canonicalReviewPath(path);
   const absolute = resolve(root, ...canonical.split("/"));
   let before: Awaited<ReturnType<typeof lstat>>;
@@ -510,6 +516,8 @@ async function stableFileSnapshot(root: string, path: string, readGitlink: (path
   try {
     const opened = await handle.stat();
     if (!sameIdentity(before, opened)) throw new ReviewEvidenceCaptureError("source-changed", "A selected Review file changed while opening.");
+    const identity = opened.ino === 0 ? actual : `${opened.dev}:${opened.ino}`;
+    if (fileIdentities.has(identity)) throw new ReviewEvidenceCaptureError("artifact-unavailable", "Selected Review paths refer to the same workspace file.");
     const hash = createHash("sha256");
     for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk as Buffer);
     const afterHandle = await handle.stat();
@@ -518,6 +526,7 @@ async function stableFileSnapshot(root: string, path: string, readGitlink: (path
     if (!sameIdentity(opened, afterHandle) || !sameIdentity(opened, afterPath) || afterActual !== actual) {
       throw new ReviewEvidenceCaptureError("source-changed", "A selected Review file changed while hashing.");
     }
+    fileIdentities.add(identity);
     return { relativePath: canonical, sha256: hash.digest("hex"), byteLength: opened.size };
   } finally {
     await handle.close().catch(() => undefined);

@@ -10,7 +10,8 @@ export const MAX_REVIEW_PROMPT_CHARACTERS = 240_000;
 
 const TRUNCATION_MARKER = "\n… (evidence truncated at the length limit)";
 const ARTIFACT_ALIAS_PREFIX = "[review-artifact]";
-const REVIEW_ALIAS_SEGMENT = /^[\p{L}\p{N} ._+@()\[\]{}'!,=-]+$/u;
+const ARTIFACT_ALIAS_SEGMENT = /^[\p{L}\p{N} ._+@()\[\]{}'!,=-]+$/u;
+const WORKSPACE_PATH_SEGMENT = /^[\p{L}\p{N} ._+@()\[\]{}'!,=#-]+$/u;
 const WINDOWS_ABSOLUTE_PATH = /\b[A-Za-z]:\\(?:[^\s<>:"|?*\r\n]+\\)*[^\s<>:"|?*\r\n]*/gu;
 const POSIX_SERVICE_PATH = /\/(?:Users|home|var|tmp|opt|srv|private|Volumes)\/(?:[^\s<>"'`\r\n]+\/?)+/gu;
 const SECRET_ASSIGNMENT = /(^|\n)([\t ]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|password|passwd|secret|cookie|credential)\s*[:=]\s*)([^\r\n]+)/giu;
@@ -199,7 +200,9 @@ export function resolveReviewTargetKind(input: Pick<BuildReviewPromptInput, "wor
 }
 
 export function isReviewEvidenceAlias(value: string): boolean {
-  return isCanonicalWorkspaceRelativePath(value) || isScopedReviewAlias(value, ARTIFACT_ALIAS_PREFIX);
+  return value.startsWith(`${ARTIFACT_ALIAS_PREFIX}/`)
+    ? isScopedReviewAlias(value, ARTIFACT_ALIAS_PREFIX)
+    : isCanonicalWorkspaceRelativePath(value);
 }
 
 function validateInput(input: BuildReviewPromptInput): void {
@@ -393,17 +396,17 @@ function allCapped(input: BuildReviewPromptInput): readonly ReviewCappedEvidence
 function isScopedReviewAlias(value: string, prefix: string): boolean {
   if (!value.startsWith(`${prefix}/`)) return false;
   const segments = value.slice(prefix.length + 1).split("/");
-  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && REVIEW_ALIAS_SEGMENT.test(segment));
+  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && ARTIFACT_ALIAS_SEGMENT.test(segment));
 }
 
 function requireWorkspaceAlias(value: string, label: string): void {
   if (!isCanonicalWorkspaceRelativePath(value)) throw new TypeError(`${label} must use a canonical workspace-relative path.`);
 }
 
-function isCanonicalWorkspaceRelativePath(value: string): boolean {
+export function isCanonicalWorkspaceRelativePath(value: string): boolean {
   if (value.length === 0 || value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:/u.test(value) || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)) return false;
   const segments = value.split("/");
-  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && REVIEW_ALIAS_SEGMENT.test(segment));
+  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && WORKSPACE_PATH_SEGMENT.test(segment));
 }
 
 function requireArtifactAlias(value: string, label: string): void {
