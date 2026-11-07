@@ -181,10 +181,10 @@ export function parseExtensionSurfaceManifest(
 
 export function parseExtensionRuntime(value: unknown): ExtensionRuntimeDescriptor {
   const raw = requirePlainObject(value, "Extension runtime");
-  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "tasks", "targets", "text", "showTaskPreferences", "deviceSync", "pick"], ["html", "tools"], "Extension runtime");
+  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "tasks", "targets", "text", "showTaskPreferences", "deviceSync", "pick", "image"], ["html", "tools"], "Extension runtime");
   const html = requirePortablePath(raw.html, "Extension runtime HTML");
   if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Extension runtime HTML must be in a self-contained directory.");
-  if (!Array.isArray(raw.tools) || raw.tools.length > 64 || raw.tools.length === 0 && raw.tasks === undefined && raw.text === undefined && raw.deviceSync === undefined && raw.pick === undefined) throw new Error("Extension runtime must declare tools or an autonomous task/text capability.");
+  if (!Array.isArray(raw.tools) || raw.tools.length > 64 || raw.tools.length === 0 && raw.tasks === undefined && raw.text === undefined && raw.deviceSync === undefined && raw.pick === undefined && raw.image === undefined) throw new Error("Extension runtime must declare a tool or a supported capability.");
   const tools = raw.tools.map(item => {
     const tool = requirePlainObject(item, "Extension tool");
     requireExactKeys(tool, ["name", "description", "inputSchema", "readOnly"], ["name", "description", "inputSchema"], "Extension tool");
@@ -207,6 +207,9 @@ export function parseExtensionRuntime(value: unknown): ExtensionRuntimeDescripto
   if (raw.agent !== undefined && raw.agent !== true) throw new Error("Extension task continuation capability must be true when present.");
   if (raw.deviceSync !== undefined && raw.deviceSync !== true) throw new Error("Extension device sync capability must be true when present.");
   if (raw.pick !== undefined && raw.pick !== true) throw new Error("Extension directory selection capability must be true when present.");
+  if (raw.image !== undefined && (!Array.isArray(raw.image) || raw.image.length !== 1 || raw.image[0] !== "generate")) {
+    throw new Error("Extension image model access requires the generate declaration.");
+  }
   if (raw.targets !== undefined && (raw.targets !== true || raw.tasks === undefined)) throw new Error("Extension targets require managed tasks and an explicit targets declaration.");
   const mailReader = raw.mailReader === undefined ? undefined : parseMailReader(raw.mailReader);
   if (mailReader === null || mailReader && (raw.mail !== true || !tools.some(tool => tool.name === mailReader.tool))) throw new Error("Mail reader must name a declared tool and mail capability.");
@@ -229,6 +232,7 @@ export function parseExtensionRuntime(value: unknown): ExtensionRuntimeDescripto
   return { html, tools, ...(card === undefined ? {} : { card }), ...(raw.mail === true ? { mail: true } : {}), ...(mailReader ? { mailReader } : {}), ...(raw.agent === true ? { agent: true } : {}), ...(network ? { network } : {}),
     ...(raw.deviceSync === true ? { deviceSync: true } : {}),
     ...(raw.pick === true ? { pick: true } : {}),
+    ...(raw.image === undefined ? {} : { image: ["generate"] as const }),
     ...(raw.targets === true ? { targets: true } : {}),
     ...(tasks ? { tasks } : {}), ...(text ? { text } : {}), ...(typeof raw.showTaskPreferences === "boolean" ? { showTaskPreferences: raw.showTaskPreferences } : {}) };
 }
@@ -428,6 +432,7 @@ export interface ExtensionRuntimeDescriptor {
   readonly agent?: true;
   readonly deviceSync?: true;
   readonly pick?: true;
+  readonly image?: readonly ["generate"];
   readonly targets?: true;
   readonly network?: ExtensionNetworkDeclaration;
   readonly tasks?: { readonly hidden?: true };

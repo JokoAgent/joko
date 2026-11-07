@@ -3069,6 +3069,8 @@ describe("McpRouter", () => {
         store, credentials, providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
         modelEnabled: (backendId, providerId, model) => modelRoutingEnabled(store, backendId, providerId, model)
       }) });
+      expect(provider.listModels()).toEqual([{ id: modelId, name: "GPT Image 2", providerId: identity.providerId }]);
+      expect(fetch).not.toHaveBeenCalled();
       router.registerBridgeToolProvider(provider);
       const granted = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", targetId: "target-1" });
       const call = () => router.executeBridgeCall({ ...bridgeScope(1), generation: 1, authorization: `Bearer ${granted.mcpBridge.token}`,
@@ -3078,6 +3080,7 @@ describe("McpRouter", () => {
       expect(fetch.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/images/generations");
       if (change === "model disabled") {
         writeBackendModelAccess(store, identity.backendId, create(BackendModelAccessUpdateSchema, { providerId: identity.providerId, modelId, enabled: false }));
+        expect(provider.listModels()).toEqual([]);
       } else {
         await setKey("replacement-synthetic-image-key");
       }

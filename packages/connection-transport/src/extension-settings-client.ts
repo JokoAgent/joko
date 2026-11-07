@@ -16,7 +16,7 @@ export class ExtensionSettingsRejected extends Error {
 }
 
 export const extensionSettingsReadOnly = (kind: ExtensionSettingsCall["kind"]): boolean =>
-  ["context.get", "agent-models.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(kind);
+  ["context.get", "agent-models.get", "image-models.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(kind);
 
 export interface ExtensionSettingsProjection {
   readonly extensionId: string; readonly revision: bigint; readonly name: string;
@@ -107,6 +107,23 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
       } finally { void client.api.closeExtensionDirectoryPicker({ pickerId }, { timeoutMs: 5_000 }).catch(() => undefined); }
     }
     case "context.get": return { context: { locale: host.locale ?? "en" } };
+    case "image-models.get": {
+      try {
+        const response = await client.api.listExtensionSettingsImageModels({ surfaceId: client.surface.surfaceId }, rpc);
+        current(); await client.fresh(signal); current();
+        const models = response.models.map(model => ({ id: model.id, name: model.name, providerId: model.providerId,
+          modalities: { input: ["text"], output: ["image"] } }));
+        const result = { ok: true, type: "image", models, defaultModelId: models[0]?.id ?? null, defaultProviderId: models[0]?.providerId ?? null };
+        if (new TextEncoder().encode(JSON.stringify(result)).byteLength > 190 * 1024) throw new Error("The image model catalog exceeds the settings response limit.");
+        return result;
+      } catch (error) {
+        current();
+        if (ConnectError.from(error).code === Code.PermissionDenied) {
+          return { ok: false, errorCode: "PERMISSION_DENIED", message: "Plugin image model permission is unavailable." };
+        }
+        throw error;
+      }
+    }
     case "agent-models.get": {
       try {
         const response = await client.api.listExtensionSettingsAgentModels({ surfaceId: client.surface.surfaceId }, rpc);
