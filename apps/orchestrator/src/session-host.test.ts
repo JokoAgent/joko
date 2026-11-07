@@ -3757,6 +3757,7 @@ describe("SessionHost", () => {
     await expect(replace()).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
     expect(fixture.host.currentAdapter(previous.id)).toBe(previous);
     expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
     expect(fixture.store.getBackend(previous.id).descriptor.instanceGeneration).toBe(current.instanceGeneration);
     expect(resumePrevious).not.toHaveBeenCalled();
 
@@ -3764,7 +3765,9 @@ describe("SessionHost", () => {
     expect(close).toHaveBeenCalledTimes(2);
     expect(fixture.host.currentAdapter(previous.id)).toBe(replacement);
     expect(fixture.host.isSessionActive(sessionId)).toBe(true);
-    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+    expect(fixture.store.getSession(sessionId).descriptor.binding).toEqual({
+      ...originalBinding, generation: originalBinding.generation + 1
+    });
   });
 
   it("returns only a durable, identity-matching Session export BlobRef", async () => {
@@ -15028,7 +15031,7 @@ describe("SessionHost", () => {
 
     const reopened = new OperationalStore(databasePath);
     cleanups.push(() => reopened.close());
-    const second = await openHost(reopened, 8);
+    const second = await openHost(reopened, advanceBackendInstanceGeneration(reopened, first.adapter.id));
     const queued = submit(second.host, "codex-delete-followup", "Next explicit request");
     await eventually(() => reopened.getQueueItem(queued.queueItemId).state === "backend_accepted");
     const current = reopened.getSession(sessionId);
@@ -15041,9 +15044,13 @@ describe("SessionHost", () => {
     const requests = (method: string) => fake.transport!.requests.filter(request => request.method === method);
     expect(requests("thread/start")).toHaveLength(1);
     expect(requests("thread/start")[0]?.params).toMatchObject({ developerInstructions: expect.stringContaining(handoff!) });
-    expect(requests("thread/resume").at(-1)?.params).toMatchObject({ threadId: replacement, developerInstructions: expect.stringContaining(handoff!) });
+    // The first resume attaches the replacement. Permission restoration also
+    // uses thread/resume once the native thread is already loaded.
+    const [attachment] = requests("thread/resume");
+    expect(attachment?.params).toMatchObject({ threadId: replacement, developerInstructions: expect.stringContaining(handoff!) });
     expect(requests("turn/start").map(request => request.params)).toEqual([expect.objectContaining({ threadId: replacement,
       input: [{ type: "text", text: "Next explicit request", text_elements: [] }] })]);
+    expect(fake.transport!.requests.indexOf(attachment!)).toBeLessThan(fake.transport!.requests.indexOf(requests("turn/start")[0]!));
     await fake.completeTurn(replacement, "New answer");
     await eventually(() => reopened.getRun(queued.runId).descriptor.state === "completed");
 
