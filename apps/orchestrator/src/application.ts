@@ -562,6 +562,7 @@ export interface OrchestratorApplication {
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionSettings?: ExtensionSettingsManager;
+  readonly desktopExtensionContext?: Pick<ExtensionCardRuntime, "desktopHostLocale" | "setDesktopHostLocale">;
   readonly extensionDirectoryPicker?: ExtensionDirectoryPicker;
   readonly extensionCards?: ExtensionCardsManager;
   readonly extensionNetwork?: ExtensionNetworkSettings;
@@ -625,6 +626,8 @@ export interface PiSettingsProjectionDefaults {
 }
 
 export interface OrchestratorApplicationDependencies {
+  /** Only an ephemeral Desktop-managed service accepts the native owner's live locale. */
+  readonly desktopManagedExtensionContext?: boolean;
   readonly agentImportSources?: { readonly home: string; readonly environment: NodeJS.ProcessEnv };
   /** Private host capability; proxy credentials remain outside durable Orchestrator state. */
   readonly resolveOutboundProxy?: OutboundProxyResolver;
@@ -3624,6 +3627,7 @@ export async function createOrchestratorApplication(
     extensionLibraries,
     extensionMainViews,
     extensionSettings,
+    ...(dependencies.desktopManagedExtensionContext ? { desktopExtensionContext: extensionCardRuntime } : {}),
     extensionDirectoryPicker,
     extensionCards,
     extensionNetwork,

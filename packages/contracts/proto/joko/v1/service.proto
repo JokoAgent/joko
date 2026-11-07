@@ -494,6 +494,8 @@ service ExtensionService {
   rpc GetExtensionPackageExport(GetExtensionPackageExportRequest) returns (GetExtensionPackageExportResponse);
   rpc OpenExtensionMainView(OpenExtensionMainViewRequest) returns (OpenExtensionMainViewResponse);
   rpc OpenExtensionSettings(OpenExtensionSettingsRequest) returns (OpenExtensionSettingsResponse);
+  // Requires the committed native Desktop host authorization in addition to the connection.
+  rpc SetDesktopExtensionHostLocale(SetDesktopExtensionHostLocaleRequest) returns (SetDesktopExtensionHostLocaleResponse);
   rpc GetExtensionSettingsRoutingData(GetExtensionSettingsRoutingDataRequest) returns (GetExtensionSettingsRoutingDataResponse);
   rpc ListExtensionSettingsAgentModels(ListExtensionSettingsAgentModelsRequest) returns (ListExtensionSettingsAgentModelsResponse);
   rpc BeginExtensionSecretCheck(BeginExtensionSecretCheckRequest) returns (BeginExtensionSecretCheckResponse);
@@ -2749,6 +2751,13 @@ message CloseExtensionDirectoryPickerRequest {
 message CloseExtensionDirectoryPickerResponse {
   bool closed = 1;
 }
+
+message SetDesktopExtensionHostLocaleRequest {
+  string locale = 1;
+  uint64 change_sequence = 2;
+}
+
+message SetDesktopExtensionHostLocaleResponse {}
 
 message GetExtensionMainViewSurfaceRequest {
   string surface_id = 1;

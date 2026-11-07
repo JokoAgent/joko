@@ -3371,7 +3371,7 @@ export class MobileClient {
       const extension = await this.network.getExtension(context.credential, surface.extensionId, signal); assert();
       if (!extension.installed || !extension.settings || extension.owner.kind !== "resource" || extension.owner.resourceId !== surface.owner.resourceId
         || extension.owner.discoveredRevision !== surface.owner.discoveredRevision || extension.owner.resourceRevision !== surface.owner.resourceRevision) throw new Error("Plugin settings installation changed.");
-      return extension;
+      return { extension, hostLocale: actual.hostLocale };
     };
     const callSettings: NonNullable<MobileExtensionTransport["callSettings"]> = async (surface, call, host, signal) => {
       requireCurrent(signal);
@@ -3388,12 +3388,17 @@ export class MobileClient {
       // A ready projection can still carry the newly opened replacement attempt.
       // Only the author request that confirmed its begin can use that attempt.
       let replacementAttemptId: string | undefined;
+      let hostLocale: string | undefined;
       const execute = (current: AbortSignal) => executeExtensionSettingsCall({ surface, api,
         ...(this.network.extensionOAuthApi ? { oauth: this.network.extensionOAuthApi(context.credential) } : {}),
         ...(this.network.extensionConnectionsApi ? { connections: this.network.extensionConnectionsApi(context.credential) } : {}),
         upload: (ticket, value, signal) => upload(context.credential, ticket, value, signal),
         current: () => { current.throwIfAborted(); if (authorization ? !settingsOwnerCurrent() : !isCurrent()) throw new Error("Plugin settings owner changed."); },
-        fresh: signal => freshSettings(surface, signal, authorization),
+        fresh: async signal => {
+          const fresh = await freshSettings(surface, signal, authorization);
+          hostLocale = fresh.hostLocale;
+          return fresh.extension;
+        },
         submit: async (extension, mutation, kind, signal) => {
           const action = this.#claimMutation();
           try {
@@ -3430,7 +3435,7 @@ export class MobileClient {
         field: submitSetupInteraction,
         secret: (extension, fieldId, value, signal) => saveSetupCredential(extension, fieldId, "headerSecret", value, signal, replacementAttemptId),
         complete: completeSetup
-      }, call, settingsHost, current);
+      }, call, { ...settingsHost, get locale() { return hostLocale ?? host.locale; } }, current);
       const request = authorization ? new AbortController() : undefined;
       const unsubscribe = request ? this.subscribe(() => {
         if (!settingsOwnerCurrent() || !this.#foreground && this.#extensionOAuthRetention !== retention) request.abort();

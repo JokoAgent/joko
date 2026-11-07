@@ -357,6 +357,7 @@ import {
   ManagedOrchestratorAuthorizationUnavailableError,
   persistManagedOrchestratorDeviceId,
   probeManagedOrchestratorConnection,
+  publishManagedExtensionHostLocale,
   resolveManagedOrchestratorEntry,
   selectManagedOrchestratorPorts,
   startManagedOrchestrator,
@@ -926,6 +927,8 @@ let packagedSmokeFinishing = false;
 let packagedSmokeLateNativeCallbackCount = 0;
 let preferredSystemLocale: DesktopSystemLocale = "en";
 let applicationMenuLocale: DesktopLocale = "en";
+let managedExtensionHostLocale: DesktopLocale | undefined;
+let managedExtensionHostLocaleSequence = 0n;
 let desktopRemoteDesktopDark: boolean | undefined;
 const applicationMenuConfigurationState = createMacApplicationMenuConfigurationState({
   shortcutRecording: false,
@@ -8041,6 +8044,19 @@ async function readDesktopDevicePeerAgentRouteAuthorization(
   }
 }
 
+function syncManagedExtensionHostLocale(): void {
+  const runtime = managedOrchestratorRuntime, locale = managedExtensionHostLocale;
+  if (!runtime || !locale || !isDesktopDevicePeerAgentAuthorityCurrent(runtime.connection)) return;
+  const sequence = ++managedExtensionHostLocaleSequence;
+  const isCurrent = () => managedOrchestratorRuntime === runtime && managedExtensionHostLocaleSequence === sequence
+    && isDesktopDevicePeerAgentAuthorityCurrent(runtime.connection);
+  const publish = () => publishManagedExtensionHostLocale({ runtime, locale, sequence, isCurrent, readAuthKey: readCredential });
+  void publish().catch(() => {
+    if (!isCurrent()) return;
+    setTimeout(() => { void publish().catch(() => undefined); }, 500).unref();
+  });
+}
+
 function disposeDesktopUpdateLifecycle(): void {
   desktopUpdateLifecycleDisposed = true;
   desktopUpdateStartupPhase = undefined;
@@ -8423,6 +8439,10 @@ function registerIpc(): void {
     const localeChanged = applicationMenuLocale !== locale;
     setSelectionContextMenuLocale(locale);
     applicationMenuLocale = locale;
+    if (event.sender === mainWindow?.webContents && locale !== managedExtensionHostLocale) {
+      managedExtensionHostLocale = locale;
+      syncManagedExtensionHostLocale();
+    }
     if (localeChanged) desktopRemoteDesktopViewers.refreshLocale();
     if (localeChanged) refreshDesktopRemoteDesktopLocalNotices();
     const overlay = globalVoiceOverlayWindow;
@@ -9854,6 +9874,7 @@ function beginManagedOrchestratorInitialization(
     return { state: "retryableError", reason: "startFailed" };
   }).then((status) => {
     managedOrchestratorStatus = status;
+    if (status.state === "ready") syncManagedExtensionHostLocale();
     reconcileDesktopDevicePeerAgentLifecycle();
     refreshTrayContextMenu();
     if (status.state !== "ready") {

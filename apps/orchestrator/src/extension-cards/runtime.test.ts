@@ -67,7 +67,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
       await writeFile(join(destination, "ui/logic/index.html"), '<!doctype html><html><head><script src="./runtime.js"></script></head><body></body></html>');
       await writeFile(join(destination, "ui/logic/runtime.js"), String.raw`
         let writes = 0, sends = 0;
-        const mailReads = [], settingsNotices = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
+        const mailReads = [], settingsNotices = [], localeNotices = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
         const taskOutcomes = {}, textOutcomes = {};
         let saved = { status: 'read_back', draftId: 'draft-one', fingerprint: 'revision-1', locator: { id: 'draft-one' },
           headers: { from: 'owner@example.test', to: 'reader@example.test', cc: '', bcc: '', subject: 'Review' },
@@ -131,9 +131,11 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
           if (message.type === 'device-sync-request') await joko.deviceSync.reply(message.requestId, { received: message.data });
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
           if (message.type === 'settings-changed') settingsNotices.push({ event: message, data: await (await fetch('/kv')).json() });
+          if (message.type === 'host-context-changed') localeNotices.push({ event: message, data: await (await fetch('/app-context')).json() });
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
-        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads, settingsNotices } }));
+        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads, settingsNotices,
+          localeNotices, context: (await (await fetch('/app-context')).json()).context } }));
         joko.tools.register('usage', async message => {
           await window.__jokoExtensionToolAccepted(message.callId, 'forged');
           return { ok: false, result: { nonceVisible: 'usageNonce' in message } };
@@ -379,6 +381,15 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     await vi.waitFor(async () => expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.settingsNotices)
       .toEqual([{ event: { type: "settings-changed" }, data: updated }]));
     expect((await alternateProvider.callTool("inspect", {}, undefined, context)).structuredContent?.settingsNotices).toEqual([]);
+
+    expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.context).toEqual({ locale: "en" });
+    runtime.setDesktopHostLocale("zh-CN", 2n);
+    runtime.setDesktopHostLocale("en", 1n);
+    await vi.waitFor(async () => {
+      const read = (await provider.callTool("inspect", {}, undefined, context)).structuredContent;
+      expect(read?.context).toEqual({ locale: "zh-CN" });
+      expect(read?.localeNotices).toEqual([{ event: { type: "host-context-changed" }, data: { context: { locale: "zh-CN" } } }]);
+    });
 
     alternateEnabled = false; changed?.([alternateId]);
     expect(await mail.previewMail(selected, owner)).toMatchObject({ error: "MAIL_PROVIDER_CHANGED", messageJson: "", readerChoices: [{ displayName: "Fixture mail" }] });
