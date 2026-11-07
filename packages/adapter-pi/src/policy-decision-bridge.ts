@@ -79,7 +79,8 @@ export function encodePolicyDecisionRequest(request: PolicyDecisionRequest): str
   return encoded;
 }
 
-function parsePolicyDecisionRequest(value: string): PolicyDecisionRequest | undefined {
+export function parsePolicyDecisionRequest(value: string): PolicyDecisionRequest | undefined {
+  if (!value.startsWith(POLICY_DECISION_REQUEST_PREFIX)) return undefined;
   const encoded = value.slice(POLICY_DECISION_REQUEST_PREFIX.length);
   if (
     encoded.length < 1

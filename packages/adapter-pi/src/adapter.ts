@@ -46,6 +46,7 @@ import {
   type NativeSessionNavigation,
   type NativeSessionNavigationResult,
   type NativeHistoryProjection,
+  type NativeMessageIdentity,
   type ImportPortableNativeSessionInput,
   type NativeSessionState,
   type NativeTextInferenceInput,
@@ -93,7 +94,7 @@ import {
   type PolicyDecisionReply
 } from "./policy-decision-bridge.js";
 import { isPiCompactionNoopRejection } from "./compaction.js";
-import { readPiWorkingContext, writePiWorkingContext } from "./working-context.js";
+import { PI_WORKING_CONTEXT_GUARD_SOURCE, readPiWorkingContext, writePiWorkingContext } from "./working-context.js";
 import {
   assertCompatibleState,
   assertManagedBridgeHandshake,
@@ -177,9 +178,10 @@ import {
   type PiRuntimeToolDescriptor
 } from "./runtime-tool-catalog.js";
 import { PiRpcTransport, spawnPiProcess, type PiProcessFactory, type PiProcessSpec } from "./transport.js";
-import { PiEventTranslator } from "./translator.js";
+import { PiEventTranslator, readCompactionNativeIdentity } from "./translator.js";
 import {
   handlePiCacheCompatibilityRequest,
+  isPiCacheCompatibilityRequest,
   PiCacheCompatibilityStore,
   piCacheRouteKey,
   type PiCacheCompatibilityRequest,
@@ -628,7 +630,7 @@ interface PiRuntime {
   workingContextSelection: string | undefined;
   workingContextUnconfirmed?: boolean;
   thresholdCheck?: Promise<void>;
-  thresholdCompaction?: { readonly id: string };
+  thresholdCompaction?: { readonly id: string; readonly context: AdapterContext; nativeIdentity?: NativeMessageIdentity };
   ready: boolean;
   abortRequested: boolean;
   lifecycle?: PiNativeLifecycle;
@@ -1134,7 +1136,8 @@ export class PiBackendAdapter implements
       effort: state.thinkingLevel,
       initialPermissionMode: runtime.control.permissionMode,
       initialPlanMode: runtime.control.planMode,
-      initialFastMode: runtime.control.fastMode
+      initialFastMode: runtime.control.fastMode,
+      compactionThresholdPercent: runtime.autoCompactionThresholdPercent
     });
     return nativeState(
       runtime.binding,
@@ -1354,8 +1357,10 @@ export class PiBackendAdapter implements
       });
     }
     const attached = this.#runtimes.get(context.sessionId);
+    // Threshold compaction owns the working context after the native turn
+    // settles. An admitted extension command can run on that same runtime.
     if (input.disposition === "prompt" && (attached === undefined || attached.lifecycle === undefined
-      && attached.runningExtensionCommand === undefined && attached.userShell === undefined)) {
+      && attached.thresholdCompaction === undefined && attached.runningExtensionCommand === undefined && attached.userShell === undefined)) {
       await this.refreshModelWorkingContext(context);
     }
     const runtime = this.#runtime(context);
@@ -1962,7 +1967,7 @@ export class PiBackendAdapter implements
         await existing.stopAndDrain();
         this.#subagentObservers.delete(context.sessionId);
       } else {
-        existing.update(context, [], 0);
+        existing.update(context, []);
         existing.start();
         this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
         return;
@@ -2072,8 +2077,7 @@ export class PiBackendAdapter implements
             { stateMayHaveChanged: true }
           );
         }
-        await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
         const projected = modelFromRpc(responseData(response) as PiRpcModel, levels, supportsFastMode);
         const profile = this.#spawnProfiles.get(context.sessionId);
@@ -2170,8 +2174,7 @@ export class PiBackendAdapter implements
           { signal: context.signal, stateMayHaveChanged: true }
         );
         accepted = true;
-        await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        await this.#advanceRuntimePolicy(runtime);
         const profile = this.#spawnProfiles.get(context.sessionId);
         if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, effort: level });
       } catch (error) {
@@ -2216,9 +2219,7 @@ export class PiBackendAdapter implements
       fastMode: enabled,
       writtenAt: new Date().toISOString()
     };
-    await writeRuntimeControl(runtime.controlPath, runtimeControlForWrite(nextControl));
-    runtime.control = nextControl;
-    this.#syncManagedSubagentObserver(runtime);
+    await this.#applyRuntimeControl(runtime, nextControl);
     const profile = this.#spawnProfiles.get(context.sessionId);
     if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, initialFastMode: enabled });
   }
@@ -2237,17 +2238,7 @@ export class PiBackendAdapter implements
         permissionMode: mode,
         writtenAt: new Date().toISOString()
       };
-      await writeRuntimeControl(runtime.controlPath, {
-        generation: runtime.transport.generation,
-        policyGeneration: nextControl.policyGeneration,
-        permissionMode: mode,
-        planMode: nextControl.planMode,
-        fastMode: nextControl.fastMode,
-        approvedRoots: nextControl.approvedRoots,
-        runtimePolicy: nextControl.runtimePolicy
-      });
-      runtime.control = nextControl;
-      this.#syncManagedSubagentObserver(runtime);
+      await this.#applyRuntimeControl(runtime, nextControl);
       const profile = this.#spawnProfiles.get(context.sessionId);
       if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, initialPermissionMode: mode });
     });
@@ -2267,17 +2258,7 @@ export class PiBackendAdapter implements
         planMode: enabled,
         writtenAt: new Date().toISOString()
       };
-      await writeRuntimeControl(runtime.controlPath, {
-        generation: runtime.transport.generation,
-        policyGeneration: nextControl.policyGeneration,
-        permissionMode: nextControl.permissionMode,
-        planMode: enabled,
-        fastMode: nextControl.fastMode,
-        approvedRoots: nextControl.approvedRoots,
-        runtimePolicy: nextControl.runtimePolicy
-      });
-      runtime.control = nextControl;
-      this.#syncManagedSubagentObserver(runtime);
+      await this.#applyRuntimeControl(runtime, nextControl);
       const profile = this.#spawnProfiles.get(context.sessionId);
       if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, initialPlanMode: enabled });
       return true;
@@ -2306,7 +2287,7 @@ export class PiBackendAdapter implements
         writtenAt: new Date().toISOString()
       };
       try {
-        await writeRuntimeControl(runtime.controlPath, runtimeControlForWrite(nextControl));
+        await this.#applyRuntimeControl(runtime, nextControl, context);
       } catch (error) {
         return this.#failClosedUnconfirmedSessionMutation(
           runtime,
@@ -2315,10 +2296,6 @@ export class PiBackendAdapter implements
           error
         );
       }
-      runtime.control = nextControl;
-      runtime.context = context;
-      if (runtime.lifecycle === undefined) runtime.translator.setContext(context);
-      this.#syncManagedSubagentObserver(runtime);
     });
     runtime.sessionMutationTail = run.then(() => undefined, () => undefined);
     await run;
@@ -2343,17 +2320,7 @@ export class PiBackendAdapter implements
         writtenAt: new Date().toISOString()
       };
       context.assertExtraDirectoriesCurrent?.(directories);
-      await writeRuntimeControl(runtime.controlPath, {
-        generation: runtime.transport.generation,
-        policyGeneration: nextControl.policyGeneration,
-        permissionMode: nextControl.permissionMode,
-        planMode: nextControl.planMode,
-        fastMode: nextControl.fastMode,
-        approvedRoots,
-        runtimePolicy: nextControl.runtimePolicy
-      });
-      runtime.control = nextControl;
-      this.#syncManagedSubagentObserver(runtime);
+      await this.#applyRuntimeControl(runtime, nextControl);
     });
   }
 
@@ -2408,6 +2375,8 @@ export class PiBackendAdapter implements
     const runtime = this.#runtime(context);
     await this.#runExclusiveSessionMutation(runtime, context, async () => {
       runtime.autoCompactionThresholdPercent = percent;
+      const profile = this.#spawnProfiles.get(context.sessionId);
+      if (profile !== undefined) this.#spawnProfiles.set(context.sessionId, { ...profile, compactionThresholdPercent: percent });
     });
     await this.#compactAtConfiguredThresholdIfIdle(runtime, context);
   }
@@ -2460,9 +2429,9 @@ export class PiBackendAdapter implements
   }
 
   async #compactAtConfiguredThresholdIfIdle(runtime: PiRuntime, context: AdapterContext): Promise<void> {
-    if (runtime.lifecycle !== undefined || runtime.runningExtensionCommand !== undefined) return;
+    if (runtime.lifecycle !== undefined || runtime.runningExtensionCommand !== undefined || runtime.userShell !== undefined) return;
     const state = await this.#requestState(runtime, context).catch(() => undefined);
-    if (state === undefined || state.isStreaming || state.isCompacting) return;
+    if (state === undefined || state.isStreaming || state.isCompacting || state.pendingMessageCount > 0) return;
     await this.#compactAtConfiguredThreshold(runtime, context);
   }
 
@@ -2487,35 +2456,40 @@ export class PiBackendAdapter implements
       || contextWindow === undefined
       || contextTokens < 0
       || contextWindow <= 0
-      || contextTokens / contextWindow < runtime.autoCompactionThresholdPercent / 100
     ) return;
+    const crossesThreshold = () => runtime.autoCompaction && contextTokens / contextWindow >= runtime.autoCompactionThresholdPercent / 100;
+    if (!crossesThreshold()) return;
 
-    const operation = { id: randomUUID() };
-    runtime.thresholdCompaction = operation;
+    const operation: NonNullable<PiRuntime["thresholdCompaction"]> = { id: randomUUID(), context };
     let started = false;
     try {
-      await context.emit({
-        type: "compaction",
-        reason: "threshold",
-        compactionId: operation.id,
-        state: "started",
-        automatic: true,
-        willRetry: false
-      }, piMetadata("adapter_threshold_compaction_start"));
-      started = true;
       const response = await this.#runExclusiveSessionMutation(
         runtime,
         context,
-        () => runtime.transport.request(
-          { type: "compact", customInstructions: undefined },
-          {
-            signal: context.signal,
-            stateMayHaveChanged: true,
-            timeoutMs: runtimeRpcTimeout(runtime, PI_LONG_RUNNING_RPC_TIMEOUT_MS),
-            refreshTimeoutOnEvent: isPiRpcProgressEvent
-          }
-        )
+        async () => {
+          if (!crossesThreshold()) return undefined;
+          runtime.thresholdCompaction = operation;
+          await context.emit({
+            type: "compaction",
+            reason: "threshold",
+            compactionId: operation.id,
+            state: "started",
+            automatic: true,
+            willRetry: false
+          }, piMetadata("adapter_threshold_compaction_start"));
+          started = true;
+          return runtime.transport.request(
+            { type: "compact", customInstructions: undefined },
+            {
+              signal: context.signal,
+              stateMayHaveChanged: true,
+              timeoutMs: runtimeRpcTimeout(runtime, PI_LONG_RUNNING_RPC_TIMEOUT_MS),
+              refreshTimeoutOnEvent: isPiRpcProgressEvent
+            }
+          );
+        }
       );
+      if (response === undefined) return;
       const result = responseData(response);
       const record = isRecord(result) ? result : {};
       const tokensBefore = optionalUnsignedNumber(record.tokensBefore) ?? contextTokens;
@@ -2527,6 +2501,10 @@ export class PiBackendAdapter implements
         state: "completed",
         automatic: true,
         willRetry: false,
+        ...(operation.nativeIdentity === undefined ? {} : { nativeHistory: { identity: operation.nativeIdentity } }),
+        ...(typeof record.summary === "string" ? { summary: redactManagedSecrets(record.summary, runtime.redactValues) } : {}),
+        ...(typeof record.firstKeptEntryId === "string" && record.firstKeptEntryId.length <= 512
+          ? { boundaryEntryId: record.firstKeptEntryId } : {}),
         ...(tokensBefore === undefined ? {} : { tokensBefore }),
         ...(tokensAfter === undefined ? {} : { tokensAfter })
       }, piMetadata("adapter_threshold_compaction_end"));
@@ -4129,8 +4107,7 @@ export class PiBackendAdapter implements
           await this.#setFastModeWithinMutation(false, context, runtime);
           policyAdvanced = true;
         }
-        if (!policyAdvanced) await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        if (!policyAdvanced) await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
         const projected = modelFromRpc(rpcModel, levels, supportsFastMode);
         const responseEffort = typeof data.thinkingLevel === "string"
@@ -4194,8 +4171,7 @@ export class PiBackendAdapter implements
             { stateMayHaveChanged: true }
           );
         }
-        await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        await this.#advanceRuntimePolicy(runtime);
         const profile = this.#spawnProfiles.get(context.sessionId);
         if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, effort: level });
         return level;
@@ -5021,6 +4997,13 @@ export class PiBackendAdapter implements
       "--offline"
     ];
     if (hosted?.trust === "guest") args.push("--no-context-files");
+    if (workingContextWindow !== undefined && profile.runtimePolicy === "standard") {
+      // The threshold guard must see the proposed native compaction before any
+      // approved extension can start its own summary for that proposal.
+      const guardPath = join(runtimeDirectory, "joko-working-context-threshold.ts");
+      await atomicWriteFile(guardPath, PI_WORKING_CONTEXT_GUARD_SOURCE);
+      args.push("--extension", guardPath);
+    }
     for (const extensionPath of managedResourceSnapshot.extensionPaths) args.push("--extension", extensionPath);
     args.push("--extension", silentEncryptedRetryPath);
     if (context.target.remoteWorkspace === undefined && profile.runtimePolicy === "standard") {
@@ -5432,12 +5415,14 @@ export class PiBackendAdapter implements
   async #resolveCacheCompatibility(
     runtime: PiRuntime,
     context: AdapterContext,
-    request: PiCacheCompatibilityRequest
+    request: PiCacheCompatibilityRequest,
+    compaction?: NonNullable<PiRuntime["thresholdCompaction"]>
   ): Promise<Readonly<Record<string, unknown>>> {
     const currentRuntime = () => !this.#disposed && this.#runtimes.get(runtime.key) === runtime
       && !runtime.transport.closed && !runtime.abortRequested && !context.signal.aborted
       && runtime.context.generation === context.generation && runtime.context.target.remoteWorkspace === undefined
-      && runtime.control.runtimePolicy === "standard";
+      && runtime.control.runtimePolicy === "standard"
+      && (compaction === undefined || runtime.thresholdCompaction === compaction);
     const exactModel = async (route: PiCacheRoute) => {
       if (!currentRuntime()) return false;
       const model = (await this.#requestState(runtime, context)).model;
@@ -5450,7 +5435,7 @@ export class PiBackendAdapter implements
       const applied = await this.#cacheCompatibility.has(request.route);
       if (!currentRuntime()) return {};
       const lifecycle = runtime.lifecycle;
-      if (applied || !request.hasCacheOptions || lifecycle === undefined || lifecycle.settlementReceived) {
+      if (applied || !request.hasCacheOptions || compaction !== undefined || lifecycle === undefined || lifecycle.settlementReceived) {
         return { current: true, applied };
       }
       const lease = randomUUID();
@@ -5460,6 +5445,7 @@ export class PiBackendAdapter implements
       }
       return { current: true, applied: false, lease };
     }
+    if (compaction !== undefined) return {};
     const receipt = runtime.cacheCompatibilityLeases.get(request.lease);
     // Consume before disk IO. Failed persistence cannot re-arm the same rejection.
     runtime.cacheCompatibilityLeases.delete(request.lease);
@@ -5506,11 +5492,37 @@ export class PiBackendAdapter implements
     };
     runtime.transport.onEvent((event) => {
       const rawEvent = event as unknown as Record<string, unknown>;
+      const thresholdCompaction = runtime.thresholdCompaction;
+      if (thresholdCompaction !== undefined && isExtensionUiRequest(event)) {
+        const receipt = readCompactionNativeIdentity(rawEvent);
+        if (receipt?.reason === "manual") {
+          thresholdCompaction.nativeIdentity = receipt.identity;
+          return;
+        }
+        if (isPiCacheCompatibilityRequest(rawEvent)) {
+          // Settlement waits for compact on the event chain. The summary's
+          // fetch needs its private route reply before compact can finish.
+          const context = thresholdCompaction.context;
+          void handlePiCacheCompatibilityRequest(rawEvent, {
+            resolve: request => this.#resolveCacheCompatibility(runtime, context, request, thresholdCompaction),
+            transport: runtime.transport,
+            isCurrent
+          }).catch((error: unknown) => reportEventFailure(context, error)).catch(() => undefined);
+          return;
+        }
+      }
+      if (runtime.workingContextWindow !== undefined && runtime.control.runtimePolicy === "standard"
+        && rawEvent.reason === "threshold" && (event.type === "compaction_start"
+          || event.type === "compaction_end" && rawEvent.result === undefined)) {
+        // Only the host publishes a threshold compaction for this runtime.
+        return;
+      }
       if (event.type === "compaction_end" && runtime.compactionMemoryEnabled) {
         const result = isRecord(rawEvent.result) ? rawEvent.result : undefined;
         const summary = typeof result?.summary === "string" ? result.summary.trim() : "";
         if (summary !== "") {
-          const reason = typeof rawEvent.reason === "string" ? rawEvent.reason : "auto";
+          const reason = thresholdCompaction !== undefined && rawEvent.reason === "manual" ? "threshold"
+            : typeof rawEvent.reason === "string" ? rawEvent.reason : "auto";
           runtime.eventChain = runtime.eventChain.then(async () => {
             if (!isCurrent()) return;
             await runtime.generationLease.generation.options.onCompactionDigest?.({
@@ -5524,7 +5536,7 @@ export class PiBackendAdapter implements
         }
       }
       if (
-        runtime.thresholdCompaction !== undefined
+        thresholdCompaction !== undefined
         && (event.type === "compaction_start" || event.type === "compaction_end")
         && rawEvent.reason === "manual"
       ) {
@@ -5876,8 +5888,34 @@ export class PiBackendAdapter implements
     this.#subagentObservers.get(runtime.key)?.update(
       runtime.context,
       runtime.redactValues,
-      runtime.control.policyGeneration
+      runtime.control.policyGeneration,
+      runtime.control
     );
+  }
+
+  async #advanceRuntimePolicy(runtime: PiRuntime): Promise<void> {
+    const current = await readControl(runtime.controlPath, runtime.transport.generation);
+    await this.#applyRuntimeControl(runtime, { ...current, policyGeneration: current.policyGeneration + 1 });
+  }
+
+  async #applyRuntimeControl(runtime: PiRuntime, control: PiRuntimeControl, context?: AdapterContext): Promise<void> {
+    await writeRuntimeControl(runtime.controlPath, runtimeControlForWrite(control));
+    runtime.control = await readControl(runtime.controlPath, runtime.transport.generation);
+    if (context !== undefined) {
+      runtime.context = context;
+      if (runtime.lifecycle === undefined) runtime.translator.setContext(context);
+    }
+    this.#syncManagedSubagentObserver(runtime);
+    try {
+      await this.#subagentObservers.get(runtime.key)?.synchronizeRuntimeControl();
+    } catch (cause) {
+      throw piError("PI_SUBAGENT_POLICY_SYNC_UNCONFIRMED", "Pi could not confirm the new policy for active delegated tasks", "dispatch", {
+        stateMayHaveChanged: true,
+        retryable: true,
+        recovery: "Retry the policy change or stop the affected delegated tasks.",
+        cause
+      });
+    }
   }
 
   async #remoteManagedDurableStore(
@@ -5920,7 +5958,7 @@ export class PiBackendAdapter implements
     if (!runtime.managedSubagentToolsEnabled) return;
     const existing = this.#subagentObservers.get(runtime.key);
     if (existing !== undefined && existing.generation === runtime.transport.generation) {
-      existing.update(runtime.context, runtime.redactValues, runtime.control.policyGeneration);
+      existing.update(runtime.context, runtime.redactValues, runtime.control.policyGeneration, runtime.control);
       existing.start();
       return;
     }
@@ -5934,6 +5972,7 @@ export class PiBackendAdapter implements
       }),
       context: runtime.context,
       policyGeneration: runtime.control.policyGeneration,
+      runtimeControl: runtime.control,
       redactValues: runtime.redactValues,
       commandConcurrencyGate: runtime.generationLease.generation.options.commandConcurrencyGate
     });
@@ -5956,7 +5995,7 @@ export class PiBackendAdapter implements
           stateMayHaveChanged: true
         });
       }
-      existing.update(context, [], 0);
+      existing.update(context, []);
       existing.start();
       return;
     }
@@ -7639,25 +7678,6 @@ async function readControl(path: string, expectedGeneration: number): Promise<Pi
       recovery: "Restore the generation-scoped managed control file before using this runtime."
     });
   }
-}
-
-async function advanceRuntimePolicy(runtime: PiRuntime): Promise<void> {
-  const current = await readControl(runtime.controlPath, runtime.transport.generation);
-  const next: PiRuntimeControl = {
-    ...current,
-    policyGeneration: current.policyGeneration + 1,
-    writtenAt: new Date().toISOString()
-  };
-  await writeRuntimeControl(runtime.controlPath, {
-    generation: next.generation,
-    policyGeneration: next.policyGeneration,
-    permissionMode: next.permissionMode,
-    planMode: next.planMode,
-    fastMode: next.fastMode,
-    approvedRoots: next.approvedRoots,
-    runtimePolicy: next.runtimePolicy
-  });
-  runtime.control = next;
 }
 
 function runtimeControlForWrite(control: PiRuntimeControl): Omit<PiRuntimeControl, "writtenAt"> {

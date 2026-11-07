@@ -530,6 +530,11 @@ describe("RemotePiProcessFactory", () => {
       runnerScriptSha256: scan.runs[0]!.runnerScriptSha256,
       expectedControlRevision: scan.runs[0]!.controlRevision
     };
+    const runtimeControl = { generation: 2, policyGeneration: 3, permissionMode: "ask" as const, planMode: false,
+      fastMode: false, approvedRoots: [], runtimePolicy: "standard" as const, writtenAt: new Date().toISOString() };
+    await expect(store!.writeRuntimeControl({ ...controlScope, control: runtimeControl })).resolves.toBe(true);
+    expect(managedStoreOperations.at(-1)).toMatchObject({ operation: "write-runtime-control", control: runtimeControl,
+      runId: controlScope.runId, runnerInstanceId: controlScope.runnerInstanceId, launchToken: controlScope.launchToken });
     await store!.writeControl({
       ...controlScope,
       kind: "control",
@@ -608,7 +613,7 @@ describe("RemotePiProcessFactory", () => {
     expect(finalizedAuthority).not.toHaveProperty("currentBearer");
     expect(JSON.stringify(finalizedAuthority)).not.toContain(nativeAuthReservationToken);
     expect(managedStoreOperations.map((value) => value.operation)).toEqual([
-      "scan", "read-tail", "write-control", "write-control", "scan", "scan", "scan", "scan", "scan", "stop-remove-session",
+      "scan", "read-tail", "write-runtime-control", "write-control", "write-control", "scan", "scan", "scan", "scan", "scan", "stop-remove-session",
       "finalize-deletion", "finalize-deletion"
     ]);
     expect(managedStoreOperations.every((value) =>
@@ -1538,6 +1543,8 @@ class ManagedStoreRemoteProcess extends EventEmitter implements RemoteProcessHan
           eof: true,
           content: Buffer.from("entry\n").toString("base64")
         };
+      } else if (operation === "write-runtime-control") {
+        response = { ok: true, authorityVerified: true, updated: true };
       } else if (operation === "write-control") {
         response = {
           ok: true,

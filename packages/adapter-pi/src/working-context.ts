@@ -4,6 +4,16 @@ import type { AdapterContext } from "@joko/core";
 import { atomicWriteJson } from "./config.js";
 import { piError } from "./errors.js";
 
+// The host owns threshold decisions while Pi uses its native reserve for
+// summaries and overflow recovery.
+export const PI_WORKING_CONTEXT_GUARD_SOURCE = `
+export default function guardWorkingContextThreshold(pi) {
+  pi.on("session_before_compact", (event, context) => {
+    if (context.mode === "rpc" && event.reason === "threshold") return { cancel: true };
+  });
+}
+`;
+
 export function readPiWorkingContext(context: AdapterContext, providerId: string | undefined, modelId: string | undefined): number | undefined {
   if (providerId === undefined || modelId === undefined || context.resolveModelWorkingContext === undefined) return undefined;
   const tokens = context.resolveModelWorkingContext({ providerId, modelId });

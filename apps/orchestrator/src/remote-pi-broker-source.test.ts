@@ -126,6 +126,7 @@ interface BrokerFixture {
   readonly runtimeRoot: string;
   readonly descriptorPath: string;
   readonly sourcePath: string;
+  readonly sourceHash?: string;
   readonly childPath: string;
   readonly runRoot: string;
   readonly productSessionId: string;
@@ -540,7 +541,7 @@ async function startBridge(
     value.launchHash,
     randomUUID()
   ], {
-    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 },
+    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256 },
     stdio: ["pipe", "pipe", "pipe"]
   });
   let diagnostics = "";
@@ -907,8 +908,10 @@ async function remoteRunnerFixture(
   const nativeSessionId = randomUUID();
   const nativeSessionDirectory = join(runDirectory, "sessions");
   const nativeSessionPath = join(nativeSessionDirectory, `${nativeSessionId}.jsonl`);
+  const runtimeControlPath = join(runDirectory, "runtime", "control.json");
   await mkdir(runDirectory, { recursive: true, mode: 0o700 });
   await mkdir(nativeSessionDirectory, { mode: 0o700 });
+  await mkdir(join(runDirectory, "runtime"), { mode: 0o700 });
   await chmod(sessionRoot, 0o700);
   await chmod(runDirectory, 0o700);
   await writeFile(runnerScript, RUNNER_SOURCE, { mode: 0o600 });
@@ -920,6 +923,7 @@ async function remoteRunnerFixture(
     runnerScript,
     runnerScriptSha256: fixture.trustedRunnerScriptSha256,
     runnerInstanceId: runnerFence,
+    runtimeControlPath,
     ...(nativeAuthRequired ? {
       nativeAuthReservationId,
       nativeAuthServiceGeneration: productGeneration,
@@ -980,7 +984,10 @@ async function remoteRunnerFixture(
   ]);
   await Promise.all([
     writeFile(join(runDirectory, "transcript.jsonl"), '{"type":"runner-ready"}\n', { mode: 0o600 }),
-    writeFile(nativeSessionPath, '{"type":"session"}\n', { mode: 0o600 })
+    writeFile(nativeSessionPath, '{"type":"session"}\n', { mode: 0o600 }),
+    writeFile(runtimeControlPath, JSON.stringify({ generation: productGeneration, policyGeneration: 0,
+      permissionMode: "bypassPermissions", planMode: false, fastMode: false, runtimePolicy: "standard",
+      approvedRoots: [], writtenAt: new Date().toISOString() }), { mode: 0o600 })
   ]);
   await waitUntil(async () => {
     try {
@@ -1006,6 +1013,7 @@ async function closeServer(server: Server): Promise<void> {
 }
 
 async function brokerMetadata(fixture: BrokerFixture): Promise<{
+  readonly sourceHash: string;
   readonly owner: { readonly pid: number };
   readonly child: { readonly pid: number };
   readonly janitor: { readonly pid: number };
@@ -1014,14 +1022,22 @@ async function brokerMetadata(fixture: BrokerFixture): Promise<{
     join(fixture.managedRoot, "sessions", fixture.identity, "owner.json"),
     "utf8"
   )) as {
+    readonly sourceHash: string;
     readonly owner: { readonly pid: number };
     readonly child: { readonly pid: number };
     readonly janitor: { readonly pid: number };
   };
 }
 
+async function managerMetadata(fixture: BrokerFixture): Promise<{ readonly pid: number; readonly sourceHash: string }> {
+  return JSON.parse(await readFile(join(fixture.managedRoot, "broker.json"), "utf8")) as {
+    readonly pid: number;
+    readonly sourceHash: string;
+  };
+}
+
 async function managerPid(fixture: BrokerFixture): Promise<number> {
-  return (JSON.parse(await readFile(join(fixture.managedRoot, "broker.json"), "utf8")) as { readonly pid: number }).pid;
+  return (await managerMetadata(fixture)).pid;
 }
 
 async function processHasArgument(argument: string): Promise<boolean> {
@@ -1039,7 +1055,7 @@ async function processHasArgument(argument: string): Promise<boolean> {
 
 async function authorityKill(fixture: BrokerFixture, authority: AuthorityEnvelope): Promise<void> {
   const child = spawn(process.execPath, [fixture.sourcePath, "kill", fixture.managedRoot], {
-    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 },
+    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256 },
     stdio: ["pipe", "pipe", "pipe"]
   });
   child.stdin.end(`${JSON.stringify({
@@ -1422,6 +1438,91 @@ try {
         await closeServer(firstUpstream.server);
         if (secondUpstream !== undefined) await closeServer(secondUpstream.server);
         try { await exactKill(await managerPid(fixture), "daemon", fixture.sourcePath); } catch { /* already stopped */ }
+        await rm(fixture.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+      }
+    },
+    process.platform === "win32" ? 120_000 : 30_000
+  );
+
+  it.runIf(process.platform === "linux" || process.platform === "win32")(
+    "uses the staged broker for new sessions and reconnects the original owner after a source change",
+    async () => {
+      const fixture = await brokerFixture();
+      const previousSource = `${REMOTE_PI_BROKER_SOURCE}\n// Previous staged artifact.\n`;
+      const previousHash = digest(previousSource);
+      const previous = {
+        ...fixture,
+        sourcePath: join(fixture.managedRoot, `broker-${previousHash}.mjs`),
+        sourceHash: previousHash
+      };
+      const freshIdentity = digest("broker-upgrade-new-session").slice(0, 32);
+      const freshRuntime = join(fixture.root, ".joko", "runtime", freshIdentity);
+      const fresh = {
+        ...fixture,
+        identity: freshIdentity,
+        runtimeRoot: freshRuntime,
+        descriptorPath: join(freshRuntime, "mcp.json"),
+        productSessionId: "broker-upgrade-new-session",
+        recoveryIdentity: digest("broker-upgrade-new-recovery")
+      };
+      const target = await upstream();
+      let initial: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let created: Awaited<ReturnType<typeof startBridge>> | undefined;
+      let resumed: Awaited<ReturnType<typeof startBridge>> | undefined;
+      try {
+        await writeFile(previous.sourcePath, previousSource, { mode: 0o600 });
+        await mkdir(freshRuntime, { mode: 0o700 });
+        initial = await startBridge(previous, bootstrap(previous, 1, "upgrade-previous-bearer-0000000000", target.port));
+        const originalManager = await managerMetadata(fixture);
+        const originalOwner = await brokerMetadata(fixture);
+        expect(originalManager.sourceHash).toBe(previousHash);
+        expect(originalOwner.sourceHash).toBe(previousHash);
+
+        await mkdir(join(fixture.managedRoot, "sessions", freshIdentity), { mode: 0o700 });
+        created = await startBridge(fresh, bootstrap(fresh, 1, "upgrade-fresh-session-bearer-0000", target.port));
+        const currentManager = await managerMetadata(fixture);
+        expect(currentManager.sourceHash).toBe(REMOTE_PI_BROKER_SOURCE_SHA256);
+        expect(currentManager.pid).not.toBe(originalManager.pid);
+        await waitUntil(() => {
+          try { process.kill(originalManager.pid, 0); return false; }
+          catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+        });
+        expect((await brokerMetadata(fresh)).sourceHash).toBe(REMOTE_PI_BROKER_SOURCE_SHA256);
+        expect(await brokerMetadata(fixture)).toMatchObject(originalOwner);
+
+        initial.process.stdin.write(sequencedFrame(FRAME_STDIN, 1, Buffer.from("prefix\n")));
+        const prefix = sequenced(await nextFrameOfType(initial.reader, FRAME_STDOUT));
+        expect(prefix.content.toString("utf8")).toBe('{"type":"stale"');
+        initial.process.stdin.write(sequencedFrame(FRAME_OUTPUT_ACK, prefix.sequence));
+        initial.process.kill("SIGKILL");
+        await processExit(initial.process);
+
+        resumed = await startBridge(fixture, bootstrap(
+          fixture, 2, "upgrade-resumed-bearer-00000000000", target.port, initial.authority, prefix.sequence
+        ));
+        expect(resumed.authority.epoch).toBe(initial.authority.epoch + 1);
+        expect(resumed.authority.childProcessLaunchHash).toBe(initial.authority.childProcessLaunchHash);
+        expect(await brokerMetadata(fixture)).toMatchObject({
+          sourceHash: previousHash, owner: originalOwner.owner, child: originalOwner.child, janitor: originalOwner.janitor
+        });
+        expect(await managerMetadata(fixture)).toEqual(currentManager);
+        resumed.process.stdin.write(sequencedFrame(FRAME_STDIN, resumed.state.inputAcknowledged + 1, Buffer.from("suffix\n")));
+        const output = sequenced(await nextFrameOfType(resumed.reader, FRAME_STDOUT));
+        expect(output.content.toString("utf8")).toBe('{"type":"fresh"}\n');
+
+        await authorityKill(fresh, created.authority);
+        await authorityKill(fixture, resumed.authority);
+      } finally {
+        const manager = await managerMetadata(fixture).catch(() => undefined);
+        const controller = manager?.sourceHash === previousHash ? previous : fixture;
+        if (created !== undefined) await authorityKill(fresh, created.authority).catch(() => undefined);
+        const recovered = resumed ?? initial;
+        if (recovered !== undefined) await authorityKill(controller, recovered.authority).catch(() => undefined);
+        for (const bridge of [initial, created, resumed]) {
+          if (bridge?.process.exitCode === null) bridge.process.kill("SIGKILL");
+        }
+        await closeServer(target.server);
+        if (manager !== undefined) await exactKill(manager.pid, "daemon", controller.sourcePath).catch(() => undefined);
         await rm(fixture.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       }
     },
@@ -1844,9 +1945,26 @@ try {
           expect(runs[0]?.[manifest]).toMatchObject({ runnerScriptSha256: fixture.trustedRunnerScriptSha256 });
           expect(runs[0]?.[manifest]).not.toHaveProperty("runnerScript");
           expect(runs[0]?.[manifest]).not.toHaveProperty("transcriptPath");
+          expect(runs[0]?.[manifest]).not.toHaveProperty("runtimeControlPath");
         }
         expect(JSON.stringify(scanned)).not.toContain(currentBearer);
         expect(JSON.stringify(scanned)).not.toContain("joko-broker-stable-bearer");
+
+        const runtimeControl = {
+          generation: 1, policyGeneration: 1, permissionMode: "ask", planMode: false,
+          fastMode: false, runtimePolicy: "standard", approvedRoots: []
+        };
+        const runtimeControlRequest = {
+          operation: "write-runtime-control", sessionId: fixture.productSessionId,
+          runId: runner.runId, runnerInstanceId: runner.runnerFence, launchToken: runner.launchToken,
+          runnerScriptSha256: fixture.trustedRunnerScriptSha256, control: runtimeControl
+        };
+        await managedStoreRejected(fixture, bridge.authority, { ...runtimeControlRequest, launchToken: randomUUID() });
+        expect(await managedStoreRequest(fixture, bridge.authority, runtimeControlRequest)).toMatchObject({ updated: true });
+        expect(await managedStoreRequest(fixture, bridge.authority, runtimeControlRequest)).toMatchObject({ updated: true });
+        await managedStoreRejected(fixture, bridge.authority, { ...runtimeControlRequest,
+          control: { ...runtimeControl, policyGeneration: 0, permissionMode: "bypassPermissions" } });
+        expect(JSON.parse(await readFile(join(runner.runDirectory, "runtime", "control.json"), "utf8"))).toMatchObject(runtimeControl);
 
         const transcriptRevision = String(runs[0]?.["transcriptRevision"]);
         const controlRevision = String(runs[0]?.["controlRevision"]);

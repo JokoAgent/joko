@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -28,6 +28,7 @@ import {
   type ApprovedDirectory,
   type BackendAuthenticationState,
   type BackendDescriptor,
+  type BlobRef,
   type BackgroundTaskOutputResult,
   type Capability,
   type CreateNativeSessionInput,
@@ -171,6 +172,7 @@ const DEFAULT_MAXIMUM_CATALOG_SESSIONS = 1_000;
 const MAX_NATIVE_HISTORY_MESSAGES = 10_000;
 const MAX_PROMPT_BYTES = 1024 * 1024;
 const MAX_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
+const MAX_MCP_COMPLETE_TEXT_BYTES = 2 * 1024 * 1024;
 const MAX_INTERACTION_CACHE = 256;
 const MAX_PENDING_INTERACTIONS = 256;
 const MAX_TURN_FRAMES = 100_000;
@@ -424,7 +426,8 @@ interface ActiveTurn {
   readonly operationId: string;
   mcpCallCancellation: AbortController;
   readonly mcpRootToolWaiters: Map<string, Deferred<void>>;
-  readonly nativeMcpToolCalls: Map<string, { readonly name: string; readonly input: Readonly<Record<string, unknown>>; claimed: boolean }>;
+  readonly nativeMcpToolCalls: Map<string, { readonly name: string; readonly input: Readonly<Record<string, unknown>>;
+    claimed: boolean; retainCompleteText?: true }>;
   readonly subtaskRouteLeases: Map<string, ManagedSubtaskRouteGrant>;
   readonly subtaskRouteAdmissions: Map<string, ManagedSubtaskRouteAdmission>;
   readonly subtaskRouteDecisions: Map<string, ManagedSubtaskRouteDecision>;
@@ -3321,6 +3324,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     });
     signal.throwIfAborted();
     assertCurrent();
+    const metadata = record(result.bridgeMetadata);
+    const nativeCall = turn!.nativeMcpToolCalls.get(options.toolUseId);
+    if (nativeCall !== undefined && !runtime.remote && turn!.context.hostedExecution === undefined && !result.isError
+      && metadata?.["format"] === 1 && metadata["truncated"] === false) nativeCall.retainCompleteText = true;
     return result;
   }
 
@@ -3505,12 +3512,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     });
   }
 
-  async resetNativeMemory(): Promise<NativeMemoryResetResult> {
+  async resetNativeMemory(assertCurrent?: () => void): Promise<NativeMemoryResetResult> {
     if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
     return this.#withNativeMemoryOperation(async () => {
       this.#assertUsable();
       try {
-        const result = await resetClaudeNativeMemory(this.#nativeMemoryConfigDirectory);
+        const result = await resetClaudeNativeMemory(this.#nativeMemoryConfigDirectory, undefined, assertCurrent);
         return result;
       } catch (error) {
         throw nativeMemoryFilesystemError(error, "reset");
@@ -3669,7 +3676,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (!context.hostedExecution && launch.runtimePolicy === "standard" && !scoped.remote && this.#resolveNativeSkills !== undefined) {
         const resourceSignal = AbortSignal.any([context.signal, abortController.signal]);
         const policy = await this.#resolveNativeSkillPolicy?.(context);
-        nativeSkills = await snapshotNativeSkills(await this.#resolveNativeSkills(context, resourceSignal), resourceSignal, undefined, policy);
+        nativeSkills = await snapshotNativeSkills(await this.#resolveNativeSkills(context, resourceSignal), resourceSignal, undefined,
+          policy?.mode === "ambient" && !this.#settingSources.includes("project") ? undefined : policy);
       }
       if (!context.hostedExecution && (this.#resolveTextResources !== undefined || nativeSkills?.skills.some(mount => mount.seed.resource.trustedBuiltin))) {
         if (launch.runtimePolicy === "review_read_only") {
@@ -3692,7 +3700,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           this.#assertBackendInstance(context);
           this.#assertBindingContext(binding, context);
           const builtinSeeds = await Promise.all((nativeSkills?.skills ?? []).filter(mount => mount.seed.resource.trustedBuiltin
-            && nativeSkills?.skillOverrides[mount.seed.resource.name] !== "off").map(async mount => ({
+            && (!nativeSkills?.restrictImplicit || nativeSkills.skillOverrides[mount.seed.resource.name] !== "off")).map(async mount => ({
             id: mount.seed.resource.id, kind: "skill" as const, name: mount.seed.resource.name, revision: mount.seed.resource.revision!, resourceVersion: mount.seed.resource.resourceVersion!,
             content: `Skill base directory: ${JSON.stringify(mount.path)}\nResolve relative references against this exact directory.\n\n${await readFile(mount.filePath, { encoding: "utf8", signal: resourceSignal })}`,
             assertCurrent: () => { nativeSkills!.assertCurrent(); if (builtinInitializationCurrent && !builtinInitializationCurrent()) throw new Error("The native Skill plugin was not acknowledged as loaded."); }
@@ -4077,7 +4085,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             : {
                 settings: {
                   disableClaudeAiConnectors: true,
-                  ...(nativeSkills?.restrictImplicit ? { skillOverrides: { ...nativeSkills.skillOverrides } } : {}),
+                  ...(nativeSkills !== undefined && (nativeSkills.restrictImplicit || Object.keys(nativeSkills.skillOverrides).length > 0)
+                    ? { skillOverrides: { ...nativeSkills.skillOverrides } } : {}),
                   // Filesystem settings remain available below, but a native
                   // helper must never replace the Host-owned credential path.
                   // The fixed CLI additionally filters provider-related `env`
@@ -4543,7 +4552,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const uuid = stringValue(envelope["uuid"]);
     if (uuid !== undefined && turn.seenFrameUuids.has(uuid)) return;
     if (uuid !== undefined) addBoundedIdentity(turn.seenFrameUuids, uuid);
-    const projected = this.#projection.user(message);
+    const projected = this.#projection.user(message, (nativeCallId) =>
+      turn.nativeMcpToolCalls.get(nativeCallId)?.retainCompleteText === true
+        ? Math.min(turn.context.artifactCapacityBytes, MAX_MCP_COMPLETE_TEXT_BYTES) : undefined);
     const nativeContent = record(envelope["message"])?.["content"];
     if (Array.isArray(nativeContent)) for (const raw of nativeContent) {
       const block = record(raw), id = stringValue(block?.["tool_use_id"]);
@@ -4554,13 +4565,57 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (turn.seenToolResults.has(result.callId)) continue;
       addBoundedIdentity(turn.seenToolResults, result.callId);
       appendTurnBlocks(turn, [result.block]);
+      const completeText = result.readCompleteText?.();
+      const artifact = completeText === undefined ? undefined : await this.#storeCompleteMcpToolOutput(runtime, turn, completeText);
       await this.#emit(runtime, turn, {
         type: "tool_result",
         callId: result.callId,
         name: runtime.toolNames.get(result.callId) ?? "Tool",
         output: result.output,
-        isError: result.isError
+        isError: result.isError,
+        ...(artifact === undefined ? {} : { artifact })
       });
+    }
+  }
+
+  async #storeCompleteMcpToolOutput(runtime: NativeRuntime, turn: ActiveTurn, text: string): Promise<BlobRef | undefined> {
+    const assertCurrent = async (): Promise<void> => {
+      turn.context.signal.throwIfAborted();
+      turn.mcpCallCancellation.signal.throwIfAborted();
+      if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
+        throw new Error("The original MCP tool turn is no longer active.");
+      }
+      turn.context.nativeToolAuthorization?.assertCurrent();
+    };
+    let directory: string | undefined;
+    try {
+      await assertCurrent();
+      directory = await mkdtemp(join(tmpdir(), "joko-claude-tool-output-"));
+      const fileName = "mcp-tool-output.txt";
+      const path = join(directory, fileName);
+      const bytes = Buffer.from(text, "utf8");
+      const handle = await open(path, "wx+", 0o600);
+      try {
+        await handle.writeFile(bytes);
+        await assertCurrent();
+        return await turn.context.storeArtifact(path, {
+          fileName, mimeType: "text/plain",
+          openFile: { handle, expectedSize: bytes.byteLength, assertCurrent }
+        });
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    } catch {
+      if (!turn.stopping && !turn.context.signal.aborted && !turn.mcpCallCancellation.signal.aborted) {
+        await this.#emit(runtime, turn, { type: "error", terminal: false, error: {
+          code: "CLAUDE_MCP_COMPLETE_OUTPUT_UNAVAILABLE", message: "The complete MCP result file could not be saved.",
+          phase: "stream", retryable: false, stateMayHaveChanged: false,
+          recovery: "Review the inline MCP result in this turn."
+        } });
+      }
+      return undefined;
+    } finally {
+      if (directory !== undefined) await rm(directory, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
@@ -8030,6 +8085,20 @@ function invalidForkBoundary(): JokoError {
 function nativeMemoryFilesystemError(error: unknown, operation: "status" | "reset"): JokoError {
   if (error instanceof JokoError) return error;
   const filesystem = error instanceof ClaudeNativeMemoryFilesystemError ? error : undefined;
+  if (filesystem?.failure === "authorization_retired") {
+    return claudeCodeError(
+      "CLAUDE_NATIVE_MEMORY_RESET_AUTHORIZATION_RETIRED",
+      "The connection that authorized the Claude native memory reset is no longer active.",
+      "memory_reset",
+      {
+        retryable: false,
+        stateMayHaveChanged: filesystem.stateMayHaveChanged,
+        recovery: filesystem.stateMayHaveChanged
+          ? "Inspect local native memory state before explicitly issuing another reset."
+          : "Use an active connection and explicitly confirm a new reset."
+      }
+    );
+  }
   const unsafe = filesystem?.failure === "unsafe_path" || filesystem?.failure === "changed";
   return claudeCodeError(
     unsafe ? "CLAUDE_NATIVE_MEMORY_PATH_UNSAFE" : operation === "status"
