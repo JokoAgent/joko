@@ -33,7 +33,8 @@ import {
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
-  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, CustomToolPermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
+  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
+  CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
@@ -2674,10 +2675,12 @@ describe("mobile Extension catalog authority", () => {
     const network = fakeNetwork(), extension = mobileExtensionFixture();
     network.getExtension = vi.fn(async () => extension);
     const task = create(SessionSchema, { ...runtimeSession, sessionId: "plugin-task" });
+    const subject = create(PermissionSubjectSchema, { kind: { case: "customTool", value: create(CustomToolPermissionSubjectSchema,
+      { toolId: "plugin_managed_task", displayName: "Plugin task" }) } });
     const approval = create(InteractionSchema, { ...permissionInteraction, interactionId: "extension-write-new", sessionId: task.sessionId,
-      request: { case: "permission", value: { risk: PermissionRisk.HIGH, title: "Allow plugin writes",
+      request: { case: "permission", value: create(PermissionRequestSchema, { risk: PermissionRisk.HIGH, title: "Allow plugin writes", subject,
         allowedDecisions: [PermissionDecisionKind.ALLOW_ONCE, PermissionDecisionKind.DENY_ONCE],
-        subject: { kind: { case: "customTool", value: create(CustomToolPermissionSubjectSchema, { toolId: "plugin_managed_task", displayName: "Plugin task" }) } } } } });
+      }) } });
     const existing = create(InteractionSchema, { ...approval, interactionId: "extension-write-old" });
     let owner = create(SnapshotSchema, { ...offlineOwnerProjection([runtimeSession, task]), interactions: [existing] });
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
