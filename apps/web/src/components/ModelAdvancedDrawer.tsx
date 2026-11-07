@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
 import { Check, CircleHelp, Minus, SlidersHorizontal } from "lucide-react";
 import type { AppController } from "../controller.js";
-import type { AppSnapshot, ModelPriceOverrideView, ModelView, ModelWorkingContextTarget, ModelWorkingContextView, ProviderCompatibilityView, ProviderConfigurationView } from "../model.js";
+import type { AppSnapshot, ModelPriceOverrideView, ModelView, ModelWorkingContextRoute, ModelWorkingContextTarget, ModelWorkingContextView, ProviderCompatibilityView, ProviderConfigurationView } from "../model.js";
 import { isConversationModel } from "../model-capabilities.js";
 import { clearModelEffort, isModelVisible, modelPreferenceKey, preferredModelEffort, readModelConfiguration, readModelPickerOwnerPreferences, setModelConfiguration, setModelVisible, useModelPickerOwnerPreferences } from "../model-picker-preferences.js";
 import { providerCompatibilityLabel, supportsProviderField } from "../provider-runtime-draft.js";
@@ -23,6 +23,7 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
   const pendingRef = useRef(false);
   const [error, setError] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [workingSettingsRevision, setWorkingSettingsRevision] = useState(0);
   const heading = useRef<HTMLDivElement>(null);
   const lifetime = useRef<AbortController | undefined>(undefined);
   const [foreground, setForeground] = useState(() => document.visibilityState !== "hidden");
@@ -52,6 +53,8 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
   const backendIds = [...new Set([...configuration?.runtimes.map(item => item.backendId) ?? [], ...routes.map(route => route.backendId)])];
   const targets = chatRoutes.map(({ backendId, providerId, modelId }) => ({ backendId, providerId, modelId }));
   const target = useMemo((): ModelWorkingContextTarget | undefined => targets.length === 0 ? undefined : { ...targets[0]!, relatedTargets: targets.slice(1) }, [routeKey]);
+  const piTarget = targets.find(route => snapshot.settings.pi.some(settings => settings.backendId === route.backendId));
+  const workingSettingsChanged = piTarget === undefined ? undefined : () => setWorkingSettingsRevision(value => value + 1);
   const act = async (operation: (signal: AbortSignal) => Promise<void>, close = false): Promise<void> => {
     const signal = lifetime.current?.signal;
     if (pendingRef.current || !connected || signal === undefined || signal.aborted) return;
@@ -106,8 +109,12 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
             {effortCustomized && <Button tone="ghost" disabled={ownerId === undefined || pending} onClick={() => { for (const route of chatRoutes) clearModelEffort(ownerId, route); }}>{t("settings.modelAdvanced.resetEffort")}</Button>}
           </Section>}
           {target !== undefined && <Section title={t("settings.modelAdvanced.context")} hint={t("settings.modelAdvanced.contextHint")}>
-            {runtime?.capabilities.supportsRepositoryModels && installed?.repositoryModel !== undefined ? <ManagedModelContextSettings controller={controller} runtime={runtime} modelId={installed.name} repositoryModel={installed.repositoryModel} disabled={!connected || pending || runtime.capabilities.canConfigure !== true} locale={controller.state.effectiveLocale} /> : <WorkingContextSettings controller={controller} target={target} routes={chatRoutes} ownerKey={ownerKey} disabled={!connected || pending} t={t} />}
+            {runtime?.capabilities.supportsRepositoryModels && installed?.repositoryModel !== undefined ? <ManagedModelContextSettings controller={controller} runtime={runtime} modelId={installed.name} repositoryModel={installed.repositoryModel} disabled={!connected || pending || runtime.capabilities.canConfigure !== true} locale={controller.state.effectiveLocale} /> : <WorkingContextSettings controller={controller} target={target} routes={chatRoutes} ownerKey={ownerKey} disabled={!connected || pending} t={t}
+              refreshRevision={workingSettingsRevision} onCommitted={workingSettingsChanged} />}
           </Section>}
+          {piTarget !== undefined && <PiModelCompactionSettings key={JSON.stringify([ownerKey, piTarget])}
+            controller={controller} target={piTarget} disabled={!connected || pending} t={t}
+            refreshRevision={workingSettingsRevision} onCommitted={workingSettingsChanged} />}
         </>}
           <Section title={t("settings.modelAdvanced.specifications")}>
             <Fact label={t("settings.contextWindow")}>{primary.contextWindow > 0 ? <>{formatTokens(primary.contextWindow)} {t("settings.modelAdvanced.tokens")} <small>{t(metadata?.contextWindowSource === "estimated" ? "settings.modelAdvanced.estimated" : metadata?.contextWindowSource === "declared" ? "settings.modelAdvanced.declared" : "settings.modelAdvanced.sourceUnknown")}</small></> : t("settings.modelAdvanced.undeclared")}</Fact>
@@ -139,7 +146,11 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
   </Modal>;
 }
 
-function WorkingContextSettings({ controller, target, routes, ownerKey, disabled, t }: { readonly controller: AppController; readonly target: ModelWorkingContextTarget; readonly routes: readonly ModelView[]; readonly ownerKey: string; readonly disabled: boolean; readonly t: Translator }): JSX.Element {
+function WorkingContextSettings({ controller, target, routes, ownerKey, disabled, t, refreshRevision, onCommitted }: {
+  readonly controller: AppController; readonly target: ModelWorkingContextTarget; readonly routes: readonly ModelView[];
+  readonly ownerKey: string; readonly disabled: boolean; readonly t: Translator;
+  readonly refreshRevision: number; readonly onCommitted: (() => void) | undefined;
+}): JSX.Element {
   const targetKey = JSON.stringify(target);
   const [context, setContext] = useState<ModelWorkingContextView>();
   const [draft, setDraft] = useState("");
@@ -162,7 +173,7 @@ function WorkingContextSettings({ controller, target, routes, ownerKey, disabled
     const retire = (): void => abort.abort();
     document.addEventListener("visibilitychange", retire); window.addEventListener("pagehide", retire);
     return () => { abort.abort(); document.removeEventListener("visibilitychange", retire); window.removeEventListener("pagehide", retire); };
-  }, [controller, ownerKey, targetKey, revision, disabled]);
+  }, [controller, ownerKey, targetKey, revision, disabled, refreshRevision]);
   const windows = routes.map(route => route.contextWindow).filter(value => value > 0);
   const min = windows.length === 0 ? 1 : Math.max(1, Math.floor(Math.min(100_000, ...windows) / 1_000));
   const k = Number(draft); const tokens = k * 1_000;
@@ -171,7 +182,11 @@ function WorkingContextSettings({ controller, target, routes, ownerKey, disabled
     const signal = lifetime.current?.signal;
     if (flight.current || loading || context === undefined || !context.canConfigure || disabled || signal === undefined || signal.aborted || !reset && (!dirty.current || !valid)) return;
     flight.current = true; setWriting(true); setError(false);
-    try { const next = reset ? await controller.resetModelWorkingContext(target, context, signal) : await controller.setModelWorkingContext(target, context, draft.trim() === "" ? undefined : tokens, signal); if (!signal.aborted) display(next); }
+    try {
+      const next = reset ? await controller.resetModelWorkingContext(target, context, signal)
+        : await controller.setModelWorkingContext(target, context, draft.trim() === "" ? undefined : tokens, signal);
+      if (!signal.aborted) { display(next); onCommitted?.(); }
+    }
     catch {
       if (!signal.aborted) {
         setError(true);
@@ -199,6 +214,84 @@ function WorkingContextSettings({ controller, target, routes, ownerKey, disabled
     </>}
     {error && <p className="danger-text" role="alert">{t("settings.modelAdvanced.contextFailed")} <Button disabled={loading || writing || disabled} onClick={() => setRevision(value => value + 1)}>{t("common.retry")}</Button></p>}
   </div>;
+}
+
+function PiModelCompactionSettings({ controller, target, disabled, t, refreshRevision, onCommitted }: {
+  readonly controller: AppController;
+  readonly target: ModelWorkingContextRoute;
+  readonly disabled: boolean;
+  readonly t: Translator;
+  readonly refreshRevision: number;
+  readonly onCommitted: (() => void) | undefined;
+}): JSX.Element | null {
+  const [context, setContext] = useState<ModelWorkingContextView>();
+  const [failed, setFailed] = useState(false);
+  const [reading, setReading] = useState(false);
+  const [writing, setWriting] = useState(false);
+  const [retry, setRetry] = useState(0);
+  const lifetime = useRef<AbortController | undefined>(undefined);
+  const flight = useRef(false);
+  useEffect(() => {
+    const abort = new AbortController();
+    lifetime.current = abort;
+    flight.current = false;
+    setReading(!disabled);
+    setWriting(false);
+    setFailed(false);
+    if (!disabled) {
+      void controller.getModelWorkingContext(target, abort.signal).then(value => {
+        if (!abort.signal.aborted) setContext(value);
+      }, () => { if (!abort.signal.aborted) setFailed(true); }).finally(() => {
+        if (!abort.signal.aborted) setReading(false);
+      });
+    }
+    const retire = (): void => abort.abort();
+    document.addEventListener("visibilitychange", retire);
+    window.addEventListener("pagehide", retire);
+    return () => {
+      abort.abort();
+      document.removeEventListener("visibilitychange", retire);
+      window.removeEventListener("pagehide", retire);
+    };
+  }, [controller, target.backendId, target.providerId, target.modelId, disabled, retry, refreshRevision]);
+
+  const defaultPercent = context?.defaultAutoCompactionThresholdPercent;
+  const configured = context?.autoCompactionThresholdPercent;
+  const change = async (value: string): Promise<void> => {
+    const signal = lifetime.current?.signal;
+    if (disabled || reading || flight.current || !context?.canConfigure || signal === undefined || signal.aborted) return;
+    flight.current = true;
+    setWriting(true);
+    setFailed(false);
+    try {
+      const saved = await controller.setModelAutoCompactionThreshold(target, context, value === "default" ? null : Number(value), signal);
+      if (!signal.aborted) { setContext(saved); onCommitted?.(); }
+    } catch {
+      if (!signal.aborted) {
+        setFailed(true);
+        try {
+          const current = await controller.getModelWorkingContext(target, signal);
+          if (!signal.aborted) setContext(current);
+        } catch { /* Keep the last observed preference available for inspection. */ }
+      }
+    } finally {
+      if (!signal.aborted) { flight.current = false; setWriting(false); }
+    }
+  };
+  if (defaultPercent === undefined && !failed) return null;
+  const percentages = new Set([50, 60, 70, 80, 85, 90]);
+  if (defaultPercent !== undefined) percentages.add(defaultPercent);
+  if (configured !== undefined) percentages.add(configured);
+  return <Section title={t("settings.modelAdvanced.compactionThreshold")} hint={t("settings.modelAdvanced.compactionThresholdHint")}>
+    {defaultPercent !== undefined && <SelectControl aria-label={t("settings.modelAdvanced.compactionThreshold")}
+      disabled={disabled || reading || writing || !context?.canConfigure} value={configured === undefined ? "default" : String(configured)}
+      onChange={event => { void change(event.target.value); }}>
+      <option value="default">{t("settings.modelAdvanced.compactionThresholdDefault", { percent: defaultPercent })}</option>
+      {[...percentages].sort((a, b) => a - b).map(percent => <option key={percent} value={String(percent)}>{percent}%</option>)}
+    </SelectControl>}
+    {failed && <p role="alert">{t("settings.modelAdvanced.compactionThresholdFailed")} <Button disabled={disabled || reading || writing}
+      onClick={() => setRetry(value => value + 1)}>{t("common.retry")}</Button></p>}
+  </Section>;
 }
 
 function ModelPricing({ controller, model, ownerKey, refreshRevision, disabled, onEdit, t }: { readonly controller: AppController; readonly model: ModelView; readonly ownerKey: string; readonly refreshRevision: number; readonly disabled: boolean; readonly onEdit: () => void; readonly t: Translator }): JSX.Element {

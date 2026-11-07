@@ -7950,6 +7950,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapModelWorkingContext(response.context, target);
   }
 
+  async setModelAutoCompactionThreshold(target: ModelWorkingContextRoute, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, percent: number | null, signal?: AbortSignal): Promise<ModelWorkingContextView> {
+    validateWorkingContextTarget(target);
+    validateWorkingContextObservation(observed);
+    if (percent !== null && !validModelCompactionPercent(percent)) throw new GatewayError("Invalid model compaction threshold.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(BackendService, scope.transport).setModelWorkingContext({
+      operationId: randomUuid(), target: workingContextRoute(target), expectedRevision: { value: observed.revision },
+      expectedSourceRevision: observed.sourceRevision,
+      autoCompactionThresholdChange: percent === null
+        ? { case: "restoreAutoCompactionThreshold", value: true }
+        : { case: "autoCompactionThresholdPercent", value: percent }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapModelWorkingContext(response.context, target);
+  }
+
   async setManagedModelContext(runtimeId: string, target: ManagedModelContextTarget, tokens: number): Promise<ManagedModelContextView> {
     const scope = this.captureActionScope();
     const response = await createClient(ManagedModelRuntimeService, scope.transport).setManagedModelContext({ runtimeId, target: protoManagedModelContextTarget(target), relatedTargets: (target.relatedTargets ?? []).map(protoManagedModelContextTarget), contextWindowTokens: BigInt(tokens) }, { signal: scope.signal });
@@ -19381,15 +19397,23 @@ function validateWorkingContextTarget(target: ModelWorkingContextTarget): void {
 function validateWorkingContextObservation(view: Pick<ModelWorkingContextView, "revision" | "sourceRevision">): void {
   if (view.revision < 0n || !validCatalogSnapshotToken(view.sourceRevision)) throw new GatewayError("Invalid working context observation.");
 }
+function validModelCompactionPercent(value: number): boolean { return Number.isSafeInteger(value) && value >= 50 && value <= 95; }
 function mapModelWorkingContext(context: ProtoModelWorkingContextView | undefined, target: ModelWorkingContextTarget): ModelWorkingContextView {
   if (context?.target === undefined || context.revision === undefined || context.target.backendId !== target.backendId || context.target.providerId !== target.providerId || context.target.modelId !== target.modelId) throw new GatewayError("Working context ownership changed.");
   const tokens = (value: bigint | undefined): number | undefined => { if (value === undefined) return undefined; const number = Number(value); if (!Number.isSafeInteger(number) || number <= 0) throw new GatewayError("Invalid working context value."); return number; };
+  const { autoCompactionThresholdPercent, defaultAutoCompactionThresholdPercent } = context;
+  if (defaultAutoCompactionThresholdPercent !== undefined && !validModelCompactionPercent(defaultAutoCompactionThresholdPercent)
+    || autoCompactionThresholdPercent !== undefined && (defaultAutoCompactionThresholdPercent === undefined || !validModelCompactionPercent(autoCompactionThresholdPercent))) {
+    throw new GatewayError("Invalid model compaction threshold metadata.");
+  }
   const view: ModelWorkingContextView = {
     target: workingContextRoute(target), revision: context.revision.value, sourceRevision: context.sourceRevision,
     ...(context.limitTokens === undefined ? {} : { limitTokens: tokens(context.limitTokens) }),
     ...(context.defaultContextWindowTokens === undefined ? {} : { defaultContextWindowTokens: tokens(context.defaultContextWindowTokens) }),
     ...(context.effectiveContextWindowTokens === undefined ? {} : { effectiveContextWindowTokens: tokens(context.effectiveContextWindowTokens) }),
     customized: context.customized, mixed: context.mixed, canConfigure: context.canConfigure,
+    ...(autoCompactionThresholdPercent === undefined ? {} : { autoCompactionThresholdPercent }),
+    ...(defaultAutoCompactionThresholdPercent === undefined ? {} : { defaultAutoCompactionThresholdPercent }),
     ...(context.blockedReason === undefined ? {} : { blockedReason: context.blockedReason }),
     ...(context.nativeContext === undefined ? {} : {
       nativeContext: {

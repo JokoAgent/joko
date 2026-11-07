@@ -421,6 +421,8 @@ export interface ModelWorkingContextView {
   readonly sourceRevision: string;
   readonly canConfigure: boolean;
   readonly blockedReason?: string;
+  readonly autoCompactionThresholdPercent?: number;
+  readonly defaultAutoCompactionThresholdPercent?: number;
   readonly nativeContext?: {
     readonly contextWindowTokens?: number;
     readonly autoCompactLimitTokens?: number;
@@ -6616,6 +6618,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   getModelWorkingContext(target: ModelWorkingContextTarget, signal?: AbortSignal): Promise<ModelWorkingContextView>;
   setModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, tokens?: number, signal?: AbortSignal): Promise<ModelWorkingContextView>;
   resetModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, signal?: AbortSignal): Promise<ModelWorkingContextView>;
+  setModelAutoCompactionThreshold(target: ModelWorkingContextRoute, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, percent: number | null, signal?: AbortSignal): Promise<ModelWorkingContextView>;
   setManagedModelContext(runtimeId: string, target: ManagedModelContextTarget, tokens: number): Promise<ManagedModelContextView>;
   resetManagedModelContext(runtimeId: string, target: ManagedModelContextTarget): Promise<ManagedModelContextView>;
   startManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView>;

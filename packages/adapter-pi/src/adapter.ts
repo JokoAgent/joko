@@ -378,6 +378,10 @@ export interface PiAdapterOptions {
   readonly appendSystemPrompt?: string;
   /** Service-owned private Maker Memory prompt snapshot resolved for this Target at runtime start. */
   readonly resolveMakerMemoryPrompt?: (context: AdapterContext, bridge: PiMcpBridgeOptions | undefined) => string | undefined;
+  /** Local managed Pi preference for the exact configured Provider and Model. */
+  readonly resolveModelAutoCompactionThreshold?: (context: AdapterContext, selection: {
+    readonly providerId: string; readonly modelId: string;
+  }) => number | undefined;
   /** Captured once per runtime; active runtimes do not hot-change this setting. */
   readonly isCompactionMemoryEnabled?: (context: AdapterContext) => boolean;
   /** Best-effort private sink; implementations must not log or event the summary. */
@@ -626,6 +630,8 @@ interface PiRuntime {
   autoCompaction: boolean;
   readonly compactionMemoryEnabled: boolean;
   autoCompactionThresholdPercent: number;
+  defaultAutoCompactionThresholdPercent: number;
+  readonly modelAutoCompactionThresholdPercent: number | undefined;
   workingContextWindow: number | undefined;
   workingContextSelection: string | undefined;
   workingContextUnconfirmed?: boolean;
@@ -1137,7 +1143,7 @@ export class PiBackendAdapter implements
       initialPermissionMode: runtime.control.permissionMode,
       initialPlanMode: runtime.control.planMode,
       initialFastMode: runtime.control.fastMode,
-      compactionThresholdPercent: runtime.autoCompactionThresholdPercent
+      compactionThresholdPercent: runtime.defaultAutoCompactionThresholdPercent
     });
     return nativeState(
       runtime.binding,
@@ -2138,16 +2144,18 @@ export class PiBackendAdapter implements
       const providerId = state.model?.provider;
       const modelId = state.model?.id;
       const desired = readPiWorkingContext(context, providerId, modelId);
+      const threshold = desired === undefined ? undefined : this.#modelAutoCompactionThreshold(context, providerId, modelId);
       const selection = providerId === undefined || modelId === undefined ? undefined : `${providerId}\0${modelId}`;
       if (desired === runtime!.workingContextWindow && !runtime!.workingContextUnconfirmed
+        && threshold === runtime!.modelAutoCompactionThresholdPercent
         && (desired === undefined || selection === runtime!.workingContextSelection)) return;
       const profile = { ...(this.#spawnProfiles.get(context.sessionId) ?? restoredSpawnProfile(context)), providerId, modelId,
         effort: state.thinkingLevel, initialPermissionMode: runtime!.control.permissionMode,
         initialPlanMode: runtime!.control.planMode, initialFastMode: runtime!.control.fastMode,
-        compactionThresholdPercent: runtime!.autoCompactionThresholdPercent,
+        compactionThresholdPercent: runtime!.defaultAutoCompactionThresholdPercent,
         autoCompaction: runtime!.autoCompaction, autoRetry: runtime!.autoRetry };
       const binding = runtime!.binding;
-      const policy = { autoCompaction: runtime!.autoCompaction, autoRetry: runtime!.autoRetry, threshold: runtime!.autoCompactionThresholdPercent };
+      const policy = { autoCompaction: runtime!.autoCompaction, autoRetry: runtime!.autoRetry };
       this.#workingContextRecoveries.set(context.sessionId, { binding, profile, targetId: context.target.id,
         workspaceRoot: context.target.workspaceRoot, backendInstanceGeneration: context.backendInstanceGeneration });
       runtime!.workingContextUnconfirmed = true;
@@ -2160,7 +2168,6 @@ export class PiBackendAdapter implements
       await next.transport.request({ type: "set_auto_retry", enabled: policy.autoRetry }, { signal: context.signal, stateMayHaveChanged: true });
       next.autoCompaction = policy.autoCompaction;
       next.autoRetry = policy.autoRetry;
-      next.autoCompactionThresholdPercent = policy.threshold;
       this.#spawnProfiles.set(context.sessionId, profile);
       this.#workingContextRecoveries.delete(context.sessionId);
       next.workingContextUnconfirmed = false;
@@ -2380,11 +2387,20 @@ export class PiBackendAdapter implements
     assertAutoCompactionThresholdPercent(percent);
     const runtime = this.#runtime(context);
     await this.#runExclusiveSessionMutation(runtime, context, async () => {
-      runtime.autoCompactionThresholdPercent = percent;
+      runtime.defaultAutoCompactionThresholdPercent = percent;
+      runtime.autoCompactionThresholdPercent = runtime.modelAutoCompactionThresholdPercent ?? percent;
       const profile = this.#spawnProfiles.get(context.sessionId);
       if (profile !== undefined) this.#spawnProfiles.set(context.sessionId, { ...profile, compactionThresholdPercent: percent });
     });
     await this.#compactAtConfiguredThresholdIfIdle(runtime, context);
+  }
+
+  #modelAutoCompactionThreshold(context: AdapterContext, providerId: string | undefined, modelId: string | undefined): number | undefined {
+    if (providerId === undefined || modelId === undefined || context.target.remoteWorkspace !== undefined
+      || context.runtimePolicy === "review_read_only" || context.hostedExecution !== undefined) return undefined;
+    const percent = this.#options.resolveModelAutoCompactionThreshold?.(context, { providerId, modelId });
+    if (percent !== undefined) assertAutoCompactionThresholdPercent(percent);
+    return percent;
   }
 
   async setAutoRetry(enabled: boolean, context: AdapterContext): Promise<void> {
@@ -4847,9 +4863,13 @@ export class PiBackendAdapter implements
       releaseUnpublished();
       throw error;
     });
-    const workingContextWindow = readPiWorkingContext(context, profile.providerId, profile.modelId);
-    let workingNativeWindow: number | undefined;
     try {
+      const workingContextWindow = readPiWorkingContext(context, profile.providerId, profile.modelId);
+      const defaultAutoCompactionThresholdPercent = profile.compactionThresholdPercent ?? configuredAutoCompactionThresholdPercent(options.settings);
+      const modelAutoCompactionThresholdPercent = workingContextWindow === undefined ? undefined
+        : this.#modelAutoCompactionThreshold(context, profile.providerId, profile.modelId);
+      const autoCompactionThresholdPercent = modelAutoCompactionThresholdPercent ?? defaultAutoCompactionThresholdPercent;
+      let workingNativeWindow: number | undefined;
       const hosted = context.hostedExecution;
       assertPiHostedModel(hosted, profile.providerId, profile.modelId);
       this.#assertProviderAuthenticationNotRevoked(options, profile.providerId);
@@ -5166,7 +5186,7 @@ export class PiBackendAdapter implements
           "The exact model capacity is unavailable for process-private configuration", "provision");
         workingNativeWindow = await writePiWorkingContext(preparedAgentHome.path, { providerId: profile.providerId, modelId: profile.modelId },
           workingContextWindow, declared?.contextWindow || workingContextWindow,
-          profile.compactionThresholdPercent ?? configuredAutoCompactionThresholdPercent(options.settings));
+          autoCompactionThresholdPercent);
       }
       redactValues = [
         ...[...secretNames]
@@ -5320,7 +5340,9 @@ export class PiBackendAdapter implements
         autoRetry: profile.autoRetry ?? options.settings?.retry?.enabled ?? true,
         autoCompaction: profile.autoCompaction ?? options.settings?.compaction?.enabled ?? true,
         compactionMemoryEnabled,
-        autoCompactionThresholdPercent: profile.compactionThresholdPercent ?? configuredAutoCompactionThresholdPercent(options.settings),
+        autoCompactionThresholdPercent,
+        defaultAutoCompactionThresholdPercent,
+        modelAutoCompactionThresholdPercent,
         workingContextWindow,
         workingContextSelection: profile.providerId === undefined || profile.modelId === undefined ? undefined : `${profile.providerId}\0${profile.modelId}`,
         ready: false,

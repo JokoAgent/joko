@@ -250,6 +250,8 @@ message ModelWorkingContextView {
   bool can_configure = 9;
   optional string blocked_reason = 10;
   ModelNativeContextInfo native_context = 11;
+  optional uint32 auto_compaction_threshold_percent = 12;
+  optional uint32 default_auto_compaction_threshold_percent = 13;
 }
 
 message SessionContextBudgetView {
