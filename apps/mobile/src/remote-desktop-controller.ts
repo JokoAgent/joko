@@ -1008,8 +1008,14 @@ export class MobileRemoteDesktopController {
     this.#set({ ...this.#snapshot, wantedControl: enabled && this.#snapshot.controlling });
     if (!enabled) {
       this.#retireClipboardOperation();
-      this.#emit({ type: "releaseInput" });
-      this.#emit({ type: "control", enabled: false });
+      if (this.presentation?.nativeVideo) {
+        this.#emit({ type: "releaseInput" });
+        this.#emit({ type: "control", enabled: false });
+      } else {
+        this.#inputBatch = undefined;
+        this.#inputPending = false;
+        this.#emit({ type: "control", enabled: false, release: true });
+      }
       this.#retireKeyboardTools(true);
       return;
     }

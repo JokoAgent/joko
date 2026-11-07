@@ -89,6 +89,23 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[2]).toMatchObject({ events: [{ kind: "button", button: 2, down: false, x: .6, y: .6 }] });
   });
 
+  it("releases a held remote button on view-only entry while its original relay ACK is outstanding", async () => {
+    const value = viewer();
+    value.pointer(value.stage, "pointerdown");
+    await vi.advanceTimersByTimeAsync(400);
+    value.pointer(value.stage, "pointerup");
+    expect(value.packets()).toHaveLength(1);
+    expect(value.packets()[0]).toMatchObject({ sequence: 101, events: [{ kind: "button", button: 0, down: true }] });
+
+    value.receive({ type: "releaseInput" });
+    value.receive({ type: "control", enabled: false, release: true });
+    expect(value.packets()).toHaveLength(2);
+    expect(value.packets()[1]).toMatchObject({ sequence: 102, events: [{ kind: "release" }] });
+    value.receive({ type: "ack", epoch: "current-mouse", sequence: 101 });
+    await vi.advanceTimersByTimeAsync(66);
+    expect(value.packets()).toHaveLength(2);
+  });
+
   it("does not click after moving away and back to the same touch point", async () => {
     const value = viewer();
     value.config(false);
