@@ -72,6 +72,7 @@ import type { ArtifactStore } from "./artifact-store.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
 import type { EnqueueResult, InteractionDecisionSubmission, SessionHost } from "./session-host.js";
+import { listAllInteractions, listAllMessagingInboundRequests } from "./operational-pagination.js";
 
 const CREDENTIAL_JOURNAL_SCOPE_TYPE = "service";
 const CREDENTIAL_JOURNAL_SCOPE_ID = "orchestrator";
@@ -600,6 +601,7 @@ export class MessagingManager {
     this.#store.recoverClaimedMessagingInteractions(this.#now());
     this.#unsubscribeProgress = this.#store.subscribe(event => { this.#observeFeishuProgress(event); this.#observeReplyStream(event); });
     await this.#cleanupCredentials();
+    await this.#recoverStartupReceipts();
     for (const connection of this.#store.listMessagingConnections()) {
       if (connection.enabled) this.#startWorker(connection.id);
       if (connection.enabled && connection.channel === "wechat") {
@@ -623,6 +625,29 @@ export class MessagingManager {
       if (connection.enabled && (connection.channel === "telegram" || connection.channel === "discord")) {
         for (const request of this.#store.listMessagingInboundRequests({ connectionId: connection.id, statuses: ["completed", "failed", "cancelled"], limit: 500 })) this.#finishReplyStream(request.id);
       }
+    }
+  }
+
+  async #recoverStartupReceipts(): Promise<void> {
+    // Host recovery can settle accepted work before Messaging starts its workers.
+    // Read all pages before projecting terminal status, which changes the queued set.
+    const requests = listAllMessagingInboundRequests(this.#store, { statuses: ["queued"] });
+    for (const request of requests) {
+      if (request.runId === undefined || request.queueItemId === undefined || request.conversationId === undefined) continue;
+      const run = this.#store.findRun(request.runId)?.descriptor;
+      if (run === undefined || (run.state !== "completed" && run.state !== "aborted" && run.state !== "failed")) continue;
+      const conversation = this.#store.findMessagingConversation(request.conversationId);
+      const connection = this.#store.findMessagingConnection(request.connectionId);
+      const queue = this.#store.getQueueItem(request.queueItemId);
+      if (conversation?.status !== "active" || conversation.partnerId !== undefined
+        || !connection?.enabled || connection.generation !== request.channelGeneration
+        || conversation.connectionId !== connection.id || conversation.channelGeneration !== connection.generation
+        || conversation.sessionId !== run.sessionId || queue.sessionId !== run.sessionId
+        || queue.runId !== run.id || queue.operationId !== request.operationId || queue.body.messagingOrigin !== undefined) continue;
+      await this.onRunSettled({ sessionId: run.sessionId, runId: run.id, outcome: run.state });
+    }
+    for (const interaction of listAllInteractions(this.#store, { status: "open" })) {
+      this.onInteractionOpened({ sessionId: interaction.sessionId, interactionId: interaction.id });
     }
   }
 

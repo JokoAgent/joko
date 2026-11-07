@@ -71,6 +71,82 @@ afterEach(async () => {
 });
 
 describe("MessagingManager", () => {
+  it.each(["reply", "permission"] as const)("recovers a %s made durable before Messaging initializes", async (outcome) => {
+    const fixture = await createFixture(undefined, () => new ControlledReplyAdapter(), () => new StreamingDiscordTransport());
+    const enqueue = fixture.store.enqueueQueueItem.bind(fixture.store);
+    vi.spyOn(fixture.store, "enqueueQueueItem").mockImplementationOnce((input) => {
+      const queue = enqueue(input);
+      fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: true, traceId: "fixture:hold-messaging-before-restart" });
+      return queue;
+    });
+    const connection = await enableReplyStream(fixture, "discord");
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("queued"));
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(connection.id).cursor).toBe("discord-cursor-1"));
+    const request = fixture.store.listMessagingInboundRequests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue.state).toBe("accepted");
+    await fixture.manager.close();
+    await fixture.host.dispose();
+
+    const adapter = new ControlledReplyAdapter();
+    const transport = new StreamingDiscordTransport();
+    const card = vi.spyOn(transport, "sendInteractionCard");
+    const poll = vi.spyOn(transport, "poll");
+    let manager!: MessagingManager;
+    const runSettled = vi.fn((input: Parameters<MessagingManager["onRunSettled"]>[0]) => manager.onRunSettled(input));
+    const interactionOpened = vi.fn((input: Parameters<MessagingManager["onInteractionOpened"]>[0]) => manager.onInteractionOpened(input));
+    const host = new SessionHost(fixture.store, fixture.artifacts, [adapter], {
+      onServiceRunSettled: runSettled,
+      onServiceInteractionOpened: interactionOpened,
+      onServiceInteractionSettled: (input) => manager.onInteractionSettled(input)
+    });
+    const options: MessagingManagerOptions = {
+      store: fixture.store, credentials: fixture.credentials, sessionHost: host, artifacts: fixture.artifacts,
+      createDiscordTransport: (input) => transport.bind(input), retryDelayMs: 5, pollTimeoutSeconds: 0
+    };
+    manager = new MessagingManager(options);
+    cleanups.push(async () => { await manager.close(); await host.dispose(); });
+    fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: false, traceId: "fixture:resume-messaging-after-restart" });
+    await host.initialize();
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    if (outcome === "reply") {
+      await adapter.finish("Recovered before Messaging was ready.");
+      await vi.waitFor(() => expect(runSettled).toHaveBeenCalledWith(expect.objectContaining({ runId: request.runId, outcome: "completed" })));
+      expect(fixture.store.getRun(request.runId!).descriptor.state).toBe("completed");
+    } else {
+      void adapter.context!.requestInteraction({
+        id: "startup-permission", kind: "permission", title: "Run command", toolName: "shell",
+        summary: "Run the approved command.", risk: "high", choices: ["allow_once", "deny_once"]
+      }).catch(() => undefined);
+      await vi.waitFor(() => expect(interactionOpened).toHaveBeenCalledWith({ sessionId: queue.sessionId, interactionId: "startup-permission" }));
+      expect(fixture.store.getInteraction("startup-permission").status).toBe("open");
+    }
+    const dedupeKey = outcome === "reply" ? `run:${request.runId}:answer` : "interaction:startup-permission:open";
+    const receipt = () => fixture.store.findMessagingDeliveryByDedupe({
+      connectionId: connection.id, channelGeneration: connection.generation, dedupeKey
+    });
+    expect(receipt()).toBeUndefined();
+    expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("queued");
+
+    await manager.initialize();
+    await vi.waitFor(() => expect(receipt()?.status).toBe("sent"));
+    await vi.waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
+    const deliveryId = receipt()!.id;
+    if (outcome === "reply") {
+      expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("completed");
+      expect([...transport.sentText, ...transport.stream.edits].some(({ text }) => text === "Recovered before Messaging was ready.")).toBe(true);
+    } else {
+      expect(card).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("Run command") }));
+    }
+    const effects = transport.sentText.length + transport.stream.edits.length + card.mock.calls.length;
+    await manager.close();
+    manager = new MessagingManager(options);
+    await manager.initialize();
+    await vi.waitFor(() => expect(poll).toHaveBeenCalledTimes(2));
+    expect(receipt()?.id).toBe(deliveryId);
+    expect(transport.sentText.length + transport.stream.edits.length + card.mock.calls.length).toBe(effects);
+  });
+
   it.each(["telegram", "discord"] as const)("serializes %s progress before the final and retains the channel's final-message lifecycle", async channel => {
     const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
     const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
