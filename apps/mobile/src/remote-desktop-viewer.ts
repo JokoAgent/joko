@@ -131,7 +131,11 @@ const VIEWER_SCRIPT = String.raw`
       else if(travel>8)multi.kind='scroll';
     }
     if(multi.kind==='pinch'){
-      zoom=Math.max(1,Math.min(5,multi.zoom*next.d/Math.max(1,multi.d)));boundPan();render();
+      zoom=bounded(multi.zoom*next.d/Math.max(1,multi.d),1,5);
+      const r=layout();
+      panX+=next.x-(r.x+multi.anchor.x*r.w);
+      panY+=next.y-(r.y+multi.anchor.y*r.h);
+      cursorNeedsEntry=true;boundPan();render();
     }else if(multi.kind==='scroll'){
       const dx=next.x-multi.lastX,dy=next.y-multi.lastY;
       if(control&&mode!=='pan'){
@@ -160,7 +164,7 @@ const VIEWER_SCRIPT = String.raw`
       },400);
     }else{
       clearTimeout(hold);if(drag)queue({kind:'release'});drag=false;start=null;
-      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,kind:null,aimed:mode!=='touch'};
+      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,anchor:point(p),kind:null,aimed:mode!=='touch'};
     }
   });
   stage.addEventListener('pointermove',event=>{
@@ -180,6 +184,10 @@ const VIEWER_SCRIPT = String.raw`
   function pointerUp(event){
     if(!pointers.has(event.pointerId))return;
     clearTimeout(hold);
+    if(pointers.size>=2&&multi&&gestureFrame!==null){
+      pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+      cancelAnimationFrame(gestureFrame);movePair();
+    }
     const wasTap=start&&!start.moved;
     pointers.delete(event.pointerId);
     if(drag){queue({kind:'button',button:0,down:false,x:cx,y:cy});flush();drag=false;}
