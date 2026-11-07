@@ -211,6 +211,73 @@ describe("Contacts sync node lifecycle", () => {
     } finally { manager.close(); vi.useRealTimers(); }
   });
 
+  it("restores missing contacts on explicit sync while automatic sync uses known clocks", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-calibration-"));
+    const store = new ContactStore(join(directory, "sender.db"));
+    const original = new ContactStore(join(directory, "recipient.db"));
+    const restored = new ContactStore(join(directory, "recipient-before-sync.db"));
+    const vault = await CredentialVault.open(join(directory, "master.key"));
+    const identity = generateNodeSyncIdentity();
+    const senderId = "node-sender", recipientId = "node-recipient";
+    const candidate = { nodeId: recipientId, displayName: "Recipient", publicKey: identity.publicKey,
+      fingerprint: contactSyncPublicKeyFingerprint(identity.publicKey), address: "127.0.0.1", port: 4318, seenAt: Date.now() };
+    const decoder = new ContactSyncWireDecoder(inProcessContactSyncCodec);
+    let recipient = original;
+    let recipientOnline = true;
+    const delivered: string[][] = [];
+    const manager = new ContactSyncManager({ store, vault, nodeId: senderId, displayName: "Sender",
+      codec: inProcessContactSyncCodec, transportFactory: () => ({
+        start: async () => undefined, stop: () => undefined,
+        candidates: () => [candidate], onlinePeerIds: () => recipientOnline ? [recipientId] : [],
+        send: async (peerId, frame) => {
+          expect(peerId).toBe(recipientId);
+          const message = await decoder.accept({ sourceNodeId: senderId, destinationNodeId: recipientId, frame,
+            ownPrivateKey: identity.privateKey, expectedPeerPublicKey: store.contactSyncConfiguration()!.publicKey });
+          if (message !== null) {
+            recipient.mergeContactSyncState(recipientId, message.state);
+            delivered.push(message.state.contacts.map(contact => contact.id));
+          }
+          return true;
+        }
+      }) });
+    cleanups.push(() => {
+      manager.close();
+      restored.close();
+      original.close();
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const contact = store.createContact({ expectedDirectoryRevision: store.directoryState().revision,
+      kind: "person", displayName: "Ada", summary: "Must survive a recipient restore" }).contact!;
+    await manager.initialize();
+    vi.useFakeTimers();
+    try {
+      await manager.setEnabled(manager.status().configurationRevision, true);
+      await manager.grantCandidate(recipientId, candidate.fingerprint);
+      await manager.syncNow(recipientId);
+      expect(original.getContact(contact.id).summary).toBe(contact.summary);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(delivered).toEqual([[contact.id], []]);
+
+      recipient = restored;
+      expect(restored.allContacts()).toEqual([]);
+      await manager.syncNow(recipientId);
+      expect(restored.getContact(contact.id).summary).toBe(contact.summary);
+      expect(delivered).toEqual([[contact.id], [], [contact.id]]);
+
+      recipientOnline = false;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(delivered).toHaveLength(3);
+      recipientOnline = true;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(delivered.slice(3)).toEqual([[contact.id]]);
+
+      vi.setSystemTime(Date.now() + 30 * 60_000);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(delivered.slice(4)).toEqual([[contact.id]]);
+    } finally { manager.close(); vi.useRealTimers(); }
+  });
+
   it("acknowledges a committed LAN frame while its separate reply is pending and retires old sends on regrant", async () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-reply-"));
     const store = new ContactStore(join(directory, "contacts.db"));
