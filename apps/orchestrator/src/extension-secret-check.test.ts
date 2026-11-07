@@ -2,10 +2,10 @@ import { expect, it, vi } from "vitest";
 import { parseExtensionNetwork } from "./extension-cards/network-manifest.js";
 import { checkExtensionSecretCandidate } from "./extension-secret-check.js";
 
-function declaration() {
+function declaration(bodyFormat = '{"candidate":"{value}"}') {
   return parseExtensionNetwork({ hosts: ["api.example.com"], secrets: [{ key: "token", label: "Token", inject: { header: "Authorization", format: "Bearer {value}" },
     exchange: { url: "https://api.example.com/exchange", bodyFormat: '{"candidate":"{value}"}', tokenPath: "access.token" },
-    check: { url: "https://api.example.com/check", bodyFormat: '{"candidate":"{value}"}', validPath: "result.active", validValue: true, expiresAtPath: "result.expires", expiresAtFormat: "unix-seconds" } }] });
+    check: { url: "https://api.example.com/check", bodyFormat, validPath: "result.active", validValue: true, expiresAtPath: "result.expires", expiresAtFormat: "unix-seconds" } }] });
 }
 
 it("checks the actual candidate in its declared exchange without exposing upstream credentials", async () => {
@@ -39,6 +39,18 @@ it("rejects a changed owner, redirects, oversized responses and a string pretend
   await expect(run(fetcher)).rejects.toThrow(/could not be completed/u);
 });
 
+it("uses a formatted JSON object in the declared candidate check", async () => {
+  const bodyFormat = '{\r\n\t"candidate": "{value}"\n}', value = 'fixture"candidate';
+  const network = declaration(bodyFormat), secret = { ...network.secrets![0]!, exchange: undefined };
+  const fetcher = vi.fn<typeof fetch>(async () => Response.json({ result: { active: true } }));
+  await expect(checkExtensionSecretCandidate({ declaration: network, secret, value, fetch: fetcher,
+    signal: new AbortController().signal, assertCurrent: () => undefined })).resolves.toEqual({ valid: true });
+  expect(secret.check?.bodyFormat).toBe(bodyFormat);
+  expect(fetcher).toHaveBeenCalledExactlyOnceWith(new URL("https://api.example.com/check"), expect.objectContaining({
+    method: "POST", redirect: "manual", body: bodyFormat.replace("{value}", () => JSON.stringify(value).slice(1, -1))
+  }));
+});
+
 it("does not let a check declaration expand its approved destinations", () => {
   expect(() => parseExtensionNetwork({ hosts: ["api.example.com"], secrets: [{ key: "token", label: "Token", inject: { header: "X-Key", format: "{value}" },
     check: { url: "https://foreign.example/check", bodyFormat: '{"value":"{value}"}', validPath: "active", validValue: true } }] })).toThrow(/not approved/u);
@@ -46,7 +58,8 @@ it("does not let a check declaration expand its approved destinations", () => {
   const manifest = (patch: Record<string, unknown>) => ({ hosts: ["api.example.com", "other.example.com"], secrets: [{ key: "token", label: "Token",
     inject: { header: "X-Key", format: "{value}", hosts: ["api.example.com"] }, check: { ...check, ...patch } }] });
   for (const patch of [{ url: "https://other.example.com/check" }, { url: "https://api.example.com/check#fragment" },
-    { bodyFormat: '{"value":{value}}' }, { bodyFormat: '["{value}"]' }, { validPath: "__proto__.active" }, { validValue: 1 },
+    { bodyFormat: '{"value":{value}}' }, { bodyFormat: '["{value}"]' }, { bodyFormat: '{"value":"\n{value}"}' },
+    { validPath: "__proto__.active" }, { validValue: 1 },
     { expiresAtFormat: "unix-ms" }, { validValue: "" }]) expect(() => parseExtensionNetwork(manifest(patch))).toThrow();
   expect(parseExtensionNetwork(manifest({ expiresAtPath: "expires", expiresAtFormat: "unix-ms" })).secrets![0]!.check).toMatchObject({ expiresAtFormat: "unix-ms" });
 });
