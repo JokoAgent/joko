@@ -4617,7 +4617,8 @@ export class OperationalStore {
         const goalCount = this.database.prepare(`
           SELECT COUNT(*) AS count FROM collaboration_workers
           WHERE goal_id = ? AND status <> 'archived'
-        `).get(goal.id) as Row;
+            AND (? = 0 OR (runtime_released = 0 AND status <> 'stopped'))
+        `).get(goal.id, input.goalLimitCountsRuntimes === true ? 1 : 0) as Row;
         if (numberValue(goalCount["count"]) >= goal.maximumWorkers) {
           throw new StoreError(`Collaboration Goal ${goal.id} reached its worker limit.`);
         }

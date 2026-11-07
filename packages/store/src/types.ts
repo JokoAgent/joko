@@ -741,6 +741,8 @@ export interface CreateCollaborationWorkerInput {
   readonly assignment: string;
   readonly softLimit: number;
   readonly hardLimit: number;
+  /** A verified plugin team's original limit is its concurrent runtime budget. */
+  readonly goalLimitCountsRuntimes?: boolean;
   readonly createdAt?: UnixMillis;
 }
 

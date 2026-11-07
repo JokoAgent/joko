@@ -570,7 +570,7 @@ export class ExtensionTasks {
           if (task.descriptor.permissionMode !== "auto" || this.preferences(owner.extensionId).config.permissionMode !== "auto" || task.descriptor.planMode) failure("PERMISSION_DENIED", "Task teams require explicitly approved Auto permission.");
           if (goal) return teams.getTree(goal.id);
           const plan = this.options.store.findSetting<{ readonly plan: TeamPlan }>("service", PLANS, task.descriptor.id)?.value?.plan;
-          return teams.createGoal({ operationId: `extension-team-${hash([owner.installation, task.descriptor.id])}`, leadSessionId: task.descriptor.id, expectedSessionGeneration: task.descriptor.binding.generation,
+          return teams.createGoal({ operationId: extensionTeamOperationId(owner.installation, task.descriptor.id), leadSessionId: task.descriptor.id, expectedSessionGeneration: task.descriptor.binding.generation,
             title: task.descriptor.title, objective: plan?.task ?? task.descriptor.title, maximumWorkers: plan?.concurrency ?? 128 });
         }
         const worker = this.options.store.getCollaborationWorker(text(request.workerId));
@@ -674,10 +674,10 @@ export function isExtensionTaskControlled(store: OperationalStore, sessionId: st
  * a model cannot turn plugin Auto permission into arbitrary worker routes. */
 export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId: string, input: {
   readonly label: string; readonly assignment: string; readonly parentWorkerId?: string;
-  readonly existingWorkerId?: string;
+  readonly existingWorkerId?: string; readonly goalId?: string;
   readonly route: { readonly targetId: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode: boolean | "ultrafast"; readonly permissionMode: string; readonly planMode: boolean };
-}): void {
-  if (!isExtensionTaskControlled(store, leadSessionId)) return;
+}): boolean {
+  if (!isExtensionTaskControlled(store, leadSessionId)) return false;
   const receipt = store.findSetting<TaskReceipt>("service", TASKS, leadSessionId)?.value;
   const config = receipt ? store.findSetting<ExtensionTaskPreferences>("service", PREFS, receipt.extensionId)?.value : undefined;
   const registered = store.findSetting<{ readonly plan: TeamPlan; readonly settledLabels?: readonly string[] }>("service", PLANS, leadSessionId)?.value, plan = registered?.plan;
@@ -690,8 +690,8 @@ export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId
   if (!receipt || receipt.revoked || !target.descriptor.trusted || target.descriptor.remoteWorkspace || !store.getTarget(lead.descriptor.targetId).descriptor.trusted
     || !within && (!extra?.descriptor.trusted || extra.descriptor.remoteWorkspace || realpathSync(extra.descriptor.workspaceRoot) !== directory)
     || !model || !modelRoutingEnabled(store, backend.id, model.providerId, model.modelId) || input.route.effort && !model.thinkingLevels.includes(input.route.effort)
-    || input.route.fastMode && (input.route.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true) || input.route.permissionMode !== "auto" || input.route.planMode || config?.permissionMode !== "auto") failure("PERMISSION_DENIED", "The worker request exceeds the plugin's directory, model or permission policy.");
-  if (!plan) return;
+    || input.route.fastMode && (input.route.fastMode === "ultrafast" ? model.supportsUltrafastMode !== true : model.supportsFastMode !== true) || input.route.permissionMode !== "auto" || input.route.planMode || config?.permissionMode !== "auto") return failure("PERMISSION_DENIED", "The worker request exceeds the plugin's directory, model or permission policy.");
+  if (!plan) return false;
   if (!item || registered?.settledLabels?.includes(input.label) || item.targetId !== input.route.targetId
     || target.descriptor.backendId !== item.route.backendId || input.route.providerId !== item.route.providerId || input.route.modelId !== item.route.modelId
     || input.route.effort !== item.route.effort || input.route.fastMode !== item.route.fastMode || input.route.permissionMode !== "auto" || input.route.planMode
@@ -702,5 +702,12 @@ export function assertExtensionWorkerPlan(store: OperationalStore, leadSessionId
         || realpathSync(directory.targetId === lead.descriptor.targetId && lead.descriptor.worktree ? lead.descriptor.worktree.path : approved.descriptor.workspaceRoot) !== directory.root;
     })) failure("PERMISSION_DENIED", "The worker request does not match the plugin's registered task plan and permission policy.");
   const goal = store.findActiveCollaborationGoalByLeadSession(leadSessionId);
-  if (goal && store.listCollaborationWorkers({ goalId: goal.id }).filter(worker => worker.id !== input.existingWorkerId && !worker.runtimeReleased && !["archived", "stopped"].includes(worker.status)).length >= plan!.concurrency) failure("TASK_BUSY", "The registered plugin team concurrency is exhausted.");
+  if (goal && store.listCollaborationWorkers({ goalId: goal.id }).filter(worker => worker.id !== input.existingWorkerId && !worker.runtimeReleased && !["archived", "stopped"].includes(worker.status)).length >= plan.concurrency) failure("TASK_BUSY", "The registered plugin team concurrency is exhausted.");
+  if (!goal || goal.id !== input.goalId || input.existingWorkerId !== undefined || goal.maximumWorkers !== plan.concurrency) return false;
+  const creation = store.findOperation<{ readonly goalId: string }>(extensionTeamOperationId(receipt.installation, leadSessionId));
+  return creation?.kind === "create_collaboration_goal" && creation.status === "completed" && creation.response?.goalId === goal.id;
+}
+
+function extensionTeamOperationId(installation: string, leadSessionId: string): string {
+  return `extension-team-${hash([installation, leadSessionId])}`;
 }

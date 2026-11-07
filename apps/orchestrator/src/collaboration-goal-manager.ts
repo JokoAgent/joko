@@ -360,7 +360,7 @@ export class CollaborationGoalManager {
           { id: input.operationId, kind: "create_collaboration_worker", body },
           (store) => {
             this.#assertWorkerAdmission?.(input.callerLeadSessionId);
-            assertExtensionWorkerPlan(store, input.callerLeadSessionId, input);
+            const goalLimitCountsRuntimes = assertExtensionWorkerPlan(store, input.callerLeadSessionId, input);
             if (workspace) {
               assertWorkerWorkspacePlan(store, workspace);
               store.setSetting("service", workerId, WORKER_WORKSPACE_PLAN_KEY, workspace);
@@ -380,6 +380,7 @@ export class CollaborationGoalManager {
               assignment: input.assignment,
               softLimit: settings.workerSoftLimit,
               hardLimit: settings.workerHardLimit,
+              goalLimitCountsRuntimes,
               createdAt: this.#now()
             });
           }
