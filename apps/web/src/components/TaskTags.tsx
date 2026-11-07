@@ -221,12 +221,16 @@ export function TaskTagDialog({ session, catalog, catalogRevision, controller, t
         </> : <form className="task-tag-editor__form" onSubmit={event => {
           event.preventDefault();
           if (!session || !name.trim() || !formChanged) return;
-          void run(() => editing === undefined
-            ? controller.createTaskTag(session.id, name.trim(), color, catalogRevision)
-            : controller.updateTaskTag(session.id, editing.id, editing.revision, {
+          void run(() => {
+            if (editing === undefined) return controller.createTaskTag(session.id, name.trim(), color, catalogRevision);
+            const latest = live.current.catalog.find(tag => tag.id === editing.id);
+            const revision = latest && latest.revision > editing.revision && latest.name === editing.name
+              && latest.color === editing.color && latest.nameCustomized === editing.nameCustomized ? latest.revision : editing.revision;
+            return controller.updateTaskTag(session.id, editing.id, revision, {
               ...(name.trim() === taskTagDisplayName(editing, t) ? {} : { name: name.trim() }),
               ...(color === editing.color ? {} : { color })
-            }), () => { setPage("list"); setEditing(undefined); });
+            });
+          }, () => { setPage("list"); setEditing(undefined); });
         }}>
           <Button disabled={busy} onClick={() => { setPage("list"); setError(undefined); }}><ArrowLeft aria-hidden="true" />{t("common.back")}</Button>
           <label className="task-tag-editor__name"><span>{t("taskTags.name")}</span><input autoFocus aria-label={t("taskTags.name")} value={name} maxLength={80} disabled={busy} onChange={event => setName(event.target.value)} /></label>
