@@ -23,6 +23,7 @@ vi.mock("@joko/connection-transport/entries", async original => {
 let root: Root | undefined;
 afterEach(async () => {
   await act(async () => root?.unmount()); root = undefined; document.body.replaceChildren();
+  window.history.replaceState(null, "", "/");
   vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers();
 });
 
@@ -88,6 +89,57 @@ it("keeps the prepared backup when a preferred entrance probe finishes after ret
     expect(app.state.activeProfile?.entryId).toBe(preferred.id);
     expect(saved.returnToPreferred).toBe(false);
   } finally { directory.mockRestore(); resolve.mockRestore(); verify.mockRestore(); }
+});
+
+it.each(["matching owner", "mismatched owner", "main window"] as const)("chooses the Desktop startup node from the correct authority (%s)", async input => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  localStorage.clear();
+  const mainWindow = input === "main window";
+  window.history.replaceState(null, "", mainWindow ? "/#/settings" : "/?sessionWindow=1&bootSession=source-task#/tasks/source-task");
+  type WindowOwner = { profileId: string; sessionId: string; draftSlot: number };
+  let completeOwner!: (owner: WindowOwner) => void;
+  const getOwner = vi.fn(() => new Promise<WindowOwner>(resolve => { completeOwner = resolve; }));
+  vi.stubGlobal("jokoDesktop", { sessionWindows: { getOwner }, appInfo: { get: async () => ({ persistentCredentialStorage: true }) },
+    window: { setZoomFactor: async () => undefined }, discovery: { scan: async () => [] }, capabilities: [] });
+  const source: ConnectionProfile = { id: "source", serverId: "source-node", deviceId: "source-device", name: "Source", origin: "https://task-source.example" };
+  const automatic: ConnectionProfile = { id: "automatic", serverId: "automatic-node", deviceId: "automatic-device", name: "Automatic", origin: "https://automatic-node.example" };
+  const profiles = [source, automatic];
+  const preferences = { ...DEFAULT_UI_PREFERENCES, automaticConnectionTarget: { kind: "profile" as const, profileId: automatic.id } };
+  vi.spyOn(LocalState, "open").mockResolvedValue({ listProfiles: async () => profiles, listMachineCaches: async () => [],
+    readPreferences: async () => preferences, readAuthKey: async () => "credential", saveProfile: async () => undefined,
+    loadEndpointTransport: LocalState.prototype.loadEndpointTransport, saveMachineCache: async () => undefined
+  } as unknown as LocalState);
+  vi.mocked(probeOrchestratorOrigin).mockImplementation(async origin => {
+    const profile = profiles.find(candidate => candidate.origin === origin)!;
+    return { serverId: profile.serverId, displayName: profile.name, version: "1", apiVersion: "1", pairingEnabled: false };
+  });
+  const activeProfiles: string[] = [];
+  vi.mocked(createOrchestratorGateway).mockImplementation((profile, _key, callbacks) => {
+    if (callbacks.onExtensionUiEffect) activeProfiles.push(profile!.id);
+    return { connect: async () => { callbacks.onSnapshot?.(emptySnapshot()); callbacks.onState?.("connected"); }, disconnect: () => undefined,
+      taskSharingApi: () => undefined, inputHandoffApi: () => undefined, providerSharingApi: () => undefined,
+      partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined,
+      listPartners: async () => ({ partners: [] })
+    } as unknown as OrchestratorGateway;
+  });
+  let app!: AppController; function Probe() { app = useAppController(); return null; }
+  root = createRoot(document.body.appendChild(document.createElement("div")));
+  await act(async () => root!.render(<Probe />));
+  if (!mainWindow) {
+    expect(getOwner).toHaveBeenCalledOnce();
+    expect(app.state.ready).toBe(false);
+    expect(activeProfiles).toEqual([]);
+    await act(async () => completeOwner({ profileId: source.id, sessionId: input === "matching owner" ? "source-task" : "another-task", draftSlot: 0 }));
+  } else expect(getOwner).not.toHaveBeenCalled();
+  const expected = mainWindow ? automatic.id : input === "matching owner" ? source.id : undefined;
+  await vi.waitFor(() => {
+    expect(app.state.ready).toBe(true);
+    expect(app.state.connectionState).toBe(expected === undefined ? "disconnected" : "connected");
+  });
+  expect(activeProfiles).toEqual(expected === undefined ? [] : [expected]);
+  expect(app.state.activeProfile?.id).toBe(expected);
+  expect(app.state.preferences.automaticConnectionTarget).toEqual(preferences.automaticConnectionTarget);
 });
 
 it("keeps connection failures through fresh projections, restores on acceptance, and ignores a retired owner's callbacks", async () => {

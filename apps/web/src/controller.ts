@@ -88,6 +88,7 @@ import { readHostSystemLocale, resolveLocalePreference } from "./system-locale.j
 import { appendTextToComposerDocument, composerDocumentKeepingQuotes } from "./composer-quote-document.js";
 import { restoreRejectedComposerDraft } from "./composer-draft-recovery.js";
 import { sessionDraftSurface } from "./session-draft-surface.js";
+import { isSessionApplicationWindow } from "./session-window-navigation.js";
 import { emptySnapshot } from "./model.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
 import {
@@ -643,12 +644,18 @@ export function useAppController(): AppController {
     const initialLocaleRevision = localePreferenceHintRevisionRef.current;
     const initialConversationRevision = conversationPreferenceHintRevisionRef.current;
     void LocalState.open().then(async (local) => {
-      const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable] = await Promise.all([
+      const desktop = window.jokoDesktop;
+      const startupSearch = window.location.search;
+      const startupQuery = new URLSearchParams(startupSearch);
+      const desktopSessionWindow = desktop !== undefined && startupQuery.has("sessionWindow");
+      const bootSessionId = desktopSessionWindow && isSessionApplicationWindow(window.location) ? startupQuery.get("bootSession") : null;
+      const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable, bootOwner] = await Promise.all([
         local.listProfiles(),
         local.listMachineCaches(),
         local.readPreferences(),
         readDesktopManagedOrchestratorStatus(),
-        automaticConnectionPersistenceAvailable()
+        automaticConnectionPersistenceAvailable(),
+        bootSessionId === null ? undefined : desktop?.sessionWindows?.getOwner?.().catch(() => undefined)
       ]);
       if (cancelled) return;
       let profiles = persistedProfiles;
@@ -681,15 +688,19 @@ export function useAppController(): AppController {
         }
       }
       const routedProfileId = routeRef.current.kind === "session" || routeRef.current.kind === "partners" || routeRef.current.kind === "tools" || routeRef.current.kind === "extensionMainView" ? routeRef.current.profileId : undefined;
-      const routedProfile = routedProfileId === undefined ? undefined : profiles.find((profile) => profile.id === routedProfileId);
-      const expectedServerId = routeRef.current.kind === "extensionMainView" ? routeRef.current.serverId : undefined;
-      const automaticProfile = routedProfileId !== undefined
-        ? expectedServerId === undefined || expectedServerId === routedProfile?.serverId ? routedProfile : undefined
-        : (automaticConnectionAvailable
+      const bootProfileId = bootOwner !== undefined && bootOwner.sessionId === bootSessionId
+        && window.location.search === startupSearch && window.jokoDesktop === desktop ? bootOwner.profileId : undefined;
+      const startupProfileId = desktopSessionWindow ? bootProfileId : routedProfileId;
+      const startupProfile = profiles.find(profile => profile.id === startupProfileId);
+      const expectedServerId = !desktopSessionWindow && routeRef.current.kind === "extensionMainView" ? routeRef.current.serverId : undefined;
+      const automaticProfile = startupProfileId !== undefined
+        ? expectedServerId === undefined || expectedServerId === startupProfile?.serverId ? startupProfile : undefined
+        : (!desktopSessionWindow && automaticConnectionAvailable
         ? automaticConnectionProfile(effectivePreferences.automaticConnectionTarget, profiles, effectiveManagedStatus)
         : undefined);
       startupAutoConnectRef.current = automaticProfile;
       startupManagedLocalAutoPendingRef.current = automaticConnectionAvailable
+        && !desktopSessionWindow
         && routedProfileId === undefined
         && effectivePreferences.automaticConnectionTarget?.kind === "managedLocal"
         && automaticProfile === undefined
