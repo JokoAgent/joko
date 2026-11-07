@@ -11,7 +11,9 @@ import type { BrowserTransferCoordinator } from "./browser-transfers.js";
 import { OperationalBrowserState } from "./operational-browser-state.js";
 import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 import { clearSecretPages, markSecretEntered } from "./input-handoff/secretTaint.js";
-import { BrowserAutomationNodeExecutor, BROWSER_AUTOMATION_NODE_CAPABILITIES } from "./browser-automation-node.js";
+import { AuthenticatedBrowserRemoteNodeRouter, BrowserAutomationNodeExecutor, BROWSER_AUTOMATION_NODE_CAPABILITIES } from "./browser-automation-node.js";
+import type { CredentialManager } from "./credential-manager.js";
+import type { LanDiscoveryService } from "./lan-discovery.js";
 
 const knowledgeStores = new Set<OperationalStore>();
 afterEach(() => { for (const store of knowledgeStores) store.close(); knowledgeStores.clear(); });
@@ -24,6 +26,7 @@ function fixture(
     readonly generation?: number;
     readonly enabledForNewSessions?: (targetId: string) => boolean;
     readonly state?: OperationalBrowserState;
+    readonly localNodeId?: string;
     readonly setBackend?: (mode: "external" | "sidebar", assertCurrent: () => void) => Promise<"external" | "sidebar">;
     readonly recipes?: readonly Readonly<Record<string, unknown>>[];
   } = {}
@@ -157,6 +160,7 @@ function fixture(
       ? {}
       : { enabledForNewSessions: options.enabledForNewSessions }),
     ...(remoteNodes === undefined ? {} : { remoteNodes }),
+    ...(options.localNodeId === undefined ? {} : { localNodeId: options.localNodeId }),
     ...(userKnowledge === undefined ? {} : { userKnowledge })
   });
   return {
@@ -178,6 +182,34 @@ function fixture(
 }
 
 describe("BrowserToolBridgeProvider", () => {
+  it("dispatches its listed local node within the original queue and task page scope", async () => {
+    const store = browserBridgeAuthorityStore(), state = new OperationalBrowserState(store);
+    const nodeId = "node-local", generation = 4, artifacts = {} as ArtifactStore;
+    const rpcFactory = vi.fn();
+    const router = new AuthenticatedBrowserRemoteNodeRouter({ localNodeId: nodeId, localGeneration: generation,
+      discovery: { list: () => [] } as unknown as LanDiscoveryService, credentials: {} as CredentialManager, artifacts, rpcFactory });
+    const { bridge, browser } = fixture(router, undefined, { state, localNodeId: nodeId });
+    const executor = new BrowserAutomationNodeExecutor({ nodeId, displayName: "Local", generation, bridge, artifacts });
+    const nodeExecute = vi.spyOn(executor, "execute");
+    router.attachLocal(executor);
+    state.recordHumanPage({ browserProviderId: "browser", pageId: "page-1", generation: 6, sessionId: "session-a", targetId: "target-a", bindingGeneration: 1,
+      url: "https://example.test/", title: "Example", updatedAt: 1 }, { active: false });
+    const first = browserBridgeContext("a", "session-a", "target-a", 1, 6), other = browserBridgeContext("b", "session-b", "target-b", 1, 6);
+    try {
+      const profiles = await bridge.callTool("browser", { action: "profiles" }, undefined, first);
+      expect(profiles.structuredContent).toMatchObject({ data: { nodes: [{ id: nodeId, generation, available: true }] } });
+      const status = await bridge.callTool("call_tool", { name: "browser", args: { action: "status", target: "node", node: nodeId } }, undefined, first);
+      expect(status.isError).toBe(false);
+      expect(JSON.parse((status.content[0] as { text: string }).text)).toMatchObject({ ok: true, data: { pages: [{ id: "page-1" }] } });
+      const foreign = await bridge.callTool("browser", { action: "status", target: "node", node: nodeId }, undefined, other);
+      expect(foreign.structuredContent).toMatchObject({ ok: true, data: { pages: [] } });
+      await expect(bridge.callTool("browser", { action: "tabs" }, undefined, first)).resolves.toMatchObject({ isError: false });
+      expect(browser.listPages).toHaveBeenCalledTimes(3);
+      expect(nodeExecute).not.toHaveBeenCalled();
+      expect(rpcFactory).not.toHaveBeenCalled();
+    } finally { store.close(); }
+  });
+
   it("binds cached originals to the task identity and original page ownership", async () => {
     const store = browserBridgeAuthorityStore(), state = new OperationalBrowserState(store);
     state.recordHumanPage({ browserProviderId: "browser", pageId: "page-1", generation: 6, sessionId: "session-a", targetId: "target-a", bindingGeneration: 1,
