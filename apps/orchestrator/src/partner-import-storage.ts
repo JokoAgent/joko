@@ -1,13 +1,14 @@
 import { realpathSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { AgentImportError, createImportedEnvironmentStore, fingerprint, validateNativePartnerPackage, type ImportReceipt } from "@joko/agent-import";
+import { AgentImportError, createImportedEnvironmentStore, fingerprint, importedEnvironmentKey, validateNativePartnerPackage, type ImportReceipt } from "@joko/agent-import";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialVault } from "./credential-vault.js";
 
 const SCOPE_TYPE = "service"; const SCOPE_ID = "orchestrator";
 const RECEIPT_PREFIX = "partner-import.receipt.";
 const ENVIRONMENT_PREFIX = "partner-import.private.";
+const environmentStorageKey = (key: string): string => ENVIRONMENT_PREFIX + fingerprint(key);
 interface StoredImportCipher {
   readonly algorithm: "aes-256-gcm"; readonly nonceHex: string; readonly ciphertextHex: string; readonly tagHex: string;
 }
@@ -24,7 +25,7 @@ export class PartnerImportStorage {
     this.#executionRoot = join(realpathSync(dataDirectory), "partner-import-executions");
     this.environment = createImportedEnvironmentStore({
       read: async (key, assertOwner) => {
-        assertOwner(); const stored = store.findSetting<{ version: 1; sealed: StoredImportCipher }>(SCOPE_TYPE, SCOPE_ID, ENVIRONMENT_PREFIX + fingerprint(key));
+        assertOwner(); const stored = store.findSetting<{ version: 1; sealed: StoredImportCipher }>(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(key));
         if (!stored) return null;
         const value = stored.value;
         if (!value || value.version !== 1 || !value.sealed || Object.keys(value).some(field => !["version", "sealed"].includes(field))) throw new AgentImportError("CREDENTIAL_STORAGE_INVALID");
@@ -42,9 +43,9 @@ export class PartnerImportStorage {
         // credential, so persist authenticated bytes in an unambiguous alphabet.
         const sealed: StoredImportCipher = { algorithm: cipher.algorithm, nonceHex: Buffer.from(cipher.nonce, "base64").toString("hex"),
           ciphertextHex: Buffer.from(cipher.ciphertext, "base64").toString("hex"), tagHex: Buffer.from(cipher.tag, "base64").toString("hex") };
-        store.setSetting(SCOPE_TYPE, SCOPE_ID, ENVIRONMENT_PREFIX + fingerprint(key), { version: 1, sealed }); assertOwner();
+        store.setSetting(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(key), { version: 1, sealed }); assertOwner();
       },
-      remove: async (key, assertOwner) => { assertOwner(); store.deleteSetting(SCOPE_TYPE, SCOPE_ID, ENVIRONMENT_PREFIX + fingerprint(key)); assertOwner(); },
+      remove: async (key, assertOwner) => { assertOwner(); store.deleteSetting(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(key)); assertOwner(); },
     });
   }
 
@@ -106,6 +107,18 @@ export class PartnerImportStorage {
     validateImportReceipt(receipt);
     this.store.setSetting(SCOPE_TYPE, SCOPE_ID, receiptKey(receipt.result.requestId), receipt);
     return Buffer.byteLength(JSON.stringify(receipt));
+  }
+  rejectUncreatedPartner(receipt: ImportReceipt): ImportReceipt["result"] {
+    const rejected: ImportReceipt = { ...receipt, creationRejected: "IMPORT_NAME_EXISTS", checkpointCleared: true, result: {
+      ...receipt.result, status: "needs-attention",
+      checks: [...receipt.result.checks.filter(check => check.entryId !== "creation"),
+        { entryId: "creation", status: "needs-attention", message: "IMPORT_NAME_EXISTS" }]
+    } };
+    this.store.transaction(() => {
+      this.saveReceipt(rejected);
+      this.store.deleteSetting(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(importedEnvironmentKey(receipt.result.partnerId)));
+    });
+    return rejected.result;
   }
   listReceipts(): ImportReceipt[] {
     const result: ImportReceipt[] = [];

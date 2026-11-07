@@ -7,7 +7,8 @@ import { Code, ConnectError, createClient, createRouterTransport, type HandlerCo
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalStore, PartnerStore, PartnerRoutineStore, partnerHomeDirectoryName } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
-import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema,
+import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportCheckStatus, PartnerImportEditor, PartnerImportReceipts,
+  PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema,
   DeletePartnerMemoryRequestSchema, DeletePartnerSkillRequestSchema, UpdatePartnerMemoryRequestSchema, UpdatePartnerSkillRequestSchema,
   PermissionRisk, PolicyEffect, PolicySettingsSchema, PolicySubjectKind } from "@joko/contracts";
 import { readImportTree, createImportBudget, prepareImportedAutomation } from "@joko/agent-import";
@@ -62,6 +63,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
   if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: false });
   imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {},
+    getPartner: id => partners.getPartner(id),
     ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
     nativeRuntimeReady: id => partners.getPartner(id).initializationState === "ready",
     prepareCreation: (selection, nativePackage) => {
@@ -119,6 +121,62 @@ function observedImportEffect<Args extends unknown[], Result>(phase: string, act
   };
 }
 describe("native import service and owning effects", () => {
+  it("releases a definitively rejected name and retries the same preview with a new request", async () => {
+    const f = await fixture();
+    const signal = new AbortController().signal;
+    const firstId = "owner_import_contested_0001", secondId = "owner_import_contested_0002";
+    const api = { ...f.api, newRequestId: vi.fn().mockReturnValueOnce(firstId).mockReturnValueOnce(secondId), start: vi.fn(f.api.start) };
+    const local = new Map<string, string>();
+    const receipts = new PartnerImportReceipts({ getItem: key => local.get(key) ?? null,
+      setItem: (key, value) => { local.set(key, value); }, removeItem: key => { local.delete(key); } }, "import-owner");
+    const editor = new PartnerImportEditor(api, receipts);
+    await editor.load();
+    await editor.choose(editor.state.sources![0]!.id);
+    const preview = editor.state.preview!;
+    editor.select(preview.entries.filter(entry => entry.category !== PartnerImportCategory.PERSONALITY).map(entry => entry.id), false);
+    editor.edit({ name: "Contested partner" });
+    const selected = [...editor.state.selected];
+    const createImported = f.partners.createImportedPartner.bind(f.partners);
+    vi.spyOn(f.partners, "createImportedPartner").mockImplementationOnce(async input => {
+      expect((await f.storage.environment.read(input.id!, () => {}))?.pendingImport?.selection.requestId).toBe(firstId);
+      await f.partners.createPartner({ ...input, id: "competing-partner", requestId: "competing_partner_create_0001",
+        expectedDirectoryRevision: f.profiles.directoryState().revision });
+      return createImported(input);
+    });
+
+    await editor.start();
+    expect(editor.state).toMatchObject({ error: "IMPORT_NAME_EXISTS", preview, name: "Contested partner" });
+    expect(editor.locked).toBe(false);
+    expect([...editor.state.selected]).toEqual(selected);
+    await expect(receipts.read()).resolves.toBeUndefined();
+    const rejected = f.storage.readReceipt(firstId)!;
+    expect(rejected).toMatchObject({ creationRejected: "IMPORT_NAME_EXISTS", checkpointCleared: true, partnerCreated: false });
+    expect(() => f.partners.getPartner(rejected.result.partnerId)).toThrow();
+    expect(f.partners.getPartner("competing-partner").displayName).toBe("Contested partner");
+    await expect(f.storage.environment.read(rejected.result.partnerId, () => {})).resolves.toBeNull();
+    expect(await f.api.retry(firstId, false, signal)).toMatchObject({ requestId: firstId, saved: false,
+      checks: expect.arrayContaining([expect.objectContaining({
+        entryId: "creation", status: PartnerImportCheckStatus.NEEDS_ATTENTION, message: "IMPORT_NAME_EXISTS"
+      })]) });
+    await expect(f.api.start({ ...api.start.mock.calls[0]![0]!, name: "Changed on the same request" }, signal)).rejects.toThrow("REQUEST_ALREADY_USED");
+
+    await receipts.claim(firstId);
+    const reopened = new PartnerImportEditor(f.api, receipts);
+    await reopened.load();
+    expect(reopened.locked).toBe(false);
+    expect(reopened.state.error).toBe("IMPORT_NAME_EXISTS");
+    expect(reopened.state.sources?.length).toBeGreaterThan(0);
+    reopened.dispose();
+
+    editor.edit({ name: "Renamed import" });
+    await editor.start();
+    const accepted = await f.imports.waitForRequest(secondId);
+    expect(accepted.saved).toBe(true);
+    expect(f.partners.getPartner(accepted.partnerId).displayName).toBe("Renamed import");
+    expect(api.start.mock.calls.map(([input]) => input?.requestId)).toEqual([firstId, secondId]);
+    editor.dispose();
+  });
+
   it.each(["global deny", "exact deny", "revoked during handshake", "revoked before response"] as const)(
     "keeps the imported routine paused when a probe is %s", async (mode) => {
       const connection = "records__fixture", tool = "read_records";
