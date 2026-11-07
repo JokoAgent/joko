@@ -35,3 +35,45 @@ test("suspension retires an in-flight read and never dispatches a retained actio
   f.editor.suspend(); f.editor.activate(); await f.editor.refresh(); assert.equal(f.mutations.length, 1);
   assert.equal(f.editor.snapshot().pending, true); f.editor.dispose();
 });
+
+test("selects the newest 200 created completions for Mobile and keeps the original open and Desktop windows", async context => {
+  const open = Array.from({ length: 201 }, (_, index) => ({ id: `open-${index + 1}`, status: "open" }));
+  const done = Array.from({ length: 201 }, (_, index) => ({ id: `done-${index + 1}`, status: "done" }));
+  const doneOffsets = [];
+  let changed = false;
+  const api = { todos: async (partnerId, view, offset) => {
+    const source = view === "open" ? open : done;
+    if (view === "done") doneOffsets.push(offset);
+    const total = changed && view === "done" && offset > 0 ? source.length - 1 : source.length;
+    const items = source.slice(offset, offset + 25);
+    return create(ListPartnerTodosResponseSchema, { partnerId, partnerRevision: { value: 1n }, items, total,
+      ...(offset + items.length < total ? { nextOffset: offset + items.length } : {}) });
+  } };
+  const mobile = new PartnerGlanceTodos(api, "partner", "newest"), desktop = new PartnerGlanceTodos(api, "partner");
+  context.after(() => { mobile.dispose(); desktop.dispose(); });
+  const load = editor => new Promise(resolve => {
+    const unsubscribe = editor.subscribe(() => {
+      if (!editor.snapshot().loaded) return;
+      unsubscribe();
+      resolve();
+    });
+    editor.activate();
+  });
+  const ids = items => items.map(todo => todo.id);
+
+  await load(desktop);
+  assert.deepEqual(ids(desktop.snapshot().done), ids(done.slice(0, 200).reverse()));
+  doneOffsets.length = 0;
+  await load(mobile);
+  assert.equal(mobile.snapshot().openTotal, 201);
+  assert.equal(mobile.snapshot().doneTotal, 201);
+  assert.deepEqual(ids(mobile.snapshot().open), ids(open.slice(0, 200)));
+  assert.deepEqual(ids(mobile.snapshot().done), ids(done.slice(1).reverse()));
+  assert.deepEqual(doneOffsets, [0, 1, 26, 51, 76, 101, 126, 151, 176]);
+
+  const retained = mobile.snapshot().done;
+  changed = true;
+  await mobile.refresh();
+  assert.equal(mobile.snapshot().failed, true);
+  assert.equal(mobile.snapshot().done, retained);
+});

@@ -14,7 +14,7 @@ export function MobilePartnerGlanceSheet({ api, homeApi, partnerId, name, visibl
   readonly colors: MobilePartnersColors; readonly locale: MobileSupportedLocale; readonly onClose: () => void;
   readonly onQuote: (todo: PartnerTodo) => void; readonly onOpenTask: (sessionId: string) => void; readonly onHomeSettings: () => void;
 }) {
-  const m = partnerAutonomyMessages(locale), editor = useMemo(() => new PartnerGlanceTodos(api, partnerId), [api, partnerId]);
+  const m = partnerAutonomyMessages(locale), editor = useMemo(() => new PartnerGlanceTodos(api, partnerId, "newest"), [api, partnerId]);
   const state = useSyncExternalStore(editor.subscribe, editor.snapshot), alive = useRef(true), flights = useRef(new Set<AbortController>()), askEpoch = useRef(0);
   const [settings, setSettings] = useState<PartnerAutonomySettings>(), [failed, setFailed] = useState(false), [busy, setBusy] = useState(false);
   const [all, setAll] = useState(false), [showDone, setShowDone] = useState(false), [outputs, setOutputs] = useState<readonly PartnerTaskOutput[]>([]);
