@@ -3,8 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { chromium } from "playwright-core";
+import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { OperationalStore } from "@joko/store";
-import { readMailCard } from "@joko/contracts";
+import { ExtensionCardService, readMailCard } from "@joko/contracts";
+import { ConnectionManager } from "../connection-manager.js";
 import { CredentialVault } from "../credential-vault.js";
 import { ExtensionMainViewManager } from "../extension-main-view-manager.js";
 import type { ExtensionCatalogDescriptor } from "../extension-catalog.js";
@@ -13,6 +15,7 @@ import type { BridgeToolProvider } from "../mcp-router.js";
 import { parseExtensionRuntime, type ExtensionRuntimeDescriptor } from "../extension-surface-manifest.js";
 import { ExtensionCardRuntime, validateExtensionEnvelope, validateExtensionRuntimeRequest } from "./runtime.js";
 import { ExtensionCardsManager } from "./manager.js";
+import { createExtensionCardConnectService } from "./connect-service.js";
 import type { ExtensionTasks, ExtensionTaskOwner } from "../extension-tasks.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "../extension-project-policy.js";
 
@@ -41,24 +44,30 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   store.createSession({ id: "other-task", backendId: "runtime", targetId: "other-target", title: "Other", binding: { opaqueRef: "other", generation: 1 },
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
   const projects = new ExtensionProjectPolicies(store);
-  const id = "extension_0123456789abcdef0123456789abcdef", revision = `sha256:${"a".repeat(64)}`;
-  let enabled = true, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
+  const id = "extension_0123456789abcdef0123456789abcdef", alternateId = "extension_1123456789abcdef0123456789abcdef";
+  const revision = `sha256:${"a".repeat(64)}`;
+  let enabled = true, alternateEnabled = false, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
   const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "targets", "text", "sync", "missing_handler", "usage"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
     card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, targets: true, deviceSync: true, text: { oneshot: true }, showTaskPreferences: false,
     network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
-  const extension = () => ({ id, revision: 1n, name: "Fixture mail", installed: true, enabled, owner: { kind: "resource", resourceId: "resource", resourceVersion: 1n, discoveredRevision: revision },
+  const extension = (extensionId = id) => ({ id: extensionId, revision: 1n, name: extensionId === id ? "Fixture mail" : "Alternate mail", installed: true,
+    enabled: extensionId === id ? enabled : alternateEnabled,
+    owner: { kind: "resource", resourceId: extensionId === id ? "resource" : "alternate-resource", resourceVersion: 1n, discoveredRevision: revision },
     setup: { state: "not_required" }, runtime: { ...declaration, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
   const resource = { id: "resource", kind: "package", scope: "managed", state: "installed", enabled: true, backendId: "runtime", versionNumber: 1n,
     discoveredRevision: revision, packageIdentity: "@sample/mail", version: "1.0.0", resourceDetails: [{ kind: "extension", entryPath: "extensions/main.js", runtime: declaration }] } as unknown as PiResourceDescriptor;
-  const surfaces = new ExtensionMainViewManager({ rootDirectory: join(root, "surfaces"), resources: { acquireInstalledPackage: async (): Promise<PiInstalledPackageLease> => ({ resource,
-    assertCurrent: async () => { if (!enabled) throw new Error("Disabled"); }, release: async () => {}, snapshotTo: async destination => {
+  const alternate = { ...resource, id: "alternate-resource", packageIdentity: "@sample/alternate-mail" };
+  const getResource = (resourceId: string) => resourceId === resource.id ? resource : alternate;
+  const surfaces = new ExtensionMainViewManager({ rootDirectory: join(root, "surfaces"), resources: { acquireInstalledPackage: async ({ resourceId }): Promise<PiInstalledPackageLease> => ({ resource: getResource(resourceId),
+    assertCurrent: async () => { if (!(resourceId === resource.id ? enabled : alternateEnabled)) throw new Error("Disabled"); }, release: async () => {}, snapshotTo: async destination => {
       await mkdir(join(destination, "extensions"), { recursive: true }); await mkdir(join(destination, "ui/logic"), { recursive: true });
-      await writeFile(join(destination, "package.json"), JSON.stringify({ name: "@sample/mail", version: "1.0.0", pi: { extensions: ["extensions/main.js"] },
+      await writeFile(join(destination, "package.json"), JSON.stringify({ name: getResource(resourceId).packageIdentity, version: "1.0.0", pi: { extensions: ["extensions/main.js"] },
         joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: "extensions/main.js", runtime: declaration }] } } }));
       await writeFile(join(destination, "extensions/main.js"), "export default function setup() {}\n");
       await writeFile(join(destination, "ui/logic/index.html"), '<!doctype html><html><head><script src="./runtime.js"></script></head><body></body></html>');
       await writeFile(join(destination, "ui/logic/runtime.js"), String.raw`
         let writes = 0, sends = 0;
+        const mailReads = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
         const taskOutcomes = {}, textOutcomes = {};
         let saved = { status: 'read_back', draftId: 'draft-one', fingerprint: 'revision-1', locator: { id: 'draft-one' },
           headers: { from: 'owner@example.test', to: 'reader@example.test', cc: '', bcc: '', subject: 'Review' },
@@ -114,13 +123,16 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
           listed: await joko.targets.list({ callId: message.callId, targetKind: 'task' }), methods: Object.keys(joko.targets)
         } }));
         joko.tools.register('sync', async () => ({ ok: true, result: { status: await joko.deviceSync.status(), nodeVisible: typeof process !== 'undefined' } }));
-        joko.tools.register('read_mail', async message => ({ ok: true, result: { accountId: 'one', messageId: 'one', from: 'Sender', to: 'Owner', cc: '', bcc: '', date: 'Today', subject: message.arguments.markRead ? 'Opened' : 'Unread', bodyHtml: '<p>Hello</p>', bodyText: 'Hello', attachments: [] } }));
+        joko.tools.register('read_mail', async message => {
+          mailReads.push(message.arguments);
+          return { ok: true, result: { accountId: 'one', messageId: 'one', from: 'Sender', to: 'Owner', cc: '', bcc: '', date: 'Today', subject: message.arguments.markRead ? 'Opened' : 'Unread', bodyHtml: '<p>Hello</p>', bodyText: mailSource, attachments: [] } };
+        });
         joko.onHostMessage(async message => {
           if (message.type === 'device-sync-request') await joko.deviceSync.reply(message.requestId, { received: message.data });
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
-        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes } }));
+        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads } }));
         joko.tools.register('usage', async message => {
           await window.__jokoExtensionToolAccepted(message.callId, 'forged');
           return { ok: false, result: { nonceVisible: 'usageNonce' in message } };
@@ -146,6 +158,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect(owner.sourceSessionId).toBe("task"); return { taskId: "managed-task", revision: "configuration", hidden: true, usage: 1n };
   }) };
   const manager = new ExtensionCardsManager({ store, vault, assertProject: (extensionId, sessionId) => projects.assertEnabledForSession(extensionId, sessionId), authority: extensionId => runtime?.authority(extensionId), redact: value => value,
+    previewMail: (request, signal, assertCurrent) => runtime!.previewMail(request, signal, assertCurrent),
     dispatch: (scope, event, assertCurrent) => runtime!.dispatch(scope, event, assertCurrent) });
   const startupErrors: string[] = [];
   const syncRequests: unknown[] = [], syncActive = vi.fn(), syncInvalidated = vi.fn();
@@ -184,7 +197,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
       };
       return browser;
     },
-    resources: { get: () => resource }, catalog: { get: () => extension(), snapshot: () => ({ revision: 1n, entries: [extension()], recoveredFromCorruption: false }),
+    resources: { get: getResource }, catalog: { get: extension, snapshot: () => ({ revision: 1n, entries: [extension(), extension(alternateId)], recoveredFromCorruption: false }),
       onAuthorityChanged: listener => { changed = listener; return () => { changed = undefined; }; } },
     registerProvider: provider => { providers.set(provider.id, provider); return () => { providers.delete(provider.id); }; }, redact: value => value,
     connections: { identity: () => connectionIdentity, hosts: () => ["one.example.test"], token: () => "connection-private-key",
@@ -274,8 +287,19 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect(connectionResponse.structuredContent).toMatchObject({ connections: { ok: true, connections: [{ id: "connection-one", host: "one.example.test", label: "One", default: true }] },
       response: { ok: true, status: 200, body: '{"messages":1,"echo":"[REDACTED]"}' } });
     expect(JSON.stringify(connectionResponse)).not.toContain("private-change-id");
-    expect(await runtime.previewMail("task", "https://mail.example.test/message/one", false, false, new AbortController().signal, () => {})).toEqual({ supported: true });
-    expect(await runtime.previewMail("task", "https://mail.example.test/message/one", true, true, new AbortController().signal, () => {})).toMatchObject({ supported: true, message: { subject: "Opened", bodyText: "Hello" } });
+    const connections = new ConnectionManager(store);
+    const transport = createRouterTransport(router => router.service(ExtensionCardService, createExtensionCardConnectService(manager, connections)));
+    const mail = createClient(ExtensionCardService, transport);
+    const pair = (label: string) => {
+      const challenge = connections.issuePairing(label);
+      const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: label });
+      return { headers: { authorization: `Bearer ${paired.authKey}` } };
+    };
+    const owner = pair("Mail owner"), otherOwner = pair("Other mail device");
+    const mailUrl = "https://mail.example.test/message/one";
+    const mailRequest = { sessionId: "task", url: mailUrl, read: true, opened: true };
+    expect(await mail.previewMail({ ...mailRequest, read: false, opened: false }, owner)).toMatchObject({ supported: true, messageJson: "" });
+    expect(JSON.parse((await mail.previewMail(mailRequest, owner)).messageJson)).toMatchObject({ subject: "Opened", bodyText: "@sample/mail" });
     const first = await provider.callTool("card", {}, undefined, context).catch(error => { throw new Error(`${String(error)}; ${startupErrors.join("; ")}`); });
     expect(first).toMatchObject({ isError: false, structuredContent: { published: true, nodeVisible: false, agentVisible: true } });
     const cardId = first.structuredContent?.joko_card_id as string; expect(manager.get("task", cardId).card.html).toContain("Approved source");
@@ -284,17 +308,17 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     await vi.waitFor(() => expect(manager.get("task", cardId).card.html).toContain("Refreshed"));
     const shown = await provider.callTool("mail", {}, undefined, context); expect(shown.isError).toBe(false);
     const mailId = shown.structuredContent?.joko_card_id as string;
-    let mail = readMailCard(manager.get("task", mailId).card.html)!; expect(mail.state).toBe("draft");
-    const fields = Object.fromEntries(mail.fields.map(field => [field.name, field.value]));
+    let draft = readMailCard(manager.get("task", mailId).card.html)!; expect(draft.state).toBe("draft");
+    const fields = Object.fromEntries(draft.fields.map(field => [field.name, field.value]));
     fields.body = "Edited"; fields.bodyHtml = '<p style="color:red">Edited</p>';
-    expect(await manager.dispatch({ sessionId: "task", cardId: mailId, actionId: `mail:change:${mail.key}`, prompt: "", formValues: fields, change: true }, () => {})).toBe(true);
+    expect(await manager.dispatch({ sessionId: "task", cardId: mailId, actionId: `mail:change:${draft.key}`, prompt: "", formValues: fields, change: true }, () => {})).toBe(true);
     await vi.waitFor(async () => {
       const result = await provider.callTool("inspect", {}, undefined, context);
       expect(result.structuredContent).toMatchObject({ writes: 1, sends: 0, saved: { editor: { body: "Edited", bodyHtml: '<p style="color:red">Edited</p>' } } });
     }, { timeout: 6000 });
-    mail = readMailCard(manager.get("task", mailId).card.html)!;
+    draft = readMailCard(manager.get("task", mailId).card.html)!;
     const currentValues = () => Object.fromEntries(readMailCard(manager.get("task", mailId).card.html)!.fields.map(field => [field.name, field.value]));
-    const action = (name: string) => manager.dispatch({ sessionId: "task", cardId: mailId, actionId: `mail:${name}:${mail.key}`, prompt: "", formValues: currentValues(), change: false }, () => {});
+    const action = (name: string) => manager.dispatch({ sessionId: "task", cardId: mailId, actionId: `mail:${name}:${draft.key}`, prompt: "", formValues: currentValues(), change: false }, () => {});
     expect(await action("send")).toBe(true); await vi.waitFor(() => expect(readMailCard(manager.get("task", mailId).card.html)?.state).toBe("sending"));
     expect(await action("cancel")).toBe(true); await vi.waitFor(() => expect(readMailCard(manager.get("task", mailId).card.html)?.state).toBe("draft"));
     expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.sends).toBe(0);
@@ -327,6 +351,27 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     projects.setEnabled(project.id, "connection", extension(), true, projects.state(project.id, "connection").revision);
     expect(provider.includeForSession?.("task", "target")).toBe(true);
     expect((await provider.callTool("card", {}, undefined, context)).isError).toBe(false);
+
+    alternateEnabled = true; changed?.([alternateId]);
+    await vi.waitFor(() => expect(providers.has(`${alternateId}-runtime`)).toBe(true));
+    const alternateProvider = providers.get(`${alternateId}-runtime`)!;
+    const discover = await mail.previewMail(mailRequest, owner);
+    expect(discover).toMatchObject({ supported: true, error: "MAIL_PROVIDER_AMBIGUOUS", messageJson: "" });
+    expect(discover.readerChoices.map(choice => choice.displayName).sort()).toEqual(["Alternate mail", "Fixture mail"]);
+    const readerSelectionId = discover.readerChoices.find(choice => choice.displayName === "Alternate mail")!.selectionId;
+    const selected = { ...mailRequest, readerSelectionId };
+    expect(await mail.previewMail(selected, otherOwner)).toMatchObject({ error: "MAIL_PROVIDER_CHANGED", messageJson: "" });
+    expect(await mail.previewMail({ ...selected, url: `${mailUrl}-other` }, owner)).toMatchObject({ error: "MAIL_PROVIDER_CHANGED", messageJson: "" });
+    expect(await mail.previewMail({ ...selected, sessionId: "other-task" }, owner)).toMatchObject({ error: "MAIL_PROVIDER_CHANGED", messageJson: "" });
+    expect((await alternateProvider.callTool("inspect", {}, undefined, context)).structuredContent?.mailReads).toEqual([]);
+    const chosen = await mail.previewMail(selected, owner);
+    expect(chosen.extensionId).toBe(alternateId);
+    expect(JSON.parse(chosen.messageJson)).toMatchObject({ subject: "Opened", bodyText: "@sample/alternate-mail" });
+    expect((await alternateProvider.callTool("inspect", {}, undefined, context)).structuredContent?.mailReads).toEqual([{ url: mailUrl, markRead: true }]);
+    alternateEnabled = false; changed?.([alternateId]);
+    expect(await mail.previewMail(selected, owner)).toMatchObject({ error: "MAIL_PROVIDER_CHANGED", messageJson: "", readerChoices: [{ displayName: "Fixture mail" }] });
+    expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.mailReads).toEqual([{ url: mailUrl, markRead: true }]);
+
     const before = publicCards().length;
     connectionIdentity = "changed";
     await expect(provider.callTool("network", {}, undefined, context)).rejects.toThrow();
