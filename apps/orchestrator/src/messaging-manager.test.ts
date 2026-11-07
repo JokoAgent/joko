@@ -601,6 +601,66 @@ describe("MessagingManager", () => {
     }
   });
 
+  it("wakes only an unclaimed WeChat text reply retry when the same peer supplies a different context", async () => {
+    const transport = new FakeWeChatTransport(weChatDirectBatch());
+    let sameContext!: () => void, changedContext!: () => void;
+    const same = new Promise<void>(resolve => { sameContext = resolve; });
+    const changed = new Promise<void>(resolve => { changedContext = resolve; });
+    const poll = transport.poll.bind(transport), normalize = transport.normalize.bind(transport);
+    vi.spyOn(transport, "poll").mockImplementation(async input => {
+      if (input.cursor !== "wechat-cursor-1" && input.cursor !== "wechat-cursor-2") return poll(input);
+      const isNew = input.cursor === "wechat-cursor-2";
+      await Promise.race([isNew ? changed : same, waitForAbort(input.signal)]);
+      return { updates: [{ client_id: isNew ? "changed-context" : "same-context" }], nextCursor: isNew ? "wechat-cursor-3" : "wechat-cursor-2" };
+    });
+    vi.spyOn(transport, "normalize").mockImplementation(updates => {
+      const batch = normalize(updates), messageId = updates[0]?.client_id;
+      if (messageId !== "same-context" && messageId !== "changed-context") return batch;
+      const base = batch.events[0]!;
+      if (base.kind !== "message") throw new Error("Expected a WeChat message.");
+      return { ...batch, events: [{ ...base, messageId, providerRequestIds: [`wechat:${messageId}`], text: `Reply from ${messageId}` }],
+        privateContexts: [{ messageId, providerConversationId: base.address.providerConversationId,
+          contextToken: messageId === "same-context" ? "private-context-a" : "rotated-context-a" }] };
+    });
+    const firstDeliveries = new Map<string, string>();
+    const send = transport.sendTextPart.bind(transport);
+    const calls = vi.spyOn(transport, "sendTextPart").mockImplementation(async input => {
+      const peer = input.address.providerConversationId;
+      if (!input.context) throw new Error("Expected a WeChat reply context.");
+      if (!firstDeliveries.has(peer)) {
+        firstDeliveries.set(peer, input.context.clientId);
+        throw new MessagingTransportError("provider_rejected", "WeChat did not accept the reply.", { retryable: true, effect: "none", retryAfterMs: 300_000 });
+      }
+      if (input.context.contextToken === "private-context-a") {
+        throw new MessagingTransportError("malformed_response", "WeChat reply outcome is unknown.", { retryable: false, effect: "unknown" });
+      }
+      return send(input);
+    });
+    const fixture = await createFixture(undefined, undefined, undefined, undefined, undefined, undefined, () => transport);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createWeChatConnection();
+    const enabled = await fixture.manager.commitWeChatAuthorization({ clientConnectionId: "desktop-one", connectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false, credentials: { token: "weChat-private-token", botId: "wx-bot", userId: "wx-account", baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    const deliveries = () => fixture.store.listMessagingDeliveries({ connectionId: enabled.id });
+    await vi.waitFor(() => expect(deliveries().filter(row => row.kind === "text" && row.status === "pending" && row.attempts === 1)).toHaveLength(2), { timeout: 5_000 });
+    const original = fixture.store.getMessagingDelivery(firstDeliveries.get("wx-peer-a")!);
+    const otherPeer = fixture.store.getMessagingDelivery(firstDeliveries.get("wx-peer-b")!);
+    expect(original.availableAt).toBeGreaterThan(Date.now());
+
+    sameContext();
+    await vi.waitFor(() => expect(deliveries().filter(row => row.status === "unknown")).toHaveLength(1), { timeout: 5_000 });
+    const unknown = deliveries().find(row => row.status === "unknown")!;
+    expect(fixture.store.getMessagingDelivery(original.id)).toEqual(original);
+    changedContext();
+    await vi.waitFor(() => expect(fixture.store.getMessagingDelivery(original.id)).toMatchObject({ status: "sent", attempts: 2 }), { timeout: 5_000 });
+    expect(Date.now()).toBeLessThan(original.availableAt);
+    expect(calls.mock.calls.filter(([input]) => input.context?.clientId === original.id).map(([input]) => input.context?.contextToken))
+      .toEqual(["private-context-a", "rotated-context-a"]);
+    expect(fixture.store.getMessagingDelivery(otherPeer.id)).toEqual(otherPeer);
+    expect(fixture.store.getMessagingDelivery(unknown.id)).toEqual(unknown);
+  });
+
   it("runs WeChat commands through one peer's durable task and keeps the previous task on /new", async () => {
     const commands = ["/new", "/permission auto", "/permission AcCePtEdItS", "/permission bypassPermissions", "/status", "/stop all"];
     const batch = weChatDirectBatch();
