@@ -48,7 +48,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const revision = `sha256:${"a".repeat(64)}`;
   let enabled = true, alternateEnabled = false, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
   const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "targets", "text", "sync", "missing_handler", "usage"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
-    card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, targets: true, deviceSync: true, text: { oneshot: true }, showTaskPreferences: false,
+    card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, targets: true, deviceSync: true, text: { oneshot: true }, image: ["generate"], showTaskPreferences: false,
     network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
   const extension = (extensionId = id) => ({ id: extensionId, revision: 1n, name: extensionId === id ? "Fixture mail" : "Alternate mail", installed: true,
     enabled: extensionId === id ? enabled : alternateEnabled,
@@ -67,7 +67,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
       await writeFile(join(destination, "ui/logic/index.html"), '<!doctype html><html><head><script src="./runtime.js"></script></head><body></body></html>');
       await writeFile(join(destination, "ui/logic/runtime.js"), String.raw`
         let writes = 0, sends = 0;
-        const mailReads = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
+        const mailReads = [], settingsNotices = [], localeNotices = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
         const taskOutcomes = {}, textOutcomes = {};
         let saved = { status: 'read_back', draftId: 'draft-one', fingerprint: 'revision-1', locator: { id: 'draft-one' },
           headers: { from: 'owner@example.test', to: 'reader@example.test', cc: '', bcc: '', subject: 'Review' },
@@ -130,9 +130,13 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
         joko.onHostMessage(async message => {
           if (message.type === 'device-sync-request') await joko.deviceSync.reply(message.requestId, { received: message.data });
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
+          if (message.type === 'settings-changed') settingsNotices.push({ event: message, data: await (await fetch('/kv')).json() });
+          if (message.type === 'host-context-changed') localeNotices.push({ event: message, data: await (await fetch('/app-context')).json() });
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
-        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads } }));
+        joko.tools.register('inspect', async message => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads, settingsNotices,
+          localeNotices, context: (await (await fetch('/app-context')).json()).context,
+          ...(message.arguments.preference ? { preference: await joko.send({ type: 'host-preference', capability: message.arguments.preference }) } : {}) } }));
         joko.tools.register('usage', async message => {
           await window.__jokoExtensionToolAccepted(message.callId, 'forged');
           return { ok: false, result: { nonceVisible: 'usageNonce' in message } };
@@ -163,11 +167,12 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const startupErrors: string[] = [];
   const syncRequests: unknown[] = [], syncActive = vi.fn(), syncInvalidated = vi.fn();
   const openSurface = surfaces.open.bind(surfaces);
-  vi.spyOn(surfaces, "open").mockImplementation(async input => {
+  const surfaceOpen = vi.spyOn(surfaces, "open").mockImplementation(async input => {
     try { return await openSurface(input); } catch (error) { startupErrors.push(String(error)); throw error; }
   });
   const registration = { id: "target", root, displayName: "Workspace", trusted: true };
   runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, projects, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
+    imageModels: () => [{ id: "image-model", providerId: "image-provider" }],
     deviceSync: { setActive: syncActive, invalidatePlugin: syncInvalidated, request: async (extensionId, input, signal, current) => {
       expect(extensionId).toBe(id); current(); signal.throwIfAborted(); syncRequests.push(input);
       return { ok: true, peers: [] };
@@ -368,6 +373,29 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect(chosen.extensionId).toBe(alternateId);
     expect(JSON.parse(chosen.messageJson)).toMatchObject({ subject: "Opened", bodyText: "@sample/alternate-mail" });
     expect((await alternateProvider.callTool("inspect", {}, undefined, context)).structuredContent?.mailReads).toEqual([{ url: mailUrl, markRead: true }]);
+
+    const authority = surfaceOpen.mock.calls.find(([input]) => input.authority.extensionId === id)![0].authority;
+    const updated = { parameter: "saved setting" };
+    store.setSetting("service", "extension-runtime-kv", id, vault.seal(JSON.stringify({ version: 1, data: updated }), id));
+    runtime.notifyRoutingChanged({ ...authority, resourceRevision: authority.resourceRevision + 1n }, () => {});
+    expect(() => runtime!.notifyRoutingChanged(authority, () => { throw new Error("Settings owner retired."); })).toThrow("Settings owner retired.");
+    runtime.notifyRoutingChanged(authority, () => {});
+    await vi.waitFor(async () => expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.settingsNotices)
+      .toEqual([{ event: { type: "settings-changed" }, data: updated }]));
+    expect((await alternateProvider.callTool("inspect", {}, undefined, context)).structuredContent?.settingsNotices).toEqual([]);
+
+    expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.context).toEqual({ locale: "en" });
+    runtime.setDesktopHostLocale("zh-CN", 2n);
+    runtime.setDesktopHostLocale("en", 1n);
+    await vi.waitFor(async () => {
+      const read = (await provider.callTool("inspect", {}, undefined, context)).structuredContent;
+      expect(read?.context).toEqual({ locale: "zh-CN" });
+      expect(read?.localeNotices).toEqual([{ event: { type: "host-context-changed" }, data: { context: { locale: "zh-CN" } } }]);
+    });
+    const preference = async (capability: string) => (await provider.callTool("inspect", { preference: capability }, undefined, context)).structuredContent?.preference;
+    await expect(preference("image.generate")).resolves.toEqual({ ok: true, capability: "image.generate", modelId: "image-model", providerId: "image-provider" });
+    await expect(preference("image.edit")).resolves.toEqual({ ok: false, errorCode: "INVALID_REQUEST" });
+
     alternateEnabled = false; changed?.([alternateId]);
     expect(await mail.previewMail(selected, owner)).toMatchObject({ error: "MAIL_PROVIDER_CHANGED", messageJson: "", readerChoices: [{ displayName: "Fixture mail" }] });
     expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.mailReads).toEqual([{ url: mailUrl, markRead: true }]);

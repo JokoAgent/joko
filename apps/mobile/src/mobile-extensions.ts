@@ -4,6 +4,7 @@ import {
   ExtensionMainViewIcon,
   ExtensionSetupFieldKind,
   ExtensionSetupState,
+  isExtensionHostLocale,
   type ExtensionCatalogEntry,
   type ExtensionMainViewSurface,
   type ExtensionTaskPreferences,
@@ -173,6 +174,7 @@ export interface MobileExtensionMainViewSurface {
   readonly expiresAt: number;
   readonly purpose?: "settings";
   readonly mobileSettings?: true;
+  readonly hostLocale?: string;
 }
 
 export interface MobileExtensionMainViewResource {
@@ -344,6 +346,9 @@ export function projectMobileExtensionMainViewSurface(
     ? Number(value.backendGeneration)
     : undefined;
   if (value.mobileSettings && !value.settings) invalid("Extension settings surface purpose");
+  if (value.hostLocale !== undefined && (!value.mobileSettings || !isExtensionHostLocale(value.hostLocale))) {
+    invalid("Extension settings host locale");
+  }
   const expiresAt = timestampMilliseconds(value.expiresAt);
   if (backendGeneration === undefined || backendGeneration < 0 || expiresAt === undefined) {
     invalid("Extension main-view authority");
@@ -367,7 +372,8 @@ export function projectMobileExtensionMainViewSurface(
     ...(icon === undefined ? {} : { icon }),
     expiresAt,
     ...(value.settings ? { purpose: "settings" as const } : {}),
-    ...(value.mobileSettings ? { mobileSettings: true as const } : {})
+    ...(value.mobileSettings ? { mobileSettings: true as const } : {}),
+    ...(value.hostLocale === undefined ? {} : { hostLocale: value.hostLocale })
   };
 }
 

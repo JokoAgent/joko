@@ -1,4 +1,7 @@
 import { createConnectionFetch } from "@joko/connection-transport";
+import { createConnectTransport } from "@joko/connection-transport/node";
+import { createClient } from "@connectrpc/connect";
+import { ConnectionService, ExtensionService } from "@joko/contracts";
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, realpath } from "node:fs/promises";
@@ -10,6 +13,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   DESKTOP_BOOTSTRAP_MAX_TTL_MS,
+  DESKTOP_HOST_AUTHORIZATION_HEADER,
   DesktopBootstrapFrameDecoder,
   createDesktopBootstrapCommit,
   createDesktopBootstrapRequest,
@@ -66,6 +70,29 @@ export interface ManagedOrchestratorRuntime {
   readonly release: () => void;
   /** Explicit service-management/test cleanup, including bundled Desktop tray exit. */
   readonly stop: () => Promise<void>;
+}
+
+export async function publishManagedExtensionHostLocale(options: {
+  readonly runtime: ManagedOrchestratorRuntime;
+  readonly locale: string;
+  readonly sequence: bigint;
+  readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
+  readonly isCurrent: () => boolean;
+}): Promise<void> {
+  const { runtime, locale, sequence, isCurrent } = options;
+  if (!isCurrent()) return;
+  const connection = runtime.connection;
+  const transport = createConnectTransport({ baseUrl: connection.origin, endpointPublicKey: connection.endpointPublicKey,
+    httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 3_000 });
+  const identity = await createClient(ConnectionService, transport).getServerInfo({});
+  if (!isCurrent()) return;
+  if (identity.server?.serverId !== connection.serverId) throw new Error("The managed extension host identity changed.");
+  const key = await options.readAuthKey(connection.profileId);
+  if (!isCurrent()) return;
+  if (!key) throw new Error("The managed extension host authorization is unavailable.");
+  await createClient(ExtensionService, transport).setDesktopExtensionHostLocale({ locale, changeSequence: sequence }, {
+    headers: { authorization: `Bearer ${key}`, [DESKTOP_HOST_AUTHORIZATION_HEADER]: `Bearer ${runtime.readDesktopHostAuthKey()}` }
+  });
 }
 
 export type ManagedOrchestratorProbeResult =

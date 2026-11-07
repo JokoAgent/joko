@@ -686,6 +686,8 @@ message ExtensionMainViewSurface {
   uint64 backend_generation = 10;
   bool settings = 11;
   bool mobile_settings = 12;
+  // Current managed Desktop locale for the original Mobile settings document.
+  optional string host_locale = 13;
 }
 
 // Generic Extension projection. Executable bytes and secrets are deliberately

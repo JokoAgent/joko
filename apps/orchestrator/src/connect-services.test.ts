@@ -1,12 +1,14 @@
-import type { ConnectRouter } from "@connectrpc/connect";
+import { Code, createClient, createRouterTransport, type ConnectRouter } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { create } from "@bufbuild/protobuf";
 import type { PartnerLearningFeedback } from "@joko/core";
-import type { PersistedEvent } from "@joko/store";
+import { OperationalStore, type PersistedEvent } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices, registerConnectServices } from "./connect-services.js";
+import { ConnectionManager } from "./connection-manager.js";
 
 function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorApplication {
   return {
@@ -27,6 +29,30 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
 }
 
 describe("Connect service composition", () => {
+  it("accepts a plugin host locale only from the current committed native Desktop", async () => {
+    const store = new OperationalStore(":memory:");
+    try {
+      const connections = new ConnectionManager(store);
+      const hostKey = Buffer.alloc(32, 13).toString("base64url");
+      const desktop = connections.issueTrustedDesktopConnection({ desktopInstanceId: "4e56f4d8-c6ee-4a17-9a89-56e059b7e592",
+        desktopDeviceId: "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75", defaultDeviceName: "Desktop", platform: "linux", appVersion: "0.1.0", desktopHostAuthKey: hostKey });
+      const setDesktopHostLocale = vi.fn();
+      const application = stubApplication({ store, connections, desktopExtensionContext: { setDesktopHostLocale } });
+      const client = createClient(contract.ExtensionService, createRouterTransport(router => registerConnectServices(router, application)));
+      const authorization = `Bearer ${desktop.authKey}`;
+      const nativeHeaders = { authorization, [DESKTOP_HOST_AUTHORIZATION_HEADER]: `Bearer ${hostKey}` };
+      const request = { locale: "zh-CN", changeSequence: 1n };
+      await expect(client.setDesktopExtensionHostLocale(request, { headers: nativeHeaders })).rejects.toMatchObject({ code: Code.Unauthenticated });
+      connections.confirmTrustedDesktopConnection(desktop.connection.id, desktop.authKey);
+      await expect(client.setDesktopExtensionHostLocale(request, { headers: { authorization } })).rejects.toMatchObject({ code: Code.Unauthenticated });
+      await expect(client.setDesktopExtensionHostLocale({ ...request, locale: "unsupported" }, { headers: nativeHeaders })).rejects.toMatchObject({ code: Code.InvalidArgument });
+      await client.setDesktopExtensionHostLocale(request, { headers: nativeHeaders });
+      connections.revoke(desktop.connection.id);
+      await expect(client.setDesktopExtensionHostLocale(request, { headers: nativeHeaders })).rejects.toMatchObject({ code: Code.Unauthenticated });
+      expect(setDesktopHostLocale).toHaveBeenCalledExactlyOnceWith("zh-CN", 1n);
+    } finally { store.close(); }
+  });
+
   it("joins original learning feedback consistently in event stream, history and around-message responses", async () => {
     const feedback: PartnerLearningFeedback = { revision: "5", receipts: [{ kind: "memory", entryId: "memory-1", title: "Preference", action: "created" }] };
     const original: PersistedEvent = { id: "original-completion", sequence: 1n, globalCursor: 1n, revision: 1n, emittedAt: 1_000,

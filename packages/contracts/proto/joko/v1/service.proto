@@ -494,8 +494,11 @@ service ExtensionService {
   rpc GetExtensionPackageExport(GetExtensionPackageExportRequest) returns (GetExtensionPackageExportResponse);
   rpc OpenExtensionMainView(OpenExtensionMainViewRequest) returns (OpenExtensionMainViewResponse);
   rpc OpenExtensionSettings(OpenExtensionSettingsRequest) returns (OpenExtensionSettingsResponse);
+  // Requires the committed native Desktop host authorization in addition to the connection.
+  rpc SetDesktopExtensionHostLocale(SetDesktopExtensionHostLocaleRequest) returns (SetDesktopExtensionHostLocaleResponse);
   rpc GetExtensionSettingsRoutingData(GetExtensionSettingsRoutingDataRequest) returns (GetExtensionSettingsRoutingDataResponse);
   rpc ListExtensionSettingsAgentModels(ListExtensionSettingsAgentModelsRequest) returns (ListExtensionSettingsAgentModelsResponse);
+  rpc ListExtensionSettingsImageModels(ListExtensionSettingsImageModelsRequest) returns (ListExtensionSettingsImageModelsResponse);
   rpc BeginExtensionSecretCheck(BeginExtensionSecretCheckRequest) returns (BeginExtensionSecretCheckResponse);
   rpc CheckExtensionSecret(CheckExtensionSecretRequest) returns (CheckExtensionSecretResponse);
   rpc OpenExtensionDirectoryPicker(OpenExtensionDirectoryPickerRequest) returns (OpenExtensionDirectoryPickerResponse);
@@ -2698,6 +2701,20 @@ message ListExtensionSettingsAgentModelsRequest {
 message ListExtensionSettingsAgentModelsResponse {
   repeated ExtensionSettingsAgentModel models = 1;
 }
+
+message ListExtensionSettingsImageModelsRequest {
+  string surface_id = 1;
+}
+
+message ListExtensionSettingsImageModelsResponse {
+  repeated ExtensionSettingsImageModel models = 1;
+}
+
+message ExtensionSettingsImageModel {
+  string id = 1;
+  string name = 2;
+  string provider_id = 3;
+}
 message ExtensionSettingsAgentModel {
   // Internal route identity for the requesting client's model visibility preference.
   string backend_id = 1;
@@ -2749,6 +2766,13 @@ message CloseExtensionDirectoryPickerRequest {
 message CloseExtensionDirectoryPickerResponse {
   bool closed = 1;
 }
+
+message SetDesktopExtensionHostLocaleRequest {
+  string locale = 1;
+  uint64 change_sequence = 2;
+}
+
+message SetDesktopExtensionHostLocaleResponse {}
 
 message GetExtensionMainViewSurfaceRequest {
   string surface_id = 1;

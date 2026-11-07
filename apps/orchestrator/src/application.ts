@@ -562,6 +562,8 @@ export interface OrchestratorApplication {
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionSettings?: ExtensionSettingsManager;
+  readonly extensionImageModels?: () => ReturnType<ImageGenerationBridgeToolProvider["listModels"]>;
+  readonly desktopExtensionContext?: Pick<ExtensionCardRuntime, "desktopHostLocale" | "setDesktopHostLocale">;
   readonly extensionDirectoryPicker?: ExtensionDirectoryPicker;
   readonly extensionCards?: ExtensionCardsManager;
   readonly extensionNetwork?: ExtensionNetworkSettings;
@@ -625,6 +627,8 @@ export interface PiSettingsProjectionDefaults {
 }
 
 export interface OrchestratorApplicationDependencies {
+  /** Only an ephemeral Desktop-managed service accepts the native owner's live locale. */
+  readonly desktopManagedExtensionContext?: boolean;
   readonly agentImportSources?: { readonly home: string; readonly environment: NodeJS.ProcessEnv };
   /** Private host capability; proxy credentials remain outside durable Orchestrator state. */
   readonly resolveOutboundProxy?: OutboundProxyResolver;
@@ -1151,7 +1155,9 @@ export async function createOrchestratorApplication(
     }
   });
   await extensionMainViews.initialize();
+  let extensionCardRuntime: ExtensionCardRuntime | undefined;
   const extensionSettings = new ExtensionSettingsManager({ store, vault: credentialVault, credentials, catalog: extensionCatalog,
+    notifyRoutingChanged: (authority, assertCurrent) => extensionCardRuntime?.notifyRoutingChanged(authority, assertCurrent),
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
       environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }) });
   const imageGenerationBridge = new ImageGenerationBridgeToolProvider({
@@ -1162,6 +1168,7 @@ export async function createOrchestratorApplication(
       IMAGE_GENERATION_RESPONSE_MAXIMUM_BYTES
     )
   });
+  const listExtensionImageModels = () => imageGenerationBridge.listModels();
   const unregisterImageGenerationBridge = mcpRouter.registerBridgeToolProvider(imageGenerationBridge);
   const unregisterPersonalDevelopmentTools = mcpRouter.registerBridgeToolProvider(
     new PersonalDevelopmentReportTools(() => personalDevelopmentCoordinator)
@@ -2605,7 +2612,6 @@ export async function createOrchestratorApplication(
   const extensionRoutineRuntime = new ExtensionRoutineRuntime({ catalog: extensionCatalog, resources: piResources, store,
     surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupRoutineRuntime = extensionRoutineRuntime;
-  let extensionCardRuntime: ExtensionCardRuntime | undefined;
   const extensionDeviceSync = new ExtensionDeviceSync({ store, vault: credentialVault, peers: devicePeers, catalog: extensionCatalog, resources: piResources,
     deliver: async (...args) => extensionCardRuntime?.deliverDeviceSync(...args) ?? false });
   hostedAgents.installExtensionSync(extensionDeviceSync);
@@ -2646,6 +2652,7 @@ export async function createOrchestratorApplication(
     vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, targets: extensionTargets, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
+    imageModels: listExtensionImageModels,
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
       environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }),
     resolveCredential: reference => credentials.resolve(reference),
@@ -3623,6 +3630,8 @@ export async function createOrchestratorApplication(
     extensionLibraries,
     extensionMainViews,
     extensionSettings,
+    extensionImageModels: listExtensionImageModels,
+    ...(dependencies.desktopManagedExtensionContext ? { desktopExtensionContext: extensionCardRuntime } : {}),
     extensionDirectoryPicker,
     extensionCards,
     extensionNetwork,

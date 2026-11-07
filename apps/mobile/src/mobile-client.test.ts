@@ -3297,6 +3297,22 @@ describe("mobile Extension catalog authority", () => {
     expect(network.listExtensions).not.toHaveBeenCalled();
   });
 
+  it("reads the latest Desktop host locale for the original Mobile settings document", async () => {
+    const f = mobileSettingsOAuthFixture();
+    const app = client(f.network, memoryStorage(credential).storage);
+    await app.start();
+    try {
+      const transport = app.extensionCatalogTransport()!;
+      const host = { ...f.host, locale: "zh-CN" };
+      const signal = new AbortController().signal;
+      vi.mocked(f.network.getExtensionMainViewSurface).mockResolvedValueOnce({ ...f.surface, hostLocale: "en" });
+      await expect(transport.callSettings!(f.surface, { kind: "context.get" }, host, signal)).resolves.toEqual({ context: { locale: "en" } });
+      vi.mocked(f.network.getExtensionMainViewSurface).mockResolvedValueOnce({ ...f.surface, hostLocale: "en-XA" });
+      await expect(transport.callSettings!(f.surface, { kind: "context.get" }, host, signal)).resolves.toEqual({ context: { locale: "en-XA" } });
+      await expect(transport.callSettings!(f.surface, { kind: "context.get" }, host, signal)).resolves.toEqual({ context: { locale: "zh-CN" } });
+    } finally { app.dispose(); }
+  });
+
   it.each(["before", "after"] as const)("keeps a routing receipt only when author settings close %s dispatch", async timing => {
     const f = mobileSettingsOAuthFixture(), saved = memoryStorage(credential);
     if (f.surface.owner.kind !== "resource") throw new Error("Settings require an installed Resource.");

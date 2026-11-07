@@ -36,6 +36,12 @@ interface ImageGenerationSnapshot {
   readonly routes: readonly ImageGenerationRoute[];
 }
 
+export interface ExecutableImageGenerationModel {
+  readonly id: string;
+  readonly name: string;
+  readonly providerId: string;
+}
+
 export interface ImageGenerationBridgeToolProviderOptions {
   readonly credentialSurfaces: ProviderCredentialSurfaceResolver;
   readonly artifacts: McpResultArtifactStore;
@@ -69,6 +75,10 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   get available(): boolean {
     this.#refreshSnapshot();
     return this.#routes.length > 0;
+  }
+
+  listModels(): readonly ExecutableImageGenerationModel[] {
+    return this.#readSnapshot().routes.map(route => ({ id: route.modelId, name: route.displayName, providerId: route.owner.provider.providerId }));
   }
 
   get tools(): readonly McpToolDescriptor[] {

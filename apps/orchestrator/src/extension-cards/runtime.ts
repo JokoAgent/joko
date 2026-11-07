@@ -45,6 +45,7 @@ interface Options {
   readonly registerProvider: (provider: BridgeToolProvider) => () => void;
   readonly redact: (text: string) => string;
   readonly locale?: () => string;
+  readonly imageModels?: () => readonly { readonly id: string; readonly providerId: string }[];
   readonly fetch?: typeof fetch;
   readonly resolveCredential?: (reference: string) => string;
   readonly media?: ExtensionCardMedia;
@@ -67,6 +68,7 @@ interface Options {
 export class ExtensionCardRuntime {
   readonly #instances = new Map<string, Instance>();
   #browser?: Browser; #browserOpening?: Promise<Browser>; #stopped = true; #generation = 0;
+  #desktopLocale?: { readonly value: string; readonly sequence: bigint };
   #tail = Promise.resolve(); #unsubscribe?: () => void; #timer?: NodeJS.Timeout;
   readonly #network: ExtensionNetwork | undefined;
   readonly #files = new ExtensionFileDeposits();
@@ -77,6 +79,22 @@ export class ExtensionCardRuntime {
   authority(id: string): ExtensionCardAuthority | undefined {
     try { return this.#capture(id); } catch { return; }
   }
+
+  get desktopHostLocale(): string | undefined { return this.#desktopLocale?.value; }
+
+  setDesktopHostLocale(value: string, sequence: bigint): void {
+    if (sequence <= (this.#desktopLocale?.sequence ?? 0n)) return;
+    const previous = this.#contextLocale();
+    this.#desktopLocale = { value, sequence };
+    if (previous === value) return;
+    for (const instance of this.#instances.values()) {
+      if (!instance.page || instance.page.isClosed()) continue;
+      try { this.#assert(instance); } catch { continue; }
+      this.#postHostEvent(instance.page, "host-context-changed");
+    }
+  }
+
+  #contextLocale(): string { return this.desktopHostLocale ?? this.options.locale?.() ?? "en"; }
 
   captureDirectorySelection(extensionId: string) {
     const authority = this.#capture(extensionId);
@@ -280,7 +298,7 @@ export class ExtensionCardRuntime {
   }
   #localRequest(instance: Instance, path: string, method: string, body: string): unknown {
     this.#assert(instance);
-    if (path === "/app-context" && method === "GET") return { context: { locale: this.options.locale?.() ?? "en" } };
+    if (path === "/app-context" && method === "GET") return { context: { locale: this.#contextLocale() } };
     if (path !== "/kv" || !["GET", "PUT"].includes(method)) throw new Error("Extension local request denied.");
     const id = instance.authority.surface.extensionId;
     if (method === "PUT") {
@@ -301,6 +319,14 @@ export class ExtensionCardRuntime {
     const request = payload as Record<string, unknown>, id = instance.authority.surface.extensionId;
     const current = () => { this.#assert(instance); };
     switch (request.type) {
+      case "host-preference": {
+        if (request.capability !== "image.generate" || Object.keys(request).length !== 2) return { ok: false, errorCode: "INVALID_REQUEST" };
+        if (!instance.authority.runtime.image) return { ok: false, errorCode: "PERMISSION_DENIED" };
+        current();
+        const model = this.options.imageModels?.()[0];
+        if (!model) return { ok: false, errorCode: "NOT_AVAILABLE" };
+        return { ok: true, capability: "image.generate", modelId: model.id, providerId: model.providerId };
+      }
       case "device-sync-request": {
         if (!instance.authority.runtime.deviceSync || !this.options.deviceSync) return { ok: false, errorCode: "SYNC_NOT_ALLOWED" };
         const owner = this.#requestOwner(instance, request.callId);
@@ -503,6 +529,24 @@ export class ExtensionCardRuntime {
     current(); const page = await this.#ensure(instance); current();
     await page.evaluate(payload => (window as unknown as { __jokoRuntime: { event(payload: unknown): void } }).__jokoRuntime.event(payload), event);
     current(); return true;
+  }
+  notifyRoutingChanged(authority: ExtensionMainViewAuthority, assertCaller: () => void): void {
+    const instance = this.#instances.get(authority.extensionId);
+    if (!instance?.page || instance.page.isClosed()) return;
+    const installed = instance.authority.surface;
+    if (installed.resourceId !== authority.resourceId || installed.resourceRevision !== authority.resourceRevision
+      || installed.discoveredRevision !== authority.discoveredRevision || installed.backendId !== authority.backendId
+      || installed.backendRevision !== authority.backendRevision || installed.backendGeneration !== authority.backendGeneration
+      || installed.packageName !== authority.packageName || installed.packageVersion !== authority.packageVersion
+      || installed.extensionEntry !== authority.extensionEntry) return;
+    assertCaller(); this.#assert(instance);
+    this.#postHostEvent(instance.page, "settings-changed");
+  }
+  #postHostEvent(page: Page, type: "settings-changed" | "host-context-changed"): void {
+    void page.evaluate(type => {
+      const runtime = (window as unknown as { __jokoRuntime: { event(event: { type: string }): void } }).__jokoRuntime;
+      runtime.event({ type });
+    }, type).catch(() => undefined);
   }
   async #close(instance: Instance): Promise<void> {
     this.#files.retire(instance.authority.key);
