@@ -785,6 +785,8 @@ export interface EnqueueServiceInput {
   readonly collaborationReportOrigin?: CollaborationReportOrigin;
   readonly taskMessageOrigin?: TaskMessageOrigin;
   readonly overrides?: TurnExecutionOverrides;
+  /** The service owner will wake dispatch after its enclosing transaction commits. */
+  readonly deferDispatch?: true;
   /** Runs inside the same Store transaction after Queue admission and before
    * dispatch can start. Trusted service owners use this to bind their durable
    * projection to the exact Queue identity. */
@@ -3420,7 +3422,7 @@ export class SessionHost {
         expiry.unref();
         this.#protectedMessagingPrompts.set(queueItemId, { prompt: acceptedPrompt, expiry });
       }
-      void this.drain(input.sessionId);
+      if (input.deferDispatch !== true) void this.drain(input.sessionId);
     }
     return execution;
   }
