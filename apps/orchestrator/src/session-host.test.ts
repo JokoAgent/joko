@@ -10526,15 +10526,21 @@ describe("SessionHost", () => {
     expect(fixture.store.listScheduleRuns("schedule-script-zero-cost")[0]?.sessionId).toBe(boundSessionId);
   });
 
-  it.each(["created", "queued"] as const)("reports %s from the real script dispatch capability and keeps its task link", async wakeKind => {
+  it.each(["created", "queued", "restored"] as const)("handles a %s task through the real script dispatch capability and keeps its task link", async wakeKind => {
     const fixture = await createFixture();
     let activeTurn!: AdapterContext;
     let existingSessionId: string | undefined;
-    if (wakeKind === "queued") {
+    if (wakeKind !== "created") {
       existingSessionId = (await fixture.host.createSession({ operationId: "script-busy-session", connection: fixture.connection,
         targetId: "target-one", title: "Busy task", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    }
+    if (wakeKind === "restored") {
+      await fixture.host.closeIfActive(existingSessionId!);
+      fixture.store.updateSession(existingSessionId!, { archived: true });
+    }
+    if (wakeKind === "queued") {
       vi.spyOn(fixture.adapter, "send").mockImplementationOnce(async (_prompt, context) => { activeTurn = context; });
-      const prior = fixture.host.enqueueInput({ connection: fixture.connection, operationId: "script-busy-input", sessionId: existingSessionId,
+      const prior = fixture.host.enqueueInput({ connection: fixture.connection, operationId: "script-busy-input", sessionId: existingSessionId!,
         prompt: { text: "The current turn", images: [], files: [], mentions: [], disposition: "prompt" } });
       await eventually(() => fixture.store.getQueueItem(prior.value.queueItemId).state === "backend_accepted");
     }
@@ -10598,8 +10604,9 @@ describe("SessionHost", () => {
       detail: { script: { resultText: expect.any(String) }, costAttribution: "zero" }
     });
     const receipt = JSON.parse((history.detail as { script: { resultText: string } }).script.resultText) as { run_id: string };
-    expect(receipt).toMatchObject({ wake_kind: wakeKind, target_session_id: taskId });
-    if (existingSessionId !== undefined) {
+    expect(receipt).toMatchObject({ wake_kind: wakeKind === "created" ? "created" : "queued", target_session_id: taskId });
+    if (wakeKind === "restored") expect(fixture.store.getSession(taskId).descriptor.archived).toBe(false);
+    if (wakeKind === "queued") {
       expect(fixture.store.findQueueItemByRunId(taskId, receipt.run_id)?.state).toBe("accepted");
       await activeTurn.emit({ type: "done", outcome: "completed" });
     }

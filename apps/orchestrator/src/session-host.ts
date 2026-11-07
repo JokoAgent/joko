@@ -2219,7 +2219,7 @@ export class SessionHost {
       if (!claim.claimed) { check(); return; }
       // A started receipt is deliberately retained on failure. Recovery must
       // inspect the original worktree lease instead of repeating an unknown effect.
-      await this.#worktrees.restore(input.sessionId);
+      await this.#worktrees.restore(input.sessionId, { assertCurrent: check });
       this.#store.completeDeferredEffectOperation(input.operationId, claim.operation.bodyHash, commit);
     });
   }

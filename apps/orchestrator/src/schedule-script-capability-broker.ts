@@ -82,8 +82,9 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
     const operationId = capabilityOperationId(context.runId, request.id);
     const sessionId = requestedSessionId === undefined
       ? await this.createSession(schedule, title, operationId, context)
-      : this.requireTargetSession(schedule, requestedSessionId);
+      : await this.prepareTargetSession(schedule, requestedSessionId, operationId, context);
     context.assertCurrent();
+    if (requestedSessionId !== undefined) this.requireTargetSession(schedule, requestedSessionId, false);
     const sent = this.host.enqueueServiceInput({
       operationId: `${operationId}-send`,
       sessionId,
@@ -142,7 +143,23 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
     }
   }
 
-  private requireTargetSession(schedule: ScheduleRecord, sessionId: string): string {
+  private async prepareTargetSession(schedule: ScheduleRecord, sessionId: string, operationId: string, context: ScheduleScriptCapabilityContext): Promise<string> {
+    const allowRestore = schedule.sessionMode !== "bound";
+    const session = this.requireTargetSession(schedule, sessionId, allowRestore);
+    if (allowRestore && (session.archived || session.worktree?.state === "preserved")) {
+      await this.host.restoreScheduledTarget({
+        sessionId,
+        operationId: `${operationId}-restore`,
+        assertCurrent: () => {
+          context.assertCurrent();
+          this.requireTargetSession(schedule, sessionId, allowRestore);
+        }
+      });
+    }
+    return session.id;
+  }
+
+  private requireTargetSession(schedule: ScheduleRecord, sessionId: string, allowRestore: boolean): SessionDescriptor {
     let session: SessionDescriptor | undefined;
     try {
       session = this.store.getSession(sessionId).descriptor;
@@ -150,7 +167,7 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
       session = undefined;
     }
     if (
-      session === undefined || session.deletedAt !== undefined || session.archived ||
+      session === undefined || session.deletedAt !== undefined || (!allowRestore && (session.archived || session.worktree?.state === "preserved")) ||
       session.backendId !== schedule.backendId || session.targetId !== schedule.targetId
     ) {
       throw new ScheduleScriptCapabilityError(
@@ -158,7 +175,7 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
         "target_session_id is unavailable or outside the Schedule workspace."
       );
     }
-    return session.id;
+    return session;
   }
 }
 
