@@ -25,6 +25,8 @@ test("reads every page and recovers the exact delete receipt before an explicit 
   const original = f.editor.snapshot().open[0]; f.loseReceipt(); await f.editor.mutate(original, "delete");
   assert.equal(f.editor.snapshot().pending, true); assert.equal(f.editor.snapshot().failed, true);
   assert.equal(original.revision, 1n);
+  await f.editor.mutate(f.editor.snapshot().open[1], "delete");
+  assert.equal(f.mutations.length, 1);
   await f.editor.mutate(); assert.deepEqual(f.mutations[0], f.mutations[1]); assert.equal(f.editor.snapshot().open.length, 59);
   const deleted = f.editor.snapshot().deleted; assert.equal(deleted.revision, 2n);
   await f.editor.mutate(deleted, "restore"); assert.equal(f.editor.snapshot().open.length, 60); assert.equal(f.editor.snapshot().deleted, undefined);
@@ -33,7 +35,9 @@ test("reads every page and recovers the exact delete receipt before an explicit 
 test("suspension retires an in-flight read and never dispatches a retained action automatically", async context => {
   const f = fixture(1); context.after(() => f.editor.dispose()); f.editor.activate(); await f.editor.refresh(); f.loseReceipt(); await f.editor.mutate(f.editor.snapshot().open[0], "delete");
   f.editor.suspend(); f.editor.activate(); await f.editor.refresh(); assert.equal(f.mutations.length, 1);
-  assert.equal(f.editor.snapshot().pending, true); f.editor.dispose();
+  assert.equal(f.editor.snapshot().openTotal, 0);
+  assert.equal(f.editor.snapshot().pending, true);
+  assert.equal(f.editor.snapshot().failed, true); f.editor.dispose();
 });
 
 test("selects the newest 200 created completions for Mobile and keeps the original open and Desktop windows", async context => {

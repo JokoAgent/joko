@@ -48,7 +48,7 @@ export class PartnerGlanceTodos {
       const [open, done] = await Promise.all([read("open"), read("done")]);
       if (request.signal.aborted || epoch !== this.#epoch || !this.#foreground || this.#closed) return;
       if (open.partnerRevision?.value !== done.partnerRevision?.value) throw new Error("The affair owner changed during pagination.");
-      this.#set({ open: open.items, done: [...done.items].reverse(), openTotal: open.total, doneTotal: done.total, loaded: true, failed: false,
+      this.#set({ open: open.items, done: [...done.items].reverse(), openTotal: open.total, doneTotal: done.total, loaded: true, failed: this.#state.pending,
         partnerRevision: open.partnerRevision!.value, nextDeferredAt: open.nextDeferredAt ? Number(open.nextDeferredAt.seconds * 1000n) : undefined, now: Date.now() });
       this.#arm();
     } catch { if (!request.signal.aborted && epoch === this.#epoch) this.#set({ loaded: true, failed: true }); }
@@ -61,12 +61,13 @@ export class PartnerGlanceTodos {
   }
   async mutate(todo?: PartnerTodo, action?: "delete" | "restore"): Promise<void> {
     if (this.#closed || !this.#foreground || this.#state.saving || !this.#state.partnerRevision) return;
+    if (this.#attempt && (todo || action)) return;
     if (!this.#attempt) {
       if (!todo || !action) return;
       this.#attempt = { operationId: this.api.newOperationId(), revision: this.#state.partnerRevision, todo, action };
     }
     const attempt = this.#attempt, request = new AbortController(); this.#request?.abort(); this.#request = request; this.#epoch++;
-    this.#set({ saving: true, failed: false, pending: true });
+    this.#set({ saving: true, failed: this.#state.pending, pending: true });
     try {
       const updated = await this.api.updateTodo(attempt.operationId, this.partnerId, attempt.revision, attempt.todo, attempt.action, request.signal);
       if (request.signal.aborted || this.#closed || !this.#foreground) return;
@@ -75,7 +76,9 @@ export class PartnerGlanceTodos {
     } catch (error) { if (!request.signal.aborted) { if (partnerMutationWasRejected(error)) { this.#attempt = undefined; this.#set({ pending: false }); } this.#set({ failed: true }); } }
     finally {
       if (this.#request === request) this.#request = undefined;
-      this.#set({ saving: false }); if (!this.#attempt) await this.refresh(); else this.#arm();
+      const interrupted = request.signal.aborted;
+      this.#set({ saving: false, failed: this.#state.failed || interrupted });
+      if (!this.#attempt || interrupted) await this.refresh(); else this.#arm();
     }
   }
 }

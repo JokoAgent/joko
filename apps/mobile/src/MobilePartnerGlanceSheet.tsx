@@ -77,6 +77,7 @@ export function MobilePartnerGlanceSheet({ api, homeApi, partnerId, name, visibl
   const action = (label: string, onPress: () => void, disabled = false) => <Pressable accessibilityRole="button" accessibilityLabel={label}
     disabled={disabled} onPress={onPress} style={[styles.action, { borderColor: colors.border }, disabled && { opacity: .45 }]}><Text style={{ color: colors.ink }}>{label}</Text></Pressable>;
   const remove = (todo: PartnerTodo) => {
+    if (state.saving || state.pending) return;
     const epoch = ++askEpoch.current;
     Alert.alert(todo.title, undefined, [{ text: m.cancel, style: "cancel" }, { text: m.remove, style: "destructive", onPress: () => {
       if (alive.current && current.current.visible && epoch === askEpoch.current && AppState.currentState === "active") void editor.mutate(todo, "delete");
