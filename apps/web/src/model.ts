@@ -6099,6 +6099,11 @@ export interface ArtifactDownloadContext {
   readonly signal: AbortSignal;
 }
 
+export interface ArtifactUrlReference {
+  readonly url: Promise<string>;
+  release(): void;
+}
+
 /** Browser dispatch does not acknowledge that a file reached the user's disk. */
 export type ArtifactDownloadOutcome = "saved" | "dispatched" | "cancelled";
 
@@ -6924,6 +6929,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   updateResource(resourceId: string): Promise<ResourceView>;
   captureBrowserScreenshot(browserId: string, pageId: string, fullPage: boolean): Promise<string>;
   getArtifactUrl(blobId: string): Promise<string>;
+  acquireArtifactUrl(blobId: string): ArtifactUrlReference;
   releaseArtifactUrl(blobId: string): void;
   downloadArtifact(blobId: string, fileName: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   copyArtifactFile(blobId: string, fileName: string, byteSize: number, context: ArtifactDownloadContext): Promise<import("./native-file-actions.js").NativeFileCopyOutcome>;

@@ -63,7 +63,28 @@ describe("Inspector Git push destinations", () => {
     expect(view.host.querySelector(".review-markdown-preview")?.textContent).toContain("Current Markdown");
     expect(view.host.textContent).not.toContain("Retired Markdown");
     expect(view.host.querySelector(".review-image-preview img")?.getAttribute("src")).toBe("blob:photo-b");
-    expect(view.api.getArtifactUrl).toHaveBeenCalledExactlyOnceWith("photo-b");
+    expect(view.api.acquireArtifactUrl).toHaveBeenCalledExactlyOnceWith("photo-b");
+  });
+
+  it("refreshes a Review image after its download failed, even with the same Blob ID", async () => {
+    const file = { path: "photo.png", source: "unstaged" as const, status: "modified" as const, binary: true, text: "", hunks: [] };
+    const view = await mount({ ...diff, files: [file] }, false, true);
+    view.api.readWorkspaceDiffImage.mockResolvedValue({ repositoryRevision: diff.repositoryRevision, maximumBytes: 4096,
+      oldImage: { present: false, tooLarge: false }, newImage: { present: true, tooLarge: false, blobId: "photo" } });
+    const releaseFailed = vi.fn(), releaseRetried = vi.fn();
+    view.api.acquireArtifactUrl.mockImplementationOnce(() => ({ url: Promise.reject(new Error("Temporary download failure")), release: releaseFailed }))
+      .mockImplementationOnce(() => ({ url: Promise.resolve("blob:retried"), release: releaseRetried }));
+    await act(async () => button(view.host, "workspace.reviewImagePreview").click());
+    expect(view.host.querySelector(".review-image-preview [role=alert]")?.textContent).toBe("workspace.reviewImageUnavailable");
+
+    await act(async () => button(view.host, "workspace.reviewRefreshPreview").click());
+    expect(view.api.readWorkspaceDiffImage).toHaveBeenCalledTimes(2);
+    expect(view.api.acquireArtifactUrl.mock.calls).toEqual([["photo"], ["photo"]]);
+    expect(view.host.querySelector(".review-image-preview img")?.getAttribute("src")).toBe("blob:retried");
+    expect(releaseFailed).toHaveBeenCalledOnce();
+    expect(releaseRetried).not.toHaveBeenCalled();
+    await view.render(remoteWorkspace);
+    expect(releaseRetried).toHaveBeenCalledOnce();
   });
 
   it("replaces a settled Review diff when the same workspace is rebound to SSH", async () => {
@@ -164,11 +185,10 @@ async function mount(initial = diff, canCommitDiff = false, canDiffImagePreview 
     listWorkspaceChangeSets: vi.fn(async () => []),
     readWorkspaceDiffFile: vi.fn<AppController["readWorkspaceDiffFile"]>(),
     readWorkspaceDiffImage: vi.fn<AppController["readWorkspaceDiffImage"]>(),
-    getArtifactUrl: vi.fn(async (blobId: string) => `blob:${blobId}`),
+    acquireArtifactUrl: vi.fn<AppController["acquireArtifactUrl"]>((blobId) => ({ url: Promise.resolve(`blob:${blobId}`), release: vi.fn() })),
     commitWorkspaceDiff: vi.fn<AppController["commitWorkspaceDiff"]>(async () => undefined),
     pushWorkspaceBranch: vi.fn<AppController["pushWorkspaceBranch"]>(async () => ({ outcome: "pushed", remote: pushTarget.remote, remoteRef: pushTarget.remoteRef,
-      repositoryRevision: "repository-1", headRevision: "a".repeat(40), ahead: 0, behind: 0 } satisfies WorkspaceGitPushResultView)),
-    releaseArtifactUrl: vi.fn()
+      repositoryRevision: "repository-1", headRevision: "a".repeat(40), ahead: 0, behind: 0 } satisfies WorkspaceGitPushResultView))
   };
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host); roots.push(root);

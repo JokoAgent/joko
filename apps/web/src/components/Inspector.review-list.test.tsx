@@ -41,6 +41,43 @@ describe("Workspace Review file list", () => {
     expect(container.querySelector('[data-virtualized-file-list="true"]')).not.toBeNull();
   });
 
+  it("releases both image acquisitions each time the virtualized Review row leaves the view", async () => {
+    const height = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("workspace-diff-preview") ? 180 : 45;
+    });
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container); roots.push(root);
+    const image = { ...file("photo.png"), binary: true };
+    const files = [image, ...Array.from({ length: 100 }, (_, index) => file(`src/file-${index}.ts`))];
+    const acquire = vi.fn((id: string) => ({ url: Promise.resolve(`blob:${id}`), release: vi.fn() }));
+    const preview = {
+      key: `revision-1:${reviewFileKey(image)}`, requestId: 1, loading: false,
+      value: { repositoryRevision: "revision-1", maximumBytes: 4096,
+        oldImage: { present: true, tooLarge: false, blobId: "old" }, newImage: { present: true, tooLarge: false, blobId: "new" } }
+    };
+    const render = (repositoryRevision: string) => act(async () => root.render(<WorkspaceDiffPreview
+      diff={{ source: "unstaged", repositoryRevision, truncated: false, files }} fallback={[]} t={key => key}
+      expandedFileKeys={new Set()} onFileExpandedChange={() => undefined} imagePreview={preview} acquireArtifactUrl={acquire} />));
+    try {
+      await render("revision-1");
+      expect(container.querySelectorAll(".review-image-preview img")).toHaveLength(2);
+      const list = container.querySelector<HTMLElement>('[data-virtualized-file-list="true"]')!;
+      const scroll = (top: number) => act(async () => { list.scrollTop = top; list.dispatchEvent(new Event("scroll")); });
+      await scroll(45 * 70);
+      expect(container.querySelector(".review-image-preview")).toBeNull();
+      expect(acquire.mock.results).toHaveLength(2);
+      for (const entry of acquire.mock.results) expect(entry.value.release).toHaveBeenCalledOnce();
+
+      await scroll(0);
+      expect(container.querySelectorAll(".review-image-preview img")).toHaveLength(2);
+      expect(acquire.mock.calls).toEqual([["old"], ["new"], ["old"], ["new"]]);
+      await render("revision-2");
+      for (const entry of acquire.mock.results) expect(entry.value.release).toHaveBeenCalledOnce();
+    } finally {
+      height.mockRestore();
+    }
+  });
+
   it("switches long text diffs to row virtualization", async () => {
     const item: WorkspaceFileDiffView = {
       ...file("src/long.ts"),
