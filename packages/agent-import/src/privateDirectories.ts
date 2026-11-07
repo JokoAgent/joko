@@ -6,7 +6,7 @@ import path from "node:path";
 export async function removePrivateImportDirectory(directory: string): Promise<void> {
   const resolved = path.resolve(directory);
   if (resolved !== directory || path.dirname(resolved) !== path.resolve(os.tmpdir())
-    || !["joko-import-skills-", "joko-import-check-", "joko-import-run-"].some(prefix => path.basename(resolved).startsWith(prefix))) {
+    || !["joko-import-skills-", "joko-import-check-"].some(prefix => path.basename(resolved).startsWith(prefix))) {
     throw new Error("Private import cleanup is outside its allocated directory");
   }
   await fs.rm(resolved, { recursive: true, force: true });

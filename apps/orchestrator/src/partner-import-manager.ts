@@ -416,6 +416,7 @@ export class PartnerImportManager {
         milestone.sourceRestored = true; this.options.storage.saveReceipt(receipt); assertOwner();
       }
     }
+    await this.options.storage.removeExecutionDirectories(partnerId, assertOwner);
     await this.options.storage.environment.remove(partnerId, assertOwner);
   }
 
