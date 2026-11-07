@@ -39,6 +39,29 @@ describe("Schedule hook management owner", () => {
     expect(changed.hook?.filePath).not.toBe(original.filePath); expect(changed.test?.status).toBe("skipped");
     expect(readFileSync(original.filePath, "utf8")).toBe("process.exit(0)\n");
   });
+  it("uses the host's interpreters for workspace checks and executes a selected Bash script", async () => {
+    const f = fixture();
+    const windows = process.platform === "win32";
+    const quote = windows ? '"' : "'";
+    const scripts = [
+      { name: "python gate.py", contents: "raise SystemExit(0)\n", interpreter: windows ? "python" : "python3" },
+      { name: "shell gate.sh", contents: 'values=(allow)\n[[ "${values[0]}" == allow ]]\n', interpreter: "bash" },
+      { name: "powershell gate.ps1", contents: "exit 0\n", interpreter: `${windows ? "powershell" : "pwsh"} -NoProfile -File` }
+    ];
+    for (const { name, contents, interpreter } of scripts) {
+      writeFileSync(join(f.root, name), contents);
+      const prepared = await f.api.prepareScheduleHook!(create(contract.PrepareScheduleHookRequestSchema, {
+        context: f.scope, source: { case: "workspaceFile", value: name }
+      }), context());
+      expect(prepared.hook?.command.startsWith(`${interpreter} ${quote}`)).toBe(true);
+      if (!windows && name.endsWith(".sh")) {
+        const receipt = await f.api.testScheduleHook!(create(contract.TestScheduleHookRequestSchema, {
+          operationId: "test-selected-bash", context: f.scope, hook: prepared.hook!
+        }), context());
+        expect(receipt.result).toMatchObject({ status: "passed", exitCode: 0 });
+      }
+    }
+  });
   it("executes a manual check once, returns timeout results, and fences unknown restart receipts", async () => {
     const f = fixture(); const marker = join(f.root, "count.txt"), path = join(f.root, "manual.mjs");
     writeFileSync(path, `import { appendFileSync } from 'node:fs'; appendFileSync(${JSON.stringify(marker)}, 'x'); process.exit(0);`);

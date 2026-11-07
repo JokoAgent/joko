@@ -142,13 +142,14 @@ async function workspaceFile(root: string, path: string): Promise<string> {
   return file;
 }
 function scriptCommand(path: string): string {
-  if (process.platform === "win32" && /["%!]/u.test(path)) throw new ConnectError("This script path cannot be represented safely by the Windows shell.", Code.InvalidArgument);
-  const quoted = process.platform === "win32" ? `"${path}"` : `'${path.replaceAll("'", `'"'"'`)}'`;
+  const windows = process.platform === "win32";
+  if (windows && /["%!]/u.test(path)) throw new ConnectError("This script path cannot be represented safely by the Windows shell.", Code.InvalidArgument);
+  const quoted = windows ? `"${path}"` : `'${path.replaceAll("'", `'"'"'`)}'`;
   switch (extname(path).toLowerCase()) {
     case ".mjs": case ".cjs": case ".js": return `joko-node ${quoted}`;
-    case ".py": return `python ${quoted}`;
-    case ".sh": return `sh ${quoted}`;
-    case ".ps1": return `powershell -NoProfile -File ${quoted}`;
+    case ".py": return `${windows ? "python" : "python3"} ${quoted}`;
+    case ".sh": return `bash ${quoted}`;
+    case ".ps1": return `${windows ? "powershell" : "pwsh"} -NoProfile -File ${quoted}`;
     case ".bat": case ".cmd": case ".exe": return quoted;
     default: throw new ConnectError("Choose a JavaScript, Python, shell, PowerShell, or executable script.", Code.InvalidArgument);
   }
