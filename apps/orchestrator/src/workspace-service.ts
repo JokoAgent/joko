@@ -1271,6 +1271,7 @@ export class WorkspaceService {
     const scanLimit = offset + pageSize + 1;
     const args = [
       "--json",
+      "--hidden",
       "--crlf",
       "--line-number",
       "--column",
@@ -1283,7 +1284,7 @@ export class WorkspaceService {
     if (options?.caseSensitive !== true) args.push("--ignore-case");
     if (options?.regularExpression !== true) args.push("--fixed-strings");
     if (options?.glob !== undefined) args.push("--glob", options.glob);
-    args.push("--", query, ".");
+    args.push("--glob", "!.git/**", "--", query, ".");
     try {
       const result = await runProcess(this.#ripgrepExecutable, args, workspace.root, 30_000, 16 * 1024 * 1024, new Set([0, 1, 2]));
       if (result.exitCode === 2) {

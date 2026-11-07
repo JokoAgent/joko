@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -128,6 +128,22 @@ describe("workspace ripgrep contracts", () => {
 });
 
 describe("WorkspaceService search/index projection", () => {
+  it("finds a hidden project directory through paged search and keeps ignore exclusions", async () => {
+    const root = await projectRoot("joko-search-hidden-page-");
+    await mkdir(join(root, ".notes"));
+    await writeFile(join(root, ".notes", "report.txt"), "literal hidden search phrase\n");
+    await writeFile(join(root, ".notes", "ignored.txt"), "literal hidden search phrase\n");
+    await writeFile(join(root, ".gitignore"), ".notes/ignored.txt\n");
+    await writeFile(join(root, ".git", "fixture.txt"), "literal hidden search phrase\n");
+    const service = new WorkspaceService();
+    await service.register({ id: "project", root, displayName: "Project", trusted: true });
+
+    await expect(service.searchPage("project", "hidden search phrase", { maximumResults: 500 })).resolves.toMatchObject({
+      matches: [{ path: ".notes/report.txt", line: 1, revision: expect.stringMatching(/^sha256:/u) }],
+      totalResults: 1, totalFiles: 1, truncated: false
+    });
+  });
+
   it.each([
     { query: "^", ending: "LF", lineEnding: "\n" },
     { query: "$", ending: "LF", lineEnding: "\n" },
