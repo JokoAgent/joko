@@ -33,7 +33,7 @@ import {
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
-  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind, ImageThumbnailSchema,
+  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, CustomToolPermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
@@ -2677,7 +2677,7 @@ describe("mobile Extension catalog authority", () => {
     const approval = create(InteractionSchema, { ...permissionInteraction, interactionId: "extension-write-new", sessionId: task.sessionId,
       request: { case: "permission", value: { risk: PermissionRisk.HIGH, title: "Allow plugin writes",
         allowedDecisions: [PermissionDecisionKind.ALLOW_ONCE, PermissionDecisionKind.DENY_ONCE],
-        subject: { kind: { case: "customTool", value: { toolId: "plugin_managed_task", displayName: "Plugin task" } } } } } });
+        subject: { kind: { case: "customTool", value: create(CustomToolPermissionSubjectSchema, { toolId: "plugin_managed_task", displayName: "Plugin task" }) } } } } });
     const existing = create(InteractionSchema, { ...approval, interactionId: "extension-write-old" });
     let owner = create(SnapshotSchema, { ...offlineOwnerProjection([runtimeSession, task]), interactions: [existing] });
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
@@ -2685,7 +2685,9 @@ describe("mobile Extension catalog authority", () => {
     const response = create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences });
     let finish!: () => void;
     const retryWriteAccess = vi.fn(async () => { await new Promise<void>(resolve => { finish = resolve; }); return response; });
-    network.extensionTaskApi = () => ({ retryWriteAccess }) as ReturnType<NonNullable<MobileNetwork["extensionTaskApi"]>>;
+    network.extensionTaskApi = () => ({
+      getPreferences: vi.fn(), updatePreferences: vi.fn(), listBackgroundTasks: vi.fn(), revealTask: vi.fn(), retryWriteAccess
+    });
     const app = client(network, memoryStorage(credential).storage);
     await app.start();
     const selected = app.state.selectedId;

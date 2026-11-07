@@ -322,7 +322,7 @@ describe("MobileExtensionsScreen", () => {
     await render(active);
     await press("View Mail");
     const pressPreference = (label: string) => act(async () => {
-      const button = [...container.querySelectorAll<HTMLButtonElement>('[testid="extensions.task-preferences"] button')]
+      const button = Array.from(container.querySelectorAll<HTMLButtonElement>('[testid="extensions.task-preferences"] button'))
         .find(value => value.textContent === label || value.textContent === `✓ ${label}`);
       expect(button).toBeDefined();
       button!.click();
@@ -351,7 +351,7 @@ describe("MobileExtensionsScreen", () => {
     const active = { ...transport(), getTaskPreferences: async () => preferences, retryTaskWriteAccess };
     await render(active);
     await press("View Mail");
-    const button = [...container.querySelectorAll("button")].find(value => value.textContent === "Retry permission · Mail review")!;
+    const button = Array.from(container.querySelectorAll("button")).find(value => value.textContent === "Retry permission · Mail review")!;
     await act(async () => button.click());
     expect(retryTaskWriteAccess).toHaveBeenCalledExactlyOnceWith(mail, "plugin-task", expect.any(AbortSignal));
     expect(container.querySelector('[aria-label="Approve displayed plugin request"]')).toBeNull();
