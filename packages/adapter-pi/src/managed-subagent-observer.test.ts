@@ -646,25 +646,27 @@ describe("managed Subagent public observation", () => {
     const completed = await physicalRun(root, sessionId, "completed-child", 6, 1, [], undefined, "completed", {}, prior);
     const pathFor = (runId: string, ...path: string[]) => join(root, managedSubagentSessionKey(sessionId), runId, ...path);
     const storedControl = async (runId: string) => JSON.parse(await readFile(pathFor(runId, "runtime", "control.json"), "utf8"));
-    const answer = Promise.withResolvers<InteractionDecision>();
-    const requested = Promise.withResolvers<void>();
+    let resolveAnswer!: (decision: InteractionDecision) => void;
+    let resolveRequested!: () => void;
+    const answer = new Promise<InteractionDecision>((resolve) => { resolveAnswer = resolve; });
+    const requested = new Promise<void>((resolve) => { resolveRequested = resolve; });
     const interactions: InteractionPayload[] = [];
     const base = { ...context(sessionId, 6, []), requestInteraction: async (interaction: InteractionPayload): Promise<InteractionDecision> => {
       interactions.push(interaction);
       if (interactions.length !== 1) return { kind: "confirmed", confirmed: false };
-      requested.resolve();
-      return answer.promise;
+      resolveRequested();
+      return answer;
     } };
     const observer = new ManagedSubagentObserver({ root, context: base, policyGeneration: prior.policyGeneration, runtimeControl: prior });
     const refreshing = observer.refresh();
     try {
-      await Promise.race([requested.promise, refreshing.then(() => { throw new Error("Missing initial permission request"); })]);
+      await Promise.race([requested, refreshing.then(() => { throw new Error("Missing initial permission request"); })]);
       observer.update(base, [], ask.policyGeneration, ask);
       await observer.synchronizeRuntimeControl();
       expect(await storedControl(child.runId)).toEqual(ask);
       expect(await storedControl(unrelated.runId)).toMatchObject({ generation: 5, permissionMode: "bypassPermissions" });
       expect(await storedControl(completed.runId)).toEqual(prior);
-      answer.resolve({ kind: "confirmed", confirmed: true });
+      resolveAnswer({ kind: "confirmed", confirmed: true });
       await refreshing;
       const approval = async () => JSON.parse(await readFile(pathFor(child.runId, "approval-control.json"), "utf8"));
       expect(await approval()).toMatchObject({ approvalId: previousApproval, confirmed: false });
@@ -683,7 +685,7 @@ describe("managed Subagent public observation", () => {
       expect(await approval()).toMatchObject({ approvalId: "new-write", confirmed: false });
       expect(interactions).toHaveLength(2);
     } finally {
-      answer.resolve({ kind: "cancelled" });
+      resolveAnswer({ kind: "cancelled" });
       await observer.stopAndDrain();
       await rm(directory, { recursive: true, force: true });
     }
