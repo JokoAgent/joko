@@ -2680,6 +2680,7 @@ export async function createOrchestratorApplication(
   const helpFeedback = new HelpFeedbackStore(join(config.dataDirectory, "help-feedback"));
   const agentImportSources = dependencies.agentImportSources ?? { home: userInfo().homedir, environment: { ...process.env } };
   partnerImports = new PartnerImportManager({ storage: partnerImportStorage, ...agentImportSources,
+    getPartner: partnerId => partners.getPartner(partnerId),
     currentCanonicalSession: partnerId => { try { const profile = partners.getPartner(partnerId); return profile.lifecycle === "deleted" ? undefined : profile.canonicalSessionId; } catch { return undefined; } },
     prepareCreation: (selection, native) => preparePartnerImportCreation(partners, selection, native),
     nativeRuntimeReady: id => { const profile = partners.getPartner(id); return profile.lifecycle === "active" && profile.initializationState === "ready" && !!profile.canonicalSessionId; },

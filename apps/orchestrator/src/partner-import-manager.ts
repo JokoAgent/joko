@@ -9,6 +9,7 @@ import {
   type AgentImportPreview, type AgentImportResult, type AgentImportSelection, type AgentImportSource,
   type ImportItem, type ImportReceipt, type ImportSnapshot, type ImportSource, type TransferDeps,
 } from "@joko/agent-import";
+import { PartnerStoreError, type PartnerProfileRecord } from "@joko/store";
 import { parseRoutineInput } from "./partner-routine-definition.js";
 import { readOpenClawCronDatabase } from "@joko/agent-import";
 import type { PartnerImportStorage } from "./partner-import-storage.js";
@@ -48,6 +49,7 @@ export class PartnerImportManager {
     readonly home: string;
     readonly environment: NodeJS.ProcessEnv;
     readonly prepareCreation: (selection: AgentImportSelection, nativePackage?: boolean) => string;
+    readonly getPartner: (partnerId: string) => PartnerProfileRecord;
     readonly nativeRuntimeReady?: (partnerId: string) => boolean;
     readonly currentCanonicalSession?: (partnerId: string) => string | undefined;
     readonly adoptSettings: (partnerId: string, assertOwner: () => void) => Promise<void>;
@@ -207,7 +209,7 @@ export class PartnerImportManager {
     const submissionHash = importSubmissionFingerprint(selection);
     const prior = this.options.storage.readReceipt(selection.requestId);
     if (prior && prior.submissionHash !== submissionHash) throw new AgentImportError("REQUEST_ALREADY_USED");
-    if (prior?.cancelled || prior?.result.status === "complete") { assertController(); return this.#present(prior.result); }
+    if (prior?.creationRejected || prior?.cancelled || prior?.result.status === "complete") { assertController(); return this.#present(prior.result); }
     let snapshot: ImportSnapshot; let creationJson: string;
     if (prior?.checkpointSaved) {
       const pending = (await this.options.storage.environment.read(prior.result.partnerId, assertController))?.pendingImport;
@@ -227,7 +229,7 @@ export class PartnerImportManager {
     const assertController = this.#controller(scope); assertController();
     const receipt = this.options.storage.readReceipt(requestId);
     if (!receipt) throw new AgentImportError("IMPORT_RECEIPT_MISSING");
-    if (receipt.cancelled) return this.#present(receipt.result);
+    if (receipt.cancelled || receipt.creationRejected) return this.#present(receipt.result);
     if (receipt.nativePackage && receipt.result.saved && receipt.result.canonicalSessionId === undefined && !receipt.checkpointCleared) {
       const activated = await this.activatePackage(receipt.result.partnerId); assertController();
       if (activated) return this.#present(activated);
@@ -334,7 +336,22 @@ export class PartnerImportManager {
         }
       },
     };
-    const result = await transferPartnerImport(snapshot, selection, deps, reconcile, resumeSetup);
+    let result: AgentImportResult;
+    try { result = await transferPartnerImport(snapshot, selection, deps, reconcile, resumeSetup); }
+    catch (error) {
+      if (!(error instanceof PartnerStoreError) || error.code !== "PARTNER_NAME_CONFLICT") throw error;
+      assertOwner();
+      const receipt = this.options.storage.readReceipt(selection.requestId);
+      if (!receipt?.checkpointSaved || receipt.cancelled || receipt.partnerCreated || receipt.environmentSaved || receipt.result.saved ||
+        receipt.result.canonicalSessionId !== undefined || receipt.result.partnerId !== partnerId) throw error;
+      try { this.options.getPartner(partnerId); }
+      catch (lookupError) {
+        if (!(lookupError instanceof PartnerStoreError) || lookupError.code !== "PARTNER_NOT_FOUND") throw lookupError;
+        assertOwner();
+        return this.options.storage.rejectUncreatedPartner(receipt);
+      }
+      throw error;
+    }
       assertOwner();
       await this.options.onSaved?.(result, snapshot.nativePackage); assertOwner();
       if (result.status === "complete") await this.#clearCheckpoint(this.options.storage.readReceipt(selection.requestId)!);
@@ -352,7 +369,7 @@ export class PartnerImportManager {
       }
     })().catch(error => {
       assertOwner(); if (error instanceof AgentImportError && error.code === "REQUEST_ALREADY_USED") throw error;
-      const receipt = this.options.storage.readReceipt(selection.requestId); if (!receipt || receipt.cancelled) throw error;
+      const receipt = this.options.storage.readReceipt(selection.requestId); if (!receipt || receipt.cancelled || receipt.creationRejected) throw error;
       receipt.result.status = "needs-attention";
       receipt.result.checks = [...receipt.result.checks.filter(check => check.entryId !== "import"), { entryId: "import", status: "needs-attention", message: importFailureCode(error) }];
       this.options.storage.saveReceipt(receipt); return receipt.result;
