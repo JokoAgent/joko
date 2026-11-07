@@ -1133,7 +1133,10 @@ function PartnerActivityPanel({ partner, partners, controller, ownerKey, t, init
       <div><strong>{partner.activity.unreadReplyCount}</strong><span>{t("partners.unread")}</span></div>
       <div><strong>{data.artifacts.length}</strong><span>{t("partners.artifacts")}</span></div>
       <div><strong>{data.delegations.filter((delegation) => partnerDelegationActive(delegation.status)).length}</strong><span>{t("partners.activeDelegations")}</span></div>
-      <Button tone="ghost" onClick={() => load()} disabled={loading}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button>
+      <Button tone="ghost" onClick={() => {
+        load();
+        setThreadReload((current) => current + 1);
+      }} disabled={loading}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button>
     </div>
     {(error !== undefined || actionError !== undefined) && <p className="partner-editor__error" role="alert">{actionError ?? error}</p>}
 
