@@ -44,7 +44,7 @@ export async function verifyPackagedSmokeTaskSharing(options: {
     "  dialog.focus(); dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));",
     "  await wait(() => !document.querySelector('[data-task-sharing-management]'), 'closed management');"
   ];
-  const shareId = await script<string>([
+  const { shareId, x, y } = await script<{ shareId: string; x: number; y: number }>([
     ...openManagement,
     "  (await button('[data-task-sharing-start]')).click();",
     `  const ownedRow = () => [...document.querySelectorAll('[data-task-sharing-owned]')].find(node => node.getAttribute('data-session-id') === ${JSON.stringify(task.sessionId)});`,
@@ -52,8 +52,13 @@ export async function verifyPackagedSmokeTaskSharing(options: {
     "  const shareId = row.getAttribute('data-share-id');",
     "  if (!shareId) throw new Error('The owned task omitted its sharing identity.');",
     "  const invite = await wait(() => { const current = ownedRow(); if (current?.getAttribute('data-share-id') !== shareId) return undefined; const node = current.querySelector('[data-task-sharing-invite]'); return node instanceof HTMLButtonElement && !node.disabled ? node : undefined; }, 'invitation for the owned task');",
-    "  invite.click(); return shareId;"
+    "  invite.scrollIntoView({ block: 'nearest', inline: 'nearest' });",
+    "  return await wait(() => { const rect = invite.getBoundingClientRect(); const x = Math.round(rect.x + rect.width / 2); const y = Math.round(rect.y + rect.height / 2); return invite.contains(document.elementFromPoint(x, y)) ? { shareId, x, y } : undefined; }, 'clickable invitation button');"
   ]);
+  // Chromium's clipboard authorization uses the focused document's user activation.
+  window.webContents.sendInputEvent({ type: "mouseMove", x, y });
+  window.webContents.sendInputEvent({ type: "mouseDown", button: "left", clickCount: 1, x, y });
+  window.webContents.sendInputEvent({ type: "mouseUp", button: "left", clickCount: 1, x, y });
   let invitation: string | undefined;
   let clipboardObservation = { hasValue: false, parsed: false, ownerMatched: false, shareMatched: false };
   const copyDeadline = Date.now() + 12_000;
