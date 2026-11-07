@@ -96,6 +96,35 @@ describe("native author settings directory selection", () => {
     expect(fetch).toHaveBeenCalledOnce();
   }));
 
+  it("keeps the original picked receipt when the upload credential exchange fails before dispatch", async () => fixture(async f => {
+    await writeFile(path.join(f.root, "read.txt"), "original report");
+    const opened = await f.picker.open(surface, "connection", () => {}), id = opened.picker.pickerId;
+    const page = await f.picker.browse(id, "connection", { directoryPath: f.root });
+    const receipt = await f.picker.pick(id, page.directory!.entryId, "plugin", "connection", () => {});
+    const exchange = "https://auth.example.test/exchange", upload = "https://files.example.test/upload";
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(new Response("temporary failure", { status: 503 }))
+      .mockResolvedValueOnce(Response.json({ token: "fixture-access" }))
+      .mockResolvedValueOnce(new Response("accepted"));
+    const network = new ExtensionNetwork({ files: f.files, fetch, redact: value => value, resolveCredential: () => "fixture-secret" });
+    const networkScope: ExtensionNetworkScope = { ...scope, task: scope, readOnly: false, signal: new AbortController().signal,
+      declaration: parseExtensionNetwork({ hosts: ["files.example.test", "auth.example.test"], secrets: [{ key: "token", label: "Token",
+        inject: { hosts: ["files.example.test"], header: "Authorization", format: "Bearer {value}" },
+        exchange: { url: exchange, bodyFormat: '{"key":"{value}"}', tokenPath: "token" } }] }), assertCurrent: () => {} };
+    const request = { url: upload, method: "POST", uploadDir: { token: receipt.token, field: "report" } };
+    await expect(network.request({ ...networkScope, task: { ...scope, authorityKey: "retired" } }, request)).resolves.toMatchObject({ ok: false });
+    expect(fetch).not.toHaveBeenCalled();
+    await expect(network.request(networkScope, request)).resolves.toMatchObject({ ok: false });
+    expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([exchange]);
+    await expect(network.request(networkScope, request)).resolves.toMatchObject({ ok: true, status: 200 });
+    expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([exchange, exchange, upload]);
+    const sent = fetch.mock.calls[2]![1]!;
+    expect(new Headers(sent.headers).get("authorization")).toBe("Bearer fixture-access");
+    expect(Buffer.from(sent.body as ArrayBuffer).toString()).toContain("original report");
+    await expect(network.request(networkScope, request)).resolves.toMatchObject({ ok: false });
+    expect(fetch).toHaveBeenCalledTimes(3);
+  }));
+
   it("bounds a single native picker and sliding attempt rate, then retires an expired or changed owner", async () => fixture(async f => {
     const first = await f.picker.open(surface, "connection", () => {});
     await expect(f.picker.open({ ...surface, extensionId: "other" }, "second", () => {})).rejects.toThrow("already open");

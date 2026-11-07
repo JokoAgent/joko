@@ -235,10 +235,21 @@ export class ExtensionFileDeposits {
       current(); return args;
     } catch (error) { for (const token of issued) { this.#directories.delete(token); this.#saves.delete(token); } throw error; }
   }
-  take(scope: ExtensionCardScope, token: string): ExtensionDirectoryTransfer | undefined {
+  #currentDirectory(scope: ExtensionCardScope, token: string): DirectoryDeposit | undefined {
     this.#sweep(); const entry = this.#directories.get(token);
     if (!entry || !matchesDirectoryOwner(entry.owner, scope)) return;
-    entry.current(); this.#directories.delete(token);
+    entry.current();
+    return entry;
+  }
+
+  directoryFileCount(scope: ExtensionCardScope, token: string): number | undefined {
+    return this.#currentDirectory(scope, token)?.files.length;
+  }
+
+  take(scope: ExtensionCardScope, token: string): ExtensionDirectoryTransfer | undefined {
+    const entry = this.#currentDirectory(scope, token);
+    if (!entry) return;
+    this.#directories.delete(token);
     return { files: entry.files.map(file => ({ relPath: file.relative, size: file.size, read: async (signal?: AbortSignal) => {
       const current = () => { entry.current(); if (entry.picked) signal?.throwIfAborted(); };
       const io = <T>(work: () => Promise<T>, closeLate?: (value: T | undefined) => Promise<void>) =>
