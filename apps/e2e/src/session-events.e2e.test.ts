@@ -604,7 +604,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const archivedActivity = fixture.application.store.getSession(sessionId).descriptor.updatedAt;
     await waitFor(async () => Date.now(), (now) => now > archivedActivity, "a later activity timestamp");
     const restore = await submit(paired.clients.operation, paired.connectionId, archiveMutation(sessionId, false));
-    expect(restore.state).toBe(OperationState.COMPLETED);
+    expect(restore.state).toBe(OperationState.SUCCEEDED);
     const restored = (await paired.clients.session.getSession({ sessionId })).session;
     expect(restored?.archived).toBe(false);
     expect(restored?.lastActivityAt).toEqual(archived?.lastActivityAt);
