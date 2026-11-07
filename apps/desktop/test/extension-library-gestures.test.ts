@@ -2,6 +2,7 @@ import { chmodSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { crc32 } from "node:zlib";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { captureUserSelectedFile } from "@joko/device-peer/private-files";
@@ -44,6 +45,15 @@ describe("Desktop Extension Library native gestures", () => {
     expect([...parsed.bytes]).toEqual([...PNG]);
     expect(parsed.bytes).not.toBe(PNG);
     expect(() => parseExtensionLibraryClipboardRequest({ extensionId: EXTENSION_ID, bytes: Buffer.from("not png") })).toThrow(/PNG/u);
+
+    // A valid ancillary chunk raises the compressed size without increasing the decoded pixels.
+    const ancillary = Buffer.alloc(18_000_000 - PNG.length);
+    ancillary.writeUInt32BE(ancillary.byteLength - 12);
+    ancillary.write("vpAg", 4, "ascii");
+    ancillary.writeUInt32BE(crc32(ancillary.subarray(4, -4)), ancillary.byteLength - 4);
+    const large = Buffer.concat([PNG.subarray(0, -12), ancillary, PNG.subarray(-12)]);
+    expect(parseExtensionLibraryClipboardRequest({ extensionId: EXTENSION_ID, bytes: large }).bytes.byteLength).toBe(18_000_000);
+    expect(() => parseExtensionLibraryClipboardRequest({ extensionId: EXTENSION_ID, bytes: new Uint8Array(20_000_001) })).toThrow(/bounded PNG/u);
   });
 
   it("keeps native reveal local and saves the original node's bytes outside a local Library", async () => {
@@ -80,7 +90,7 @@ describe("Desktop Extension Library native gestures", () => {
     const firstScope = {};
     const secondScope = {};
     coordinator.attempt(EXTENSION_ID, "reveal");
-    expect(() => coordinator.attempt(EXTENSION_ID, "reveal")).toThrow(/frequent/u);
+    expect(() => coordinator.attempt(EXTENSION_ID, "reveal")).toThrow(expect.objectContaining({ code: "RATE_LIMITED" }));
     now += 3_000;
     expect(() => coordinator.attempt(EXTENSION_ID, "reveal")).not.toThrow();
 

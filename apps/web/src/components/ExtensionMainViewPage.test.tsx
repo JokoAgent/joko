@@ -423,7 +423,7 @@ describe("Extension main view", () => {
       return request.totalBytes;
     });
     const cancelSave = vi.fn(async () => undefined);
-    const clipboardWrite = vi.fn(async () => 4);
+    const clipboardWrite = vi.fn<NonNullable<Window["jokoDesktop"]>["extensionLibraries"]["clipboardWrite"]>(async request => request.bytes.byteLength);
     Object.defineProperty(window, "jokoDesktop", {
       configurable: true,
       value: {
@@ -474,7 +474,7 @@ describe("Extension main view", () => {
     dispatchBridge(frame, "capabilities-native", { kind: "capabilities" });
     dispatchBridge(frame, "reveal-native", { kind: "reveal", path: "exports/art.png" });
     dispatchBridge(frame, "save-native", { kind: "saveAs", path: "exports/art.png", name: "drawing.png" });
-    dispatchBridge(frame, "clipboard-native", { kind: "clipboardWrite", content: new Uint8Array([1, 2, 3, 4]) });
+    dispatchBridge(frame, "clipboard-native", { kind: "clipboardWrite", content: new Uint8Array(18_000_000) });
     await settle();
     await settle();
 
@@ -495,16 +495,28 @@ describe("Extension main view", () => {
     }, { read: expect.any(Function), verify: expect.any(Function) });
     expect(callExtensionLibrary).toHaveBeenCalledWith(expect.any(String),
       { kind: "read", path: "exports/art.png", offset: 0n, length: BigInt(sourceBytes.length) }, expect.any(AbortSignal), { tag });
-    expect(clipboardWrite).toHaveBeenCalledWith({ extensionId: extension.id, bytes: new Uint8Array([1, 2, 3, 4]) });
+    expect(clipboardWrite).toHaveBeenCalledOnce();
+    expect(clipboardWrite.mock.calls[0]?.[0].extensionId).toBe(extension.id);
+    expect(clipboardWrite.mock.calls[0]?.[0].bytes.byteLength).toBe(18_000_000);
     expect(cancelSave).not.toHaveBeenCalled();
     expect(postedResponse(postMessage, "reveal-native")).toMatchObject({ ok: true, result: { path: "exports/art.png" } });
     expect(postedResponse(postMessage, "save-native")).toMatchObject({
       ok: true, result: { cancelled: false, path: "exports/art.png", bytes: sourceBytes.length }
     });
-    expect(postedResponse(postMessage, "clipboard-native")).toMatchObject({ ok: true, result: { bytes: 4 } });
+    expect(postedResponse(postMessage, "clipboard-native")).toMatchObject({ ok: true, result: { bytes: 18_000_000 } });
     for (const id of ["reveal-native", "save-native", "clipboard-native"]) {
       expect(JSON.stringify(postedResponse(postMessage, id))).not.toContain("private");
     }
+
+    dispatchBridge(frame, "clipboard-too-large", { kind: "clipboardWrite", content: new Uint8Array(20_000_001) });
+    expect(postedResponse(postMessage, "clipboard-too-large")).toMatchObject({ ok: false, error: { code: "TOO_LARGE" } });
+    expect(clipboardWrite).toHaveBeenCalledOnce();
+
+    clipboardWrite.mockRejectedValueOnce({ code: "RATE_LIMITED" });
+    dispatchBridge(frame, "clipboard-rate", { kind: "clipboardWrite", content: new Uint8Array([1, 2, 3, 4]) });
+    await settle();
+    expect(clipboardWrite).toHaveBeenCalledTimes(2);
+    expect(postedResponse(postMessage, "clipboard-rate")).toMatchObject({ ok: false, error: { code: "RATE_LIMITED" } });
 
     commitSave.mockImplementationOnce(async (request, source) => {
       await source.read(0, request.totalBytes);

@@ -4,6 +4,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { crc32 } from "node:zlib";
 import type { MessagePortMain } from "electron";
+import { EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES } from "@joko/contracts";
 
 import {
   isDesktopExtensionId,
@@ -15,7 +16,6 @@ import {
 } from "./channels.js";
 import { sameFileIdentity, sameStableFile, streamUserSelectedFile, type UserSelectedFileDestination, type UserSelectedFileReceipt } from "@joko/device-peer/private-files";
 
-export const EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES = 16 * 1024 * 1024;
 export const EXTENSION_LIBRARY_NATIVE_SAVE_MAXIMUM_BYTES = 8 * 1024 * 1024 * 1024;
 export const EXTENSION_LIBRARY_GESTURE_MINIMUM_INTERVAL_MS = 3_000;
 export const EXTENSION_LIBRARY_SAVE_TICKET_TTL_MS = 2 * 60_000;

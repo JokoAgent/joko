@@ -516,7 +516,10 @@ const desktopApi = Object.freeze({
       return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionLibraryClipboardWrite, {
         extensionId: request.extensionId,
         bytes: new Uint8Array(request.bytes)
-      }).then(parseExtensionLibraryByteCount);
+      }).then((value: unknown) => {
+        if (value === "RATE_LIMITED") return Promise.reject({ code: value });
+        return parseExtensionLibraryByteCount(value);
+      });
     }
   }),
   projects: Object.freeze({
@@ -2229,10 +2232,12 @@ function commitExtensionLibrarySave(request: DesktopExtensionLibraryCommitSaveRe
   });
 }
 
+const EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES = 20_000_000 satisfies typeof import("@joko/contracts").EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES;
+
 function isDesktopExtensionLibraryClipboardRequest(value: unknown): value is DesktopExtensionLibraryClipboardRequest {
   if (!exactRecord(value, ["extensionId", "bytes"]) || !isDesktopExtensionId(value["extensionId"])
     || !(value["bytes"] instanceof Uint8Array) || value["bytes"].byteLength < 8
-    || value["bytes"].byteLength > 16 * 1024 * 1024) return false;
+    || value["bytes"].byteLength > EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES) return false;
   const bytes = value["bytes"];
   return bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
     && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a;
