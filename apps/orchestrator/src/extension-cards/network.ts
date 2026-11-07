@@ -145,8 +145,22 @@ export class ExtensionNetwork {
       }
       if (uploadDir) {
         if (this.#largeResponse) throw new Error(); holdingLarge = this.#largeResponse = true;
+        const unavailable = { ok: false, message: "The directory receipt is unavailable or does not contain exactly one file. Transfer dir again before retrying." };
+        current();
+        const count = this.options.files!.directoryFileCount(scope.task!, uploadDir.token);
+        if (count === undefined || uploadDir.field !== undefined && count !== 1) return unavailable;
+        // Exchange the credentials before consuming the one-use directory receipt.
+        // Each upload hop still resolves its current credential after reading the files.
+        for (const secret of scope.declaration.secrets ?? []) {
+          if (!secret.exchange || !(secret.inject.hosts ?? scope.declaration.hosts).some(pattern => extensionNetworkHostMatches(pattern, url.hostname))) continue;
+          current();
+          const raw = this.options.resolveCredential(extensionNetworkCredentialReference(scope.extensionId, scope.declaration, secret));
+          if (!raw || /[\r\n]/u.test(raw)) throw new Error();
+          secrets.add(raw);
+          await this.#exchange(scope, secret, raw, signal, secrets);
+        }
         current(); const transfer = this.options.files!.take(scope.task!, uploadDir.token);
-        if (!transfer || uploadDir.field !== undefined && transfer.files.length !== 1) return { ok: false, message: "The directory receipt is unavailable or does not contain exactly one file. Transfer dir again before retrying." };
+        if (!transfer || uploadDir.field !== undefined && transfer.files.length !== 1) return unavailable;
         const boundary = `----joko-extension-${randomUUID()}`, encoder = new TextEncoder(), parts: Uint8Array[] = [];
         const declaredBytes = transfer.files.reduce((size, file) => size + file.size, 0);
         for (const [name, value] of Object.entries(uploadDir.fields)) parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value.replace("{bytes}", () => String(declaredBytes))}\r\n`));
