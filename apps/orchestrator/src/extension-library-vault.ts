@@ -69,6 +69,13 @@ export class ExtensionLibraryError extends Error {
   }
 }
 
+export class ExtensionLibraryOrphanMarkerWriteError extends Error {
+  constructor(cause: unknown) {
+    super("Extension Library orphan marker could not be staged.", { cause });
+    this.name = "ExtensionLibraryOrphanMarkerWriteError";
+  }
+}
+
 export type ExtensionLibraryState = "ready" | "read_only" | "unavailable";
 
 export interface ExtensionLibraryUsage {
@@ -831,12 +838,12 @@ export class ExtensionLibraryVault {
     const path = join(this.#hostRoot(), METADATA_FILE);
     const previous = join(this.#hostRoot(), METADATA_PREVIOUS_FILE);
     await mkdir(this.#hostRoot(), { recursive: true });
-    try {
-      await atomicBytes(previous, await readBoundedRegularFile(path));
-    } catch (error) {
+    const current = await readBoundedRegularFile(path).catch((error: unknown) => {
       if (!isMissing(error)) throw error;
-    }
-    await atomicJson(path, metadata);
+      return undefined;
+    });
+    if (current !== undefined) await atomicBytes(previous, current, orphanMarkerStagingFailure);
+    await atomicJson(path, metadata, orphanMarkerStagingFailure);
     this.#metadata = metadata;
   }
 
@@ -1095,18 +1102,28 @@ async function pathKind(path: string): Promise<"missing" | "file" | "directory" 
   }
 }
 
-async function atomicJson(path: string, value: unknown): Promise<void> {
-  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
+function orphanMarkerStagingFailure(error: unknown): unknown {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EIO" || code === "ENOSPC" || code === "EDQUOT" || code === "EACCES" || code === "EPERM" || code === "EROFS"
+    ? new ExtensionLibraryOrphanMarkerWriteError(error) : error;
 }
 
-async function atomicBytes(path: string, bytes: Uint8Array): Promise<void> {
+async function atomicJson(path: string, value: unknown, stagingFailure?: (error: unknown) => unknown): Promise<void> {
+  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"), stagingFailure);
+}
+
+async function atomicBytes(path: string, bytes: Uint8Array, stagingFailure?: (error: unknown) => unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
   let handle: FileHandle | undefined;
   try {
-    handle = await open(temporary, "wx", 0o600);
-    await handle.writeFile(bytes);
-    await handle.sync();
+    try {
+      handle = await open(temporary, "wx", 0o600);
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } catch (error) {
+      throw stagingFailure ? stagingFailure(error) : error;
+    }
     await handle.close();
     handle = undefined;
     await rename(temporary, path);
