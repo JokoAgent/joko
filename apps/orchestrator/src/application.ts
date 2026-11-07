@@ -2201,6 +2201,7 @@ export async function createOrchestratorApplication(
     store,
     sessions: sessionHost,
     resources: piResources,
+    artifacts,
     mutations: skillMutations,
     market: skillMarket,
     rootDirectory: join(config.dataDirectory, "skill-learning"),
