@@ -260,6 +260,11 @@ export interface BridgeToolPolicyDeclaration {
   }>>;
 }
 
+export interface NativeBridgeToolAdmission {
+  readonly assertCurrent: () => void;
+  readonly inputQueueItem?: { readonly id: string; readonly runId: string; readonly attemptId: string };
+}
+
 /** Product scope authenticated from the durable Session binding, never from tool arguments. */
 export interface BridgeToolCallContext {
   readonly assertCurrent?: () => void;
@@ -269,6 +274,8 @@ export interface BridgeToolCallContext {
   readonly assertNativeRoot?: () => void;
   /** The original input when the parent Pi RPC tied it to this native root proof. */
   readonly nativeRootQueueInput?: PiNativeRootQueueInput;
+  /** The sole active Queue Attempt captured before native tool admission awaited policy. */
+  readonly inputQueueItem?: NativeBridgeToolAdmission["inputQueueItem"];
   readonly sessionId: string;
   readonly targetId: string;
   readonly generation: number;
@@ -596,7 +603,7 @@ export class McpRouter {
   readonly #nativeAuthProviderRoutes = new Map<string, NativeAuthProviderRouteState>();
   readonly #remoteAttestationNonces = new Map<string, number>();
   readonly #bridgeToolProviders = new Map<string, BridgeToolProvider>();
-  #nativeToolAdmission?: (sessionId: string, serverId: string, toolName: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<() => void>;
+  #nativeToolAdmission?: (sessionId: string, serverId: string, toolName: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<NativeBridgeToolAdmission>;
   readonly #targetReferences: McpRouterOptions["targetReferences"];
   readonly #isGroupSession: McpRouterOptions["isGroupSession"];
   readonly #capturePartnerLearningSave: McpRouterOptions["capturePartnerLearningSave"];
@@ -690,7 +697,7 @@ export class McpRouter {
   }
 
   /** Register an in-process Tool Provider without persisting it as MCP configuration. */
-  setNativeToolAdmission(admit: (sessionId: string, serverId: string, toolName: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<() => void>): void { this.#nativeToolAdmission = admit; }
+  setNativeToolAdmission(admit: (sessionId: string, serverId: string, toolName: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<NativeBridgeToolAdmission>): void { this.#nativeToolAdmission = admit; }
 
   registerBridgeToolProvider(provider: BridgeToolProvider): () => void {
     this.#assertInitialized();
@@ -1251,8 +1258,8 @@ export class McpRouter {
       || input.appCall.params.name !== input.toolName || operationBodyHash(input.appCall.params.arguments ?? {}) !== operationBodyHash(input.arguments ?? {}))) throw new Error("MCP model call escaped its original channel.");
     modelChannel?.assertCurrent();
     input.assertCallerCurrent?.();
-    const assertAdmission = await this.#nativeToolAdmission?.(input.sessionId, input.serverId, input.toolName, input.arguments ?? {}, input.signal ?? new AbortController().signal);
-    const assertDelegated = () => { input.assertCallerCurrent?.(); assertAdmission?.(); };
+    const admission = await this.#nativeToolAdmission?.(input.sessionId, input.serverId, input.toolName, input.arguments ?? {}, input.signal ?? new AbortController().signal);
+    const assertDelegated = () => { input.assertCallerCurrent?.(); admission?.assertCurrent(); };
     assertDelegated?.();
     let appCapture: McpAppCapture | undefined;
     let modelTask: CreateTaskResult | undefined;
@@ -1423,6 +1430,7 @@ export class McpRouter {
               },
               ...(assertNativeRoot === undefined ? {} : { assertNativeRoot }),
               ...(nativeRootQueueInput === undefined ? {} : { nativeRootQueueInput }),
+              ...(admission?.inputQueueItem === undefined ? {} : { inputQueueItem: admission.inputQueueItem }),
               ...(partnerLearningSave === undefined ? {} : { partnerLearningSave })
             },
             () => assertDispatchedImageCredential !== undefined
