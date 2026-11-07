@@ -72,29 +72,35 @@ it("localizes untouched presets and keeps all mobile task dots visible", () => {
   }
 });
 
-it.each([false, true])("deletes from the Home tag sheet only while its row is current with retirement=%s", async retired => {
+it.each([
+  { fromHome: true, retired: false, elapsed: 0 },
+  { fromHome: true, retired: true, elapsed: 0 },
+  { fromHome: false, retired: false, elapsed: 61_000 }
+])("uses the original tag deletion source fromHome=$fromHome, retired=$retired, elapsed=$elapsed ms", async ({ fromHome, retired, elapsed }) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  let homeOwner = "home-task-owner";
+  let owner = "task-owner";
   const preview = create(TaskTagDeletePreviewSchema, { taskTagId: "release", affectedSessionCount: 2n,
     tagRevision: { value: 4n }, associationRevision: { value: 2n } });
   const previewTaskTagDeletion = vi.fn(async () => preview), deleteTaskTag = vi.fn(async () => true);
-  const client = { state: { status: "connected", selectedId: undefined }, homeTaskTagSourceKey: () => homeOwner,
-    taskHeaderSourceKey: () => undefined, previewTaskTagDeletion, deleteTaskTag } as unknown as MobileClient;
-  const session = create(SessionSchema, { sessionId: "home-task", displayName: "Home task" });
+  const client = { state: { status: "connected", selectedId: fromHome ? undefined : "task" }, homeTaskTagSourceKey: () => owner,
+    taskHeaderSourceKey: () => owner, previewTaskTagDeletion, deleteTaskTag } as unknown as MobileClient;
+  const session = create(SessionSchema, { sessionId: "task", displayName: "Task" });
   const catalog = create(TaskTagCatalogSchema, { taskTags: [tag("release", "Release", TaskTagColor.TEAL)] });
   const colors = { background: "white", surface: "white", ink: "black", muted: "gray", border: "gray", accent: "blue", brandBackground: "white", negative: "red" };
   const host = document.body.appendChild(document.createElement("div")), root = createRoot(host);
   try {
-    await act(async () => root.render(createElement(MobileTaskTagsSheet, { visible: true, fromHome: true, session, catalog, client, colors, locale: "en", onClose() {} })));
+    await act(async () => root.render(createElement(MobileTaskTagsSheet, { visible: true, fromHome, session, catalog, client, colors, locale: "en", onClose() {} })));
     await act(async () => host.querySelector("button")!.click());
     await act(async () => host.querySelector("button")!.click());
     expect(previewTaskTagDeletion).toHaveBeenCalledExactlyOnceWith("release");
     const confirm = vi.mocked(Alert.alert).mock.calls[0]?.[2]?.find(button => button.style === "destructive")?.onPress;
     expect(confirm).toBeDefined();
-    if (retired) homeOwner = "replacement-task-owner";
-    await act(async () => confirm!());
+    if (retired) owner = "replacement-task-owner";
+    const time = vi.spyOn(Date, "now").mockReturnValue(Date.now() + elapsed);
+    try { await act(async () => confirm!()); }
+    finally { time.mockRestore(); }
     if (retired) expect(deleteTaskTag).not.toHaveBeenCalled();
-    else expect(deleteTaskTag).toHaveBeenCalledExactlyOnceWith("home-task", preview);
+    else expect(deleteTaskTag).toHaveBeenCalledExactlyOnceWith("task", preview);
   } finally { await act(async () => root.unmount()); }
 });
 

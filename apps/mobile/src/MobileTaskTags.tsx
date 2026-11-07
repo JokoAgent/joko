@@ -205,7 +205,6 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
     try {
       const preview = await client.previewTaskTagDeletion(tag.taskTagId);
       if (!current() || operation.current !== actionOwner || confirmationEpoch.current !== promptEpoch) return;
-      const expiresAt = Date.now() + 60_000;
       let answered = false;
       Alert.alert(
         mobileMessage(locale, "taskTags.delete"),
@@ -213,7 +212,7 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
         [
           { text: mobileMessage(locale, "common.cancel"), style: "cancel", onPress: () => { answered = true; } },
           { text: mobileMessage(locale, "taskTags.delete"), style: "destructive", onPress: () => {
-            if (answered || !current() || Date.now() >= expiresAt || confirmationEpoch.current !== promptEpoch) return;
+            if (answered || !current() || confirmationEpoch.current !== promptEpoch) return;
             answered = true;
             void run(() => client.deleteTaskTag(session.sessionId, preview), () => setEditing(undefined));
           } }
