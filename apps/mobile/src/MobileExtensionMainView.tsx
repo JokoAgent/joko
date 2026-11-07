@@ -25,6 +25,7 @@ type SurfaceState =
   | { readonly phase: "opening" }
   | { readonly phase: "ready"; readonly surface: MobileExtensionMainViewSurface; readonly document: PreparedExtensionMainViewDocument; readonly logicalUrl: string }
   | { readonly phase: "error" | "revoked" };
+type ActiveSurface = Omit<MobileExtensionMainViewSurface, "expiresAt"> & { expiresAt: number };
 
 export function MobileExtensionMainView({ colors, extension, locale, onBack, transport, settings = false, onOpenLibrary }: {
   readonly colors: MobilePartnersColors;
@@ -39,7 +40,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
   transportRef.current = transport;
   const openLibraryRef = useRef(onOpenLibrary); openLibraryRef.current = onOpenLibrary;
   const leaseTransport = useRef<MobileExtensionTransport | undefined>(undefined);
-  const surfaceRef = useRef<MobileExtensionMainViewSurface | undefined>(undefined);
+  const surfaceRef = useRef<ActiveSurface | undefined>(undefined);
   const documentRef = useRef<PreparedExtensionMainViewDocument | undefined>(undefined);
   const occurrence = useRef<symbol | undefined>(undefined);
   const openingAbort = useRef<AbortController | undefined>(undefined);
@@ -97,12 +98,13 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     }
     const opening = settings ? currentTransport.openSettings?.(extension, controller.signal)
       ?? Promise.reject(new Error("Plugin author settings are unavailable.")) : currentTransport.openMainView(extension, controller.signal);
-    void opening.then(async (surface) => {
+    void opening.then(async (opened) => {
       if (controller.signal.aborted || occurrence.current !== request
         || transportRef.current.ownerKey !== currentTransport.ownerKey) {
-        void currentTransport.closeMainView(surface).catch(() => undefined);
+        void currentTransport.closeMainView(opened).catch(() => undefined);
         return;
       }
+      const surface = { ...opened };
       leaseTransport.current = currentTransport;
       surfaceRef.current = surface;
       const resource = await currentTransport.readMainViewResource(surface, surface.url, "document", controller.signal);
@@ -156,11 +158,16 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     let probing = false;
     const controller = new AbortController();
     const timer = setInterval(() => {
-      if (settings && authorizing.current && AppState.currentState !== "active") return;
+      if (AppState.currentState !== "active" && (!settings || authorizing.current)) return;
       if (probing || surfaceRef.current?.surfaceId !== expected.surfaceId) return;
       probing = true;
-      void currentTransport.probeMainView(expected, controller.signal).then((current) => {
+      void currentTransport.probeMainView(expected, controller.signal, settings ? undefined : true).then((current) => {
+        const surface = surfaceRef.current;
+        if (controller.signal.aborted || surface?.surfaceId !== expected.surfaceId
+          || transportRef.current.ownerKey !== currentTransport.ownerKey) return;
         if (!sameMobileExtensionMainViewSurface(expected, current)) throw new Error("Extension main view changed.");
+        // The mounted document and its Library bridge keep this same lease.
+        if (!settings) surface.expiresAt = Math.max(surface.expiresAt, current.expiresAt);
       }).catch(() => {
         if (!controller.signal.aborted && !(settings && authorizing.current)) revoke(expected, "revoked");
       }).finally(() => { probing = false; });

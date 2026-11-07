@@ -9,7 +9,7 @@ import { readSessionArchivePreview } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { projectProviderGroupRebalance } from "@joko/contracts";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
-import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
+import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import type { McpAppApi } from "./model.js";
 import type { ExtensionProjectView, ExtensionProjectStateView } from "./model.js";
@@ -6161,12 +6161,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapExtensionMainViewSurface(response.surface);
   }
 
-  async getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView> {
+  async getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal, keepAlive?: true): Promise<ExtensionMainViewSurfaceView> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ExtensionService, scope.transport).getExtensionMainViewSurface(
       { surfaceId },
-      { signal: scope.signal }
+      { signal: scope.signal, ...(keepAlive ? { headers: { [EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER]: "1" } } : {}) }
     );
+    scope.signal.throwIfAborted();
     if (response.surface === undefined) throw new GatewayError("Orchestrator returned an empty Extension main-view probe.");
     return mapExtensionMainViewSurface(response.surface);
   }

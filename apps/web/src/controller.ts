@@ -3998,7 +3998,7 @@ export function useAppController(): AppController {
     getExtension: async (extensionId, sessionId, signal, includeProjectDisabled) => catalogGateway().getExtension(extensionId, sessionId, signal, includeProjectDisabled),
     openExtensionMainView: async (extensionId, expectedRevision, signal) =>
       catalogGateway().openExtensionMainView(extensionId, expectedRevision, signal),
-    getExtensionMainViewSurface: async (surfaceId, signal) => catalogGateway().getExtensionMainViewSurface(surfaceId, signal),
+    getExtensionMainViewSurface: async (surfaceId, signal, keepAlive) => catalogGateway().getExtensionMainViewSurface(surfaceId, signal, keepAlive),
     closeExtensionMainView: async (surfaceId, signal) => catalogGateway().closeExtensionMainView(surfaceId, signal),
     getExtensionLibraryOverview: async (extensionId, expectedRevision, signal) =>
       catalogGateway().getExtensionLibraryOverview(extensionId, expectedRevision, signal),

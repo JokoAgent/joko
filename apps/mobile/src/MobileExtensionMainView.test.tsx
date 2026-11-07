@@ -229,6 +229,35 @@ describe("MobileExtensionMainView", () => {
     expect(native.web!.injectedJavaScriptBeforeContentLoaded).toContain(`${surface.surfaceId}:1`);
   });
 
+  it("keeps the same document and Library session after a foreground probe extends its lease", async () => {
+    vi.useFakeTimers();
+    const extension = { ...fixtureExtension(), library: { schemaVersion: 1 as const } };
+    const surface = { ...fixtureSurface(extension), expiresAt: Date.now() + 15_001 };
+    const renewed = { ...surface, expiresAt: Date.now() + 60_000 };
+    const active = fixtureTransport(surface), session = fixtureLibrarySession(extension);
+    vi.mocked(active.probeMainView).mockResolvedValue(renewed);
+    vi.mocked(active.openLibrary).mockResolvedValue(session);
+    vi.mocked(active.callLibrary).mockResolvedValue({ kind: "read", path: "mail", content: Uint8Array.of(128), sha256: "a".repeat(64) });
+    await render(active, extension);
+    const document = native.documents[0]!;
+    const onMessage = native.web!.onMessage as (event: { nativeEvent: { data: string; url: string } }) => void;
+    const read = (id: string) => onMessage({ nativeEvent: { url: document.documentUrl,
+      data: encodeMobileLibraryMessage({ surfaceId: surface.surfaceId, frameId: `${surface.surfaceId}:0`,
+        request: { type: "joko:extension-library-request", version: 1, id, operation: { kind: "read", path: "mail" } } }) } });
+    await act(async () => read("before"));
+    await act(async () => vi.advanceTimersByTimeAsync(16_000));
+    expect(Date.now()).toBeGreaterThan(surface.expiresAt);
+    expect(active.probeMainView).toHaveBeenCalledWith(expect.objectContaining({ surfaceId: surface.surfaceId }), expect.any(AbortSignal), true);
+    expect(native.documents).toEqual([document]);
+    expect(document.close).not.toHaveBeenCalled();
+
+    await act(async () => read("after"));
+    expect(active.openLibrary).toHaveBeenCalledOnce();
+    expect(active.callLibrary).toHaveBeenCalledTimes(2);
+    expect(active.callLibrary).toHaveBeenLastCalledWith(extension, renewed, session, { kind: "read", path: "mail" }, expect.any(AbortSignal));
+    expect(decodeMobileLibraryMessage(native.messages.at(-1)!)).toMatchObject({ response: { id: "after", ok: true } });
+  });
+
   it("retires settings that are still opening when the app enters background", async () => {
     const extension = { ...fixtureExtension(), settings: { height: 400, mobileCustom: true } };
     const surface: MobileExtensionMainViewSurface = { ...fixtureSurface(extension), purpose: "settings", mobileSettings: true };

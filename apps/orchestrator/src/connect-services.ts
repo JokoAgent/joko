@@ -4821,13 +4821,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     getExtensionMainViewSurface: async (request, context) => {
       const connection = authenticate(context);
-      if (dependencies.extensionMainViews === undefined) {
+      const views = dependencies.extensionMainViews;
+      if (views === undefined) {
         throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
       }
-      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(
-        nonBlankRequest(request.surfaceId, "surface_id"),
-        connection.id
-      ));
+      const surfaceId = nonBlankRequest(request.surfaceId, "surface_id");
+      const renew = context.requestHeader.get(contract.EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER) === "1";
+      const surface = await extensionMainViewEffect(() => renew
+        ? views.getSurface(surfaceId, connection.id, "visible", context.signal)
+        : views.getSurface(surfaceId, connection.id));
       return { surface: mapExtensionMainViewSurface(surface) };
     },
     closeExtensionMainView: async (request, context) => {
