@@ -2641,11 +2641,13 @@ describe("Mobile Remote Desktop presentation transition authority", () => {
 });
 
 describe("mobile Extension catalog authority", () => {
-  it("preserves the exact approved task directory when resetting its model and retires old preference writes", async () => {
+  it("preserves compatible plugin task directories, clears incompatible ones and retires old writes", async () => {
     const network = fakeNetwork(), extension = mobileExtensionFixture();
     network.getExtension = vi.fn(async () => extension);
     const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: extension.extensionId, revision: { value: 7n }, targetId: "opaque-approved-directory",
-      permissionMode: PermissionMode.AUTO, showPreferences: true, model: { backendId: "runtime", providerId: "provider", modelId: "answer" } });
+      permissionMode: PermissionMode.AUTO, showPreferences: true, model: { backendId: "runtime", providerId: "provider", modelId: "answer" },
+      models: [{ name: "Another model", route: { backendId: "other-runtime", providerId: "provider", modelId: "other-answer" } }],
+      directories: [{ targetId: "opaque-approved-directory", backendId: "runtime", name: "Approved project" }] });
     const update = vi.fn(async (_request: unknown, _options?: unknown) => create(ExtensionTaskServiceUpdatePreferencesResponseSchema, { preferences }));
     const retry = vi.fn(async (_request: unknown, _options?: unknown) => create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences }));
     network.extensionTaskApi = vi.fn(() => ({ getPreferences: async () => create(ExtensionTaskServiceGetPreferencesResponseSchema, { preferences }), updatePreferences: update, retryWriteAccess: retry }) as unknown as ReturnType<NonNullable<MobileNetwork["extensionTaskApi"]>>);
@@ -2654,6 +2656,11 @@ describe("mobile Extension catalog authority", () => {
     await expect(transport.getTaskPreferences!(extension, signal)).resolves.toMatchObject({ targetId: "opaque-approved-directory" });
     await transport.setTaskPreferences!(extension, preferences, undefined, PermissionMode.AUTO, signal);
     expect(update.mock.calls[0]?.[0]).toMatchObject({ extensionId: extension.extensionId, expectedRevision: { value: 7n }, targetId: "opaque-approved-directory", model: undefined, permissionMode: PermissionMode.AUTO });
+    await transport.setTaskPreferences!(extension, preferences, preferences.model, PermissionMode.AUTO, signal);
+    expect(update.mock.calls[1]?.[0]).toMatchObject({ targetId: "opaque-approved-directory", model: preferences.model });
+    const otherModel = preferences.models[0]!.route!;
+    await transport.setTaskPreferences!(extension, preferences, otherModel, PermissionMode.ASK, signal);
+    expect(update.mock.calls[2]?.[0]).toMatchObject({ expectedRevision: { value: 7n }, targetId: undefined, model: otherModel, permissionMode: PermissionMode.ASK });
     await transport.retryTaskWriteAccess!(extension, "owned-task", signal);
     expect(retry).toHaveBeenCalledWith({ extensionId: extension.extensionId, taskId: "owned-task" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(network.extensionTaskApi).toHaveBeenCalledWith(credential);
@@ -2661,7 +2668,7 @@ describe("mobile Extension catalog authority", () => {
     await expect(transport.setTaskPreferences!(extension, preferences, undefined, PermissionMode.ASK, signal)).rejects.toThrow(/owner changed/u);
     await expect(transport.retryTaskWriteAccess!(extension, "owned-task", signal)).rejects.toThrow(/owner changed/u);
     expect(retry).toHaveBeenCalledTimes(1);
-    expect(update).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledTimes(3);
   });
   it("lists and opens only an exact current installed descriptor", async () => {
     const network = fakeNetwork();

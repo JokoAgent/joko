@@ -148,6 +148,7 @@ import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
   mobileExtensionOwnerKey,
+  mobileExtensionTaskTarget,
   projectMobileExtensionMainViewSurface,
   sameMobileExtensionMainViewSurface,
   type MobileExtension,
@@ -3479,7 +3480,7 @@ export class MobileClient {
         await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
         if (!api || preferences.extensionId !== expected.extensionId) throw new Error("Plugin task preferences are unavailable.");
         const result = await api.updatePreferences({ extensionId: expected.extensionId, expectedRevision: preferences.revision, model, permissionMode,
-          targetId: preferences.targetId }, { signal: current }); requireCurrent(current);
+          targetId: mobileExtensionTaskTarget(preferences, model) }, { signal: current }); requireCurrent(current);
         if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin preference owner changed."); return result.preferences;
       }),
       retryTaskWriteAccess: (expected, taskId, signal) => owned(signal, async current => {
