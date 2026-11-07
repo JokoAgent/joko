@@ -96,7 +96,7 @@ packagedIt("converges conversation settings across real application windows and 
       createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId, displayName }))));
   }
   console.info("Packaged settings: fixture and both tasks ready.");
-  const application = await launchSettingsDesktop();
+  const { application, profilePath } = await launchSettingsDesktop();
   const main = await application.firstWindow({ timeout: 60_000 });
   const pageErrors: string[] = [];
   const observe = (page: Page): void => {
@@ -119,7 +119,7 @@ packagedIt("converges conversation settings across real application windows and 
       profileTimer = setTimeout(() => rejectProfile(new Error("Settings Desktop main-process profile query timed out.")), 30_000);
     })
   ]).finally(() => { if (profileTimer !== undefined) clearTimeout(profileTimer); });
-  const profileRelative = relative(profileDirectory, userDataPath);
+  const profileRelative = relative(profilePath, userDataPath);
   if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
     throw new Error("Settings Desktop did not use its isolated profile.");
   }
@@ -279,7 +279,7 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
     const owner = await direct.pair("Draft fixture owner");
     const sessionId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId,
       createSessionMutation({ backendId: profile.id, targetId: direct.targetId(), displayName: "Draft fixture task" })));
-    const application = await launchSettingsDesktop();
+    const { application } = await launchSettingsDesktop();
     const main = await application.firstWindow({ timeout: 60_000 });
     main.setDefaultTimeout(30_000);
     await pairSettingsDesktop(main, direct);
@@ -346,9 +346,10 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
   }
 });
 
-async function launchSettingsDesktop(): Promise<ElectronApplication> {
+async function launchSettingsDesktop(): Promise<{ readonly application: ElectronApplication; readonly profilePath: string }> {
   const executablePath = resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!);
-  profileDirectory = await mkdtemp(join(tmpdir(), "joko-settings-desktop-"));
+  const profilePath = await mkdtemp(join(tmpdir(), "joko-settings-desktop-"));
+  profileDirectory = profilePath;
   desktop = await _electron.launch({
     executablePath,
     env: {
@@ -356,8 +357,8 @@ async function launchSettingsDesktop(): Promise<ElectronApplication> {
       JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
       JOKO_DESKTOP_PACKAGED_SMOKE: "1",
       JOKO_DESKTOP_SMOKE_SCOPE: "external",
-      ...startupEvidence.environment(profileDirectory),
-      JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
+      ...startupEvidence.environment(profilePath),
+      JOKO_DESKTOP_SMOKE_USER_DATA: profilePath
     },
     timeout: 60_000
   });
@@ -369,7 +370,7 @@ async function launchSettingsDesktop(): Promise<ElectronApplication> {
     throw new Error("Settings Desktop launched an unexpected executable.");
   }
   console.info("Packaged settings: owned process confirmed.");
-  return desktop;
+  return { application: desktop, profilePath };
 }
 
 async function pairSettingsDesktop(main: Page, activeFixture: OrchestratorE2eFixture): Promise<void> {
