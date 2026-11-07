@@ -7,7 +7,10 @@ import { describe, expect, it, vi } from "vitest";
 import { AppWithController } from "./App.js";
 import { clearTransientExtensionUiState, type AppController, type ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES } from "./local-state.js";
-import { emptySnapshot } from "./model.js";
+import { emptySnapshot, type SessionView, type TimelineItemView } from "./model.js";
+
+vi.mock("./components/SessionPane.js", () => ({ SessionPane: ({ session, timeline }: { session: SessionView; timeline: readonly TimelineItemView[] }) =>
+  <section data-background-task-pane>{session.name}{timeline.map(item => item.text).join(" ")}</section> }));
 
 describe("extension notification application surface", () => {
   it("renders typed live-region semantics and drops the previous generation", async () => {
@@ -59,6 +62,40 @@ describe("extension notification application surface", () => {
     await act(async () => { root.unmount(); });
     container.remove();
   });
+});
+
+it("opens a scoped hidden task and reads its ordinary timeline without adding a sidebar row", async () => {
+  const initial = connectedState();
+  const route = { kind: "session" as const, sessionId: "background", profileId: initial.activeProfile!.id, backgroundExtensionId: `extension_${"1".repeat(32)}` };
+  const session: SessionView = { id: route.sessionId, backendId: "pi", targetId: "project", name: "Private extension review", hidden: true,
+    archived: false, pinned: false, state: "idle", generation: 3n, updatedAt: 1, permissionMode: "ask", planMode: false, fastMode: false };
+  const state: ControllerState = { ...initial, route, connectionGeneration: 1, extensionBackgroundTask: {
+    route, navigationRevision: initial.navigationRevision, connectionGeneration: 1, ownerGeneration: initial.snapshot.generation,
+    view: { session, cursor: 1n }
+  } };
+  const navigate = vi.fn();
+  const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({
+    items: [{ id: "answer", sequence: 1n, createdAt: 1, kind: "assistant", text: "Retained review result." }]
+  }));
+  const host = document.createElement("div"); document.body.append(host);
+  const root = createRoot(host);
+  const render = (value: ControllerState) => root.render(createElement(AppWithController, {
+    controller: { ...controller(value, navigate, vi.fn()), loadSessionTimelinePage }
+  }));
+  try {
+    await act(async () => render(state));
+    await vi.waitFor(() => expect(host.querySelector("[data-background-task-pane]")?.textContent).toContain("Retained review result."));
+    expect(host.querySelector("[data-background-task-pane]")?.textContent).toContain(session.name);
+    expect(host.querySelector(".sidebar__sessions")?.textContent ?? "").not.toContain(session.name);
+    expect(loadSessionTimelinePage).toHaveBeenCalledWith(route.sessionId, undefined, 240);
+    expect(navigate).not.toHaveBeenCalled();
+
+    await act(async () => render({ ...state, connectionGeneration: 2 }));
+    expect(host.querySelector("[data-background-task-pane]")).toBeNull();
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+  }
 });
 
 function connectedState(): ControllerState {

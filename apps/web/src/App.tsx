@@ -3,10 +3,10 @@ import { parseDeviceLink, parseDeviceAuthorizationReview, type DeviceAuthorizati
 import { DeviceAuthorizationReview } from './components/DeviceAuthorizationReview.js';
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { AlertTriangle, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
-import { appRouteHash, useAppController } from "./controller.js";
+import { appRouteHash, extensionBackgroundTaskForRoute, useAppController } from "./controller.js";
 import { useAppDefaultModelBridge } from "./app-default-model-bridge.js";
 import { useWallpaperSettings } from "./wallpaper-settings.js";
-import type { AppController } from "./controller.js";
+import type { AppController, ControllerState } from "./controller.js";
 import { translate } from "./i18n.js";
 import type { ComposerDraft, ComposerFileSelectionQuoteDraft, InteractionView, SessionMessageSearchMatchView, SessionView, TargetView, TimelineHistoryCursorView, TimelineItemView } from "./model.js";
 import { fileAttachmentInsertionFor, type FileAttachmentInsertion } from "./file-attachment-insertion.js";
@@ -861,10 +861,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (state.route.kind === "session" && state.route.profileId !== undefined
       && state.route.profileId !== state.activeProfile?.id) return undefined;
     const sessionId = state.route.sessionId;
-    if (sessionId !== undefined) return state.snapshot.sessions.find((session) => session.id === sessionId);
-    return [...state.snapshot.sessions].filter((session) => !session.archived).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt)[0];
-  }, [state.activeProfile?.id, state.connectionState, state.route, state.snapshot.sessions]);
+    if (sessionId !== undefined) return sessionForTaskRoute(state, sessionId);
+    return [...state.snapshot.sessions].filter((session) => !session.archived && !session.hidden).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt)[0];
+  }, [state]);
+  const backgroundTaskRoute = state.route.kind === "session" && state.route.backgroundExtensionId !== undefined;
+  const directedBackgroundTask = backgroundTaskRoute && activeSession?.hidden === true;
+  const backgroundTaskPending = backgroundTaskRoute && state.route.kind === "session"
+    && state.activeProfile?.id === state.route.profileId && state.connectionState === "connected"
+    && extensionBackgroundTaskForRoute(state) === undefined;
   const explicitSessionOwnerPending = state.route.kind === "session"
+    && !backgroundTaskRoute
     && state.route.sessionId !== undefined
     && state.route.profileId !== undefined
     && state.error === undefined
@@ -909,11 +915,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }
   const nativeTaskStatusVisibleSessionIds = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return [];
-    if (state.route.kind === "session" && sessionSplitLayout.root !== undefined && activeSession?.archived !== true) {
+    if (state.route.kind === "session" && sessionSplitLayout.root !== undefined && activeSession?.archived !== true && !directedBackgroundTask) {
       return Object.freeze(sessionSplitPanes(sessionSplitLayout.root).map((pane) => pane.sessionId));
     }
     return Object.freeze(activeSession === undefined ? [] : [activeSession.id]);
-  }, [activeSession, sessionSplitLayout.root, state.route.kind]);
+  }, [activeSession, directedBackgroundTask, sessionSplitLayout.root, state.route.kind]);
   const sidebarSnapshot = useMemo(() => {
     const sessions = applySessionProjectOverrides(state.snapshot.sessions, sessionProjectOverrides);
     return sessions === state.snapshot.sessions ? state.snapshot : { ...state.snapshot, sessions };
@@ -995,7 +1001,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (next !== sessionSplitLayout) commitSessionSplitLayout(next);
     const routeSessionId = state.route.kind === "session" ? state.route.sessionId : undefined;
     const focusedExists = focusedSplitSessionId === undefined || activeIds.has(focusedSplitSessionId);
-    const routeExists = routeSessionId === undefined || knownIds.has(routeSessionId);
+    const routeExists = routeSessionId === undefined || backgroundTaskRoute || knownIds.has(routeSessionId);
     if (focusedExists && routeExists) return;
     const replacement = sessionSplitPanes(sessionSplitLayout.root)
       .find((pane) => activeIds.has(pane.sessionId))?.sessionId;
@@ -1004,6 +1010,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       ? { kind: "session" }
       : { kind: "session", sessionId: replacement });
   }, [
+    backgroundTaskRoute,
     commitSessionSplitLayout,
     controller,
     focusedSplitSessionId,
@@ -1020,7 +1027,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       lastSplitRouteSessionIdRef.current = undefined;
       return;
     }
-    if (activeSession.archived) {
+    if (activeSession.archived || directedBackgroundTask) {
       lastSplitRouteSessionIdRef.current = undefined;
       return;
     }
@@ -1041,7 +1048,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const next = replaceSessionSplit(sessionSplitLayout, replaceId, activeSession.id);
     if (next !== sessionSplitLayout) commitSessionSplitLayout(next);
     setFocusedSplitSessionId(activeSession.id);
-  }, [activeSession, commitSessionSplitLayout, focusedSplitSessionId, sessionSplitLayout, state.route.kind]);
+  }, [activeSession, commitSessionSplitLayout, directedBackgroundTask, focusedSplitSessionId, sessionSplitLayout, state.route.kind]);
   useEffect(() => {
     if (layoutNotice === undefined) return;
     const timer = window.setTimeout(() => setLayoutNotice(undefined), 4_000);
@@ -1180,7 +1187,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     allowCached = true
   ): Promise<void> => {
     const state = controllerRef.current.state;
-    const selected = state.snapshot.sessions.find(session => session.id === sessionId);
+    const selected = sessionForTaskRoute(state, sessionId);
     const ownerKey = timelineHistoryOwnerKey(state.activeProfile, generation, sessionId, selected?.generation ?? 0n, historyRevision);
     const sourceVersion = JSON.stringify([selected?.updatedAt, selected?.activeRunId, selected?.state]);
     const cached = reset && ownerKey ? timelineHistoryCacheRef.current.get(ownerKey) : undefined;
@@ -1964,15 +1971,15 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       onArchive={() => requestArchiveSession(activeSession)}
       onPrefetchRemoval={() => prefetchRemoval(activeSession)}
       onDelete={() => requestDeleteSessions([activeSession])}
-      onMoveSessionProject={(placement) => moveTaskToProject(activeSession, placement)}
+      onMoveSessionProject={directedBackgroundTask ? undefined : (placement) => moveTaskToProject(activeSession, placement)}
       movingSessionProject={movingSessionProjectIds.has(activeSession.id)}
-      onCopyTaskLink={() => copyTaskLink(activeSession)}
+      onCopyTaskLink={directedBackgroundTask ? undefined : () => copyTaskLink(activeSession)}
       onExportPortableSession={() => setPortableExportSession(activeSession)}
-      onSplitSession={(side) => {
+      onSplitSession={directedBackgroundTask ? undefined : (side) => {
         const anchor = focusedSplitSessionId ?? activeSession.id;
         addSessionToSplit(activeSession.id, anchor, side);
       }}
-      onOpenSessionWindow={() => openTaskWindow(activeSession)}
+      onOpenSessionWindow={directedBackgroundTask ? undefined : () => openTaskWindow(activeSession)}
       onSideChatOpened={(sourceSessionId, childId) => addSessionToSplit(childId, sourceSessionId, "right")}
     />
   );
@@ -2510,7 +2517,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             onSubmit={submitNewSession}
           /> : <>
           {state.route.kind === "session" && (activeSession === undefined ? (
-            explicitSessionOwnerPending || state.connectionState === "connecting"
+            explicitSessionOwnerPending || backgroundTaskPending || state.connectionState === "connecting"
               ? <RouteLoading label={t("connection.connecting")} />
               : <EmptySessionPage
                   navigationOpen={navigationOpen}
@@ -2525,17 +2532,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
                   onNewTask={() => controller.navigate({ kind: "newSession" })}
                 />
           ) : <SessionSplitView
-            layout={activeSession.archived ? {} : sessionSplitLayout}
+            layout={activeSession.archived || directedBackgroundTask ? {} : sessionSplitLayout}
             currentSessionId={activeSession.id}
             focusedSessionId={focusedSplitSessionId ?? activeSession.id}
-            sessions={state.snapshot.sessions}
+            sessions={directedBackgroundTask ? [activeSession] : state.snapshot.sessions}
             t={t}
             renderPane={renderSessionSplitPane}
             onLayoutChange={commitSessionSplitLayout}
             onFocus={focusSplitSession}
             onPreviewFocus={setFocusedSplitSessionId}
             onClose={closeSessionSplitPane}
-            onDropSession={addSessionToSplit}
+            onDropSession={(sessionId, anchorId, side) => { if (!directedBackgroundTask) addSessionToSplit(sessionId, anchorId, side); }}
           />)}
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.effectiveLocale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
@@ -2700,6 +2707,15 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     </PartnerAvatarProvider>
     </PartnerConversationScope>
   );
+}
+
+function sessionForTaskRoute(state: ControllerState, sessionId: string): SessionView | undefined {
+  const listed = state.snapshot.sessions.find(session => session.id === sessionId);
+  if (state.route.kind !== "session" || state.route.sessionId !== sessionId || state.route.backgroundExtensionId === undefined) return listed;
+  const scoped = extensionBackgroundTaskForRoute(state)?.view;
+  if (scoped === undefined) return undefined;
+  if (listed !== undefined && state.snapshot.cursor >= scoped.cursor) return listed.state === "closed" ? undefined : listed;
+  return scoped.session;
 }
 
 function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAction, onOpenNavigation, onRename, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, onOpenTurnReview }: {

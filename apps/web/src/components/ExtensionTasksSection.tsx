@@ -87,7 +87,7 @@ export function ExtensionTasksSection({ controller, extension, disabled, t, runA
       <p>{t("extensions.tasks.disclosure")}</p><Button disabled={busy} onClick={() => setRefresh(value => value + 1)}>{t("common.refresh")}</Button>
       {!background.length && <p>{t("extensions.tasks.empty")}</p>}
       {background.map(task => <div className="extension-network__row" key={task.taskId}><strong>{task.title}</strong><div className="extension-network__actions">
-        <Button onClick={() => controller.navigate({ kind: "session", sessionId: task.taskId })}>{t("extensions.tasks.open")}</Button>
+        <Button disabled={disabled || busy} onClick={() => controller.navigate({ kind: "session", sessionId: task.taskId, backgroundExtensionId: extension.id })}>{t("extensions.tasks.open")}</Button>
         <Button disabled={disabled || busy} onClick={() => { void run(async () => { const api = controller.extensionTaskApi?.(); if (!api) throw new Error("Connection unavailable."); await api.revealTask({ extensionId: extension.id, taskId: task.taskId }, { signal: lifetime.abort.signal }); lifetime.abort.signal.throwIfAborted(); await controller.refresh(); setRefresh(value => value + 1); }); }}>{t("extensions.tasks.reveal")}</Button>
       </div></div>)}
     </section>}

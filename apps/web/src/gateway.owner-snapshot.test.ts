@@ -1,7 +1,7 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
-  EventPayloadSchema, EventSchema, GetSnapshotResponseSchema, MessageRole, SessionState, SnapshotSchema,
+  EventPayloadSchema, EventSchema, ExtensionTaskServiceListBackgroundTasksResponseSchema, GetSnapshotResponseSchema, MessageRole, SessionState, SnapshotSchema,
   StreamEventsResponseSchema, type Event, type Snapshot
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
@@ -17,6 +17,24 @@ describe("Gateway snapshot-only connection", () => {
     expect(harness.states.at(-1)).toBe("connected");
     expect(harness.transport.stream).not.toHaveBeenCalled();
     harness.gateway.disconnect();
+  });
+
+  it("reads the exact hidden plugin Session without publishing it in the Owner directory", async () => {
+    const harness = ownerHarness();
+    harness.replaceSession(undefined);
+    await harness.gateway.connect({ snapshotOnly: true });
+    try {
+      const signal = new AbortController().signal;
+      await expect(harness.gateway.readExtensionBackgroundTask("wrong-extension", "background", signal)).rejects.toThrow("unavailable");
+      expect(harness.requests).toHaveLength(1);
+
+      const task = await harness.gateway.readExtensionBackgroundTask("owning-extension", "background", signal);
+      expect(task).toMatchObject({ session: { id: "background", hidden: true, generation: 3n }, cursor: 1n });
+      expect(harness.requests[1]).toMatchObject({ scope: { kind: { case: "session", value: { sessionId: "background", recentTimelineItems: 0 } } } });
+      expect(harness.latest().sessions).toEqual([]);
+      await harness.gateway.refresh();
+      expect(harness.latest().sessions).toEqual([]);
+    } finally { harness.gateway.disconnect(); }
   });
 
   it("keeps the normal connection's Event stream and retires it on disconnect", async () => {
@@ -139,9 +157,17 @@ function ownerHarness(beforeSnapshot?: () => Promise<void>) {
   });
   const transport = {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+      if (method.localName === "listBackgroundTasks") return response(method, create(ExtensionTaskServiceListBackgroundTasksResponseSchema, {
+        tasks: input.extensionId === "owning-extension" ? [{ taskId: "background" }] : []
+      }));
       if (method.localName !== "getSnapshot") throw new Error(`Unexpected method: ${method.localName}`);
       requests.push(input); snapshotReads += 1;
       await beforeSnapshot?.();
+      if (input.scope.kind.case === "session") return response(method, create(GetSnapshotResponseSchema, { snapshot: {
+        server: { serverId: "server-one" }, generation: 3n, resumeCursor: { generation: 3n, sequence: 1n }, scope: input.scope,
+        sessions: [{ sessionId: "background", hidden: true, backendId: "backend-one", targetId: "target-one", state: SessionState.IDLE,
+          nativeBinding: { runtimeGeneration: 3n }, location: { kind: { case: "serviceNode", value: {} } } }]
+      } }));
       return response(method, create(GetSnapshotResponseSchema, { snapshot: rawSnapshot() }));
     }),
     stream: vi.fn(async (method: any, signal: AbortSignal) => response(method, stream(signal), true))

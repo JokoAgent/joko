@@ -32,6 +32,7 @@ import {
   isUnauthenticatedError,
   probeOrchestratorOrigin,
   probeOrchestratorRuntimeActivityAt,
+  type ExtensionBackgroundTaskView,
   type ExtensionNotificationKind,
   type ExtensionUiEffect,
   type GatewayError,
@@ -148,7 +149,7 @@ const TOOLS_TABS: readonly ToolsTab[] = ["browser", "extensions", "skills", "res
 
 export type AppRoute =
   | { readonly kind: "sharedTask"; readonly joinId: string; readonly profileId: string }
-  | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string }
+  | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string; readonly backgroundExtensionId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string; readonly initialModel?: NewSessionModelRequest }
   | { readonly kind: "projects"; readonly projectId?: string }
@@ -180,6 +181,15 @@ interface NavigationHashHandoff {
   readonly isCurrent: () => boolean;
 }
 
+interface ExtensionBackgroundTaskRead {
+  readonly route: AppRoute;
+  readonly navigationRevision: number | undefined;
+  readonly connectionGeneration: number | undefined;
+  readonly ownerGeneration: bigint;
+  /** Missing view represents a completed read that did not confirm the task. */
+  readonly view?: ExtensionBackgroundTaskView;
+}
+
 export interface BrowserInspectorFocusRequest {
   readonly sessionId: string;
   readonly browserId: string;
@@ -207,6 +217,7 @@ export interface ControllerState {
   /** Whether an Auth Key can be protected across a full client restart. */
   readonly automaticConnectionAvailable: boolean;
   readonly snapshot: AppSnapshot;
+  readonly extensionBackgroundTask?: ExtensionBackgroundTaskRead;
   readonly taskSource?: TaskSource;
   readonly sessionAccess?: SessionAccess;
   readonly route: AppRoute;
@@ -235,6 +246,13 @@ export interface ControllerState {
     readonly text: string;
     readonly kind: ExtensionNotificationKind;
   }[];
+}
+
+export function extensionBackgroundTaskForRoute(state: ControllerState): ExtensionBackgroundTaskRead | undefined {
+  const task = state.extensionBackgroundTask;
+  return task !== undefined && state.connectionState === "connected" && task.route === state.route
+    && task.navigationRevision === state.navigationRevision && task.connectionGeneration === state.connectionGeneration
+    && task.ownerGeneration === state.snapshot.generation ? task : undefined;
 }
 
 export interface AppController extends OperationApi {
@@ -391,6 +409,7 @@ export function useAppController(): AppController {
     extensionNotifications: []
   });
   const [windowZoomApplicationRevision, setWindowZoomApplicationRevision] = useState(0);
+  const [ownerSnapshotLoad, setOwnerSnapshotLoad] = useState(0);
   const localRef = useRef<LocalState | undefined>(undefined);
   const activeProfileRef = useRef<ConnectionProfile | undefined>(state.activeProfile);
   activeProfileRef.current = state.activeProfile;
@@ -1090,9 +1109,10 @@ export function useAppController(): AppController {
           ...(connectionState === "connected" ? { statusMessage: undefined, error: undefined } : statusMessage === undefined ? {} : { statusMessage })
         }));
       },
-      onSnapshot: (snapshot) => {
+      onSnapshot: (snapshot, authoritative) => {
         if (gatewayGenerationRef.current !== generation) return;
         snapshotRef.current = snapshot;
+        if (authoritative) setOwnerSnapshotLoad(value => value + 1);
         const cache = machineCacheFromSnapshot(profile, snapshot);
         setState((current) => ({
           ...current,
@@ -2688,6 +2708,7 @@ export function useAppController(): AppController {
   useEffect(() => {
     const route = state.route;
     if (!state.ready || route.kind !== "session" || route.profileId === undefined || route.sessionId === undefined) return;
+    if (route.backgroundExtensionId !== undefined) return;
     if (explicitDisconnectRef.current) return;
     if (activeProfileRef.current?.id === route.profileId && connectionStateRef.current === "connecting") return;
     if (activeProfileRef.current?.id === route.profileId
@@ -2701,6 +2722,34 @@ export function useAppController(): AppController {
       setState((current) => ({ ...current, error: messageOf(error) }));
     });
   }, [openMachineSession, state.connectionState, state.navigationRevision, state.ready, state.route]);
+
+  useEffect(() => {
+    const { route, navigationRevision, connectionGeneration } = state;
+    const ownerGeneration = state.snapshot.generation, profileId = state.activeProfile?.id;
+    const gateway = gatewayRef.current;
+    if (route.kind !== "session" || route.backgroundExtensionId === undefined) {
+      setState(current => current.extensionBackgroundTask === undefined ? current : { ...current, extensionBackgroundTask: undefined });
+      return;
+    }
+    if (!state.ready || state.connectionState !== "connected" || gateway === undefined
+      || route.sessionId === undefined || route.profileId === undefined || route.profileId !== profileId) return;
+
+    // The Owner snapshot intentionally excludes hidden tasks. Re-read the exact
+    // task on each authoritative refresh without adding it to that directory.
+    const abort = new AbortController(), locationHash = window.location.hash;
+    const current = () => !abort.signal.aborted && gatewayRef.current === gateway
+      && connectionStateRef.current === "connected" && gatewayGenerationRef.current === connectionGeneration
+      && activeProfileRef.current?.id === profileId && snapshotRef.current.generation === ownerGeneration
+      && routeRef.current === route && navigationRevisionRef.current === navigationRevision && window.location.hash === locationHash;
+    const publish = (view?: ExtensionBackgroundTaskView) => {
+      if (!current()) return;
+      setState(value => current() ? { ...value, extensionBackgroundTask: { route, navigationRevision, connectionGeneration, ownerGeneration, view } } : value);
+    };
+    void gateway.readExtensionBackgroundTask(route.backgroundExtensionId, route.sessionId, abort.signal)
+      .then(view => publish(view), () => publish());
+    return () => abort.abort();
+  }, [ownerSnapshotLoad, state.activeProfile?.id, state.connectionGeneration, state.connectionState,
+    state.navigationRevision, state.ready, state.route, state.snapshot.generation]);
 
   const refreshDiscoveredNodes = useCallback(async (): Promise<void> => {
     const generation = ++discoveryGenerationRef.current;
@@ -5128,13 +5177,17 @@ export function routeFromHash(hash: string): AppRoute {
       ...(profileId === undefined || profileId === "" ? {} : { profileId })
     };
   }
+  const backgroundExtensions = query.getAll("backgroundExtension");
+  const backgroundExtensionId = backgroundExtensions.length === 1 && /^extension_[a-f0-9]{32}$/u.test(backgroundExtensions[0]!)
+    && profileId && !partnerId ? backgroundExtensions[0] : undefined;
   return {
     kind: "session",
     sessionId: parts[1],
     ...(partnerId === undefined || partnerId === "" ? {} : { partnerId }),
     ...(profileId === undefined || profileId === "" ? {} : { profileId }),
     ...(messageId === undefined || messageId === "" ? {} : { messageId }),
-    ...(messageEventId === undefined || messageEventId === "" ? {} : { messageEventId })
+    ...(messageEventId === undefined || messageEventId === "" ? {} : { messageEventId }),
+    ...(backgroundExtensionId === undefined ? {} : { backgroundExtensionId })
   };
 }
 
@@ -5144,6 +5197,7 @@ export function sessionRouteHash(route: Extract<AppRoute, { readonly kind: "sess
   if (route.messageId !== undefined) query.set("message", route.messageId);
   if (route.profileId !== undefined) query.set("profile", route.profileId);
   if (route.partnerId !== undefined) query.set("partner", route.partnerId);
+  if (route.backgroundExtensionId !== undefined) query.set("backgroundExtension", route.backgroundExtensionId);
   const suffix = query.size === 0 ? "" : `?${query.toString()}`;
   if (route.sessionId === undefined) return `#/tasks/${suffix}`;
   return `#/tasks/${encodeURIComponent(route.sessionId)}${suffix}`;
