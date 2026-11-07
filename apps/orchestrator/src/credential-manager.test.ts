@@ -449,7 +449,7 @@ describe("ProviderCatalogManager", () => {
     store.close();
   });
 
-  it("adds only newly discovered models and keeps them hidden by default", async () => {
+  it.each(["openai-responses", "google-generative-ai"] as const)("adds only newly discovered %s models and keeps them hidden by default", async api => {
     const { credentials, store } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
     providers.initialize();
@@ -461,12 +461,15 @@ describe("ProviderCatalogManager", () => {
       displayName: "Discovery key",
       kind: "api_key"
     });
+    const google = api === "google-generative-ai";
+    const origin = google ? "https://generativelanguage.googleapis.com" : "https://models.example.test";
+    const baseUrl = `${origin}/${google ? "v1beta" : "v1"}`;
     await providers.upsert({
-      backendId: "pi", credentialOrigin: "https://models.example.test",
+      backendId: "pi", credentialOrigin: origin,
       provider: {
         id: "discoverable",
-        baseUrl: "https://models.example.test/v1",
-        api: "openai-responses",
+        baseUrl,
+        api,
         apiKeyEnv: "DISCOVERY_API_KEY",
         models: [{ id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000 }]
       },
@@ -478,8 +481,19 @@ describe("ProviderCatalogManager", () => {
       supportsLogout: true,
       supportsRefresh: false
     });
-    const request = async (_url: string | URL | Request, init?: RequestInit) => {
-      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer discovery-secret-value");
+    const request = async (url: string | URL | Request, init?: RequestInit) => {
+      expect(url).toBe(`${baseUrl}/models`);
+      expect(init?.redirect).toBe("error");
+      const headers = new Headers(init?.headers);
+      if (google) {
+        expect(headers.has("authorization")).toBe(false);
+        expect(headers.get("x-goog-api-key")).toBe("discovery-secret-value");
+        return Response.json({ models: [
+          { name: "models/kept", displayName: "Renamed upstream", supportedGenerationMethods: ["generateContent"] },
+          { name: "models/new-model", displayName: "New model", supportedGenerationMethods: ["generateContent"], inputTokenLimit: 1_000_000 }
+        ] });
+      }
+      expect(headers.get("authorization")).toBe("Bearer discovery-secret-value");
       return new Response(JSON.stringify({ data: [
         { id: "kept", name: "Renamed upstream" },
         { id: "new-model", name: "New model", context_window: 1_000_000 }

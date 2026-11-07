@@ -43,14 +43,15 @@ export class ProviderModelDiscoveryError extends Error {
 const DISCOVERY_TIMEOUT_MS = 10_000;
 const MAXIMUM_RESPONSE_BYTES = 1024 * 1024;
 
-export function deriveProviderModelsUrl(baseUrl: string): string {
+export function deriveProviderModelsUrl(baseUrl: string, api?: string): string {
   const url = new URL(baseUrl);
   url.hash = "";
   let pathname = url.pathname;
   while (pathname.length > 1 && pathname.endsWith("/")) pathname = pathname.slice(0, -1);
-  url.pathname = /\/v\d+$/iu.test(pathname)
-    ? `${pathname}/models`
-    : `${pathname === "/" ? "" : pathname}/v1/models`;
+  const basePath = pathname === "/" ? "" : pathname;
+  url.pathname = api === "google-generative-ai" || /\/v\d+$/iu.test(pathname)
+    ? `${basePath}/models`
+    : `${basePath}/v1/models`;
   return url.toString();
 }
 
@@ -176,15 +177,16 @@ export async function fetchProviderModels(
   const baseUrl = safeDiscoveryBaseUrl(spec.baseUrl);
   if (baseUrl === undefined) throw new ProviderModelDiscoveryError("unsafe_endpoint");
   const headers = discoveryHeaders(spec);
-  if (!hasAuthentication(headers) && baseUrl.protocol !== "http:") {
+  const authenticated = hasAuthentication(headers, spec.api);
+  if (!authenticated && baseUrl.protocol !== "http:") {
     throw new ProviderModelDiscoveryError("unsafe_endpoint");
   }
-  if (!hasAuthentication(headers) && !isLoopback(baseUrl.hostname)) {
+  if (!authenticated && !isLoopback(baseUrl.hostname)) {
     throw new ProviderModelDiscoveryError("unsafe_endpoint");
   }
   let response: Response, sourceUrl: string;
   try {
-    const endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString())) : new URL(spec.modelsEndpoint);
+    const endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString(), spec.api)) : new URL(spec.modelsEndpoint);
     if (endpoint.origin !== baseUrl.origin || endpoint.username !== "" || endpoint.password !== "" || endpoint.hash !== "" || endpoint.search !== "") throw new Error("Model catalog authority differs.");
     sourceUrl = endpoint.toString();
     response = await fetchImpl(endpoint.toString(), {
@@ -260,6 +262,8 @@ function discoveryHeaders(spec: ProviderModelDiscoverySpec): Record<string, stri
       result["x-api-key"] = spec.apiKey;
       result["authorization"] = `Bearer ${spec.apiKey}`;
     }
+  } else if (spec.api === "google-generative-ai") {
+    if (spec.apiKey !== undefined) result["x-goog-api-key"] = spec.apiKey;
   } else if (spec.apiKey !== undefined) {
     result["authorization"] = `Bearer ${spec.apiKey}`;
   }
@@ -281,8 +285,9 @@ function safeDiscoveryBaseUrl(raw: string): URL | undefined {
   return url.protocol === "http:" && isLoopback(url.hostname) ? url : undefined;
 }
 
-function hasAuthentication(headers: Readonly<Record<string, string>>): boolean {
-  return Object.keys(headers).some((name) => name === "authorization" || name === "x-api-key");
+function hasAuthentication(headers: Readonly<Record<string, string>>, api: string | undefined): boolean {
+  return Object.keys(headers).some((name) => name === "authorization" || name === "x-api-key"
+    || api === "google-generative-ai" && name === "x-goog-api-key");
 }
 
 function isLoopback(hostname: string): boolean {
