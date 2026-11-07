@@ -3,9 +3,12 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
   ErrorInfoSchema,
+  DiffLineKind,
+  FileChangeKind,
   FileKind,
   GetSnapshotResponseSchema,
   GitFileStatus,
+  GitDiffSource,
   ListWorkspaceChangeSetsResponseSchema,
   ListWorkspaceEntriesResponseSchema,
   ListWorkspaceFilesResponseSchema,
@@ -385,7 +388,14 @@ describe("formal Workspace Files gateway", () => {
               sessionId: "session-1",
               runId: "run-old",
               turnId: "turn-old",
-              completeBaseline: true
+              completeBaseline: true,
+              changes: [{ relativePath: "report.txt", kind: FileChangeKind.UPDATED, diff: {
+                relativePath: "report.txt", source: GitDiffSource.TURN_SET, status: GitFileStatus.MODIFIED,
+                hunks: [{ oldStart: 1, oldCount: 1, newStart: 1, newCount: 1, lines: [
+                  { kind: DiffLineKind.REMOVED, oldLine: 1, text: "one" },
+                  { kind: DiffLineKind.ADDED, newLine: 1, text: "two" }
+                ] }]
+              } }]
             }],
             page: { totalSize: 2n }
           });
@@ -394,7 +404,9 @@ describe("formal Workspace Files gateway", () => {
 
     await expect(gateway.listWorkspaceChangeSets("workspace-1", "session-1")).resolves.toMatchObject([
       { id: "change-new", runId: "run-new" },
-      { id: "change-old", runId: "run-old" }
+      { id: "change-old", runId: "run-old", changes: [{ path: "report.txt", kind: "updated", diff: {
+        source: "turnSet", evidenceId: "change-old:0", text: "@@ -1,1 +1,1 @@\n-one\n+two"
+      } }] }
     ]);
     expect(tokens).toEqual(["", "change-page-2"]);
     gateway.disconnect();
