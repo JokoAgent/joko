@@ -1614,17 +1614,20 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
     return () => { current = false; };
   }, [filePreviewOwner, selectedPath, workspace?.id, workspace?.revision]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setSearchMatches([]);
     setSearchError(undefined);
     setSearchTotalMatches(0);
     setSearchTotalFiles(0);
     setSearchTruncated(false);
-    if (workspace === undefined || query.trim().length < 2) return;
+    if (workspace === undefined || query.trim().length < 2) {
+      setSearching(false);
+      return;
+    }
     let current = true;
     const abort = new AbortController();
+    setSearching(true);
     const timer = window.setTimeout(() => {
-      setSearching(true);
       void collectCompleteWorkspaceSearch((pageToken) => controllerRef.current.searchWorkspacePage(workspace.id, {
         query: query.trim(),
         caseSensitive: false,
@@ -1644,7 +1647,7 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
       });
     }, 250);
     return () => { current = false; abort.abort(); window.clearTimeout(timer); };
-  }, [query, searchRetry, workspace?.id]);
+  }, [filePreviewOwner, query, searchRetry, workspace?.id]);
 
   if (workspace === undefined) return <PanelEmpty text={t("workspace.noWorkspace")} />;
   return (
@@ -1868,7 +1871,7 @@ export function FileTreeNode({ controller, workspaceId, entry, selectedPath, onS
   return <div role="treeitem" tabIndex={-1} data-inspector-tree-key={entry.path} aria-label={entry.name} aria-level={level} aria-selected={selectedPath === entry.path}><button className={cx("file-tree__row", selectedPath === entry.path && "is-active")} type="button" tabIndex={-1} data-inspector-tree-primary="" onClick={() => onSelect(entry.path)}><span className="tree-spacer" /><File aria-hidden="true" /><span>{entry.name}</span>{entry.status !== undefined && <i className={`file-status file-status--${entry.status}`} aria-label={entry.status} />}</button></div>;
 }
 
-export function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, canDiffImagePreview, canStageDiff, canUnstageDiff, canRevertDiff, canCommitDiff, canPushDiff, canRewind, gitWriteDisabledReason, t, runAction }: {
+interface ChangesPanelProps {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly workspace?: WorkspaceView;
@@ -1884,7 +1887,26 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
   readonly gitWriteDisabledReason?: string;
   readonly t: Translator;
   readonly runAction: RunAction;
-}): JSX.Element {
+}
+
+export function ChangesPanel(props: ChangesPanelProps): JSX.Element {
+  const { workspace } = props;
+  const sourceKey = JSON.stringify([workspace?.id, workspace?.targetId, workspace?.serverPath, workspace?.remoteWorkspace, workspace?.trusted]);
+  const source = useMemo(() => ({ key: sourceKey }), [sourceKey]);
+  const currentSource = useRef(source);
+  useLayoutEffect(() => { currentSource.current = source; }, [source]);
+  return <WorkspaceChangesPanel key={source.key} {...props} isCurrentSource={() => currentSource.current === source} />;
+}
+
+interface ReviewImagePreviewState {
+  readonly key: string;
+  readonly requestId: number;
+  readonly loading: boolean;
+  readonly value?: WorkspaceDiffImageView;
+  readonly error?: string;
+}
+
+function WorkspaceChangesPanel({ controller, session, workspace, focusRequest, canDiff, canDiffImagePreview, canStageDiff, canUnstageDiff, canRevertDiff, canCommitDiff, canPushDiff, canRewind, gitWriteDisabledReason, t, runAction, isCurrentSource }: ChangesPanelProps & { readonly isCurrentSource: () => boolean }): JSX.Element {
   const [diff, setDiff] = useState<WorkspaceDiffView>();
   const [changeSets, setChangeSets] = useState<readonly WorkspaceChangeSetView[]>([]);
   const [preview, setPreview] = useState<WorkspaceRewindPreviewView>();
@@ -1910,7 +1932,8 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
   const [diffExpansionOverrides, setDiffExpansionOverrides] = useState<ReadonlyMap<string, boolean>>(() => new Map());
   const [pendingHunkKey, setPendingHunkKey] = useState<string>();
   const [revertConfirmation, setRevertConfirmation] = useState<{ readonly file: WorkspaceFileDiffView; readonly target: "file" | "hunk"; readonly hunkIndex?: number }>();
-  const [imagePreview, setImagePreview] = useState<{ readonly key: string; readonly loading: boolean; readonly value?: WorkspaceDiffImageView; readonly error?: string }>();
+  const [imagePreview, setImagePreview] = useState<ReviewImagePreviewState>();
+  const imagePreviewSequence = useRef(0);
   const [commitMessage, setCommitMessage] = useState("");
   const [includeUnstaged, setIncludeUnstaged] = useState(false);
   const [remote, setRemote] = useState<string>();
@@ -1983,16 +2006,10 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
     return () => { current = false; };
   }, [canDiff, changeSets, changeSetsLoaded, commitRef, branchRef, hideWhitespace, sourceDescriptor, sourceKind, turnSetId, workspace?.id]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setMarkdownPreview(undefined);
     setImagePreview(undefined);
-  }, [diff?.repositoryRevision, sourceKind]);
-
-  useEffect(() => {
-    const blobIds = [imagePreview?.value?.oldImage.blobId, imagePreview?.value?.newImage.blobId]
-      .filter((value): value is string => value !== undefined);
-    return () => { for (const blobId of blobIds) controllerRef.current.releaseArtifactUrl(blobId); };
-  }, [imagePreview?.value?.newImage.blobId, imagePreview?.value?.oldImage.blobId]);
+  }, [diff?.repositoryRevision, hideWhitespace, sourceDescriptor]);
 
   useEffect(() => {
     setChangeSets([]);
@@ -2056,6 +2073,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
   };
   const canExecute = preview !== undefined && (preview.safety !== "blocked" || (preview.dialogueOnlyAvailable && dialogueOnly));
   const reloadCurrentDiff = async (): Promise<void> => {
+    if (!isCurrentSource()) return;
     const next = await loadReviewSourceDiff(controller, workspace.id, sourceDescriptor, changeSets, hideWhitespace);
     setDiff(next);
     setSelectedFileKey((selected) => next.files.some((file) => reviewFileKey(file) === selected) ? selected : reviewFileKey(next.files[0] ?? { source: "unspecified", path: "" }));
@@ -2099,19 +2117,23 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
     if (diff === undefined) return;
     const key = `${diff.repositoryRevision}:${reviewFileKey(file)}`;
     if (markdownPreview?.key === key && (markdownPreview.loading || markdownPreview.text !== undefined)) return;
-    setMarkdownPreview({ key, loading: true });
-    void controller.readWorkspaceDiffFile(workspace.id, file, diff).then((result) => {
-      setMarkdownPreview({ key, loading: false, text: result.text ?? "", truncated: result.truncated });
-    }).catch((cause: unknown) => setMarkdownPreview({ key, loading: false, error: messageOf(cause) }));
+    const pending = { key, loading: true };
+    setMarkdownPreview(pending);
+    void controller.readWorkspaceDiffFile(workspace.id, file, diff).then(
+      (result) => setMarkdownPreview((current) => current === pending ? { key, loading: false, text: result.text ?? "", truncated: result.truncated } : current),
+      (cause: unknown) => setMarkdownPreview((current) => current === pending ? { key, loading: false, error: messageOf(cause) } : current)
+    );
   };
   const loadImagePreview = (file: WorkspaceFileDiffView): void => {
     if (diff === undefined || !canDiffImagePreview || !sourceCapabilities.canRichPreview) return;
     const key = `${diff.repositoryRevision}:${reviewFileKey(file)}`;
-    if (imagePreview?.key === key && (imagePreview.loading || imagePreview.value !== undefined)) return;
-    setImagePreview({ key, loading: true });
-    void controller.readWorkspaceDiffImage(workspace.id, file, diff).then((value) => {
-      setImagePreview({ key, loading: false, value });
-    }).catch((cause: unknown) => setImagePreview({ key, loading: false, error: messageOf(cause) }));
+    if (imagePreview?.key === key && imagePreview.loading) return;
+    const pending = { key, requestId: ++imagePreviewSequence.current, loading: true };
+    setImagePreview(pending);
+    void controller.readWorkspaceDiffImage(workspace.id, file, diff).then(
+      (value) => setImagePreview((current) => current === pending ? { ...pending, loading: false, value } : current),
+      (cause: unknown) => setImagePreview((current) => current === pending ? { ...pending, loading: false, error: messageOf(cause) } : current)
+    );
   };
   const currentMutationFence = (): Promise<WorkspaceDiffView> => controller.getWorkspaceDiff(workspace.id, { source: "unstaged" });
   const displayedRemote = remote ?? diff?.pushTarget?.remote ?? "";
@@ -2122,6 +2144,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
     fence: Pick<WorkspaceDiffView, "headRevision" | "repositoryRevision">,
     expectedRemoteOid?: string
   ): Promise<void> => {
+    if (!isCurrentSource()) return;
     const selectedRemote = destination.remote.trim();
     const selectedRemoteRef = destination.remoteRef.trim();
     if (selectedRemote === "" || selectedRemoteRef === "") throw new Error(t("workspace.reviewPushTargetRequired"));
@@ -2170,6 +2193,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
       let committed = false;
       try {
         const fence = await currentMutationFence();
+        if (!isCurrentSource()) return;
         const committedFence = await controller.commitWorkspaceDiff(workspace.id, {
           message,
           includeUnstaged,
@@ -2251,7 +2275,7 @@ export function ChangesPanel({ controller, session, workspace, focusRequest, can
             canImagePreview={canDiffImagePreview && sourceCapabilities.canRichPreview}
             imagePreview={imagePreview}
             onLoadImage={loadImagePreview}
-            getArtifactUrl={controller.getArtifactUrl}
+            acquireArtifactUrl={controller.acquireArtifactUrl}
           />)}
           {(canCommitDiff || canPushDiff) && sourceCapabilities.canCommit && <section className="review-write-panel" aria-label={t("workspace.reviewWriteActions")}>
             <header><GitCommitHorizontal aria-hidden="true" /><strong>{t("workspace.reviewCommitAndPush")}</strong></header>
@@ -2352,16 +2376,16 @@ export function WorkspaceDiffPreview({ diff, fallback, ...props }: {
   readonly markdownPreview?: { readonly key: string; readonly text?: string; readonly error?: string; readonly truncated?: boolean; readonly loading: boolean };
   readonly onLoadMarkdown?: (file: WorkspaceFileDiffView) => void;
   readonly canImagePreview?: boolean;
-  readonly imagePreview?: { readonly key: string; readonly loading: boolean; readonly value?: WorkspaceDiffImageView; readonly error?: string };
+  readonly imagePreview?: ReviewImagePreviewState;
   readonly onLoadImage?: (file: WorkspaceFileDiffView) => void;
-  readonly getArtifactUrl?: (blobId: string) => Promise<string>;
+  readonly acquireArtifactUrl?: AppController["acquireArtifactUrl"];
 }): JSX.Element {
   if (diff === undefined) return <ul className="change-list">{fallback.map((entry) => <li key={entry.path}><FileDiff aria-hidden="true" /><div><strong>{entry.name}</strong><span>{entry.path}</span></div><Pill tone={entry.status === "conflicted" ? "danger" : "warning"}>{entry.status}</Pill></li>)}</ul>;
   if (diff.files.length === 0) return <div className="clean-state"><CheckCircle2 aria-hidden="true" /><span>{props.t("workspace.noDiff")}</span></div>;
   return <StructuredWorkspaceDiffPreview diff={diff} {...props} />;
 }
 
-function StructuredWorkspaceDiffPreview({ diff, t, viewMode = "unified", wordWrap = false, wordDiff = true, fileTreeVisible = false, selectedFileKey, onSelectFile, expandedFileKeys, onFileExpandedChange, canStage = false, canUnstage = false, canRevert = false, pendingHunkKey, onDiffAction, markdownPreview, onLoadMarkdown, canImagePreview = false, imagePreview, onLoadImage, getArtifactUrl }: {
+function StructuredWorkspaceDiffPreview({ diff, t, viewMode = "unified", wordWrap = false, wordDiff = true, fileTreeVisible = false, selectedFileKey, onSelectFile, expandedFileKeys, onFileExpandedChange, canStage = false, canUnstage = false, canRevert = false, pendingHunkKey, onDiffAction, markdownPreview, onLoadMarkdown, canImagePreview = false, imagePreview, onLoadImage, acquireArtifactUrl }: {
   readonly diff: WorkspaceDiffView;
   readonly t: Translator;
   readonly viewMode?: "unified" | "split";
@@ -2380,9 +2404,9 @@ function StructuredWorkspaceDiffPreview({ diff, t, viewMode = "unified", wordWra
   readonly markdownPreview?: { readonly key: string; readonly text?: string; readonly error?: string; readonly truncated?: boolean; readonly loading: boolean };
   readonly onLoadMarkdown?: (file: WorkspaceFileDiffView) => void;
   readonly canImagePreview?: boolean;
-  readonly imagePreview?: { readonly key: string; readonly loading: boolean; readonly value?: WorkspaceDiffImageView; readonly error?: string };
+  readonly imagePreview?: ReviewImagePreviewState;
   readonly onLoadImage?: (file: WorkspaceFileDiffView) => void;
-  readonly getArtifactUrl?: (blobId: string) => Promise<string>;
+  readonly acquireArtifactUrl?: AppController["acquireArtifactUrl"];
 }): JSX.Element {
   const layoutRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -2458,6 +2482,7 @@ function StructuredWorkspaceDiffPreview({ diff, t, viewMode = "unified", wordWra
 
   const renderFile = (file: WorkspaceFileDiffView): JSX.Element => {
     const key = reviewFileKey(file);
+    const previewKey = `${diff.repositoryRevision}:${key}`;
     return <WorkspaceReviewFile
       file={file}
       t={t}
@@ -2471,12 +2496,12 @@ function StructuredWorkspaceDiffPreview({ diff, t, viewMode = "unified", wordWra
       canRevert={canRevert}
       pendingHunkKey={pendingHunkKey}
       onDiffAction={onDiffAction}
-      markdownPreview={markdownPreview}
+      markdownPreview={markdownPreview?.key === previewKey ? markdownPreview : undefined}
       onLoadMarkdown={onLoadMarkdown}
       canImagePreview={canImagePreview}
-      imagePreview={imagePreview}
+      imagePreview={imagePreview?.key === previewKey ? imagePreview : undefined}
       onLoadImage={onLoadImage}
-      getArtifactUrl={getArtifactUrl}
+      acquireArtifactUrl={acquireArtifactUrl}
     />;
   };
 
@@ -2653,7 +2678,7 @@ function ReviewFileJump({ files, selectedKey, onSelect, t }: {
   </div>;
 }
 
-function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, onExpandedChange, canStage, canUnstage, canRevert, pendingHunkKey, onDiffAction, markdownPreview, onLoadMarkdown, canImagePreview, imagePreview, onLoadImage, getArtifactUrl }: {
+function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, onExpandedChange, canStage, canUnstage, canRevert, pendingHunkKey, onDiffAction, markdownPreview: activeMarkdown, onLoadMarkdown, canImagePreview, imagePreview: activeImage, onLoadImage, acquireArtifactUrl }: {
   readonly file: WorkspaceFileDiffView;
   readonly t: Translator;
   readonly viewMode: "unified" | "split";
@@ -2669,15 +2694,12 @@ function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, 
   readonly markdownPreview?: { readonly key: string; readonly text?: string; readonly error?: string; readonly truncated?: boolean; readonly loading: boolean };
   readonly onLoadMarkdown?: (file: WorkspaceFileDiffView) => void;
   readonly canImagePreview: boolean;
-  readonly imagePreview?: { readonly key: string; readonly loading: boolean; readonly value?: WorkspaceDiffImageView; readonly error?: string };
+  readonly imagePreview?: ReviewImagePreviewState;
   readonly onLoadImage?: (file: WorkspaceFileDiffView) => void;
-  readonly getArtifactUrl?: (blobId: string) => Promise<string>;
+  readonly acquireArtifactUrl?: AppController["acquireArtifactUrl"];
 }): JSX.Element {
   const additions = file.hunks.reduce((total, hunk) => total + hunk.lines.filter((line) => line.kind === "added").length, 0);
   const deletions = file.hunks.reduce((total, hunk) => total + hunk.lines.filter((line) => line.kind === "removed").length, 0);
-  const markdownKeySuffix = `:${reviewFileKey(file)}`;
-  const activeMarkdown = markdownPreview?.key.endsWith(markdownKeySuffix) === true ? markdownPreview : undefined;
-  const activeImage = imagePreview?.key.endsWith(markdownKeySuffix) === true ? imagePreview : undefined;
   const sourceLabel = file.source === "staged"
     ? t("workspace.diffStaged")
     : file.source === "unstaged"
@@ -2704,7 +2726,7 @@ function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, 
     {activeMarkdown?.text !== undefined && <section className="review-markdown-preview" aria-label={t("workspace.reviewMarkdownPreview")}><StreamingMarkdown text={activeMarkdown.text} streaming={false} t={t} />{activeMarkdown.truncated === true && <Pill tone="warning">{t("workspace.previewTruncated")}</Pill>}</section>}
     {activeImage?.loading === true && <Spinner label={t("workspace.loadingPreview")} />}
     {activeImage?.error !== undefined && <p className="inline-error" role="alert">{activeImage.error}</p>}
-    {activeImage?.value !== undefined && getArtifactUrl !== undefined && <ReviewImageDiffPreview value={activeImage.value} getArtifactUrl={getArtifactUrl} t={t} />}
+    {activeImage?.value !== undefined && acquireArtifactUrl !== undefined && <ReviewImageDiffPreview key={activeImage.requestId} value={activeImage.value} acquireArtifactUrl={acquireArtifactUrl} t={t} />}
     {expanded && (file.binary ? activeImage?.value === undefined && <p className="muted review-binary-notice">{t("workspace.binary")}</p> : file.hunks.length === 0 ? <p className="muted review-binary-notice">{t("timeline.noTextDiff")}</p> : <ReviewFileHunks file={file} t={t} viewMode={viewMode} wordWrap={wordWrap} wordDiff={wordDiff} stageable={stageable} unstageable={unstageable} revertable={revertable} pending={pendingHunkKey !== undefined} onDiffAction={onDiffAction} />)}
   </details>;
 }
@@ -2819,21 +2841,21 @@ function ReviewHunkHeader({ file, hunk, hunkIndex, t, stageable, unstageable, re
   </div></header>;
 }
 
-function ReviewImageDiffPreview({ value, getArtifactUrl, t }: {
+function ReviewImageDiffPreview({ value, acquireArtifactUrl, t }: {
   readonly value: WorkspaceDiffImageView;
-  readonly getArtifactUrl: (blobId: string) => Promise<string>;
+  readonly acquireArtifactUrl: AppController["acquireArtifactUrl"];
   readonly t: Translator;
 }): JSX.Element {
   return <section className="review-image-preview" aria-label={t("workspace.reviewImagePreview")}>
-    <ReviewImageSide label={t("workspace.reviewImageBefore")} side={value.oldImage} getArtifactUrl={getArtifactUrl} t={t} />
-    <ReviewImageSide label={t("workspace.reviewImageAfter")} side={value.newImage} getArtifactUrl={getArtifactUrl} t={t} />
+    <ReviewImageSide label={t("workspace.reviewImageBefore")} side={value.oldImage} acquireArtifactUrl={acquireArtifactUrl} t={t} />
+    <ReviewImageSide label={t("workspace.reviewImageAfter")} side={value.newImage} acquireArtifactUrl={acquireArtifactUrl} t={t} />
   </section>;
 }
 
-function ReviewImageSide({ label, side, getArtifactUrl, t }: {
+function ReviewImageSide({ label, side, acquireArtifactUrl, t }: {
   readonly label: string;
   readonly side: WorkspaceDiffImageView["oldImage"];
-  readonly getArtifactUrl: (blobId: string) => Promise<string>;
+  readonly acquireArtifactUrl: AppController["acquireArtifactUrl"];
   readonly t: Translator;
 }): JSX.Element {
   return <figure><figcaption>{label}</figcaption>{side.tooLarge
@@ -2842,7 +2864,7 @@ function ReviewImageSide({ label, side, getArtifactUrl, t }: {
       ? <p className="muted">{t("workspace.reviewImageMissing")}</p>
       : side.blobId === undefined
         ? <p className="muted">{t("workspace.reviewImageUnavailable")}</p>
-        : <AuthenticatedImage blobId={side.blobId} getUrl={getArtifactUrl} alt={side.alt || label} unavailableLabel={t("workspace.reviewImageUnavailable")} loadingLabel={t("workspace.loadingPreview")} />}</figure>;
+        : <AuthenticatedImage blobId={side.blobId} getUrl={acquireArtifactUrl} alt={side.alt || label} unavailableLabel={t("workspace.reviewImageUnavailable")} loadingLabel={t("workspace.loadingPreview")} />}</figure>;
 }
 
 function ReviewUnifiedHunk({ hunk, wordWrap, wordDiff }: { readonly hunk: WorkspaceDiffHunkView; readonly wordWrap: boolean; readonly wordDiff: boolean }): JSX.Element {

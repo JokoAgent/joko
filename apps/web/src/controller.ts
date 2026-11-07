@@ -3342,6 +3342,8 @@ export function useAppController(): AppController {
     if (artifactGateway === undefined) throw new Error("Connect to Joko before loading an artifact.");
     return artifactGateway.getArtifactUrl(blobId);
   }, [artifactGateway]);
+  const acquireArtifactUrl = useCallback<AppController["acquireArtifactUrl"]>((blobId) => artifactGateway?.acquireArtifactUrl(blobId)
+    ?? { url: Promise.reject(new Error("Connect to Joko before loading an artifact.")), release: () => undefined }, [artifactGateway]);
   const releaseArtifactUrl = useCallback((blobId: string): void => artifactGateway?.releaseArtifactUrl(blobId), [artifactGateway]);
   const downloadArtifact = useCallback<AppController["downloadArtifact"]>(async (blobId, fileName, context) => {
     context.signal.throwIfAborted();
@@ -4418,13 +4420,14 @@ export function useAppController(): AppController {
     updateResource: async (resourceId) => catalogGateway().updateResource(resourceId),
     captureBrowserScreenshot: (browserId, pageId, fullPage) => gateway().captureBrowserScreenshot(browserId, pageId, fullPage),
     getArtifactUrl,
+    acquireArtifactUrl,
     releaseArtifactUrl,
     downloadArtifact,
     copyArtifactFile,
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

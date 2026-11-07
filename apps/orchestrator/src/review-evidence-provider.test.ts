@@ -7,14 +7,17 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { EventPayload, PiEventMetadata, PromptInput } from "@joko/core";
 import { OperationalStore, type PersistedEvent, type QueueItemRecord } from "@joko/store";
 import { extractPdfText, PdfTextExtractionError, PDF_TEXT_MAX_BYTES, PDF_TEXT_TIMEOUT_MS, type PdfTextWorkerResult } from "@joko/tool-document";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import type { ArtifactStore } from "./artifact-store.js";
 import { ArtifactStore as RealArtifactStore } from "./artifact-store.js";
+import { fromProtoBlobRef, toProtoBlobRef } from "./proto-mapper.js";
 import { buildReviewEvidence } from "./review-evidence.js";
 import { DurableReviewEvidenceProvider, ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
+import { buildReviewPrompt } from "./review-prompt.js";
 import type { WorkspaceChangeSetService } from "./workspace-change-set.js";
 import { WorkspaceService } from "./workspace-service.js";
 
@@ -22,10 +25,12 @@ const cleanups: Array<() => void> = [];
 afterEach(() => cleanups.splice(0).reverse().forEach((cleanup) => cleanup()));
 
 describe("DurableReviewEvidenceProvider", () => {
-  it("captures the text diff and file fingerprint for a real Git C-quoted path", async () => {
+  it.each([
+    ["报告.txt", /^diff --git "a\/\\[0-7]{3}.*\n[\s\S]*\n-old\n\+new\n$/u],
+    ["report#1.txt", /^diff --git a\/report#1\.txt b\/report#1\.txt\n[\s\S]*\n-old\n\+new\n$/u]
+  ] as const)("captures the file fingerprint and Review prompt for the real Git path %s", async (file, patchPattern) => {
     const fixture = setup();
     const workspaces = new WorkspaceService();
-    const file = "报告.txt";
     try {
       const git = initWorkspaceRepository(fixture.root);
       git("config", "core.quotePath", "true");
@@ -38,11 +43,89 @@ describe("DurableReviewEvidenceProvider", () => {
       const capture = await providerFor(fixture.store, workspaces, []).capture(request());
       expect(capture.workspaceEvidence?.diffs).toEqual([{
         relativePath: file, source: "unstaged", status: "modified", additions: 1, deletions: 1,
-        patch: expect.stringMatching(/^diff --git "a\/\\[0-7]{3}.*\n[\s\S]*\n-old\n\+new\n$/u)
+        patch: expect.stringMatching(patchPattern)
       }]);
       expect(capture.workspace.files).toEqual([{
         relativePath: file, byteLength: 4, sha256: createHash("sha256").update("new\n").digest("hex")
       }]);
+      expect(buildReviewPrompt(buildReviewEvidence(capture).promptInput).prompt).toContain(`### ${file} (unstaged`);
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
+  it.skipIf(process.platform !== "linux")("keeps distinct case-sensitive Git files in the evidence and prompt", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    try {
+      const git = initWorkspaceRepository(fixture.root);
+      writeWorkspaceFile(fixture.root, "A.txt", "old upper\n");
+      writeWorkspaceFile(fixture.root, "a.txt", "old lower\n");
+      git("add", "--", "A.txt", "a.txt");
+      git("commit", "--quiet", "-m", "base");
+      writeWorkspaceFile(fixture.root, "A.txt", "new upper\n");
+      writeWorkspaceFile(fixture.root, "a.txt", "new lower\n");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const provider = providerFor(fixture.store, workspaces, []);
+      const capture = await provider.capture(request());
+      expect(new Set(capture.workspace.files.map(file => file.relativePath))).toEqual(new Set(["A.txt", "a.txt"]));
+      const evidence = buildReviewEvidence(capture);
+      const prompt = buildReviewPrompt(evidence.promptInput).prompt;
+      expect(prompt).toContain("### A.txt (unstaged");
+      expect(prompt).toContain("+new upper\n");
+      expect(prompt).toContain("### a.txt (unstaged");
+      expect(prompt).toContain("+new lower\n");
+      writeWorkspaceFile(fixture.root, "a.txt", "newer lower\n");
+      const refreshed = buildReviewEvidence(await provider.capture(request(), "reobserve"));
+      expect(refreshed.freshness.filesSha256).not.toBe(evidence.freshness.filesSha256);
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
+  it("captures a clean staged submodule update by Git identity", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    const childSource = path.join(fixture.directory, "submodule-source");
+    try {
+      mkdirSync(childSource);
+      const childGit = initWorkspaceRepository(childSource);
+      writeWorkspaceFile(childSource, "version.txt", "one\n");
+      childGit("add", "--", "version.txt");
+      childGit("commit", "--quiet", "-m", "first child commit");
+      const headOid = childGit("rev-parse", "HEAD").trim();
+
+      const git = initWorkspaceRepository(fixture.root);
+      git("config", "diff.submodule", "short");
+      git("-c", "protocol.file.allow=always", "submodule", "add", "--quiet", "--", childSource, "lib");
+      git("commit", "--quiet", "-m", "add submodule");
+      writeWorkspaceFile(childSource, "version.txt", "two\n");
+      childGit("commit", "--quiet", "-am", "second child commit");
+      const indexOid = childGit("rev-parse", "HEAD").trim();
+      git("-c", "protocol.file.allow=always", "-C", "lib", "fetch", "--quiet", "--no-tags", "origin", "HEAD");
+      git("-C", "lib", "checkout", "--quiet", "--detach", indexOid);
+      git("add", "--", "lib");
+      expect(git("status", "--porcelain=v1", "-z")).toBe("M  lib\0");
+      expect(git("-C", "lib", "status", "--porcelain=v1", "-z")).toBe("");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const provider = providerFor(fixture.store, workspaces, []);
+      const capture = await provider.capture(request());
+      expect(capture.workspaceEvidence?.diffs).toMatchObject([
+        { relativePath: "lib", source: "staged", status: "modified", patch: expect.stringContaining(`-Subproject commit ${headOid}\n+Subproject commit ${indexOid}`) }
+      ]);
+      expect(capture.workspace.files).toEqual([{
+        relativePath: "lib", byteLength: 0,
+        sha256: createHash("sha256").update(JSON.stringify(["gitlink", "lib", headOid, indexOid, indexOid])).digest("hex")
+      }]);
+      expect(buildReviewEvidence(await provider.capture(request(), "reobserve")).freshness).toEqual(buildReviewEvidence(capture).freshness);
+
+      // Parent configuration can hide a dirty checkout from the parent status.
+      git("config", "submodule.lib.ignore", "dirty");
+      writeWorkspaceFile(fixture.root, "lib/version.txt", "dirty\n");
+      expect(git("status", "--porcelain=v1", "-z")).toBe("M  lib\0");
+      await expect(provider.capture(request())).rejects.toMatchObject({ code: "artifact-unavailable" });
     } finally {
       await workspaces.close();
     }
@@ -227,6 +310,51 @@ describe("DurableReviewEvidenceProvider", () => {
     expect(second.freshness.workspaceSha256).not.toBe(first.freshness.workspaceSha256);
   });
 
+  it("captures both a real branch commit and independent uncommitted edits", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    try {
+      const git = initWorkspaceRepository(fixture.root);
+      git("symbolic-ref", "HEAD", "refs/heads/main");
+      writeWorkspaceFile(fixture.root, "committed.txt", "base committed\n");
+      writeWorkspaceFile(fixture.root, "draft.txt", "base draft\n");
+      git("add", "--", "committed.txt", "draft.txt");
+      git("commit", "--quiet", "-m", "base");
+      const base = git("rev-parse", "HEAD").trim();
+      git("checkout", "--quiet", "-b", "feature");
+      writeWorkspaceFile(fixture.root, "committed.txt", "committed deliverable\n");
+      git("commit", "--quiet", "-am", "deliverable");
+      writeWorkspaceFile(fixture.root, "draft.txt", "uncommitted deliverable\n");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const provider = providerFor(fixture.store, workspaces, []);
+      const review = { sourceSessionId: "source", attachments: [] };
+      const capture = await provider.capture(review);
+      expect(capture.branchEvidence).toMatchObject({ baseRefLabel: "main", fileCount: 1,
+        diffs: [{ relativePath: "committed.txt", source: "branch" }] });
+      expect(capture.workspaceEvidence?.diffs).toMatchObject([{ relativePath: "draft.txt", source: "unstaged" }]);
+      expect(capture.workspace.git).toMatchObject({ baseOid: base, mergeBaseOid: base });
+      expect(capture.workspace.files.map(file => file.relativePath)).toEqual(["committed.txt", "draft.txt"]);
+      const initial = buildReviewEvidence(capture);
+      const built = buildReviewPrompt(initial.promptInput);
+      expect(built.targetKind).toBe("changes");
+      expect(built.prompt).toContain("+committed deliverable\n");
+      expect(built.prompt).toContain("+uncommitted deliverable\n");
+      expect(built.prompt).not.toContain("no uncommitted changes");
+
+      git("branch", "-D", "main");
+      const withoutBase = await provider.capture(review);
+      expect(withoutBase.branchEvidence).toBeUndefined();
+      const partial = buildReviewEvidence(withoutBase);
+      expect(partial.freshness.workspaceSha256).not.toBe(initial.freshness.workspaceSha256);
+      const partialPrompt = buildReviewPrompt(partial.promptInput).prompt;
+      expect(partialPrompt).toContain("+uncommitted deliverable\n");
+      expect(partialPrompt).toContain("branch comparison is unavailable");
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
   it("fails closed instead of routing an unmatched target to the first workspace", async () => {
     const fixture = setup("unmatched-target");
     const workspaces = workspaceStub(fixture.root, cleanGit(), cleanDiff());
@@ -261,6 +389,104 @@ describe("DurableReviewEvidenceProvider", () => {
     tampered[0] = tampered[0] === 0xff ? 0xfe : tampered[0]! + 1;
     writeFileSync(stored.storagePath, tampered);
     await expect(provider.capture(reviewRequest)).rejects.toMatchObject({ code: "artifact-unavailable" });
+  });
+
+  it("includes a BOM-marked UTF-16LE text attachment in the Review prompt using its original Blob identity", async () => {
+    const fixture = setup();
+    const artifacts = new RealArtifactStore({ rootDirectory: path.join(fixture.directory, "artifacts"),
+      repository: new OperationalArtifactRepository(fixture.store), ingestRoots: [fixture.directory] });
+    await artifacts.initialize();
+    const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
+    const bytes = Buffer.from([0xff, 0xfe, 0x41, 0, 0x42, 0, 0x0a, 0]);
+    const stored = await artifacts.ingestBytes(bytes, { fileName: "evidence.txt", mimeType: "text/plain" });
+    const blob = fromProtoBlobRef(toProtoBlobRef(stored));
+    const captured = await provider.capture(request({ kind: "file", displayName: "evidence.txt", blob }));
+    expect(captured.artifacts[0]).toMatchObject({ blob: { id: blob.id, byteLength: 8, sha256: createHash("sha256").update(bytes).digest("hex") },
+      excerpt: { format: "text/plain", coverage: "full file", content: "AB\n" } });
+    const evidence = buildReviewEvidence(captured);
+    expect(buildReviewPrompt(evidence.promptInput).prompt).toContain("<untrusted-artifact-content>\nAB\n");
+    expect(evidence.promptInput.artifactWarnings).toBeUndefined();
+
+    const malformed = fromProtoBlobRef(toProtoBlobRef(await artifacts.ingestBytes(bytes.subarray(0, -1), {
+      fileName: "malformed.txt", mimeType: "text/plain"
+    })));
+    const unavailable = await provider.capture(request({ kind: "file", displayName: "malformed.txt", blob: malformed }));
+    expect(unavailable.artifacts[0]?.excerpt).toBeUndefined();
+    expect(unavailable.artifacts[0]?.warning).toContain("no textual Review excerpt");
+  });
+
+  it("keeps the newest retained attachments when the Review history budget fills", async () => {
+    const fixture = setup();
+    const artifacts = new RealArtifactStore({ rootDirectory: path.join(fixture.directory, "artifacts"),
+      repository: new OperationalArtifactRepository(fixture.store), ingestRoots: [fixture.directory] });
+    await artifacts.initialize();
+    const blobs = [];
+    for (let index = 1; index <= 21; index += 1) {
+      const label = `A${index}.txt`;
+      const stored = await artifacts.ingestBytes(Buffer.from(`Deliverable ${index}\n`), { fileName: label, mimeType: "text/plain" });
+      const blob = fromProtoBlobRef(toProtoBlobRef(stored));
+      blobs.push(blob);
+      recordCompletedPrompt(fixture.store, index, { text: "Review this deliverable", images: [], files: [{ blob }], mentions: [], disposition: "prompt" });
+    }
+
+    const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
+    const captured = await provider.capture(request());
+    expect(captured.artifacts.map(({ blob }) => blob.id)).toEqual(blobs.slice(1).reverse().map(({ id }) => id));
+    expect(captured.artifactsOmitted).toBe(true);
+    const prompt = buildReviewPrompt(buildReviewEvidence(captured).promptInput).prompt;
+    expect(prompt).toContain("Deliverable 21\n");
+    expect(prompt).not.toContain("Deliverable 1\n");
+    expect(prompt).toContain("additional task-history attachments were omitted");
+
+    const withExplicit = await provider.capture(request({ kind: "file", displayName: "A1.txt", blob: blobs[0]! }));
+    expect(withExplicit.artifacts.map(({ blob }) => blob.id)).toEqual([
+      blobs[0]!.id, ...blobs.slice(2).reverse().map(({ id }) => id)
+    ]);
+    expect(withExplicit.artifactsOmitted).toBe(true);
+  });
+
+  it("retains a user's constraint and the final Pi reply when tool progress would exhaust the context budget", async () => {
+    const fixture = setup();
+    const artifacts = new RealArtifactStore({ rootDirectory: path.join(fixture.directory, "artifacts"),
+      repository: new OperationalArtifactRepository(fixture.store), ingestRoots: [fixture.directory] });
+    await artifacts.initialize();
+    const stored = await artifacts.ingestBytes(Buffer.from("Artifact from a tool round\n"), { fileName: "draft.txt", mimeType: "text/plain" });
+    const blob = fromProtoBlobRef(toProtoBlobRef(stored));
+    const messageEnd: PiEventMetadata = { rpcEventType: "message_end", payload: { case: "messageLifecycle", value: {
+      kind: "message_end", nativeMessageId: "", nativeEntryId: "", parentEntryId: "", role: "assistant", contentIndex: 0
+    } } };
+    const settled: PiEventMetadata = { rpcEventType: "agent_settled", payload: { case: "diagnostic", value: {
+      command: "unknown", nativeEventType: "agent_settled"
+    } } };
+    recordCompletedPrompt(fixture.store, 1, { text: "Keep the ledger append-only", images: [], files: [], mentions: [], disposition: "prompt" }, emit => {
+      for (let index = 1; index <= 13; index += 1) {
+        emit({ type: "message_complete", role: "assistant", blocks: [
+          { kind: "text", text: `Tool progress ${index}: `.padEnd(2_000, "x") },
+          { kind: "tool_call", callId: `read-${index}`, name: "read", input: "{}" },
+          ...(index === 1 ? [{ kind: "artifact" as const, blob, label: "draft.txt" }] : [])
+        ] }, messageEnd);
+      }
+      emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The ledger is ready for review" }] }, messageEnd);
+      emit({ type: "done", outcome: "completed" }, settled);
+    });
+    recordCompletedPrompt(fixture.store, 2, { text: "Also retain the older trace", images: [], files: [], mentions: [], disposition: "prompt" }, emit => {
+      emit({ type: "message_complete", role: "assistant", blocks: [
+        { kind: "text", text: "An unclassified tool round" }, { kind: "tool_call", callId: "legacy", name: "read", input: "{}" }
+      ] });
+      emit({ type: "done", outcome: "completed" });
+    });
+
+    const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
+    const capture = await provider.capture(request());
+    const built = buildReviewEvidence(capture);
+    const prompt = buildReviewPrompt(built.promptInput).prompt;
+    expect(prompt).toContain("Keep the ledger append-only");
+    expect(prompt).toContain("The ledger is ready for review");
+    expect(prompt).toContain("Artifact from a tool round");
+    expect(prompt).toContain("An unclassified tool round");
+    expect(prompt).not.toContain("Tool progress");
+    const fullHistory = { ...capture.conversation, messages: capture.conversation.messages.map(({ id, ordinal, role, text }) => ({ id, ordinal, role, text })) };
+    expect(built.freshness).toEqual(buildReviewEvidence({ ...capture, conversation: fullHistory }).freshness);
   });
 
   it("rejects per-artifact and aggregate Review byte budgets before artifact I/O", async () => {
@@ -405,6 +631,40 @@ function initWorkspaceRepository(root: string) {
   git("config", "user.name", "Review Test");
   git("config", "user.email", "review@example.test");
   return git;
+}
+
+function recordCompletedPrompt(
+  store: OperationalStore,
+  index: number,
+  prompt: PromptInput & { readonly disposition: "prompt" },
+  results?: (emit: (payload: EventPayload, pi?: PiEventMetadata) => void) => void
+): void {
+  const sessionId = "source";
+  const runId = `history-run-${index}`, attemptId = `history-attempt-${index}`;
+  const operationId = `history-send-${index}`, queueItemId = `history-queue-${index}`;
+  const at = index * 10;
+  store.createRun({ id: runId, sessionId, source: "user", state: "queued", createdAt: at });
+  store.createAttempt({ id: attemptId, runId, ordinal: 1, generation: 1, startedAt: at });
+  store.runOperation({ id: operationId, kind: "send_input", body: { sessionId, prompt } }, current => {
+    current.enqueueQueueItem({ id: queueItemId, sessionId, runId, attemptId, operationId, disposition: "prompt", body: prompt });
+    return {};
+  });
+  store.claimNextQueueItem({ sessionId, backendInstanceGeneration: 0, at });
+  store.updateRunState({ runId, state: "running", activeAttemptId: attemptId, traceId: runId, startedAt: at });
+  store.updateQueueState({ queueItemId, state: "backend_accepted", traceId: queueItemId, at });
+  const emit = (payload: EventPayload, pi?: PiEventMetadata) => {
+    store.appendEvent({ backendId: "pi", targetId: "workspace", sessionId, runId, attemptId, operationId, generation: 1,
+      emittedAt: at + 1, traceId: operationId, payload,
+      ...(pi === undefined ? {} : { pi, metadata: { namespace: "pi", fields: { rpcEventType: pi.rpcEventType } } }) });
+  };
+  emit({ type: "message_complete", role: "user", blocks: [
+    { kind: "text", text: prompt.text },
+    ...prompt.files.map(({ blob }) => ({ kind: "artifact" as const, blob, label: blob.fileName ?? "file" }))
+  ] });
+  results?.(emit);
+  store.finishAttempt(attemptId, undefined, at + 2);
+  store.updateRunState({ runId, state: "completed", traceId: runId, endedAt: at + 2 });
+  store.updateQueueState({ queueItemId, state: "completed", traceId: queueItemId, at: at + 2 });
 }
 
 function providerFor(

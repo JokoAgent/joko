@@ -528,6 +528,14 @@ export class SessionWorktreeCoordinator {
     });
   }
 
+  #reviewUsesCheckout(sessionId: string): boolean {
+    return this.#store.listReviewRuns({ sourceSessionId: sessionId, state: "running", limit: 1 }).length > 0;
+  }
+
+  #assertCheckoutNotUnderReview(sessionId: string): void {
+    if (this.#reviewUsesCheckout(sessionId)) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+  }
+
   activeWorkspacePath(sessionId: string, expectedBinding: SessionWorktreeBinding): string | undefined {
     if (!this.#initialized) return undefined;
     if (expectedBinding.remote !== undefined) return undefined;
@@ -637,7 +645,7 @@ export class SessionWorktreeCoordinator {
     const safeReferences = (): boolean => {
       const current = this.#recycleSession(record);
       if (current === undefined) return false;
-      if (this.#workerReferencesLease(lease.id)) return false;
+      if (this.#workerReferencesLease(lease.id) || this.#reviewUsesCheckout(lease.sessionId)) return false;
       const cleanup = this.#store.findPendingSessionLifecycleCleanup(lease.sessionId);
       if (cleanup !== undefined && (!cleanup.closeCompleted || !cleanup.nativeCompleted)) return false;
       if (this.#store.listRuns({ sessionId: lease.sessionId, activeOnly: true, limit: 1 }).length > 0) return false;
@@ -738,9 +746,11 @@ export class SessionWorktreeCoordinator {
       .find((candidate) => candidate.descriptor.id === sessionId);
     const persistedBinding = session?.descriptor.worktree;
     const binding = expectedBinding ?? persistedBinding ?? this.#activeBindings.get(sessionId);
+    const reviewGuard = { assertCurrent: () => this.#assertCheckoutNotUnderReview(sessionId) };
+    if (binding !== undefined && binding.remote === undefined) reviewGuard.assertCurrent();
     if (binding?.remote === undefined && binding && this.#workerReferencesLease(binding.leaseId)) {
       if (expectedBinding) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
-      const retained = await this.#service.release(sessionId, { retainForRestore: true }, async lease =>
+      const retained = await this.#service.release(sessionId, { ...reviewGuard, retainForRestore: true }, async lease =>
         lease.id === binding.leaseId && !this.#workerReferencesLease(lease.id));
       if (!retained.ok) throw new SessionWorktreeCoordinatorError(retained.error.code);
       if (retained.value.status !== "preserved"
@@ -785,7 +795,7 @@ export class SessionWorktreeCoordinator {
             refreshed: binding.sourceRefreshed,
             ...(binding.sourceRemote === undefined ? {} : { remote: binding.sourceRemote })
           }, acquiredAt: binding.acquiredAt
-        });
+        }, reviewGuard);
       } else if (expectedBinding !== undefined) {
         const retiredCleanup = options === undefined ? undefined : this.#store.findSessionLifecycleCleanup(options.retiredCleanupOperationId);
         const canReconcileReleased = retiredCleanup?.sessionId === sessionId && retiredCleanup.state === "pending"
@@ -808,7 +818,7 @@ export class SessionWorktreeCoordinator {
             ...(binding.sourceRemote === undefined ? {} : { remote: binding.sourceRemote })
           },
           acquiredAt: binding.acquiredAt
-        });
+        }, reviewGuard);
       } else if (binding.state === "active") {
         const activeLease = this.#service.snapshot().active
           .find((candidate) => candidate.sessionId === sessionId);
@@ -818,7 +828,7 @@ export class SessionWorktreeCoordinator {
           || !sameLease(activeLease, binding)) {
           throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
         }
-        result = await this.#service.release(sessionId);
+        result = await this.#service.release(sessionId, reviewGuard);
       } else {
         if (persistedBinding === undefined) {
           throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
@@ -828,7 +838,7 @@ export class SessionWorktreeCoordinator {
         if (preview.value.state !== "preserved") {
           throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
         }
-        result = await this.#service.release(sessionId);
+        result = await this.#service.release(sessionId, reviewGuard);
       }
     } else {
       result = await this.#service.release(sessionId);
@@ -861,6 +871,7 @@ export class SessionWorktreeCoordinator {
     if (session.descriptor.deletedAt === undefined || binding === undefined || binding.remote !== undefined) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
+    this.#assertCheckoutNotUnderReview(receipt.replacedSessionId);
     const result = await this.#service.releaseExact({
       sessionId: receipt.replacedSessionId,
       leaseId: binding.leaseId,
@@ -875,7 +886,7 @@ export class SessionWorktreeCoordinator {
         ...(binding.sourceRemote === undefined ? {} : { remote: binding.sourceRemote })
       },
       acquiredAt: binding.acquiredAt
-    });
+    }, { assertCurrent: () => this.#assertCheckoutNotUnderReview(receipt.replacedSessionId) });
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     if (result.value.status === "preserved") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     this.#activeBindings.delete(receipt.replacedSessionId);
@@ -894,7 +905,8 @@ export class SessionWorktreeCoordinator {
     if (this.activeWorkspacePath(sessionId, binding) === undefined) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
-    const result = await this.#service.release(sessionId, { retainForRestore: true });
+    this.#assertCheckoutNotUnderReview(sessionId);
+    const result = await this.#service.release(sessionId, { retainForRestore: true, assertCurrent: () => this.#assertCheckoutNotUnderReview(sessionId) });
     this.notifyRecycleOpportunity(sessionId);
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     if (result.value.status !== "preserved" || result.value.reason !== "restorable"

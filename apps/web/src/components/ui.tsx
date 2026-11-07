@@ -3,7 +3,7 @@ import { Children, createContext, isValidElement, useCallback, useContext, useEf
 import { createPortal } from "react-dom";
 import { AlertTriangle, ArrowLeft, Check, ChevronDown, LoaderCircle, X } from "lucide-react";
 import { translate } from "../i18n.js";
-import type { Locale } from "../model.js";
+import type { ArtifactUrlReference, Locale } from "../model.js";
 
 export function cx(...values: readonly (string | false | null | undefined)[]): string {
   return values.filter(Boolean).join(" ");
@@ -809,7 +809,7 @@ export function Spinner({ label = currentMessage("common.loading") }: { readonly
 export function AuthenticatedImage({ blobId, alt, getUrl, className, unavailableLabel = currentMessage("browser.screenshotUnavailable"), loadingLabel = currentMessage("browser.loadingScreenshot") }: {
   readonly blobId: string;
   readonly alt: string;
-  readonly getUrl: (blobId: string) => Promise<string>;
+  readonly getUrl: (blobId: string) => Promise<string> | ArtifactUrlReference;
   readonly className?: string;
   readonly unavailableLabel?: string;
   readonly loadingLabel?: string;
@@ -822,12 +822,17 @@ export function AuthenticatedImage({ blobId, alt, getUrl, className, unavailable
     let current = true;
     setUrl(undefined);
     setFailed(false);
-    void getUrlRef.current(blobId).then((next) => {
+    const acquisition = getUrlRef.current(blobId);
+    const pending = "url" in acquisition ? acquisition.url : acquisition;
+    void pending.then((next) => {
       if (current) setUrl(next);
     }).catch(() => {
       if (current) setFailed(true);
     });
-    return () => { current = false; };
+    return () => {
+      current = false;
+      if ("url" in acquisition) acquisition.release();
+    };
   }, [blobId]);
   if (failed) return <span className="authenticated-image-state" role="alert">{unavailableLabel}</span>;
   if (url === undefined) return <span className="authenticated-image-state" role="status"><Spinner label={loadingLabel} /></span>;

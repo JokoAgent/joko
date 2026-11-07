@@ -10,7 +10,8 @@ export const MAX_REVIEW_PROMPT_CHARACTERS = 240_000;
 
 const TRUNCATION_MARKER = "\n… (evidence truncated at the length limit)";
 const ARTIFACT_ALIAS_PREFIX = "[review-artifact]";
-const REVIEW_ALIAS_SEGMENT = /^[\p{L}\p{N} ._+@()\[\]{}'!,=-]+$/u;
+const ARTIFACT_ALIAS_SEGMENT = /^[\p{L}\p{N} ._+@()\[\]{}'!,=-]+$/u;
+const WORKSPACE_PATH_SEGMENT = /^[\p{L}\p{N} ._+@()\[\]{}'!,=#-]+$/u;
 const WINDOWS_ABSOLUTE_PATH = /\b[A-Za-z]:\\(?:[^\s<>:"|?*\r\n]+\\)*[^\s<>:"|?*\r\n]*/gu;
 const POSIX_SERVICE_PATH = /\/(?:Users|home|var|tmp|opt|srv|private|Volumes)\/(?:[^\s<>"'`\r\n]+\/?)+/gu;
 const SECRET_ASSIGNMENT = /(^|\n)([\t ]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|password|passwd|secret|cookie|credential)\s*[:=]\s*)([^\r\n]+)/giu;
@@ -109,6 +110,7 @@ export function buildReviewPrompt(input: BuildReviewPromptInput): BuiltReviewPro
   validateInput(input);
   const targetKind = resolveReviewTargetKind(input);
   const coverage = coverageSection(input);
+  const changes = changeEvidenceSection(input);
   const focus = normalizedEvidence(input.focus ?? "").trim();
   const focusSection = focus.length === 0
     ? ""
@@ -160,7 +162,7 @@ ${contextSection(input.context) || "(No visible task context.)"}
 
 ## Current change evidence
 
-${changeEvidenceSection(input)}`;
+${changes.text}`;
 
   const tail = `
 
@@ -182,7 +184,7 @@ If there are no actionable findings, explicitly state that no changes are needed
   return {
     prompt: `${header}${boundedEvidence.text}${tail}`,
     targetKind,
-    truncated: boundedEvidence.truncated || evidenceSectionsWereTruncated(input)
+    truncated: boundedEvidence.truncated || changes.truncated || otherSectionsWereTruncated(input)
   };
 }
 
@@ -198,7 +200,9 @@ export function resolveReviewTargetKind(input: Pick<BuildReviewPromptInput, "wor
 }
 
 export function isReviewEvidenceAlias(value: string): boolean {
-  return isCanonicalWorkspaceRelativePath(value) || isScopedReviewAlias(value, ARTIFACT_ALIAS_PREFIX);
+  return value.startsWith(`${ARTIFACT_ALIAS_PREFIX}/`)
+    ? isScopedReviewAlias(value, ARTIFACT_ALIAS_PREFIX)
+    : isCanonicalWorkspaceRelativePath(value);
 }
 
 function validateInput(input: BuildReviewPromptInput): void {
@@ -235,17 +239,19 @@ function coverageSection(input: BuildReviewPromptInput): string {
       parts.push(`${input.workspace.sensitiveFilesOmitted} changes at sensitive paths were excluded; do not read or assess their contents.`);
     }
     if ((input.workspace.capped?.length ?? 0) > 0) parts.push("Some changes have summaries only because of size limits; do not claim complete coverage.");
-  } else if (input.branch !== undefined && input.branch !== null) {
-    parts.push(`The current Git workspace has no uncommitted changes. Below are this branch's changes relative to ${safeInline(input.branch.baseRefLabel, 500, "the resolved base ref")} (${input.branch.fileCount} files).`);
+  }
+  if (input.branch !== undefined && input.branch !== null) {
+    if (input.workspace?.dirty !== true) parts.push("The current Git workspace has no uncommitted changes.");
+    parts.push(`Below are this branch's committed changes relative to ${safeInline(input.branch.baseRefLabel, 500, "the resolved base ref")} (${input.branch.fileCount} files).`);
     if ((input.branch.sensitiveFilesOmitted ?? 0) > 0) parts.push(`${input.branch.sensitiveFilesOmitted} changes at sensitive paths were excluded.`);
     if (input.branch.capped !== undefined) parts.push("Some branch changes have summaries only because of size limits; do not claim complete coverage.");
     if (input.branch.unavailableReason !== undefined) parts.push(`Branch evidence gap: ${safeInline(input.branch.unavailableReason, 1_000, "unspecified")}`);
-  } else if (input.changeSet !== null) {
+  } else if (input.workspace?.dirty !== true && input.changeSet !== null) {
     parts.push("Below is change evidence captured during the latest turn; it does not represent the complete current workspace diff.");
     if (input.changeSet.state !== "complete" || input.changeSet.incompleteReasons.length > 0) {
       parts.push(`The latest turn's evidence may be incomplete: ${input.changeSet.incompleteReasons.map((reason) => safeInline(reason, 1_000, "unspecified")).join("; ") || "unspecified"}.`);
     }
-  } else {
+  } else if (input.workspace?.dirty !== true) {
     const unavailable = input.workspace?.unavailableReason ?? input.branchUnavailableReason;
     parts.push(unavailable === undefined
       ? "No Git change evidence is available; this is not a reason to skip the review."
@@ -282,16 +288,32 @@ function contextSection(messages: readonly ReviewContextMessage[]): string {
   return output.join("\n\n");
 }
 
-function changeEvidenceSection(input: BuildReviewPromptInput): string {
-  if (input.workspace?.dirty === true) return diffsSection(input.workspace.diffs, input.workspace.capped ?? []);
-  if (input.branch !== undefined && input.branch !== null) {
-    return diffsSection(input.branch.diffs, input.branch.capped === undefined ? [] : [input.branch.capped]);
+function changeEvidenceSection(input: BuildReviewPromptInput): { readonly text: string; readonly truncated: boolean } {
+  const branch = input.branch;
+  if (input.workspace?.dirty === true) {
+    if (branch != null && (branch.diffs.length > 0 || branch.capped !== undefined)) {
+      const committedHeading = "### Committed branch changes\n\n";
+      const worktreeHeading = "\n\n### Current uncommitted changes\n\n";
+      const budget = Math.floor((MAX_REVIEW_CHANGE_EVIDENCE_CHARACTERS - committedHeading.length - worktreeHeading.length) / 2);
+      const committed = diffsSection(branch.diffs, branch.capped === undefined ? [] : [branch.capped], budget);
+      const uncommitted = diffsSection(input.workspace.diffs, input.workspace.capped ?? [], budget);
+      return {
+        text: `${committedHeading}${committed.text}${worktreeHeading}${uncommitted.text}`,
+        truncated: committed.truncated || uncommitted.truncated
+      };
+    }
+    return diffsSection(input.workspace.diffs, input.workspace.capped ?? []);
   }
+  if (branch != null) return diffsSection(branch.diffs, branch.capped === undefined ? [] : [branch.capped]);
   if (input.changeSet !== null) return diffsSection(input.changeSet.diffs, []);
-  return "(No Git patch.)";
+  return { text: "(No Git patch.)", truncated: false };
 }
 
-function diffsSection(diffs: readonly ReviewDiffEvidence[], capped: readonly ReviewCappedEvidence[]): string {
+function diffsSection(
+  diffs: readonly ReviewDiffEvidence[],
+  capped: readonly ReviewCappedEvidence[],
+  budget = MAX_REVIEW_CHANGE_EVIDENCE_CHARACTERS
+): { readonly text: string; readonly truncated: boolean } {
   const parts: string[] = [];
   for (const diff of diffs) {
     const source = diff.source === "staged" ? "staged"
@@ -306,7 +328,7 @@ function diffsSection(diffs: readonly ReviewDiffEvidence[], capped: readonly Rev
     parts.push(`### Changes with summaries only\n\nLimit reached: ${safeInline(bucket.reason, 1_000, "unspecified")}; ${bucket.fileCount} files, ${bucket.totalChangedLines} changed lines. Use read-only tools to inspect relevant non-sensitive files; do not claim complete patch coverage.\n\n${files}`);
   }
   const joined = parts.length === 0 ? "(No text patches available to embed.)" : parts.join("\n\n");
-  return clipUnicode(joined, MAX_REVIEW_CHANGE_EVIDENCE_CHARACTERS).text;
+  return clipUnicode(joined, budget);
 }
 
 function artifactContentSection(input: BuildReviewPromptInput): string {
@@ -374,17 +396,17 @@ function allCapped(input: BuildReviewPromptInput): readonly ReviewCappedEvidence
 function isScopedReviewAlias(value: string, prefix: string): boolean {
   if (!value.startsWith(`${prefix}/`)) return false;
   const segments = value.slice(prefix.length + 1).split("/");
-  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && REVIEW_ALIAS_SEGMENT.test(segment));
+  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && ARTIFACT_ALIAS_SEGMENT.test(segment));
 }
 
 function requireWorkspaceAlias(value: string, label: string): void {
   if (!isCanonicalWorkspaceRelativePath(value)) throw new TypeError(`${label} must use a canonical workspace-relative path.`);
 }
 
-function isCanonicalWorkspaceRelativePath(value: string): boolean {
+export function isCanonicalWorkspaceRelativePath(value: string): boolean {
   if (value.length === 0 || value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:/u.test(value) || /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value)) return false;
   const segments = value.split("/");
-  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && REVIEW_ALIAS_SEGMENT.test(segment));
+  return segments.every((segment) => segment !== "" && segment !== "." && segment !== ".." && WORKSPACE_PATH_SEGMENT.test(segment));
 }
 
 function requireArtifactAlias(value: string, label: string): void {
@@ -395,11 +417,9 @@ function requireCount(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be a non-negative safe integer.`);
 }
 
-function evidenceSectionsWereTruncated(input: BuildReviewPromptInput): boolean {
+function otherSectionsWereTruncated(input: BuildReviewPromptInput): boolean {
   const contextCharacters = input.context.reduce((total, message) => total + [...normalizedEvidence(message.text)].length, 0);
-  const changeCharacters = allDiffs(input).reduce((total, diff) => total + [...normalizedEvidence(diff.patch ?? "")].length, 0);
   const artifactCharacters = (input.artifactExcerpts ?? []).reduce((total, excerpt) => total + [...normalizedEvidence(excerpt.content)].length, 0);
   return contextCharacters > MAX_REVIEW_CONTEXT_CHARACTERS
-    || changeCharacters > MAX_REVIEW_CHANGE_EVIDENCE_CHARACTERS
     || artifactCharacters > MAX_REVIEW_ARTIFACT_EXCERPT_CHARACTERS;
 }

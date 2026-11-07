@@ -18,6 +18,46 @@ afterEach(() => {
 });
 
 describe("WorkspaceFilesRoute leave gate", () => {
+  it("reruns an already settled Files search against the rebound workspace", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    vi.useFakeTimers();
+    const streamWorkspaceSearch = vi.fn<AppController["streamWorkspaceSearch"]>(async function* () {
+      yield { kind: "end" as const, truncated: false, totalMatches: 0, totalFiles: 0, revision: "new" };
+    }).mockImplementationOnce(async function* () {
+      yield { kind: "match" as const, match: { path: "report.txt", line: 1, preview: "needle_A from the old root", submatches: [], revision: "old",
+        range: { startByte: 0, endByte: 8, startLine: 1, endLine: 1, startColumn: 1, endColumn: 9 } } };
+      yield { kind: "end" as const, truncated: false, totalMatches: 1, totalFiles: 1, revision: "old" };
+    });
+    const connected = Object.assign(controller(), { listWorkspaceEntries: vi.fn(async () => []), streamWorkspaceSearch });
+    const original = workspace();
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    try {
+      await act(async () => root.render(routeView(connected)));
+      await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="workspace.search"]')!.click());
+      const search = host.querySelector<HTMLInputElement>('input[aria-label="workspace.searchPlaceholder"]')!;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(search, "needle_A");
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      expect(host.textContent).toContain("needle_A from the old root");
+      await act(async () => root.render(routeView(connected, backend(), { ...original,
+        remoteWorkspace: { kind: "ssh", hostId: "ssh-host", hostTargetId: "ssh-target", workspaceRoot: "/project" }
+      })));
+      expect(search.value).toBe("needle_A");
+      expect(host.textContent).not.toContain("needle_A from the old root");
+      await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+      expect(streamWorkspaceSearch).toHaveBeenCalledTimes(2);
+      expect(streamWorkspaceSearch).toHaveBeenLastCalledWith(original.id, "needle_A", false, expect.any(AbortSignal));
+      expect(host.textContent).toContain("workspace.noMatches");
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+      vi.useRealTimers();
+    }
+  });
+
   it("closes an aborted dirty-document prompt without saving or discarding", async () => {
     vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     const save = vi.fn(async () => true);
@@ -95,9 +135,9 @@ describe("WorkspaceFilesRoute leave gate", () => {
   });
 });
 
-function routeView(controller: AppController, backendView = backend()) {
+function routeView(controller: AppController, backendView = backend(), selectedWorkspace = workspace()) {
   return <WorkspaceFilesRoute controller={controller} route={{ kind: "files", sessionId: "leave-task" }}
-    session={session()} target={target()} backend={backendView} workspace={workspace()} sessions={[session()]}
+    session={session()} target={target()} backend={backendView} workspace={selectedWorkspace} sessions={[session()]}
     chatPane={null} t={(key) => key} onError={vi.fn()} onArchiveSession={vi.fn()}
     navigation={{
       open: true, mode: "expanded", width: 320,

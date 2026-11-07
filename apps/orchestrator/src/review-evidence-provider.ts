@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-import type { BlobRef, MessageBlock } from "@joko/core";
-import type { OperationalStore } from "@joko/store";
+import type { BlobRef, MessageBlock, SessionDescriptor } from "@joko/core";
+import type { OperationalStore, StoredTarget } from "@joko/store";
 import { extractPdfText, PDF_TEXT_MAX_BYTES, PdfTextExtractionError, type PdfTextWorkerResult } from "@joko/tool-document";
 import type { ArtifactStore } from "./artifact-store.js";
 import { readGitPatchPaths } from "./git-patch-paths.js";
@@ -73,14 +73,19 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
     assertSourceIdle(this.#store, request.sourceSessionId);
     const source = this.#store.getSession(request.sourceSessionId);
     const target = this.#store.getTarget(source.descriptor.targetId);
-    const registration = exactWorkspaceRegistration(target.metadata, target.descriptor.id, this.#workspaces);
+    const registration = exactWorkspaceRegistration(source.descriptor, target, this.#workspaces);
+    if (source.descriptor.worktree !== undefined && this.#store.findPendingSessionLifecycleCleanup(request.sourceSessionId) !== undefined) {
+      throw new ReviewEvidenceCaptureError("source-changed", "The source worktree is being retired.");
+    }
     const events = listAllVisibleSessionEvents(this.#store, request.sourceSessionId);
     const visible = visibleMessages(this.#store, request.sourceSessionId, events);
+    const supersededProgress = supersededPiToolMessages(events, visible);
     const messages = visible.map((event, ordinal) => ({
       id: event.id,
       ordinal,
       role: event.payload.role,
-      text: event.payload.blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join("")
+      text: event.payload.blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join(""),
+      ...(supersededProgress.has(event.id) ? { omitFromContext: true as const } : {})
     }));
 
     const git = await this.#workspaces.gitState(registration.id).catch(() => {
@@ -91,27 +96,35 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
           throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review workspace changes are unavailable.");
         })
       : undefined;
-    const patchBudget = { remaining: MAX_PATCH_CHARACTERS };
-    const workspaceDiffs = git.repository ? dirtyEvidence(git, workingDiff!, patchBudget) : [];
-
     let branch: ReviewSourceBranchEvidence | null = null;
     let branchDiff: WorkspaceGitDiff | undefined;
     let branchUnavailableReason: string | undefined;
-    if (git.repository && !git.dirty) {
+    let branchPatchCharacters = 0;
+    if (git.repository) {
       try {
         // WorkspaceService resolves the configured default/upstream base and
         // returns immutable base/head/merge-base fences.
-        branchDiff = await this.#workspaces.gitReviewDiff(registration.id, { source: "branch" });
-        const diffs = unifiedDiffEvidence(branchDiff.comparison, "branch", patchBudget);
+        const comparison = await this.#workspaces.gitReviewDiff(registration.id, { source: "branch" });
+        const limit = git.dirty ? Math.floor(MAX_PATCH_CHARACTERS / 2) : MAX_PATCH_CHARACTERS;
+        const budget = { remaining: limit };
+        const diffs = unifiedDiffEvidence(comparison.comparison, "branch", budget);
         branch = {
-          baseRefLabel: branchDiff.resolvedBaseRef ?? branchDiff.baseRevision ?? "default branch",
+          baseRefLabel: comparison.resolvedBaseRef ?? comparison.baseRevision ?? "default branch",
           fileCount: uniqueDiffPaths(diffs).size,
           diffs
         };
+        branchDiff = comparison;
+        branchPatchCharacters = limit - budget.remaining;
       } catch {
         branchUnavailableReason = "The default or upstream branch comparison is unavailable.";
       }
     }
+    if (git.dirty && branchDiff !== undefined && (branchDiff.headRevision !== git.head || branchDiff.headRevision !== workingDiff?.headRevision)) {
+      throw new ReviewEvidenceCaptureError("source-changed", "Review branch and worktree evidence no longer share the same HEAD.");
+    }
+    const workspaceDiffs = git.repository
+      ? dirtyEvidence(git, workingDiff!, { remaining: MAX_PATCH_CHARACTERS - branchPatchCharacters })
+      : [];
 
     const latestChangeSet = (await this.#workspaceChanges.listChangeSets({
       workspaceId: registration.id,
@@ -141,7 +154,19 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
     if (selectedPaths.size > MAX_SELECTED_PATHS) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review selected too many workspace paths.");
     }
-    const files = await hashSelectedFiles(registration.root, [...selectedPaths].sort((a, b) => a.localeCompare(b, "en-US")));
+    const stagedUpdates = new Set(git.changes.filter(change => change.index === "M" && change.worktree === " " && change.originalPath === undefined)
+      .map(change => canonicalReviewPath(change.path)));
+    let capturedGitlink = false;
+    const files = await hashSelectedFiles(registration.root, [...selectedPaths].sort((a, b) => a.localeCompare(b, "en-US")), async path => {
+      if (!stagedUpdates.has(path) || !workingDiff?.headRevision || workingDiff.headRevision !== git.head) return undefined;
+      try {
+        const { headOid, indexOid, checkoutOid } = await this.#workspaces.readStagedGitlink(registration.id, path, workingDiff.headRevision);
+        capturedGitlink = true;
+        return sha256(JSON.stringify(["gitlink", path, headOid, indexOid, checkoutOid]));
+      } catch {
+        throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review submodule could not be confirmed.");
+      }
+    });
 
     const attachments = collectAttachments(request, visible);
     assertArtifactBudget(attachments.values);
@@ -156,6 +181,12 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
       });
       artifacts.push(artifact);
       if (pdf && artifact.excerpt !== undefined) remainingPdfCharacters -= artifact.excerpt.content.length;
+    }
+    if (capturedGitlink) {
+      const current = await this.#workspaces.gitDiff(registration.id).catch(() => undefined);
+      if (current?.repositoryRevision !== workingDiff?.repositoryRevision) {
+        throw new ReviewEvidenceCaptureError("source-changed", "The staged Review submodule changed during evidence capture.");
+      }
     }
     assertSourceIdle(this.#store, request.sourceSessionId);
     const currentSource = this.#store.getSession(request.sourceSessionId);
@@ -187,7 +218,8 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
           target.descriptor.id,
           registration.id,
           source.descriptor.binding.opaqueRef,
-          source.descriptor.binding.nativeSessionId ?? ""
+          source.descriptor.binding.nativeSessionId ?? "",
+          ...(source.descriptor.worktree === undefined ? [] : [source.descriptor.worktree.leaseId, registration.root, target.revision.toString()])
         ])),
         messages
       },
@@ -264,7 +296,8 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
       if (stored.byteLength > MAX_ARTIFACT_EXCERPT_BYTES) {
         return { ...attachment, warning: "File exceeds the bounded Review excerpt limit." };
       }
-      if (!isTextMime(read.mimeType) || read.data.includes(0)) {
+      const content = isTextMime(read.mimeType) ? decodeReviewText(read.data) : undefined;
+      if (content === undefined) {
         return { ...attachment, warning: "Binary file has no textual Review excerpt." };
       }
       return {
@@ -272,7 +305,7 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
         excerpt: {
           format: read.mimeType,
           coverage: "full file",
-          content: new TextDecoder("utf-8", { fatal: false }).decode(read.data)
+          content
         }
       };
     } catch {
@@ -294,8 +327,20 @@ function assertArtifactBudget(artifacts: readonly ReviewSourceArtifact[]): void 
   }
 }
 
-function exactWorkspaceRegistration(metadata: unknown, targetId: string, workspaces: WorkspaceService) {
+function exactWorkspaceRegistration(source: SessionDescriptor, target: StoredTarget, workspaces: WorkspaceService) {
   const registrations = workspaces.listRegistrations();
+  const worktree = source.worktree;
+  if (worktree !== undefined) {
+    const registration = registrations.find(item => item.id === worktree.workspaceId);
+    if (source.archived || source.deletedAt !== undefined || worktree.state !== "active" || worktree.remote !== undefined
+      || source.remoteWorkspace !== undefined || target.descriptor.remoteWorkspace !== undefined || !target.descriptor.trusted
+      || registration === undefined || registration.remote !== undefined || !registration.trusted || relative(worktree.path, registration.root) !== "") {
+      throw new ReviewEvidenceCaptureError("source-changed", "The source task's exact local worktree is unavailable.");
+    }
+    return registration;
+  }
+  const { metadata } = target;
+  const targetId = target.descriptor.id;
   let workspaceId: string | undefined;
   if (metadata !== null && typeof metadata === "object" && !Array.isArray(metadata)) {
     const value = (metadata as Record<string, unknown>)["workspaceId"];
@@ -340,6 +385,33 @@ function visibleMessages(store: OperationalStore, sessionId: string, events: Lis
   });
 }
 
+function supersededPiToolMessages(events: readonly ListedEvent[], messages: readonly MessageEvent[]): ReadonlySet<string> {
+  const settlements = new Map<string, bigint>();
+  for (const event of events) {
+    if (event.attemptId !== undefined && event.pi?.rpcEventType === "agent_settled"
+      && event.payload.type === "done" && event.payload.outcome === "completed") {
+      settlements.set(event.attemptId, event.globalCursor);
+    }
+  }
+  const superseded = new Set<string>();
+  if (settlements.size === 0) return superseded;
+  const hasFinalReply = new Map<string, boolean>();
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const event = messages[index]!;
+    if (event.attemptId === undefined || event.pi?.rpcEventType !== "message_end" || event.payload.role !== "assistant") continue;
+    const settlement = settlements.get(event.attemptId);
+    if (settlement === undefined || event.globalCursor >= settlement) continue;
+    const toolRound = event.payload.blocks.some(block => block.kind === "tool_call");
+    const final = hasFinalReply.get(event.attemptId);
+    if (final === undefined) {
+      hasFinalReply.set(event.attemptId, !toolRound && event.payload.blocks.some(block => block.kind === "text" && block.text.trim() !== ""));
+    } else if (final && toolRound) {
+      superseded.add(event.id);
+    }
+  }
+  return superseded;
+}
+
 function collectAttachments(request: StartReviewRequest, messages: readonly MessageEvent[]): {
   readonly values: readonly ReviewSourceArtifact[];
   readonly omitted: boolean;
@@ -347,7 +419,8 @@ function collectAttachments(request: StartReviewRequest, messages: readonly Mess
   const values: ReviewSourceArtifact[] = request.attachments.map((item) => ({ ...item }));
   const seen = new Set(values.map((item) => item.blob.id));
   let omitted = false;
-  for (const event of messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const event = messages[index]!;
     for (const block of event.payload.blocks) {
       const artifact = blockAttachment(block);
       if (artifact === undefined || seen.has(artifact.blob.id)) continue;
@@ -436,12 +509,13 @@ function changeSetEvidenceItem(change: WorkspaceChange): ReviewSourceDiffEvidenc
   };
 }
 
-async function hashSelectedFiles(root: string, paths: readonly string[]): Promise<ReviewSourceFileSnapshot[]> {
+async function hashSelectedFiles(root: string, paths: readonly string[], readGitlink: (path: string) => Promise<string | undefined>): Promise<ReviewSourceFileSnapshot[]> {
   const result: ReviewSourceFileSnapshot[] = [];
+  const fileIdentities = new Set<string>();
   let totalBytes = 0;
   for (const path of paths) {
     if (isSensitiveReviewPath(path)) continue;
-    const snapshot = await stableFileSnapshot(root, path);
+    const snapshot = await stableFileSnapshot(root, path, readGitlink, fileIdentities);
     totalBytes += snapshot.byteLength;
     if (totalBytes > MAX_SELECTED_TOTAL_BYTES) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review selected files exceed the aggregate byte limit.");
@@ -451,7 +525,12 @@ async function hashSelectedFiles(root: string, paths: readonly string[]): Promis
   return result;
 }
 
-async function stableFileSnapshot(root: string, path: string): Promise<ReviewSourceFileSnapshot> {
+async function stableFileSnapshot(
+  root: string,
+  path: string,
+  readGitlink: (path: string) => Promise<string | undefined>,
+  fileIdentities: Set<string>
+): Promise<ReviewSourceFileSnapshot> {
   const canonical = canonicalReviewPath(path);
   const absolute = resolve(root, ...canonical.split("/"));
   let before: Awaited<ReturnType<typeof lstat>>;
@@ -463,6 +542,16 @@ async function stableFileSnapshot(root: string, path: string): Promise<ReviewSou
     }
     throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review file is unavailable.");
   }
+  if (before.isDirectory()) {
+    const digest = await readGitlink(canonical);
+    if (digest !== undefined) {
+      const after = await lstat(absolute).catch(() => undefined);
+      if (!after?.isDirectory() || !sameIdentity(before, after)) {
+        throw new ReviewEvidenceCaptureError("source-changed", "A selected Review submodule directory changed while reading.");
+      }
+      return { relativePath: canonical, sha256: digest, byteLength: 0 };
+    }
+  }
   if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > MAX_SELECTED_FILE_BYTES) {
     throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review file is unsafe or exceeds its byte limit.");
   }
@@ -472,6 +561,8 @@ async function stableFileSnapshot(root: string, path: string): Promise<ReviewSou
   try {
     const opened = await handle.stat();
     if (!sameIdentity(before, opened)) throw new ReviewEvidenceCaptureError("source-changed", "A selected Review file changed while opening.");
+    const identity = opened.ino === 0 ? actual : `${opened.dev}:${opened.ino}`;
+    if (fileIdentities.has(identity)) throw new ReviewEvidenceCaptureError("artifact-unavailable", "Selected Review paths refer to the same workspace file.");
     const hash = createHash("sha256");
     for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk as Buffer);
     const afterHandle = await handle.stat();
@@ -480,6 +571,7 @@ async function stableFileSnapshot(root: string, path: string): Promise<ReviewSou
     if (!sameIdentity(opened, afterHandle) || !sameIdentity(opened, afterPath) || afterActual !== actual) {
       throw new ReviewEvidenceCaptureError("source-changed", "A selected Review file changed while hashing.");
     }
+    fileIdentities.add(identity);
     return { relativePath: canonical, sha256: hash.digest("hex"), byteLength: opened.size };
   } finally {
     await handle.close().catch(() => undefined);
@@ -575,4 +667,16 @@ function sha256(value: string | Uint8Array): string {
 
 function isTextMime(value: string): boolean {
   return value.startsWith("text/") || /(?:json|javascript|typescript|xml|yaml|toml|markdown)/iu.test(value);
+}
+
+function decodeReviewText(bytes: Uint8Array): string | undefined {
+  if (bytes[0] !== 0xff || bytes[1] !== 0xfe) {
+    return bytes.includes(0) ? undefined : new TextDecoder("utf-8").decode(bytes);
+  }
+  try {
+    const content = new TextDecoder("utf-16le", { fatal: true }).decode(bytes);
+    return content.includes("\0") ? undefined : content;
+  } catch {
+    return undefined;
+  }
 }
