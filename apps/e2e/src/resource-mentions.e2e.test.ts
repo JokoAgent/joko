@@ -25,20 +25,26 @@ import {
   InputMentionRangeSchema,
   InputPartSchema,
   OperationState,
-  ResourceKind
+  PermissionMode,
+  ResourceKind,
+  RunState,
+  ScheduleSessionMode
 } from "@joko/contracts";
 import type { AdapterContext, PromptInput, RuntimeResource } from "@joko/core";
-import { PI_LIKE_PROFILE } from "@joko/testkit";
+import { CODEX_LIKE_PROFILE, PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it } from "vitest";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
+  createManualScheduleMutation,
   createSessionMutation,
   pauseQueueMutation,
   resumeQueueMutation,
+  scheduleIdFrom,
   sendInputMutation,
   sessionIdFrom,
-  submit
+  submit,
+  triggerScheduleMutation
 } from "./operations.js";
 
 it("uses the authenticated live task resource catalog through durable queue dispatch", async () => {
@@ -295,6 +301,68 @@ it("keeps approved Claude resource content inside the live Query and rejects a q
   }
 });
 
+it("dispatches the saved acceptEdits policy to Claude and rejects it on Backends without that mode", { timeout: 60_000 }, async () => {
+  const runtime = new ControlledClaudeRuntime();
+  const backendId = "claude-code";
+  const fixture = await OrchestratorE2eFixture.start({
+    profiles: [PI_LIKE_PROFILE, CODEX_LIKE_PROFILE],
+    backendFactories: [{ instanceId: backendId, adapterKind: "claude-agent-sdk-stdio", displayName: "Controlled Claude fixture",
+      create: ({ generation }) => new ClaudeCodeAdapter({ instanceGeneration: generation, runtime,
+        environment: {}, initializationTimeoutMs: 5_000, admissionTimeoutMs: 5_000, teardownTimeoutMs: 100 }) }]
+  });
+  try {
+    const { clients, connectionId } = await fixture.pair("Claude Schedule owner");
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const targetId = fixture.targetId(backendId);
+    const runSchedule = async (scheduleId: string, total: number) => {
+      expect((await mutate(triggerScheduleMutation(scheduleId))).state).toBe(OperationState.SUCCEEDED);
+      const { history } = await waitFor(() => clients.scheduler.listScheduleRunHistory({ scheduleId }),
+        value => value.history.filter(run => run.state === RunState.SUCCEEDED).length === total,
+        "scheduled Claude completion");
+      return history;
+    };
+    const execution = { permissionMode: PermissionMode.ACCEPT_EDITS };
+    const dispatchedModes = (text: string) => runtime.queries.flatMap(query => query.receivedInputs.flatMap((input, index) =>
+      input.message.content === text ? [query.inputPermissionModes[index]] : []));
+    for (const permissionMode of [PermissionMode.ACCEPT_EDITS, PermissionMode.ASK]) {
+      const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId, permissionMode })));
+      const text = `Run on the bound task with baseline ${permissionMode}.`;
+      const scheduleId = scheduleIdFrom(await mutate(createManualScheduleMutation({ backendId, targetId, sessionId, text, execution })));
+      const [run] = await runSchedule(scheduleId, 1);
+      expect(run?.sessionId).toBe(sessionId);
+      expect(fixture.application.store.getSession(sessionId).descriptor.permissionMode)
+        .toBe(permissionMode === PermissionMode.ACCEPT_EDITS ? "acceptEdits" : "ask");
+      expect(dispatchedModes(text)).toEqual(["acceptEdits"]);
+    }
+    for (const sessionMode of [ScheduleSessionMode.FRESH, ScheduleSessionMode.PERSISTENT]) {
+      const text = `Run on the generated task for mode ${sessionMode}.`;
+      const scheduleId = scheduleIdFrom(await mutate(createManualScheduleMutation({ backendId, targetId, sessionMode, text, execution })));
+      const [run] = await runSchedule(scheduleId, 1);
+      const task = fixture.application.store.getSession(run!.sessionId).descriptor;
+      expect(task.permissionMode).toBe("acceptEdits");
+      expect(dispatchedModes(text)).toEqual(["acceptEdits"]);
+      if (sessionMode === ScheduleSessionMode.PERSISTENT) {
+        const history = await runSchedule(scheduleId, 2);
+        expect(history.map(run => run.sessionId)).toEqual([task.id, task.id]);
+        expect(dispatchedModes(text)).toEqual(["acceptEdits", "acceptEdits"]);
+      }
+    }
+    for (const profile of [PI_LIKE_PROFILE, CODEX_LIKE_PROFILE]) {
+      const targetId = fixture.targetId(profile.id);
+      const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId: profile.id, targetId })));
+      const scheduleId = scheduleIdFrom(await mutate(createManualScheduleMutation({
+        backendId: profile.id, targetId, sessionId, text: "Reject this permission snapshot", execution
+      })));
+      expect((await mutate(triggerScheduleMutation(scheduleId))).state).toBe(OperationState.SUCCEEDED);
+      const { history } = await clients.scheduler.listScheduleRunHistory({ scheduleId });
+      expect(history).toMatchObject([{ state: RunState.FAILED, error: { code: "TURN_OVERRIDE_PERMISSION_UNSUPPORTED" } }]);
+      expect(fixture.adapter(profile.id).sendCalls).toHaveLength(0);
+    }
+  } finally {
+    await fixture.close();
+  }
+});
+
 function resourceInputMutation(
   sessionId: string,
   generation: bigint,
@@ -421,10 +489,12 @@ class ControlledClaudeRuntime implements ClaudeSdkRuntime {
 
 class ControlledClaudeQuery implements ClaudeSdkQuery {
   readonly receivedInputs: ClaudeSdkUserMessage[] = [];
+  readonly inputPermissionModes: ClaudeSdkQueryParams["options"]["permissionMode"][] = [];
   readonly #params: ClaudeSdkQueryParams;
   readonly #nativeSessionId: string;
   readonly #persistInput: (message: ClaudeSdkUserMessage) => void;
   readonly #output = new ControlledAsyncOutput();
+  #permissionMode: ClaudeSdkQueryParams["options"]["permissionMode"];
   #closed = false;
 
   constructor(
@@ -433,6 +503,7 @@ class ControlledClaudeQuery implements ClaudeSdkQuery {
     persistInput: (message: ClaudeSdkUserMessage) => void
   ) {
     this.#params = params;
+    this.#permissionMode = params.options.permissionMode;
     this.#nativeSessionId = nativeSessionId;
     this.#persistInput = persistInput;
     void this.#consume();
@@ -446,8 +517,9 @@ class ControlledClaudeQuery implements ClaudeSdkQuery {
     for await (const message of this.#params.prompt) {
       if (this.#closed) return;
       this.receivedInputs.push(message);
+      this.inputPermissionModes.push(this.#permissionMode);
       this.#persistInput(message);
-      this.#output.push(claudeSystemInit(this.#nativeSessionId, this.#params));
+      this.#output.push(claudeSystemInit(this.#nativeSessionId, this.#params, this.#permissionMode));
       this.#output.push(claudeResult(this.#nativeSessionId, message.uuid));
     }
   }
@@ -470,7 +542,9 @@ class ControlledClaudeQuery implements ClaudeSdkQuery {
 
   async stopTask(_taskId: string): Promise<void> {}
 
-  async setPermissionMode(_mode: Parameters<ClaudeSdkQuery["setPermissionMode"]>[0]): Promise<void> {}
+  async setPermissionMode(mode: Parameters<ClaudeSdkQuery["setPermissionMode"]>[0]): Promise<void> {
+    this.#permissionMode = mode;
+  }
 
   async setModel(_model?: string): Promise<void> {}
 
@@ -513,7 +587,7 @@ class ControlledAsyncOutput implements AsyncIterable<unknown>, AsyncIterator<unk
   }
 }
 
-function claudeSystemInit(nativeSessionId: string, params: ClaudeSdkQueryParams) {
+function claudeSystemInit(nativeSessionId: string, params: ClaudeSdkQueryParams, permissionMode: ClaudeSdkQueryParams["options"]["permissionMode"]) {
   return {
     type: "system",
     subtype: "init",
@@ -523,7 +597,7 @@ function claudeSystemInit(nativeSessionId: string, params: ClaudeSdkQueryParams)
     apiKeySource: "none",
     cwd: params.options.cwd,
     model: params.options.model ?? "fixture-model",
-    permissionMode: params.options.permissionMode,
+    permissionMode,
     tools: ["Read"],
     mcp_servers: [],
     slash_commands: [],

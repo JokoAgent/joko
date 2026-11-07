@@ -36,6 +36,7 @@ import {
   createScheduleHookScriptGenerator,
   SessionHost,
   availableBackendProviderIds,
+  modelRoutingEnabled,
   withSessionReferenceCapability,
   SessionWorktreeCoordinator,
   WorkspaceChangeSetService,
@@ -333,6 +334,7 @@ export class OrchestratorE2eFixture {
       backendDescriptorsAlreadyPublished: true,
       workspaceCapture: new DurableWorkspaceRunCapture(store, workspaceChanges),
       worktrees: sessionWorktrees,
+      modelRoutingEnabled: (backendId, providerId, modelId) => modelRoutingEnabled(store, backendId, providerId, modelId),
       onUserInputAdmitted: (transactionStore, result) =>
         objectives?.onUserInputAdmitted(transactionStore, result),
       onServiceRunSettled: (input) => objectives?.onRunSettled(input),

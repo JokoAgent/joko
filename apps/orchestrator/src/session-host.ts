@@ -2198,7 +2198,7 @@ export class SessionHost {
       if (!claim.claimed) { check(); return; }
       // A started receipt is deliberately retained on failure. Recovery must
       // inspect the original worktree lease instead of repeating an unknown effect.
-      await this.#worktrees.restore(input.sessionId);
+      await this.#worktrees.restore(input.sessionId, { assertCurrent: check });
       this.#store.completeDeferredEffectOperation(input.operationId, claim.operation.bodyHash, commit);
     });
   }
@@ -3422,7 +3422,7 @@ export class SessionHost {
     let validationCause: unknown;
     let validationFailure: PublicError | undefined;
     try {
-      this.validateTurnOverrides(sessionId, overrides);
+      this.validateTurnOverrides(sessionId, overrides, { checkInheritedRoute: true });
       acceptedPrompt = this.canonicalQueuedPrompt(sessionId, input.schedule.prompt);
       assertPromptInlineTextRanges(acceptedPrompt);
       this.assertInputCapabilities(sessionId, acceptedPrompt);
@@ -6950,13 +6950,18 @@ export class SessionHost {
     );
   }
 
-  private validateTurnOverrides(sessionId: string, overrides: TurnExecutionOverrides | undefined): void {
-    if (overrides === undefined) return;
+  private validateTurnOverrides(
+    sessionId: string,
+    overrides: TurnExecutionOverrides | undefined,
+    options: { readonly checkInheritedRoute?: boolean } = {}
+  ): void {
+    if (overrides === undefined && !options.checkInheritedRoute) return;
     const stored = this.#store.getSession(sessionId);
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
-    const hasProvider = overrides.providerId !== undefined;
-    const hasModel = overrides.modelId !== undefined;
-    if (hasProvider !== hasModel || (overrides.providerId?.trim() === "") || (overrides.modelId?.trim() === "")) {
+    const { providerId, modelId } = overrides ?? {};
+    const hasProvider = providerId !== undefined;
+    const hasModel = modelId !== undefined;
+    if (hasProvider !== hasModel || providerId?.trim() === "" || modelId?.trim() === "") {
       throw turnOverrideError("TURN_OVERRIDE_MODEL_INVALID", "Per-turn model selection requires both provider and model IDs.");
     }
     if (hasProvider && (stored.descriptor.providerId === undefined || stored.descriptor.modelId === undefined)) {
@@ -6966,8 +6971,7 @@ export class SessionHost {
       );
     }
     const modelChanged = hasProvider && hasModel && (
-      overrides.providerId !== stored.descriptor.providerId ||
-      overrides.modelId !== stored.descriptor.modelId
+      providerId !== stored.descriptor.providerId || modelId !== stored.descriptor.modelId
     );
     if (modelChanged && backend.capabilities.get("model.switch")?.supported !== true) {
       throw turnOverrideError(
@@ -6975,8 +6979,8 @@ export class SessionHost {
         "The selected Backend does not support per-turn model switching."
       );
     }
-    const effectiveProviderId = overrides.providerId ?? stored.descriptor.providerId;
-    const effectiveModelId = overrides.modelId ?? stored.descriptor.modelId;
+    const effectiveProviderId = providerId ?? stored.descriptor.providerId;
+    const effectiveModelId = modelId ?? stored.descriptor.modelId;
     const effectiveModel = effectiveProviderId === undefined || effectiveModelId === undefined
       ? undefined
       : backend.models.find((candidate) =>
@@ -6988,7 +6992,7 @@ export class SessionHost {
       );
     }
     if (
-      modelChanged && effectiveProviderId !== undefined && effectiveModelId !== undefined
+      (modelChanged || options.checkInheritedRoute) && effectiveProviderId !== undefined && effectiveModelId !== undefined
       && !this.#modelRoutingEnabled(backend.id, effectiveProviderId, effectiveModelId)
     ) {
       throw turnOverrideError(
@@ -6996,6 +7000,7 @@ export class SessionHost {
         "The requested per-turn model is disabled for new routes."
       );
     }
+    if (overrides === undefined) return;
     if (overrides.effort !== undefined) {
       if (overrides.effort.trim() === "") throw turnOverrideError("TURN_OVERRIDE_EFFORT_INVALID", "Per-turn effort must not be empty.");
       if (stored.descriptor.effort === undefined) {
@@ -7022,8 +7027,8 @@ export class SessionHost {
     const effectiveFastMode = overrides.fastMode ?? stored.descriptor.fastMode;
     this.validateFastSelection(
       stored.descriptor.backendId,
-      overrides.providerId ?? stored.descriptor.providerId,
-      overrides.modelId ?? stored.descriptor.modelId,
+      effectiveProviderId,
+      effectiveModelId,
       effectiveFastMode,
       "Applying the per-turn model policy"
     );
@@ -7040,17 +7045,17 @@ export class SessionHost {
     if (
       overrides.permissionMode !== undefined &&
       overrides.permissionMode !== "ask" &&
+      overrides.permissionMode !== "acceptEdits" &&
       overrides.permissionMode !== "auto" &&
       overrides.permissionMode !== "bypassPermissions"
     ) {
       throw turnOverrideError("TURN_OVERRIDE_PERMISSION_INVALID", "Per-turn permission mode is invalid.");
     }
-    if (overrides.permissionMode !== undefined && overrides.permissionMode !== stored.descriptor.permissionMode) {
-      const change = backend.capabilities.get("permission.change");
-      const modes = backend.capabilities.get("permission.modes");
+    if (overrides.permissionMode !== undefined) {
+      const changed = overrides.permissionMode !== stored.descriptor.permissionMode;
       if (
-        change?.supported !== true || modes?.supported !== true ||
-        !modes.options?.includes(overrides.permissionMode)
+        (changed && backend.capabilities.get("permission.change")?.supported !== true)
+        || ((changed || overrides.permissionMode === "acceptEdits") && !supportsPermissionMode(backend, overrides.permissionMode))
       ) {
         throw turnOverrideError(
           "TURN_OVERRIDE_PERMISSION_UNSUPPORTED",
@@ -11845,6 +11850,10 @@ export class SessionHost {
             { version: 1, operationId: claim.operation.id, phase: "creating" } satisfies PrivateCreationReceipt);
           if ("serviceKind" in input && (input.serviceKind === "personal_development" || input.workerWorkspace !== undefined)) personalNativeCreationDispatched = true;
           for (;;) {
+            if (operationKind === "create_scheduled_session" && input.permissionMode === "acceptEdits"
+              && !supportsPermissionMode(this.#store.getBackend(runtimeTarget.backendId).descriptor, input.permissionMode)) {
+              throw turnOverrideError("SESSION_PERMISSION_MODE_UNSUPPORTED", "The selected Backend does not support the scheduled task permission mode.");
+            }
             try {
               if (groupAssignment) {
                 groupAssignment.assertCurrent();
@@ -19045,6 +19054,11 @@ function extraDirectoryCapabilityInvariant(backendId: string): JokoError {
     stateMayHaveChanged: false,
     recovery: "Refresh or replace the Backend before changing approved extra directories."
   });
+}
+
+function supportsPermissionMode(backend: BackendDescriptor, mode: PermissionMode): boolean {
+  const capability = backend.capabilities.get("permission.modes");
+  return capability?.supported === true && capability.options?.includes(mode) === true;
 }
 
 function turnOverrideError(code: string, message: string): JokoError {

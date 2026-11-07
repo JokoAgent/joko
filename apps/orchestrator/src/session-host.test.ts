@@ -10391,22 +10391,27 @@ describe("SessionHost", () => {
     expect(executePreRunHook).not.toHaveBeenCalled();
   });
 
-  it("runs a script Schedule to durable zero-cost success without fabricating a product Session or core Run", async () => {
+  it.each(["fresh", "bound"] as const)("records zero-cost %s script history with only the original task link", async sessionMode => {
     const fixture = await createFixture();
+    const boundSessionId = sessionMode === "bound"
+      ? (await fixture.host.createSession({ operationId: "script-probe-session", connection: fixture.connection,
+        targetId: "target-one", title: "Inspect this task", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId
+      : undefined;
     const scriptPath = join(fixture.directory, "schedule-complete.mjs");
     writeFileSync(scriptPath, [
       "import { createInterface } from 'node:readline';",
       "const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });",
       "for await (const line of lines) {",
       "  const frame = JSON.parse(line);",
-      "  if (frame.type === 'start') console.log(JSON.stringify({ protocol: 'joko-schedule-script/1', type: 'complete', resultText: 'probe complete' }));",
+      "  if (frame.type === 'start') console.log(JSON.stringify({ protocol: 'joko-schedule-script/1', type: 'complete', resultText: 'probe complete', primarySessionId: frame.context.targetSessionId }));",
       "}"
     ].join("\n"), "utf8");
     fixture.store.upsertSchedule({
       id: "schedule-script-zero-cost",
       backendId: fixture.adapter.id,
       targetId: "target-one",
-      sessionMode: "fresh",
+      sessionMode,
+      ...(boundSessionId === undefined ? {} : { sessionId: boundSessionId }),
       name: "Script probe",
       kind: "manual",
       timezone: "UTC",
@@ -10434,8 +10439,9 @@ describe("SessionHost", () => {
     const result = await new ScheduleCoordinator(fixture.store, fixture.host)
       .runNowWithResult("schedule-script-zero-cost", "script-zero-cost");
     expect(result).toMatchObject({ status: "success" });
-    expect(result).not.toHaveProperty("sessionId");
-    expect(fixture.store.listSessions()).toHaveLength(0);
+    expect(result.sessionId).toBe(boundSessionId);
+    expect(fixture.store.listSessions().map(session => session.descriptor.id)).toEqual(boundSessionId === undefined ? [] : [boundSessionId]);
+    expect(fixture.store.listRuns()).toEqual([]);
     expect(() => fixture.store.getRun(result.runId)).toThrow();
     expect(fixture.store.listScheduleRuns("schedule-script-zero-cost")).toEqual([
       expect.objectContaining({
@@ -10453,10 +10459,28 @@ describe("SessionHost", () => {
         }
       })
     ]);
+    expect(fixture.store.listScheduleRuns("schedule-script-zero-cost")[0]?.sessionId).toBe(boundSessionId);
   });
 
-  it("lets a granted script capability durably create and dispatch a linked product task", async () => {
+  it.each(["created", "queued", "restored"] as const)("handles a %s task through the real script dispatch capability and keeps its task link", async wakeKind => {
     const fixture = await createFixture();
+    let activeTurn!: AdapterContext;
+    let existingSessionId: string | undefined;
+    if (wakeKind !== "created") {
+      existingSessionId = (await fixture.host.createSession({ operationId: "script-busy-session", connection: fixture.connection,
+        targetId: "target-one", title: "Busy task", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    }
+    if (wakeKind === "restored") {
+      await fixture.host.closeIfActive(existingSessionId!);
+      fixture.store.updateSession(existingSessionId!, { archived: true });
+    }
+    if (wakeKind === "queued") {
+      vi.spyOn(fixture.adapter, "send").mockImplementationOnce(async (_prompt, context) => { activeTurn = context; });
+      const prior = fixture.host.enqueueInput({ connection: fixture.connection, operationId: "script-busy-input", sessionId: existingSessionId!,
+        prompt: { text: "The current turn", images: [], files: [], mentions: [], disposition: "prompt" } });
+      await eventually(() => fixture.store.getQueueItem(prior.value.queueItemId).state === "backend_accepted");
+    }
+    const params = { message: "inspect the workspace", title: "Dispatched task", target_session_id: existingSessionId };
     const scriptPath = join(fixture.directory, "schedule-dispatch.mjs");
     writeFileSync(scriptPath, [
       "import { createInterface } from 'node:readline';",
@@ -10464,10 +10488,10 @@ describe("SessionHost", () => {
       "for await (const line of lines) {",
       "  const frame = JSON.parse(line);",
       "  if (frame.type === 'start') {",
-      "    console.log(JSON.stringify({ protocol: 'joko-schedule-script/1', type: 'call', id: 'dispatch-1', method: 'sessions.dispatch', params: { message: 'inspect the workspace', title: 'Dispatched task' } }));",
+      `    console.log(JSON.stringify({ protocol: 'joko-schedule-script/1', type: 'call', id: 'dispatch-1', method: 'sessions.dispatch', params: ${JSON.stringify(params)} }));`,
       "  } else if (frame.type === 'call_result') {",
       "    if (!frame.ok) process.exit(4);",
-      "    console.log(JSON.stringify({ protocol: 'joko-schedule-script/1', type: 'complete', resultText: 'task queued', primarySessionId: frame.result.target_session_id }));",
+      "    console.log(JSON.stringify({ protocol: 'joko-schedule-script/1', type: 'complete', resultText: JSON.stringify(frame.result), primarySessionId: frame.result.target_session_id }));",
       "  }",
       "}"
     ].join("\n"), "utf8");
@@ -10504,17 +10528,25 @@ describe("SessionHost", () => {
       .runNowWithResult("schedule-script-dispatch", "script-dispatch");
     expect(result).toMatchObject({ status: "success", sessionId: expect.any(String) });
     const taskId = result.sessionId!;
-    expect(fixture.store.getSession(taskId).descriptor.title).toBe("Dispatched task");
+    if (existingSessionId !== undefined) expect(taskId).toBe(existingSessionId);
+    expect(fixture.store.getSession(taskId).descriptor.title).toBe(wakeKind === "created" ? "Dispatched task" : "Busy task");
+    expect(fixture.store.listSessions()).toHaveLength(1);
     expect(() => fixture.store.getRun(result.runId)).toThrow();
-    const nestedRun = fixture.store.listRuns({ sessionId: taskId })[0];
-    expect(nestedRun).toBeDefined();
-    await eventually(() => fixture.store.getRun(nestedRun!.descriptor.id).descriptor.state === "completed");
-    expect(fixture.store.listScheduleRuns("schedule-script-dispatch")[0]).toMatchObject({
+    const history = fixture.store.listScheduleRuns("schedule-script-dispatch")[0]!;
+    expect(history).toMatchObject({
       runId: result.runId,
       sessionId: taskId,
       status: "success",
-      detail: { script: { resultText: "task queued" }, costAttribution: "zero" }
+      detail: { script: { resultText: expect.any(String) }, costAttribution: "zero" }
     });
+    const receipt = JSON.parse((history.detail as { script: { resultText: string } }).script.resultText) as { run_id: string };
+    expect(receipt).toMatchObject({ wake_kind: wakeKind === "created" ? "created" : "queued", target_session_id: taskId });
+    if (wakeKind === "restored") expect(fixture.store.getSession(taskId).descriptor.archived).toBe(false);
+    if (wakeKind === "queued") {
+      expect(fixture.store.findQueueItemByRunId(taskId, receipt.run_id)?.state).toBe("accepted");
+      await activeTurn.emit({ type: "done", outcome: "completed" });
+    }
+    await eventually(() => fixture.store.getRun(receipt.run_id).descriptor.state === "completed");
   });
 
   it.each([1, 2])("scans later due Schedules while a script retains one of %i execution slots", async maximum => {
@@ -10592,6 +10624,52 @@ describe("SessionHost", () => {
     expect(f.store.listDueSchedules(now)).toEqual([]);
     expect(coordinator.runtimeSnapshot().slotsInUse).toBe(0);
   });
+
+  it.each(["success", "failed", "manual", "edited", "cancelled"] as const)(
+    "settles an interval script with its owned next occurrence when %s", async scenario => {
+      const fixture = await createFixture();
+      const gate = new AsyncGate();
+      const startedAt = 60_000;
+      const interval = 60_000;
+      let now = startedAt;
+      const schedule = seedScriptSchedule(fixture, "script-interval", { kind: "interval", expression: String(interval),
+        anchorAt: startedAt, nextRunAt: scenario === "manual" ? startedAt + interval : startedAt });
+      const executeScript = vi.fn(async () => {
+        gate.enter();
+        await gate.wait;
+        if (scenario === "failed") throw new Error("Script failed");
+        return { durationMs: 50_000, stderr: "", stderrTruncated: false };
+      });
+      const coordinator = new ScheduleCoordinator(fixture.store, fixture.host, { executeScript, now: () => now });
+      cleanups.push(() => coordinator.stop());
+      const execution = scenario === "manual" ? coordinator.runNowWithResult(schedule.id, "manual-interval") : coordinator.tick();
+      const editedNextAt = startedAt + 180_000;
+      try {
+        await gate.entered;
+        if (scenario === "edited") {
+          fixture.store.upsertSchedule({ ...schedule, expectedRevision: schedule.revision, expression: "180000", nextRunAt: editedNextAt });
+        }
+        if (scenario === "cancelled") await coordinator.abortSchedule(schedule.id);
+        now = startedAt + 50_000;
+      } finally {
+        gate.release();
+      }
+      await execution;
+      const status = scenario === "failed" ? "failed" : scenario === "cancelled" ? "aborted" : "success";
+      expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ firedAt: startedAt, finishedAt: now, status }]);
+      const nextRunAt = scenario === "manual" || scenario === "cancelled" ? startedAt + interval
+        : scenario === "edited" ? editedNextAt : now + interval;
+      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({ nextRunAt });
+      if (scenario === "success" || scenario === "failed") {
+        now = startedAt + interval;
+        await coordinator.tick();
+        expect(executeScript).toHaveBeenCalledOnce();
+        now = nextRunAt;
+        await coordinator.tick();
+        expect(executeScript).toHaveBeenCalledTimes(2);
+      }
+    }
+  );
 
   it("freezes script task creation and retains later Schedule edits", async () => {
     const f = await createFixture(), gate = new AsyncGate(); let fire = 0;
@@ -10824,6 +10902,24 @@ describe("SessionHost", () => {
     coordinator.start();
     coordinator.stop();
     expect(fixture.store.listScheduleRuns("schedule-script-recovery")).toHaveLength(1);
+  });
+
+  it("waits a full interval after recording an interrupted automatic script on restart", async () => {
+    const fixture = await createFixture();
+    const firedAt = 1_000, resumedAt = 91_000, interval = 60_000;
+    const schedule = seedScriptSchedule(fixture, "interrupted-interval", {
+      kind: "interval", expression: String(interval), anchorAt: firedAt, nextRunAt: firedAt
+    });
+    fixture.store.recordScheduleOccurrence({ scheduleId: schedule.id, runId: "interrupted-script", firedAt, status: "running",
+      detail: { script: { status: "running" }, cadence: { preserveNextRun: false, intervalFromFinish: true, nextRunAt: firedAt + interval } } });
+    const executeScript = vi.fn(async () => ({ durationMs: 1, stderr: "", stderrTruncated: false }));
+    const coordinator = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => resumedAt, executeScript });
+    cleanups.push(() => coordinator.stop());
+    coordinator.start();
+    await coordinator.tick();
+    expect(executeScript).not.toHaveBeenCalled();
+    expect(fixture.store.getSchedule(schedule.id).nextRunAt).toBe(resumedAt + interval);
+    expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ firedAt, finishedAt: resumedAt, status: "interrupted" }]);
   });
 
   it("creates a distinct product task for every fresh Schedule fire and records both task links", async () => {
@@ -11147,6 +11243,44 @@ describe("SessionHost", () => {
       lastRunAt: scheduledAt,
       nextRunAt: 31_234
     });
+  });
+
+  it("does not dispatch the later fold after a persisted automatic cron Run consumed the earlier one", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-repeated-cron-task", connection: fixture.connection, targetId: "target-one",
+      title: "Repeated cron time", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const earlierAt = Date.UTC(2026, 10, 1, 5, 30);
+    const laterAt = Date.UTC(2026, 10, 1, 6, 30);
+    const followingDay = Date.UTC(2026, 10, 2, 6, 30);
+    const id = "schedule-repeated-cron-time";
+    fixture.store.upsertSchedule({
+      id, backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+      name: "Legacy cron", kind: "cron", expression: "30 1 * * *", timezone: "America/New_York", enabled: true,
+      prompt: { text: "Run once at this local time", images: [], files: [], mentions: [], disposition: "prompt" },
+      executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once",
+      nextRunAt: earlierAt, now: earlierAt - 60_000
+    });
+    const first = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => earlierAt });
+    try {
+      await first.tick();
+      const [history] = fixture.store.listScheduleRuns(id);
+      expect(history?.firedAt).toBe(earlierAt);
+      await eventually(() => fixture.store.getRun(history!.runId).descriptor.state === "completed");
+      expect(fixture.store.getSchedule(id).nextRunAt).toBe(laterAt);
+    } finally { first.stop(); }
+
+    const restarted = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => laterAt });
+    try {
+      await restarted.tick();
+      expect(fixture.store.listScheduleRuns(id)).toHaveLength(1);
+      expect(fixture.store.getSchedule(id)).toMatchObject({ lastRunAt: earlierAt, nextRunAt: followingDay });
+
+      await restarted.runNow(id, "manual-after-repeated-cron");
+      expect(fixture.store.listScheduleRuns(id)).toHaveLength(2);
+      expect(fixture.store.getSchedule(id).nextRunAt).toBe(followingDay);
+    } finally { restarted.stop(); }
   });
 
   it("persists an invalid execution snapshot as failed and advances the due occurrence exactly once", async () => {

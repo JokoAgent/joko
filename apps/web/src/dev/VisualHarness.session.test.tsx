@@ -245,7 +245,7 @@ describe("Session visual harness", () => {
       return frameId;
     });
     vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
-    onTestFinished(() => vi.unstubAllGlobals());
+    onTestFinished(() => { vi.unstubAllGlobals(); });
     const nextFrame = async () => {
       const callbacks = [...frames];
       await act(async () => {

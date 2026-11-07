@@ -49,4 +49,17 @@ describe("schedule recurrence", () => {
       expect(nextOccurrence({ kind: "cron", expression, timezone: "America/New_York" }, after)).toBe(expected);
     }
   });
+
+  it("uses only the later instant for each matching wall time across a fall-back", () => {
+    const timing = { kind: "cron", expression: "15,45 1 * * *", timezone: "America/New_York" } as const;
+    const first = nextOccurrence(timing, Date.UTC(2026, 10, 1, 4));
+    expect(first).toBe(Date.UTC(2026, 10, 1, 6, 15));
+    const second = nextOccurrence(timing, first!);
+    expect(second).toBe(Date.UTC(2026, 10, 1, 6, 45));
+    expect(nextOccurrence(timing, second!)).toBe(Date.UTC(2026, 10, 2, 6, 15));
+
+    // The next matching wall time can be days away from the search cursor.
+    expect(nextOccurrence({ kind: "cron", expression: "45 1 5 4 *", timezone: "Australia/Lord_Howe" },
+      Date.UTC(2026, 3, 2))).toBe(Date.UTC(2026, 3, 4, 15, 15));
+  });
 });

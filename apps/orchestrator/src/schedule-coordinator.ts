@@ -30,7 +30,7 @@ import {
   type ScheduleScriptExecutionResult,
   type ScheduleScriptInput
 } from "./schedule-script-runner.js";
-import { nextOccurrence, type ScheduleTiming } from "./scheduler.js";
+import { nextOccurrence, repeatedWallTime, type ScheduleTiming } from "./scheduler.js";
 import {
   SchedulerOccurrenceRecovery,
   type ScheduleOccurrenceReleaseReason
@@ -428,6 +428,25 @@ export class ScheduleCoordinator {
       throw new Error("Schedule deletion is in progress.");
     }
     const scheduledAt = options.scheduledAt ?? schedule.nextRunAt ?? this.#now();
+    if (options.source === "automatic" && schedule.kind === "cron") {
+      const repeated = repeatedWallTime(scheduledAt, schedule.timezone);
+      if (repeated?.later === scheduledAt) {
+        // A schedule can still have an occurrence from before the later-instant
+        // rule. Its exact automatic Run already consumed this wall-clock slot.
+        const earlierRunId = scheduledRunId(occurrenceOperationId(schedule.id, repeated.earlier));
+        const earlier = this.#store.findScheduleRunByRunId(earlierRunId);
+        if (earlier?.scheduleId === schedule.id && earlier.firedAt === repeated.earlier) {
+          const nextRunAt = nextScheduleOccurrence(schedule, scheduledAt);
+          this.#store.upsertSchedule(copyScheduleForCoordinator(schedule, {
+            enabled: nextRunAt !== undefined && schedule.enabled,
+            ...(nextRunAt === undefined ? {} : { nextRunAt }),
+            expectedRevision: schedule.revision,
+            now: this.#now()
+          }));
+          return { runId: earlierRunId, status: "skipped" };
+        }
+      }
+    }
     const operationId = options.operationId ?? occurrenceOperationId(schedule.id, scheduledAt);
     const runtimeRunId = scheduledRunId(operationId);
     if (this.#admittedRuns.has(runtimeRunId)) {
@@ -694,6 +713,7 @@ export class ScheduleCoordinator {
         operationId,
         runId,
         scheduledAt,
+        preserveNextRun: options.preserveNextRun === true,
         ...(nextRunAt === undefined ? {} : { nextRunAt }),
         signal,
         ...(options.canDispatch === undefined ? {} : { canDispatch: options.canDispatch }),
@@ -828,6 +848,7 @@ export class ScheduleCoordinator {
     readonly runId: string;
     readonly scheduledAt: number;
     readonly nextRunAt?: number;
+    readonly intervalFromFinish?: boolean;
     readonly status: "skipped" | "failed" | "aborted" | "interrupted";
     readonly detail: unknown;
   }): void {
@@ -845,7 +866,7 @@ export class ScheduleCoordinator {
         }
       },
       (store) => {
-        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt);
+        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt, input.intervalFromFinish);
         store.recordScheduleOccurrence({
           scheduleId: input.schedule.id,
           runId: input.runId,
@@ -866,6 +887,7 @@ export class ScheduleCoordinator {
     readonly runId: string;
     readonly scheduledAt: number;
     readonly nextRunAt?: number;
+    readonly preserveNextRun: boolean;
     readonly signal: AbortSignal;
     readonly canDispatch?: () => boolean;
     readonly preRunDetail?: Readonly<Record<string, unknown>>;
@@ -892,6 +914,7 @@ export class ScheduleCoordinator {
     }
     const routing = { backendId: input.schedule.backendId, targetId: input.schedule.targetId,
       ...(input.schedule.sessionMode === "bound" ? { boundSessionId: input.schedule.sessionId } : {}) };
+    const intervalFromFinish = !input.preserveNextRun && input.schedule.kind === "interval";
     const occurrence = this.#store.recordScheduleOccurrence({
       scheduleId: input.schedule.id,
       runId: input.runId,
@@ -903,7 +926,8 @@ export class ScheduleCoordinator {
         script: { status: "running" },
         costAttribution: "zero",
         cadence: {
-          preserveNextRun: input.nextRunAt === input.schedule.nextRunAt,
+          preserveNextRun: input.preserveNextRun,
+          ...(intervalFromFinish ? { intervalFromFinish: true } : {}),
           ...(input.nextRunAt === undefined ? {} : { nextRunAt: input.nextRunAt })
         }
       }
@@ -976,6 +1000,7 @@ export class ScheduleCoordinator {
         runId: input.runId,
         scheduledAt: input.scheduledAt,
         ...(input.nextRunAt === undefined ? {} : { nextRunAt: input.nextRunAt }),
+        intervalFromFinish,
         ...(sessionId === undefined ? {} : { sessionId }),
         detail
       });
@@ -991,6 +1016,7 @@ export class ScheduleCoordinator {
           runId: input.runId,
           scheduledAt: input.scheduledAt,
           ...(input.nextRunAt === undefined ? {} : { nextRunAt: input.nextRunAt }),
+          intervalFromFinish: status === "failed" && intervalFromFinish,
           status,
           detail: {
             ...(input.preRunDetail ?? {}),
@@ -1012,6 +1038,7 @@ export class ScheduleCoordinator {
     readonly sessionId?: string;
     readonly scheduledAt: number;
     readonly nextRunAt?: number;
+    readonly intervalFromFinish: boolean;
     readonly detail: unknown;
   }): void {
     const finishedAt = Math.max(input.scheduledAt, this.#now());
@@ -1028,7 +1055,7 @@ export class ScheduleCoordinator {
         }
       },
       (store) => {
-        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt);
+        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt, input.intervalFromFinish);
         store.recordScheduleOccurrence({
           scheduleId: input.schedule.id,
           runId: input.runId,
@@ -1096,12 +1123,14 @@ export class ScheduleCoordinator {
       : "Schedule dispatch owner stopped renewing its durable lease.";
     const previousDetail = isRecord(history?.detail) ? history.detail : {};
     const previousScript = isRecord(previousDetail["script"]) ? previousDetail["script"] : undefined;
+    const cadence = isRecord(previousDetail["cadence"]) ? previousDetail["cadence"] : undefined;
     this.recordPreSessionOutcome({
       schedule,
       operationId: `schedule-runtime-recovery-${occurrence.runId}-${occurrence.ownerGeneration}`,
       runId: occurrence.runId,
       scheduledAt: occurrence.scheduledAt,
       ...(nextRunAt === undefined ? {} : { nextRunAt }),
+      intervalFromFinish: occurrence.source === "automatic" && cadence?.["intervalFromFinish"] === true,
       status,
       detail: {
         ...previousDetail,
@@ -1158,6 +1187,7 @@ export class ScheduleCoordinator {
           runId: occurrence.runId,
           scheduledAt: occurrence.firedAt,
           ...(nextRunAt === undefined ? {} : { nextRunAt }),
+          intervalFromFinish: !preserveNextRun && cadence["intervalFromFinish"] === true,
           status: "interrupted",
           detail: {
             ...detail,
@@ -1421,15 +1451,28 @@ function advanceScheduleWithoutSession(
   schedule: ScheduleRecord,
   firedAt: number,
   nextRunAt: number | undefined,
-  now: number
+  now: number,
+  intervalFromFinish = false
 ): void {
   if (store.findPendingScheduleDeletionCleanupForSchedule(schedule.id) !== undefined) return;
-  if (store.getSchedule(schedule.id).revision !== schedule.revision) return;
-  store.upsertSchedule(copyScheduleForCoordinator(schedule, {
-    enabled: schedule.kind !== "one_shot" && schedule.enabled,
+  const current = store.findSchedule(schedule.id);
+  if (current === undefined) return;
+  if (intervalFromFinish) {
+    // Only this automatic due occurrence owns the interval. Keep any schedule
+    // edits, including a new due time or recurrence published while it ran.
+    if (!current.enabled || current.kind !== "interval" || current.nextRunAt !== firedAt) return;
+    try {
+      if (scheduleExtensionSnapshot(current.executionSnapshot).executionMode !== "script") return;
+    } catch {
+      return;
+    }
+    nextRunAt = nextScheduleOccurrenceOrUndefined({ ...current, anchorAt: now }, now);
+  } else if (current.revision !== schedule.revision) return;
+  store.upsertSchedule(copyScheduleForCoordinator(current, {
+    enabled: current.kind !== "one_shot" && current.enabled,
     ...(nextRunAt === undefined ? {} : { nextRunAt }),
-    lastRunAt: firedAt,
-    expectedRevision: schedule.revision,
+    lastRunAt: intervalFromFinish ? Math.max(current.lastRunAt ?? firedAt, firedAt) : firedAt,
+    expectedRevision: current.revision,
     now
   }));
 }
@@ -1489,7 +1532,8 @@ function scheduleCreationSnapshot(value: unknown): {
   const effort = typeof record["effort"] === "string" && record["effort"].length > 0
     ? record["effort"]
     : undefined;
-  const permissionMode = record["permissionMode"] === "auto" || record["permissionMode"] === "bypassPermissions"
+  const permissionMode = record["permissionMode"] === "acceptEdits"
+    || record["permissionMode"] === "auto" || record["permissionMode"] === "bypassPermissions"
     ? record["permissionMode"]
     : "ask";
   return {

@@ -35,7 +35,10 @@ export function nextOccurrence(timing: ScheduleTiming, after: number): number | 
           // A DST gap can normalize an absent slot to a different wall time.
           // Check that actual wall time with the same parser, without a DST gap.
           const wallTime = wallClockTime(next, timing.timezone);
-          if (wallClockCron.nextRun(new Date(wallTime - 1_000))?.getTime() === wallTime) return next;
+          if (wallClockCron.nextRun(new Date(wallTime - 1_000))?.getTime() === wallTime) {
+            const canonical = repeatedWallTime(next, timing.timezone)?.later ?? next;
+            return repeated === undefined ? canonical : Math.min(canonical, repeated);
+          }
           cursor = next;
         }
       } finally { wallClockCron.stop(); cron.stop(); }
@@ -51,10 +54,13 @@ function wallClockTime(epoch: number, timezone: string): number {
   return wallTime.getTime();
 }
 
-function nextRepeatedOccurrence(cron: Cron, timezone: string, after: number): number | undefined {
-  // Croner can wrap to the following day before a repeated half-hour starts.
-  // Locate the nearby offset decrease, then ask the same parser for a slot in
-  // its repeated segment. This preserves seconds and Croner's calendar syntax.
+interface ClockOverlap {
+  readonly transition: number;
+  readonly shift: number;
+  readonly laterOffset: number;
+}
+
+function findClockOverlap(timezone: string, after: number): ClockOverlap | undefined {
   let left = Math.floor(after / 1_000) - 86_400;
   let right = left + 172_800;
   const offsetAt = (second: number): number => wallClockTime(second * 1_000, timezone) - second * 1_000;
@@ -66,12 +72,30 @@ function nextRepeatedOccurrence(cron: Cron, timezone: string, after: number): nu
     if (offsetAt(middle) === beforeOffset) left = middle;
     else right = middle;
   }
-  const transition = right * 1_000;
-  const end = transition + beforeOffset - afterOffset;
+  return { transition: right * 1_000, shift: beforeOffset - afterOffset, laterOffset: afterOffset };
+}
+
+export function repeatedWallTime(at: number, timezone: string): { readonly earlier: number; readonly later: number } | undefined {
+  const overlap = findClockOverlap(timezone, at);
+  if (overlap === undefined) return undefined;
+  const { transition, shift } = overlap;
+  if (at < transition - shift || at >= transition + shift) return undefined;
+  const earlier = at < transition ? at : at - shift;
+  return { earlier, later: earlier + shift };
+}
+
+function nextRepeatedOccurrence(cron: Cron, timezone: string, after: number): number | undefined {
+  // Croner can wrap to the following day before a repeated half-hour starts.
+  // Ask the same parser for a slot in the later segment so cron syntax and
+  // seconds keep their existing meaning.
+  const overlap = findClockOverlap(timezone, after);
+  if (overlap === undefined) return undefined;
+  const { transition, shift, laterOffset } = overlap;
+  const end = transition + shift;
   const start = Math.max(transition, (Math.floor(after / 1_000) + 1) * 1_000);
   if (start >= end) return undefined;
   const wallTime = cron.nextRun(new Date(wallClockTime(start, timezone) - 1_000))?.getTime();
   if (wallTime === undefined) return undefined;
-  const next = wallTime - afterOffset;
+  const next = wallTime - laterOffset;
   return next >= start && next < end && wallClockTime(next, timezone) === wallTime ? next : undefined;
 }

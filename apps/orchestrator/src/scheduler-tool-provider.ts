@@ -124,7 +124,7 @@ const CREATE_PROPERTIES = {
   prompt: { type: "string", minLength: 1, maxLength: 262_144, description: "Prompt sent for each agent run." },
   kind: { type: "string", enum: ["cron", "interval", "one_shot", "manual"], description: "Recurrence kind." },
   cronExpr: { type: "string", minLength: 1, maxLength: 256, description: "Five-field cron expression." },
-  intervalMs: { type: "integer", minimum: 1_000, description: "Anchored interval in milliseconds." },
+  intervalMs: { type: "integer", minimum: 1_000, description: "Interval in milliseconds. An automatically triggered script waits this long after completion." },
   runAt: { type: "integer", minimum: 0, description: "One-shot Unix timestamp in milliseconds." },
   timezone: { type: "string", minLength: 1, maxLength: 128, description: "IANA timezone identifier." },
   recurring: { type: "boolean", description: "False turns the next cron occurrence into a one-shot task." },
@@ -186,6 +186,14 @@ export const SCHEDULER_TOOLS: readonly McpToolDescriptor[] = [
       id: ID_SCHEMA,
       expectedRevision: REVISION_SCHEMA,
       ...CREATE_PROPERTIES,
+      intervalMs: {
+        anyOf: [CREATE_PROPERTIES.intervalMs, { type: "null" }],
+        description: "Set an interval in milliseconds, or pass null with cronExpr to clear the interval. Omit to keep it."
+      },
+      targetSessionId: {
+        anyOf: [CREATE_PROPERTIES.targetSessionId, { type: "null" }],
+        description: "Set an existing task binding, or pass null to clear it. Omit to keep it."
+      },
       expireAt: { anyOf: [CREATE_PROPERTIES.expireAt, { type: "null" }] },
       preRunHook: { anyOf: [PRE_RUN_HOOK_SCHEMA, { type: "null" }] },
       scriptConfig: { anyOf: [SCRIPT_CONFIG_SCHEMA, { type: "null" }] }
