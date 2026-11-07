@@ -104,9 +104,12 @@ export function MobileDrawer({
   }, [translateX]);
 
   const panResponder = useMemo(() => PanResponder.create({
-    onMoveShouldSetPanResponder: (_event, gesture) => gesture.dx < 0 && shouldClaimHorizontalSwipe(gesture.dx, gesture.dy),
-    onPanResponderMove: (_event, gesture) => translateX.setValue(Math.max(-width, Math.min(0, gesture.dx))),
+    onMoveShouldSetPanResponder: (_event, gesture) => visibleRef.current && gesture.dx < 0 && shouldClaimHorizontalSwipe(gesture.dx, gesture.dy),
+    onPanResponderMove: (_event, gesture) => {
+      if (visibleRef.current) translateX.setValue(Math.max(-width, Math.min(0, gesture.dx)));
+    },
     onPanResponderRelease: (_event, gesture) => {
+      if (!visibleRef.current) return;
       if (shouldCloseDrawer(gesture.dx, gesture.vx, width)) onClose();
       else Animated.timing(translateX, {
         duration: reducedMotion ? 0 : 140,
@@ -115,11 +118,14 @@ export function MobileDrawer({
         useNativeDriver: true
       }).start();
     },
-    onPanResponderTerminate: () => Animated.timing(translateX, {
-      duration: reducedMotion ? 0 : 140,
-      toValue: 0,
-      useNativeDriver: true
-    }).start()
+    onPanResponderTerminate: () => {
+      if (!visibleRef.current) return;
+      Animated.timing(translateX, {
+        duration: reducedMotion ? 0 : 140,
+        toValue: 0,
+        useNativeDriver: true
+      }).start();
+    }
   }), [onClose, reducedMotion, translateX, width]);
 
   if (!mounted) return null;

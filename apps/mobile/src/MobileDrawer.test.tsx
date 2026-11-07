@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 import { act, createElement, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import type { GestureResponderEvent, PanResponderCallbacks, PanResponderGestureState } from "react-native";
 import { expect, it, vi } from "vitest";
 import { MobileDrawer } from "./MobileDrawer";
 
-const { animations, dismissKeyboard } = vi.hoisted(() => ({
+const { animations, dismissKeyboard, responders } = vi.hoisted(() => ({
   animations: [] as { readonly finish: (finished?: boolean) => void; readonly closing: boolean }[],
-  dismissKeyboard: vi.fn()
+  dismissKeyboard: vi.fn(),
+  responders: [] as PanResponderCallbacks[]
 }));
 
 vi.mock("react-native", async () => {
@@ -15,7 +17,7 @@ vi.mock("react-native", async () => {
     element("div", { "data-testid": testID }, children);
   class Value {
     generation = 0;
-    setValue() {}
+    setValue() { this.stopAnimation(); }
     stopAnimation() { this.generation += 1; }
   }
   return {
@@ -29,7 +31,10 @@ vi.mock("react-native", async () => {
       }
     }) },
     Easing: { cubic: () => undefined, in: () => undefined, out: () => undefined },
-    PanResponder: { create: () => ({ panHandlers: {} }) },
+    PanResponder: { create: (callbacks: PanResponderCallbacks) => {
+      responders.push(callbacks);
+      return { panHandlers: {} };
+    } },
     Modal: ({ visible, children, onRequestClose }: { readonly visible: boolean; readonly children?: ReactNode; readonly onRequestClose: () => void }) =>
       visible ? element("div", { "data-modal": "true", onKeyDown: (event: KeyboardEvent) => { if (event.key === "Escape") onRequestClose(); } }, children) : null,
     Pressable: ({ children, accessibilityLabel, onPress }: { readonly children?: ReactNode; readonly accessibilityLabel?: string; readonly onPress: () => void }) =>
@@ -49,7 +54,7 @@ function setup() {
     onClose: close, onClosed: closed, onMountedChange: mounted,
     children: createElement("div", { "data-testid": "drawer.content" }, "Complete Home")
   })));
-  const cleanup = () => { act(() => root.unmount()); animations.splice(0); dismissKeyboard.mockClear(); };
+  const cleanup = () => { act(() => root.unmount()); animations.splice(0); responders.splice(0); dismissKeyboard.mockClear(); };
   const finish = () => act(() => { for (const animation of animations.splice(0)) animation.finish(); });
   return { container, root, close, closed, mounted, render, cleanup, finish };
 }
@@ -63,6 +68,29 @@ it("hands navigation back only after the modal content actually unmounts", () =>
     fixture.render(false);
     expect(fixture.closed).not.toHaveBeenCalled();
     expect(fixture.container.querySelector('[data-testid="drawer.content"]')).not.toBeNull();
+    fixture.finish();
+    expect(fixture.closed).toHaveBeenCalledOnce();
+    expect(fixture.container.querySelector('[data-modal="true"]')).toBeNull();
+    expect(fixture.mounted.mock.calls).toEqual([[true], [false]]);
+  } finally { fixture.cleanup(); }
+});
+
+it.each(["onPanResponderRelease", "onPanResponderTerminate"] as const)("finishes Back dismissal despite a short swipe and %s", end => {
+  const fixture = setup();
+  try {
+    fixture.render(true);
+    fixture.finish();
+    const responder = responders.at(-1)!;
+    const event = {} as GestureResponderEvent;
+    const swipe: PanResponderGestureState = { stateID: 1, moveX: 80, moveY: 100, x0: 100, y0: 100,
+      dx: -20, dy: 0, vx: -0.1, vy: 0, numberActiveTouches: 1, _accountsForMovesUpTo: 1 };
+    expect(responder.onMoveShouldSetPanResponder?.(event, swipe)).toBe(true);
+    act(() => fixture.container.querySelector('[data-modal="true"]')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(fixture.close).toHaveBeenCalledOnce();
+    fixture.render(false);
+    expect(responder.onMoveShouldSetPanResponder?.(event, swipe)).toBe(false);
+    act(() => { responder.onPanResponderMove?.(event, swipe); responder[end]?.(event, swipe); });
+    expect(animations).toHaveLength(1);
     fixture.finish();
     expect(fixture.closed).toHaveBeenCalledOnce();
     expect(fixture.container.querySelector('[data-modal="true"]')).toBeNull();
