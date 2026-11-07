@@ -10,8 +10,9 @@ beforeAll(() => { (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REAC
 const roots: Array<{ root: Root; element: HTMLElement }> = [];
 afterEach(async () => { for (const { root, element } of roots.splice(0)) { await act(async () => root.unmount()); element.remove(); } });
 const message = (id: string) => ({ accountId: "account", messageId: id, from: "Sender", to: "Owner", cc: "", bcc: "", subject: id, date: "Today", bodyText: `Body ${id}`, bodyHtml: "", attachments: [] });
+type Preview = { supported: boolean; messageJson: string; error?: string; readerChoices?: readonly { selectionId: string; displayName: string }[] };
 function fixture(server = "first") {
-  const previewMail = vi.fn(async ({ url, read }: { url: string; read: boolean }) => ({ supported: true, messageJson: read ? JSON.stringify(message(url.split("/").at(-1)!)) : "" }));
+  const previewMail = vi.fn(async ({ url, read }: { url: string; read: boolean; readerSelectionId?: string }): Promise<Preview> => ({ supported: true, messageJson: read ? JSON.stringify(message(url.split("/").at(-1)!)) : "" }));
   const controller = { state: { connectionState: "connected", connectionGeneration: 1, navigationRevision: 1, route: { kind: "session", sessionId: "task" },
     activeProfile: { id: "owner", serverId: server, origin: `https://${server}.example.test` } }, extensionCardApi: () => ({ previewMail }), openHttpLink: vi.fn(async () => {}) } as unknown as AppController;
   const fallback = vi.fn(async () => {}), failures: unknown[] = [];
@@ -45,6 +46,29 @@ it("does not let an older link probe replace a newer opened message", async () =
   expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Body two");
   await act(async () => completions.get("https://mail.example.test/one")!({ supported: true, messageJson: "" }));
   expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Body two"); expect(f.previewMail.mock.calls.filter(([request]) => request.read)).toHaveLength(1);
+});
+it("reads an overlapping mail link only through the explicitly selected current plugin", async () => {
+  const f = fixture(), initial = [{ selectionId: "retired", displayName: "First plugin" }, { selectionId: "alternate", displayName: "Second plugin" }];
+  f.previewMail.mockImplementation(async ({ read, readerSelectionId }) => {
+    if (!read) return { supported: true, messageJson: "" };
+    if (readerSelectionId === undefined) return { supported: true, messageJson: "", error: "MAIL_PROVIDER_AMBIGUOUS", readerChoices: initial };
+    if (readerSelectionId === "retired") return { supported: true, messageJson: "", error: "MAIL_PROVIDER_CHANGED", readerChoices: [initial[1]!] };
+    return { supported: true, messageJson: JSON.stringify(message("from the second plugin")) };
+  });
+  const button = (label: string) => [...document.querySelectorAll("button")].find(item => item.textContent === label)!;
+  const dialog = () => document.querySelector('[role="dialog"]');
+  await act(async () => f.render());
+  await act(async () => button("First link").click());
+  expect(dialog()?.textContent).toContain("Choose a plugin to read this message");
+  expect(f.previewMail.mock.calls.map(([request]) => request.readerSelectionId)).toEqual([undefined, undefined]);
+  await act(async () => button("First plugin").click());
+  expect(dialog()?.textContent).toContain("The selected plugin changed");
+  expect(f.previewMail).toHaveBeenCalledTimes(3);
+  await act(async () => button("Second plugin").click());
+  expect(f.previewMail).toHaveBeenLastCalledWith({ sessionId: "task", url: "https://mail.example.test/one", read: true, opened: true,
+    readerSelectionId: "alternate" }, expect.any(Object));
+  expect(dialog()?.textContent).toContain("Body from the second plugin");
+  expect(f.fallback).not.toHaveBeenCalled();
 });
 it("fences a pending opening when its node changes", async () => {
   const f = fixture(); let finish!: (value: { supported: boolean; messageJson: string }) => void;

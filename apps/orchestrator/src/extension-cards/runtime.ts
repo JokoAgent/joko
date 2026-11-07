@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import type { ExtensionUsageSubject, OperationalStore } from "@joko/store";
 import type { ExtensionCatalogManager } from "../extension-catalog.js";
@@ -14,7 +14,7 @@ import type { CredentialVault, EncryptedCredential } from "../credential-vault.j
 import { ExtensionNetwork } from "./network.js";
 import type { ExtensionNetworkConnections } from "./network-connections.js";
 import type { ExtensionOAuthAccounts } from "./oauth-accounts.js";
-import { createExtensionMailReader, type ExtensionMailPreview } from "./mail-reader.js";
+import { createExtensionMailReader, type ExtensionMailPreview, type ExtensionMailPreviewRequest } from "./mail-reader.js";
 import type { ExtensionCardMedia } from "./media.js";
 import { EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE } from "./runtime-bootstrap.js";
 import type { WorkspaceService } from "../workspace-service.js";
@@ -93,7 +93,8 @@ export class ExtensionCardRuntime {
     if (captured.authorityKey !== input.authorityKey) throw new Error("Directory selection plugin authority changed.");
     return this.#files.preparePickedDirectory({ ...input, assertCurrent: captured.assertCurrent });
   }
-  async previewMail(sessionId: string, url: string, read: boolean, opened: boolean, signal: AbortSignal, assertCaller: () => void): Promise<ExtensionMailPreview> {
+  async previewMail(request: ExtensionMailPreviewRequest, signal: AbortSignal, assertCaller: () => void): Promise<ExtensionMailPreview> {
+    const { sessionId, url, read, opened, readerSelectionId } = request;
     const task = this.options.store.getSession(sessionId).descriptor;
     const current = () => {
       assertCaller(); signal.throwIfAborted();
@@ -101,17 +102,26 @@ export class ExtensionCardRuntime {
       if (this.#stopped || selected.createdAt !== task.createdAt || selected.targetId !== task.targetId || selected.binding.generation !== task.binding.generation
         || selected.archived || selected.deletedAt !== undefined || this.options.store.findPendingSessionLifecycleCleanup(sessionId)) throw new Error("Mail task changed.");
     };
+    const selectionOf = (instance: Instance) => createHash("sha256").update(JSON.stringify([
+      instance.connectionId, request.connectionId, sessionId, task.createdAt, task.targetId, task.binding.generation, url
+    ])).digest("hex");
     const reader = createExtensionMailReader({ authorize: current, captureScope: () => current,
       plugins: () => [...this.#instances.values()].flatMap(instance => {
-        try { this.#assert(instance); this.options.projects?.assertEnabledForSession(instance.authority.surface.extensionId, sessionId); return instance.authority.runtime.mailReader ? [{ id: instance.authority.surface.extensionId, reader: instance.authority.runtime.mailReader }] : []; } catch { return []; }
+        const id = instance.authority.surface.extensionId, reader = instance.authority.runtime.mailReader;
+        if (reader === undefined) return [];
+        try {
+          this.#assert(instance); this.options.projects?.assertEnabledForSession(id, sessionId);
+          return [{ id, reader, displayName: instance.authority.name, selectionId: selectionOf(instance) }];
+        } catch { return []; }
       }),
       call: async (plugin, url, markRead) => {
-        current(); const instance = this.#instances.get(plugin.id); if (!instance) throw new Error("Mail source changed.");
+        current(); const instance = this.#instances.get(plugin.id);
+        if (!instance || selectionOf(instance) !== plugin.selectionId) throw new Error("Mail source changed.");
         const result = await this.#call(instance, plugin.reader.tool, { url, ...(markRead ? { markRead: true } : {}) }, signal,
-          { sessionId, targetId: task.targetId, generation: task.binding.generation });
+          { sessionId, targetId: task.targetId, generation: task.binding.generation, assertCurrent: current });
         current(); return { ok: !result.isError, result: result.structuredContent };
       } });
-    return reader(url, read, opened && this.options.store.findSessionRuntimePolicy(sessionId)?.policy !== "review_read_only");
+    return reader(url, read, opened && this.options.store.findSessionRuntimePolicy(sessionId)?.policy !== "review_read_only", readerSelectionId);
   }
   #capture(id: string): Authority {
     if (this.#stopped) throw new Error("Extension runtime stopped.");

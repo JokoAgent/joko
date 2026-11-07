@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ActivityIndicator, AppState, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { mailMessageFields, mailPreviewImages, parseMailMessage, resolveExtensionCardMedia, extensionCardInlineImages, type MailMessage } from "@joko/contracts";
+import { mailMessageFields, mailPreviewImages, parseMailMessage, resolveExtensionCardMedia, extensionCardInlineImages, type ExtensionMailReaderChoice, type MailMessage } from "@joko/contracts";
 import type { MobileExtensionCardApi } from "./mobile-extension-card-api";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
@@ -9,6 +9,15 @@ import { MobileExtensionCardFields } from "./MobileExtensionCardForm";
 import { mobileExtensionCardMessages } from "./mobile-extension-card-messages";
 
 const Context = createContext<((url: string) => Promise<boolean>) | undefined>(undefined);
+interface MailView {
+  readonly url: string;
+  readonly readerSelectionId?: string;
+  readonly loading: boolean;
+  readonly message?: MailMessage;
+  readonly media?: Record<string, string>;
+  readonly error?: string;
+  readonly readerChoices?: readonly ExtensionMailReaderChoice[];
+}
 export function useMobileMailLink() { return useContext(Context); }
 export function MobileExtensionMailReaderProvider({ ownerKey, sessionId, bind, colors, locale, children }: {
   readonly ownerKey: string; readonly sessionId?: string; readonly bind: (sessionId: string) => MobileExtensionCardApi | undefined;
@@ -16,7 +25,7 @@ export function MobileExtensionMailReaderProvider({ ownerKey, sessionId, bind, c
 }) {
   const latest = useRef(ownerKey); latest.current = ownerKey;
   const lifetime = useRef(new AbortController()), sequence = useRef(0), copy = mobileExtensionCardMessages(locale);
-  const [view, setView] = useState<{ url: string; loading: boolean; message?: MailMessage; media?: Record<string, string>; error?: string }>();
+  const [view, setView] = useState<MailView>();
   const [threadFor, setThreadFor] = useState<string>();
   const api = useMemo(() => sessionId ? bind(sessionId) : undefined, [ownerKey, sessionId]);
   const close = () => { sequence.current++; setView(undefined); };
@@ -25,21 +34,25 @@ export function MobileExtensionMailReaderProvider({ ownerKey, sessionId, bind, c
     return () => { abort.abort(); sequence.current++; listener.remove(); };
   }, [ownerKey, sessionId]);
   const current = () => { lifetime.current.signal.throwIfAborted(); if (latest.current !== ownerKey || AppState.currentState !== "active") throw new Error("Mail owner changed."); };
-  const load = async (url: string) => {
+  const load = async (url: string, readerSelectionId?: string) => {
     if (!api || !sessionId) return;
     const request = ++sequence.current;
     try {
-      current(); setView({ url, loading: true });
-      const result = await api.previewMail({ sessionId, url, read: true, opened: true }, { signal: lifetime.current.signal }); current();
+      current(); setView({ url, readerSelectionId, loading: true });
+      const result = await api.previewMail({ sessionId, url, read: true, opened: true, readerSelectionId }, { signal: lifetime.current.signal }); current();
       if (request !== sequence.current) return;
       const message = result.messageJson ? parseMailMessage(JSON.parse(result.messageJson)) : null;
-      setView({ url, loading: false, ...(message ? { message } : { error: result.error === "MAIL_PROVIDER_AMBIGUOUS" ? copy.mailAmbiguous : copy.mailFailed }) });
+      const choices = result.readerChoices ?? [];
+      const resolved = { url, readerSelectionId, loading: false };
+      const error = message ? undefined : result.error === "MAIL_PROVIDER_CHANGED" ? copy.mailSourceChanged
+        : choices.length > 0 ? undefined : result.error === "MAIL_PROVIDER_AMBIGUOUS" ? copy.mailAmbiguous : copy.mailFailed;
+      setView({ ...resolved, message: message ?? undefined, readerChoices: message ? undefined : choices, error });
       if (message && result.extensionId) {
         const uris = mailPreviewImages({ attachmentItems: JSON.stringify(message.attachments) }).map(image => image.url);
         const media = await resolveExtensionCardMedia(uris, async uri => (await api.readMedia({ sessionId, extensionId: result.extensionId, uri }, { signal: lifetime.current.signal })).dataUrl, lifetime.current.signal);
-        current(); if (request === sequence.current) setView({ url, loading: false, message, media });
+        current(); if (request === sequence.current) setView({ ...resolved, message, media });
       }
-    } catch { if (!lifetime.current.signal.aborted && latest.current === ownerKey && request === sequence.current && AppState.currentState === "active") setView({ url, loading: false, error: copy.mailFailed }); }
+    } catch { if (!lifetime.current.signal.aborted && latest.current === ownerKey && request === sequence.current && AppState.currentState === "active") setView({ url, readerSelectionId, loading: false, error: copy.mailFailed }); }
   };
   const open = async (url: string): Promise<boolean> => {
     if (!api || !sessionId || !url.startsWith("https://")) return false;
@@ -58,7 +71,14 @@ export function MobileExtensionMailReaderProvider({ ownerKey, sessionId, bind, c
       </View>
       <ScrollView keyboardShouldPersistTaps="handled">
         {view?.loading && <ActivityIndicator color={colors.accent} />}
-        {view?.error && <View accessibilityRole="alert" style={styles.meta}><Text style={{ color: colors.negative }}>{view.error}</Text><Pressable accessibilityRole="button" style={styles.control} onPress={() => { if (view) void load(view.url); }}><Text style={{ color: colors.accent }}>{copy.retry}</Text></Pressable></View>}
+        {view?.error && <View accessibilityRole="alert" style={styles.meta}><Text style={{ color: colors.negative }}>{view.error}</Text>
+          {!view.readerChoices?.length && <Pressable accessibilityRole="button" style={styles.control} onPress={() => void load(view.url, view.readerSelectionId)}><Text style={{ color: colors.accent }}>{copy.retry}</Text></Pressable>}
+        </View>}
+        {!!view?.readerChoices?.length && <View>
+          <Text accessibilityRole="header" style={[styles.meta, { color: colors.ink }]}>{copy.mailChooseReader}</Text>
+          {view.readerChoices.map(choice => <Pressable key={choice.selectionId} accessibilityRole="button" style={styles.control}
+            onPress={() => void load(view.url, choice.selectionId)}><Text style={{ color: colors.accent }}>{choice.displayName}</Text></Pressable>)}
+        </View>}
         {view?.message && <>
           <Text style={[styles.meta, { color: colors.muted }]}>{view.message.from}{"\n"}{view.message.date}</Text>
           {(view.message.conversationUnavailable || view.message.markReadFailed) && <Text style={[styles.meta, { color: colors.muted }]}>{copy.mailPartial}</Text>}
