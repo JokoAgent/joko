@@ -10458,7 +10458,8 @@ describe("SessionHost", () => {
   it.each(["fresh", "bound"] as const)("records zero-cost %s script history with only the original task link", async sessionMode => {
     const fixture = await createFixture();
     const boundSessionId = sessionMode === "bound"
-      ? (await fixture.host.createSession({ operationId: "script-probe-session", connection: fixture.connection, targetId: "target-one", title: "Inspect this task" })).value.sessionId
+      ? (await fixture.host.createSession({ operationId: "script-probe-session", connection: fixture.connection,
+        targetId: "target-one", title: "Inspect this task", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId
       : undefined;
     const scriptPath = join(fixture.directory, "schedule-complete.mjs");
     writeFileSync(scriptPath, [
@@ -10531,7 +10532,7 @@ describe("SessionHost", () => {
     let existingSessionId: string | undefined;
     if (wakeKind === "queued") {
       existingSessionId = (await fixture.host.createSession({ operationId: "script-busy-session", connection: fixture.connection,
-        targetId: "target-one", title: "Busy task" })).value.sessionId;
+        targetId: "target-one", title: "Busy task", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
       vi.spyOn(fixture.adapter, "send").mockImplementationOnce(async (_prompt, context) => { activeTurn = context; });
       const prior = fixture.host.enqueueInput({ connection: fixture.connection, operationId: "script-busy-input", sessionId: existingSessionId,
         prompt: { text: "The current turn", images: [], files: [], mentions: [], disposition: "prompt" } });
