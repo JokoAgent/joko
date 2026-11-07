@@ -20,6 +20,7 @@ const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOK
 it("honors a Codex schedule admitted before model disablement and rejects later runs on the same route", async () => {
   const backendId = "codex-scheduled-model";
   const model = { providerId: "openai", modelId: "gpt-test" };
+  const effortId = "medium";
   const native = new FakeCodexAppServer();
   const host = new AppServerHost({ transportFactory: () => native.createTransport() });
   let fixture: OrchestratorE2eFixture | undefined;
@@ -31,10 +32,10 @@ it("honors a Codex schedule admitted before model disablement and rejects later 
     const { clients, connectionId } = await fixture.pair("Schedule owner");
     const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
     const targetId = fixture.targetId(backendId);
-    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId, ...model })));
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId, ...model, effortId })));
     const { binding } = fixture.application.store.getSession(sessionId).descriptor;
     const explicitId = scheduleIdFrom(await mutate(createManualScheduleMutation({
-      backendId, targetId, sessionId, text: "Run the saved route", execution: { model: { model } }
+      backendId, targetId, sessionId, text: "Run the saved route", execution: { model: { model, effortId } }
     })));
     const inheritedId = scheduleIdFrom(await mutate(createManualScheduleMutation({
       backendId, targetId, sessionId, text: "Run the task's current route"
