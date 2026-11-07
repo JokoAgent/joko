@@ -6005,6 +6005,21 @@ export class MobileClient {
     await write;
   }
 
+  async #retireUndispatchedSettingsReceipt(pending: PendingOperation): Promise<void> {
+    const retained = (item: PendingOperation) => item.operationId !== pending.operationId || item.connectionId !== pending.connectionId
+      || item.taskJoinId !== pending.taskJoinId || item.kind !== pending.kind;
+    const write = this.#pendingWrite.then(async () => {
+      const remaining = this.#allPending.filter(retained);
+      if (remaining.length !== this.#allPending.length) {
+        await this.storage.savePending(remaining);
+        this.#allPending = remaining;
+      }
+      this.#set({ pending: this.#state.pending.filter(retained), saved: this.#savedViews() });
+    });
+    this.#pendingWrite = write.then(() => undefined, () => undefined);
+    await write;
+  }
+
   async select(sessionId?: string): Promise<void> {
     if (this.#partnerRosterNavigation?.sessionId !== sessionId) this.#partnerRosterNavigation = undefined;
     if (sessionId !== undefined && !this.#state.owner?.sessions.some((session) => session.sessionId === sessionId)) {
@@ -16556,14 +16571,22 @@ export class MobileClient {
     const before = this.#state.pending;
     const next = [...before, pending];
     this.#set({ pending: next, ...(markBusy ? { busy: true } : {}), error: undefined });
+    let persisted: boolean;
     try {
-      if (!await this.#persistPending(next, epoch)) return { accepted: false, definitive: false };
+      persisted = await this.#persistPending(next, epoch);
     } catch (error) {
       if (this.#current(epoch)) this.#set({ pending: before, ...(markBusy ? { busy: false } : {}) });
       throw error;
     }
     let operation: Operation;
-    if (!requestCurrent() || authority?.beforeDispatch?.() === false) return { accepted: false, definitive: false };
+    if (!persisted || !requestCurrent() || authority?.beforeDispatch?.() === false) {
+      if (pending.kind === "extension-settings-routing" || pending.kind === "extension-settings-credential-clear"
+        || pending.kind === "extension-settings-directory") {
+        await this.#retireUndispatchedSettingsReceipt(pending);
+        return { accepted: false, definitive: true };
+      }
+      return { accepted: false, definitive: false };
+    }
     const operationSignal = authority === undefined ? this.#abort?.signal
       : this.#abort === undefined ? authority.signal : AbortSignal.any([this.#abort.signal, authority.signal]);
     try {
