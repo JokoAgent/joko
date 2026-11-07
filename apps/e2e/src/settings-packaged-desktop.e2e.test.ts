@@ -304,6 +304,12 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
     await editor.pressSequentially("Draft survived quit");
     await pane.locator(".is-dirty").waitFor({ state: "visible" });
 
+    const unexpectedDialogs: string[] = [];
+    main.on("dialog", observed => {
+      // Electron owns the beforeunload decision below. A second response from
+      // Playwright can reach Chromium after Electron has already resolved it.
+      if (observed.type() !== "beforeunload") unexpectedDialogs.push(observed.type());
+    });
     const vetoed = await application.evaluate(({ app, BrowserWindow, dialog }, id) => {
       const contents = BrowserWindow.fromId(id)?.webContents;
       if (contents === undefined) return false;
@@ -341,6 +347,7 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
     expect(proxy.httpConnectRequests).toBe(beforeQuit + 1);
     expect(await (await application.browserWindow(main)).evaluate(window => window.id)).toBe(windowId);
     await closeDesktop();
+    expect(unexpectedDialogs).toEqual([]);
   } finally {
     await proxy.close();
   }
