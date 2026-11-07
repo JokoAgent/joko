@@ -320,20 +320,24 @@ export class PartnerSessionTaskManager {
         const open = store.listInteractions({ sessionId: childSessionId, status: "open" });
         if (open.length && message) throw invalid("Resume without input, then answer the pending interaction.");
 
-        // The task stays held while Host admits the input. Publish the input,
-        // queue restoration and resumed task together before waking dispatch.
-        if (message || !open.length && store.countQueueItems({ sessionId: childSessionId, states: ["accepted"] }) === 0) {
-          this.#enqueue(task, inputOperationId, text, "prompt", callerSessionId);
-        }
+        const needsInput = Boolean(message) || !open.length && store.countQueueItems({ sessionId: childSessionId, states: ["accepted"] }) === 0;
+        // Restore the original pause while the task still owns it. Admit the
+        // continuation after the same transaction makes the task active.
         this.host.restorePartnerQueue({ sessionId: childSessionId, operationId,
           ...(task.queuePauseRevision ? { queuePauseRevision: BigInt(task.queuePauseRevision) } : {}) });
         const at = this.now();
-        this.#save({ ...this.#read(task.id), control: "active", deadlineAt: task.deadlineAt + Math.max(0, at - task.pauseAt!),
-          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: at });
+        const resumed: PartnerSessionTaskRecord = { ...task, control: "active", deadlineAt: task.deadlineAt + Math.max(0, at - task.pauseAt!),
+          pauseAt: undefined, queuePauseRevision: undefined, updatedAt: at };
+        this.#save(resumed);
+        if (needsInput) this.#enqueue(resumed, inputOperationId, text, "prompt", callerSessionId, { deferDispatch: true });
         return { sessionId: childSessionId };
       });
     });
-    if (this.#read(task.id).control === "active") this.host.wakePartnerSession(childSessionId);
+    const current = this.#read(task.id);
+    if (current.control === "active") {
+      this.#arm(current);
+      this.host.wakePartnerSession(childSessionId);
+    }
   }
 
   stop(sessionId: string, id: string, operationId: string, mode: "cancel" | "pause" | "request-stop", assertCaller: () => void) {
@@ -404,12 +408,13 @@ export class PartnerSessionTaskManager {
       this.#save(task); this.#arm(task); if (terminal !== "paused") await this.#deliver(task); return this.#read(task.id);
     } catch { task = { ...this.#read(task.id), error: "Task shutdown is still unconfirmed. Input remains held; inspect or retry stopping the same task.", updatedAt: this.now() }; this.#save(task); return task; }
   }
-  #enqueue(task: PartnerSessionTaskRecord, operationId: string, text: string, disposition: PromptInput["disposition"] = "prompt", callerSessionId = task.parentSessionId) {
+  #enqueue(task: PartnerSessionTaskRecord, operationId: string, text: string, disposition: PromptInput["disposition"] = "prompt",
+    callerSessionId = task.parentSessionId, options: { readonly deferDispatch?: true } = {}) {
     this.#assertTaskSession(task);
-    this.host.enqueueServiceInput({ operationId, sessionId: task.sessionId!, source: "system", originSessionId: callerSessionId, prompt: prompt(text, disposition),
+    this.host.enqueueServiceInput({ operationId, sessionId: task.sessionId!, source: "system", originSessionId: callerSessionId, prompt: prompt(text, disposition), ...options,
       onAdmitted: (_store, receipt) => this.#save({ ...task, runId: receipt.runId,
         executionRunIds: [...new Set([...task.executionRunIds, receipt.runId])], status: "queued", updatedAt: this.now() }) });
-    this.#arm(this.#read(task.id));
+    if (options.deferDispatch !== true) this.#arm(this.#read(task.id));
   }
   async #reconcile(id: string): Promise<PartnerSessionTaskRecord> {
     let task = this.#read(id);

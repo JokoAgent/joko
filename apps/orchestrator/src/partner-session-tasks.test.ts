@@ -311,23 +311,27 @@ describe("Partner independent Session tasks", () => {
     const held = await f.tasks.stop(f.parent, task.id, "task:resume-rollback:hold", "pause", () => undefined);
     expect(held.control).toBe("paused");
     expect(f.store.getRun(task.runId!).descriptor.state).toBe("aborted");
-    const originalRestore = f.host.restorePartnerQueue.bind(f.host);
+    const originalEnqueue = f.host.enqueueServiceInput.bind(f.host);
     let operationId = "";
     let interruptedState: unknown;
-    const restore = vi.spyOn(f.host, "restorePartnerQueue").mockImplementationOnce(input => {
-      operationId = input.operationId;
-      const inputState = f.store.findOperation(`${operationId}:resume-input`)?.status;
-      const heldBeforeRestore = f.tasks.isHeld(task.sessionId!);
-      originalRestore(input);
-      interruptedState = { inputState, heldBeforeRestore, queuePaused: f.store.getQueueControl(task.sessionId!).paused };
+    const enqueue = vi.spyOn(f.host, "enqueueServiceInput").mockImplementationOnce(input => {
+      operationId = input.operationId.slice(0, -":resume-input".length);
+      originalEnqueue(input);
+      interruptedState = {
+        inputState: f.store.findOperation(input.operationId)?.status,
+        taskHeld: f.tasks.isHeld(task.sessionId!),
+        queuePaused: f.store.getQueueControl(task.sessionId!).paused,
+        deferDispatch: input.deferDispatch,
+        nativeSends: f.primary.inputs.filter(item => item.context.sessionId === task.sessionId).length
+      };
       throw new Error("Controlled interruption before the resume transaction commits.");
     });
     const call = (args = request) => new PartnerSessionTaskTools(f.tasks).callTool("message_session_task", args, undefined, context);
     try {
       await expect(call()).resolves.toMatchObject({ isError: true });
-      expect(restore).toHaveBeenCalledOnce();
-    } finally { restore.mockRestore(); }
-    expect(interruptedState).toEqual({ inputState: "completed", heldBeforeRestore: true, queuePaused: false });
+      expect(enqueue).toHaveBeenCalledOnce();
+    } finally { enqueue.mockRestore(); }
+    expect(interruptedState).toEqual({ inputState: "completed", taskHeld: false, queuePaused: false, deferDispatch: true, nativeSends: 1 });
     expect(f.store.findOperation(`${operationId}:resume-input`)).toBeUndefined();
     expect(f.store.findOperation(`${operationId}:resume-queue`)).toBeUndefined();
     expect(f.store.findOperation(`${operationId}:resume-task`)).toBeUndefined();
