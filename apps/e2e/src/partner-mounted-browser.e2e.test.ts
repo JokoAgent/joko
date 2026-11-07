@@ -19,7 +19,7 @@ import {
 import { chromium, type Browser, type Page, type Request, type Response, type Route } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
+import { queueRunIdFrom, resolvePermissionMutation, sendInputMutation, submit } from "./operations.js";
 import {
   REAL_PI_MODEL_ID,
   REAL_PI_PROVIDER_ID,
@@ -173,13 +173,42 @@ describe("mounted Partner collaboration product chain", () => {
     const topic = await makeTopic("A"), sibling = await makeTopic("B");
     const taskTool = (sessionId: string, name: string) => store.listEvents({ sessionId }).flatMap(event => event.payload.type === "tool_result"
       && event.payload.name.endsWith(name) ? [event.payload] : []).at(-1);
+    const settleStart = async (runId: string, label: string) => {
+      try {
+        const run = await waitFor(async () => {
+          // Exercise topic authority after the ordinary tool permission gate.
+          // An explicit fixture approval must not turn a service Run into owner input.
+          const pending = store.listInteractions({ sessionId: topic, runId, status: "open" })[0];
+          if (pending !== undefined) {
+            expect(pending.payload).toMatchObject({ kind: "permission", toolName: expect.stringMatching(/(?:__|\/)start_session_task$/u) });
+            await submit(manager.clients.operation, manager.connectionId, resolvePermissionMutation({
+              connectionId: manager.connectionId, interactionId: pending.id, generation: BigInt(pending.generation)
+            }), `topic-fixture-allow-${pending.id}`);
+          }
+          return store.getRun(runId).descriptor;
+        }, run => run.endedAt !== undefined, label, 35_000);
+        expect(run.state).toBe("completed");
+      } catch (error) {
+        const requests = active.providerRequests.slice(-8).map(request => ({
+          role: lastMessageRole(request), tools: providerToolNames(request).filter(name => name.includes("session_task")),
+          review: JSON.stringify(request.body).includes("You are a permission reviewer for one tool call"),
+          marker: [start, blocked].find(marker => latestUserText(request).includes(marker))
+        }));
+        const interactions = store.listInteractions({ sessionId: topic, runId }).map(item => ({
+          status: item.status, kind: item.kind, tool: item.payload.kind === "permission" ? item.payload.toolName : undefined
+        }));
+        throw new Error(`${label}: ${error instanceof Error ? error.message : String(error)} ${JSON.stringify({ requests, interactions })}`, { cause: error });
+      }
+    };
     const serviceInput = sessionHost.enqueueServiceInput({ operationId: "service-topic-fixture", sessionId: topic, source: "system",
       prompt: { text: blocked, images: [], files: [], mentions: [], disposition: "prompt" } });
-    await waitFor(async () => store.getRun(serviceInput.value.runId).descriptor.state, state => state === "completed", "the service topic input to settle", 30_000);
+    await settleStart(serviceInput.value.runId, "the service topic input to settle");
     expect(taskTool(topic, "start_session_task")).toMatchObject({ isError: true, output: expect.stringContaining("TASK_CALLER_CHANGED") });
     expect(partnerSessionTasks!.list(partner.partnerId)).toEqual([]);
 
-    await sendPartnerPrompt(active, manager, topic, start);
+    const ownerInput = await submit(manager.clients.operation, manager.connectionId,
+      sendInputMutation(topic, BigInt(store.getSession(topic).descriptor.binding.generation), start));
+    await settleStart(queueRunIdFrom(ownerInput), "the owner topic input to settle");
     const task = required(await waitFor(async () => partnerSessionTasks!.list(partner.partnerId)[0], item => item?.deliveredExecution === 1,
       "the result to return to the original topic", 30_000), "the completed independent task");
     taskId = task.id;
