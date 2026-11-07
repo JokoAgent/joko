@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { Code, ConnectError } from '@connectrpc/connect';
 import { AppState, Pressable, Text, TextInput, View } from 'react-native';
 import Svg, { Rect } from 'react-native-svg';
 import qrcode from 'qrcode-generator';
@@ -71,7 +72,8 @@ export function MobileDeviceAuthorizationSettings({ getApi, colors, locale, node
   const displayedLink = shareMode === 'code' || seed.current?.allowKnock ? target : link;
   const create = async (allowKnock = false) => {
     if (invitation) { seed.current = undefined; setInvitation(undefined); }
-    if (seed.current && seed.current.allowKnock !== allowKnock) throw new Error(zh ? '请先重试原邀请。' : 'Retry the original invitation first.');
+    const previous = seed.current;
+    if (previous && previous.allowKnock !== allowKnock) throw new Error(zh ? '请先重试原邀请。' : 'Retry the original invitation first.');
     const current = available.find(entry => entry.origin === route?.origin && entry.transportKind === (route?.transportKind ?? 'https'));
     const entryIds = scope === 'all' ? [] : scope === 'current' ? current ? [current.entryId] : [] : allowedIds;
     if (!seed.current && scope !== 'all' && (!entryIds.length || entryIds.some(id => !available.some(entry => entry.entryId === id)))) throw new Error(zh ? '请至少选择一种当前已发布的方式。' : 'Select at least one currently published method.');
@@ -79,7 +81,10 @@ export function MobileDeviceAuthorizationSettings({ getApi, colors, locale, node
       shortCode: [...globalThis.crypto.getRandomValues(new Uint8Array(8))].map(byte => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[byte % 32]).join(''), allowKnock, entryIds: [...entryIds] };
     const prepared = seed.current;
     const result = await api.current!.create({ invitationId: prepared.invitationId, invitationSecretDigest: bytesToHex(sha256(new TextEncoder().encode(prepared.invitationSecret))),
-      invitationCodeDigest: bytesToHex(sha256(new TextEncoder().encode(prepared.shortCode))), allowKnock: prepared.allowKnock, entryIds: prepared.entryIds });
+      invitationCodeDigest: bytesToHex(sha256(new TextEncoder().encode(prepared.shortCode))), allowKnock: prepared.allowKnock, entryIds: prepared.entryIds }).catch((failure: unknown) => {
+      if (previous === undefined && seed.current === prepared && failure instanceof ConnectError && failure.code === Code.FailedPrecondition) seed.current = undefined;
+      throw failure;
+    });
     const value = authorizationView(result.authorization);
     if (alive.current) { setEntrances(result.entries ?? []); setRequestLink('');
       const entry = result.entries?.find(value => !value.requiresServerSetup && value.origin === route?.origin && value.transportKind === (route?.transportKind ?? 'https'))
