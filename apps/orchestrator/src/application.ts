@@ -3968,13 +3968,13 @@ function createClaudeCodeCredentialPort(
 function createOutboundFetch(
   resolveProxy: OutboundProxyResolver | undefined,
   maximumResponseBytes = 1024 * 1024
-): typeof fetch {
+): (input: RequestInfo | URL, init?: RequestInit, assertBeforeDispatch?: () => void) => Promise<Response> {
   if (!Number.isSafeInteger(maximumResponseBytes)
     || maximumResponseBytes < 1
     || maximumResponseBytes > 256 * 1024 * 1024) {
     throw new Error("The outbound response size limit is invalid.");
   }
-  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  return async (input, init, assertBeforeDispatch) => {
     const target = input instanceof Request ? input.url : input.toString();
     const requestSignal = init?.signal instanceof AbortSignal ? init.signal : undefined;
     const environmentProxy = environmentProxyForTarget(new URL(target), process.env);
@@ -3983,6 +3983,7 @@ function createOutboundFetch(
       : environmentProxy;
     requestSignal?.throwIfAborted();
     if (proxyValue === undefined || proxyValue === null || proxyValue === "") {
+      assertBeforeDispatch?.();
       return boundedOutboundResponse(await fetch(input, init), maximumResponseBytes);
     }
     const protocol = new URL(proxyValue).protocol;
@@ -3990,6 +3991,7 @@ function createOutboundFetch(
       ? createSocks5Dispatcher(proxyValue)
       : new ProxyAgent(proxyValue);
     try {
+      assertBeforeDispatch?.();
       const upstream = await proxyFetch(input as Parameters<typeof proxyFetch>[0], {
         ...(init as Parameters<typeof proxyFetch>[1]),
         dispatcher
@@ -3998,7 +4000,7 @@ function createOutboundFetch(
     } finally {
       await awaitWithAbort(dispatcher.close().catch(() => undefined), requestSignal);
     }
-  }) as typeof fetch;
+  };
 }
 
 async function awaitWithAbort<T>(

@@ -1160,7 +1160,7 @@ describe("PiEventTranslator", () => {
     expect(storeArtifact).not.toHaveBeenCalled();
   });
 
-  it("keeps a managed generated image in the tool result when the final assistant reply is text only", async () => {
+  it.each(["image_generate", "image_edit"])("keeps the %s image in the tool result when the final assistant reply is text only", async toolName => {
     const events: EventPayload[] = [];
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-generated-image-workspace-"));
     const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-generated-image-artifacts-"));
@@ -1171,28 +1171,29 @@ describe("PiEventTranslator", () => {
     });
     const blob: BlobRef = { id: "generated-image", sha256: "e".repeat(64), byteLength: 16,
       mimeType: "image/png", fileName: "generated-image.png" };
-    const result = { content: [{ type: "text", text: "Image generated successfully." }],
+    const text = "Your image is ready.";
+    const result = { content: [{ type: "text", text }],
       details: { jokoMcpBridge: { format: 1, imageOutputs: [{ blob }] } } };
     await translator.translate({ type: "tool_execution_end", toolCallId: "image-call",
-      toolName: "image_generate", isError: false, result } as unknown as PiRpcEvent);
+      toolName, isError: false, result } as unknown as PiRpcEvent);
     await translator.translate({ type: "message_end", message: {
-      role: "assistant", content: [{ type: "text", text: "Your image is ready." }]
+      role: "assistant", content: [{ type: "text", text }]
     } } as unknown as PiRpcEvent);
     expect(events.filter(event => event.type === "tool_result" || event.type === "message_complete")).toEqual([
-      expect.objectContaining({ type: "tool_result", name: "image_generate", isError: false, parts: [
-        { kind: "text", text: "Image generated successfully." }, { kind: "image", blob }
+      expect.objectContaining({ type: "tool_result", name: toolName, isError: false, parts: [
+        { kind: "text", text }, { kind: "image", blob }
       ] }),
-      expect.objectContaining({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Your image is ready." }] })
+      expect.objectContaining({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] })
     ]);
     const nativeEntry = await translator.materializeNativeHistoryEntry({
       id: "image-result", type: "message", timestamp: 1,
-      data: { message: { role: "toolResult", toolCallId: "image-call", toolName: "image_generate",
+      data: { message: { role: "toolResult", toolCallId: "image-call", toolName,
         content: result.content, details: result.details, isError: false, timestamp: 1 } }
     });
     const projected = projectPiNativeHistory(undefined, { entries: [nativeEntry], leafId: nativeEntry.id });
     expect(projected.events.find(event => event.payload.type === "tool_result")?.payload).toMatchObject({
-      name: "image_generate", isError: false, parts: [
-        { kind: "text", text: "Image generated successfully." }, { kind: "image", blob }
+      name: toolName, isError: false, parts: [
+        { kind: "text", text }, { kind: "image", blob }
       ]
     });
     expect(storeArtifact).not.toHaveBeenCalled();

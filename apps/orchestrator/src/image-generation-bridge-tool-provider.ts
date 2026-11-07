@@ -1,6 +1,7 @@
 import { JokoError, type BlobRef } from "@joko/core";
 import { OperationInProgressError, OperationPreviouslyFailedError, type OperationalStore } from "@joko/store";
 
+import type { ArtifactStore } from "./artifact-store.js";
 import type {
   BridgeToolCallContext,
   BridgeToolCallResult,
@@ -17,16 +18,30 @@ export const IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID = "joko-image-generation";
 export const IMAGE_GENERATION_RESPONSE_MAXIMUM_BYTES = 64 * 1024 * 1024;
 
 const IMAGE_GENERATION_TOOL_NAME = "image_generate";
+const IMAGE_EDIT_TOOL_NAME = "image_edit";
 const OPENAI_IMAGES_GENERATION_ENDPOINT = "https://api.openai.com/v1/images/generations";
+const OPENAI_IMAGES_EDIT_ENDPOINT = "https://api.openai.com/v1/images/edits";
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
 const IMAGE_RESULT_STAGING_MS = 10 * 60_000;
 const MAXIMUM_PROMPT_BYTES = 32 * 1024;
+const MAXIMUM_REFERENCE_IMAGES = 16;
+const REFERENCE_IMAGE_BYTE_LIMIT = 50_000_000;
+const MAXIMUM_REFERENCE_TOTAL_BYTES = 64 * 1024 * 1024;
 const ASPECT_RATIOS = ["1:1", "3:2", "2:3"] as const;
 const EXACT_IMAGE_QUALITIES = ["auto", "low", "medium", "high"] as const;
 
 type ImageAspectRatio = (typeof ASPECT_RATIOS)[number];
 type ImageQuality = (typeof EXACT_IMAGE_QUALITIES)[number];
 type SupportedImageMime = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+type ImageToolName = typeof IMAGE_GENERATION_TOOL_NAME | typeof IMAGE_EDIT_TOOL_NAME;
+
+interface ImageEditReference {
+  readonly blob: BlobRef;
+  readonly file: Blob;
+  readonly extension: string;
+}
+
+type ImageProviderFetch = (input: RequestInfo | URL, init: RequestInit, beforeDispatch: () => void) => Promise<Response>;
 
 interface ImageGenerationRoute {
   readonly owner: ConfiguredProviderCredentialSurface;
@@ -48,8 +63,8 @@ export interface ExecutableImageGenerationModel {
 export interface ImageGenerationBridgeToolProviderOptions {
   readonly store: OperationalStore;
   readonly credentialSurfaces: ProviderCredentialSurfaceResolver;
-  readonly artifacts: McpResultArtifactStore;
-  readonly fetch?: typeof fetch;
+  readonly artifacts: McpResultArtifactStore & Pick<ArtifactStore, "readBlob">;
+  readonly fetch?: ImageProviderFetch;
 }
 
 /**
@@ -59,9 +74,9 @@ export interface ImageGenerationBridgeToolProviderOptions {
 export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   readonly id = IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID;
   readonly #credentialSurfaces: ProviderCredentialSurfaceResolver;
-  readonly #artifacts: McpResultArtifactStore;
+  readonly #artifacts: ImageGenerationBridgeToolProviderOptions["artifacts"];
   readonly #store: OperationalStore;
-  readonly #fetch: typeof fetch;
+  readonly #fetch: ImageProviderFetch;
   #generation = 1;
   #signature: string | undefined;
   #routes: readonly ImageGenerationRoute[] = [];
@@ -70,7 +85,10 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     this.#store = options.store;
     this.#credentialSurfaces = options.credentialSurfaces;
     this.#artifacts = options.artifacts;
-    this.#fetch = options.fetch ?? globalThis.fetch;
+    this.#fetch = options.fetch ?? ((input, init, beforeDispatch) => {
+      beforeDispatch();
+      return globalThis.fetch(input, init);
+    });
   }
 
   get generation(): number {
@@ -90,51 +108,19 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   get tools(): readonly McpToolDescriptor[] {
     this.#refreshSnapshot();
     if (this.#routes.length === 0) return [];
-    const multipleRoutes = this.#routes.length > 1;
-    const exactOptions = this.#routes.some(supportsExactImageOptions);
-    return [{
-      serverId: this.id,
-      name: IMAGE_GENERATION_TOOL_NAME,
-      runtimeName: IMAGE_GENERATION_TOOL_NAME,
-      description:
-        "Generate an image with the configured image model. Use a clear, complete visual prompt and supported output options.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          prompt: {
-            type: "string",
-            minLength: 1,
-            description: "A complete description of the image to generate."
-          },
-          aspect_ratio: {
-            type: "string",
-            enum: [...ASPECT_RATIOS],
-            description: "Optional output aspect ratio."
-          },
-          ...(exactOptions ? {
-            size: {
-              type: "string",
-              description: "GPT Image 2 exact WIDTHxHEIGHT or auto. Each edge must be divisible by 16 and at most 3840, with a ratio up to 3:1 and 655360–8294400 pixels."
-            },
-            quality: {
-              type: "string",
-              enum: [...EXACT_IMAGE_QUALITIES],
-              description: "Optional GPT Image 2 quality."
-            }
-          } : {}),
-          ...(multipleRoutes ? {
-            model: {
-              type: "string",
-              enum: this.#routes.map((route) => route.modelId),
-              description: "The configured image model to use."
-            }
-          } : {})
-        },
-        required: multipleRoutes ? ["prompt", "model"] : ["prompt"],
-        additionalProperties: false
-      },
-      requiresPermission: true
-    }];
+    const tools = [describeImageTool(IMAGE_GENERATION_TOOL_NAME, this.#routes)];
+    const editRoutes = this.#routes.filter(isGptImage2Route);
+    if (editRoutes.length > 0) tools.push(describeImageTool(IMAGE_EDIT_TOOL_NAME, editRoutes));
+    return tools;
+  }
+
+  toolsForSession(sessionId: string): readonly McpToolDescriptor[] {
+    const tools = this.tools;
+    const session = this.#store.findSession(sessionId)?.descriptor;
+    if (session === undefined) return tools;
+    const target = this.#store.getTarget(session.targetId).descriptor;
+    return target.trusted && target.remoteWorkspace === undefined && session.remoteWorkspace === undefined
+      ? tools : tools.filter(tool => tool.name !== IMAGE_EDIT_TOOL_NAME);
   }
 
   async callTool(
@@ -144,41 +130,41 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     context: BridgeToolCallContext
   ): Promise<BridgeToolCallResult> {
     this.#refreshSnapshot();
-    if (name !== IMAGE_GENERATION_TOOL_NAME || this.#routes.length === 0) {
-      throw new Error("Image generation is not part of this runtime snapshot.");
+    if (name !== IMAGE_GENERATION_TOOL_NAME && name !== IMAGE_EDIT_TOOL_NAME) {
+      throw new Error("The image tool is unavailable in this runtime snapshot.");
     }
-    const multipleRoutes = this.#routes.length > 1;
-    assertOnlyKeys(arguments_, multipleRoutes
-      ? ["prompt", "aspect_ratio", "size", "quality", "model"]
-      : ["prompt", "aspect_ratio", "size", "quality"]);
+    const editing = name === IMAGE_EDIT_TOOL_NAME;
+    const routes = editing ? this.#routes.filter(isGptImage2Route) : this.#routes;
+    const multipleRoutes = routes.length > 1;
+    const allowed = ["prompt", "aspect_ratio", "size", "quality"];
+    if (editing) allowed.push("image");
+    if (multipleRoutes) allowed.push("model");
+    assertOnlyKeys(arguments_, allowed);
     const prompt = requiredUtf8String(arguments_["prompt"], MAXIMUM_PROMPT_BYTES, "Image prompt is invalid.");
     const aspectRatio = optionalAspectRatio(arguments_["aspect_ratio"]);
     const selectedModel = multipleRoutes ? requiredModel(arguments_["model"]) : undefined;
     const route = multipleRoutes
-      ? this.#routes.find((candidate) => candidate.modelId === selectedModel)
-      : this.#routes[0];
+      ? routes.find((candidate) => candidate.modelId === selectedModel)
+      : routes[0];
     if (route === undefined || !this.#credentialSurfaces.modelEnabled(route.owner, route.modelId)) {
       throw new Error("The selected image model is unavailable.");
     }
-    if (!supportsExactImageOptions(route) && (arguments_["size"] !== undefined || arguments_["quality"] !== undefined)) {
+    if (!isGptImage2Route(route) && (arguments_["size"] !== undefined || arguments_["quality"] !== undefined)) {
       throw new Error("The selected image model does not support size and quality options.");
     }
     const size = imageSize(arguments_["size"], aspectRatio);
     const quality = optionalImageQuality(arguments_["quality"]);
+    const references = editing ? await this.#readEditReferences(arguments_["image"], context, signal) : undefined;
 
     let apiKey: string | undefined;
     try {
       apiKey = this.#credentialSurfaces.resolveSecret(route.owner).trim();
       if (apiKey.length === 0) throw new Error("Image generation credential is not configured.");
-      context.acceptDispatchedImageResult?.(() => this.#credentialSurfaces.assertDispatchedCredential(route.owner, route.modelId));
-      signal?.throwIfAborted();
-      context.assertCurrent?.();
-      const claim = this.#claimImageEffect(route, context);
-      if (!claim.claimed) {
-        const stored = this.#store.getArtifact(claim.value.id);
-        if (stored.deletedAt !== undefined) throw new Error("The original image result is no longer available.");
-        return imageResult(claim.value, route.modelId);
-      }
+      let operation: { readonly id: string; readonly bodyHash: string } | undefined;
+      const assertDispatched = () => {
+        this.#credentialSurfaces.assertDispatchedCredential(route.owner, route.modelId);
+        references?.assertCurrent();
+      };
       try {
         const generated = await this.#dispatch({
           executionApi: route.owner.surface.executionApi,
@@ -187,21 +173,39 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
           prompt,
           size,
           ...(quality === undefined ? {} : { quality }),
-          ...(signal === undefined ? {} : { signal })
+          ...(references === undefined ? {} : { references: references.images }),
+          ...(signal === undefined ? {} : { signal }),
+          beforeDispatch: () => {
+            signal?.throwIfAborted();
+            context.assertCurrent?.();
+            assertDispatched();
+            context.acceptDispatchedImageResult?.(assertDispatched);
+            const claim = this.#claimImageEffect(route, context, references?.images);
+            if (!claim.claimed) throw new ReplayedImageEffect(claim.value);
+            operation = claim.operation;
+          }
         });
+        if (operation === undefined) throw new Error("The original image request was not captured.");
         context.assertCurrent?.();
-        const blob = await this.#artifacts.ingestBytes(generated.bytes, {
-          fileName: `generated-image${extensionForMime(generated.mimeType)}`,
+        const staged = await this.#artifacts.ingestBytes(generated.bytes, {
+          fileName: `${editing ? "edited" : "generated"}-image${extensionForMime(generated.mimeType)}`,
           mimeType: generated.mimeType,
           ...(context.acceptDispatchedImageResult === undefined ? {} : { expiresAt: Date.now() + IMAGE_RESULT_STAGING_MS })
         });
         context.assertCurrent?.();
-        this.#store.completeDeferredEffectOperation(claim.operation.id, claim.operation.bodyHash, () => blob);
-        return imageResult(blob, route.modelId);
+        const blob = this.#store.getArtifact(staged.id).blob;
+        this.#store.completeDeferredEffectOperation(operation.id, operation.bodyHash, () => blob);
+        return imageResult(blob, route.modelId, editing);
       } catch (error) {
-        const failure = imageSubmissionFailure(claim.operation.id, error instanceof ImageProviderRejection);
+        if (error instanceof ReplayedImageEffect) {
+          const stored = this.#store.findArtifact(error.blob.id);
+          if (stored === undefined) throw new Error("The original image result is no longer available.");
+          return imageResult(stored.blob, route.modelId, editing);
+        }
+        if (operation === undefined) throw error;
+        const failure = imageSubmissionFailure(operation.id, error instanceof ImageProviderRejection);
         try {
-          this.#store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, failure);
+          this.#store.failEffectOperation(operation.id, operation.bodyHash, failure);
         } catch {
           // A lost terminal write leaves the original durable claim in place.
         }
@@ -213,17 +217,103 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     }
   }
 
-  #claimImageEffect(route: ImageGenerationRoute, context: BridgeToolCallContext) {
+  async #readEditReferences(value: unknown, context: BridgeToolCallContext, signal: AbortSignal | undefined) {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAXIMUM_REFERENCE_IMAGES) {
+      throw new Error(`Image editing requires 1–${MAXIMUM_REFERENCE_IMAGES} image references.`);
+    }
+    const input = context.nativeRootQueueInput;
+    const assertRoot = context.assertNativeRoot;
+    if (input === undefined || assertRoot === undefined) throw imageEditInputUnavailable();
+    const assertNativeInput = (): void => {
+      signal?.throwIfAborted();
+      assertRoot();
+      input.assertCurrent();
+    };
+    context.assertCurrent?.();
+    assertNativeInput();
+    const original = this.#store.getQueueItem(input.queueItemId);
+    const operation = this.#store.getOperation(original.operationId);
+    if ((operation.kind !== "sendInput" && operation.kind !== "send_input") || operation.status !== "completed"
+      || operation.connectionId === undefined) throw imageEditInputUnavailable();
+    const connection = this.#store.getConnection(operation.connectionId);
+    const assertOwner = (): void => {
+      assertNativeInput();
+      const session = this.#store.getSession(context.sessionId).descriptor;
+      const target = this.#store.getTarget(session.targetId).descriptor;
+      const queue = this.#store.getQueueItem(original.id);
+      const run = this.#store.getRun(queue.runId).descriptor;
+      const backendGeneration = this.#store.getBackend(session.backendId).descriptor.instanceGeneration;
+      if (queue.sessionId !== session.id || run.sessionId !== session.id || run.source !== "user" || run.parentRunId !== undefined
+        || session.targetId !== context.targetId || session.binding.generation !== context.generation
+        || session.archived || session.deletedAt !== undefined || session.remoteWorkspace !== undefined
+        || !target.trusted || target.remoteWorkspace !== undefined || queue.bodyHash !== original.bodyHash
+        || queue.backendInstanceGeneration !== backendGeneration
+        || (queue.state !== "dispatching" && queue.state !== "backend_accepted") || queue.attemptId === undefined
+        || queue.attemptId !== original.attemptId || run.activeAttemptId !== queue.attemptId) throw imageEditInputUnavailable();
+      const attempt = this.#store.getAttempt(queue.attemptId).descriptor;
+      if (attempt.generation !== context.generation || attempt.backendInstanceGeneration !== backendGeneration
+        || attempt.endedAt !== undefined || attempt.runId !== run.id) throw imageEditInputUnavailable();
+      this.#store.authorizeConnection(connection.id, connection.authKeyDigest);
+    };
+    assertOwner();
+    const attached = original.body.images.map(image => image.blob);
+    const records = value.map((reference: unknown) => {
+      if (!boundedIdentifier(reference, 512)) throw imageEditInputUnavailable();
+      const numbered = /^input:([1-9]\d{0,2})$/u.exec(reference);
+      const attachment = numbered === null ? attached.find(blob => blob.id === reference) : attached[Number(numbered[1]) - 1];
+      if (numbered !== null && attachment === undefined) throw imageEditInputUnavailable();
+      const artifact = this.#store.findArtifact(attachment?.id ?? reference);
+      if (artifact === undefined || (artifact.sessionId !== context.sessionId && (artifact.sessionId !== undefined || attachment === undefined))
+        || (attachment !== undefined && (artifact.blob.sha256 !== attachment.sha256 || artifact.blob.byteLength !== attachment.byteLength))) {
+        throw imageEditInputUnavailable();
+      }
+      if (!supportedEditMime(artifact.blob.mimeType) || artifact.blob.byteLength < 1 || artifact.blob.byteLength >= REFERENCE_IMAGE_BYTE_LIMIT) {
+        throw new Error("An image reference exceeds its size limit or has an unsupported format.");
+      }
+      return artifact;
+    });
+    if (new Set(records.map(record => record.blob.id)).size !== records.length
+      || records.reduce((bytes, record) => bytes + record.blob.byteLength, 0) > MAXIMUM_REFERENCE_TOTAL_BYTES) {
+      throw new Error("Image references must be distinct and within the total size limit.");
+    }
+    const assertCurrent = (): void => {
+      assertOwner();
+      for (const record of records) {
+        const current = this.#store.findArtifact(record.blob.id);
+        if (current === undefined || current.revision !== record.revision) throw imageEditInputUnavailable();
+        if (isRecord(current.metadata) && typeof current.metadata["expiresAt"] === "number"
+          && current.metadata["expiresAt"] <= Date.now()) throw imageEditInputUnavailable();
+      }
+    };
+    const images: ImageEditReference[] = [];
+    for (const record of records) {
+      context.assertCurrent?.();
+      assertCurrent();
+      const image = await this.#artifacts.readBlob(record.blob);
+      const mimeType = sniffImageMime(image.data);
+      if (mimeType !== record.blob.mimeType || !supportedEditMime(mimeType)) {
+        throw new Error("An image reference has an unsupported format.");
+      }
+      images.push({ blob: record.blob, file: new Blob([Uint8Array.from(image.data)], { type: mimeType }), extension: extensionForMime(mimeType) });
+    }
+    context.assertCurrent?.();
+    assertCurrent();
+    return { images, assertCurrent };
+  }
+
+  #claimImageEffect(route: ImageGenerationRoute, context: BridgeToolCallContext, references: readonly ImageEditReference[] | undefined) {
     const { requestIdentity, requestBodyHash } = context;
     if (requestIdentity === undefined || requestBodyHash === undefined) throw new Error("Image request identity is unavailable.");
     const operationId = `mcp-image:${requestIdentity}`;
     const { backend, provider, surface, credential } = route.owner;
     try {
-      return this.#store.claimDeferredEffectOperation<BlobRef>({ id: operationId, kind: "mcp_image_generate", body: {
+      return this.#store.claimDeferredEffectOperation<BlobRef>({ id: operationId,
+        kind: references === undefined ? "mcp_image_generate" : "mcp_image_edit", body: {
         requestBodyHash, sessionId: context.sessionId, targetId: context.targetId, generation: context.generation,
         backendId: backend.id, backendGeneration: backend.instanceGeneration, providerId: provider.providerId,
         surfaceId: surface.surfaceId, executionApi: surface.executionApi, modelId: route.modelId,
-        credentialReferenceId: route.owner.credentialReferenceId, credentialGeneration: credential.generation
+        credentialReferenceId: route.owner.credentialReferenceId, credentialGeneration: credential.generation,
+        ...(references === undefined ? {} : { referenceImages: references.map(({ blob }) => ({ id: blob.id, sha256: blob.sha256 })) })
       } });
     } catch (error) {
       if (error instanceof OperationInProgressError) throw imageSubmissionFailure(operationId, false);
@@ -282,7 +372,9 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     readonly prompt: string;
     readonly size: string;
     readonly quality?: ImageQuality;
+    readonly references?: readonly ImageEditReference[];
     readonly signal?: AbortSignal;
+    readonly beforeDispatch: () => void;
   }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
     switch (input.executionApi) {
       case "openai-images":
@@ -298,38 +390,57 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     readonly prompt: string;
     readonly size: string;
     readonly quality?: ImageQuality;
+    readonly references?: readonly ImageEditReference[];
     readonly signal?: AbortSignal;
+    readonly beforeDispatch: () => void;
   }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
+    const endpoint = input.references === undefined ? OPENAI_IMAGES_GENERATION_ENDPOINT : OPENAI_IMAGES_EDIT_ENDPOINT;
+    const options = {
+      model: input.model, prompt: input.prompt, n: 1, size: input.size,
+      ...(input.quality === undefined ? {} : { quality: input.quality })
+    };
+    let body: string | FormData;
+    if (input.references === undefined) body = JSON.stringify(options);
+    else {
+      const form = new FormData();
+      for (const [key, value] of Object.entries(options)) form.set(key, String(value));
+      input.references.forEach(({ file, extension }, index) => form.append("image[]", file, `reference-${index + 1}${extension}`));
+      body = form;
+    }
     const requestSignal = boundedSignal(input.signal, IMAGE_GENERATION_TIMEOUT_MS);
     let response: Response;
+    let dispatchGuardFailure: { readonly error: unknown } | undefined;
     try {
-      response = await this.#fetch(OPENAI_IMAGES_GENERATION_ENDPOINT, {
+      response = await this.#fetch(endpoint, {
         method: "POST",
         headers: {
           authorization: `Bearer ${input.apiKey}`,
           accept: "application/json",
-          "content-type": "application/json"
+          ...(typeof body === "string" ? { "content-type": "application/json" } : {})
         },
-        body: JSON.stringify({
-          model: input.model,
-          prompt: input.prompt,
-          n: 1,
-          size: input.size,
-          ...(input.quality === undefined ? {} : { quality: input.quality })
-        }),
+        body,
         redirect: "error",
         credentials: "omit",
         cache: "no-store",
         referrerPolicy: "no-referrer",
         signal: requestSignal.signal
+      }, () => {
+        try {
+          requestSignal.signal.throwIfAborted();
+          input.beforeDispatch();
+        } catch (error) {
+          dispatchGuardFailure = { error };
+          throw error;
+        }
       });
     } catch {
       requestSignal.dispose();
+      if (dispatchGuardFailure !== undefined) throw dispatchGuardFailure.error;
       throw new Error("Image generation request did not complete.");
     }
     try {
       if (response.redirected
-        || (response.url !== "" && response.url !== OPENAI_IMAGES_GENERATION_ENDPOINT)) {
+        || (response.url !== "" && response.url !== endpoint)) {
         await response.body?.cancel().catch(() => undefined);
         throw new Error("Image generation response was redirected.");
       }
@@ -362,6 +473,10 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
 
 class ImageProviderRejection extends Error {}
 
+class ReplayedImageEffect extends Error {
+  constructor(readonly blob: BlobRef) { super("The original image result was already saved."); }
+}
+
 function imageSubmissionFailure(operationId: string, rejected: boolean): JokoError {
   return new JokoError({
     code: rejected ? "IMAGE_SUBMISSION_REJECTED" : "IMAGE_SUBMISSION_OUTCOME_UNKNOWN",
@@ -375,11 +490,12 @@ function imageSubmissionFailure(operationId: string, rejected: boolean): JokoErr
   });
 }
 
-function imageResult(blob: BlobRef, model: string): BridgeToolCallResult {
+function imageResult(blob: BlobRef, model: string, editing: boolean): BridgeToolCallResult {
+  const status = editing ? "Image edited successfully." : "Image generated successfully.";
   return {
-    content: [{ type: "text", text: "Image generated successfully." }],
+    content: [{ type: "text", text: `${status} Image reference ${blob.id}.` }],
     structuredContent: {
-      generated: true,
+      ...(editing ? { edited: true } : { generated: true }),
       model,
       mimeType: blob.mimeType,
       byteLength: blob.byteLength
@@ -387,6 +503,57 @@ function imageResult(blob: BlobRef, model: string): BridgeToolCallResult {
     isError: false,
     hostImages: [{ blob }]
   };
+}
+
+function describeImageTool(name: ImageToolName, routes: readonly ImageGenerationRoute[]): McpToolDescriptor {
+  const editing = name === IMAGE_EDIT_TOOL_NAME;
+  const multipleRoutes = routes.length > 1;
+  const exactOptions = routes.some(isGptImage2Route);
+  return {
+    serverId: IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID,
+    name,
+    runtimeName: name,
+    description: editing
+      ? "Edit images from the current owner prompt or use exact image Artifact IDs from this task."
+      : "Generate an image with the configured image model. Use a clear, complete visual prompt and supported output options.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string", minLength: 1,
+          description: editing ? "A complete description of the image edits." : "A complete description of the image to generate."
+        },
+        aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS], description: "Optional output aspect ratio." },
+        ...(editing ? { image: {
+          type: "array", minItems: 1, maxItems: MAXIMUM_REFERENCE_IMAGES,
+          items: { type: "string", minLength: 1, maxLength: 512 },
+          description: "Use input:1, input:2, and so on for images attached to this prompt, or pass an exact image Artifact ID from this task."
+        } } : {}),
+        ...(exactOptions ? {
+          size: {
+            type: "string",
+            description: "GPT Image 2 exact WIDTHxHEIGHT or auto. Each edge must be divisible by 16 and at most 3840, with a ratio up to 3:1 and 655360–8294400 pixels."
+          },
+          quality: { type: "string", enum: [...EXACT_IMAGE_QUALITIES], description: "Optional GPT Image 2 quality." }
+        } : {}),
+        ...(multipleRoutes ? {
+          model: { type: "string", enum: routes.map(route => route.modelId), description: "The configured image model to use." }
+        } : {})
+      },
+      required: ["prompt", ...(editing ? ["image"] : []), ...(multipleRoutes ? ["model"] : [])],
+      additionalProperties: false
+    },
+    requiresPermission: true,
+    ...(editing ? { requiresNativeRoot: true } : {})
+  };
+}
+
+function imageEditInputUnavailable(): Error {
+  return new Error("The original image reference is unavailable in this task.");
+}
+
+function supportedEditMime(value: string | undefined): value is Exclude<SupportedImageMime, "image/gif"> {
+  return value === "image/png" || value === "image/jpeg" || value === "image/webp";
 }
 
 function assertOnlyKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): void {
@@ -418,7 +585,7 @@ function optionalAspectRatio(value: unknown): ImageAspectRatio | undefined {
   return value as ImageAspectRatio;
 }
 
-function supportsExactImageOptions(route: ImageGenerationRoute): boolean {
+function isGptImage2Route(route: ImageGenerationRoute): boolean {
   return route.owner.surface.executionApi === "openai-images" && route.modelId === "gpt-image-2";
 }
 
