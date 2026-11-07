@@ -3149,6 +3149,7 @@ export class MobileRemoteDesktopController {
     this.#emit({ type: "init", epoch,
       width: display.width, height: display.height, trickleIce: this.#snapshot.capabilities.trickleIce,
       webrtc: this.#snapshot.capabilities.webrtcVideo,
+      integerScroll: this.#snapshot.capabilities.platform === "darwin",
       cursorOverlay: this.#snapshot.capabilities.cursorOverlay,
       audio: this.#negotiatedAudio(),
       nativeVideo: this.presentation?.nativeVideo === true, net: RTC_NETWORK, iceServers: PUBLIC_STUN,
