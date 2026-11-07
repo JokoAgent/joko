@@ -122,6 +122,12 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
     const url = new URL(target, base);
     if ((url.origin !== new URL(base).origin && url.origin !== location.origin) || !/^\/(kv|app-context|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
     if (url.username || url.password) throw new Error("Settings URL credentials are not allowed.");
+    const signal = init && init.signal !== undefined ? init.signal : input && input.signal;
+    const assertNotAborted = () => {
+      if (signal && signal.aborted) throw signal.reason === undefined ? new DOMException("The operation was aborted.", "AbortError") : signal.reason;
+    };
+    const dispatch = command => { assertNotAborted(); return call(command); };
+    assertNotAborted();
     const method = String(init && init.method || input && input.method || "GET").toUpperCase();
     let body = init && init.body, command;
     if (body === undefined && input && typeof input.clone === "function" && method !== "GET" && method !== "HEAD") body = await input.clone().text();
@@ -135,8 +141,8 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
       command = { kind: "directory.pick", ...(request.title === undefined ? {} : { title: request.title }) };
     }
     else if (url.pathname === "/kv") {
-      if (method === "GET") { const result = await call({ kind: "routing.get" }); revision = result.revision; return new Response(result.dataJson, { headers: { "content-type": "application/json" } }); }
-      if (method === "PUT") { if (revision === undefined) revision = (await call({ kind: "routing.get" })).revision; command = { kind: "routing.set", revision, dataJson: JSON.stringify(json()) }; }
+      if (method === "GET") { const result = await dispatch({ kind: "routing.get" }); revision = result.revision; return new Response(result.dataJson, { headers: { "content-type": "application/json" } }); }
+      if (method === "PUT") { if (revision === undefined) revision = (await dispatch({ kind: "routing.get" })).revision; command = { kind: "routing.set", revision, dataJson: JSON.stringify(json()) }; }
     } else if (url.pathname === "/secrets" && method === "GET") command = { kind: "setup.get" };
     else if (url.pathname === "/permissions" && method === "GET") command = { kind: "setup.get" };
     else if (url.pathname === "/permissions" && method === "POST") command = { kind: "setup.complete" };
@@ -155,7 +161,7 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
         : { kind: "connections.set", key: connection[1], host: json().host, value: json().value, ...(json().label ? { label: json().label } : {}) };
     }
     if (!command) throw new Error("Settings endpoint is not supported.");
-    const result = await call(command); if (command.kind === "routing.set") revision = result.revision;
+    const result = await dispatch(command); if (command.kind === "routing.set") revision = result.revision;
     return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });
   };
 })();`;

@@ -23,7 +23,7 @@ test("author settings only accepts declared commands and bounded private input",
 function page() {
   const listeners = new Map(), requests = [];
   const parent = { postMessage: value => requests.push(value) };
-  const context = { parent, navigator: {}, location: { origin: "null" }, crypto: webcrypto, URL, Response,
+  const context = { parent, navigator: {}, location: { origin: "null" }, crypto: webcrypto, URL, Response, DOMException,
     fetch: async () => { throw new Error("ambient network denied"); }, setTimeout, clearTimeout,
     addEventListener: (name, callback) => { const values = listeners.get(name) ?? new Set(); values.add(callback); listeners.set(name, values); },
     removeEventListener: (name, callback) => listeners.get(name)?.delete(callback) };
@@ -85,4 +85,24 @@ test("fetch does not send a password that becomes escaped in plugin parameters",
   await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "1",
     dataJson: `{"route":${JSON.stringify(value)},"route":"ordinary"}` }), /Secrets/u);
   assert.equal(current.requests.length, 1);
+});
+
+test("fetch rejects an already cancelled credential write before it sends a settings command", { timeout: 2_000 }, async t => {
+  const current = page();
+  t.after(() => current.dispatch("pagehide", {}));
+  const controller = new AbortController();
+  controller.abort();
+  const reason = controller.signal.reason;
+  const body = JSON.stringify({ value: "fixture-secret" });
+  const aborted = error => error === reason;
+  await assert.rejects(current.context.fetch("/secrets/token", { method: "PUT", body, signal: controller.signal }), aborted);
+  const request = new Request("https://settings.joko.invalid/secrets/token", { method: "PUT", body, signal: controller.signal });
+  await assert.rejects(current.context.fetch(request), aborted);
+  assert.equal(current.requests.length, 0);
+
+  const pending = current.context.fetch(request, { signal: null, body });
+  assert.equal(current.requests.length, 1);
+  assert.equal(current.requests[0].command.kind, "secret.set");
+  current.respond(current.requests[0].id, { configured: true });
+  assert.equal((await (await pending).json()).configured, true);
 });
