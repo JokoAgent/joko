@@ -383,8 +383,99 @@ describe("real Pi managed generation smoke", () => {
     }
   });
 
+  it("uses the live working-context threshold and retains native overflow compaction", { timeout: 45_000 }, async () => {
+    const provider = await startGatedCompletionServer(2, [1, 80_000, 1, 1, 129_000]);
+    const address = provider.server.address() as AddressInfo;
+    const directory = await mkdtemp(join(tmpdir(), "joko-real-pi-working-context-"));
+    const agentHome = join(directory, "home");
+    const workspace = join(directory, "workspace");
+    await Promise.all([mkdir(agentHome), mkdir(workspace)]);
+    const adapter = createPiAdapter({
+      agentHome,
+      sessionRoot: agentHome,
+      providers: [{
+        id: "working-context-provider",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        api: "openai-completions",
+        keyless: true,
+        models: [{ id: "continuation-model", contextWindow: 128_000, maxTokens: 1_024 }]
+      }],
+      settings: {
+        // Keep the latest user/assistant pair so each summary uses one request.
+        compaction: { enabled: true, thresholdPercent: 75, keepRecentTokens: 8 },
+        retry: { enabled: false }
+      }
+    });
+    const target: TargetDescriptor = {
+      id: "real-pi-working-context-target",
+      backendId: "pi",
+      displayName: "Real Pi working context",
+      workspaceRoot: workspace,
+      managed: true,
+      trusted: false
+    };
+    const sink = new EventSink();
+    const creation = { ...smokeContext(target, 1, sink), resolveModelWorkingContext: () => 100_000 };
+    try {
+      const binding = await adapter.createSession({
+        target,
+        providerId: "working-context-provider",
+        modelId: "continuation-model",
+        effort: "off",
+        fastMode: false,
+        permissionMode: "ask"
+      }, creation);
+      const context = { ...creation, binding };
+      const send = (text: string) => adapter.send({ text, images: [], files: [], mentions: [], disposition: "prompt" }, context);
+      const compactions = () => sink.events.filter((event) => event.type === "compaction");
+      await send("warm up");
+      await sink.waitForDone(1);
+      await send("hold this response until the threshold changes");
+      await provider.gatedRequestReceived;
+      await adapter.setAutoCompactionThreshold(95, context);
+      provider.releaseResponse();
+      await sink.waitForDone(2);
+
+      await expect(adapter.inspectSession(binding, context)).resolves.toMatchObject({ binding, usage: { contextTokens: 80_001 } });
+      expect(provider.requests).toHaveLength(2);
+      expect(compactions()).toEqual([]);
+
+      await adapter.setAutoCompactionThreshold(75, context);
+      const compacted = await adapter.getTree(context);
+      expect(flattenTree(compacted.roots).filter((node) => node.kind === "compaction")).toEqual([
+        { entryId: compacted.leafId, kind: "compaction" }
+      ]);
+      const [started, completed] = compactions();
+      expect(compactions()).toHaveLength(2);
+      expect(started).toMatchObject({ state: "started", reason: "threshold", automatic: true });
+      expect(completed).toMatchObject({
+        state: "completed", reason: "threshold", automatic: true, compactionId: started?.compactionId,
+        summary: expect.stringContaining("native-response-3"),
+        nativeHistory: { identity: { entryId: compacted.leafId } }
+      });
+      expect(provider.requests).toHaveLength(3);
+
+      await send("continue after the threshold compaction");
+      await sink.waitForDone(3);
+      await send("exceed the native model context window");
+      await sink.waitForDone(4);
+      const overflowed = await adapter.getTree(context);
+      expect(compactions().slice(2)).toMatchObject([
+        { state: "started", reason: "overflow" },
+        { state: "completed", reason: "overflow", nativeHistory: { identity: { entryId: overflowed.leafId } } }
+      ]);
+      expect(provider.requests).toHaveLength(6);
+      await expect(adapter.inspectSession(binding, context)).resolves.toMatchObject({ binding });
+    } finally {
+      provider.releaseResponse();
+      await adapter.dispose().catch(() => undefined);
+      await closeServer(provider.server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("routes one real Pi prompt lifecycle across steer and follow-up without orphaning product runs", { timeout: 30_000 }, async () => {
-    const provider = await startGatedContinuationServer();
+    const provider = await startGatedCompletionServer();
     const address = provider.server.address() as AddressInfo;
     const agentHome = await mkdtemp(join(tmpdir(), "joko-real-pi-continuation-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-real-pi-continuation-workspace-"));
@@ -425,10 +516,10 @@ describe("real Pi managed generation smoke", () => {
       const followUpContext = { ...smokeContext(target, 1, followUpSink), sessionId: creationContext.sessionId, binding };
 
       await adapter.send({ text: "initial prompt", images: [], files: [], mentions: [], disposition: "prompt" }, promptContext);
-      await provider.firstRequestReceived;
+      await provider.gatedRequestReceived;
       await adapter.send({ text: "steering input", images: [], files: [], mentions: [], disposition: "steer" }, steerContext);
       await adapter.send({ text: "follow-up input", images: [], files: [], mentions: [], disposition: "follow_up" }, followUpContext);
-      provider.releaseFirstResponse();
+      provider.releaseResponse();
 
       await Promise.all([
         promptSink.waitForDone(1),
@@ -444,7 +535,7 @@ describe("real Pi managed generation smoke", () => {
       expect(steerSink.text).toBe("");
       expect(provider.requests).toHaveLength(3);
     } finally {
-      provider.releaseFirstResponse();
+      provider.releaseResponse();
       await adapter.dispose().catch(() => undefined);
       await closeServer(provider.server);
     }
@@ -460,7 +551,7 @@ describe("real Pi managed generation smoke", () => {
       console.info("Pi continuation abort failure:", { phase, failurePhase, elapsedMs: Math.round(performance.now() - started),
         providerRequests: requestCount(), doneCounts: doneCounts() });
     });
-    const provider = await startGatedContinuationServer();
+    const provider = await startGatedCompletionServer();
     requestCount = () => provider.requests.length;
     const address = provider.server.address() as AddressInfo;
     const agentHome = await mkdtemp(join(tmpdir(), "joko-real-pi-abort-home-"));
@@ -506,7 +597,7 @@ describe("real Pi managed generation smoke", () => {
       phase = "initial-prompt";
       await adapter.send({ text: "initial prompt", images: [], files: [], mentions: [], disposition: "prompt" }, promptContext);
       phase = "provider-request";
-      await provider.firstRequestReceived;
+      await provider.gatedRequestReceived;
       phase = "steer";
       await adapter.send({ text: "queued steering", images: [], files: [], mentions: [], disposition: "steer" }, steerContext);
       phase = "follow-up";
@@ -530,7 +621,7 @@ describe("real Pi managed generation smoke", () => {
       throw error;
     } finally {
       phase = "release-provider";
-      provider.releaseFirstResponse();
+      provider.releaseResponse();
       phase = "dispose-adapter";
       await adapter.dispose().catch(() => undefined);
       phase = "close-provider";
@@ -768,20 +859,20 @@ class EventSink {
   }
 }
 
-async function startGatedContinuationServer(): Promise<{
+async function startGatedCompletionServer(gatedOrdinal = 1, promptTokens: readonly number[] = []): Promise<{
   readonly server: Server;
   readonly requests: readonly Record<string, unknown>[];
-  readonly firstRequestReceived: Promise<void>;
-  readonly releaseFirstResponse: () => void;
+  readonly gatedRequestReceived: Promise<void>;
+  readonly releaseResponse: () => void;
 }> {
   const requests: Record<string, unknown>[] = [];
-  let markFirstRequestReceived!: () => void;
-  const firstRequestReceived = new Promise<void>((resolve) => {
-    markFirstRequestReceived = resolve;
+  let markGatedRequestReceived!: () => void;
+  const gatedRequestReceived = new Promise<void>((resolve) => {
+    markGatedRequestReceived = resolve;
   });
-  let releaseFirstResponse!: () => void;
-  const firstResponseGate = new Promise<void>((resolve) => {
-    releaseFirstResponse = resolve;
+  let releaseResponse!: () => void;
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve;
   });
   const server = createServer((request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
@@ -793,9 +884,11 @@ async function startGatedContinuationServer(): Promise<{
     request.once("end", () => {
       requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
       const ordinal = requests.length;
-      if (ordinal === 1) markFirstRequestReceived();
-      void (ordinal === 1 ? firstResponseGate : Promise.resolve()).then(() => {
+      const gated = ordinal === gatedOrdinal;
+      if (gated) markGatedRequestReceived();
+      void (gated ? responseGate : Promise.resolve()).then(() => {
         if (response.destroyed) return;
+        const inputTokens = promptTokens[ordinal - 1] ?? ordinal;
         response.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache",
@@ -817,7 +910,7 @@ async function startGatedContinuationServer(): Promise<{
             created: ordinal,
             model: "continuation-model",
             choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-            usage: { prompt_tokens: ordinal, completion_tokens: 1, total_tokens: ordinal + 1 }
+            usage: { prompt_tokens: inputTokens, completion_tokens: 1, total_tokens: inputTokens + 1 }
           })}\n\n`
         );
         response.end("data: [DONE]\n\n");
@@ -831,7 +924,7 @@ async function startGatedContinuationServer(): Promise<{
       resolve();
     });
   });
-  return { server, requests, firstRequestReceived, releaseFirstResponse };
+  return { server, requests, gatedRequestReceived, releaseResponse };
 }
 
 interface StoredArtifact {

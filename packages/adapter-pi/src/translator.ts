@@ -25,6 +25,28 @@ const INLINE_OUTPUT_LIMIT = 256 * 1024;
 
 type ProviderFailureKind = "context_overflow" | "stream_interrupted" | "upstream_overload" | "generic";
 
+const COMPACTION_IDENTITY_STATUS_KEY = "joko-compaction-identity/v1";
+
+export function readCompactionNativeIdentity(event: Readonly<Record<string, unknown>>): {
+  readonly reason: "manual" | "threshold" | "overflow";
+  readonly identity: NativeMessageIdentity;
+} | undefined {
+  if (event["method"] !== "setStatus" || event["statusKey"] !== COMPACTION_IDENTITY_STATUS_KEY
+    || typeof event["statusText"] !== "string" || event["statusText"].length > 4_096) return undefined;
+  try {
+    const value: unknown = JSON.parse(event["statusText"]);
+    if (!isRecord(value) || Object.keys(value).some((key) => !["entryId", "parentEntryId", "reason"].includes(key))
+      || (value.reason !== "manual" && value.reason !== "threshold" && value.reason !== "overflow")) return undefined;
+    const validId = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.length <= 512
+      && !/[\u0000-\u001f\u007f]/u.test(id);
+    if (!validId(value.entryId) || value.parentEntryId !== undefined && !validId(value.parentEntryId)) return undefined;
+    return { reason: value.reason, identity: { entryId: value.entryId,
+      ...(value.parentEntryId === undefined ? {} : { parentEntryId: value.parentEntryId }) } };
+  } catch {
+    return undefined;
+  }
+}
+
 export interface PiEventTranslatorOptions {
   readonly context: AdapterContext;
   readonly artifactDirectory: string;
@@ -81,21 +103,10 @@ export class PiEventTranslator {
   /** The managed hook observes the exact persisted leaf before the native
    * terminal. This internal receipt never becomes a user-visible status. */
   consumeCompactionNativeIdentity(event: Readonly<Record<string, unknown>>): boolean {
-    if (event["method"] !== "setStatus" || event["statusKey"] !== "joko-compaction-identity/v1") return false;
-    if (typeof event["statusText"] !== "string" || event["statusText"].length > 4_096) return true;
-    try {
-      const value: unknown = JSON.parse(event["statusText"]);
-      if (!isRecord(value) || Object.keys(value).some((key) => !["entryId", "parentEntryId", "reason"].includes(key))
-        || this.#activeCompactionId === undefined || value.reason !== this.#activeCompactionReason
-        || (value.reason !== "threshold" && value.reason !== "overflow")) return true;
-      const validId = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.length <= 512
-        && !/[\u0000-\u001f\u007f]/u.test(id);
-      if (!validId(value.entryId) || value.parentEntryId !== undefined && !validId(value.parentEntryId)) return true;
-      this.#activeCompactionNativeIdentity = {
-        entryId: value.entryId,
-        ...(value.parentEntryId === undefined ? {} : { parentEntryId: value.parentEntryId })
-      };
-    } catch { /* An absent exact native identity cannot replace history. */ }
+    if (event["method"] !== "setStatus" || event["statusKey"] !== COMPACTION_IDENTITY_STATUS_KEY) return false;
+    const receipt = readCompactionNativeIdentity(event);
+    if (receipt !== undefined && receipt.reason !== "manual" && this.#activeCompactionId !== undefined
+      && receipt.reason === this.#activeCompactionReason) this.#activeCompactionNativeIdentity = receipt.identity;
     return true;
   }
 

@@ -1167,15 +1167,15 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     }
   }
 
-  let automaticCompactionParent: { entryId: string | null; reason: string } | undefined;
+  let compactionParent: { entryId: string | null; reason: string } | undefined;
   pi.on("session_before_compact", (event, ctx) => {
-    automaticCompactionParent = ctx.mode === "rpc" && (event.reason === "threshold" || event.reason === "overflow")
+    compactionParent = ctx.mode === "rpc"
       ? { entryId: ctx.sessionManager.getLeafId(), reason: event.reason } : undefined;
   });
-  pi.on("session_compact_failed", () => { automaticCompactionParent = undefined; });
+  pi.on("session_compact_failed", () => { compactionParent = undefined; });
   pi.on("session_compact", (event, ctx) => {
-    const before = automaticCompactionParent;
-    automaticCompactionParent = undefined;
+    const before = compactionParent;
+    compactionParent = undefined;
     if (ctx.mode !== "rpc" || before === undefined || event.reason !== before.reason) return;
     // The published runtime appends and synchronously persists the compaction
     // before this hook. Read its current leaf rather than matching summary
