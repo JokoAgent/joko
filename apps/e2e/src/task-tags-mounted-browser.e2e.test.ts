@@ -69,7 +69,9 @@ mountedIt("edits and drags tags through the production task page and retains the
   await page.setViewportSize({ width: 1280, height: 960 });
   await page.locator(".task-tag-editor__row").filter({ hasText: "Delivery review" }).getByRole("checkbox").click();
   await waitFor(async () => fixture!.application.store.listTaskTagsForSessions([sessionId]), rows => rows[0]?.tags.some(tag => tag.name === "Delivery review") === true, "the task association");
+  await page.locator('.task-tag-modal .task-tag-editor[aria-busy="false"]').waitFor({ state: "visible" });
   await page.locator(".task-tag-modal").getByRole("button", { name: "Close", exact: true }).click();
+  await page.locator(".task-tag-modal").waitFor({ state: "hidden" });
   await open();
   expect(await page.locator(".task-tag-editor__row").evaluateAll(rows => rows.map(row => row.getAttribute("data-tag-id")))).toEqual([...reordered, fixture.application.store.listTaskTags().at(-1)!.id]);
   expect(errors).toEqual([]);

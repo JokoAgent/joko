@@ -47,9 +47,15 @@ mountedIt("updates the selected branch through the production page and recovers 
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
     for (const width of [1280, 390]) {
       await page.setViewportSize({ width, height: 900 });
+      const closeNavigation = page.getByRole("button", { name: "Close navigation", exact: true });
+      if (width === 390 && await closeNavigation.isVisible()) {
+        await closeNavigation.press("Enter");
+        await closeNavigation.waitFor({ state: "hidden" });
+      }
       const button = page.getByRole("button", { name: "Update selected branch", exact: true });
       await button.focus(); expect(await button.evaluate(value => value === value.ownerDocument.activeElement)).toBe(true);
-      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      const overflow = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth);
+      expect(overflow, `${theme} layout at ${width}px`).toBeLessThanOrEqual(0);
       if (evidence) await page.screenshot({ path: resolve(evidence, `branch-${theme}-${width}.png`), fullPage: true });
     }
   }
