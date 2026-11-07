@@ -185,7 +185,10 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
           if (command) controller.nativeCommandFailed(command);
         });
       }
-      webView.current?.injectJavaScript(remoteDesktopViewerCommand(message));
+      const viewerMessage = message.type === "init"
+        ? { ...message, integerScroll: controller.snapshot.capabilities?.platform === "darwin" }
+        : message;
+      webView.current?.injectJavaScript(remoteDesktopViewerCommand(viewerMessage));
     });
     return () => controller.setViewerSink(() => undefined);
   }, [controller, nativePresentation]);
