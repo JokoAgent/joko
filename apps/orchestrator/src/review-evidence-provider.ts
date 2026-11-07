@@ -91,27 +91,35 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
           throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review workspace changes are unavailable.");
         })
       : undefined;
-    const patchBudget = { remaining: MAX_PATCH_CHARACTERS };
-    const workspaceDiffs = git.repository ? dirtyEvidence(git, workingDiff!, patchBudget) : [];
-
     let branch: ReviewSourceBranchEvidence | null = null;
     let branchDiff: WorkspaceGitDiff | undefined;
     let branchUnavailableReason: string | undefined;
-    if (git.repository && !git.dirty) {
+    let branchPatchCharacters = 0;
+    if (git.repository) {
       try {
         // WorkspaceService resolves the configured default/upstream base and
         // returns immutable base/head/merge-base fences.
-        branchDiff = await this.#workspaces.gitReviewDiff(registration.id, { source: "branch" });
-        const diffs = unifiedDiffEvidence(branchDiff.comparison, "branch", patchBudget);
+        const comparison = await this.#workspaces.gitReviewDiff(registration.id, { source: "branch" });
+        const limit = git.dirty ? Math.floor(MAX_PATCH_CHARACTERS / 2) : MAX_PATCH_CHARACTERS;
+        const budget = { remaining: limit };
+        const diffs = unifiedDiffEvidence(comparison.comparison, "branch", budget);
         branch = {
-          baseRefLabel: branchDiff.resolvedBaseRef ?? branchDiff.baseRevision ?? "default branch",
+          baseRefLabel: comparison.resolvedBaseRef ?? comparison.baseRevision ?? "default branch",
           fileCount: uniqueDiffPaths(diffs).size,
           diffs
         };
+        branchDiff = comparison;
+        branchPatchCharacters = limit - budget.remaining;
       } catch {
         branchUnavailableReason = "The default or upstream branch comparison is unavailable.";
       }
     }
+    if (git.dirty && branchDiff !== undefined && (branchDiff.headRevision !== git.head || branchDiff.headRevision !== workingDiff?.headRevision)) {
+      throw new ReviewEvidenceCaptureError("source-changed", "Review branch and worktree evidence no longer share the same HEAD.");
+    }
+    const workspaceDiffs = git.repository
+      ? dirtyEvidence(git, workingDiff!, { remaining: MAX_PATCH_CHARACTERS - branchPatchCharacters })
+      : [];
 
     const latestChangeSet = (await this.#workspaceChanges.listChangeSets({
       workspaceId: registration.id,

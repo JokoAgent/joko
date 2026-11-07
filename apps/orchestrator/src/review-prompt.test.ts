@@ -159,4 +159,17 @@ describe("review prompt", () => {
     expect(built.prompt).not.toContain("\ufffd");
     expect(built.truncated).toBe(true);
   });
+
+  it("reserves evidence space for uncommitted edits when the branch patch reaches its share", () => {
+    const built = buildReviewPrompt(base({
+      workspace: { dirty: true, totalFiles: 1, stagedFiles: 1, unstagedFiles: 0, untrackedFiles: 0,
+        diffs: [{ path: "draft.txt", source: "staged", status: "modified", additions: 1, deletions: 0, patch: "+draft change" }] },
+      branch: { baseRefLabel: "main", fileCount: 1,
+        diffs: [{ path: "committed.txt", source: "branch", status: "modified", additions: 1, deletions: 0,
+          patch: "+branch change\n" + "a".repeat(MAX_REVIEW_CHANGE_EVIDENCE_CHARACTERS * 3 / 4) }] }
+    }));
+    expect(built.prompt).toContain("+branch change");
+    expect(built.prompt).toContain("+draft change");
+    expect(built.truncated).toBe(true);
+  });
 });
