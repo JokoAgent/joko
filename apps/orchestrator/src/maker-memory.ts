@@ -199,8 +199,8 @@ export class MakerMemoryController {
     return this.snapshot([]);
   }
 
-  reset(kind: "curated" | "backend", backendId?: string): { readonly removedEntries: number; readonly removedTargets: number } {
-    if (kind === "curated") return this.#store.resetMakerMemory("curated");
+  reset(kind: "curated" | "ordinary_local" | "backend", backendId?: string): { readonly removedEntries: number; readonly removedTargets: number } {
+    if (kind !== "backend") return this.#store.resetMakerMemory(kind);
     if (!validId(backendId)) throw new Error("Backend memory reset requires a valid Backend ID.");
     return this.#store.resetMakerMemory("digest", backendId);
   }

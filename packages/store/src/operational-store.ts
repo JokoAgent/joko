@@ -17888,20 +17888,26 @@ export class OperationalStore {
     });
   }
 
-  resetMakerMemory(scope: "curated"): { readonly removedEntries: number; readonly removedTargets: number };
+  resetMakerMemory(scope: "curated" | "ordinary_local"): { readonly removedEntries: number; readonly removedTargets: number };
   resetMakerMemory(scope: "digest", backendId: string): { readonly removedEntries: number; readonly removedTargets: number };
   resetMakerMemory(
-    scope: "curated" | "digest",
+    scope: "curated" | "ordinary_local" | "digest",
     backendId?: string
   ): { readonly removedEntries: number; readonly removedTargets: number } {
     this.assertOpen();
-    if (scope === "curated" && backendId !== undefined) {
-      throw new StoreError("Curated Maker Memory reset does not accept a Backend ID.");
+    if (scope !== "digest" && backendId !== undefined) {
+      throw new StoreError("Workspace Maker Memory reset does not accept a Backend ID.");
     }
     const params = scope === "digest" ? [makerMemoryBackendId(backendId ?? "")] : [];
     const kindFilter = scope === "digest" ? "kind = 'digest' AND backend_id = ?" : "kind <> 'digest'";
-    // Include retired Homes in the exclusion: their digests stay with their original Targets.
-    const filter = `${kindFilter} AND target_id NOT IN (
+    // Include retired Homes in the exclusion so they retain their original records.
+    const filter = scope === "ordinary_local" ? `target_id IN (
+      SELECT id FROM targets WHERE remote_location_kind IS NULL
+        AND json_extract(metadata_json, '$.partnerId') IS NULL
+        AND coalesce(json_extract(metadata_json, '$.kind'), '') NOT IN (
+          'partner_home', 'partner_group', 'partner_session_task', 'partner_workbench'
+        )
+    )` : `${kindFilter} AND target_id NOT IN (
       SELECT id FROM targets WHERE json_extract(metadata_json, '$.kind') = 'partner_home'
     )`;
     return this.write(() => {

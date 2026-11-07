@@ -6897,7 +6897,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     readonly backendEnabled?: boolean;
   }): Promise<void>;
   restoreMemoryDefaults(): Promise<void>;
-  resetMemory(scope: "curated" | "backend", backendId?: string): Promise<{
+  resetMemory(scope: "curated" | "ordinary_local" | "backend", backendId?: string): Promise<{
     readonly removedEntries?: number;
     readonly removedTargets?: number;
   }>;

@@ -19810,6 +19810,12 @@ async function dispatchMutation(
           }
           reset = () => memory.reset("curated");
           break;
+        case contract.MemoryResetScope.ORDINARY_LOCAL_WORKSPACES:
+          if (payload.value.backendId.trim() !== "") {
+            throw invalidArgument("reset_memory.backend_id must be empty for ORDINARY_LOCAL_WORKSPACES scope");
+          }
+          reset = () => memory.reset("ordinary_local");
+          break;
         case contract.MemoryResetScope.BACKEND: {
           const backendId = payload.value.backendId.trim();
           if (backendId === "") throw invalidArgument("reset_memory.backend_id is required for BACKEND scope");
@@ -19922,8 +19928,7 @@ async function dispatchMutation(
         return presented(execution);
       }
       if (reset === undefined) throw new StoreError("Memory reset owner was not resolved.");
-      // Store-owned curated/digest resets remain synchronous and never touch
-      // Backend-native persistence. No Memory body enters the Operation result.
+      // Store-owned resets and their receipts share one transaction.
       const execution = await host.mutate({
         operationId,
         connection,
