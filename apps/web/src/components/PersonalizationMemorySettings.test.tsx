@@ -91,6 +91,25 @@ describe("PersonalizationMemorySettings", () => {
     expect(resetButtons[1]?.disabled).toBe(true);
   });
 
+  it("retains the effective native-memory switch when the saved update awaits confirmation", async () => {
+    const update = vi.fn(async () => { throw Object.assign(new Error("Live native memory confirmation is pending."), { code: "NATIVE_MEMORY_APPLICATION_PENDING" }); });
+    const controller = { updateMemorySettings: update } as unknown as AppController;
+    const snapshot = nativeSnapshot(false, true);
+    const settings = snapshot.settings;
+    const onSuccess = vi.fn();
+    const onError = vi.fn();
+    const container = await render(controller, { ...snapshot, settings: { ...settings, memory: { ...settings.memory,
+      backends: [{ ...settings.memory.backends[0]!, enabled: false, reason: "Live native memory confirmation is pending." }]
+    } } }, (_key, work) => { void work().catch(onError); }, onSuccess);
+    const toggle = container.querySelector<HTMLButtonElement>('button[aria-label="Toggle Codex Auto Memory"]')!;
+    await act(async () => toggle.click());
+    expect(update).toHaveBeenCalledWith({ backendId: "codex", backendEnabled: true });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(container.textContent).toContain("Waiting for Codex to confirm the live memory setting.");
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "Saved the preference. Codex could not confirm the live memory update." }));
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
   it("keeps Backend-native memory mutually exclusive with Maker Memory and hides an unimplemented reset", async () => {
     const update = vi.fn(async () => undefined);
     const reset = vi.fn(async () => ({}));

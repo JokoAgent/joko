@@ -85,6 +85,9 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
         onSuccess(t(key, { backend: backendName }));
       } catch (error) {
         setBackendEnabled((current) => ({ ...current, [backendId]: previous }));
+        if (error instanceof Error && "code" in error && error.code === "NATIVE_MEMORY_APPLICATION_PENDING") {
+          throw new Error(t("settings.memory.nativeUpdatePending", { backend: backendName }), { cause: error });
+        }
         throw error;
       } finally {
         markPending(`backend:${backendId}`, false);
@@ -202,6 +205,8 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
               )}</span>
               {native && makerEnabled && <small role="status">{t("settings.memory.nativeBlocked")}</small>}
               {!backend.supported && <small role="status">{backend.reason || t("common.unavailable")}</small>}
+              {native && backend.supported && backend.updatesActiveLocalSessions && backend.reason !== ""
+                && <small role="status">{t("settings.memory.nativeStatusPending", { backend: backendName })}</small>}
             </span>
             <span className="memory-settings__actions">
               <SwitchControl

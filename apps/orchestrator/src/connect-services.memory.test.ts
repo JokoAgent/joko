@@ -746,56 +746,51 @@ describe("Connect Maker Memory owner and reset scopes", () => {
     }
   });
 
-  it("keeps the durable native-memory choice and records a content-free diagnostic when live reconcile fails", async () => {
-    const current = { format: 1 as const, makerEnabled: false, backendEnabled: {} as Readonly<Record<string, boolean>> };
-    const descriptor = {
-      id: "native-memory",
-      capabilities: new Map([["memory.native", {
-        key: "memory.native",
-        supported: true,
-        options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION]
-      }]])
-    };
-    const setSetting = vi.fn();
-    const appendDiagnostic = vi.fn();
-    const store = {
-      findOperation: () => undefined,
-      setSetting,
-      getBackend: () => ({ descriptor }),
-      listBackends: () => [{ descriptor }],
-      appendDiagnostic
-    };
-    const services = createConnectServices(stubApplication({
-      store,
-      makerMemory: {
-        patchedSettings: (patch: { readonly backendId?: string; readonly backendEnabled?: boolean }) => ({
-          ...current,
-          backendEnabled: { [patch.backendId!]: patch.backendEnabled! }
-        }),
-        reconcileSettingsChange: vi.fn(async () => true)
-      },
-      sessionHost: immediateHost(store, {
-        id: descriptor.id,
-        reconcileNativeMemory: async () => { throw new Error("private runtime failure"); }
-      } as unknown as BackendAdapter)
-    }));
-
-    await expect(submitMemoryUpdate(services.operation.submitOperation, {
-      operationId: "memory-native-live-reconcile-failure",
-      connectionId: owner.id,
-      backendId: descriptor.id,
-      backendEnabled: true
-    })).resolves.toBeDefined();
-    expect(setSetting).toHaveBeenCalledWith("service", "orchestrator", "settings.memory", {
-      format: 1,
-      makerEnabled: false,
-      backendEnabled: { "native-memory": true }
-    });
-    expect(appendDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
-      code: "NATIVE_MEMORY_RECONCILIATION_FAILED",
-      details: { backendIds: ["native-memory"] }
-    }));
-    expect(JSON.stringify(appendDiagnostic.mock.calls)).not.toContain("private runtime failure");
+  it("keeps a rejected live native-memory update pending through a failed status refresh and adopts a confirmed retry", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-native-memory-application-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const memory = new MakerMemoryController({ store });
+    const backendId = "codex";
+    try {
+      const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      store.upsertBackend({ id: backendId, displayName: "Codex", adapterKind: "codex", version: "test", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required",
+        capabilities: new Map([["memory.native", { key: "memory.native", supported: true, options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION] }]]),
+        models: [], tools: [], diagnostics: [] });
+      await memory.update({ makerEnabled: false, backendId, backendEnabled: false });
+      let rejectUpdate = false;
+      let effectiveEnabled = false;
+      const apply = () => {
+        if (rejectUpdate) throw new Error("private runtime failure");
+        effectiveEnabled = memory.nativeEnabledForBackend(backendId);
+      };
+      const adapter = { id: backendId, reconcileNativeMemory: async () => { apply(); return "immediate" as const; },
+        readNativeMemoryStatus: async () => { apply(); return { enabled: effectiveEnabled }; } } as unknown as BackendAdapter;
+      const services = createConnectServices(stubApplication({ store, makerMemory: memory, adapters: [adapter],
+        connections: { authenticate: () => connection }, sessionHost: immediateHost(store, adapter) }));
+      const getSettings = services.settings.getSettings as unknown as (
+        request: unknown, context: unknown
+      ) => Promise<contract.GetSettingsResponse>;
+      const row = async () => (await getSettings({}, context())).settings?.memory?.backends[0];
+      expect(await row()).toMatchObject({ enabled: false, reason: "" });
+      rejectUpdate = true;
+      const result = await submitMemoryUpdate<contract.SubmitOperationResponse>(services.operation.submitOperation, {
+        operationId: "memory-native-live-reconcile-failure", connectionId: connection.id, backendId, backendEnabled: true
+      });
+      const pending = { enabled: false, support: contract.CapabilitySupport.SUPPORTED, reason: "Live native memory confirmation is pending." };
+      expect(result.operation?.result?.payload).toMatchObject({ case: "settings", value: { memory: { backends: [pending] } } });
+      expect(memory.settings().backendEnabled[backendId]).toBe(true);
+      expect(effectiveEnabled).toBe(false);
+      expect(await row()).toMatchObject(pending);
+      const diagnostics = store.listDiagnostics();
+      expect(diagnostics).toContainEqual(expect.objectContaining({ code: "NATIVE_MEMORY_RECONCILIATION_FAILED", details: { backendIds: [backendId] } }));
+      expect(diagnostics.map(item => item.message).join("\n")).not.toContain("private runtime failure");
+      rejectUpdate = false;
+      expect(await row()).toMatchObject({ enabled: true, reason: "" });
+    } finally {
+      memory.dispose(); store.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects ambiguous reset scopes before deleting anything", async () => {
