@@ -62,11 +62,17 @@ message ExtensionCardServiceAuthorizeLinkResponse {
   bool authorized = 1;
 }
 
+message ExtensionMailReaderChoice {
+  // Opaque selection scoped to the original connection, task and URL.
+  string selection_id = 1;
+  string display_name = 2;
+}
 message ExtensionCardServicePreviewMailRequest {
   string session_id = 1;
   string url = 2;
   bool read = 3;
   bool opened = 4;
+  optional string reader_selection_id = 5;
 }
 message ExtensionCardServicePreviewMailResponse {
   bool supported = 1;
@@ -74,6 +80,7 @@ message ExtensionCardServicePreviewMailResponse {
   string message_json = 2;
   string error = 3;
   string extension_id = 4;
+  repeated ExtensionMailReaderChoice reader_choices = 5;
 }
 
 message ExtensionCardServiceBeginAttachmentRequest {
