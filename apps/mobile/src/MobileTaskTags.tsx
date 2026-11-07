@@ -122,14 +122,13 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
   const [error, setError] = useState("");
   const [createName, setCreateName] = useState("");
   const [createColor, setCreateColor] = useState(TaskTagColor.BLUE);
-  const [editingId, setEditingId] = useState<string>();
+  const [editing, setEditing] = useState<TaskTag>();
   const [editName, setEditName] = useState("");
   const [editColor, setEditColor] = useState(TaskTagColor.BLUE);
   const [adding, setAdding] = useState(false);
   const [sorting, setSorting] = useState(false);
   const tags = catalog?.taskTags ?? [];
   const palette = colors.dark ? DARK_COLOR_VALUE : LIGHT_COLOR_VALUE;
-  const editing = tags.find((tag) => tag.taskTagId === editingId);
   const attached = new Set(session?.taskTags.map((tag) => tag.taskTagId) ?? []);
   const readSourceOwner = () => fromHome ? session && client.homeTaskTagSourceKey(session.sessionId) : client.taskHeaderSourceKey();
   const sourceOwner = readSourceOwner();
@@ -152,19 +151,13 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
     setError("");
     setCreateName("");
     setCreateColor(TaskTagColor.BLUE);
-    setEditingId(undefined);
+    setEditing(undefined);
     setAdding(false);
     setSorting(false);
     operation.current = undefined;
     confirmationEpoch.current++;
     return () => { operation.current = undefined; };
   }, [scope, visible]);
-  useEffect(() => {
-    if (!editing) return;
-    setEditName(editing.name);
-    setEditColor(editing.color);
-  }, [editing?.taskTagId, editing?.revision?.value]);
-
   const run = async (action: () => Promise<boolean>, success?: () => void): Promise<void> => {
     if (operation.current || !session || !current()) return;
     const actionOwner = Symbol("task-tags-mutation"); operation.current = actionOwner;
@@ -176,6 +169,25 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
     } catch {
       if (current() && operation.current === actionOwner) setError(mobileMessage(locale, "taskTags.changeFailed"));
     } finally { if (operation.current === actionOwner) { operation.current = undefined; setBusy(false); } }
+  };
+  const openEdit = (tag: TaskTag): void => {
+    setEditing(tag);
+    setEditName(tag.name);
+    setEditColor(tag.color);
+  };
+  const trimmedEditName = editName.trim();
+  const canSaveEdit = editing !== undefined && !!trimmedEditName && (trimmedEditName !== editing.name || editColor !== editing.color);
+  const saveEdit = (): void => {
+    if (!session || !editing || !canSaveEdit) return;
+    const baseline = editing.revision?.value ?? 0n;
+    const latest = tags.find(tag => tag.taskTagId === editing.taskTagId);
+    const latestRevision = latest?.revision?.value ?? 0n;
+    const revision = latest && latestRevision > baseline && latest.name === editing.name
+      && latest.color === editing.color && latest.nameCustomized === editing.nameCustomized ? latestRevision : baseline;
+    void run(() => client.updateTaskTag(session.sessionId, editing.taskTagId, revision, {
+      ...(trimmedEditName === editing.name ? {} : { name: trimmedEditName }),
+      ...(editColor === editing.color ? {} : { color: editColor })
+    }), () => setEditing(undefined));
   };
   const reorder = (tagId: string, to: number, ids = tags.map(tag => tag.taskTagId), revision = catalog?.revision?.value ?? 0n): void => {
     if (!session) return;
@@ -203,7 +215,7 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
           { text: mobileMessage(locale, "taskTags.delete"), style: "destructive", onPress: () => {
             if (answered || !current() || Date.now() >= expiresAt || confirmationEpoch.current !== promptEpoch) return;
             answered = true;
-            void run(() => client.deleteTaskTag(session.sessionId, preview), () => setEditingId(undefined));
+            void run(() => client.deleteTaskTag(session.sessionId, preview), () => setEditing(undefined));
           } }
         ]
       );
@@ -213,28 +225,27 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
   };
 
   if (mobileTaskTagsNativeAvailable) return <MobileTaskTagsNative key={scope} visible={visible && session !== undefined} busy={busy} error={error}
-    colors={colors} locale={locale} subtitle={session?.displayName} onClose={onClose} onBack={() => { setEditingId(undefined); setAdding(false); }}
+    colors={colors} locale={locale} subtitle={session?.displayName} onClose={onClose} onBack={() => { setEditing(undefined); setAdding(false); }}
     adding={adding} revision={catalog?.revision?.value ?? 0n} onAdd={() => setAdding(true)} onMove={(from, to) => { const tag = tags[from]; if (tag) reorder(tag.taskTagId, to); }}
     items={tags.map((tag) => ({ id: tag.taskTagId, name: mobileTaskTagName(tag, locale), color: palette[tag.color] ?? palette[TaskTagColor.GRAY]!,
       attached: attached.has(tag.taskTagId), onToggle: () => { if (session) void run(() => client.setSessionTaskTag(session.sessionId, tag.taskTagId, !attached.has(tag.taskTagId))); },
-      onEdit: () => setEditingId(tag.taskTagId) }))}
+      onEdit: () => openEdit(tag) }))}
     palette={COLORS.map(value => ({ value, name: mobileMessage(locale, colorMessageKey(value)), hex: palette[value]! }))}
     create={{ name: createName, color: createColor, canSave: !!createName.trim() && tags.length < 256, onName: setCreateName, onColor: setCreateColor,
       onSave: () => { if (session) void run(() => client.createTaskTag(session.sessionId, createName, createColor, catalog?.revision?.value ?? 0n), () => { setCreateName(""); setCreateColor(TaskTagColor.BLUE); setAdding(false); }); } }}
-    {...(editing ? { edit: { name: editName, color: editColor, canSave: !!editName.trim() && (editName.trim() !== editing.name || editColor !== editing.color),
-      onName: setEditName, onColor: setEditColor, onSave: () => { if (session) void run(() => client.updateTaskTag(session.sessionId, editing.taskTagId, editing.revision?.value ?? 0n,
-        { ...(editName.trim() === editing.name ? {} : { name: editName.trim() }), ...(editColor === editing.color ? {} : { color: editColor }) }), () => setEditingId(undefined)); } } } : {})}
+    {...(editing ? { edit: { name: editName, color: editColor, canSave: canSaveEdit,
+      onName: setEditName, onColor: setEditColor, onSave: saveEdit } } : {})}
     onDelete={() => { if (editing) void previewDelete(editing); }} />;
 
   const form = adding || editing !== undefined;
   return <Modal visible={visible && session !== undefined} animationType="slide" presentationStyle="pageSheet"
-    onRequestClose={() => { if (!busy && !sorting) { if (form) { setAdding(false); setEditingId(undefined); } else onClose(); } }}>
+    onRequestClose={() => { if (!busy && !sorting) { if (form) { setAdding(false); setEditing(undefined); } else onClose(); } }}>
     <SafeAreaView style={[styles.root, { backgroundColor: colors.background }]} edges={["top", "bottom", "left", "right"]}>
       <View style={[styles.header, { borderColor: colors.border, backgroundColor: colors.surface }]}>
         <View style={styles.fill}><Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, editing ? "taskTags.manage" : adding ? "taskTags.create" : "taskTags.title")}</Text>
           <Text numberOfLines={1} style={[styles.caption, { color: colors.muted }]}>{session?.displayName}</Text></View>
         <SheetButton label={mobileMessage(locale, form ? "common.back" : "common.cancel")} colors={colors} disabled={busy || sorting}
-          onPress={() => { if (form) { setAdding(false); setEditingId(undefined); setError(""); } else onClose(); }} />
+          onPress={() => { if (form) { setAdding(false); setEditing(undefined); setError(""); } else onClose(); }} />
       </View>
       {form ? <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <View style={[styles.create, { borderColor: colors.border, backgroundColor: colors.surface }]}>
@@ -248,14 +259,11 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
           {editing && <SheetButton label={mobileMessage(locale, "taskTags.delete")} destructive colors={colors} disabled={busy}
             onPress={() => void previewDelete(editing)} />}
           <SheetButton label={mobileMessage(locale, "taskTags.save")} colors={colors}
-            disabled={busy || (editing ? !editName.trim() || editName.trim() === editing.name && editColor === editing.color : !createName.trim() || tags.length >= 256)}
+            disabled={busy || (editing ? !canSaveEdit : !createName.trim() || tags.length >= 256)}
             onPress={() => {
               if (!session) return;
-              if (editing) {
-                void run(() => client.updateTaskTag(session.sessionId, editing.taskTagId, editing.revision?.value ?? 0n, {
-                  ...(editName.trim() === editing.name ? {} : { name: editName.trim() }), ...(editColor === editing.color ? {} : { color: editColor })
-                }), () => setEditingId(undefined));
-              } else {
+              if (editing) saveEdit();
+              else {
                 void run(() => client.createTaskTag(session.sessionId, createName, createColor, catalog?.revision?.value ?? 0n),
                   () => { setCreateName(""); setCreateColor(TaskTagColor.BLUE); setAdding(false); });
               }
@@ -266,7 +274,7 @@ export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalo
         <MobileTaskTagReorderList key={scope} tags={tags} revision={catalog?.revision?.value ?? 0n} attached={attached} busy={busy}
           visible={visible} colors={colors} locale={locale} name={tag => mobileTaskTagName(tag, locale)} palette={palette}
           onToggle={tag => { if (session) void run(() => client.setSessionTaskTag(session.sessionId, tag.taskTagId, !attached.has(tag.taskTagId))); }}
-          onEdit={tag => setEditingId(tag.taskTagId)} onReorder={reorder} onSortingChange={setSorting} />
+          onEdit={openEdit} onReorder={reorder} onSortingChange={setSorting} />
         <View style={styles.content}><SheetButton label={mobileMessage(locale, "taskTags.create")} colors={colors}
           disabled={busy || sorting || tags.length >= 256} onPress={() => setAdding(true)} /></View>
       </>}

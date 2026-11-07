@@ -5856,8 +5856,7 @@ export class MobileClient {
         }
         if (!event.eventId || !cursor || !cursor.opaqueToken || cursor.generation !== this.#streamGeneration
           || cursor.sequence > (this.#streamSequence ?? 0n) + 1n
-          || event.payload?.kind.case === "projectionInvalidated"
-          || event.payload?.kind.case === "taskTagCatalogChanged") {
+          || event.payload?.kind.case === "projectionInvalidated") {
           this.#clearHistory();
           void this.refresh();
           return;
@@ -14129,10 +14128,13 @@ export class MobileClient {
       throw new Error("A previous task-tag change is still pending.");
     }
     this.#ready();
+    const epoch = this.#epoch;
     const action = this.#claimMutation();
     try {
-      const result = await this.#submitTerminal(mutation, { kind: "task-tag", sessionId });
-      return result.accepted && result.definitive;
+      const result = await this.#submitTerminal(mutation, { kind: "task-tag", sessionId }, undefined, true, false);
+      const changed = result.accepted && result.definitive;
+      if (changed && this.#current(epoch)) await this.refresh();
+      return changed;
     } finally { this.#releaseMutation(action); }
   }
 
