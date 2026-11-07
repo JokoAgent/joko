@@ -167,11 +167,11 @@ describe("Connect Extension catalog boundary", () => {
       store.recordExtensionUsage(other, 0n);
       await expect(clear("stale-extension-usage", 0n, entry.revision - 1n)).rejects.toMatchObject({ code: Code.Aborted });
       expect(await detail()).toMatchObject({ callsLast7Days: 1n, historyGeneration: 0n });
-      expect((await clear("clear-extension-usage", 0n)).operation?.state).toBe(contract.OperationState.COMPLETED);
+      expect((await clear("clear-extension-usage", 0n)).operation?.state).toBe(contract.OperationState.SUCCEEDED);
       store.recordExtensionUsage(subject, 0n);
       expect(await detail()).toEqual({ callsLast7Days: 0n, historyGeneration: 1n });
       store.recordExtensionUsage(subject, 1n);
-      expect((await clear("clear-extension-usage", 0n)).operation?.state).toBe(contract.OperationState.COMPLETED);
+      expect((await clear("clear-extension-usage", 0n)).operation?.state).toBe(contract.OperationState.SUCCEEDED);
       await expect(clear("stale-extension-history", 0n)).rejects.toMatchObject({ code: Code.Aborted });
       expect(await detail()).toMatchObject({ callsLast7Days: 1n, historyGeneration: 1n });
       expect(store.readExtensionUsage(other)).toMatchObject({ callsLast7Days: 1n, historyGeneration: 0n });
@@ -861,7 +861,7 @@ describe("Connect Extension catalog boundary", () => {
       connectionId: connection.id,
       mutation: remove
     });
-    expect(removedReceipt.operation?.state).toBe(contract.OperationState.COMPLETED);
+    expect(removedReceipt.operation?.state).toBe(contract.OperationState.SUCCEEDED);
     expect(events).toEqual([
       `acquire:${first.id},${second.id}`,
       "commit:remove",
