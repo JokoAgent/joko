@@ -1161,6 +1161,7 @@ export async function createOrchestratorApplication(
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
       environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }) });
   const imageGenerationBridge = new ImageGenerationBridgeToolProvider({
+    store,
     credentialSurfaces: providerCredentialSurfaces,
     artifacts,
     fetch: createOutboundFetch(
