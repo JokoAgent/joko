@@ -65,5 +65,7 @@ describe("native Remote Desktop clipboard boundary", () => {
     expect(size).toContain("data.count <= transferLimit * 3");
     expect(size).not.toContain("16 * 1024");
     expect(swift).toContain("RemoteClipboardSize.acceptsTransfer(json)");
+    expect(swift).toMatch(/guard RemoteClipboardSize\.acceptsTransferUTF8Bytes\(data\) else \{\s*throw failure\("REMOTE_DESKTOP_CLIPBOARD_TOO_LONG"\)/u);
+    expect(swift).toMatch(/guard let decoded = String\(data: data, encoding: \.utf8\) else \{\s*throw failure\("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED"\)/u);
   });
 });
