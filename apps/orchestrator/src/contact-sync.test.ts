@@ -14,7 +14,8 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ContactSyncWorkerCodec } from "./contact-sync-codec.js";
-import { generateNodeSyncIdentity, NodeSyncLanTransport, type NodeSyncCipherChunkFrame, type NodeSyncLanTransportOptions } from "@joko/node-sync";
+import { generateNodeSyncIdentity, NodeSyncLanTransport, NodeSyncTcpTransport,
+  type NodeSyncCipherChunkFrame, type NodeSyncDeliveryContext, type NodeSyncLanTransportOptions } from "@joko/node-sync";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import {
   ContactSyncWireDecoder,
@@ -208,6 +209,75 @@ describe("Contacts sync node lifecycle", () => {
       expect(send.mock.calls.every(call => call[0] === candidate.nodeId)).toBe(true);
       expect(manager.status().peers).toHaveLength(1);
     } finally { manager.close(); vi.useRealTimers(); }
+  });
+
+  it("acknowledges a committed LAN frame while its separate reply is pending and retires old sends on regrant", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-reply-"));
+    const store = new ContactStore(join(directory, "contacts.db"));
+    const vault = await CredentialVault.open(join(directory, "master.key"));
+    const identity = generateNodeSyncIdentity();
+    const callerId = "node-first", receiverId = "node-receiver";
+    const logger = { debug: () => undefined, warn: () => undefined };
+    let receiverPublicKey = "", receivedReplies = 0;
+    const caller = new NodeSyncTcpTransport({ purpose: "contacts", logger, listenHost: "127.0.0.1",
+      getSelf: () => ({ nodeId: callerId, displayName: "Caller", ...identity }),
+      isPeerAllowed: (peerId, key) => peerId === receiverId && key === receiverPublicKey,
+      onFrame: () => { receivedReplies += 1; }
+    });
+    let receiver!: NodeSyncTcpTransport;
+    let explicitSync = false;
+    const send = vi.fn<(nodeId: string, frame: NodeSyncCipherChunkFrame, delivery: NodeSyncDeliveryContext) => Promise<boolean>>();
+    const candidate = { nodeId: callerId, displayName: "Caller", publicKey: identity.publicKey,
+      fingerprint: contactSyncPublicKeyFingerprint(identity.publicKey), address: "127.0.0.1", port: 4318, seenAt: Date.now() };
+    const manager = new ContactSyncManager({ store, vault, nodeId: receiverId, displayName: "Receiver", codec: inProcessContactSyncCodec,
+      transportFactory: (options) => {
+        receiver = new NodeSyncTcpTransport({ ...options, listenHost: "127.0.0.1" });
+        return { start: () => receiver.start(), stop: () => receiver.stop(), send,
+          candidates: () => [candidate], onlinePeerIds: () => explicitSync ? [callerId] : [] };
+      }
+    });
+    cleanups.push(() => { manager.close(); caller.stop(); store.close(); rmSync(directory, { recursive: true, force: true }); });
+    await caller.start();
+    await manager.initialize();
+    await manager.setEnabled(manager.status().configurationRevision, true);
+    receiverPublicKey = store.contactSyncConfiguration()!.publicKey;
+    await manager.grantCandidate(callerId, candidate.fingerprint);
+
+    const frames = encodeContactSyncMessageInProcess({ message: { version: 1, type: "state", state: populatedState(12), requestReply: true },
+      ownPrivateKey: identity.privateKey, ownPublicKey: identity.publicKey, peerPublicKey: receiverPublicKey,
+      sourceNodeId: callerId, destinationNodeId: receiverId });
+    expect(frames).toHaveLength(1);
+    let failReply!: (sent: boolean) => void;
+    send.mockImplementationOnce(() => new Promise<boolean>((resolve) => { failReply = resolve; }));
+    try {
+      expect(await caller.send({ host: "127.0.0.1", port: receiver.listenerPort()!, publicKey: receiverPublicKey }, receiverId, frames[0]!)).toBe(true);
+      expect(store.getContact("contact-1").displayName).toBe("Ada");
+      expect(send).toHaveBeenCalledOnce();
+      expect(manager.status().phase).toBe("syncing");
+    } finally { failReply?.(false); }
+    await waitUntil(() => manager.status().errorCode === "sync_failed");
+
+    let releaseSend!: () => void;
+    const pendingSend = new Promise<void>((resolve) => { releaseSend = resolve; });
+    send.mockImplementationOnce(async (peerId, frame, delivery) => {
+      await pendingSend;
+      return receiver.send({ host: "127.0.0.1", port: caller.listenerPort()!, publicKey: identity.publicKey }, peerId, frame, delivery);
+    });
+    explicitSync = true;
+    const syncing = manager.syncNow(callerId);
+    explicitSync = false;
+    const rejected = expect(syncing).rejects.toThrow(/could not be reached|authority changed/u);
+    await waitUntil(() => send.mock.calls.length === 2);
+    const originalDelivery = send.mock.calls[1]![2];
+    const granted = manager.status().peers[0]!;
+    manager.revokePeer(granted.peerId, granted.revision);
+    await manager.grantCandidate(callerId, candidate.fingerprint);
+    releaseSend();
+    await rejected;
+    expect(originalDelivery.signal.aborted).toBe(true);
+    expect(originalDelivery.isCurrent()).toBe(false);
+    expect(receivedReplies).toBe(0);
+    expect(manager.status().errorCode).toBeUndefined();
   });
 
   it("discovers explicit candidates, converges two real LAN nodes, and revokes delivery", { timeout: 25_000 }, async ({ signal, onTestFailed, onTestFinished }) => {
