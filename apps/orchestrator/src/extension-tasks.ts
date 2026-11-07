@@ -3,7 +3,8 @@ import { mkdir, realpath } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import type { OperationalStore, QueueItemRecord, StoredSession, StoredRun } from "@joko/store";
-import type { ExtensionCatalogManager } from "./extension-catalog.js";
+import { resourceExtensionIds, type ExtensionCatalogManager } from "./extension-catalog.js";
+import type { PiResourceDescriptor } from "./resource-manager.js";
 import type { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import type { SessionHost } from "./session-host.js";
 import type { AppDefaultModelCoordinator } from "./app-default-model.js";
@@ -357,14 +358,30 @@ export class ExtensionTasks {
   /** Called in the same Resource removal transaction, before ownership is revoked. */
   uninstall(store: OperationalStore, resourceId: string): void {
     for (const receipt of this.#all().filter(receipt => receipt.resourceId === resourceId)) {
-      this.#hidden(receipt.sessionId!, false);
-      for (const goal of store.listCollaborationGoals({ leadSessionId: receipt.sessionId! })) {
-        for (const worker of store.listCollaborationWorkers({ goalId: goal.id, includeArchived: true })) if (worker.sessionId) this.#hidden(worker.sessionId, false);
-      }
-      store.setSetting("service", TASKS, receipt.sessionId!, { ...receipt, revoked: true });
+      this.#retireTask(store, receipt);
     }
     const installation = store.findSetting<{ readonly version: 1; readonly id: string }>("service", INSTALLATIONS, resourceId)?.value;
     if (installation) store.setSetting("service", INSTALLATIONS, resourceId, { ...installation, active: false });
+  }
+  reconcilePackageTasks(store: OperationalStore, resources: readonly PiResourceDescriptor[]): void {
+    const installed = new Map(resources.filter(resource => resource.kind === "package"
+      && ["installed", "loaded", "disabled", "update_available"].includes(resource.state))
+      .map(resource => [resource.id, resourceExtensionIds(resource)] as const));
+    if (installed.size === 0) return;
+    for (const receipt of this.#all()) {
+      const current = installed.get(receipt.resourceId);
+      if (!receipt.revoked && current && !current.has(receipt.extensionId)) this.#retireTask(store, receipt);
+    }
+  }
+  #retireTask(store: OperationalStore, receipt: TaskReceipt): void {
+    const sessionId = receipt.sessionId!;
+    if (store.findSession(sessionId)) this.#hidden(sessionId, false);
+    for (const goal of store.listCollaborationGoals({ leadSessionId: sessionId })) {
+      for (const worker of store.listCollaborationWorkers({ goalId: goal.id, includeArchived: true })) {
+        if (worker.sessionId && store.findSession(worker.sessionId)) this.#hidden(worker.sessionId, false);
+      }
+    }
+    store.setSetting("service", TASKS, sessionId, { ...receipt, revoked: true });
   }
   async retryWriteAccess(extensionId: string, taskId: string, signal: AbortSignal, assertCurrent: () => void) {
     assertCurrent(); signal.throwIfAborted();

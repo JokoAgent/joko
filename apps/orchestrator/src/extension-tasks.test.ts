@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -15,7 +15,8 @@ import { SessionHost } from "./session-host.js";
 import { SnapshotProjector } from "./snapshot-projector.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { ExtensionTasks, type ExtensionTaskOwner } from "./extension-tasks.js";
-import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
+import { resourceExtensionIds, type ExtensionCatalogDescriptor } from "./extension-catalog.js";
+import { PiResourceManager } from "./resource-manager.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "./extension-project-policy.js";
 import { projectNativeHistory } from "./native-history.js";
 import { SessionHelperToolBridgeProvider } from "./session-helper-tool-provider.js";
@@ -434,6 +435,52 @@ it("preserves user takeover after a declaration is removed and reveals before un
   f.store.transaction(store => f.tasks.uninstall(store, "resource")); f.uninstall();
   expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(1);
   f.reinstall(); await expect(f.request({ kind: "get", taskId: task.taskId })).rejects.toThrow();
+});
+it("reveals the retired facet's hidden tasks only when the package replacement commits", async () => {
+  const f = await fixture(), source = join(f.root, "workflow-package");
+  await mkdir(source);
+  const writePackage = async (version: string, entry: string) => {
+    await writeFile(join(source, entry), "export default function workflow() {}\n");
+    await writeFile(join(source, "package.json"), JSON.stringify({ name: "workflow-package", version, type: "module", pi: { extensions: [`./${entry}`] } }));
+  };
+  await writePackage("1.0.0", "worker.js");
+  const resources = new PiResourceManager({ store: f.store, managedRoot: join(f.root, "installed-packages") });
+  await resources.initialize();
+  const discovered = await resources.discoverPackage({ id: "workflow-package", backendId: f.adapter.id, scope: "global", source: { kind: "local", path: source } });
+  await resources.approve(discovered.id, discovered.discoveredRevision, "connection-owner");
+  const installed = await resources.install(discovered.id);
+  const extensionId = [...resourceExtensionIds(installed)][0]!;
+  const tasks = new ExtensionTasks({ ...f.tasks.options, catalog: { get: id => {
+    if (!resourceExtensionIds(resources.get(installed.id)).has(id)) throw new Error("The installed extension is unavailable.");
+    return { ...f.descriptor(), id, owner: { kind: "resource", resourceId: installed.id } };
+  } } });
+  resources.setExtensionTaskPackageChange((transaction, resource) => tasks.reconcilePackageTasks(transaction, [resource]));
+  const owner = { ...f.owner, extensionId, resourceId: installed.id, installation: tasks.installation(extensionId, installed.id) };
+  const request = (value: Record<string, unknown>, identity = owner) => tasks.request(identity, { type: "tasks-request", ...value });
+  const task = await request({ kind: "create", requestKey: "old-work", title: "Old background task", hidden: true }) as { taskId: string };
+  const other = await f.request({ kind: "create", requestKey: "other-work", title: "Unrelated background task", hidden: true }) as { taskId: string };
+  expect(tasks.backgroundTasks(extensionId).map(item => item.taskId)).toEqual([task.taskId]);
+
+  await writePackage("2.0.0", "worker-v2.js");
+  const failed = await resources.prepareUpdate(installed.id, { approvedByConnectionId: "connection-owner" });
+  await expect(resources.completePreparedMutation(failed, finalize => f.store.transaction(store => {
+    finalize(store);
+    throw new Error("Package receipt was rolled back.");
+  }))).rejects.toThrow("Package receipt was rolled back.");
+  expect(tasks.backgroundTasks(extensionId).map(item => item.taskId)).toEqual([task.taskId]);
+  await expect(request({ kind: "get", taskId: task.taskId })).resolves.toMatchObject({ taskId: task.taskId });
+
+  const updated = await resources.update(installed.id, { approvedByConnectionId: "connection-owner" });
+  const replacement = [...resourceExtensionIds(updated)][0]!;
+  expect(updated.id).toBe(installed.id);
+  expect(replacement).toBeDefined();
+  expect(replacement).not.toBe(extensionId);
+  expect(f.store.listSessions({ excludeHidden: true }).map(item => item.descriptor.id)).toEqual([task.taskId]);
+  expect(f.store.getSession(other.taskId).descriptor.hidden).toBe(true);
+  expect(tasks.backgroundTasks(replacement)).toEqual([]);
+  const installation = tasks.installation(replacement, installed.id);
+  expect(installation).toBe(owner.installation);
+  await expect(request({ kind: "get", taskId: task.taskId }, { ...owner, extensionId: replacement, installation })).rejects.toThrow();
 });
 it("rejects another installation, invalid model tuning, stale settings and hidden declaration escalation", async () => {
   const f = await fixture(), prefs = f.tasks.preferences(f.extensionId);

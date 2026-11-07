@@ -659,9 +659,13 @@ export class PiResourceManager {
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
   #extensionTaskRemoval?: (store: OperationalStore, resourceId: string) => void;
+  #extensionTaskPackageChange?: (store: OperationalStore, packageResource: PiResourceDescriptor) => void;
   #partnerHomeDataRoot?: (targetId: string) => string | undefined;
 
   setExtensionTaskRemoval(participant: (store: OperationalStore, resourceId: string) => void): void { this.#extensionTaskRemoval = participant; }
+  setExtensionTaskPackageChange(participant: (store: OperationalStore, packageResource: PiResourceDescriptor) => void): void {
+    this.#extensionTaskPackageChange = participant;
+  }
   setPartnerHomeDataRoot(resolveRoot: (targetId: string) => string | undefined): void { this.#partnerHomeDataRoot = resolveRoot; }
 
   /** Only personal Skill records follow a Partner. Host packages, plugins and credentials do not. */
@@ -4123,7 +4127,12 @@ export class PiResourceManager {
       }
     }
     const changed = prepared.entries.filter((entry) => entry.next !== entry.expected);
-    for (const entry of changed) if (entry.next.state === "removed" && entry.expected?.state !== "removed") this.#extensionTaskRemoval?.(store, entry.id);
+    for (const entry of changed) {
+      if (entry.next.state === "removed" && entry.expected?.state !== "removed") this.#extensionTaskRemoval?.(store, entry.id);
+      if (entry.next.kind === "package" && entry.next.installedPath !== undefined && entry.next.installedPath !== entry.expected?.installedPath) {
+        this.#extensionTaskPackageChange?.(store, publicResource(entry.next));
+      }
+    }
     for (const entry of changed) this.#records.set(entry.id, entry.next);
     try {
       if (changed.length > 0) this.#persist(store);

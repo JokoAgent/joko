@@ -2593,6 +2593,8 @@ export async function createOrchestratorApplication(
   sessionHost.setExtensionNativeToolAuthorization(sessionId => partnerNetwork?.nativeToolAuthorization(sessionId) ?? extensionTasks.nativeToolAuthorization(sessionId));
   mcpRouter.setNativeToolAdmission((...args) => sessionHost.authorizeNativeBridgeTool(...args));
   piResources.setExtensionTaskRemoval((transaction, resourceId) => extensionTasks.uninstall(transaction, resourceId));
+  piResources.setExtensionTaskPackageChange((transaction, resource) => extensionTasks.reconcilePackageTasks(transaction, [resource]));
+  store.transaction(transaction => extensionTasks.reconcilePackageTasks(transaction, piResources.list({ kind: "package" })));
   const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
   const extensionCards = new ExtensionCardsManager({ store, vault: credentialVault,
     assertProject: (extensionId, sessionId) => extensionProjects.assertEnabledForSession(extensionId, sessionId),
