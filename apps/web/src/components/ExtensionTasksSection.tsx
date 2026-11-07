@@ -1,23 +1,27 @@
-import { useEffect, useMemo, useState, type JSX } from "react";
+import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { PermissionMode, encodeModelSpeed, decodeModelSpeed, type ExtensionTaskPreferences, type ExtensionTaskRoute, type ExtensionBackgroundTask } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { ExtensionCatalogEntryView } from "../model.js";
-import type { Translator } from "./types.js";
+import type { RunAction, Translator } from "./types.js";
+import { InteractionDialog } from "./InteractionDialog.js";
 import { Button, CheckboxControl } from "./ui.js";
 import { ModelSpeedControl } from "./ModelSpeedControl.js";
 import "./extension-network.css";
 
 const routeKey = (route: Pick<ExtensionTaskRoute, "backendId" | "providerId" | "modelId">) => JSON.stringify([route.backendId, route.providerId, route.modelId]);
-export function ExtensionTasksSection({ controller, extension, disabled, t }: {
-  readonly controller: AppController; readonly extension: ExtensionCatalogEntryView; readonly disabled: boolean; readonly t: Translator;
+export function ExtensionTasksSection({ controller, extension, disabled, t, runAction }: {
+  readonly controller: AppController; readonly extension: ExtensionCatalogEntryView; readonly disabled: boolean; readonly t: Translator; readonly runAction: RunAction;
 }): JSX.Element | null {
   const [state, setState] = useState<ExtensionTaskPreferences>(), [background, setBackground] = useState<ExtensionBackgroundTask[]>([]);
   const [model, setModel] = useState<ExtensionTaskRoute>(), [targetId, setTargetId] = useState<string>(), [permission, setPermission] = useState(PermissionMode.ASK);
   const [busy, setBusy] = useState(false), [error, setError] = useState(false), [refresh, setRefresh] = useState(0);
-  const lifetime = useMemo(() => ({ abort: new AbortController(), busy: false }), [controller, extension.id]);
+  const [retry, setRetry] = useState<{ readonly taskId: string; readonly existingIds: ReadonlySet<string> }>();
+  const controllerRef = useRef(controller);
+  controllerRef.current = controller;
+  const lifetime = useMemo(() => ({ abort: new AbortController(), busy: false }), [extension.id]);
   useEffect(() => { if (lifetime.abort.signal.aborted) lifetime.abort = new AbortController(); return () => lifetime.abort.abort(); }, [lifetime]);
   useEffect(() => {
-    const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.abort.signal]), api = controller.extensionTaskApi?.();
+    const abort = new AbortController(), signal = AbortSignal.any([abort.signal, lifetime.abort.signal]), api = controllerRef.current.extensionTaskApi?.();
     if (!api) return;
     void api.getPreferences({ extensionId: extension.id }, { signal }).then(result => {
       if (signal.aborted || !result.preferences) return;
@@ -26,9 +30,12 @@ export function ExtensionTasksSection({ controller, extension, disabled, t }: {
     void api.listBackgroundTasks({ extensionId: extension.id }, { signal }).then(result => { if (!signal.aborted) setBackground(result.tasks); })
       .catch(() => { if (!signal.aborted) setError(true); });
     return () => abort.abort();
-  }, [controller, extension.id, extension.revision, refresh, lifetime]);
+  }, [extension.id, extension.revision, refresh, lifetime]);
   const selected = state?.extensionId === extension.id ? state : undefined;
   const declared = extension.permissions.some(item => item.id === "runtime-hidden-tasks");
+  const interaction = retry === undefined ? undefined : controller.state.snapshot.interactions.find(candidate => candidate.sessionId === retry.taskId
+    && candidate.kind === "permission" && candidate.permissionSubject?.kind === "customTool"
+    && candidate.permissionSubject.toolId === "plugin_managed_task" && !retry.existingIds.has(candidate.id));
   if (!selected?.showPreferences && !declared && !background.length && !selected?.writeRequests.length) return null;
   const chosen = selected?.models.find(item => item.route && model && routeKey(item.route) === routeKey(model));
   const run = async (work: () => Promise<void>) => {
@@ -60,10 +67,22 @@ export function ExtensionTasksSection({ controller, extension, disabled, t }: {
       {selected.writeRequests.map(request => <div className="extension-network__row" key={request.taskId}><strong>{request.title}</strong>
         <Button disabled={disabled || busy} onClick={() => { void run(async () => {
           const api = controller.extensionTaskApi?.(); if (!api) throw new Error("Connection unavailable.");
-          const result = await api.retryWriteAccess({ extensionId: extension.id, taskId: request.taskId }, { signal: lifetime.abort.signal });
-          lifetime.abort.signal.throwIfAborted(); setState(result.preferences); if (!result.granted) setError(true);
+          setRetry({ taskId: request.taskId, existingIds: new Set(controller.state.snapshot.interactions.map(item => item.id)) });
+          try {
+            const result = await api.retryWriteAccess({ extensionId: extension.id, taskId: request.taskId }, { signal: lifetime.abort.signal });
+            lifetime.abort.signal.throwIfAborted();
+            const next = result.preferences;
+            setState(next);
+            if (result.granted && next !== undefined) {
+              setPermission(current => current === selected.permissionMode ? next.permissionMode : current);
+            }
+            if (!result.granted) setError(true);
+          } finally {
+            if (!lifetime.abort.signal.aborted) setRetry(undefined);
+          }
         }); }}>{t("extensions.tasks.retryPermission")}</Button></div>)}
     </section>}
+    {interaction !== undefined && <InteractionDialog controller={controller} interaction={interaction} remaining={0} inline t={t} runAction={runAction} />}
     {(declared || background.length > 0) && <section aria-label={t("extensions.tasks.background")}><h3>{t("extensions.tasks.background")}</h3>
       <p>{t("extensions.tasks.disclosure")}</p><Button disabled={busy} onClick={() => setRefresh(value => value + 1)}>{t("common.refresh")}</Button>
       {!background.length && <p>{t("extensions.tasks.empty")}</p>}

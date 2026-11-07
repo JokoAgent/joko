@@ -2,6 +2,9 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { create } from "@bufbuild/protobuf";
+import { ExtensionTaskPreferencesSchema, ExtensionTaskServiceGetPreferencesResponseSchema, ExtensionTaskServiceListBackgroundTasksResponseSchema,
+  ExtensionTaskServiceRetryWriteAccessResponseSchema, PermissionMode } from "@joko/contracts";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
@@ -20,6 +23,7 @@ import {
   type ExtensionPackagePreviewView,
   type NewSessionLocalDraft,
   type ExtensionSourceCatalogView,
+  type InteractionView,
   type PendingExtensionSuggestionView,
   type ResourceView
 } from "../model.js";
@@ -40,6 +44,50 @@ afterEach(async () => {
 });
 
 describe("Extension catalog interactions", () => {
+  it("keeps plugin permission recovery open on its own live interaction event", async () => {
+    const extension = readyExtension();
+    const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: extension.id, revision: { value: 1n }, showPreferences: true,
+      tasksAvailable: true, permissionMode: PermissionMode.ASK, writeRequests: [{ taskId: "task-write", title: "Draft", mode: PermissionMode.AUTO }] });
+    let retrySignal!: AbortSignal;
+    let finish!: () => void;
+    const getExtension = vi.fn(async () => catalog(extension));
+    const getPreferences = vi.fn(async () => create(ExtensionTaskServiceGetPreferencesResponseSchema, { preferences }));
+    const view = await renderExtensions({ extension, controller: {
+      listExtensions: async () => catalog(extension), getExtension,
+      extensionTaskApi: () => ({
+        getPreferences,
+        listBackgroundTasks: async () => create(ExtensionTaskServiceListBackgroundTasksResponseSchema),
+        retryWriteAccess: async (_request, options) => {
+          retrySignal = options!.signal!;
+          await new Promise<void>((resolve) => { finish = resolve; });
+          return create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences: { ...preferences, permissionMode: PermissionMode.AUTO, writeRequests: [] } });
+        }
+      }) as NonNullable<ReturnType<AppController["extensionTaskApi"]>>
+    } });
+    const retry = buttonWithText(view.container, translate("en", "extensions.tasks.retryPermission"));
+    const save = buttonWithText(view.container, translate("en", "common.save"));
+    await act(async () => retry.click());
+    expect(save.disabled).toBe(true);
+    const approval: InteractionView = { id: "extension-write-live", sessionId: "task-write", generation: 1n, kind: "permission",
+      title: "Approve plugin task writes", message: "Allow edits for this task", createdAt: 1, fields: [], planSteps: [],
+      options: [{ id: "1", label: "Allow once" }, { id: "4", label: "Deny once" }],
+      permissionSubject: { kind: "customTool", toolId: "plugin_managed_task", displayName: "Plugin task", arguments: [] } };
+    const snapshot = { ...view.snapshot, interactions: [
+      { ...approval, id: "other-task", sessionId: "another-task", title: "Unrelated approval" }, approval
+    ] };
+    const state = view.controller.state;
+    await view.rerenderController({ ...view.controller, state: { ...state, snapshot } }, snapshot);
+    expect(retrySignal.aborted).toBe(false);
+    expect(getExtension).toHaveBeenCalledOnce();
+    expect(getPreferences).toHaveBeenCalledOnce();
+    expect(view.container.querySelector('[aria-label="Approve plugin task writes"]')).not.toBeNull();
+    expect(view.container.textContent).not.toContain("Unrelated approval");
+    await act(async () => finish());
+    expect(save.disabled).toBe(false);
+    expect([...view.container.querySelectorAll("select")].find(select => select.textContent?.includes(translate("en", "extensions.tasks.ask")))?.value).toBe(String(PermissionMode.AUTO));
+    expect(view.container.querySelector('[aria-label="Approve plugin task writes"]')).toBeNull();
+  });
+
   it("uses the selected project's revision without changing global plugin availability", async () => {
     const extension = readyExtension(), project = { id: "a".repeat(64), name: "Project A", path: "/projects/a" };
     let state = { project, revision: 3n, disabledExtensionIds: [] as string[] };

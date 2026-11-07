@@ -971,13 +971,14 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
   const [packageExport, setPackageExport] = useState<ExtensionCatalogEntryView>();
   const [packageRemoval, setPackageRemoval] = useState<ExtensionCatalogEntryView>();
   const [packageBatchOpen, setPackageBatchOpen] = useState(false);
-  const creatorControllerRef = useRef(controller); creatorControllerRef.current = controller;
+  const controllerRef = useRef(controller); controllerRef.current = controller;
+  const translatorRef = useRef(t); translatorRef.current = t;
   const launchCreator = (trigger: HTMLButtonElement) => runAction("plugin-creator", async () => {
     const source = controller;
     const key = (value: AppController) => JSON.stringify([value.state.activeProfile?.id, value.state.activeProfile?.serverId,
       value.state.activeProfile?.origin, value.state.connectionGeneration, value.state.connectionState]);
     const owner = key(source);
-    const current = () => trigger.isConnected && trigger.ownerDocument.defaultView !== null && key(creatorControllerRef.current) === owner;
+    const current = () => trigger.isConnected && trigger.ownerDocument.defaultView !== null && key(controllerRef.current) === owner;
     const original = await source.readNewSessionDraft();
     if (!current()) throw new Error(t("composer.inputUnavailable"));
     await source.saveNewSessionDraft(pluginCreatorDraft(original));
@@ -1022,7 +1023,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
     setListError(undefined);
     const timer = window.setTimeout(() => {
       const filters = extensionFacetFilters(facet);
-      void controller.listExtensions({
+      void controllerRef.current.listExtensions({
         includeProjectDisabled: true,
         ...filters,
         ...(query.trim() === "" ? {} : { query: query.trim() }),
@@ -1034,22 +1035,22 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
         setCatalogRevision(catalog.revision);
         setRecovered(catalog.recoveredFromCorruption);
       }).catch((cause: unknown) => {
-        if (!abort.signal.aborted && request === listRequest.current) setListError(extensionErrorMessage(cause, t));
+        if (!abort.signal.aborted && request === listRequest.current) setListError(extensionErrorMessage(cause, translatorRef.current));
       }).finally(() => {
         if (!abort.signal.aborted && request === listRequest.current) setListLoading(false);
       });
     }, query.trim() === "" ? 0 : 180);
     return () => { window.clearTimeout(timer); abort.abort(); };
-  }, [controller, facet, query, refreshRevision, catalogSessionId]);
+  }, [facet, query, refreshRevision, catalogSessionId, snapshot.extensionCatalogRevision, snapshot.generation]);
 
   const loadDetail = useCallback(async (extensionId: string, signal?: AbortSignal): Promise<ExtensionCatalogEntryView> => {
-    const catalog = await controller.getExtension(extensionId, catalogSessionId, signal, true);
+    const catalog = await controllerRef.current.getExtension(extensionId, catalogSessionId, signal, true);
     const next = catalog.extensions[0];
-    if (next === undefined || next.id !== extensionId) throw new Error(t("extensions.detailUnavailable"));
+    if (next === undefined || next.id !== extensionId) throw new Error(translatorRef.current("extensions.detailUnavailable"));
     setCatalogRevision(catalog.revision);
     setRecovered(catalog.recoveredFromCorruption);
     return next;
-  }, [controller, catalogSessionId, t]);
+  }, [catalogSessionId]);
 
   useEffect(() => {
     detailRetryAbort.current?.abort();
@@ -1068,7 +1069,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
     void loadDetail(selectedId, abort.signal).then((next) => {
       if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === selectedId) setDetail(next);
     }).catch((cause: unknown) => {
-      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === selectedId) setDetailError(extensionErrorMessage(cause, t));
+      if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === selectedId) setDetailError(extensionErrorMessage(cause, translatorRef.current));
     }).finally(() => {
       if (!abort.signal.aborted && request === detailRequest.current && selectedRef.current === selectedId) setDetailLoading(false);
     });
@@ -1076,7 +1077,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
       abort.abort();
       detailRetryAbort.current?.abort();
     };
-  }, [loadDetail, selectedId]);
+  }, [loadDetail, selectedId, snapshot.extensionCatalogRevision, snapshot.generation]);
 
   const refreshSelected = async (extensionId: string): Promise<ExtensionCatalogEntryView> => {
     const next = await loadDetail(extensionId);
@@ -1284,6 +1285,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
         locale={locale}
         busy={mutationKey !== undefined || continuationLocksDetail}
         t={t}
+        runAction={runAction}
         onEnabledChange={(enabled) => projectScope.ready && mutate(
           `extension-enabled:${selectedDetail.id}`,
           selectedDetail.id,
@@ -1464,7 +1466,7 @@ function ExtensionSuggestionContinuation({ state, busy, canAct, t, onRetry, onCa
   </section>;
 }
 
-function ExtensionDetail({ controller, extension, projectSelected, projectReady, projectEnabled, projectSupported, locale, busy, t, onEnabledChange, onSidebarChange, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
+function ExtensionDetail({ controller, extension, projectSelected, projectReady, projectEnabled, projectSupported, locale, busy, t, runAction, onEnabledChange, onSidebarChange, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
   readonly controller: AppController;
   readonly extension: ExtensionCatalogEntryView;
   readonly projectSelected: boolean;
@@ -1474,6 +1476,7 @@ function ExtensionDetail({ controller, extension, projectSelected, projectReady,
   readonly locale: string;
   readonly busy: boolean;
   readonly t: Translator;
+  readonly runAction: RunAction;
   readonly onEnabledChange: (enabled: boolean) => void;
   readonly onSidebarChange: (visible: boolean) => void;
   readonly onSetup: () => void;
@@ -1497,7 +1500,7 @@ function ExtensionDetail({ controller, extension, projectSelected, projectReady,
     {extension.owner.kind === "resource" && extension.installed && <ExtensionNetworkSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionOAuthSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionTasksSection key={JSON.stringify([extension.id, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
-      controller.state.connectionGeneration, controller.state.connectionState])} controller={controller} extension={extension} disabled={busy} t={t} />}
+      controller.state.connectionGeneration, controller.state.connectionState])} controller={controller} extension={extension} disabled={busy} t={t} runAction={runAction} />}
     {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
       <label><span><strong>{t(projectSelected ? "extensions.project.enabled" : "extensions.enabled")}</strong><small>{t(projectSelected ? !projectSupported ? "extensions.project.unsupported" : !extension.enabled ? "extensions.project.globallyDisabled" : "extensions.project.enabledBody" : "extensions.enabledBody")}</small></span><CheckboxControl checked={projectSelected ? projectReady && projectEnabled : extension.enabled} disabled={busy || projectSelected && (!projectReady || !projectSupported || !extension.enabled)} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}
