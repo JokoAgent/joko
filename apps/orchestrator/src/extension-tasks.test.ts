@@ -408,6 +408,8 @@ it("returns the completed Worker Run timestamp so a plugin can release its plan 
   const endedAt = f.store.listRuns({ sessionId: worker.sessionId!, limit: 1 })[0]!.descriptor.endedAt;
   const queueCompletedAt = f.store.listQueueItems({ sessionId: worker.sessionId! })[0]!.completedAt;
   expect(queueCompletedAt).toBeGreaterThan(endedAt!);
+  await expect(f.teams.createWorker({ ...base, operationId: "second-before-release", expectedGoalRevision: f.teams.getTree(team.goal.id).goal.revision,
+    label: second.label, assignment: second.task })).rejects.toMatchObject({ code: "TASK_BUSY" });
   const read = await f.request({ kind: "getTeam", taskId }) as { workers: readonly { id: string; completedAt?: number }[] };
   const completedAt = read.workers.find(value => value.id === worker.id)?.completedAt;
   expect(completedAt).toBe(endedAt);
