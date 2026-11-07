@@ -101,12 +101,17 @@ export class PartnerImportRuntime implements BridgeToolProvider, PartnerImported
       return success({ text: document.slice(offset, offset + 64_000), total: document.length, ...(offset + 64_000 < document.length ? { nextOffset: offset + 64_000 } : {}) });
     }
     if (name === "run_command") {
-      if (typeof input.command !== "string" || !input.command.trim() || input.command.length > 64_000) throw new AgentImportError("INVALID_SELECTION");
+      const command = input.command;
+      if (typeof command !== "string" || !command.trim() || command.length > 64_000) throw new AgentImportError("INVALID_SELECTION");
       const timeoutMs = input.timeout_ms === undefined ? 300_000 : Number(input.timeout_ms);
       if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw new AgentImportError("INVALID_SELECTION");
       const target = this.options.store.getTarget(context.targetId).descriptor;
-      const result = await withImportedSkillResources(environment, assertOwner, env => runImportedProcess({ command: process.platform === "win32" ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe") : "/bin/sh",
-        args: process.platform === "win32" ? ["/d", "/s", "/c", input.command as string] : ["-c", input.command as string], cwd: target.workspaceRoot,
+      const windows = process.platform === "win32";
+      const result = await withImportedSkillResources(environment, assertOwner, env => runImportedProcess({
+        command: windows ? path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe") : "/bin/sh",
+        // cmd /s removes the outer quotes and interprets the original command text.
+        args: windows ? ["/d", "/s", "/c", `"${command}"`] : ["-c", command], windowsVerbatimArguments: windows,
+        cwd: target.workspaceRoot,
         env: importedProcessEnvironment(env), timeoutMs, signal: signal ?? new AbortController().signal, assertOwner }));
       return success({ exitCode: result.exitCode, stdout: redact(result.stdout) });
     }
