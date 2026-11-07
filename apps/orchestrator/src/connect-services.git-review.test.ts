@@ -21,6 +21,7 @@ const connection = {
   pairedAt: 1,
   revision: 1n
 };
+const imageWorkspace = { id: "workspace-review", root: "/project", displayName: "Review", trusted: true };
 
 function context(): unknown {
   return { requestHeader: new Headers({ authorization: "Bearer review-test" }), signal: new AbortController().signal };
@@ -280,7 +281,7 @@ describe("Connect Git Review contracts", () => {
       newImage: { present: true, tooLarge: false, path: "assets/photo.png", mediaType: "image/png", bytes },
       repositoryRevision: "image-fence"
     }));
-    const services = createConnectServices(application({ workspaces: { readGitDiffImage }, ingestBytes }));
+    const services = createConnectServices(application({ workspaces: { listRegistrations: () => [imageWorkspace], readGitDiffImage }, ingestBytes }));
     const response = await services.workspace.readWorkspaceDiffImage(create(contract.ReadWorkspaceDiffImageRequestSchema, {
       workspaceId: "workspace-review",
       relativePath: "assets/photo.png",
@@ -297,11 +298,36 @@ describe("Connect Git Review contracts", () => {
     expect(response.newImage?.image?.blob?.fileName).not.toContain("assets/");
   });
 
+  it("drops an in-flight Review image after its workspace trust changes during staging", async () => {
+    let registration = imageWorkspace;
+    const readGitDiffImage = vi.fn(async () => ({
+      oldImage: { present: false, tooLarge: false },
+      newImage: { present: true, tooLarge: false, path: "photo.png", mediaType: "image/png", bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+      repositoryRevision: "original-commit"
+    }));
+    let finishIngest!: (record: object) => void;
+    const ingestBytes = vi.fn(() => new Promise<object>((resolve) => { finishIngest = resolve; }));
+    const services = createConnectServices(application({ workspaces: { listRegistrations: () => [registration], readGitDiffImage }, ingestBytes }));
+    const result = services.workspace.readWorkspaceDiffImage(create(contract.ReadWorkspaceDiffImageRequestSchema, {
+      workspaceId: registration.id,
+      relativePath: "photo.png",
+      source: contract.GitDiffSource.COMMIT,
+      sourceRevision: "a".repeat(40),
+      expectedRepositoryRevision: "original-commit"
+    }), context() as never);
+    await vi.waitFor(() => expect(ingestBytes).toHaveBeenCalledOnce());
+    registration = { ...registration, trusted: false };
+    finishIngest({ id: "blob-before-revoke", sha256: `sha256:${"a".repeat(64)}`, byteLength: 4, mimeType: "image/png",
+      fileName: "photo.png", createdAt: 1, expiresAt: Date.now() + 60_000 });
+    await expect(result).rejects.toMatchObject({ code: Code.Aborted, rawMessage: expect.stringContaining("workspace authority changed") });
+    expect(readGitDiffImage).toHaveBeenCalledOnce();
+  });
+
   it("redacts unexpected backend details from public Review errors", async () => {
     const readGitDiffImage = vi.fn(async () => {
       throw new Error("SECRET_IMAGE_BODY C:\\private\\workspace token@example.test");
     });
-    const services = createConnectServices(application({ workspaces: { readGitDiffImage } }));
+    const services = createConnectServices(application({ workspaces: { listRegistrations: () => [imageWorkspace], readGitDiffImage } }));
     await expect(services.workspace.readWorkspaceDiffImage(create(contract.ReadWorkspaceDiffImageRequestSchema, {
       workspaceId: "workspace-review",
       relativePath: "photo.png",
