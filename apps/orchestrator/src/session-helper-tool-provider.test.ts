@@ -274,6 +274,14 @@ describe("SessionHelperToolBridgeProvider", () => {
     expect(store.getSession("session-b").descriptor.archived).toBe(false);
   });
 
+  it("rejects a generic archive batch containing a Partner canonical task before changing any task", async () => {
+    const { store, provider } = fixture(undefined, sessionId => sessionId === "session-c");
+    const failed = await callNested(provider, "archive_sessions", { session_ids: ["session-b", "session-c"] });
+    expect(errorData(failed)).toMatchObject({ errorCode: "PRECONDITION_FAILED" });
+    expect(store.getSession("session-b").descriptor.archived).toBe(false);
+    expect(store.getSession("session-c").descriptor.archived).toBe(false);
+  });
+
   it("lists workdirs, task metadata, raw role history, semantic fallback search, and stable cursors", async () => {
     const { store, provider, roots } = fixture();
     appendMessage(store, "message-a-user", "session-a", "user", "alpha needle", NOW + 10);
@@ -594,7 +602,10 @@ describe("SessionHelperToolBridgeProvider", () => {
   });
 });
 
-function fixture(taskSenderPartner?: (sessionId: string) => Pick<TaskMessageOrigin, "senderPartnerId" | "senderPartnerName"> | undefined) {
+function fixture(
+  taskSenderPartner?: (sessionId: string) => Pick<TaskMessageOrigin, "senderPartnerId" | "senderPartnerName"> | undefined,
+  isPartnerCanonicalTask?: (sessionId: string) => boolean
+) {
   const store = new OperationalStore(":memory:");
   openStores.push(store);
   const base = mkdtempSync(join(tmpdir(), "joko-session-helper-"));
@@ -812,7 +823,8 @@ function fixture(taskSenderPartner?: (sessionId: string) => Pick<TaskMessageOrig
       "isSessionActive" | "resume" | "sessionRuntimeFallbackEnabled" | "setSessionRuntimeControl"
     >,
     now: () => NOW + 10_000,
-    taskSenderPartner
+    taskSenderPartner,
+    isPartnerCanonicalTask
   });
   return { store, provider, hostState, roots };
 }

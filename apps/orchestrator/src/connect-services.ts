@@ -538,6 +538,7 @@ export interface ConnectServiceDependencies {
   readonly runtimeProcesses: RuntimeProcessControl;
   readonly sessionHost: SessionHost;
   readonly sessionWorktrees?: SessionWorktreeCoordinator;
+  readonly isPartnerCanonicalTask?: (sessionId: string) => boolean;
   readonly personalDevelopment?: () => OrchestratorApplication["personalDevelopmentCoordinator"];
   readonly assertPersonalDevelopmentLocalConnection?: (connection: ConnectionRecord) => void;
   readonly runtimeActivity?: RuntimeActivityTracker;
@@ -1331,6 +1332,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ),
     sessionHost: application.sessionHost,
     sessionWorktrees: application.sessionWorktrees,
+    isPartnerCanonicalTask: sessionId => application.partners?.isCanonicalTask(sessionId) === true,
     personalDevelopment: () => application.personalDevelopmentCoordinator,
     assertPersonalDevelopmentLocalConnection: connection => {
       if (application.personalDevelopmentNativeBroker === undefined) throw new ConnectError("Personal development is unavailable.", Code.Unavailable);
@@ -17391,6 +17393,9 @@ async function dispatchMutation(
           body: mutation,
           sessionLifecycleFenceId: payload.value.sessionId,
           precondition: (store) => {
+            if (dependencies.isPartnerCanonicalTask?.(payload.value.sessionId)) {
+              throw new ConnectError("Use Partner settings to archive this Partner.", Code.FailedPrecondition);
+            }
             const schedules = store.readSessionArchiveSchedules(payload.value.sessionId);
             if ((schedules.count > 0 || payload.value.archiveConfirmation !== "")
               && payload.value.archiveConfirmation !== schedules.confirmation) {
