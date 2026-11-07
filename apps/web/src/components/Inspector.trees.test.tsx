@@ -200,19 +200,24 @@ describe("Inspector production trees", () => {
     expect(controller.forkSession).not.toHaveBeenCalled();
   });
 
-  it("moves through Review hierarchy and collapses its parent with standard tree keys", async () => {
+  it.each(["main", "detached"] as const)("moves through the %s Review hierarchy with standard tree keys", async location => {
     const files = [diff("src/App.tsx"), diff("src/lib/data.ts"), diff("README.md")];
     const onSelect = vi.fn();
-    const host = await render(<ReviewFileTree files={files} selectedKey={reviewFileKey(files[0]!)} onSelect={onSelect} t={t} />);
+    const owner = location === "main"
+      ? document
+      : required(document.body.appendChild(document.createElement("iframe")).contentDocument);
+    const host = await render(<ReviewFileTree files={files} selectedKey={reviewFileKey(files[0]!)} onSelect={onSelect} t={t} />, owner);
     await settle();
 
     const tree = required(host.querySelector<HTMLDivElement>('[role="tree"]'));
+    expect(tree.ownerDocument).toBe(owner);
+    expect(tree instanceof Element).toBe(location === "main");
     let selected = required(tree.querySelector<HTMLElement>('[role="treeitem"][aria-selected="true"]'));
     expect(inspectorTreeItems(tree).filter((item) => item.tabIndex === 0)).toEqual([selected]);
     selected.focus();
     await press(selected, "ArrowLeft");
     let parent = required(tree.querySelector<HTMLElement>('[data-inspector-tree-key="directory:src"]'));
-    expect(document.activeElement).toBe(parent);
+    expect(owner.activeElement).toBe(parent);
 
     await press(parent, "ArrowLeft");
     expect(parent.getAttribute("aria-expanded")).toBe("false");
@@ -221,17 +226,17 @@ describe("Inspector production trees", () => {
     expect(parent.getAttribute("aria-expanded")).toBe("true");
     await press(parent, "ArrowRight");
     const nestedDirectory = required(tree.querySelector<HTMLElement>('[data-inspector-tree-key="directory:src/lib"]'));
-    expect(document.activeElement).toBe(nestedDirectory);
+    expect(owner.activeElement).toBe(nestedDirectory);
     await press(nestedDirectory, "ArrowRight");
     const nestedFile = required(tree.querySelector<HTMLElement>(`[data-inspector-tree-key="${reviewFileKey(files[1]!)}"]`));
-    expect(document.activeElement).toBe(nestedFile);
+    expect(owner.activeElement).toBe(nestedFile);
     await press(nestedFile, "Enter");
     expect(onSelect).toHaveBeenCalledWith(reviewFileKey(files[1]!));
   });
 });
 
-async function render(element: ReactNode): Promise<HTMLDivElement> {
-  const host = document.body.appendChild(document.createElement("div"));
+async function render(element: ReactNode, owner = document): Promise<HTMLDivElement> {
+  const host = owner.body.appendChild(owner.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
   await act(async () => root.render(element));
