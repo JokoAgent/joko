@@ -22,7 +22,6 @@ import {
   type NativeSkillSnapshot,
   type RuntimeResource,
   type RuntimeCommand,
-  MEMORY_NATIVE_DEFAULT_DISABLED_OPTION,
   MEMORY_NATIVE_LIVE_LOCAL_OPTION,
   MEMORY_NATIVE_RESET_LOCAL_OPTION,
   type AdapterContext,
@@ -6093,7 +6092,6 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           && supportsNativeMemoryRuntime(this.#host)
           ? { options: [
               MEMORY_NATIVE_LIVE_LOCAL_OPTION,
-              MEMORY_NATIVE_DEFAULT_DISABLED_OPTION,
               MEMORY_NATIVE_RESET_LOCAL_OPTION
             ] }
           : {})
