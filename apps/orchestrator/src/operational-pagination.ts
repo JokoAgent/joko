@@ -1,5 +1,6 @@
 import type {
   InteractionRecord,
+  MessagingInboundRequestRecord,
   OperationalStore,
   PersistedEvent,
   QueueItemRecord,
@@ -11,6 +12,7 @@ const COMPLETE_SCAN_PAGE_SIZE = 100_000;
 type QueueItemListOptions = NonNullable<Parameters<OperationalStore["listQueueItems"]>[0]>;
 type InteractionListOptions = NonNullable<Parameters<OperationalStore["listInteractions"]>[0]>;
 type RunListOptions = NonNullable<Parameters<OperationalStore["listRuns"]>[0]>;
+type MessagingInboundListOptions = NonNullable<Parameters<OperationalStore["listMessagingInboundRequests"]>[0]>;
 
 export function visitVisibleSessionEvents(
   store: OperationalStore,
@@ -95,6 +97,17 @@ export function listAllRuns(
 ): StoredRun[] {
   return listAllByOffset(
     (offset) => store.listRuns({ ...options, limit: pageSize, offset }),
+    pageSize
+  );
+}
+
+export function listAllMessagingInboundRequests(
+  store: OperationalStore,
+  options: Omit<MessagingInboundListOptions, "limit" | "offset"> = {},
+  pageSize = 500
+): MessagingInboundRequestRecord[] {
+  return listAllByOffset(
+    (offset) => store.listMessagingInboundRequests({ ...options, limit: pageSize, offset }),
     pageSize
   );
 }

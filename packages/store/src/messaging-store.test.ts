@@ -21,6 +21,22 @@ afterEach(() => {
 });
 
 describe("OperationalStore messaging", () => {
+  it("paginates inbound requests with equal timestamps without losing earlier rows", () => {
+    const fixture = createActiveFixture();
+    for (const id of ["request-a", "request-c", "request-b"]) {
+      fixture.store.createMessagingInboundRequest({
+        id, connectionId: fixture.connectionId, expectedChannelGeneration: fixture.generation,
+        conversationId: fixture.conversationId, providerRequestIds: [id],
+        bodyHash: operationBodyHash({ id }), protectedContent: false, occurredAt: 30, receivedAt: 30
+      });
+    }
+    const page = (offset: number) => fixture.store.listMessagingInboundRequests({
+      connectionId: fixture.connectionId, statuses: ["preparing"], limit: 2, offset
+    }).map(({ id }) => id);
+    expect(page(0)).toEqual(["request-c", "request-b"]);
+    expect(page(2)).toEqual(["request-a"]);
+  });
+
   it("reopens raw Telegram pages before cursor acknowledgement and commits cursor advancement with batch removal", () => {
     const fixture = createActiveFixture();
     const updates = [{ update_id: 9, message: { message_id: 81, media_group_id: "album-one",

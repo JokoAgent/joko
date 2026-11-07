@@ -6750,6 +6750,7 @@ export class OperationalStore {
     readonly connectionId?: string;
     readonly statuses?: readonly MessagingInboundRequestStatus[];
     readonly limit?: number;
+    readonly offset?: number;
   } = {}): MessagingInboundRequestRecord[] {
     this.assertOpen();
     const clauses: string[] = [];
@@ -6767,8 +6768,8 @@ export class OperationalStore {
     const rows = this.database.prepare(`
       SELECT id FROM messaging_inbound_requests
       ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
-      ORDER BY received_at DESC, id DESC LIMIT ?
-    `).all(...params, limit) as Row[];
+      ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?
+    `).all(...params, limit, normalizeOffset(input.offset)) as Row[];
     return rows.map((row) => this.getMessagingInboundRequest(stringValue(row["id"])));
   }
 
