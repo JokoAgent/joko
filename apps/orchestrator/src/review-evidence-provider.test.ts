@@ -275,6 +275,51 @@ describe("DurableReviewEvidenceProvider", () => {
     expect(second.freshness.workspaceSha256).not.toBe(first.freshness.workspaceSha256);
   });
 
+  it("captures both a real branch commit and independent uncommitted edits", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    try {
+      const git = initWorkspaceRepository(fixture.root);
+      git("symbolic-ref", "HEAD", "refs/heads/main");
+      writeWorkspaceFile(fixture.root, "committed.txt", "base committed\n");
+      writeWorkspaceFile(fixture.root, "draft.txt", "base draft\n");
+      git("add", "--", "committed.txt", "draft.txt");
+      git("commit", "--quiet", "-m", "base");
+      const base = git("rev-parse", "HEAD").trim();
+      git("checkout", "--quiet", "-b", "feature");
+      writeWorkspaceFile(fixture.root, "committed.txt", "committed deliverable\n");
+      git("commit", "--quiet", "-am", "deliverable");
+      writeWorkspaceFile(fixture.root, "draft.txt", "uncommitted deliverable\n");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const provider = providerFor(fixture.store, workspaces, []);
+      const review = { sourceSessionId: "source", attachments: [] };
+      const capture = await provider.capture(review);
+      expect(capture.branchEvidence).toMatchObject({ baseRefLabel: "main", fileCount: 1,
+        diffs: [{ relativePath: "committed.txt", source: "branch" }] });
+      expect(capture.workspaceEvidence?.diffs).toMatchObject([{ relativePath: "draft.txt", source: "unstaged" }]);
+      expect(capture.workspace.git).toMatchObject({ baseOid: base, mergeBaseOid: base });
+      expect(capture.workspace.files.map(file => file.relativePath)).toEqual(["committed.txt", "draft.txt"]);
+      const initial = buildReviewEvidence(capture);
+      const built = buildReviewPrompt(initial.promptInput);
+      expect(built.targetKind).toBe("changes");
+      expect(built.prompt).toContain("+committed deliverable\n");
+      expect(built.prompt).toContain("+uncommitted deliverable\n");
+      expect(built.prompt).not.toContain("no uncommitted changes");
+
+      git("branch", "-D", "main");
+      const withoutBase = await provider.capture(review);
+      expect(withoutBase.branchEvidence).toBeUndefined();
+      const partial = buildReviewEvidence(withoutBase);
+      expect(partial.freshness.workspaceSha256).not.toBe(initial.freshness.workspaceSha256);
+      const partialPrompt = buildReviewPrompt(partial.promptInput).prompt;
+      expect(partialPrompt).toContain("+uncommitted deliverable\n");
+      expect(partialPrompt).toContain("branch comparison is unavailable");
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
   it("fails closed instead of routing an unmatched target to the first workspace", async () => {
     const fixture = setup("unmatched-target");
     const workspaces = workspaceStub(fixture.root, cleanGit(), cleanDiff());
