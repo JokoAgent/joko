@@ -228,6 +228,59 @@ it("restores the durable permission on the native task when plugin preferences t
   await expect(f.host.inspect(task.taskId)).resolves.toMatchObject({ permissionMode: "ask", binding: before.binding });
   expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
 });
+it("retires an unconfirmed permission runtime before dispatching the original queued input", async () => {
+  const f = await fixture();
+  const task = await f.request({ kind: "create", requestKey: "unconfirmed-native-write", title: "Original Ask task" }) as { taskId: string };
+  const before = f.store.getSession(task.taskId).descriptor;
+  const preferences = f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => undefined);
+  const inspect = f.adapter.inspectSession.bind(f.adapter), setMode = f.adapter.setPermissionMode.bind(f.adapter);
+  const applying = vi.fn(), restoring = vi.fn();
+  let releaseApply!: () => void, releaseRestore!: () => void;
+  const applyHold = new Promise<void>(resolve => { releaseApply = resolve; });
+  const restoreHold = new Promise<void>(resolve => { releaseRestore = resolve; });
+  vi.spyOn(f.adapter, "inspectSession").mockImplementation(async (...args) => {
+    const state = await inspect(...args);
+    if (state.permissionMode === "auto" && state.binding.generation === before.binding.generation) {
+      applying(); await applyHold;
+    }
+    return state;
+  });
+  vi.spyOn(f.adapter, "setPermissionMode").mockImplementation(async (mode, context) => {
+    if (mode === "ask" && context.generation === before.binding.generation) {
+      restoring(); await restoreHold; throw new Error("Could not restore the original policy.");
+    }
+    return setMode(mode, context);
+  });
+  const close = vi.spyOn(f.adapter, "closeSession");
+  const send = f.adapter.send.bind(f.adapter);
+  const sends = vi.spyOn(f.adapter, "send").mockImplementation(async (input, context) => {
+    expect(context.generation).toBeGreaterThan(before.binding.generation);
+    expect(context.binding?.opaqueRef).toBe(before.binding.opaqueRef);
+    expect(close).toHaveBeenCalledExactlyOnceWith(before.binding, expect.objectContaining({ sessionId: task.taskId, generation: before.binding.generation }));
+    expect((await inspect(context.binding!, context)).permissionMode).toBe("ask");
+    await send(input, context);
+  });
+  const request = f.request({ kind: "requestWriteAccess", taskId: task.taskId, mode: "auto" });
+  const rejected = expect(request).rejects.toMatchObject({ code: "STALE_REVISION" });
+  let queueItemId: string;
+  try {
+    await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: task.taskId, status: "open" })).toHaveLength(1));
+    const approval = f.store.listInteractions({ sessionId: task.taskId, status: "open" })[0]!;
+    f.host.resolveInteraction(approval.id, approval.generation, { kind: "permission", decision: "allow_once" }, "approve-before-restore-failure");
+    await vi.waitFor(() => expect(applying).toHaveBeenCalled());
+    f.tasks.updatePreferences(f.extensionId, preferences.revision, { model: f.route, permissionMode: "ask" }, () => undefined);
+    releaseApply();
+    await vi.waitFor(() => expect(restoring).toHaveBeenCalledOnce());
+    queueItemId = f.host.enqueueServiceInput({ operationId: "queue-during-policy-recovery", sessionId: task.taskId, source: "system",
+      prompt: { text: "Continue the original task", images: [], files: [], mentions: [], disposition: "prompt" } }).value.queueItemId;
+    expect(f.store.getQueueItem(queueItemId).state).toBe("accepted");
+    expect(sends).not.toHaveBeenCalled();
+  } finally { releaseApply(); releaseRestore(); }
+  await rejected;
+  await vi.waitFor(() => expect(f.store.getQueueItem(queueItemId).state).toBe("completed"));
+  expect(sends).toHaveBeenCalledOnce();
+  expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
+});
 it("supports an unplanned team within its approved task root and refuses an unrelated trusted target", async () => {
   const f = await fixture(); f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => {});
   const task = await f.request({ kind: "create", requestKey: "unplanned", title: "Team without registered plan" }) as { taskId: string };

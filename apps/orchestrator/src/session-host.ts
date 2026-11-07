@@ -240,7 +240,7 @@ interface ActiveBackendSideEffectLease {
   readonly release: () => void;
 }
 
-function samePartnerPolicyBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
+function samePolicyBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
   return left.nativeSessionId === right.nativeSessionId && left.generation === right.generation && left.opaqueRef === right.opaqueRef;
 }
 
@@ -1036,6 +1036,7 @@ export class SessionHost {
   readonly #partnerPolicyRetirements = new Map<string, {
     readonly active: ActiveSession; readonly stored: StoredSession; readonly assertOwner: () => void;
   }>();
+  readonly #extensionPermissionUpdates = new Set<string>();
   readonly #partnerPauseFlights = new Map<string, Promise<void>>();
   readonly #partnerTargetRetired: (targetId: string) => boolean;
   readonly #resolveServiceRuntimePrompt: ((session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>) | undefined;
@@ -4427,10 +4428,10 @@ export class SessionHost {
   async retirePartnerPolicyRuntime(sessionId: string, expectedBinding: NativeSessionBinding, assertOwner: () => void): Promise<void> {
     this.#assertOpen(); assertOwner();
     const stored = this.#store.getSession(sessionId);
-    if (!samePartnerPolicyBinding(stored.descriptor.binding, expectedBinding)) throw new StoreError("The permission cleanup binding changed.");
+    if (!samePolicyBinding(stored.descriptor.binding, expectedBinding)) throw new StoreError("The permission cleanup binding changed.");
     const existing = this.#partnerPolicyRetirements.get(sessionId);
     if (existing !== undefined) {
-      if (!samePartnerPolicyBinding(existing.stored.descriptor.binding, expectedBinding)) throw new StoreError("The original permission cleanup is still pending.");
+      if (!samePolicyBinding(existing.stored.descriptor.binding, expectedBinding)) throw new StoreError("The original permission cleanup is still pending.");
     } else {
       const active = this.#active.get(sessionId);
       if (active === undefined) return;
@@ -4448,7 +4449,7 @@ export class SessionHost {
       const current = this.#store.getSession(sessionId);
       if (this.#active.get(sessionId) !== held.active || this.#adapters.get(current.descriptor.backendId) !== held.active.adapter
         || this.#adapterGenerations.get(current.descriptor.backendId) !== held.active.backendInstanceGeneration
-        || !samePartnerPolicyBinding(current.descriptor.binding, held.stored.descriptor.binding)) {
+        || !samePolicyBinding(current.descriptor.binding, held.stored.descriptor.binding)) {
         throw new StoreError("The original permission cleanup owner changed.");
       }
     };
@@ -9156,12 +9157,12 @@ export class SessionHost {
     }).length === 0;
   }
 
-  private canEnterSessionArchive(sessionId: string, allowHeldAcceptedQueue = false): boolean {
+  private canEnterSessionArchive(sessionId: string, allowHeldAcceptedQueue = false, allowedActiveEffects = 0): boolean {
     if (
       this.#activating.has(sessionId)
       || this.#messageDeletionLocks.has(sessionId)
       || this.#sessionResetLocks.has(sessionId)
-      || (this.#activeEffects.get(sessionId) ?? 0) > 0
+      || (this.#activeEffects.get(sessionId) ?? 0) > allowedActiveEffects
       || this.#reaping.has(sessionId)
       || this.#runSilenceRecoveries.has(sessionId)
       || this.#draining.has(sessionId)
@@ -13845,6 +13846,7 @@ export class SessionHost {
       || this.#hasHeldProviderGroupRecovery(sessionId)
       || this.#runSilenceRecoveries.has(sessionId)
       || this.#runtimeRestartFences.has(sessionId)
+      || this.#extensionPermissionUpdates.has(sessionId)
       || this.#disposed
       || this.#partnerSessionRestarting(sessionId)
       || this.#partnerSessionPaused(sessionId)
@@ -15401,6 +15403,61 @@ export class SessionHost {
         : "This lets this unstarted task accept file edits. Commands and external actions still require confirmation. The plugin's task permission preference is updated if needed.", risk: "high", choices: ["allow_once", "deny_once"] }, { signal });
     assertCurrent(); signal.throwIfAborted(); this.assertSessionLifecycleIdle(sessionId);
     if (!(decision.kind === "confirmed" && decision.confirmed || decision.kind === "selected" && decision.value === "allow_once")) throw new StoreError("Plugin task write access was not approved.");
+  }
+
+  /** Holds dispatch until the approved policy is committed or the original native policy is safe to use. */
+  async applyApprovedExtensionTaskWrite(sessionId: string, mode: "acceptEdits" | "auto", assertCurrent: () => void,
+    commit: (store: OperationalStore) => void): Promise<void> {
+    await this.#withSessionRuntimeControlLock(sessionId, async () => {
+      assertCurrent(); this.assertSessionLifecycleIdle(sessionId);
+      this.#extensionPermissionUpdates.add(sessionId);
+      try {
+        const active = await this.activate(sessionId);
+        assertCurrent(); this.assertSessionLifecycleIdle(sessionId);
+        const backend = this.#store.getBackend(active.adapter.id).descriptor;
+        const modes = backend.capabilities.get("permission.modes");
+        if (backend.capabilities.get("permission.change")?.supported !== true || modes?.supported !== true || !modes.options?.includes(mode)) {
+          throw new StoreError("The task's native Backend does not support the approved permission mode.");
+        }
+        const lease = this.beginActiveBackendSideEffect(sessionId, active);
+        const binding = lease.stored.descriptor.binding;
+        const currentBinding = () => {
+          const current = this.assertActiveBackendSideEffectLease(lease).descriptor;
+          if (!samePolicyBinding(current.binding, binding)) throw new StoreError("The permission runtime binding changed.");
+          return current;
+        };
+        try {
+          await active.adapter.setPermissionMode(mode, lease.context);
+          currentBinding();
+          const observed = await this.refreshNativeStateObservation(sessionId, active);
+          currentBinding(); assertCurrent();
+          if (observed.permissionMode !== mode) throw new StoreError("The Backend did not confirm the approved permission mode.");
+          if (!this.canEnterSessionArchive(sessionId, false, 1)) throw new StoreError("Wait for the task to be idle before changing write access.");
+          this.persistRuntimeUsage(sessionId, observed.binding.generation, observed.usage, false, observed.providerId, observed.modelId);
+          this.#store.transaction(commit);
+        } catch (error) {
+          let durableMode: PermissionMode;
+          try { durableMode = currentBinding().permissionMode; } catch { throw error; }
+          try {
+            await active.adapter.setPermissionMode(durableMode, lease.context);
+            currentBinding();
+            const restored = await this.refreshNativeStateObservation(sessionId, active);
+            if (restored.permissionMode !== durableMode || currentBinding().permissionMode !== durableMode) {
+              throw new StoreError("The Backend did not confirm the durable permission mode.");
+            }
+          } catch (restoreError) {
+            this.recordFailure("extension_permission_restore", restoreError);
+            try { currentBinding(); await active.adapter.closeSession(binding, lease.context); }
+            catch (closeError) { this.recordFailure("extension_permission_runtime_close", closeError); }
+            finally { this.deleteActiveSession(sessionId, active); }
+          }
+          throw error;
+        } finally { lease.release(); }
+      } finally {
+        this.#extensionPermissionUpdates.delete(sessionId);
+        void this.drain(sessionId);
+      }
+    });
   }
 
   async authorizeImportProbe(sessionId: string, action: ImportProbeAction, signal: AbortSignal, assertOwner: () => void): Promise<() => void> {

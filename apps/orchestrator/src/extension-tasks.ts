@@ -390,34 +390,24 @@ export class ExtensionTasks {
     const previous = this.#writeAttempts.get(key);
     if (previous?.pending || previous && !explicit) return { granted: false, task: this.#view(task) };
     if ([...this.#writeAttempts.values()].some(value => value.pending)) failure("TASK_BUSY", "Another plugin permission request is already pending.");
-    const assertCurrent = () => { if (taskScope(this.#own(owner, task.descriptor.id)) !== scope || hash(this.preferences(owner.extensionId).config) !== stamp) failure("STALE_REVISION", "Task configuration or plugin permission preferences changed."); };
+    const assertCurrent = () => {
+      if (taskScope(this.#own(owner, task.descriptor.id)) !== scope || hash(this.preferences(owner.extensionId).config) !== stamp
+        || this.options.store.getBackend(backend.id).descriptor.instanceGeneration !== backend.instanceGeneration) {
+        failure("STALE_REVISION", "Task configuration or plugin permission preferences changed.");
+      }
+    };
     const attempt = { extensionId: owner.extensionId, taskId: task.descriptor.id, installation: owner.installation, mode: mode as "acceptEdits" | "auto", pending: true };
     this.#writeAttempts.set(key, attempt);
     try {
     try { await this.options.host.authorizeExtensionTaskWrite(task.descriptor.id, owner.signal, assertCurrent, mode); }
     catch { this.#assert(owner); return { granted: false, task: this.#view(this.#own(owner, task.descriptor.id)) }; }
     assertCurrent();
-    try {
-      await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: mode }, { requireNativeObservation: true });
-      assertCurrent(); this.options.host.assertSessionLifecycleIdle(task.descriptor.id);
-      this.options.store.transaction(store => {
-        assertCurrent(); const current = this.#own(owner, task.descriptor.id);
-        if (current.descriptor.planMode) failure("PERMISSION_DENIED", "Plan mode changed during plugin permission approval.");
-        store.updateSession(task.descriptor.id, { permissionMode: mode });
-        store.setSetting("service", PREFS, owner.extensionId, { ...initial.config, permissionMode: mode === "auto" || initial.config.permissionMode === "ask" ? mode : initial.config.permissionMode });
-      });
-    } catch (error) {
-      const current = this.options.store.findSession(task.descriptor.id)?.descriptor;
-      if (current && !current.archived && current.deletedAt === undefined && current.backendId === backend.id
-        && hash(current.binding) === hash(task.descriptor.binding)
-        && this.options.store.getBackend(backend.id).descriptor.instanceGeneration === backend.instanceGeneration) {
-        // The durable mode may still be unchanged even though the native
-        // setter already ran. Reconcile it on this binding explicitly.
-        await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: current.permissionMode },
-          { reconcileNativePolicy: true }).catch(() => undefined);
-      }
-      throw error;
-    }
+    await this.options.host.applyApprovedExtensionTaskWrite(task.descriptor.id, mode, assertCurrent, store => {
+      assertCurrent(); const current = this.#own(owner, task.descriptor.id);
+      if (current.descriptor.planMode) failure("PERMISSION_DENIED", "Plan mode changed during plugin permission approval.");
+      store.updateSession(task.descriptor.id, { permissionMode: mode });
+      store.setSetting("service", PREFS, owner.extensionId, { ...initial.config, permissionMode: mode === "auto" || initial.config.permissionMode === "ask" ? mode : initial.config.permissionMode });
+    });
     this.#writeAttempts.delete(key); return { granted: true, task: this.#view(this.#own(owner, task.descriptor.id)) };
     } finally { attempt.pending = false; }
   }
