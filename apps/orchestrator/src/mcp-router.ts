@@ -263,6 +263,8 @@ export interface BridgeToolPolicyDeclaration {
 /** Product scope authenticated from the durable Session binding, never from tool arguments. */
 export interface BridgeToolCallContext {
   readonly assertCurrent?: () => void;
+  /** Capture the original credential for a dispatched image whose model can leave discovery before completion. */
+  readonly acceptDispatchedImageResult?: (assertCredentialCurrent: () => void) => void;
   /** Present only after consuming a service-owned proof of the SDK root tool. */
   readonly assertNativeRoot?: () => void;
   readonly sessionId: string;
@@ -1288,6 +1290,7 @@ export class McpRouter {
       let hostImages: readonly BridgeToolImageOutput[] = [];
       let hostArtifacts: readonly BridgeToolArtifactOutput[] = [];
       let completeOutputOwner: McpCompleteOutputOwner | undefined;
+      let adoptDispatchedImages: (() => void) | undefined;
       if (bridgeProvider === undefined) {
         const runtime = this.#requireRuntime(input.serverId, serverGeneration);
         const targetRevision = this.#store.getTarget(session.targetId).revision;
@@ -1367,6 +1370,7 @@ export class McpRouter {
         }
       } else {
         const targetRevision = this.#store.getTarget(session.targetId).revision;
+        let assertDispatchedImageCredential: (() => void) | undefined;
         const context = {
           sessionId: input.sessionId,
           targetId: input.targetId,
@@ -1381,13 +1385,14 @@ export class McpRouter {
           const current = this.#store.getSession(context.sessionId).descriptor;
           if (this.#findGrant(token) !== grant
             || this.#bridgeToolProviders.get(input.serverId) !== bridgeProvider
-            || !bridgeProvider.available || bridgeProvider.generation !== serverGeneration
+            || assertDispatchedImageCredential === undefined && (!bridgeProvider.available || bridgeProvider.generation !== serverGeneration)
             || current.targetId !== context.targetId || current.binding.generation !== context.generation
             || current.archived || current.deletedAt !== undefined
             || this.#store.findPendingSessionLifecycleCleanup(current.id) !== undefined
             || this.#store.getTarget(context.targetId).revision !== targetRevision) {
             throw new Error("Bridge Tool audio publication owner is no longer active.");
           }
+          assertDispatchedImageCredential?.();
         };
         guard();
         const execution = await this.#callBridgeToolProvider(
@@ -1405,9 +1410,16 @@ export class McpRouter {
               effectIdentity,
               requestBodyHash,
               assertCurrent: guard,
+              acceptDispatchedImageResult: assertCredential => {
+                guard();
+                if (assertDispatchedImageCredential !== undefined) throw new Error("The image dispatch authority was already captured.");
+                assertCredential();
+                assertDispatchedImageCredential = assertCredential;
+              },
               ...(assertNativeRoot === undefined ? {} : { assertNativeRoot }),
               ...(partnerLearningSave === undefined ? {} : { partnerLearningSave })
-            }
+            },
+            () => assertDispatchedImageCredential !== undefined
           );
         guard();
         hostImages = execution.hostImages;
@@ -1438,8 +1450,15 @@ export class McpRouter {
           );
         }
         guard();
+        if (assertDispatchedImageCredential !== undefined && !result.isError && hostImages.length > 0) {
+          adoptDispatchedImages = () => this.#store.transaction(store => {
+            guard();
+            for (const { blob } of hostImages) store.adoptSessionArtifact({ blob, sessionId: context.sessionId });
+          });
+        }
       }
       const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts, completeOutputOwner);
+      adoptDispatchedImages?.();
       return modelTask ? { ...projected, details: { ...projected.details, mcpTask: modelTask } } : projected;
     } catch (error) {
       await appCapture?.cancel(input.signal?.aborted === true).catch(() => undefined);
@@ -2483,7 +2502,8 @@ export class McpRouter {
     toolName: string,
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    context: BridgeToolCallContext
+    context: BridgeToolCallContext,
+    dispatchedImage: () => boolean
   ): Promise<{
     readonly result: McpCallResult;
     readonly hostImages: readonly BridgeToolImageOutput[];
@@ -2492,6 +2512,7 @@ export class McpRouter {
     const assertCurrent = (): void => {
       context.assertCurrent?.();
       signal?.throwIfAborted();
+      if (dispatchedImage()) return;
       if (this.#bridgeToolProviders.get(provider.id) !== provider
         || !provider.available
         || provider.generation !== expectedGeneration) {
