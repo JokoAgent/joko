@@ -12354,11 +12354,12 @@ describe("native current-task Files ownership", () => {
   it.each(["meta", "remote-meta"])("opens and shares a content match with a separate %s entry version", async (kind) => {
     const parent = "docs"; const path = parent + "/page.txt";
     const digest = sha256Hex(new TextEncoder().encode("page"));
+    const entryRevision = create(FileRevisionSchema, { opaqueRevision: `${kind}:page-r1`, byteSize: 4n });
     const page = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: path, displayName: "page.txt",
-      kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: `${kind}:page-r1`, byteSize: 4n } });
+      kind: FileKind.REGULAR, mediaType: "text/plain", revision: entryRevision });
     const sibling = create(WorkspaceEntrySchema, { ...page, relativePath: parent + "/next.txt", displayName: "next.txt" });
     const filePreviewEntry = create(WorkspaceEntrySchema, { ...page,
-      revision: { opaqueRevision: `sha256:${digest}:4`, byteSize: 4n, sha256Hex: digest } });
+      revision: create(FileRevisionSchema, { opaqueRevision: `sha256:${digest}:4`, byteSize: 4n, sha256Hex: digest }) });
     const searchRevision = create(FileRevisionSchema, { opaqueRevision: kind === "meta" ? `sha256:${digest}:4` : `sha256:${"a".repeat(64)}` });
     let directoryEntries = [page, sibling];
     const network = fakeNetwork(); configureFiles(network);
@@ -12393,7 +12394,8 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.previewPager?.index).toBe(0);
     await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
     expect(app.state.files.preview).toMatchObject({ kind: "text", title: "page.txt", text: "page" });
-    directoryEntries = [create(WorkspaceEntrySchema, { ...page, revision: { ...page.revision, opaqueRevision: `${kind}:page-r2` } }), sibling];
+    const changedRevision = create(FileRevisionSchema, { ...entryRevision, opaqueRevision: `${kind}:page-r2` });
+    directoryEntries = [create(WorkspaceEntrySchema, { ...page, revision: changedRevision }), sibling];
     await expect(app.shareFilesItem(source)).rejects.toThrow(/search result changed/u);
     expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledOnce();
   });
