@@ -101,7 +101,7 @@ interface PendingComposerDraftSave {
   queued: boolean;
 }
 
-export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest = 0, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -110,7 +110,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly readOnly?: boolean;
   readonly autoFocus?: boolean;
   /** Monotonic request used by adjacent controls to return focus to the editor. */
-  readonly focusRequest?: number;
+  readonly focusRequest?: () => boolean;
   readonly queue: readonly QueueItemView[];
   readonly queueControl?: QueueControlView;
   readonly workspace?: WorkspaceView;
@@ -713,10 +713,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   }, [autoFocus, hydratedSession, readOnly, session.id]);
 
   useEffect(() => {
-    if (focusRequest <= 0 || readOnly || hydratedSession !== session.id) return;
+    if (focusRequest === undefined || readOnly || hydratedSession !== session.id) return;
     const ownerWindow = composerStackRef.current?.ownerDocument.defaultView;
     if (ownerWindow === null || ownerWindow === undefined) return;
-    const frame = ownerWindow.requestAnimationFrame(() => richEditorRef.current?.focus("end"));
+    const frame = ownerWindow.requestAnimationFrame(() => {
+      if (focusRequest()) richEditorRef.current?.focus("end");
+    });
     return () => ownerWindow.cancelAnimationFrame(frame);
   }, [focusRequest, hydratedSession, readOnly, session.id]);
 
