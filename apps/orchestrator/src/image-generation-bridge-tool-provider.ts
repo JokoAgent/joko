@@ -22,8 +22,10 @@ const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
 const IMAGE_RESULT_STAGING_MS = 10 * 60_000;
 const MAXIMUM_PROMPT_BYTES = 32 * 1024;
 const ASPECT_RATIOS = ["1:1", "3:2", "2:3"] as const;
+const EXACT_IMAGE_QUALITIES = ["auto", "low", "medium", "high"] as const;
 
 type ImageAspectRatio = (typeof ASPECT_RATIOS)[number];
+type ImageQuality = (typeof EXACT_IMAGE_QUALITIES)[number];
 type SupportedImageMime = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
 
 interface ImageGenerationRoute {
@@ -89,12 +91,13 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     this.#refreshSnapshot();
     if (this.#routes.length === 0) return [];
     const multipleRoutes = this.#routes.length > 1;
+    const exactOptions = this.#routes.some(supportsExactImageOptions);
     return [{
       serverId: this.id,
       name: IMAGE_GENERATION_TOOL_NAME,
       runtimeName: IMAGE_GENERATION_TOOL_NAME,
       description:
-        "Generate an image with the configured image model. Use a clear, complete visual prompt and an optional supported aspect ratio.",
+        "Generate an image with the configured image model. Use a clear, complete visual prompt and supported output options.",
       inputSchema: {
         type: "object",
         properties: {
@@ -108,6 +111,17 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
             enum: [...ASPECT_RATIOS],
             description: "Optional output aspect ratio."
           },
+          ...(exactOptions ? {
+            size: {
+              type: "string",
+              description: "GPT Image 2 exact WIDTHxHEIGHT or auto. Each edge must be divisible by 16 and at most 3840, with a ratio up to 3:1 and 655360–8294400 pixels."
+            },
+            quality: {
+              type: "string",
+              enum: [...EXACT_IMAGE_QUALITIES],
+              description: "Optional GPT Image 2 quality."
+            }
+          } : {}),
           ...(multipleRoutes ? {
             model: {
               type: "string",
@@ -135,8 +149,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     }
     const multipleRoutes = this.#routes.length > 1;
     assertOnlyKeys(arguments_, multipleRoutes
-      ? ["prompt", "aspect_ratio", "model"]
-      : ["prompt", "aspect_ratio"]);
+      ? ["prompt", "aspect_ratio", "size", "quality", "model"]
+      : ["prompt", "aspect_ratio", "size", "quality"]);
     const prompt = requiredUtf8String(arguments_["prompt"], MAXIMUM_PROMPT_BYTES, "Image prompt is invalid.");
     const aspectRatio = optionalAspectRatio(arguments_["aspect_ratio"]);
     const selectedModel = multipleRoutes ? requiredModel(arguments_["model"]) : undefined;
@@ -146,6 +160,11 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     if (route === undefined || !this.#credentialSurfaces.modelEnabled(route.owner, route.modelId)) {
       throw new Error("The selected image model is unavailable.");
     }
+    if (!supportsExactImageOptions(route) && (arguments_["size"] !== undefined || arguments_["quality"] !== undefined)) {
+      throw new Error("The selected image model does not support size and quality options.");
+    }
+    const size = imageSize(arguments_["size"], aspectRatio);
+    const quality = optionalImageQuality(arguments_["quality"]);
 
     let apiKey: string | undefined;
     try {
@@ -166,7 +185,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
           apiKey,
           model: route.modelId,
           prompt,
-          ...(aspectRatio === undefined ? {} : { aspectRatio }),
+          size,
+          ...(quality === undefined ? {} : { quality }),
           ...(signal === undefined ? {} : { signal })
         });
         context.assertCurrent?.();
@@ -260,7 +280,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     readonly apiKey: string;
     readonly model: string;
     readonly prompt: string;
-    readonly aspectRatio?: ImageAspectRatio;
+    readonly size: string;
+    readonly quality?: ImageQuality;
     readonly signal?: AbortSignal;
   }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
     switch (input.executionApi) {
@@ -275,7 +296,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     readonly apiKey: string;
     readonly model: string;
     readonly prompt: string;
-    readonly aspectRatio?: ImageAspectRatio;
+    readonly size: string;
+    readonly quality?: ImageQuality;
     readonly signal?: AbortSignal;
   }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
     const requestSignal = boundedSignal(input.signal, IMAGE_GENERATION_TIMEOUT_MS);
@@ -292,7 +314,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
           model: input.model,
           prompt: input.prompt,
           n: 1,
-          size: input.aspectRatio === undefined ? "auto" : sizeForAspectRatio(input.aspectRatio)
+          size: input.size,
+          ...(input.quality === undefined ? {} : { quality: input.quality })
         }),
         redirect: "error",
         credentials: "omit",
@@ -393,6 +416,38 @@ function optionalAspectRatio(value: unknown): ImageAspectRatio | undefined {
     throw new Error("Image aspect ratio is invalid.");
   }
   return value as ImageAspectRatio;
+}
+
+function supportsExactImageOptions(route: ImageGenerationRoute): boolean {
+  return route.owner.surface.executionApi === "openai-images" && route.modelId === "gpt-image-2";
+}
+
+function imageSize(value: unknown, aspectRatio: ImageAspectRatio | undefined): string {
+  const size = typeof value === "string" && value.length <= 100 ? value.trim().toLowerCase().replace("×", "x") : undefined;
+  if (value === undefined || size === "auto") return aspectRatio === undefined ? "auto" : sizeForAspectRatio(aspectRatio);
+  const match = /^(\d{1,6})x(\d{1,6})$/u.exec(size ?? "");
+  if (match === null) throw new Error("Image size must be auto or WIDTHxHEIGHT.");
+  const width = Number(match[1]), height = Number(match[2]);
+  const pixels = width * height;
+  if (width % 16 !== 0 || height % 16 !== 0 || Math.max(width, height) > 3840 ||
+    Math.max(width, height) > 3 * Math.min(width, height) || pixels < 655_360 || pixels > 8_294_400) {
+    throw new Error("Image size is outside GPT Image 2's supported dimensions.");
+  }
+  if (aspectRatio !== undefined) {
+    const [aspectWidth, aspectHeight] = aspectRatio.split(":").map(Number);
+    if (Math.abs(width / height - aspectWidth! / aspectHeight!) > 0.001) {
+      throw new Error("Image size and aspect ratio conflict. Use size alone for exact dimensions.");
+    }
+  }
+  return `${width}x${height}`;
+}
+
+function optionalImageQuality(value: unknown): ImageQuality | undefined {
+  if (value === undefined) return undefined;
+  const quality = typeof value === "string" ? value.trim() : undefined;
+  const supported = EXACT_IMAGE_QUALITIES.find(candidate => candidate === quality);
+  if (supported === undefined) throw new Error("Image quality must be auto, low, medium, or high.");
+  return supported;
 }
 
 function sizeForAspectRatio(value: ImageAspectRatio): string {
