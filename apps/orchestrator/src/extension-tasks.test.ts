@@ -16,6 +16,7 @@ import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { ExtensionTasks, type ExtensionTaskOwner } from "./extension-tasks.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "./extension-project-policy.js";
+import { projectNativeHistory } from "./native-history.js";
 import { SessionHelperToolBridgeProvider } from "./session-helper-tool-provider.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -101,6 +102,38 @@ it("adopts hidden ordinary Sessions atomically, dispatches one durable Run, and 
   expect(messages.items.length).toBeGreaterThan(0);
   f.tasks.reveal(f.extensionId, task.taskId, () => {});
   expect(f.store.searchSessionMessages({ query: "assessment", scope: { owner: true } }).matches.length).toBeGreaterThan(0);
+});
+it("reads only the current native branch of a plugin-owned task", async () => {
+  const f = await fixture();
+  const { taskId } = await f.request({ kind: "create", requestKey: "native-branch", title: "Branch history" }) as { taskId: string };
+  const { backendId, targetId, binding } = f.store.getSession(taskId).descriptor;
+  const scope = { backendId, targetId, sessionId: taskId, generation: binding.generation, traceId: "native-branch" };
+  const nativeMessage = (nativeEntryId: string, nativeParentEntryId: string | undefined, role: "assistant" | "user", text: string) => ({
+    nativeEntryId, ...(nativeParentEntryId === undefined ? {} : { nativeParentEntryId }), projectionKind: "message", contentIndex: 0,
+    payload: { type: "message_complete" as const, role, blocks: [{ kind: "text" as const, text }] }
+  });
+  const projected = projectNativeHistory(taskId, binding.opaqueRef, { activeEntryId: "reply", events: [
+    nativeMessage("kept", undefined, "assistant", "Kept answer"),
+    nativeMessage("prompt", "kept", "user", "Rewound prompt"),
+    nativeMessage("reply", "prompt", "assistant", "Rewound answer")
+  ] });
+  for (const event of projected) f.store.appendEvent({ ...scope, ...event });
+  const nativeLeaf = (leafId: string) => f.store.appendEvent({ ...scope, id: `leaf-${leafId}`,
+    payload: { type: "native_session_changed", opaqueRef: binding.opaqueRef, leafId } });
+  nativeLeaf("reply");
+  f.store.appendEvent({ ...scope, id: "product-message", payload: { type: "message_complete", role: "assistant",
+    blocks: [{ kind: "text", text: "Product-owned message" }] } });
+  const read = async (after?: string) => await f.request({ kind: "readMessages", taskId, limit: 100, ...(after === undefined ? {} : { after }) }) as {
+    items: { id: string; cursor: string }[]; nextCursor: string | null;
+  };
+  const before = await read();
+  expect(before.items.map(item => item.id)).toEqual([...projected.map(event => event.id), "product-message"]);
+
+  nativeLeaf("kept");
+  const after = await read();
+  expect(after.items.map(item => item.id)).toEqual([projected[0]!.id, "product-message"]);
+  expect(await read(before.items[0]!.cursor)).toEqual({ items: [after.items[1]], nextCursor: null });
+  expect(f.store.listEvents({ sessionId: taskId }).some(event => event.id === projected[2]!.id)).toBe(true);
 });
 it("approves explicit Auto through the original host interaction and refuses a changed configuration", async () => {
   const f = await fixture(), task = await f.request({ kind: "create", requestKey: "write", title: "Approved actions", hidden: true }) as { taskId: string };
