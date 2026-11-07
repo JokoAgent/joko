@@ -1,10 +1,14 @@
-import { AgentImportError, createImportedEnvironmentStore, fingerprint, validateNativePartnerPackage, type ImportReceipt } from "@joko/agent-import";
+import { realpathSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { AgentImportError, createImportedEnvironmentStore, fingerprint, importedEnvironmentKey, validateNativePartnerPackage, type ImportReceipt } from "@joko/agent-import";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialVault } from "./credential-vault.js";
 
 const SCOPE_TYPE = "service"; const SCOPE_ID = "orchestrator";
 const RECEIPT_PREFIX = "partner-import.receipt.";
 const ENVIRONMENT_PREFIX = "partner-import.private.";
+const environmentStorageKey = (key: string): string => ENVIRONMENT_PREFIX + fingerprint(key);
 interface StoredImportCipher {
   readonly algorithm: "aes-256-gcm"; readonly nonceHex: string; readonly ciphertextHex: string; readonly tagHex: string;
 }
@@ -16,10 +20,12 @@ function cipherBytes(value: unknown, size?: number): Buffer {
 /** SQLite commits safe progress before effects; private archives use the existing vault and master key. */
 export class PartnerImportStorage {
   readonly environment;
-  constructor(private readonly store: OperationalStore, private readonly vault: CredentialVault) {
+  readonly #executionRoot: string;
+  constructor(private readonly store: OperationalStore, private readonly vault: CredentialVault, dataDirectory: string) {
+    this.#executionRoot = join(realpathSync(dataDirectory), "partner-import-executions");
     this.environment = createImportedEnvironmentStore({
       read: async (key, assertOwner) => {
-        assertOwner(); const stored = store.findSetting<{ version: 1; sealed: StoredImportCipher }>(SCOPE_TYPE, SCOPE_ID, ENVIRONMENT_PREFIX + fingerprint(key));
+        assertOwner(); const stored = store.findSetting<{ version: 1; sealed: StoredImportCipher }>(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(key));
         if (!stored) return null;
         const value = stored.value;
         if (!value || value.version !== 1 || !value.sealed || Object.keys(value).some(field => !["version", "sealed"].includes(field))) throw new AgentImportError("CREDENTIAL_STORAGE_INVALID");
@@ -37,10 +43,57 @@ export class PartnerImportStorage {
         // credential, so persist authenticated bytes in an unambiguous alphabet.
         const sealed: StoredImportCipher = { algorithm: cipher.algorithm, nonceHex: Buffer.from(cipher.nonce, "base64").toString("hex"),
           ciphertextHex: Buffer.from(cipher.ciphertext, "base64").toString("hex"), tagHex: Buffer.from(cipher.tag, "base64").toString("hex") };
-        store.setSetting(SCOPE_TYPE, SCOPE_ID, ENVIRONMENT_PREFIX + fingerprint(key), { version: 1, sealed }); assertOwner();
+        store.setSetting(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(key), { version: 1, sealed }); assertOwner();
       },
-      remove: async (key, assertOwner) => { assertOwner(); store.deleteSetting(SCOPE_TYPE, SCOPE_ID, ENVIRONMENT_PREFIX + fingerprint(key)); assertOwner(); },
+      remove: async (key, assertOwner) => { assertOwner(); store.deleteSetting(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(key)); assertOwner(); },
     });
+  }
+
+  async createExecutionDirectory(partnerId: string, assertOwner: () => void): Promise<{ directory: string; cleanup(): Promise<void> }> {
+    const parent = await this.#executionParent(partnerId, true, assertOwner);
+    if (parent === undefined) throw new AgentImportError("CREDENTIAL_STORAGE_UNAVAILABLE");
+    assertOwner();
+    const directory = await mkdtemp(join(parent, "run-"));
+    const identity = await lstat(directory);
+    return { directory, cleanup: async () => {
+      if (await this.#executionParent(partnerId, false, () => undefined) === undefined) return;
+      const current = await lstat(directory).catch(error => {
+        if (missing(error)) return undefined;
+        throw error;
+      });
+      if (current === undefined) return;
+      if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== identity.dev || current.ino !== identity.ino) {
+        throw new AgentImportError("CREDENTIAL_STORAGE_INVALID");
+      }
+      await rm(directory, { recursive: true, force: true });
+    } };
+  }
+
+  async removeExecutionDirectories(partnerId: string, assertOwner: () => void): Promise<void> {
+    const parent = await this.#executionParent(partnerId, false, assertOwner);
+    if (parent === undefined) return;
+    assertOwner();
+    await rm(parent, { recursive: true, force: true });
+  }
+
+  async #executionParent(partnerId: string, create: boolean, assertOwner: () => void): Promise<string | undefined> {
+    const parent = join(this.#executionRoot, fingerprint(partnerId));
+    for (const directory of [this.#executionRoot, parent]) {
+      assertOwner();
+      if (create) await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
+      const info = await lstat(directory).catch(error => {
+        if (missing(error)) return undefined;
+        throw error;
+      });
+      if (info === undefined) return undefined;
+      if (!info.isDirectory() || info.isSymbolicLink() || relative(directory, await realpath(directory)) !== ""
+        || process.platform !== "win32" && (info.mode & 0o077) !== 0) {
+        throw new AgentImportError("CREDENTIAL_STORAGE_INVALID");
+      }
+    }
+    return parent;
   }
 
   readReceipt(requestId: string): ImportReceipt | undefined {
@@ -55,6 +108,18 @@ export class PartnerImportStorage {
     this.store.setSetting(SCOPE_TYPE, SCOPE_ID, receiptKey(receipt.result.requestId), receipt);
     return Buffer.byteLength(JSON.stringify(receipt));
   }
+  rejectUncreatedPartner(receipt: ImportReceipt): ImportReceipt["result"] {
+    const rejected: ImportReceipt = { ...receipt, creationRejected: "IMPORT_NAME_EXISTS", checkpointCleared: true, result: {
+      ...receipt.result, status: "needs-attention",
+      checks: [...receipt.result.checks.filter(check => check.entryId !== "creation"),
+        { entryId: "creation", status: "needs-attention", message: "IMPORT_NAME_EXISTS" }]
+    } };
+    this.store.transaction(() => {
+      this.saveReceipt(rejected);
+      this.store.deleteSetting(SCOPE_TYPE, SCOPE_ID, environmentStorageKey(importedEnvironmentKey(receipt.result.partnerId)));
+    });
+    return rejected.result;
+  }
   listReceipts(): ImportReceipt[] {
     const result: ImportReceipt[] = [];
     for (const setting of this.store.listSettingsByKeyPrefix(SCOPE_TYPE, SCOPE_ID, RECEIPT_PREFIX)) {
@@ -62,6 +127,10 @@ export class PartnerImportStorage {
     }
     return result;
   }
+}
+
+function missing(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function readStoredReceipt(value: unknown): ImportReceipt {

@@ -91,6 +91,41 @@ export function toggleImportEntry(entries: readonly PartnerImportEntry[], curren
   for (const other of entries) if (item.exclusiveWith.includes(other.id) || other.exclusiveWith.includes(item.id)) selected.delete(other.id);
   selected.add(entryId); return selected;
 }
+
+export function areImportEntriesSelected(entries: readonly PartnerImportEntry[], selected: ReadonlySet<string>): boolean {
+  const selectedHere = new Set(entries.filter(entry => selected.has(entry.id)).map(entry => entry.id));
+  const covered = new Set(selectedHere);
+  for (const entry of entries) {
+    if (!selectedHere.has(entry.id)) continue;
+    for (const other of entry.exclusiveWith) covered.add(other);
+  }
+  return entries.every(entry => covered.has(entry.id) || entry.exclusiveWith.some(id => selectedHere.has(id)));
+}
+
+export function toggleImportEntries(entries: readonly PartnerImportEntry[], current: ReadonlySet<string>, ids: readonly string[], enabled: boolean): ReadonlySet<string> {
+  if (ids.length === 1) return toggleImportEntry(entries, current, ids[0]!, enabled);
+  if (ids.length === 0) return current;
+  const requested = new Set(ids);
+  const known = new Set(entries.map(entry => entry.id));
+  if ([...requested].some(id => !known.has(id))) throw new Error("Import entry is unavailable.");
+  const selected = new Set(current);
+  if (!enabled) {
+    for (const id of requested) selected.delete(id);
+    return selected;
+  }
+  // Bulk selection leaves any conflicting credentials to the user's explicit choice.
+  const blocked = new Set<string>();
+  for (const entry of entries) {
+    const activeOrRequested = current.has(entry.id) || requested.has(entry.id);
+    for (const other of entry.exclusiveWith) {
+      if (activeOrRequested) blocked.add(other);
+      if (current.has(other) || requested.has(other)) blocked.add(entry.id);
+    }
+  }
+  for (const id of requested) if (!blocked.has(id)) selected.add(id);
+  return selected;
+}
+
 export function importSelectionRanges(entries: readonly PartnerImportEntry[], selected: ReadonlySet<string>): Array<{ first: number; last: number }> {
   const indexes = entries.filter(entry => selected.has(entry.id)).map(entry => entry.index).sort((a, b) => a - b);
   if (indexes.length !== selected.size) throw new Error("Import selection changed.");

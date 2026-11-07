@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -7,10 +7,11 @@ import { Code, ConnectError, createClient, createRouterTransport, type HandlerCo
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalStore, PartnerStore, PartnerRoutineStore, partnerHomeDirectoryName } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
-import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema,
+import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportCheckStatus, PartnerImportEditor, PartnerImportReceipts,
+  PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema,
   DeletePartnerMemoryRequestSchema, DeletePartnerSkillRequestSchema, UpdatePartnerMemoryRequestSchema, UpdatePartnerSkillRequestSchema,
   PermissionRisk, PolicyEffect, PolicySettingsSchema, PolicySubjectKind } from "@joko/contracts";
-import { readImportTree, createImportBudget } from "@joko/agent-import";
+import { readImportTree, createImportBudget, prepareImportedAutomation } from "@joko/agent-import";
 import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -52,7 +53,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     partnerSessionRetiring: id => profiles.isPartnerSessionRetiring(id) || profiles.isPartnerTargetRetiring(store.getSession(id).descriptor.targetId),
     partnerTargetRetired: id => profiles.isPartnerTargetRetired(id),
     partnerSessionPaused: id => profiles.isPartnerSessionPaused(id), partnerSessionRestarting: id => profiles.isPartnerSessionRestarting(id) }); await host.initialize();
-  const vault = await CredentialVault.open(join(root, "credentials", "master.key")); const storage = new PartnerImportStorage(store, vault);
+  const vault = await CredentialVault.open(join(root, "credentials", "master.key")); const storage = new PartnerImportStorage(store, vault, root);
   const resources = new PiResourceManager({ store, managedRoot: join(root, "resources"), maximumFiles: options.resourceFiles ?? 2 }); await resources.initialize();
   const memory = new MakerMemoryController({ store }); const scheduler = new ScheduleCoordinator(store, host);
   let imports: PartnerImportManager; let routines: PartnerRoutineManager;
@@ -62,6 +63,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
   if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: false });
   imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {},
+    getPartner: id => partners.getPartner(id),
     ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
     nativeRuntimeReady: id => partners.getPartner(id).initializationState === "ready",
     prepareCreation: (selection, nativePackage) => {
@@ -119,6 +121,82 @@ function observedImportEffect<Args extends unknown[], Result>(phase: string, act
   };
 }
 describe("native import service and owning effects", () => {
+  it.skipIf(process.platform !== "win32")("runs an imported command with a quoted executable path and arguments on Windows", async () => {
+    const f = await fixture();
+    const signal = new AbortController().signal;
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+    const selection = { previewId: preview.id, requestId: "owner_import_windows_cmd_0001", name: "Windows command fixture",
+      entryIds: preview.entries.filter(entry => entry.category === PartnerImportCategory.PERSONALITY).map(entry => entry.id), takeover: false, deferSetup: true };
+    await f.api.start(selection, signal);
+    const saved = await f.imports.waitForRequest(selection.requestId);
+    const task = f.store.getSession(saved.canonicalSessionId!).descriptor;
+    const executable = join(f.store.getTarget(task.targetId).descriptor.workspaceRoot, "Node With Spaces.exe");
+    await copyFile(process.execPath, executable);
+    const runtime = new PartnerImportRuntime({ partners: f.partners, store: f.store, host: f.host,
+      routines: f.routines, storage: f.storage, imports: f.imports, assertServiceOwner: () => {},
+      auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }), run: async () => ({ status: "ok", text: "" }) } });
+    const result = await runtime.callTool("run_command", {
+      command: `"${executable}" -e "process.stdout.write(process.argv[1])" "quoted argument"`, timeout_ms: 10_000
+    }, signal, { sessionId: task.id, targetId: task.targetId, generation: task.binding.generation });
+    expect(result).toEqual({ isError: false, content: [{ type: "text", text: JSON.stringify({ exitCode: 0, stdout: "quoted argument" }) }] });
+  }, 20_000);
+
+  it("releases a definitively rejected name and retries the same preview with a new request", async () => {
+    const f = await fixture();
+    const signal = new AbortController().signal;
+    const firstId = "owner_import_contested_0001", secondId = "owner_import_contested_0002";
+    const api = { ...f.api, newRequestId: vi.fn().mockReturnValueOnce(firstId).mockReturnValueOnce(secondId), start: vi.fn(f.api.start) };
+    const local = new Map<string, string>();
+    const receipts = new PartnerImportReceipts({ getItem: key => local.get(key) ?? null,
+      setItem: (key, value) => { local.set(key, value); }, removeItem: key => { local.delete(key); } }, "import-owner");
+    const editor = new PartnerImportEditor(api, receipts);
+    await editor.load();
+    await editor.choose(editor.state.sources![0]!.id);
+    const preview = editor.state.preview!;
+    editor.select(preview.entries.filter(entry => entry.category !== PartnerImportCategory.PERSONALITY).map(entry => entry.id), false);
+    editor.edit({ name: "Contested partner" });
+    const selected = [...editor.state.selected];
+    const createImported = f.partners.createImportedPartner.bind(f.partners);
+    vi.spyOn(f.partners, "createImportedPartner").mockImplementationOnce(async input => {
+      expect((await f.storage.environment.read(input.id!, () => {}))?.pendingImport?.selection.requestId).toBe(firstId);
+      await f.partners.createPartner({ ...input, id: "competing-partner", requestId: "competing_partner_create_0001",
+        expectedDirectoryRevision: f.profiles.directoryState().revision });
+      return createImported(input);
+    });
+
+    await editor.start();
+    expect(editor.state).toMatchObject({ error: "IMPORT_NAME_EXISTS", preview, name: "Contested partner" });
+    expect(editor.locked).toBe(false);
+    expect([...editor.state.selected]).toEqual(selected);
+    await expect(receipts.read()).resolves.toBeUndefined();
+    const rejected = f.storage.readReceipt(firstId)!;
+    expect(rejected).toMatchObject({ creationRejected: "IMPORT_NAME_EXISTS", checkpointCleared: true, partnerCreated: false });
+    expect(() => f.partners.getPartner(rejected.result.partnerId)).toThrow();
+    expect(f.partners.getPartner("competing-partner").displayName).toBe("Contested partner");
+    await expect(f.storage.environment.read(rejected.result.partnerId, () => {})).resolves.toBeNull();
+    expect(await f.api.retry(firstId, false, signal)).toMatchObject({ requestId: firstId, saved: false,
+      checks: expect.arrayContaining([expect.objectContaining({
+        entryId: "creation", status: PartnerImportCheckStatus.NEEDS_ATTENTION, message: "IMPORT_NAME_EXISTS"
+      })]) });
+    await expect(f.api.start({ ...api.start.mock.calls[0]![0]!, name: "Changed on the same request" }, signal)).rejects.toThrow("REQUEST_ALREADY_USED");
+
+    await receipts.claim(firstId);
+    const reopened = new PartnerImportEditor(f.api, receipts);
+    await reopened.load();
+    expect(reopened.locked).toBe(false);
+    expect(reopened.state.error).toBe("IMPORT_NAME_EXISTS");
+    expect(reopened.state.sources?.length).toBeGreaterThan(0);
+    reopened.dispose();
+
+    editor.edit({ name: "Renamed import" });
+    await editor.start();
+    const accepted = await f.imports.waitForRequest(secondId);
+    expect(accepted.saved).toBe(true);
+    expect(f.partners.getPartner(accepted.partnerId).displayName).toBe("Renamed import");
+    expect(api.start.mock.calls.map(([input]) => input?.requestId)).toEqual([firstId, secondId]);
+    editor.dispose();
+  });
+
   it.each(["global deny", "exact deny", "revoked during handshake", "revoked before response"] as const)(
     "keeps the imported routine paused when a probe is %s", async (mode) => {
       const connection = "records__fixture", tool = "read_records";
@@ -378,7 +456,7 @@ describe("native import service and owning effects", () => {
     expect(f.routines.list(profile.id)).toHaveLength(1); expect(f.routines.list(profile.id)[0]!.enabled).toBe(false);
     const receipt = f.storage.readReceipt(result.requestId)!;
     expect(receipt.nativePackage?.packageId).toBe(entry.packageId); expect(receipt.checkpointCleared).toBe(true);
-    const restored = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
+    const restored = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")), f.root);
     expect(restored.readReceipt(result.requestId)?.nativePackage?.packageHash).toBe(entry.packageHash);
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.partnerId).toBe(profile.id);
     canonical = "new-main-canonical-session";
@@ -457,7 +535,7 @@ describe("native import service and owning effects", () => {
     expect((await restoredResources.runtimeTextSnapshot(profile.capabilities.modelChain[0]!.backendId, profile.homeTargetId, signal))[0]!.content).toBe(text[0]!.content);
     const routine = f.routines.list(profile.id)[0]!; expect(routine.enabled).toBe(false); expect(environment?.automations[routine.id]?.handover).toBe("ready");
     advance("receipt-recovery");
-    const receipts = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
+    const receipts = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")), f.root);
     expect(receipts.readReceipt(selection.requestId)?.result).toEqual(saved);
     expect((await receipts.environment.read(profile.id, () => {}))?.skillFiles).toEqual(environment?.skillFiles);
     advance("persistence");
@@ -488,9 +566,37 @@ describe("native import service and owning effects", () => {
     expect(saved.saved).toBe(true); expect(saved.status).toBe("complete");
     phase = "private-environment";
     const partner = f.partners.getPartner(saved.partnerId); expect(await f.storage.environment.read(partner.id, () => {})).toBeDefined();
+    const assertOwner = () => { if (f.partners.getPartner(partner.id).lifecycle !== "active") throw new Error("The test Partner retired."); };
+    const sourceScript = join(f.native, "scripts", "review.py");
+    await mkdir(dirname(sourceScript), { recursive: true });
+    const bytes = Buffer.from("print('original source')\n");
+    await writeFile(sourceScript, bytes);
+    await f.storage.environment.update(partner.id, assertOwner, environment => {
+      environment.files["scripts/review.py"] = bytes.toString("base64");
+      environment.automations["prepared-routine"] = { kind: "hermes", original: {}, sourceRoot: f.native, sourceWorkspace: f.native,
+        sourceId: "original-script", handover: "ready", issues: [], deliveries: [], completed: 0 };
+    });
+    let abandoned = "";
+    await prepareImportedAutomation({ id: "prepared-routine", partnerId: partner.id, prompt: "Review the workspace" }, "abandoned-run", signal, assertOwner, {
+      environment: f.storage.environment, appendMessage: async () => { throw new Error("No delivery was requested."); },
+      createExecutionDirectory: async (partnerId, owner) => {
+        const allocated = await f.storage.createExecutionDirectory(partnerId, owner);
+        abandoned = allocated.directory;
+        return { directory: allocated.directory, cleanup: async () => undefined };
+      }
+    });
+    const abandonedScript = join(abandoned, "scripts", "review.py");
+    expect(await readFile(abandonedScript)).toEqual(bytes);
+    const otherOwner = await f.storage.createExecutionDirectory("unrelated-partner", () => undefined);
+    const unrelated = join(otherOwner.directory, "keep.txt");
+    await writeFile(unrelated, "Other owner");
     phase = "delete";
     const deletion = await f.partners.deletePartner({ requestId: "owner_import_delete_0002", partnerId: partner.id, expectedRevision: partner.revision, confirmName: partner.displayName });
     expect(deletion.phase).toBe("completed");
+    await expect(readFile(abandonedScript)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(sourceScript)).toEqual(bytes);
+    expect(await readFile(unrelated, "utf8")).toBe("Other owner");
+    await otherOwner.cleanup();
     expect(f.storage.readReceipt(selection.requestId)?.cancelled).toBe(true);
     phase = "retired-storage";
     await expect(f.storage.environment.read(partner.id, () => {})).rejects.toMatchObject({ code: "IMPORT_OWNER_RETIRED" });

@@ -1,8 +1,6 @@
 import { promises as fs } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
-import { removePrivateImportDirectory } from './privateDirectories.js';
 import type { createImportedEnvironmentStore } from './environment.js';
 import { object, string, AgentImportError } from './types.js';
 import { writeImportFiles } from './files.js';
@@ -19,6 +17,9 @@ export interface ImportedAutomationRuntime {
   environment: ReturnType<typeof createImportedEnvironmentStore>;
   appendMessage(sessionId: string, requestId: string, content: string, assertOwner: () => void): Promise<void>;
 }
+type ImportedAutomationPreparation = ImportedAutomationRuntime & {
+  createExecutionDirectory(partnerId: string, assertOwner: () => void): Promise<{ directory: string; cleanup(): Promise<void> }>;
+};
 const untrustedJsonBlock = (value: unknown): string => JSON.stringify(value);
 
 /** Command literals are private too, including values supplied without env names. */
@@ -51,7 +52,7 @@ export async function assertImportedAutomationReady(partnerId: string, routineId
 }
 
 /** Source script bytes are encrypted at rest and materialized only in a private execution directory. */
-export async function prepareImportedAutomation(routine: ImportedAutomationRoutine, runId: string, signal: AbortSignal, assertOwner: () => void, deps: ImportedAutomationRuntime): Promise<{
+export async function prepareImportedAutomation(routine: ImportedAutomationRoutine, runId: string, signal: AbortSignal, assertOwner: () => void, deps: ImportedAutomationPreparation): Promise<{
   runId: string; prompt: string; direct?: string; skipped?: boolean; deferred?: boolean; exhausted?: boolean;
 } | undefined> {
   const environment = await deps.environment.read(routine.partnerId, assertOwner);
@@ -76,7 +77,7 @@ export async function prepareImportedAutomation(routine: ImportedAutomationRouti
     ...(binding.prepared.direct === undefined ? {} : { direct: redact(binding.prepared.direct) }),
     ...(binding.prepared.monitorOutput === undefined ? {} : { monitorOutput: redact(binding.prepared.monitorOutput) }) };
   assertOwner();
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'joko-import-run-'));
+  const { directory, cleanup } = await deps.createExecutionDirectory(routine.partnerId, assertOwner);
   const runScript = async (value: string) => {
     const name = importedScriptName(binding.sourceRoot, value);
     if (!Object.hasOwn(environment.files, name)) throw new AgentImportError('AUTOMATION_SCRIPT_MISSING');
@@ -90,7 +91,7 @@ export async function prepareImportedAutomation(routine: ImportedAutomationRouti
   try {
     // Retain script helpers/resources, including cross-directory imports.
     await writeImportFiles(directory, Object.entries(environment.files).filter(([name]) => name.startsWith('scripts/'))
-      .map(([name, bytes]) => ({ name, bytes: Buffer.from(bytes, 'base64'), executable: environment.fileExecutables[name] === true })));
+      .map(([name, bytes]) => ({ name, bytes: Buffer.from(bytes, 'base64'), executable: environment.fileExecutables[name] === true })), assertOwner);
     let prompt = redact(routine.prompt); let direct: string | undefined; let skipped = false;
     let monitorOutput: string | undefined;
     if (command) {
@@ -128,7 +129,7 @@ export async function prepareImportedAutomation(routine: ImportedAutomationRouti
       // Commit monitor/repeat counters only after execution and delivery succeed.
     });
     return prepared;
-  } finally { await removePrivateImportDirectory(directory); }
+  } finally { await cleanup(); }
 }
 
 /** Commit delivery/counting once; return whether the host should stop future runs. */

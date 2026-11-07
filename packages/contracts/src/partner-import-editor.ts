@@ -1,5 +1,5 @@
-import { PartnerImportStatus, PartnerImportCategory, type PartnerImportResult, type PartnerImportSource } from "./gen/joko/v1/partner_import_pb.js";
-import { defaultImportSelection, importSelectionInput, toggleImportEntry, type PartnerImportApi, type PartnerImportPreview } from "./partner-import.js";
+import { PartnerImportStatus, PartnerImportCategory, PartnerImportCheckStatus, type PartnerImportResult, type PartnerImportSource } from "./gen/joko/v1/partner_import_pb.js";
+import { defaultImportSelection, importSelectionInput, toggleImportEntries, type PartnerImportApi, type PartnerImportPreview } from "./partner-import.js";
 
 export interface ImportReceiptStorage {
   getItem(key: string): string | null | Promise<string | null>;
@@ -64,7 +64,15 @@ export class PartnerImportEditor {
     try { await action(request.signal); }
     catch (error) { if (!request.signal.aborted && !this.#disposed) {
       const code = error instanceof Error ? error.message.match(/\b[A-Z][A-Z_]{3,90}\b/)?.[0] : undefined;
-      this.#set({ error: code ?? "IMPORT_FAILED" });
+      const pendingId = this.state.pendingId;
+      if (code === "IMPORT_NAME_EXISTS" && pendingId !== undefined) {
+        try {
+          const result = await this.api.status(pendingId, request.signal); this.#current(request.signal);
+          if (result === undefined) await this.#releaseRejectedCreation(pendingId, request.signal);
+          else if (!await this.#releaseIfCreationRejected(result, request.signal)) this.#set({ error: code });
+        }
+        catch { if (!request.signal.aborted && !this.#disposed) this.#set({ error: code }); }
+      } else this.#set({ error: code ?? "IMPORT_FAILED" });
     } }
     finally { if (this.#request === request) { this.#request = undefined; this.#set({ busy: false }); } }
   }
@@ -86,9 +94,7 @@ export class PartnerImportEditor {
   edit(patch: Partial<Pick<PartnerImportEditorState, "name" | "avatarImageBase64" | "takeover">>): void { if (!this.locked) this.#set(patch); }
   select(ids: readonly string[], enabled: boolean): void {
     if (this.locked || !this.state.preview) return;
-    let selected = this.state.selected;
-    for (const id of ids) selected = toggleImportEntry(this.state.preview.entries, selected, id, enabled);
-    this.#set({ selected });
+    this.#set({ selected: toggleImportEntries(this.state.preview.entries, this.state.selected, ids, enabled) });
   }
   filter(category?: PartnerImportCategory, query = ""): void { this.#set({ category, query, page: 0 }); }
   page(page: number, details = false): void { if (Number.isSafeInteger(page) && page >= 0) this.#set(details ? { detailPage: page } : { page }); }
@@ -110,9 +116,11 @@ export class PartnerImportEditor {
       }
       this.#current(signal);
       let result = await this.api.status(requestId, signal); this.#current(signal);
+      if (result && await this.#releaseIfCreationRejected(result, signal)) return;
       if (!result) result = await this.api.start(this.#intent, signal);
       else if (result.status === PartnerImportStatus.NEEDS_ATTENTION) result = await this.api.retry(requestId, false, signal);
-      this.#current(signal); this.#set({ result, detailPage: 0 }); await this.#poll(requestId, signal);
+      this.#current(signal); if (await this.#releaseIfCreationRejected(result, signal)) return;
+      this.#set({ result, detailPage: 0 }); await this.#poll(requestId, signal);
     });
   }
   async refresh(): Promise<void> { if (!this.state.pendingId) return this.load(); await this.#perform(signal => this.#observe(this.state.pendingId!, signal)); }
@@ -120,11 +128,13 @@ export class PartnerImportEditor {
     if (!this.state.pendingId || this.state.absent) return;
     await this.#perform(async signal => {
       const result = await this.api.retry(this.state.pendingId!, resumeSetup, signal); this.#current(signal);
+      if (await this.#releaseIfCreationRejected(result, signal)) return;
       this.#set({ result, detailPage: 0 }); await this.#poll(result.requestId, signal);
     });
   }
   async #observe(requestId: string, signal: AbortSignal): Promise<void> {
     const result = await this.api.status(requestId, signal); this.#current(signal);
+    if (result && await this.#releaseIfCreationRejected(result, signal)) return;
     this.#set({ result, absent: !result, detailPage: 0 }); if (result) await this.#poll(requestId, signal);
   }
   async #poll(requestId: string, signal: AbortSignal): Promise<void> {
@@ -135,7 +145,23 @@ export class PartnerImportEditor {
         const timer = setTimeout(done, 1000); signal.addEventListener("abort", abort, { once: true });
       });
       this.#current(signal); const result = await this.api.status(requestId, signal); this.#current(signal);
-      if (!result) throw new Error("IMPORT_RECEIPT_MISSING"); this.#set({ result });
+      if (!result) throw new Error("IMPORT_RECEIPT_MISSING");
+      if (await this.#releaseIfCreationRejected(result, signal)) return;
+      this.#set({ result });
+    }
+  }
+  async #releaseIfCreationRejected(result: PartnerImportResult, signal: AbortSignal): Promise<boolean> {
+    if (result.requestId !== this.state.pendingId || result.status !== PartnerImportStatus.NEEDS_ATTENTION || result.saved ||
+      result.canonicalSessionId || result.savedEntryIds.length !== 0 || !result.checks.some(check => check.entryId === "creation" &&
+        check.status === PartnerImportCheckStatus.NEEDS_ATTENTION && check.message === "IMPORT_NAME_EXISTS")) return false;
+    await this.#releaseRejectedCreation(result.requestId, signal);
+    return true;
+  }
+  async #releaseRejectedCreation(requestId: string, signal: AbortSignal): Promise<void> {
+    await this.receipts.release(requestId); this.#current(signal); this.#intent = undefined;
+    this.#set({ pendingId: undefined, result: undefined, absent: false, error: "IMPORT_NAME_EXISTS" });
+    if (!this.state.preview && !this.state.sources) {
+      const sources = await this.api.sources(signal); this.#current(signal); this.#set({ sources });
     }
   }
   /** Only an authoritative absent receipt or a saved canonical task allows a new intent. */
