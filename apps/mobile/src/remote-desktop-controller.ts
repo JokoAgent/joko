@@ -82,6 +82,7 @@ import type {
   MobileRemoteDesktopHostMutePreferences,
   MobileRemoteDesktopPreferenceOwner
 } from "./mobile-remote-desktop-host-mute-preference";
+import type { MobileRemoteDesktopDisplayModePreferences } from "./mobile-remote-desktop-display-mode-preference";
 import type { MobileRemoteDesktopLockIdentity, MobileRemoteDesktopLockPreferences } from "./mobile-remote-desktop-lock-preference";
 import type { MobileRemoteDesktopClipboardSyncPreferences } from "./mobile-remote-desktop-clipboard-sync-preference";
 import type { MobileRemoteDesktopPrivacyIdentity, MobileRemoteDesktopPrivacyPreferences } from "./mobile-remote-desktop-privacy-preference";
@@ -528,6 +529,7 @@ export class MobileRemoteDesktopController {
     readonly keys: readonly MobileRemoteDesktopKeyCode[]; readonly scope: MobileKeyboardScope }>();
   #displayModeOperation?: { readonly request: AbortController };
   #displayModeReconnect?: DisplayModeReconnect;
+  readonly #rememberedDisplayAttempts = new Set<string>();
   #displaySwitch?: DisplaySwitch;
   #displaySwitchCompletion?: Promise<void>;
   #permissionGuideVisible = false;
@@ -587,7 +589,8 @@ export class MobileRemoteDesktopController {
     private readonly clipboardSyncPreferences?: MobileRemoteDesktopClipboardSyncPreferences,
     private readonly privacyPreferences?: MobileRemoteDesktopPrivacyPreferences,
     private readonly credentialEnvironment?: { readonly native: MobileRemoteDesktopCredentialsNative;
-      readonly locale: () => string; readonly theme: () => "light" | "dark" }
+      readonly locale: () => string; readonly theme: () => "light" | "dark" },
+    private readonly displayModePreferences?: MobileRemoteDesktopDisplayModePreferences
   ) {
     const channelTransport: Pick<MobileRemoteDesktopTransport, "control" | "presentation" | "setHostMute" | "setPrivacyScreen" | "systemAction" | "listDisplayModes" | "setClipboardSync" | "clipboardVersion"> = {
       control: (host, lease, enabled, signal) => this.#smallRequest(host, { op: "control", lease, enabled }, signal,
@@ -739,6 +742,7 @@ export class MobileRemoteDesktopController {
     this.#permissionBlocked = false;
     this.#displayModeReconnect = undefined;
     this.#temporaryModeUncertain = false;
+    this.#rememberedDisplayAttempts.clear();
     const generation = this.#newRequest();
     this.#lease = undefined;
     this.#resumeEligible = false;
@@ -1419,6 +1423,12 @@ export class MobileRemoteDesktopController {
     this.#displayModeOperation = undefined;
     if (!this.#ready(generation) || this.#lease?.leaseId !== lease.leaseId || peerKey(this.#snapshot.host) !== peerKey(host)) return;
     if (temporary && error === undefined && result?.lease) {
+      const targetDeviceId = host.route?.targetDeviceId;
+      const display = result.lease.display;
+      if (!viewerDisplay && mode && targetDeviceId && capabilities?.platform === "darwin" && this.displayModePreferences
+        && display && display.displayId === this.#snapshot.selectedDisplayId && display.width === mode.width && display.height === mode.height) {
+        void this.displayModePreferences.save({ ...this.transport.preferenceOwner, targetDeviceId, displayId: display.displayId }, mode).catch(() => undefined);
+      }
       const stillWanted = this.#snapshot.wantedControl;
       const nextGeneration = this.#newRequest();
       this.#lease = result.lease; this.#adoptControlGeneration(result.lease.controlGeneration);
@@ -2551,6 +2561,46 @@ export class MobileRemoteDesktopController {
     }
   }
 
+  async #restoreRememberedDisplayMode(host: DevicePeerDescriptor, displayId: string, lease: RemoteDesktopLease,
+    isCurrent: () => boolean): Promise<RemoteDesktopLease> {
+    const preferences = this.displayModePreferences, capabilities = this.#snapshot.capabilities;
+    const targetDeviceId = host.route?.targetDeviceId;
+    const current = () => isCurrent() && this.#interactive && this.#routeFocused;
+    if (!preferences || !targetDeviceId || !lease.controlling || lease.display?.displayId !== displayId
+      || capabilities?.platform !== "darwin" || !capabilities.canControl || !capabilities.resolutionRestore || !capabilities.displayModes
+      || this.#rememberedDisplayAttempts.has(displayId) || !current()) return lease;
+    const signal = this.#request.signal;
+    const remembered = await preferences.load({ ...this.transport.preferenceOwner, targetDeviceId, displayId }).catch(() => undefined);
+    if (!remembered || !current()) return lease;
+    const modes = await this.transport.listDisplayModes(host, lease.leaseId, signal).catch((error: unknown) => {
+      const reason = remoteDesktopFailure(error)?.reason;
+      if (error instanceof MobileRemoteDesktopAuthorityError || reason === RemoteDesktopFailureReason.AUTHORITY_CHANGED
+        || reason === RemoteDesktopFailureReason.LEASE_EXPIRED || reason === RemoteDesktopFailureReason.STOPPED) throw error;
+      return undefined;
+    });
+    if (!modes || !validDisplayModes(modes) || !current()) return lease;
+    const sameSize = (mode: RemoteDesktopDisplayMode) => mode.width === remembered.width && mode.height === remembered.height;
+    const mode = modes.find(mode => mode.modeId === remembered.modeId && sameSize(mode)) ?? modes.find(sameSize);
+    if (!mode || mode.current) return lease;
+    this.#rememberedDisplayAttempts.add(displayId);
+    const autoControl = capabilities.autoControl === true;
+    let result: RemoteDesktopDisplayModeResult;
+    try {
+      result = await this.transport.setDisplayMode(host, lease.leaseId, lease.controlGeneration, mode.modeId, true, signal, ...autoControl ? [true] as const : []);
+    } catch (error) {
+      const reason = remoteDesktopFailure(error)?.reason;
+      if (reason === RemoteDesktopFailureReason.DISPLAY_BUSY || reason === RemoteDesktopFailureReason.DISPLAY_MODE_MISSING) return lease;
+      throw error;
+    }
+    const adopted = result?.lease, display = adopted?.display;
+    if (!adopted || adopted.leaseId !== lease.leaseId || !validControlGeneration(adopted.controlGeneration)
+      || adopted.controlGeneration <= lease.controlGeneration || adopted.controlling && !autoControl
+      || !display || display.displayId !== displayId || display.width !== mode.width || display.height !== mode.height) {
+      throw new Error("Remembered display mode changed its captured occurrence.");
+    }
+    return adopted;
+  }
+
   async #start(
     mode: RemoteDesktopStartMode,
     generation: number,
@@ -2604,17 +2654,28 @@ export class MobileRemoteDesktopController {
         }
       }
       this.#controlRecoveryWanted = this.#snapshot.capabilities?.canControl === true;
-      const lease = this.#snapshot.capabilities?.autoControl
+      let lease = this.#snapshot.capabilities?.autoControl
         ? await this.transport.start(host, displayId, mode, this.#request.signal, this.#controlRecoveryWanted)
         : await this.transport.start(host, displayId, mode, this.#request.signal);
-      if (!this.#ready(generation) || peerKey(this.#snapshot.host) !== peerKey(host)
-        || this.#snapshot.selectedDisplayId !== displayId) {
-        if (this.transport.canStop()) void this.transport.stop(host, lease.leaseId, { lockScreen: false, controlGeneration: 0n }).catch(() => undefined);
-        return;
-      }
+      const current = () => this.#ready(generation) && peerKey(this.#snapshot.host) === peerKey(host) && this.#snapshot.selectedDisplayId === displayId;
+      let retired = false;
+      const retire = () => {
+        if (retired || !this.transport.canStop()) return;
+        retired = true;
+        void this.transport.stop(host, lease.leaseId, { lockScreen: false, controlGeneration: 0n }).catch(() => undefined);
+      };
+      if (!current()) { retire(); return; }
       if (!validControlGeneration(lease.controlGeneration)) {
-        if (this.transport.canStop()) void this.transport.stop(host, lease.leaseId, { lockScreen: false, controlGeneration: 0n }).catch(() => undefined);
+        retire();
         throw new Error("Invalid Remote Desktop control generation.");
+      }
+      if (this.displayModePreferences && mode === RemoteDesktopStartMode.NEW && this.#displayModeReconnect === undefined) {
+        const signal = this.#request.signal;
+        signal.addEventListener("abort", retire, { once: true });
+        try { lease = await this.#restoreRememberedDisplayMode(host, displayId, lease, current); }
+        catch (error) { retire(); throw error; }
+        finally { signal.removeEventListener("abort", retire); }
+        if (!current()) { retire(); return; }
       }
       this.#lease = lease;
       this.#controlRecoveryWanted = lease.controlling || this.#snapshot.capabilities?.canControl === true;

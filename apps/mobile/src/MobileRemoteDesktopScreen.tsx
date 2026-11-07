@@ -27,6 +27,7 @@ import {
 import { remoteDesktopViewerCommand, remoteDesktopViewerHtml } from "./remote-desktop-viewer";
 import { remotePresentation } from "../modules/joko-remote-presentation/src/index";
 import { createMobileRemoteDesktopHostMutePreferenceStore } from "./mobile-remote-desktop-host-mute-preference";
+import { createMobileRemoteDesktopDisplayModePreferenceStore } from "./mobile-remote-desktop-display-mode-preference";
 import { createMobileRemoteDesktopLockPreferenceStore } from "./mobile-remote-desktop-lock-preference";
 import { createMobileRemoteDesktopClipboardSyncPreferenceStore } from "./mobile-remote-desktop-clipboard-sync-preference";
 import { createMobileRemoteDesktopPrivacyPreferenceStore } from "./mobile-remote-desktop-privacy-preference";
@@ -51,6 +52,8 @@ import { avoidReservedRegions, keyboardControlRegion, safeWindowRect, windowDivi
 import { MobileRemoteDesktopDisplaySelector, MobileRemoteDesktopPanel, MobileRemoteDesktopToolbar,
   type MobileRemoteDesktopPanelProps, type MobileRemoteDesktopToolbarAction } from "./MobileRemoteDesktopChrome";
 import { MobileRemoteDesktopPermissionGuide } from "./MobileRemoteDesktopPermissionGuide";
+
+const displayModePreferences = Platform.OS === "ios" ? createMobileRemoteDesktopDisplayModePreferenceStore(AsyncStorage) : undefined;
 
 export type MobileRemoteDesktopLifecycleHandler = (transition: MobileAppLifecycleTransition) => void;
 type RegisterLifecycle = (handler: MobileRemoteDesktopLifecycleHandler) => () => void;
@@ -153,7 +156,7 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
     }
   }), []);
   const controller = useMemo(() => new MobileRemoteDesktopController(
-    transport, preferredDeviceId, mobileRemoteClipboardSystem, nativePresentation, hostMutePreferences, lockPreferences, clipboardSyncPreferences, privacyPreferences, credentialEnvironment
+    transport, preferredDeviceId, mobileRemoteClipboardSystem, nativePresentation, hostMutePreferences, lockPreferences, clipboardSyncPreferences, privacyPreferences, credentialEnvironment, displayModePreferences
   ),
     [transport.ownerKey, preferredDeviceId, nativePresentation, hostMutePreferences, lockPreferences, clipboardSyncPreferences, privacyPreferences, credentialEnvironment]);
   const snapshot = useSyncExternalStore(controller.subscribe, () => controller.snapshot);
