@@ -332,6 +332,56 @@ describe("DurableReviewEvidenceProvider", () => {
     expect(unavailable.artifacts[0]?.warning).toContain("no textual Review excerpt");
   });
 
+  it("keeps the newest retained attachments when the Review history budget fills", async () => {
+    const fixture = setup();
+    const artifacts = new RealArtifactStore({ rootDirectory: path.join(fixture.directory, "artifacts"),
+      repository: new OperationalArtifactRepository(fixture.store), ingestRoots: [fixture.directory] });
+    await artifacts.initialize();
+    const sessionId = "source";
+    const blobs = [];
+    for (let index = 1; index <= 21; index += 1) {
+      const label = `A${index}.txt`;
+      const blob = await artifacts.ingestBytes(Buffer.from(`Deliverable ${index}\n`), { fileName: label, mimeType: "text/plain" });
+      blobs.push(blob);
+      const runId = `attachment-run-${index}`, attemptId = `attachment-attempt-${index}`;
+      const operationId = `attachment-send-${index}`, queueItemId = `attachment-queue-${index}`;
+      const at = index * 10;
+      const prompt = { text: "Review this deliverable", images: [], files: [{ blob }], mentions: [], disposition: "prompt" as const };
+      fixture.store.createRun({ id: runId, sessionId, source: "user", state: "queued", createdAt: at });
+      fixture.store.createAttempt({ id: attemptId, runId, ordinal: 1, generation: 1, startedAt: at });
+      fixture.store.runOperation({ id: operationId, kind: "send_input", body: { sessionId, prompt } }, (store) => {
+        store.enqueueQueueItem({ id: queueItemId, sessionId, runId, attemptId, operationId, disposition: "prompt", body: prompt });
+        return {};
+      });
+      fixture.store.claimNextQueueItem({ sessionId, backendInstanceGeneration: 0, at });
+      fixture.store.updateRunState({ runId, state: "running", activeAttemptId: attemptId, traceId: runId, startedAt: at });
+      fixture.store.updateQueueState({ queueItemId, state: "backend_accepted", traceId: queueItemId, at });
+      fixture.store.appendEvent({ id: `attachment-message-${index}`, backendId: "pi", targetId: "workspace", sessionId,
+        runId, attemptId, generation: 1, emittedAt: at + 1, traceId: operationId,
+        payload: { type: "message_complete", role: "user", blocks: [
+          { kind: "text", text: prompt.text }, { kind: "artifact", blob, label }
+        ] } });
+      fixture.store.finishAttempt(attemptId, undefined, at + 2);
+      fixture.store.updateRunState({ runId, state: "completed", traceId: runId, endedAt: at + 2 });
+      fixture.store.updateQueueState({ queueItemId, state: "completed", traceId: queueItemId, at: at + 2 });
+    }
+
+    const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
+    const captured = await provider.capture(request());
+    expect(captured.artifacts.map(({ blob }) => blob.id)).toEqual(blobs.slice(1).reverse().map(({ id }) => id));
+    expect(captured.artifactsOmitted).toBe(true);
+    const prompt = buildReviewPrompt(buildReviewEvidence(captured).promptInput).prompt;
+    expect(prompt).toContain("Deliverable 21\n");
+    expect(prompt).not.toContain("Deliverable 1\n");
+    expect(prompt).toContain("additional task-history attachments were omitted");
+
+    const withExplicit = await provider.capture(request({ kind: "file", displayName: "A1.txt", blob: blobs[0]! }));
+    expect(withExplicit.artifacts.map(({ blob }) => blob.id)).toEqual([
+      blobs[0]!.id, ...blobs.slice(2).reverse().map(({ id }) => id)
+    ]);
+    expect(withExplicit.artifactsOmitted).toBe(true);
+  });
+
   it("rejects per-artifact and aggregate Review byte budgets before artifact I/O", async () => {
     const fixture = setup();
     const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), []);

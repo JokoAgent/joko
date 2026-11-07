@@ -366,7 +366,8 @@ function collectAttachments(request: StartReviewRequest, messages: readonly Mess
   const values: ReviewSourceArtifact[] = request.attachments.map((item) => ({ ...item }));
   const seen = new Set(values.map((item) => item.blob.id));
   let omitted = false;
-  for (const event of messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const event = messages[index]!;
     for (const block of event.payload.blocks) {
       const artifact = blockAttachment(block);
       if (artifact === undefined || seen.has(artifact.blob.id)) continue;
