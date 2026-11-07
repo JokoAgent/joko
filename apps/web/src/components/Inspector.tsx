@@ -2186,7 +2186,7 @@ function WorkspaceChangesPanel({ controller, session, workspace, focusRequest, c
     });
   };
   const loadMarkdownPreview = (file: WorkspaceFileDiffView): void => {
-    if (diff === undefined) return;
+    if (diff === undefined || !sourceCapabilities.canRichPreview || file.source === "turnSet") return;
     const key = `${diff.repositoryRevision}:${reviewFileKey(file)}`;
     if (markdownPreview?.key === key && (markdownPreview.loading || markdownPreview.text !== undefined)) return;
     const pending = { key, loading: true };
@@ -2784,13 +2784,17 @@ function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, 
   const stageable = file.source === "unstaged" && canStage;
   const unstageable = file.source === "staged" && canUnstage;
   const revertable = file.source === "unstaged" && canRevert;
+  const showMarkdownPreview = isReviewMarkdownPath(file.path) && file.status !== "deleted" && !file.binary && onLoadMarkdown !== undefined;
+  const historicalMarkdown = file.source === "turnSet";
+  const markdownUnavailable = historicalMarkdown ? t("workspace.reviewHistoricalMarkdownUnavailable") : undefined;
   return <details className="workspace-review-file" open={expanded}>
     <summary aria-expanded={expanded} onClick={(event) => { event.preventDefault(); onExpandedChange(!expanded); }}><FileDiff aria-hidden="true" /><strong>{file.oldPath === undefined || file.oldPath === file.path ? file.path : `${file.oldPath} → ${file.path}`}</strong><span className="review-diff-stats"><i>+{additions}</i><b>−{deletions}</b></span>{file.source !== "unspecified" && <Pill tone={file.source === "staged" ? "success" : file.source === "branch" || file.source === "commit" ? "accent" : "warning"}>{sourceLabel}</Pill>}<Pill tone={file.status === "conflicted" ? "danger" : "warning"}>{file.status ?? "changed"}</Pill></summary>
-    {(stageable || unstageable || revertable || (isReviewMarkdownPath(file.path) && file.status !== "deleted" && !file.binary && onLoadMarkdown !== undefined) || (canImagePreview && isPreviewableReviewImageDiff(file) && onLoadImage !== undefined)) && <div className="review-file-preview-actions">
+    {(stageable || unstageable || revertable || showMarkdownPreview || (canImagePreview && isPreviewableReviewImageDiff(file) && onLoadImage !== undefined)) && <div className="review-file-preview-actions">
       {stageable && <Button tone="ghost" disabled={pendingHunkKey !== undefined} onClick={() => onDiffAction?.(file, "file", undefined, "stage")}><Plus aria-hidden="true" />{t("workspace.reviewStageFile")}</Button>}
       {unstageable && <Button tone="ghost" disabled={pendingHunkKey !== undefined} onClick={() => onDiffAction?.(file, "file", undefined, "unstage")}><Minus aria-hidden="true" />{t("workspace.reviewUnstageFile")}</Button>}
       {revertable && <Button tone="danger" disabled={pendingHunkKey !== undefined} onClick={() => onDiffAction?.(file, "file", undefined, "revert")}><Undo2 aria-hidden="true" />{t("workspace.reviewRevertFile")}</Button>}
-      {isReviewMarkdownPath(file.path) && file.status !== "deleted" && !file.binary && onLoadMarkdown !== undefined && <Button tone="ghost" onClick={() => onLoadMarkdown(file)}><FileText aria-hidden="true" />{activeMarkdown?.text === undefined ? t("workspace.reviewMarkdownPreview") : t("workspace.reviewRefreshPreview")}</Button>}
+      {showMarkdownPreview && <Button tone="ghost" disabled={historicalMarkdown} title={markdownUnavailable} aria-description={markdownUnavailable}
+        onClick={historicalMarkdown ? undefined : () => onLoadMarkdown?.(file)}><FileText aria-hidden="true" />{activeMarkdown?.text === undefined ? t("workspace.reviewMarkdownPreview") : t("workspace.reviewRefreshPreview")}</Button>}
       {canImagePreview && isPreviewableReviewImageDiff(file) && onLoadImage !== undefined && <Button tone="ghost" onClick={() => onLoadImage(file)}><ImageIcon aria-hidden="true" />{activeImage?.value === undefined ? t("workspace.reviewImagePreview") : t("workspace.reviewRefreshPreview")}</Button>}
     </div>}
     {activeMarkdown?.loading === true && <Spinner label={t("workspace.loadingPreview")} />}
