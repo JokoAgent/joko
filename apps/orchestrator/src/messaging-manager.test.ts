@@ -1354,6 +1354,43 @@ describe("MessagingManager", () => {
       .toHaveLength(2);
   });
 
+  it("delivers Discord lifecycle notices once per service lifetime on the same connection generation", async () => {
+    const transport = new FakeDiscordTransport();
+    const fixture = await createFixture(undefined, undefined, () => transport);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createDiscordConnection({
+      ownerProviderUserId: "111111111111111111",
+      configuration: { ...DEFAULT_DISCORD_MESSAGING_CONFIGURATION, lifecycleAnnouncements: true }
+    });
+    const enabled = await replaceCredential(fixture, created, "discord-repeated-lifecycle", true);
+    const sent = (phase: "connected" | "shutdown") => fixture.store.listMessagingDeliveries({
+      connectionId: enabled.id, statuses: ["sent"]
+    }).filter((delivery) => delivery.dedupeKey.startsWith(`lifecycle:${phase}:`));
+
+    await vi.waitFor(() => expect(sent("connected")).toHaveLength(1));
+    await fixture.manager.close();
+    expect(sent("shutdown")).toHaveLength(1);
+    const priorShutdown = sent("shutdown")[0]!;
+    const stale = fixture.store.enqueueMessagingDelivery({
+      connectionId: enabled.id, expectedChannelGeneration: enabled.generation, conversationId: priorShutdown.conversationId,
+      dedupeKey: `lifecycle:shutdown:generation:${enabled.generation}`,
+      kind: "notice", partIndex: 0, partCount: 1, payload: priorShutdown.payload, payloadHash: priorShutdown.payloadHash,
+      createdAt: Date.now()
+    });
+
+    await fixture.restartManager();
+    await vi.waitFor(() => {
+      expect(sent("connected")).toHaveLength(2);
+      expect(fixture.store.getMessagingDelivery(stale.id).status).toBe("cancelled");
+    });
+    await fixture.manager.close();
+    expect(sent("shutdown")).toHaveLength(2);
+    expect(fixture.store.getMessagingConnection(enabled.id).generation).toBe(enabled.generation);
+    const lifecycleTexts = ["Joko is connected and ready on Discord.", "Joko is disconnecting from Discord."];
+    expect(transport.sentText.map(({ text }) => text).filter((text) => lifecycleTexts.includes(text)))
+      .toEqual([...lifecycleTexts, ...lifecycleTexts]);
+  });
+
   it("projects terminal Discord Gateway credential loss without retrying the retired worker", async () => {
     const transport = new AuthLossDiscordTransport();
     const fixture = await createFixture(undefined, undefined, () => transport);

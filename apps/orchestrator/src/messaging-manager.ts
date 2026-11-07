@@ -508,6 +508,7 @@ export class MessagingManager {
   readonly #slackProgressTiming: { readonly tickMs: number; readonly firstProgressMs: number; readonly repeatProgressMs: number };
   readonly #now: () => number;
   readonly #idFactory: () => string;
+  readonly #discordLifecycleId = randomUUID();
   readonly #tickets = new Map<string, CredentialTicketBinding>();
   readonly #workers = new Map<string, ActiveWorker>();
   readonly #workerRetirements = new Map<string, Promise<void>>();
@@ -3605,11 +3606,13 @@ export class MessagingManager {
           ? `Joko's ${providerName} connection is being disabled.`
           : `Joko is disconnecting from ${providerName}.`;
     const payload = { format: 1, address, text };
+    const lifecycleKey = `lifecycle:${phase}:generation:${connection.generation}`;
+    const serviceLifecycle = connection.channel === "discord" && (phase === "connected" || phase === "shutdown");
     this.#store.enqueueMessagingDelivery({
       connectionId: connection.id,
       expectedChannelGeneration: connection.generation,
       conversationId: conversation.id,
-      dedupeKey: `lifecycle:${phase}:generation:${connection.generation}`,
+      dedupeKey: serviceLifecycle ? `${lifecycleKey}:instance:${this.#discordLifecycleId}` : lifecycleKey,
       kind: "notice",
       partIndex: 0,
       partCount: 1,
@@ -3633,8 +3636,11 @@ export class MessagingManager {
       });
       if (delivery === undefined) return;
       try {
+        const retiredLifecycle = connection.channel === "discord" && delivery.kind === "notice"
+          && /^lifecycle:(?:connected|shutdown):generation:/u.test(delivery.dedupeKey)
+          && !delivery.dedupeKey.endsWith(`:instance:${this.#discordLifecycleId}`);
         const streamPayload = isRecord(delivery.payload) && (delivery.payload["replyStream"] !== undefined || delivery.payload["streamFinalRequestId"] !== undefined);
-        if (this.#obsoleteInteractionDelivery(delivery) || streamPayload && !this.#streamDeliverySource(delivery)) {
+        if (retiredLifecycle || this.#obsoleteInteractionDelivery(delivery) || streamPayload && !this.#streamDeliverySource(delivery)) {
           this.#store.settleMessagingDelivery({
             deliveryId: delivery.id,
             expectedRevision: delivery.revision,
