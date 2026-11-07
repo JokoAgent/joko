@@ -13,6 +13,7 @@ import {
   GetPartnerDelegationResponseSchema,
   CancelPartnerDelegationRequestSchema,
   CancelPartnerDelegationResponseSchema,
+  OperationState,
   PermissionMode,
   RunState
 } from "@joko/contracts";
@@ -171,7 +172,8 @@ describe("mounted Partner collaboration product chain", () => {
       return required(topic.topic?.sessionId, "the original topic task");
     };
     const topic = await makeTopic("A"), sibling = await makeTopic("B");
-    const taskTool = (sessionId: string, name: string) => store.listEvents({ sessionId }).flatMap(event => event.payload.type === "tool_result"
+    const taskTool = (sessionId: string, name: string, runId?: string) => store.listEvents({ sessionId }).flatMap(event =>
+      (runId === undefined || event.runId === runId) && event.payload.type === "tool_result"
       && event.payload.name.endsWith(name) ? [event.payload] : []).at(-1);
     const settleStart = async (runId: string, label: string) => {
       try {
@@ -181,9 +183,10 @@ describe("mounted Partner collaboration product chain", () => {
           const pending = store.listInteractions({ sessionId: topic, runId, status: "open" })[0];
           if (pending !== undefined) {
             expect(pending.payload).toMatchObject({ kind: "permission", toolName: expect.stringMatching(/(?:__|\/)start_session_task$/u) });
-            await submit(manager.clients.operation, manager.connectionId, resolvePermissionMutation({
+            const approval = await submit(manager.clients.operation, manager.connectionId, resolvePermissionMutation({
               connectionId: manager.connectionId, interactionId: pending.id, generation: BigInt(pending.generation)
             }), `topic-fixture-allow-${pending.id}`);
+            expect(approval.state).toBe(OperationState.SUCCEEDED);
           }
           return store.getRun(runId).descriptor;
         }, run => run.endedAt !== undefined, label, 35_000);
@@ -203,12 +206,17 @@ describe("mounted Partner collaboration product chain", () => {
     const serviceInput = sessionHost.enqueueServiceInput({ operationId: "service-topic-fixture", sessionId: topic, source: "system",
       prompt: { text: blocked, images: [], files: [], mentions: [], disposition: "prompt" } });
     await settleStart(serviceInput.value.runId, "the service topic input to settle");
-    expect(taskTool(topic, "start_session_task")).toMatchObject({ isError: true, output: expect.stringContaining("TASK_CALLER_CHANGED") });
+    expect(taskTool(topic, "start_session_task", serviceInput.value.runId))
+      .toMatchObject({ isError: true, output: expect.stringContaining("TASK_CALLER_CHANGED") });
     expect(partnerSessionTasks!.list(partner.partnerId)).toEqual([]);
 
     const ownerInput = await submit(manager.clients.operation, manager.connectionId,
       sendInputMutation(topic, BigInt(store.getSession(topic).descriptor.binding.generation), start));
-    await settleStart(queueRunIdFrom(ownerInput), "the owner topic input to settle");
+    expect(ownerInput.state).toBe(OperationState.SUCCEEDED);
+    const ownerRunId = queueRunIdFrom(ownerInput);
+    expect(store.findOperation(ownerInput.operationId)).toMatchObject({ kind: "sendInput", connectionId: manager.connectionId });
+    await settleStart(ownerRunId, "the owner topic input to settle");
+    expect(taskTool(topic, "start_session_task", ownerRunId)).toMatchObject({ isError: false, output: expect.stringContaining(title) });
     const task = required(await waitFor(async () => partnerSessionTasks!.list(partner.partnerId)[0], item => item?.deliveredExecution === 1,
       "the result to return to the original topic", 30_000), "the completed independent task");
     taskId = task.id;

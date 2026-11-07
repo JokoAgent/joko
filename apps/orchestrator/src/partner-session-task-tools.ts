@@ -71,8 +71,10 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
       || queue.backendInstanceGeneration !== backendGeneration
       || !["dispatching", "backend_accepted"].includes(queue.state)) throw deny();
     const attempt = store.getAttempt(queue.attemptId).descriptor, operation = store.getOperation(queue.operationId);
+    // OperationService and the direct Host entry both persist owner input.
+    const ownerInput = operation.kind === "sendInput" || operation.kind === "send_input";
     if (attempt.runId !== run.id || attempt.generation !== context.generation || attempt.backendInstanceGeneration !== backendGeneration
-      || attempt.endedAt !== undefined || operation.kind !== "send_input" || operation.status !== "completed" || !operation.connectionId) throw deny();
+      || attempt.endedAt !== undefined || !ownerInput || operation.status !== "completed" || !operation.connectionId) throw deny();
     const connection = store.getConnection(operation.connectionId);
     store.authorizeConnection(connection.id, connection.authKeyDigest);
   }
