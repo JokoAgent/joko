@@ -15,7 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 
-describe("OrchestratorGateway Memory reset scopes", () => {
+describe("OrchestratorGateway Memory settings", () => {
   it("preserves the typed Backend memory role and reset authority", () => {
     const projected = mapSnapshot(create(SnapshotSchema, {
       settings: {
@@ -71,6 +71,26 @@ describe("OrchestratorGateway Memory reset scopes", () => {
 
     expect(settings()).not.toHaveProperty("entryCount");
     expect(settings(0n)).toHaveProperty("entryCount", 0);
+  });
+
+  it("surfaces a committed preference with an unconfirmed native-memory update", async () => {
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret", {}, () => transport((method, input) => response(method, create(SubmitOperationResponseSchema, {
+        operation: {
+          operationId: input.operationId, connectionId: input.connectionId, state: OperationState.SUCCEEDED,
+          result: { payload: { case: "settings", value: { memory: { backends: [{
+            backendId: "codex", enabled: false, support: CapabilitySupport.SUPPORTED, kind: BackendMemoryKind.NATIVE_AUTO_MEMORY,
+            updatesActiveLocalSessions: true, reason: "Live native memory confirmation is pending."
+          }] } } } }
+        }
+      })))
+    );
+    await gateway.connect();
+    try {
+      await expect(gateway.updateMemorySettings({ backendId: "codex", backendEnabled: true }))
+        .rejects.toMatchObject({ code: "NATIVE_MEMORY_APPLICATION_PENDING" });
+    } finally { gateway.disconnect(); }
   });
 
   it("sends distinct CURATED and capability-owned BACKEND mutations", async () => {

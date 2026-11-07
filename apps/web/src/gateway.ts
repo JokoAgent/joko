@@ -10578,7 +10578,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     readonly backendId?: string;
     readonly backendEnabled?: boolean;
   }): Promise<void> {
-    await this.submit({
+    const operation = await this.submit({
       case: "updateMemorySettings",
       value: {
         restoreDefaults: false,
@@ -10589,6 +10589,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         }
       }
     }, true);
+    const result = operation.result?.payload;
+    if (patch.backendId === undefined || result?.case !== "settings") return;
+    const backend = result.value.memory?.backends.find(item => item.backendId === patch.backendId);
+    if (backend?.kind === BackendMemoryKind.NATIVE_AUTO_MEMORY && backend.updatesActiveLocalSessions
+      && backend.support === CapabilitySupport.SUPPORTED && backend.reason !== "") {
+      throw new GatewayError(backend.reason, { code: "NATIVE_MEMORY_APPLICATION_PENDING" });
+    }
   }
 
   async restoreMemoryDefaults(): Promise<void> {
