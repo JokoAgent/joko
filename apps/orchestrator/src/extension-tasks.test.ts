@@ -159,7 +159,7 @@ it("keeps the original plugin run ID attached to its durably admitted Provider G
         attempt: 1, maximumAttempts: 5, sessionTotal: 1 } } });
   await vi.waitFor(() => expect(f.store.getQueueItem(resume.value.queueItemId).state).toBe("backend_accepted"));
   f.store.setQueuePaused({ sessionId: taskId, paused: true, reason: "Keep the independent input queued", traceId: "test" });
-  const unrelated = f.host.enqueueServiceInput({ operationId: "unrelated-service-input", sessionId: taskId, source: "system", parentRunId: original.runId,
+  const unrelated = f.host.enqueueServiceInput({ operationId: "unrelated-service-input", sessionId: taskId, source: "system",
     prompt: { text: "Another input", images: [], files: [], mentions: [], disposition: "prompt" } });
 
   expect(await f.request({ kind: "getRun", runId: original.runId })).toMatchObject({ ...receipt, status: "running", queueState: "backend_accepted" });
@@ -451,8 +451,10 @@ it("reveals the retired facet's hidden tasks only when the package replacement c
   const installed = await resources.install(discovered.id);
   const extensionId = [...resourceExtensionIds(installed)][0]!;
   const tasks = new ExtensionTasks({ ...f.tasks.options, catalog: { get: id => {
-    if (!resourceExtensionIds(resources.get(installed.id)).has(id)) throw new Error("The installed extension is unavailable.");
-    return { ...f.descriptor(), id, owner: { kind: "resource", resourceId: installed.id } };
+    const current = resources.get(installed.id);
+    if (!resourceExtensionIds(current).has(id)) throw new Error("The installed extension is unavailable.");
+    return { ...f.descriptor(), id, owner: { kind: "resource", resourceId: current.id,
+      discoveredRevision: current.discoveredRevision, resourceVersion: current.versionNumber } };
   } } });
   resources.setExtensionTaskPackageChange((transaction, resource) => tasks.reconcilePackageTasks(transaction, [resource]));
   const owner = { ...f.owner, extensionId, resourceId: installed.id, installation: tasks.installation(extensionId, installed.id) };
