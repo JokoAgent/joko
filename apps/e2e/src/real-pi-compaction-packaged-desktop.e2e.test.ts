@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { create } from "@bufbuild/protobuf";
 import {
   CompactionState,
+  MessageRole,
   OperationState,
   RunState,
   SessionState,
@@ -235,6 +236,7 @@ describe("packaged Desktop Pi compaction", () => {
       const runId = queueRunIdFrom(queued);
       await waitFor(() => manager.clients.run.getRun({ runId }),
         (response) => response.run?.state === RunState.SUCCEEDED, `packaged Pi turn: ${text}`, 30_000);
+      return runId;
     };
     const timelineStates = async (sessionId: string) => {
       const response = await manager.clients.event.getSnapshot({ scope: create(SnapshotScopeSchema, {
@@ -268,12 +270,15 @@ describe("packaged Desktop Pi compaction", () => {
     const confirmCompact = async (sessionId = compactSessionId) => {
       const pane = page.locator(`.session-pane[data-input-session-id='${sessionId}']`);
       const witness = await page.evaluateHandle(() => {
-        const events: Array<{ type: string; sessionId?: string; generation?: string; target?: string; button?: string | null }> = [];
+        const events: Array<{ type: string; sessionId?: string; generation?: string; target?: string; className?: string | null; button?: string | null; pressTargetStillMounted?: boolean }> = [];
+        let pressTarget: Element | undefined;
         const capture = (event: Event) => {
           if (events.length >= 12) return;
           const target = event.target instanceof Element ? event.target : undefined;
+          if (event.type === "pointerdown") pressTarget = target;
           const owner = target?.closest<HTMLElement>(".session-pane");
-          events.push({ type: event.type, target: target?.tagName, button: target?.closest("button")?.getAttribute("aria-label"),
+          events.push({ type: event.type, target: target?.tagName, className: target?.getAttribute("class"),
+            button: target?.closest("button")?.getAttribute("aria-label"), pressTargetStillMounted: pressTarget?.isConnected,
             sessionId: owner?.dataset.inputSessionId, generation: owner?.dataset.inputSessionGeneration });
         };
         const types = ["pointerdown", "pointerup", "click"];
@@ -327,8 +332,14 @@ describe("packaged Desktop Pi compaction", () => {
     await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
 
     await send(failingSessionId, "First Desktop turn for a genuine Provider failure.");
-    await send(failingSessionId, "Second Desktop turn for a genuine Provider failure.");
+    const lastFailingTurn = await send(failingSessionId, "Second Desktop turn for a genuine Provider failure.");
+    const history = await manager.clients.session.listSessionTimeline({ sessionId: failingSessionId, limit: 40 });
+    const lastReply = history.events.find((event) => event.identity?.runId === lastFailingTurn
+      && event.payload?.kind.case === "messageCompleted" && event.payload.kind.value.role === MessageRole.ASSISTANT);
+    if (lastReply?.payload?.kind.case !== "messageCompleted") throw new Error("The final Pi reply was not recorded.");
     await route(failingSessionId);
+    await page.locator(`.session-pane .message-assistant[data-selection-quote-source-event-id=${JSON.stringify(lastReply.eventId)}]`)
+      .waitFor({ state: "visible", timeout: 30_000 });
     failSummary = true;
     await confirmCompact(failingSessionId);
     const failure = page.locator(".compact-action-feedback--failure");
