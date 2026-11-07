@@ -37,6 +37,7 @@ it("runs the shipped example with the actual SDK and card service, including the
   const sandbox: Record<string, unknown> = { AbortController, __jokoExtensionRequest: async (payload: unknown) => {
     const result = await cards.handleCardUpdate("extension", "install", payload, () => undefined); return { ok: result.accepted };
   } };
+  sandbox["__jokoExtensionToolAccepted"] = vi.fn(async () => true);
   sandbox["window"] = sandbox;
   runInNewContext(`(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})({});`, sandbox);
   runInNewContext(await readFile(new URL("./system-skills/joko-plugin-creator/examples/status/ui/runtime.js", import.meta.url), "utf8"), sandbox);

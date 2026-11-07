@@ -92,6 +92,7 @@ import type {
   ConnectionRecord,
   DeviceControlRelationRecord,
   DeviceRecord,
+  ExtensionUsageSubject,
   InteractionRecord,
   MobilePushRegistrationRecord,
   OperationExecution,
@@ -4605,10 +4606,14 @@ export function createConnectServices(application: OrchestratorApplication, proj
         }
         throw new ConnectError("Extension not found.", Code.NotFound);
       }
+      const subject = extensionUsageSubject(dependencies, entry);
+      const usage = subject ? dependencies.store.readExtensionUsage(subject) : undefined;
       return {
         extension: mapExtensionCatalogEntry(entry),
         catalogRevision: toProtoRevision(snapshot.revision),
-        recoveredFromCorruption: snapshot.recoveredFromCorruption
+        recoveredFromCorruption: snapshot.recoveredFromCorruption,
+        ...(usage ? { usage: { historyGeneration: usage.historyGeneration, callsLast7Days: usage.callsLast7Days,
+          ...(usage.lastUsedAt === undefined ? {} : { lastUsedAt: toProtoTimestamp(usage.lastUsedAt) }) } } : {})
       };
     },
     getExtensionSourceGitPreflight: async (_request, context) => {
@@ -11085,6 +11090,15 @@ function requireCurrentExtensionMutation(
     throw new ConnectError("Extension changed concurrently.", Code.Aborted);
   }
   return entry;
+}
+
+function extensionUsageSubject(dependencies: ConnectServiceDependencies, entry: NativeExtensionCatalogDescriptor): ExtensionUsageSubject | undefined {
+  if (!entry.installed || entry.owner.kind !== "resource" || !entry.runtime?.tools.length || !dependencies.piResources) return undefined;
+  const resource = dependencies.piResources.get(entry.owner.resourceId);
+  if (resource.scope !== "managed" || resource.kind !== "package" || !resource.packageIdentity
+    || resource.versionNumber !== entry.owner.resourceVersion || resource.discoveredRevision !== entry.owner.discoveredRevision) return undefined;
+  if (resource.targetId && dependencies.store.getTarget(resource.targetId).descriptor.remoteWorkspace) return undefined;
+  return { extensionId: entry.id, packageName: resource.packageIdentity };
 }
 
 function requireExtensionPackageExportAuthority(
@@ -22223,6 +22237,26 @@ async function dispatchMutation(
           assertCurrent(); await dependencies.extensionCatalog!.clearSetupCredential(surface.extensionId, payload.value.fieldId, expectedRevision, assertCurrent);
           reconcileExtensionCatalog(dependencies);
         });
+    }
+    case "clearExtensionUsage": {
+      const { extensionId, expectedRevision, expectedHistoryGeneration } = payload.value;
+      if (expectedRevision === undefined || expectedHistoryGeneration === undefined) {
+        throw invalidArgument("expected_revision and expected_history_generation are required");
+      }
+      const revision = fromProtoRevision(expectedRevision, "clear_extension_usage.expected_revision");
+      return presented(await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation,
+        commit: () => {
+          dependencies.connections.fence(connection);
+          const entry = requireCurrentExtensionMutation(dependencies, extensionId, revision);
+          const subject = extensionUsageSubject(dependencies, entry);
+          if (!subject) throw new ConnectError("This plugin has no local tool usage history.", Code.FailedPrecondition);
+          if (!dependencies.store.clearExtensionUsage(subject, expectedHistoryGeneration)) {
+            throw new ConnectError("Plugin usage history changed concurrently.", Code.Aborted);
+          }
+          return { accepted: true, resultCase: "acknowledgement", entityId: entry.id };
+        }
+      }));
     }
     case "setExtensionEnabled": {
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");

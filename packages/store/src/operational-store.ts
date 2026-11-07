@@ -449,6 +449,27 @@ const MESSAGE_SEARCH_RRF_K = 60;
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
 const RETAINED_CONTEXT_EVENTS_KEY = "runtime.retained_context_events";
+export const EXTENSION_USAGE_SETTINGS_PREFIX = "extension-usage.v1:";
+const EXTENSION_USAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface ExtensionUsageSubject {
+  readonly extensionId: string;
+  readonly packageName: string;
+}
+
+interface ExtensionUsageHistory {
+  readonly generation: number;
+  readonly lastUsedAt?: number;
+}
+
+function extensionUsageScope(subject: ExtensionUsageSubject): string {
+  const digest = createHash("sha256").update(JSON.stringify([subject.extensionId, subject.packageName])).digest("hex");
+  return EXTENSION_USAGE_SETTINGS_PREFIX + digest;
+}
+
+function extensionUsageCallKey(timestamp: number): string {
+  return "call:" + String(Math.max(0, Math.trunc(timestamp))).padStart(16, "0");
+}
 
 type SqlFilter = {
   readonly where: string;
@@ -18003,6 +18024,64 @@ export class OperationalStore {
     return this.write(() => this.database.prepare(`
       DELETE FROM settings WHERE scope_type = ? AND scope_id = ? AND key = ?
     `).run(scopeType, scopeId, key.trim()).changes === 1);
+  }
+
+  private readExtensionUsageHistory(scope: string): ExtensionUsageHistory {
+    const history = this.findSetting<ExtensionUsageHistory>("service", scope, "history");
+    if (!history) return { generation: 0 };
+    const value = history.value;
+    if (!value || !Number.isSafeInteger(value.generation) || value.generation < 0
+      || (value.lastUsedAt !== undefined && (!Number.isSafeInteger(value.lastUsedAt) || value.lastUsedAt < 0))) {
+      throw new StoreError("Plugin usage history is invalid.");
+    }
+    return value;
+  }
+
+  getExtensionUsageGeneration(subject: ExtensionUsageSubject): bigint {
+    return BigInt(this.readExtensionUsageHistory(extensionUsageScope(subject)).generation);
+  }
+
+  readExtensionUsage(subject: ExtensionUsageSubject): { historyGeneration: bigint; callsLast7Days: bigint; lastUsedAt?: number } {
+    return this.readConsistent(() => {
+      const scope = extensionUsageScope(subject);
+      const history = this.readExtensionUsageHistory(scope);
+      const row = this.database.prepare(`
+        SELECT coalesce(sum(CAST(value_json AS INTEGER)), 0) AS calls FROM settings
+        WHERE scope_type = 'service' AND scope_id = ? AND key >= ? AND key < 'call;'
+      `).get(scope, extensionUsageCallKey(this.now() - EXTENSION_USAGE_WINDOW_MS)) as { calls: number };
+      return { historyGeneration: BigInt(history.generation), callsLast7Days: BigInt(row.calls),
+        ...(history.lastUsedAt === undefined ? {} : { lastUsedAt: history.lastUsedAt }) };
+    });
+  }
+
+  recordExtensionUsage(subject: ExtensionUsageSubject, expectedGeneration: bigint): void {
+    this.write(() => {
+      const scope = extensionUsageScope(subject);
+      const history = this.readExtensionUsageHistory(scope);
+      if (BigInt(history.generation) !== expectedGeneration) return;
+      const now = Math.trunc(this.now());
+      const key = extensionUsageCallKey(now);
+      const calls = this.findSetting<number>("service", scope, key)?.value ?? 0;
+      this.setSetting("service", scope, key, calls + 1, now);
+      this.setSetting("service", scope, "history", { generation: history.generation, lastUsedAt: Math.max(now, history.lastUsedAt ?? 0) }, now);
+      this.database.prepare(`
+        DELETE FROM settings WHERE scope_type = 'service' AND scope_id = ? AND key >= 'call:' AND key < ?
+      `).run(scope, extensionUsageCallKey(now - EXTENSION_USAGE_WINDOW_MS));
+    });
+  }
+
+  clearExtensionUsage(subject: ExtensionUsageSubject, expectedGeneration: bigint): boolean {
+    return this.write(() => {
+      const scope = extensionUsageScope(subject);
+      const history = this.readExtensionUsageHistory(scope);
+      if (BigInt(history.generation) !== expectedGeneration) return false;
+      if (history.generation >= Number.MAX_SAFE_INTEGER) throw new StoreError("Plugin usage history generation is exhausted.");
+      this.database.prepare(`
+        DELETE FROM settings WHERE scope_type = 'service' AND scope_id = ? AND key >= 'call:' AND key < 'call;'
+      `).run(scope);
+      this.setSetting("service", scope, "history", { generation: history.generation + 1 });
+      return true;
+    });
   }
 
   appendDiagnostic(input: {

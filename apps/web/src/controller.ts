@@ -4051,6 +4051,7 @@ export function useAppController(): AppController {
     getExtensionProjectState: async (projectId, signal) => catalogGateway().getExtensionProjectState(projectId, signal),
     listExtensionProjectDirectories: async (path, signal) => catalogGateway().listProjectDirectories(path, signal),
     setExtensionEnabled: async (extensionId, enabled, expectedRevision, project) => catalogGateway().setExtensionEnabled(extensionId, enabled, expectedRevision, project),
+    clearExtensionUsage: async (extensionId, expectedRevision, expectedHistoryGeneration) => catalogGateway().clearExtensionUsage(extensionId, expectedRevision, expectedHistoryGeneration),
     setExtensionSidebarVisible: async (extensionId, visible, expectedRevision) => catalogGateway().setExtensionSidebarVisible(extensionId, visible, expectedRevision),
     beginExtensionSetup: async (extensionId, expectedRevision) => catalogGateway().beginExtensionSetup(extensionId, expectedRevision),
     submitExtensionSetupInteraction: async (extensionId, attemptId, fieldId, value, expectedRevision) =>

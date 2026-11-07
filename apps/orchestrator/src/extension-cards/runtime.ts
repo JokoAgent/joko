@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
-import type { OperationalStore } from "@joko/store";
+import type { ExtensionUsageSubject, OperationalStore } from "@joko/store";
 import type { ExtensionCatalogManager } from "../extension-catalog.js";
 import type { PiResourceManager } from "../resource-manager.js";
 import type { ExtensionMainViewAuthority, ExtensionMainViewManager, ExtensionMainViewSurface } from "../extension-main-view-manager.js";
@@ -34,7 +34,7 @@ interface Instance {
   unregister: () => void; current: boolean; context?: BrowserContext; page?: Page; surface?: ExtensionMainViewSurface;
   opening?: Promise<Page>; readonly tickets: Map<string, { scope: ExtensionCardScope; assertCurrent: () => void }>;
   readonly calls: Set<string>; pending: number;
-  readonly callGuards: Map<string, { signal: AbortSignal; assertCurrent: () => void }>;
+  readonly callGuards: Map<string, { signal: AbortSignal; assertCurrent: () => void; usage?: { nonce: string; record: () => void } }>;
 }
 interface Options {
   readonly catalog: Pick<ExtensionCatalogManager, "get" | "snapshot" | "onAuthorityChanged">;
@@ -253,6 +253,16 @@ export class ExtensionCardRuntime {
       catch { return { ok: false }; }
       finally { instance.pending -= 1; }
     });
+    await page.exposeBinding("__jokoExtensionToolAccepted", ({ frame }, callId: unknown, nonce: unknown) => {
+      if (frame !== page.mainFrame() || typeof callId !== "string" || !instance.calls.has(callId)) return false;
+      const guard = instance.callGuards.get(callId);
+      const usage = guard?.usage;
+      if (!guard || !usage || usage.nonce !== nonce) return false;
+      delete guard.usage;
+      guard.assertCurrent();
+      try { usage.record(); } catch { /* Usage storage does not own the dispatch outcome. */ }
+      return true;
+    });
     await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true })})` });
     if (instance.authority.runtime.mail) await page.addInitScript({ content: `${MAIL_COMPOSE_RUNTIME_SOURCE}\nObject.defineProperty(window, "jokoMail", { value: jokoMail, writable: false, configurable: false });` });
     await page.goto(url.href, { waitUntil: "load", timeout: 15_000 }); this.#assert(instance);
@@ -393,13 +403,14 @@ export class ExtensionCardRuntime {
       return { content: [{ type: "text", text: "Connect the plugin account using the host authorization card to continue this task." }], isError: false,
         structuredContent: { setup_required: true, joko_card_id: callId } };
     }
+    const usage = this.#captureUsage(instance, context);
     const page = await this.#ensure(instance); assertCurrent();
     const callId = this.options.cards.registerCall(instance.authority.surface.extensionId, instance.authority.key, context.sessionId, null);
     const callAbort = new AbortController();
     const callSignal = AbortSignal.any([callAbort.signal, instance.abort.signal, ...(signal ? [signal] : [])]);
     const assertCallCurrent = () => { callSignal.throwIfAborted(); assertCurrent(); };
     for (const id of instance.callGuards.keys()) if (!this.options.cards.cards.callInfoOf(id)) instance.callGuards.delete(id);
-    instance.callGuards.set(callId, { signal: callSignal, assertCurrent: assertCallCurrent });
+    instance.callGuards.set(callId, { signal: callSignal, assertCurrent: assertCallCurrent, ...(usage ? { usage } : {}) });
     instance.calls.add(callId);
     let rejectAbort: (reason?: unknown) => void = () => {};
     const cancelled = new Promise<never>((_, reject) => { rejectAbort = reject; });
@@ -422,6 +433,7 @@ export class ExtensionCardRuntime {
       const value: unknown = await Promise.race([page.evaluate(async input => {
         return (window as unknown as { __jokoRuntime: { tool(value: unknown): Promise<unknown> } }).__jokoRuntime.tool(input);
       }, { name, arguments: preparedArgs, callId, sessionId: context.sessionId,
+        ...(usage ? { usageNonce: usage.nonce } : {}),
         readOnly: this.options.store.findSessionRuntimePolicy(context.sessionId)?.policy === "review_read_only" }), cancelled]);
       assertCurrent(); validateExtensionEnvelope(value);
       if (!value || typeof value !== "object" || Array.isArray(value) || typeof (value as { ok?: unknown }).ok !== "boolean") throw new Error("Extension tool returned an invalid result.");
@@ -431,7 +443,23 @@ export class ExtensionCardRuntime {
         ...(result.result && typeof result.result === "object" && !Array.isArray(result.result) ? { structuredContent: JSON.parse(this.options.redact(JSON.stringify(result.result))) as Record<string, unknown> } : {}) };
     } finally {
       clearTimeout(timer); signal?.removeEventListener("abort", cancel); instance.abort.signal.removeEventListener("abort", cancel);
+      const guard = instance.callGuards.get(callId);
+      if (guard) delete guard.usage;
       instance.calls.delete(callId); if (!finalized) await this.options.cards.finalizeCall(callId);
+    }
+  }
+  #captureUsage(instance: Instance, context: BridgeToolCallContext): { nonce: string; record: () => void } | undefined {
+    const { store } = this.options;
+    const { extensionId, packageName } = instance.authority.surface;
+    const subject: ExtensionUsageSubject = { extensionId, packageName };
+    try {
+      if (store.getSession(context.sessionId).descriptor.remoteWorkspace || store.getTarget(context.targetId).descriptor.remoteWorkspace
+        || store.findSessionRuntimePolicy(context.sessionId)?.policy === "review_read_only") return undefined;
+      const generation = store.getExtensionUsageGeneration(subject);
+      return { nonce: randomUUID(), record: () => store.recordExtensionUsage(subject, generation) };
+    } catch {
+      // The admitted tool retains its existing behavior if usage storage is unavailable.
+      return undefined;
     }
   }
   async dispatch(scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void): Promise<void> {

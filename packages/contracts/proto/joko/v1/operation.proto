@@ -210,6 +210,7 @@ message OperationMutation {
     UpdateSubagentModelSettingsMutation update_subagent_model_settings = 180;
     SetExtensionEnabledMutation set_extension_enabled = 181;
     SetExtensionSidebarVisibleMutation set_extension_sidebar_visible = 182;
+    ClearExtensionUsageMutation clear_extension_usage = 231;
     BeginExtensionSetupMutation begin_extension_setup = 183;
     SubmitExtensionSetupInteractionMutation submit_extension_setup_interaction = 184;
     CommitExtensionSetupCredentialMutation commit_extension_setup_credential = 185;
@@ -372,6 +373,12 @@ message SetExtensionEnabledMutation {
   bool enabled = 2;
   Revision expected_revision = 3;
   ExtensionProjectPolicyMutation project = 4;
+}
+
+message ClearExtensionUsageMutation {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  optional uint64 expected_history_generation = 3;
 }
 
 message AddExtensionSourceMutation {
