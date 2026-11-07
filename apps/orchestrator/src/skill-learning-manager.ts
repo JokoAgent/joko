@@ -2,10 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
-import { redactSecrets, type SessionDescriptor } from "@joko/core";
+import { redactSecrets, type FileInput, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type ConnectionRecord, type OperationalStore } from "@joko/store";
 
 import type { PiLearnedSkillPreview, PiMarketSkillDiffChange, PiResourceManager } from "./resource-manager.js";
+import type { ArtifactStore } from "./artifact-store.js";
 import type { SessionHost } from "./session-host.js";
 import {
   SkillMutationCoordinator,
@@ -99,6 +100,7 @@ export interface SkillLearningManagerOptions {
   readonly store: OperationalStore;
   readonly sessions: SessionHost;
   readonly resources: PiResourceManager;
+  readonly artifacts: Pick<ArtifactStore, "ingestBytes">;
   readonly mutations: SkillMutationCoordinator;
   readonly market?: SkillMarketManager;
   readonly rootDirectory: string;
@@ -111,6 +113,8 @@ const RUN_ID = /^skill_learning_[a-f0-9]{32}$/u;
 const REVISION = /^sha256:[a-f0-9]{64}$/u;
 const MAX_INSTRUCTION = 4_000;
 const MAX_EVIDENCE = 24_000;
+const MAX_MARKET_REFERENCE_BYTES = 512 * 1024;
+const MAX_MARKET_REFERENCES = 40;
 const MAX_OUTPUT = 768 * 1024;
 const MAX_FILES = 64;
 const MAX_FILE_BYTES = 256 * 1024;
@@ -131,6 +135,7 @@ export class SkillLearningManager {
   readonly #store: OperationalStore;
   readonly #sessions: SessionHost;
   readonly #resources: PiResourceManager;
+  readonly #artifacts: Pick<ArtifactStore, "ingestBytes">;
   readonly #mutations: SkillMutationCoordinator;
   readonly #market?: SkillMarketManager;
   readonly #root: string;
@@ -145,6 +150,7 @@ export class SkillLearningManager {
     this.#store = options.store;
     this.#sessions = options.sessions;
     this.#resources = options.resources;
+    this.#artifacts = options.artifacts;
     this.#mutations = options.mutations;
     this.#market = options.market;
     this.#root = options.rootDirectory;
@@ -237,19 +243,23 @@ export class SkillLearningManager {
         const inherited = source === undefined ? undefined : this.#sourceRoute(source.id, target.descriptor.backendId);
         const routeDigest = inherited === undefined ? undefined : operationBodyHash(inherited);
         const routeGeneration = inherited === undefined ? undefined : this.#store.getBackend(target.descriptor.backendId).descriptor.instanceGeneration;
-        const assertSource = source === undefined ? undefined : () => {
+        const assertSource = () => {
           this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+          if (this.#store.getTarget(input.targetId).revision !== target.revision) throw new Error("The Skill learning Target changed.");
+          if (input.marketIdentity !== undefined) this.#market?.getEntry(input.marketIdentity);
+          if (source === undefined) return;
           const current = this.#store.getSession(source.id).descriptor;
           if (current.deletedAt !== undefined || current.targetId !== input.targetId || current.backendId !== source.backendId
             || current.binding.generation !== source.binding.generation || current.binding.opaqueRef !== source.binding.opaqueRef
-            || this.#store.getTarget(input.targetId).revision !== target.revision
             || routeDigest !== undefined && (this.#store.getBackend(target.descriptor.backendId).descriptor.instanceGeneration !== routeGeneration
               || operationBodyHash(this.#sourceRoute(source.id, target.descriptor.backendId) ?? null) !== routeDigest)) {
             throw new Error("The original Skill learning source or route changed.");
           }
         };
-        const evidence = await this.#collectEvidence(input, sourceKind, instruction, source);
-        assertSource?.();
+        const canAttach = sourceKind === "market" && target.descriptor.trusted && target.descriptor.remoteWorkspace === undefined &&
+          this.#store.getBackend(target.descriptor.backendId).descriptor.capabilities.get("input.file")?.supported === true;
+        const evidence = await this.#collectEvidence(input, sourceKind, instruction, source, canAttach, assertSource);
+        assertSource();
         const createdSession = await this.#sessions.createServiceSession({
           operationId: `${id}_session`,
           serviceKind: "learning",
@@ -260,25 +270,26 @@ export class SkillLearningManager {
           permissionMode: "ask",
           planMode: false,
           appendSystemPrompt: DISTILLATION_INSTRUCTION,
-          ...(assertSource === undefined ? {} : { assertServiceScope: assertSource })
+          assertServiceScope: assertSource
         });
         const withSession = this.#save(created, {
           state: "distilling",
           distillationSessionId: createdSession.value.sessionId
         });
-        assertSource?.();
+        assertSource();
         const queued = this.#sessions.enqueueServiceInput({
           operationId: `${id}_input`,
           sessionId: createdSession.value.sessionId,
           source: "system",
-          prompt: { text: learningPrompt(instruction, evidence), images: [], files: [], mentions: [], disposition: "prompt" }
+          prompt: { text: learningPrompt(instruction, evidence.text), images: [], files: evidence.files, mentions: [], disposition: "prompt" }
         });
         return this.#public(this.#save(withSession, { modelRunId: queued.value.runId }));
-      } catch {
+      } catch (error) {
         const current = this.#read(id)!;
         return this.#public(this.#save(current, {
           state: "failed",
-          error: "Learning could not start. Check the Target and Backend, then start a new run."
+          error: error instanceof MarketLearningEvidenceError ? error.message
+            : "Learning could not start. Check the Target and Backend, then start a new run."
         }));
       }
     });
@@ -455,8 +466,11 @@ export class SkillLearningManager {
     };
   }
 
-  async #collectEvidence(input: StartSkillLearningInput, sourceKind: SkillLearningSourceKind, instruction: string, source?: SessionDescriptor): Promise<string> {
-    if (sourceKind === "text") return instruction;
+  async #collectEvidence(
+    input: StartSkillLearningInput, sourceKind: SkillLearningSourceKind, instruction: string,
+    source: SessionDescriptor | undefined, canAttach: boolean, assertSource: () => void
+  ): Promise<{ readonly text: string; readonly files: readonly FileInput[] }> {
+    if (sourceKind === "text") return { text: instruction, files: [] };
     if (sourceKind === "session") {
       if (source === undefined || source.deletedAt !== undefined || source.targetId !== input.targetId) {
         throw new Error("The source task is unavailable on the selected Target.");
@@ -473,7 +487,7 @@ export class SkillLearningManager {
           const text = event.payload.blocks.filter((block) => block.kind === "text").map((block) => block.text).join("\n");
           return `${event.payload.role}: ${safeEvidence(text, 2_000)}`;
         });
-      return safeEvidence(excerpts.join("\n\n"), MAX_EVIDENCE);
+      return { text: safeEvidence(excerpts.join("\n\n"), MAX_EVIDENCE), files: [] };
     }
     const entry = this.#market?.getEntry(input.marketIdentity!);
     if (entry === undefined) throw new Error("Skill catalog evidence is unavailable.");
@@ -481,30 +495,66 @@ export class SkillLearningManager {
     const lease = await this.#market!.acquireEntry(identity);
     const temporary = join(this.#root, `market-${randomUUID().replaceAll("-", "")}`);
     try {
+      assertSource();
+      const mainEntry = lease.archiveEntries.find(file => file.kind === "file" && file.key === "SKILL.md");
+      if (mainEntry === undefined || mainEntry.size > MAX_MARKET_REFERENCE_BYTES) {
+        throw new MarketLearningEvidenceError("The catalog Skill requires a complete SKILL.md of at most 512 KiB.");
+      }
       const inspection = await lease.extractTo(temporary);
-      const main = await readFile(join(inspection.canonicalPath, "SKILL.md"), "utf8");
-      const references: string[] = [];
+      const mainBytes = await readFile(join(inspection.canonicalPath, "SKILL.md"));
+      const main = mainBytes.byteLength === mainEntry.size ? marketReferenceText(mainBytes) : undefined;
+      if (main === undefined) throw new MarketLearningEvidenceError("The catalog SKILL.md could not be read as complete UTF-8 text.");
+      const files: FileInput[] = [];
+      const attachments: string[] = [];
+      const inline: string[] = [];
+      const omissions: string[] = [];
+      let considered = 0;
+      let omitted = 0;
+      let inlineBytes = 0;
+      const omit = (key: string, reason: string) => {
+        omitted += 1;
+        if (omissions.length < MAX_MARKET_REFERENCES) omissions.push(`${JSON.stringify(key)} (${reason})`);
+      };
       for (const file of lease.archiveEntries) {
-        if (file.kind !== "file" || file.key === "SKILL.md" || file.size > MAX_EVIDENCE) continue;
-        const raw = await readFile(join(inspection.canonicalPath, ...file.key.split("/")));
-        if (raw.byteLength > MAX_EVIDENCE) continue;
-        let content: string;
-        try {
-          content = new TextDecoder("utf-8", { fatal: true }).decode(raw);
-        } catch {
+        if (file.kind !== "file" || file.key === "SKILL.md") continue;
+        const key = redactSecrets(file.key).slice(0, 240);
+        if (++considered > MAX_MARKET_REFERENCES || file.size > MAX_MARKET_REFERENCE_BYTES) {
+          omit(key, "outside the reference file limits");
           continue;
         }
-        if (/[\u0000-\u0008\u000e-\u001f]/u.test(content)) continue;
-        references.push(`<file path="${file.key}">\n${safeEvidence(content, MAX_EVIDENCE)}\n</file>`);
+        const raw = await readFile(join(inspection.canonicalPath, ...file.key.split("/"))).catch(() => undefined);
+        const content = raw !== undefined && raw.byteLength === file.size ? marketReferenceText(raw) : undefined;
+        if (content === undefined) {
+          omit(key, "complete UTF-8 text is unavailable");
+          continue;
+        }
+        if (canAttach) {
+          assertSource();
+          const { id, sha256, byteLength, mimeType, fileName } = await this.#artifacts.ingestBytes(Buffer.from(content, "utf8"), {
+            fileName: `skill-reference-${files.length + 1}.txt`, mimeType: "text/plain", expiresAt: this.#now() + REVIEW_TTL_MS
+          });
+          files.push({ blob: { id, sha256, byteLength, mimeType, ...(fileName === undefined ? {} : { fileName }) } });
+          attachments.push(`${files.length}. ${JSON.stringify(key)}`);
+        } else {
+          const block = `<file path=${JSON.stringify(key)}>\n${content}\n</file>`;
+          const bytes = Buffer.byteLength(block, "utf8");
+          if (inlineBytes + bytes <= MAX_EVIDENCE) {
+            inlineBytes += bytes;
+            inline.push(block);
+          } else omit(key, "outside the inline reference budget for this Target");
+        }
       }
       await lease.assertCurrent();
-      return safeEvidence([
+      const metadata = safeEvidence([
         `Catalog Skill: ${entry.name} (${entry.slug})`,
         `Description: ${entry.description}`,
-        `Tags: ${entry.tags.join(", ")}`,
-        main,
-        ...references
-      ].join("\n\n"), MAX_EVIDENCE);
+        `Tags: ${entry.tags.join(", ")}`
+      ].join("\n"), MAX_INSTRUCTION);
+      const text = [metadata, `<catalog_skill>\n${main}\n</catalog_skill>`, ...inline,
+        ...(attachments.length === 0 ? [] : [`Catalog reference attachments in input order\n${attachments.join("\n")}`]),
+        ...(omitted === 0 ? [] : [`Omitted catalog reference files\n${omissions.join("\n")}${omitted > omissions.length ? `\n${omitted - omissions.length} more omitted.` : ""}`])
+      ].join("\n\n");
+      return { text, files };
     } finally {
       lease.release();
       await rm(temporary, { recursive: true, force: true });
@@ -835,6 +885,16 @@ function learningPrompt(instruction: string, evidence: string): string {
 
 function safeEvidence(value: string, maximum: number): string {
   return redactPrivateText(value).slice(0, maximum).trim();
+}
+
+class MarketLearningEvidenceError extends Error {}
+
+function marketReferenceText(bytes: Uint8Array): string | undefined {
+  if (bytes.byteLength > MAX_MARKET_REFERENCE_BYTES) return undefined;
+  let content: string;
+  try { content = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return undefined; }
+  return /[\u0000-\u0008\u000e-\u001f]/u.test(content) ? undefined : redactPrivateText(content);
 }
 
 function redactPrivateText(value: string): string {
