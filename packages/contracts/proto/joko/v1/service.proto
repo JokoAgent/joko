@@ -495,6 +495,7 @@ service ExtensionService {
   rpc OpenExtensionMainView(OpenExtensionMainViewRequest) returns (OpenExtensionMainViewResponse);
   rpc OpenExtensionSettings(OpenExtensionSettingsRequest) returns (OpenExtensionSettingsResponse);
   rpc GetExtensionSettingsRoutingData(GetExtensionSettingsRoutingDataRequest) returns (GetExtensionSettingsRoutingDataResponse);
+  rpc ListExtensionSettingsAgentModels(ListExtensionSettingsAgentModelsRequest) returns (ListExtensionSettingsAgentModelsResponse);
   rpc BeginExtensionSecretCheck(BeginExtensionSecretCheckRequest) returns (BeginExtensionSecretCheckResponse);
   rpc CheckExtensionSecret(CheckExtensionSecretRequest) returns (CheckExtensionSecretResponse);
   rpc OpenExtensionDirectoryPicker(OpenExtensionDirectoryPickerRequest) returns (OpenExtensionDirectoryPickerResponse);
@@ -2683,6 +2684,24 @@ message GetExtensionSettingsRoutingDataRequest {
 }
 message GetExtensionSettingsRoutingDataResponse {
   ExtensionSettingsRoutingData routing_data = 1;
+}
+message ListExtensionSettingsAgentModelsRequest {
+  string surface_id = 1;
+}
+message ListExtensionSettingsAgentModelsResponse {
+  repeated ExtensionSettingsAgentModel models = 1;
+}
+message ExtensionSettingsAgentModel {
+  // Internal route identity for the requesting client's model visibility preference.
+  string backend_id = 1;
+  string id = 2;
+  string name = 3;
+  string agent = 4;
+  string provider_id = 5;
+  string provider_name = 6;
+  repeated string efforts = 7;
+  optional string default_effort = 8;
+  bool default_visible = 9;
 }
 message BeginExtensionSecretCheckRequest {
   string surface_id = 1;
