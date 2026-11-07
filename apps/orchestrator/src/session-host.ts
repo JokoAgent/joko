@@ -385,6 +385,11 @@ interface ReviewWorktreeReference {
   readonly authority: string;
 }
 
+interface ExtensionTargetSteerFallback {
+  readonly requeue: (item: QueueItemRecord, error: PublicError) => boolean;
+  readonly assertCurrent: (item: QueueItemRecord) => void;
+}
+
 interface DispatchPreparation {
   readonly settled: Promise<void>;
   readonly resolve: () => void;
@@ -943,6 +948,7 @@ export class SessionHost {
   #messagingQueueGuard: ((item: QueueItemRecord) => void) | undefined;
   #messagingToolReview: ((item: QueueItemRecord, request: import('@joko/core').NativeToolAuthorizationRequest) => import('@joko/core').NativeToolAuthorizationDecision) | undefined;
   #extensionTaskQueueGuard?: (item: QueueItemRecord) => void;
+  #extensionTargetSteerFallback?: ExtensionTargetSteerFallback;
   #extensionNativeToolAuthorization?: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined;
   readonly #resolveMcpAppModelContext: ((sessionId: string) => Promise<McpAppModelContext>) | undefined;
   readonly #pendingDispatchAcceptances = new Map<string, PendingDispatchAcceptance>();
@@ -14292,6 +14298,7 @@ export class SessionHost {
                 stored.descriptor.binding.generation,
                 partnerPolicy
               );
+              this.#extensionTargetSteerFallback?.assertCurrent(item);
               this.assertQueueProviderAuthentication(item, stored);
               return this.persistNativeDispatchRecoveryBaseline(
                 item,
@@ -14434,6 +14441,14 @@ export class SessionHost {
           const uncertain = failure.stateMayHaveChanged;
           this.#providerGroups?.service.turnSettled(sessionId, false);
           this.#providerGroups?.reporter.leasesChanged();
+          if (dispatchPreparation.phase === "sending" && item.disposition === "steer"
+            && error instanceof JokoError && failure.code === "PI_STEER_REQUIRES_ACTIVE_RUN" && !uncertain
+            && this.#extensionTargetSteerFallback !== undefined
+            && this.#store.transaction(store => {
+              if (!this.#extensionTargetSteerFallback?.requeue(item, failure)) return false;
+              removeNativeDispatchRecoveryEntry(store, sessionId, run.descriptor.id);
+              return true;
+            })) continue;
           const groupRecovery = !uncertain && this.#providerGroupMayHandleRun(sessionId, run.descriptor.id, failure);
           if (uncertain) {
             const active = this.#active.get(sessionId);
@@ -15404,7 +15419,11 @@ export class SessionHost {
     });
   }
 
-  setExtensionTaskQueueGuard(guard: (item: QueueItemRecord) => void): void { this.#extensionTaskQueueGuard = guard; }
+  setExtensionTaskQueueGuard(guard: (item: QueueItemRecord) => void,
+    steerFallback?: ExtensionTargetSteerFallback): void {
+    this.#extensionTaskQueueGuard = guard;
+    this.#extensionTargetSteerFallback = steerFallback;
+  }
   setExtensionNativeToolAuthorization(factory: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined): void { this.#extensionNativeToolAuthorization = factory; }
   setPartnerHomeInputGuard(guard: (sessionId: string) => void): void { this.#partnerHomeInputGuard = guard; }
   setMessagingQueueGuard(guard: (item: QueueItemRecord) => void,

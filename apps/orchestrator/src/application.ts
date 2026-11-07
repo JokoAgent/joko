@@ -2589,7 +2589,10 @@ export async function createOrchestratorApplication(
       adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter ? [adapter] : []; }) }) });
   const extensionTargets = new ExtensionTargets({ store, host: sessionHost, tasks: extensionTasks, catalog: extensionCatalog, projects: extensionProjects,
     partners, artifacts, redact: value => credentials.redactText(value) });
-  sessionHost.setExtensionTaskQueueGuard(item => { if (!extensionTargets.assertQueueCurrent(item)) extensionTasks.assertQueueCurrent(item); });
+  sessionHost.setExtensionTaskQueueGuard(item => { if (!extensionTargets.assertQueueCurrent(item)) extensionTasks.assertQueueCurrent(item); }, {
+    requeue: (item, error) => extensionTargets.requeueInactiveSteer(item, error),
+    assertCurrent: item => extensionTargets.assertSteerFallbackCurrent(item)
+  });
   sessionHost.setExtensionNativeToolAuthorization(sessionId => partnerNetwork?.nativeToolAuthorization(sessionId) ?? extensionTasks.nativeToolAuthorization(sessionId));
   mcpRouter.setNativeToolAdmission((...args) => sessionHost.authorizeNativeBridgeTool(...args));
   piResources.setExtensionTaskRemoval((transaction, resourceId) => extensionTasks.uninstall(transaction, resourceId));
