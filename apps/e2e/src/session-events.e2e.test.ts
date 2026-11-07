@@ -598,8 +598,16 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(adapter.interactionDecisions).toEqual(["allow_once"]);
 
     await submit(paired.clients.operation, paired.connectionId, archiveMutation(sessionId, true));
-    expect((await paired.clients.session.getSession({ sessionId })).session?.archived).toBe(true);
-    await submit(paired.clients.operation, paired.connectionId, archiveMutation(sessionId, false));
+    const archived = (await paired.clients.session.getSession({ sessionId })).session;
+    expect(archived?.archived).toBe(true);
+    expect(archived?.lastActivityAt).toBeDefined();
+    const archivedActivity = fixture.application.store.getSession(sessionId).descriptor.updatedAt;
+    await waitFor(async () => Date.now(), (now) => now > archivedActivity, "a later activity timestamp");
+    const restore = await submit(paired.clients.operation, paired.connectionId, archiveMutation(sessionId, false));
+    expect(restore.state).toBe(OperationState.COMPLETED);
+    const restored = (await paired.clients.session.getSession({ sessionId })).session;
+    expect(restored?.archived).toBe(false);
+    expect(restored?.lastActivityAt).toEqual(archived?.lastActivityAt);
   });
 
   it("disconnecting the event client never aborts an owned Run", async () => {

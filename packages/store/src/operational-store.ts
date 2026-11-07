@@ -8543,6 +8543,8 @@ export class OperationalStore {
       "providerId" | "modelId" | "effort" | "fastMode" | "binding">>, "effort"> & {
         /** `null` explicitly clears a stale effort when the selected model exposes none. */
         readonly effort?: string | null;
+        /** An explicit restore changes visibility without recording new task activity. */
+        readonly preserveActivityOnRestore?: true;
       },
     expectedRevision?: bigint,
     now = this.now(),
@@ -8601,7 +8603,7 @@ export class OperationalStore {
           ? null
           : asSqlInteger(descriptor.summarySourceCursor),
         clearSummary ? null : descriptor.summaryUpdatedAt ?? null,
-        now,
+        patch.archived === false && patch.preserveActivityOnRestore ? descriptor.updatedAt : now,
         asSqlInteger(this.requireActiveRevision()),
         id,
         asSqlInteger(current.revision)
