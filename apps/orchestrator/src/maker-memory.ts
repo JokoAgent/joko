@@ -216,7 +216,8 @@ export class MakerMemoryController {
     return `${MEMORY_RULES}\n\n## Current index\n\n${truncateUtf8(index, 4_096)}`;
   }
 
-  /** Best-effort compaction sink. Content is never copied to Events or logs. */
+  /** Best-effort sink for a runtime that accepted digests at startup. The current
+   * Maker and workspace permissions still apply when the native result arrives. */
   writeCompactionDigest(input: {
     readonly backendId: string;
     readonly targetId: string;
@@ -224,7 +225,7 @@ export class MakerMemoryController {
     readonly summary: string;
     readonly reason: string;
   }): boolean {
-    if (!this.enabledForBackend(input.backendId) || !this.enabledForTarget(input.targetId)) return false;
+    if (!this.available || !this.enabledForTarget(input.targetId)) return false;
     const body = truncateUtf8(input.summary.trim(), 7_000);
     if (body === "") return false;
     try {
