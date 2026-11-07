@@ -1,6 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import type { ProviderModel } from "@joko/core";
 import { operationBodyHash, type OperationRecord } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
@@ -1182,10 +1183,12 @@ describe("Connect Extension catalog boundary", () => {
     } };
     let live = true;
     const getSurface = vi.fn(async () => surface), fence = vi.fn();
+    const textModel: ProviderModel = { providerId: "test", modelId: "text", displayName: "Hidden Text", api: "openai-responses",
+      contextWindow: 32_000, maxOutputTokens: 8_000, supportsImages: false, cost: {}, thinkingLevels: ["low", "high"], defaultEffort: "low", defaultVisible: false };
     const select = vi.fn(() => [
-      { providerId: "test", modelId: "text", displayName: "Hidden Text", thinkingLevels: ["low", "high"], defaultEffort: "low", defaultVisible: false },
-      { providerId: "test", modelId: "image", displayName: "Image Only", declaredOutputModalities: ["image"], thinkingLevels: [] },
-      { providerId: "group-member", modelId: "group-text", displayName: "Grouped Text", thinkingLevels: [] }
+      textModel,
+      { ...textModel, modelId: "image", displayName: "Image Only", declaredOutputModalities: ["image"] },
+      { ...textModel, providerId: "group-member", modelId: "group-text", displayName: "Grouped Text" }
     ]);
     const services = createConnectServices(stubApplication({
       store: { getBackend: () => backend, listBackends: () => [backend, { descriptor: { id: "remote", adapterKind: "hosted" } }] },
