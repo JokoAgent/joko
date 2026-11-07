@@ -6338,6 +6338,18 @@ export class SessionHost {
         && (held.kind === "active-turn" || !this.#providerGroups || held.resumeAt !== undefined && held.resumeAt > Date.now());
     });
   }
+  providerGroupContinuation(source: QueueItemRecord): { readonly claimed: boolean; readonly child?: QueueItemRecord } {
+    const { sessionId, runId } = source;
+    const continuationId = stableId("provider-group-continue", `${sessionId}:${runId}`);
+    const operation = this.#store.findOperation(continuationId);
+    if (operation?.kind !== "service_send_input" || operation.status !== "completed") return { claimed: operation !== undefined };
+    const child = this.#store.findQueueItemByRunId(sessionId, stableId("run", continuationId), { includeCleared: true });
+    if (child?.operationId !== continuationId || child.body.automaticContinuation?.sourceRunId !== runId
+      || this.#store.getRun(child.runId).descriptor.parentRunId !== runId
+      || JSON.stringify(child.body.messagingOrigin ?? null) !== JSON.stringify(source.body.messagingOrigin ?? null)) return { claimed: true };
+    return { claimed: true, child };
+  }
+
   #restoreProviderGroupRecoveries(onlySessionId?: string): void {
     if (!this.#providerGroups || this.#disposed) return;
     for (const session of this.#store.listSessions({ includeArchived: true, includeDeleted: true })) {
@@ -6346,14 +6358,10 @@ export class SessionHost {
         const runId = setting.key.slice("provider.group-error:".length), held = this.#heldProviderGroupRecovery(sessionId, runId);
         if (!held) continue;
         const run = this.#store.getRun(runId).descriptor, queue = this.#store.getQueueItem(held.queueItemId);
-        const continuationId = stableId("provider-group-continue", `${sessionId}:${runId}`), continuation = this.#store.findOperation(continuationId);
-        const child = this.#store.findQueueItemByRunId(sessionId, stableId("run", continuationId), { includeCleared: true });
-        const continued = continuation?.kind === "service_send_input" && continuation.status === "completed" && child?.operationId === continuationId
-          && child.body.automaticContinuation?.sourceRunId === runId && this.#store.getRun(child.runId).descriptor.parentRunId === runId
-          && JSON.stringify(child.body.messagingOrigin ?? null) === JSON.stringify(queue.body.messagingOrigin ?? null);
-        if (continuation || run.state === "completed" || run.state === "aborted" || !this.#providerGroupRecoverySourceCurrent(held)) {
+        const continuation = this.providerGroupContinuation(queue);
+        if (continuation.claimed || run.state === "completed" || run.state === "aborted" || !this.#providerGroupRecoverySourceCurrent(held)) {
           this.#store.deleteSetting("session", sessionId, setting.key); this.#cancelProviderGroupWait(sessionId);
-          if (!continued && run.state === "failed") this.#publishHeldProviderGroupError(sessionId, runId, held.payload.error);
+          if (continuation.child === undefined && run.state === "failed") this.#publishHeldProviderGroupError(sessionId, runId, held.payload.error);
           if (queue.body.messagingOrigin && run.state !== "completed") void this.notifyServiceRunSettled(sessionId, runId, run.state === "aborted" ? "aborted" : "failed");
           void this.drain(sessionId); continue;
         }

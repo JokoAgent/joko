@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -134,6 +135,42 @@ it("reads only the current native branch of a plugin-owned task", async () => {
   expect(after.items.map(item => item.id)).toEqual([projected[0]!.id, "product-message"]);
   expect(await read(before.items[0]!.cursor)).toEqual({ items: [after.items[1]], nextCursor: null });
   expect(f.store.listEvents({ sessionId: taskId }).some(event => event.id === projected[2]!.id)).toBe(true);
+});
+it("keeps the original plugin run ID attached to its durably admitted Provider Group continuation", async () => {
+  const f = await fixture();
+  const task = await f.request({ kind: "create", requestKey: "group-task", title: "Group task" }) as { taskId: string; revision: string };
+  const { taskId } = task;
+  f.adapter.injectFault(taskId, "crash");
+  const input = { kind: "send", taskId, expectedRevision: task.revision, requestKey: "group-input", text: "Run once across a handoff" };
+  const original = await f.request(input) as { runId: string; acceptedAt: number };
+  const receipt = { runId: original.runId, acceptedAt: original.acceptedAt };
+  await vi.waitFor(() => expect(f.store.getRun(original.runId).descriptor.state).toBe("failed"));
+  f.adapter.clearFault(taskId);
+  expect(await f.request({ kind: "getRun", runId: original.runId })).toMatchObject({ status: "failed" });
+
+  const send = vi.spyOn(f.adapter, "send").mockResolvedValue(undefined);
+  const abort = vi.spyOn(f.adapter, "abort");
+  const stable = (prefix: string, value: string) => `${prefix}-${createHash("sha256").update(value).digest("hex").slice(0, 24)}`;
+  const resume = f.host.enqueueServiceInput({ operationId: stable("provider-group-continue", `${taskId}:${original.runId}`),
+    sessionId: taskId, source: "system", parentRunId: original.runId,
+    prompt: { text: "Continue the original task", images: [], files: [], mentions: [], disposition: "prompt",
+      automaticContinuation: { recoveryId: stable("provider-group-recovery", original.runId), sourceRunId: original.runId,
+        attempt: 1, maximumAttempts: 5, sessionTotal: 1 } } });
+  await vi.waitFor(() => expect(f.store.getQueueItem(resume.value.queueItemId).state).toBe("backend_accepted"));
+  f.store.setQueuePaused({ sessionId: taskId, paused: true, reason: "Keep the independent input queued", traceId: "test" });
+  const unrelated = f.host.enqueueServiceInput({ operationId: "unrelated-service-input", sessionId: taskId, source: "system", parentRunId: original.runId,
+    prompt: { text: "Another input", images: [], files: [], mentions: [], disposition: "prompt" } });
+
+  expect(await f.request({ kind: "getRun", runId: original.runId })).toMatchObject({ ...receipt, status: "running", queueState: "backend_accepted" });
+  expect(await f.request(input)).toMatchObject({ ...receipt, status: "running" });
+  await f.request({ kind: "cancel", runId: original.runId });
+  expect(abort).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: resume.value.runId }));
+  expect(send).toHaveBeenCalledOnce();
+  expect(f.store.getRun(original.runId).descriptor.state).toBe("failed");
+  expect(f.store.getRun(resume.value.runId).descriptor.state).toBe("aborted");
+  expect(f.store.getQueueItem(unrelated.value.queueItemId).state).toBe("accepted");
+  expect(await f.request({ kind: "cancel", runId: original.runId })).toMatchObject({ ...receipt, status: "aborted" });
+  expect(abort).toHaveBeenCalledOnce();
 });
 it("approves explicit Auto through the original host interaction and refuses a changed configuration", async () => {
   const f = await fixture(), task = await f.request({ kind: "create", requestKey: "write", title: "Approved actions", hidden: true }) as { taskId: string };

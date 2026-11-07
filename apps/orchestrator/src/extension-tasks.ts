@@ -284,13 +284,22 @@ export class ExtensionTasks {
     return value.version === 1 && !value.revoked && value.sessionId === setting.key ? [value] : [];
   }); }
   #run(owner: ExtensionTaskOwner, runId: string) {
-    this.#assert(owner); const receipt = inputReceipt(this.options.store, runId);
+    const store = this.options.store;
+    this.#assert(owner); const receipt = inputReceipt(store, runId);
     if (!receipt || receipt.revoked || receipt.extensionId !== owner.extensionId || receipt.installation !== owner.installation) return failure("RUN_NOT_FOUND", "This plugin does not own that input.");
     this.#own(owner, receipt.sessionId);
-    const run = this.options.store.getRun(runId).descriptor, queue = this.options.store.findQueueItemByRunId(receipt.sessionId, runId, { includeCleared: true }) ?? this.options.store.getQueueItem(receipt.queueItemId);
+    let run = store.getRun(runId).descriptor;
     if (run.sessionId !== receipt.sessionId) return failure("RUN_NOT_FOUND", "The input does not belong to this task.");
-    return { receipt: { ...receipt, runId, queueItemId: queue.id }, value: { runId, taskId: receipt.sessionId, status: run.state, queueState: queue.state,
-      acceptedAt: run.createdAt, ...(run.endedAt ? { completedAt: run.endedAt } : {}), ...(run.error ? { error: run.error } : {}),
+    const acceptedAt = run.createdAt;
+    let queue = store.findQueueItemByRunId(receipt.sessionId, runId, { includeCleared: true }) ?? store.getQueueItem(receipt.queueItemId);
+    while (run.state === "failed" && queue.runId === run.id) {
+      const { child } = this.options.host.providerGroupContinuation(queue);
+      if (child === undefined) break;
+      queue = child;
+      run = store.getRun(child.runId).descriptor;
+    }
+    return { receipt: { ...receipt, runId: run.id, queueItemId: queue.id }, value: { runId, taskId: receipt.sessionId, status: run.state, queueState: queue.state,
+      acceptedAt, ...(run.endedAt ? { completedAt: run.endedAt } : {}), ...(run.error ? { error: run.error } : {}),
       usage: run.usage ?? { status: "unavailable", reason: "Per-input usage is not available." } } };
   }
   assertQueueCurrent(item: QueueItemRecord): void {
@@ -484,13 +493,16 @@ export class ExtensionTasks {
       }
       if (kind === "getRun") return this.#run(owner, text(request.runId)).value;
       if (kind === "cancel") {
-        const run = this.#run(owner, text(request.runId)); const queue = this.options.store.getQueueItem(run.receipt.queueItemId);
+        const runId = text(request.runId);
+        const run = this.#run(owner, runId); const queue = this.options.store.getQueueItem(run.receipt.queueItemId);
         if (["completed", "failed", "aborted"].includes(run.value.status)) return run.value;
         this.#assert(owner);
         if (queue.state === "accepted") this.options.store.cancelQueueItem({ queueItemId: queue.id, expectedRevision: queue.revision, traceId: `extension-cancel:${queue.id}` });
-        else if (["dispatching", "backend_accepted"].includes(queue.state)) await this.options.host.abort(queue.sessionId, queue.runId, () => { this.#assert(owner); this.#run(owner, queue.runId); });
+        else if (["dispatching", "backend_accepted"].includes(queue.state)) await this.options.host.abort(queue.sessionId, queue.runId, () => {
+          if (this.#run(owner, runId).receipt.runId !== queue.runId) failure("STALE_REVISION", "The plugin input's active execution changed before cancellation.");
+        });
         else if (queue.state === "dispatch_unknown") failure("RECONCILING", "The input dispatch result is unknown.");
-        return this.#run(owner, run.value.runId).value;
+        return this.#run(owner, runId).value;
       }
       const task = this.#own(owner, text(request.taskId));
       if (["setTeamPlan", "startTeam", "getTeam", "releaseWorker"].includes(kind)) {
