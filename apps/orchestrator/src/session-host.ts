@@ -377,6 +377,14 @@ interface ReviewRuntimeFlight {
   settled: boolean;
 }
 
+const REVIEW_WORKTREE_REFERENCE = "review.worktree-reference";
+interface ReviewWorktreeReference {
+  readonly reviewRunId: string;
+  readonly sourceSessionId: string;
+  readonly path: string;
+  readonly authority: string;
+}
+
 interface DispatchPreparation {
   readonly settled: Promise<void>;
   readonly resolve: () => void;
@@ -2734,6 +2742,19 @@ export class SessionHost {
       throw new StoreError("Reviewer model selection must exactly inherit the source Session.");
     }
     const target = this.#store.getTarget(input.targetId);
+    const worktree = source.descriptor.worktree;
+    const requestedWorktree = input.sourceWorktree;
+    if ((worktree === undefined) !== (requestedWorktree === undefined)
+      || worktree !== undefined && requestedWorktree !== undefined
+        && (!sameSessionWorktreeBinding(worktree, requestedWorktree.checkout) || !sameNativeBinding(source.descriptor.binding, requestedWorktree.binding))) {
+      throw new StoreError("The Review source worktree changed after evidence capture.");
+    }
+    const worktreeReference: ReviewWorktreeReference | undefined = worktree === undefined ? undefined : {
+      reviewRunId: input.reviewRunId, sourceSessionId: input.sourceSessionId, path: worktree.path,
+      authority: reviewWorktreeAuthority(source.descriptor, target.revision)
+    };
+    if (worktreeReference !== undefined) this.assertReviewWorktreeCurrent(worktreeReference);
+    const effectiveTarget = worktreeReference === undefined ? target.descriptor : { ...target.descriptor, workspaceRoot: worktreeReference.path };
     this.assertInheritedSessionCreationReady(
       target.descriptor.backendId,
       input,
@@ -2755,7 +2776,7 @@ export class SessionHost {
     const now = Date.now();
     const context = this.provisionalContext(
       reviewerSessionId,
-      target.descriptor,
+      effectiveTarget,
       1,
       "review_read_only",
       undefined,
@@ -2764,7 +2785,7 @@ export class SessionHost {
     let binding: NativeSessionBinding | undefined;
     try {
       binding = await adapter.createSession({
-        target: target.descriptor,
+        target: effectiveTarget,
         ...(input.providerId === undefined ? {} : { providerId: input.providerId }),
         ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
         ...(input.effort === undefined ? {} : { effort: input.effort }),
@@ -2773,7 +2794,7 @@ export class SessionHost {
         nativeStart: { kind: "new" },
         runtimePolicy: "review_read_only"
       }, context);
-      this.#store.createSession({
+      const descriptor: SessionDescriptor = {
         id: reviewerSessionId,
         backendId: target.descriptor.backendId,
         targetId: target.descriptor.id,
@@ -2792,7 +2813,20 @@ export class SessionHost {
           : { remoteWorkspace: target.descriptor.remoteWorkspace }),
         createdAt: now,
         updatedAt: now
-      });
+      };
+      if (worktreeReference !== undefined && requestedWorktree !== undefined) {
+        this.assertCurrentAdapterGeneration(target.descriptor.backendId, adapter, backendInstanceGeneration);
+        this.#store.transaction(store => {
+          this.assertReviewWorktreeCurrent(worktreeReference);
+          store.createSession(descriptor);
+          store.setSetting("service", reviewerSessionId, REVIEW_WORKTREE_REFERENCE, worktreeReference);
+          store.attachReviewSession({ reviewRunId: input.reviewRunId, reviewerSessionId,
+            sourceLeaseFencingToken: input.sourceLeaseFencingToken, expectedRunRevision: review.run.revision,
+            operationId: requestedWorktree.operationId, traceId: `review:${input.reviewRunId}:attached` });
+        });
+      } else {
+        this.#store.createSession(descriptor);
+      }
       this.assertCurrentAdapterGeneration(target.descriptor.backendId, adapter, backendInstanceGeneration);
       this.setActiveSession(
         reviewerSessionId,
@@ -2805,6 +2839,26 @@ export class SessionHost {
     } finally {
       releaseBackendAdmission();
     }
+  }
+
+  private assertReviewWorktreeCurrent(reference: ReviewWorktreeReference): void {
+    const review = this.#store.getReviewRunBundle(reference.reviewRunId);
+    const source = this.#store.getSession(reference.sourceSessionId).descriptor;
+    const target = this.#store.getTarget(source.targetId);
+    const worktree = source.worktree;
+    if (review.run.state !== "running" || review.run.sourceSessionId !== source.id || review.sourceLease.state !== "active"
+      || source.archived || source.deletedAt !== undefined || source.remoteWorkspace !== undefined
+      || this.#store.findPendingSessionLifecycleCleanup(source.id) !== undefined
+      || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined || target.descriptor.backendId !== source.backendId
+      || worktree === undefined || worktree.state !== "active" || worktree.remote !== undefined
+      || worktree.path !== reference.path || reviewWorktreeAuthority(source, target.revision) !== reference.authority
+      || this.#worktrees?.activeWorkspacePath(source.id, worktree) !== worktree.path) {
+      throw new StoreError("The Reviewer lost its exact local source worktree.");
+    }
+  }
+
+  private reviewWorktreeReference(sessionId: string): ReviewWorktreeReference | undefined {
+    return this.#store.findSetting<ReviewWorktreeReference>("service", sessionId, REVIEW_WORKTREE_REFERENCE)?.value;
   }
 
   /** Host-owned exactly-once Review queue. Policy attachment is a hard admission fence. */
@@ -14214,6 +14268,10 @@ export class SessionHost {
           await appContext?.assertCurrent();
           await this.#assertApplicationQueueCurrent(item);
           this.assertDispatchAdmissionOwner(item, attemptId, active, stored.descriptor.binding.generation, partnerPolicy);
+          if (reviewReadOnly) {
+            const reference = this.reviewWorktreeReference(sessionId);
+            if (reference !== undefined) this.assertReviewWorktreeCurrent(reference);
+          }
           if (protectedInput && !this.#forgetProtectedMessagingPrompt(item.id)) throw protectedMessagingInputExpired();
           dispatchPreparation.phase = "sending";
           const pendingAcceptance: PendingDispatchAcceptance = {};
@@ -14512,14 +14570,18 @@ export class SessionHost {
     extraDirectories?: readonly ApprovedDirectory[],
     backendInstanceGeneration?: number
   ): AdapterContext {
-    const runtimePolicy = this.#store.findSessionRuntimePolicy(stored.descriptor.id)?.policy;
+    const policy = this.#store.findSessionRuntimePolicy(stored.descriptor.id);
+    const runtimePolicy = policy?.policy;
+    const reviewWorktree = runtimePolicy === "review_read_only" ? this.reviewWorktreeReference(stored.descriptor.id) : undefined;
+    if (reviewWorktree !== undefined && reviewWorktree.reviewRunId !== policy?.reviewRunId) throw new StoreError("The Reviewer worktree reference does not match its read-only policy.");
+    const target = this.targetForSession(stored);
     const handoff = this.#store.getSessionContextHandoff(stored.descriptor.id);
     const privatePrompt = this.serviceRuntimePrompt(stored.descriptor);
     const appendSystemPrompt = handoff === undefined ? privatePrompt
       : [privatePrompt, handoff].filter((value) => value !== undefined).join("\n\n");
     const context = this.makeContext(
       stored.descriptor.id,
-      this.targetForSession(stored),
+      reviewWorktree === undefined ? target : { ...target, workspaceRoot: reviewWorktree.path },
       stored.descriptor.binding.generation,
       stored.descriptor.binding,
       runId,
@@ -17752,6 +17814,11 @@ function sameSessionWorktreeBinding(left: SessionWorktreeBinding, right: Session
     && left.state === right.state
     && left.acquiredAt === right.acquiredAt
     && left.updatedAt === right.updatedAt;
+}
+
+function reviewWorktreeAuthority(source: SessionDescriptor, targetRevision: bigint): string {
+  return operationBodyHash({ sessionId: source.id, targetId: source.targetId, backendId: source.backendId,
+    targetRevision, binding: source.binding, worktree: source.worktree });
 }
 
 function sameEventIds(left: readonly string[], right: readonly string[]): boolean {

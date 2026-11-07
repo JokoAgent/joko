@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import type { PromptInput } from "@joko/core";
+import type { NativeSessionBinding, PromptInput, SessionWorktreeBinding } from "@joko/core";
 import { InvalidStateTransitionError, RevisionConflictError } from "@joko/store";
 import type {
   OperationalStore,
@@ -26,6 +26,7 @@ export interface CreateFreshReviewerInput {
   readonly sourceSessionId: string;
   readonly sourceLeaseFencingToken: bigint;
   readonly targetId: string;
+  readonly sourceWorktree?: { readonly checkout: SessionWorktreeBinding; readonly binding: NativeSessionBinding; readonly operationId: string };
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
@@ -324,6 +325,9 @@ export class ReviewCoordinator {
         sourceSessionId: request.sourceSessionId,
         sourceLeaseFencingToken: fencingToken,
         targetId: source.descriptor.targetId,
+        ...(source.descriptor.worktree === undefined ? {} : { sourceWorktree: {
+          checkout: source.descriptor.worktree, binding: source.descriptor.binding, operationId
+        } }),
         ...(source.descriptor.providerId === undefined ? {} : { providerId: source.descriptor.providerId }),
         ...(source.descriptor.modelId === undefined ? {} : { modelId: source.descriptor.modelId }),
         ...(source.descriptor.effort === undefined ? {} : { effort: source.descriptor.effort }),

@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-import type { BlobRef, MessageBlock } from "@joko/core";
-import type { OperationalStore } from "@joko/store";
+import type { BlobRef, MessageBlock, SessionDescriptor } from "@joko/core";
+import type { OperationalStore, StoredTarget } from "@joko/store";
 import { extractPdfText, PDF_TEXT_MAX_BYTES, PdfTextExtractionError, type PdfTextWorkerResult } from "@joko/tool-document";
 import type { ArtifactStore } from "./artifact-store.js";
 import { readGitPatchPaths } from "./git-patch-paths.js";
@@ -73,7 +73,10 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
     assertSourceIdle(this.#store, request.sourceSessionId);
     const source = this.#store.getSession(request.sourceSessionId);
     const target = this.#store.getTarget(source.descriptor.targetId);
-    const registration = exactWorkspaceRegistration(target.metadata, target.descriptor.id, this.#workspaces);
+    const registration = exactWorkspaceRegistration(source.descriptor, target, this.#workspaces);
+    if (source.descriptor.worktree !== undefined && this.#store.findPendingSessionLifecycleCleanup(request.sourceSessionId) !== undefined) {
+      throw new ReviewEvidenceCaptureError("source-changed", "The source worktree is being retired.");
+    }
     const events = listAllVisibleSessionEvents(this.#store, request.sourceSessionId);
     const visible = visibleMessages(this.#store, request.sourceSessionId, events);
     const supersededProgress = supersededPiToolMessages(events, visible);
@@ -215,7 +218,8 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
           target.descriptor.id,
           registration.id,
           source.descriptor.binding.opaqueRef,
-          source.descriptor.binding.nativeSessionId ?? ""
+          source.descriptor.binding.nativeSessionId ?? "",
+          ...(source.descriptor.worktree === undefined ? [] : [source.descriptor.worktree.leaseId, registration.root, target.revision.toString()])
         ])),
         messages
       },
@@ -323,8 +327,20 @@ function assertArtifactBudget(artifacts: readonly ReviewSourceArtifact[]): void 
   }
 }
 
-function exactWorkspaceRegistration(metadata: unknown, targetId: string, workspaces: WorkspaceService) {
+function exactWorkspaceRegistration(source: SessionDescriptor, target: StoredTarget, workspaces: WorkspaceService) {
   const registrations = workspaces.listRegistrations();
+  const worktree = source.worktree;
+  if (worktree !== undefined) {
+    const registration = registrations.find(item => item.id === worktree.workspaceId);
+    if (source.archived || source.deletedAt !== undefined || worktree.state !== "active" || worktree.remote !== undefined
+      || source.remoteWorkspace !== undefined || target.descriptor.remoteWorkspace !== undefined || !target.descriptor.trusted
+      || registration === undefined || registration.remote !== undefined || !registration.trusted || relative(worktree.path, registration.root) !== "") {
+      throw new ReviewEvidenceCaptureError("source-changed", "The source task's exact local worktree is unavailable.");
+    }
+    return registration;
+  }
+  const { metadata } = target;
+  const targetId = target.descriptor.id;
   let workspaceId: string | undefined;
   if (metadata !== null && typeof metadata === "object" && !Array.isArray(metadata)) {
     const value = (metadata as Record<string, unknown>)["workspaceId"];
