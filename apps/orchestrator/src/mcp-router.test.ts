@@ -3045,22 +3045,7 @@ describe("McpRouter", () => {
   it.each(["model disabled", "credential replaced", "response lost", "provider rejected", "result saved"] as const)(
     "records the original image request once when %s", async scenario => {
     const { root, store, router, credentials, artifacts } = await fixture();
-    const identity = { backendId: "codex", providerId: "openai", surfaceId: "image-generation" };
-    const modelId = "gpt-image-2";
-    store.upsertBackend({ ...store.getBackend("pi").descriptor, id: identity.backendId, adapterKind: "codex",
-      providers: [{ providerId: identity.providerId, displayName: "OpenAI", api: "openai-responses",
-        authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false,
-        supportsRefresh: false, supportsModelRefresh: false, credentialSurfaces: [{
-          surfaceId: identity.surfaceId, capability: "image_generation", kind: "api_key", executionApi: "openai-images",
-          models: [{ modelId, displayName: "GPT Image 2" }]
-        }] }] });
-    const owner = resolveDeclaredProviderCredentialSurface(store, credentials, identity)!;
-    const setKey = async (secret: string) => {
-      const ticket = credentials.createUploadTicket({ kind: "api_key", providerId: identity.providerId, credentialReferenceId: owner.credentialReferenceId });
-      credentials.upload(ticket.credentialUploadTicketId, secret);
-      return credentials.commitManagedUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, kind: "api_key",
-        providerId: identity.providerId, credentialReferenceId: owner.credentialReferenceId, displayName: "Image fixture" });
-    };
+    const { identity, modelId, setKey, credentialSurfaces } = configureImageTestRoute(store, credentials);
     const response = deferred<Response>();
     const fetch = vi.fn<typeof globalThis.fetch>(async () => {
       const result = await response.promise;
@@ -3070,10 +3055,10 @@ describe("McpRouter", () => {
     const ingest = vi.spyOn(artifacts, "ingestBytes");
     try {
       await setKey("original-synthetic-image-key");
-      const provider = new ImageGenerationBridgeToolProvider({ store, artifacts, fetch, credentialSurfaces: new ProviderCredentialSurfaceResolver({
-        store, credentials, providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
-        modelEnabled: (backendId, providerId, model) => modelRoutingEnabled(store, backendId, providerId, model)
-      }) });
+      const provider = new ImageGenerationBridgeToolProvider({ store, artifacts, credentialSurfaces, fetch: (input, init, beforeDispatch) => {
+        beforeDispatch();
+        return fetch(input, init);
+      } });
       expect(provider.listModels()).toEqual([{ id: modelId, name: "GPT Image 2", providerId: identity.providerId }]);
       expect(fetch).not.toHaveBeenCalled();
       router.registerBridgeToolProvider(provider);
@@ -3118,7 +3103,8 @@ describe("McpRouter", () => {
         expect(store.getArtifact(staged.id)).toMatchObject({ sessionId: "session-1", metadata: {} });
         expect(store.getArtifact(staged.id).metadata).not.toHaveProperty("expiresAt");
         expect(ingest.mock.calls[0]?.[1]).toMatchObject({ expiresAt: expect.any(Number) });
-        expect(store.getOperation(claim!.id)).toMatchObject({ status: "completed", response: staged });
+        expect(store.getOperation(claim!.id)).toMatchObject({ status: "completed", response: store.getArtifact(staged.id).blob });
+        expect(store.getOperation(claim!.id).response).not.toHaveProperty("storagePath");
         if (scenario === "result saved") {
           await expect(call()).resolves.toEqual(result);
           await expect(call("Different prompt on the original request ID")).resolves.toMatchObject({ isError: true });
@@ -3140,6 +3126,107 @@ describe("McpRouter", () => {
       expect(fetch).toHaveBeenCalledOnce();
     } finally {
       response.resolve(Response.json({ data: [] }));
+      await router.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("edits exact images through the native task tool and retires an undispatched edit when its input connection is revoked", async () => {
+    const { root, store, router, credentials, artifacts } = await fixture();
+    const { modelId, setKey, credentialSurfaces } = configureImageTestRoute(store, credentials);
+    const proxyEntered = deferred<void>(), releaseProxy = deferred<void>();
+    const requests: { readonly request: Request; readonly multipart: FormData }[] = [];
+    let holdProxy = false;
+    try {
+      await setKey("synthetic-image-edit-key");
+      const provider = new ImageGenerationBridgeToolProvider({ store, artifacts, credentialSurfaces,
+        fetch: async (input, init, beforeDispatch) => {
+          if (holdProxy) { proxyEntered.resolve(); await releaseProxy.promise; }
+          beforeDispatch();
+          const request = new Request(input, init);
+          requests.push({ request, multipart: await request.formData() });
+          return Response.json({ data: [{ b64_json: AUDIO_ARTWORK_PNG }] });
+        }
+      });
+      router.registerBridgeToolProvider(provider);
+      const scope = bridgeScope(1);
+      const granted = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp",
+        targetId: scope.targetId, sessionId: scope.sessionId, expectedPiGeneration: 1 });
+      expect(granted.mcpBridge.tools).toEqual(expect.arrayContaining([expect.objectContaining({ runtimeName: "image_edit", requiresNativeRoot: true })]));
+      expect(provider.toolsForSession("session-remote").map(tool => tool.name)).toEqual(["image_generate"]);
+
+      const originalBytes = Buffer.from(AUDIO_ARTWORK_PNG, "base64");
+      const secondBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+      const source = store.getArtifact((await artifacts.ingestBytes(originalBytes, { fileName: "attached.png", mimeType: "image/png" })).id).blob;
+      const prior = store.getArtifact((await artifacts.ingestBytes(secondBytes, { fileName: "prior.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 })).id).blob;
+      const foreign = store.getArtifact((await artifacts.ingestBytes(secondBytes, { fileName: "other-task.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 })).id).blob;
+      store.transaction(transaction => {
+        transaction.adoptSessionArtifact({ blob: prior, sessionId: scope.sessionId });
+        transaction.adoptSessionArtifact({ blob: foreign, sessionId: "session-2" });
+      });
+      const connection = store.createConnection({ id: "image-edit-owner", name: "Edit fixture", authKeyDigest: "image-edit-digest" });
+      const queueItemId = "image-edit-input";
+      const prompt = { text: "Edit my attached image", images: [{ blob: source }], files: [], mentions: [], disposition: "prompt" } as const;
+      store.runOperation({ id: "image-edit-send-input", connectionId: connection.id, kind: "sendInput", body: prompt }, transaction => {
+        transaction.createRun({ id: "image-edit-run", sessionId: scope.sessionId, source: "user", state: "queued", createdAt: 1 });
+        transaction.createAttempt({ id: "image-edit-attempt", runId: "image-edit-run", ordinal: 1, generation: 1, startedAt: 1 });
+        transaction.enqueueQueueItem({ id: queueItemId, sessionId: scope.sessionId, runId: "image-edit-run", attemptId: "image-edit-attempt",
+          operationId: "image-edit-send-input", body: prompt, disposition: "prompt" });
+        return {};
+      });
+      expect(store.claimNextQueueItem({ sessionId: scope.sessionId, backendInstanceGeneration: 0 })?.id).toBe(queueItemId);
+
+      const edit = (image: readonly string[], requestId = randomUUID()) => {
+        const arguments_ = { image, prompt: "Replace the background", quality: "high" };
+        const call = { ...scope, requestId, serverId: provider.id, toolName: "image_edit" };
+        const nativeRootProof = granted.mcpBridge.captureRootCall!({ ...call, arguments: arguments_, assertCurrent: () => {},
+          queueInput: { queueItemId, assertCurrent: () => {} } });
+        return router.executeBridgeCall({ ...call, authorization: `Bearer ${granted.mcpBridge.token}`, generation: 1, arguments: arguments_, nativeRootProof });
+      };
+      const imageOperations = () => store.listOperations().filter(operation => operation.kind === "mcp_image_edit");
+      await expect(router.executeBridgeCall({ ...scope, authorization: `Bearer ${granted.mcpBridge.token}`, generation: 1,
+        serverId: provider.id, toolName: "image_edit", arguments: { image: ["input:1"], prompt: "Replace the background" } }))
+        .rejects.toThrow(/native root/u);
+      await expect(edit([])).resolves.toMatchObject({ isError: true });
+      await expect(edit([foreign.id])).resolves.toMatchObject({ isError: true });
+      await expect(edit(["input:1", source.id])).resolves.toMatchObject({ isError: true });
+      expect(imageOperations()).toHaveLength(0);
+      expect(requests).toHaveLength(0);
+
+      const result = await edit(["input:1", prior.id], scope.requestId);
+      expect(result).toMatchObject({ isError: false, details: { mcpStructuredContent: { edited: true },
+        jokoMcpBridge: { imageOutputs: [{ blob: { mimeType: "image/png" } }] } } });
+      expect(requests).toHaveLength(1);
+      const { request, multipart } = requests[0]!;
+      expect(request.url).toBe("https://api.openai.com/v1/images/edits");
+      expect(request.headers.get("authorization")).toBe("Bearer synthetic-image-edit-key");
+      expect(multipart.get("model")).toBe(modelId);
+      expect(multipart.get("prompt")).toBe("Replace the background");
+      expect(multipart.get("quality")).toBe("high");
+      const images = multipart.getAll("image[]");
+      expect(images).toMatchObject([{ name: "reference-1.png", type: "image/png" }, { name: "reference-2.png", type: "image/png" }]);
+      expect(await Promise.all(images.map(async image => Buffer.from(await (image as Blob).arrayBuffer())))).toEqual([originalBytes, secondBytes]);
+      const [operation] = imageOperations();
+      expect(operation).toMatchObject({ status: "completed", body: { referenceImages: [
+        { id: source.id, sha256: source.sha256 }, { id: prior.id, sha256: prior.sha256 }
+      ] } });
+      const output = operation?.response as { id: string };
+      expect(store.getArtifact(output.id)).toMatchObject({ sessionId: scope.sessionId });
+      await expect(edit(["input:1", prior.id], scope.requestId)).resolves.toEqual(result);
+      await expect(edit([prior.id], scope.requestId)).resolves.toMatchObject({ isError: true });
+      expect(requests).toHaveLength(1);
+
+      holdProxy = true;
+      const denied = edit(["input:1"]);
+      await proxyEntered.promise;
+      store.revokeConnection(connection.id);
+      releaseProxy.resolve();
+      await expect(denied).resolves.toMatchObject({ isError: true });
+      expect(requests).toHaveLength(1);
+      expect(imageOperations()).toHaveLength(1);
+    } finally {
+      releaseProxy.resolve();
       await router.dispose();
       store.close();
       await rm(root, { recursive: true, force: true });
@@ -3465,4 +3552,29 @@ function listedTool(name: string, description = name) {
 
 function bridgeScope(generation: number) {
   return { requestId: randomUUID(), sessionId: `session-${generation}`, targetId: "target-1" } as const;
+}
+
+function configureImageTestRoute(store: OperationalStore, credentials: CredentialManager) {
+  const identity = { backendId: "codex", providerId: "openai", surfaceId: "image-generation" };
+  const modelId = "gpt-image-2";
+  store.upsertBackend({ ...store.getBackend("pi").descriptor, id: identity.backendId, adapterKind: "codex",
+    providers: [{ providerId: identity.providerId, displayName: "OpenAI", api: "openai-responses",
+      authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false,
+      supportsRefresh: false, supportsModelRefresh: false, credentialSurfaces: [{
+        surfaceId: identity.surfaceId, capability: "image_generation", kind: "api_key", executionApi: "openai-images",
+        models: [{ modelId, displayName: "GPT Image 2" }]
+      }] }] });
+  const owner = resolveDeclaredProviderCredentialSurface(store, credentials, identity)!;
+  return {
+    identity, modelId,
+    credentialSurfaces: new ProviderCredentialSurfaceResolver({ store, credentials,
+      providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
+      modelEnabled: (backendId, providerId, model) => modelRoutingEnabled(store, backendId, providerId, model) }),
+    async setKey(secret: string) {
+      const ticket = credentials.createUploadTicket({ kind: "api_key", providerId: identity.providerId, credentialReferenceId: owner.credentialReferenceId });
+      credentials.upload(ticket.credentialUploadTicketId, secret);
+      return credentials.commitManagedUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, kind: "api_key",
+        providerId: identity.providerId, credentialReferenceId: owner.credentialReferenceId, displayName: "Image fixture" });
+    }
+  };
 }
