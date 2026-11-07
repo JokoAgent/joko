@@ -48,6 +48,7 @@ import {
   REMOTE_PI_BROKER_PROTOCOL_VERSION,
   REMOTE_PI_BROKER_SOURCE,
   REMOTE_PI_BROKER_SOURCE_SHA256,
+  REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES,
   remotePiLaunchHash
 } from "./remote-pi-broker-source.js";
 import { REMOTE_PI_SESSION_SOURCE, REMOTE_PI_SESSION_SOURCE_SHA256 } from "./remote-pi-session-source.js";
@@ -844,53 +845,55 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
     this.#authorityStore = options.authorityStore;
   }
 
-  async scan(input: {
-    readonly sessionId: string;
-    readonly sessionKey: string;
-    readonly afterRevision?: string;
-    readonly limitBytes: number;
-  }): Promise<{
-    readonly revision: string;
-    readonly unchanged: boolean;
-    readonly retryAfterMs: number;
-    readonly runs: readonly PiManagedDurableRunSnapshot[];
-  }> {
+  async scan(input: Parameters<PiManagedDurableStore["scan"]>[0]) {
     this.#assertSession(input.sessionId, input.sessionKey);
     if (!Number.isSafeInteger(input.limitBytes) || input.limitBytes < 1 || input.limitBytes > 1024 * 1024) {
       throw new Error("Remote managed durable store scan limit is invalid.");
     }
-    const response = await this.#request({
+    const taskId = input.taskId === undefined ? undefined : exactBoundedText(input.taskId, 256, "managed task identity");
+    const request = {
       operation: "scan",
       sessionId: input.sessionId,
       sessionKey: input.sessionKey,
       limitBytes: input.limitBytes,
-      ...(input.afterRevision === undefined ? {} : {
-        afterRevision: exactDigest(input.afterRevision, "managed store revision")
-      })
-    });
-    assertExactKeys(response, [
-      "ok", "authorityVerified", "revision", "unchanged", "retryAfterMs", "runs"
-    ]);
-    const unchanged = response["unchanged"];
-    const retryAfterMs = positiveSafeInteger(response["retryAfterMs"], "managed store retry delay");
-    if (
-      response["ok"] !== true || response["authorityVerified"] !== true ||
-      typeof unchanged !== "boolean" || retryAfterMs < 100 || retryAfterMs > 60_000 ||
-      !Array.isArray(response["runs"]) || response["runs"].length > 256 ||
-      unchanged && response["runs"].length !== 0 ||
-      unchanged && input.afterRevision === undefined
-    ) {
-      throw new Error("Remote managed durable store scan response failed its schema fence.");
-    }
-    const revision = exactDigest(response["revision"], "managed store revision");
-    if (unchanged && revision !== input.afterRevision) {
-      throw new Error("Remote managed durable store unchanged response crossed its revision fence.");
+      ...(taskId === undefined ? {} : { taskId })
+    };
+    const afterRevision = input.afterRevision === undefined
+      ? undefined : exactDigest(input.afterRevision, "managed store revision");
+    const first = parseRemoteManagedScanPage(await this.#request({
+      ...request, ...(afterRevision === undefined ? {} : { afterRevision })
+    }), afterRevision);
+    const { revision, unchanged, retryAfterMs } = first;
+    const runs = [...first.runs];
+    let page = first.nextPage;
+    if (page !== undefined) {
+      const scanId = page.scanId;
+      let bytes = Buffer.byteLength(JSON.stringify(runs)) - 1;
+      for (let index = 1; page !== undefined; index += 1) {
+        if (page.scanId !== scanId || page.index !== index || index >= 256) {
+          throw new Error("Remote managed durable store scan crossed its page fence.");
+        }
+        const next = parseRemoteManagedScanPage(await this.#request({ ...request, page }));
+        bytes += Buffer.byteLength(JSON.stringify(next.runs)) - 1;
+        if (next.revision !== revision || next.retryAfterMs !== retryAfterMs || next.runs.length === 0
+          || runs.length + next.runs.length > 256 || bytes > REMOTE_PI_MANAGED_SCAN_LIMIT_BYTES) {
+          throw new Error("Remote managed durable store scan page crossed its revision or size fence.");
+        }
+        runs.push(...next.runs);
+        page = next.nextPage;
+      }
+      const digest = createHash("sha256").update(JSON.stringify([
+        input.sessionId, ...runs.map((run) => [run.runId, run.revision])
+      ])).digest("hex");
+      if (digest !== revision || runs.some((run, index) => index > 0 && runs[index - 1]!.runId >= run.runId)) {
+        throw new Error("Remote managed durable store scan pages do not form the attested snapshot.");
+      }
     }
     return {
       revision,
       unchanged,
       retryAfterMs,
-      runs: response["runs"].map((value) => parseRemoteManagedRunSnapshot(value))
+      runs: taskId === undefined ? runs : runs.filter((run) => run.config["taskId"] === taskId)
     };
   }
 
@@ -2020,6 +2023,40 @@ function exactUuid(value: unknown, label: string): string {
     throw new Error(`Remote Pi authority ${label} is invalid.`);
   }
   return accepted.toLowerCase();
+}
+
+function parseRemoteManagedScanPage(response: Record<string, unknown>, afterRevision?: string): {
+  readonly revision: string;
+  readonly unchanged: boolean;
+  readonly retryAfterMs: number;
+  readonly runs: readonly PiManagedDurableRunSnapshot[];
+  readonly nextPage?: { readonly scanId: string; readonly index: number };
+} {
+  const cursor = response["nextPage"];
+  assertExactKeys(response, [
+    "ok", "authorityVerified", "revision", "unchanged", "retryAfterMs", "runs",
+    ...(cursor === undefined ? [] : ["nextPage"])
+  ]);
+  const revision = exactDigest(response["revision"], "managed store revision");
+  const unchanged = response["unchanged"];
+  const retryAfterMs = positiveSafeInteger(response["retryAfterMs"], "managed store retry delay");
+  const runs = response["runs"];
+  if (response["ok"] !== true || response["authorityVerified"] !== true || typeof unchanged !== "boolean"
+    || retryAfterMs < 100 || retryAfterMs > 60_000 || !Array.isArray(runs) || runs.length > 256
+    || unchanged && (runs.length !== 0 || revision !== afterRevision || cursor !== undefined)) {
+    throw new Error("Remote managed durable store scan response failed its schema or revision fence.");
+  }
+  let nextPage;
+  if (cursor !== undefined) {
+    if (!isPlainRecord(cursor) || runs.length === 0) throw new Error("Remote managed durable store scan cursor is invalid.");
+    assertExactKeys(cursor, ["scanId", "index"]);
+    nextPage = {
+      scanId: exactUuid(cursor["scanId"], "managed store scan identity"),
+      index: positiveSafeInteger(cursor["index"], "managed store scan page")
+    };
+  }
+  return { revision, unchanged, retryAfterMs, runs: runs.map(parseRemoteManagedRunSnapshot),
+    ...(nextPage === undefined ? {} : { nextPage }) };
 }
 
 function parseRemoteManagedRunSnapshot(value: unknown): PiManagedDurableRunSnapshot {

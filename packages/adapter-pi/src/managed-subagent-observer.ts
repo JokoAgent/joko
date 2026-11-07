@@ -726,7 +726,8 @@ export async function assertManagedSubagentControlTarget(input: {
     new Map(),
     input.durableStore === undefined
       ? undefined
-      : { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS }
+      : { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS },
+    input.runId
   );
   const projection = assertOwnedManagedSubagentControlTarget(projections, input);
   return currentProviderId(projection.latest.config["route"]);
@@ -757,7 +758,8 @@ export async function writeManagedSubagentDurableControl(input: {
     transcriptCache,
     input.durableStore,
     resultCache,
-    durableState
+    durableState,
+    input.runId
   );
   let projections = await read();
   let projection = assertOwnedManagedSubagentControlTarget(projections, input);
@@ -984,7 +986,8 @@ async function readLogicalProjections(
   transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
   durableStore?: PiManagedDurableStore,
   resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }> = new Map(),
-  durableState?: DurableProjectionState
+  durableState?: DurableProjectionState,
+  durableTaskId?: string
 ): Promise<readonly LogicalProjection[]> {
   if (durableStore !== undefined) {
     return readDurableLogicalProjections(
@@ -995,7 +998,8 @@ async function readLogicalProjections(
       redactValues,
       transcriptCache,
       resultCache,
-      durableState ?? { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS }
+      durableState ?? { projections: [], retryAfterMs: DEFAULT_INTERVAL_MS },
+      durableTaskId
     );
   }
   const sessionDirectory = join(root, managedSubagentSessionKey(productSessionId));
@@ -1039,11 +1043,13 @@ async function readDurableLogicalProjections(
   redactValues: readonly string[],
   transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
   resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>,
-  durableState: DurableProjectionState
+  durableState: DurableProjectionState,
+  taskId?: string
 ): Promise<readonly LogicalProjection[]> {
   const scan = await store.scan({
     sessionId: productSessionId,
     sessionKey: managedSubagentSessionKey(productSessionId),
+    ...(taskId === undefined ? {} : { taskId }),
     ...(durableState.revision === undefined ? {} : { afterRevision: durableState.revision }),
     limitBytes: REMOTE_SCAN_LIMIT_BYTES
   });
@@ -1062,6 +1068,7 @@ async function readDurableLogicalProjections(
   }
   const grouped = new Map<string, PhysicalRun[]>();
   for (const snapshot of scan.runs) {
+    if (taskId !== undefined && snapshot.config["taskId"] !== taskId) continue;
     const physical = await readDurablePhysicalRun(
       store,
       snapshot,
@@ -1069,12 +1076,13 @@ async function readDurableLogicalProjections(
       productGeneration,
       redactValues,
       transcriptCache,
-      resultCache
+      resultCache,
+      taskId !== undefined
     );
-    const taskId = requiredString(physical.status["taskId"], 256);
-    const runs = grouped.get(taskId) ?? [];
+    const logicalTaskId = requiredString(physical.status["taskId"], 256);
+    const runs = grouped.get(logicalTaskId) ?? [];
     runs.push(physical);
-    grouped.set(taskId, runs);
+    grouped.set(logicalTaskId, runs);
   }
   const values: LogicalProjection[] = [];
   for (const [taskId, physicalRuns] of grouped) {
@@ -1205,7 +1213,8 @@ async function readDurablePhysicalRun(
   productGeneration: number,
   redactValues: readonly string[],
   transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
-  resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>
+  resultCache: Map<string, { readonly size: number; readonly result: Readonly<Record<string, unknown>> }>,
+  metadataOnly: boolean
 ): Promise<PhysicalRun> {
   const runId = requiredUuid(snapshot.runId, "run");
   const revision = requiredRevision(snapshot.revision);
@@ -1229,7 +1238,8 @@ async function readDurablePhysicalRun(
   const status = { ...snapshot.status };
   const claim = snapshot.claim === undefined ? undefined : { ...snapshot.claim };
   const taskId = requiredString(status["taskId"], 256);
-  const runnerScript = requiredRemotePath(config["runnerScript"], "runner script");
+  // The broker checks canonical runner and artifact paths on the remote host.
+  // Its projection binds them by identity and revision without returning paths.
   if (
     config["format"] !== FORMAT || owner["format"] !== FORMAT || status["format"] !== FORMAT
     || config["runId"] !== runId || owner["runId"] !== runId || status["runId"] !== runId
@@ -1239,7 +1249,6 @@ async function readDurablePhysicalRun(
     || status["productSessionId"] !== productSessionId || !Number.isSafeInteger(config["productGeneration"])
     || number(config["productGeneration"]) < 0 || number(config["productGeneration"]) > productGeneration
     || config["taskId"] !== taskId || owner["taskId"] !== taskId
-    || owner["runnerScript"] !== runnerScript || status["runnerScript"] !== runnerScript
     || config["runnerScriptSha256"] !== runnerScriptSha256
     || owner["runnerScriptSha256"] !== runnerScriptSha256 || status["runnerScriptSha256"] !== runnerScriptSha256
     || config["runnerInstanceId"] !== runnerInstanceId
@@ -1262,11 +1271,19 @@ async function readDurablePhysicalRun(
       || runnerPid > 0 && status["runnerInstanceId"] !== runnerInstanceId) {
     throw new Error("managed Subagent durable process identity mismatch");
   }
-  const transcriptPath = requiredRemotePath(config["transcriptPath"], "transcript");
-  if (status["transcriptPath"] !== transcriptPath) {
-    throw new Error("managed Subagent durable transcript identity mismatch");
-  }
-
+  const manifest = {
+    runId,
+    directory: `durable:${runId}`,
+    durableRevision: revision,
+    durableControlRevision: controlRevision,
+    durableTranscriptRevision: transcriptRevision,
+    durableResultRevision: resultRevision,
+    config,
+    status,
+    resumeSafe: snapshot.resumeSafe,
+    controlSafe: snapshot.controlSafe
+  };
+  if (metadataOnly) return { ...manifest, transcript: [] };
   const cacheKey = `durable:${runId}:transcript:${transcriptRevision}`;
   let transcript = transcriptCache.get(cacheKey);
   if (transcript === undefined || transcript.size !== snapshot.transcriptBytes) {
@@ -1306,18 +1323,9 @@ async function readDurablePhysicalRun(
     result = { ...cachedResult.result };
   }
   return {
-    runId,
-    directory: `durable:${runId}`,
-    durableRevision: revision,
-    durableControlRevision: controlRevision,
-    durableTranscriptRevision: transcriptRevision,
-    durableResultRevision: resultRevision,
-    config,
-    status,
+    ...manifest,
     ...(result === undefined ? {} : { result }),
-    transcript: transcript.records,
-    resumeSafe: snapshot.resumeSafe,
-    controlSafe: snapshot.controlSafe
+    transcript: transcript.records
   };
 }
 
@@ -1820,14 +1828,6 @@ function requiredDigest(value: unknown, label: string): string {
 
 function requiredRevision(value: unknown): string {
   return requiredDigest(value, "durable revision");
-}
-
-function requiredRemotePath(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > 32_768
-      || !value.startsWith("/") || value.includes("\0")) {
-    throw new Error(`managed Subagent remote ${label} path is invalid`);
-  }
-  return value;
 }
 
 async function decisionOrCancellation(

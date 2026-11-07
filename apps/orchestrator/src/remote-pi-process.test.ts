@@ -321,6 +321,7 @@ describe("RemotePiProcessFactory", () => {
     });
     const remoteProcess = new ManualRemoteProcess({ authorityCommitGate });
     const managedStoreOperations: Record<string, unknown>[] = [];
+    let pagination: { wrongRevision: boolean } | undefined;
     let processRequest: RemoteProcessStartRequest | undefined;
     let forwardClosed = false;
     const lease: RemoteSshTransportLease = {
@@ -335,7 +336,7 @@ describe("RemotePiProcessFactory", () => {
       processes: {
         open: async (request) => {
           if (request.args[1] === "store") {
-            return new ManagedStoreRemoteProcess(managedStoreOperations);
+            return new ManagedStoreRemoteProcess(managedStoreOperations, pagination);
           }
           processRequest = request;
           return remoteProcess;
@@ -557,6 +558,14 @@ describe("RemotePiProcessFactory", () => {
       afterRevision: scan.revision,
       limitBytes: 256 * 1024
     })).toMatchObject({ revision: scan.revision, unchanged: true, runs: [] });
+    const scanInput = { sessionId: productSessionId, sessionKey, limitBytes: 256 * 1024 };
+    pagination = { wrongRevision: false };
+    expect((await rediscovered!.scan(scanInput)).runs.map((run) => run.runId))
+      .toEqual([MANAGED_STORE_RUN_ID, MANAGED_STORE_SECOND_RUN_ID]);
+    expect(managedStoreOperations.at(-1)).toMatchObject({ page: { scanId: MANAGED_STORE_SCAN_ID, index: 1 } });
+    pagination = { wrongRevision: true };
+    await expect(rediscovered!.scan(scanInput)).rejects.toThrow("scan page crossed its revision or size fence");
+    pagination = undefined;
     const removal = await rediscovered!.stopAndRemoveSession({
       sessionId: productSessionId,
       sessionKey,
@@ -599,7 +608,7 @@ describe("RemotePiProcessFactory", () => {
     expect(finalizedAuthority).not.toHaveProperty("currentBearer");
     expect(JSON.stringify(finalizedAuthority)).not.toContain(nativeAuthReservationToken);
     expect(managedStoreOperations.map((value) => value.operation)).toEqual([
-      "scan", "read-tail", "write-control", "write-control", "scan", "stop-remove-session",
+      "scan", "read-tail", "write-control", "write-control", "scan", "scan", "scan", "scan", "scan", "stop-remove-session",
       "finalize-deletion", "finalize-deletion"
     ]);
     expect(managedStoreOperations.every((value) =>
@@ -1456,6 +1465,8 @@ type PiMemoryEntry =
   | { kind: "file"; mode: number; modifiedAt: number; content: Buffer };
 
 const MANAGED_STORE_RUN_ID = "22222222-2222-4222-8222-222222222222";
+const MANAGED_STORE_SECOND_RUN_ID = "22222222-2222-4222-8222-222222222223";
+const MANAGED_STORE_SCAN_ID = "22222222-2222-4222-8222-222222222224";
 const MANAGED_STORE_RUNNER_ID = "33333333-3333-4333-8333-333333333333";
 const MANAGED_STORE_LAUNCH_TOKEN = "44444444-4444-4444-8444-444444444444";
 const MANAGED_STORE_SCRIPT_HASH = "5".repeat(64);
@@ -1471,7 +1482,7 @@ class ManagedStoreRemoteProcess extends EventEmitter implements RemoteProcessHan
   signalCode: NodeJS.Signals | null = null;
   #pending = Buffer.alloc(0);
 
-  constructor(readonly operations: Record<string, unknown>[]) {
+  constructor(readonly operations: Record<string, unknown>[], pagination?: { readonly wrongRevision: boolean }) {
     super();
     this.stdin.on("data", (chunk: Buffer | string) => {
       this.#pending = Buffer.concat([this.#pending, Buffer.from(chunk)]);
@@ -1482,19 +1493,27 @@ class ManagedStoreRemoteProcess extends EventEmitter implements RemoteProcessHan
       const operation = request.operation;
       let response: Record<string, unknown>;
       if (operation === "scan") {
+        const continuing = request.page !== undefined;
         const identity = {
-          runId: MANAGED_STORE_RUN_ID,
+          runId: continuing ? MANAGED_STORE_SECOND_RUN_ID : MANAGED_STORE_RUN_ID,
           runnerInstanceId: MANAGED_STORE_RUNNER_ID,
           launchToken: MANAGED_STORE_LAUNCH_TOKEN,
           runnerScriptSha256: MANAGED_STORE_SCRIPT_HASH
         };
+        const revision = pagination === undefined || continuing && pagination.wrongRevision
+          ? MANAGED_STORE_REVISION
+          : createHash("sha256").update(JSON.stringify([
+            request.sessionId, [MANAGED_STORE_RUN_ID, MANAGED_STORE_RUN_REVISION],
+            [MANAGED_STORE_SECOND_RUN_ID, MANAGED_STORE_RUN_REVISION]
+          ])).digest("hex");
         response = {
           ok: true,
           authorityVerified: true,
-          revision: MANAGED_STORE_REVISION,
-          unchanged: request.afterRevision === MANAGED_STORE_REVISION,
+          revision,
+          unchanged: request.afterRevision === revision,
           retryAfterMs: 1_000,
-          runs: request.afterRevision === MANAGED_STORE_REVISION ? [] : [{
+          ...(pagination !== undefined && !continuing ? { nextPage: { scanId: MANAGED_STORE_SCAN_ID, index: 1 } } : {}),
+          runs: request.afterRevision === revision ? [] : [{
             ...identity,
             revision: MANAGED_STORE_RUN_REVISION,
             controlRevision: MANAGED_STORE_RUN_REVISION,
