@@ -140,7 +140,8 @@ it("stops setup revocation after the original device loses authority between cre
       return result;
     });
     const application = { config: { publicOrigin: "https://orchestrator.example.test" }, store, adapters: [],
-      sessionHost: host, extensionCatalog: catalog, connections: new ConnectionManager(store), piResources: { list: () => [installed] }
+      sessionHost: host, extensionCatalog: catalog, connections: new ConnectionManager(store),
+      piResources: { list: () => [installed], get: () => installed }
     } as unknown as OrchestratorApplication;
     const transport = createRouterTransport(router => registerConnectServices(router, application));
     const operations = createClient(contract.OperationService, transport);
