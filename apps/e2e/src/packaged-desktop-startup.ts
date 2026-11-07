@@ -16,7 +16,9 @@ export function createPackagedDesktopStartupEvidence() {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const nativeState = application === undefined ? undefined : await Promise.race([
         application.evaluate(({ app, BrowserWindow }) => ({
-          ready: app.isReady(), windows: BrowserWindow.getAllWindows().length
+          ready: app.isReady(), windows: BrowserWindow.getAllWindows().map(window => ({
+            visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized()
+          }))
         })).catch(() => undefined),
         new Promise<undefined>((resolveObservation) => { timer = setTimeout(() => resolveObservation(undefined), 1_000); })
       ]).finally(() => clearTimeout(timer));

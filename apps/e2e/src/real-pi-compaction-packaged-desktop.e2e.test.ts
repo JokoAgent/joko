@@ -109,7 +109,32 @@ describe("packaged Desktop Pi compaction", () => {
     }
     const page = await desktop.firstWindow({ timeout: 60_000 });
     await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
-    await page.locator(".connection-tabs > button").nth(2).click();
+    const pairingTab = page.locator(".connection-tabs > button").nth(2);
+    try {
+      await pairingTab.click();
+    } catch (error) {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const observation = await Promise.race([
+        pairingTab.evaluate(element => {
+          const bounds = element.getBoundingClientRect();
+          const hit = document.elementFromPoint(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+          return {
+            visibility: document.visibilityState,
+            focused: document.hasFocus(),
+            bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+            disabled: element.matches(":disabled"),
+            pressed: element.getAttribute("aria-pressed"),
+            cardBusy: element.closest(".connection-card")?.getAttribute("aria-busy"),
+            hitButton: hit !== null && element.contains(hit),
+            hitTag: hit?.tagName,
+            pointerEvents: getComputedStyle(element).pointerEvents
+          };
+        }, undefined, { timeout: 1_000 }).catch(() => undefined),
+        new Promise<undefined>(resolveObservation => { deadline = setTimeout(resolveObservation, 2_000); })
+      ]).finally(() => clearTimeout(deadline));
+      console.info("Packaged Pi pairing control:", JSON.stringify(observation ?? null));
+      throw error;
+    }
     await page.locator('details.device-authorization__manual > summary').click();
     await page.getByLabel("Joko node address").fill(currentFixture.baseUrl);
     await page.getByLabel("Pairing code").fill(pairingCode);
