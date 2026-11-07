@@ -9,7 +9,7 @@ export const REMOTE_PI_BROKER_SOURCE = String.raw`
 import { execFile, spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -75,6 +75,11 @@ function launchHash(value) {
   boundedText(value, 64);
   if (!/^[a-f0-9]{64}$/.test(value)) fail();
   return value;
+}
+function brokerSourcePath(root, sourceHash) {
+  return sourceHash === SOURCE_HASH
+    ? resolve(process.argv[1])
+    : join(root, "broker-" + sourceHash + ".mjs");
 }
 function bearer(value) {
   const accepted = boundedText(value, 4096);
@@ -145,37 +150,45 @@ async function acquireProcessLock(lockPath, value) {
     await privateDirectory(temporary).then(() => rm(temporary, { recursive: true })).catch(() => undefined);
   }
 }
-async function releaseProcessLock(lockPath, expectedPid) {
+async function readProcessLock(lockPath) {
   await privateDirectory(lockPath);
   const content = await privateRegularFile(join(lockPath, "owner.json"), 4096);
   const value = JSON.parse(content.toString("utf8"));
-  if (!value || value.version !== VERSION || value.sourceHash !== SOURCE_HASH || value.pid !== expectedPid) fail();
+  if (!value || value.version !== VERSION) fail();
+  return { sourceHash: launchHash(value.sourceHash), pid: positiveInteger(value.pid), startedAt: positiveInteger(value.startedAt) };
+}
+async function releaseProcessLock(lockPath, expectedPid) {
+  const value = await readProcessLock(lockPath);
+  if (value.sourceHash !== SOURCE_HASH || value.pid !== expectedPid) fail();
   await rm(lockPath, { recursive: true });
 }
-async function processMatches(pid, mode, root) {
-  if (!Number.isSafeInteger(pid) || pid < 1) return false;
-  try { process.kill(pid, 0); } catch { return false; }
-  const fingerprint = await processFingerprint(pid);
+async function processMatches(lock, mode, root) {
+  try { process.kill(lock.pid, 0); } catch (error) { return error?.code !== "ESRCH"; }
+  const fingerprint = await processFingerprint(lock.pid);
   if (fingerprint === undefined) {
+    if (process.platform === "linux") {
+      const status = await linuxProcessStatus("/proc/" + lock.pid).catch(() => undefined);
+      if (status?.exited) return false;
+    }
     // Without a trustworthy process-start identity, preserve the lock. PID
     // reuse must never authorize destructive recovery.
     return true;
   }
-  return fingerprint.args.includes(resolve(process.argv[1]))
-    && fingerprint.args.includes(mode) && fingerprint.args.includes(root);
+  const modes = mode === "daemon" ? ["daemon"] : ["bridge", "kill", "store"];
+  return fingerprint.args.length >= 4 && modes.includes(fingerprint.args[2])
+    && sameNativePath(fingerprint.args[1], brokerSourcePath(root, lock.sourceHash))
+    && sameNativePath(fingerprint.args[3], root);
 }
 async function reclaimStaleLock(lockPath, mode, root) {
   let owner;
+  let before;
   try {
-    await privateDirectory(lockPath);
-    const content = await privateRegularFile(join(lockPath, "owner.json"), 4096);
-    if (content.byteLength > 4096) return false;
-    owner = JSON.parse(content.toString("utf8"));
+    before = await lstat(lockPath);
+    owner = await readProcessLock(lockPath);
   } catch { return false; }
-  if (!owner || owner.version !== VERSION || owner.sourceHash !== SOURCE_HASH || !Number.isSafeInteger(owner.startedAt)) return false;
-  if (await processMatches(owner.pid, mode, root)) return false;
-  const info = await lstat(lockPath).catch(() => undefined);
-  if (!info || !info.isDirectory() || info.isSymbolicLink()) return false;
+  if (await processMatches(owner, mode, root)) return false;
+  const after = await lstat(lockPath).catch(() => undefined);
+  if (!after?.isDirectory() || after.isSymbolicLink() || after.dev !== before.dev || after.ino !== before.ino) return false;
   await rm(lockPath, { recursive: true });
   return true;
 }
@@ -690,7 +703,7 @@ async function bootstrapChildMatches(fingerprint, record) {
 }
 async function bootstrapOwnerProcess(root, record) {
   const expected = [
-    resolve(process.execPath), resolve(process.argv[1]), "owner", root,
+    resolve(process.execPath), brokerSourcePath(root, record.sourceHash), "owner", root,
     record.identity, record.ownerLaunchHash, record.ownerIdentity
   ];
   if (record.owner !== undefined) {
@@ -968,11 +981,11 @@ function unixSocketPath(parent, name) {
   return path;
 }
 function bootstrapRecord(value, expectedIdentity) {
-  if (!value || typeof value !== "object" || value.version !== VERSION || value.sourceHash !== SOURCE_HASH) fail();
+  if (!value || typeof value !== "object" || value.version !== VERSION) fail();
   if (identity(value.identity) !== expectedIdentity) fail();
   return {
     version: VERSION,
-    sourceHash: SOURCE_HASH,
+    sourceHash: launchHash(value.sourceHash),
     identity: expectedIdentity,
     launchHash: launchHash(value.launchHash),
     ownerLaunchHash: value.ownerLaunchHash === undefined
@@ -1017,11 +1030,11 @@ function authorityFence(authority) {
   };
 }
 function ownerRecord(value, expectedIdentity) {
-  if (!value || typeof value !== "object" || value.version !== VERSION || value.sourceHash !== SOURCE_HASH) fail();
+  if (!value || typeof value !== "object" || value.version !== VERSION) fail();
   if (identity(value.identity) !== expectedIdentity) fail();
   const record = {
     version: VERSION,
-    sourceHash: SOURCE_HASH,
+    sourceHash: launchHash(value.sourceHash),
     identity: expectedIdentity,
     launchHash: launchHash(value.launchHash),
     ownerLaunchHash: value.ownerLaunchHash === undefined
@@ -1210,7 +1223,7 @@ async function ownerControl(path, request) {
 function exactOwnerCommand(fingerprint, root, record) {
   const expected = [
     resolve(process.execPath),
-    resolve(process.argv[1]),
+    brokerSourcePath(root, record.sourceHash),
     "owner",
     root,
     record.identity,
@@ -1224,7 +1237,7 @@ function exactChildCommand(fingerprint, request, executable = request.executable
   return exactProcessArguments(fingerprint.args, expected);
 }
 function exactJanitorCommand(fingerprint, root, record) {
-  const expected = [resolve(process.execPath), ...janitorArguments(root, record)];
+  const expected = [resolve(process.execPath), ...janitorArguments(root, record, brokerSourcePath(root, record.sourceHash))];
   return exactProcessArguments(fingerprint.args, expected);
 }
 function exactProcessArguments(actual, expected) {
@@ -1241,7 +1254,7 @@ async function inspectLiveOwner(root, sessionIdentity) {
   await privateSocket(paths.socketPath);
   await privateSocket(paths.controlSocketPath);
   const owner = await processFingerprint(record.owner.pid);
-  if (!fingerprintsMatch(owner, record.owner) || !exactOwnerCommand(owner, root, record)) fail();
+  if (!fingerprintsMatch(owner, record.owner) || !sameFingerprintOwner(owner) || !exactOwnerCommand(owner, root, record)) fail();
   const deadline = Date.now() + START_TIMEOUT_MS;
   for (;;) {
     const challenge = randomBytes(32).toString("hex");
@@ -1261,7 +1274,7 @@ async function inspectLiveOwner(root, sessionIdentity) {
         && createHash("sha256").update(JSON.stringify(committedAuthority)).digest("hex") !== record.committedAuthorityDigest
     ) fail();
     const janitor = await processFingerprint(record.janitor.pid);
-    if (!fingerprintsMatch(janitor, record.janitor) || !exactJanitorCommand(janitor, root, record)) fail();
+    if (!fingerprintsMatch(janitor, record.janitor) || !sameFingerprintOwner(janitor) || !exactJanitorCommand(janitor, root, record)) fail();
     if (!status.terminal) {
       const child = await processFingerprint(record.child.pid);
       if (child === undefined && Date.now() < deadline) {
@@ -1277,7 +1290,7 @@ async function writeReaped(paths, record) {
   await privateDirectory(paths.sessionRoot);
   await atomicJson(paths.reapedPath, {
     version: VERSION,
-    sourceHash: SOURCE_HASH,
+    sourceHash: record.sourceHash ?? SOURCE_HASH,
     identity: record.identity,
     ownerIdentity: record.ownerIdentity,
     childIdentity: fingerprintIdentity(record.child),
@@ -1288,7 +1301,7 @@ async function validReaped(paths, record) {
   try {
     const content = await privateRegularFile(paths.reapedPath, 4096);
     const value = JSON.parse(content.toString("utf8"));
-    return value && value.version === VERSION && value.sourceHash === SOURCE_HASH
+    return value && value.version === VERSION && (value.sourceHash === record.sourceHash || value.sourceHash === SOURCE_HASH)
       && value.identity === record.identity && value.ownerIdentity === record.ownerIdentity
       && value.childIdentity === fingerprintIdentity(record.child)
       && Number.isSafeInteger(value.reapedAt) && value.reapedAt > 0;
@@ -1331,11 +1344,11 @@ function verifiesStoredAuthorityFence(recovery, fence) {
     && recovery.processStartIdentity === fence.childIdentity;
 }
 function tombstoneRecord(value, expectedIdentity) {
-  if (!value || typeof value !== "object" || value.version !== VERSION || value.sourceHash !== SOURCE_HASH) fail();
+  if (!value || typeof value !== "object" || value.version !== VERSION) fail();
   if (identity(value.identity) !== expectedIdentity) fail();
   const record = {
     version: VERSION,
-    sourceHash: SOURCE_HASH,
+    sourceHash: launchHash(value.sourceHash),
     identity: expectedIdentity,
     ownerIdentity: launchHash(value.ownerIdentity),
     launchHash: launchHash(value.launchHash),
@@ -1369,7 +1382,7 @@ async function persistTombstone(paths, value) {
   await privateDirectory(paths.sessionsRoot);
   await atomicJson(paths.tombstonePath, {
     version: VERSION,
-    sourceHash: SOURCE_HASH,
+    sourceHash: value.sourceHash,
     identity: value.identity,
     ownerIdentity: value.ownerIdentity,
     launchHash: value.launchHash,
@@ -1391,7 +1404,7 @@ async function persistTombstone(paths, value) {
 async function writeTombstone(paths, record) {
   return persistTombstone(paths, {
     version: VERSION,
-    sourceHash: SOURCE_HASH,
+    sourceHash: record.sourceHash,
     identity: record.identity,
     ownerIdentity: record.ownerIdentity,
     launchHash: record.launchHash,
@@ -1485,9 +1498,9 @@ async function managedRemovalTombstoneResult(paths, value, expectedIdentity) {
     deletionReceipt: removal.deletionReceipt
   };
 }
-function janitorArguments(root, record) {
+function janitorArguments(root, record, sourcePath = process.argv[1]) {
   return [
-    process.argv[1], "janitor", root, record.identity, record.launchHash, record.ownerIdentity,
+    sourcePath, "janitor", root, record.identity, record.launchHash, record.ownerIdentity,
     String(record.owner.pid), record.owner.startTicks, record.owner.commandHash, record.owner.executableHash,
     String(record.child.pid), record.child.startTicks, record.child.commandHash, record.child.executableHash,
     record.managedEnabled ? "1" : "0",
@@ -1555,7 +1568,7 @@ async function recoverDeadOwner(root, sessionIdentity) {
   }
   if (bootstrap !== undefined) {
     if (
-      bootstrap.ownerIdentity !== record.ownerIdentity
+      bootstrap.sourceHash !== record.sourceHash || bootstrap.ownerIdentity !== record.ownerIdentity
       || bootstrap.ownerLaunchHash !== record.ownerLaunchHash
       || await bootstrapOwnerProcess(root, bootstrap) !== undefined
     ) fail();
@@ -1607,7 +1620,7 @@ async function runBootstrapSentinel(root, expectedIdentity, expectedHash, expect
   const paths = sessionPaths(canonicalRoot, expectedIdentity);
   for (;;) {
     const record = await readBootstrapRecord(paths, expectedIdentity);
-    if (record.launchHash !== expectedHash || record.ownerIdentity !== expectedOwnerIdentity) fail();
+    if (record.sourceHash !== SOURCE_HASH || record.launchHash !== expectedHash || record.ownerIdentity !== expectedOwnerIdentity) fail();
     const owner = await bootstrapOwnerProcess(canonicalRoot, record);
     const child = await bootstrapChildProcess(record);
     if (owner !== undefined) {
@@ -1628,14 +1641,23 @@ async function recoverIncompleteBootstrap(root, sessionIdentity) {
   try {
     record = await readBootstrapRecord(paths, sessionIdentity);
   } catch (error) {
-    if (error && error.code === "ENOENT") return undefined;
-    throw error;
+    if (error?.code !== "ENOENT") throw error;
+    // The manager can exit between mkdir and the bootstrap marker. An owner
+    // cannot have been spawned for an empty directory without that marker.
+    try {
+      await privateDirectory(paths.sessionRoot);
+      await rmdir(paths.sessionRoot);
+      return { recovered: true };
+    } catch (directoryError) {
+      if (directoryError?.code === "ENOENT" || directoryError?.code === "ENOTEMPTY") return undefined;
+      throw directoryError;
+    }
   }
   const deadline = Date.now() + START_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
       const live = await inspectLiveOwner(root, sessionIdentity);
-      if (live.record.ownerIdentity !== record.ownerIdentity) fail();
+      if (live.record.sourceHash !== record.sourceHash || live.record.ownerIdentity !== record.ownerIdentity) fail();
       return { live };
     } catch (error) {
       if (error && error.code !== "ENOENT") {
@@ -3381,7 +3403,8 @@ async function runSessionOwner(root, request, ownerIdentity) {
   await privateDirectory(paths.sessionRoot);
   const bootstrapMarker = await readBootstrapRecord(paths, request.identity);
   if (
-    bootstrapMarker.launchHash !== request.launchHash || bootstrapMarker.ownerIdentity !== ownerIdentity
+    bootstrapMarker.sourceHash !== SOURCE_HASH || bootstrapMarker.launchHash !== request.launchHash
+    || bootstrapMarker.ownerIdentity !== ownerIdentity
     || bootstrapMarker.spawnIdentity !== request.authority.spawnIdentity
   ) fail();
   const relayConnections = new Set();
@@ -4346,7 +4369,7 @@ async function spawnOwner(root, request, rawRequest) {
   while (Date.now() < deadline) {
     try {
       const live = await inspectLiveOwner(root, request.identity);
-      if (live.record.ownerIdentity !== ownerIdentity) fail();
+      if (live.record.sourceHash !== SOURCE_HASH || live.record.ownerIdentity !== ownerIdentity) fail();
       return live;
     } catch {
       if (owner.exitCode !== null || owner.signalCode !== null) break;
@@ -4458,12 +4481,21 @@ async function runDaemon(managedRoot) {
     });
     return { ...configured, reattached: true };
   });
+  let markManagerReady;
+  const managerReady = new Promise((resolveReady) => { markManagerReady = resolveReady; });
   const manager = createServer((socket) => {
     socket.setTimeout(30_000, () => socket.destroy());
-    void readControlLine(socket).then(async ({ value }) => {
+    socket.on("error", () => undefined);
+    void managerReady.then((ready) => {
+      if (!ready) fail();
+      return readControlLine(socket);
+    }).then(async ({ value, tail }) => {
+      if (tail.byteLength !== 0) fail();
       if (value && value.action === "hello") {
         writeControl(socket, { ok: true, version: VERSION, sourceHash: SOURCE_HASH });
-        return socket.end();
+        if (value.expectedSourceHash !== SOURCE_HASH) return socket.end();
+        ({ value, tail } = await readControlLine(socket));
+        if (tail.byteLength !== 0) fail();
       }
       if (value && value.action === "kill") {
         const key = identity(value.identity);
@@ -4555,57 +4587,98 @@ async function runDaemon(managedRoot) {
     });
   });
   manager.maxConnections = 128;
-  await new Promise((resolveListen, rejectListen) => {
-    manager.once("error", rejectListen);
-    manager.listen(managerSocket, resolveListen);
-  });
-  if (process.platform !== "win32") await chmod(managerSocket, 0o600);
-  await atomicJson(join(root, "broker.json"), {
-    version: VERSION,
-    sourceHash: SOURCE_HASH,
-    pid: process.pid,
-    socket: managerSocket,
-    startedAt: Date.now()
-  });
+  try {
+    await new Promise((resolveListen, rejectListen) => {
+      manager.once("error", rejectListen);
+      manager.listen(managerSocket, resolveListen);
+    });
+    if (process.platform !== "win32") await chmod(managerSocket, 0o600);
+    await atomicJson(join(root, "broker.json"), { ...daemonOwner, socket: managerSocket });
+  } catch (error) {
+    markManagerReady(false);
+    await closeListeningServer(manager);
+    throw error;
+  }
   const release = () => {
     void rm(managerSocket, { force: true });
     void releaseProcessLock(daemonLock, process.pid).catch(() => undefined);
   };
   process.once("exit", release);
+  markManagerReady(true);
+}
+
+async function probeManager(root) {
+  const socketPath = unixSocketPath(root, "broker.sock");
+  const socket = createConnection(socketPath);
+  socket.setTimeout(START_TIMEOUT_MS, () => socket.destroy());
+  try {
+    await new Promise((resolveConnect, rejectConnect) => {
+      socket.once("connect", resolveConnect);
+      socket.once("error", rejectConnect);
+    });
+    writeControl(socket, { action: "hello", expectedSourceHash: SOURCE_HASH });
+    const { value, tail } = await readControlLine(socket);
+    if (tail.byteLength !== 0 || value?.ok !== true || value.version !== VERSION) fail();
+    const sourceHash = launchHash(value.sourceHash);
+    await privateSocket(socketPath);
+    if (sourceHash !== SOURCE_HASH) {
+      socket.destroy();
+      return { sourceHash };
+    }
+    socket.setTimeout(0);
+    return { sourceHash, socket };
+  } catch (error) {
+    socket.destroy();
+    if (error?.code === "ENOENT" || error?.code === "ECONNREFUSED") return undefined;
+    throw error;
+  }
+}
+
+async function retireManager(root, sourceHash) {
+  const lock = await readProcessLock(join(root, "daemon.lock"));
+  const content = await privateRegularFile(join(root, "broker.json"), 4096);
+  const metadata = JSON.parse(content.toString("utf8"));
+  if (lock.sourceHash !== sourceHash || metadata?.version !== VERSION || metadata.sourceHash !== sourceHash
+    || metadata.pid !== lock.pid || metadata.socket !== unixSocketPath(root, "broker.sock")
+    || positiveInteger(metadata.startedAt) < lock.startedAt) fail();
+  const fingerprint = await processFingerprint(lock.pid);
+  if (fingerprint === undefined) {
+    if (!(await processMatches(lock, "daemon", root))) return;
+    fail();
+  }
+  const expected = [resolve(process.execPath), brokerSourcePath(root, sourceHash), "daemon", root];
+  if (!sameFingerprintOwner(fingerprint) || !sameNativePath(fingerprint.executable, process.execPath)
+    || !exactProcessArguments(fingerprint.args, expected)) fail();
+  // Owners and their janitors have independent sockets and lifetimes.
+  if (!(await stopExactProcess(fingerprint))) fail();
 }
 
 async function connectManager(root, recoveryAttempt = 0) {
-  const socketPath = unixSocketPath(root, "broker.sock");
-  const connect = () => new Promise((resolveConnect, rejectConnect) => {
-    const socket = createConnection(socketPath);
-    socket.once("connect", () => resolveConnect(socket));
-    socket.once("error", rejectConnect);
-  });
-  try { return await connect(); } catch {}
+  const existing = await probeManager(root);
+  if (existing?.socket !== undefined) return existing.socket;
   const lockPath = join(root, "start.lock");
-  await secureDirectory(root);
-  let ownsLock = false;
+  const startOwner = { version: VERSION, sourceHash: SOURCE_HASH, pid: process.pid, startedAt: Date.now() };
+  const ownsLock = await acquireProcessLock(lockPath, startOwner);
   try {
-    const startOwner = { version: VERSION, sourceHash: SOURCE_HASH, pid: process.pid, startedAt: Date.now() };
-    ownsLock = await acquireProcessLock(lockPath, startOwner);
     if (!ownsLock && recoveryAttempt < 1 && await reclaimStaleLock(lockPath, "bridge", root)) {
       return connectManager(root, recoveryAttempt + 1);
     }
     if (ownsLock) {
-      const daemonEnvironment = { JOKO_REMOTE_BROKER_SOURCE_HASH: SOURCE_HASH };
-      for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR"]) {
-        if (typeof process.env[name] === "string") daemonEnvironment[name] = process.env[name];
-      }
-      const child = spawn(process.execPath, [process.argv[1], "daemon", root], { detached: true, stdio: "ignore", env: daemonEnvironment });
+      const current = await probeManager(root);
+      if (current?.socket !== undefined) return current.socket;
+      if (current !== undefined) await retireManager(root, current.sourceHash);
+      const child = spawn(process.execPath, [process.argv[1], "daemon", root], {
+        detached: true,
+        stdio: "ignore",
+        env: safeDaemonEnvironment()
+      });
       child.unref();
     }
-  } catch (error) {
-    throw error;
-  }
-  const deadline = Date.now() + START_TIMEOUT_MS;
-  try {
+    const deadline = Date.now() + START_TIMEOUT_MS;
     while (Date.now() < deadline) {
-      try { return await connect(); } catch { await new Promise((resolveWait) => setTimeout(resolveWait, 50)); }
+      const current = await probeManager(root);
+      if (current?.socket !== undefined) return current.socket;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
     }
     throw new Error("Remote runtime broker did not become ready.");
   } finally {
@@ -4615,11 +4688,14 @@ async function connectManager(root, recoveryAttempt = 0) {
 
 async function requestManager(root, request) {
   const socket = await connectManager(root);
-  writeControl(socket, request);
-  const response = await readControlLine(socket);
-  socket.end();
-  if (!response.value || response.value.ok !== true) fail();
-  return response.value;
+  try {
+    writeControl(socket, request);
+    const response = await readControlLine(socket);
+    if (!response.value || response.value.ok !== true) fail();
+    return response.value;
+  } finally {
+    socket.end();
+  }
 }
 
 async function runBridge(root, expectedIdentity, expectedHash, terminalFence) {
