@@ -3715,6 +3715,13 @@ export function createConnectServices(application: OrchestratorApplication, proj
         throw invalidArgument("A concrete staged, unstaged, commit, or branch image source is required.");
       }
       try {
+        const registration = requireWorkspace(dependencies.workspaceService, request.workspaceId);
+        const assertCurrent = (): void => {
+          authenticate(context);
+          if (requireWorkspace(dependencies.workspaceService, request.workspaceId) !== registration) {
+            throw new ConnectError("The workspace authority changed while preparing the Review image.", Code.Aborted);
+          }
+        };
         const preview = await dependencies.workspaceService.readGitDiffImage(request.workspaceId, {
           path: request.relativePath,
           ...(request.oldRelativePath === "" ? {} : { oldPath: request.oldRelativePath }),
@@ -3723,10 +3730,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
           ...(request.sourceRevision === "" ? {} : { sourceRevision: request.sourceRevision }),
           ...(request.expectedMergeBaseRevision === "" ? {} : { expectedMergeBaseRevision: request.expectedMergeBaseRevision })
         });
+        assertCurrent();
         const [oldImage, newImage] = await Promise.all([
           mapWorkspaceDiffImageSide(dependencies.artifactStore, preview.oldImage, "Previous Review image"),
           mapWorkspaceDiffImageSide(dependencies.artifactStore, preview.newImage, "Current Review image")
         ]);
+        assertCurrent();
         return {
           oldImage,
           newImage,
