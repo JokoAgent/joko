@@ -675,7 +675,7 @@ describe("MessagingManager", () => {
     cleanups.push(async () => { try { await f.manager.close(); } finally { profiles.close(); } });
     const partners = new PartnerManager({ store: profiles, operationalStore: f.store, sessionHost: f.host, homesRoot: join(f.root, "homes"),
       workspaceService: { register: async input => input, unregister: () => undefined } });
-    const partner = await partners.createPartner({ requestId: "wechat-partner", expectedDirectoryRevision: profiles.directoryState().revision,
+    const partner = await partners.createPartner({ requestId: "wechat-partner-create", expectedDirectoryRevision: profiles.directoryState().revision,
       displayName: "Ada", avatar: "orbit", identitySource: "A Partner who shares this private WeChat conversation.", templateId: "general", usesDirectoryDefaults: false,
       capabilities: { modelChain: [{ backendId: f.adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
     expect(partner.initializationState).toBe("ready");
