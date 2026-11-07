@@ -17081,14 +17081,15 @@ async function dispatchMutation(
       return presented(execution);
     }
     case "createTaskTag": {
+      const originSessionId = payload.value.originSessionId;
       const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
         commit: (store) => {
-          store.createTaskTag({
-            originSessionId: payload.value.originSessionId,
+          const created = store.createTaskTag({
+            originSessionId,
             name: payload.value.name,
             color: fromProtoTaskTagColor(payload.value.color),
             expectedCatalogRevision: fromProtoRevision(
@@ -17097,6 +17098,7 @@ async function dispatchMutation(
             ),
             ...(payload.value.presetId === undefined ? {} : { presetId: payload.value.presetId })
           });
+          store.setSessionTaskTags({ originSessionId, sessionIds: [originSessionId], tagIds: [created.id], attached: true });
           return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
         }
       });
