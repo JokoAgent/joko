@@ -14,7 +14,7 @@ export class PartnerGlanceTodos {
   #epoch = 0; #timer: ReturnType<typeof setTimeout> | undefined;
   #attempt: { readonly operationId: string; readonly revision: bigint; readonly todo: PartnerTodo; readonly action: "delete" | "restore" } | undefined;
   #state: PartnerGlanceTodoState = { open: [], done: [], openTotal: 0, doneTotal: 0, loaded: false, failed: false, saving: false, pending: false, now: Date.now() };
-  constructor(readonly api: PartnerAutonomyApi, readonly partnerId: string) {}
+  constructor(readonly api: PartnerAutonomyApi, readonly partnerId: string, private readonly completedWindow: "oldest" | "newest" = "oldest") {}
   snapshot = (): PartnerGlanceTodoState => this.#state;
   subscribe = (listener: () => void): (() => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
   #set(patch: Partial<PartnerGlanceTodoState>) { if (this.#closed) return; this.#state = { ...this.#state, ...patch }; for (const listener of this.#listeners) listener(); }
@@ -26,17 +26,24 @@ export class PartnerGlanceTodos {
     const epoch = ++this.#epoch, request = new AbortController(); this.#request?.abort(); this.#request = request;
     try {
       const read = async (view: "open" | "done") => {
-        let page = await this.api.todos(this.partnerId, view, 0, request.signal), items = [...page.items], offset = page.nextOffset;
-        const first = page;
-        while (offset !== undefined && items.length < Math.min(page.total, 200)) {
-          page = await this.api.todos(this.partnerId, view, offset, request.signal);
-          if (page.partnerRevision?.value !== first.partnerRevision?.value || page.items.length === 0) break;
+        const first = await this.api.todos(this.partnerId, view, 0, request.signal);
+        const limit = Math.min(first.total, 200);
+        let offset = view === "done" && this.completedWindow === "newest" ? first.total - limit : 0;
+        let page = offset === 0 ? first : await this.api.todos(this.partnerId, view, offset, request.signal);
+        const items: PartnerTodo[] = [];
+        while (true) {
+          if (page.partnerRevision?.value !== first.partnerRevision?.value || page.total !== first.total) {
+            throw new Error("The affair list changed during pagination.");
+          }
           items.push(...page.items);
-          if (page.nextOffset !== undefined && page.nextOffset <= offset) throw new Error("The affair cursor did not advance.");
+          if (page.nextOffset === undefined || items.length >= limit) break;
+          if (page.nextOffset <= offset || page.items.length === 0) throw new Error("The affair cursor did not advance.");
           offset = page.nextOffset;
+          page = await this.api.todos(this.partnerId, view, offset, request.signal);
         }
         const unique = new Map(items.map(todo => [todo.id, todo]));
-        return { ...first, items: [...unique.values()].slice(0, 200), total: page.total };
+        if (unique.size < limit) throw new Error("The affair page window is incomplete.");
+        return { ...first, items: [...unique.values()].slice(0, limit) };
       };
       const [open, done] = await Promise.all([read("open"), read("done")]);
       if (request.signal.aborted || epoch !== this.#epoch || !this.#foreground || this.#closed) return;
