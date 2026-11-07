@@ -204,8 +204,10 @@ enum RemoteClipboard {
       if let string = item[type] as? String {
         value = string
       } else if let data = item[type] as? Data {
-        guard RemoteClipboardSize.acceptsTransferUTF8Bytes(data),
-          let decoded = String(data: data, encoding: .utf8) else {
+        guard RemoteClipboardSize.acceptsTransferUTF8Bytes(data) else {
+          throw failure("REMOTE_DESKTOP_CLIPBOARD_TOO_LONG")
+        }
+        guard let decoded = String(data: data, encoding: .utf8) else {
           throw failure("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED")
         }
         value = decoded
