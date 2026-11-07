@@ -421,6 +421,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   readonly #state: OperationalBrowserState | undefined;
   readonly #enabledForNewSessions: (targetId: string) => boolean;
   readonly #remoteNodes: BrowserRemoteNodeRouter | undefined;
+  readonly #localNodeId: string | undefined;
   readonly #userKnowledge: BrowserUserKnowledgeLayer | undefined;
   readonly #setBackend: ((mode: BrowserTargetMode, assertCurrent: () => void) => Promise<BrowserTargetMode>) | undefined;
   readonly #recipes = new Map<string, BrowserRecipe>();
@@ -445,6 +446,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     readonly state?: OperationalBrowserState;
     readonly enabledForNewSessions?: (targetId: string) => boolean;
     readonly remoteNodes?: BrowserRemoteNodeRouter;
+    readonly localNodeId?: string;
     readonly userKnowledge?: BrowserUserKnowledgeLayer;
     readonly setBackend?: (mode: BrowserTargetMode, assertCurrent: () => void) => Promise<BrowserTargetMode>;
   }) {
@@ -454,6 +456,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     this.#state = input.state;
     this.#enabledForNewSessions = input.enabledForNewSessions ?? (() => true);
     this.#remoteNodes = input.remoteNodes;
+    this.#localNodeId = input.localNodeId;
     this.#userKnowledge = input.userKnowledge;
     this.#setBackend = input.setBackend;
     for (const raw of BUILTIN_BROWSER_RECIPES) {
@@ -1251,7 +1254,6 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     input: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined
   ): Promise<McpCallResult> {
-    this.#remoteResultActive = true;
     const nodeId = requiredString(input, "node", 512);
     const route = await this.#remoteNodes?.resolve(nodeId);
     if (route === undefined || route.id !== nodeId || !route.available) {
@@ -1265,6 +1267,18 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       throw new Error(`Remote Browser node does not advertise action:${action}.`);
     }
     const actKind = validateRemoteBrowserInput(action, input);
+    const context = this.#activeContext;
+    if (context !== undefined && action === "stop") {
+      throw new Error("A Session-scoped call cannot stop a shared remote Browser node.");
+    }
+    if (nodeId === this.#localNodeId) {
+      // This bridge already owns the queue and the original Session authority.
+      signal?.throwIfAborted(); this.#assertSessionContext();
+      const result = await this.#executeUnified(copyRemoteArguments(input), signal);
+      this.#assertRemoteRoute(route, generation);
+      return result;
+    }
+    this.#remoteResultActive = true;
     const recipeId = action === "recipe" || action === "saveRecipe"
       ? isRecord(input["recipeDraft"]) ? validateRecipe(input["recipeDraft"]).id : requiredString(input, "recipeId", 256) : undefined;
     const recipeKey = recipeId === undefined ? undefined : JSON.stringify([nodeId, recipeId]);
@@ -1291,10 +1305,6 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       throw new Error("Remote Browser node does not advertise artifact-upload.");
     }
     const remoteProviderId = remoteBrowserAuthorityId(nodeId);
-    const context = this.#activeContext;
-    if (context !== undefined && action === "stop") {
-      throw new Error("A Session-scoped call cannot stop a shared remote Browser node.");
-    }
     const pageId = context === undefined ? undefined : scopedRemotePageId(action, input);
     if (pageId !== undefined) this.#assertRemotePageContext(remoteProviderId, pageId, generation);
 
@@ -1543,7 +1553,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   async #observeBrowserFlow(name: string, input: Readonly<Record<string, unknown>>, result: McpCallResult, signal?: AbortSignal): Promise<McpCallResult> {
     try {
       const args = name === "browser" ? input : name === "call_tool" && input["name"] === "browser" ? optionalRecord(input, "args") : undefined;
-      if (!args || args["target"] === "node") return result;
+      if (!args || args["target"] === "node" && args["node"] !== this.#localNodeId) return result;
       const action = args["action"], request = optionalRecord(args, "request");
       if (action === "stop") { this.#recipeTasks.clear(); return result; }
       if (!["open", "navigate", "close", "act", "extract", "recipe"].includes(String(action))) return result;
