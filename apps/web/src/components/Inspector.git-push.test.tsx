@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
-import type { SessionView, WorkspaceDiffImageView, WorkspaceDiffView, WorkspaceFilePreviewView, WorkspaceGitPushResultView, WorkspaceView } from "../model.js";
+import type { SessionView, WorkspaceChangeSetView, WorkspaceDiffImageView, WorkspaceDiffView, WorkspaceFilePreviewView, WorkspaceGitPushResultView, WorkspaceView } from "../model.js";
 import { ChangesPanel } from "./Inspector.js";
 
 const roots: Root[] = [];
@@ -64,6 +64,22 @@ describe("Inspector Git push destinations", () => {
     expect(view.host.textContent).not.toContain("Retired Markdown");
     expect(view.host.querySelector(".review-image-preview img")?.getAttribute("src")).toBe("blob:photo-b");
     expect(view.api.acquireArtifactUrl).toHaveBeenCalledExactlyOnceWith("photo-b");
+  });
+
+  it("shows a captured Markdown file with its live preview disabled", async () => {
+    const view = await mount(diff, false, true, [{ id: "review-turn", runId: "run", turnId: "turn", changeCount: 1,
+      changes: [{ path: "README.md", kind: "updated" }], completeBaseline: true, gaps: [], capturedAt: 2 }]);
+    view.api.getWorkspaceDiff.mockClear();
+    await act(async () => view.host.querySelector<HTMLButtonElement>('[aria-label="workspace.reviewSource"]')!.click());
+    await act(async () => [...document.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find(option => option.textContent === "workspace.reviewSourceTurnSet")!.click());
+    expect(view.host.querySelector(".workspace-review-file summary")?.textContent).toContain("README.md");
+    const preview = button(view.host, "workspace.reviewMarkdownPreview");
+    expect(preview.disabled).toBe(true);
+    expect(preview.getAttribute("aria-description")).toBe("workspace.reviewHistoricalMarkdownUnavailable");
+    await act(async () => preview.click());
+    expect(view.api.readWorkspaceDiffFile).not.toHaveBeenCalled();
+    expect(view.api.getWorkspaceDiff).not.toHaveBeenCalled();
   });
 
   it("refreshes a Review image after its download failed, even with the same Blob ID", async () => {
@@ -179,10 +195,10 @@ describe("Inspector Git push destinations", () => {
   });
 });
 
-async function mount(initial = diff, canCommitDiff = false, canDiffImagePreview = false) {
+async function mount(initial = diff, canCommitDiff = false, canDiffImagePreview = false, changeSets: readonly WorkspaceChangeSetView[] = []) {
   const api = {
     getWorkspaceDiff: vi.fn<AppController["getWorkspaceDiff"]>(async () => initial),
-    listWorkspaceChangeSets: vi.fn(async () => []),
+    listWorkspaceChangeSets: vi.fn(async () => changeSets),
     readWorkspaceDiffFile: vi.fn<AppController["readWorkspaceDiffFile"]>(),
     readWorkspaceDiffImage: vi.fn<AppController["readWorkspaceDiffImage"]>(),
     acquireArtifactUrl: vi.fn<AppController["acquireArtifactUrl"]>((blobId) => ({ url: Promise.resolve(`blob:${blobId}`), release: vi.fn() })),
