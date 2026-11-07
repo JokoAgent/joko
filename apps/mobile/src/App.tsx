@@ -20,6 +20,7 @@ import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
   CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, capabilityNames, partnerResumeMessages,
+  partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
@@ -6303,6 +6304,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       </View>
     </View>;
         const delegatedCards = delegatedAffinity.byEventId.get(item.eventId) ?? [];
+        const taskReceipt = item.partnerTaskReceipt;
+        const receiptChild = taskReceipt?.taskSessionId;
         const taskSource = item.taskMessageOrigin;
         const sourceName = taskSource?.senderPartnerName?.trim() || taskSource?.senderSessionTitle?.trim();
         const sourceLabel = taskSource && (sourceName ? mobileMessage(locale, taskSource.senderPartnerName?.trim()
@@ -6330,6 +6333,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         {!delegatedOnly && !item.collaboration && (!partnerIdentity.partner || item.kind !== "user" && item.kind !== "assistant" || item.optimistic) && <View style={styles.statusTitle}>
           <Text style={[styles.caption, { color: colors.muted }]}>{item.objectiveLifecycle
             ? mobileMessage(locale, item.objectiveLifecycle.status ? `objective.${item.objectiveLifecycle.status}` : "objective.clear")
+            : taskReceipt ? `${partnerSessionTaskReceiptLabel(locale, taskReceipt.status)} · #${taskReceipt.execution}`
             : item.runtimeHandoff ? handoffMessages(locale).changed : item.label}{item.runtimeHandoff?.resumed ? ` · ${handoffMessages(locale).resumed}` : ""}{item.optimistic
             ? ` · ${mobileMessage(locale, "common.sending")}` : ""}</Text>
           {item.optimistic && <ActivityIndicator size="small" color={colors.accent} />}
@@ -6377,7 +6381,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             const target = await collaborationApi.resolveReport(origin, signal); signal.throwIfAborted();
             if (!taskMountedRef.current || client.taskCollaborationApi()?.ownerKey !== collaborationApi.ownerKey) return;
             requestTaskHomeNavigation({ kind: "session", sessionId: target }, drawerMountedRef.current);
-          }} /> : delegatedOnly ? undefined : item.extensionCard ? <MobileExtensionCard card={item.extensionCard} colors={colors} locale={locale}
+          }} /> : delegatedOnly ? undefined : taskReceipt ? <View style={styles.field}>
+          <Text style={[styles.label, { color: colors.ink }]}>{taskReceipt.title}</Text>
+          {item.text !== "" && <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
+          {receiptChild && state.taskSource?.kind !== "joined" && state.owner?.sessions.some(candidate => candidate.sessionId === receiptChild)
+            && <Action label={partnerSessionTaskMessages(locale).open} colors={colors} compact
+              disabled={state.status !== "connected" || state.busy || voice.busy || attachmentBusy || navigationBusy}
+              onPress={() => { requestTaskHomeNavigation({ kind: "session", sessionId: receiptChild }, drawerMountedRef.current); }} />}
+        </View> : item.extensionCard ? <MobileExtensionCard card={item.extensionCard} colors={colors} locale={locale}
             enabled={state.status === "connected" && !conversationShare.active} readOnly={state.taskSource?.kind === "joined"} /> : item.mcpApp ? <MobileMcpAppCard card={item.mcpApp} colors={colors} locale={locale}
             visible={focused || visibleTimelineRows?.has(item.id) === true}
             enabled={state.status === "connected" && !conversationShare.active} readOnly={state.taskSource?.kind === "joined"} /> : item.messageParts ? item.messageParts.map((part) => {

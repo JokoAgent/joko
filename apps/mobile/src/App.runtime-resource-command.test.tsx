@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, type ComponentProps, type ReactNode } f
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
+  MessageRole, PartnerSessionTaskStatus, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
@@ -320,6 +320,22 @@ it("opens the actual Task private source pill with a fresh current peer and keep
   expect(offline?.disabled).toBe(true);
   await act(async () => offline!.click());
   expect(openPrivateThread).toHaveBeenCalledOnce(); expect(privateDirectory).toHaveBeenCalledOnce();
+});
+
+it("renders separate independent task outcomes from the original Partner's older timeline page", async () => {
+  activePartner = { ...peer, partnerId: "ada", displayName: "Ada", canonicalSessionId: "session" };
+  renderedState = { ...state, older: ["First retained result", "Second retained result"].map((result, index) => create(EventSchema, {
+    eventId: `receipt-${index}`, identity: { sessionId: "session", generation: 1n }, cursor: { sequence: BigInt(index + 1) },
+    payload: { kind: { case: "partnerSessionTaskReceipt", value: { taskId: "independent", title: "Independent inspection",
+      execution: index + 1, status: PartnerSessionTaskStatus.COMPLETED, taskSessionId: "child", result } } }
+  })) };
+  await render(false);
+  expect(host.textContent?.match(/Independent inspection/gu)).toHaveLength(2);
+  expect(host.textContent).toContain("First retained result");
+  expect(host.textContent).toContain("Second retained result");
+  expect(host.textContent).toContain("Completed · #1");
+  expect(host.textContent).toContain("Completed · #2");
+  expect(host.querySelector('[aria-label="Open task"]')).toBeNull();
 });
 
 it("closes the native App view when a retained timeline card scrolls out and discards its late link grant", async () => {

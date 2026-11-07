@@ -1752,6 +1752,8 @@ details[open] > summary .details-chevron { transform: rotate(180deg); }
 .notice-block > span, .background-block > svg { color: var(--purple); }
 .notice-block > div, .background-block > div { min-width: 0; flex: 1; }
 .notice-block p, .background-block p { margin: 2px 0 0; overflow: hidden; color: var(--text-soft); font-size: var(--text-11); text-overflow: ellipsis; white-space: nowrap; }
+.partner-task-receipt { align-items: flex-start; }
+.partner-task-receipt p { white-space: pre-wrap; overflow-wrap: anywhere; }
 .notice-block--accent { border-color: color-mix(in srgb, var(--accent-edge) 38%, var(--line)); background: var(--accent-soft); }
 .background-block time, .notice-block time, .status-block time { margin-left: auto; }
 .subagent-inline-card { width: 100%; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); color: var(--text); }

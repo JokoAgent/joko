@@ -6,7 +6,7 @@ import { OperationalStore, PartnerStore, PartnerNetworkStore } from "@joko/store
 import type { AdapterContext, PromptInput } from "@joko/core";
 import { projectPiInputSchema } from "@joko/adapter-pi";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createClient, Code, ConnectError } from "@connectrpc/connect";
+import { createClient, createRouterTransport, Code, ConnectError } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import * as contract from "@joko/contracts";
@@ -18,6 +18,7 @@ import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { sessionTaskActivity } from "./session-task-activity.js";
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { ConnectionManager } from "./connection-manager.js";
+import { registerConnectServices } from "./connect-services.js";
 import { AppDefaultModelCoordinator } from "./app-default-model.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
@@ -48,6 +49,60 @@ class RecordedAdapter extends FakeBackendAdapter {
   }
 }
 describe("Partner independent Session tasks", () => {
+  it("keeps each execution receipt in the original Owner timeline before attempting the hidden return", async () => {
+    const f = await fixture();
+    const parentGeneration = f.store.getSession(f.parent).descriptor.binding.generation;
+    const receipts = () => f.store.listEvents({ sessionId: f.parent, activeNativeTimeline: true })
+      .flatMap(event => event.payload.type === "partner_session_task_receipt" ? [event.payload.receipt] : []);
+    const nativeEnqueue = f.host.enqueueServiceInput.bind(f.host);
+    const outcomesAtReturn: string[][] = [];
+    vi.spyOn(f.host, "enqueueServiceInput").mockImplementation(input => {
+      if (input.sessionId !== f.parent || !input.operationId.startsWith("task:visible:result:")) return nativeEnqueue(input);
+      outcomesAtReturn.push(receipts().flatMap(receipt => receipt.status === "completed" && receipt.result ? [receipt.result] : []));
+      throw new Error("Original return admission is held in this fixture.");
+    });
+    const task = await f.tasks.start(f.parent, "task:visible", { title: "Independent inspection", instruction: "Read the first result" }, () => undefined);
+    expect(receipts()).toMatchObject([{ taskId: task.id, execution: 1, status: "preparing" }]);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(input => input.context.sessionId === task.sessionId)).toHaveLength(1));
+    await f.primary.complete(task.sessionId!, "First retained result");
+    await vi.waitFor(() => expect(outcomesAtReturn).toContainEqual(["First retained result"]));
+    await f.tasks.message(f.parent, task.id, "task:visible:continue", { mode: "queue", message: "Read the second result" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(input => input.context.sessionId === task.sessionId)).toHaveLength(2));
+    await f.primary.complete(task.sessionId!, "Second retained result");
+    await vi.waitFor(() => expect(outcomesAtReturn).toContainEqual(["First retained result", "Second retained result"]));
+    expect(f.store.listRuns({ sessionId: f.parent })).toEqual([]);
+    expect(f.store.listEvents({ sessionId: task.sessionId! }).every(event => event.payload.type !== "partner_session_task_receipt")).toBe(true);
+
+    expect(await f.partners.restartPartner({ requestId: "restart-receipt-parent", partnerId: f.partner.id, expectedRevision: f.partner.revision }))
+      .toMatchObject({ phase: "ready" });
+    expect(f.store.getSession(f.parent).descriptor.binding.generation).toBeGreaterThan(parentGeneration);
+    await f.tasks.close();
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now);
+    await f.tasks.initialize();
+    const connections = new ConnectionManager(f.store), challenge = connections.issuePairing("Receipt owner");
+    const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Receipt owner" });
+    const transport = createRouterTransport(router => registerConnectServices(router, { config: { publicOrigin: "http://127.0.0.1" },
+      store: f.store, connections, sessionHost: f.host, adapters: [f.primary, f.secondary] } as unknown as OrchestratorApplication));
+    const client = createClient(contract.SessionService, transport);
+    const timeline: contract.Event[] = [];
+    let beforeCursor: contract.EventCursor | undefined;
+    do {
+      const page = await client.listSessionTimeline({ sessionId: f.parent, beforeCursor, limit: 1 },
+        { headers: { authorization: `Bearer ${paired.authKey}` } });
+      expect(page.events.length).toBeLessThanOrEqual(1);
+      timeline.unshift(...page.events);
+      beforeCursor = page.nextBeforeCursor;
+    } while (beforeCursor !== undefined && timeline.length < 100);
+    expect(beforeCursor).toBeUndefined();
+    expect(timeline.flatMap(event => event.payload?.kind.case === "partnerSessionTaskReceipt" ? [event.payload.kind.value] : []))
+      .toMatchObject([
+        { taskId: task.id, execution: 1, status: contract.PartnerSessionTaskStatus.PREPARING },
+        { taskId: task.id, execution: 1, status: contract.PartnerSessionTaskStatus.COMPLETED, taskSessionId: task.sessionId, result: "First retained result" },
+        { taskId: task.id, execution: 2, status: contract.PartnerSessionTaskStatus.PREPARING },
+        { taskId: task.id, execution: 2, status: contract.PartnerSessionTaskStatus.COMPLETED, taskSessionId: task.sessionId, result: "Second retained result" }
+      ]);
+  });
+
   it("admits the active owner group tool, retains its group parent and returns output after that execution ends without waking either lane", async () => {
     const f = await fixture(), group = await groupFixture(f), tools = new PartnerSessionTaskTools(f.tasks);
     const session = f.store.getSession(group.sessionId).descriptor;

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
-import { redactSecrets, type PromptInput, type RunDescriptor, type TargetDescriptor } from "@joko/core";
+import { redactSecrets, type PartnerSessionTaskReceipt, type PromptInput, type RunDescriptor, type TargetDescriptor } from "@joko/core";
 import { NotFoundError, type OperationalStore, type PartnerModelRouteRecord, type PartnerProfileRecord, type QueueItemRecord } from "@joko/store";
 import type { PartnerManager } from "./partner-manager.js";
 import type { SessionHost, InteractionDecisionSubmission } from "./session-host.js";
@@ -200,7 +200,10 @@ export class PartnerSessionTaskManager {
         ...(caller.group ? { group: { version: 1, roomId: caller.group.roomId, joinId: caller.group.joinId, hostServerId: caller.group.hostServerId,
           actorId: caller.group.actorId, ownerId: caller.group.ownerId, sourceMessageId: caller.group.sourceMessageId, accessRevision: caller.group.accessRevision,
           fallbackSessionId: profile.canonicalSessionId! } } : {}) };
-      this.#save(task);
+      this.store.transaction(() => {
+        this.#save(task);
+        this.#recordTaskReceipt(task);
+      });
       try {
         const binding = remote === undefined ? undefined : { ...remote, workspaceRoot: actual };
         await this.workspaces.register({ id: targetId, root: actual, displayName: basename(directory), trusted: true,
@@ -524,8 +527,11 @@ export class PartnerSessionTaskManager {
     callerSessionId = task.parentSessionId, options: { readonly deferDispatch?: true } = {}) {
     this.#assertTaskSession(task);
     this.host.enqueueServiceInput({ operationId, sessionId: task.sessionId!, source: "system", originSessionId: callerSessionId, prompt: prompt(text, disposition), ...options,
-      onAdmitted: (_store, receipt) => this.#save({ ...task, runId: receipt.runId,
-        executionRunIds: [...new Set([...task.executionRunIds, receipt.runId])], status: "queued", updatedAt: this.now() }) });
+      onAdmitted: (_store, receipt) => {
+        if (this.#read(task.id).execution !== task.execution) this.#recordTaskReceipt(task);
+        this.#save({ ...task, runId: receipt.runId,
+          executionRunIds: [...new Set([...task.executionRunIds, receipt.runId])], status: "queued", updatedAt: this.now() });
+      } });
     if (options.deferDispatch !== true) this.#arm(this.#read(task.id));
   }
   async #reconcile(id: string): Promise<PartnerSessionTaskRecord> {
@@ -549,6 +555,7 @@ export class PartnerSessionTaskManager {
     if (!task.sessionId || task.status === "preparing" || task.status === "unknown") {
       if (task.status === "unknown") this.groupPublisher?.skipProgress(task.id);
       else if (task.group && !isActive(task.status)) await this.#deliver(task);
+      else if (!isActive(task.status)) this.#recordTaskReceipt(task, true);
       this.#arm(this.#read(id)); return this.#read(id);
     }
     for (const interaction of interactions) {
@@ -591,6 +598,7 @@ export class PartnerSessionTaskManager {
         if (task.sessionId && task.runId) persistSessionTaskActivity(this.store, task.sessionId, { runId: task.runId, completionNotification: "none" });
         return;
       }
+      if (!task.group) this.#recordTaskReceipt(task, true);
       const runIds = this.#executionRuns(task).ids;
       if (task.group && !task.groupFallback && this.groupPublisher) {
         const delivered = await this.groupPublisher.terminal(task, runIds);
@@ -623,6 +631,28 @@ export class PartnerSessionTaskManager {
       }
       // An uncertain admission retains its exact durable return identity.
     }
+  }
+
+  #recordTaskReceipt(task: PartnerSessionTaskRecord, includeOutcome = false): void {
+    if (task.group) return;
+    const profile = this.partners.getPartner(task.partnerId);
+    const parent = this.store.findSession(task.parentSessionId)?.descriptor;
+    if (parent === undefined || profile.lifecycle !== "active" || profile.canonicalSessionId !== parent.id
+      || profile.homeTargetId !== parent.targetId || parent.archived || parent.deletedAt !== undefined
+      || !this.store.getTarget(parent.targetId).descriptor.trusted) return;
+    const common = { taskId: task.id, execution: task.execution, title: task.title };
+    const write = (receipt: PartnerSessionTaskReceipt): void => {
+      const phase = receipt.status === "preparing" ? "request" : "outcome";
+      const id = `partner-task-receipt:${hash(JSON.stringify([parent.id, task.id, task.execution, phase]))}`;
+      this.store.recordPartnerSessionTaskReceipt(id, parent.id, receipt);
+    };
+    this.store.transaction(() => {
+      write({ ...common, status: "preparing" });
+      const { status } = task;
+      if (includeOutcome && (status === "completed" || status === "failed" || status === "cancelled" || status === "timed-out")) {
+        write({ ...common, status, taskSessionId: task.sessionId, result: task.result, error: task.error });
+      }
+    });
   }
   #returnGroupPrivate(task: PartnerSessionTaskRecord, deliveryId: string, sessionId: string): "delivered" | "retry" | "failed" {
     const assertDestination = () => {

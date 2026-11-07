@@ -33,6 +33,7 @@ import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRe
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
+import { projectPartnerSessionTaskReceipt } from "@joko/contracts";
 import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi, createPartnerMessagingApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
@@ -12193,6 +12194,7 @@ export function projectSnapshotEvent(
     case "statusStream":
     case "messageCompleted":
     case "partnerLearningChanged":
+    case "partnerSessionTaskReceipt":
     case "mcpAppChanged":
     case "extensionCardChanged":
     case "toolCallStarted":
@@ -12335,6 +12337,7 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "statusStream"
     || kind === "messageCompleted"
     || kind === "partnerLearningChanged"
+    || kind === "partnerSessionTaskReceipt"
     || kind === "mcpAppChanged"
     || kind === "extensionCardChanged"
     || kind === "toolCallStarted"
@@ -12621,6 +12624,13 @@ function projectTimelineEvent(
         text: kind.value.detail,
         streaming: !kind.value.terminal
       });
+      break;
+    }
+    case "partnerSessionTaskReceipt": {
+      const receipt = projectPartnerSessionTaskReceipt(kind.value);
+      if (receipt === undefined || receipt.taskSessionId === sessionId) changed = false;
+      else replaceOrAppend({ id: event.eventId, sourceEventId: event.eventId, sequence, createdAt, kind: "status",
+        title: receipt.title, text: receipt.result || receipt.error, partnerTaskReceipt: receipt });
       break;
     }
     case "extensionCardChanged": {

@@ -79,7 +79,8 @@ function projectWindow(rows: readonly TimelineRow[], running: boolean, partnerId
         return;
       }
       if (row.plan || row.workActivity && !media(row)) return;
-      if (!row.runtimeHandoff && (row.kind === "system" || row.kind === "status" || row.kind === "activity" && !delivery(row) && !row.runStopped)) return;
+      if (!row.runtimeHandoff && !row.partnerTaskReceipt
+        && (row.kind === "system" || row.kind === "status" || row.kind === "activity" && !delivery(row) && !row.runStopped)) return;
       if (row.kind === "tool") {
         if (delivery(row)) {
           const { tool: _tool, ...receipt } = row;

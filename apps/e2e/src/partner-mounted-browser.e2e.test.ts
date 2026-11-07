@@ -81,6 +81,55 @@ describe("mounted Partner collaboration product chain", () => {
     fixture = undefined;
   });
 
+  mountedIt("retains an independent Pi task result in the original Partner conversation after reload", async () => {
+    const command = "PARTNER_TASK_RECEIPT_FIXTURE";
+    const objective = "Read the independent fixture output";
+    const title = "Independent inspection";
+    const result = "Retained output from the independent task.";
+    fixture = await RealPiSystemFixture.start({
+      webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true,
+      providerResponder: async ({ request, requestNumber }) => {
+        if (JSON.stringify(request.body).includes("You are a permission reviewer for one tool call")) {
+          return { kind: "text", text: JSON.stringify({ verdict: "allow", reason: "The independent task uses the owned fixture." }) };
+        }
+        if (lastMessageRole(request) === "tool") return { kind: "text", text: "Independent task accepted." };
+        const input = latestUserText(request);
+        if (input.includes(command)) return { kind: "tool", name: requiredToolName(request, "start_session_task"),
+          arguments: { title, instruction: objective }, callId: `independent-receipt-${requestNumber}` };
+        return { kind: "text", text: input.includes(objective) ? result : "Return acknowledged." };
+      }
+    });
+    const manager = await fixture.pair("Receipt fixture owner");
+    const partner = await createPartner(fixture, manager, "Aster", "orbit");
+    const challenge = required((await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Receipt fixture Web" })).challenge, "the pairing challenge");
+    browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
+    const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, locale: "en-US" });
+    await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("Receipt fixture Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+    await page.locator(partnerCard(partner.partnerId)).waitFor({ state: "visible", timeout: 30_000 });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(partner.canonicalSessionId)}`);
+    await sendPartnerPrompt(fixture, manager, partner.canonicalSessionId, command);
+
+    const request = page.locator('.partner-task-receipt[data-partner-task-status="preparing"]').filter({ hasText: title });
+    const outcome = page.locator('.partner-task-receipt[data-partner-task-status="completed"]').filter({ hasText: result });
+    await request.waitFor({ state: "visible", timeout: 30_000 });
+    await outcome.waitFor({ state: "visible", timeout: 30_000 });
+    expect(await outcome.innerText()).toContain("Completed · #1");
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await outcome.waitFor({ state: "visible", timeout: 30_000 });
+    expect(await request.count()).toBe(1);
+    expect(await outcome.count()).toBe(1);
+    const child = required(fixture.application.partnerSessionTasks!.list(partner.partnerId).find(task => task.title === title)?.sessionId,
+      "the independent child session");
+    await outcome.getByRole("button", { name: "Open task", exact: true }).click();
+    await waitFor(async () => page.url(), url => new URL(url).hash === `#/tasks/${encodeURIComponent(child)}`, "the original independent child task");
+  }, 120_000);
+
   mountedIt("discovers, installs without a model, configures and reopens a bundled partner with disabled routines through production Web", async () => {
     fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), keepRoot: true, enableInternalServer: true });
     const manager = await fixture.pair("Partner package manager");

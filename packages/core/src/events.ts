@@ -38,6 +38,17 @@ export interface EventEnvelope {
   readonly pi?: PiEventMetadata;
 }
 
+/** One durable receipt in the original Owner conversation for a Partner task execution. */
+export type PartnerSessionTaskReceipt = {
+  readonly taskId: string;
+  readonly execution: number;
+  readonly title: string;
+} & (
+  | { readonly status: "preparing" }
+  | { readonly status: "completed" | "failed" | "cancelled" | "timed-out";
+      readonly taskSessionId?: string; readonly result?: string; readonly error?: string }
+);
+
 export type ResourceUsageSource =
   | "structured_resource_mention"
   | "native_skill_command"
@@ -139,6 +150,7 @@ export interface TaskMessageOrigin {
 export type EventPayload =
   | { readonly type: "mcp_app_changed"; readonly card: McpAppCardProjection }
   | { readonly type: "extension_card_changed"; readonly card: ExtensionCardProjection }
+  | { readonly type: "partner_session_task_receipt"; readonly receipt: PartnerSessionTaskReceipt }
   /** Store-owned metadata for one existing assistant completion, never a new message. */
   | { readonly type: "partner_learning_changed"; readonly completionEventId: string; readonly messageId: string;
       readonly feedback: import("./partner-learning.js").PartnerLearningFeedback }
