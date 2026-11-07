@@ -1139,15 +1139,15 @@ function setupDescriptor(
         && requirement.credentialKinds?.includes(credential.kind) === true
         && (attempt?.credentialGenerations[requirement.id] === credential.generation
           || record.authorization?.credentialGenerations[requirement.id] === credential.generation);
+      const value = attempt?.values[requirement.id] ?? record.authorization?.values[requirement.id];
+      const valueConfigured = requirement.kind === "confirmation" ? value === true : value !== undefined;
       return {
         id: requirement.id,
         label: requirement.label,
         description: requirement.description,
         kind: credential?.kind === "oauth" ? "oauth" : requirement.kind,
         required: requirement.required,
-        configured: requirement.credentialReferenceId === undefined
-          ? attempt?.values[requirement.id] !== undefined || record.authorization?.values[requirement.id] !== undefined
-          : configured,
+        configured: requirement.credentialReferenceId === undefined ? valueConfigured : configured,
         options: [...(requirement.options ?? [])]
       };
     }),
