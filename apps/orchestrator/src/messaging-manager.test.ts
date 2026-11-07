@@ -670,7 +670,12 @@ describe("MessagingManager", () => {
     const transport = new FakeWeChatTransport({ ...batch, events: [{ ...base, text: "/new",
       address: { ...base.address, providerConversationId: userId }, speaker: { ...base.speaker, providerUserId: userId, isOwner: true }
     }], privateContexts: [{ ...batch.privateContexts[0]!, providerConversationId: userId }] });
-    const f = await createFixture(undefined, undefined, undefined, undefined, undefined, undefined, () => transport);
+    const partnerAdapter = () => new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+        ? { ...capability, options: ["ask"] } : capability)
+    });
+    const f = await createFixture(undefined, partnerAdapter, undefined, undefined, undefined, undefined, () => transport);
     const profiles = new PartnerStore(join(f.root, "partners.db"));
     cleanups.push(async () => { try { await f.manager.close(); } finally { profiles.close(); } });
     const partners = new PartnerManager({ store: profiles, operationalStore: f.store, sessionHost: f.host, homesRoot: join(f.root, "homes"),
@@ -678,6 +683,7 @@ describe("MessagingManager", () => {
     const partner = await partners.createPartner({ requestId: "wechat-partner-create", expectedDirectoryRevision: profiles.directoryState().revision,
       displayName: "Ada", avatar: "orbit", identitySource: "A Partner who shares this private WeChat conversation.", templateId: "general", usesDirectoryDefaults: false,
       capabilities: { modelChain: [{ backendId: f.adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
+    expect(partner.initializationErrorCode).toBeUndefined();
     expect(partner.initializationState).toBe("ready");
     const sessionId = partner.canonicalSessionId!;
     const runtime = new PartnerMessagingRuntime({ store: f.store, profiles, partners, host: f.host, messaging: f.manager, pauseGoal: async () => undefined });
