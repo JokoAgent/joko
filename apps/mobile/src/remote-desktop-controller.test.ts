@@ -53,6 +53,7 @@ vi.mock("@joko/connection-transport", async importOriginal => {
 });
 import { createMobileRemoteDesktopHostMutePreferenceStore,
   type MobileRemoteDesktopHostMutePreferences } from "./mobile-remote-desktop-host-mute-preference";
+import { createMobileRemoteDesktopDisplayModePreferenceStore } from "./mobile-remote-desktop-display-mode-preference";
 import { createMobileRemoteDesktopLockPreferenceStore } from "./mobile-remote-desktop-lock-preference";
 import { createMobileRemoteDesktopClipboardSyncPreferenceStore } from "./mobile-remote-desktop-clipboard-sync-preference";
 import { createMobileRemoteDesktopPrivacyPreferenceStore, type MobileRemoteDesktopPrivacyPreferences } from "./mobile-remote-desktop-privacy-preference";
@@ -469,6 +470,74 @@ describe("Mobile native media and background presentation", () => {
     expect(value.setDisplayMode).toHaveBeenCalledWith(value.host, "lease-1", 1n, "20", true, expect.any(AbortSignal), true);
     expect(controller.snapshot).toMatchObject({ controlling: true, wantedControl: true, status: "live" });
     expect(value.control).not.toHaveBeenCalled(); await controller.close();
+  });
+
+  it("remembers the chosen physical mode across a normal disconnect and applies it before the reopened viewer initializes", async () => {
+    const disk = new Map<string, string>();
+    const storage = { getItem: async (key: string) => disk.get(key) ?? null,
+      setItem: async (key: string, value: string) => { disk.set(key, value); } };
+    const build = (value: ReturnType<typeof fixture>) => {
+      value.capabilities.autoControl = true;
+      value.capabilities.resolutionRestore = true;
+      return new MobileRemoteDesktopController(value.transport, undefined, undefined, undefined,
+        undefined, undefined, undefined, undefined, undefined, createMobileRemoteDesktopDisplayModePreferenceStore(storage));
+    };
+    const receipt = (value: ReturnType<typeof fixture>) => create(RemoteDesktopDisplayModeResultSchema, { lease: {
+      ...value.lease, controlling: true, controlGeneration: 2n, display: { ...value.lease.display!, width: 1280, height: 720 }
+    } });
+    const initial = fixture(true, true, false, true), first = build(initial);
+    initial.setDisplayMode.mockResolvedValue(receipt(initial));
+    try {
+      await first.open(); await flushAsync();
+      await first.setDisplayMode("20");
+      await vi.waitFor(() => expect(disk.size).toBe(1));
+      expect(JSON.parse([...disk.values()][0]!)).toEqual({ version: 1, modeId: "20", width: 1280, height: 720 });
+    } finally { await first.close(); }
+    expect(initial.stop).toHaveBeenCalledOnce();
+
+    const next = fixture(true, true, false, true), reopened = build(next);
+    let resolveMode!: (response: ReturnType<typeof receipt>) => void;
+    const modeResult = new Promise<ReturnType<typeof receipt>>(resolve => { resolveMode = resolve; });
+    next.setDisplayMode.mockReturnValueOnce(modeResult);
+    const commands: Record<string, unknown>[] = [];
+    reopened.setViewerSink(command => commands.push(command as Record<string, unknown>));
+    reopened.viewerMessage({ type: "ready" });
+    const opening = reopened.open();
+    try {
+      await vi.waitFor(() => expect(next.setDisplayMode).toHaveBeenCalledExactlyOnceWith(next.host, next.lease.leaseId,
+        1n, "20", true, expect.any(AbortSignal), true));
+      expect(commands.filter(command => command.type === "init")).toEqual([]);
+      resolveMode(receipt(next)); await opening;
+      expect(commands.filter(command => command.type === "init")).toMatchObject([{ width: 1280, height: 720 }]);
+      expect(reopened.snapshot).toMatchObject({ status: "live", controlling: true });
+      expect(next.control).not.toHaveBeenCalled();
+    } finally { resolveMode(receipt(next)); await opening; await reopened.close(); }
+  });
+
+  it("retires a newly opened lease if the viewer closes while reading a remembered mode", async () => {
+    const value = fixture(true, true, false, true);
+    value.capabilities.resolutionRestore = true;
+    const identityRead = vi.fn();
+    let finishRead!: (value: string | null) => void;
+    const preferences = createMobileRemoteDesktopDisplayModePreferenceStore({ getItem: async () => {
+      identityRead(); return new Promise(resolve => { finishRead = resolve; });
+    }, setItem: async () => {} });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, preferences);
+    const commands: Record<string, unknown>[] = [];
+    controller.setViewerSink(command => commands.push(command as Record<string, unknown>));
+    controller.viewerMessage({ type: "ready" });
+    const opening = controller.open();
+    try {
+      await vi.waitFor(() => expect(identityRead).toHaveBeenCalledOnce());
+      await controller.close();
+      expect(value.stop).toHaveBeenCalledExactlyOnceWith(value.host, value.lease.leaseId,
+        { lockScreen: false, controlGeneration: 0n });
+      finishRead(JSON.stringify({ version: 1, modeId: "20", width: 1280, height: 720 })); await opening;
+      expect(value.setDisplayMode).not.toHaveBeenCalled();
+      expect(value.stop).toHaveBeenCalledOnce();
+      expect(commands.filter(command => command.type === "init")).toEqual([]);
+    } finally { finishRead?.(null); await opening; await controller.close(); }
   });
 
   it("sends small native control requests over the current media channel and adopts only its matched reply", async () => {
