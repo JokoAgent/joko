@@ -1461,6 +1461,7 @@ export class PartnerStore {
       if (Number(retired.changes) !== 1) throw unavailable("The previous canonical Session link is missing.");
       this.#database.prepare("UPDATE partner_session_links SET role = 'history', routine_key = NULL, routine_operation_id = NULL WHERE partner_id = ? AND role = 'routine'")
         .run(current.id);
+      this.#retireHomeTopics(current.id, version);
       const updated = this.#database.prepare(`UPDATE partners SET revision = ?, profile_version = ?, home_target_id = ?, canonical_session_id = ?,
         model_chain_json = ?, task_model_json = NULL, permission_mode = ?, plan_mode = ?, input_handoff = ?, uses_directory_defaults = 0,
         initialization_state = 'ready', invitation_stage = 'ready', initialization_error_code = NULL, updated_at = ? WHERE id = ? AND revision = ?`)
@@ -1472,6 +1473,31 @@ export class PartnerStore {
       this.#insertVersion(current.id, version, current.identitySource, capabilities, false, at);
       this.#bumpDirectory(at); return this.getPartner(current.id);
     });
+  }
+
+  /** Reconcile the original topic links when the exact committed Home move is retried. */
+  retireMovedHomeTopics(input: { readonly partnerId: string; readonly sourceSessionId: string; readonly targetId: string;
+    readonly sessionId: string; readonly sourceSessionIds: readonly string[] }): void {
+    this.#write(() => {
+      const current = this.getPartner(input.partnerId);
+      const source = this.getSessionLink(input.sourceSessionId);
+      if (current.lifecycle !== "active" || current.homeTargetId !== input.targetId
+        || current.canonicalSessionId !== input.sessionId || source?.role !== "history" || source.partnerId !== current.id) {
+        throw changed(current.id);
+      }
+      if (this.#retireHomeTopics(current.id, current.profileVersion, input.sourceSessionIds)) this.#bumpDirectory(this.#now());
+    });
+  }
+
+  #retireHomeTopics(partnerId: string, currentProfileVersion: number, sourceSessionIds?: readonly string[]): boolean {
+    const scope = sourceSessionIds === undefined ? null : JSON.stringify(sourceSessionIds);
+    const result = this.#database.prepare(`
+      UPDATE partner_session_links SET role = 'history', parent_session_id = NULL,
+        topic_root_json = NULL, topic_operation_id = NULL
+      WHERE partner_id = ? AND role = 'topic' AND profile_version < ?
+        AND (? IS NULL OR session_id IN (SELECT value FROM json_each(?)))
+    `).run(partnerId, currentProfileVersion, scope, scope);
+    return Number(result.changes) > 0;
   }
 
   listProfileVersions(partnerId: string): readonly PartnerProfileVersionRecord[] {
