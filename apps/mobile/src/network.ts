@@ -889,7 +889,6 @@ export async function collectWorkspaceSearchPages(
   let revision: string | undefined;
   let totalSize: bigint | undefined;
   let totalFiles: bigint | undefined;
-  let truncated: boolean | undefined;
   while (true) {
     const page = await readPage(pageToken);
     if (!page.revision || page.totalSize < 0n || page.totalFiles < 0n) {
@@ -899,8 +898,7 @@ export async function collectWorkspaceSearchPages(
       revision = page.revision;
       totalSize = page.totalSize;
       totalFiles = page.totalFiles;
-      truncated = page.truncated;
-    } else if (revision !== page.revision || totalSize !== page.totalSize || totalFiles !== page.totalFiles || truncated !== page.truncated) {
+    } else if (revision !== page.revision || totalSize !== page.totalSize || totalFiles !== page.totalFiles) {
       throw new Error("Workspace search results changed while paging.");
     }
     for (const match of page.matches) {
@@ -908,7 +906,16 @@ export async function collectWorkspaceSearchPages(
       if (!match.revision?.opaqueRevision) throw new Error("The Joko node returned an unfenced workspace-search match.");
       matches.push(match);
     }
-    if (!page.nextPageToken) break;
+    if (!page.nextPageToken) {
+      if (BigInt(matches.length) !== totalSize) throw new Error("The Joko node returned an incomplete workspace-search result set.");
+      return {
+        matches,
+        revision,
+        // Earlier pages also set this flag when more matches fit on a later page.
+        truncated: page.truncated,
+        totalFiles: safeResultCount(page.totalFiles, "workspace-search file")
+      };
+    }
     if (page.nextPageToken === pageToken || tokens.has(page.nextPageToken)) {
       throw new Error("The Joko node returned a cyclic workspace-search page token.");
     }
@@ -916,13 +923,6 @@ export async function collectWorkspaceSearchPages(
     pageToken = page.nextPageToken;
     if (tokens.size > 10_000) throw new Error("Workspace search exceeded the supported page count.");
   }
-  if (BigInt(matches.length) !== totalSize) throw new Error("The Joko node returned an incomplete workspace-search result set.");
-  return {
-    matches,
-    revision: revision!,
-    truncated: truncated!,
-    totalFiles: safeResultCount(totalFiles!, "workspace-search file")
-  };
 }
 
 export async function collectArtifactPages(
