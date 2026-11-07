@@ -66,7 +66,7 @@ const VIEWER_SCRIPT = String.raw`
   let deadline=null,disconnectTimer=null,retryTimer=null,stableTimer=null,iceTimer=null;
   let localCandidates=[],localAck=0,remoteAfter=0,remoteComplete=false,remoteSeen=new Set(),icePending=null,exchangeId=0,exchangeUntil=0;
   let seq=0,sequenceLimit=Number.MAX_SAFE_INTEGER,pending=[],sending=false,drag=false,hold=null,start=null,last=null,multi=null,gestureFrame=null;
-  let congestionAt=null;
+  let congestionAt=null,integerScroll=false;
   const pointers=new Map();let cx=.5,cy=.5,composing=false,keyboardEnabled=false;
   const heldMouse=new Map(),mouseControlHandlers=new Map();let showMouseButtons=false,nativeMouseControls=false,wheelY=null;
   let nativeTouchpad=null,fitToInsets=false,topInset=0,bottomInset=0,cursorNeedsEntry=true;
@@ -175,7 +175,15 @@ const VIEWER_SCRIPT = String.raw`
           queue({kind:'move',x:cx,y:cy});render();
           multi.aimed=true;
         }
-        if(multi.aimed)queue({kind:'scroll',dx:bounded(-dx,-2000,2000),dy:bounded(-dy,-2000,2000)});
+        if(multi.aimed){
+          let wheelX=-dx,wheelY=-dy;
+          if(integerScroll){
+            const x=multi.scrollRemainderX+wheelX,y=multi.scrollRemainderY+wheelY;
+            wheelX=Math.trunc(x);wheelY=Math.trunc(y);
+            multi.scrollRemainderX=x-wheelX;multi.scrollRemainderY=y-wheelY;
+          }
+          if(wheelX||wheelY)queue({kind:'scroll',dx:bounded(wheelX,-2000,2000),dy:bounded(wheelY,-2000,2000)});
+        }
       }else pan(dx,dy);
     }
     multi.lastX=next.x;multi.lastY=next.y;
@@ -195,7 +203,7 @@ const VIEWER_SCRIPT = String.raw`
       },400);
     }else{
       clearTimeout(hold);if(drag)queue({kind:'release'});drag=false;start=null;
-      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,anchor:point(p),kind:null,aimed:mode!=='touch'};
+      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,anchor:point(p),kind:null,aimed:mode!=='touch',scrollRemainderX:0,scrollRemainderY:0};
     }
   });
   stage.addEventListener('pointermove',event=>{
@@ -266,7 +274,7 @@ const VIEWER_SCRIPT = String.raw`
       }
       case'init':
         release();showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();cursorOverlay=message.cursorOverlay===true;resetCursor();pending=[];sending=false;congestionAt=null;
-        control=false;controlGeneration=0;
+        control=false;controlGeneration=0;integerScroll=message.integerScroll===true;
         seq=Number.isSafeInteger(message.sequenceBase)&&message.sequenceBase>=0?message.sequenceBase:0;
         sequenceLimit=Number.isSafeInteger(message.sequenceLimit)&&message.sequenceLimit>seq?message.sequenceLimit:Number.MAX_SAFE_INTEGER;
         epoch=message.epoch;dw=message.width;dh=message.height;zoom=1;panX=panY=0;cursorNeedsEntry=true;fitToInsets=false;topInset=bottomInset=0;video.muted=message.audio!==true;retries=0;render();

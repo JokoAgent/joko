@@ -14,7 +14,7 @@ afterEach(() => {
   document.documentElement.innerHTML = "<head></head><body></body>";
 });
 
-function viewer(nativeControls = false, desktop = { width: 800, height: 600 }, viewport = { width: 800, height: 600 }) {
+function viewer(nativeControls = false, desktop = { width: 800, height: 600 }, viewport = { width: 800, height: 600 }, integerScroll = false) {
   vi.useFakeTimers();
   let resized!: () => void;
   vi.stubGlobal("ResizeObserver", class { constructor(callback: () => void) { resized = callback; } observe() {} disconnect() {} });
@@ -29,7 +29,7 @@ function viewer(nativeControls = false, desktop = { width: 800, height: 600 }, v
   }
   new Function(html.match(/<script>([\s\S]*?)<\/script>/u)![1]!)();
   const receive = (value: object) => scope.__jokoRemoteDesktop.receive(value);
-  receive({ type: "init", epoch: "current-mouse", ...desktop, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
+  receive({ type: "init", epoch: "current-mouse", ...desktop, integerScroll, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
   receive({ type: "control", enabled: true, controlGeneration: 1 });
   const config = (enabled: boolean, native = nativeControls) => receive({ type: "mouseButtons", epoch: "current-mouse", enabled, nativeControls: native, labels });
   config(true);
@@ -151,6 +151,33 @@ describe("actual floating mouse controls viewer", () => {
       { kind: "move", x: .375, y: 85 / 450 },
       { kind: "scroll", dx: 0, dy: -20 }
     ]);
+  });
+
+  it.each([true, false])("preserves fractional two-finger wheel travel with integer scrolling=%s", async integerScroll => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 }, integerScroll);
+    const pair = [{ id: 8, x: 100, y: 300 }, { id: 9, x: 200, y: 300 }];
+    for (const point of pair) value.pointer(value.stage, "pointerdown", point.id, point.x, point.y);
+    for (const point of pair) {
+      point.y -= 10;
+      value.pointer(value.stage, "pointermove", point.id, point.x, point.y);
+    }
+    await vi.advanceTimersByTimeAsync(33);
+    expect(value.packets()[0]?.events.at(-1)).toEqual({ kind: "scroll", dx: 0, dy: 10 });
+    value.ack();
+
+    for (let step = 0; step < 40; step++) {
+      const point = pair[step % 2]!;
+      point.y -= 1;
+      value.pointer(value.stage, "pointermove", point.id, point.x, point.y);
+      await vi.advanceTimersByTimeAsync(33);
+      const expected = integerScroll ? Math.floor((step + 1) / 2) : step + 1;
+      expect(value.packets()).toHaveLength(1 + expected);
+      if (!integerScroll || step % 2 === 1) value.ack();
+    }
+
+    expect(value.packets().slice(1).flatMap(packet => packet.events))
+      .toEqual(Array.from({ length: integerScroll ? 20 : 40 }, () => ({ kind: "scroll", dx: 0, dy: integerScroll ? 1 : .5 })));
   });
 
   it("keeps the picture point under an off-center pinch", async () => {
