@@ -15,6 +15,7 @@ import type { ArtifactStore } from "./artifact-store.js";
 import { ArtifactStore as RealArtifactStore } from "./artifact-store.js";
 import { buildReviewEvidence } from "./review-evidence.js";
 import { DurableReviewEvidenceProvider, ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
+import { buildReviewPrompt } from "./review-prompt.js";
 import type { WorkspaceChangeSetService } from "./workspace-change-set.js";
 import { WorkspaceService } from "./workspace-service.js";
 
@@ -308,6 +309,27 @@ describe("DurableReviewEvidenceProvider", () => {
     tampered[0] = tampered[0] === 0xff ? 0xfe : tampered[0]! + 1;
     writeFileSync(stored.storagePath, tampered);
     await expect(provider.capture(reviewRequest)).rejects.toMatchObject({ code: "artifact-unavailable" });
+  });
+
+  it("includes a BOM-marked UTF-16LE text attachment in the Review prompt using its original Blob identity", async () => {
+    const fixture = setup();
+    const artifacts = new RealArtifactStore({ rootDirectory: path.join(fixture.directory, "artifacts"),
+      repository: new OperationalArtifactRepository(fixture.store), ingestRoots: [fixture.directory] });
+    await artifacts.initialize();
+    const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
+    const bytes = Buffer.from([0xff, 0xfe, 0x41, 0, 0x42, 0, 0x0a, 0]);
+    const blob = await artifacts.ingestBytes(bytes, { fileName: "evidence.txt", mimeType: "text/plain" });
+    const captured = await provider.capture(request({ kind: "file", displayName: "evidence.txt", blob }));
+    expect(captured.artifacts[0]).toMatchObject({ blob: { id: blob.id, byteLength: 8, sha256: createHash("sha256").update(bytes).digest("hex") },
+      excerpt: { format: "text/plain", coverage: "full file", content: "AB\n" } });
+    const evidence = buildReviewEvidence(captured);
+    expect(buildReviewPrompt(evidence.promptInput).prompt).toContain("<untrusted-artifact-content>\nAB\n");
+    expect(evidence.promptInput.artifactWarnings).toBeUndefined();
+
+    const malformed = await artifacts.ingestBytes(bytes.subarray(0, -1), { fileName: "malformed.txt", mimeType: "text/plain" });
+    const unavailable = await provider.capture(request({ kind: "file", displayName: "malformed.txt", blob: malformed }));
+    expect(unavailable.artifacts[0]?.excerpt).toBeUndefined();
+    expect(unavailable.artifacts[0]?.warning).toContain("no textual Review excerpt");
   });
 
   it("rejects per-artifact and aggregate Review byte budgets before artifact I/O", async () => {
