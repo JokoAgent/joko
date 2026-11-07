@@ -8969,6 +8969,33 @@ describe("native current-task message and Queue actions", () => {
     expect(JSON.stringify(saved.pending())).not.toContain("Earlier task");
   });
 
+  it("sends from the originally archived task through the same owner and native generation", async () => {
+    const active = sessionMentionSnapshot;
+    const archived = create(SnapshotSchema, { ...active, sessions: active.sessions.map(session => session.sessionId === "session"
+      ? { ...session, archived: true, state: SessionState.ARCHIVED } : session) });
+    const network = projectedNetwork(archived);
+    const drafts = memoryDraftStores();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
+    await app.start();
+    const original = app.state.detail?.sessions.find(session => session.sessionId === "session");
+    expect(original?.archived).toBe(true);
+    const draft = plainTextMobileComposerDraft("Resume this task");
+    vi.mocked(network.submit).mockImplementationOnce(async (_owner, operationId) => {
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: active });
+      vi.mocked(network.readSession).mockResolvedValue(active);
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED });
+    });
+
+    await expect(app.send(draft)).resolves.toBe(true);
+
+    expect(network.submit).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" }, expectedGeneration: original?.nativeBinding?.runtimeGeneration }],
+      payload: { case: "sendInput", value: { sessionId: "session" } }
+    });
+    expect(app.state.detail?.sessions.find(session => session.sessionId === "session")?.archived).toBe(false);
+  });
+
   it("retains a structured Session-reference draft and a body-free receipt when send is unknown", async () => {
     const network = projectedNetwork(sessionMentionSnapshot);
     const saved = memoryStorage(credential);
