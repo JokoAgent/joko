@@ -70,6 +70,7 @@ export class MakerMemoryController {
   readonly #targetPreferences: PartnerMemoryPreferences | undefined;
   readonly #partnerProfiles: Pick<PartnerStore, "findPartnerByHomeTarget"> | undefined;
   #generation = 1;
+  #makerEnabledAtToolGeneration: boolean;
   #entriesRefresh?: ReturnType<typeof setTimeout>;
 
   constructor(input: {
@@ -84,8 +85,7 @@ export class MakerMemoryController {
     this.#onSettingsChanged = input.onSettingsChanged ?? (() => Promise.resolve());
     this.#targetPreferences = input.targetPreferences;
     this.#partnerProfiles = input.partnerProfiles;
-    const stored = this.#store.findSetting<unknown>("service", this.#scopeId, MAKER_MEMORY_SETTING_KEY);
-    if (stored !== undefined) validateStoredSettings(stored.value);
+    this.#makerEnabledAtToolGeneration = this.settings().makerEnabled;
   }
 
   get generation(): number {
@@ -96,7 +96,7 @@ export class MakerMemoryController {
     if (this.#entriesRefresh) clearTimeout(this.#entriesRefresh);
     this.#entriesRefresh = setTimeout(() => {
       this.#entriesRefresh = undefined;
-      void this.reconcileSettingsChange();
+      void this.reconcileSettingsChange({ entriesChanged: true });
     }, 3_000);
     this.#entriesRefresh.unref();
   }
@@ -136,9 +136,13 @@ export class MakerMemoryController {
     };
   }
 
-  /** Re-fences future runtimes after the caller has durably committed settings. */
-  async reconcileSettingsChange(): Promise<boolean> {
-    this.#generation += 1;
+  /** Refresh future runtime settings while preserving unrelated curated tool grants. */
+  async reconcileSettingsChange({ entriesChanged = false }: { readonly entriesChanged?: boolean } = {}): Promise<boolean> {
+    const makerEnabled = this.available;
+    if (entriesChanged || makerEnabled !== this.#makerEnabledAtToolGeneration) {
+      this.#makerEnabledAtToolGeneration = makerEnabled;
+      this.#generation += 1;
+    }
     try {
       await this.#onSettingsChanged();
       return true;
