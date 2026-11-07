@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, useEffect, useRef, useState, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { SessionSchema, SessionState, SnapshotSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
-  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema } from "@joko/contracts";
+  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -314,6 +314,19 @@ async function renderTask(patch: Partial<TaskProps> = {}): Promise<void> {
 async function closeTaskDrawer(): Promise<void> { await act(async () => finishDrawerClose?.()); }
 
 describe("actual Home navigation hosts", () => {
+  it.each(["android", "ios"] as const)("bounds the %s task title dots while retaining all tag names", async platform => {
+    platformOS = platform;
+    const tags = Array.from({ length: 32 }, (_, index) => create(TaskTagSchema, {
+      taskTagId: `tag-${index}`, name: `Tag ${index}`, color: TaskTagColor.BLUE
+    }));
+    state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, sessions: state.detail!.sessions.map(session =>
+      session.sessionId === "current" ? create(SessionSchema, { ...session, taskTags: tags }) : session) }) };
+
+    await renderTask();
+
+    expect(headerProps.titleAccessory).toMatchObject({ props: { maximum: 7, tags } });
+  });
+
   it("offers current-task rename, pin and archive/restore with the exact task and read-only exclusions", async () => {
     await renderTask();
     expect(headerProps.actions.filter(action => ["rename", "pin", "archive", "delete"].includes(action.id)).map(action => action.id))

@@ -6476,7 +6476,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         label: partnerRead.partner.displayName, settingsLabel: mobileMessage(locale, "partnerProfile.open", { name: partnerRead.partner.displayName }),
         disabled: !partnerProfileTransport || state.busy || attachmentBusy || voice.busy,
         onOpen: openRuntimeControls } : undefined}
-      titleAccessory={<MobileTaskTagDots tags={session?.taskTags} locale={locale} dark={colors.dark} />}
+      titleAccessory={<MobileTaskTagDots tags={session?.taskTags} locale={locale} maximum={7} dark={colors.dark} />}
       subtitle={session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}
       navigationLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
       onNavigate={() => { requestTaskHomeNavigation({ kind: "home" }, drawerMounted); }}
