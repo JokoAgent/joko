@@ -1,17 +1,85 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 
+import { create } from "@bufbuild/protobuf";
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { OperationState, RunState, ToolCallState } from "@joko/contracts";
+import { OperationMutationSchema, OperationState, RunState, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import {
+  createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
+  scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
+} from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it("honors a Codex schedule admitted before model disablement and rejects later runs on the same route", async () => {
+  const backendId = "codex-scheduled-model";
+  const model = { providerId: "openai", modelId: "gpt-test" };
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Schedule fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Schedule owner");
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const targetId = fixture.targetId(backendId);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId, ...model })));
+    const { binding } = fixture.application.store.getSession(sessionId).descriptor;
+    const explicitId = scheduleIdFrom(await mutate(createManualScheduleMutation({
+      backendId, targetId, sessionId, text: "Run the saved route", execution: { model: { model } }
+    })));
+    const inheritedId = scheduleIdFrom(await mutate(createManualScheduleMutation({
+      backendId, targetId, sessionId, text: "Run the task's current route"
+    })));
+    const queueControl = async () => (await clients.queue.getQueueControl({ sessionId })).queueControl!;
+    expect((await mutate(pauseQueueMutation(await queueControl()))).state).toBe(OperationState.SUCCEEDED);
+    expect((await mutate(triggerScheduleMutation(explicitId))).state).toBe(OperationState.SUCCEEDED);
+    const [admitted] = (await clients.scheduler.listScheduleRunHistory({ scheduleId: explicitId })).history;
+    expect(admitted?.state).toBe(RunState.QUEUED);
+    const turnStarts = () => native.transport?.requests.filter(request => request.method === "turn/start") ?? [];
+    expect(turnStarts()).toHaveLength(0);
+
+    const setAccess = (enabled: boolean, modelId?: string) => mutate(create(OperationMutationSchema, {
+      payload: { case: "updateBackendSettings", value: { patch: {
+        backendId, modelAccessUpdate: { providerId: model.providerId, modelId, enabled }
+      } } }
+    }));
+    expect((await setAccess(false, model.modelId)).state).toBe(OperationState.SUCCEEDED);
+    expect((await mutate(resumeQueueMutation(await queueControl()))).state).toBe(OperationState.SUCCEEDED);
+    await waitFor(async () => turnStarts(), requests => requests.length === 1, "admitted Codex turn");
+    expect(turnStarts()[0]?.params).toMatchObject({ threadId: binding.nativeSessionId, model: model.modelId });
+    await native.completeTurn(binding.nativeSessionId!, "The accepted run finished.");
+    await waitFor(() => clients.run.getRun({ runId: admitted!.runId }),
+      value => value.run?.state === RunState.SUCCEEDED, "admitted Schedule completion");
+
+    for (const scheduleId of [explicitId, inheritedId]) {
+      expect((await mutate(triggerScheduleMutation(scheduleId))).state).toBe(OperationState.SUCCEEDED);
+      const { history } = await clients.scheduler.listScheduleRunHistory({ scheduleId });
+      expect(history).toContainEqual(expect.objectContaining({
+        sessionId, state: RunState.FAILED, error: expect.objectContaining({ code: "TURN_OVERRIDE_MODEL_UNAVAILABLE" })
+      }));
+    }
+    expect((await setAccess(true, model.modelId)).state).toBe(OperationState.SUCCEEDED);
+    expect((await setAccess(false)).state).toBe(OperationState.SUCCEEDED);
+    expect((await mutate(triggerScheduleMutation(inheritedId))).state).toBe(OperationState.SUCCEEDED);
+    const { history } = await clients.scheduler.listScheduleRunHistory({ scheduleId: inheritedId });
+    expect(history).toHaveLength(2);
+    for (const run of history) expect(run).toMatchObject({ state: RunState.FAILED, error: { code: "TURN_OVERRIDE_MODEL_UNAVAILABLE" } });
+    expect(turnStarts()).toHaveLength(1);
+    expect(fixture.application.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
 
 it("keeps a Codex thread and durable Queue on the production HTTP/SQLite/Connect path while another Backend remains isolated", async () => {
   const backendId = "codex-product";

@@ -3443,7 +3443,7 @@ export class SessionHost {
     let validationCause: unknown;
     let validationFailure: PublicError | undefined;
     try {
-      this.validateTurnOverrides(sessionId, overrides);
+      this.validateTurnOverrides(sessionId, overrides, { checkInheritedRoute: true });
       acceptedPrompt = this.canonicalQueuedPrompt(sessionId, input.schedule.prompt);
       assertPromptInlineTextRanges(acceptedPrompt);
       this.assertInputCapabilities(sessionId, acceptedPrompt);
@@ -6994,13 +6994,18 @@ export class SessionHost {
     );
   }
 
-  private validateTurnOverrides(sessionId: string, overrides: TurnExecutionOverrides | undefined): void {
-    if (overrides === undefined) return;
+  private validateTurnOverrides(
+    sessionId: string,
+    overrides: TurnExecutionOverrides | undefined,
+    options: { readonly checkInheritedRoute?: boolean } = {}
+  ): void {
+    if (overrides === undefined && !options.checkInheritedRoute) return;
     const stored = this.#store.getSession(sessionId);
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
-    const hasProvider = overrides.providerId !== undefined;
-    const hasModel = overrides.modelId !== undefined;
-    if (hasProvider !== hasModel || (overrides.providerId?.trim() === "") || (overrides.modelId?.trim() === "")) {
+    const { providerId, modelId } = overrides ?? {};
+    const hasProvider = providerId !== undefined;
+    const hasModel = modelId !== undefined;
+    if (hasProvider !== hasModel || providerId?.trim() === "" || modelId?.trim() === "") {
       throw turnOverrideError("TURN_OVERRIDE_MODEL_INVALID", "Per-turn model selection requires both provider and model IDs.");
     }
     if (hasProvider && (stored.descriptor.providerId === undefined || stored.descriptor.modelId === undefined)) {
@@ -7010,8 +7015,7 @@ export class SessionHost {
       );
     }
     const modelChanged = hasProvider && hasModel && (
-      overrides.providerId !== stored.descriptor.providerId ||
-      overrides.modelId !== stored.descriptor.modelId
+      providerId !== stored.descriptor.providerId || modelId !== stored.descriptor.modelId
     );
     if (modelChanged && backend.capabilities.get("model.switch")?.supported !== true) {
       throw turnOverrideError(
@@ -7019,8 +7023,8 @@ export class SessionHost {
         "The selected Backend does not support per-turn model switching."
       );
     }
-    const effectiveProviderId = overrides.providerId ?? stored.descriptor.providerId;
-    const effectiveModelId = overrides.modelId ?? stored.descriptor.modelId;
+    const effectiveProviderId = providerId ?? stored.descriptor.providerId;
+    const effectiveModelId = modelId ?? stored.descriptor.modelId;
     const effectiveModel = effectiveProviderId === undefined || effectiveModelId === undefined
       ? undefined
       : backend.models.find((candidate) =>
@@ -7032,7 +7036,7 @@ export class SessionHost {
       );
     }
     if (
-      modelChanged && effectiveProviderId !== undefined && effectiveModelId !== undefined
+      (modelChanged || options.checkInheritedRoute) && effectiveProviderId !== undefined && effectiveModelId !== undefined
       && !this.#modelRoutingEnabled(backend.id, effectiveProviderId, effectiveModelId)
     ) {
       throw turnOverrideError(
@@ -7040,6 +7044,7 @@ export class SessionHost {
         "The requested per-turn model is disabled for new routes."
       );
     }
+    if (overrides === undefined) return;
     if (overrides.effort !== undefined) {
       if (overrides.effort.trim() === "") throw turnOverrideError("TURN_OVERRIDE_EFFORT_INVALID", "Per-turn effort must not be empty.");
       if (stored.descriptor.effort === undefined) {
@@ -7066,8 +7071,8 @@ export class SessionHost {
     const effectiveFastMode = overrides.fastMode ?? stored.descriptor.fastMode;
     this.validateFastSelection(
       stored.descriptor.backendId,
-      overrides.providerId ?? stored.descriptor.providerId,
-      overrides.modelId ?? stored.descriptor.modelId,
+      effectiveProviderId,
+      effectiveModelId,
       effectiveFastMode,
       "Applying the per-turn model policy"
     );
