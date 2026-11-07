@@ -108,8 +108,9 @@ export function MobileTaskTagDots({ tags, locale, maximum = 32, dark = false }: 
   </View>;
 }
 
-export function MobileTaskTagsSheet({ visible, session, catalog, client, colors, locale, onClose }: {
+export function MobileTaskTagsSheet({ visible, fromHome = false, session, catalog, client, colors, locale, onClose }: {
   readonly visible: boolean;
+  readonly fromHome?: boolean;
   readonly session?: Session;
   readonly catalog?: TaskTagCatalog;
   readonly client: MobileClient;
@@ -130,14 +131,16 @@ export function MobileTaskTagsSheet({ visible, session, catalog, client, colors,
   const palette = colors.dark ? DARK_COLOR_VALUE : LIGHT_COLOR_VALUE;
   const editing = tags.find((tag) => tag.taskTagId === editingId);
   const attached = new Set(session?.taskTags.map((tag) => tag.taskTagId) ?? []);
-  const sourceOwner = client.taskHeaderSourceKey();
+  const readSourceOwner = () => fromHome ? session && client.homeTaskTagSourceKey(session.sessionId) : client.taskHeaderSourceKey();
+  const sourceOwner = readSourceOwner();
   const scope = JSON.stringify([sourceOwner, client.state.activeProfileId, client.state.node?.serverId, client.state.origin,
     session?.sessionId, session?.nativeBinding?.runtimeGeneration.toString()]);
   const live = useRef({ scope, visible }); live.current = { scope, visible };
   const mounted = useRef(true), confirmationEpoch = useRef(0);
   const operation = useRef<symbol | undefined>(undefined);
   const current = () => mounted.current && live.current.visible && live.current.scope === scope && AppState.currentState === "active"
-    && client.state.status === "connected" && client.state.selectedId === session?.sessionId && client.taskHeaderSourceKey() === sourceOwner;
+    && client.state.status === "connected" && (fromHome ? sourceOwner !== undefined : client.state.selectedId === session?.sessionId)
+    && readSourceOwner() === sourceOwner;
   useEffect(() => {
     mounted.current = true;
     const listener = AppState.addEventListener("change", value => { if (value !== "active") confirmationEpoch.current++; });

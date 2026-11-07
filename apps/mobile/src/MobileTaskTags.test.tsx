@@ -3,10 +3,13 @@
 import { act, createElement, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
+import { Alert } from "react-native";
 
 import { create } from "@bufbuild/protobuf";
-import { TaskTagColor, TaskTagSchema, type TaskTag } from "@joko/contracts";
-import { MobileTaskTagDots, mobileTaskTagName } from "./MobileTaskTags";
+import { SessionSchema, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, TaskTagSchema, type TaskTag } from "@joko/contracts";
+import { MobileTaskTagDots, MobileTaskTagsSheet, mobileTaskTagName } from "./MobileTaskTags";
+import type { MobileTaskTagsNativeProps } from "./MobileTaskTagsNative";
+import type { MobileClient } from "./mobile-client";
 
 vi.mock("react-native", async () => {
   const { createElement: element } = await import("react");
@@ -17,6 +20,7 @@ vi.mock("react-native", async () => {
   return {
     ActivityIndicator: primitive("span"),
     Alert: { alert: vi.fn() },
+    AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
     Modal: ({ visible, children }: { readonly visible: boolean; readonly children?: ReactNode }) => visible ? element("div", {}, children) : null,
     Pressable: primitive("div"),
     ScrollView: primitive("div"),
@@ -26,6 +30,12 @@ vi.mock("react-native", async () => {
     StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 }
   };
 });
+vi.mock("./MobileTaskTagsNative", async () => {
+  const { createElement: element } = await import("react");
+  return { mobileTaskTagsNativeAvailable: true, MobileTaskTagsNative: ({ visible, items, edit, onDelete }: MobileTaskTagsNativeProps) =>
+    visible ? element("div", {}, edit ? element("button", { onClick: onDelete }, "Delete tag")
+      : items.map(item => element("button", { key: item.id, onClick: item.onEdit }, item.name))) : null };
+});
 vi.mock("react-native-safe-area-context", async () => {
   const { createElement: element } = await import("react");
   return { SafeAreaView: ({ children }: { readonly children?: ReactNode }) => element("div", {}, children) };
@@ -33,6 +43,8 @@ vi.mock("react-native-safe-area-context", async () => {
 
 afterEach(() => {
   document.body.replaceChildren();
+  vi.clearAllMocks();
+  vi.unstubAllGlobals();
 });
 
 it("localizes untouched presets and keeps all mobile task dots visible", () => {
@@ -53,6 +65,32 @@ it("localizes untouched presets and keeps all mobile task dots visible", () => {
   } finally {
     act(() => root.unmount());
   }
+});
+
+it.each([false, true])("deletes from the Home tag sheet only while its row is current with retirement=%s", async retired => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  let homeOwner = "home-task-owner";
+  const preview = create(TaskTagDeletePreviewSchema, { taskTagId: "release", affectedSessionCount: 2n,
+    tagRevision: { value: 4n }, associationRevision: { value: 2n } });
+  const previewTaskTagDeletion = vi.fn(async () => preview), deleteTaskTag = vi.fn(async () => true);
+  const client = { state: { status: "connected", selectedId: undefined }, homeTaskTagSourceKey: () => homeOwner,
+    taskHeaderSourceKey: () => undefined, previewTaskTagDeletion, deleteTaskTag } as unknown as MobileClient;
+  const session = create(SessionSchema, { sessionId: "home-task", displayName: "Home task" });
+  const catalog = create(TaskTagCatalogSchema, { taskTags: [tag("release", "Release", TaskTagColor.TEAL)] });
+  const colors = { background: "white", surface: "white", ink: "black", muted: "gray", border: "gray", accent: "blue", brandBackground: "white", negative: "red" };
+  const host = document.body.appendChild(document.createElement("div")), root = createRoot(host);
+  try {
+    await act(async () => root.render(createElement(MobileTaskTagsSheet, { visible: true, fromHome: true, session, catalog, client, colors, locale: "en", onClose() {} })));
+    await act(async () => host.querySelector("button")!.click());
+    await act(async () => host.querySelector("button")!.click());
+    expect(previewTaskTagDeletion).toHaveBeenCalledExactlyOnceWith("release");
+    const confirm = vi.mocked(Alert.alert).mock.calls[0]?.[2]?.find(button => button.style === "destructive")?.onPress;
+    expect(confirm).toBeDefined();
+    if (retired) homeOwner = "replacement-task-owner";
+    await act(async () => confirm!());
+    if (retired) expect(deleteTaskTag).not.toHaveBeenCalled();
+    else expect(deleteTaskTag).toHaveBeenCalledExactlyOnceWith("home-task", preview);
+  } finally { await act(async () => root.unmount()); }
 });
 
 function tag(

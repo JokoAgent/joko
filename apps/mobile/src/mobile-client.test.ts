@@ -8190,6 +8190,10 @@ describe("mobile Home search and task mutations", () => {
     await expect(app.reorderTaskTags("session", ["tag-release", "preset:work"], 6n)).resolves.toBe(true);
     await expect(app.setSessionTaskTag("session", "tag-release", true)).resolves.toBe(true);
     await expect(app.setSessionTaskTag("session", "tag-release", false)).resolves.toBe(true);
+    await app.select();
+    expect(app.state.selectedId).toBeUndefined();
+    expect(app.homeTaskTagSourceKey("session")).toBeTruthy();
+    expect(app.homeTaskTagSourceKey("retired-task")).toBeUndefined();
     const preview = await app.previewTaskTagDeletion("tag-release");
     await expect(app.deleteTaskTag("session", preview)).resolves.toBe(true);
 
