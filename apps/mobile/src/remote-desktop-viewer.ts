@@ -95,6 +95,7 @@ const VIEWER_SCRIPT = String.raw`
   function point(p){const r=layout();return{x:clamp((p.x-r.x)/r.w),y:clamp((p.y-r.y)/r.h)};}
   function inside(p){const r=layout();return p.x>=r.x&&p.x<=r.x+r.w&&p.y>=r.y&&p.y<=r.y+r.h;}
   function pan(dx,dy){panX+=dx;panY+=dy;cursorNeedsEntry=true;boundPan();render();}
+  function settlePan(){if(zoom===1){panX=0;panY=0;}boundPan();render();}
   const bounded=(value,min,max)=>Math.max(min,Math.min(max,value));
   function cursorViewport(){const v=viewport(),hotX=remoteCursor?.hotX??9,hotY=remoteCursor?.hotY??9,w=remoteCursor?.width??18,h=remoteCursor?.height??18,minX=Math.min(v.width-1,8+hotX),minY=Math.min(v.top+v.height-1,v.top+8+hotY);return{minX,maxX:Math.max(minX,v.width-8-(w-hotX)),minY,maxY:Math.max(minY,v.top+v.height-8-(h-hotY))};}
   function moveTouchpad(dx,dy){const r=layout(),v=cursorViewport(),area=viewport();if(cursorNeedsEntry){cx=clamp((bounded(r.x+cx*r.w,v.minX,v.maxX)-r.x)/r.w);cy=clamp((bounded(r.y+cy*r.h,v.minY,v.maxY)-r.y)/r.h);cursorNeedsEntry=false;}cx=clamp(cx+dx/r.w);cy=clamp(cy+dy/r.h);const x=r.x+cx*r.w,y=r.y+cy*r.h;if(zoom>1||r.w>area.width||r.h>area.height){panX+=bounded(x,v.minX,v.maxX)-x;panY+=bounded(y,v.minY,v.maxY)-y;}queue({kind:'move',x:cx,y:cy});render();}
@@ -207,9 +208,9 @@ const VIEWER_SCRIPT = String.raw`
       if(mode==='touch'){const p=point({x:event.clientX,y:event.clientY});cx=p.x;cy=p.y;}
       click();
     }
-    start=last=multi=null;boundPan();render();
+    start=last=multi=null;settlePan();
   }
-  stage.addEventListener('pointerup',pointerUp);stage.addEventListener('pointercancel',()=>{release();boundPan();render();});
+  stage.addEventListener('pointerup',pointerUp);stage.addEventListener('pointercancel',()=>{release();settlePan();});
   stage.addEventListener('contextmenu',event=>event.preventDefault());stage.addEventListener('selectstart',event=>event.preventDefault());stage.addEventListener('dragstart',event=>event.preventDefault());
   const sentinel='\u200b';function resetKeyboard(){keyboard.value=sentinel;keyboard.setSelectionRange(1,1);}function showKeyboard(enabled){keyboardEnabled=enabled&&control;if(!keyboardEnabled){composing=false;resetKeyboard();keyboard.blur();return;}keyboard.blur();resetKeyboard();keyboard.focus({preventScroll:true});}
   function keyboardKey(code){if(!keyboardEnabled||!control)return;queue({kind:'key',code,down:true});queue({kind:'key',code,down:false});flush();}

@@ -150,6 +150,24 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()).toHaveLength(0);
   });
 
+  it("recenters a fitted picture after a view-only drag ends", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    value.receive({ type: "control", enabled: false });
+    value.receive({ type: "mode", mode: "pan" });
+    const image = document.getElementById("image")!;
+    expect(image.style.top).toBe("198.75px");
+
+    value.pointer(value.stage, "pointerdown", 8, 180, 220);
+    value.pointer(value.stage, "pointermove", 8, 180, 520);
+    expect(Number.parseFloat(image.style.top)).toBeGreaterThan(198.75);
+    value.pointer(value.stage, "pointerup", 8, 180, 520);
+
+    expect(image.style.top).toBe("198.75px");
+    expect(image.style.height).toBe("202.5px");
+    expect(value.packets()).toHaveLength(0);
+  });
+
   it("applies a queued pinch frame before removing the first released pointer", async () => {
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
     const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
