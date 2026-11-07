@@ -302,9 +302,6 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     && window.jokoDesktop?.capabilities.includes("hardware.dedicatedInput") === true
     ? window.jokoDesktop.dedicatedHardware
     : undefined;
-  const bootSessionId = sessionApplicationWindow
-    ? new URLSearchParams(window.location.search).get("bootSession") ?? undefined
-    : undefined;
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.effectiveLocale, key, values), [state.effectiveLocale]);
   const [renameSession, setRenameSession] = useState<SessionView>();
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
@@ -322,7 +319,6 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   movingSessionProjectIdsRef.current = movingSessionProjectIds;
   const [sessionSplitLayout, setSessionSplitLayout] = useState<SessionSplitLayout>({});
   const [focusedSplitSessionId, setFocusedSplitSessionId] = useState<string>();
-  const [bootConnectionProfileId, setBootConnectionProfileId] = useState<string>();
   const [portableExportSession, setPortableExportSession] = useState<SessionView>();
   const [portableImportRequest, setPortableImportRequest] = useState<PortableSessionImportRequest>();
   const portableImportConnectionKey = portableSessionImportOwnerKey(state);
@@ -529,7 +525,6 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     });
     return () => abort.abort();
   }, [portableImportRequest?.id, portableImportRequest?.owner, portableImportOwner?.key, portableWorktreeProbeTargetKey]);
-  const bootConnectionAttemptedRef = useRef(false);
   const layoutRouteSessionIdRef = useRef(state.route.kind === "session" ? state.route.sessionId : undefined);
   layoutRouteSessionIdRef.current = state.route.kind === "session" ? state.route.sessionId : undefined;
   const desktopLayoutResetAvailable = window.jokoDesktop?.capabilities.includes("layout.reset") === true;
@@ -553,26 +548,6 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       unsubscribe?.();
     };
   }, [auxiliaryApplicationWindow, desktopLayoutResetAvailable]);
-  useEffect(() => {
-    if (!sessionApplicationWindow || bootSessionId === undefined) return;
-    const readOwner = window.jokoDesktop?.sessionWindows.getOwner;
-    if (readOwner === undefined) return;
-    let retired = false;
-    void readOwner().then((owner) => {
-      if (!retired && owner.sessionId === bootSessionId) setBootConnectionProfileId(owner.profileId);
-    }).catch(() => undefined);
-    return () => { retired = true; };
-  }, [bootSessionId, sessionApplicationWindow]);
-  useEffect(() => {
-    if (!auxiliaryApplicationWindow || !state.ready || state.activeProfile !== undefined ||
-      state.connectionState !== "disconnected" || bootConnectionProfileId === undefined || bootConnectionAttemptedRef.current) return;
-    const profile = state.profiles.find((candidate) => candidate.id === bootConnectionProfileId);
-    if (profile === undefined) return;
-    bootConnectionAttemptedRef.current = true;
-    void controllerRef.current.connect(profile).catch(() => {
-      bootConnectionAttemptedRef.current = false;
-    });
-  }, [auxiliaryApplicationWindow, bootConnectionProfileId, state.activeProfile, state.connectionState, state.profiles, state.ready]);
   const sessionNotificationTrackerRef = useRef(new SessionNotificationTracker());
   const scheduleNotificationTrackerRef = useRef(new ScheduleNotificationTracker());
   const notificationOwnerId = state.activeProfile?.serverId;
