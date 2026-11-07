@@ -451,6 +451,35 @@ describe("Mobile native media and background presentation", () => {
     await value.controller.close();
   });
 
+  it("delivers a relay release for local view-only with an older batch still in flight", async () => {
+    const value = fixture(false, true);
+    const controller = new MobileRemoteDesktopController(value.transport);
+    const commands: Record<string, unknown>[] = [];
+    controller.setViewerSink(command => commands.push({ ...command }));
+    await controller.open();
+    controller.viewerMessage({ type: "ready" });
+    const epoch = commands.findLast(command => command.type === "init")!.epoch as string;
+    const send = (sequence: number, events: object[]) => controller.viewerMessage({ type: "input", epoch, controlGeneration: 1, sequence, events });
+    let completeOld!: () => void;
+    value.input.mockImplementationOnce(() => new Promise(resolve => { completeOld = resolve; }));
+    try {
+      send(1, [{ kind: "button", button: 0, down: true, x: .5, y: .5 }]);
+      expect(value.input).toHaveBeenCalledTimes(1);
+      await controller.setControl(false);
+      expect(commands.findLast(command => command.type === "control")).toMatchObject({ enabled: false, release: true });
+      send(2, [{ kind: "release" }]);
+      await flushAsync();
+      expect(value.input.mock.calls[1]?.slice(1, 5)).toMatchObject(["lease-1", 1n, 2n, [{ event: { case: "release" } }]]);
+      await controller.setControl(true);
+      send(3, [{ kind: "key", code: "KeyA", down: true }]);
+      await flushAsync();
+      expect(value.input).toHaveBeenCalledTimes(3);
+      completeOld();
+      await flushAsync();
+      expect(commands.filter(command => command.type === "ack").map(command => command.sequence)).toEqual([2, 3]);
+    } finally { completeOld?.(); await controller.close(); }
+  });
+
   it("requests host input with start when advertised and adopts it without a second control request", async () => {
     const value = fixture(true, true); value.capabilities.autoControl = true;
     const controller = new MobileRemoteDesktopController(value.transport);

@@ -100,7 +100,16 @@ const VIEWER_SCRIPT = String.raw`
   function cursorViewport(){const v=viewport(),hotX=remoteCursor?.hotX??9,hotY=remoteCursor?.hotY??9,w=remoteCursor?.width??18,h=remoteCursor?.height??18,minX=Math.min(v.width-1,8+hotX),minY=Math.min(v.top+v.height-1,v.top+8+hotY);return{minX,maxX:Math.max(minX,v.width-8-(w-hotX)),minY,maxY:Math.max(minY,v.top+v.height-8-(h-hotY))};}
   function moveTouchpad(dx,dy){const r=layout(),v=cursorViewport(),area=viewport();if(cursorNeedsEntry){cx=clamp((bounded(r.x+cx*r.w,v.minX,v.maxX)-r.x)/r.w);cy=clamp((bounded(r.y+cy*r.h,v.minY,v.maxY)-r.y)/r.h);cursorNeedsEntry=false;}cx=clamp(cx+dx/r.w);cy=clamp(cy+dy/r.h);const x=r.x+cx*r.w,y=r.y+cy*r.h;if(zoom>1||r.w>area.width||r.h>area.height){panX+=bounded(x,v.minX,v.maxX)-x;panY+=bounded(y,v.minY,v.maxY)-y;}queue({kind:'move',x:cx,y:cy});render();}
   function queue(event){if(!control)return;if(event.kind==='key'||event.kind==='text'){localCursorAwake=false;render();}if(event.kind==='move'||event.kind==='button')noteLocalCursorActivity();const tail=pending[pending.length-1];if(event.kind==='move'&&tail?.kind==='move')pending[pending.length-1]=event;else if(event.kind==='scroll'&&tail?.kind==='scroll'){tail.dx=Math.max(-2000,Math.min(2000,tail.dx+event.dx));tail.dy=Math.max(-2000,Math.min(2000,tail.dy+event.dy));}else pending.push(event);if(pending.length>64){pending=[{kind:'release'}];control=false;post({type:'inputOverflow'});}}
-  function flush(){if(!pending.length||sending||controlGeneration<1)return;if(seq>=sequenceLimit){pending=[];control=false;post({type:'inputOverflow'});render();return;}const events=pending.splice(0,64),sequence=++seq;if(pc?.connectionState==='connected'&&dc?.readyState==='open'&&dc.bufferedAmount<16384)dc.send(JSON.stringify({controlGeneration,sequence,events}));else{sending=true;post({type:'input',controlGeneration,sequence,events});}}
+  function flush(releaseViaRelay=false){
+    if(!pending.length||sending||controlGeneration<1)return;
+    if(seq>=sequenceLimit){pending=[];control=false;post({type:'inputOverflow'});render();return;}
+    const events=pending.splice(0,64),sequence=++seq;
+    if(!releaseViaRelay&&pc?.connectionState==='connected'&&dc?.readyState==='open'&&dc.bufferedAmount<16384){
+      dc.send(JSON.stringify({controlGeneration,sequence,events}));
+    }else{
+      sending=true;post({type:'input',controlGeneration,sequence,events});
+    }
+  }
   setInterval(()=>{if(wheelY?.moved&&!sending){const offset=Math.max(-24,Math.min(24,wheelY.y-wheelY.start));if(Math.abs(offset)>4)scrollMouse(Math.sign(offset)*(Math.abs(offset)-4)*1.5);}flush();},33);
   function click(button=0){queue({kind:'button',button,down:true,x:cx,y:cy});queue({kind:'button',button,down:false,x:cx,y:cy});flush();}
   function resetWheel(){wheelY=null;wheelGrip.style.transform='translateY(0px)';}
@@ -306,7 +315,14 @@ const VIEWER_SCRIPT = String.raw`
       }
       case'control':{
         const generation=message.enabled===true&&Number.isSafeInteger(message.controlGeneration)&&message.controlGeneration>0?message.controlGeneration:0;
-        if(generation!==controlGeneration||generation===0){pending=[];release(false);sending=false;}
+        if(generation!==controlGeneration||generation===0){
+          const releaseHost=control&&generation===0&&message.release===true;
+          pending=[];release(false);sending=false;
+          if(releaseHost){
+            // The newer release sequence fences the outstanding relay batch.
+            pending=[{kind:'release'}];flush(true);sending=false;
+          }
+        }
         controlGeneration=generation;control=generation>0;if(!control)showKeyboard(false);updateMouseButtons();render();break;
       }
       case'mode':release();mode=message.mode;render();break;
