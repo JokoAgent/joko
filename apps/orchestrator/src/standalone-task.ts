@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { parseArgs } from "node:util";
-import { fromJsonString, toJson, type JsonValue, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, fromJsonString, toJson, type JsonValue, type MessageInitShape } from "@bufbuild/protobuf";
 import { createClient, createRouterTransport, type CallOptions } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { redactSecrets } from "@joko/core";
@@ -113,7 +113,7 @@ async function executeTask(application: OrchestratorApplication, targetId: strin
   const paired = application.connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Standalone task" });
   const transport = createRouterTransport(router => registerConnectServices(router, application));
   const operations = createClient(contract.OperationService, transport), sessions = createClient(contract.SessionService, transport);
-  const runs = createClient(contract.RunService, transport), settings = createClient(contract.SettingsService, transport);
+  const runs = createClient(contract.RunService, transport), credentials = createClient(contract.CredentialService, transport);
   const options: CallOptions = { headers: { authorization: `Bearer ${paired.authKey}` }, timeoutMs: 120_000 };
   const submit = async (mutation: MessageInitShape<typeof contract.OperationMutationSchema>, callSignal: AbortSignal | undefined = signal) => {
     const { operation } = await operations.submitOperation({ operationId: randomUUID(), connectionId: paired.connection.id, mutation },
@@ -121,7 +121,7 @@ async function executeTask(application: OrchestratorApplication, targetId: strin
     if (operation?.state !== contract.OperationState.SUCCEEDED) throw new Error(operation?.error?.message || "The task operation could not be confirmed.");
     return operation.result?.payload;
   };
-  const ticket = (await settings.beginCredentialUpload({ kind: contract.CredentialKind.API_KEY, providerId: profile.providerId }, { ...options, signal })).ticket;
+  const ticket = (await credentials.beginCredentialUpload({ kind: contract.CredentialKind.API_KEY, providerId: profile.providerId }, { ...options, signal })).ticket;
   if (!ticket || !application.credentials) throw new Error("The standalone credential channel is unavailable.");
   application.credentials.upload(ticket.ticketId, key, paired.connection.id);
   const reference = `cred_${randomUUID()}`;
@@ -129,7 +129,8 @@ async function executeTask(application: OrchestratorApplication, targetId: strin
     credentialReferenceId: reference, providerId: profile.providerId, displayName: "Standalone task API key", kind: contract.CredentialKind.API_KEY } } });
   const runtime = profile.runtimes[0]!;
   await submit({ payload: { case: "upsertProvider", value: { provider: { ...profile, kind: contract.ProviderKind.API_KEY, enabled: true,
-    version: { revision: { value: 0n } }, runtimes: [{ ...runtime, credentialReferenceId: reference, credentialOrigin: new URL(runtime.endpoint).origin }] } } } });
+    version: create(contract.EntityVersionSchema, { revision: { value: 0n } }),
+    runtimes: [{ ...runtime, credentialReferenceId: reference, credentialOrigin: new URL(runtime.endpoint).origin }] } } } });
   const created = await submit({ payload: { case: "createSession", value: { backendId: "pi", targetId, displayName: "Standalone task",
     permissionMode: contract.PermissionMode.ASK, model: { model: { providerId: profile.providerId, modelId }, effortId: "off" } } } });
   if (created?.case !== "session" || created.value.nativeBinding === undefined) throw new Error("The standalone task session could not be confirmed.");
