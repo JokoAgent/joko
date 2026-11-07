@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { ServerInfoSchema } from "@joko/contracts";
+import type { AdapterContext } from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { DEFAULT_COLLABORATION_SETTINGS } from "@joko/runtime-governance";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
@@ -15,6 +16,7 @@ import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { ExtensionTasks, type ExtensionTaskOwner } from "./extension-tasks.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "./extension-project-policy.js";
+import { SessionHelperToolBridgeProvider } from "./session-helper-tool-provider.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -43,7 +45,7 @@ async function fixture(options: { readonly edits?: boolean; readonly review?: Co
     assertCurrent: () => { if (!enabled || !installed || installation !== owner.installation) throw new Error("Retired source"); } };
   cleanups.push(async () => { await teams.close(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true }); });
   const request = (value: Record<string, unknown>) => tasks.request(owner, { type: "tasks-request", ...value });
-  return { root, store, host, artifacts, teams, tasks, owner, extensionId, route, request, projects, descriptor, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
+  return { root, store, host, adapter, artifacts, teams, tasks, owner, extensionId, route, request, projects, descriptor, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
 }
 it("adopts bounded plugin images through its own task Queue and preserves input-key replay", async () => {
   const f = await fixture(), model = PI_LIKE_PROFILE.models.find(model => model.supportsImages)!;
@@ -125,6 +127,36 @@ it("approves explicit Auto through the original host interaction and refuses a c
   f.store.updateSession(other.taskId, { planMode: false });
   await expect(f.request({ kind: "requestWriteAccess", taskId: other.taskId, mode: "auto" })).resolves.toMatchObject({ granted: false });
   expect(f.store.listInteractions({ sessionId: other.taskId, status: "open" })).toHaveLength(0);
+});
+it("restores the durable permission on the native task when plugin preferences tighten after the setter", async () => {
+  const f = await fixture();
+  const task = await f.request({ kind: "create", requestKey: "stale-native-write", title: "Original Ask task" }) as { taskId: string };
+  const before = f.store.getSession(task.taskId).descriptor;
+  const preferences = f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => undefined);
+  const inspect = f.adapter.inspectSession.bind(f.adapter);
+  let nativeChanged!: () => void, release!: () => void;
+  const observed = new Promise<void>(resolve => { nativeChanged = resolve; });
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  vi.spyOn(f.adapter, "inspectSession").mockImplementation(async (...input) => {
+    const state = await inspect(...input);
+    if (state.permissionMode === "auto") { nativeChanged(); await pending; }
+    return state;
+  });
+  const setters = vi.spyOn(f.adapter, "setPermissionMode");
+  const request = f.request({ kind: "requestWriteAccess", taskId: task.taskId, mode: "auto" });
+  const rejected = expect(request).rejects.toMatchObject({ code: "STALE_REVISION" });
+  try {
+    await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: task.taskId, status: "open" })).toHaveLength(1));
+    const approval = f.store.listInteractions({ sessionId: task.taskId, status: "open" })[0]!;
+    f.host.resolveInteraction(approval.id, approval.generation, { kind: "permission", decision: "allow_once" }, "approve-before-preference-tightens");
+    await observed;
+    expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
+    f.tasks.updatePreferences(f.extensionId, preferences.revision, { model: f.route, permissionMode: "ask" }, () => undefined);
+  } finally { release(); }
+  await rejected;
+  expect(setters.mock.calls.map(([mode]) => mode)).toEqual(["auto", "ask"]);
+  await expect(f.host.inspect(task.taskId)).resolves.toMatchObject({ permissionMode: "ask", binding: before.binding });
+  expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("ask");
 });
 it("supports an unplanned team within its approved task root and refuses an unrelated trusted target", async () => {
   const f = await fixture(); f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => {});
@@ -213,6 +245,59 @@ it("creates real hidden team workers only in the approved immutable plan and rev
   f.store.transaction(store => f.tasks.uninstall(store, "resource")); f.uninstall();
   expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(2);
   expect(() => f.tasks.assertTeamWorkerCurrent(task.taskId)).toThrow();
+});
+it("keeps account-wide history closed while an uninstalled plugin's Worker still runs behind a queued human input", async () => {
+  const f = await fixture();
+  f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "auto" }, () => undefined);
+  const lead = await f.request({ kind: "create", requestKey: "active-orca-lead", title: "Plugin lead" }) as { taskId: string };
+  await f.request({ kind: "setTeamPlan", taskId: lead.taskId, plan: { concurrency: 1, task: "Review one document",
+    items: [{ label: "Reader", workingDir: f.root, route: f.route, task: "Read the document." }] } });
+  const team = await f.request({ kind: "startTeam", taskId: lead.taskId }) as ReturnType<CollaborationGoalManager["getTree"]>;
+  const target = f.store.listTargets().find(value => value.descriptor.id.startsWith("extension-team-target-"))!.descriptor;
+  const { worker } = await f.teams.createWorker({ operationId: "active-orca-worker", goalId: team.goal.id,
+    callerLeadSessionId: lead.taskId, expectedGoalRevision: team.goal.revision, label: "Reader", role: "Read", assignment: "Read the document.",
+    route: { ...f.route, targetId: target.id, permissionMode: "auto", planMode: false } });
+  const workerId = worker.sessionId!;
+  await vi.waitFor(() => expect(f.store.listRuns({ sessionId: workerId, limit: 1 })[0]?.descriptor.state).toBe("completed"));
+  const connection = f.store.createConnection({ id: "worker-owner", name: "Owner", authKeyDigest: "worker-owner-digest" });
+  const user = (operationId: string, text: string) => f.host.enqueueInput({ operationId, connection, sessionId: workerId,
+    prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+  const earlier = user("worker-earlier-owner-input", "Earlier approved human input");
+  await vi.waitFor(() => expect(f.store.getRun(earlier.runId).descriptor.state).toBe("completed"));
+  const send = f.adapter.send.bind(f.adapter);
+  let running: AdapterContext | undefined;
+  vi.spyOn(f.adapter, "send").mockImplementation(async (input, context) => {
+    if (context.operationId === "held-orca-input") { running = context; return; }
+    await send(input, context);
+  });
+  const live = f.store.getCollaborationWorker(worker.id);
+  const { dispatch } = await f.teams.sendMessage({ operationId: "held-orca-input", goalId: team.goal.id, workerId: worker.id,
+    callerLeadSessionId: lead.taskId, expectedWorkerRevision: live.revision, expectedSessionGeneration: live.sessionGeneration!,
+    message: "Hold original system assignment" });
+  const active = f.store.getQueueItem(dispatch.queueItemId!);
+  await vi.waitFor(() => expect(f.store.getQueueItem(active.id).state).toBe("backend_accepted"));
+  expect(running).toBeDefined();
+  f.store.transaction(store => f.tasks.uninstall(store, "resource")); f.uninstall();
+  const next = user("worker-queued-after-uninstall", "New human input");
+  expect(f.store.getRun(next.runId).descriptor.state).toBe("queued");
+  expect(f.store.getRun(active.runId).descriptor).toMatchObject({ state: "running", source: "system" });
+  const leadSession = f.store.getSession(lead.taskId).descriptor;
+  f.store.appendEvent({ id: "outside-worker-history", backendId: leadSession.backendId, targetId: leadSession.targetId,
+    sessionId: leadSession.id, generation: leadSession.binding.generation, traceId: "history-fixture",
+    payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original account history marker" }] } });
+  const helpers = new SessionHelperToolBridgeProvider({ store: f.store, host: () => f.host });
+  const history = () => helpers.callTool("call_tool", { name: "get_chat_history", args: { session_ids: [lead.taskId] } }, undefined,
+    { sessionId: workerId, targetId: target.id, generation: live.sessionGeneration! });
+  expect(f.tasks.nativeToolAuthorization(workerId)).toBeDefined();
+  const blocked = await history();
+  expect(blocked.isError).toBe(true);
+  expect(JSON.stringify(blocked)).toContain("PERMISSION_DENIED");
+  expect(JSON.stringify(blocked)).not.toContain("Original account history marker");
+  await running!.emit({ type: "done", outcome: "completed" });
+  await vi.waitFor(() => expect(f.store.getRun(next.runId).descriptor.state).toBe("completed"));
+  const allowed = await history();
+  expect(allowed.isError).toBe(false);
+  expect(JSON.stringify(allowed)).toContain("Original account history marker");
 });
 it("preserves user takeover after a declaration is removed and reveals before uninstall revokes ownership", async () => {
   const f = await fixture();

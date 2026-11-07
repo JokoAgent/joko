@@ -388,7 +388,6 @@ export class ExtensionTasks {
     try { await this.options.host.authorizeExtensionTaskWrite(task.descriptor.id, owner.signal, assertCurrent, mode); }
     catch { this.#assert(owner); return { granted: false, task: this.#view(this.#own(owner, task.descriptor.id)) }; }
     assertCurrent();
-    const oldMode = task.descriptor.permissionMode;
     try {
       await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: mode }, { requireNativeObservation: true });
       assertCurrent(); this.options.host.assertSessionLifecycleIdle(task.descriptor.id);
@@ -398,7 +397,18 @@ export class ExtensionTasks {
         store.updateSession(task.descriptor.id, { permissionMode: mode });
         store.setSetting("service", PREFS, owner.extensionId, { ...initial.config, permissionMode: mode === "auto" || initial.config.permissionMode === "ask" ? mode : initial.config.permissionMode });
       });
-    } catch (error) { await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: oldMode }).catch(() => undefined); throw error; }
+    } catch (error) {
+      const current = this.options.store.findSession(task.descriptor.id)?.descriptor;
+      if (current && !current.archived && current.deletedAt === undefined && current.backendId === backend.id
+        && hash(current.binding) === hash(task.descriptor.binding)
+        && this.options.store.getBackend(backend.id).descriptor.instanceGeneration === backend.instanceGeneration) {
+        // The durable mode may still be unchanged even though the native
+        // setter already ran. Reconcile it on this binding explicitly.
+        await this.options.host.applySessionSettings(task.descriptor.id, { permissionMode: current.permissionMode },
+          { reconcileNativePolicy: true }).catch(() => undefined);
+      }
+      throw error;
+    }
     this.#writeAttempts.delete(key); return { granted: true, task: this.#view(this.#own(owner, task.descriptor.id)) };
     } finally { attempt.pending = false; }
   }
@@ -622,8 +632,9 @@ export function isExtensionTaskControlled(store: OperationalStore, sessionId: st
   const receipt = store.findSetting<TaskReceipt>("service", TASKS, leadSessionId)?.value;
   if (!receipt) return false;
   if (!receipt.revoked) return true;
-  if (worker && store.listRuns({ sessionId, limit: 1 })[0]?.descriptor.source !== "user") return true;
-  if (store.listRuns({ sessionId, activeOnly: true, limit: 1 })[0]?.descriptor.source === "system") return true;
+  const inProgress = ["running", "waiting", "retrying", "dispatch_unknown"] as const;
+  if (store.countRuns({ sessionId, states: inProgress, source: "system" }) > 0) return true;
+  if (worker && store.listRuns({ sessionId, states: [...inProgress, "completed", "failed", "aborted"], limit: 1 })[0]?.descriptor.source !== "user") return true;
   return store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"] }).some(item => inputReceipt(store, item.runId) !== undefined);
 }
 

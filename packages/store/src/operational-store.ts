@@ -314,6 +314,7 @@ type TransactionFrame = {
 type RunListOptions = {
   readonly sessionId?: string;
   readonly targetId?: string;
+  readonly source?: RunDescriptor["source"];
   readonly states?: readonly RunState[];
   readonly activeOnly?: boolean;
   readonly includeCleared?: boolean;
@@ -500,6 +501,10 @@ function runSqlFilter(options: RunListOptions): SqlFilter {
   if (options.states !== undefined && options.states.length > 0) {
     clauses.push(`run.state IN (${options.states.map(() => "?").join(", ")})`);
     params.push(...options.states);
+  }
+  if (options.source !== undefined) {
+    clauses.push("run.source = ?");
+    params.push(options.source);
   }
   if (options.activeOnly === true) {
     clauses.push("run.state IN ('queued', 'running', 'waiting', 'retrying', 'dispatch_unknown')");
@@ -17721,26 +17726,22 @@ export class OperationalStore {
     if (scope === "curated" && backendId !== undefined) {
       throw new StoreError("Curated Maker Memory reset does not accept a Backend ID.");
     }
-    const normalizedBackendId = scope === "digest"
-      ? makerMemoryBackendId(backendId ?? "")
-      : undefined;
-    const targets = scope === "curated"
-      ? this.database.prepare("SELECT count(DISTINCT target_id) AS count FROM maker_memory_entries WHERE kind <> 'digest'").get() as Row
-      : this.database.prepare("SELECT count(DISTINCT target_id) AS count FROM maker_memory_entries WHERE kind = 'digest' AND backend_id = ?")
-        .get(normalizedBackendId!) as Row;
+    const params = scope === "digest" ? [makerMemoryBackendId(backendId ?? "")] : [];
+    const kindFilter = scope === "digest" ? "kind = 'digest' AND backend_id = ?" : "kind <> 'digest'";
+    // Include retired Homes in the exclusion: their digests stay with their original Targets.
+    const filter = `${kindFilter} AND target_id NOT IN (
+      SELECT id FROM targets WHERE json_extract(metadata_json, '$.kind') = 'partner_home'
+    )`;
     return this.write(() => {
-      const ftsResult = scope === "curated"
-        ? this.database.prepare("DELETE FROM maker_memory_fts WHERE kind <> 'digest'").run()
-        : this.database.prepare(`
-            DELETE FROM maker_memory_fts WHERE entry_id IN (
-              SELECT id FROM maker_memory_entries WHERE kind = 'digest' AND backend_id = ?
-            )
-          `).run(normalizedBackendId!);
-      const result = scope === "curated"
-        ? this.database.prepare("DELETE FROM maker_memory_entries WHERE kind <> 'digest'").run()
-        : this.database.prepare("DELETE FROM maker_memory_entries WHERE kind = 'digest' AND backend_id = ?")
-          .run(normalizedBackendId!);
-      void ftsResult;
+      const targets = this.database.prepare(`
+        SELECT count(DISTINCT target_id) AS count FROM maker_memory_entries WHERE ${filter}
+      `).get(...params) as Row;
+      this.database.prepare(`
+        DELETE FROM maker_memory_fts WHERE entry_id IN (
+          SELECT id FROM maker_memory_entries WHERE ${filter}
+        )
+      `).run(...params);
+      const result = this.database.prepare(`DELETE FROM maker_memory_entries WHERE ${filter}`).run(...params);
       return { removedEntries: Number(result.changes), removedTargets: numberValue(targets["count"]) };
     });
   }

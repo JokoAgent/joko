@@ -240,6 +240,7 @@ export class ExtensionCatalogManager {
   readonly #scopeId: string;
   readonly #now: () => number;
   readonly #records = new Map<string, StoredExtensionRecord>();
+  readonly #sidebarRecordBases = new WeakMap<StoredExtensionRecord, StoredExtensionRecord>();
   readonly #definitions = new Map<string, ExtensionDefinition>();
   readonly #tickets = new Map<string, SetupCredentialTicket>();
   readonly #managedCredentialReferences = new Set<string>();
@@ -382,12 +383,14 @@ export class ExtensionCatalogManager {
     if (!definition.sidebarSupported) throw new Error("Extension does not advertise a sidebar entry.");
     const current = this.#requireRecord(extensionId, expectedRevision);
     if (current.sidebarVisible === visible) return this.#descriptor(definition);
-    this.#replaceRecord({
+    const next = {
       ...current,
       sidebarVisible: visible,
       revision: increment(current.revision),
       updatedAt: this.#now()
-    });
+    };
+    this.#sidebarRecordBases.set(next, this.#sidebarRecordBases.get(current) ?? current);
+    this.#replaceRecord(next);
     return this.#descriptor(definition);
   }
 
@@ -598,12 +601,18 @@ export class ExtensionCatalogManager {
     return this.#descriptor(definition);
   }
 
-  async revokeSetup(extensionId: string, expectedRevision: bigint): Promise<ExtensionCatalogDescriptor> {
+  async revokeSetup(extensionId: string, expectedRevision: bigint, assertCurrent: () => void): Promise<ExtensionCatalogDescriptor> {
     const definition = this.#requireDefinition(extensionId);
     const current = this.#requireRecord(extensionId, expectedRevision);
+    const assertSetupCurrent = () => {
+      assertCurrent();
+      this.#requireRecord(extensionId, expectedRevision);
+      if (this.#requireDefinition(extensionId).authorityIdentity !== definition.authorityIdentity) throw new Error("Extension installation changed.");
+    };
     for (const requirement of definition.setupRequirements) {
       const reference = requirement.credentialReferenceId;
       if (reference === undefined) continue;
+      assertSetupCurrent();
       const credential = this.#credentials.find(reference);
       if (credential !== undefined) {
         this.#credentials.reserveManagedSecret({
@@ -614,11 +623,12 @@ export class ExtensionCatalogManager {
         this.#managedCredentialReferences.add(reference);
       }
       if (credential !== undefined || this.#managedCredentialReferences.has(reference)) {
-        const retired = await this.#credentials.retireManagedCredential(reference, credential?.generation);
+        const retired = await this.#credentials.retireManagedCredential(reference, credential?.generation, assertSetupCurrent);
         if (!retired) throw new Error("Setup credential changed concurrently.");
         this.#managedCredentialReferences.delete(reference);
       }
     }
+    assertSetupCurrent();
     this.#replaceRecord({
       ...current,
       authorization: undefined,
@@ -630,18 +640,26 @@ export class ExtensionCatalogManager {
   }
 
   async clearSetupCredential(extensionId: string, fieldId: string, expectedRevision: bigint, assertCurrent: () => void): Promise<ExtensionCatalogDescriptor> {
-    const definition = this.#requireDefinition(extensionId), current = this.#requireRecord(extensionId, expectedRevision);
+    const definition = this.#requireDefinition(extensionId), original = this.#requireRecord(extensionId, expectedRevision);
     const requirement = definition.setupRequirements.find(field => field.id === fieldId && field.kind === "secret");
     if (!definition.installed || !requirement?.credentialReferenceId) throw new Error("Select a declared installed credential field.");
     const reference = requirement.credentialReferenceId, credential = this.#credentials.find(reference);
-    assertCurrent();
+    const base = this.#sidebarRecordBases.get(original) ?? original;
+    const assertClearCurrent = () => {
+      assertCurrent();
+      if (this.#requireDefinition(extensionId).authorityIdentity !== definition.authorityIdentity) throw new Error("Extension installation changed.");
+      const current = this.#requireRecord(extensionId);
+      // A sidebar toggle changes the displayed revision without changing the setup record's authority.
+      if ((this.#sidebarRecordBases.get(current) ?? current) !== base) throw new Error("Extension changed concurrently.");
+      return current;
+    };
+    assertClearCurrent();
     if (credential) {
       this.#credentials.reserveManagedSecret({ credentialReferenceId: reference, kind: credential.kind });
       this.#managedCredentialReferences.add(reference);
-      if (!await this.#credentials.retireManagedCredential(reference, credential.generation)) throw new Error("Setup credential changed concurrently.");
+      if (!await this.#credentials.retireManagedCredential(reference, credential.generation, assertClearCurrent)) throw new Error("Setup credential changed concurrently.");
     }
-    assertCurrent(); this.#requireRecord(extensionId, expectedRevision);
-    if (this.#requireDefinition(extensionId).authorityIdentity !== definition.authorityIdentity) throw new Error("Extension installation changed.");
+    const current = assertClearCurrent();
     this.#managedCredentialReferences.delete(reference);
     const generations = { ...current.authorization?.credentialGenerations }; delete generations[fieldId];
     const attemptGenerations = { ...current.attempt?.credentialGenerations }; delete attemptGenerations[fieldId];
@@ -1121,15 +1139,15 @@ function setupDescriptor(
         && requirement.credentialKinds?.includes(credential.kind) === true
         && (attempt?.credentialGenerations[requirement.id] === credential.generation
           || record.authorization?.credentialGenerations[requirement.id] === credential.generation);
+      const value = attempt?.values[requirement.id] ?? record.authorization?.values[requirement.id];
+      const valueConfigured = requirement.kind === "confirmation" ? value === true : value !== undefined;
       return {
         id: requirement.id,
         label: requirement.label,
         description: requirement.description,
         kind: credential?.kind === "oauth" ? "oauth" : requirement.kind,
         required: requirement.required,
-        configured: requirement.credentialReferenceId === undefined
-          ? attempt?.values[requirement.id] !== undefined || record.authorization?.values[requirement.id] !== undefined
-          : configured,
+        configured: requirement.credentialReferenceId === undefined ? valueConfigured : configured,
         options: [...(requirement.options ?? [])]
       };
     }),

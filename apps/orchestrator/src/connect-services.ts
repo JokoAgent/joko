@@ -2,6 +2,7 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { captureModelPriceReference, createModelPriceOverrideValues, modelPriceOverrideConflict, modelPricesWithOverride, modelTokenPricesAt, type ModelPriceReferenceSnapshot } from "@joko/core";
 import { priceMicros, toProtoModelPriceOverrideValues } from "./model-pricing-projection.js";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
+import { ExtensionSecretCheckUpstreamError } from "./extension-secret-check.js";
 import type { ExtensionDirectoryPicker, ExtensionDirectoryPage, PickedExtensionDirectory } from "./extension-directory-picker.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
 import { createServerAccessConnectService } from './server-access-connect-service.js';
@@ -4769,7 +4770,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
         if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
         assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
       };
-      const result = await dependencies.extensionSettings!.check(surface, request.secretKey, request.credentialUploadTicketId, connection.id, context.signal, assertCurrent);
+      const result = await dependencies.extensionSettings!.check(surface, request.secretKey, request.credentialUploadTicketId, connection.id, context.signal, assertCurrent)
+        .catch(async (error: unknown) => {
+          if (!(error instanceof ExtensionSecretCheckUpstreamError)) throw error;
+          await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id); assertCurrent();
+          throw new ConnectError(contract.EXTENSION_SECRET_CHECK_FAILED, Code.FailedPrecondition);
+        });
       await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id); assertCurrent();
       return { valid: result.valid, ...(result.expiresAt === undefined ? {} : { expiresAt: toProtoTimestamp(result.expiresAt) }) };
     },
@@ -6616,6 +6622,9 @@ export function toProtoOperation(
 
 function publicOperationMutation(mutation: contract.OperationMutation): contract.OperationMutation {
   const payload = mutation.payload;
+  if (payload.case === "setExtensionSettingsRoutingData") {
+    return { ...mutation, payload: { case: payload.case, value: { ...payload.value, dataJson: "" } } };
+  }
   if (payload.case === "resolveInteraction") {
     const resolution = payload.value.resolution;
     if (resolution?.decision.case === "question") {
@@ -21979,11 +21988,12 @@ async function dispatchMutation(
       const surface = await requireExtensionSettingsSurface(dependencies, payload.value.surfaceId, connection.id);
       if (surface.extensionId !== payload.value.extensionId) throw invalidArgument("Settings document belongs to another plugin.");
       const assertCurrent = () => {
-        dependencies.connections.fence(connection); requireCurrentExtensionMutation(dependencies, surface.extensionId, expectedRevision);
+        dependencies.connections.fence(connection);
         if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
         assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
       };
       assertCurrent();
+      requireCurrentExtensionMutation(dependencies, surface.extensionId, expectedRevision);
       return effectOperation(dependencies, operationId, connection, mutation, payload.case,
         { accepted: true, resultCase: "acknowledgement", entityId: surface.extensionId }, async () => {
           assertCurrent(); await dependencies.extensionCatalog!.clearSetupCredential(surface.extensionId, payload.value.fieldId, expectedRevision, assertCurrent);
@@ -22197,21 +22207,26 @@ async function dispatchMutation(
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
       const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "revoke_extension_setup.expected_revision");
       const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      const assertCurrent = () => { dependencies.connections.fence(connection); };
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
         resultCase: "acknowledgement",
         entityId: entry.id
       }, async () => extensionCatalogEffect(async () => {
+        assertCurrent();
         const current = requireExtensionMutation(dependencies, entry.id, expectedRevision);
-        await dependencies.extensionCatalog!.revokeSetup(current.id, expectedRevision);
+        await dependencies.extensionCatalog!.revokeSetup(current.id, expectedRevision, assertCurrent);
         if (current.owner.kind === "mcp" && dependencies.mcpRouter !== undefined) {
           const serverId = current.owner.serverId;
           const server = dependencies.mcpRouter.list().find((candidate) => candidate.id === serverId);
           if (server?.enabled === true) {
+            assertCurrent();
             await dependencies.mcpRouter.restart(server.id);
+            assertCurrent();
             await dependencies.refreshPiGeneration?.();
           }
         }
+        assertCurrent();
         reconcileExtensionCatalog(dependencies);
       }));
     }

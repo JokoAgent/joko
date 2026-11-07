@@ -1,6 +1,8 @@
 import type { ExtensionOAuthAuthorization } from "./gen/joko/v1/extension_oauth_pb.js";
 import type { ExtensionDirectoryPickerPage } from "./gen/joko/v1/extension_pb.js";
 
+export const EXTENSION_SECRET_CHECK_FAILED = "SECRET_CHECK_FAILED";
+
 export interface ExtensionSettingsDirectoryChoice {
   readonly name: string; readonly title?: string; readonly initialPage: ExtensionDirectoryPickerPage;
   browse(input: { readonly entryId?: string; readonly pageToken?: string; readonly directoryPath?: string }): Promise<ExtensionDirectoryPickerPage>;
@@ -69,8 +71,7 @@ export function parseExtensionSettingsBridgeRequest(value: unknown): ExtensionSe
   return valid ? value as unknown as ExtensionSettingsBridgeRequest : undefined;
 }
 
-/** Ahead-of-time source; it runs before the author's first script on all engines. */
-export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
+const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
   "use strict";
   for (const key of ["localStorage", "sessionStorage", "indexedDB", "caches", "Worker", "SharedWorker", "BroadcastChannel", "WebSocket", "EventSource", "RTCPeerConnection", "webkitRTCPeerConnection"]) {
     try { Object.defineProperty(window, key, { get() { throw new Error("Ambient settings capability is unavailable."); }, configurable: false }); } catch (_) {}
@@ -80,12 +81,30 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
   try { Object.defineProperty(window, "console", { value: Object.freeze({ log() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {} }) }); } catch (_) {}
   const pending = new Map(), sensitive = new Set(); let sequence = 0, revision, closed = false;
   const marker = Symbol.for("joko.extension-settings-mobile.transport"), ready = "joko:extension-settings-ready";
-  const protect = value => { if (typeof value === "string" && value) { if (sensitive.size >= 64 && !sensitive.has(value)) throw new Error("Reopen settings before entering more secrets."); sensitive.add(value); } };
+  const protect = value => {
+    if (typeof value !== "string" || !value) return;
+    // The routing guard already rejects any value containing a tracked string.
+    for (const secret of sensitive) if (value.includes(secret)) return;
+    if (sensitive.size >= 64) throw new Error("Reopen settings before entering more secrets.");
+    sensitive.add(value);
+  };
+  const routingContainsSecret = raw => {
+    if (typeof raw !== "string" || raw.length > 65536) throw new Error("Plugin parameters are invalid.");
+    const includesSecret = text => { for (const secret of sensitive) if (text.includes(secret)) return true; return false; };
+    if (includesSecret(raw)) return true;
+    try {
+      JSON.parse(raw);
+      for (const [token] of raw.matchAll(/"(?:[^"\\]|\\.)*"/gu)) {
+        if (token.includes("\\") && includesSecret(JSON.parse(token))) return true;
+      }
+    } catch (_) { throw new Error("Plugin parameters are invalid."); }
+    return false;
+  };
   addEventListener("input", event => { if (event.target && event.target.type === "password") protect(event.target.value); }, true);
   const call = command => new Promise((resolve, reject) => {
     if (closed || pending.size >= 16) { reject(new Error("Settings are unavailable or busy.")); return; }
     if (command.kind === "secret.set" || command.kind === "secret.check" || command.kind === "connections.set") protect(command.value);
-    if (command.kind === "routing.set") for (const value of sensitive) if (command.dataJson.includes(value)) { reject(new Error("Secrets cannot be saved as plugin parameters.")); return; }
+    if (command.kind === "routing.set" && sensitive.size && routingContainsSecret(command.dataJson)) { reject(new Error("Secrets cannot be saved as plugin parameters.")); return; }
     const random = new Uint8Array(16); crypto.getRandomValues(random);
     const id = "settings_" + (++sequence) + "_" + Array.from(random, byte => byte.toString(16).padStart(2, "0")).join("");
     const send = () => parent.postMessage({ type: "joko:extension-settings-request", version: 1, id, command }, "*");
@@ -103,15 +122,27 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
   addEventListener("pagehide", () => { closed = true; for (const item of pending.values()) { clearTimeout(item.timer); removeEventListener(ready, item.send); item.reject(new Error("Settings closed.")); } pending.clear(); sensitive.clear(); }, { once: true });
   Object.defineProperty(window, "joko", { value: Object.freeze({ settings: call }), writable: false, configurable: false });
   const originalFetch = window.fetch.bind(window);
-  window.fetch = async (input, init) => {
-    const target = typeof input === "string" ? input : input && input.url;
-    if (typeof target !== "string" || target.startsWith("//")) return originalFetch(input, init);
+  const jsonResponse = (result, status = 200) => new Response(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? value.toString(10) : value),
+    { status, headers: { "content-type": "application/json" } });
+  const settingsUrl = target => {
+    if (typeof target !== "string" || target.startsWith("//")) return;
     const base = globalThis[Symbol.for("joko.extension.surface.base")] || "https://settings.joko.invalid/";
     const url = new URL(target, base);
-    if ((url.origin !== new URL(base).origin && url.origin !== location.origin) || !/^\/(kv|app-context|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
+    if (url.origin === new URL(base).origin || url.origin === location.origin) return url;
+  };
+  const settingsFetch = window.fetch = async (input, init) => {
+    const target = typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
+    const url = settingsUrl(target);
+    if (!url || !/^\/(kv|app-context|secrets|permissions|oauth|connections|pick)(\/|$)/.test(url.pathname)) return originalFetch(input, init);
     if (url.username || url.password) throw new Error("Settings URL credentials are not allowed.");
+    const signal = init && init.signal !== undefined ? init.signal : input && input.signal;
+    const assertNotAborted = () => {
+      if (signal && signal.aborted) throw signal.reason === undefined ? new DOMException("The operation was aborted.", "AbortError") : signal.reason;
+    };
+    const dispatch = command => { assertNotAborted(); return call(command); };
+    assertNotAborted();
     const method = String(init && init.method || input && input.method || "GET").toUpperCase();
-    let body = init && init.body, command;
+    let body = init && init.body, command, authorConnectionHost, deleteConnection = false;
     if (body === undefined && input && typeof input.clone === "function" && method !== "GET" && method !== "HEAD") body = await input.clone().text();
     if (typeof body === "string" && body.length > 65536) throw new Error("Settings request is too large.");
     const json = () => typeof body === "string" ? JSON.parse(body || "{}") : {};
@@ -123,9 +154,21 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
       command = { kind: "directory.pick", ...(request.title === undefined ? {} : { title: request.title }) };
     }
     else if (url.pathname === "/kv") {
-      if (method === "GET") { const result = await call({ kind: "routing.get" }); revision = result.revision; return new Response(result.dataJson, { headers: { "content-type": "application/json" } }); }
-      if (method === "PUT") { if (revision === undefined) revision = (await call({ kind: "routing.get" })).revision; command = { kind: "routing.set", revision, dataJson: JSON.stringify(json()) }; }
-    } else if (url.pathname === "/secrets" && method === "GET") command = { kind: "setup.get" };
+      if (method === "GET") {
+        const result = await dispatch({ kind: "routing.get" });
+        assertNotAborted();
+        revision = result.revision;
+        return new Response(result.dataJson, { headers: { "content-type": "application/json" } });
+      }
+      if (method === "PUT") { if (revision === undefined) revision = (await dispatch({ kind: "routing.get" })).revision; command = { kind: "routing.set", revision, dataJson: JSON.stringify(json()) }; }
+    } else if (url.pathname === "/secrets" && method === "GET") {
+      const result = await dispatch({ kind: "setup.get" });
+      const secrets = { ...result.secrets };
+      for (const key of checkableSecrets) {
+        if (Object.hasOwn(secrets, key)) secrets[key] = { ...secrets[key], checkSupported: true };
+      }
+      return jsonResponse({ ...result, secrets });
+    }
     else if (url.pathname === "/permissions" && method === "GET") command = { kind: "setup.get" };
     else if (url.pathname === "/permissions" && method === "POST") command = { kind: "setup.complete" };
     else if (url.pathname === "/oauth" && method === "GET") command = { kind: "oauth.get" };
@@ -134,16 +177,144 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
       const secret = /^\/secrets\/([a-z][a-z0-9_]{0,31})(\/check)?$/.exec(url.pathname);
       const oauth = /^\/oauth\/([a-z][a-z0-9_]{0,31})\/(connect|remove|default|clearClient)$/.exec(url.pathname);
       const connection = /^\/connections\/([a-z][a-z0-9_]{0,31})(?:\/(remove|default))?$/.exec(url.pathname);
+      const connectionPath = /^\/connections\/([a-z][a-z0-9_]{0,31})\/([a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/.exec(url.pathname);
       if (secret) command = secret[2] && method === "POST" ? { kind: "secret.check", key: secret[1], value: json().value }
         : method === "PUT" ? { kind: "secret.set", fieldId: "network-secret:" + secret[1], value: json().value }
         : method === "DELETE" ? { kind: "secret.clear", fieldId: "network-secret:" + secret[1] } : undefined;
       else if (oauth && method === "POST") command = oauth[2] === "connect" ? { kind: "oauth.connect", key: oauth[1], ...(json().scopes ? { scopes: json().scopes } : {}) }
         : { kind: "oauth.change", key: oauth[1], action: oauth[2], ...(json().accountId ? { accountId: json().accountId } : {}) };
-      else if (connection && method === "POST") command = connection[2] ? { kind: "connections.change", key: connection[1], action: connection[2], connectionId: json().connectionId }
-        : { kind: "connections.set", key: connection[1], host: json().host, value: json().value, ...(json().label ? { label: json().label } : {}) };
+      else if (connection && method === "POST") {
+        const request = json();
+        if (connection[2]) command = { kind: "connections.change", key: connection[1], action: connection[2], connectionId: request.connectionId };
+        else {
+          const authorToken = request.value === undefined && typeof request.token === "string";
+          if (authorToken && typeof request.host === "string") authorConnectionHost = request.host.trim().toLowerCase();
+          command = { kind: "connections.set", key: connection[1], host: request.host,
+            value: authorToken ? request.token : request.value, ...(request.label ? { label: request.label } : {}) };
+        }
+      } else if (connectionPath && method === "DELETE") {
+        command = { kind: "connections.change", key: connectionPath[1], action: "remove", connectionId: connectionPath[2] };
+        deleteConnection = true;
+      }
     }
     if (!command) throw new Error("Settings endpoint is not supported.");
-    const result = await call(command); if (command.kind === "routing.set") revision = result.revision;
-    return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });
+    try {
+      const result = await dispatch(command);
+      if (command.kind === "routing.set") revision = result.revision;
+      if (deleteConnection) return new Response(null, { status: 204 });
+      if (authorConnectionHost !== undefined) {
+        const slot = result?.slots?.find(slot => slot.key === command.key);
+        const saved = slot?.connections?.find(connection => connection.host === authorConnectionHost && connection.configured);
+        if (!saved || typeof saved.connectionId !== "string" || !saved.connectionId) throw new Error("Plugin connection receipt is unavailable.");
+        const connection = { id: saved.connectionId, host: saved.host, isDefault: saved.isDefault,
+          ...(saved.label ? { label: saved.label } : {}) };
+        return jsonResponse({ ...result, ok: true, connection });
+      }
+      return jsonResponse(result);
+    } catch (error) {
+      if (command.kind === "secret.check" && !(signal && signal.aborted) && error?.message === "${EXTENSION_SECRET_CHECK_FAILED}") {
+        return jsonResponse({ error: "${EXTENSION_SECRET_CHECK_FAILED}" }, 502);
+      }
+      throw error;
+    }
   };
-})();`;
+  if (window.ReactNativeWebView && typeof window.XMLHttpRequest === "function") {
+    // Only the asynchronous parameter read shares the guarded Fetch path. All
+    // other requests keep the native XHR behavior under the document CSP.
+    window.XMLHttpRequest = class extends window.XMLHttpRequest {
+      #read;
+      open(method, input, ...options) {
+        const previous = this.#read;
+        clearTimeout(previous?.timer);
+        previous?.controller?.abort();
+        let url;
+        try { url = settingsUrl(String(input)); } catch (_) {}
+        const allowed = String(method).toUpperCase() === "GET" && (options[0] === undefined || Boolean(options[0]))
+          && options[1] == null && options[2] == null && url?.pathname === "/kv" && !url.search && !url.hash && !url.username && !url.password;
+        const read = allowed ? { url: url.href, state: 1, text: "", json: null } : undefined;
+        this.#read = read;
+        const wasOpened = super.readyState === 1;
+        try { super.open(method, read?.url ?? input, ...options); }
+        catch (error) { this.#read = undefined; throw error; }
+        if (read && this.#read === read && wasOpened && previous?.state !== 1) this.dispatchEvent(new Event("readystatechange"));
+      }
+      get readyState() { return this.#read?.state ?? super.readyState; }
+      get status() { return this.#read ? this.#read.response?.status ?? 0 : super.status; }
+      get statusText() { return this.#read ? this.#read.response?.statusText ?? "" : super.statusText; }
+      get responseURL() { return this.#read ? this.#read.response ? this.#read.url : "" : super.responseURL; }
+      get responseText() {
+        if (!this.#read) return super.responseText;
+        if (this.responseType !== "" && this.responseType !== "text") throw new DOMException("Response is not text.", "InvalidStateError");
+        return this.#read.text;
+      }
+      get response() {
+        const read = this.#read;
+        if (!read) return super.response;
+        if (this.responseType === "json") return read.state === 4 ? read.json : null;
+        return read.text;
+      }
+      getResponseHeader(name) { return this.#read ? this.#read.response?.headers.get(name) ?? null : super.getResponseHeader(name); }
+      getAllResponseHeaders() {
+        if (!this.#read) return super.getAllResponseHeaders();
+        return Array.from(this.#read.response?.headers ?? [], ([name, value]) => name + ": " + value + "\r\n").join("");
+      }
+      send(body) {
+        const read = this.#read;
+        if (!read) return super.send(body);
+        if (read.state !== 1 || read.controller) throw new DOMException("Request is not open.", "InvalidStateError");
+        if (!["", "text", "json"].includes(this.responseType)) {
+          this.#read = undefined;
+          return super.send(body);
+        }
+        read.controller = new AbortController();
+        if (this.timeout > 0) read.timer = setTimeout(() => this.#finish(read, "timeout"), this.timeout);
+        this.dispatchEvent(new ProgressEvent("loadstart"));
+        if (!this.#active(read)) return;
+        void settingsFetch(read.url, { signal: read.controller.signal }).then(async response => {
+          if (!this.#active(read)) return;
+          read.response = response;
+          read.state = 2; this.dispatchEvent(new Event("readystatechange"));
+          if (!this.#active(read)) return;
+          const text = await response.text();
+          if (!this.#active(read)) return;
+          read.text = text;
+          if (this.responseType === "json") try { read.json = JSON.parse(text); } catch (_) {}
+          read.state = 3; this.dispatchEvent(new Event("readystatechange"));
+          if (!this.#active(read)) return;
+          read.loaded = new TextEncoder().encode(text).byteLength;
+          this.dispatchEvent(new ProgressEvent("progress", { loaded: read.loaded }));
+          this.#finish(read, "load");
+        }).catch(() => this.#finish(read, "error"));
+      }
+      abort() {
+        const read = this.#read;
+        if (!read) return super.abort();
+        if (read.controller) this.#finish(read, "abort");
+        if (this.#read === read && read.state === 4) {
+          Object.assign(read, { state: 0, response: undefined, text: "", json: null });
+        }
+      }
+      #active(read) { return this.#read === read && read.state > 0 && read.state < 4; }
+      #finish(read, type) {
+        if (!this.#active(read)) return;
+        clearTimeout(read.timer);
+        if (type !== "load") {
+          read.controller.abort();
+          Object.assign(read, { response: undefined, text: "", json: null });
+        }
+        read.state = 4; this.dispatchEvent(new Event("readystatechange"));
+        if (this.#read !== read || read.state !== 4) return;
+        const progress = { loaded: type === "load" ? read.loaded : 0 };
+        this.dispatchEvent(new ProgressEvent(type, progress));
+        if (this.#read === read && read.state === 4) this.dispatchEvent(new ProgressEvent("loadend", progress));
+      }
+    };
+  }
+})`;
+
+/** It runs before the author's first script, with keys from the installed settings surface. */
+export function extensionSettingsSdkSource(checkableSecrets: readonly string[]): string {
+  return `${EXTENSION_SETTINGS_SDK_FACTORY}(${JSON.stringify(checkableSecrets)});`;
+}
+
+export const EXTENSION_SETTINGS_SDK_SOURCE = extensionSettingsSdkSource([]);

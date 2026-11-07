@@ -107,10 +107,11 @@ export function parseExtensionNetwork(value: unknown): ExtensionNetworkDeclarati
       if (oauth) throw new Error("Only user-provided credentials can declare candidate validation.");
       const value = object(secret.check, ["url", "bodyFormat", "validPath", "validValue", "expiresAtPath", "expiresAtFormat"], ["url", "bodyFormat", "validPath", "validValue"]);
       const destination = extensionNetworkUrl(value.url, injectionHosts ?? hosts), url = destination.href;
-      const bodyFormat = text(value.bodyFormat, 4096), validPath = text(value.validPath, 128);
+      const bodyFormat = value.bodyFormat, validPath = text(value.validPath, 128);
       const path = (value: unknown): value is string => typeof value === "string" && value.length <= 128
         && /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/u.test(value) && !value.split(".").some(key => ["__proto__", "prototype", "constructor"].includes(key));
-      if (destination.hash || !path(validPath) || bodyFormat.split("{value}").length !== 2
+      if (destination.hash || !path(validPath) || typeof bodyFormat !== "string" || bodyFormat.length > 4096
+        || bodyFormat.includes("\u007f") || bodyFormat.split("{value}").length !== 2
         || typeof value.validValue !== "boolean" && !(typeof value.validValue === "string" && value.validValue.length > 0 && value.validValue.length <= 64)
         || value.expiresAtPath !== undefined && !path(value.expiresAtPath)
         || value.expiresAtFormat !== undefined && (value.expiresAtPath === undefined || !["iso", "unix-seconds", "unix-ms"].includes(String(value.expiresAtFormat)))) throw new Error("Extension credential check is invalid.");

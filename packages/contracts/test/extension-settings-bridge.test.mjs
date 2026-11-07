@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Script, createContext } from "node:vm";
 import { webcrypto } from "node:crypto";
-import { EXTENSION_SETTINGS_SDK_SOURCE, parseExtensionSettingsBridgeRequest } from "../dist/index.js";
+import { EXTENSION_SECRET_CHECK_FAILED, EXTENSION_SETTINGS_SDK_SOURCE, extensionSettingsSdkSource, parseExtensionSettingsBridgeRequest } from "../dist/index.js";
 
 test("author settings only accepts declared commands and bounded private input", () => {
   const request = command => ({ type: "joko:extension-settings-request", version: 1, id: "settings-one", command });
@@ -20,18 +20,19 @@ test("author settings only accepts declared commands and bounded private input",
   assert.equal(parseExtensionSettingsBridgeRequest({ ...request({ kind: "context.get" }), sourceSession: "foreign" }), undefined);
 });
 
-function page() {
+function page(source = EXTENSION_SETTINGS_SDK_SOURCE) {
   const listeners = new Map(), requests = [];
   const parent = { postMessage: value => requests.push(value) };
-  const context = { parent, navigator: {}, location: { origin: "null" }, crypto: webcrypto, URL, Response,
+  const context = { parent, navigator: {}, location: { origin: "null" }, crypto: webcrypto, URL, Response, DOMException,
     fetch: async () => { throw new Error("ambient network denied"); }, setTimeout, clearTimeout,
     addEventListener: (name, callback) => { const values = listeners.get(name) ?? new Set(); values.add(callback); listeners.set(name, values); },
     removeEventListener: (name, callback) => listeners.get(name)?.delete(callback) };
   context.window = context;
-  new Script(EXTENSION_SETTINGS_SDK_SOURCE).runInContext(createContext(context));
+  new Script(source).runInContext(createContext(context));
   const dispatch = (name, event) => { for (const callback of listeners.get(name) ?? []) callback(event); };
   const respond = (id, result, source = parent) => dispatch("message", { source, data: { type: "joko:extension-settings-response", version: 1, id, ok: true, result } });
-  return { context, requests, dispatch, respond };
+  const reject = (id, message) => dispatch("message", { source: parent, data: { type: "joko:extension-settings-response", version: 1, id, ok: false, message } });
+  return { context, requests, dispatch, respond, reject };
 }
 
 test("directory selection only sends a native choice request and requires a read deposit", async () => {
@@ -42,6 +43,37 @@ test("directory selection only sends a native choice request and requires a read
   assert.deepEqual(JSON.parse(JSON.stringify(current.requests[0].command)), { kind: "directory.pick", title: "Reports" });
   current.respond(current.requests[0].id, { dir_deposit: { token: "receipt", file_count: 1, total_bytes: 4, rel_paths: ["report.txt"] } });
   const response = await pending; assert.equal((await response.json()).dir_deposit.token, "receipt");
+});
+
+test("author connection token and deletion path use the protected v1 commands", async () => {
+  const current = page();
+  const token = "private-synthetic-connection-token", id = "7f33bd64-4853-47a7-816a-f566432c946d";
+  const row = { connectionId: id, host: "gitlab.example.com", label: "Office", configured: true, isDefault: true };
+  const state = { extensionId: "extension", revision: { value: "8" }, slots: [{ key: "gitlab", connections: [row] }] };
+  const add = current.context.fetch("/connections/gitlab", { method: "POST",
+    body: JSON.stringify({ host: "Gitlab.example.com", token, label: "Office" }) });
+  const setting = parseExtensionSettingsBridgeRequest(current.requests[0]);
+  assert.deepEqual(JSON.parse(JSON.stringify(setting?.command)), { kind: "connections.set", key: "gitlab",
+    host: "Gitlab.example.com", value: token, label: "Office" });
+  current.respond(setting.id, state);
+  const saved = await (await add).json();
+  assert.deepEqual(saved, { ...state, ok: true, connection: { id, host: row.host, label: row.label, isDefault: true } });
+  assert.doesNotMatch(JSON.stringify(saved), /private-synthetic-connection-token/u);
+  await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "0", dataJson: JSON.stringify({ token }) }), /Secrets/u);
+
+  const legacy = current.context.fetch("/connections/gitlab", { method: "POST",
+    body: JSON.stringify({ host: row.host, value: "replacement" }) });
+  current.respond(current.requests[1].id, state);
+  assert.deepEqual(await (await legacy).json(), state);
+
+  const remove = current.context.fetch(`/connections/gitlab/${id}`, { method: "DELETE" });
+  const deletion = parseExtensionSettingsBridgeRequest(current.requests[2]);
+  assert.deepEqual(JSON.parse(JSON.stringify(deletion?.command)), { kind: "connections.change", key: "gitlab", action: "remove", connectionId: id });
+  current.respond(deletion.id, { ...state, slots: [{ key: "gitlab", connections: [] }] });
+  const removed = await remove;
+  assert.equal(removed.status, 204);
+  assert.equal(await removed.text(), "");
+  assert.equal(current.requests.length, 3);
 });
 
 test("the real settings SDK binds responses and keeps entered secrets out of routing parameters", async () => {
@@ -72,4 +104,110 @@ test("fetch uses the settings bridge and checks its routing revision before a wr
   const response = await pending;
   assert.equal((await response.json()).revision, "9");
   await assert.rejects(current.context.fetch("https://foreign.example/kv"), /ambient/u);
+});
+
+test("a standard same-origin URL enters the bounded settings fetch bridge", async () => {
+  const current = page(), endpoint = new URL("/kv", "https://settings.joko.invalid/author/settings.html");
+  const pending = current.context.fetch(endpoint);
+  assert.equal(current.requests[0]?.command.kind, "routing.get");
+  current.respond(current.requests[0].id, { revision: "8", dataJson: '{"folder":"inbox"}' });
+  assert.deepEqual(await (await pending).json(), { folder: "inbox" });
+  await assert.rejects(current.context.fetch(new URL("/kv", "https://foreign.example/")), /ambient/u);
+  await assert.rejects(current.context.fetch(new URL("/kv?scope=other", endpoint)), /query/u);
+  assert.equal(current.requests.length, 1);
+});
+
+test("fetch does not send a password that becomes escaped in plugin parameters", async () => {
+  const current = page(), value = 'fixture"header-secret';
+  current.dispatch("input", { target: { type: "password", value } });
+  const pending = current.context.fetch("/kv", { method: "PUT", body: JSON.stringify({ route: [{ value }] }) });
+  assert.equal(current.requests[0].command.kind, "routing.get");
+  current.respond(current.requests[0].id, { revision: "1", dataJson: "{}" });
+  await assert.rejects(pending, /Secrets/u);
+  assert.equal(current.requests.length, 1);
+  await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "1",
+    dataJson: `{"route":${JSON.stringify(value)},"route":"ordinary"}` }), /Secrets/u);
+  assert.equal(current.requests.length, 1);
+});
+
+test("fetch rejects an already cancelled credential write before it sends a settings command", { timeout: 2_000 }, async t => {
+  const current = page();
+  t.after(() => current.dispatch("pagehide", {}));
+  const controller = new AbortController();
+  controller.abort();
+  const reason = controller.signal.reason;
+  const body = JSON.stringify({ value: "fixture-secret" });
+  const aborted = error => error === reason;
+  await assert.rejects(current.context.fetch("/secrets/token", { method: "PUT", body, signal: controller.signal }), aborted);
+  const request = new Request("https://settings.joko.invalid/secrets/token", { method: "PUT", body, signal: controller.signal });
+  await assert.rejects(current.context.fetch(request), aborted);
+  assert.equal(current.requests.length, 0);
+
+  const pending = current.context.fetch(request, { signal: null, body });
+  assert.equal(current.requests.length, 1);
+  assert.equal(current.requests[0].command.kind, "secret.set");
+  current.respond(current.requests[0].id, { configured: true });
+  assert.equal((await (await pending).json()).configured, true);
+});
+
+test("progressive password input keeps the complete candidate savable through the private bridge", { timeout: 2_000 }, async t => {
+  const current = page(), value = "A".repeat(65);
+  t.after(() => current.dispatch("pagehide", {}));
+  for (let length = 1; length <= value.length; length += 1) {
+    current.dispatch("input", { target: { type: "password", value: value.slice(0, length) } });
+  }
+  const pending = current.context.fetch("/secrets/token", { method: "PUT", body: JSON.stringify({ value }) });
+  assert.equal(current.requests.length, 1);
+  assert.equal(current.requests[0].command.kind, "secret.set");
+  assert.equal(current.requests[0].command.value, value);
+  current.respond(current.requests[0].id, { configured: true });
+  assert.equal((await (await pending).json()).configured, true);
+  await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "0", dataJson: JSON.stringify({ parameter: value }) }), /Secrets/u);
+  assert.equal(current.requests.length, 1);
+});
+
+test("default connection selection and readback return a lossless JSON revision", { timeout: 2_000 }, async t => {
+  const current = page();
+  t.after(() => current.dispatch("pagehide", {}));
+  const state = { extensionId: "fixture-extension", revision: { value: 9007199254740993n }, slots: [{ key: "gitlab", connections: [
+    { connectionId: "a", isDefault: false, configured: true }, { connectionId: "b", isDefault: true, configured: true }
+  ] }] };
+  const saved = current.context.fetch("/connections/gitlab/default", { method: "POST", body: JSON.stringify({ connectionId: "b" }) });
+  assert.deepEqual(JSON.parse(JSON.stringify(current.requests[0].command)), { kind: "connections.change", key: "gitlab", action: "default", connectionId: "b" });
+  current.respond(current.requests[0].id, state);
+  const expected = { ...state, revision: { value: "9007199254740993" } };
+  assert.deepEqual(await (await saved).json(), expected);
+  const read = current.context.fetch("/connections");
+  assert.equal(current.requests[1].command.kind, "connections.get");
+  current.respond(current.requests[1].id, state);
+  assert.deepEqual(await (await read).json(), expected);
+});
+
+test("the installed settings SDK exposes checks only for matching current secret slots", { timeout: 2_000 }, async t => {
+  const current = page(extensionSettingsSdkSource(["token", "retired"]));
+  t.after(() => current.dispatch("pagehide", {}));
+  const read = current.context.fetch("/secrets");
+  assert.equal(current.requests[0].command.kind, "setup.get");
+  const result = { extensionId: "fixture-extension", secrets: { token: { configured: false }, optional: { configured: true } } };
+  current.respond(current.requests[0].id, result);
+  assert.deepEqual(await (await read).json(), { ...result, secrets: {
+    token: { configured: false, checkSupported: true }, optional: { configured: true }
+  } });
+  assert.equal(result.secrets.token.checkSupported, undefined);
+});
+
+test("a confirmed candidate check failure has an HTTP receipt and the same document can explicitly retry", { timeout: 2_000 }, async t => {
+  const current = page();
+  t.after(() => current.dispatch("pagehide", {}));
+  const request = () => current.context.fetch("/secrets/token/check", { method: "POST", body: '{"value":"fixture-candidate"}' });
+  const failed = request();
+  assert.equal(current.requests[0].command.kind, "secret.check");
+  current.reject(current.requests[0].id, EXTENSION_SECRET_CHECK_FAILED);
+  const response = await failed;
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), { error: EXTENSION_SECRET_CHECK_FAILED });
+  assert.equal(current.requests.length, 1);
+  const retry = request();
+  current.respond(current.requests[1].id, { valid: true });
+  assert.deepEqual(await (await retry).json(), { valid: true });
 });
