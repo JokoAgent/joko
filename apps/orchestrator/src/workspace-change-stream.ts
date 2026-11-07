@@ -226,7 +226,7 @@ export class NodeWorkspaceWatcherProvider implements WorkspaceWatcherProvider {
           pendingDeletions.delete(current.identity);
           if (pending.entry.path === path) {
             await observer.change({ kind: "modified", path, revision: current.revision });
-          } else {
+          } else if (!known.has(pending.entry.path)) {
             rewriteKnownDirectoryPrefix(known, pending.entry, current);
             await observer.change({
               kind: "renamed",
@@ -234,6 +234,9 @@ export class NodeWorkspaceWatcherProvider implements WorkspaceWatcherProvider {
               previousPath: pending.entry.path,
               revision: current.revision
             });
+          } else {
+            // A replacement already owns the old path, so this entry cannot move its tab.
+            await observer.change({ kind: previous === undefined ? "created" : "modified", path, revision: current.revision });
           }
           return;
         }
@@ -250,9 +253,10 @@ export class NodeWorkspaceWatcherProvider implements WorkspaceWatcherProvider {
       const existing = pendingDeletions.get(entry.identity);
       if (existing !== undefined) clearTimeout(existing.timer);
       const timer = setTimeout(() => {
-        pendingDeletions.delete(entry.identity);
         tail = tail.then(async () => {
-          if (!closed && !failed) await observer.change({ kind: "deleted", path: entry.path });
+          if (pendingDeletions.get(entry.identity)?.timer !== timer) return;
+          pendingDeletions.delete(entry.identity);
+          if (!closed && !failed && !known.has(entry.path)) await observer.change({ kind: "deleted", path: entry.path });
         }).catch(() => reportOverflow());
       }, WORKSPACE_WATCH_RENAME_WINDOW_MS);
       timer.unref?.();
