@@ -671,6 +671,19 @@ describe("mounted Partner collaboration product chain", () => {
     const cancelCard = page.getByLabel(`Delegated work: ${CANCEL_TITLE}`);
     await cancelCard.waitFor({ state: "visible", timeout: 30_000 });
     await cancelCard.getByText("Running", { exact: true }).waitFor({ state: "visible" });
+    const stopDelegation = cancelCard.getByRole("button", { name: "Stop delegation", exact: true });
+    const pointerReceipt = await stopDelegation.evaluateHandle(button => {
+      const controller = new AbortController();
+      const events: Array<{ type: string; tag?: string; originalButton: boolean; connected: boolean }> = [];
+      for (const type of ["pointerdown", "pointerup", "click"]) {
+        document.addEventListener(type, event => {
+          if (events.length >= 8) return;
+          events.push({ type, originalButton: event.composedPath().includes(button), connected: button.isConnected,
+            ...(event.target instanceof Element ? { tag: event.target.tagName } : {}) });
+        }, { capture: true, signal: controller.signal });
+      }
+      return { events, stop: () => controller.abort() };
+    });
     const cancellationRequests: unknown[] = [], cancellationFailures: string[] = [];
     const cancellationEndpoint = "/joko.v1.PartnerService/CancelPartnerDelegation";
     const observeCancellation = (request: Request): void => {
@@ -696,15 +709,18 @@ describe("mounted Partner collaboration product chain", () => {
           const request = fromBinary(CancelPartnerDelegationRequestSchema, body);
           return request.partnerId === first.partnerId && request.delegationId === cancellable.delegationId;
         }, { timeout: 30_000 }),
-        cancelCard.getByRole("button", { name: "Stop delegation" }).click().then(() => { cancellationClicked = true; })
+        stopDelegation.click().then(() => { cancellationClicked = true; })
       ]);
     } catch (cause) {
       throw new Error(`The inline delegation cancellation did not settle: ${JSON.stringify({
-        clicked: cancellationClicked, requests: cancellationRequests, failures: cancellationFailures,
+        clicked: cancellationClicked, pointer: await pointerReceipt.evaluate(receipt => receipt.events).catch(() => []),
+        requests: cancellationRequests, failures: cancellationFailures,
         card: (await cancelCard.textContent({ timeout: 5_000 }))?.slice(-2_000), browserErrors
       })}`, { cause });
     } finally {
       page.off("request", observeCancellation); page.off("requestfailed", observeCancellationFailure);
+      await pointerReceipt.evaluate(receipt => receipt.stop()).catch(() => undefined);
+      await pointerReceipt.dispose();
     }
     const cancellationRequest = fromBinary(CancelPartnerDelegationRequestSchema, required(cancelledRpc.request().postDataBuffer(), "the cancellation request"));
     const requestedRevision = required(cancellationRequest.expectedRevision, "the requested delegation revision").value;
