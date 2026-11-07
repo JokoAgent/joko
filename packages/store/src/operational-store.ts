@@ -6428,6 +6428,18 @@ export class OperationalStore {
         at,
         revision
       );
+      if (input.wakeWeChatTextReplies === true && connection.channel === "wechat" && sourceKind === "request"
+        && conversation.conversationKind === "direct" && conversation.status === "active"
+        && current?.materialGeneration === materialGeneration) {
+        // An attempted row returns to pending only through the known-failure retry path.
+        this.database.prepare(`
+          UPDATE messaging_deliveries
+          SET available_at = ?, updated_at = ?, revision = ?
+          WHERE connection_id = ? AND channel_generation = ? AND conversation_id = ?
+            AND status = 'pending' AND attempts > 0 AND available_at > ?
+            AND kind = 'text' AND dedupe_key GLOB 'run:*:answer'
+        `).run(at, at, revision, connection.id, connection.generation, conversation.id, at);
+      }
       return this.getMessagingConversationContext(conversation.id);
     });
   }
@@ -6721,6 +6733,7 @@ export class OperationalStore {
     readonly connectionId?: string;
     readonly statuses?: readonly MessagingInboundRequestStatus[];
     readonly limit?: number;
+    readonly offset?: number;
   } = {}): MessagingInboundRequestRecord[] {
     this.assertOpen();
     const clauses: string[] = [];
@@ -6738,8 +6751,8 @@ export class OperationalStore {
     const rows = this.database.prepare(`
       SELECT id FROM messaging_inbound_requests
       ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
-      ORDER BY received_at DESC, id DESC LIMIT ?
-    `).all(...params, limit) as Row[];
+      ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?
+    `).all(...params, limit, normalizeOffset(input.offset)) as Row[];
     return rows.map((row) => this.getMessagingInboundRequest(stringValue(row["id"])));
   }
 
@@ -7100,6 +7113,16 @@ export class OperationalStore {
     return row === undefined ? undefined : messagingDeliveryFromRow(row);
   }
 
+  hasUnknownMessagingDelivery(input: { readonly connectionId: string; readonly channelGeneration: number;
+    readonly conversationId: string; readonly dedupeKeyPrefix: string }): boolean {
+    this.assertOpen();
+    const connectionId = messagingIdentity(input.connectionId, "connection ID"), generation = messagingPositiveInteger(input.channelGeneration, "channel generation");
+    const conversationId = messagingIdentity(input.conversationId, "conversation ID"), prefix = messagingIdentity(input.dedupeKeyPrefix, "delivery dedupe prefix", 512);
+    return this.database.prepare(`SELECT 1 FROM messaging_deliveries WHERE connection_id = ? AND channel_generation = ?
+      AND conversation_id = ? AND status = 'unknown' AND substr(dedupe_key, 1, length(?)) = ? LIMIT 1`)
+      .get(connectionId, generation, conversationId, prefix, prefix) !== undefined;
+  }
+
   getMessagingDelivery(id: string): MessagingDeliveryRecord {
     const delivery = this.findMessagingDelivery(id);
     if (delivery === undefined) throw new NotFoundError("Messaging delivery", id);
@@ -7163,11 +7186,35 @@ export class OperationalStore {
       if (!connection.enabled || connection.runtimeStatus !== "connected") return undefined;
       const claimToken = messagingClaimToken(input.claimToken);
       const at = messagingTimestamp(input.claimedAt ?? this.now(), "delivery claim time");
+      // A Discord final can edit the same carrier as an in-flight progress effect.
+      // Keep it pending through that effect's receipt, and keep its remaining parts behind the first.
       const row = this.database.prepare(`
-        SELECT * FROM messaging_deliveries
-        WHERE connection_id = ? AND channel_generation = ? AND status = 'pending' AND available_at <= ?
-        ORDER BY available_at, created_at, id LIMIT 1
-      `).get(connection.id, connection.generation, at) as Row | undefined;
+        SELECT delivery.* FROM messaging_deliveries AS delivery
+        WHERE delivery.connection_id = ? AND delivery.channel_generation = ?
+          AND delivery.status = 'pending' AND delivery.available_at <= ?
+          AND NOT EXISTS (
+            SELECT 1 FROM messaging_deliveries AS first_part
+            WHERE ? = 'discord' AND first_part.connection_id = delivery.connection_id
+              AND first_part.channel_generation = delivery.channel_generation
+              AND first_part.conversation_id = delivery.conversation_id
+              AND first_part.dedupe_key = delivery.dedupe_key AND first_part.part_index = 0
+              AND first_part.kind = 'text' AND json_type(first_part.payload_json, '$.streamFinalRequestId') = 'text'
+              AND (
+                (delivery.part_index > 0 AND first_part.status IN ('pending', 'dispatching'))
+                OR (delivery.part_index = 0 AND EXISTS (
+                  SELECT 1 FROM messaging_deliveries AS progress
+                  WHERE progress.connection_id = delivery.connection_id
+                    AND progress.channel_generation = delivery.channel_generation
+                    AND progress.conversation_id = delivery.conversation_id
+                    AND progress.status = 'dispatching' AND progress.kind = 'notice'
+                    AND json_extract(progress.payload_json, '$.replyStream.phase') IN ('start', 'edit')
+                    AND json_extract(progress.payload_json, '$.replyStream.requestId')
+                      = json_extract(first_part.payload_json, '$.streamFinalRequestId')
+                ))
+              )
+          )
+        ORDER BY delivery.available_at, delivery.created_at, delivery.id LIMIT 1
+      `).get(connection.id, connection.generation, at, connection.channel) as Row | undefined;
       if (row === undefined) return undefined;
       const current = messagingDeliveryFromRow(row);
       const result = this.database.prepare(`

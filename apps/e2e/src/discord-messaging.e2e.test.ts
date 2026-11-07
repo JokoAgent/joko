@@ -123,6 +123,9 @@ describe("Discord Messaging production product chain", () => {
       "the real Pi reply to leave through Discord REST",
       60_000
     );
+    const firstReply = required(discord.outboundMessages.find(message => message.text === FIRST_REPLY), "confirmed edited reply");
+    expect(discord.methods).toContain(`PATCH channels/${DISCORD_SYSTEM_THREAD_ID}/messages/${firstReply.messageId}`);
+    expect(discord.methods.filter(method => method === `POST channels/${DISCORD_SYSTEM_THREAD_ID}/messages`)).toHaveLength(1);
 
     const firstRequest = required(fixture.application.store.listMessagingInboundRequests()[0], "first Discord request");
     expect(firstRequest).toMatchObject({
@@ -205,7 +208,8 @@ describe("Discord Messaging production product chain", () => {
         providerRequests: fixture!.providerRequests.length,
         diagnostics: JSON.stringify(fixture!.application.store.listDiagnostics({ limit: 8 }), (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)
       }),
-      (state) => state.messages.some((message) => message.text === SECOND_REPLY),
+      (state) => state.messages.some((message) => message.text === SECOND_REPLY && state.deliveries.some((delivery) =>
+        delivery.kind === "text" && delivery.status === "sent" && delivery.providerMessageId === message.messageId)),
       "the restarted Discord worker to deliver the second reply",
       60_000
     );
@@ -216,18 +220,29 @@ describe("Discord Messaging production product chain", () => {
       `discord:message:${FIRST_MESSAGE_ID}`,
       `discord:message:${SECOND_MESSAGE_ID}`
     ]);
+    const secondRequest = required(requests.find((request) => request.providerMessageId === SECOND_MESSAGE_ID), "restarted Discord request");
+    const admittedAttempt = fixture.application.store.getAttempt(required(secondRequest.attemptId, "admitted Attempt")).descriptor;
+    const queue = fixture.application.store.getQueueItem(required(secondRequest.queueItemId, "original accepted Queue item"));
+    const activeAttempt = fixture.application.store.getAttempt(required(queue.attemptId, "renewed Queue Attempt")).descriptor;
+    expect(activeAttempt.runId).toBe(secondRequest.runId);
+    expect(activeAttempt.generation).toBeGreaterThan(admittedAttempt.generation);
+    const finalDelivery = required(fixture.application.store.listMessagingDeliveries()
+      .find((delivery) => delivery.dedupeKey === `run:${queue.runId}:answer`), "restarted Discord final delivery");
+    expect(finalDelivery.status).toBe("sent");
     const restartedConversation = required(
       fixture.application.store.listMessagingConversations({ connectionId: created.connectionId })[0],
       "restarted Discord conversation"
     );
     expect(restartedConversation.sessionId).toBe(sessionId);
+    expect(restartedConversation.sessionGeneration).toBe(activeAttempt.generation);
     expect((await restartedClients.session.getSession({ sessionId })).session?.sessionId).toBe(sessionId);
     expect(fixture.providerRequests).toHaveLength(1);
-    expect(discord.outboundMessages).toContainEqual(expect.objectContaining({
+    expect(discord.outboundMessages.filter((message) => message.replyToMessageId === SECOND_MESSAGE_ID)).toEqual([expect.objectContaining({
       channelId: DISCORD_SYSTEM_THREAD_ID,
       text: SECOND_REPLY,
+      messageId: finalDelivery.providerMessageId,
       replyToMessageId: SECOND_MESSAGE_ID
-    }));
+    })]);
 
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),

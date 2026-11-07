@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   listAllInteractions,
+  listAllMessagingInboundRequests,
   listAllQueueItems,
   listAllRuns,
   listAllVisibleSessionEvents
@@ -36,13 +37,16 @@ describe("complete Operational Store traversal", () => {
     const queue = Array.from({ length: 5 }, (_, index) => ({ id: `queue-${index}` }));
     const interactions = Array.from({ length: 5 }, (_, index) => ({ id: `interaction-${index}` }));
     const runs = Array.from({ length: 5 }, (_, index) => ({ descriptor: { id: `run-${index}` } }));
+    const requests = Array.from({ length: 5 }, (_, index) => ({ id: `request-${index}` }));
     const listQueueItems = vi.fn((options: { readonly offset?: number; readonly limit?: number }) =>
       queue.slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 1_000)));
     const listInteractions = vi.fn((options: { readonly offset?: number; readonly limit?: number }) =>
       interactions.slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 1_000)));
     const listRuns = vi.fn((options: { readonly offset?: number; readonly limit?: number }) =>
       runs.slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 1_000)));
-    const store = { listQueueItems, listInteractions, listRuns } as unknown as OperationalStore;
+    const listMessagingInboundRequests = vi.fn((options: { readonly offset?: number; readonly limit?: number }) =>
+      requests.slice(options.offset ?? 0, (options.offset ?? 0) + (options.limit ?? 500)));
+    const store = { listQueueItems, listInteractions, listRuns, listMessagingInboundRequests } as unknown as OperationalStore;
 
     expect(listAllQueueItems(store, { sessionId: "session-one" }, 2).map((item) => item.id)).toEqual(
       queue.map((item) => item.id)
@@ -53,9 +57,13 @@ describe("complete Operational Store traversal", () => {
     expect(listAllRuns(store, { sessionId: "session-one" }, 2).map((run) => run.descriptor.id)).toEqual(
       runs.map((run) => run.descriptor.id)
     );
+    expect(listAllMessagingInboundRequests(store, { statuses: ["queued"] }, 2).map((request) => request.id)).toEqual(
+      requests.map((request) => request.id)
+    );
     expect(listQueueItems.mock.calls.map(([options]) => options.offset)).toEqual([0, 2, 4]);
     expect(listInteractions.mock.calls.map(([options]) => options.offset)).toEqual([0, 2, 4]);
     expect(listRuns.mock.calls.map(([options]) => options.offset)).toEqual([0, 2, 4]);
+    expect(listMessagingInboundRequests.mock.calls.map(([options]) => options.offset)).toEqual([0, 2, 4]);
   });
 });
 

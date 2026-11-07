@@ -92,6 +92,10 @@ export class DiscordApi {
     });
   }
 
+  async deleteMessage(channelId: string, messageId: string, signal?: AbortSignal): Promise<void> {
+    await this.requestJson("DELETE", `channels/${channelId}/messages/${messageId}`, undefined, { signal, effect: "unknown" });
+  }
+
   async typing(channelId: string, signal?: AbortSignal): Promise<void> {
     await this.requestJson("POST", `channels/${channelId}/typing`, undefined, {
       signal,

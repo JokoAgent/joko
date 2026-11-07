@@ -1,10 +1,13 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   MessagingTransportError,
+  TelegramTransport,
+  normalizeTelegramUpdates,
   type DingTalkCallbackUpdate,
   type DingTalkNormalizationResult,
   type DingTalkPollResult,
@@ -38,8 +41,8 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
-import type { AdapterContext, BlobRef, EventPayload, InteractionDecision, MessageBlock, PromptInput } from "@joko/core";
-import { OperationalStore } from "@joko/store";
+import type { AdapterContext, BlobRef, DurableNativeDispatchPreparation, EventPayload, InteractionDecision, MessageBlock, NativeHistoryProjection, PromptInput } from "@joko/core";
+import { OperationalStore, PartnerStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -59,6 +62,8 @@ import {
   type WeComMessagingConfiguration
 } from "./messaging-manager.js";
 import { SessionHost } from "./session-host.js";
+import { PartnerManager } from "./partner-manager.js";
+import { PartnerMessagingRuntime } from "./partner-messaging.js";
 import { mkdtempSync } from "./test-paths.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -68,6 +73,246 @@ afterEach(async () => {
 });
 
 describe("MessagingManager", () => {
+  it.each(["reply", "permission"] as const)("recovers a %s made durable before Messaging initializes", async (outcome) => {
+    const fixture = await createFixture(undefined, () => new ControlledReplyAdapter(), () => new StreamingDiscordTransport());
+    const enqueue = fixture.store.enqueueQueueItem.bind(fixture.store);
+    vi.spyOn(fixture.store, "enqueueQueueItem").mockImplementationOnce((input) => {
+      const queue = enqueue(input);
+      fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: true, traceId: "fixture:hold-messaging-before-restart" });
+      return queue;
+    });
+    const connection = await enableReplyStream(fixture, "discord");
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("queued"));
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(connection.id).cursor).toBe("discord-cursor-1"));
+    const request = fixture.store.listMessagingInboundRequests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue.state).toBe("accepted");
+    await fixture.manager.close();
+    await fixture.host.dispose();
+
+    const adapter = new ControlledReplyAdapter();
+    const transport = new StreamingDiscordTransport();
+    const card = vi.spyOn(transport, "sendInteractionCard");
+    const poll = vi.spyOn(transport, "poll");
+    let manager!: MessagingManager;
+    const runSettled = vi.fn((input: Parameters<MessagingManager["onRunSettled"]>[0]) => manager.onRunSettled(input));
+    const interactionOpened = vi.fn((input: Parameters<MessagingManager["onInteractionOpened"]>[0]) => manager.onInteractionOpened(input));
+    const host = new SessionHost(fixture.store, fixture.artifacts, [adapter], {
+      onServiceRunSettled: runSettled,
+      onServiceInteractionOpened: interactionOpened,
+      onServiceInteractionSettled: (input) => manager.onInteractionSettled(input)
+    });
+    const options: MessagingManagerOptions = {
+      store: fixture.store, credentials: fixture.credentials, sessionHost: host, artifacts: fixture.artifacts,
+      createDiscordTransport: (input) => transport.bind(input), retryDelayMs: 5, pollTimeoutSeconds: 0
+    };
+    manager = new MessagingManager(options);
+    cleanups.push(async () => { await manager.close(); await host.dispose(); });
+    fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: false, traceId: "fixture:resume-messaging-after-restart" });
+    await host.initialize();
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    if (outcome === "reply") {
+      await adapter.finish("Recovered before Messaging was ready.");
+      await vi.waitFor(() => expect(runSettled).toHaveBeenCalledWith(expect.objectContaining({ runId: request.runId, outcome: "completed" })));
+      expect(fixture.store.getRun(request.runId!).descriptor.state).toBe("completed");
+    } else {
+      void adapter.context!.requestInteraction({
+        id: "startup-permission", kind: "permission", title: "Run command", toolName: "shell",
+        summary: "Run the approved command.", risk: "high", choices: ["allow_once", "deny_once"]
+      }).catch(() => undefined);
+      await vi.waitFor(() => expect(interactionOpened).toHaveBeenCalledWith({ sessionId: queue.sessionId, interactionId: "startup-permission" }));
+      expect(fixture.store.getInteraction("startup-permission").status).toBe("open");
+    }
+    const dedupeKey = outcome === "reply" ? `run:${request.runId}:answer` : "interaction:startup-permission:open";
+    const receipt = () => fixture.store.findMessagingDeliveryByDedupe({
+      connectionId: connection.id, channelGeneration: connection.generation, dedupeKey
+    });
+    expect(receipt()).toBeUndefined();
+    expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("queued");
+
+    await manager.initialize();
+    await vi.waitFor(() => expect(receipt()?.status).toBe("sent"));
+    await vi.waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
+    const deliveryId = receipt()!.id;
+    if (outcome === "reply") {
+      expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("completed");
+      expect([...transport.sentText, ...transport.stream.edits].some(({ text }) => text === "Recovered before Messaging was ready.")).toBe(true);
+    } else {
+      expect(card).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining("Run command") }));
+    }
+    const effects = transport.sentText.length + transport.stream.edits.length + card.mock.calls.length;
+    await manager.close();
+    manager = new MessagingManager(options);
+    await manager.initialize();
+    await vi.waitFor(() => expect(poll).toHaveBeenCalledTimes(2));
+    expect(receipt()?.id).toBe(deliveryId);
+    expect(transport.sentText.length + transport.stream.edits.length + card.mock.calls.length).toBe(effects);
+  });
+
+  it.each(["telegram", "discord"] as const)("serializes %s progress before the final and retains the channel's final-message lifecycle", async channel => {
+    const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
+    const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
+      channel === "discord" ? () => transport as StreamingDiscordTransport : undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, channel); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "tool_start", callId: "read-one", name: "read", input: "private-tool-argument" });
+    await vi.waitFor(() => expect([...transport.sentText, ...transport.stream.edits].some(row => row.text.includes("Using read"))).toBe(true));
+    await adapter.emit({ type: "tool_result", callId: "read-one", name: "read", output: "private-tool-result", isError: false });
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(transport.stream.edits.some(row => row.text === "Draft")).toBe(true));
+    let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; }); cleanups.push(() => release());
+    transport.stream.beforeEdit = input => input.text.includes("late draft") ? gate : Promise.resolve();
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: " late draft" });
+    await vi.waitFor(() => expect(transport.stream.attempts.some(row => row.text.includes("late draft"))).toBe(true));
+    const image = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "stream-result.png", mimeType: "image/png" });
+    await adapter.emit(generatedImageResult(image));
+    await adapter.finish("Final " + "x".repeat(4_200));
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("completed"));
+    expect(transport.stream.attempts.some(row => row.text.startsWith("Final"))).toBe(false);
+    expect(transport.sentText.some(row => row.text.startsWith("Final"))).toBe(false);
+    release();
+    await vi.waitFor(() => {
+      const answers = fixture.store.listMessagingDeliveries().filter(row => row.dedupeKey.endsWith(":answer"));
+      expect(answers.length).toBeGreaterThan(1); expect(answers.every(row => row.status === "sent")).toBe(true);
+      if (channel === "telegram") expect(transport.stream.removed).toHaveLength(1);
+    });
+    const start = fixture.store.listMessagingDeliveries().find(row => row.dedupeKey.endsWith(":progress:start"))!;
+    const first = fixture.store.listMessagingDeliveries().find(row => row.dedupeKey.endsWith(":answer") && row.partIndex === 0)!;
+    if (channel === "discord") {
+      expect(first.providerMessageId).toBe(start.providerMessageId); expect(transport.stream.removed).toEqual([]);
+      expect(transport.stream.edits.at(-1)?.text).toMatch(/^Final/u);
+    } else expect(first.providerMessageId).not.toBe(start.providerMessageId);
+    expect(JSON.stringify([...transport.sentText, ...transport.stream.edits])).not.toMatch(/private-tool-argument|private-tool-result/u);
+    const count = transport.sentText.length + transport.stream.edits.length;
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "too late" });
+    await new Promise(resolve => setTimeout(resolve, 30)); expect(transport.sentText.length + transport.stream.edits.length).toBe(count);
+  });
+
+  it.each([1, 2])("holds all %i Discord final parts while the poll worker competes with an in-flight edit", async (partCount) => {
+    const adapter = new ControlledReplyAdapter();
+    const transport = new StreamingDiscordTransport();
+    const fixture = await createFixture(undefined, () => adapter, () => transport,
+      undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    const secondPoll = deliveryGate();
+    const secondTyping = deliveryGate();
+    const progressReceipt = deliveryGate();
+    const secondMessageId = "999999999999999992";
+    const poll = transport.poll.bind(transport);
+    vi.spyOn(transport, "poll").mockImplementation(async (input) => {
+      if (input.cursor !== "discord-cursor-1") return poll(input);
+      await secondPoll.wait;
+      const update = (await poll({ ...input, cursor: null })).updates[0];
+      if (update?.message === undefined) throw new Error("Missing Discord message fixture.");
+      return {
+        updates: [{ ...update, sequence: 2, message: { ...update.message, id: secondMessageId, content: "Second Discord input" } }],
+        nextCursor: "discord-cursor-2"
+      };
+    });
+    const typing = vi.spyOn(transport, "sendTyping").mockImplementationOnce(async () => undefined)
+      .mockImplementationOnce(() => secondTyping.wait);
+    const editDispatched = vi.fn(({ text }: ReplyEditInput) => text === "Draft" ? progressReceipt.wait : undefined);
+    transport.stream.beforeEditReceipt = editDispatched;
+
+    const connection = await enableReplyStream(fixture, "discord");
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    const firstRequest = fixture.store.listMessagingInboundRequests()[0]!;
+    const opener = (requestId: string) => fixture.store.findMessagingDeliveryByDedupe({
+      connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${requestId}:progress:start`
+    });
+    await vi.waitFor(() => expect(opener(firstRequest.id)?.status).toBe("sent"));
+    const carrierId = opener(firstRequest.id)?.providerMessageId;
+
+    secondPoll.release();
+    await vi.waitFor(() => expect(typing).toHaveBeenCalledTimes(2));
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(editDispatched).toHaveBeenCalledWith(expect.objectContaining({ messageId: carrierId, text: "Draft" })));
+    await adapter.finish(partCount === 1 ? "Final answer" : `Final ${"answer ".repeat(400)}`);
+    const final = () => fixture.store.listMessagingDeliveries({ connectionId: connection.id })
+      .filter((row) => row.dedupeKey === `run:${firstRequest.runId}:answer`);
+    const secondRequest = fixture.store.listMessagingInboundRequests().find((row) => row.providerMessageId === secondMessageId)!;
+
+    secondTyping.release();
+    await vi.waitFor(() => expect(opener(secondRequest.id)?.status).toBe("sent"));
+    expect(fixture.store.listMessagingDeliveries({ connectionId: connection.id, statuses: ["dispatching"] })).toMatchObject([
+      { kind: "notice", dedupeKey: expect.stringContaining(`request:${firstRequest.id}:progress:frame:`) }
+    ]);
+    expect(final().map((row) => row.status)).toEqual(Array(partCount).fill("pending"));
+    expect(transport.stream.edits).toEqual([]);
+
+    progressReceipt.release();
+    await vi.waitFor(() => expect(final().map((row) => row.status)).toEqual(Array(partCount).fill("sent")));
+    expect(transport.stream.edits).toMatchObject([
+      { messageId: carrierId, text: "Draft" },
+      { messageId: carrierId, text: expect.stringMatching(/^Final answer/u) }
+    ]);
+    expect(final().find((row) => row.partIndex === 0)?.providerMessageId).toBe(carrierId);
+  });
+
+  it("retains a Telegram progress carrier when the independent final ACK is unknown, including after restart", async () => {
+    const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
+    const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, "telegram"); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(transport.sentText).toHaveLength(1));
+    transport.unknownFinal = true; await adapter.finish("Final answer");
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] }).some(row => row.dedupeKey.endsWith(":answer"))).toBe(true));
+    const attempts = transport.textAttempts; expect(transport.stream.removed).toEqual([]);
+    await fixture.restartManager(); expect(transport.textAttempts).toBe(attempts); expect(transport.stream.removed).toEqual([]);
+  });
+
+  it("retires a pending stream when its original connection generation is disabled", async () => {
+    const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
+    const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 20, discordMs: 20 });
+    const enabled = await enableReplyStream(fixture, "telegram"); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    const current = fixture.store.getMessagingConnection(enabled.id);
+    await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision, expectedGeneration: current.generation, enabled: false });
+    const sent = transport.sentText.length, edited = transport.stream.edits.length;
+    await adapter.finish("Final answer"); await new Promise(resolve => setTimeout(resolve, 40));
+    expect(transport.sentText).toHaveLength(sent); expect(transport.stream.edits).toHaveLength(edited); expect(transport.stream.removed).toEqual([]);
+  });
+
+  it("publishes Discord's final independently after an uncertain progress edit and never replays that edit", async () => {
+    const adapter = new ControlledReplyAdapter(), transport = new StreamingDiscordTransport();
+    const fixture = await createFixture(undefined, () => adapter, () => transport, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, "discord"); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await vi.waitFor(() => expect(transport.sentText).toHaveLength(1)); transport.stream.unknownEdit = true;
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] })).toHaveLength(1));
+    await adapter.finish("Final answer");
+    await vi.waitFor(() => { expect(transport.sentText.some(row => row.text === "Final answer")).toBe(true); expect(transport.stream.removed).toHaveLength(1); });
+    const attempts = transport.stream.attempts.length; await fixture.restartManager(); expect(transport.stream.attempts).toHaveLength(attempts);
+    expect(transport.stream.edits).toEqual([]);
+  });
+
+  it.each(["telegram", "discord"] as const)("keeps an unknown %s opener single-attempt while delivering an independent final", async channel => {
+    const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport(); transport.unknownStart = true;
+    const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
+      channel === "discord" ? () => transport as StreamingDiscordTransport : undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, channel); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] })).toHaveLength(1));
+    await adapter.finish("Final answer");
+    await vi.waitFor(() => expect(transport.sentText.some(row => row.text === "Final answer")).toBe(true));
+    expect(transport.stream.removed).toEqual([]); expect(transport.stream.edits).toEqual([]);
+    await fixture.restartManager();
+    expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] })[0]?.attempts).toBe(1);
+    expect(transport.sentText.filter(row => row.text === "Final answer")).toHaveLength(1);
+  });
+
+  it.each(["telegram", "discord"] as const)("keeps %s NO_REPLY prefixes silent and retires only its confirmed carrier", async channel => {
+    const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
+    const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
+      channel === "discord" ? () => transport as StreamingDiscordTransport : undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    await enableReplyStream(fixture, channel); await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    if (channel === "discord") await vi.waitFor(() => expect(transport.sentText).toHaveLength(1));
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "NO_" }); await new Promise(resolve => setTimeout(resolve, 25));
+    expect([...transport.sentText, ...transport.stream.edits].some(row => row.text.includes("NO_"))).toBe(false);
+    await adapter.finish("NO_REPLY");
+    await vi.waitFor(() => { expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("completed");
+      if (channel === "discord") expect(transport.stream.removed).toHaveLength(1); });
+    expect(fixture.store.listMessagingDeliveries().some(row => row.dedupeKey.endsWith(":answer"))).toBe(false);
+  });
+
   it("orders a fast failed Slack run's accepted and terminal reactions after durable ACK", async () => {
     const transport = new FastFailureSlackTransport();
     const fixture = await createFixture(
@@ -358,8 +603,112 @@ describe("MessagingManager", () => {
     }
   });
 
+  it("wakes only an unclaimed WeChat text reply retry when the same peer supplies a different context", async () => {
+    const transport = new FakeWeChatTransport(weChatDirectBatch());
+    let sameContext!: () => void, changedContext!: () => void;
+    const same = new Promise<void>(resolve => { sameContext = resolve; });
+    const changed = new Promise<void>(resolve => { changedContext = resolve; });
+    const poll = transport.poll.bind(transport), normalize = transport.normalize.bind(transport);
+    vi.spyOn(transport, "poll").mockImplementation(async input => {
+      if (input.cursor !== "wechat-cursor-1" && input.cursor !== "wechat-cursor-2") return poll(input);
+      const isNew = input.cursor === "wechat-cursor-2";
+      await Promise.race([isNew ? changed : same, waitForAbort(input.signal)]);
+      return { updates: [{ client_id: isNew ? "changed-context" : "same-context" }], nextCursor: isNew ? "wechat-cursor-3" : "wechat-cursor-2" };
+    });
+    vi.spyOn(transport, "normalize").mockImplementation(updates => {
+      const batch = normalize(updates), messageId = updates[0]?.client_id;
+      if (messageId !== "same-context" && messageId !== "changed-context") return batch;
+      const base = batch.events[0]!;
+      if (base.kind !== "message") throw new Error("Expected a WeChat message.");
+      return { ...batch, events: [{ ...base, messageId, providerRequestIds: [`wechat:${messageId}`], text: `Reply from ${messageId}` }],
+        privateContexts: [{ messageId, providerConversationId: base.address.providerConversationId,
+          contextToken: messageId === "same-context" ? "private-context-a" : "rotated-context-a" }] };
+    });
+    const firstDeliveries = new Map<string, string>();
+    const send = transport.sendTextPart.bind(transport);
+    const calls = vi.spyOn(transport, "sendTextPart").mockImplementation(async input => {
+      const peer = input.address.providerConversationId;
+      if (!input.context) throw new Error("Expected a WeChat reply context.");
+      if (!firstDeliveries.has(peer)) {
+        firstDeliveries.set(peer, input.context.clientId);
+        throw new MessagingTransportError("provider_rejected", "WeChat did not accept the reply.", { retryable: true, effect: "none", retryAfterMs: 300_000 });
+      }
+      if (input.context.contextToken === "private-context-a") {
+        throw new MessagingTransportError("malformed_response", "WeChat reply outcome is unknown.", { retryable: false, effect: "unknown" });
+      }
+      return send(input);
+    });
+    const fixture = await createFixture(undefined, undefined, undefined, undefined, undefined, undefined, () => transport);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createWeChatConnection();
+    const enabled = await fixture.manager.commitWeChatAuthorization({ clientConnectionId: "desktop-one", connectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false, credentials: { token: "weChat-private-token", botId: "wx-bot", userId: "wx-account", baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    const deliveries = () => fixture.store.listMessagingDeliveries({ connectionId: enabled.id });
+    await vi.waitFor(() => expect(deliveries().filter(row => row.kind === "text" && row.status === "pending" && row.attempts === 1)).toHaveLength(2), { timeout: 5_000 });
+    const original = fixture.store.getMessagingDelivery(firstDeliveries.get("wx-peer-a")!);
+    const otherPeer = fixture.store.getMessagingDelivery(firstDeliveries.get("wx-peer-b")!);
+    expect(original.availableAt).toBeGreaterThan(Date.now());
+
+    sameContext();
+    await vi.waitFor(() => expect(deliveries().filter(row => row.status === "unknown")).toHaveLength(1), { timeout: 5_000 });
+    const unknown = deliveries().find(row => row.status === "unknown")!;
+    expect(fixture.store.getMessagingDelivery(original.id)).toEqual(original);
+    changedContext();
+    await vi.waitFor(() => expect(fixture.store.getMessagingDelivery(original.id)).toMatchObject({ status: "sent", attempts: 2 }), { timeout: 5_000 });
+    expect(Date.now()).toBeLessThan(original.availableAt);
+    expect(calls.mock.calls.filter(([input]) => input.context?.clientId === original.id).map(([input]) => input.context?.contextToken))
+      .toEqual(["private-context-a", "rotated-context-a"]);
+    expect(fixture.store.getMessagingDelivery(otherPeer.id)).toEqual(otherPeer);
+    expect(fixture.store.getMessagingDelivery(unknown.id)).toEqual(unknown);
+  });
+
+  it("keeps the canonical Partner task open when its WeChat owner sends /new", async () => {
+    const batch = weChatDirectBatch(), base = batch.events[0]!;
+    if (base.kind !== "message") throw new Error("Expected a WeChat message.");
+    const userId = "wx-account";
+    const transport = new FakeWeChatTransport({ ...batch, events: [{ ...base, text: "/new",
+      address: { ...base.address, providerConversationId: userId }, speaker: { ...base.speaker, providerUserId: userId, isOwner: true }
+    }], privateContexts: [{ ...batch.privateContexts[0]!, providerConversationId: userId }] });
+    const partnerAdapter = () => new FakeBackendAdapter({
+      ...PI_LIKE_PROFILE,
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+        ? { ...capability, options: ["ask"] } : capability)
+    });
+    const f = await createFixture(undefined, partnerAdapter, undefined, undefined, undefined, undefined, () => transport);
+    const profiles = new PartnerStore(join(f.root, "partners.db"));
+    cleanups.push(async () => { try { await f.manager.close(); } finally { profiles.close(); } });
+    const partners = new PartnerManager({ store: profiles, operationalStore: f.store, sessionHost: f.host, homesRoot: join(f.root, "homes"),
+      workspaceService: { register: async input => input, unregister: () => undefined } });
+    const partner = await partners.createPartner({ requestId: "wechat-partner-create", expectedDirectoryRevision: profiles.directoryState().revision,
+      displayName: "Ada", avatar: "orbit", identitySource: "A Partner who shares this private WeChat conversation.", templateId: "general", usesDirectoryDefaults: false,
+      capabilities: { modelChain: [{ backendId: f.adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
+    expect(partner.initializationErrorCode).toBeUndefined();
+    expect(partner.initializationState).toBe("ready");
+    const sessionId = partner.canonicalSessionId!;
+    const runtime = new PartnerMessagingRuntime({ store: f.store, profiles, partners, host: f.host, messaging: f.manager, pauseGoal: async () => undefined });
+    f.manager.setPartnerRuntime(runtime);
+    const owner = f.store.createConnection({ id: "wechat-ui-owner", name: "Owner", authKeyDigest: "wechat-ui-auth" });
+    const created = f.manager.createWeChatConnection();
+    const bound = await runtime.setBinding({ operationId: "wechat-partner-bind", owner, connectionId: created.id, partnerId: partner.id,
+      expectedBindingRevision: 0, expectedConnectionRevision: created.revision, expectedConnectionGeneration: created.generation, expectedPartnerRevision: partner.revision });
+    const original = f.store.getSession(sessionId).descriptor;
+    expect(f.host.canRestartPartnerSession(sessionId)).toBe(true);
+    const restart = vi.spyOn(f.host, "restartPartnerSession"), close = vi.spyOn(f.adapter, "closeSession");
+    const enabled = await f.manager.commitWeChatAuthorization({ clientConnectionId: owner.id, connectionId: created.id,
+      expectedRevision: bound.connection.revision, expectedGeneration: bound.connection.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false, credentials: { token: "weChat-private-token", botId: "wx-bot", userId, baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    await vi.waitFor(() => expect(transport.sentText).toMatchObject([{ text: expect.stringContaining("shares the Partner's long-running task") }]), { timeout: 5_000 });
+    expect(runtime.lanes(enabled.id)).toMatchObject([{ kind: "owner_dm", sessionId, generation: original.binding.generation }]);
+    expect(f.store.getSession(sessionId).descriptor.binding).toEqual(original.binding);
+    expect(f.store.findPendingContextRebuild(sessionId)).toBeUndefined();
+    expect(f.store.listSettings("service", "partner.messaging.v1").filter(row => row.key.startsWith("restart:"))).toEqual([]);
+    expect(restart).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
   it("runs WeChat commands through one peer's durable task and keeps the previous task on /new", async () => {
-    const commands = ["/new", "/permission auto", "/status", "/stop all"];
+    const commands = ["/new", "/permission auto", "/permission AcCePtEdItS", "/permission bypassPermissions", "/status", "/stop all"];
     const batch = weChatDirectBatch();
     const transport = new FakeWeChatTransport({
       ...batch,
@@ -375,11 +724,13 @@ describe("MessagingManager", () => {
         contextToken: `private-command-${index}`
       }))
     });
+    const permissionModes = ["ask", "acceptEdits", "auto", "bypassPermissions"] as const;
     const adapter = new FakeBackendAdapter({
       ...PI_LIKE_PROFILE,
+      permissionModes,
       capabilities: [
         ...PI_LIKE_PROFILE.capabilities.map((capability) => capability.key === "permission.modes"
-          ? { key: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] }
+          ? { key: "permission.modes", supported: true, options: [...permissionModes] }
           : capability),
         { key: "permission.change", supported: true }
       ]
@@ -413,16 +764,20 @@ describe("MessagingManager", () => {
     const taskIds = fixture.store.listSessions().map((session) => session.descriptor.id);
     expect(taskIds).toContain(conversation.sessionId);
     expect(taskIds).toHaveLength(2);
+    expect(fixture.store.getSession(conversation.sessionId!).descriptor.permissionMode).toBe("acceptEdits");
+    expect(fixture.store.getSession(taskIds.find((id) => id !== conversation.sessionId)!).descriptor.permissionMode).toBe("ask");
     expect(transport.sentText.map((entry) => entry.text)).toEqual([
       expect.stringContaining("new conversation is ready"),
       expect.stringContaining("Permission changed to auto"),
+      "Permission changed to acceptEdits.",
+      expect.stringContaining("Current permission: acceptEdits. Available: ask, acceptEdits, auto, bypassPermissions."),
       expect.stringContaining("pending task"),
       expect.stringContaining("Only the connected account")
     ]);
     expect(transport.sentText.every((entry) => entry.context?.contextToken.startsWith("private-command-")))
       .toBe(true);
     expect(fixture.store.listMessagingInteractions({ connectionId: enabled.id, limit: 20 })
-      .map((interaction) => interaction.status)).toEqual(["completed", "completed", "completed", "completed"]);
+      .map((interaction) => interaction.status)).toEqual(commands.map(() => "completed"));
   });
 
   it("refreshes WeChat typing and persists bounded progress notices until the run settles", async ({ signal, onTestFailed, onTestFinished }) => {
@@ -651,6 +1006,99 @@ describe("MessagingManager", () => {
     await vi.waitFor(() => {
       expect(fixture.store.listMessagingDeliveries().every((delivery) => delivery.status === "sent")).toBe(true);
     }, { timeout: 2_000 });
+  });
+
+  it("runs protected Telegram text once without retaining the input in Queue, Operation, or native history projection", async () => {
+    const privateText = "protectedtelegrambodya17c";
+    const transport = new ProtectedTelegramTransport(privateText);
+    const adapter = new ProtectedTelegramAdapter();
+    const fixture = await createFixture(() => transport, () => adapter);
+    const persistPoll = vi.spyOn(fixture.store, "saveMessagingPollBatch");
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const connection = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, groupActivation: { "-100555": "mention" } } });
+    await replaceCredential(fixture, connection, "protected-text", true);
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]).toMatchObject({ protectedContent: true, status: "completed" }));
+    const request = fixture.store.listMessagingInboundRequests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(adapter.received).toHaveLength(1);
+    expect(persistPoll).not.toHaveBeenCalled();
+    expect(adapter.received[0]).toContain(privateText);
+    expect(adapter.history.events[0]?.payload).toMatchObject({ role: "user", blocks: [{ text: expect.stringContaining(privateText) }] });
+    expect(queue.body.text).toBe("[Protected message]");
+    expect(fixture.store.getOperation(request.operationId!).body).toMatchObject({ prompt: { text: "[Protected message]" } });
+    expect(fixture.store.listEvents({ sessionId: queue.sessionId }).some(event => event.payload.type === "message_complete" && event.payload.role === "user")).toBe(false);
+    expect(fixture.store.searchSessionMessages({ scope: { sessionId: queue.sessionId }, query: privateText, limit: 20 }).matches).toEqual([]);
+    await vi.waitFor(() => expect(transport.sentText.some(entry => entry.text.includes("The protected request was handled."))).toBe(true));
+    await expect(fixture.host.exportPortableSession({ sessionId: queue.sessionId }))
+      .rejects.toMatchObject({ publicError: { code: "PROTECTED_NATIVE_EXPORT_UNAVAILABLE" } });
+  });
+
+  it("settles a protected Telegram Queue after losing the process-local prompt without sending a placeholder", async () => {
+    const transport = new ProtectedTelegramTransport("protectedpendingbodyd81a");
+    const fixture = await createFixture(() => transport);
+    const enqueue = fixture.store.enqueueQueueItem.bind(fixture.store);
+    vi.spyOn(fixture.store, "enqueueQueueItem").mockImplementationOnce(input => {
+      const queue = enqueue(input);
+      fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: true, traceId: "fixture:pause-before-dispatch" });
+      return queue;
+    });
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const connection = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, groupActivation: { "-100555": "mention" } } });
+    await replaceCredential(fixture, connection, "protected-restart", true);
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests()[0]).toMatchObject({ protectedContent: true, status: "queued" }));
+    const request = fixture.store.listMessagingInboundRequests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue).toMatchObject({ state: "accepted", body: { text: "[Protected message]" } });
+    await fixture.manager.close();
+    await fixture.host.dispose();
+    fixture.store.setQueuePaused({ sessionId: queue.sessionId, paused: false, traceId: "fixture:resume-after-restart" });
+    const coldAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const send = vi.spyOn(coldAdapter, "send");
+    const coldHost = new SessionHost(fixture.store, fixture.artifacts, [coldAdapter]);
+    try {
+      await coldHost.initialize();
+      await vi.waitFor(() => expect(fixture.store.getQueueItem(queue.id)).toMatchObject({ state: "failed", error: { code: "PROTECTED_INPUT_EXPIRED" } }));
+      expect(send).not.toHaveBeenCalled();
+    } finally { await coldHost.dispose(); }
+  });
+
+  it("dispatches a durable Telegram Markdown reply through the actual renderer and confirms only its final plain receipt", async () => {
+    class RenderedTransport extends FakeTelegramTransport {
+      readonly bodies: Record<string, unknown>[] = [];
+      outbound?: TelegramTransport;
+      override bind(options: TelegramTransportOptions): this {
+        super.bind(options);
+        this.outbound = new TelegramTransport({ ...options, fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => {
+          this.bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(JSON.stringify(this.bodies.length === 1
+            ? { ok: false, error_code: 400, description: "Can't parse entities" }
+            : { ok: true, result: { message_id: 901 } }), { status: this.bodies.length === 1 ? 400 : 200 });
+        }) as typeof fetch });
+        return this;
+      }
+      override sendTextPart(input: Parameters<TelegramTransport["sendTextPart"]>[0]) { return this.outbound!.sendTextPart(input); }
+    }
+    class ReplyAdapter extends FakeBackendAdapter {
+      override async send(_input: PromptInput, context: AdapterContext) {
+        await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "**Answer**\n```ts\n    const value = '<&>';\n```" }] });
+        await context.emit({ type: "done", outcome: "completed" });
+      }
+    }
+    const transport = new RenderedTransport(directMessageBatch());
+    const fixture = await createFixture(() => transport, () => new ReplyAdapter(PI_LIKE_PROFILE));
+    const connection = await enableTelegramReply(fixture, "formatted-reply");
+    await vi.waitFor(() => {
+      const deliveries = fixture.store.listMessagingDeliveries({ connectionId: connection.id }).filter(item => item.kind === "text");
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0]).toMatchObject({ status: "sent", providerMessageId: "901", attempts: 1 });
+    });
+    expect(transport.bodies).toHaveLength(2);
+    expect(transport.bodies[0]).toMatchObject({ parse_mode: "HTML", text: "<b>Answer</b>\n<pre><code class=\"language-ts\">    const value = '&lt;&amp;&gt;';</code></pre>" });
+    expect(transport.bodies[1]).toMatchObject({ text: "**Answer**\n```ts\n    const value = '<&>';\n```" });
+    expect(transport.bodies[1]).not.toHaveProperty("parse_mode");
+    expect(transport.bodies[1]!.chat_id).toBe(transport.bodies[0]!.chat_id);
   });
 
   it("keeps an uncertain outbound Telegram effect unknown and never sends it again after reconnect", async () => {
@@ -1092,6 +1540,43 @@ describe("MessagingManager", () => {
     expect(transport.sentText.some((entry) => entry.text === "Joko's Discord connection is being disabled.")).toBe(true);
     expect(fixture.store.listMessagingDeliveries().filter((delivery) => delivery.kind === "notice"))
       .toHaveLength(2);
+  });
+
+  it("delivers Discord lifecycle notices once per service lifetime on the same connection generation", async () => {
+    const transport = new FakeDiscordTransport();
+    const fixture = await createFixture(undefined, undefined, () => transport);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createDiscordConnection({
+      ownerProviderUserId: "111111111111111111",
+      configuration: { ...DEFAULT_DISCORD_MESSAGING_CONFIGURATION, lifecycleAnnouncements: true }
+    });
+    const enabled = await replaceCredential(fixture, created, "discord-repeated-lifecycle", true);
+    const sent = (phase: "connected" | "shutdown") => fixture.store.listMessagingDeliveries({
+      connectionId: enabled.id, statuses: ["sent"]
+    }).filter((delivery) => delivery.dedupeKey.startsWith(`lifecycle:${phase}:`));
+
+    await vi.waitFor(() => expect(sent("connected")).toHaveLength(1));
+    await fixture.manager.close();
+    expect(sent("shutdown")).toHaveLength(1);
+    const priorShutdown = sent("shutdown")[0]!;
+    const stale = fixture.store.enqueueMessagingDelivery({
+      connectionId: enabled.id, expectedChannelGeneration: enabled.generation, conversationId: priorShutdown.conversationId,
+      dedupeKey: `lifecycle:shutdown:generation:${enabled.generation}`,
+      kind: "notice", partIndex: 0, partCount: 1, payload: priorShutdown.payload, payloadHash: priorShutdown.payloadHash,
+      createdAt: Date.now()
+    });
+
+    await fixture.restartManager();
+    await vi.waitFor(() => {
+      expect(sent("connected")).toHaveLength(2);
+      expect(fixture.store.getMessagingDelivery(stale.id).status).toBe("cancelled");
+    });
+    await fixture.manager.close();
+    expect(sent("shutdown")).toHaveLength(2);
+    expect(fixture.store.getMessagingConnection(enabled.id).generation).toBe(enabled.generation);
+    const lifecycleTexts = ["Joko is connected and ready on Discord.", "Joko is disconnecting from Discord."];
+    expect(transport.sentText.map(({ text }) => text).filter((text) => lifecycleTexts.includes(text)))
+      .toEqual([...lifecycleTexts, ...lifecycleTexts]);
   });
 
   it("projects terminal Discord Gateway credential loss without retrying the retired worker", async () => {
@@ -1930,12 +2415,14 @@ class FakeDiscordTransport {
     return waitForAbort(input.signal);
   }
 
-  normalize(_updates: readonly DiscordGatewayUpdate[]): DiscordNormalizationResult {
+  normalize(updates: readonly DiscordGatewayUpdate[]): DiscordNormalizationResult {
+    const message = updates[0]?.message;
+    const messageId = message?.id ?? "999999999999999991";
     return {
       events: [{
         kind: "message",
-        providerRequestIds: ["discord:message:999999999999999991"],
-        messageId: "999999999999999991",
+        providerRequestIds: [`discord:message:${messageId}`],
+        messageId,
         address: this.ownerAddress(),
         speaker: {
           providerUserId: "111111111111111111",
@@ -1945,7 +2432,7 @@ class FakeDiscordTransport {
           isOwner: true
         },
         occurredAt: Date.now(),
-        text: "Hello from Discord",
+        text: message?.content ?? "Hello from Discord",
         ambient: false,
         protectedContent: false,
         attachments: [],
@@ -2002,6 +2489,55 @@ class FakeDiscordTransport {
   }
   async answerInteraction(): Promise<void> {}
   async close(): Promise<void> {}
+}
+
+interface ReplyEditInput {
+  readonly address: MessagingAddress; readonly messageId: string; readonly text: string;
+  readonly assertCurrent?: () => void; readonly signal?: AbortSignal;
+}
+class ControlledReplyEffects {
+  readonly attempts: ReplyEditInput[] = []; readonly edits: ReplyEditInput[] = []; readonly removed: string[] = [];
+  beforeEdit?: (input: ReplyEditInput) => Promise<void>; unknownEdit = false;
+  beforeEditReceipt?: (input: ReplyEditInput) => Promise<void> | undefined;
+  async edit(input: ReplyEditInput) {
+    this.attempts.push(input); await this.beforeEdit?.(input); input.signal?.throwIfAborted(); input.assertCurrent?.();
+    if (this.beforeEditReceipt !== undefined) await this.beforeEditReceipt(input);
+    if (this.unknownEdit) throw new MessagingTransportError("network", "Progress ACK lost.", { effect: "unknown", retryable: true });
+    this.edits.push(input); return { providerMessageId: input.messageId, address: input.address };
+  }
+  async remove(input: { readonly address: MessagingAddress; readonly messageId: string; readonly assertCurrent?: () => void; readonly signal?: AbortSignal }) {
+    input.signal?.throwIfAborted(); input.assertCurrent?.(); this.removed.push(input.messageId);
+    return { providerMessageId: input.messageId, address: input.address };
+  }
+}
+
+function deliveryGate(): { readonly wait: Promise<void>; readonly release: () => void } {
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  cleanups.push(release);
+  return { wait, release };
+}
+class StreamingTelegramTransport extends FakeTelegramTransport {
+  readonly stream = new ControlledReplyEffects(); unknownFinal = false; unknownStart = false;
+  constructor() { super(directMessageBatch()); }
+  editTextPart(input: ReplyEditInput) { return this.stream.edit(input); }
+  removeTextPart(input: Parameters<ControlledReplyEffects["remove"]>[0]) { return this.stream.remove(input); }
+  override async sendTextPart(input: Parameters<FakeTelegramTransport["sendTextPart"]>[0]) {
+    if (this.unknownStart) { this.unknownStart = false; this.textAttempts++; throw new MessagingTransportError("network", "Opener ACK lost.", { effect: "unknown", retryable: true }); }
+    if (this.unknownFinal && input.text.startsWith("Final")) {
+      this.textAttempts++; throw new MessagingTransportError("network", "Final ACK lost.", { effect: "unknown", retryable: true });
+    }
+    return super.sendTextPart(input);
+  }
+}
+class StreamingDiscordTransport extends FakeDiscordTransport {
+  readonly stream = new ControlledReplyEffects(); unknownStart = false;
+  override async sendTextPart(input: Parameters<FakeDiscordTransport["sendTextPart"]>[0]) {
+    if (this.unknownStart) { this.unknownStart = false; throw new MessagingTransportError("network", "Opener ACK lost.", { effect: "unknown", retryable: true }); }
+    return super.sendTextPart(input);
+  }
+  editTextPart(input: ReplyEditInput) { return this.stream.edit(input); }
+  removeTextPart(input: Parameters<ControlledReplyEffects["remove"]>[0]) { return this.stream.remove(input); }
 }
 
 class AuthLossDiscordTransport extends FakeDiscordTransport {
@@ -3086,6 +3622,37 @@ class BoundedAlbumPagesTransport extends FakeTelegramTransport {
   }
 }
 
+class ProtectedTelegramAdapter extends FakeBackendAdapter {
+  readonly received: string[] = [];
+  history: NativeHistoryProjection = { events: [], activeLineage: [] };
+  constructor() { super(PI_LIKE_PROFILE); }
+  async getNativeHistoryProjection(): Promise<NativeHistoryProjection> { return this.history; }
+  async sendWithDurableNativeDispatchFence(input: PromptInput, context: AdapterContext,
+    persist: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<void> {
+    const inputFingerprint = createHash("sha256").update(input.text).digest("hex");
+    await persist({ inputFingerprint, nativeHistory: this.history });
+    this.received.push(input.text);
+    const echo = { type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] } as const;
+    this.history = { events: [{ nativeEntryId: "protected-user-entry", projectionKind: "message_complete", contentIndex: 0,
+      payload: echo, metadata: { namespace: "fixture", fields: { nativeDispatchFingerprint: inputFingerprint } } }],
+      activeEntryId: "protected-user-entry", activeLineage: [{ entryId: "protected-user-entry" }] };
+    await context.emit(echo);
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The protected request was handled." }] });
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+}
+
+class ControlledReplyAdapter extends FakeBackendAdapter {
+  context?: AdapterContext;
+  constructor() { super(PI_LIKE_PROFILE); }
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> { this.context = context; }
+  async emit(event: EventPayload): Promise<void> { if (!this.context) throw new Error("No admitted reply run."); await this.context.emit(event); }
+  async finish(text: string): Promise<void> {
+    await this.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] });
+    await this.emit({ type: "done", outcome: "completed" });
+  }
+}
+
 class AttachmentFakeAdapter extends FakeBackendAdapter {
   blocks: readonly MessageBlock[] = [{ kind: "text", text: "Files are ready." }];
   events: readonly EventPayload[] = [];
@@ -3124,6 +3691,14 @@ async function enableTelegramReply(fixture: Awaited<ReturnType<typeof createFixt
     ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off"
   } });
   return replaceCredential(fixture, created, suffix, true);
+}
+
+async function enableReplyStream(fixture: Awaited<ReturnType<typeof createFixture>>, channel: "telegram" | "discord") {
+  fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+  const created = channel === "telegram" ? fixture.manager.createTelegramConnection({ ownerProviderUserId: "42", configuration: {
+    ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" } }) : fixture.manager.createDiscordConnection({ ownerProviderUserId: "111111111111111111",
+    configuration: { ...DEFAULT_DISCORD_MESSAGING_CONFIGURATION, emojiReactions: "off", lifecycleAnnouncements: false } });
+  return replaceCredential(fixture, created, `${channel}-stream`, true);
 }
 
 async function enableFeishuReply(fixture: Awaited<ReturnType<typeof createFixture>>) {
@@ -3312,7 +3887,8 @@ async function createFixture(
   weComTransportFactory?: (options: WeComTransportOptions) => FakeWeComTransport,
   weChatTransportFactory?: (options: WeChatTransportOptions) => FakeWeChatTransport,
   weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"],
-  slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport
+  slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport,
+  replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"]
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -3352,6 +3928,7 @@ async function createFixture(
     artifacts,
     retryDelayMs: 5,
     ...(weChatPresenceTiming === undefined ? {} : { weChatPresenceTiming }),
+    ...(replyStreamTiming === undefined ? {} : { replyStreamTiming }),
     pollTimeoutSeconds: 0,
     ...(transportFactory === undefined ? {} : {
       createTelegramTransport: (input) => transportFactory(input).bind(input)
@@ -3453,6 +4030,25 @@ function weChatDirectBatch(): WeChatNormalizationResult {
       { messageId: "wx-peer-b-incoming", providerConversationId: "wx-peer-b", contextToken: "private-context-b" }
     ]
   };
+}
+
+class ProtectedTelegramTransport extends FakeTelegramTransport {
+  readonly #update: TelegramUpdate;
+  constructor(text: string) {
+    const mention = "@joko_test_bot";
+    const update: TelegramUpdate = { update_id: 9, message: {
+      message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
+      chat: { id: -100555, type: "supergroup" }, date: Math.floor(Date.now() / 1000),
+      text: `${mention} ${text}`, has_protected_content: true,
+      entities: [{ type: "mention", offset: 0, length: mention.length }]
+    } };
+    super(normalizeTelegramUpdates([update], { connectionId: "placeholder", ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } }));
+    this.#update = update;
+  }
+  override async poll(input: Parameters<FakeTelegramTransport["poll"]>[0]): Promise<TelegramPollResult> {
+    return input.cursor === null ? { updates: [this.#update], nextCursor: "10" } : super.poll(input);
+  }
 }
 
 function directMessageBatch(): TelegramNormalizationResult {

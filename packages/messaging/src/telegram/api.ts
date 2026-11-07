@@ -214,11 +214,16 @@ function providerFailure<T>(
   token: string
 ): MessagingTransportError {
   const status = Number.isSafeInteger(envelope.error_code) ? envelope.error_code as number : httpStatus;
+  // A structured Bot API rejection proves that this particular call did not
+  // produce a message. Missing/invalid envelopes and server failures do not.
+  if (envelope.ok === false && envelope.error_code === status && status >= 400 && status < 500
+    && httpStatus >= 400 && httpStatus < 500) effect = "none";
   const description = sanitizeProviderDescription(envelope.description, token);
   const retryAfterSeconds = envelope.parameters?.retry_after;
-  const retryAfterMs = typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
-    ? Math.min(Math.ceil(retryAfterSeconds * 1_000), 24 * 60 * 60 * 1_000)
-    : undefined;
+  const retryAfterMs = typeof retryAfterSeconds === "number" && retryAfterSeconds > 0
+    && Number.isSafeInteger(Math.ceil(retryAfterSeconds * 1_000))
+    ? Math.ceil(retryAfterSeconds * 1_000)
+    : status === 429 ? 3_000 : undefined;
   if (status === 401 || (status === 404 && method === "getMe")) {
     return new MessagingTransportError("invalid_credential", `Telegram rejected the credential: ${description}`, {
       retryable: false,

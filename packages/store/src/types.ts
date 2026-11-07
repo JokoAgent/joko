@@ -1037,6 +1037,8 @@ interface PutMessagingConversationContextInputBase {
   readonly expectedRevision: bigint | null;
   readonly sealed: SealedMessagingConversationContext;
   readonly updatedAt?: UnixMillis;
+  /** A new plain-text WeChat request supplied a different verified reply context. */
+  readonly wakeWeChatTextReplies?: boolean;
 }
 
 export type PutMessagingConversationContextInput = PutMessagingConversationContextInputBase & (

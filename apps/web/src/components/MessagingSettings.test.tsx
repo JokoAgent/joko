@@ -701,13 +701,13 @@ describe("Messaging settings", () => {
     expect(container.textContent).toContain("Waiting for first direct message");
   });
 
-  it("saves Lark lifecycle, reply, reaction, group permission, and approved chat policy together", async () => {
+  it.each(["feishu", "lark"] as const)("saves %s policy across revision-only runtime drift", async channel => {
     const original = feishuConnection({
-      id: "lark-one",
-      channel: "lark",
-      ownerProviderUserId: "ou_lark_owner",
+      id: `${channel}-one`,
+      channel,
+      ownerProviderUserId: `ou_${channel}_owner`,
       feishuConfiguration: {
-        appId: "cli_lark",
+        appId: `cli_${channel}`,
         lifecycleAnnouncements: true,
         emojiReactions: "minimal",
         replyQuoteDm: "off",
@@ -716,25 +716,28 @@ describe("Messaging settings", () => {
         groupPermissionMode: "ask"
       }
     });
-    const update = vi.fn(async (_connectionId, _revision, _generation, configuration) => feishuConnection({
-      id: "lark-one",
-      channel: "lark",
-      generation: 7n,
-      revision: 11n,
-      ownerProviderUserId: undefined,
-      feishuConfiguration: configuration
-    }));
+    const getMessagingSettings = vi.fn()
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValueOnce(messagingSettings([original]))
+      .mockResolvedValue(messagingSettings([{ ...original, revision: 11n }]));
+    const update = vi.fn<AppController["updateFeishuMessagingConfiguration"]>()
+      .mockRejectedValueOnce(new ConnectError("runtime projection changed", Code.Aborted))
+      .mockImplementation(async (_connectionId, _revision, _generation, configuration) => feishuConnection({
+        id: `${channel}-one`, channel, generation: 7n, revision: 12n,
+        ownerProviderUserId: undefined, feishuConfiguration: configuration
+      }));
     const controller = controllerFixture(messagingSettings([original]), {
+      getMessagingSettings,
       updateFeishuMessagingConfiguration: update
     });
     const container = await renderSettings(controller, snapshot());
 
     await act(async () => button(container, "Configure").click());
     const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
-    expect(dialog.textContent).toContain("Lark behavior");
+    expect(dialog.textContent).toContain(`${channel === "feishu" ? "Feishu" : "Lark"} behavior`);
     expect(dialog.textContent).toContain("Group history is untrusted");
     const appId = required(dialog.querySelector<HTMLInputElement>('input[autocomplete="off"]'));
-    await change(appId, "cli_lark_replacement");
+    await change(appId, `cli_${channel}_replacement`);
     const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
     await act(async () => lifecycle.click());
     const selects = [...dialog.querySelectorAll<HTMLSelectElement>("select")];
@@ -746,8 +749,9 @@ describe("Messaging settings", () => {
     await change(groups, "oc_primary=always\noc_muted=disabled");
     await act(async () => button(dialog, "Save").click());
 
-    expect(update).toHaveBeenCalledWith("lark-one", 10n, 6n, {
-      appId: "cli_lark_replacement",
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenNthCalledWith(1, `${channel}-one`, 10n, 6n, {
+      appId: `cli_${channel}_replacement`,
       lifecycleAnnouncements: false,
       emojiReactions: "expressive",
       replyQuoteDm: "first",
@@ -755,6 +759,7 @@ describe("Messaging settings", () => {
       groupActivation: { oc_primary: "always", oc_muted: "disabled" },
       groupPermissionMode: "bypassPermissions"
     });
+    expect(update).toHaveBeenNthCalledWith(2, `${channel}-one`, 11n, 6n, update.mock.calls[0]![3]);
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(container.textContent).toContain("Waiting for first direct message");
   });
