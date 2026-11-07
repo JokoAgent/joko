@@ -128,9 +128,21 @@ mountedIt("keeps the Review and Files inspector usable across focus, collapse, r
   expect(await fileContents.count()).toBe(0);
   await openTask(sessionId);
   await fileContents.waitFor({ state: "visible" });
+  const persisted = () => page.evaluate(id => {
+    const buckets = JSON.parse(localStorage.getItem("joko.session.inspectorTabs.v1") ?? "{}");
+    return buckets[id];
+  }, sessionId);
+  expect(await persisted()).toMatchObject({ activeTabId: "files", fileSelection: { path: "restored.txt" } });
 
   await page.reload({ waitUntil: "domcontentloaded" });
-  await fileContents.waitFor({ state: "visible" });
+  await files.waitFor({ state: "visible" });
+  await filePanel.waitFor({ state: "visible" });
+  try { await fileContents.waitFor({ state: "visible" }); }
+  catch (cause) {
+    const observation = { persisted: await persisted(), selected: await fileRow.getAttribute("aria-selected"),
+      preview: await filePanel.locator(".file-preview-card").textContent() };
+    throw new Error(`The saved file was not read after reload: ${JSON.stringify(observation)}`, { cause });
+  }
   expect(await files.getAttribute("aria-selected")).toBe("true");
   await closeDetails.click();
   await page.setViewportSize({ width: 900, height: 760 });

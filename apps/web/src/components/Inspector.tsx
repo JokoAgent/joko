@@ -5,7 +5,7 @@ import { PartnerWorkbench, type PartnerWorkbenchDrafts } from "./PartnerWorkbenc
 import { readTerminalAppearance } from "../terminal-appearance.js";
 import { requestWorkspaceDocumentLeave } from "../workspace-document-lifecycle.js";
 import { InspectorTabContribution, type InspectorDock } from "./inspector-layout-context.js";
-import { inspectorLayoutOwner, inspectorSessionTabKey } from "./inspector-layout.js";
+import { inspectorSessionTabKey } from "./inspector-layout.js";
 import type { TerminalPaletteView } from "../model.js";
 import { lazy, Suspense, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
@@ -303,9 +303,8 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
   ]), [canWorkbench, canBackgroundTasks, canBrowser, canDiff, canFiles, canRewind, canSubagents, canTree, canUserShell]);
   const storedBucket = tabBuckets[session.id] ?? createInitialInspectorTabBucket();
   const profile = controller.state.activeProfile;
-  const layoutOwner = inspectorLayoutOwner(profile);
-  const fileSelectionOwner = layoutOwner === undefined || workspace === undefined || workspace.remoteWorkspace !== undefined
-    ? undefined : JSON.stringify([layoutOwner, profile?.deviceId, session.backendId, session.generation.toString(),
+  const fileSelectionOwner = profile === undefined || workspace === undefined || workspace.remoteWorkspace !== undefined
+    ? undefined : JSON.stringify([profile.serverId, profile.id, profile.deviceId, session.backendId,
       workspace.id, workspace.targetId, workspace.serverPath]);
   const bucket = useMemo(() => projectInspectorTabBucket(storedBucket, availableKinds), [availableKinds, storedBucket]);
   const activeTabIdRef = useRef(bucket.activeTabId);
