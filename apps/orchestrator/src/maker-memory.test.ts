@@ -180,6 +180,19 @@ describe("MakerMemoryController", () => {
     })).resolves.toMatchObject({ isError: false });
   });
 
+  it("persists a digest from a previously enabled runtime while honoring a current Maker revocation", async () => {
+    const { memory } = createFixture();
+    const input = { backendId: "memory-capable", targetId: "target-a", sessionId: "session-a", reason: "manual", summary: "The original runtime produced this digest." };
+    expect(memory.enabledForBackend(input.backendId)).toBe(true);
+    await memory.update({ backendId: input.backendId, backendEnabled: false });
+    expect(memory.enabledForBackend(input.backendId)).toBe(false);
+    expect(memory.writeCompactionDigest(input)).toBe(true);
+    expect(memory.search(input.targetId, "produced", "digest")).toHaveLength(1);
+
+    await memory.update({ makerEnabled: false });
+    expect(memory.writeCompactionDigest(input)).toBe(false);
+  });
+
   it("rejects credential-shaped curated memory without storing or echoing it", () => {
     const { store, memory } = createFixture();
     expect(() => memory.write("target-a", {

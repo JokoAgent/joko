@@ -1550,6 +1550,7 @@ describe("PiBackendAdapter", () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-memory-compaction-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-memory-compaction-workspace-"));
     const digests: Array<Record<string, string>> = [];
+    let digestsEnabled = true;
     const adapter = createPiAdapter({
       agentHome,
       sessionRoot: agentHome,
@@ -1561,7 +1562,7 @@ describe("PiBackendAdapter", () => {
         keyless: true,
         models: [{ id: "test-model", contextWindow: 32768, maxTokens: 4096 }]
       }],
-      isCompactionMemoryEnabled: () => true,
+      isCompactionMemoryEnabled: () => digestsEnabled,
       onCompactionDigest: async (input) => {
         digests.push({ ...input });
         throw new Error("private memory storage unavailable");
@@ -1579,14 +1580,20 @@ describe("PiBackendAdapter", () => {
     const events: EventPayload[] = [];
     const context = makeContext(target, events);
     try {
-      const binding = await adapter.createSession({
+      const input = {
         target,
         providerId: "local",
         modelId: "test-model",
         fastMode: false,
-        permissionMode: "ask"
-      }, context);
+        permissionMode: "ask" as const
+      };
+      const binding = await adapter.createSession(input, context);
+      digestsEnabled = false;
       await expect(adapter.compact(undefined, { ...context, binding })).resolves.toBe("compacted");
+      await flushAdapterEvents();
+      const nextContext = { ...context, sessionId: "session-next" };
+      const nextBinding = await adapter.createSession(input, nextContext);
+      await expect(adapter.compact(undefined, { ...nextContext, binding: nextBinding })).resolves.toBe("compacted");
       await flushAdapterEvents();
       expect(digests).toEqual([expect.objectContaining({
         backendId: "pi",
