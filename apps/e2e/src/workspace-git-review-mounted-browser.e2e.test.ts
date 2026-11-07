@@ -135,6 +135,9 @@ mountedIt("keeps the Review and Files inspector usable across focus, collapse, r
   expect(await persisted()).toMatchObject({ activeTabId: "files", fileSelection: { path: "restored.txt" } });
 
   await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+  await page.locator(".connection-card .profile-card").filter({ hasText: "Review Web" }).getByRole("button", { name: "Connect", exact: true }).click();
+  await page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`).waitFor({ state: "visible" });
   await files.waitFor({ state: "visible" });
   await filePanel.waitFor({ state: "visible" });
   try { await fileContents.waitFor({ state: "visible" }); }

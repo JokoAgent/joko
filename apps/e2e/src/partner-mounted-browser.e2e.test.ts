@@ -121,6 +121,10 @@ describe("mounted Partner collaboration product chain", () => {
     await outcome.waitFor({ state: "visible", timeout: 30_000 });
     expect(await outcome.innerText()).toContain("Completed · #1");
     await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: "Receipt fixture Web" })
+      .getByRole("button", { name: "Connect", exact: true }).click();
+    await page.locator(`.timeline[data-timeline-session-id="${partner.canonicalSessionId}"]`).waitFor({ state: "visible", timeout: 30_000 });
     await outcome.waitFor({ state: "visible", timeout: 30_000 });
     expect(await request.count()).toBe(1);
     expect(await outcome.count()).toBe(1);

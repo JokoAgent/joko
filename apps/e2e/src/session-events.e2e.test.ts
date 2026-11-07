@@ -684,7 +684,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     await page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`).waitFor({ state: "visible" });
     await page.locator(".session-header__abort").waitFor({ state: "visible" });
     await page.locator(".send-button--stop").waitFor({ state: "visible" });
-    await page.getByRole("textbox", { name: "Message", exact: true }).press("Escape");
+    await page.locator(".composer-rich-editor__content[contenteditable=true]").press("Escape");
     await waitFor(async () => store.getRun(first.runId).descriptor.state, state => state === "aborted", "the original native Run to stop");
     expect(fixture.adapter().abortCalls).toBe(1);
     expect(store.getQueueControl(sessionId).paused).toBe(true);
