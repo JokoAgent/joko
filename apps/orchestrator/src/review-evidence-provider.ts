@@ -141,7 +141,19 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
     if (selectedPaths.size > MAX_SELECTED_PATHS) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review selected too many workspace paths.");
     }
-    const files = await hashSelectedFiles(registration.root, [...selectedPaths].sort((a, b) => a.localeCompare(b, "en-US")));
+    const stagedUpdates = new Set(git.changes.filter(change => change.index === "M" && change.worktree === " " && change.originalPath === undefined)
+      .map(change => canonicalReviewPath(change.path)));
+    let capturedGitlink = false;
+    const files = await hashSelectedFiles(registration.root, [...selectedPaths].sort((a, b) => a.localeCompare(b, "en-US")), async path => {
+      if (!stagedUpdates.has(path) || !workingDiff?.headRevision || workingDiff.headRevision !== git.head) return undefined;
+      try {
+        const { headOid, indexOid, checkoutOid } = await this.#workspaces.readStagedGitlink(registration.id, path, workingDiff.headRevision);
+        capturedGitlink = true;
+        return sha256(JSON.stringify(["gitlink", path, headOid, indexOid, checkoutOid]));
+      } catch {
+        throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review submodule could not be confirmed.");
+      }
+    });
 
     const attachments = collectAttachments(request, visible);
     assertArtifactBudget(attachments.values);
@@ -156,6 +168,12 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
       });
       artifacts.push(artifact);
       if (pdf && artifact.excerpt !== undefined) remainingPdfCharacters -= artifact.excerpt.content.length;
+    }
+    if (capturedGitlink) {
+      const current = await this.#workspaces.gitDiff(registration.id).catch(() => undefined);
+      if (current?.repositoryRevision !== workingDiff?.repositoryRevision) {
+        throw new ReviewEvidenceCaptureError("source-changed", "The staged Review submodule changed during evidence capture.");
+      }
     }
     assertSourceIdle(this.#store, request.sourceSessionId);
     const currentSource = this.#store.getSession(request.sourceSessionId);
@@ -436,12 +454,12 @@ function changeSetEvidenceItem(change: WorkspaceChange): ReviewSourceDiffEvidenc
   };
 }
 
-async function hashSelectedFiles(root: string, paths: readonly string[]): Promise<ReviewSourceFileSnapshot[]> {
+async function hashSelectedFiles(root: string, paths: readonly string[], readGitlink: (path: string) => Promise<string | undefined>): Promise<ReviewSourceFileSnapshot[]> {
   const result: ReviewSourceFileSnapshot[] = [];
   let totalBytes = 0;
   for (const path of paths) {
     if (isSensitiveReviewPath(path)) continue;
-    const snapshot = await stableFileSnapshot(root, path);
+    const snapshot = await stableFileSnapshot(root, path, readGitlink);
     totalBytes += snapshot.byteLength;
     if (totalBytes > MAX_SELECTED_TOTAL_BYTES) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review selected files exceed the aggregate byte limit.");
@@ -451,7 +469,7 @@ async function hashSelectedFiles(root: string, paths: readonly string[]): Promis
   return result;
 }
 
-async function stableFileSnapshot(root: string, path: string): Promise<ReviewSourceFileSnapshot> {
+async function stableFileSnapshot(root: string, path: string, readGitlink: (path: string) => Promise<string | undefined>): Promise<ReviewSourceFileSnapshot> {
   const canonical = canonicalReviewPath(path);
   const absolute = resolve(root, ...canonical.split("/"));
   let before: Awaited<ReturnType<typeof lstat>>;
@@ -462,6 +480,16 @@ async function stableFileSnapshot(root: string, path: string): Promise<ReviewSou
       return { relativePath: canonical, sha256: sha256(`absent\0${canonical}`), byteLength: 0 };
     }
     throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review file is unavailable.");
+  }
+  if (before.isDirectory()) {
+    const digest = await readGitlink(canonical);
+    if (digest !== undefined) {
+      const after = await lstat(absolute).catch(() => undefined);
+      if (!after?.isDirectory() || !sameIdentity(before, after)) {
+        throw new ReviewEvidenceCaptureError("source-changed", "A selected Review submodule directory changed while reading.");
+      }
+      return { relativePath: canonical, sha256: digest, byteLength: 0 };
+    }
   }
   if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1 || before.size > MAX_SELECTED_FILE_BYTES) {
     throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review file is unsafe or exceeds its byte limit.");
