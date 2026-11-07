@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -121,6 +121,26 @@ function observedImportEffect<Args extends unknown[], Result>(phase: string, act
   };
 }
 describe("native import service and owning effects", () => {
+  it.skipIf(process.platform !== "win32")("runs an imported command with a quoted executable path and arguments on Windows", async () => {
+    const f = await fixture();
+    const signal = new AbortController().signal;
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+    const selection = { previewId: preview.id, requestId: "owner_import_windows_cmd_0001", name: "Windows command fixture",
+      entryIds: preview.entries.filter(entry => entry.category === PartnerImportCategory.PERSONALITY).map(entry => entry.id), takeover: false, deferSetup: true };
+    await f.api.start(selection, signal);
+    const saved = await f.imports.waitForRequest(selection.requestId);
+    const task = f.store.getSession(saved.canonicalSessionId!).descriptor;
+    const executable = join(f.store.getTarget(task.targetId).descriptor.workspaceRoot, "Node With Spaces.exe");
+    await copyFile(process.execPath, executable);
+    const runtime = new PartnerImportRuntime({ partners: f.partners, store: f.store, host: f.host,
+      routines: f.routines, storage: f.storage, imports: f.imports, assertServiceOwner: () => {},
+      auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }), run: async () => ({ status: "ok", text: "" }) } });
+    const result = await runtime.callTool("run_command", {
+      command: `"${executable}" -e "process.stdout.write(process.argv[1])" "quoted argument"`, timeout_ms: 10_000
+    }, signal, { sessionId: task.id, targetId: task.targetId, generation: task.binding.generation });
+    expect(result).toEqual({ isError: false, content: [{ type: "text", text: JSON.stringify({ exitCode: 0, stdout: "quoted argument" }) }] });
+  }, 20_000);
+
   it("releases a definitively rejected name and retries the same preview with a new request", async () => {
     const f = await fixture();
     const signal = new AbortController().signal;
