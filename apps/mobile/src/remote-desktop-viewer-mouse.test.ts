@@ -10,11 +10,11 @@ const scope = window as unknown as {
 };
 let stop: (() => void) | undefined;
 afterEach(() => {
-  stop?.(); stop = undefined; vi.useRealTimers(); vi.unstubAllGlobals();
+  stop?.(); stop = undefined; vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks();
   document.documentElement.innerHTML = "<head></head><body></body>";
 });
 
-function viewer(nativeControls = false) {
+function viewer(nativeControls = false, desktop = { width: 800, height: 600 }) {
   vi.useFakeTimers();
   let resized!: () => void;
   vi.stubGlobal("ResizeObserver", class { constructor(callback: () => void) { resized = callback; } observe() {} disconnect() {} });
@@ -29,7 +29,7 @@ function viewer(nativeControls = false) {
   }
   new Function(html.match(/<script>([\s\S]*?)<\/script>/u)![1]!)();
   const receive = (value: object) => scope.__jokoRemoteDesktop.receive(value);
-  receive({ type: "init", epoch: "current-mouse", width: 800, height: 600, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
+  receive({ type: "init", epoch: "current-mouse", ...desktop, webrtc: false, sequenceBase: 100, sequenceLimit: 10_000 });
   receive({ type: "control", enabled: true, controlGeneration: 1 });
   const config = (enabled: boolean, native = nativeControls) => receive({ type: "mouseButtons", epoch: "current-mouse", enabled, nativeControls: native, labels });
   config(true);
@@ -106,6 +106,34 @@ describe("actual floating mouse controls viewer", () => {
       { kind: "button", button: 0, down: true, x: .5, y: .5 },
       { kind: "button", button: 0, down: false, x: .5, y: .5 }
     ] });
+  });
+
+  it("aims a two-finger touch scroll inside the picture before sending any wheel input", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1600, height: 900 });
+    value.config(false);
+    value.pointer(value.stage, "pointerdown");
+    value.pointer(value.stage, "pointerup");
+    value.ack();
+
+    const scroll = async (from: number, to: number) => {
+      value.pointer(value.stage, "pointerdown", 8, 200, from);
+      value.pointer(value.stage, "pointerdown", 9, 400, from);
+      value.pointer(value.stage, "pointermove", 8, 200, to);
+      value.pointer(value.stage, "pointermove", 9, 400, to);
+      await vi.advanceTimersByTimeAsync(66);
+      value.pointer(value.stage, "pointerup", 8, 200, to);
+      value.pointer(value.stage, "pointerup", 9, 400, to);
+    };
+    await scroll(25, 45);
+    expect(value.packets()).toHaveLength(1);
+
+    await scroll(140, 160);
+    expect(value.packets()).toHaveLength(2);
+    expect(value.packets()[1]?.events).toEqual([
+      { kind: "move", x: .375, y: 85 / 450 },
+      { kind: "scroll", dx: 0, dy: -20 }
+    ]);
   });
 
   it("uses bounded displacement ticks and skips ACK time without accumulating a scroll backlog", async () => {
