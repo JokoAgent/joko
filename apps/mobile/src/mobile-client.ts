@@ -10418,14 +10418,15 @@ export class MobileClient {
     const authorityKey = this.#taskAuthorityKey();
     if (!authorityKey) throw new Error("The current task authority is unavailable.");
     const epoch = this.#epoch, signal = this.#abort!.signal, sourceGeneration = this.#taskGeneration();
+    const mayRestoreArchived = !this.#joinedTask && (session.archived || session.state === SessionState.ARCHIVED);
     const connectionCurrent = (): boolean => this.#current(epoch) && !signal.aborted && this.#foreground
       && this.#state.status === "connected" && this.#credential === credential;
     const isCurrent = (): boolean => {
       const current = this.#selectedSession();
       return connectionCurrent() && this.#taskGeneration() === sourceGeneration && this.#state.selectedId === sessionId
         && current?.sessionId === sessionId && current.backendId === session.backendId && current.targetId === session.targetId
-        && current.nativeBinding?.runtimeGeneration === generation && !current.archived
-        && ![SessionState.CLOSED, SessionState.ARCHIVED].includes(current.state);
+        && current.nativeBinding?.runtimeGeneration === generation && current.state !== SessionState.CLOSED
+        && (mayRestoreArchived || !current.archived && current.state !== SessionState.ARCHIVED);
     };
     const mentionControls = this.taskSessionMentionControls();
     const workspaceMentionControls = this.taskWorkspaceMentionControls();
