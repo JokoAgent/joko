@@ -15357,12 +15357,12 @@ export class SessionHost {
   }
 
   async authorizeNativeBridgeTool(sessionId: string, serverId: string, toolName: string,
-    args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<() => void> {
+    args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<import("./mcp-router.js").NativeBridgeToolAdmission> {
     return this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal, true);
   }
 
   async #authorizeMcpTool(sessionId: string, serverId: string, toolName: string,
-    args: Readonly<Record<string, unknown>>, signal: AbortSignal, nativeBridge = false): Promise<() => void> {
+    args: Readonly<Record<string, unknown>>, signal: AbortSignal, nativeBridge = false): Promise<import("./mcp-router.js").NativeBridgeToolAdmission> {
     signal.throwIfAborted();
     const stored = this.#store.getSession(sessionId), target = this.targetForSession(stored);
     const policy = policySnapshotFor(this.#store, target);
@@ -15391,13 +15391,16 @@ export class SessionHost {
       if (current.descriptor.archived || current.descriptor.deletedAt !== undefined || current.descriptor.binding.generation !== stored.descriptor.binding.generation
         || policySnapshotFor(this.#store, this.targetForSession(current)).generation !== policy.generation) throw new StoreError("MCP tool permission owner changed.");
     };
+    const admission = { assertCurrent: guard, ...(currentQueue?.attemptId === undefined ? {} : {
+      inputQueueItem: { id: currentQueue.id, runId: currentQueue.runId, attemptId: currentQueue.attemptId }
+    }) };
     guard();
     const delegated = await authority?.review({ toolName: `mcp__${serverId}__${toolName}`, input: args, signal });
     const messaging = messageQueue ? this.#messagingToolReview?.(messageQueue, { toolName: `mcp__${serverId}__${toolName}`, input: args, signal }) : undefined;
     if (delegated?.authorizationRevision !== undefined) revision = delegated.authorizationRevision;
     guard();
     if (delegated?.verdict === "block") throw new StoreError(delegated.reason ?? "The delegated task denied this MCP action.");
-    if (messaging?.verdict !== 'ask' && (delegated?.verdict === "allow" && ordered?.action !== "ask" || delegated?.verdict !== "ask" && delegated?.verdict !== "allow" && decision.action === "allow")) return guard;
+    if (messaging?.verdict !== 'ask' && (delegated?.verdict === "allow" && ordered?.action !== "ask" || delegated?.verdict !== "ask" && delegated?.verdict !== "allow" && decision.action === "allow")) return admission;
     const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding,
       messageQueue?.runId, messageQueue?.attemptId, messageQueue?.operationId);
     const answer = await context.requestInteraction({ id: `mcp-app-permission-${randomUUID()}`, kind: "permission",
@@ -15407,7 +15410,7 @@ export class SessionHost {
     guard();
     if (!(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once"))
       throw new StoreError("MCP App tool was not approved.");
-    return guard;
+    return admission;
   }
 
   async enqueueMcpAppMessage(sessionId: string, serverId: string, content: unknown[], guard: McpAppMessageGuard): Promise<void> {

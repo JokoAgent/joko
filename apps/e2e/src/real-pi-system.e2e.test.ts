@@ -34,12 +34,15 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createE2eClients } from "./connect-clients.js";
 import {
   compactMutation,
+  createManualScheduleMutation,
   createSessionMutation,
   queueRunIdFrom,
   restartBackendMutation,
+  scheduleIdFrom,
   sendInputMutation,
   sessionIdFrom,
-  submit
+  submit,
+  triggerScheduleMutation
 } from "./operations.js";
 import {
   REAL_PI_MODEL_ID,
@@ -109,6 +112,64 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const updated = store.getSchedule(id);
     expect(updated).toMatchObject({ kind: "cron", expression: "0 9 * * *", sessionMode: "fresh" });
     expect(updated.sessionId).toBeUndefined();
+  });
+
+  it("lets a published Pi Schedule finish after pausing or deleting itself", { timeout: 90_000 }, async () => {
+    let releasePause!: () => void;
+    const pauseGate = new Promise<void>(resolve => { releasePause = resolve; });
+    let toolName = "schedule_pause";
+    let scheduleId = "";
+    const acknowledgement = "The original Schedule run finished its report.";
+    fixture = await RealPiSystemFixture.start({ enableInternalServer: true, providerResponder: async ({ request }) => {
+      const messages = request.body["messages"] as readonly { readonly role: string }[];
+      if (messages.at(-1)?.role === "tool") return { kind: "text", text: acknowledgement };
+      if (toolName === "schedule_pause") await pauseGate;
+      return { kind: "tool", name: toolName, arguments: { id: scheduleId } };
+    } });
+    try {
+      const { store } = fixture.application;
+      const backendId = "pi", targetId = "workspace-real-pi";
+      const target = store.getTarget(targetId);
+      store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
+      const { clients, connectionId } = await fixture.pair("Self-stopping Schedule owner");
+      const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+      const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId,
+        providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, permissionMode: PermissionMode.BYPASS_PERMISSIONS })));
+      const createSchedule = async (text: string) => scheduleIdFrom(await mutate(createManualScheduleMutation({ backendId, targetId, sessionId, text,
+        execution: { permissionMode: PermissionMode.BYPASS_PERMISSIONS } })));
+      const trigger = async () => expect((await mutate(triggerScheduleMutation(scheduleId))).state).toBe(OperationState.SUCCEEDED);
+      const finish = async (runId: string) => {
+        const run = await waitForRealSystem(async () => store.getRun(runId).descriptor,
+          value => value.endedAt !== undefined, "the invoking Schedule to finish", 20_000);
+        expect(run.state).toBe("completed");
+        const events = store.listEvents({ sessionId }).filter(event => event.runId === runId);
+        expect(events.map(event => event.payload)).toContainEqual(expect.objectContaining({ type: "tool_result", name: toolName, isError: false }));
+        expect(events.map(event => event.payload)).toContainEqual(expect.objectContaining({
+          type: "message_complete", role: "assistant", blocks: expect.arrayContaining([expect.objectContaining({ text: acknowledgement })])
+        }));
+      };
+
+      scheduleId = await createSchedule("Pause this Schedule and finish the report.");
+      await trigger();
+      const [first] = store.listScheduleRuns(scheduleId);
+      await waitForRealSystem(async () => store.getRun(first!.runId).descriptor.state,
+        value => value === "running", "the original scheduled turn", 15_000);
+      await trigger();
+      const queued = store.listScheduleRuns(scheduleId).find(run => run.runId !== first!.runId);
+      expect(store.findQueueItemByRunId(sessionId, queued!.runId)?.state).toBe("accepted");
+      releasePause();
+      await finish(first!.runId);
+      expect(store.getSchedule(scheduleId).enabled).toBe(false);
+      expect(store.findQueueItemByRunId(sessionId, queued!.runId)?.state).toBe("cancelled");
+
+      toolName = "schedule_delete";
+      scheduleId = await createSchedule("Delete this Schedule and finish the report.");
+      await trigger();
+      const deleting = store.listRuns({ sessionId, source: "schedule" }).find(run =>
+        run.descriptor.id !== first!.runId && run.descriptor.id !== queued!.runId);
+      await finish(deleting!.descriptor.id);
+      expect(store.findSchedule(scheduleId)).toBeUndefined();
+    } finally { releasePause(); }
   });
 
   it("pairs, creates, sends, settles, and projects public plus Pi-native context", { timeout: 60_000 }, async () => {

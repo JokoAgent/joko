@@ -649,7 +649,7 @@ describe("SessionHost", () => {
     const { sessionId } = (await f.host.createSession({ operationId: "native-mcp-policy", connection: f.connection,
       targetId: "target-one", title: "Native MCP", fastMode: false, permissionMode: "ask", planMode: false })).value;
     const signal = new AbortController().signal;
-    const unruled = await f.host.authorizeNativeBridgeTool(sessionId, "server__name", "submit", {}, signal);
+    const { assertCurrent: unruled } = await f.host.authorizeNativeBridgeTool(sessionId, "server__name", "submit", {}, signal);
     unruled(); expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
     const update = (effect: contract.PolicyEffect) => f.store.setSetting("service", "orchestrator", "settings.policy", create(contract.PolicySettingsSchema, {
       rules: [{ policyRuleId: "native-mcp", effect, subjectKind: contract.PolicySubjectKind.MCP,
@@ -663,7 +663,7 @@ describe("SessionHost", () => {
     await eventually(() => f.store.listInteractions({ sessionId, status: "open" }).length === 1);
     const opened = f.store.listInteractions({ sessionId, status: "open" })[0]!;
     f.host.resolveInteraction(opened.id, opened.generation, { kind: "permission", decision: "allow_once" }, "native-mcp-approve");
-    const guard = await pending; guard();
+    const { assertCurrent: guard } = await pending; guard();
     update(contract.PolicyEffect.DENY);
     expect(guard).toThrow();
     expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);

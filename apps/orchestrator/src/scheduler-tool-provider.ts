@@ -64,7 +64,8 @@ export interface SchedulerToolCoordinator {
   }>;
   abortSchedule?(
     scheduleId: string,
-    linkedOccurrences?: readonly { readonly runId: string; readonly sessionId?: string }[]
+    linkedOccurrences?: readonly { readonly runId: string; readonly sessionId?: string }[],
+    invokingRunId?: string
   ): Promise<void>;
 }
 
@@ -202,13 +203,13 @@ export const SCHEDULER_TOOLS: readonly McpToolDescriptor[] = [
   ),
   tool(
     "schedule_delete",
-    "Delete one schedule owned by this workspace.",
+    "Delete one schedule owned by this workspace. The currently invoking run can finish if it belongs to this schedule.",
     objectSchema({ id: ID_SCHEMA, expectedRevision: REVISION_SCHEMA }, ["id"]),
     true
   ),
   tool(
     "schedule_pause",
-    "Pause automatic firing while retaining the schedule and its recurrence.",
+    "Pause automatic firing while retaining the schedule and its recurrence. The currently invoking run can finish if it belongs to this schedule.",
     objectSchema({ id: ID_SCHEMA, expectedRevision: REVISION_SCHEMA }, ["id"]),
     true
   ),
@@ -322,9 +323,10 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
           assertKeys(arguments_, ["id", "expectedRevision"]);
           const schedule = this.#requireOwnedSchedule(requiredId(arguments_, "id"), context.targetId);
           const expectedRevision = optionalRevision(arguments_["expectedRevision"]) ?? schedule.revision;
+          const invokingRunId = this.#invokingScheduleRun(schedule.id, caller, context.inputQueueItem);
           const linkedOccurrences = listAllScheduleRuns(this.#store, schedule.id);
           this.#store.deleteSchedule(schedule.id, expectedRevision);
-          await this.#coordinator()?.abortSchedule?.(schedule.id, linkedOccurrences);
+          await this.#coordinator()?.abortSchedule?.(schedule.id, linkedOccurrences, invokingRunId);
           return toolResult({ id: schedule.id, deleted: true });
         }
         case "schedule_pause": {
@@ -332,13 +334,14 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
           const schedule = this.#requireOwnedSchedule(requiredId(arguments_, "id"), context.targetId);
           const expectedRevision = optionalRevision(arguments_["expectedRevision"]) ?? schedule.revision;
           if (!schedule.enabled) return toolResult(publicSchedule(schedule));
+          const invokingRunId = this.#invokingScheduleRun(schedule.id, caller, context.inputQueueItem);
           const paused = this.#store.upsertSchedule(copySchedule(schedule, {
             enabled: false,
             nextRunAt: schedule.nextRunAt,
             expectedRevision,
             now: this.#now()
           }));
-          await this.#coordinator()?.abortSchedule?.(schedule.id);
+          await this.#coordinator()?.abortSchedule?.(schedule.id, undefined, invokingRunId);
           return toolResult(publicSchedule(paused));
         }
         case "schedule_resume": {
@@ -423,6 +426,20 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
   #findOwnedSchedule(id: string, targetId: string): ScheduleRecord | undefined {
     const schedule = this.#store.findSchedule(id);
     return schedule?.targetId === targetId && !isPartnerRoutineSchedule(schedule) ? schedule : undefined;
+  }
+
+  #invokingScheduleRun(scheduleId: string, caller: SessionDescriptor, input: BridgeToolCallContext["inputQueueItem"]): string | undefined {
+    if (input === undefined) return undefined;
+    const queue = this.#store.findQueueItemByRunId(caller.id, input.runId);
+    const run = this.#store.findRun(input.runId)?.descriptor;
+    if (queue?.id !== input.id || queue.attemptId !== input.attemptId
+      || !["dispatching", "backend_accepted"].includes(queue.state)
+      || run?.source !== "schedule" || run.sessionId !== caller.id || run.activeAttemptId !== input.attemptId) return undefined;
+    const attempt = this.#store.getAttempt(input.attemptId).descriptor;
+    if (attempt.runId !== input.runId || attempt.generation !== caller.binding.generation || attempt.endedAt !== undefined
+      || attempt.backendInstanceGeneration !== this.#store.getBackend(caller.backendId).descriptor.instanceGeneration) return undefined;
+    const history = this.#store.findScheduleRunByRunId(input.runId);
+    return history?.scheduleId === scheduleId && history.sessionId === caller.id ? input.runId : undefined;
   }
 
   #requireOwnedSchedule(id: string, targetId: string): ScheduleRecord {
