@@ -717,15 +717,19 @@ describe("PiBackendAdapter", () => {
     try {
       const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, base), bound = { ...base, binding };
       const oldHome = processes[0]!.spec.env["PI_CODING_AGENT_DIR"]!;
+      const originalMaterial = join(oldHome, "retirement-canary");
+      await writeFile(originalMaterial, "original runtime material", { mode: 0o600 });
       budget = 20_000; await expect(adapter.refreshModelWorkingContext(bound)).rejects.toBeDefined();
       await expect(adapter.closeSession(binding, bound)).rejects.toMatchObject({ publicError: { code: "PI_PROCESS_KILL_UNCONFIRMED" } });
       await expect(access(join(oldHome, "settings.json"))).resolves.toBeUndefined();
+      await expect(readFile(originalMaterial, "utf8")).resolves.toBe("original runtime material");
       expect(processes[0]!.exitCode).toBeNull();
       expect(processes).toHaveLength(1);
       await expect(adapter.send({ text: "retained", images: [], files: [], mentions: [], disposition: "steer" }, bound)).rejects.toMatchObject({ publicError: { code: "PI_WORKING_CONTEXT_UNCONFIRMED" } });
       permitExit = true; budget = 12_000; await adapter.refreshModelWorkingContext(bound);
       expect(processes).toHaveLength(2); expect(processes[1]!.sessionFile).toBe(binding.opaqueRef);
-      await expect(access(oldHome)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(processes[0]!.exitCode).toBe(0);
+      await expect(access(originalMaterial)).rejects.toMatchObject({ code: "ENOENT" });
     } finally { permitExit = true; await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
   it("isolates explicit skills for an empty shelf while retaining the native policy bridge", async () => {
@@ -8018,7 +8022,7 @@ describe("managed resource precedence", () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-workspace-"));
     const command = join(agentHome, "custom-pi.exe");
-    await writeFile(command, "not a compatible RPC executable\n");
+    await writeFile(command, "not a compatible RPC executable\n", { mode: 0o700 });
     let spawns = 0;
     const adapter = createPiAdapter({
       agentHome,
