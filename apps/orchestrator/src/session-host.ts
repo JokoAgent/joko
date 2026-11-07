@@ -14050,6 +14050,13 @@ export class SessionHost {
         }
         const claimBackendInstanceGeneration = this.#store
           .getBackend(claimSession.descriptor.backendId).descriptor.instanceGeneration;
+        if (pending.backendInstanceGeneration !== undefined && pending.backendInstanceGeneration !== claimBackendInstanceGeneration) {
+          this.#failExpiredApplicationInput(pending, {
+            code: "APPLICATION_INPUT_EXPIRED", message: "The original Backend instance is no longer available.",
+            phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Submit a new request to the current task."
+          });
+          continue;
+        }
         const scheduleGate = this.#store.getRun(pending.runId).descriptor.source === "schedule"
           ? this.#scheduleDispatchGate : undefined;
         if (scheduleGate?.acquire(pending.runId) === false) return;
