@@ -23,6 +23,7 @@ import {
   type ExtensionPackagePreviewView,
   type NewSessionLocalDraft,
   type ExtensionSourceCatalogView,
+  type ExtensionTaskApi,
   type InteractionView,
   type PendingExtensionSuggestionView,
   type ResourceView
@@ -52,17 +53,20 @@ describe("Extension catalog interactions", () => {
     let finish!: () => void;
     const getExtension = vi.fn(async () => catalog(extension));
     const getPreferences = vi.fn(async () => create(ExtensionTaskServiceGetPreferencesResponseSchema, { preferences }));
+    const taskApi: ExtensionTaskApi = {
+      getPreferences,
+      updatePreferences: vi.fn(),
+      listBackgroundTasks: async () => create(ExtensionTaskServiceListBackgroundTasksResponseSchema),
+      revealTask: vi.fn(),
+      retryWriteAccess: async (_request, options) => {
+        retrySignal = options!.signal!;
+        await new Promise<void>((resolve) => { finish = resolve; });
+        return create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences: { ...preferences, permissionMode: PermissionMode.AUTO, writeRequests: [] } });
+      }
+    };
     const view = await renderExtensions({ extension, controller: {
       listExtensions: async () => catalog(extension), getExtension,
-      extensionTaskApi: () => ({
-        getPreferences,
-        listBackgroundTasks: async () => create(ExtensionTaskServiceListBackgroundTasksResponseSchema),
-        retryWriteAccess: async (_request, options) => {
-          retrySignal = options!.signal!;
-          await new Promise<void>((resolve) => { finish = resolve; });
-          return create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences: { ...preferences, permissionMode: PermissionMode.AUTO, writeRequests: [] } });
-        }
-      }) as NonNullable<ReturnType<AppController["extensionTaskApi"]>>
+      extensionTaskApi: () => taskApi
     } });
     const retry = buttonWithText(view.container, translate("en", "extensions.tasks.retryPermission"));
     const save = buttonWithText(view.container, translate("en", "common.save"));
