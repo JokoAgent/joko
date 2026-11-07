@@ -12348,20 +12348,35 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.previewPager).toBeUndefined(); expect(app.state.files.preview).toBeUndefined();
   });
 
-  it("opens a content search result in its actual parent and preserves its initial verified text window", async () => {
+  it.each(["meta", "remote-meta"])("opens and shares a content match with a separate %s entry version", async (kind) => {
     const parent = "docs"; const path = parent + "/page.txt";
+    const digest = sha256Hex(new TextEncoder().encode("page"));
     const page = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: path, displayName: "page.txt",
-      kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: "page-r1", byteSize: 4n } });
+      kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: `${kind}:page-r1`, byteSize: 4n } });
     const sibling = create(WorkspaceEntrySchema, { ...page, relativePath: parent + "/next.txt", displayName: "next.txt" });
+    const filePreviewEntry = create(WorkspaceEntrySchema, { ...page,
+      revision: { opaqueRevision: `sha256:${digest}:4`, byteSize: 4n, sha256Hex: digest } });
+    const searchRevision = create(FileRevisionSchema, { opaqueRevision: kind === "meta" ? `sha256:${digest}:4` : `sha256:${"a".repeat(64)}` });
+    let directoryEntries = [page, sibling];
     const network = fakeNetwork(); configureFiles(network);
     vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, directory) => ({
-      entries: directory === parent ? [page, sibling] : [sourceDirectory], revision: "directory-" + directory }));
+      entries: directory === parent ? directoryEntries : [sourceDirectory], revision: "directory-" + directory }));
     vi.mocked(network.searchWorkspace).mockResolvedValue({ matches: [create(WorkspaceSearchMatchSchema, {
-      relativePath: path, revision: page.revision, linePreview: "page" })], revision: "search-r1", truncated: false, totalFiles: 1 });
-    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: page,
+      relativePath: path, revision: searchRevision, entryRevision: page.revision, linePreview: "page" })], revision: "search-r1", truncated: false, totalFiles: 1 });
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: filePreviewEntry,
       content: { case: "text", value: { utf8Text: "page", startByte: 0n, endByte: 4n, totalLines: 1 } } }));
-    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.searchFiles("page", "content", false);
+    const blob = create(BlobRefSchema, { blobId: "page-blob", fileName: "page.txt", mediaType: "text/plain", byteSize: 4n, sha256Hex: digest });
+    vi.mocked(network.materializeWorkspaceFileBlob).mockResolvedValue({ entry: filePreviewEntry, blob });
+    vi.mocked(network.authorizeBlobDownload).mockResolvedValue({ url: "http://192.168.1.20:4318/v1/blobs/page-ticket", headers: {},
+      blobId: blob.blobId, fileName: blob.fileName, mediaType: blob.mediaType, byteSize: 4, sha256Hex: blob.sha256Hex });
+    const perform = vi.fn(async (request: Parameters<MobileFileShare["perform"]>[0]) => { await request.assertCurrent(); request.onDispatch?.(); });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, { perform });
+    await app.start(); await app.openFiles(); await app.searchFiles("page", "content", false);
     const source = { kind: "search-result" as const, result: app.state.files.searchResults[0]! };
+    await app.shareFilesItem(source);
+    expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledExactlyOnceWith(credential, "workspace", path, page.revision, expect.any(AbortSignal));
+    expect(perform).toHaveBeenCalledOnce();
     await app.previewFileSearchResult(source.result); const original = app.state.files.preview;
     await app.openFilesPreviewPager(source);
     expect(app.state.files.location).toEqual({ kind: "workspace", path: "" });
@@ -12375,6 +12390,9 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.previewPager?.index).toBe(0);
     await app.selectFilesPreviewPage(pager.id, pager.pages[1]!.key);
     expect(app.state.files.preview).toMatchObject({ kind: "text", title: "page.txt", text: "page" });
+    directoryEntries = [create(WorkspaceEntrySchema, { ...page, revision: { ...page.revision, opaqueRevision: `${kind}:page-r2` } }), sibling];
+    await expect(app.shareFilesItem(source)).rejects.toThrow(/search result changed/u);
+    expect(network.materializeWorkspaceFileBlob).toHaveBeenCalledOnce();
   });
 
   it("shares the visible original revision and rejects actions from a previous page before dispatch", async () => {
@@ -14708,7 +14726,7 @@ describe("native current-task Files ownership", () => {
     })).resolves.toBe("reference");
     vi.mocked(network.searchWorkspace).mockResolvedValueOnce({
       matches: [create(WorkspaceSearchMatchSchema, {
-        relativePath: "README.md", revision, linePreview: "# Joko"
+        relativePath: "README.md", revision: { opaqueRevision: `sha256:${"a".repeat(64)}` }, entryRevision: revision, linePreview: "# Joko"
       })],
       revision: "search-content-1",
       truncated: false,

@@ -253,6 +253,10 @@ export function workspaceEntryRevisionKey(revision: FileRevision | undefined): s
   return [revision.opaqueRevision, revision.sha256Hex, revision.byteSize.toString(10), modified].join(":");
 }
 
+export function workspaceSearchEntryRevision(match: WorkspaceSearchMatch): FileRevision | undefined {
+  return match.entryRevision ?? match.revision;
+}
+
 export function sortWorkspaceEntries(entries: readonly WorkspaceEntry[]): WorkspaceEntry[] {
   return [...entries].sort((left, right) => {
     const leftDirectory = left.kind === FileKind.DIRECTORY;

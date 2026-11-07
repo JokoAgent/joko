@@ -220,7 +220,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         case "deleteEntry": result = await this.#deleteEntry(registration, transports.files, args[0] as { path: string; expectedRevision: string; confirmRecursive: boolean }); break;
         case "copyEntry": result = await this.#copyEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
         case "search": result = (await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined)).matches; break;
-        case "searchPage": result = await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined); break;
+        case "searchPage": result = await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined, request?.signal); break;
         case "gitState": result = await this.#gitState(registration, transports); break;
         case "gitDiff": result = await this.#gitDiff(registration, transports, args[0] as readonly string[], args[1] as Record<string, unknown>); break;
         case "gitReviewDiff": result = await this.#gitReviewDiff(registration, transports, args[0] as WorkspaceGitReviewDiffInput); break;
@@ -640,13 +640,37 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const files = new Set(matches.map((match) => match.path));
     const revision = hashText(JSON.stringify(matches));
     return {
-      matches: selected,
+      matches: options?.includeEntryRevisions === true ? await this.#searchEntryRevisions(registration, transports, selected, signal) : selected,
       totalResults: matches.length,
       totalFiles: files.size,
       truncated: offset + selected.length < matches.length,
       ...(offset + selected.length < matches.length ? { nextOffset: offset + selected.length } : {}),
       revision
     };
+  }
+
+  async #searchEntryRevisions(registration: WorkspaceRegistration, transports: RemoteTransports, matches: readonly WorkspaceSearchResult[], signal?: AbortSignal): Promise<WorkspaceSearchResult[]> {
+    const files = transports.files;
+    const paths = [...new Set(matches.map(match => match.path))];
+    const entries = new Map<string, WorkspaceEntryRecord>();
+    const batchSize = 8;
+    try {
+      for (let offset = 0; offset < paths.length; offset += batchSize) {
+        const batch = await Promise.all(paths.slice(offset, offset + batchSize).map(async relativePath => {
+          const path = remoteWorkspacePath(registration, relativePath, false);
+          if (await files.realpath(path, signal) !== path) throw new Error("Remote search path is not canonical.");
+          const info = await files.stat(path, signal);
+          if (info.kind !== "file" || await files.realpath(path, signal) !== path) throw new Error("Remote search result is no longer a canonical file.");
+          return remoteEntry(relativePath, info);
+        }));
+        signal?.throwIfAborted(); transports.assertCurrent();
+        for (const entry of batch) entries.set(entry.path, entry);
+      }
+    } catch {
+      signal?.throwIfAborted(); transports.assertCurrent();
+      throw new WorkspaceSearchError("Remote workspace search results changed while resolving their entries.", "result_changed");
+    }
+    return matches.map(match => ({ ...match, entryRevision: entries.get(match.path)! }));
   }
 
   async #gitState(registration: WorkspaceRegistration, transports: RemoteTransports): Promise<GitState> {

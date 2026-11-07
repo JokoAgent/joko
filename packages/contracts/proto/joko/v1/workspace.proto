@@ -99,6 +99,8 @@ message WorkspaceSearchMatch {
   string line_preview = 3;
   FileRevision revision = 4;
   repeated WorkspaceSearchSubmatch submatches = 5;
+  // Separate from the search revision, which also serves text replacement.
+  FileRevision entry_revision = 6;
 }
 
 // Ordered, owner-authorized workspace filesystem notifications. These events

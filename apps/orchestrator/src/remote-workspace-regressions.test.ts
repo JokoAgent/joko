@@ -230,13 +230,18 @@ it("searches past 200 matches in one remote file with stable pages and exact tot
   const f = await fixture();
   try {
     await writeFile(join(f.root, "matches.txt"), Array.from({ length: 305 }, (_, index) => `match ${index + 1}`).join("\n"));
-    const first = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50 });
-    const later = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, offset: 200 });
+    const first = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, includeEntryRevisions: true });
+    const later = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, offset: 200, includeEntryRevisions: true });
     const final = await f.workspaces.searchPage("workspace", "match", { maximumResults: 50, offset: 300 });
     expect(first).toMatchObject({ totalResults: 305, totalFiles: 1, truncated: true, nextOffset: 50 });
+    const entry = (await f.workspaces.list("workspace")).find(candidate => candidate.path === "matches.txt");
+    expect(entry?.revision).toMatch(/^remote-(?:meta|version):/u);
+    expect(first.matches.every(match => match.entryRevision?.revision === entry?.revision && match.revision !== entry?.revision)).toBe(true);
+    expect(later.matches[0]?.entryRevision).toEqual(entry);
     expect(later.matches[0]).toMatchObject({ path: "matches.txt", line: 201 });
     expect(later.revision).toBe(first.revision); expect(final.revision).toBe(first.revision);
     expect(final.matches).toHaveLength(5); expect(final.truncated).toBe(false); expect(final.nextOffset).toBeUndefined();
+    expect(final.matches[0]?.entryRevision).toBeUndefined();
     expect(f.requests.filter(request => request.executable === "rg").every(request => request.args.includes("--sort") && !request.args.includes("--max-count"))).toBe(true);
   } finally { await f.close(); }
 });

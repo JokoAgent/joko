@@ -3542,27 +3542,35 @@ export function createConnectServices(application: OrchestratorApplication, proj
       } finally { owner.dispose(); }
     },
     searchWorkspace: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
       const offset = decodePageToken(request.page?.pageToken ?? "");
       const pageSize = Math.min(Math.max(request.page?.pageSize || DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
       const searchGlob = workspaceSearchPrefixGlob(request.relativePathPrefix);
-      const result = await dependencies.workspaceService.searchPage(request.workspaceId, request.query, {
+      const options = {
         ...(searchGlob === undefined ? {} : { glob: searchGlob }),
         maximumResults: pageSize,
         offset,
         caseSensitive: request.caseSensitive,
         regularExpression: request.regularExpression
-      });
-      return {
-        matches: result.matches.map(mapWorkspaceSearchResult),
-        page: create(contract.PageInfoSchema, {
-          nextPageToken: result.nextOffset === undefined ? "" : encodePageToken(result.nextOffset),
-          totalSize: BigInt(result.totalResults)
-        }),
-        revision: create(contract.RevisionSchema, { value: 0n, etag: result.revision }),
-        truncated: result.truncated,
-        totalFiles: BigInt(result.totalFiles)
       };
+      const owner = request.includeEntryRevisions ? captureWorkspaceFileRequest(dependencies.connections, connection, context.signal) : undefined;
+      try {
+        const result = owner === undefined
+          ? await dependencies.workspaceService.searchPage(request.workspaceId, request.query, options)
+          : await dependencies.workspaceService.searchPage(request.workspaceId, request.query, { ...options, includeEntryRevisions: true }, owner);
+        owner?.assertCurrent();
+        return {
+          matches: result.matches.map(mapWorkspaceSearchResult),
+          page: create(contract.PageInfoSchema, {
+            nextPageToken: result.nextOffset === undefined ? "" : encodePageToken(result.nextOffset),
+            totalSize: BigInt(result.totalResults)
+          }),
+          revision: create(contract.RevisionSchema, { value: 0n, etag: result.revision }),
+          truncated: result.truncated,
+          totalFiles: BigInt(result.totalFiles)
+        };
+      } catch (error) { owner?.assertCurrent(); throw error; }
+      finally { owner?.dispose(); }
     },
     streamWorkspaceSearch: async function* (request, context) {
       const authenticated = authenticate(context);
@@ -8533,6 +8541,7 @@ function mapWorkspaceSearchResult(item: WorkspaceSearchResult): contract.Workspa
       startByte: BigInt(submatch.startByte),
       endByte: BigInt(submatch.endByte)
     })),
+    ...(item.entryRevision === undefined ? {} : { entryRevision: fileRevision(item.entryRevision) }),
     revision: create(contract.FileRevisionSchema, {
       sha256Hex: "",
       byteSize: 0n,
