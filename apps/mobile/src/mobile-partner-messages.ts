@@ -247,6 +247,7 @@ const rows = [
   ["partner.pair", "{first} · {second}", "{first} · {second}", "{first} · {second}", "{first} · {second}", "{first} · {second}"],
   ["partner.unknownName", "Unknown Partner", "未知伙伴", "未知夥伴", "不明なパートナー", "알 수 없는 파트너"],
   ["partner.lifecycle.active", "Active", "活跃", "使用中", "有効", "활성"],
+  ["partner.lifecycle.paused", "Paused", "已暂停", "已暫停", "一時停止", "일시 중지"],
   ["partner.lifecycle.archived", "Archived", "已归档", "已封存", "アーカイブ済み", "보관됨"],
   ["partner.initialization.pending", "Setting up", "正在设置", "正在設定", "準備中", "설정 중"],
   ["partner.initialization.error", "Setup needs attention", "设置需要处理", "設定需要處理", "設定に対応が必要", "설정 확인 필요"],
