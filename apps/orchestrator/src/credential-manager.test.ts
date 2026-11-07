@@ -449,7 +449,7 @@ describe("ProviderCatalogManager", () => {
     store.close();
   });
 
-  it.each(["openai-responses", "google-generative-ai", "anthropic-messages"] as const)("adds only newly discovered %s models and keeps them hidden by default", async api => {
+  it.each(["openai-responses", "google-generative-ai", "anthropic-messages"] as const)("shows newly discovered direct Pi text models from %s by default", async api => {
     const { credentials, store } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
     providers.initialize();
@@ -471,7 +471,7 @@ describe("ProviderCatalogManager", () => {
         baseUrl,
         api,
         apiKeyEnv: "DISCOVERY_API_KEY",
-        models: [{ id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000 }]
+        models: [{ id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000, defaultVisible: false }]
       },
       displayName: "Discoverable",
       kind: "custom_endpoint",
@@ -523,8 +523,8 @@ describe("ProviderCatalogManager", () => {
     });
     expect(providers.get("pi", "discoverable")).toMatchObject({ supportsModelRefresh: true });
     expect(providers.get("pi", "discoverable").provider.models).toEqual([
-      { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000 },
-      { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: false,
+      { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000, defaultVisible: false },
+      { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: true,
         contextWindowSource: "declared", maxOutputTokensSource: "estimated" }
     ]);
     await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toMatchObject({
