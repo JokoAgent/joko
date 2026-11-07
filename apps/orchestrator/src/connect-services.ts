@@ -2,6 +2,7 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { captureModelPriceReference, createModelPriceOverrideValues, modelPriceOverrideConflict, modelPricesWithOverride, modelTokenPricesAt, type ModelPriceReferenceSnapshot } from "@joko/core";
 import { priceMicros, toProtoModelPriceOverrideValues } from "./model-pricing-projection.js";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
+import { ExtensionSecretCheckUpstreamError } from "./extension-secret-check.js";
 import type { ExtensionDirectoryPicker, ExtensionDirectoryPage, PickedExtensionDirectory } from "./extension-directory-picker.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
 import { createServerAccessConnectService } from './server-access-connect-service.js';
@@ -4779,7 +4780,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
         if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) throw new Error("Plugin settings document retired.");
         assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
       };
-      const result = await dependencies.extensionSettings!.check(surface, request.secretKey, request.credentialUploadTicketId, connection.id, context.signal, assertCurrent);
+      const result = await dependencies.extensionSettings!.check(surface, request.secretKey, request.credentialUploadTicketId, connection.id, context.signal, assertCurrent)
+        .catch(async (error: unknown) => {
+          if (!(error instanceof ExtensionSecretCheckUpstreamError)) throw error;
+          await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id); assertCurrent();
+          throw new ConnectError(contract.EXTENSION_SECRET_CHECK_FAILED, Code.FailedPrecondition);
+        });
       await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id); assertCurrent();
       return { valid: result.valid, ...(result.expiresAt === undefined ? {} : { expiresAt: toProtoTimestamp(result.expiresAt) }) };
     },

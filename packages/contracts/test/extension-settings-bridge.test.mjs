@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Script, createContext } from "node:vm";
 import { webcrypto } from "node:crypto";
-import { EXTENSION_SETTINGS_SDK_SOURCE, extensionSettingsSdkSource, parseExtensionSettingsBridgeRequest } from "../dist/index.js";
+import { EXTENSION_SECRET_CHECK_FAILED, EXTENSION_SETTINGS_SDK_SOURCE, extensionSettingsSdkSource, parseExtensionSettingsBridgeRequest } from "../dist/index.js";
 
 test("author settings only accepts declared commands and bounded private input", () => {
   const request = command => ({ type: "joko:extension-settings-request", version: 1, id: "settings-one", command });
@@ -31,7 +31,8 @@ function page(source = EXTENSION_SETTINGS_SDK_SOURCE) {
   new Script(source).runInContext(createContext(context));
   const dispatch = (name, event) => { for (const callback of listeners.get(name) ?? []) callback(event); };
   const respond = (id, result, source = parent) => dispatch("message", { source, data: { type: "joko:extension-settings-response", version: 1, id, ok: true, result } });
-  return { context, requests, dispatch, respond };
+  const reject = (id, message) => dispatch("message", { source: parent, data: { type: "joko:extension-settings-response", version: 1, id, ok: false, message } });
+  return { context, requests, dispatch, respond, reject };
 }
 
 test("directory selection only sends a native choice request and requires a read deposit", async () => {
@@ -151,4 +152,20 @@ test("the installed settings SDK exposes checks only for matching current secret
     token: { configured: false, checkSupported: true }, optional: { configured: true }
   } });
   assert.equal(result.secrets.token.checkSupported, undefined);
+});
+
+test("a confirmed candidate check failure has an HTTP receipt and the same document can explicitly retry", { timeout: 2_000 }, async t => {
+  const current = page();
+  t.after(() => current.dispatch("pagehide", {}));
+  const request = () => current.context.fetch("/secrets/token/check", { method: "POST", body: '{"value":"fixture-candidate"}' });
+  const failed = request();
+  assert.equal(current.requests[0].command.kind, "secret.check");
+  current.reject(current.requests[0].id, EXTENSION_SECRET_CHECK_FAILED);
+  const response = await failed;
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), { error: EXTENSION_SECRET_CHECK_FAILED });
+  assert.equal(current.requests.length, 1);
+  const retry = request();
+  current.respond(current.requests[1].id, { valid: true });
+  assert.deepEqual(await (await retry).json(), { valid: true });
 });

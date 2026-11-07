@@ -1,5 +1,5 @@
-import { createClient, createRouterTransport } from "@connectrpc/connect";
-import { ExtensionAuthorizationPhase, ExtensionNetworkService, ExtensionOAuthService, ExtensionService, type ExtensionSettingsHost } from "@joko/contracts";
+import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
+import { EXTENSION_SECRET_CHECK_FAILED, ExtensionAuthorizationPhase, ExtensionNetworkService, ExtensionOAuthService, ExtensionService, type ExtensionSettingsHost } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import { executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionSettingsClient, type ExtensionSettingsProjection } from "./extension-settings-client.js";
 
@@ -114,6 +114,21 @@ describe("author settings shared client", () => {
     const publicRequests = [...begin.mock.calls, ...check.mock.calls].map(([request]) => request);
     expect(JSON.stringify(publicRequests)).not.toContain("private-candidate");
     expect(f.client.secret).not.toHaveBeenCalled(); expect(f.client.submit).not.toHaveBeenCalled();
+  });
+
+  it("reports the known candidate check failure without submitting or looking up an operation", async () => {
+    const check = vi.fn(() => { throw new ConnectError(EXTENSION_SECRET_CHECK_FAILED, Code.FailedPrecondition); });
+    const transport = createRouterTransport(router => router.service(ExtensionService, {
+      beginExtensionSecretCheck: () => ({ ticket: { ticketId: "candidate", relativeEndpoint: "/private-upload", maximumBytes: 8192n } }),
+      checkExtensionSecret: check
+    }));
+    const f = fixture({ api: createClient(ExtensionService, transport) });
+    const result = executeExtensionSettingsCall(f.client, { kind: "secret.check", key: "token", value: "fixture-candidate" }, f.host, new AbortController().signal);
+    await expect(result).rejects.toBeInstanceOf(ExtensionSettingsRejected);
+    await expect(result).rejects.toThrow(EXTENSION_SECRET_CHECK_FAILED);
+    expect(f.client.upload).toHaveBeenCalledOnce();
+    expect(check).toHaveBeenCalledOnce();
+    expect(f.client.submit).not.toHaveBeenCalled();
   });
 
   it("keeps an unknown original routing operation and does not resubmit or report success", async () => {
