@@ -329,10 +329,10 @@ describe("managed Pi subagent extension", () => {
     const prompt = task!.promptTask!;
     expect(prompt.length).toBeLessThanOrEqual(64_000);
     expect(prompt.endsWith(`\n\nAssignment:\n${assignment}`)).toBe(true);
-    expect(prompt).toContain(start);
-    expect(prompt).toContain(end);
+    const latestUser = prompt.split("\n\n").find(section => section.startsWith(`USER:\n${start}`));
+    expect(latestUser).toContain(end);
+    expect(latestUser?.includes("[… middle omitted …]")).toBe(long);
     expect(prompt).toContain("Most recent compressed constraints");
-    expect(prompt.includes("[… middle omitted …]")).toBe(long);
     expect(prompt).not.toContain("Earlier message 0:");
     expect(Buffer.from(prompt, "utf8").toString("utf8")).toBe(prompt);
     expect(sibling!.promptTask!.split("\n\nAssignment:\n")[0]).toBe(prompt.split("\n\nAssignment:\n")[0]);
