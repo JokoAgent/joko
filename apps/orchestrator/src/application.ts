@@ -1151,7 +1151,9 @@ export async function createOrchestratorApplication(
     }
   });
   await extensionMainViews.initialize();
+  let extensionCardRuntime: ExtensionCardRuntime | undefined;
   const extensionSettings = new ExtensionSettingsManager({ store, vault: credentialVault, credentials, catalog: extensionCatalog,
+    notifyRoutingChanged: (authority, assertCurrent) => extensionCardRuntime?.notifyRoutingChanged(authority, assertCurrent),
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
       environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }) });
   const imageGenerationBridge = new ImageGenerationBridgeToolProvider({
@@ -2605,7 +2607,6 @@ export async function createOrchestratorApplication(
   const extensionRoutineRuntime = new ExtensionRoutineRuntime({ catalog: extensionCatalog, resources: piResources, store,
     surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupRoutineRuntime = extensionRoutineRuntime;
-  let extensionCardRuntime: ExtensionCardRuntime | undefined;
   const extensionDeviceSync = new ExtensionDeviceSync({ store, vault: credentialVault, peers: devicePeers, catalog: extensionCatalog, resources: piResources,
     deliver: async (...args) => extensionCardRuntime?.deliverDeviceSync(...args) ?? false });
   hostedAgents.installExtensionSync(extensionDeviceSync);

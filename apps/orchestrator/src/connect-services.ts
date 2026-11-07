@@ -22227,6 +22227,8 @@ async function dispatchMutation(
           assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
           dependencies.extensionSettings!.write(surface, payload.value.expectedRoutingRevision, payload.value.dataJson);
           return { accepted: true, resultCase: "acknowledgement", entityId: surface.extensionId } satisfies OperationOutcome;
+        }, afterCommit: execution => {
+          if (!execution.replayed) dependencies.extensionSettings!.routingCommitted(surface, () => dependencies.connections.fence(connection));
         } }));
     }
     case "clearExtensionSetupCredential": {
