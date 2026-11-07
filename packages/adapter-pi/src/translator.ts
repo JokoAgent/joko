@@ -1746,7 +1746,7 @@ function nativeContentWithManagedOutputs(
 }
 
 function isManagedMcpToolName(value: string): boolean {
-  return value.startsWith("mcp__") || value === "image_generate";
+  return value.startsWith("mcp__") || value === "image_generate" || value === "image_edit";
 }
 
 function extensionForMime(mimeType: string): string {

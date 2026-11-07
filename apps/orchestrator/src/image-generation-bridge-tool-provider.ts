@@ -1,6 +1,7 @@
 import { JokoError, type BlobRef } from "@joko/core";
 import { OperationInProgressError, OperationPreviouslyFailedError, type OperationalStore } from "@joko/store";
 
+import type { ArtifactStore } from "./artifact-store.js";
 import type {
   BridgeToolCallContext,
   BridgeToolCallResult,
@@ -17,14 +18,50 @@ export const IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID = "joko-image-generation";
 export const IMAGE_GENERATION_RESPONSE_MAXIMUM_BYTES = 64 * 1024 * 1024;
 
 const IMAGE_GENERATION_TOOL_NAME = "image_generate";
+const IMAGE_EDIT_TOOL_NAME = "image_edit";
 const OPENAI_IMAGES_GENERATION_ENDPOINT = "https://api.openai.com/v1/images/generations";
+const OPENAI_IMAGES_EDIT_ENDPOINT = "https://api.openai.com/v1/images/edits";
+const GEMINI_IMAGES_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
 const IMAGE_RESULT_STAGING_MS = 10 * 60_000;
 const MAXIMUM_PROMPT_BYTES = 32 * 1024;
+const MAXIMUM_REFERENCE_IMAGES = 16;
+const REFERENCE_IMAGE_BYTE_LIMIT = 50_000_000;
+const MAXIMUM_REFERENCE_TOTAL_BYTES = 64 * 1024 * 1024;
 const ASPECT_RATIOS = ["1:1", "3:2", "2:3"] as const;
+const EXACT_IMAGE_QUALITIES = ["auto", "low", "medium", "high"] as const;
+const GEMINI_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
+const GEMINI_FLASH_ASPECT_RATIOS = [...GEMINI_ASPECT_RATIOS, "1:4", "4:1", "1:8", "8:1"] as const;
+const GEMINI_RESOLUTIONS = ["512", "1K", "2K", "4K"] as const;
+const GEMINI_FLASH_MODEL = "gemini/gemini-3.1-flash-image";
+const GEMINI_PRO_MODEL = "gemini/gemini-3-pro-image";
 
 type ImageAspectRatio = (typeof ASPECT_RATIOS)[number];
+type ImageQuality = (typeof EXACT_IMAGE_QUALITIES)[number];
 type SupportedImageMime = "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+type ImageToolName = typeof IMAGE_GENERATION_TOOL_NAME | typeof IMAGE_EDIT_TOOL_NAME;
+
+interface ImageEditReference {
+  readonly blob: BlobRef;
+  readonly file: Blob;
+  readonly extension: string;
+}
+
+interface ImageDispatchInput {
+  readonly executionApi: ConfiguredProviderCredentialSurface["surface"]["executionApi"];
+  readonly apiKey: string;
+  readonly model: string;
+  readonly prompt: string;
+  readonly size?: string;
+  readonly quality?: ImageQuality;
+  readonly aspectRatio?: string;
+  readonly resolution?: string;
+  readonly references?: readonly ImageEditReference[];
+  readonly signal?: AbortSignal;
+  readonly beforeDispatch: () => void;
+}
+
+type ImageProviderFetch = (input: RequestInfo | URL, init: RequestInit, beforeDispatch: () => void) => Promise<Response>;
 
 interface ImageGenerationRoute {
   readonly owner: ConfiguredProviderCredentialSurface;
@@ -46,8 +83,8 @@ export interface ExecutableImageGenerationModel {
 export interface ImageGenerationBridgeToolProviderOptions {
   readonly store: OperationalStore;
   readonly credentialSurfaces: ProviderCredentialSurfaceResolver;
-  readonly artifacts: McpResultArtifactStore;
-  readonly fetch?: typeof fetch;
+  readonly artifacts: McpResultArtifactStore & Pick<ArtifactStore, "readBlob">;
+  readonly fetch?: ImageProviderFetch;
 }
 
 /**
@@ -57,9 +94,9 @@ export interface ImageGenerationBridgeToolProviderOptions {
 export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   readonly id = IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID;
   readonly #credentialSurfaces: ProviderCredentialSurfaceResolver;
-  readonly #artifacts: McpResultArtifactStore;
+  readonly #artifacts: ImageGenerationBridgeToolProviderOptions["artifacts"];
   readonly #store: OperationalStore;
-  readonly #fetch: typeof fetch;
+  readonly #fetch: ImageProviderFetch;
   #generation = 1;
   #signature: string | undefined;
   #routes: readonly ImageGenerationRoute[] = [];
@@ -68,7 +105,10 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     this.#store = options.store;
     this.#credentialSurfaces = options.credentialSurfaces;
     this.#artifacts = options.artifacts;
-    this.#fetch = options.fetch ?? globalThis.fetch;
+    this.#fetch = options.fetch ?? ((input, init, beforeDispatch) => {
+      beforeDispatch();
+      return globalThis.fetch(input, init);
+    });
   }
 
   get generation(): number {
@@ -88,39 +128,19 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   get tools(): readonly McpToolDescriptor[] {
     this.#refreshSnapshot();
     if (this.#routes.length === 0) return [];
-    const multipleRoutes = this.#routes.length > 1;
-    return [{
-      serverId: this.id,
-      name: IMAGE_GENERATION_TOOL_NAME,
-      runtimeName: IMAGE_GENERATION_TOOL_NAME,
-      description:
-        "Generate an image with the configured image model. Use a clear, complete visual prompt and an optional supported aspect ratio.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          prompt: {
-            type: "string",
-            minLength: 1,
-            description: "A complete description of the image to generate."
-          },
-          aspect_ratio: {
-            type: "string",
-            enum: [...ASPECT_RATIOS],
-            description: "Optional output aspect ratio."
-          },
-          ...(multipleRoutes ? {
-            model: {
-              type: "string",
-              enum: this.#routes.map((route) => route.modelId),
-              description: "The configured image model to use."
-            }
-          } : {})
-        },
-        required: multipleRoutes ? ["prompt", "model"] : ["prompt"],
-        additionalProperties: false
-      },
-      requiresPermission: true
-    }];
+    const tools = [describeImageTool(IMAGE_GENERATION_TOOL_NAME, this.#routes)];
+    const editRoutes = this.#routes.filter(route => isGptImage2Route(route) || isGeminiImageRoute(route));
+    if (editRoutes.length > 0) tools.push(describeImageTool(IMAGE_EDIT_TOOL_NAME, editRoutes));
+    return tools;
+  }
+
+  toolsForSession(sessionId: string): readonly McpToolDescriptor[] {
+    const tools = this.tools;
+    const session = this.#store.findSession(sessionId)?.descriptor;
+    if (session === undefined) return tools;
+    const target = this.#store.getTarget(session.targetId).descriptor;
+    return target.trusted && target.remoteWorkspace === undefined && session.remoteWorkspace === undefined
+      ? tools : tools.filter(tool => tool.name !== IMAGE_EDIT_TOOL_NAME);
   }
 
   async callTool(
@@ -130,58 +150,91 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     context: BridgeToolCallContext
   ): Promise<BridgeToolCallResult> {
     this.#refreshSnapshot();
-    if (name !== IMAGE_GENERATION_TOOL_NAME || this.#routes.length === 0) {
-      throw new Error("Image generation is not part of this runtime snapshot.");
+    if (name !== IMAGE_GENERATION_TOOL_NAME && name !== IMAGE_EDIT_TOOL_NAME) {
+      throw new Error("The image tool is unavailable in this runtime snapshot.");
     }
-    const multipleRoutes = this.#routes.length > 1;
-    assertOnlyKeys(arguments_, multipleRoutes
-      ? ["prompt", "aspect_ratio", "model"]
-      : ["prompt", "aspect_ratio"]);
+    const editing = name === IMAGE_EDIT_TOOL_NAME;
+    const routes = editing ? this.#routes.filter(route => isGptImage2Route(route) || isGeminiImageRoute(route)) : this.#routes;
+    const multipleRoutes = routes.length > 1;
+    const allowed = ["prompt", "aspect_ratio", "size", "quality", "resolution"];
+    if (editing) allowed.push("image");
+    if (multipleRoutes) allowed.push("model");
+    assertOnlyKeys(arguments_, allowed);
     const prompt = requiredUtf8String(arguments_["prompt"], MAXIMUM_PROMPT_BYTES, "Image prompt is invalid.");
-    const aspectRatio = optionalAspectRatio(arguments_["aspect_ratio"]);
     const selectedModel = multipleRoutes ? requiredModel(arguments_["model"]) : undefined;
     const route = multipleRoutes
-      ? this.#routes.find((candidate) => candidate.modelId === selectedModel)
-      : this.#routes[0];
+      ? routes.find((candidate) => candidate.modelId === selectedModel)
+      : routes[0];
     if (route === undefined || !this.#credentialSurfaces.modelEnabled(route.owner, route.modelId)) {
       throw new Error("The selected image model is unavailable.");
     }
+    if (!isGptImage2Route(route) && (arguments_["size"] !== undefined || arguments_["quality"] !== undefined)) {
+      throw new Error("The selected image model does not support size and quality options.");
+    }
+    const gemini = isGeminiImageRoute(route);
+    const openAiAspectRatio = gemini ? undefined : optionalAspectRatio(arguments_["aspect_ratio"]);
+    const aspectRatio = gemini ? optionalGeminiAspectRatio(arguments_["aspect_ratio"], route.modelId) : openAiAspectRatio;
+    if (!gemini && arguments_["resolution"] !== undefined) throw new Error("The selected image model does not support resolution.");
+    const resolution = gemini ? optionalGeminiResolution(arguments_["resolution"], route.modelId) : undefined;
+    const size = gemini ? undefined : imageSize(arguments_["size"], openAiAspectRatio);
+    const quality = optionalImageQuality(arguments_["quality"]);
+    if (editing && gemini && Array.isArray(arguments_["image"]) && arguments_["image"].length > 14) {
+      throw new Error("Gemini image editing accepts at most 14 reference images.");
+    }
+    const references = editing ? await this.#readEditReferences(arguments_["image"], context, signal) : undefined;
 
     let apiKey: string | undefined;
     try {
       apiKey = this.#credentialSurfaces.resolveSecret(route.owner).trim();
       if (apiKey.length === 0) throw new Error("Image generation credential is not configured.");
-      context.acceptDispatchedImageResult?.(() => this.#credentialSurfaces.assertDispatchedCredential(route.owner, route.modelId));
-      signal?.throwIfAborted();
-      context.assertCurrent?.();
-      const claim = this.#claimImageEffect(route, context);
-      if (!claim.claimed) {
-        const stored = this.#store.getArtifact(claim.value.id);
-        if (stored.deletedAt !== undefined) throw new Error("The original image result is no longer available.");
-        return imageResult(claim.value, route.modelId);
-      }
+      let operation: { readonly id: string; readonly bodyHash: string } | undefined;
+      const assertDispatched = () => {
+        this.#credentialSurfaces.assertDispatchedCredential(route.owner, route.modelId);
+        references?.assertCurrent();
+      };
       try {
         const generated = await this.#dispatch({
           executionApi: route.owner.surface.executionApi,
           apiKey,
           model: route.modelId,
           prompt,
+          ...(size === undefined ? {} : { size }),
           ...(aspectRatio === undefined ? {} : { aspectRatio }),
-          ...(signal === undefined ? {} : { signal })
+          ...(resolution === undefined ? {} : { resolution }),
+          ...(quality === undefined ? {} : { quality }),
+          ...(references === undefined ? {} : { references: references.images }),
+          ...(signal === undefined ? {} : { signal }),
+          beforeDispatch: () => {
+            signal?.throwIfAborted();
+            context.assertCurrent?.();
+            assertDispatched();
+            context.acceptDispatchedImageResult?.(assertDispatched);
+            const claim = this.#claimImageEffect(route, context, references?.images);
+            if (!claim.claimed) throw new ReplayedImageEffect(claim.value);
+            operation = claim.operation;
+          }
         });
+        if (operation === undefined) throw new Error("The original image request was not captured.");
         context.assertCurrent?.();
-        const blob = await this.#artifacts.ingestBytes(generated.bytes, {
-          fileName: `generated-image${extensionForMime(generated.mimeType)}`,
+        const staged = await this.#artifacts.ingestBytes(generated.bytes, {
+          fileName: `${editing ? "edited" : "generated"}-image${extensionForMime(generated.mimeType)}`,
           mimeType: generated.mimeType,
           ...(context.acceptDispatchedImageResult === undefined ? {} : { expiresAt: Date.now() + IMAGE_RESULT_STAGING_MS })
         });
         context.assertCurrent?.();
-        this.#store.completeDeferredEffectOperation(claim.operation.id, claim.operation.bodyHash, () => blob);
-        return imageResult(blob, route.modelId);
+        const blob = this.#store.getArtifact(staged.id).blob;
+        this.#store.completeDeferredEffectOperation(operation.id, operation.bodyHash, () => blob);
+        return imageResult(blob, route.modelId, editing);
       } catch (error) {
-        const failure = imageSubmissionFailure(claim.operation.id, error instanceof ImageProviderRejection);
+        if (error instanceof ReplayedImageEffect) {
+          const stored = this.#store.findArtifact(error.blob.id);
+          if (stored === undefined) throw new Error("The original image result is no longer available.");
+          return imageResult(stored.blob, route.modelId, editing);
+        }
+        if (operation === undefined) throw error;
+        const failure = imageSubmissionFailure(operation.id, error instanceof ImageProviderRejection);
         try {
-          this.#store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, failure);
+          this.#store.failEffectOperation(operation.id, operation.bodyHash, failure);
         } catch {
           // A lost terminal write leaves the original durable claim in place.
         }
@@ -193,17 +246,103 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     }
   }
 
-  #claimImageEffect(route: ImageGenerationRoute, context: BridgeToolCallContext) {
+  async #readEditReferences(value: unknown, context: BridgeToolCallContext, signal: AbortSignal | undefined) {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAXIMUM_REFERENCE_IMAGES) {
+      throw new Error(`Image editing requires 1–${MAXIMUM_REFERENCE_IMAGES} image references.`);
+    }
+    const input = context.nativeRootQueueInput;
+    const assertRoot = context.assertNativeRoot;
+    if (input === undefined || assertRoot === undefined) throw imageEditInputUnavailable();
+    const assertNativeInput = (): void => {
+      signal?.throwIfAborted();
+      assertRoot();
+      input.assertCurrent();
+    };
+    context.assertCurrent?.();
+    assertNativeInput();
+    const original = this.#store.getQueueItem(input.queueItemId);
+    const operation = this.#store.getOperation(original.operationId);
+    if ((operation.kind !== "sendInput" && operation.kind !== "send_input") || operation.status !== "completed"
+      || operation.connectionId === undefined) throw imageEditInputUnavailable();
+    const connection = this.#store.getConnection(operation.connectionId);
+    const assertOwner = (): void => {
+      assertNativeInput();
+      const session = this.#store.getSession(context.sessionId).descriptor;
+      const target = this.#store.getTarget(session.targetId).descriptor;
+      const queue = this.#store.getQueueItem(original.id);
+      const run = this.#store.getRun(queue.runId).descriptor;
+      const backendGeneration = this.#store.getBackend(session.backendId).descriptor.instanceGeneration;
+      if (queue.sessionId !== session.id || run.sessionId !== session.id || run.source !== "user" || run.parentRunId !== undefined
+        || session.targetId !== context.targetId || session.binding.generation !== context.generation
+        || session.archived || session.deletedAt !== undefined || session.remoteWorkspace !== undefined
+        || !target.trusted || target.remoteWorkspace !== undefined || queue.bodyHash !== original.bodyHash
+        || queue.backendInstanceGeneration !== backendGeneration
+        || (queue.state !== "dispatching" && queue.state !== "backend_accepted") || queue.attemptId === undefined
+        || queue.attemptId !== original.attemptId || run.activeAttemptId !== queue.attemptId) throw imageEditInputUnavailable();
+      const attempt = this.#store.getAttempt(queue.attemptId).descriptor;
+      if (attempt.generation !== context.generation || attempt.backendInstanceGeneration !== backendGeneration
+        || attempt.endedAt !== undefined || attempt.runId !== run.id) throw imageEditInputUnavailable();
+      this.#store.authorizeConnection(connection.id, connection.authKeyDigest);
+    };
+    assertOwner();
+    const attached = original.body.images.map(image => image.blob);
+    const records = value.map((reference: unknown) => {
+      if (!boundedIdentifier(reference, 512)) throw imageEditInputUnavailable();
+      const numbered = /^input:([1-9]\d{0,2})$/u.exec(reference);
+      const attachment = numbered === null ? attached.find(blob => blob.id === reference) : attached[Number(numbered[1]) - 1];
+      if (numbered !== null && attachment === undefined) throw imageEditInputUnavailable();
+      const artifact = this.#store.findArtifact(attachment?.id ?? reference);
+      if (artifact === undefined || (artifact.sessionId !== context.sessionId && (artifact.sessionId !== undefined || attachment === undefined))
+        || (attachment !== undefined && (artifact.blob.sha256 !== attachment.sha256 || artifact.blob.byteLength !== attachment.byteLength))) {
+        throw imageEditInputUnavailable();
+      }
+      if (!supportedEditMime(artifact.blob.mimeType) || artifact.blob.byteLength < 1 || artifact.blob.byteLength >= REFERENCE_IMAGE_BYTE_LIMIT) {
+        throw new Error("An image reference exceeds its size limit or has an unsupported format.");
+      }
+      return artifact;
+    });
+    if (new Set(records.map(record => record.blob.id)).size !== records.length
+      || records.reduce((bytes, record) => bytes + record.blob.byteLength, 0) > MAXIMUM_REFERENCE_TOTAL_BYTES) {
+      throw new Error("Image references must be distinct and within the total size limit.");
+    }
+    const assertCurrent = (): void => {
+      assertOwner();
+      for (const record of records) {
+        const current = this.#store.findArtifact(record.blob.id);
+        if (current === undefined || current.revision !== record.revision) throw imageEditInputUnavailable();
+        if (isRecord(current.metadata) && typeof current.metadata["expiresAt"] === "number"
+          && current.metadata["expiresAt"] <= Date.now()) throw imageEditInputUnavailable();
+      }
+    };
+    const images: ImageEditReference[] = [];
+    for (const record of records) {
+      context.assertCurrent?.();
+      assertCurrent();
+      const image = await this.#artifacts.readBlob(record.blob);
+      const mimeType = sniffImageMime(image.data);
+      if (mimeType !== record.blob.mimeType || !supportedEditMime(mimeType)) {
+        throw new Error("An image reference has an unsupported format.");
+      }
+      images.push({ blob: record.blob, file: new Blob([Uint8Array.from(image.data)], { type: mimeType }), extension: extensionForMime(mimeType) });
+    }
+    context.assertCurrent?.();
+    assertCurrent();
+    return { images, assertCurrent };
+  }
+
+  #claimImageEffect(route: ImageGenerationRoute, context: BridgeToolCallContext, references: readonly ImageEditReference[] | undefined) {
     const { requestIdentity, requestBodyHash } = context;
     if (requestIdentity === undefined || requestBodyHash === undefined) throw new Error("Image request identity is unavailable.");
     const operationId = `mcp-image:${requestIdentity}`;
     const { backend, provider, surface, credential } = route.owner;
     try {
-      return this.#store.claimDeferredEffectOperation<BlobRef>({ id: operationId, kind: "mcp_image_generate", body: {
+      return this.#store.claimDeferredEffectOperation<BlobRef>({ id: operationId,
+        kind: references === undefined ? "mcp_image_generate" : "mcp_image_edit", body: {
         requestBodyHash, sessionId: context.sessionId, targetId: context.targetId, generation: context.generation,
         backendId: backend.id, backendGeneration: backend.instanceGeneration, providerId: provider.providerId,
         surfaceId: surface.surfaceId, executionApi: surface.executionApi, modelId: route.modelId,
-        credentialReferenceId: route.owner.credentialReferenceId, credentialGeneration: credential.generation
+        credentialReferenceId: route.owner.credentialReferenceId, credentialGeneration: credential.generation,
+        ...(references === undefined ? {} : { referenceImages: references.map(({ blob }) => ({ id: blob.id, sha256: blob.sha256 })) })
       } });
     } catch (error) {
       if (error instanceof OperationInProgressError) throw imageSubmissionFailure(operationId, false);
@@ -222,10 +361,10 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   }
 
   #readSnapshot(): ImageGenerationSnapshot {
-    const owners = this.#credentialSurfaces.listConfigured({
-      capability: "image_generation",
-      executionApi: "openai-images"
-    });
+    const owners = [
+      ...this.#credentialSurfaces.listConfigured({ capability: "image_generation", executionApi: "openai-images" }),
+      ...this.#credentialSurfaces.listConfigured({ capability: "image_generation", executionApi: "gemini-images" })
+    ];
     if (owners.length > 64 || owners.some((owner) => owner.surface.models.length > 64)) {
       return { signature: "catalog-limit", routes: [] };
     }
@@ -233,7 +372,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       if (!boundedIdentifier(model.modelId, 256)
         || !boundedDisplayName(model.displayName, 512)
         || !this.#credentialSurfaces.modelEnabled(owner, model.modelId)) return [];
-      return [{ owner, modelId: model.modelId, displayName: model.displayName }];
+      const route = { owner, modelId: model.modelId, displayName: model.displayName };
+      return owner.surface.executionApi === "gemini-images" && !isGeminiImageRoute(route) ? [] : [route];
     }));
     const counts = new Map<string, number>();
     for (const candidate of candidates) {
@@ -255,58 +395,93 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     return { signature, routes };
   }
 
-  async #dispatch(input: {
-    readonly executionApi: ConfiguredProviderCredentialSurface["surface"]["executionApi"];
-    readonly apiKey: string;
-    readonly model: string;
-    readonly prompt: string;
-    readonly aspectRatio?: ImageAspectRatio;
-    readonly signal?: AbortSignal;
-  }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
+  async #dispatch(input: ImageDispatchInput): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
     switch (input.executionApi) {
       case "openai-images":
         return await this.#dispatchOpenAiImages(input);
+      case "gemini-images":
+        return await this.#dispatchGeminiImages(input);
       default:
         throw new Error("Image generation execution protocol is unsupported.");
     }
   }
 
-  async #dispatchOpenAiImages(input: {
-    readonly apiKey: string;
-    readonly model: string;
-    readonly prompt: string;
-    readonly aspectRatio?: ImageAspectRatio;
-    readonly signal?: AbortSignal;
-  }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
+  async #dispatchOpenAiImages(input: ImageDispatchInput) {
+    const endpoint = input.references === undefined ? OPENAI_IMAGES_GENERATION_ENDPOINT : OPENAI_IMAGES_EDIT_ENDPOINT;
+    const options = {
+      model: input.model, prompt: input.prompt, n: 1, size: input.size ?? "auto",
+      ...(input.quality === undefined ? {} : { quality: input.quality })
+    };
+    let body: string | FormData;
+    if (input.references === undefined) body = JSON.stringify(options);
+    else {
+      const form = new FormData();
+      for (const [key, value] of Object.entries(options)) form.set(key, String(value));
+      input.references.forEach(({ file, extension }, index) => form.append("image[]", file, `reference-${index + 1}${extension}`));
+      body = form;
+    }
+    return this.#requestImage(input, endpoint, {
+      authorization: `Bearer ${input.apiKey}`,
+      ...(typeof body === "string" ? { "content-type": "application/json" } : {})
+    }, body);
+  }
+
+  async #dispatchGeminiImages(input: ImageDispatchInput) {
+    const parts: Record<string, unknown>[] = [{ text: input.prompt }];
+    for (const reference of input.references ?? []) {
+      input.signal?.throwIfAborted();
+      const data = Buffer.from(await reference.file.arrayBuffer()).toString("base64");
+      parts.push({ inlineData: { mimeType: reference.file.type, data } });
+    }
+    const body = JSON.stringify({
+      contents: [{ parts }],
+      generationConfig: {
+        responseModalities: ["TEXT", "IMAGE"],
+        ...(input.aspectRatio === undefined && input.resolution === undefined ? {} : { imageConfig: {
+          ...(input.aspectRatio === undefined ? {} : { aspectRatio: input.aspectRatio }),
+          ...(input.resolution === undefined ? {} : { imageSize: input.resolution })
+        } })
+      }
+    });
+    if (Buffer.byteLength(body, "utf8") > 20_000_000) throw new Error("Gemini inline image input exceeds its request size limit.");
+    const endpoint = `${GEMINI_IMAGES_BASE}${encodeURIComponent(input.model.slice("gemini/".length))}:generateContent`;
+    return this.#requestImage(input, endpoint, { "x-goog-api-key": input.apiKey, "content-type": "application/json" }, body);
+  }
+
+  async #requestImage(input: ImageDispatchInput, endpoint: string, headers: Record<string, string>, body: string | FormData) {
     const requestSignal = boundedSignal(input.signal, IMAGE_GENERATION_TIMEOUT_MS);
     let response: Response;
+    let dispatchGuardFailure: { readonly error: unknown } | undefined;
     try {
-      response = await this.#fetch(OPENAI_IMAGES_GENERATION_ENDPOINT, {
+      response = await this.#fetch(endpoint, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${input.apiKey}`,
           accept: "application/json",
-          "content-type": "application/json"
+          ...headers
         },
-        body: JSON.stringify({
-          model: input.model,
-          prompt: input.prompt,
-          n: 1,
-          size: input.aspectRatio === undefined ? "auto" : sizeForAspectRatio(input.aspectRatio)
-        }),
+        body,
         redirect: "error",
         credentials: "omit",
         cache: "no-store",
         referrerPolicy: "no-referrer",
         signal: requestSignal.signal
+      }, () => {
+        try {
+          requestSignal.signal.throwIfAborted();
+          input.beforeDispatch();
+        } catch (error) {
+          dispatchGuardFailure = { error };
+          throw error;
+        }
       });
     } catch {
       requestSignal.dispose();
+      if (dispatchGuardFailure !== undefined) throw dispatchGuardFailure.error;
       throw new Error("Image generation request did not complete.");
     }
     try {
       if (response.redirected
-        || (response.url !== "" && response.url !== OPENAI_IMAGES_GENERATION_ENDPOINT)) {
+        || (response.url !== "" && response.url !== endpoint)) {
         await response.body?.cancel().catch(() => undefined);
         throw new Error("Image generation response was redirected.");
       }
@@ -326,10 +501,13 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       } catch {
         throw new Error("Image generation returned an invalid response.");
       }
-      const base64 = imageBase64(parsed);
-      const bytes = decodeCanonicalBase64(base64, this.#artifacts.maximumBlobBytes);
+      const encoded: { readonly base64: string; readonly mimeType?: string } = input.executionApi === "gemini-images"
+        ? geminiImageData(parsed) : { base64: imageBase64(parsed) };
+      const bytes = decodeCanonicalBase64(encoded.base64, this.#artifacts.maximumBlobBytes);
       const mimeType = sniffImageMime(bytes);
-      if (mimeType === undefined) throw new Error("Image generation returned an unsupported image format.");
+      if (mimeType === undefined || encoded.mimeType !== undefined && encoded.mimeType !== mimeType) {
+        throw new Error("Image generation returned an unsupported image format.");
+      }
       return { bytes, mimeType };
     } finally {
       requestSignal.dispose();
@@ -338,6 +516,10 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
 }
 
 class ImageProviderRejection extends Error {}
+
+class ReplayedImageEffect extends Error {
+  constructor(readonly blob: BlobRef) { super("The original image result was already saved."); }
+}
 
 function imageSubmissionFailure(operationId: string, rejected: boolean): JokoError {
   return new JokoError({
@@ -352,11 +534,12 @@ function imageSubmissionFailure(operationId: string, rejected: boolean): JokoErr
   });
 }
 
-function imageResult(blob: BlobRef, model: string): BridgeToolCallResult {
+function imageResult(blob: BlobRef, model: string, editing: boolean): BridgeToolCallResult {
+  const status = editing ? "Image edited successfully." : "Image generated successfully.";
   return {
-    content: [{ type: "text", text: "Image generated successfully." }],
+    content: [{ type: "text", text: `${status} Image reference ${blob.id}.` }],
     structuredContent: {
-      generated: true,
+      ...(editing ? { edited: true } : { generated: true }),
       model,
       mimeType: blob.mimeType,
       byteLength: blob.byteLength
@@ -364,6 +547,62 @@ function imageResult(blob: BlobRef, model: string): BridgeToolCallResult {
     isError: false,
     hostImages: [{ blob }]
   };
+}
+
+function describeImageTool(name: ImageToolName, routes: readonly ImageGenerationRoute[]): McpToolDescriptor {
+  const editing = name === IMAGE_EDIT_TOOL_NAME;
+  const multipleRoutes = routes.length > 1;
+  const exactOptions = routes.some(isGptImage2Route);
+  const geminiOptions = routes.some(isGeminiImageRoute);
+  return {
+    serverId: IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID,
+    name,
+    runtimeName: name,
+    description: editing
+      ? "Edit images from the current owner prompt or use exact image Artifact IDs from this task."
+      : "Generate an image with the configured image model. Use a clear, complete visual prompt and supported output options.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string", minLength: 1,
+          description: editing ? "A complete description of the image edits." : "A complete description of the image to generate."
+        },
+        aspect_ratio: { type: "string", enum: geminiOptions ? [...GEMINI_FLASH_ASPECT_RATIOS] : [...ASPECT_RATIOS], description: "Optional output aspect ratio supported by the selected model." },
+        ...(editing ? { image: {
+          type: "array", minItems: 1, maxItems: MAXIMUM_REFERENCE_IMAGES,
+          items: { type: "string", minLength: 1, maxLength: 512 },
+          description: "Use input:1, input:2, and so on for images attached to this prompt, or pass an exact image Artifact ID from this task."
+        } } : {}),
+        ...(exactOptions ? {
+          size: {
+            type: "string",
+            description: "GPT Image 2 exact WIDTHxHEIGHT or auto. Each edge must be divisible by 16 and at most 3840, with a ratio up to 3:1 and 655360–8294400 pixels."
+          },
+          quality: { type: "string", enum: [...EXACT_IMAGE_QUALITIES], description: "Optional GPT Image 2 quality." }
+        } : {}),
+        ...(geminiOptions ? { resolution: {
+          type: "string", enum: [...GEMINI_RESOLUTIONS],
+          description: "Optional Gemini output resolution. Only Gemini 3.1 Flash Image supports 512."
+        } } : {}),
+        ...(multipleRoutes ? {
+          model: { type: "string", enum: routes.map(route => route.modelId), description: "The configured image model to use." }
+        } : {})
+      },
+      required: ["prompt", ...(editing ? ["image"] : []), ...(multipleRoutes ? ["model"] : [])],
+      additionalProperties: false
+    },
+    requiresPermission: true,
+    ...(editing ? { requiresNativeRoot: true } : {})
+  };
+}
+
+function imageEditInputUnavailable(): Error {
+  return new Error("The original image reference is unavailable in this task.");
+}
+
+function supportedEditMime(value: string | undefined): value is Exclude<SupportedImageMime, "image/gif"> {
+  return value === "image/png" || value === "image/jpeg" || value === "image/webp";
 }
 
 function assertOnlyKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): void {
@@ -393,6 +632,73 @@ function optionalAspectRatio(value: unknown): ImageAspectRatio | undefined {
     throw new Error("Image aspect ratio is invalid.");
   }
   return value as ImageAspectRatio;
+}
+
+function isGptImage2Route(route: ImageGenerationRoute): boolean {
+  return route.owner.surface.executionApi === "openai-images" && route.modelId === "gpt-image-2";
+}
+
+function isGeminiImageRoute(route: ImageGenerationRoute): boolean {
+  return route.owner.surface.executionApi === "gemini-images"
+    && (route.modelId === GEMINI_FLASH_MODEL || route.modelId === GEMINI_PRO_MODEL);
+}
+
+function optionalGeminiAspectRatio(value: unknown, model: string): string | undefined {
+  if (value === undefined) return undefined;
+  const ratios: readonly string[] = model === GEMINI_FLASH_MODEL ? GEMINI_FLASH_ASPECT_RATIOS : GEMINI_ASPECT_RATIOS;
+  if (typeof value !== "string" || !ratios.includes(value)) throw new Error("The selected Gemini image model does not support this aspect ratio.");
+  return value;
+}
+
+function optionalGeminiResolution(value: unknown, model: string): string | undefined {
+  if (value === undefined) return undefined;
+  const resolution = typeof value === "string" ? value.trim().toUpperCase() : "";
+  if (!(GEMINI_RESOLUTIONS as readonly string[]).includes(resolution) || resolution === "512" && model !== GEMINI_FLASH_MODEL) {
+    throw new Error("The selected Gemini image model does not support this resolution.");
+  }
+  return resolution;
+}
+
+function geminiImageData(value: unknown): { readonly base64: string; readonly mimeType?: string } {
+  if (!isRecord(value)) throw new Error("Gemini image response is invalid.");
+  if (isRecord(value["promptFeedback"]) && value["promptFeedback"]["blockReason"]) throw new ImageProviderRejection();
+  const candidate = Array.isArray(value["candidates"]) ? value["candidates"][0] : undefined;
+  const content = isRecord(candidate) && isRecord(candidate["content"]) ? candidate["content"] : undefined;
+  const parts: unknown[] = content !== undefined && Array.isArray(content["parts"]) ? content["parts"] : [];
+  const image = parts.find(part => isRecord(part) && part["thought"] !== true
+    && isRecord(part["inlineData"]) && typeof part["inlineData"]["data"] === "string");
+  if (!isRecord(image) || !isRecord(image["inlineData"])) throw new Error("Gemini image response contains no image.");
+  const data = image["inlineData"];
+  if (typeof data["data"] !== "string" || typeof data["mimeType"] !== "string") throw new Error("Gemini image data is invalid.");
+  return { base64: data["data"], mimeType: data["mimeType"] };
+}
+
+function imageSize(value: unknown, aspectRatio: ImageAspectRatio | undefined): string {
+  const size = typeof value === "string" && value.length <= 100 ? value.trim().toLowerCase().replace("×", "x") : undefined;
+  if (value === undefined || size === "auto") return aspectRatio === undefined ? "auto" : sizeForAspectRatio(aspectRatio);
+  const match = /^(\d{1,6})x(\d{1,6})$/u.exec(size ?? "");
+  if (match === null) throw new Error("Image size must be auto or WIDTHxHEIGHT.");
+  const width = Number(match[1]), height = Number(match[2]);
+  const pixels = width * height;
+  if (width % 16 !== 0 || height % 16 !== 0 || Math.max(width, height) > 3840 ||
+    Math.max(width, height) > 3 * Math.min(width, height) || pixels < 655_360 || pixels > 8_294_400) {
+    throw new Error("Image size is outside GPT Image 2's supported dimensions.");
+  }
+  if (aspectRatio !== undefined) {
+    const [aspectWidth, aspectHeight] = aspectRatio.split(":").map(Number);
+    if (Math.abs(width / height - aspectWidth! / aspectHeight!) > 0.001) {
+      throw new Error("Image size and aspect ratio conflict. Use size alone for exact dimensions.");
+    }
+  }
+  return `${width}x${height}`;
+}
+
+function optionalImageQuality(value: unknown): ImageQuality | undefined {
+  if (value === undefined) return undefined;
+  const quality = typeof value === "string" ? value.trim() : undefined;
+  const supported = EXACT_IMAGE_QUALITIES.find(candidate => candidate === quality);
+  if (supported === undefined) throw new Error("Image quality must be auto, low, medium, or high.");
+  return supported;
 }
 
 function sizeForAspectRatio(value: ImageAspectRatio): string {

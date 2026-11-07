@@ -228,6 +228,7 @@ export class ArtifactStore {
     try {
       const opened = await handle.stat();
       if (!sameFileIdentity(before.info, opened)) throw new Error("Artifact changed while it was being opened.");
+      if (opened.size !== artifact.byteLength) throw new Error("Artifact content changed after it was registered.");
       const data = await handle.readFile();
       const afterHandle = await handle.stat();
       const after = await this.verifyStoragePath(artifact);
