@@ -3483,12 +3483,43 @@ export class MobileClient {
           targetId: mobileExtensionTaskTarget(preferences, model) }, { signal: current }); requireCurrent(current);
         if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin preference owner changed."); return result.preferences;
       }),
-      retryTaskWriteAccess: (expected, taskId, signal) => owned(signal, async current => {
-        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
-        if (!api) throw new Error("Plugin task permissions are unavailable.");
-        const result = await api.retryWriteAccess({ extensionId: expected.extensionId, taskId }, { signal: current }); requireCurrent(current);
-        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin permission owner changed."); return result.preferences;
-      }),
+      retryTaskWriteAccess: (expected, taskId, signal) => {
+        let priorInteractionIds: ReadonlySet<string> | undefined;
+        const interaction = (): Interaction | undefined => {
+          const prior = priorInteractionIds;
+          if (prior === undefined || signal.aborted || !isCurrent()) return;
+          const matches = pendingMobileInteractions(this.#state.owner, taskId).filter(candidate => {
+            if (prior.has(candidate.interactionId) || candidate.request.case !== "permission") return false;
+            const subject = candidate.request.value.subject?.kind;
+            return subject?.case === "customTool" && subject.value.toolId === "plugin_managed_task";
+          });
+          return matches.length === 1 ? matches[0] : undefined;
+        };
+        const settle = async (displayed: Interaction, effect: (exact: Interaction) => Promise<boolean>): Promise<boolean> => {
+          const exact = interaction();
+          if (exact === undefined || !equals(InteractionSchema, exact, displayed)) return false;
+          const settled = await effect(exact);
+          if (settled) priorInteractionIds = undefined;
+          return settled;
+        };
+        const result = owned(signal, async current => {
+          await readExactDetail(expected, current);
+          const api = this.network.extensionTaskApi?.(context.credential);
+          if (!api) throw new Error("Plugin task permissions are unavailable.");
+          priorInteractionIds = new Set(this.#state.owner?.interactions.map(item => item.interactionId));
+          try {
+            const result = await api.retryWriteAccess({ extensionId: expected.extensionId, taskId }, { signal: current });
+            requireCurrent(current);
+            if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin permission owner changed.");
+            return { preferences: result.preferences, granted: result.granted };
+          } finally {
+            priorInteractionIds = undefined;
+          }
+        });
+        return { result, interaction,
+          resolve: (displayed, submission) => settle(displayed, exact => this.#resolvePendingInteraction(exact, submission)),
+          dismiss: displayed => settle(displayed, exact => this.#dismissPendingInteraction(exact)) };
+      },
       detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current, false)),
       setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
       setSidebarVisible: (expected, visible, signal) => mutate(expected, "sidebar", visible, signal),
@@ -13811,7 +13842,10 @@ export class MobileClient {
   }
 
   async resolveInteraction(interactionId: string, submission: MobileInteractionSubmission): Promise<boolean> {
-    const interaction = this.#interactionContext(interactionId);
+    return this.#resolvePendingInteraction(this.#interactionContext(interactionId), submission);
+  }
+
+  async #resolvePendingInteraction(interaction: Interaction, submission: MobileInteractionSubmission): Promise<boolean> {
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     const credential = this.#ready();
     const resolution = createMobileInteractionResolution(interaction, submission, credential.connectionId);
@@ -13832,7 +13866,10 @@ export class MobileClient {
   }
 
   async dismissInteraction(interactionId: string): Promise<boolean> {
-    const interaction = this.#interactionContext(interactionId);
+    return this.#dismissPendingInteraction(this.#interactionContext(interactionId));
+  }
+
+  async #dismissPendingInteraction(interaction: Interaction): Promise<boolean> {
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     this.#ready();
     const concurrentUserShell = this.#userShellFlight?.sessionId === interaction.sessionId;

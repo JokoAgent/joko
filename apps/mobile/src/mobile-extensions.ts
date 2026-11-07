@@ -7,7 +7,8 @@ import {
   type ExtensionCatalogEntry,
   type ExtensionMainViewSurface,
   type ExtensionTaskPreferences,
-  type ExtensionTaskRoute
+  type ExtensionTaskRoute,
+  type Interaction
 } from "@joko/contracts";
 import type { ExtensionLibraryFileMatch } from "@joko/connection-transport";
 import type {
@@ -17,6 +18,7 @@ import type {
 } from "./mobile-extension-library";
 import type { MobileExtensionLibraryOverview } from "./mobile-extension-library";
 import type { MobileExtensionLibraryCall, MobileExtensionLibraryCallResult, MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
+import type { MobileInteractionSubmission } from "./mobile-interactions";
 
 const EXTENSION_ID = /^extension_[a-f0-9]{32}$/u;
 const SOURCE_ID = /^extension_source_[a-f0-9]{32}$/u;
@@ -36,6 +38,13 @@ export function mobileExtensionTaskTarget(preferences: ExtensionTaskPreferences,
   if (model === undefined || targetId === undefined) return targetId;
   const directoryBackend = preferences.directories.find(directory => directory.targetId === targetId)?.backendId ?? preferences.model?.backendId;
   return directoryBackend !== undefined && model.backendId !== directoryBackend ? undefined : targetId;
+}
+
+export interface MobileExtensionTaskWriteRetry {
+  readonly result: Promise<{ readonly preferences: ExtensionTaskPreferences; readonly granted: boolean }>;
+  interaction(): Interaction | undefined;
+  resolve(displayed: Interaction, submission: MobileInteractionSubmission): Promise<boolean>;
+  dismiss(displayed: Interaction): Promise<boolean>;
 }
 
 export type MobileExtensionOwner =
@@ -203,7 +212,7 @@ export interface MobileExtensionTransport {
     allowSourceReplacement: boolean, signal: AbortSignal): Promise<MobileExtensionCatalog>;
   removePackage?(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionCatalog>;
   getTaskPreferences?(expected: MobileExtension, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
-  retryTaskWriteAccess?(expected: MobileExtension, taskId: string, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
+  retryTaskWriteAccess?(expected: MobileExtension, taskId: string, signal: AbortSignal): MobileExtensionTaskWriteRetry;
   setTaskPreferences?(expected: MobileExtension, preferences: import("@joko/contracts").ExtensionTaskPreferences, model: import("@joko/contracts").ExtensionTaskRoute | undefined,
     permissionMode: import("@joko/contracts").PermissionMode, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
   readonly ownerKey: string;

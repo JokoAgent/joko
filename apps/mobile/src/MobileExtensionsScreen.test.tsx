@@ -2,7 +2,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { ExtensionTaskPreferencesSchema, PermissionMode } from "@joko/contracts";
+import { ExtensionTaskPreferencesSchema, InteractionSchema, PermissionDecisionKind, PermissionMode } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionsScreen, type MobileExtensionsScreenProps } from "./MobileExtensionsScreen";
 import { MobileExtensionPackages } from "./MobileExtensionPackages";
@@ -103,6 +103,17 @@ vi.mock("./MobileExtensionLibrary", async () => {
         React.createElement("span", {}, `Library ${extension.name}`),
         React.createElement("button", { "aria-label": "Back", onClick: onBack }, "Back"))
   };
+});
+
+vi.mock("./MobileInteractionSheet", async () => {
+  const React = await import("react");
+  return { MobileInteractionSheet: (props: React.ComponentProps<typeof import("./MobileInteractionSheet").MobileInteractionSheet>) => {
+    const interaction = props.interactions[0];
+    return !props.visible || interaction === undefined ? null : React.createElement("button", {
+      "aria-label": "Approve displayed plugin request",
+      onClick: () => { void props.onResolve(interaction, { kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE }); }
+    }, interaction.interactionId);
+  } };
 });
 
 const colors: MobileExtensionsScreenProps["colors"] = {
@@ -326,6 +337,31 @@ describe("MobileExtensionsScreen", () => {
     expect(container.textContent).toContain("✓ Accept file edits");
     await pressPreference("Save");
     expect(setTaskPreferences).toHaveBeenCalledExactlyOnceWith(mail, preferences, expect.objectContaining(other), PermissionMode.ACCEPT_EDITS, expect.any(AbortSignal));
+  });
+
+  it("presents the active plugin permission retry in the installed Extension detail", async () => {
+    const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: mail.extensionId, showPreferences: false,
+      writeRequests: [{ taskId: "plugin-task", title: "Mail review", mode: PermissionMode.AUTO }] });
+    const approval = create(InteractionSchema, { interactionId: "extension-write-new", sessionId: "plugin-task" });
+    let observed = false;
+    let finish!: (value: { preferences: typeof preferences; granted: boolean }) => void;
+    const result = new Promise<{ preferences: typeof preferences; granted: boolean }>(resolve => { finish = resolve; });
+    const resolve = vi.fn(async () => { finish({ preferences: create(ExtensionTaskPreferencesSchema, { extensionId: mail.extensionId }), granted: true }); return true; });
+    const retryTaskWriteAccess = vi.fn(() => ({ result, interaction: () => observed ? approval : undefined, resolve, dismiss: async () => false }));
+    const active = { ...transport(), getTaskPreferences: async () => preferences, retryTaskWriteAccess };
+    await render(active);
+    await press("View Mail");
+    const button = [...container.querySelectorAll("button")].find(value => value.textContent === "Retry permission · Mail review")!;
+    await act(async () => button.click());
+    expect(retryTaskWriteAccess).toHaveBeenCalledExactlyOnceWith(mail, "plugin-task", expect.any(AbortSignal));
+    expect(container.querySelector('[aria-label="Approve displayed plugin request"]')).toBeNull();
+
+    observed = true;
+    await render({ ...active });
+    await press("Approve displayed plugin request");
+    expect(resolve).toHaveBeenCalledExactlyOnceWith(approval, { kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE });
+    expect(onOpenTask).not.toHaveBeenCalled();
+    expect(container.querySelector('[aria-label="Approve displayed plugin request"]')).toBeNull();
   });
 
   it("opens a ready Resource main view in the narrow detail pane and returns without losing detail", async () => {

@@ -2661,14 +2661,58 @@ describe("mobile Extension catalog authority", () => {
     const otherModel = preferences.models[0]!.route!;
     await transport.setTaskPreferences!(extension, preferences, otherModel, PermissionMode.ASK, signal);
     expect(update.mock.calls[2]?.[0]).toMatchObject({ expectedRevision: { value: 7n }, targetId: undefined, model: otherModel, permissionMode: PermissionMode.ASK });
-    await transport.retryTaskWriteAccess!(extension, "owned-task", signal);
+    await transport.retryTaskWriteAccess!(extension, "owned-task", signal).result;
     expect(retry).toHaveBeenCalledWith({ extensionId: extension.extensionId, taskId: "owned-task" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(network.extensionTaskApi).toHaveBeenCalledWith(credential);
     app.setForeground(false);
     await expect(transport.setTaskPreferences!(extension, preferences, undefined, PermissionMode.ASK, signal)).rejects.toThrow(/owner changed/u);
-    await expect(transport.retryTaskWriteAccess!(extension, "owned-task", signal)).rejects.toThrow(/owner changed/u);
+    await expect(transport.retryTaskWriteAccess!(extension, "owned-task", signal).result).rejects.toThrow(/owner changed/u);
     expect(retry).toHaveBeenCalledTimes(1);
     expect(update).toHaveBeenCalledTimes(3);
+  });
+  it("settles only the exact permission opened by the current plugin retry without selecting its task", async () => {
+    const network = fakeNetwork(), extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    const task = create(SessionSchema, { ...runtimeSession, sessionId: "plugin-task" });
+    const approval = create(InteractionSchema, { ...permissionInteraction, interactionId: "extension-write-new", sessionId: task.sessionId,
+      request: { case: "permission", value: { risk: PermissionRisk.HIGH, title: "Allow plugin writes",
+        allowedDecisions: [PermissionDecisionKind.ALLOW_ONCE, PermissionDecisionKind.DENY_ONCE],
+        subject: { kind: { case: "customTool", value: { toolId: "plugin_managed_task", displayName: "Plugin task" } } } } } });
+    const existing = create(InteractionSchema, { ...approval, interactionId: "extension-write-old" });
+    let owner = create(SnapshotSchema, { ...offlineOwnerProjection([runtimeSession, task]), interactions: [existing] });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: extension.extensionId, permissionMode: PermissionMode.AUTO });
+    const response = create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences });
+    let finish!: () => void;
+    const retryWriteAccess = vi.fn(async () => { await new Promise<void>(resolve => { finish = resolve; }); return response; });
+    network.extensionTaskApi = () => ({ retryWriteAccess }) as ReturnType<NonNullable<MobileNetwork["extensionTaskApi"]>>;
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const selected = app.state.selectedId;
+    const controller = new AbortController();
+    const pending = app.extensionCatalogTransport()!.retryTaskWriteAccess!(extension, task.sessionId, controller.signal);
+    await vi.waitFor(() => expect(retryWriteAccess).toHaveBeenCalledOnce());
+    expect(pending.interaction()).toBeUndefined();
+    const other = create(InteractionSchema, { ...approval, interactionId: "extension-write-other", sessionId: runtimeSession.sessionId });
+    owner = create(SnapshotSchema, { ...owner, interactions: [existing, other, approval] });
+    await app.refresh();
+
+    const allow = { kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE } as const;
+    expect(pending.interaction()).toEqual(approval);
+    await expect(pending.resolve(other, allow)).resolves.toBe(false);
+    await expect(pending.dismiss(existing)).resolves.toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
+    await expect(pending.resolve(approval, allow)).resolves.toBe(true);
+    expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
+      preconditions: [{ entity: { kind: EntityKind.INTERACTION, id: approval.interactionId }, expectedRevision: { value: 44n }, expectedGeneration: 8n }],
+      payload: { case: "resolveInteraction", value: { interactionId: approval.interactionId, interactionGeneration: 8n } }
+    });
+    expect(app.state.selectedId).toBe(selected);
+    finish();
+    await expect(pending.result).resolves.toEqual({ granted: true, preferences });
+    expect(pending.interaction()).toBeUndefined();
+    await expect(pending.resolve(approval, allow)).resolves.toBe(false);
+    expect(network.submit).toHaveBeenCalledOnce();
   });
   it("lists and opens only an exact current installed descriptor", async () => {
     const network = fakeNetwork();
