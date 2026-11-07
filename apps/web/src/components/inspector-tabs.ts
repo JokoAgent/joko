@@ -10,6 +10,7 @@ export interface InspectorTabState {
 export interface InspectorTabBucket {
   readonly tabs: readonly InspectorTabState[];
   readonly activeTabId?: string;
+  readonly fileSelection?: { readonly owner: string; readonly path: string };
   readonly workbenchInitialized?: true;
   readonly workbenchOwner?: string;
   readonly workbenchTaskId?: string;
@@ -55,8 +56,10 @@ export function closeInspectorTab(bucket: InspectorTabBucket, tabId: string): In
   const index = bucket.tabs.findIndex((tab) => tab.id === tabId);
   if (index < 0) return bucket;
   const tabs = bucket.tabs.filter((tab) => tab.id !== tabId);
-  if (bucket.activeTabId !== tabId) return { ...bucket, tabs };
-  return { ...bucket, tabs, activeTabId: tabs[Math.min(index, tabs.length - 1)]?.id };
+  const retained = bucket.tabs[index]?.kind === "files" && bucket.fileSelection !== undefined
+    ? { ...bucket, fileSelection: undefined } : bucket;
+  if (bucket.activeTabId !== tabId) return { ...retained, tabs };
+  return { ...retained, tabs, activeTabId: tabs[Math.min(index, tabs.length - 1)]?.id };
 }
 
 export function reorderVisibleInspectorTabs(
@@ -107,7 +110,7 @@ export function parseInspectorTabBuckets(raw: string | null): InspectorTabBucket
   const buckets: Record<string, InspectorTabBucket> = {};
   for (const [sessionId, candidate] of Object.entries(value)) {
     if (!isSafeSessionKey(sessionId) || !isRecord(candidate) || !Array.isArray(candidate.tabs)) return {};
-    if (Object.keys(candidate).some((key) => !["tabs", "activeTabId", "workbenchInitialized", "workbenchOwner", "workbenchTaskId", "workbenchProject"].includes(key))) return {};
+    if (Object.keys(candidate).some((key) => !["tabs", "activeTabId", "fileSelection", "workbenchInitialized", "workbenchOwner", "workbenchTaskId", "workbenchProject"].includes(key))) return {};
     if (candidate.workbenchInitialized !== undefined && candidate.workbenchInitialized !== true) return {};
     if (candidate.workbenchOwner !== undefined && (typeof candidate.workbenchOwner !== "string" || candidate.workbenchOwner.length > 4_096)) return {};
     if (candidate.workbenchTaskId !== undefined && (typeof candidate.workbenchTaskId !== "string" || candidate.workbenchTaskId.length > 256)) return {};
@@ -125,7 +128,14 @@ export function parseInspectorTabBuckets(raw: string | null): InspectorTabBucket
     }
     const activeTabId = candidate.activeTabId;
     if ((tabs.length === 0 && activeTabId !== undefined) || (tabs.length > 0 && (typeof activeTabId !== "string" || !tabs.some((tab) => tab.id === activeTabId)))) return {};
+    const selection = candidate.fileSelection;
+    const fileSelection = kinds.has("files") && isRecord(selection) && Object.keys(selection).length === 2 && typeof selection.owner === "string"
+      && selection.owner.length > 0 && selection.owner.length <= 32_768 && typeof selection.path === "string"
+      && selection.path.length <= 32_768 && !/[\\\u0000]/u.test(selection.path) && !/^[A-Za-z]:\//u.test(selection.path)
+      && selection.path.split("/").every(segment => segment !== "" && segment !== "." && segment !== "..")
+      ? { owner: selection.owner, path: selection.path } : undefined;
     buckets[sessionId] = { tabs, ...(activeTabId === undefined ? {} : { activeTabId: activeTabId as string }),
+      ...(fileSelection === undefined ? {} : { fileSelection }),
       ...(candidate.workbenchInitialized === true ? { workbenchInitialized: true } : {}),
       ...(candidate.workbenchOwner === undefined ? {} : { workbenchOwner: candidate.workbenchOwner as string }),
       ...(candidate.workbenchTaskId === undefined ? {} : { workbenchTaskId: candidate.workbenchTaskId as string }),

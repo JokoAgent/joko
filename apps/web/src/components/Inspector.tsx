@@ -5,7 +5,7 @@ import { PartnerWorkbench, type PartnerWorkbenchDrafts } from "./PartnerWorkbenc
 import { readTerminalAppearance } from "../terminal-appearance.js";
 import { requestWorkspaceDocumentLeave } from "../workspace-document-lifecycle.js";
 import { InspectorTabContribution, type InspectorDock } from "./inspector-layout-context.js";
-import { inspectorSessionTabKey } from "./inspector-layout.js";
+import { inspectorLayoutOwner, inspectorSessionTabKey } from "./inspector-layout.js";
 import type { TerminalPaletteView } from "../model.js";
 import { lazy, Suspense, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@xterm/xterm/css/xterm.css";
@@ -302,6 +302,11 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
     ...(canBrowser ? ["browser" as const] : [])
   ]), [canWorkbench, canBackgroundTasks, canBrowser, canDiff, canFiles, canRewind, canSubagents, canTree, canUserShell]);
   const storedBucket = tabBuckets[session.id] ?? createInitialInspectorTabBucket();
+  const profile = controller.state.activeProfile;
+  const layoutOwner = inspectorLayoutOwner(profile);
+  const fileSelectionOwner = layoutOwner === undefined || workspace === undefined || workspace.remoteWorkspace !== undefined
+    ? undefined : JSON.stringify([layoutOwner, profile?.deviceId, session.backendId, session.generation.toString(),
+      workspace.id, workspace.targetId, workspace.serverPath]);
   const bucket = useMemo(() => projectInspectorTabBucket(storedBucket, availableKinds), [availableKinds, storedBucket]);
   const activeTabIdRef = useRef(bucket.activeTabId);
   activeTabIdRef.current = bucket.activeTabId;
@@ -1109,7 +1114,11 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
             })()} />}
           {tab.kind === "branches" && canTree && <BranchesPanel controller={controller} backend={backend} session={session} t={t} runAction={runAction} />}
           {tab.kind === "files" && canFiles && <FilesPanel controller={controller} workspace={workspace} sessionId={session.id}
-            canWrite={canWriteFiles} t={t} onSelectionQuote={onSelectionQuote} leaveRef={filesLeaveRef} ownerDocument={ownerDocument} />}
+            canWrite={canWriteFiles} t={t} onSelectionQuote={onSelectionQuote} leaveRef={filesLeaveRef} ownerDocument={ownerDocument}
+            selection={fileSelectionOwner === undefined ? undefined : {
+              path: storedBucket.fileSelection?.owner === fileSelectionOwner ? storedBucket.fileSelection.path : undefined,
+              setPath: path => setSessionBucket({ ...storedBucketRef.current, fileSelection: { owner: fileSelectionOwner, path } })
+            }} />}
           {tab.kind === "changes" && (canDiff || canRewind) && <ChangesPanel controller={controller} session={session} workspace={workspace} {...(turnReviewFocusRequest === undefined ? {} : { focusRequest: turnReviewFocusRequest })} canDiff={canDiff} canDiffImagePreview={canDiffImagePreview} canStageDiff={canStageDiff} canUnstageDiff={canUnstageDiff} canRevertDiff={canRevertDiff} canCommitDiff={canCommitDiff} canPushDiff={canPushDiff} canRewind={canRewind} gitWriteDisabledReason={gitWriteDisabledReason} t={t} runAction={runAction} />}
           {tab.kind === "background" && canBackgroundTasks && <BackgroundTasksPanel
             timeline={timeline}
@@ -1529,7 +1538,7 @@ interface FilesPanelLeaveHandle { requestClose(): Promise<boolean>; }
 type FilesPanelLeave = { readonly kind: "switch"; readonly path: string }
   | { readonly kind: "close"; readonly resolve: (allowed: boolean) => void };
 
-export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSelectionQuote, leaveRef, ownerDocument }: {
+export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSelectionQuote, leaveRef, ownerDocument, selection }: {
   readonly controller: AppController;
   readonly workspace?: WorkspaceView;
   readonly sessionId: string;
@@ -1538,9 +1547,11 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
   readonly onSelectionQuote: (sessionId: string, quote: ComposerFileSelectionQuoteDraft) => void;
   readonly leaveRef?: Ref<FilesPanelLeaveHandle>;
   readonly ownerDocument?: Document;
+  readonly selection?: { readonly path?: string; readonly setPath: (path: string) => void };
 }): JSX.Element {
   const [query, setQuery] = useState("");
-  const [selectedPath, setSelectedPath] = useState<string>();
+  const [localPath, setLocalPath] = useState<string>();
+  const selectedPath = selection === undefined ? localPath : selection.path;
   const [pendingLeave, setPendingLeave] = useState<FilesPanelLeave>();
   const pendingLeaveRef = useRef<FilesPanelLeave | undefined>(undefined);
   const savingLeaveRef = useRef<FilesPanelLeave | undefined>(undefined);
@@ -1610,7 +1621,7 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
   }, [sessionId, filePreviewOwner, settleLeave]);
 
   useEffect(() => {
-    setSelectedPath(undefined);
+    setLocalPath(undefined);
     setPreview(undefined);
     setPreviewError(undefined);
     previewRequestEpochRef.current += 1;
@@ -1636,10 +1647,11 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
   }, [rootRetry, workspace?.id, workspace?.revision]);
 
   const commitSelectedPath = useCallback((path: string): void => {
-    setSelectedPath(path);
+    if (selection === undefined) setLocalPath(path);
+    else selection.setPath(path);
     setPreview((current) => current?.path === path ? current : undefined);
     setPreviewError(undefined);
-  }, []);
+  }, [selection]);
 
   const requestSelectedPath = useCallback((path: string): void => {
     if (path === selectedPath || pendingLeaveRef.current !== undefined) return;

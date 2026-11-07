@@ -40,10 +40,14 @@ mountedIt("keeps the Review and Files inspector usable across focus, collapse, r
   await git("commit", "-m", "Baseline");
   await writeFile(join(root, "review.txt"), `${long}new\ncolor = red\n`);
   await git("add", "--", "review.txt");
+  await writeFile(join(root, "restored.txt"), "Original selected file contents");
 
   const manager = await fixture.pair("Review manager");
   const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
     backendId: PI_LIKE_PROFILE.id, targetId: fixture.targetId(), displayName: "Staged Review"
+  })));
+  const otherSessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
+    backendId: PI_LIKE_PROFILE.id, targetId: fixture.targetId(), displayName: "Other Review"
   })));
   const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Review Web" });
   if (!challenge.challenge) throw new Error("Review pairing did not return a challenge.");
@@ -103,14 +107,30 @@ mountedIt("keeps the Review and Files inspector usable across focus, collapse, r
   const closeDetails = dock.getByRole("button", { name: "Close details", exact: true });
   const openDetails = page.getByRole("button", { name: "Open details", exact: true });
   await filePanel.waitFor({ state: "visible" });
+  const fileRow = filePanel.getByRole("treeitem", { name: "restored.txt", exact: true });
+  const fileContents = filePanel.locator(".file-preview-card").getByText("Original selected file contents", { exact: true });
+  await fileRow.getByRole("button").click();
+  await fileContents.waitFor({ state: "visible" });
   await closeDetails.press("Enter");
   await dock.waitFor({ state: "hidden" });
   await openDetails.click();
-  await filePanel.waitFor({ state: "visible" });
+  await fileContents.waitFor({ state: "visible" });
   await dock.getByRole("tab", { name: "Changes", exact: true }).waitFor({ state: "visible" });
 
+  const openTask = async (id: string): Promise<void> => {
+    await page.evaluate(hash => { location.hash = hash; }, `#/tasks/${encodeURIComponent(id)}`);
+    await page.locator(`.timeline[data-timeline-session-id="${id}"]`).waitFor({ state: "visible" });
+  };
+  await openTask(otherSessionId);
+  await addTab.click();
+  await addMenu.getByRole("menuitem", { name: "Files", exact: true }).click();
+  expect(await fileRow.getAttribute("aria-selected")).toBe("false");
+  expect(await fileContents.count()).toBe(0);
+  await openTask(sessionId);
+  await fileContents.waitFor({ state: "visible" });
+
   await page.reload({ waitUntil: "domcontentloaded" });
-  await filePanel.waitFor({ state: "visible" });
+  await fileContents.waitFor({ state: "visible" });
   expect(await files.getAttribute("aria-selected")).toBe("true");
   await closeDetails.click();
   await page.setViewportSize({ width: 900, height: 760 });
