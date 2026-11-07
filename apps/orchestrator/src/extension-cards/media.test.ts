@@ -151,3 +151,19 @@ it("recovers a PNG declared as plain text only for explicit media downloads", as
   expect(await network.request(scope, request)).toMatchObject({ ok: true, body: "ordinary text" });
   expect(await network.request(scope, { ...request, as: "text" })).toMatchObject({ ok: true, body: new TextDecoder().decode(png) });
 });
+
+it("returns an empty media poll receipt with the upstream status and retry header", async () => {
+  const f = await fixture();
+  const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null, { status: 204, headers: { "retry-after": "3" } }));
+  const ingest = vi.spyOn(f.media, "ingest");
+  const network = new ExtensionNetwork({ fetch: fetchMock, media: f.media, resolveCredential: () => "", redact: value => value });
+  const task = { extensionId: "extension", authorityKey: f.authority.key, sessionId: "task", sessionCreatedAt: 1, targetId: "target", toolUseId: null };
+  const scope = { extensionId: "extension", authorityKey: f.authority.key, declaration: { hosts: ["api.example.test"] }, task,
+    readOnly: true, signal: new AbortController().signal, assertCurrent: () => {} };
+
+  await expect(network.request(scope, { url: "https://api.example.test/poll", as: "media" })).resolves.toEqual({
+    ok: true, status: 204, headers: { "retry-after": "3" }, body: ""
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(ingest).not.toHaveBeenCalled();
+});

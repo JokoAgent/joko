@@ -266,7 +266,7 @@ export class ExtensionNetwork {
           }
           if (["", "application/octet-stream", "binary/octet-stream"].includes(contentType)) {
             const probe = new TextDecoder("utf-8", { fatal: true }).decode(read.bytes.subarray(0, 65_536), { stream: read.bytes.byteLength > 65_536 });
-            if (probe && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(probe)) return { ok: true, status: response.status, headers,
+            if (!/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(probe)) return { ok: true, status: response.status, headers,
               body: scrub(new TextDecoder().decode(read.bytes.subarray(0, MAX_RESPONSE))), ...(read.bytes.byteLength > MAX_RESPONSE ? { truncated: true } : {}) };
           }
           return { ok: false, message: "The response is not a supported media type." };
