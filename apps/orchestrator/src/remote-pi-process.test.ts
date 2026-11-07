@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
-import { link, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join, posix as remotePath, win32, type PlatformPath } from "node:path";
@@ -721,6 +721,68 @@ describe("RemotePiProcessFactory", () => {
     bridge.complete(0);
     await terminal;
   });
+
+  it("stages a release-sized Linux Pi executable with its RPC startup files before opening the SSH broker", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-release-"));
+    temporaryDirectories.push(fixture);
+    const runtime = join(fixture, "runtime"), sessions = join(fixture, "sessions"), release = join(fixture, "release");
+    await Promise.all([mkdir(runtime), mkdir(sessions), mkdir(join(release, "theme"), { recursive: true })]);
+    const control = join(runtime, "control.json");
+    const executable = join(release, "pi");
+    const size = 104_974_464;
+    const header = Buffer.alloc(20);
+    header.writeUInt32BE(0x7f454c46);
+    header[4] = 2;
+    header[5] = 1;
+    header.writeUInt16LE(0x3e, 18);
+    const handle = await open(executable, "wx", 0o700);
+    try {
+      await handle.write(header, 0, header.byteLength, 0);
+      await handle.truncate(size);
+      await handle.write(Buffer.of(42), 0, 1, size - 1);
+    } finally { await handle.close(); }
+    const packageJson = JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.85.1" });
+    await Promise.all([
+      writeFile(control, JSON.stringify({ generation: 1 })),
+      writeFile(join(release, "package.json"), packageJson),
+      writeFile(join(release, "theme", "dark.json"), '{"name":"dark"}'),
+      writeFile(join(release, "theme", "light.json"), '{"name":"light"}'),
+      writeFile(join(release, "unrelated-local-file"), "private fixture")
+    ]);
+    const files = new PiMemoryRemoteFiles(request => {
+      if (!request.path.endsWith("/pi")) return;
+      expect(request).toMatchObject({ managedPiExecutable: true, atomic: true });
+      expect(request.content.byteLength).toBe(size);
+      expect(request.content[size - 1]).toBe(42);
+    });
+    await files.mkdir("/workspace", { recursive: true });
+    await files.mkdir("/home/maker", { recursive: true });
+    const reads = vi.spyOn(files, "read");
+    const bridge = new ManualRemoteProcess();
+    const lease: RemoteSshTransportLease = {
+      capabilities: { commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false },
+      files, processes: { open: async () => bridge }
+    };
+    const registry = { transports: async () => ({ host: {}, lease }) } as unknown as RemoteHostRegistry;
+    const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
+      command: executable, args: ["--mode", "rpc"], cwd: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,
+      env: { JOKO_PI_TARGET_ID: "target-a", JOKO_PI_SPAWN_IDENTITY: "a".repeat(64), JOKO_PI_REMOTE_RECOVERY_IDENTITY: "b".repeat(64),
+        JOKO_PI_GENERATION: "1", JOKO_PI_MCP_TOKEN: "bridge-token-a", JOKO_PI_CONTROL_FILE: control, PI_CODING_AGENT_SESSION_DIR: sessions }
+    });
+    const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as { command: string };
+    const remoteRelease = remotePath.dirname(bootstrap.command);
+    expect(bootstrap.command).toMatch(/\/bin\/[a-f0-9]{64}\/pi$/u);
+    expect(reads).toHaveBeenCalledWith({ path: bootstrap.command, maximumBytes: size, managedPiExecutable: true });
+    expect(files.text(`${remoteRelease}/package.json`)).toBe(packageJson);
+    expect(files.text(`${remoteRelease}/theme/dark.json`)).toBe('{"name":"dark"}');
+    expect(files.text(`${remoteRelease}/theme/light.json`)).toBe('{"name":"light"}');
+    expect((await files.list(remoteRelease)).map(entry => entry.name).sort()).toEqual(["package.json", "pi", "theme"]);
+
+    const terminal = new Promise<void>((resolveExit) => mapped.once("exit", () => resolveExit()));
+    bridge.stdout.write(testFrame(4, 1, terminalContent(0, null)));
+    bridge.complete(0);
+    await terminal;
+  }, 15_000);
 
   it.each(["bridge exit", "lost output acknowledgement", "verified child absence"] as const)("resolves %s against the original remote child", async (loss) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-reconnect-"));
