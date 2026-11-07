@@ -999,6 +999,24 @@ class RemotePiManagedDurableStore implements PiManagedDurableStore {
     };
   }
 
+  async writeRuntimeControl(input: Parameters<PiManagedDurableStore["writeRuntimeControl"]>[0]): Promise<boolean> {
+    this.#assertSession(input.sessionId);
+    const response = await this.#request({
+      operation: "write-runtime-control",
+      sessionId: input.sessionId,
+      runId: exactUuid(input.runId, "managed run identity"),
+      runnerInstanceId: exactUuid(input.runnerInstanceId, "managed runner identity"),
+      launchToken: exactUuid(input.launchToken, "managed launch token"),
+      runnerScriptSha256: exactDigest(input.runnerScriptSha256, "managed runner script hash"),
+      control: input.control
+    });
+    assertExactKeys(response, ["ok", "authorityVerified", "updated"]);
+    if (response["ok"] !== true || response["authorityVerified"] !== true || typeof response["updated"] !== "boolean") {
+      throw new Error("Remote managed Subagent runtime control response failed its schema fence.");
+    }
+    return response["updated"];
+  }
+
   async stopAndRemoveSession(input: {
     readonly sessionId: string;
     readonly sessionKey: string;

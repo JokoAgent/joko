@@ -907,8 +907,10 @@ async function remoteRunnerFixture(
   const nativeSessionId = randomUUID();
   const nativeSessionDirectory = join(runDirectory, "sessions");
   const nativeSessionPath = join(nativeSessionDirectory, `${nativeSessionId}.jsonl`);
+  const runtimeControlPath = join(runDirectory, "runtime", "control.json");
   await mkdir(runDirectory, { recursive: true, mode: 0o700 });
   await mkdir(nativeSessionDirectory, { mode: 0o700 });
+  await mkdir(join(runDirectory, "runtime"), { mode: 0o700 });
   await chmod(sessionRoot, 0o700);
   await chmod(runDirectory, 0o700);
   await writeFile(runnerScript, RUNNER_SOURCE, { mode: 0o600 });
@@ -920,6 +922,7 @@ async function remoteRunnerFixture(
     runnerScript,
     runnerScriptSha256: fixture.trustedRunnerScriptSha256,
     runnerInstanceId: runnerFence,
+    runtimeControlPath,
     ...(nativeAuthRequired ? {
       nativeAuthReservationId,
       nativeAuthServiceGeneration: productGeneration,
@@ -980,7 +983,10 @@ async function remoteRunnerFixture(
   ]);
   await Promise.all([
     writeFile(join(runDirectory, "transcript.jsonl"), '{"type":"runner-ready"}\n', { mode: 0o600 }),
-    writeFile(nativeSessionPath, '{"type":"session"}\n', { mode: 0o600 })
+    writeFile(nativeSessionPath, '{"type":"session"}\n', { mode: 0o600 }),
+    writeFile(runtimeControlPath, JSON.stringify({ generation: productGeneration, policyGeneration: 0,
+      permissionMode: "bypassPermissions", planMode: false, fastMode: false, runtimePolicy: "standard",
+      approvedRoots: [], writtenAt: new Date().toISOString() }), { mode: 0o600 })
   ]);
   await waitUntil(async () => {
     try {
@@ -1844,9 +1850,26 @@ try {
           expect(runs[0]?.[manifest]).toMatchObject({ runnerScriptSha256: fixture.trustedRunnerScriptSha256 });
           expect(runs[0]?.[manifest]).not.toHaveProperty("runnerScript");
           expect(runs[0]?.[manifest]).not.toHaveProperty("transcriptPath");
+          expect(runs[0]?.[manifest]).not.toHaveProperty("runtimeControlPath");
         }
         expect(JSON.stringify(scanned)).not.toContain(currentBearer);
         expect(JSON.stringify(scanned)).not.toContain("joko-broker-stable-bearer");
+
+        const runtimeControl = {
+          generation: 1, policyGeneration: 1, permissionMode: "ask", planMode: false,
+          fastMode: false, runtimePolicy: "standard", approvedRoots: []
+        };
+        const runtimeControlRequest = {
+          operation: "write-runtime-control", sessionId: fixture.productSessionId,
+          runId: runner.runId, runnerInstanceId: runner.runnerFence, launchToken: runner.launchToken,
+          runnerScriptSha256: fixture.trustedRunnerScriptSha256, control: runtimeControl
+        };
+        await managedStoreRejected(fixture, bridge.authority, { ...runtimeControlRequest, launchToken: randomUUID() });
+        expect(await managedStoreRequest(fixture, bridge.authority, runtimeControlRequest)).toMatchObject({ updated: true });
+        expect(await managedStoreRequest(fixture, bridge.authority, runtimeControlRequest)).toMatchObject({ updated: true });
+        await managedStoreRejected(fixture, bridge.authority, { ...runtimeControlRequest,
+          control: { ...runtimeControl, policyGeneration: 0, permissionMode: "bypassPermissions" } });
+        expect(JSON.parse(await readFile(join(runner.runDirectory, "runtime", "control.json"), "utf8"))).toMatchObject(runtimeControl);
 
         const transcriptRevision = String(runs[0]?.["transcriptRevision"]);
         const controlRevision = String(runs[0]?.["controlRevision"]);

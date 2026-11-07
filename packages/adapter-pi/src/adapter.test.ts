@@ -1208,6 +1208,7 @@ describe("PiBackendAdapter", () => {
       scan,
       readTail: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
       writeControl: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
+      writeRuntimeControl: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
       stopAndRemoveSession,
       finalizeDeletion,
       dispose: disposeStore
@@ -4257,6 +4258,7 @@ describe("PiBackendAdapter", () => {
     const durable: PiManagedDurableStore = {
       scan: async () => ({ revision: "empty", unchanged: false, retryAfterMs: 500, runs: [] }),
       readTail: async () => { throw new Error("No delegated run exists."); }, writeControl: async () => { throw new Error("No delegated run exists."); },
+      writeRuntimeControl: async () => { throw new Error("No delegated run exists."); },
       stopAndRemoveSession: async () => ({ terminalRunIds: [], removed: true, deletionReceipt: createHash("sha256").update("home rebuild lineage").digest("hex") }),
       finalizeDeletion: async () => undefined, dispose: async () => undefined
     };
@@ -7324,6 +7326,7 @@ describe("PiBackendAdapter", () => {
       scan,
       readTail: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
       writeControl: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
+      writeRuntimeControl: vi.fn(async () => { throw new Error("No remote run exists in this fixture."); }),
       stopAndRemoveSession: vi.fn(async () => ({
         terminalRunIds: [],
         removed: true as const,

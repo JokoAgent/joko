@@ -1,3 +1,5 @@
+import type { PiRuntimeControl } from "./config.js";
+
 export interface PiManagedDurableRunSnapshot {
   readonly runId: string;
   readonly runnerInstanceId: string;
@@ -67,6 +69,16 @@ export interface PiManagedDurableStore {
     readonly controlRevision: string;
     readonly receipt: string;
   }>;
+
+  /** Updates one live runner's private policy snapshot under its original owner. */
+  writeRuntimeControl(input: {
+    readonly sessionId: string;
+    readonly runId: string;
+    readonly runnerInstanceId: string;
+    readonly launchToken: string;
+    readonly runnerScriptSha256: string;
+    readonly control: PiRuntimeControl;
+  }): Promise<boolean>;
 
   stopAndRemoveSession(input: {
     readonly sessionId: string;

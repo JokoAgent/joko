@@ -3,11 +3,12 @@ import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import type { AdapterContext, BlobRef, EventPayload, InteractionPayload, TargetDescriptor } from "@joko/core";
+import type { AdapterContext, BlobRef, EventPayload, InteractionDecision, InteractionPayload, TargetDescriptor } from "@joko/core";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { describe, expect, it, vi } from "vitest";
 
 import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
+import type { PiRuntimeControl } from "./config.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
 import {
@@ -627,6 +628,67 @@ describe("managed Subagent public observation", () => {
     }
   });
 
+  it("applies the new policy to a live child while its prior confirmation is pending", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-subagent-policy-change-"));
+    const root = join(directory, "subagent-runs");
+    const sessionId = `session-${randomUUID()}`;
+    const taskId = "policy-change:scout";
+    const prior: PiRuntimeControl = { generation: 6, policyGeneration: 7, permissionMode: "bypassPermissions",
+      planMode: false, fastMode: false, approvedRoots: [], runtimePolicy: "standard", writtenAt: new Date().toISOString() };
+    const ask: PiRuntimeControl = { ...prior, policyGeneration: 8, permissionMode: "ask" };
+    const pending = (id: string, title: string, method: "confirm" | "input" = "confirm") => ({
+      id, childId: `${taskId}:child`, method, title, requestedAt: Date.now()
+    });
+    const previousApproval = "previous-write";
+    const child = await physicalRun(root, sessionId, taskId, 6, 1, [], undefined, "running",
+      { pendingApproval: pending(previousApproval, "joko:permission:write") }, prior);
+    const unrelated = await physicalRun(root, sessionId, "older-owner", 5, 1, [], undefined, "running", {}, { ...prior, generation: 5 });
+    const completed = await physicalRun(root, sessionId, "completed-child", 6, 1, [], undefined, "completed", {}, prior);
+    const pathFor = (runId: string, ...path: string[]) => join(root, managedSubagentSessionKey(sessionId), runId, ...path);
+    const storedControl = async (runId: string) => JSON.parse(await readFile(pathFor(runId, "runtime", "control.json"), "utf8"));
+    const answer = Promise.withResolvers<InteractionDecision>();
+    const requested = Promise.withResolvers<void>();
+    const interactions: InteractionPayload[] = [];
+    const base = { ...context(sessionId, 6, []), requestInteraction: async (interaction: InteractionPayload): Promise<InteractionDecision> => {
+      interactions.push(interaction);
+      if (interactions.length !== 1) return { kind: "confirmed", confirmed: false };
+      requested.resolve();
+      return answer.promise;
+    } };
+    const observer = new ManagedSubagentObserver({ root, context: base, policyGeneration: prior.policyGeneration, runtimeControl: prior });
+    const refreshing = observer.refresh();
+    try {
+      await Promise.race([requested.promise, refreshing.then(() => { throw new Error("Missing initial permission request"); })]);
+      observer.update(base, [], ask.policyGeneration, ask);
+      await observer.synchronizeRuntimeControl();
+      expect(await storedControl(child.runId)).toEqual(ask);
+      expect(await storedControl(unrelated.runId)).toMatchObject({ generation: 5, permissionMode: "bypassPermissions" });
+      expect(await storedControl(completed.runId)).toEqual(prior);
+      answer.resolve({ kind: "confirmed", confirmed: true });
+      await refreshing;
+      const approval = async () => JSON.parse(await readFile(pathFor(child.runId, "approval-control.json"), "utf8"));
+      expect(await approval()).toMatchObject({ approvalId: previousApproval, confirmed: false });
+
+      const statusPath = pathFor(child.runId, "status.json");
+      const status = JSON.parse(await readFile(statusPath, "utf8"));
+      const update = (next: ReturnType<typeof pending>) => writeFile(statusPath, JSON.stringify({ ...status,
+        heartbeatAt: Date.now(), pendingApproval: next }));
+      await update(pending("safe-read", encodePolicyDecisionRequest({ policyGeneration: 8,
+        observation: { subjectKind: "file_read", risk: "read_only", toolName: "read" } }), "input"));
+      await observer.refresh();
+      expect(JSON.parse((await approval()).value)).toEqual({ decision: "default", ownerUserInstructions: [] });
+      expect(interactions).toHaveLength(1);
+      await update(pending("new-write", "joko:permission:write"));
+      await observer.refresh();
+      expect(await approval()).toMatchObject({ approvalId: "new-write", confirmed: false });
+      expect(interactions).toHaveLength(2);
+    } finally {
+      answer.resolve({ kind: "cancelled" });
+      await observer.stopAndDrain();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("evaluates current delegated policy requests and fails an older policy generation closed", async () => {
     const root = join(await mkdtemp(join(tmpdir(), "joko-subagent-policy-")), "subagent-runs");
     const sessionId = `session-${randomUUID()}`;
@@ -1054,6 +1116,10 @@ class DurableStoreFixture implements PiManagedDurableStore {
     return { controlRevision: this.#controlRevision, receipt };
   }
 
+  async writeRuntimeControl(): Promise<boolean> {
+    throw new Error("The fixture has no delegated policy writer.");
+  }
+
   async stopAndRemoveSession(input: {
     readonly sessionId: string;
     readonly sessionKey: string;
@@ -1088,7 +1154,8 @@ async function physicalRun(
   transcript: readonly Record<string, unknown>[],
   resumeSessionPath?: string,
   state: "running" | "completed" = "completed",
-  statusPatch: Readonly<Record<string, unknown>> = {}
+  statusPatch: Readonly<Record<string, unknown>> = {},
+  control?: PiRuntimeControl
 ): Promise<{ readonly runId: string; readonly nativeSessionPath: string }> {
   const runId = randomUUID();
   const launchToken = randomUUID();
@@ -1100,6 +1167,7 @@ async function physicalRun(
   const runnerScriptSource = "fixture runner\n";
   const runnerScriptSha256 = createHash("sha256").update(runnerScriptSource).digest("hex");
   const transcriptPath = join(runDirectory, "transcript.jsonl");
+  const runtimeControlPath = join(runDirectory, "runtime", "control.json");
   const nativeSessionPath = resumeSessionPath ?? join(runDirectory, "sessions", `${nativeSessionId}.jsonl`);
   const createdAt = 1_000 * turnCount;
   await Promise.all([
@@ -1128,6 +1196,7 @@ async function physicalRun(
     nativeSessionId,
     turnCount,
     transcriptPath,
+    ...(control === undefined ? {} : { runtimeControlPath }),
     ...(resumeSessionPath === undefined ? {} : { resumeSessionPath })
   };
   const owner = {
@@ -1188,6 +1257,7 @@ async function physicalRun(
     })}\n`, { mode: 0o600 }),
     writeFile(join(runDirectory, "status.json"), `${JSON.stringify(status)}\n`, { mode: 0o600 }),
     writeFile(transcriptPath, `${transcript.map((entry) => JSON.stringify(entry)).join("\n")}\n`, { mode: 0o600 }),
+    ...(control === undefined ? [] : [writeFile(runtimeControlPath, JSON.stringify(control), { mode: 0o600 })]),
     writeFile(nativeSessionPath, "{}\n", { mode: 0o600 }),
     ...(state === "completed" ? [writeFile(join(runDirectory, "result.json"), `${JSON.stringify({
       format: 1,

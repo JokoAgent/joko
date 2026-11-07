@@ -654,11 +654,21 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     exposeSessionEnvironment: false,
     spawnHook: ({ command, cwd, env }) => ({ command, cwd, env: sanitizeEnvironment(env) }),
   });
+  const commandPolicies = new Map<string, Control>();
+  const takeCommandPolicy = (id: string): Control => {
+    const policy = commandPolicies.get(id);
+    commandPolicies.delete(id);
+    if (policy === undefined) throw new Error("Command has no current execution policy approval");
+    assertPolicyUnchanged(policy);
+    return policy;
+  };
   pi.registerTool({
     ...bashTool,
     execute: async (id, params, signal, onUpdate, ctx) => {
-      if (!hostedExecutor) await commandGateRequest(ctx, "acquire", String(id));
+      const policy = hostedExecutor ? undefined : takeCommandPolicy(String(id));
+      if (policy !== undefined) await commandGateRequest(ctx, "acquire", String(id));
       try {
+        if (policy !== undefined) assertPolicyUnchanged(policy);
         const current = hostedExecutor?.createTools(String(id), signal).bash ?? bashTool;
         return await current.execute(
           id,
@@ -668,7 +678,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
           ctx,
         );
       } finally {
-        if (!hostedExecutor) await commandGateRequest(ctx, "release", String(id)).catch(() => undefined);
+        if (policy !== undefined) await commandGateRequest(ctx, "release", String(id)).catch(() => undefined);
       }
     },
   });
@@ -681,8 +691,10 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       ...powershellTool,
       execute: async (id, params, signal, onUpdate, ctx) => {
         const timeout = bashTimeout((params as { timeout?: unknown }).timeout);
+        const policy = takeCommandPolicy(String(id));
         await commandGateRequest(ctx, "acquire", String(id));
         try {
+          assertPolicyUnchanged(policy);
           return await powershellTool.execute(id, { ...params, timeout }, signal, onUpdate, ctx);
         } finally {
           await commandGateRequest(ctx, "release", String(id)).catch(() => undefined);
@@ -861,15 +873,20 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     } catch (error) {
       return { block: true, reason: error instanceof Error ? error.message : "Joko policy changed while ordered rules were evaluated" };
     }
+    const allow = (): void => {
+      if (!hostedExecutor && (event.toolName === "bash" || event.toolName === "powershell")) {
+        commandPolicies.set(event.toolCallId, control);
+      }
+    };
     if (orderedDecision === "stale") return { block: true, reason: "Ordered policy evaluation was unavailable or stale" };
     if (orderedDecision === "deny") return { block: true, reason: "The current owner policy or delegated task authority denied this tool call" };
-    if (orderedDecision === "allow" || orderedDecision === "delegated_allow") return;
+    if (orderedDecision === "allow" || orderedDecision === "delegated_allow") return allow();
     // Full Access is the user's explicit acceptance of execution with the Pi
     // process account. Immutable reviewer and Plan Mode boundaries above still
     // dominate it, but ordinary risk classification must not silently turn
     // Full Access back into Ask.
-    if (orderedDecision !== "ask" && control.permissionMode === "bypassPermissions") return;
-    if (orderedDecision !== "ask" && control.permissionMode === "ask" && localReview.tier === "green" && risk === "safe_read") return;
+    if (orderedDecision !== "ask" && control.permissionMode === "bypassPermissions") return allow();
+    if (orderedDecision !== "ask" && control.permissionMode === "ask" && localReview.tier === "green" && risk === "safe_read") return allow();
 
     let decision: { verdict: "allow" | "block" | "ask"; reason: string; safeAlternative?: string };
     if (orderedDecision !== "ask" && control.permissionMode === "auto") {
@@ -883,7 +900,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
           if (ctx.hasUI) ctx.ui.notify(message, "warning");
         },
       });
-      if (decision.verdict === "allow") return;
+      if (decision.verdict === "allow") return allow();
       if (decision.verdict === "block") {
         const alternative = decision.safeAlternative ? " Safe alternative: " + decision.safeAlternative : "";
         return { block: true, reason: "Auto-review blocked this tool call: " + decision.reason + alternative };
@@ -903,6 +920,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       return { block: true, reason: error instanceof Error ? error.message : "Joko policy changed while permission was pending" };
     }
     if (!confirmed) return { block: true, reason: "The user declined this tool call" };
+    return allow();
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -922,6 +940,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
   });
 
   pi.on("agent_end", async (event, ctx) => {
+    commandPolicies.clear();
     const control = readControl();
     if (!control.planMode || !ctx.hasUI || event.willRetry) return;
     const plan = [...event.messages].reverse().map(messageText).find(Boolean);

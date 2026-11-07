@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { access, link, mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -12,6 +12,48 @@ import { createPiAdapter } from "./adapter.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("real Pi managed generation smoke", () => {
+  it("rechecks the approved command policy after waiting for capacity", { timeout: 45_000 }, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-real-pi-command-policy-"));
+    const home = join(directory, "home");
+    const workspace = join(directory, "workspace");
+    await Promise.all([mkdir(home), mkdir(workspace)]);
+    const toolName = process.platform === "win32" ? "powershell" : "bash";
+    const command = toolName === "powershell"
+      ? "Set-Content -LiteralPath stale-executed.txt -Value stale"
+      : "printf stale > stale-executed.txt";
+    const server = await startOpenAiCompatibleServer([{ command, toolName }]);
+    const address = server.address() as AddressInfo;
+    const gate = createCommandConcurrencyGate({ readMaximum: () => 1 });
+    const adapter = createPiAdapter({ agentHome: home, sessionRoot: home, settings: { defaultTools: [toolName] },
+      includeManagedSubagentTools: () => false, commandConcurrencyGate: gate,
+      providers: [{ id: "smoke", baseUrl: `http://127.0.0.1:${address.port}/v1`, api: "openai-completions", keyless: true,
+        models: [{ id: "smoke-model", contextWindow: 16_384, maxTokens: 1_024 }] }] });
+    const target: TargetDescriptor = { id: "command-policy-target", backendId: "pi", displayName: "Command policy fixture",
+      workspaceRoot: workspace, managed: true, trusted: false };
+    const sink = new EventSink();
+    const context = { ...smokeContext(target, 1, sink), sessionId: "command-policy-session" };
+    try {
+      await gate.acquire({ sessionId: "separate-session", commandId: "occupied" });
+      const binding = await adapter.createSession({ target, providerId: "smoke", modelId: "smoke-model",
+        fastMode: false, permissionMode: "bypassPermissions" }, context);
+      const bound = { ...context, binding };
+      await adapter.send({ text: "execute the scripted command", images: [], files: [], mentions: [], disposition: "prompt" }, bound);
+      await vi.waitFor(() => expect(gate.snapshot()).toEqual({ running: 1, queued: 1 }), { timeout: 10_000 });
+      await adapter.setPermissionMode("ask", bound);
+      gate.release("occupied", "fixture_released");
+      await sink.waitForDone(1);
+      await expect(access(join(workspace, "stale-executed.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(sink.events).toContainEqual(expect.objectContaining({ type: "tool_result", name: toolName, isError: true,
+        output: expect.stringContaining("policy changed") }));
+      expect(gate.snapshot()).toEqual({ running: 0, queued: 0 });
+    } finally {
+      gate.close();
+      await adapter.dispose().catch(() => undefined);
+      await closeServer(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(process.platform !== "win32")("isolates real PowerShell tools and enforces their command gate and timeout", { timeout: 45_000 }, async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-real-pi-powershell-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-real-pi-powershell-workspace-"));
@@ -858,7 +900,11 @@ function blob(bytes: Uint8Array, mimeType = "application/octet-stream", fileName
   };
 }
 
-async function startOpenAiCompatibleServer(powerShellCalls: readonly { readonly command: string; readonly timeout?: number }[] = []): Promise<Server> {
+async function startOpenAiCompatibleServer(shellCalls: readonly {
+  readonly command: string;
+  readonly timeout?: number;
+  readonly toolName?: "bash" | "powershell";
+}[] = []): Promise<Server> {
   let toolCallIndex = 0;
   const server = createServer((request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
@@ -867,7 +913,7 @@ async function startOpenAiCompatibleServer(powerShellCalls: readonly { readonly 
     }
     request.resume();
     request.once("end", () => {
-      const toolInput = powerShellCalls[toolCallIndex++];
+      const toolInput = shellCalls[toolCallIndex++];
       response.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache",
@@ -882,7 +928,8 @@ async function startOpenAiCompatibleServer(powerShellCalls: readonly { readonly 
           choices: [{ index: 0, delta: toolInput === undefined
             ? { role: "assistant", content: "real-pi-smoke" }
             : { role: "assistant", tool_calls: [{ index: 0, id: `shell-${toolCallIndex}`, type: "function",
-                function: { name: "powershell", arguments: JSON.stringify(toolInput) } }] }, finish_reason: null }]
+                function: { name: toolInput.toolName ?? "powershell",
+                  arguments: JSON.stringify({ command: toolInput.command, timeout: toolInput.timeout }) } }] }, finish_reason: null }]
         })}\n\n`
       );
       response.write(
