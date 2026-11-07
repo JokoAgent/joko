@@ -69,8 +69,7 @@ export function parseExtensionSettingsBridgeRequest(value: unknown): ExtensionSe
   return valid ? value as unknown as ExtensionSettingsBridgeRequest : undefined;
 }
 
-/** Ahead-of-time source; it runs before the author's first script on all engines. */
-export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
+const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
   "use strict";
   for (const key of ["localStorage", "sessionStorage", "indexedDB", "caches", "Worker", "SharedWorker", "BroadcastChannel", "WebSocket", "EventSource", "RTCPeerConnection", "webkitRTCPeerConnection"]) {
     try { Object.defineProperty(window, key, { get() { throw new Error("Ambient settings capability is unavailable."); }, configurable: false }); } catch (_) {}
@@ -121,6 +120,8 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
   addEventListener("pagehide", () => { closed = true; for (const item of pending.values()) { clearTimeout(item.timer); removeEventListener(ready, item.send); item.reject(new Error("Settings closed.")); } pending.clear(); sensitive.clear(); }, { once: true });
   Object.defineProperty(window, "joko", { value: Object.freeze({ settings: call }), writable: false, configurable: false });
   const originalFetch = window.fetch.bind(window);
+  const jsonResponse = result => new Response(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? value.toString(10) : value),
+    { headers: { "content-type": "application/json" } });
   window.fetch = async (input, init) => {
     const target = typeof input === "string" ? input : input && input.url;
     if (typeof target !== "string" || target.startsWith("//")) return originalFetch(input, init);
@@ -149,7 +150,14 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
     else if (url.pathname === "/kv") {
       if (method === "GET") { const result = await dispatch({ kind: "routing.get" }); revision = result.revision; return new Response(result.dataJson, { headers: { "content-type": "application/json" } }); }
       if (method === "PUT") { if (revision === undefined) revision = (await dispatch({ kind: "routing.get" })).revision; command = { kind: "routing.set", revision, dataJson: JSON.stringify(json()) }; }
-    } else if (url.pathname === "/secrets" && method === "GET") command = { kind: "setup.get" };
+    } else if (url.pathname === "/secrets" && method === "GET") {
+      const result = await dispatch({ kind: "setup.get" });
+      const secrets = { ...result.secrets };
+      for (const key of checkableSecrets) {
+        if (Object.hasOwn(secrets, key)) secrets[key] = { ...secrets[key], checkSupported: true };
+      }
+      return jsonResponse({ ...result, secrets });
+    }
     else if (url.pathname === "/permissions" && method === "GET") command = { kind: "setup.get" };
     else if (url.pathname === "/permissions" && method === "POST") command = { kind: "setup.complete" };
     else if (url.pathname === "/oauth" && method === "GET") command = { kind: "oauth.get" };
@@ -168,6 +176,13 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
     }
     if (!command) throw new Error("Settings endpoint is not supported.");
     const result = await dispatch(command); if (command.kind === "routing.set") revision = result.revision;
-    return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });
+    return jsonResponse(result);
   };
-})();`;
+})`;
+
+/** It runs before the author's first script, with keys from the installed settings surface. */
+export function extensionSettingsSdkSource(checkableSecrets: readonly string[]): string {
+  return `${EXTENSION_SETTINGS_SDK_FACTORY}(${JSON.stringify(checkableSecrets)});`;
+}
+
+export const EXTENSION_SETTINGS_SDK_SOURCE = extensionSettingsSdkSource([]);
