@@ -82,6 +82,20 @@ describe("Inspector Git push destinations", () => {
     expect(view.api.getWorkspaceDiff).not.toHaveBeenCalled();
   });
 
+  it("returns focus to the Review file jump button after Escape", async () => {
+    const view = await mount({ ...diff, files: [
+      { path: "changes.txt", source: "unstaged", status: "modified", binary: false, text: "", hunks: [] }
+    ] });
+    const trigger = button(view.host, "workspace.reviewJumpToFile");
+    await act(async () => { trigger.focus(); trigger.click(); });
+    const filter = view.host.querySelector<HTMLInputElement>('[aria-label="workspace.reviewFilterFiles"]')!;
+    await vi.waitFor(() => expect(document.activeElement).toBe(filter));
+    await act(async () => { filter.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    expect(filter.isConnected).toBe(false);
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it("refreshes a Review image after its download failed, even with the same Blob ID", async () => {
     const file = { path: "photo.png", source: "unstaged" as const, status: "modified" as const, binary: true, text: "", hunks: [] };
     const view = await mount({ ...diff, files: [file] }, false, true);
