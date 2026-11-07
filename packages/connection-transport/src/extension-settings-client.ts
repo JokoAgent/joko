@@ -1,13 +1,16 @@
 import { create } from "@bufbuild/protobuf";
-import type { Client } from "@connectrpc/connect";
-import { ExtensionAuthorizationPhase, OperationMutationSchema, type ExtensionOAuthFlow, type ExtensionOAuthService,
+import { Code, ConnectError, type Client } from "@connectrpc/connect";
+import { EXTENSION_SECRET_CHECK_FAILED, ExtensionAuthorizationPhase, OperationMutationSchema, type ExtensionOAuthFlow, type ExtensionOAuthService,
   type CredentialUploadTicket, type OperationMutation, type ExtensionNetworkService, type ExtensionService,
   type ExtensionSettingsCall, type ExtensionSettingsHost, type ExtensionPickedDirectoryDeposit } from "@joko/contracts";
 
-/** The host declined before dispatch or the original operation was confirmed rejected. */
+const settingsRejections = { cancelled: "The settings change was cancelled.", rejected: "The settings change was rejected.",
+  "check-failed": EXTENSION_SECRET_CHECK_FAILED } as const;
+
+/** A rejection whose outcome is already known to the host. */
 export class ExtensionSettingsRejected extends Error {
-  constructor(reason: "cancelled" | "rejected") {
-    super(reason === "cancelled" ? "The settings change was cancelled." : "The settings change was rejected.");
+  constructor(reason: keyof typeof settingsRejections) {
+    super(settingsRejections[reason]);
     this.name = "ExtensionSettingsRejected";
   }
 }
@@ -137,7 +140,15 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
       const response = await client.api.beginExtensionSecretCheck({ surfaceId: client.surface.surfaceId, secretKey: call.key }, rpc);
       current(); if (!response.ticket) throw new Error("The candidate validation channel is unavailable.");
       const ticket = await client.upload(response.ticket, call.value, signal); current();
-      const result = await client.api.checkExtensionSecret({ surfaceId: client.surface.surfaceId, secretKey: call.key, credentialUploadTicketId: ticket }, { signal, timeoutMs: 18_000 }); current();
+      const result = await client.api.checkExtensionSecret({ surfaceId: client.surface.surfaceId, secretKey: call.key, credentialUploadTicketId: ticket }, { signal, timeoutMs: 18_000 })
+        .catch((error: unknown) => {
+          current();
+          if (error instanceof ConnectError && error.code === Code.FailedPrecondition && error.rawMessage === EXTENSION_SECRET_CHECK_FAILED) {
+            throw new ExtensionSettingsRejected("check-failed");
+          }
+          throw error;
+        });
+      current();
       const expiry = result.expiresAt ? Number(result.expiresAt.seconds) * 1000 + Math.floor(result.expiresAt.nanos / 1_000_000) : undefined;
       return { valid: result.valid, ...(expiry === undefined ? {} : { expiresAt: new Date(expiry).toISOString() }) };
     }

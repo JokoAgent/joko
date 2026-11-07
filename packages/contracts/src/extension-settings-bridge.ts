@@ -1,6 +1,8 @@
 import type { ExtensionOAuthAuthorization } from "./gen/joko/v1/extension_oauth_pb.js";
 import type { ExtensionDirectoryPickerPage } from "./gen/joko/v1/extension_pb.js";
 
+export const EXTENSION_SECRET_CHECK_FAILED = "SECRET_CHECK_FAILED";
+
 export interface ExtensionSettingsDirectoryChoice {
   readonly name: string; readonly title?: string; readonly initialPage: ExtensionDirectoryPickerPage;
   browse(input: { readonly entryId?: string; readonly pageToken?: string; readonly directoryPath?: string }): Promise<ExtensionDirectoryPickerPage>;
@@ -120,8 +122,8 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
   addEventListener("pagehide", () => { closed = true; for (const item of pending.values()) { clearTimeout(item.timer); removeEventListener(ready, item.send); item.reject(new Error("Settings closed.")); } pending.clear(); sensitive.clear(); }, { once: true });
   Object.defineProperty(window, "joko", { value: Object.freeze({ settings: call }), writable: false, configurable: false });
   const originalFetch = window.fetch.bind(window);
-  const jsonResponse = result => new Response(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? value.toString(10) : value),
-    { headers: { "content-type": "application/json" } });
+  const jsonResponse = (result, status = 200) => new Response(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? value.toString(10) : value),
+    { status, headers: { "content-type": "application/json" } });
   window.fetch = async (input, init) => {
     const target = typeof input === "string" ? input : input && input.url;
     if (typeof target !== "string" || target.startsWith("//")) return originalFetch(input, init);
@@ -175,8 +177,16 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
         : { kind: "connections.set", key: connection[1], host: json().host, value: json().value, ...(json().label ? { label: json().label } : {}) };
     }
     if (!command) throw new Error("Settings endpoint is not supported.");
-    const result = await dispatch(command); if (command.kind === "routing.set") revision = result.revision;
-    return jsonResponse(result);
+    try {
+      const result = await dispatch(command);
+      if (command.kind === "routing.set") revision = result.revision;
+      return jsonResponse(result);
+    } catch (error) {
+      if (command.kind === "secret.check" && !(signal && signal.aborted) && error?.message === "${EXTENSION_SECRET_CHECK_FAILED}") {
+        return jsonResponse({ error: "${EXTENSION_SECRET_CHECK_FAILED}" }, 502);
+      }
+      throw error;
+    }
   };
 })`;
 

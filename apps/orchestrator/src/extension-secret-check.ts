@@ -1,6 +1,13 @@
 import { extensionNetworkUrl, type ExtensionNetworkDeclaration, type ExtensionNetworkSecret } from "./extension-cards/network-manifest.js";
 
 const MAXIMUM_BYTES = 64 * 1024;
+export class ExtensionSecretCheckUpstreamError extends Error {
+  constructor() {
+    super("The credential check was rejected by its upstream.");
+    this.name = "ExtensionSecretCheckUpstreamError";
+  }
+}
+
 const pathValue = (value: unknown, path: string): unknown => {
   for (const key of path.split(".")) {
     if (!value || typeof value !== "object" || Array.isArray(value) || !Object.hasOwn(value, key)) return undefined;
@@ -26,6 +33,7 @@ export async function checkExtensionSecretCandidate(input: {
     const response = await input.fetch(extensionNetworkUrl(url, input.declaration.hosts), { method: "POST", body, headers, redirect: "manual", signal });
     try {
       current();
+      if (response.status >= 400 && response.status <= 599) throw new ExtensionSecretCheckUpstreamError();
       if (!response.ok || !response.body || response.headers.has("content-length") && Number(response.headers.get("content-length")) > MAXIMUM_BYTES) throw new Error();
       const reader = response.body.getReader(); const chunks: Buffer[] = []; let size = 0;
       try {
@@ -68,5 +76,8 @@ export async function checkExtensionSecretCandidate(input: {
       }
     }
     current(); return { valid: valid === check.validValue, ...(expiresAt === undefined ? {} : { expiresAt }) };
-  } catch { throw new Error("The credential check could not be completed."); }
+  } catch (error) {
+    if (error instanceof ExtensionSecretCheckUpstreamError) { current(); throw error; }
+    throw new Error("The credential check could not be completed.");
+  }
 }

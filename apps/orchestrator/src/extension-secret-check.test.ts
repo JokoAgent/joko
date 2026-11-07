@@ -1,6 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { parseExtensionNetwork } from "./extension-cards/network-manifest.js";
-import { checkExtensionSecretCandidate } from "./extension-secret-check.js";
+import { checkExtensionSecretCandidate, ExtensionSecretCheckUpstreamError } from "./extension-secret-check.js";
 
 function declaration(bodyFormat = '{"candidate":"{value}"}') {
   return parseExtensionNetwork({ hosts: ["api.example.com"], secrets: [{ key: "token", label: "Token", inject: { header: "Authorization", format: "Bearer {value}" },
@@ -49,6 +49,16 @@ it("uses a formatted JSON object in the declared candidate check", async () => {
   expect(fetcher).toHaveBeenCalledExactlyOnceWith(new URL("https://api.example.com/check"), expect.objectContaining({
     method: "POST", redirect: "manual", body: bodyFormat.replace("{value}", () => JSON.stringify(value).slice(1, -1))
   }));
+});
+
+it("discards a definite upstream failure body before reporting a failed candidate check", async () => {
+  const network = declaration(), secret = { ...network.secrets![0]!, exchange: undefined };
+  const cancelled = vi.fn();
+  const response = new Response(new ReadableStream({ cancel: cancelled }), { status: 503 });
+  await expect(checkExtensionSecretCandidate({ declaration: network, secret, value: "fixture-candidate",
+    fetch: vi.fn(async () => response), signal: new AbortController().signal, assertCurrent: () => undefined }))
+    .rejects.toBeInstanceOf(ExtensionSecretCheckUpstreamError);
+  expect(cancelled).toHaveBeenCalledOnce();
 });
 
 it("does not let a check declaration expand its approved destinations", () => {
