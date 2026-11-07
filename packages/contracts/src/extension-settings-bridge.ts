@@ -80,7 +80,13 @@ export const EXTENSION_SETTINGS_SDK_SOURCE = String.raw`(() => {
   try { Object.defineProperty(window, "console", { value: Object.freeze({ log() {}, error() {}, warn() {}, info() {}, debug() {}, trace() {} }) }); } catch (_) {}
   const pending = new Map(), sensitive = new Set(); let sequence = 0, revision, closed = false;
   const marker = Symbol.for("joko.extension-settings-mobile.transport"), ready = "joko:extension-settings-ready";
-  const protect = value => { if (typeof value === "string" && value) { if (sensitive.size >= 64 && !sensitive.has(value)) throw new Error("Reopen settings before entering more secrets."); sensitive.add(value); } };
+  const protect = value => {
+    if (typeof value !== "string" || !value) return;
+    // The routing guard already rejects any value containing a tracked string.
+    for (const secret of sensitive) if (value.includes(secret)) return;
+    if (sensitive.size >= 64) throw new Error("Reopen settings before entering more secrets.");
+    sensitive.add(value);
+  };
   const routingContainsSecret = raw => {
     if (typeof raw !== "string" || raw.length > 65536) throw new Error("Plugin parameters are invalid.");
     const includesSecret = text => { for (const secret of sensitive) if (text.includes(secret)) return true; return false; };

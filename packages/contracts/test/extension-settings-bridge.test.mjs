@@ -106,3 +106,19 @@ test("fetch rejects an already cancelled credential write before it sends a sett
   current.respond(current.requests[0].id, { configured: true });
   assert.equal((await (await pending).json()).configured, true);
 });
+
+test("progressive password input keeps the complete candidate savable through the private bridge", { timeout: 2_000 }, async t => {
+  const current = page(), value = "A".repeat(65);
+  t.after(() => current.dispatch("pagehide", {}));
+  for (let length = 1; length <= value.length; length += 1) {
+    current.dispatch("input", { target: { type: "password", value: value.slice(0, length) } });
+  }
+  const pending = current.context.fetch("/secrets/token", { method: "PUT", body: JSON.stringify({ value }) });
+  assert.equal(current.requests.length, 1);
+  assert.equal(current.requests[0].command.kind, "secret.set");
+  assert.equal(current.requests[0].command.value, value);
+  current.respond(current.requests[0].id, { configured: true });
+  assert.equal((await (await pending).json()).configured, true);
+  await assert.rejects(current.context.joko.settings({ kind: "routing.set", revision: "0", dataJson: JSON.stringify({ parameter: value }) }), /Secrets/u);
+  assert.equal(current.requests.length, 1);
+});
