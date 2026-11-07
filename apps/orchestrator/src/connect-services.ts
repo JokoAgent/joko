@@ -17421,7 +17421,7 @@ async function dispatchMutation(
           mutation,
           payload.case,
           payload.value.sessionId,
-          { archived: false },
+          { archived: false, preserveActivityOnRestore: true },
           existing.descriptor.worktree?.state === "preserved"
             ? async () => {
                 if (dependencies.sessionWorktrees === undefined) {
@@ -23820,7 +23820,9 @@ async function updateSessionOperation(
   mutation: contract.OperationMutation,
   kind: string,
   sessionId: string,
-  patch: Partial<Pick<import("@joko/core").SessionDescriptor, "title" | "pinned" | "archived" | "deletedAt" | "permissionMode" | "planMode" | "providerId" | "modelId" | "effort" | "fastMode" | "binding">>,
+  patch: Partial<Pick<import("@joko/core").SessionDescriptor, "title" | "pinned" | "archived" | "deletedAt" | "permissionMode" | "planMode" | "providerId" | "modelId" | "effort" | "fastMode" | "binding">> & {
+    readonly preserveActivityOnRestore?: true;
+  },
   effect?: () => Promise<void>
 ): Promise<PresentedOperation> {
   const execution = await dependencies.sessionHost.mutate({
