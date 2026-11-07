@@ -1,14 +1,20 @@
 import { create } from "@bufbuild/protobuf";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import type { ProviderModel } from "@joko/core";
-import { operationBodyHash, type OperationRecord } from "@joko/store";
+import { OperationalStore, operationBodyHash, type OperationRecord } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { createConnectServices } from "./connect-services.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
+import { parseExtensionRuntime } from "./extension-surface-manifest.js";
+import { SessionHost } from "./session-host.js";
 
 const connection = {
   id: "connection-extension",
@@ -123,6 +129,59 @@ function replayingHost(
 }
 
 describe("Connect Extension catalog boundary", () => {
+  it("reads the rolling local usage window and clears only the confirmed installation history across restart and replay", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-extension-usage-"));
+    const path = join(root, "store.db");
+    const acceptedAt = Date.UTC(2026, 0, 1);
+    let now = acceptedAt;
+    let store = new OperationalStore(path, { now: () => now });
+    let host = new SessionHost(store, {} as never, []);
+    const entry = extensionEntry({ runtime: { ...parseExtensionRuntime({ html: "ui/index.html",
+      tools: [{ name: "check", description: "Check", inputSchema: { type: "object" } }] }), extensionEntry: "extensions/check.js" } });
+    const resource = { scope: "managed", kind: "package", packageIdentity: "@sample/check", versionNumber: 4n, discoveredRevision: "sha256:owner" };
+    const subject = { extensionId: entry.id, packageName: resource.packageIdentity };
+    const other = { ...subject, packageName: "@sample/another-installation" };
+    const services = () => createConnectServices(stubApplication({ store, sessionHost: host,
+      connections: new ConnectionManager(store, { now: () => now }),
+      extensionCatalog: { get: () => entry, reconcile: () => catalog(entry) }, piResources: { get: () => resource, list: () => [resource] } }));
+    const detail = async () => (await invoke<contract.GetExtensionResponse>(services().extension.getExtension, { extensionId: entry.id })).usage;
+    const clear = (operationId: string, expectedHistoryGeneration: bigint, revision = entry.revision) => invoke<contract.SubmitOperationResponse>(
+      services().operation.submitOperation, { operationId, connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, { payload: { case: "clearExtensionUsage", value: {
+          extensionId: entry.id, expectedRevision: { value: revision }, expectedHistoryGeneration
+        } } }) });
+    try {
+      store.createConnection({ id: connection.id, name: connection.name, authKeyDigest: digestAuthKey("extension-test") });
+      expect(await detail()).toEqual({ callsLast7Days: 0n, historyGeneration: 0n });
+      store.recordExtensionUsage(subject, 0n);
+      store.recordExtensionUsage(subject, 0n);
+      now += 7 * 24 * 60 * 60_000;
+      expect(await detail()).toMatchObject({ callsLast7Days: 2n, lastUsedAt: { seconds: BigInt(acceptedAt / 1000) } });
+      now++;
+      await host.dispose();
+      store.close();
+      store = new OperationalStore(path, { now: () => now });
+      host = new SessionHost(store, {} as never, []);
+      expect(await detail()).toMatchObject({ callsLast7Days: 0n, lastUsedAt: { seconds: BigInt(acceptedAt / 1000) } });
+      store.recordExtensionUsage(subject, 0n);
+      store.recordExtensionUsage(other, 0n);
+      await expect(clear("stale-extension-usage", 0n, entry.revision - 1n)).rejects.toMatchObject({ code: Code.Aborted });
+      expect(await detail()).toMatchObject({ callsLast7Days: 1n, historyGeneration: 0n });
+      expect((await clear("clear-extension-usage", 0n)).operation?.state).toBe(contract.OperationState.COMPLETED);
+      store.recordExtensionUsage(subject, 0n);
+      expect(await detail()).toEqual({ callsLast7Days: 0n, historyGeneration: 1n });
+      store.recordExtensionUsage(subject, 1n);
+      expect((await clear("clear-extension-usage", 0n)).operation?.state).toBe(contract.OperationState.COMPLETED);
+      await expect(clear("stale-extension-history", 0n)).rejects.toMatchObject({ code: Code.Aborted });
+      expect(await detail()).toMatchObject({ callsLast7Days: 1n, historyGeneration: 1n });
+      expect(store.readExtensionUsage(other)).toMatchObject({ callsLast7Days: 1n, historyGeneration: 0n });
+    } finally {
+      await host.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a native directory choice in its original operation and returns the same typed receipt after a cold service read", async () => {
     let entry = extensionEntry();
     const operations = new Map<string, OperationRecord<unknown>>();

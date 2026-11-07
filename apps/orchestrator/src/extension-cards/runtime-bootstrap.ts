@@ -2,6 +2,7 @@
 export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities) => {
   const target = window;
   const transport = target.__jokoExtensionRequest.bind(window);
+  const acceptTool = target.__jokoExtensionToolAccepted.bind(window);
   const request = payload => {
     const serialized = JSON.stringify(payload);
     if (serialized === undefined) throw new Error("Invalid extension message.");
@@ -36,10 +37,16 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
     }]))) } : {})
   }), writable: false, configurable: false });
   target.__jokoRuntime = {
-    async tool(input) {
+    async tool({ usageNonce, ...input }) {
       const handler = handlers.get(input.name); if (!handler) throw new Error("Tool handler unavailable.");
       const controller = new AbortController(); calls.set(input.callId, controller);
-      try { return await handler({ ...input, signal: controller.signal }); } finally { calls.delete(input.callId); }
+      try {
+        if (usageNonce !== undefined) {
+          if (!await acceptTool(input.callId, usageNonce)) throw new Error("Extension tool dispatch expired.");
+          controller.signal.throwIfAborted();
+        }
+        return await handler({ ...input, signal: controller.signal });
+      } finally { calls.delete(input.callId); }
     },
     event(event) {
       // Acknowledge synchronous capture; provider writes and send countdowns

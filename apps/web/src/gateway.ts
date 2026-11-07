@@ -6138,12 +6138,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       ...(sessionId === undefined ? {} : { sessionId }),
       includeProjectDisabled
     }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
     if (response.extension === undefined || response.catalogRevision?.value === undefined) {
       throw new GatewayError("Orchestrator returned an incomplete Extension detail.");
     }
     return {
       revision: response.catalogRevision.value,
-      extensions: [mapExtensionCatalogEntry(response.extension)],
+      extensions: [{
+        ...mapExtensionCatalogEntry(response.extension),
+        ...(response.usage === undefined ? {} : { usage: {
+          historyGeneration: response.usage.historyGeneration,
+          callsLast7Days: response.usage.callsLast7Days,
+          ...(response.usage.lastUsedAt === undefined ? {} : { lastUsedAt: timestampMs(response.usage.lastUsedAt) })
+        } })
+      }],
       recoveredFromCorruption: response.recoveredFromCorruption
     };
   }
@@ -6711,6 +6719,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void> {
     await this.submit({ case: "setExtensionSidebarVisible", value: { extensionId, visible, expectedRevision: { value: expectedRevision } } }, true);
+  }
+
+  async clearExtensionUsage(extensionId: string, expectedRevision: bigint, expectedHistoryGeneration: bigint): Promise<void> {
+    await this.submit({ case: "clearExtensionUsage", value: { extensionId, expectedRevision: { value: expectedRevision }, expectedHistoryGeneration } }, true);
   }
 
   async beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void> {

@@ -1296,6 +1296,9 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
           enabled && !projectScope.project ? suggestionMutation("enable", selectedDetail) : undefined
         )}
         onSidebarChange={(visible) => mutate(`extension-sidebar:${selectedDetail.id}`, selectedDetail.id, () => controller.setExtensionSidebarVisible(selectedDetail.id, visible, selectedDetail.revision))}
+        onRefreshUsage={retryDetail}
+        onClearUsage={(generation) => mutate(`extension-usage-clear:${selectedDetail.id}`, selectedDetail.id,
+          () => controller.clearExtensionUsage(selectedDetail.id, selectedDetail.revision, generation))}
         onSetup={() => setSetupOpen(true)}
         onNetworkChanged={async () => { await refreshSelected(selectedDetail.id); }}
         onUse={(command) => useCommand(selectedDetail, command)}
@@ -1466,7 +1469,7 @@ function ExtensionSuggestionContinuation({ state, busy, canAct, t, onRetry, onCa
   </section>;
 }
 
-function ExtensionDetail({ controller, extension, projectSelected, projectReady, projectEnabled, projectSupported, locale, busy, t, runAction, onEnabledChange, onSidebarChange, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
+function ExtensionDetail({ controller, extension, projectSelected, projectReady, projectEnabled, projectSupported, locale, busy, t, runAction, onEnabledChange, onSidebarChange, onRefreshUsage, onClearUsage, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
   readonly controller: AppController;
   readonly extension: ExtensionCatalogEntryView;
   readonly projectSelected: boolean;
@@ -1479,6 +1482,8 @@ function ExtensionDetail({ controller, extension, projectSelected, projectReady,
   readonly runAction: RunAction;
   readonly onEnabledChange: (enabled: boolean) => void;
   readonly onSidebarChange: (visible: boolean) => void;
+  readonly onRefreshUsage: () => void;
+  readonly onClearUsage: (generation: bigint) => void;
   readonly onSetup: () => void;
   readonly onNetworkChanged: () => Promise<void>;
   readonly onUse: (command: ExtensionCatalogEntryView["commands"][number]) => void;
@@ -1494,6 +1499,9 @@ function ExtensionDetail({ controller, extension, projectSelected, projectReady,
     <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={sourceOwned ? extensionInstallTone(extension.installState) : effectiveEnabled ? "success" : "neutral"}>{sourceOwned ? extensionInstallLabel(extension.installState, t) : effectiveEnabled === undefined ? t("common.loading") : effectiveEnabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
     {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
     <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : extension.owner.kind === "mcp" ? t("extensions.mcpOwner") : t("extensions.sourceOwner")}</dd></div></dl>
+    {extension.usage && <ExtensionUsageSection key={`${extension.id}:${extension.revision}:${extension.usage.historyGeneration}`}
+      usage={extension.usage} name={extension.name} locale={locale} busy={busy} t={t}
+      onRefresh={onRefreshUsage} onClear={onClearUsage} />}
     {extension.mainView !== undefined && <section className="extension-main-view-actions"><LayoutDashboard aria-hidden="true" /><div><strong>{extension.mainView.title ?? t("extensions.mainView.title")}</strong><p>{extensionMainViewReady(extension) ? t("extensions.mainView.readyBody") : t("extensions.mainView.notReadyBody")}</p></div><Button tone="primary" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenMainView}>{t("extensions.mainView.open")}</Button><Button tone="ghost" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenWindow}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button></section>}
     {extensionMainViewReady(extension) && <div className="extension-main-view-actions"><Button tone="ghost" disabled={busy} onClick={() => openInspectorExtension(extension.id, "sidebar", inspectorLayoutOwner(controller.state.activeProfile))}>{t("inspector.plugin.sidebar")}</Button><Button tone="ghost" disabled={busy} onClick={() => openInspectorExtension(extension.id, "reset", inspectorLayoutOwner(controller.state.activeProfile))}>{t("inspector.plugin.reset")}</Button></div>}
     {extension.library !== undefined && <ExtensionLibrarySection controller={controller} extension={extension} locale={locale} disabled={busy} t={t} />}
@@ -1515,6 +1523,42 @@ function ExtensionDetail({ controller, extension, projectSelected, projectReady,
     <ExtensionDetailSection title={t("extensions.tools")} empty={t("extensions.noTools")} items={extension.tools.map((tool) => <div className="extension-capability-row" key={tool.name}><span><strong>{tool.name}</strong><small>{tool.description}</small></span>{tool.requiresPermission && <Pill tone="warning">{t("extensions.permissionRequired")}</Pill>}</div>)} />
     <ExtensionDetailSection title={t("extensions.permissions")} empty={t("extensions.noPermissions")} items={extension.permissions.map((permission) => <div className="extension-capability-row" key={permission.id}><span><strong>{permission.label}</strong><small>{permission.description}</small></span><Pill tone={permission.granted ? "success" : permission.required ? "warning" : "neutral"}>{permission.granted ? t("extensions.granted") : permission.required ? t("extensions.required") : t("extensions.optional")}</Pill></div>)} />
   </article>;
+}
+
+function ExtensionUsageSection({ usage, name, locale, busy, t, onRefresh, onClear }: {
+  readonly usage: NonNullable<ExtensionCatalogEntryView["usage"]>;
+  readonly name: string;
+  readonly locale: string;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onRefresh: () => void;
+  readonly onClear: (generation: bigint) => void;
+}): JSX.Element {
+  const [confirm, setConfirm] = useState(false);
+  const lastUsed = usage.lastUsedAt === undefined ? undefined : new Date(usage.lastUsedAt);
+  return <section className="extension-detail__section" aria-label={t("extensions.usage.title")}>
+    <h3>{t("extensions.usage.title")}</h3>
+    <div>
+      <div className="extension-capability-row"><span><strong>{t("extensions.usage.lastUsed")}</strong></span>
+        {lastUsed === undefined ? <span>{t("extensions.usage.never")}</span>
+          : <time dateTime={lastUsed.toISOString()}>{new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(lastUsed)}</time>}
+      </div>
+      <div className="extension-capability-row"><span><strong>{t("extensions.usage.callsLast7Days")}</strong></span>
+        <span>{usage.callsLast7Days.toLocaleString(locale)}</span>
+      </div>
+      <div className="extension-capability-row">
+        <Button tone="ghost" disabled={busy} onClick={onRefresh}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button>
+        <Button tone="ghost" className="danger-text" disabled={busy} onClick={() => setConfirm(true)}><Trash2 aria-hidden="true" />{t("extensions.usage.clear")}</Button>
+      </div>
+    </div>
+    <Modal open={confirm} title={t("extensions.usage.confirmTitle", { name })} onClose={() => setConfirm(false)}>
+      <p>{t("extensions.usage.confirmBody")}</p>
+      <div className="modal__actions">
+        <Button onClick={() => setConfirm(false)}>{t("common.cancel")}</Button>
+        <Button tone="danger" disabled={busy} onClick={() => { setConfirm(false); onClear(usage.historyGeneration); }}>{t("extensions.usage.clear")}</Button>
+      </div>
+    </Modal>
+  </section>;
 }
 
 function ExtensionDetailSection({ title, empty, items }: { readonly title: string; readonly empty: string; readonly items: readonly ReactNode[] }): JSX.Element {

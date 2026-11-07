@@ -7,6 +7,7 @@ export * from "./session-runtime-handoff-store.js";
 export type { PartnerLearningTurnRecord } from "./partner-learning-shape.js";
 export * from "./partner-workbench-store.js";
 export * from "./voice-dictionary-peer-store.js";
+export { EXTENSION_USAGE_SETTINGS_PREFIX, type ExtensionUsageSubject } from "./operational-store.js";
 export {
   CONTACT_SCHEMA_BASELINE_ID,
   ContactStore,
