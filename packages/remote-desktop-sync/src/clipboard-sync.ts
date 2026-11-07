@@ -44,6 +44,11 @@ function skippableContent(error: unknown): boolean {
     (error.reason === "empty" || error.reason === "unsupported" || error.reason === "too-large");
 }
 
+function skipEmptyClipboard(error: unknown): null {
+  if (error instanceof ClipboardSyncError && error.reason === "empty") return null;
+  throw error;
+}
+
 /** Serial sync: opaque versions trigger reads; proven content changes trigger writes. */
 export class ClipboardSync {
   #pending = false;
@@ -174,19 +179,18 @@ export class ClipboardSync {
       }
       let localChanged = local !== this.baseline.local, remoteChanged = remote !== this.baseline.remote;
       if (!localChanged && !remoteChanged) return;
-      const localContent = localChanged ? await this.readLocal(local).then(content => {
-        readLocalDigest = content.digest; return content;
-      }) : undefined;
-      const remoteContent = remoteChanged ? await this.readRemote(remote).then(content => {
-        readRemoteDigest = content.digest; return content;
-      }) : undefined;
+      const localContent = localChanged ? await this.readLocal(local).catch(skipEmptyClipboard) : undefined;
+      readLocalDigest = localContent?.digest;
+      const remoteContent = remoteChanged ? await this.readRemote(remote).catch(skipEmptyClipboard) : undefined;
+      readRemoteDigest = remoteContent?.digest;
       this.check();
       if ((await this.deps.localVersion()) !== local) throw new ClipboardSyncError("changed");
+      if (remoteContent === null && (await this.remoteVersion()) !== remote) throw new ClipboardSyncError("changed");
       this.check();
-      if (localContent?.digest === this.baseline.localDigest) localChanged = false;
-      if (remoteContent?.digest === this.baseline.remoteDigest) remoteChanged = false;
-      const localDigest = localContent?.digest ?? this.baseline.localDigest;
-      const remoteDigest = remoteContent?.digest ?? this.baseline.remoteDigest;
+      if (localContent == null || localContent.digest === this.baseline.localDigest) localChanged = false;
+      if (remoteContent == null || remoteContent.digest === this.baseline.remoteDigest) remoteChanged = false;
+      const localDigest = localContent === undefined ? this.baseline.localDigest : localContent?.digest;
+      const remoteDigest = remoteContent === undefined ? this.baseline.remoteDigest : remoteContent?.digest;
       if (localDigest && localDigest === remoteDigest) { localChanged = false; remoteChanged = false; }
       if (localChanged && remoteChanged) {
         Object.assign(this.baseline, { local, remote, localDigest: undefined, remoteDigest: undefined });
@@ -205,7 +209,7 @@ export class ClipboardSync {
         this.deps.trace?.("remote-to-local-complete");
       } else {
         Object.assign(this.baseline, { local, remote, localDigest, remoteDigest });
-        this.deps.trace?.("unchanged-content");
+        this.deps.trace?.(localContent === null || remoteContent === null ? "content-skipped" : "unchanged-content");
       }
     } catch (error) {
       if (local !== undefined && remote !== undefined && skippableContent(error)) {

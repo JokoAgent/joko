@@ -127,6 +127,34 @@ describe("clipboard sync", () => {
     expect(f.remoteValue()).toBe(item("next readable copy"));
   });
 
+  it("copies the phone's new value over a confirmed empty remote clipboard in the same tick", async () => {
+    const f = fixture(); await f.sync.tick();
+    f.setLocal(item("new phone copy")); f.setRemote(item(""));
+    f.remote.copy.mockRejectedValueOnce(new ClipboardSyncError("empty"));
+
+    await f.sync.tick();
+
+    expect(f.remote.paste).toHaveBeenCalledExactlyOnceWith(item("new phone copy"), "2");
+    expect(f.remoteValue()).toBe(f.local());
+    expect(f.writeLocal).not.toHaveBeenCalled();
+    await f.sync.tick();
+    expect(f.remote.paste).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks the empty remote version again before overwriting it", async () => {
+    const f = fixture(); await f.sync.tick();
+    f.setLocal(item("new phone copy")); f.setRemote(item(""));
+    f.remote.copy.mockImplementationOnce(async () => {
+      f.setRemote(item("new host copy"));
+      throw new ClipboardSyncError("empty");
+    });
+
+    await expect(f.sync.tick()).rejects.toMatchObject({ reason: "changed" });
+    expect(f.remoteValue()).toBe(item("new host copy"));
+    expect(f.remote.paste).not.toHaveBeenCalled();
+    expect(f.writeLocal).not.toHaveBeenCalled();
+  });
+
   it("does not cache a denied permission read as a successful baseline", async () => {
     const f = fixture(); f.readLocal.mockRejectedValueOnce(new ClipboardSyncError("permission"));
     await expect(f.sync.tick()).rejects.toMatchObject({ reason: "permission" });
