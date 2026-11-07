@@ -7,12 +7,14 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { EventPayload, PiEventMetadata, PromptInput } from "@joko/core";
 import { OperationalStore, type PersistedEvent, type QueueItemRecord } from "@joko/store";
 import { extractPdfText, PdfTextExtractionError, PDF_TEXT_MAX_BYTES, PDF_TEXT_TIMEOUT_MS, type PdfTextWorkerResult } from "@joko/tool-document";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import type { ArtifactStore } from "./artifact-store.js";
 import { ArtifactStore as RealArtifactStore } from "./artifact-store.js";
+import { fromProtoBlobRef, toProtoBlobRef } from "./proto-mapper.js";
 import { buildReviewEvidence } from "./review-evidence.js";
 import { DurableReviewEvidenceProvider, ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
 import { buildReviewPrompt } from "./review-prompt.js";
@@ -396,7 +398,8 @@ describe("DurableReviewEvidenceProvider", () => {
     await artifacts.initialize();
     const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
     const bytes = Buffer.from([0xff, 0xfe, 0x41, 0, 0x42, 0, 0x0a, 0]);
-    const blob = await artifacts.ingestBytes(bytes, { fileName: "evidence.txt", mimeType: "text/plain" });
+    const stored = await artifacts.ingestBytes(bytes, { fileName: "evidence.txt", mimeType: "text/plain" });
+    const blob = fromProtoBlobRef(toProtoBlobRef(stored));
     const captured = await provider.capture(request({ kind: "file", displayName: "evidence.txt", blob }));
     expect(captured.artifacts[0]).toMatchObject({ blob: { id: blob.id, byteLength: 8, sha256: createHash("sha256").update(bytes).digest("hex") },
       excerpt: { format: "text/plain", coverage: "full file", content: "AB\n" } });
@@ -404,7 +407,9 @@ describe("DurableReviewEvidenceProvider", () => {
     expect(buildReviewPrompt(evidence.promptInput).prompt).toContain("<untrusted-artifact-content>\nAB\n");
     expect(evidence.promptInput.artifactWarnings).toBeUndefined();
 
-    const malformed = await artifacts.ingestBytes(bytes.subarray(0, -1), { fileName: "malformed.txt", mimeType: "text/plain" });
+    const malformed = fromProtoBlobRef(toProtoBlobRef(await artifacts.ingestBytes(bytes.subarray(0, -1), {
+      fileName: "malformed.txt", mimeType: "text/plain"
+    })));
     const unavailable = await provider.capture(request({ kind: "file", displayName: "malformed.txt", blob: malformed }));
     expect(unavailable.artifacts[0]?.excerpt).toBeUndefined();
     expect(unavailable.artifacts[0]?.warning).toContain("no textual Review excerpt");
@@ -415,33 +420,13 @@ describe("DurableReviewEvidenceProvider", () => {
     const artifacts = new RealArtifactStore({ rootDirectory: path.join(fixture.directory, "artifacts"),
       repository: new OperationalArtifactRepository(fixture.store), ingestRoots: [fixture.directory] });
     await artifacts.initialize();
-    const sessionId = "source";
     const blobs = [];
     for (let index = 1; index <= 21; index += 1) {
       const label = `A${index}.txt`;
-      const blob = await artifacts.ingestBytes(Buffer.from(`Deliverable ${index}\n`), { fileName: label, mimeType: "text/plain" });
+      const stored = await artifacts.ingestBytes(Buffer.from(`Deliverable ${index}\n`), { fileName: label, mimeType: "text/plain" });
+      const blob = fromProtoBlobRef(toProtoBlobRef(stored));
       blobs.push(blob);
-      const runId = `attachment-run-${index}`, attemptId = `attachment-attempt-${index}`;
-      const operationId = `attachment-send-${index}`, queueItemId = `attachment-queue-${index}`;
-      const at = index * 10;
-      const prompt = { text: "Review this deliverable", images: [], files: [{ blob }], mentions: [], disposition: "prompt" as const };
-      fixture.store.createRun({ id: runId, sessionId, source: "user", state: "queued", createdAt: at });
-      fixture.store.createAttempt({ id: attemptId, runId, ordinal: 1, generation: 1, startedAt: at });
-      fixture.store.runOperation({ id: operationId, kind: "send_input", body: { sessionId, prompt } }, (store) => {
-        store.enqueueQueueItem({ id: queueItemId, sessionId, runId, attemptId, operationId, disposition: "prompt", body: prompt });
-        return {};
-      });
-      fixture.store.claimNextQueueItem({ sessionId, backendInstanceGeneration: 0, at });
-      fixture.store.updateRunState({ runId, state: "running", activeAttemptId: attemptId, traceId: runId, startedAt: at });
-      fixture.store.updateQueueState({ queueItemId, state: "backend_accepted", traceId: queueItemId, at });
-      fixture.store.appendEvent({ id: `attachment-message-${index}`, backendId: "pi", targetId: "workspace", sessionId,
-        runId, attemptId, generation: 1, emittedAt: at + 1, traceId: operationId,
-        payload: { type: "message_complete", role: "user", blocks: [
-          { kind: "text", text: prompt.text }, { kind: "artifact", blob, label }
-        ] } });
-      fixture.store.finishAttempt(attemptId, undefined, at + 2);
-      fixture.store.updateRunState({ runId, state: "completed", traceId: runId, endedAt: at + 2 });
-      fixture.store.updateQueueState({ queueItemId, state: "completed", traceId: queueItemId, at: at + 2 });
+      recordCompletedPrompt(fixture.store, index, { text: "Review this deliverable", images: [], files: [{ blob }], mentions: [], disposition: "prompt" });
     }
 
     const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
@@ -458,6 +443,50 @@ describe("DurableReviewEvidenceProvider", () => {
       blobs[0]!.id, ...blobs.slice(2).reverse().map(({ id }) => id)
     ]);
     expect(withExplicit.artifactsOmitted).toBe(true);
+  });
+
+  it("retains a user's constraint and the final Pi reply when tool progress would exhaust the context budget", async () => {
+    const fixture = setup();
+    const artifacts = new RealArtifactStore({ rootDirectory: path.join(fixture.directory, "artifacts"),
+      repository: new OperationalArtifactRepository(fixture.store), ingestRoots: [fixture.directory] });
+    await artifacts.initialize();
+    const stored = await artifacts.ingestBytes(Buffer.from("Artifact from a tool round\n"), { fileName: "draft.txt", mimeType: "text/plain" });
+    const blob = fromProtoBlobRef(toProtoBlobRef(stored));
+    const messageEnd: PiEventMetadata = { rpcEventType: "message_end", payload: { case: "messageLifecycle", value: {
+      kind: "message_end", nativeMessageId: "", nativeEntryId: "", parentEntryId: "", role: "assistant", contentIndex: 0
+    } } };
+    const settled: PiEventMetadata = { rpcEventType: "agent_settled", payload: { case: "diagnostic", value: {
+      command: "unknown", nativeEventType: "agent_settled"
+    } } };
+    recordCompletedPrompt(fixture.store, 1, { text: "Keep the ledger append-only", images: [], files: [], mentions: [], disposition: "prompt" }, emit => {
+      for (let index = 1; index <= 13; index += 1) {
+        emit({ type: "message_complete", role: "assistant", blocks: [
+          { kind: "text", text: `Tool progress ${index}: `.padEnd(2_000, "x") },
+          { kind: "tool_call", callId: `read-${index}`, name: "read", input: "{}" },
+          ...(index === 1 ? [{ kind: "artifact" as const, blob, label: "draft.txt" }] : [])
+        ] }, messageEnd);
+      }
+      emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The ledger is ready for review" }] }, messageEnd);
+      emit({ type: "done", outcome: "completed" }, settled);
+    });
+    recordCompletedPrompt(fixture.store, 2, { text: "Also retain the older trace", images: [], files: [], mentions: [], disposition: "prompt" }, emit => {
+      emit({ type: "message_complete", role: "assistant", blocks: [
+        { kind: "text", text: "An unclassified tool round" }, { kind: "tool_call", callId: "legacy", name: "read", input: "{}" }
+      ] });
+      emit({ type: "done", outcome: "completed" });
+    });
+
+    const provider = providerFor(fixture.store, workspaceStub(fixture.root, cleanGit(), cleanDiff()), [], artifacts);
+    const capture = await provider.capture(request());
+    const built = buildReviewEvidence(capture);
+    const prompt = buildReviewPrompt(built.promptInput).prompt;
+    expect(prompt).toContain("Keep the ledger append-only");
+    expect(prompt).toContain("The ledger is ready for review");
+    expect(prompt).toContain("Artifact from a tool round");
+    expect(prompt).toContain("An unclassified tool round");
+    expect(prompt).not.toContain("Tool progress");
+    const fullHistory = { ...capture.conversation, messages: capture.conversation.messages.map(({ id, ordinal, role, text }) => ({ id, ordinal, role, text })) };
+    expect(built.freshness).toEqual(buildReviewEvidence({ ...capture, conversation: fullHistory }).freshness);
   });
 
   it("rejects per-artifact and aggregate Review byte budgets before artifact I/O", async () => {
@@ -602,6 +631,40 @@ function initWorkspaceRepository(root: string) {
   git("config", "user.name", "Review Test");
   git("config", "user.email", "review@example.test");
   return git;
+}
+
+function recordCompletedPrompt(
+  store: OperationalStore,
+  index: number,
+  prompt: PromptInput & { readonly disposition: "prompt" },
+  results?: (emit: (payload: EventPayload, pi?: PiEventMetadata) => void) => void
+): void {
+  const sessionId = "source";
+  const runId = `history-run-${index}`, attemptId = `history-attempt-${index}`;
+  const operationId = `history-send-${index}`, queueItemId = `history-queue-${index}`;
+  const at = index * 10;
+  store.createRun({ id: runId, sessionId, source: "user", state: "queued", createdAt: at });
+  store.createAttempt({ id: attemptId, runId, ordinal: 1, generation: 1, startedAt: at });
+  store.runOperation({ id: operationId, kind: "send_input", body: { sessionId, prompt } }, current => {
+    current.enqueueQueueItem({ id: queueItemId, sessionId, runId, attemptId, operationId, disposition: "prompt", body: prompt });
+    return {};
+  });
+  store.claimNextQueueItem({ sessionId, backendInstanceGeneration: 0, at });
+  store.updateRunState({ runId, state: "running", activeAttemptId: attemptId, traceId: runId, startedAt: at });
+  store.updateQueueState({ queueItemId, state: "backend_accepted", traceId: queueItemId, at });
+  const emit = (payload: EventPayload, pi?: PiEventMetadata) => {
+    store.appendEvent({ backendId: "pi", targetId: "workspace", sessionId, runId, attemptId, operationId, generation: 1,
+      emittedAt: at + 1, traceId: operationId, payload,
+      ...(pi === undefined ? {} : { pi, metadata: { namespace: "pi", fields: { rpcEventType: pi.rpcEventType } } }) });
+  };
+  emit({ type: "message_complete", role: "user", blocks: [
+    { kind: "text", text: prompt.text },
+    ...prompt.files.map(({ blob }) => ({ kind: "artifact" as const, blob, label: blob.fileName ?? "file" }))
+  ] });
+  results?.(emit);
+  store.finishAttempt(attemptId, undefined, at + 2);
+  store.updateRunState({ runId, state: "completed", traceId: runId, endedAt: at + 2 });
+  store.updateQueueState({ queueItemId, state: "completed", traceId: queueItemId, at: at + 2 });
 }
 
 function providerFor(

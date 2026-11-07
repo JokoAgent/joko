@@ -33,6 +33,8 @@ export interface ReviewSourceMessage {
   readonly ordinal: number;
   readonly role: "user" | "assistant";
   readonly text: string;
+  /** Retain the visible row in the freshness seal even when its text is redundant for Review. */
+  readonly omitFromContext?: true;
 }
 
 export interface ReviewSourceConversationSnapshot {
@@ -164,7 +166,8 @@ export function buildReviewEvidence(input: BuildReviewEvidenceInput): BuiltRevie
     : mapBranchEvidence(input.branchEvidence);
   const changeSetEvidence = input.changeSetEvidence === null ? null : mapChangeSetEvidence(input.changeSetEvidence);
 
-  const context: ReviewContextMessage[] = input.conversation.messages.map(({ role, text }) => ({ role, text: normalizeText(text) }));
+  const context: ReviewContextMessage[] = input.conversation.messages.flatMap(({ role, text, omitFromContext }) =>
+    omitFromContext === true ? [] : [{ role, text: normalizeText(text) }]);
   const labels: ReviewArtifactLabel[] = artifacts.map(({ source, alias }) => ({ kind: source.kind, alias }));
   const artifactExcerpts: ReviewArtifactExcerpt[] = artifacts.flatMap(({ source, alias }) => source.excerpt === undefined ? [] : [{ alias, ...source.excerpt }]);
   const artifactWarnings: ReviewEvidenceWarning[] = artifacts.flatMap(({ source, alias }) => source.warning === undefined ? [] : [{ alias, message: source.warning }]);
