@@ -1886,7 +1886,8 @@ describe('automatic entry after device approval', () => {
       },
       claimDeviceAuthorization: request => {
         claim(request.requestId);
-        return { authorization: { invitationId: invitation.invitationId, requestId: request.requestId, connection, state: DeviceAuthorizationState.CLAIMED } };
+        return { authorization: { invitationId: invitation.invitationId, requestId: request.requestId,
+          connection: { ...connection, displayName: 'Phone' }, state: DeviceAuthorizationState.CLAIMED } };
       }
     }));
     network.deviceAuthorizationTransport = () => transport;
