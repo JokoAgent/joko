@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { readdir } from "node:fs/promises";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 
-import { create } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   AddSkillMarketSourceMutationSchema,
   ApplySkillDraftMutationSchema,
+  BackendSettingsPatchSchema,
   OperationMutationSchema,
   OperationState,
   SkillLearningSourceKind,
@@ -17,7 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
 import { createSessionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
-import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
+import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture, startLocalProvider, type CapturedProviderRequest } from "./real-pi-fixture.js";
 import { writeSkillMarketSource } from "./skill-market-system-fixture.js";
 
 const skillDocument = (body: string): string => [
@@ -268,6 +270,55 @@ describe("production Skill learning", () => {
     expect((await paired.clients.skill.discardSkillLearning({
       operationId: randomUUID(), runId: sessionReview.runId, expectedRunRevision: sessionReview.revision
     })).run?.state).toBe(SkillLearningState.DISCARDED);
+  });
+
+  it("uses the source task's exact Provider for distillation while that route is enabled", { timeout: 90_000 }, async () => {
+    const sourceRequests: CapturedProviderRequest[] = [];
+    const alternate = await startLocalProvider(sourceRequests, undefined, undefined, [], () => ({ kind: "text", text: proposal("# Source route") }));
+    try {
+      fixture = await RealPiSystemFixture.start({ providerResponder: () => ({ kind: "text", text: proposal("# Default route") }) });
+      const backendId = "pi", targetId = "workspace-real-pi";
+      const sourceProvider = "joko-e2e-source-route";
+      const sourceModel = { providerId: sourceProvider, modelId: REAL_PI_MODEL_ID };
+      await fixture.application.providers!.upsert({
+        backendId, credentialOrigin: "", provider: { id: sourceProvider, api: "openai-completions", keyless: true,
+          baseUrl: `http://127.0.0.1:${(alternate.address() as AddressInfo).port}/v1`,
+          models: [{ id: REAL_PI_MODEL_ID, reasoning: true, contextWindow: 16_384, maxTokens: 1_024 }] },
+        displayName: "Alternate local route", kind: "local_keyless", credentialBindings: {}, enabled: true,
+        supportsLogin: false, supportsLogout: false, supportsRefresh: false
+      });
+      await fixture.application.refreshPiGeneration!();
+      const { clients, connectionId } = await fixture.pair("Task learning route owner");
+      const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+      const patchBackend = (patch: MessageInitShape<typeof BackendSettingsPatchSchema>) =>
+        mutate(create(OperationMutationSchema, { payload: { case: "updateBackendSettings", value: { patch } } }));
+      expect((await patchBackend({ backendId, defaultModel: { model: { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID } } })).state)
+        .toBe(OperationState.SUCCEEDED);
+      const sourceSessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId, ...sourceModel, effortId: "high" })));
+      const learn = async () => {
+        const { run } = await clients.skill.startSkillLearning({ requestId: randomUUID(), targetId, sourceSessionId, instruction: "Distill the source task." });
+        expect(run?.state).toBe(SkillLearningState.DISTILLING);
+        const review = await waitFor(() => clients.skill.getSkillLearningRun({ runId: run!.runId }),
+          value => value.run?.state === SkillLearningState.AWAITING_REVIEW, "the distillation proposal", 30_000);
+        return { session: fixture!.application.store.getSession(run!.distillationSessionId!).descriptor, proposal: review.run?.proposal };
+      };
+
+      const inherited = await learn();
+      expect(inherited.session).toMatchObject({ ...sourceModel, effort: "high", permissionMode: "ask" });
+      expect(inherited.proposal?.files[0]?.content).toContain("# Source route");
+      expect(sourceRequests).toHaveLength(1);
+      expect(fixture.providerRequests).toHaveLength(0);
+
+      expect((await patchBackend({ backendId, modelAccessUpdate: { ...sourceModel, enabled: false } })).state).toBe(OperationState.SUCCEEDED);
+      const fallback = await learn();
+      expect(fallback.session).toMatchObject({ providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID });
+      expect(fallback.proposal?.files[0]?.content).toContain("# Default route");
+      expect(sourceRequests).toHaveLength(1);
+      expect(fixture.providerRequests).toHaveLength(1);
+    } finally {
+      alternate.closeAllConnections();
+      await new Promise<void>(resolve => alternate.close(() => resolve()));
+    }
   });
 
   it("commits cancellation before aborting in-flight distillation", { timeout: 120_000 }, async () => {
