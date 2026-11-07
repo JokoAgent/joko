@@ -8633,7 +8633,7 @@ function snapshotFileRevision(item: SnapshotFile): contract.FileRevision {
   return create(contract.FileRevisionSchema, {
     sha256Hex: item.sha256,
     byteSize: BigInt(item.byteLength),
-    modifiedAt: toProtoTimestamp(item.modifiedAt),
+    modifiedAt: toProtoTimestamp(Math.trunc(item.modifiedAt)),
     opaqueRevision: `${item.sha256}:${item.byteLength}:${item.modifiedAt}`
   });
 }
