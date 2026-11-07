@@ -2211,6 +2211,7 @@ async function inspectManagedRun(session, sessionId, runId, taskId) {
     controlRevision,
     runDirectory,
     configPath,
+    runtimeControlPath: config.runtimeControlPath,
     statusRecord: status,
     transcriptSnapshot,
     resultSnapshot,
@@ -2222,6 +2223,7 @@ function publicManagedSnapshot(snapshot) {
   const {
     runDirectory,
     configPath,
+    runtimeControlPath,
     statusRecord,
     transcriptSnapshot,
     resultSnapshot,
@@ -2551,6 +2553,54 @@ async function writeManagedControl(session, value) {
     receipt
   });
 }
+function managedRuntimePolicy(value, generation) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.generation !== generation
+    || !Number.isSafeInteger(value.policyGeneration) || value.policyGeneration < 0
+    || !["ask", "auto", "bypassPermissions"].includes(value.permissionMode)
+    || typeof value.planMode !== "boolean" || typeof value.fastMode !== "boolean"
+    || value.runtimePolicy !== "standard" || !Array.isArray(value.approvedRoots)) fail();
+  const approvedRoots = value.approvedRoots.map((root) => {
+    const path = boundedText(root?.path, 4096);
+    if (!isAbsolute(path) || !sameNativePath(resolve(path), path)
+      || !["read_only", "read_write"].includes(root.access)) fail();
+    return { path, access: root.access };
+  });
+  return {
+    generation, policyGeneration: value.policyGeneration, permissionMode: value.permissionMode,
+    planMode: value.planMode, fastMode: value.fastMode, runtimePolicy: value.runtimePolicy, approvedRoots
+  };
+}
+async function writeManagedRuntimeControl(session, value) {
+  if (session.managedRemoval !== undefined) fail();
+  const control = managedRuntimePolicy(value.control, session.authority.runtimeGeneration);
+  const currentRun = async () => {
+    const run = await inspectManagedRun(session, value.sessionId, value.runId);
+    if (value.runnerInstanceId !== run.runnerInstanceId || value.launchToken !== run.launchToken
+      || value.runnerScriptSha256 !== run.runnerScriptSha256) fail();
+    return run;
+  };
+  const run = await currentRun();
+  if (run.terminal || run.config.productGeneration !== session.childGeneration) return { ok: true, updated: false };
+  const path = join(run.runDirectory, "runtime", "control.json");
+  if (run.runtimeControlPath !== path) fail();
+  await privateDirectory(dirname(path));
+  const previous = await privateRegularFile(path, 512 * 1024);
+  const current = managedRuntimePolicy(parsedPrivateRecord(previous), session.childGeneration);
+  const next = { ...control, generation: session.childGeneration };
+  if (current.policyGeneration > next.policyGeneration) fail();
+  if (current.policyGeneration === next.policyGeneration) {
+    if (JSON.stringify(current) !== JSON.stringify(next)) fail();
+    return { ok: true, updated: true };
+  }
+  const confirmed = await currentRun();
+  if (confirmed.terminal) return { ok: true, updated: false };
+  if (confirmed.runtimeControlPath !== path || confirmed.config.productGeneration !== session.childGeneration
+    || !previous.equals(await privateRegularFile(path, 512 * 1024))) fail();
+  await atomicJson(path, { ...next, writtenAt: new Date().toISOString() });
+  const written = managedRuntimePolicy(parsedPrivateRecord(await privateRegularFile(path, 512 * 1024)), session.childGeneration);
+  if (JSON.stringify(written) !== JSON.stringify(next)) fail();
+  return { ok: true, updated: true };
+}
 async function completeManagedRemoval(session, layout, terminalRunIds) {
   session.managedScanSnapshots.clear();
   if (session.managedRemoval !== undefined) {
@@ -2750,6 +2800,7 @@ async function managedStoreOperation(session, value) {
   if (value.operation === "scan") return scanManagedRuns(session, value);
   if (value.operation === "read-tail") return readManagedTail(session, value);
   if (value.operation === "write-control") return writeManagedControl(session, value);
+  if (value.operation === "write-runtime-control") return writeManagedRuntimeControl(session, value);
   if (value.operation === "stop-remove-session") return stopAndRemoveManagedSession(session, value);
   if (value.operation === "finalize-deletion") return finalizeManagedDeletion(session, value);
   fail();
@@ -4071,6 +4122,8 @@ async function runSessionOwner(root, request, ownerIdentity) {
           const recovery = normalizeRecovery(value.authority);
           const verification = verifyRecovery(session, recovery);
           if (!verification.valid && !verifyManagedRemovalRecovery(session, recovery)) fail();
+          if (value.operation === "write-runtime-control"
+            && (!verification.valid || recovery.runtimeGeneration !== session.authority.runtimeGeneration)) fail();
           const result = await managedStoreOperation(session, value);
           return {
             ...result,

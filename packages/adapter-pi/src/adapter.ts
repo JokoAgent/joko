@@ -1968,7 +1968,7 @@ export class PiBackendAdapter implements
         await existing.stopAndDrain();
         this.#subagentObservers.delete(context.sessionId);
       } else {
-        existing.update(context, [], 0);
+        existing.update(context, []);
         existing.start();
         this.#unresolvedRemoteSubagentOwners.delete(context.sessionId);
         return;
@@ -2078,8 +2078,7 @@ export class PiBackendAdapter implements
             { stateMayHaveChanged: true }
           );
         }
-        await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
         const projected = modelFromRpc(responseData(response) as PiRpcModel, levels, supportsFastMode);
         const profile = this.#spawnProfiles.get(context.sessionId);
@@ -2176,8 +2175,7 @@ export class PiBackendAdapter implements
           { signal: context.signal, stateMayHaveChanged: true }
         );
         accepted = true;
-        await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        await this.#advanceRuntimePolicy(runtime);
         const profile = this.#spawnProfiles.get(context.sessionId);
         if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, effort: level });
       } catch (error) {
@@ -2222,9 +2220,7 @@ export class PiBackendAdapter implements
       fastMode: enabled,
       writtenAt: new Date().toISOString()
     };
-    await writeRuntimeControl(runtime.controlPath, runtimeControlForWrite(nextControl));
-    runtime.control = nextControl;
-    this.#syncManagedSubagentObserver(runtime);
+    await this.#applyRuntimeControl(runtime, nextControl);
     const profile = this.#spawnProfiles.get(context.sessionId);
     if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, initialFastMode: enabled });
   }
@@ -2243,17 +2239,7 @@ export class PiBackendAdapter implements
         permissionMode: mode,
         writtenAt: new Date().toISOString()
       };
-      await writeRuntimeControl(runtime.controlPath, {
-        generation: runtime.transport.generation,
-        policyGeneration: nextControl.policyGeneration,
-        permissionMode: mode,
-        planMode: nextControl.planMode,
-        fastMode: nextControl.fastMode,
-        approvedRoots: nextControl.approvedRoots,
-        runtimePolicy: nextControl.runtimePolicy
-      });
-      runtime.control = nextControl;
-      this.#syncManagedSubagentObserver(runtime);
+      await this.#applyRuntimeControl(runtime, nextControl);
       const profile = this.#spawnProfiles.get(context.sessionId);
       if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, initialPermissionMode: mode });
     });
@@ -2273,17 +2259,7 @@ export class PiBackendAdapter implements
         planMode: enabled,
         writtenAt: new Date().toISOString()
       };
-      await writeRuntimeControl(runtime.controlPath, {
-        generation: runtime.transport.generation,
-        policyGeneration: nextControl.policyGeneration,
-        permissionMode: nextControl.permissionMode,
-        planMode: enabled,
-        fastMode: nextControl.fastMode,
-        approvedRoots: nextControl.approvedRoots,
-        runtimePolicy: nextControl.runtimePolicy
-      });
-      runtime.control = nextControl;
-      this.#syncManagedSubagentObserver(runtime);
+      await this.#applyRuntimeControl(runtime, nextControl);
       const profile = this.#spawnProfiles.get(context.sessionId);
       if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, initialPlanMode: enabled });
       return true;
@@ -2312,7 +2288,7 @@ export class PiBackendAdapter implements
         writtenAt: new Date().toISOString()
       };
       try {
-        await writeRuntimeControl(runtime.controlPath, runtimeControlForWrite(nextControl));
+        await this.#applyRuntimeControl(runtime, nextControl, context);
       } catch (error) {
         return this.#failClosedUnconfirmedSessionMutation(
           runtime,
@@ -2321,10 +2297,6 @@ export class PiBackendAdapter implements
           error
         );
       }
-      runtime.control = nextControl;
-      runtime.context = context;
-      if (runtime.lifecycle === undefined) runtime.translator.setContext(context);
-      this.#syncManagedSubagentObserver(runtime);
     });
     runtime.sessionMutationTail = run.then(() => undefined, () => undefined);
     await run;
@@ -2349,17 +2321,7 @@ export class PiBackendAdapter implements
         writtenAt: new Date().toISOString()
       };
       context.assertExtraDirectoriesCurrent?.(directories);
-      await writeRuntimeControl(runtime.controlPath, {
-        generation: runtime.transport.generation,
-        policyGeneration: nextControl.policyGeneration,
-        permissionMode: nextControl.permissionMode,
-        planMode: nextControl.planMode,
-        fastMode: nextControl.fastMode,
-        approvedRoots,
-        runtimePolicy: nextControl.runtimePolicy
-      });
-      runtime.control = nextControl;
-      this.#syncManagedSubagentObserver(runtime);
+      await this.#applyRuntimeControl(runtime, nextControl);
     });
   }
 
@@ -4136,8 +4098,7 @@ export class PiBackendAdapter implements
           await this.#setFastModeWithinMutation(false, context, runtime);
           policyAdvanced = true;
         }
-        if (!policyAdvanced) await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        if (!policyAdvanced) await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
         const projected = modelFromRpc(rpcModel, levels, supportsFastMode);
         const responseEffort = typeof data.thinkingLevel === "string"
@@ -4201,8 +4162,7 @@ export class PiBackendAdapter implements
             { stateMayHaveChanged: true }
           );
         }
-        await advanceRuntimePolicy(runtime);
-        this.#syncManagedSubagentObserver(runtime);
+        await this.#advanceRuntimePolicy(runtime);
         const profile = this.#spawnProfiles.get(context.sessionId);
         if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, effort: level });
         return level;
@@ -5883,8 +5843,34 @@ export class PiBackendAdapter implements
     this.#subagentObservers.get(runtime.key)?.update(
       runtime.context,
       runtime.redactValues,
-      runtime.control.policyGeneration
+      runtime.control.policyGeneration,
+      runtime.control
     );
+  }
+
+  async #advanceRuntimePolicy(runtime: PiRuntime): Promise<void> {
+    const current = await readControl(runtime.controlPath, runtime.transport.generation);
+    await this.#applyRuntimeControl(runtime, { ...current, policyGeneration: current.policyGeneration + 1 });
+  }
+
+  async #applyRuntimeControl(runtime: PiRuntime, control: PiRuntimeControl, context?: AdapterContext): Promise<void> {
+    await writeRuntimeControl(runtime.controlPath, runtimeControlForWrite(control));
+    runtime.control = await readControl(runtime.controlPath, runtime.transport.generation);
+    if (context !== undefined) {
+      runtime.context = context;
+      if (runtime.lifecycle === undefined) runtime.translator.setContext(context);
+    }
+    this.#syncManagedSubagentObserver(runtime);
+    try {
+      await this.#subagentObservers.get(runtime.key)?.synchronizeRuntimeControl();
+    } catch (cause) {
+      throw piError("PI_SUBAGENT_POLICY_SYNC_UNCONFIRMED", "Pi could not confirm the new policy for active delegated tasks", "dispatch", {
+        stateMayHaveChanged: true,
+        retryable: true,
+        recovery: "Retry the policy change or stop the affected delegated tasks.",
+        cause
+      });
+    }
   }
 
   async #remoteManagedDurableStore(
@@ -5927,7 +5913,7 @@ export class PiBackendAdapter implements
     if (!runtime.managedSubagentToolsEnabled) return;
     const existing = this.#subagentObservers.get(runtime.key);
     if (existing !== undefined && existing.generation === runtime.transport.generation) {
-      existing.update(runtime.context, runtime.redactValues, runtime.control.policyGeneration);
+      existing.update(runtime.context, runtime.redactValues, runtime.control.policyGeneration, runtime.control);
       existing.start();
       return;
     }
@@ -5941,6 +5927,7 @@ export class PiBackendAdapter implements
       }),
       context: runtime.context,
       policyGeneration: runtime.control.policyGeneration,
+      runtimeControl: runtime.control,
       redactValues: runtime.redactValues,
       commandConcurrencyGate: runtime.generationLease.generation.options.commandConcurrencyGate
     });
@@ -5963,7 +5950,7 @@ export class PiBackendAdapter implements
           stateMayHaveChanged: true
         });
       }
-      existing.update(context, [], 0);
+      existing.update(context, []);
       existing.start();
       return;
     }
@@ -7646,25 +7633,6 @@ async function readControl(path: string, expectedGeneration: number): Promise<Pi
       recovery: "Restore the generation-scoped managed control file before using this runtime."
     });
   }
-}
-
-async function advanceRuntimePolicy(runtime: PiRuntime): Promise<void> {
-  const current = await readControl(runtime.controlPath, runtime.transport.generation);
-  const next: PiRuntimeControl = {
-    ...current,
-    policyGeneration: current.policyGeneration + 1,
-    writtenAt: new Date().toISOString()
-  };
-  await writeRuntimeControl(runtime.controlPath, {
-    generation: next.generation,
-    policyGeneration: next.policyGeneration,
-    permissionMode: next.permissionMode,
-    planMode: next.planMode,
-    fastMode: next.fastMode,
-    approvedRoots: next.approvedRoots,
-    runtimePolicy: next.runtimePolicy
-  });
-  runtime.control = next;
 }
 
 function runtimeControlForWrite(control: PiRuntimeControl): Omit<PiRuntimeControl, "writtenAt"> {

@@ -19,10 +19,12 @@ import { evaluateOrderedPolicyRules, policyObservationForToolCall, workspaceSubt
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 
 import { COMMAND_GATE_REQUEST_PREFIX, handleCommandGateExtensionRequest, readCommandGateExtensionRequest } from "./command-gate-bridge.js";
+import type { PiRuntimeControl } from "./config.js";
 import {
   handlePolicyDecisionExtensionRequest,
   MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS,
   MAXIMUM_POLICY_DECISION_TITLE_BYTES,
+  parsePolicyDecisionRequest,
   POLICY_DECISION_REQUEST_PREFIX,
   type PolicyDecisionRequest,
   type PolicyDecisionResult
@@ -116,6 +118,7 @@ interface PendingApproval {
 
 interface CommandGateApproval {
   readonly interactionId: string;
+  readonly policyGeneration: number;
   readonly cancellation: AbortController;
   readonly signal: AbortSignal;
   delivery?: ApprovalDelivery;
@@ -129,6 +132,7 @@ export interface ManagedSubagentObserverOptions {
   readonly durableStore?: PiManagedDurableStore;
   readonly context: AdapterContext;
   readonly policyGeneration?: number;
+  readonly runtimeControl?: PiRuntimeControl;
   readonly redactValues?: readonly string[];
   readonly intervalMs?: number;
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
@@ -145,6 +149,9 @@ export class ManagedSubagentObserver {
   readonly #durableStore: PiManagedDurableStore | undefined;
   #context: AdapterContext;
   #policyGeneration: number;
+  #runtimeControl: PiRuntimeControl | undefined;
+  #runtimeControlTail: Promise<void> = Promise.resolve();
+  readonly #runtimeControlRuns = new Map<string, boolean>();
   #redactValues: readonly string[];
   readonly #intervalMs: number;
   readonly #commandConcurrencyGate: CommandConcurrencyGate | undefined;
@@ -169,7 +176,8 @@ export class ManagedSubagentObserver {
     this.#journalRoot = normalizedRoot(options.journalRoot ?? options.root);
     this.#durableStore = options.durableStore;
     this.#context = options.context;
-    this.#policyGeneration = options.policyGeneration ?? 0;
+    this.#policyGeneration = options.runtimeControl?.policyGeneration ?? options.policyGeneration ?? 0;
+    this.#runtimeControl = options.runtimeControl;
     this.#redactValues = options.redactValues ?? [];
     this.#intervalMs = Math.max(100, options.intervalMs ?? DEFAULT_INTERVAL_MS);
     this.#commandConcurrencyGate = options.commandConcurrencyGate;
@@ -187,16 +195,24 @@ export class ManagedSubagentObserver {
     return this.#durableStore;
   }
 
-  update(context: AdapterContext, redactValues: readonly string[], policyGeneration = this.#policyGeneration): void {
-    if (context.sessionId !== this.#context.sessionId || context.generation !== this.#context.generation) {
+  update(context: AdapterContext, redactValues: readonly string[], policyGeneration = this.#policyGeneration,
+    runtimeControl = this.#runtimeControl): void {
+    if (context.sessionId !== this.#context.sessionId || context.generation !== this.#context.generation
+      || context.target.id !== this.#context.target.id) {
       throw new Error("managed Subagent observer ownership changed");
     }
-    if (!Number.isSafeInteger(policyGeneration) || policyGeneration < 0) {
+    if (!Number.isSafeInteger(policyGeneration) || policyGeneration < 0
+      || runtimeControl !== undefined && (runtimeControl.generation !== context.generation || runtimeControl.policyGeneration !== policyGeneration)) {
       throw new Error("managed Subagent observer policy generation is invalid");
     }
     this.#context = context;
     this.#policyGeneration = policyGeneration;
     this.#redactValues = redactValues;
+    const previous = this.#runtimeControl;
+    if (runtimeControl !== previous && (runtimeControl === undefined || previous === undefined || !sameRuntimePolicy(previous, runtimeControl))) {
+      this.#runtimeControl = runtimeControl;
+      this.#runtimeControlRuns.clear();
+    }
   }
 
   start(): void {
@@ -218,7 +234,65 @@ export class ManagedSubagentObserver {
   async stopAndDrain(): Promise<void> {
     this.stop();
     await this.#refreshing?.catch(() => undefined);
+    await this.#runtimeControlTail;
     await Promise.all(this.#commandGateWork);
+  }
+
+  synchronizeRuntimeControl(): Promise<void> {
+    return this.#reconcileRuntimeControl();
+  }
+
+  #reconcileRuntimeControl(observed?: readonly PhysicalRun[]): Promise<void> {
+    const control = this.#runtimeControl;
+    // New runners start with the owner's launch snapshot. Reconcile when the
+    // attached owner has advanced beyond that snapshot.
+    if (control === undefined || control.policyGeneration === 0) return Promise.resolve();
+    const sessionId = this.#context.sessionId;
+    const store = this.#durableStore;
+    const current = () => !this.#stopped && this.#runtimeControl === control;
+    const sync = this.#runtimeControlTail.then(async () => {
+      if (!current()) return;
+      let runs = observed;
+      if (runs === undefined) {
+        if (store === undefined) {
+          runs = await readLocalPhysicalRuns(this.#root, sessionId, control.generation, [], new Map(), true);
+        } else {
+          const scan = await store.scan({ sessionId, sessionKey: managedSubagentSessionKey(sessionId), limitBytes: REMOTE_SCAN_LIMIT_BYTES });
+          runs = await Promise.all(scan.runs.filter((run) => isActivePhysicalRun(run.status))
+            .map((run) => readDurablePhysicalRun(store, run, sessionId, control.generation, [], new Map(), new Map(), true)));
+        }
+      }
+      if (!current()) return;
+      const active = runs.filter((run) => isActivePhysicalRun(run.status));
+      const activeOwners = new Set(active.map(runtimePolicyOwner));
+      for (const owner of this.#runtimeControlRuns.keys()) {
+        if (!activeOwners.has(owner)) this.#runtimeControlRuns.delete(owner);
+      }
+      const failures: unknown[] = [];
+      for (const run of active) {
+        if (!current()) return;
+        const owner = runtimePolicyOwner(run);
+        if (this.#runtimeControlRuns.has(owner)) continue;
+        try {
+          const updated = store === undefined
+            ? await synchronizeLocalRuntimeControl(run, sessionId, control)
+            : await store.writeRuntimeControl({
+              sessionId,
+              runId: run.runId,
+              runnerInstanceId: requiredUuid(run.config["runnerInstanceId"], "runner instance"),
+              launchToken: requiredUuid(run.config["launchToken"], "launch token"),
+              runnerScriptSha256: requiredDigest(run.config["runnerScriptSha256"], "runner script"),
+              control
+            });
+          if (current()) this.#runtimeControlRuns.set(owner, updated);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (failures.length > 0) throw new AggregateError(failures, "managed Subagent runtime policy was not confirmed");
+    });
+    this.#runtimeControlTail = sync.catch(() => undefined);
+    return sync;
   }
 
   /**
@@ -264,6 +338,12 @@ export class ManagedSubagentObserver {
       this.#resultCache,
       this.#durableProjectionState
     );
+    let policyFailure: unknown;
+    try {
+      await this.#reconcileRuntimeControl(projections.flatMap((projection) => projection.physicalRuns));
+    } catch (error) {
+      policyFailure = error;
+    }
     const currentRuns = new Set(projections.map((projection) => projection.latest.runId));
     for (const runId of this.#commandGateApprovals.keys()) {
       if (!currentRuns.has(runId)) this.#retireCommandGateApproval(runId);
@@ -272,6 +352,7 @@ export class ManagedSubagentObserver {
       await this.#processApproval(projection);
       await this.#publish(projection);
     }
+    if (policyFailure !== undefined) throw policyFailure;
     return projections.filter((projection) =>
       projection.run.state === "queued" || projection.run.state === "running"
     ).length;
@@ -323,6 +404,8 @@ export class ManagedSubagentObserver {
       return;
     }
     const launchGeneration = requiredGeneration(projection.latest.config["productGeneration"]);
+    const policyGeneration = this.#policyGeneration;
+    const policyIsCurrent = () => this.#policyGeneration === policyGeneration && this.#runtimePolicyIsCurrent(projection.latest);
     const interactionId = approvalInteractionId(
       this.#context.sessionId,
       launchGeneration,
@@ -340,9 +423,11 @@ export class ManagedSubagentObserver {
     this.#retireCommandGateApproval(projection.latest.runId);
     const journal = await this.#journal(projection.taskId);
     const retained = journal.approval;
+    const requestedPolicy = pending.method === "input" ? parsePolicyDecisionRequest(pending.title) : undefined;
     if (retained !== undefined && retained.runId === projection.latest.runId
         && retained.childId === pending.childId && retained.approvalId === pending.id
-        && retained.interactionId === interactionId) {
+        && retained.interactionId === interactionId && policyIsCurrent()
+        && (requestedPolicy === undefined || requestedPolicy.policyGeneration === policyGeneration)) {
       await this.#writeApprovalControl(projection, pending, retained);
       return;
     }
@@ -363,7 +448,7 @@ export class ManagedSubagentObserver {
       };
       const handled = await handlePolicyDecisionExtensionRequest(extensionEvent, {
         decide: async (request) => {
-          if (request.policyGeneration !== this.#policyGeneration) return "stale";
+          if (request.policyGeneration !== policyGeneration || !policyIsCurrent()) return "stale";
           const snapshot = this.#context.policySnapshot;
           const remoteRoot = this.#context.target.remoteWorkspace?.workspaceRoot;
           const decision = snapshot === undefined
@@ -378,7 +463,7 @@ export class ManagedSubagentObserver {
           && this.#context.sessionId === projection.run.sessionId
           && this.#context.generation >= launchGeneration
       }).catch(() => false);
-      if (!handled || delivered === undefined) {
+      if (!handled || delivered === undefined || this.#policyGeneration !== policyGeneration) {
         delivered = this.#approvalDelivery(projection, pending, interactionId, { cancelled: true });
       }
       await this.#retainAndWriteApproval(journal, projection, pending, delivered);
@@ -387,7 +472,7 @@ export class ManagedSubagentObserver {
 
     let decision: InteractionDecision = { kind: "confirmed", confirmed: false };
     try {
-      decision = await decisionOrCancellation(this.#context.requestInteraction({
+      if (policyIsCurrent()) decision = await decisionOrCancellation(this.#context.requestInteraction({
         id: interactionId,
         kind: "permission",
         title: `Allow delegated Pi tool: ${permissionToolName(pending.title)}`,
@@ -402,8 +487,14 @@ export class ManagedSubagentObserver {
     const confirmed = decision.kind === "confirmed"
       ? decision.confirmed
       : decision.kind === "selected" && (decision.value === "allow_once" || decision.value === "yes");
-    const delivery = this.#approvalDelivery(projection, pending, interactionId, { confirmed });
+    const delivery = this.#approvalDelivery(projection, pending, interactionId, { confirmed: confirmed && policyIsCurrent() });
     await this.#retainAndWriteApproval(journal, projection, pending, delivery);
+  }
+
+  #runtimePolicyIsCurrent(run: PhysicalRun): boolean {
+    const control = this.#runtimeControl;
+    return !this.#stopped && (control === undefined || control.policyGeneration === 0
+      || this.#runtimeControlRuns.get(runtimePolicyOwner(run)) === true);
   }
 
   async #processCommandGateApproval(
@@ -414,8 +505,10 @@ export class ManagedSubagentObserver {
     acquire: boolean
   ): Promise<void> {
     const runId = projection.latest.runId;
+    const policyGeneration = this.#policyGeneration;
     const ownerIsCurrent = () => !this.#stopped
-      && this.#context.sessionId === projection.run.sessionId && this.#context.generation >= launchGeneration;
+      && this.#context.sessionId === projection.run.sessionId && this.#context.generation >= launchGeneration
+      && (!acquire || this.#policyGeneration === policyGeneration && this.#runtimePolicyIsCurrent(projection.latest));
     const resolve = async (signal: AbortSignal, waiting?: CommandGateApproval): Promise<ApprovalResponse> => {
       let response: ApprovalResponse = { cancelled: true };
       await handleCommandGateExtensionRequest({ ...pending }, {
@@ -446,7 +539,7 @@ export class ManagedSubagentObserver {
     if (waiting?.interactionId !== interactionId) {
       this.#retireCommandGateApproval(runId);
       const cancellation = new AbortController();
-      const admission: CommandGateApproval = { interactionId, cancellation,
+      const admission: CommandGateApproval = { interactionId, policyGeneration, cancellation,
         signal: AbortSignal.any([this.#context.signal, cancellation.signal]), writeAttempted: false };
       this.#commandGateApprovals.set(runId, admission);
       const work: Promise<void> = resolve(admission.signal, admission).then(
@@ -455,6 +548,13 @@ export class ManagedSubagentObserver {
       ).finally(() => { this.#commandGateWork.delete(work); });
       this.#commandGateWork.add(work);
       return;
+    }
+    if (waiting.policyGeneration !== policyGeneration || !ownerIsCurrent()) {
+      if (waiting.writeAttempted) return;
+      waiting.cancellation.abort();
+      waiting.releaseBeforeDispatch?.();
+      waiting.releaseBeforeDispatch = undefined;
+      waiting.delivery = decide({ cancelled: true });
     }
     if (waiting.delivery === undefined) return;
     if (waiting.signal.aborted && waiting.delivery.response.value === "admitted") {
@@ -1002,26 +1102,8 @@ async function readLogicalProjections(
       durableTaskId
     );
   }
-  const sessionDirectory = join(root, managedSubagentSessionKey(productSessionId));
-  const sessionInfo = await lstat(sessionDirectory).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return undefined;
-    throw error;
-  });
-  if (sessionInfo === undefined) return [];
-  if (!sessionInfo.isDirectory() || sessionInfo.isSymbolicLink() || !samePath(await realpath(sessionDirectory), sessionDirectory)) {
-    throw new Error("managed Subagent session observation root is unsafe");
-  }
   const grouped = new Map<string, PhysicalRun[]>();
-  for (const entry of await readdir(sessionDirectory, { withFileTypes: true })) {
-    if (!entry.isDirectory() || entry.isSymbolicLink() || !UUID_PATTERN.test(entry.name)) continue;
-    const physical = await readPhysicalRun(
-      join(sessionDirectory, entry.name),
-      productSessionId,
-      productGeneration,
-      redactValues,
-      transcriptCache
-    ).catch(() => undefined);
-    if (physical === undefined) continue;
+  for (const physical of await readLocalPhysicalRuns(root, productSessionId, productGeneration, redactValues, transcriptCache)) {
     const taskId = requiredString(physical.status["taskId"], 256);
     const runs = grouped.get(taskId) ?? [];
     runs.push(physical);
@@ -1033,6 +1115,88 @@ async function readLogicalProjections(
     values.push(projectLogicalRun(productSessionId, taskId, physicalRuns, controlEnabled, redactValues));
   }
   return values.sort((left, right) => left.run.startedAt - right.run.startedAt || left.taskId.localeCompare(right.taskId));
+}
+
+async function readLocalPhysicalRuns(
+  root: string,
+  productSessionId: string,
+  productGeneration: number,
+  redactValues: readonly string[],
+  transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
+  metadataOnly = false
+): Promise<PhysicalRun[]> {
+  const sessionDirectory = join(root, managedSubagentSessionKey(productSessionId));
+  const sessionInfo = await lstat(sessionDirectory).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (sessionInfo === undefined) return [];
+  if (!sessionInfo.isDirectory() || sessionInfo.isSymbolicLink() || !samePath(await realpath(sessionDirectory), sessionDirectory)) {
+    throw new Error("managed Subagent session observation root is unsafe");
+  }
+  const runs: PhysicalRun[] = [];
+  for (const entry of await readdir(sessionDirectory, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.isSymbolicLink() || !UUID_PATTERN.test(entry.name)) continue;
+    const physical = await readPhysicalRun(
+      join(sessionDirectory, entry.name),
+      productSessionId,
+      productGeneration,
+      redactValues,
+      transcriptCache,
+      metadataOnly
+    ).catch(() => undefined);
+    if (physical !== undefined) runs.push(physical);
+  }
+  return runs;
+}
+
+function isActivePhysicalRun(status: Readonly<Record<string, unknown>>): boolean {
+  return status["state"] === "queued" || status["state"] === "running";
+}
+
+function runtimePolicyOwner(run: PhysicalRun): string {
+  return JSON.stringify([run.runId, run.config["launchToken"], run.config["runnerInstanceId"], run.config["runnerScriptSha256"]]);
+}
+
+function sameRuntimePolicy(left: Readonly<Record<string, unknown>> | PiRuntimeControl, right: PiRuntimeControl): boolean {
+  return left["generation"] === right.generation && left["policyGeneration"] === right.policyGeneration
+    && left["permissionMode"] === right.permissionMode && left["planMode"] === right.planMode
+    && left["fastMode"] === right.fastMode && left["runtimePolicy"] === right.runtimePolicy
+    && JSON.stringify(left["approvedRoots"]) === JSON.stringify(right.approvedRoots);
+}
+
+async function synchronizeLocalRuntimeControl(run: PhysicalRun, sessionId: string, control: PiRuntimeControl): Promise<boolean> {
+  if (run.config["productGeneration"] !== control.generation) return false;
+  const path = join(run.directory, "runtime", "control.json");
+  if (run.config["runtimeControlPath"] !== path) throw new Error("managed Subagent runtime control path mismatch");
+  const current = await readBoundedJson(path, MAX_JSON_BYTES);
+  if (!isRecord(current) || current["generation"] !== control.generation
+    || !Number.isSafeInteger(current["policyGeneration"]) || number(current["policyGeneration"]) < 0
+    || number(current["policyGeneration"]) > control.policyGeneration
+    || current["runtimePolicy"] !== control.runtimePolicy) {
+    throw new Error("managed Subagent runtime policy crossed its owner or generation fence");
+  }
+  if (current["policyGeneration"] === control.policyGeneration) {
+    if (!sameRuntimePolicy(current, control)) {
+      throw new Error("managed Subagent runtime policy changed without advancing its generation");
+    }
+    return true;
+  }
+  const confirmed = await readPhysicalRun(run.directory, sessionId, control.generation, [], new Map(), true);
+  if (!isActivePhysicalRun(confirmed.status)) return false;
+  if (confirmed.config["launchToken"] !== run.config["launchToken"]
+    || confirmed.config["runnerInstanceId"] !== run.config["runnerInstanceId"]
+    || confirmed.config["runnerScriptSha256"] !== run.config["runnerScriptSha256"]
+    || confirmed.config["runtimeControlPath"] !== path
+    || JSON.stringify(await readBoundedJson(path, MAX_JSON_BYTES)) !== JSON.stringify(current)) {
+    throw new Error("managed Subagent runtime policy owner changed before publication");
+  }
+  await atomicWriteJson(path, control);
+  const written = await readBoundedJson(path, MAX_JSON_BYTES);
+  if (!isRecord(written) || !sameRuntimePolicy(written, control)) {
+    throw new Error("managed Subagent runtime policy publication was not confirmed");
+  }
+  return true;
 }
 
 async function readDurableLogicalProjections(
@@ -1100,7 +1264,8 @@ async function readPhysicalRun(
   productSessionId: string,
   productGeneration: number,
   redactValues: readonly string[],
-  transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>
+  transcriptCache: Map<string, { readonly size: number; readonly records: readonly Record<string, unknown>[] }>,
+  metadataOnly = false
 ): Promise<PhysicalRun> {
   if (!UUID_PATTERN.test(basename(directory)) || !samePath(await realpath(directory), directory)) {
     throw new Error("managed Subagent physical run path is unsafe");
@@ -1154,6 +1319,10 @@ async function readPhysicalRun(
   ) || claim !== undefined && !claimValid || ownerState === "running" && runnerPid > 0 && !claimValid) {
     throw new Error("managed Subagent process identity mismatch");
   }
+  const active = isActivePhysicalRun(status);
+  const heartbeatAt = timestamp(status["heartbeatAt"], timestamp(status["createdAt"], 0));
+  const controlSafe = !active || Date.now() - heartbeatAt <= RUNNER_HEARTBEAT_STALE_MS;
+  if (metadataOnly) return { runId, directory, config, status, transcript: [], resumeSafe: false, controlSafe };
   const transcriptPath = join(directory, "transcript.jsonl");
   if (status["transcriptPath"] !== transcriptPath || config["transcriptPath"] !== transcriptPath) {
     throw new Error("managed Subagent transcript identity mismatch");
@@ -1192,8 +1361,6 @@ async function readPhysicalRun(
     resumeSafe = nativeInfo !== undefined && nativeInfo.isFile() && !nativeInfo.isSymbolicLink()
       && nativeInfo.size <= 256 * 1024 * 1024 && samePath(await realpath(nativeSessionPath), resolve(nativeSessionPath));
   }
-  const active = status["state"] === "queued" || status["state"] === "running";
-  const heartbeatAt = timestamp(status["heartbeatAt"], timestamp(status["createdAt"], 0));
   return {
     runId,
     directory,
@@ -1202,7 +1369,7 @@ async function readPhysicalRun(
     ...(isRecord(result) ? { result } : {}),
     transcript: transcript.records,
     resumeSafe,
-    controlSafe: !active || Date.now() - heartbeatAt <= RUNNER_HEARTBEAT_STALE_MS
+    controlSafe
   };
 }
 
