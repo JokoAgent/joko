@@ -1079,10 +1079,10 @@ async function readDurableLogicalProjections(
       resultCache,
       taskId !== undefined
     );
-    const taskId = requiredString(physical.status["taskId"], 256);
-    const runs = grouped.get(taskId) ?? [];
+    const logicalTaskId = requiredString(physical.status["taskId"], 256);
+    const runs = grouped.get(logicalTaskId) ?? [];
     runs.push(physical);
-    grouped.set(taskId, runs);
+    grouped.set(logicalTaskId, runs);
   }
   const values: LogicalProjection[] = [];
   for (const [taskId, physicalRuns] of grouped) {
