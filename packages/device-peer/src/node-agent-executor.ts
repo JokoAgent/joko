@@ -1028,12 +1028,11 @@ export class NodeDevicePeerAgentExecutor {
           throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
         }
         this.#refreshRemoteDesktopClipboardTransfer(state);
-        return remoteDesktopClipboardContentResult({
-          data: state.data.slice(
-            request.action.value.offset,
-            request.action.value.offset + REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS
-          )
-        });
+        const { offset } = request.action.value;
+        let end = Math.min(state.length, offset + REMOTE_DESKTOP_CLIPBOARD_CHUNK_CHARACTERS);
+        // The response is a UTF-8 protobuf string, so stop before a split surrogate pair.
+        if ((state.data.codePointAt(end - 1) ?? 0) > 0xffff) end--;
+        return remoteDesktopClipboardContentResult({ data: state.data.slice(offset, end) });
       }
       case "write": {
         const state = this.#requireRemoteDesktopClipboardTransfer(

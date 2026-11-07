@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   DevicePeerCapabilityKind,
   type DevicePeerCommand,
@@ -47,6 +47,7 @@ import {
   RemoteDesktopClipboardContentCopyActionSchema,
   RemoteDesktopClipboardContentSchema,
   RemoteDesktopClipboardContentReadActionSchema,
+  RemoteDesktopClipboardContentResultSchema,
   type RemoteDesktopClipboardContentRequest,
   RemoteDesktopClipboardContentRequestSchema,
   RemoteDesktopClipboardContentWriteActionSchema,
@@ -1133,7 +1134,9 @@ describe("Node Device peer Remote Desktop host ownership", () => {
   it("keeps explicit text and rich clipboard transfers bounded and consumes paste before effect", async () => {
     const root = await testRoot();
     const pasted: unknown[] = [];
+    const text = "a".repeat(65_526) + "😀b";
     const fixture = remoteDesktopHost({
+      copyClipboardContent: async () => create(RemoteDesktopClipboardContentSchema, { text }),
       pasteClipboardContent: async (request) => { pasted.push(request.content); }
     });
     const executor = new NodeDevicePeerAgentExecutor({
@@ -1163,14 +1166,21 @@ describe("Node Device peer Remote Desktop host ownership", () => {
       throw new Error("Expected a rich clipboard transfer.");
     }
     const transferId = copyPayload.value.transferId;
-    const read = await execute(executor, remoteDesktopClipboardContentCommand({
-      case: "read",
-      value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId, offset: 0 })
-    }));
-    expect(read.at(-1)?.payload).toMatchObject({
-      case: "remoteDesktopClipboardContent",
-      value: { data: JSON.stringify({ text: "rich text" }) }
-    });
+    const readChunk = async (offset: number): Promise<string> => {
+      const result = await execute(executor, remoteDesktopClipboardContentCommand({
+        case: "read",
+        value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId, offset })
+      }));
+      const payload = result.at(-1)?.payload;
+      if (payload?.case !== "remoteDesktopClipboardContent") throw new Error("Expected a clipboard result.");
+      const decoded = fromBinary(RemoteDesktopClipboardContentResultSchema, toBinary(RemoteDesktopClipboardContentResultSchema, payload.value));
+      if (decoded.data === undefined) throw new Error("Expected a clipboard chunk.");
+      return decoded.data;
+    };
+    const first = await readChunk(0);
+    const second = await readChunk(first.length);
+    expect(first).toHaveLength(65_535);
+    expect(first + second).toBe(JSON.stringify({ text }));
     const staleRead = await execute(executor, remoteDesktopClipboardContentCommand({
       case: "read",
       value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId, offset: 0 })
