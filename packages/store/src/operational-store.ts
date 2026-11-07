@@ -16044,8 +16044,9 @@ export class OperationalStore {
       ) throw new StoreError("Session lifecycle cleanup still has pending external effects.");
       const session = this.getSession(cleanup.sessionId);
       if (cleanup.disposition === "archive") {
-        if (!session.descriptor.archived) {
-          this.updateSession(cleanup.sessionId, { archived: true }, session.revision, at);
+        const clearPin = session.descriptor.pinned && this.findOperation(operationId)?.kind === "archiveSession";
+        if (!session.descriptor.archived || clearPin) {
+          this.updateSession(cleanup.sessionId, { archived: true, ...(clearPin ? { pinned: false } : {}) }, session.revision, at);
         }
       } else if (session.descriptor.deletedAt === undefined) {
         this.updateSession(cleanup.sessionId, { archived: true, deletedAt: at }, session.revision, at);
