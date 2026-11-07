@@ -66,20 +66,42 @@ describe("Inspector Git push destinations", () => {
     expect(view.api.acquireArtifactUrl).toHaveBeenCalledExactlyOnceWith("photo-b");
   });
 
-  it("shows a captured Markdown file with its live preview disabled", async () => {
+  it("shows a captured Markdown patch with its live preview disabled", async () => {
     const view = await mount(diff, false, true, [{ id: "review-turn", runId: "run", turnId: "turn", changeCount: 1,
-      changes: [{ path: "README.md", kind: "updated" }], completeBaseline: true, gaps: [], capturedAt: 2 }]);
+      changes: [{ path: "README.md", kind: "updated", diff: {
+        path: "README.md", source: "turnSet", status: "modified", binary: false, text: "-one\n+two",
+        hunks: [{ oldStart: 1, oldCount: 1, newStart: 1, newCount: 1, heading: "", lines: [
+          { kind: "removed", oldLine: 1, newLine: 0, text: "one" },
+          { kind: "added", oldLine: 0, newLine: 1, text: "two" }
+        ] }]
+      } }], completeBaseline: true, gaps: [], capturedAt: 2 }]);
     view.api.getWorkspaceDiff.mockClear();
     await act(async () => view.host.querySelector<HTMLButtonElement>('[aria-label="workspace.reviewSource"]')!.click());
     await act(async () => [...document.querySelectorAll<HTMLElement>('[role="option"]')]
       .find(option => option.textContent === "workspace.reviewSourceTurnSet")!.click());
     expect(view.host.querySelector(".workspace-review-file summary")?.textContent).toContain("README.md");
+    expect(view.host.querySelector(".review-diff-line--removed code")?.textContent).toBe("one");
+    expect(view.host.querySelector(".review-diff-line--added code")?.textContent).toBe("two");
     const preview = button(view.host, "workspace.reviewMarkdownPreview");
     expect(preview.disabled).toBe(true);
     expect(preview.getAttribute("aria-description")).toBe("workspace.reviewHistoricalMarkdownUnavailable");
     await act(async () => preview.click());
     expect(view.api.readWorkspaceDiffFile).not.toHaveBeenCalled();
     expect(view.api.getWorkspaceDiff).not.toHaveBeenCalled();
+  });
+
+  it("returns focus to the Review file jump button after Escape", async () => {
+    const view = await mount({ ...diff, files: [
+      { path: "changes.txt", source: "unstaged", status: "modified", binary: false, text: "", hunks: [] }
+    ] });
+    const trigger = button(view.host, "workspace.reviewJumpToFile");
+    await act(async () => { trigger.focus(); trigger.click(); });
+    const filter = view.host.querySelector<HTMLInputElement>('[aria-label="workspace.reviewFilterFiles"]')!;
+    await vi.waitFor(() => expect(document.activeElement).toBe(filter));
+    await act(async () => { filter.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
+    expect(filter.isConnected).toBe(false);
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(trigger);
   });
 
   it("refreshes a Review image after its download failed, even with the same Blob ID", async () => {

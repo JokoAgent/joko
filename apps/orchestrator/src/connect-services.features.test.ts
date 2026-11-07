@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -23,9 +23,11 @@ import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { ProviderAuthUnsupportedError, type CredentialManager } from "./credential-manager.js";
 import { McpRouter, type McpClientFactoryInput } from "./mcp-router.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
+import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
 import { InteractionDecisionValidationError, SessionHost } from "./session-host.js";
+import { WorkspaceChangeSetService } from "./workspace-change-set.js";
 
 const connection = {
   id: "connection-features",
@@ -4623,6 +4625,67 @@ describe("Connect typed feature boundaries", () => {
       scanId: "------------------------------------",
       backupEnabled: false
     })).rejects.toMatchObject({ code: Code.InvalidArgument });
+  });
+
+  it("returns a scoped historical forward patch from intact captured bytes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-forward-change-set-"));
+    cleanupPaths.push(directory);
+    const root = join(directory, "project");
+    mkdirSync(root);
+    const store = new OperationalStore(join(directory, "store.sqlite"));
+    const workspaceChanges = new WorkspaceChangeSetService({
+      snapshotDirectory: join(directory, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(store)
+    });
+    try {
+      await workspaceChanges.initialize();
+      writeFileSync(join(root, "report.txt"), "keep\none\nend\n");
+      writeFileSync(join(root, "retired.txt"), "retired\n");
+      writeFileSync(join(root, ".env"), "VALUE=first\n");
+      writeFileSync(join(root, "corrupt.txt"), "old\n");
+      const baseline = await workspaceChanges.captureBaseline("workspace", root);
+      writeFileSync(join(root, "report.txt"), "keep\ntwo\nend\n");
+      writeFileSync(join(root, "added.txt"), "added\n");
+      writeFileSync(join(root, "binary.bin"), Buffer.from([0, 1, 2]));
+      writeFileSync(join(root, ".env"), "VALUE=second\n");
+      writeFileSync(join(root, "corrupt.txt"), "new\n");
+      unlinkSync(join(root, "retired.txt"));
+      const captured = await workspaceChanges.captureChangeSet(baseline.id, "session", "run");
+      const broken = captured.changes.find(change => change.path === "corrupt.txt")!.after!;
+      writeFileSync(broken.blobPath, "bad\n");
+      writeFileSync(join(root, "report.txt"), "later live content\n");
+      const services = createConnectServices(stubApplication({ store, workspaceChanges }));
+      const list = (workspaceId: string, sessionId: string) => invoke<contract.ListWorkspaceChangeSetsResponse>(
+        services.workspace.listWorkspaceChangeSets, create(contract.ListWorkspaceChangeSetsRequestSchema, { workspaceId, sessionId })
+      );
+      const scoped = await list("workspace", "session");
+      expect(scoped.changeSets).toHaveLength(1);
+      expect(scoped.changeSets[0]?.changeSetId).toBe(captured.id);
+      const changes = new Map(scoped.changeSets[0]?.changes.map(change => [change.relativePath, change]));
+      expect(changes.get("report.txt")?.diff).toMatchObject({
+        relativePath: "report.txt", source: contract.GitDiffSource.TURN_SET, status: contract.GitFileStatus.MODIFIED,
+        hunks: [{ oldStart: 1, oldCount: 3, newStart: 1, newCount: 3, lines: [
+          { kind: contract.DiffLineKind.CONTEXT, oldLine: 1, newLine: 1, text: "keep" },
+          { kind: contract.DiffLineKind.REMOVED, oldLine: 2, newLine: 0, text: "one" },
+          { kind: contract.DiffLineKind.ADDED, oldLine: 0, newLine: 2, text: "two" },
+          { kind: contract.DiffLineKind.CONTEXT, oldLine: 3, newLine: 3, text: "end" }
+        ] }]
+      });
+      expect(changes.get("added.txt")?.diff).toMatchObject({
+        status: contract.GitFileStatus.ADDED, hunks: [{ oldStart: 0, newStart: 1 }]
+      });
+      expect(changes.get("retired.txt")?.diff).toMatchObject({
+        status: contract.GitFileStatus.DELETED, hunks: [{ oldStart: 1, newStart: 0 }]
+      });
+      expect(changes.get("binary.bin")?.diff).toMatchObject({ binary: true, hunks: [] });
+      expect(changes.get(".env")).toBeDefined();
+      expect(changes.get(".env")?.diff).toBeUndefined();
+      expect(changes.get("corrupt.txt")).toBeDefined();
+      expect(changes.get("corrupt.txt")?.diff).toBeUndefined();
+      expect((await list("workspace", "")).changeSets[0]?.changes.every(change => change.diff === undefined)).toBe(true);
+      expect((await list("workspace", "other-session")).changeSets).toEqual([]);
+    } finally {
+      store.close();
+    }
   });
 
   it("previews an integrity-checked inverse diff and executes dialogue-only rewind without restoring files", async () => {

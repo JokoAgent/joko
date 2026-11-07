@@ -244,6 +244,14 @@ export class WorkspaceChangeSetService {
       .sort((left, right) => right.capturedAt - left.capturedAt);
   }
 
+  async readChangeSetFile(file: SnapshotFile, maximumBytes: number): Promise<Buffer> {
+    if (!/^[a-f0-9]{64}$/u.test(file.sha256)
+      || !Number.isSafeInteger(file.byteLength) || file.byteLength < 0 || file.byteLength > maximumBytes) {
+      throw new Error("Workspace change-set file is invalid or exceeds its byte limit.");
+    }
+    return this.readBaselineBlob(file, file.byteLength);
+  }
+
   /**
    * Removes only snapshot blobs that no surviving baseline or change set can
    * reach. Database history maintenance calls this after its verified commit;
@@ -892,10 +900,10 @@ export class WorkspaceChangeSetService {
     }
   }
 
-  private async readBaselineBlob(file: SnapshotFile): Promise<Buffer> {
+  private async readBaselineBlob(file: SnapshotFile, maximumBytes?: number): Promise<Buffer> {
     const expected = join(this.snapshotRoot(), "blobs", file.sha256.slice(0, 2), file.sha256);
     if (!samePath(resolve(file.blobPath), expected)) throw new Error("Workspace rewind baseline blob path is invalid.");
-    const content = await readSecureFileWithinRoot(this.snapshotRoot(), toSlash(relative(this.snapshotRoot(), expected)));
+    const content = await readSecureFileWithinRoot(this.snapshotRoot(), toSlash(relative(this.snapshotRoot(), expected)), maximumBytes);
     const hash = createHash("sha256").update(content).digest("hex");
     if (hash !== file.sha256 || content.byteLength !== file.byteLength) throw new Error("Workspace rewind baseline blob is corrupt.");
     return content;
@@ -1208,10 +1216,10 @@ async function hashFromInspection(root: string, path: string, inspection: Secure
   return createHash("sha256").update(content).digest("hex");
 }
 
-async function readSecureFileWithinRoot(root: string, path: string): Promise<Buffer> {
+async function readSecureFileWithinRoot(root: string, path: string, maximumBytes?: number): Promise<Buffer> {
   const inspection = await inspectWorkspaceFile(root, path);
   if (inspection.missingAncestor || inspection.leaf === undefined) throw new Error("Managed snapshot file is missing.");
-  const content = await readRegularFileNoFollow(inspection.destination, inspection.leaf);
+  const content = await readRegularFileNoFollow(inspection.destination, inspection.leaf, maximumBytes);
   await assertInspectionAncestorsUnchanged(root, inspection);
   const fresh = await inspectWorkspaceFile(root, path);
   if (
@@ -1240,7 +1248,7 @@ async function readStableFile(path: string, expectedSize: number, expectedMtime:
   return content;
 }
 
-async function readRegularFileNoFollow(path: string, expected?: Stats): Promise<Buffer> {
+async function readRegularFileNoFollow(path: string, expected?: Stats, maximumBytes?: number): Promise<Buffer> {
   const handle = await open(path, constants.O_RDONLY | noFollowFlag());
   try {
     const before = await handle.stat();
@@ -1248,7 +1256,16 @@ async function readRegularFileNoFollow(path: string, expected?: Stats): Promise<
     if (expected !== undefined && !sameIdentity(fileIdentity(before), fileIdentity(expected))) {
       throw new Error(`File identity changed before it was opened: ${path}`);
     }
-    const content = await handle.readFile();
+    if (maximumBytes !== undefined && before.size > maximumBytes) throw new Error("Workspace change-set file exceeded its byte limit.");
+    const content = maximumBytes === undefined ? await handle.readFile() : Buffer.alloc(before.size);
+    if (maximumBytes !== undefined) {
+      let offset = 0;
+      while (offset < content.byteLength) {
+        const { bytesRead } = await handle.read(content, offset, content.byteLength - offset, offset);
+        if (bytesRead === 0) throw new Error("Workspace change-set file changed while it was read.");
+        offset += bytesRead;
+      }
+    }
     const after = await handle.stat();
     if (
       !sameIdentity(fileIdentity(before), fileIdentity(after))

@@ -129,6 +129,7 @@ export interface ReviewSourceArtifact {
 
 export interface BuildReviewEvidenceInput {
   readonly focus?: string;
+  readonly focusedWorkspaceFile?: string;
   readonly conversation: ReviewSourceConversationSnapshot;
   readonly workspace: ReviewSourceWorkspaceSnapshot;
   readonly workspaceEvidence: ReviewSourceWorkspaceEvidence | null;
