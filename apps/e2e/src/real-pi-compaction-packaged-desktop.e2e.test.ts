@@ -265,9 +265,39 @@ describe("packaged Desktop Pi compaction", () => {
       (focused) => focused, "Desktop compact focus restoration");
     expect(await timelineStates(compactSessionId)).toEqual([]);
 
-    const confirmCompact = async () => {
-      await trigger.click();
-      await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
+    const confirmCompact = async (sessionId = compactSessionId) => {
+      const pane = page.locator(`.session-pane[data-input-session-id='${sessionId}']`);
+      const witness = await page.evaluateHandle(() => {
+        const events: Array<{ type: string; sessionId?: string; generation?: string; target?: string; button?: string | null }> = [];
+        const capture = (event: Event) => {
+          if (events.length >= 12) return;
+          const target = event.target instanceof Element ? event.target : undefined;
+          const owner = target?.closest<HTMLElement>(".session-pane");
+          events.push({ type: event.type, target: target?.tagName, button: target?.closest("button")?.getAttribute("aria-label"),
+            sessionId: owner?.dataset.inputSessionId, generation: owner?.dataset.inputSessionGeneration });
+        };
+        const types = ["pointerdown", "pointerup", "click"];
+        for (const type of types) document.addEventListener(type, capture, true);
+        return { events, stop: () => { for (const type of types) document.removeEventListener(type, capture, true); } };
+      });
+      try {
+        await pane.getByRole("button", { name: "Click to compact context" }).click();
+        await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
+      } catch (error) {
+        const [pointer, view, owner] = await Promise.all([
+          witness.evaluate(value => value.events).catch(() => []),
+          page.evaluate(() => ({ route: window.location.hash, panes: Array.from(document.querySelectorAll<HTMLElement>(".session-pane")).map(item => ({
+            sessionId: item.dataset.inputSessionId, generation: item.dataset.inputSessionGeneration,
+            canCompact: item.querySelector("button.context-capacity-ring--button") !== null
+          })), dialogs: Array.from(document.querySelectorAll('[role="dialog"]')).map(item => item.getAttribute("aria-label")) })).catch(() => undefined),
+          manager.clients.session.getSession({ sessionId }).then(result => ({ state: result.session?.state,
+            generation: result.session?.nativeBinding?.runtimeGeneration.toString() })).catch(() => undefined)
+        ]);
+        throw new Error(`Packaged compact confirmation did not open or accept: ${JSON.stringify({ sessionId, owner, view, pointer, errors: errors.slice(-6) })}`, { cause: error });
+      } finally {
+        await witness.evaluate(value => value.stop()).catch(() => undefined);
+        await witness.dispose().catch(() => undefined);
+      }
     };
     await confirmCompact();
     const feedback = page.locator(".compact-action-feedback");
@@ -300,7 +330,7 @@ describe("packaged Desktop Pi compaction", () => {
     await send(failingSessionId, "Second Desktop turn for a genuine Provider failure.");
     await route(failingSessionId);
     failSummary = true;
-    await confirmCompact();
+    await confirmCompact(failingSessionId);
     const failure = page.locator(".compact-action-feedback--failure");
     await failure.waitFor({ state: "visible", timeout: 30_000 });
     failSummary = false;
