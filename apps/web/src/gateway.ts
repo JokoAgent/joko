@@ -42,6 +42,7 @@ import { createPartnerConnectionsApi } from "@joko/contracts";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } from "./partner-avatar.js";
 import { mapPartnerWorkingStatus } from "./partner-working-status.js";
+import { partnerPrivateSentReceipt } from "./partner-private-sent.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
 import { StateImpact } from "@joko/contracts";
@@ -12554,6 +12555,8 @@ function projectTimelineEvent(
         result,
         outputMode
       );
+      const privateSent = kind.case === "toolCallCompleted" && call.runId === (event.identity?.runId ?? "")
+        && call.attemptId === (event.identity?.attemptId ?? "") ? partnerPrivateSentReceipt(call, sessionId) : undefined;
       const referencedBlobs = new Set((toolItem.attachments ?? []).map((attachment) => attachment.blobId));
       if (referencedBlobs.size > 0) {
         for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -12561,7 +12564,7 @@ function projectTimelineEvent(
           if (item?.artifact !== undefined && referencedBlobs.has(item.artifact.blobId)) items.splice(index, 1);
         }
       }
-      replaceOrAppend(toolItem);
+      replaceOrAppend(privateSent === undefined ? toolItem : { ...toolItem, partnerPrivateSent: privateSent });
       break;
     }
     case "statusStream": {

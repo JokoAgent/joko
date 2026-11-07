@@ -4,12 +4,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
-import { emptySnapshot, type PartnerActivityView, type PartnerPrivateThreadView, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
+import { mapSnapshot } from "../gateway.js";
+import { emptySnapshot, type PartnerActivityView, type PartnerPrivateThreadDetailView, type PartnerPrivateThreadView, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
 import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { Timeline } from "./Timeline.js";
 import { setPendingPartnerReplyQuote } from '../partner-reply-quote.js';
 import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
-  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema,
+  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, SnapshotSchema, ToolCallState,
   type PartnerHomeApi, type PartnerMemoryApi, type PartnerConnectionsApi, type ConnectionsDetail, type PartnerLearningFeedbackView } from "@joko/contracts";
 
 vi.mock("@tanstack/react-virtual", () => ({
@@ -233,6 +234,55 @@ describe("mounted Partner conversation", () => {
     if (missing) expect(dialog.querySelector(".partner-private-thread [role='alert']")?.textContent).toContain("Receipt thread is unavailable.");
     else expect(dialog.querySelectorAll(".partner-private-list button")[1]?.classList.contains("is-selected")).toBe(true);
     expect(view.app.markPartnerRead).not.toHaveBeenCalled();
+  });
+
+  it("expands an outbound receipt in the canonical timeline and opens only the verified thread", async () => {
+    const thread: PartnerPrivateThreadView = { id: "sent-thread", firstPartnerId: "partner", secondPartnerId: "recipient", status: "active",
+      messageCount: 1, maxMessages: 12, expiresAt: 60_000, createdAt: 1_000, updatedAt: 1_000 };
+    const messageId = `partner-private-message:${"a".repeat(64)}`;
+    const detail: PartnerPrivateThreadDetailView = { thread, messages: [{ id: messageId, threadId: thread.id, sequence: 1,
+      senderPartnerId: "partner", recipientPartnerId: "recipient", content: "FYI from the durable thread", deliveryStatus: "delivered", createdAt: 1_000 }] };
+    const getThread = vi.fn<AppController["getPartnerPrivateThread"]>(async () => detail).mockResolvedValueOnce({
+      thread, messages: [{ ...detail.messages[0]!, senderPartnerId: "recipient", recipientPartnerId: "partner", content: "Wrong message" }]
+    });
+    const app = controller({ getPartnerPrivateThread: getThread,
+      listPartnerPrivateThreads: vi.fn(async () => [{ ...thread, id: "another-thread" }, thread]),
+      markPartnerPrivateThreadRead: vi.fn(async (partnerId, threadId, throughSequence) => ({ partnerId, threadId, throughSequence, updatedAt: 2_000 })),
+      listPartnerDelegations: vi.fn(async () => []), listSessionArtifacts: vi.fn(async () => []) });
+    const output = JSON.stringify({ thread_id: thread.id, message_id: messageId, target_partner: { id: "recipient", display_name: "Birch", avatar: "leaf", status: "active", ready: true },
+      delivery_status: "delivered", remaining_messages: 11, conversation_ended: false });
+    const timeline = mapSnapshot(create(SnapshotSchema, { timeline: [false, true].map((truncated, index) => ({
+      eventId: `event-${index}`, identity: { sessionId: "session", runId: "run", attemptId: "attempt" }, cursor: { sequence: BigInt(index + 1) },
+      payload: { kind: { case: "toolCallCompleted" as const, value: { toolCall: { toolCallId: `call-${index}`,
+        toolId: "mcp__joko_partners__send_private_message", sessionId: "session", runId: "run", attemptId: "attempt", state: ToolCallState.SUCCEEDED,
+        result: { truncated, parts: [{ content: { case: "text" as const, value: output } }] } } } } }
+    })) })).timelineBySession.get("session")!;
+    const view = await mount(app, true, false, timeline);
+    const cards = view.host.querySelectorAll<HTMLElement>(".partner-private-sent");
+    expect(cards).toHaveLength(1);
+    const card = cards[0]!;
+    const toggle = card.querySelector<HTMLButtonElement>("button")!;
+    expect(toggle.textContent).toBe("partners.privateMessageTo");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(getThread).not.toHaveBeenCalled();
+    expect(view.host.textContent).not.toContain(output);
+
+    await act(async () => { toggle.click(); await settle(); });
+    expect(getThread).toHaveBeenCalledExactlyOnceWith("partner", thread.id, expect.any(AbortSignal));
+    expect(card.querySelector('[role="alert"]')?.textContent).toBe("partners.privateThreadLoadFailed");
+    expect(card.textContent).not.toContain("Wrong message");
+    const retry = Array.from(card.querySelectorAll("button")).find(button => button.textContent === "common.retry")!;
+    await act(async () => { retry.click(); await settle(); });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(card.textContent).toContain("FYI from the durable thread");
+    expect(app.markPartnerPrivateThreadRead).not.toHaveBeenCalled();
+
+    const open = Array.from(card.querySelectorAll("button")).find(button => button.textContent === "partners.openPrivateThread")!;
+    await act(async () => { open.click(); await settle(); });
+    expect(getThread).toHaveBeenCalledTimes(3);
+    expect(getThread).toHaveBeenLastCalledWith("partner", thread.id, expect.any(AbortSignal));
+    expect(document.querySelector(".partner-private-list button.is-selected")?.closest("[role='dialog']")).not.toBeNull();
+    expect(app.markPartnerPrivateThreadRead).toHaveBeenCalledExactlyOnceWith("partner", thread.id, 1, expect.any(AbortSignal));
   });
 });
 

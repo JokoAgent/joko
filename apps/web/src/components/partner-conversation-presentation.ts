@@ -10,7 +10,7 @@ const hasAttachments = (item: TimelineItemView): boolean => (item.attachments?.l
 
 /** Adapt the stable turn/window projection to durable Joko Run outcomes. A
  * completed segment never seals a turn. Technical history remains persisted. */
-export function simplifyPartnerRenderItems(source: readonly TimelineRenderItem[], active: boolean): readonly TimelineRenderItem[] {
+export function simplifyPartnerRenderItems(source: readonly TimelineRenderItem[], active: boolean, showPrivateSent = false): readonly TimelineRenderItem[] {
   const result: TimelineRenderItem[] = [];
   let window: TimelineRenderItem[] = [];
   let previousEnd: number | undefined;
@@ -21,16 +21,16 @@ export function simplifyPartnerRenderItems(source: readonly TimelineRenderItem[]
     const end = validTimestamp(last?.endedAt ?? last?.createdAt);
     if (first?.kind !== "user" && (row.historyGapBefore !== undefined
       || start !== undefined && previousEnd !== undefined && start - previousEnd > TIMELINE_WORK_HISTORY_GAP_MS)) {
-      result.push(...projectWindow(window, false)); window = [];
+      result.push(...projectWindow(window, false, showPrivateSent)); window = [];
     }
     window.push(row);
     if (end !== undefined) previousEnd = first?.kind === "user" ? end : Math.max(previousEnd ?? end, end);
   }
-  result.push(...projectWindow(window, active));
+  result.push(...projectWindow(window, active, showPrivateSent));
   return result;
 }
 
-function projectWindow(source: readonly TimelineRenderItem[], active: boolean): readonly TimelineRenderItem[] {
+function projectWindow(source: readonly TimelineRenderItem[], active: boolean, showPrivateSent: boolean): readonly TimelineRenderItem[] {
   const rows: TimelineRenderItem[] = source.flatMap((row): TimelineRenderItem[] => row.type !== "work" ? [row]
     : row.children.map((item, index) => ({ type: "item", key: item.id, childIds: [item.id], item,
       ...(index !== 0 || row.historyGapBefore === undefined ? {} : { historyGapBefore: row.historyGapBefore }) })));
@@ -72,6 +72,7 @@ function projectWindow(source: readonly TimelineRenderItem[], active: boolean): 
       const item = row.item;
       if (item.inlinePlan !== undefined || item.kind === "diff" || item.kind === "thinking" || isInternalContinuationTimelineItem(item)
         || item.kind === "status" && item.streaming !== undefined) return;
+      if (showPrivateSent && item.partnerPrivateSent !== undefined) { push(row); return; }
       if ((item.kind === "tool" || item.kind === "toolResult") && (item.tool === undefined || readPartnerDelegationCardData(item.tool) === undefined)) {
         if (hasAttachments(item)) {
           const { tool: _tool, text: _text, ...delivery } = item;

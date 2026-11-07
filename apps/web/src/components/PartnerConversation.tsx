@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
 
 import type { AppController } from "../controller.js";
-import type { PartnerListView, PartnerMutationView, PartnerProfileView, PartnerSessionView, PartnerReplyQuoteView, SessionView, TimelineItemView } from "../model.js";
+import type { PartnerListView, PartnerMutationView, PartnerPrivateSentView, PartnerProfileView, PartnerSessionView, PartnerReplyQuoteView, SessionView, TimelineItemView } from "../model.js";
 import { clearSentPartnerReplyQuote, partnerReplyQuoteFor, setPendingPartnerReplyQuote, usePendingPartnerReplyQuote, clearSentPartnerTodoQuote,
   setPendingPartnerTodoQuote, usePendingPartnerTodoQuote, type PendingPartnerTodoQuote } from '../partner-reply-quote.js';
 import { isLoopbackHostname } from "../connection-origin.js";
@@ -41,6 +41,7 @@ export interface PartnerConversationView {
   readonly openSettings: (section?: "profile" | "activity") => void;
   readonly openLearningSettings: (destination: PartnerLearningSettingsDestination) => void;
   readonly openPrivateThread: (threadId: string) => void;
+  readonly readSentPrivateMessage?: (receipt: PartnerPrivateSentView, signal: AbortSignal) => Promise<string>;
   readonly topicRoot?: PartnerSessionView['topicRoot'];
   readonly topics?: readonly PartnerSessionView[];
   readonly openingTopicId?: string;
@@ -220,6 +221,24 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   }
   const readContextRef = useRef({ editable, active, partnerIdentity, session });
   readContextRef.current = { editable, active, partnerIdentity, session };
+  const canReadSentPrivateMessage = active && editable && partnerIdentity?.partner.canonicalSessionId === session.id;
+  const readSentPrivateMessage = useCallback(async (receipt: PartnerPrivateSentView, signal: AbortSignal): Promise<string> => {
+    const assertCurrent = (): PartnerProfileView => {
+      signal.throwIfAborted();
+      const current = readContextRef.current;
+      const partner = current.partnerIdentity?.partner;
+      if (!canReadSentPrivateMessage || requestOwnerRef.current !== requestOwner || !current.active || !current.editable
+        || partner?.canonicalSessionId !== session.id) throw new Error("The original Partner conversation is unavailable.");
+      return partner;
+    };
+    const partnerId = assertCurrent().id;
+    const detail = await controllerRef.current.getPartnerPrivateThread(partnerId, receipt.threadId, signal);
+    const message = detail.messages.find(value => value.id === receipt.messageId);
+    if (assertCurrent().id !== partnerId || detail.thread.id !== receipt.threadId || message?.threadId !== receipt.threadId
+      || message.senderPartnerId !== partnerId || message.recipientPartnerId !== receipt.recipientPartnerId
+      || message.deliveryStatus !== "delivered") throw new Error("The original private message is unavailable.");
+    return message.content;
+  }, [canReadSentPrivateMessage, requestOwner, session.id]);
   const acceptMutation = (result: PartnerMutationView): void => {
     if (conversationOwnerRef.current !== conversationOwner || !connected || !documentActive || partnerIdentity === undefined) return;
     if (result.partner.id !== partnerIdentity.partner.id || !ownsConversation(result.partner, session, partnerIdentity.topic)) {
@@ -280,7 +299,11 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   const openLearningSettings = (destination: PartnerLearningSettingsDestination): void => {
     if (editable && conversationOwnerRef.current === conversationOwner) setSettings({ owner: conversationOwner, section: "profile", learningDestination: destination });
   };
-  const openPrivateThread = (threadId: string): void => { if (editable) setSettings({ owner: conversationOwner, section: "activity", threadId }); };
+  const openPrivateThread = (threadId: string): void => {
+    if (conversationOwnerRef.current === conversationOwner && readContextRef.current.editable) {
+      setSettings({ owner: conversationOwner, section: "activity", threadId });
+    }
+  };
   const target = controller.state.snapshot.targets.find((item) => item.id === session.targetId);
   const workbenchAvailable = partnerIdentity !== undefined && !partnerIdentity.topic && target?.trusted === true && target.remoteWorkspace === undefined && isLocalOrigin(profile?.origin);
   const openTopicSession = (sessionId: string): void => {
@@ -312,6 +335,7 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
     entryReadCursor: entryReadRef.current?.owner === conversationOwner ? entryReadRef.current.cursor : undefined,
     readFailed: readFailure === conversationOwner, readRetry, acknowledge, retryRead,
     refresh: () => setRefresh((value) => value + 1), openSettings, openLearningSettings, openPrivateThread,
+    readSentPrivateMessage: canReadSentPrivateMessage ? readSentPrivateMessage : undefined,
     topicRoot: partnerIdentity?.topic?.topicRoot, topics: partnerIdentity?.topics, openTopic: editable && !partnerIdentity?.topic && controller.ensurePartnerTopic ? openTopic : undefined,
     openTopicSession, returnToMain: partnerIdentity?.topic?.topicRoot ? () => { const root = partnerIdentity.topic!.topicRoot!;
       controllerRef.current.navigate({ kind: 'session', sessionId: root.sessionId, messageId: root.messageId, messageEventId: root.eventId }); } : undefined,

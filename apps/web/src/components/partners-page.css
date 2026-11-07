@@ -173,6 +173,13 @@
 .partner-private-receipt > button { display: flex; align-items: center; gap: 6px; border: 0; padding: 4px 8px; background: transparent; color: var(--text-faint); font: inherit; font-size: var(--text-10); cursor: pointer; }
 .partner-private-receipt > button:disabled { cursor: default; }
 .partner-private-receipt svg { width: 14px; height: 14px; }
+.partner-private-sent { width: fit-content; max-width: 100%; margin: 8px auto; border: 1px solid var(--line); border-radius: 10px; color: var(--text-soft); font-size: var(--text-10); }
+.partner-private-sent__toggle { display: flex; align-items: center; gap: 6px; max-width: 100%; padding: 7px 10px; border: 0; border-radius: inherit; background: transparent; color: inherit; font: inherit; text-align: start; overflow-wrap: anywhere; cursor: pointer; }
+.partner-private-sent__toggle:disabled { cursor: default; }
+.partner-private-sent__toggle > svg { flex: none; width: 14px; height: 14px; }
+.partner-private-sent__toggle[aria-expanded="true"] > .details-chevron { transform: rotate(180deg); }
+.partner-private-sent__body { padding: 0 10px 8px; }
+.partner-private-sent__body p { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .partner-private-reply { color: var(--text-faint); font-size: var(--text-9); }
 .partner-learning-footer { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; max-width: 100%; }
 .partner-learning-footer button { display: flex; align-items: center; gap: 8px; min-height: 28px; max-width: 100%; padding: 0; border: 0; background: transparent; color: var(--text-faint); font-size: var(--text-10); text-align: left; cursor: pointer; }

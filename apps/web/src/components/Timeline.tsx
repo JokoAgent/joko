@@ -83,6 +83,7 @@ import { MessageNavRail } from "./MessageNavRail.js";
 import { PrevMessageJumpChip } from "./PrevMessageJumpChip.js";
 import { MessageUsageMeta } from "./MessageUsageMeta.js";
 import { PartnerLearningFooter } from "./PartnerLearningFooter.js";
+import { PartnerPrivateSentCard } from "./PartnerPrivateSentCard.js";
 import { SubagentInlineCard } from "./SubagentInlineCard.js";
 import {
   PartnerDelegationInlineCard,
@@ -268,15 +269,16 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const planTimelineItems = useMemo(() => projectInlinePlanTimeline(items), [items]);
   const partnerConversation = usePartnerConversation();
   const partnerPresentation = partnerConversation?.kind === "partner";
+  const showPrivateSent = partnerPresentation && partnerConversation.partner?.canonicalSessionId === sessionId;
   const currentPlan = useMemo(() => projectPinnedPlan(items), [items]);
   const renderItems = useMemo(
     () => insertTimelineDerivationOrigin(
-      partnerPresentation ? simplifyPartnerRenderItems(projectTimelineRenderItems(items, { sessionActive }), sessionActive)
+      partnerPresentation ? simplifyPartnerRenderItems(projectTimelineRenderItems(items, { sessionActive }), sessionActive, showPrivateSent)
         : projectTimelineRenderItems(planTimelineItems, { sessionActive }),
       derivationOrigin,
       sessionCreatedAt
     ),
-    [derivationOrigin, items, partnerPresentation, planTimelineItems, sessionActive, sessionCreatedAt]
+    [derivationOrigin, items, partnerPresentation, planTimelineItems, sessionActive, sessionCreatedAt, showPrivateSent]
   );
   const partnerTimeGroups = useMemo(() => partnerPresentation ? partnerTimeGroupStarts(renderItems) : new Map<string, number>(), [partnerPresentation, renderItems]);
   const firstPartnerUnread = partnerPresentation ? firstUnreadPartnerReply(renderItems, partnerConversation.entryReadCursor) : undefined;
@@ -2013,9 +2015,15 @@ function usePrefersReducedMotion(): boolean {
 export function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"] }): JSX.Element {
   const { ownerKey } = useContext(TimelinePersonalizationContext);
   const partnerDelegationActions = useContext(TimelinePartnerDelegationContext);
+  const partner = usePartnerConversation();
   const [payloadPreview, setPayloadPreview] = useState<{ readonly sectionId: ToolPayloadSection["id"]; readonly trigger: HTMLButtonElement }>();
   const tool = item.tool;
   if (tool === undefined) return <NoticeBlock item={item} icon={<Wrench />} title={item.title ?? t("timeline.tool")} locale={locale} />;
+  if (item.partnerPrivateSent !== undefined && partner?.kind === "partner" && partner.partner?.canonicalSessionId === partner.sessionId) {
+    const receipt = item.partnerPrivateSent;
+    return <PartnerPrivateSentCard key={JSON.stringify([partner.ownerKey, receipt.messageId, receipt.threadId, receipt.recipientPartnerId])}
+      receipt={receipt} read={partner.readSentPrivateMessage} openThread={partner.openPrivateThread} t={t} />;
+  }
   const partnerDelegation = readPartnerDelegationCardData(tool);
   if (partnerDelegation !== undefined) return <PartnerDelegationInlineCard
     initial={partnerDelegation.delegation}
