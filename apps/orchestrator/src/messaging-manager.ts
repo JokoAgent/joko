@@ -2399,13 +2399,12 @@ export class MessagingManager {
     const session = this.#store.getSession(conversation.sessionId);
     const available = this.#store.getBackend(session.descriptor.backendId).descriptor.capabilities
       .get("permission.modes")?.options ?? [];
-    const choice = /^\/permission(?:\s+(ask|acceptEdits|auto|bypassPermissions)(?:\s+(confirm))?)?$/iu.exec(command);
+    const choice = /^\/permission\s+(\S+)(?:\s+(confirm))?$/iu.exec(command);
     const picker = `Current permission: ${session.descriptor.permissionMode}. Available: ${available.join(", ") || "none"}. Use /permission <mode>; bypassPermissions requires /permission bypassPermissions confirm.`;
     if (choice === null || choice[1] === undefined) return picker;
-    const mode = choice[1].toLowerCase() === "bypasspermissions"
-      ? "bypassPermissions"
-      : choice[1].toLowerCase() as "ask" | "auto";
-    if (!available.includes(mode)) return picker;
+    const requested = choice[1].toLowerCase();
+    const mode = (["ask", "acceptEdits", "auto", "bypassPermissions"] as const).find((option) => option.toLowerCase() === requested);
+    if (mode === undefined || !available.includes(mode)) return picker;
     if (mode === "bypassPermissions" && choice[2]?.toLowerCase() !== "confirm") return picker;
     if (session.descriptor.permissionMode === mode) return `Permission is already ${mode}.`;
     await this.#sessionHost.applySessionSettings(session.descriptor.id, { permissionMode: mode });
