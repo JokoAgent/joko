@@ -2,7 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Client } from "@connectrpc/connect";
 import { EXTENSION_SECRET_CHECK_FAILED, ExtensionAuthorizationPhase, OperationMutationSchema, type ExtensionOAuthFlow, type ExtensionOAuthService,
   type CredentialUploadTicket, type OperationMutation, type ExtensionNetworkService, type ExtensionService,
-  type ExtensionSettingsCall, type ExtensionSettingsHost, type ExtensionPickedDirectoryDeposit } from "@joko/contracts";
+  type ExtensionSettingsAgentModel, type ExtensionSettingsCall, type ExtensionSettingsHost, type ExtensionPickedDirectoryDeposit } from "@joko/contracts";
 
 const settingsRejections = { cancelled: "The settings change was cancelled.", rejected: "The settings change was rejected.",
   "check-failed": EXTENSION_SECRET_CHECK_FAILED } as const;
@@ -16,7 +16,7 @@ export class ExtensionSettingsRejected extends Error {
 }
 
 export const extensionSettingsReadOnly = (kind: ExtensionSettingsCall["kind"]): boolean =>
-  ["context.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(kind);
+  ["context.get", "agent-models.get", "routing.get", "setup.get", "oauth.get", "connections.get", "secret.check", "library.open"].includes(kind);
 
 export interface ExtensionSettingsProjection {
   readonly extensionId: string; readonly revision: bigint; readonly name: string;
@@ -31,6 +31,7 @@ export interface ExtensionSettingsClient<E extends ExtensionSettingsProjection> 
   readonly api: Client<typeof ExtensionService>;
   readonly oauth?: Client<typeof ExtensionOAuthService>;
   readonly connections?: Client<typeof ExtensionNetworkService>;
+  readonly modelVisible?: (model: ExtensionSettingsAgentModel) => boolean;
   readonly upload: (ticket: CredentialUploadTicket, value: string, signal: AbortSignal) => Promise<string>;
   readonly fresh: (signal: AbortSignal) => Promise<E>;
   readonly current: () => void;
@@ -106,6 +107,25 @@ export async function executeExtensionSettingsCall<E extends ExtensionSettingsPr
       } finally { void client.api.closeExtensionDirectoryPicker({ pickerId }, { timeoutMs: 5_000 }).catch(() => undefined); }
     }
     case "context.get": return { context: { locale: host.locale ?? "en" } };
+    case "agent-models.get": {
+      try {
+        const response = await client.api.listExtensionSettingsAgentModels({ surfaceId: client.surface.surfaceId }, rpc);
+        current(); await client.fresh(signal); current();
+        const result = { ok: true, models: response.models.map(model => ({
+          id: model.id, name: model.name, agent: model.agent, providerId: model.providerId, providerName: model.providerName,
+          efforts: model.efforts, defaultEffort: model.defaultEffort ?? null, visible: client.modelVisible?.(model) ?? model.defaultVisible
+        })) };
+        // Leave room for the original mobile settings response envelope.
+        if (new TextEncoder().encode(JSON.stringify(result)).byteLength > 190 * 1024) throw new Error("The model catalog exceeds the settings response limit.");
+        return result;
+      } catch (error) {
+        current();
+        if (ConnectError.from(error).code === Code.PermissionDenied) {
+          return { ok: false, errorCode: "PERMISSION_DENIED", message: "Plugin settings permission is unavailable." };
+        }
+        throw error;
+      }
+    }
     case "routing.get": return readRouting();
     case "routing.set": {
       await client.submit(extension, create(OperationMutationSchema, { payload: { case: "setExtensionSettingsRoutingData", value: {

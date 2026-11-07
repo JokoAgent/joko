@@ -7,9 +7,11 @@ import { EXTENSION_SECRET_CHECK_FAILED, EXTENSION_SETTINGS_SDK_SOURCE, extension
 test("author settings only accepts declared commands and bounded private input", () => {
   const request = command => ({ type: "joko:extension-settings-request", version: 1, id: "settings-one", command });
   assert.ok(parseExtensionSettingsBridgeRequest(request({ kind: "secret.check", key: "token", value: "candidate" })));
+  assert.ok(parseExtensionSettingsBridgeRequest(request({ kind: "agent-models.get" })));
   assert.ok(parseExtensionSettingsBridgeRequest(request({ kind: "directory.pick", title: "Select report files" })));
   for (const command of [
     { kind: "rpc", method: "deleteSession", arguments: {} },
+    { kind: "agent-models.get", backendId: "remote" },
     { kind: "secret.set", fieldId: "network-secret:token", value: "x", resourceId: "other" },
     { kind: "oauth.connect", key: "account", scopes: new Array(33).fill("scope") },
     { kind: "secret.check", key: "token", value: "x".repeat(65_537) },
@@ -34,6 +36,30 @@ function page(source = EXTENSION_SETTINGS_SDK_SOURCE) {
   const reject = (id, message) => dispatch("message", { source: parent, data: { type: "joko:extension-settings-response", version: 1, id, ok: false, message } });
   return { context, requests, dispatch, respond, reject };
 }
+
+test("the authored Agent model directory admits only its parameterless same-origin read", async () => {
+  const current = page();
+  assert.equal((await current.context.fetch("/agent-models", { method: "POST" })).status, 405);
+  assert.equal((await current.context.fetch("/agent-models?backend=remote")).status, 400);
+  await assert.rejects(current.context.fetch("https://foreign.example/agent-models"), /ambient/u);
+  assert.equal(current.requests.length, 0);
+
+  const pending = current.context.fetch("/agent-models");
+  const request = parseExtensionSettingsBridgeRequest(current.requests[0]);
+  assert.equal(request.command.kind, "agent-models.get");
+  const models = [{ id: "text", name: "Text", agent: "pi", providerId: "test", providerName: "Test", efforts: [], defaultEffort: null, visible: false }];
+  current.respond(request.id, { ok: true, models });
+  const response = await pending;
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), { ok: true, models });
+
+  const unavailable = current.context.fetch("/agent-models");
+  current.reject(current.requests[1].id, "internal fixture details");
+  const failed = await unavailable;
+  assert.equal(failed.status, 503);
+  assert.deepEqual(await failed.json(), { ok: false, errorCode: "NOT_AVAILABLE", message: "Model catalog unavailable." });
+});
 
 test("directory selection only sends a native choice request and requires a read deposit", async () => {
   const current = page();

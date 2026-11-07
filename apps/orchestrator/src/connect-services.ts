@@ -4764,6 +4764,19 @@ export function createConnectServices(application: OrchestratorApplication, proj
       context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       return { routingData: dependencies.extensionSettings!.read(surface) };
     },
+    listExtensionSettingsAgentModels: async (request, context) => {
+      const connection = authenticate(context);
+      const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+      if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id)) {
+        throw new ConnectError("Plugin settings document retired.", Code.PermissionDenied);
+      }
+      assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
+      if (!dependencies.extensionCatalog!.get(surface.authority.extensionId).enabled) {
+        throw new ConnectError("The plugin is unavailable.", Code.FailedPrecondition);
+      }
+      return { models: localExtensionSettingsAgentModels(dependencies) };
+    },
     beginExtensionSecretCheck: async (request, context) => {
       const connection = authenticate(context);
       const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
@@ -11292,6 +11305,28 @@ async function requireExtensionSettingsSurface(dependencies: ConnectServiceDepen
   const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.getSurface(surfaceId, connectionId));
   if (!surface.authority.settings) throw new ConnectError("This document does not own plugin settings.", Code.PermissionDenied);
   return surface;
+}
+
+function localExtensionSettingsAgentModels(dependencies: ConnectServiceDependencies): contract.ExtensionSettingsAgentModel[] {
+  return dependencies.store.listBackends().flatMap(({ descriptor: backend }) => {
+    const agent = backend.adapterKind === "claude-agent-sdk-stdio" ? "claude-code" : backend.adapterKind;
+    if (agent !== "codex" && agent !== "claude-code" && agent !== "pi") return [];
+    return dependencies.sessionHost.listSelectableTaskModels(backend.id).flatMap(model => {
+      const outputs = model.declaredOutputModalities;
+      if (outputs?.length && !outputs.some(output => output.toLowerCase() === "text")) return [];
+      const source = projectModelSource(dependencies, create(contract.ModelDescriptorSchema, {
+        backendId: backend.id, key: { providerId: model.providerId, modelId: model.modelId }, available: true
+      }));
+      if (!source.available || source.source?.kind !== contract.ModelSourceKind.LOCAL || source.source.grouped) return [];
+      const efforts = backend.capabilities.get("model.effort")?.supported === true ? [...model.thinkingLevels] : [];
+      return [create(contract.ExtensionSettingsAgentModelSchema, {
+        backendId: backend.id, id: model.modelId, name: model.displayName, agent,
+        providerId: model.providerId, providerName: source.source.displayName, efforts,
+        defaultEffort: model.defaultEffort && efforts.includes(model.defaultEffort) ? model.defaultEffort : undefined,
+        defaultVisible: model.defaultVisible ?? true
+      })];
+    });
+  });
 }
 
 function mapExtensionDirectoryPage(page: ExtensionDirectoryPage): contract.ExtensionDirectoryPickerPage {

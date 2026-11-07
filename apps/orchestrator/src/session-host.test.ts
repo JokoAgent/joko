@@ -2177,7 +2177,11 @@ describe("SessionHost", () => {
   it("rejects a disabled route from service-owned task creation", async () => {
     const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
     const createNative = vi.spyOn(adapter, "createSession");
-    const fixture = await createFixture(adapter, { modelRoutingEnabled: () => false });
+    let routeEnabled = true;
+    const fixture = await createFixture(adapter, { modelRoutingEnabled: () => routeEnabled });
+    expect(fixture.host.listSelectableTaskModels(adapter.id)).toEqual(expect.arrayContaining([expect.objectContaining({ providerId: "test", modelId: "text" })]));
+    routeEnabled = false;
+    expect(fixture.host.listSelectableTaskModels(adapter.id)).toEqual([]);
 
     await expect(fixture.host.createServiceSession({
       operationId: "create-disabled-service-route",

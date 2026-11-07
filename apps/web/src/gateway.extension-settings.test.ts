@@ -6,6 +6,7 @@ import { ExtensionCatalogSource, ExtensionInstallState, ExtensionSetupState, Ope
 import { expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 import { extensionSettingsProfilePin, parsePendingExtensionSettingsOperation, type PendingExtensionSettingsOperation } from "./extension-settings-operation.js";
+import { setModelVisible } from "./model-picker-preferences.js";
 
 async function fixture(operationCall?: (method: string, input: any) => Promise<Record<string, unknown>>) {
   const owner = { resourceId: "resource", resourceVersion: { value: 2n }, discoveredRevision: `sha256:${"a".repeat(64)}` };
@@ -18,7 +19,7 @@ async function fixture(operationCall?: (method: string, input: any) => Promise<R
   const calls: Array<{ method: string; input: unknown }> = [];
   const transport = { unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
     calls.push({ method: method.localName, input });
-    const value = operationCall && ["submitOperation", "getOperation"].includes(method.localName) ? await operationCall(method.localName, input)
+    const value = operationCall && ["submitOperation", "getOperation", "listExtensionSettingsAgentModels"].includes(method.localName) ? await operationCall(method.localName, input)
       : method.localName === "getSnapshot" ? { snapshot: {} }
       : method.localName === "openExtensionSettings" || method.localName === "getExtensionMainViewSurface" ? { surface }
         : method.localName === "getExtension" ? { extension: entry } : method.localName === "closeExtensionMainView" ? { closed: true }
@@ -35,6 +36,26 @@ async function fixture(operationCall?: (method: string, input: any) => Promise<R
   } };
 }
 const host: ExtensionSettingsHost = { confirm: async () => true, authorize: async () => ({ state: "state" }), openLibrary: async () => undefined };
+
+it("reads the original settings model catalog and applies the active owner's picker visibility", async () => {
+  const model = { backendId: "native", id: "text", name: "Text", agent: "pi", providerId: "test", providerName: "Test", efforts: [], defaultVisible: true };
+  const f = await fixture(async () => ({ models: [model] }));
+  f.entry.enabled = true;
+  setModelVisible(f.profile.serverId, model.backendId, model.providerId, model.id, false);
+  try {
+    const api = f.settingsApi(), signal = new AbortController().signal;
+    const surface = await api.open(f.entry.extensionId, 4n, signal);
+    await expect(api.call(surface, { kind: "agent-models.get" }, host, signal)).resolves.toEqual({ ok: true, models: [{
+      id: "text", name: "Text", agent: "pi", providerId: "test", providerName: "Test", efforts: [], defaultEffort: null, visible: false
+    }] });
+    const read = f.calls.findIndex(call => call.method === "listExtensionSettingsAgentModels");
+    expect(f.calls[read]?.input).toMatchObject({ surfaceId: surface.id });
+    expect(f.calls.slice(read + 1).map(call => call.method)).toEqual(["getExtensionMainViewSurface", "getExtension"]);
+  } finally {
+    setModelVisible(f.profile.serverId, model.backendId, model.providerId, model.id, true);
+    f.gateway.disconnect();
+  }
+});
 
 it("opens author settings for a disabled, incomplete installation and pins every call to its original surface purpose", async () => {
   const f = await fixture();
