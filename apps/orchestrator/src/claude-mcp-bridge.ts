@@ -25,6 +25,7 @@ export function createClaudeMcpBridge(options: {
         targetId: input.targetId,
         expectedPiGeneration: input.generation,
         ttlMs: GRANT_TTL_MS,
+        useLatestAppTools: true,
         includeToolPolicy: (policyId) => options.includeToolPolicy(input.sessionId, input.targetId, policyId)
       });
       let released = false;

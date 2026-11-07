@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { CallToolResultSchema, CreateTaskResultSchema, type CallToolRequest, type CreateTaskResult, type Progress } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolResultSchema, CreateTaskResultSchema, ListToolsResultSchema, type CallToolRequest, type CreateTaskResult, type Progress } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport, FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { PiMcpBridgeOptions, PiMcpToolDescriptor } from "@joko/adapter-pi";
 import { validateMcpEndpoint } from "@joko/adapter-pi";
@@ -299,8 +299,14 @@ interface Runtime {
   readonly generation: number;
   readonly connection: McpClientConnection;
   readonly tools: readonly McpToolDescriptor[];
+  latestAppTools?: AppToolCatalog;
   state: McpServerState;
   error?: string;
+}
+
+interface AppToolCatalog {
+  readonly tools: readonly McpToolDescriptor[];
+  readonly digest: string;
 }
 
 interface BridgeGrant {
@@ -309,6 +315,7 @@ interface BridgeGrant {
   readonly authorityDigest: Buffer;
   readonly serverGenerations: ReadonlyMap<string, number>;
   readonly tools: readonly PiMcpToolDescriptor[];
+  readonly appToolCatalogs: ReadonlyMap<string, AppToolCatalog>;
   readonly audioResultMappings: ReadonlyMap<string, McpAudioResultMapping>;
   readonly publishCompleteOutput: boolean;
   readonly expectedPiGeneration?: number;
@@ -941,6 +948,8 @@ export class McpRouter {
     readonly targetId?: string;
     readonly expectedPiGeneration?: number;
     readonly ttlMs?: number;
+    /** New Claude Queries have their own App client and schema validation. */
+    readonly useLatestAppTools?: boolean;
     /** Ordinary local runtime may publish complete external results to this exact Session. */
     readonly publishCompleteOutput?: boolean;
     readonly nativeAuthLease?: {
@@ -994,6 +1003,7 @@ export class McpRouter {
       };
     }
     const serverGenerations = new Map<string, number>();
+    const appToolCatalogs = new Map<string, AppToolCatalog>();
     const references = input.targetId === undefined ? undefined : this.#targetReferences?.(input.targetId, input.sessionId);
     const tools: PiMcpToolDescriptor[] = [];
     const audioResultMappings = new Map<string, McpAudioResultMapping>();
@@ -1003,7 +1013,9 @@ export class McpRouter {
       const runtime = this.#runtime(server.input.id, server.generation);
       if (runtime === undefined || runtime.state !== "connected") continue;
       serverGenerations.set(server.input.id, server.generation);
-      for (const tool of runtime.tools) {
+      const appCatalog = input.useLatestAppTools ? runtime.latestAppTools : undefined;
+      if (appCatalog !== undefined) appToolCatalogs.set(server.input.id, appCatalog);
+      for (const tool of appCatalog?.tools ?? runtime.tools) {
         if (tool.modelVisible === false) continue;
         tools.push({
           serverId: tool.serverId,
@@ -1078,6 +1090,7 @@ export class McpRouter {
       productScope,
       serverGenerations,
       tools,
+      appToolCatalogs,
       audioResultMappings,
       nativeAuth
     });
@@ -1086,6 +1099,7 @@ export class McpRouter {
       authorityDigest,
       serverGenerations,
       tools,
+      appToolCatalogs,
       audioResultMappings,
       publishCompleteOutput: productScope !== undefined && input.publishCompleteOutput === true,
       ...(input.expectedPiGeneration === undefined ? {} : { expectedPiGeneration: input.expectedPiGeneration }),
@@ -1206,6 +1220,9 @@ export class McpRouter {
     if (!grant.tools.some((tool) => tool.serverId === input.serverId && tool.name === input.toolName)) {
       throw new Error("MCP tool is not present in this Pi runtime snapshot.");
     }
+    if (grant.appToolCatalogs.has(input.serverId) && input.appCall === undefined) {
+      throw new Error("An updated MCP tool catalog requires its original model channel.");
+    }
     let assertNativeRoot: (() => void) | undefined;
     const rootRequired = grant.tools.some(tool => tool.serverId === input.serverId && tool.name === input.toolName && tool.requiresNativeRoot);
     if (rootRequired) {
@@ -1289,7 +1306,8 @@ export class McpRouter {
         const replay = input.appCall?.params.task ? undefined : this.#audioArtifacts?.replay(context);
         if (replay !== undefined) result = replay;
         else {
-          const tool = runtime.tools.find(candidate => candidate.name === input.toolName);
+          const tools = grant.appToolCatalogs.get(input.serverId)?.tools ?? runtime.tools;
+          const tool = tools.find(candidate => candidate.name === input.toolName);
           if (grant.publishCompleteOutput && input.appCall?.params.task === undefined && tool?.appResourceUri === undefined
             && audioResultMapping === undefined && this.#canPublishCompleteOutput(session)) {
             completeOutputOwner = { session, assertCurrent: () => {
@@ -2526,6 +2544,14 @@ export class McpRouter {
         onClose: () => this.#runtimeClosed(server.input.id, server.generation),
         onError: (error) => this.#runtimeErrored(server.input.id, server.generation, error)
       });
+      const app = connection.appConnection;
+      let appToolsChanged = false;
+      let refreshAppTools: (() => void) | undefined;
+      app?.listen(message => {
+        if (message.method !== "notifications/tools/list_changed") return;
+        if (refreshAppTools === undefined) appToolsChanged = true;
+        else refreshAppTools();
+      });
       const tools = await discoverAllTools(
         connection,
         server.input.id,
@@ -2545,6 +2571,10 @@ export class McpRouter {
       if (this.#servers.get(server.input.id)?.generation === server.generation) {
         this.#states.set(server.input.id, { state: "connected", generation: server.generation });
       }
+      if (app !== undefined) {
+        refreshAppTools = this.#createAppToolRefresh(runtime, app, assertHeadersCurrent);
+        if (appToolsChanged) refreshAppTools();
+      }
     } catch (error) {
       await connection?.close().catch(() => undefined);
       const message = this.#redactedError(error);
@@ -2562,6 +2592,45 @@ export class McpRouter {
       // An adopted runtime belongs to the service, independently of the device that saved it.
       startupAuthority = undefined;
     }
+  }
+
+  #createAppToolRefresh(runtime: Runtime, app: AppConnection, assertCredentialsCurrent?: () => void): () => void {
+    const { serverId, generation } = runtime;
+    const isCurrent = () => this.#servers.get(serverId)?.generation === generation
+      && this.#runtime(serverId, generation) === runtime && runtime.state === "connected";
+    const assertCurrent = () => {
+      if (!isCurrent()) throw new Error("The MCP tool catalog runtime retired.");
+      assertCredentialsCurrent?.();
+    };
+    let pending = false;
+    let refreshing = false;
+    const refresh = async () => {
+      while (pending && isCurrent()) {
+        pending = false;
+        try {
+          assertCurrent();
+          const client = await app.getClient();
+          if (client.getServerCapabilities()?.tools?.listChanged !== true) return;
+          // SDK listTools changes the original client's tool validators. This
+          // read feeds new Queries while that client keeps its startup schema.
+          const tools = await discoverAllTools({ listTools: (cursor, signal) => client.request({
+            method: "tools/list",
+            ...(cursor === undefined ? {} : { params: { cursor } })
+          }, ListToolsResultSchema, { signal }) }, serverId, this.#toolDiscoveryPolicy, assertCurrent);
+          assertCurrent();
+          if (duplicateToolName(tools) !== undefined) continue;
+          const digest = appToolCatalogDigest(tools);
+          runtime.latestAppTools = digest === appToolCatalogDigest(runtime.tools) ? undefined : { tools, digest };
+        } catch { /* An invalid or retired update cannot replace a verified catalog. */ }
+      }
+    };
+    return () => {
+      if (!isCurrent()) return;
+      pending = true;
+      if (refreshing) return;
+      refreshing = true;
+      void refresh().finally(() => { refreshing = false; });
+    };
   }
 
   #runtimeClosed(serverId: string, generation: number): void {
@@ -2593,7 +2662,7 @@ export class McpRouter {
       enabled: server.input.enabled,
       state: state.state,
       runtimeGeneration: server.generation,
-      tools: runtime?.tools ?? [],
+      tools: runtime?.latestAppTools?.tools ?? runtime?.tools ?? [],
       credentialBindings: server.input.credentialBindings.map((binding) => ({
         ...binding,
         configured: this.#credentials.find(binding.credentialReferenceId)?.configured === true
@@ -2929,7 +2998,7 @@ function normalizeTool(serverId: string, tool: McpListedTool): McpToolDescriptor
 }
 
 async function discoverAllTools(
-  connection: McpClientConnection,
+  connection: Pick<McpClientConnection, "listTools">,
   serverId: string,
   policy: McpToolDiscoveryPolicy,
   assertCurrent?: () => void
@@ -2989,6 +3058,10 @@ async function discoverAllTools(
   } finally {
     clearTimeout(timer);
   }
+}
+
+function appToolCatalogDigest(tools: readonly McpToolDescriptor[]): string {
+  return operationBodyHash([...tools].sort((left, right) => left.name.localeCompare(right.name, "en")));
 }
 
 function throwIfDiscoveryAborted(signal: AbortSignal): void {
@@ -3083,6 +3156,7 @@ function bridgeGrantAuthorityDigest(input: {
   readonly productScope?: BridgeGrant["productScope"];
   readonly serverGenerations: ReadonlyMap<string, number>;
   readonly tools: readonly PiMcpToolDescriptor[];
+  readonly appToolCatalogs: ReadonlyMap<string, AppToolCatalog>;
   readonly audioResultMappings: ReadonlyMap<string, McpAudioResultMapping>;
   readonly nativeAuth?: BridgeGrant["nativeAuth"];
 }): Buffer {
@@ -3107,6 +3181,9 @@ function bridgeGrantAuthorityDigest(input: {
     audioResultMappings: [...input.audioResultMappings]
       .sort(([left], [right]) => left.localeCompare(right, "en"))
       .map(([tool, mapping]) => ({ tool, mapping })),
+    ...(input.appToolCatalogs.size === 0 ? {} : { appToolCatalogs: [...input.appToolCatalogs]
+      .sort(([left], [right]) => left.localeCompare(right, "en"))
+      .map(([serverId, catalog]) => ({ serverId, digest: catalog.digest })) }),
     ...(input.nativeAuth === undefined ? {} : {
       nativeAuth: {
         catalogGeneration: input.nativeAuth.catalogGeneration,
