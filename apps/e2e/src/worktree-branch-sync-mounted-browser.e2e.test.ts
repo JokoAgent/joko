@@ -53,7 +53,9 @@ mountedIt("updates the selected branch through the production page and recovers 
         await navigationScrim.waitFor({ state: "hidden" });
       }
       const button = page.getByRole("button", { name: "Update selected branch", exact: true });
-      await button.focus(); expect(await button.evaluate(value => value === value.ownerDocument.activeElement)).toBe(true);
+      await expect.poll(() => button.isEnabled(), { timeout: 10_000 }).toBe(true);
+      await button.focus();
+      expect(await button.evaluate(value => value === value.ownerDocument.activeElement), `${theme} button focus at ${width}px`).toBe(true);
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth);
       expect(overflow, `${theme} layout at ${width}px`).toBeLessThanOrEqual(0);
       if (evidence) await page.screenshot({ path: resolve(evidence, `branch-${theme}-${width}.png`), fullPage: true });
