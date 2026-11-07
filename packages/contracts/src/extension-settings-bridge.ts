@@ -125,7 +125,7 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
   const jsonResponse = (result, status = 200) => new Response(JSON.stringify(result, (_key, value) => typeof value === "bigint" ? value.toString(10) : value),
     { status, headers: { "content-type": "application/json" } });
   window.fetch = async (input, init) => {
-    const target = typeof input === "string" ? input : input && input.url;
+    const target = typeof input === "string" ? input : input instanceof URL ? input.href : input && input.url;
     if (typeof target !== "string" || target.startsWith("//")) return originalFetch(input, init);
     const base = globalThis[Symbol.for("joko.extension.surface.base")] || "https://settings.joko.invalid/";
     const url = new URL(target, base);
