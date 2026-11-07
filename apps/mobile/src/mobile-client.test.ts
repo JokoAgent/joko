@@ -974,7 +974,8 @@ function memoryOfflineCache(now: () => number = () => 1_500) {
   let sequence = 0;
   return {
     cache: new MobileOfflineCache(driver, now, () => `cache-${++sequence}`),
-    values
+    values,
+    driver
   };
 }
 
@@ -5683,6 +5684,47 @@ describe("native mobile connection and operation ownership", () => {
     expect(saved.storage.loadCredential).toHaveBeenCalledWith(otherCredential.profileId);
     expect(saved.storage.loadCredential).not.toHaveBeenCalledWith(credential.profileId);
     expect(network.readOwner).toHaveBeenCalledWith(otherCredential, expect.objectContaining({ defaultDisplayName: "Joko android" }), expect.any(AbortSignal));
+  });
+
+  it("connects after the saved Home read deadline and never adopts the late archived copy", async () => {
+    const staleSession = create(SessionSchema, { ...runtimeSession, archived: true, state: SessionState.ARCHIVED });
+    const offline = memoryOfflineCache();
+    const profile = profileFromCredential(credential);
+    await offline.cache.save(profile, node, offlineOwnerProjection([staleSession]));
+    const manifestKey = [...offline.values.keys()].find((key) => key.endsWith(".manifest"))!;
+    const originalManifest = offline.values.get(manifestKey)!;
+    let releaseManifest!: (value: string) => void;
+    let markReading!: () => void;
+    const reading = new Promise<void>((resolve) => { markReading = resolve; });
+    const lateManifest = new Promise<string>((resolve) => { releaseManifest = resolve; });
+    const getItem = offline.driver.getItem.bind(offline.driver);
+    let holdOriginal = true;
+    vi.spyOn(offline.driver, "getItem").mockImplementation((key) => {
+      if (key !== manifestKey || !holdOriginal) return getItem(key);
+      holdOriginal = false;
+      markReading();
+      return lateManifest;
+    });
+    const network = fakeNetwork();
+    const fresh = offlineOwnerProjection();
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: fresh });
+    vi.mocked(network.readSession).mockResolvedValue(offlineDetailProjection());
+    const app = clientWithOfflineCache(network, memoryStorage(credential).storage, offline.cache);
+    vi.useFakeTimers();
+    const starting = app.start();
+    await reading;
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(network.inspect).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await starting;
+    expect(network.inspect).toHaveBeenCalledOnce();
+    expect(app.state).toMatchObject({ status: "connected", owner: fresh, offlineSnapshotAt: undefined });
+
+    releaseManifest(originalManifest);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.owner?.sessions[0]?.archived).toBe(false);
+    expect((await offline.cache.load(profile))?.owner.sessions[0]?.archived).toBe(false);
   });
 
   it("restores a current-v1 task copy before anonymous inspection and retries into authoritative online state", async () => {

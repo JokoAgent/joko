@@ -854,6 +854,7 @@ const textOnlyIncomingSharePolicy: MobileAttachmentControls["policy"] = {
   imageMediaTypes: [],
   fileMediaTypes: []
 };
+const savedHomeCacheReadBudgetMs = 2_000;
 
 function confirmedMobileDeviceName(operation: Operation, deviceId: string, connectionId: string): Device {
   const confirmed = operation.result?.payload.case === "device" ? operation.result.payload.value : undefined;
@@ -4912,13 +4913,20 @@ export class MobileClient {
         selection = await this.storage.loadSelection(profileId);
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         if (!preserveActiveConnection && this.offlineCache) {
+          const cacheRead = new AbortController();
+          const abortCacheRead = () => cacheRead.abort();
+          const cacheDeadline = setTimeout(abortCacheRead, savedHomeCacheReadBudgetMs);
+          controller.signal.addEventListener("abort", abortCacheRead, { once: true });
           try {
-            cached = await this.offlineCache.load(profile, selection);
+            cached = await this.offlineCache.load(profile, selection, cacheRead.signal);
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
             if (cached) this.#showOfflineProjection(profile, cached, selection, "connecting");
           } catch (error) {
-            cacheLoadWarning = message(error);
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            if (!cacheRead.signal.aborted) cacheLoadWarning = message(error);
+          } finally {
+            clearTimeout(cacheDeadline);
+            controller.signal.removeEventListener("abort", abortCacheRead);
           }
         }
         // Public identity proof must precede the protected credential read.
