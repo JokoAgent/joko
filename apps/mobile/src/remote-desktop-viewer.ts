@@ -123,9 +123,50 @@ const VIEWER_SCRIPT = String.raw`
   listenMouse(wheel,'keydown',event=>{if(event.key==='ArrowUp'||event.key==='ArrowDown'){event.preventDefault();scrollMouse(event.key==='ArrowUp'?-120:120);}});
   function pair(){const [a,b]=[...pointers.values()];return{x:(a.x+b.x)/2,y:(a.y+b.y)/2,d:Math.hypot(a.x-b.x,a.y-b.y)};}
   function movePair(){gestureFrame=null;if(pointers.size<2||!multi)return;const next=pair(),span=Math.abs(next.d-multi.d),travel=Math.hypot(next.x-multi.x,next.y-multi.y);if(!multi.kind){if(span>8&&span>travel*.7)multi.kind='pinch';else if(travel>8)multi.kind='scroll';}if(multi.kind==='pinch'){zoom=Math.max(1,Math.min(5,multi.zoom*next.d/Math.max(1,multi.d)));boundPan();render();}else if(multi.kind==='scroll'){const dx=next.x-multi.lastX,dy=next.y-multi.lastY;if(control&&mode!=='pan')queue({kind:'scroll',dx:Math.max(-2000,Math.min(2000,-dx)),dy:Math.max(-2000,Math.min(2000,-dy))});else pan(dx,dy);}multi.lastX=next.x;multi.lastY=next.y;}
-  stage.addEventListener('pointerdown',event=>{if(pointers.has(event.pointerId))return;event.preventDefault();stage.setPointerCapture(event.pointerId);pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});if(pointers.size===1){start=last={x:event.clientX,y:event.clientY};hold=setTimeout(()=>{if(control&&mode!=='pan'&&pointers.size===1&&start&&!heldMouse.size&&(mode!=='touch'||inside(start))){if(mode==='touch'){const p=point(start);cx=p.x;cy=p.y;}queue({kind:'button',button:0,down:true,x:cx,y:cy});flush();drag=true;}},400);}else{clearTimeout(hold);if(drag)queue({kind:'release'});drag=false;start=null;const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,kind:null};}});
-  stage.addEventListener('pointermove',event=>{if(!pointers.has(event.pointerId))return;event.preventDefault();pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});if(pointers.size>=2){if(gestureFrame===null)gestureFrame=requestAnimationFrame(movePair);return;}if(!start||!last)return;const now={x:event.clientX,y:event.clientY},dx=now.x-last.x,dy=now.y-last.y;last=now;if(Math.hypot(now.x-start.x,now.y-start.y)>6)clearTimeout(hold);if(!control||mode==='pan'||(mode==='touch'&&!drag&&!heldMouse.size)){pan(dx,dy);return;}if(mode==='trackpad'){const r=layout();cx=clamp(cx+dx/r.w*1.5);cy=clamp(cy+dy/r.h*1.5);}else{const p=point(now);cx=p.x;cy=p.y;}queue({kind:'move',x:cx,y:cy});render();});
-  function pointerUp(event){if(!pointers.has(event.pointerId))return;clearTimeout(hold);const wasTap=start&&last&&Math.hypot(last.x-start.x,last.y-start.y)<=6;pointers.delete(event.pointerId);if(drag){queue({kind:'button',button:0,down:false,x:cx,y:cy});flush();drag=false;}else if(wasTap&&control&&mode!=='pan'&&!heldMouse.size&&event.type==='pointerup'&&(mode!=='touch'||inside({x:event.clientX,y:event.clientY}))){if(mode==='touch'){const p=point({x:event.clientX,y:event.clientY});cx=p.x;cy=p.y;}click();}start=last=multi=null;boundPan();render();}
+  stage.addEventListener('pointerdown',event=>{
+    if(pointers.has(event.pointerId))return;
+    event.preventDefault();stage.setPointerCapture(event.pointerId);
+    const position={x:event.clientX,y:event.clientY};
+    pointers.set(event.pointerId,position);
+    if(pointers.size===1){
+      start={...position,moved:false};last=position;
+      hold=setTimeout(()=>{
+        if(control&&mode!=='pan'&&pointers.size===1&&start&&!heldMouse.size&&(mode!=='touch'||inside(start))){
+          if(mode==='touch'){const p=point(start);cx=p.x;cy=p.y;}
+          queue({kind:'button',button:0,down:true,x:cx,y:cy});flush();drag=true;
+        }
+      },400);
+    }else{
+      clearTimeout(hold);if(drag)queue({kind:'release'});drag=false;start=null;
+      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,kind:null};
+    }
+  });
+  stage.addEventListener('pointermove',event=>{
+    if(!pointers.has(event.pointerId))return;
+    event.preventDefault();
+    const now={x:event.clientX,y:event.clientY};
+    pointers.set(event.pointerId,now);
+    if(pointers.size>=2){if(gestureFrame===null)gestureFrame=requestAnimationFrame(movePair);return;}
+    if(!start||!last)return;
+    const dx=now.x-last.x,dy=now.y-last.y;last=now;
+    if(!start.moved&&Math.hypot(now.x-start.x,now.y-start.y)>6){start.moved=true;clearTimeout(hold);}
+    if(!control||mode==='pan'||(mode==='touch'&&!drag&&!heldMouse.size)){pan(dx,dy);return;}
+    if(mode==='trackpad'){const r=layout();cx=clamp(cx+dx/r.w*1.5);cy=clamp(cy+dy/r.h*1.5);}
+    else{const p=point(now);cx=p.x;cy=p.y;}
+    queue({kind:'move',x:cx,y:cy});render();
+  });
+  function pointerUp(event){
+    if(!pointers.has(event.pointerId))return;
+    clearTimeout(hold);
+    const wasTap=start&&!start.moved;
+    pointers.delete(event.pointerId);
+    if(drag){queue({kind:'button',button:0,down:false,x:cx,y:cy});flush();drag=false;}
+    else if(wasTap&&control&&mode!=='pan'&&!heldMouse.size&&event.type==='pointerup'&&(mode!=='touch'||inside({x:event.clientX,y:event.clientY}))){
+      if(mode==='touch'){const p=point({x:event.clientX,y:event.clientY});cx=p.x;cy=p.y;}
+      click();
+    }
+    start=last=multi=null;boundPan();render();
+  }
   stage.addEventListener('pointerup',pointerUp);stage.addEventListener('pointercancel',()=>{release();boundPan();render();});
   stage.addEventListener('contextmenu',event=>event.preventDefault());stage.addEventListener('selectstart',event=>event.preventDefault());stage.addEventListener('dragstart',event=>event.preventDefault());
   const sentinel='\u200b';function resetKeyboard(){keyboard.value=sentinel;keyboard.setSelectionRange(1,1);}function showKeyboard(enabled){keyboardEnabled=enabled&&control;if(!keyboardEnabled){composing=false;resetKeyboard();keyboard.blur();return;}keyboard.blur();resetKeyboard();keyboard.focus({preventScroll:true});}

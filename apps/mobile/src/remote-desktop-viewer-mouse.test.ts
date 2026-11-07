@@ -89,6 +89,25 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()[2]).toMatchObject({ events: [{ kind: "button", button: 2, down: false, x: .6, y: .6 }] });
   });
 
+  it("does not click after moving away and back to the same touch point", async () => {
+    const value = viewer();
+    value.config(false);
+    value.pointer(value.stage, "pointerdown");
+    value.pointer(value.stage, "pointermove", 7, 420, 300);
+    value.pointer(value.stage, "pointermove");
+    await vi.advanceTimersByTimeAsync(100);
+    value.pointer(value.stage, "pointerup");
+    expect(value.packets()).toEqual([]);
+
+    value.pointer(value.stage, "pointerdown", 8);
+    value.pointer(value.stage, "pointerup", 8);
+    expect(value.packets()).toHaveLength(1);
+    expect(value.packets()[0]).toMatchObject({ events: [
+      { kind: "button", button: 0, down: true, x: .5, y: .5 },
+      { kind: "button", button: 0, down: false, x: .5, y: .5 }
+    ] });
+  });
+
   it("uses bounded displacement ticks and skips ACK time without accumulating a scroll backlog", async () => {
     const value = viewer(), wheel = value.button("wheel");
     value.pointer(wheel, "pointerdown", 7, 0, 100); value.pointer(wheel, "pointermove", 7, 0, 104);
