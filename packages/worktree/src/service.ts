@@ -936,9 +936,11 @@ export class EphemeralWorktreeService {
     entry: ManagedWorktreeEntry,
     control: WorktreeOperationControl
   ): Promise<ManagedWorktreeEntry> {
+    control.check();
     const store = this.#requireStore();
     let current = store.get(entry.id) ?? entry;
     await this.#validateManagedRecord(current);
+    control.check();
     if (await cancelWorktreeSourceUses(current.path)) throw new WorktreeServiceError("SESSION_CONFLICT", "The project worktree is still in use.");
     await validateOrdinaryDirectory(
       current.repositoryRoot,

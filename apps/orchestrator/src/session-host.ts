@@ -2069,8 +2069,11 @@ export class SessionHost {
     if (current.state !== "active" || current.authKeyDigest !== connection.authKeyDigest || session.archived || session.deletedAt !== undefined
       || this.#store.sessionCreationServiceKind(sessionId) !== undefined || session.automationOrigin !== undefined
       || this.#partnerSessionPolicy?.(sessionId) !== undefined || this.isReviewReadOnlySession(sessionId) || this.hasDurableSessionWork(sessionId)) return;
+    // Existing tasks need no draft startup. If a cold task must advance its
+    // native generation, the first admitted input owns the replacement Attempt.
+    if (provisional === undefined) return;
     this.assertProvisionalCreationReady({ operationId: "prewarm", connection, title: session.title, targetId: session.targetId,
-      provisionalDraftId: provisional?.draftId ?? "ordinary_user_task", providerId: session.providerId, modelId: session.modelId,
+      provisionalDraftId: provisional.draftId, providerId: session.providerId, modelId: session.modelId,
       effort: session.effort, fastMode: session.fastMode, permissionMode: session.permissionMode, planMode: session.planMode,
       ...(session.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: session.appendSystemPrompt }),
       ...(session.worktree === undefined ? {} : { worktree: { refreshRemote: false } }) });
@@ -3734,11 +3737,17 @@ export class SessionHost {
     let prepared: MessageDeletionPlan | undefined;
     const assertPrecondition = (store: OperationalStore): void => {
       input.precondition?.(store);
-      this.assertMessageDeletionSupported(input.sessionId);
+      const adapter = this.assertMessageDeletionSupported(input.sessionId);
       this.assertMessageDeletionIdle(input.sessionId, store);
       const current = planMessageDeletion(store, input.sessionId, input.eventId);
       if (prepared !== undefined && !sameEventIds(current.deletedEventIds, prepared.deletedEventIds)) {
         throw new StoreError("The visible message turn changed while deletion was being prepared.");
+      }
+      if (adapter.rebuildContext === undefined) {
+        const remaining = contextRebuildInput(store, input.sessionId, {
+          reason: "message_deletion", latestDeletionOperationId: input.operationId, sourceInputPending: false, replaySafe: false
+        }, new Set(current.deletedEventIds));
+        assertMessageDeletionHandoffBound(remaining.handoff);
       }
     };
     try {
@@ -3749,7 +3758,10 @@ export class SessionHost {
         body: input.body,
         precondition: assertPrecondition,
         effect: async () => {
-          await this.prepareMessageDeletion(input.sessionId);
+          const adapter = this.assertMessageDeletionSupported(input.sessionId);
+          await this.prepareMessageDeletion(input.sessionId, adapter, () => {
+            this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+          });
           prepared = planMessageDeletion(this.#store, input.sessionId, input.eventId);
         },
         commit: (store) => {
@@ -5078,7 +5090,8 @@ export class SessionHost {
         if (sourceMessage !== undefined) {
           const visible = store.findVisibleSessionMessageOrigin({
             sessionId: input.sourceSessionId,
-            eventId: sourceMessage.eventId
+            eventId: sourceMessage.eventId,
+            includeRetainedContext: input.kind !== "fork"
           });
           if (visible?.messageId !== sourceMessage.messageId) {
             throw new StoreError("The derivation source message is no longer visible.");
@@ -5191,8 +5204,10 @@ export class SessionHost {
           ...(remotePlan === undefined ? {} : { remoteWorktreePlan: remotePlan })
         });
         if (remotePlan !== undefined) {
-          derivedWorktree = await this.#worktrees!.acquirePlannedRemoteDerivation(remotePlan);
+          const assertCurrent = () => { this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest); };
+          derivedWorktree = await this.#worktrees!.acquirePlannedRemoteDerivation(remotePlan, assertCurrent);
           acquiredDerivedWorktree = derivedWorktree;
+          assertCurrent();
           this.#store.attachNativeSessionDerivationWorktree({
             operationId: claim.operation.id,
             expectedRevision: prepared.revision,
@@ -5201,6 +5216,7 @@ export class SessionHost {
           this.assertActiveBackendSideEffectLease(sideEffectLease);
           this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
           await this.#worktrees!.assertActiveRemoteWorktree(sessionId, derivedWorktree);
+          assertCurrent();
         }
       }
       const derivation: NativeSessionDerivation = {
@@ -9520,14 +9536,16 @@ export class SessionHost {
     throw new StoreError("Destructive task cleanup requires a durable lifecycle owner.");
   }
 
-  private assertMessageDeletionSupported(sessionId: string): void {
+  private assertMessageDeletionSupported(sessionId: string): BackendAdapter {
     const stored = this.#store.getSession(sessionId);
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
     const adapter = this.requireAdapter(stored.descriptor.backendId);
+    if (adapter.rebuildContext === undefined) this.assertSessionNotPendingScheduleDeletion(sessionId);
     if (
-      backend.capabilities.get("session.message_delete")?.supported === true &&
-      adapter.rebuildContext !== undefined
-    ) return;
+      !this.isReviewReadOnlySession(sessionId) && !(stored.descriptor.derivationOrigin?.sideChat && stored.descriptor.worktree === undefined) &&
+      supportsNativeStartNavigation(backend.capabilities.get("session.message_delete"), this.targetForSession(stored)) &&
+      (adapter.rebuildContext !== undefined || adapter.prepareRestartContext !== undefined || backend.adapterKind === "codex")
+    ) return adapter;
     throw messageDeletionError(
       "SESSION_MESSAGE_DELETE_UNSUPPORTED",
       "The selected Backend cannot safely delete a message from native context.",
@@ -9557,6 +9575,9 @@ export class SessionHost {
       this.#compactionEffects.has(sessionId) ||
       this.#userShellRequests.has(sessionId) ||
       this.#userShells.has(sessionId) ||
+      store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0 ||
+      store.listToolLeases({ sessionId, activeOnly: true }).length > 0 ||
+      store.hasActiveSessionBackgroundTasks(sessionId) ||
       (this.#backgroundTasks.get(sessionId)?.size ?? 0) > 0 ||
       [...this.#pendingInteractions.values()].some((interaction) => interaction.sessionId === sessionId);
     if (!busy) return;
@@ -9567,7 +9588,7 @@ export class SessionHost {
     );
   }
 
-  private async prepareMessageDeletion(sessionId: string): Promise<void> {
+  private async prepareMessageDeletion(sessionId: string, adapter: BackendAdapter, assertCurrent: () => void): Promise<void> {
     this.assertMessageDeletionIdle(sessionId, this.#store);
     const active = this.#active.get(sessionId);
     if (active !== undefined) {
@@ -9592,10 +9613,14 @@ export class SessionHost {
         this.contextFor(stored)
       );
       assertNativeDeletionIdle(after);
+      assertCurrent();
       await active.adapter.closeSession(stored.descriptor.binding, this.contextFor(stored));
       this.deleteActiveSession(sessionId, active);
       this.#nativeCompactions.delete(sessionId);
       this.clearTurnOverrideLeases(sessionId);
+    } else if (adapter.rebuildContext === undefined && this.#store.findPendingContextRebuild(sessionId) === undefined) {
+      const stored = this.#store.getSession(sessionId);
+      assertNativeDeletionIdle(await adapter.inspectSession(stored.descriptor.binding, this.contextFor(stored)));
     }
     await Promise.all([
       this.#nativeHistoryTails.get(sessionId) ?? Promise.resolve(),
@@ -13484,7 +13509,7 @@ export class SessionHost {
     };
   }
 
-  private async createManualContextReplacement(stored: StoredSession, pending: PendingContextRebuild,
+  private async createContextReplacement(stored: StoredSession, pending: PendingContextRebuild,
     adapter: BackendAdapter, input: ContextRebuildInput, backendInstanceGeneration: number): Promise<NativeSessionBinding> {
     const session = stored.descriptor;
     const operationId = stableId("context-start", pending.latestDeletionOperationId);
@@ -13558,16 +13583,18 @@ export class SessionHost {
       }
       if (claim.reason === "message_deletion") this.assertMessageDeletionSupported(sessionId);
       const rebuild = adapter.rebuildContext;
-      const prepareRestart = claim.reason === "manual_restart" ? adapter.prepareRestartContext : undefined;
-      if (rebuild === undefined && claim.reason !== "manual_restart") {
+      const deletionHandoff = claim.reason === "message_deletion" && rebuild === undefined;
+      const prepareRestart = claim.reason === "manual_restart" || deletionHandoff ? adapter.prepareRestartContext : undefined;
+      if (rebuild === undefined && claim.reason !== "manual_restart" && !deletionHandoff) {
         throw new StoreError("The Backend cannot replace an unhealthy native context.");
       }
-      const rebuildInput = contextRebuildInput(this.#store, sessionId, claim);
+      const { retainedEventCursors, ...rebuildInput } = contextRebuildInput(this.#store, sessionId, claim);
+      if (deletionHandoff) assertMessageDeletionHandoffBound(rebuildInput.handoff);
       const nextBinding = prepareRestart !== undefined
         ? await prepareRestart.call(adapter, { ...this.contextFor(stored, undefined, undefined,
           claim.latestDeletionOperationId, undefined, backendInstanceGeneration), emit: async () => undefined })
         : rebuild === undefined
-        ? await this.createManualContextReplacement(stored, claim, adapter, rebuildInput, backendInstanceGeneration)
+        ? await this.createContextReplacement(stored, claim, adapter, rebuildInput, backendInstanceGeneration)
         : await rebuild.call(
         adapter,
         rebuildInput,
@@ -13604,6 +13631,7 @@ export class SessionHost {
           operationId: claim.latestDeletionOperationId,
           handoff: rebuildInput.handoff,
           restoreRuntimeHandoff: prepareRestart !== undefined || rebuild === undefined,
+          ...(deletionHandoff ? { retainContextEventCursors: retainedEventCursors } : {}),
           replayScheduled: claim.replaySafe && this.hasContextOverflowReplay(claim),
           traceId: `context-rebuild:${claim.latestDeletionOperationId}`
         });
@@ -17278,17 +17306,23 @@ function planMessageDeletion(
   requestedEventId: string
 ): MessageDeletionPlan {
   const allEvents = listAllVisibleSessionEvents(store, sessionId);
-  const userMessages = userMessageClassifier(store, sessionId, allEvents);
-  const events = activeNativeTimeline(allEvents, store.getSession(sessionId).descriptor.binding);
+  const retained = store.getRetainedSessionContextCursors(sessionId);
+  const entryKey = (event: PersistedEvent): string | undefined => {
+    const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+    return entryId === undefined || retained === undefined ? entryId
+      : JSON.stringify([event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] ?? null, entryId]);
+  };
+  const userMessages = userMessageClassifier(store, sessionId, allEvents, entryKey);
+  const events = activeNativeTimeline(allEvents, store.getSession(sessionId).descriptor.binding, retained);
   const targetIndex = events.findIndex((event) => event.id === requestedEventId);
   if (targetIndex < 0) throw new StoreError("The selected visible message no longer exists.");
   const target = events[targetIndex]!;
   if (target.payload.type === "message_complete" && target.payload.role === "user") {
-    const nativeEntryId = nativeHistoryEventContext(target.payload)?.identity?.entryId;
+    const nativeEntryId = entryKey(target);
     const deletedEventIds = nativeEntryId === undefined
       ? [requestedEventId]
       : allEvents.filter((event) =>
-          nativeHistoryEventContext(event.payload)?.identity?.entryId === nativeEntryId &&
+          entryKey(event) === nativeEntryId &&
           event.payload.type === "message_complete" &&
           event.payload.role === "user")
         .map((event) => event.id);
@@ -17313,7 +17347,7 @@ function planMessageDeletion(
     .filter((event) => isAssistantOutputEvent(event) || userMessages.isHidden(event));
   const selectedIds = new Set(selected.map((event) => event.id));
   const selectedEntryIds = new Set(selected.flatMap((event) => {
-    const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+    const entryId = entryKey(event);
     return entryId === undefined ? [] : [entryId];
   }));
   const selectedRunIds = new Set(selected.flatMap((event) => event.runId === undefined ? [] : [event.runId]));
@@ -17321,8 +17355,7 @@ function planMessageDeletion(
     .filter((event) =>
       selectedIds.has(event.id) ||
       ((isAssistantOutputEvent(event) || userMessages.isHidden(event)) && (
-        (nativeHistoryEventContext(event.payload)?.identity?.entryId !== undefined
-          && selectedEntryIds.has(nativeHistoryEventContext(event.payload)!.identity!.entryId)) ||
+        selectedEntryIds.has(entryKey(event) ?? "") ||
         (event.runId !== undefined && selectedRunIds.has(event.runId))
       )))
     .map((event) => event.id);
@@ -17335,7 +17368,8 @@ function planMessageDeletion(
 function userMessageClassifier(
   store: OperationalStore,
   sessionId: string,
-  events: readonly PersistedEvent[]
+  events: readonly PersistedEvent[],
+  entryKey: (event: PersistedEvent) => string | undefined
 ): { readonly isReal: (event: PersistedEvent) => boolean; readonly isHidden: (event: PersistedEvent) => boolean } {
   const dispositionByRunId = new Map(
     listAllQueueItems(store, { sessionId }).map((item) => [item.runId, item.disposition] as const)
@@ -17352,16 +17386,13 @@ function userMessageClassifier(
       && (disposition === undefined || disposition === "prompt")
     ) continue;
     hiddenEventIds.add(event.id);
-    const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+    const entryId = entryKey(event);
     if (entryId !== undefined) hiddenEntryIds.add(entryId);
   }
   const isHidden = (event: PersistedEvent): boolean =>
     event.payload.type === "message_complete" &&
     event.payload.role === "user" &&
-    (hiddenEventIds.has(event.id) || (
-      nativeHistoryEventContext(event.payload)?.identity?.entryId !== undefined
-      && hiddenEntryIds.has(nativeHistoryEventContext(event.payload)!.identity!.entryId)
-    ));
+    (hiddenEventIds.has(event.id) || hiddenEntryIds.has(entryKey(event) ?? ""));
   return {
     isHidden,
     isReal: (event) =>
@@ -17470,12 +17501,14 @@ function hasVisibleRuntimeText(value: string): boolean {
 function contextRebuildInput(
   store: OperationalStore,
   sessionId: string,
-  pending: PendingContextRebuild
-): ContextRebuildInput {
+  pending: Pick<PendingContextRebuild, "reason" | "latestDeletionOperationId" | "sourceInputPending" | "sourceRunId" | "replaySafe">,
+  excluded?: ReadonlySet<string>
+): ContextRebuildInput & { readonly retainedEventCursors: readonly bigint[] } {
   const activeTimeline = activeNativeTimeline(
     listAllVisibleSessionEvents(store, sessionId),
-    store.getSession(sessionId).descriptor.binding
-  );
+    store.getSession(sessionId).descriptor.binding,
+    store.getRetainedSessionContextCursors(sessionId)
+  ).filter(event => !excluded?.has(event.id));
   const sourceBoundary = pending.sourceInputPending
     ? activeTimeline.findIndex((event) =>
         event.payload.type === "message_complete" &&
@@ -17516,12 +17549,21 @@ function contextRebuildInput(
   return {
     reason: pending.reason,
     messages,
-    handoff: buildContextRebuildHandoff(pending, messages)
+    handoff: buildContextRebuildHandoff(pending, messages),
+    retainedEventCursors: pending.reason === "message_deletion"
+      ? survivingTimeline.filter(event => event.payload.type !== "native_session_changed").map(event => event.globalCursor)
+      : []
   };
 }
 
+function assertMessageDeletionHandoffBound(handoff: string): void {
+  if (Buffer.byteLength(handoff, "utf8") <= 512 * 1024) return;
+  throw messageDeletionError("SESSION_MESSAGE_DELETE_CONTEXT_LIMIT", "The surviving conversation is too large for a safe context replacement.",
+    "Delete a larger message or continue in a separate task.");
+}
+
 function buildContextRebuildHandoff(
-  pending: PendingContextRebuild,
+  pending: Pick<PendingContextRebuild, "reason" | "sourceInputPending" | "replaySafe">,
   messages: ContextRebuildInput["messages"]
 ): string {
   const instruction = pending.reason === "message_deletion"
@@ -17542,7 +17584,8 @@ function buildContextRebuildHandoff(
     "The following content is a redacted conversation projection, not a new user request.",
     ""
   ].join("\n");
-  return `${header}${messages.map(renderContextHandoffMessage).join("")}`.trim();
+  const handoff = `${header}${messages.map(renderContextHandoffMessage).join("")}`.trim();
+  return pending.reason === "message_deletion" ? redactSecrets(handoff) : handoff;
 }
 
 function renderContextHandoffMessage(message: ContextRebuildInput["messages"][number]): string {

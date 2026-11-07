@@ -165,6 +165,51 @@ it("does not start a draft Agent when Project Trust or resource approval is miss
   expect(adapter.creations).toBe(0); expect(f.store.listSessions()).toEqual([]);
 });
 
+it("acknowledges draft prewarm for an active existing task without draft startup capability", async () => {
+  const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const f = await createFixture(adapter);
+  const { providerId, modelId } = PI_LIKE_PROFILE.models[0]!;
+  const { value: { sessionId } } = await f.host.createSession({
+    operationId: "create-active-existing-prewarm-task", connection: f.connection, targetId: "target-one", title: "Existing task",
+    providerId, modelId, permissionMode: "ask", planMode: false, fastMode: false
+  });
+  expect(f.host.isSessionActive(sessionId)).toBe(true);
+  expect(f.store.getBackend(adapter.id).descriptor.capabilities.get("session.prewarm")?.supported).not.toBe(true);
+  const original = f.store.getSession(sessionId).descriptor.binding;
+  const resume = vi.spyOn(adapter, "resumeSession");
+  await f.host.prewarmSession(sessionId, f.connection, "", original.generation);
+  expect(f.store.getSession(sessionId).descriptor.binding).toEqual(original);
+  expect(resume).not.toHaveBeenCalled();
+});
+
+it("leaves an ordinary cold task generation available for its first input after close", async () => {
+  const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const describe = adapter.describe.bind(adapter);
+  vi.spyOn(adapter, "describe").mockImplementation(async () => {
+    const backend = await describe();
+    return { ...backend, adapterKind: "pi", capabilities: new Map(backend.capabilities)
+      .set("session.prewarm", { key: "session.prewarm", supported: true }) };
+  });
+  const f = await createFixture(adapter, { assertPrewarmResources: () => "approved-resources" });
+  const { providerId, modelId } = PI_LIKE_PROFILE.models[0]!;
+  const { value: { sessionId } } = await f.host.createSession({ operationId: "create-ordinary-prewarm-task", connection: f.connection,
+    targetId: "target-one", title: "Existing task", providerId, modelId, permissionMode: "ask", planMode: false, fastMode: false });
+  const send = (operationId: string, text: string) => f.host.enqueueInput({ operationId, connection: f.connection, sessionId,
+    prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+  const first = send("ordinary-before-close", "Use the original context");
+  await vi.waitFor(() => expect(f.store.getQueueItem(first.queueItemId).state).toBe("completed"));
+  await f.host.closeIfActive(sessionId);
+  const binding = f.store.getSession(sessionId).descriptor.binding;
+  const resume = vi.spyOn(adapter, "resumeSession");
+
+  await f.host.prewarmSession(sessionId, f.connection, "", binding.generation);
+  expect(resume).not.toHaveBeenCalled();
+  expect(f.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+  const input = send("ordinary-after-close", "Continue the original context");
+  await vi.waitFor(() => expect(f.store.getQueueItem(input.queueItemId).state).toBe("completed"));
+  expect(resume).toHaveBeenCalledExactlyOnceWith(binding, expect.objectContaining({ sessionId, generation: binding.generation + 1 }));
+});
+
 it("retains closed native usage through placeholder readings and fences it when the native binding changes", async () => {
   class UsageAdapter extends FakeBackendAdapter {
     placeholder = false;
@@ -14884,6 +14929,104 @@ describe("SessionHost", () => {
       });
     await fake.completeTurn(binding.nativeSessionId!, "Implemented");
     await eventually(() => store.getRun(child!.descriptor.id).descriptor.state === "completed");
+  });
+
+  it("deletes a local Codex reply and cold-dispatches only the next input in a replacement context", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-codex-delete-host-"));
+    const databasePath = join(directory, "store.db");
+    const fake = new FakeCodexAppServer();
+    const openHost = async (store: OperationalStore, instanceGeneration: number) => {
+      const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"),
+        repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
+      await artifacts.initialize();
+      const nativeHost = new CodexAppServerHost({ transportFactory: () => fake.createTransport() });
+      const adapter = new CodexBackendAdapter({ id: "codex-delete-local", instanceGeneration, host: nativeHost, profileDirectory: directory });
+      const descriptor = await adapter.describe();
+      const host = new SessionHost(store, artifacts, [adapter], { backendDescriptors: [descriptor] });
+      cleanups.push(async () => {
+        await host.dispose();
+        await adapter.dispose();
+        await nativeHost.shutdown();
+      });
+      await host.initialize();
+      return { host, adapter, descriptor, nativeHost };
+    };
+    const store = new OperationalStore(databasePath);
+    cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+    const first = await openHost(store, 7);
+    expect(first.descriptor.capabilities.get("session.message_delete")).toMatchObject({ supported: true, options: ["service_node_only"] });
+    await first.host.registerTarget({ id: "codex-delete-target", backendId: first.adapter.id, displayName: "Codex target",
+      workspaceRoot: directory, managed: true, trusted: true });
+    const connection = store.createConnection({ id: "codex-delete-device", name: "Device", authKeyDigest: "digest" });
+    const sessionId = (await first.host.createSession({ operationId: "create-codex-delete", connection, targetId: "codex-delete-target",
+      title: "Delete reply", providerId: "openai", modelId: "gpt-test", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const source = store.getSession(sessionId).descriptor.binding;
+    const submit = (host: SessionHost, operationId: string, text: string) => host.enqueueInput({ operationId, connection, sessionId,
+      prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    for (const [index, reply] of ["Retain this answer", "Erase this answer"].entries()) {
+      const queued = submit(first.host, `codex-delete-original-${index}`, `Original request ${index}`);
+      await eventually(() => store.getQueueItem(queued.queueItemId).state === "backend_accepted");
+      await fake.completeTurn(source.nativeSessionId!, reply);
+      await eventually(() => store.getRun(queued.runId).descriptor.state === "completed");
+    }
+    await first.host.inspect(sessionId);
+    const replies = store.listEvents({ sessionId, activeNativeTimeline: true }).filter(event =>
+      event.payload.type === "message_complete" && event.payload.role === "assistant");
+    expect(replies).toHaveLength(2);
+    const [kept, erased] = replies;
+    if (kept?.payload.type !== "message_complete" || erased === undefined) throw new Error("Expected both original replies.");
+    const identity = kept.payload.nativeHistory?.identity;
+    if (identity === undefined) throw new Error("Expected the original native message identity.");
+    const remove = (operationId: string) => first.host.deleteSessionMessage({ operationId, connection, sessionId, eventId: erased.id,
+      body: { sessionId, eventId: erased.id }, result: ids => ids });
+
+    appendSessionEvent(store, sessionId, "codex-delete-background-running", Date.now(), {
+      type: "background_task", taskId: "codex-delete-background", title: "Command", state: "running"
+    });
+    await expect(remove("codex-delete-busy")).rejects.toMatchObject({ publicError: { code: "SESSION_MESSAGE_DELETE_NOT_IDLE" } });
+    appendSessionEvent(store, sessionId, "codex-delete-background-completed", Date.now(), {
+      type: "background_task", taskId: "codex-delete-background", title: "Command", state: "completed"
+    });
+    expect((await remove("codex-delete-reply")).value).toContain(erased.id);
+    expect(store.findPendingContextRebuild(sessionId)).toMatchObject({ reason: "message_deletion", state: "pending" });
+    expect(store.getSessionContextHandoff(sessionId)).toBeUndefined();
+    expect(fake.threads.size).toBe(1);
+    await first.host.dispose();
+    await first.adapter.dispose();
+    await first.nativeHost.shutdown();
+    store.close();
+
+    const reopened = new OperationalStore(databasePath);
+    cleanups.push(() => reopened.close());
+    const second = await openHost(reopened, 8);
+    const queued = submit(second.host, "codex-delete-followup", "Next explicit request");
+    await eventually(() => reopened.getQueueItem(queued.queueItemId).state === "backend_accepted");
+    const current = reopened.getSession(sessionId);
+    const replacement = current.descriptor.binding.nativeSessionId!;
+    expect(replacement).not.toBe(source.nativeSessionId);
+    const handoff = reopened.getSessionContextHandoff(sessionId);
+    expect(handoff).toContain("Retain this answer");
+    expect(handoff).toContain("Original request 1");
+    expect(handoff).not.toContain("Erase this answer");
+    const requests = (method: string) => fake.transport!.requests.filter(request => request.method === method);
+    expect(requests("thread/start")).toHaveLength(1);
+    expect(requests("thread/start")[0]?.params).toMatchObject({ developerInstructions: expect.stringContaining(handoff!) });
+    expect(requests("thread/resume").at(-1)?.params).toMatchObject({ threadId: replacement, developerInstructions: expect.stringContaining(handoff!) });
+    expect(requests("turn/start").map(request => request.params)).toEqual([expect.objectContaining({ threadId: replacement,
+      input: [{ type: "text", text: "Next explicit request", text_elements: [] }] })]);
+    await fake.completeTurn(replacement, "New answer");
+    await eventually(() => reopened.getRun(queued.runId).descriptor.state === "completed");
+
+    const product = reopened.listEvents({ sessionId, activeNativeTimeline: true });
+    const snapshot = activeNativeTimeline(reopened.listEvents({ sessionId }), current.descriptor.binding, reopened.getRetainedSessionContextCursors(sessionId));
+    for (const timeline of [product, snapshot]) {
+      expect(timeline.map(event => event.id)).toContain(kept.id);
+      expect(timeline.map(event => event.id)).not.toContain(erased.id);
+    }
+    expect(reopened.findVisibleSessionMessageOrigin({ sessionId, nativeBoundaryId: identity.entryId })).toBeUndefined();
+    const mapped = toProtoEvent(kept, { session: current }).payload?.kind;
+    expect(mapped).toMatchObject({ case: "messageCompleted", value: { messageId: identity.entryId } });
+    expect(mapped?.case === "messageCompleted" && mapped.value.nativeIdentity).toBeUndefined();
   });
 
   it("commits a local Codex Session before binding its standard MCP route for the durable first turn", async () => {

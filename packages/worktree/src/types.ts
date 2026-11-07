@@ -5,6 +5,8 @@ export const MAXIMUM_WORKTREE_SOURCE_REF_CHARACTERS = 1_024;
 
 export interface WorktreeCallOptions {
   readonly signal?: AbortSignal;
+  /** Optional caller-owned check before worktree effects. */
+  readonly assertCurrent?: () => void;
   /** Whole-operation wall-clock budget. */
   readonly timeoutMs?: number;
 }

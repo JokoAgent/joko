@@ -59,18 +59,18 @@ describe("ProviderSettings model advanced journey", () => {
     expect(document.activeElement).toBe(mounted.container.querySelector(".provider-model-advanced-button"));
   });
 
-  it("applies one effort intent to exact routes, keeps Fast and clears only the effort override", async () => {
-    setModelConfiguration("node", "a", "provider", "model-primary", { effort: "high", fast: true });
+  it.each([true, "ultrafast"] as const)("applies effort to exact routes and preserves the stored speed %s", async fast => {
+    setModelConfiguration("node", "a", "provider", "model-primary", { effort: "high", fast });
     setModelConfiguration("node", "b", "provider", "model-secondary", { effort: "low" });
-    const mounted = await mount(); await open();
+    const mounted = await mount({}, undefined, { supportsUltrafast: fast === "ultrafast" }); await open();
     expect(document.body.textContent).toContain("Runtime defaults differ");
     const displayOnly = required([...document.querySelectorAll<HTMLButtonElement>(".model-advanced-efforts button")].find(item => item.textContent === "ultra"));
     expect(displayOnly.disabled).toBe(true);
     await clickText("high", ".model-advanced-efforts");
-    expect(readModelConfiguration(readModelPickerOwnerPreferences("node"), "a", "provider", "model-primary")).toEqual({ effort: "high", fast: true });
+    expect(readModelConfiguration(readModelPickerOwnerPreferences("node"), "a", "provider", "model-primary")).toEqual({ effort: "high", fast });
     expect(readModelConfiguration(readModelPickerOwnerPreferences("node"), "b", "provider", "model-secondary")).toEqual({ effort: "medium" });
     await clickText("Restore recommended effort");
-    expect(readModelConfiguration(readModelPickerOwnerPreferences("node"), "a", "provider", "model-primary")).toEqual({ fast: true });
+    expect(readModelConfiguration(readModelPickerOwnerPreferences("node"), "a", "provider", "model-primary")).toEqual({ fast });
     expect(readModelConfiguration(readModelPickerOwnerPreferences("node"), "b", "provider", "model-secondary")).toBeUndefined();
     expect(mounted.api.updateBackendSettings).not.toHaveBeenCalled();
   });

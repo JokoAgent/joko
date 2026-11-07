@@ -1,5 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
+import { create } from "@bufbuild/protobuf";
+import { OperationMutationSchema, OperationState, TaskTagColor } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
@@ -65,14 +67,29 @@ mountedIt("edits and drags tags through the production task page and retains the
     }
   }
   await page.locator(".task-tag-editor__form").getByRole("button", { name: "Save", exact: true }).click();
-  await waitFor(async () => fixture!.application.store.listTaskTags(), tags => tags.some(tag => tag.name === "Delivery review" && tag.color === "teal"), "the saved tag");
+  const store = fixture.application.store;
+  await waitFor(async () => store.listTaskTags(), tags => tags.some(tag => tag.name === "Delivery review" && tag.color === "teal"), "the saved tag");
+  expect(store.listSessionTaskTags(sessionId)).toContainEqual(expect.objectContaining({ name: "Delivery review", color: "teal" }));
   await page.setViewportSize({ width: 1280, height: 960 });
-  await page.locator(".task-tag-editor__row").filter({ hasText: "Delivery review" }).getByRole("checkbox").click();
-  await waitFor(async () => fixture!.application.store.listTaskTagsForSessions([sessionId]), rows => rows[0]?.tags.some(tag => tag.name === "Delivery review") === true, "the task association");
+  await page.locator(".task-tag-editor__row").filter({ hasText: "Delivery review" }).getByRole("checkbox", { checked: true }).waitFor({ state: "visible" });
   await page.locator('.task-tag-modal .task-tag-editor[aria-busy="false"]').waitFor({ state: "visible" });
   await page.locator(".task-tag-modal").getByRole("button", { name: "Close", exact: true }).click();
   await page.locator(".task-tag-modal").waitFor({ state: "hidden" });
   await open();
   expect(await page.locator(".task-tag-editor__row").evaluateAll(rows => rows.map(row => row.getAttribute("data-tag-id")))).toEqual([...reordered, fixture.application.store.listTaskTags().at(-1)!.id]);
   expect(errors).toEqual([]);
+
+  store.transaction(() => {
+    const tagIds = Array.from({ length: 31 }, (_, index) => store.createTaskTag({ originSessionId: sessionId,
+      name: `Capacity fixture ${index}`, color: "blue", expectedCatalogRevision: store.getTaskTagCatalog().revision }).id);
+    store.setSessionTaskTags({ originSessionId: sessionId, sessionIds: [sessionId], tagIds, attached: true });
+  });
+  const full = store.getTaskTagCatalog(), operationId = "create-tag-over-capacity";
+  await expect(submit(manager.clients.operation, manager.connectionId, create(OperationMutationSchema, {
+    payload: { case: "createTaskTag", value: { originSessionId: sessionId, name: "Overflow tag", color: TaskTagColor.BLUE,
+      expectedCatalogRevision: { value: full.revision } } }
+  }), operationId)).rejects.toThrow();
+  expect((await manager.clients.operation.getOperation({ operationId })).operation?.state).toBe(OperationState.FAILED);
+  expect(store.getTaskTagCatalog()).toEqual(full);
+  expect(store.listSessionTaskTags(sessionId)).toHaveLength(32);
 });

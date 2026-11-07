@@ -238,9 +238,26 @@ describe("Session visual harness", () => {
   }, 10_000);
 
   it("saves and cancels queue edits from the keyboard without consuming composition or steering an edited row", async ({ onTestFinished }) => {
+    const frames = new Map<number, FrameRequestCallback>();
+    let frameId = 0;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++frameId, callback);
+      return frameId;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
+    onTestFinished(() => vi.unstubAllGlobals());
+    const nextFrame = async () => {
+      const callbacks = [...frames];
+      await act(async () => {
+        for (const [id, callback] of callbacks) {
+          if (frames.delete(id)) callback(performance.now());
+        }
+      });
+    };
     const container = document.createElement("div");
     document.body.append(container);
     await renderHarness(container);
+    await nextFrame();
     const actions: string[] = [];
     const observer = new MutationObserver((records) => {
       for (const record of records) if (record.oldValue !== null) actions.push(record.oldValue);
@@ -252,6 +269,7 @@ describe("Session visual harness", () => {
       return required(container.querySelector<HTMLTextAreaElement>('[aria-label="Queued input text"]'));
     };
     const textarea = await beginEdit();
+    await nextFrame();
     expect(document.activeElement).toBe(textarea);
     await act(async () => {
       Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(textarea, "Updated queued follow-up");

@@ -513,7 +513,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const remoteLastActivityCutoff = sidebarLastActivityCutoff(sidebarLayout.lastActivity, Date.now());
   const remoteContentIdentityFilterActive = sidebarLayout.backendId !== "all" || sidebarLayout.projectFilter !== "all";
   const remoteMachineSessionCount = remoteMachineCaches.reduce((count, cache) => count + cache.sessions.filter((session) =>
-    !session.pinned && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
+    !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
       && !remoteContentIdentityFilterActive
       && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff)
   ).length, 0);
@@ -679,13 +679,13 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   ) : [], [currentMachineIncluded, navigationSessions, snapshot.targets]);
   const pinnedProjectIds = useMemo(() => new Set(pinnedProjectTargets.map((target) => target.id)), [pinnedProjectTargets]);
   const pinnedSessions = useMemo(() => currentMachineIncluded ? sortSidebarSessions(
-    navigationSessions.filter((session) => session.pinned),
+    navigationSessions.filter(sidebarTaskPinned),
     "recency"
   ) : [], [currentMachineIncluded, navigationSessions]);
   const pinnedSessionEntries = useMemo<readonly SidebarPinnedEntry[]>(() => [
     ...pinnedSessions.map((session) => ({ kind: "session" as const, id: session.id, session })),
     ...remoteMachineCaches.flatMap((cache) => cache.sessions
-      .filter((session) => session.pinned)
+      .filter(sidebarTaskPinned)
       .map((session) => ({
         kind: "remoteSession" as const,
         id: `${SIDEBAR_PINNED_REMOTE_SESSION_PREFIX}${cache.profileId}:${session.id}`,
@@ -712,11 +712,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       kind: "project" as const,
       id: `${SIDEBAR_PINNED_PROJECT_PREFIX}${target.id}`,
       target,
-      sessions: sortSidebarSessions(navigationSessions.filter((session) => session.projectId === target.id && !session.pinned), sidebarLayout.sortBy, priorityContext)
+      sessions: sortSidebarSessions(navigationSessions.filter((session) => session.projectId === target.id && !session.pinned && !session.archived), sidebarLayout.sortBy, priorityContext)
     }))
   ].sort((left, right) => (pinnedRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (pinnedRank.get(right.id) ?? Number.MAX_SAFE_INTEGER)), [pinnedProjectTargets, pinnedRank, pinnedSessionEntries, priorityContext, sidebarLayout.sortBy, navigationSessions]);
   const recent = sortSidebarSessions(filterSidebarSessions(
-    sessions.filter((session) => !session.pinned && (session.projectId === undefined || !pinnedProjectIds.has(session.projectId))),
+    sessions.filter((session) => !sidebarTaskPinned(session) && (session.archived || session.projectId === undefined || !pinnedProjectIds.has(session.projectId))),
     sidebarLayout,
     Date.now(),
     hiddenProjectIds
@@ -743,7 +743,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     priorityContext
   );
   const railLocalPanelSessions = sortSidebarSessions(filterSidebarSessions(
-    sessions.filter((session) => !session.pinned),
+    sessions.filter((session) => !sidebarTaskPinned(session)),
     sidebarLayout,
     Date.now(),
     hiddenProjectIds
@@ -756,7 +756,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     return [{ kind: "local", id: target.id, name: target.name, target, sessions: targetSessions }];
   });
   const railRemotePanelEntries = remoteMachineCaches.flatMap((cache) => cache.sessions
-    .filter((session) => !session.pinned && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
+    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
       && !remoteContentIdentityFilterActive
       && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff))
     .map((session) => ({ cache, session })));
@@ -807,7 +807,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     && visibleScheduleGroupKeys.every((key) => !expandedScheduleGroupKeys.has(key));
   const visibleRemoteDeviceIds = remoteMachineCaches
     .filter((cache) => cache.sessions.some((session) =>
-      !session.pinned && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
+      !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
         && !remoteContentIdentityFilterActive
         && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff)))
     .map((cache) => cache.profileId);
@@ -3465,7 +3465,7 @@ function RemoteMachineSessionRow({ cache, session, presence, locale, t, onOpen }
     >
       <MessageSquare className="session-row__agent" aria-hidden="true" />
       <span className="session-row__copy"><span className="session-row__title-line"><SidebarTitleMarquee title={session.name}>{session.name}</SidebarTitleMarquee><TaskTagDots tags={session.taskTags} t={t} /></span><small>{session.targetName ?? cache.name} · {stateLabel}</small></span>
-      {session.pinned && <Pin className="session-row__pin" aria-label={t("session.pin")} />}
+      {sidebarTaskPinned(session) && <Pin className="session-row__pin" aria-label={t("session.pin")} />}
       <span className="session-row__right-slot">{cachedStatus === undefined ? <span
         className={cx("remote-machine-session__presence", presence !== "online" && "is-offline")}
         role="img"
@@ -3490,7 +3490,7 @@ function RemoteMachineSessionSections({ caches, presenceByProfile, status, group
 }): JSX.Element {
   const cutoff = sidebarLastActivityCutoff(lastActivity, Date.now());
   const entries = caches.flatMap((cache) => cache.sessions
-    .filter((session) => !session.pinned && remoteSessionMatchesSidebarStatus(session, status)
+    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, status)
       && !contentFiltersActive
       && (cutoff === undefined || session.lastActivityAt >= cutoff))
     .map((session) => ({ cache, session })));
@@ -4599,8 +4599,8 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
         }}
       >
         <MessageSquare className="session-row__agent" aria-hidden="true" />
-        <span className="session-row__copy"><span className="session-row__title-line"><SidebarTitleMarquee title={session.name}><HighlightedText value={session.name} ranges={match?.nameRanges ?? []} /></SidebarTitleMarquee><TaskTagDots tags={session.taskTags} t={t} /></span>{session.pinned && session.summary !== undefined && <span className="session-row__summary">{session.summary}</span>}<small>{targetName !== undefined && <><HighlightedText value={targetName} ranges={match?.targetRanges ?? []} /> · </>}{stateLabel}</small></span>
-        {session.pinned && <Pin className="session-row__pin" aria-label={t("session.pin")} />}
+        <span className="session-row__copy"><span className="session-row__title-line"><SidebarTitleMarquee title={session.name}><HighlightedText value={session.name} ranges={match?.nameRanges ?? []} /></SidebarTitleMarquee><TaskTagDots tags={session.taskTags} t={t} /></span>{sidebarTaskPinned(session) && session.summary !== undefined && <span className="session-row__summary">{session.summary}</span>}<small>{targetName !== undefined && <><HighlightedText value={targetName} ranges={match?.targetRanges ?? []} /> · </>}{stateLabel}</small></span>
+        {sidebarTaskPinned(session) && <Pin className="session-row__pin" aria-label={t("session.pin")} />}
         <span className="session-row__right-slot">{indicator === undefined
           ? infoPieces.map((piece) => <span className={cx("session-row__metadata", `session-row__metadata--${piece.field}`)} key={piece.field}>{piece.field === "pr"
             ? <CodeHostPullRequestSidebarBadge pullRequests={session.codeHostPullRequests} t={t} />
@@ -5196,6 +5196,10 @@ export function remoteCachedStatus(session: MachineSessionCacheView): SidebarRig
   if (session.state === "running" || session.state === "retrying") return "running";
   if (session.state === "error") return "error";
   return undefined;
+}
+
+function sidebarTaskPinned(session: { readonly pinned: boolean; readonly archived: boolean }): boolean {
+  return session.pinned && !session.archived;
 }
 
 export function remoteSessionMatchesSidebarStatus(session: MachineSessionCacheView, status: SidebarLayout["status"]): boolean {

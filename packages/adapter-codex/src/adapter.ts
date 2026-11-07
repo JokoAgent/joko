@@ -11,6 +11,7 @@ import {
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
+  SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
   snapshotNativeSkills,
   nativeTextInferenceImages,
   assertHostedExecution,
@@ -5961,6 +5962,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "interaction.permission",
       "interaction.question"
     ]);
+    if (this.#hosted === undefined) supported.add("session.message_delete");
     if (this.#managedProviders !== undefined) supported.add("provider.managed_catalog");
     if (this.#resolveNativeSkills !== undefined) { supported.add("runtime.resources"); supported.add("runtime.commands"); }
     if (this.#resolveNativeMemoryEnabled !== undefined && supportsNativeMemoryRuntime(this.#host)) {
@@ -6015,6 +6017,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ? { reason: "not_implemented" as const }
             : {}),
         ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {}),
+        ...(key === "session.message_delete" && available ? { options: [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] } : {}),
         ...(key === "model.fast_mode" ? { options: [
           ...(this.#models.some(model => model.supportsFastMode) ? ["fast"] : []),
           ...(this.#models.some(model => model.supportsUltrafastMode) ? ["ultrafast"] : [])
