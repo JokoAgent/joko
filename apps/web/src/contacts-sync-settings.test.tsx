@@ -7,7 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import type { AppController } from "./controller.js";
 import { ContactsSettings } from "./components/ContactsSettings.js";
 import { translate } from "./i18n.js";
-import type { ContactDirectoryView, ContactSyncStatusView } from "./model.js";
+import type { ContactDirectoryView, ContactListOptionsView, ContactProfileView, ContactSyncStatusView } from "./model.js";
 
 const roots: Root[] = [];
 
@@ -104,6 +104,40 @@ describe("Contacts device sync settings", () => {
     expect(retry.disabled).toBe(false);
     await act(async () => { retry.click(); });
     expect(controller.syncContactsNow).toHaveBeenCalledWith();
+  });
+
+  it("reloads the selected profile and retains loaded pages after manual sync", async () => {
+    const status = contactSyncStatus();
+    const base = contactController(status);
+    const profiles: ContactProfileView[] = ["First", "Second"].map(displayName => ({
+      id: displayName, displayName, revision: 7n, kind: "person", status: "confirmed", source: "manual",
+      aliases: [], summary: "Before sync", identityCount: 0, createdAt: 1, updatedAt: 1,
+      narrative: "", agentNotes: "", identities: [], events: [], groups: [], relations: []
+    }));
+    const controller = {
+      ...base,
+      getContactDirectory: async () => ({ ...await base.getContactDirectory(), revision: profiles[1]!.revision }),
+      listContacts: async ({ pageOffset }: ContactListOptionsView) => pageOffset === 1
+        ? { contacts: [profiles[1]!], total: 2 } : { contacts: [profiles[0]!], total: 2, nextPageOffset: 1 },
+      getContact: async (id: string) => profiles.find(profile => profile.id === id)!,
+      syncContactsNow: async () => {
+        profiles[1] = { ...profiles[1]!, summary: "After sync", revision: 8n };
+        return status;
+      }
+    };
+    const { container } = await render(
+      <ContactsSettings controller={controller as unknown as AppController} locale="en" t={(key, values) => translate("en", key, values)} />
+    );
+    await act(async () => { button(container, "Load more").click(); });
+    const second = container.querySelectorAll<HTMLButtonElement>(".contacts-list__item")[1]!;
+    await act(async () => { second.click(); });
+    expect(container.querySelector(".contact-detail__header h3")?.textContent).toBe("Second");
+    expect(container.querySelector(".contact-detail__header p")?.textContent).toBe("Before sync");
+
+    await act(async () => { button(container, "Sync now").click(); });
+    expect(second.getAttribute("aria-pressed")).toBe("true");
+    expect(second.textContent).toContain("After sync");
+    expect(container.querySelector(".contact-detail__header p")?.textContent).toBe("After sync");
   });
 });
 
