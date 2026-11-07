@@ -802,6 +802,10 @@ export class ExtensionLibraryVault {
       || !sameFilesystemObject(input.before, after)) {
       throw new ExtensionLibraryError("CONFLICT", "Library staged write could not be identity-fenced into place.");
     }
+    // Linking and renaming can change ctime. The bytes verified before publication retain their mtime.
+    if (after.mtimeNs !== input.before.mtimeNs) {
+      throw new ExtensionLibraryError("CONFLICT", "Library staged content changed during publication.");
+    }
     await this.reconcileUsage();
     return { path: relativePath, bytes: input.bytes, sha256: input.sha256 };
   }
