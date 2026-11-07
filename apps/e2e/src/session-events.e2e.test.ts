@@ -681,6 +681,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
     await page.getByLabel("Device name").fill("Native retry Web");
     await page.locator("form.pair-form button[type=submit]").click();
+    await page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`).waitFor({ state: "visible" });
     await page.locator(".session-header__abort").waitFor({ state: "visible" });
     await page.locator(".send-button--stop").waitFor({ state: "visible" });
     await page.getByRole("textbox", { name: "Message", exact: true }).press("Escape");
