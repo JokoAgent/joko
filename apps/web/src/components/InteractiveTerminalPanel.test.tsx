@@ -11,10 +11,16 @@ import { InteractiveTerminalPanel } from "./InteractiveTerminalPanel.js";
 const mocks = vi.hoisted(() => ({ terminals: [] as any[], fit: vi.fn(), links: [] as ((event: MouseEvent, uri: string) => void)[] }));
 vi.mock("@xterm/xterm", () => ({ Terminal: class {
   options: any; cols = 90; rows = 30; input = (_data: string) => {}; key = (_event: KeyboardEvent) => true;
-  selection = ""; write = vi.fn((_data: string, parsed?: () => void) => parsed?.()); reset = vi.fn(); dispose = vi.fn(); focus = vi.fn(() => this.element?.querySelector("textarea")?.focus()); element: HTMLElement | undefined; resize = vi.fn();
+  selection = ""; write = vi.fn((_data: string, parsed?: () => void) => parsed?.()); reset = vi.fn(); dispose = vi.fn(); focus = vi.fn(() => this.textarea?.focus()); element: HTMLElement | undefined; resize = vi.fn();
+  textarea: HTMLTextAreaElement | undefined; modes = { sendFocusMode: false };
   parser = { registerCsiHandler: vi.fn(() => ({ dispose: vi.fn() })), registerDcsHandler: vi.fn(() => ({ dispose: vi.fn() })), registerOscHandler: vi.fn(() => ({ dispose: vi.fn() })) };
   constructor(options: any) { this.options = options; mocks.terminals.push(this); }
-  open(slot: HTMLElement) { this.element = slot; slot.appendChild(slot.ownerDocument.createElement("textarea")).className = "xterm-helper-textarea"; }
+  open(slot: HTMLElement) {
+    this.element = slot;
+    this.textarea = slot.appendChild(slot.ownerDocument.createElement("textarea"));
+    this.textarea.className = "xterm-helper-textarea";
+    this.textarea.addEventListener("blur", () => { if (this.modes.sendFocusMode && !this.options.disableStdin) this.input("\x1b[O"); });
+  }
   loadAddon() {} attachCustomKeyEventHandler(handler: typeof this.key) { this.key = handler; }
   onData(handler: typeof this.input) { this.input = handler; return { dispose: vi.fn() }; }
   hasSelection() { return this.selection !== ""; } getSelection() { return this.selection; }
@@ -114,6 +120,14 @@ it("waits for the live appearance acknowledgement, replays current overrides aft
   expect(api.writeTerminal).not.toHaveBeenCalled();
   await act(async () => terminal.input("ok"));
   expect(api.writeTerminal).toHaveBeenCalledWith("session-one", "terminal-one", 1n, expect.any(String), 1n, "ok", expect.any(AbortSignal));
+  terminal.modes.sendFocusMode = true;
+  const beforeBlur = updateAppearance.mock.calls.length;
+  await act(async () => outside.focus());
+  expect(api.writeTerminal).toHaveBeenLastCalledWith("session-one", "terminal-one", 1n, watches[0]!.appearance.viewId, 2n, "\x1b[O", expect.any(AbortSignal));
+  expect(updateAppearance).toHaveBeenCalledTimes(beforeBlur);
+  await act(async () => terminal.input("\x1b[O"));
+  expect(api.writeTerminal).toHaveBeenCalledTimes(2);
+  terminal.modes.sendFocusMode = false;
   let rejectOld!: (reason: Error) => void;
   updateAppearance.mockImplementationOnce(async () => new Promise((_, reject) => { rejectOld = reject; }));
   color = "#abcdef";
