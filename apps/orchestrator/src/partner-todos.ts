@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { applyTodoPatch, emptyTodoState, effectiveTodoDeadline, queryTodoItems, redactSecrets, validateTodoDeadline,
   validateTodoTimestamp, type PartnerTodoRecord, type TodoListQuery, type TodoPatch, type TodoState } from "@joko/core";
-import type { ConnectionRecord, OperationalStore, PartnerStore } from "@joko/store";
+import { AuthorizationError, type ConnectionRecord, type OperationalStore, type PartnerStore } from "@joko/store";
+import type { PartnerHomeRuntimeAdapter } from "./partner-home-runtime.js";
 import type { PartnerManager } from "./partner-manager.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpToolDescriptor } from "./mcp-router.js";
 
@@ -11,13 +12,20 @@ const PATCH_KEYS = ["id", "expectedRevision", "key", "origin", "title", "progres
 
 /** The original Store transaction owns both a Todo mutation and its operation receipt. */
 export class PartnerTodoManager {
-  constructor(readonly store: OperationalStore, readonly profiles: PartnerStore, readonly partners: PartnerManager, readonly now = Date.now) {}
+  constructor(readonly store: OperationalStore, readonly profiles: PartnerStore, readonly partners: PartnerManager, readonly now = Date.now,
+    private readonly homeRuntime?: () => Pick<PartnerHomeRuntimeAdapter, "assertDeviceHomeCurrent"> | undefined) {}
   owner(partnerId: string, writable = false, revision?: bigint) {
     const profile = this.partners.getPartner(partnerId);
     if (profile.lifecycle === "deleted" || writable && profile.lifecycle !== "active" || profile.initializationState !== "ready"
       || !profile.canonicalSessionId || this.partners.isHomeChanging(partnerId) || revision !== undefined && profile.revision !== revision) throw new Error("The Todo owner changed.");
-    const session = this.store.getSession(profile.canonicalSessionId).descriptor, target = this.store.getTarget(profile.homeTargetId).descriptor;
-    if (session.targetId !== profile.homeTargetId || session.archived || session.deletedAt !== undefined || session.remoteWorkspace || target.remoteWorkspace || !target.trusted) throw new Error("Open this Partner on its home computer.");
+    const session = this.store.getSession(profile.canonicalSessionId).descriptor, target = this.store.getTarget(profile.homeTargetId);
+    if (session.targetId !== profile.homeTargetId || session.archived || session.deletedAt !== undefined || !target.descriptor.trusted) throw new Error("Open this Partner on its home computer.");
+    if (session.remoteWorkspace || target.descriptor.remoteWorkspace) {
+      if (writable) throw new AuthorizationError("This affair action is unavailable on the Partner's execution computer.");
+      const runtime = this.homeRuntime?.();
+      if (!runtime) throw new Error("Open this Partner on its home computer.");
+      runtime.assertDeviceHomeCurrent(profile, session, target);
+    }
     return profile;
   }
   state(partnerId: string): TodoState {
@@ -114,7 +122,9 @@ export class PartnerTodoTools implements BridgeToolProvider {
       const link = this.manager.profiles.getSessionLink(context.sessionId), session = this.manager.store.getSession(context.sessionId).descriptor;
       const routineRead = name === "todo_list" && link?.role === "routine";
       if (!link || link.role !== "canonical" && link.role !== "topic" && !routineRead) throw new Error("This task cannot access this Partner's affair ledger operation.");
-      const profile = this.manager.owner(link.partnerId, true), backend = this.manager.store.getBackend(session.backendId).descriptor;
+      const canonicalRead = name === "todo_list" && link.role === "canonical";
+      const profile = this.manager.owner(link.partnerId, !canonicalRead), backend = this.manager.store.getBackend(session.backendId).descriptor;
+      if (profile.lifecycle !== "active" || canonicalRead && profile.canonicalSessionId !== session.id) throw new Error("The Todo tool owner changed.");
       const assertCurrent = () => {
         signal?.throwIfAborted(); context.assertCurrent?.();
         const current = this.manager.store.getSession(context.sessionId).descriptor;
@@ -122,7 +132,7 @@ export class PartnerTodoTools implements BridgeToolProvider {
           || current.targetId !== profile.homeTargetId || current.binding.generation !== context.generation || current.archived || current.deletedAt !== undefined
           || current.binding.opaqueRef !== session.binding.opaqueRef || this.manager.store.getBackend(session.backendId).descriptor.instanceGeneration !== backend.instanceGeneration) throw new Error("The Todo tool owner changed.");
         if (routineRead && this.manager.partners.runtimeCaller(context.sessionId).id !== profile.id) throw new Error("The Todo tool owner changed.");
-        this.manager.owner(profile.id, true, profile.revision);
+        this.manager.owner(profile.id, !canonicalRead, profile.revision);
       };
       assertCurrent(); let value: unknown;
       if (name === "todo_list") {
