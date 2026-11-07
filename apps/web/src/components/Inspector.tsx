@@ -1993,7 +1993,7 @@ function WorkspaceChangesPanel({ controller, session, workspace, focusRequest, c
   const [changeSetsLoaded, setChangeSetsLoaded] = useState(false);
   const [viewMode, setViewMode] = useState<"unified" | "split">("unified");
   const [wordWrap, setWordWrap] = useState(false);
-  const [wordDiff, setWordDiff] = useState(true);
+  const [wordDiff, setWordDiff] = useState(false);
   const [hideWhitespace, setHideWhitespace] = useState(false);
   const [fileTreeVisible, setFileTreeVisible] = useState(false);
   const [selectedFileKey, setSelectedFileKey] = useState<string>();
