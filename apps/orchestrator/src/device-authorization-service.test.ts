@@ -55,8 +55,12 @@ describe('device approval RPC boundary', () => {
       expect((await first.entries(link)).map(entry => entry.id)).toEqual(['private']);
       await expect(first.start(formatDeviceInvitation({ ...invitation, endpointPublicKey: `ed25519:${'d'.repeat(64)}` }), 'New device', DeviceKind.MOBILE, 'mobile', undefined, 'private')).rejects.toThrow(/identity/u);
       expect(draft).toBeUndefined(); expect((await owner.list()).map(row => row.state)).toEqual(['invited']);
-      await expect(createClient(ConnectionService, transport).requestDeviceAuthorization({ invitationId, invitationSecret, requestId: randomUUID(), requesterSecret: randomBytes(32).toString('hex'),
-        authKeyDigest: digest(randomBytes(32).toString('hex')), deviceName: 'Not allowed', deviceKind: DeviceKind.MOBILE, platform: 'mobile', entryId: 'direct' })).rejects.toThrow();
+      const client = createClient(ConnectionService, transport);
+      for (const entryId of [undefined, 'direct']) {
+        await expect(client.requestDeviceAuthorization({ invitationId, invitationSecret, requestId: randomUUID(), requesterSecret: randomBytes(32).toString('hex'),
+          authKeyDigest: digest(randomBytes(32).toString('hex')), deviceName: 'Not allowed', deviceKind: DeviceKind.MOBILE, platform: 'mobile', entryId })).rejects.toThrow();
+      }
+      expect((await owner.list()).map(row => row.state)).toEqual(['invited']);
       const pending = await first.start(link, 'New device', DeviceKind.MOBILE, 'mobile', undefined, 'private');
       expect(pending.state).toBe('pending'); expect(store.listConnections()).toHaveLength(1);
       await owner.resolve(invitationId, pending.requestId, 'approved');

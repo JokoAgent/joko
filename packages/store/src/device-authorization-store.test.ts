@@ -71,6 +71,18 @@ describe('request-bound device authorization', () => {
     const durable = JSON.stringify(f.store.listSettings().map(row => row.value));
     for (const value of [f.authKey, f.input.requesterSecret, f.invitationSecret]) expect(durable).not.toContain(value);
   });
+  it.each(['pending', 'approved'] as const)('retires an existing %s request with no allowed entrance before granting access', state => {
+    const f = fixture(), pending = f.sessions().request(f.input);
+    const request = state === 'pending' ? pending : f.sessions().resolve(f.invitationId, f.proof.requestId, 'approved', f.issuer);
+    const saved = f.store.listSettings().find(row => row.key === f.invitationId)!;
+    f.store.setSetting(saved.scopeType, saved.scopeId, saved.key, { ...request, entryIds: ['direct'] });
+    f.restart();
+
+    if (state === 'pending') expect(f.sessions().resolve(f.invitationId, f.proof.requestId, 'approved', f.issuer).state).toBe('cancelled');
+    expect(f.sessions().claim(f.proof).state).toBe('cancelled');
+    expect(f.sessions().request(f.input).state).toBe('cancelled');
+    expect(f.store.listConnections()).toHaveLength(1);
+  });
   it('does not let a short code, invitation or alternate requester consume or cancel the exact request', () => {
     const f = fixture(), pending = f.sessions().request(f.input);
     expect(() => f.sessions().read({ ...f.proof, requesterSecret: pending.request!.code })).toThrow();
