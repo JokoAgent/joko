@@ -12750,6 +12750,9 @@ function projectTimelineEvent(
     }
     case "retryChanged": {
       const maxAttempts = kind.value.maxAttempts;
+      const code = kind.value.error?.code;
+      const source = code === "PI_SUMMARIZATION_RETRY" ? "summarization"
+        : kind.value.state === RetryState.WAITING && code !== "CLAUDE_CODE_API_RETRY" ? "auto" : "unknown";
       replaceOrAppend({
         id: event.eventId,
         ...(kind.value.runId || event.identity?.runId ? { runId: kind.value.runId || event.identity?.runId } : {}),
@@ -12760,7 +12763,7 @@ function projectTimelineEvent(
         text: kind.value.error?.message || `Attempt ${kind.value.attemptNumber}`,
         retry: {
           state: retryTimelineState(kind.value.state),
-          source: kind.value.error?.code === "PI_SUMMARIZATION_RETRY" ? "summarization" : kind.value.state === RetryState.WAITING ? "auto" : "unknown",
+          source,
           attemptNumber: kind.value.attemptNumber,
           ...(maxAttempts === undefined || maxAttempts <= 0 ? {} : { maxAttempts }),
           ...(kind.value.retryAt === undefined ? {} : { retryAt: timestampMs(kind.value.retryAt) }),
