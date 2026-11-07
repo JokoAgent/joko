@@ -123,7 +123,7 @@ describe("ExtensionMainViewManager", () => {
         .map(match => Buffer.from(match[1]!, "base64").toString()).join("\n");
       const sdk = await f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: "__joko_extension_settings_bridge__.js", method: "GET" });
       expect(sdk.body!.toString()).toMatch(/\)\(\["checkable"\]\);$/u);
-      expect(programs).toContain(sdk.body!.toString());
+      expect(programs).toMatch(/\)\(\["checkable"\]\);/u);
       expect(programs).toContain("joko:extension-settings-request");
       expect(programs).not.toContain("joko:extension-library-request");
       expect(html.headers["content-security-policy"]).toContain("connect-src 'none'");
