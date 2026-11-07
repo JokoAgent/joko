@@ -278,6 +278,49 @@ describe("Partner independent Session tasks", () => {
     await vi.waitFor(() => expect(sessionTaskActivity(f.store, f.store.getSession(task.sessionId!))?.completionNotification).toBe("none"));
     expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
   });
+  it.each(["after ready", "during closing"])("dispatches a result produced %s to the original restarted Partner", async timing => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:restart-return", { instruction: "Prepare the result" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === task.sessionId)).toBe(true));
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
+    const resultId = `${task.id}:result:${task.execution}`;
+    const enqueue = vi.spyOn(f.host, "enqueueServiceInput");
+    const input = { requestId: "restart-result-parent", partnerId: f.partner.id, expectedRevision: f.partner.revision };
+    const finish = () => f.primary.complete(task.sessionId!, "Result from the original execution.");
+    if (timing === "during closing") {
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const restartHost = f.host.restartPartnerSession.bind(f.host);
+      const restart = vi.spyOn(f.host, "restartPartnerSession").mockImplementationOnce(request => restartHost({ ...request,
+        pauseGoal: async () => { await request.pauseGoal(); enter(); await gate; } }));
+      const pending = f.partners.restartPartner(input);
+      try {
+        await entered;
+        await finish();
+        await vi.waitFor(() => expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ operationId: resultId, sessionId: f.parent })));
+        expect(f.partnerStore.isPartnerSessionRestarting(f.parent)).toBe(true);
+        expect(f.store.findOperation(resultId)).toBeUndefined();
+        expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed" });
+        expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBeUndefined();
+      } finally {
+        release();
+        await pending;
+        restart.mockRestore();
+      }
+      expect(await pending).toMatchObject({ phase: "ready" });
+    } else {
+      expect(await f.partners.restartPartner(input)).toMatchObject({ phase: "ready" });
+      await finish();
+    }
+    expect(f.store.getQueueControl(f.parent)).toMatchObject({ paused: false, resumeOnUserInput: false });
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === f.parent).map(item => item.input.text))
+      .toEqual([expect.stringContaining("Result from the original execution.")]));
+    expect(f.store.getOperation(resultId)).toMatchObject({ kind: "service_send_input", status: "completed", body: { sessionId: f.parent, originSessionId: task.sessionId } });
+    expect(f.tasks.list(f.partner.id)[0]?.deliveredExecution).toBe(task.execution);
+    expect(await f.partners.restartPartner(input)).toMatchObject({ phase: "ready" });
+    expect(f.store.listQueueItems({ sessionId: f.parent }).map(item => item.operationId)).toEqual([resultId]);
+  });
   it("preserves the pending queue across pause/restart and resumes without replaying the original objective", async () => {
     const f = await fixture(); const created = await f.tasks.start(f.parent, "task:pause", { instruction: "Implement the change", workingDir: f.project }, () => undefined);
     await vi.waitFor(() => expect(f.primary.inputs.some(item => item.context.sessionId === created.sessionId)).toBe(true));
@@ -299,6 +342,87 @@ describe("Partner independent Session tasks", () => {
     f.advance(3_000);
     const resumedAgain = await f.tasks.message(f.parent, created.id, "task:resume-again", { mode: "resume" }, () => undefined);
     expect(resumedAgain.deadlineAt).toBe(created.deadlineAt + 13_000); expect(resumedAgain.pauseAt).toBeUndefined();
+  });
+  it.each(["confirmed close", "newer manual pause", "unrelated abort"])("recovers an interrupted cancellation with %s", async condition => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:cancel-before-restart", { instruction: "Run once" }, () => undefined);
+    const sessionId = task.sessionId!;
+    await vi.waitFor(() => expect(f.store.findQueueItemByRunId(sessionId, task.runId!)?.state).toBe("backend_accepted"));
+    await f.tasks.close();
+
+    // Retain the persisted v1 checkpoint between the Host's close and the
+    // independent task's final write.
+    const operationId = `partner-task-control:${"c".repeat(64)}`;
+    const held = { ...f.tasks.list(f.partner.id)[0]!, control: "cancelling", pauseAt: f.now(), updatedAt: f.now() };
+    f.store.setSetting("service", "partner.session-tasks", task.id, held);
+    const revision = f.host.preparePartnerPauseQueue({ sessionId, operationId, wasQueuePaused: false });
+    f.store.setSetting("service", "partner.session-tasks", task.id, { ...held, queuePauseRevision: revision!.toString() });
+    if (condition === "unrelated abort") {
+      f.store.cancelQueueItem({ queueItemId: f.store.findQueueItemByRunId(sessionId, task.runId!)!.id, traceId: "unrelated-cancel" });
+    } else {
+      await f.host.pausePartnerSession({ sessionId, operationId, assertCurrent: () => undefined, pauseGoal: async () => undefined, cancelQueued: true });
+    }
+    if (condition === "newer manual pause") f.store.setQueuePaused({ sessionId, paused: true, reason: "Manual hold", traceId: "manual-hold" });
+    expect(f.store.getRun(task.runId!).descriptor.state).toBe("aborted");
+    expect(f.store.findOperation(operationId)).toBeUndefined();
+    await f.host.dispose();
+
+    const adapter = new RecordedAdapter(profile);
+    const cold = new SessionHost(f.store, f.artifacts, [adapter], {
+      partnerSessionPaused: id => f.partnerStore.isPartnerSessionPaused(id) || f.tasks.isHeld(id)
+    });
+    const close = vi.spyOn(adapter, "closeSession");
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, cold, f.workspaces, f.managed, f.now);
+    cleanups.push(async () => { await f.tasks.close(); await cold.dispose(); });
+    await cold.initialize();
+    await f.tasks.initialize();
+    const checked = await f.tasks.check(f.parent, task.id);
+    expect(close).not.toHaveBeenCalled();
+    expect(adapter.inputs.filter(item => item.context.sessionId === sessionId)).toEqual([]);
+    if (condition === "unrelated abort") {
+      expect(checked).toMatchObject({ control: "cancelling", execution: task.execution });
+      expect(f.store.getQueueControl(sessionId).paused).toBe(true);
+      expect(f.store.findOperation(operationId)).toBeUndefined();
+      expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
+    } else {
+      expect(checked).toMatchObject({ control: "active", status: "cancelled", execution: task.execution, runId: task.runId });
+      expect(f.store.getOperation(operationId)).toMatchObject({ status: "completed", response: { taskId: task.id, sessionId, execution: task.execution, status: "cancelled" } });
+      expect(f.store.getOperation(`${operationId}:resume-queue`).body).toEqual({ sessionId, queuePauseRevision: revision!.toString() });
+      expect(f.store.getQueueControl(sessionId).paused).toBe(condition === "newer manual pause");
+      expect(f.store.listQueueItems({ sessionId: f.parent }).map(item => item.operationId)).toEqual([`${task.id}:result:${task.execution}`]);
+    }
+  });
+
+  it("commits the tool's original cancellation and does not apply its replay to a later execution", async () => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:cancel-execution", { instruction: "Original input" }, () => undefined);
+    const sessionId = task.sessionId!;
+    await vi.waitFor(() => expect(f.store.findQueueItemByRunId(sessionId, task.runId!)?.state).toBe("backend_accepted"));
+    await f.tasks.message(f.parent, task.id, "cancel-pending-input", { mode: "queue", message: "Pending input" }, () => undefined);
+    const effectIdentity = "b".repeat(64);
+    const operationId = `partner-task-control:${effectIdentity}`;
+    const tool = new PartnerSessionTaskTools(f.tasks);
+    const stop = () => {
+      const parent = f.store.getSession(f.parent).descriptor;
+      return tool.callTool("stop_session_task", { task_id: task.id, mode: "cancel" }, undefined, {
+        sessionId: parent.id, targetId: parent.targetId, generation: parent.binding.generation, providerGeneration: 1, effectIdentity
+      });
+    };
+    const stopped = await stop();
+    expect(stopped.isError).toBe(false);
+    expect(JSON.parse(stopped.content[0]!.text)).toMatchObject({ status: "cancelled", control: "active", stop_confirmed: true });
+    const receipt = f.store.getOperation(operationId);
+    expect(receipt).toMatchObject({ status: "completed", response: { taskId: task.id, sessionId, execution: task.execution, status: "cancelled" } });
+    expect(f.store.listQueueItems({ sessionId }).map(item => item.state)).toEqual(["cancelled", "cancelled"]);
+    expect(f.store.getQueueControl(sessionId).paused).toBe(false);
+
+    const next = await f.tasks.message(f.parent, task.id, "cancel-next-execution", { mode: "queue", message: "Start the next execution" }, () => undefined);
+    expect(next.execution).toBe(task.execution + 1);
+    expect((await stop()).isError).toBe(false);
+    expect(f.store.getOperation(operationId)).toEqual(receipt);
+    await vi.waitFor(() => expect(f.primary.inputs.filter(item => item.context.sessionId === sessionId).map(item => item.input.text))
+      .toEqual(["Original input", "Start the next execution"]));
+    expect(f.store.getRun(next.runId!).descriptor.state).not.toBe("aborted");
   });
 
   it("rolls back an interrupted task resume and accepts the original keyed message once after recovery", async () => {
@@ -626,13 +750,15 @@ async function fixture(streamDelayMs = 30_000, appDefaultModel?: () => SessionRu
   const artifacts = new ArtifactStore({ rootDirectory: join(managed, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const primary = new RecordedAdapter({ ...profile, streamDelayMs }), secondary = new RecordedAdapter({ ...profile, streamDelayMs, id: "task-secondary" }); let tasks!: PartnerSessionTaskManager;
   const host = new SessionHost(store, artifacts, [primary, secondary], { partnerSessionPaused: sessionId => partnerStore.isPartnerSessionPaused(sessionId) || tasks?.isHeld(sessionId) === true,
+    partnerSessionRestarting: sessionId => partnerStore.isPartnerSessionRestarting(sessionId),
     partnerSessionRetiring: sessionId => partnerStore.isPartnerSessionRetiring(sessionId) || tasks?.isRetiring(sessionId) === true,
     partnerTargetRetired: targetId => partnerStore.isPartnerTargetRetired(targetId),
     serviceSessionRuntimeFallback: input => tasks?.fallback(input) ?? { owned: false } }); await host.initialize();
   const workspaces = { register: vi.fn(async (input: { id: string; root: string; displayName: string; trusted: boolean }) => input), unregister: vi.fn() };
   const partners = new PartnerManager({ store: partnerStore, operationalStore: store, sessionHost: host, workspaceService: workspaces, homesRoot: join(managed, "partner-homes"),
     ...(appDefaultModel === undefined ? {} : { appDefaultModel }),
-    ownedIndependentSessions: partnerId => tasks?.ownedSessions(partnerId) ?? [], forgetIndependentTasks: partnerId => tasks?.forgetPartner(partnerId) });
+    ownedIndependentSessions: partnerId => tasks?.ownedSessions(partnerId) ?? [], forgetIndependentTasks: partnerId => tasks?.forgetPartner(partnerId),
+    resumeIndependentReturns: async partnerId => tasks?.refreshPartner(partnerId) });
   const partner = await partners.createPartner({ requestId: "task-partner-create", expectedDirectoryRevision: partnerStore.directoryState().revision, displayName: "Aster", avatar: "orbit", identitySource: "You help with projects.", templateId: "general", usesDirectoryDefaults: false,
     capabilities: { modelChain: [{ backendId: primary.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
   let now = Date.now(); const clock = () => now;

@@ -344,7 +344,7 @@ export class PartnerMessagingRuntime {
       try {
         assertCurrent(); save('closing');
         const closeId = receipt.closeOperationId ?? receipt.operationId;
-        await this.options.host.restartPartnerSession({ sessionId: receipt.sessionId, operationId: `im-restart:${digest(closeId)}`,
+        await this.options.host.restartPartnerSession({ sessionId: receipt.sessionId, operationId: `im-restart:${digest(closeId)}`, pauseEmptyQueue: true,
           assertCurrent, pauseGoal: () => this.options.pauseGoal(receipt.sessionId, `im-restart:${digest(closeId)}:goal`) });
         assertCurrent();
         for (const row of this.options.store.listSettings('service', SCOPE)) {
