@@ -1,5 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { LinkspanError } from "@jokoagent/linkspan-core";
 import { parseMobileRemoteDesktopNativeEvent, parseMobileRemoteDesktopNativeInputBatch, parseMobileRemoteDesktopNativeViewport,
   type MobileRemoteDesktopNativeInputBatch, type MobileRemoteDesktopNativeCommand } from "./remote-desktop-native-bridge";
 import { RTC_NETWORK } from "./remote-desktop-viewer";
@@ -2352,14 +2353,20 @@ export class MobileRemoteDesktopController {
           for (let offset = 0; offset < json.length;) {
             this.#assertClipboardCurrent(context);
             const end = clipboardChunkEnd(json, offset);
-            await this.transport.clipboardContent(context.host,
-              create(RemoteDesktopClipboardContentRequestSchema, {
-                leaseId: context.lease.leaseId,
-                controlGeneration: context.controlGeneration,
-                action: { case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, {
-                  transferId, offset, data: json.slice(offset, end)
-                }) }
-              }), context.operation.request.signal);
+            const chunk = create(RemoteDesktopClipboardContentRequestSchema, {
+              leaseId: context.lease.leaseId,
+              controlGeneration: context.controlGeneration,
+              action: { case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, {
+                transferId, offset, data: json.slice(offset, end)
+              }) }
+            });
+            try {
+              await this.transport.clipboardContent(context.host, chunk, context.operation.request.signal);
+            } catch (error) {
+              if (!clipboardChunkReceiptLost(error)) throw error;
+              this.#assertClipboardCurrent(context);
+              await this.transport.clipboardContent(context.host, chunk, context.operation.request.signal);
+            }
             this.#markClipboardProgress(context);
             offset = end;
           }
@@ -4036,6 +4043,14 @@ export class MobileRemoteDesktopController {
       }
     });
   }
+}
+
+function clipboardChunkReceiptLost(error: unknown): boolean {
+  for (let remaining = 8; remaining > 0 && error instanceof Error; remaining--) {
+    if (error instanceof LinkspanError) return error.code === "transport_error";
+    error = error.cause;
+  }
+  return false;
 }
 
 function mobileClipboardSyncError(error: unknown): ClipboardSyncError {

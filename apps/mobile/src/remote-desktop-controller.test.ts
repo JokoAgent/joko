@@ -1,6 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { LinkspanError } from "@jokoagent/linkspan-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DeviceKind,
@@ -3181,7 +3182,7 @@ describe("MobileRemoteDesktopController", () => {
       }
       if (request.action.case === "commit") {
         commitCalls += 1;
-        throw new Error("response lost after consume");
+        throw new LinkspanError("transport_error", "response lost after consume");
       }
       return create(RemoteDesktopClipboardContentResultSchema, {});
     });
@@ -3190,6 +3191,42 @@ describe("MobileRemoteDesktopController", () => {
     expect(value.clipboardContent.mock.calls.map((call) => call[1].action.case))
       .toEqual(["begin", "write", "commit", "cancel"]);
     expect(controller.snapshot).toMatchObject({ clipboardBusy: false, clipboardNotice: "failed" });
+    await controller.close();
+  });
+
+  it.each(["transport_error", "authentication_failed"] as const)("retries an exact staged chunk only for a lost transport receipt (%s)", async code => {
+    const value = fixture(true, true), phone = clipboardFixture(true);
+    const transferId = "123e4567-e89b-12d3-a456-426614174000";
+    const text = "a".repeat(70_000), json = JSON.stringify({ text });
+    phone.readPortable.mockImplementationOnce(async check => { check(); return { text }; });
+    let staged = "", lost = false;
+    value.clipboardContent.mockImplementation(async (_host, request) => {
+      const action = request.action;
+      if (action.case === "begin") return create(RemoteDesktopClipboardContentResultSchema, { transferId });
+      if (action.case === "write") {
+        const { offset, data } = action.value;
+        if (offset === staged.length) staged += data;
+        else expect({ offset, data }).toEqual({ offset: 0, data: staged });
+        if (!lost) {
+          lost = true;
+          throw ConnectError.from(new Error("Clipboard response unavailable", { cause: new LinkspanError(code, "test transport") }));
+        }
+      }
+      if (action.case === "commit") expect(staged).toBe(json);
+      return create(RemoteDesktopClipboardContentResultSchema);
+    });
+    const controller = new MobileRemoteDesktopController(value.transport, undefined, phone.clipboard);
+    await controller.open();
+    await controller.pasteFromPhone();
+    const requests = value.clipboardContent.mock.calls.map(([, request]) => request);
+    if (code === "transport_error") {
+      expect(requests.map(request => request.action.case)).toEqual(["begin", "write", "write", "write", "commit", "cancel"]);
+      expect(requests[2]).toEqual(requests[1]);
+      expect(controller.snapshot.clipboardNotice).toBe("pasted");
+    } else {
+      expect(requests.map(request => request.action.case)).toEqual(["begin", "write", "cancel"]);
+      expect(controller.snapshot.clipboardNotice).toBe("failed");
+    }
     await controller.close();
   });
 
