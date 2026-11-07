@@ -103,15 +103,17 @@ describe("clipboard sync", () => {
     expect(f.remote.paste).not.toHaveBeenCalled();
   });
 
-  it("preserves both simultaneous content changes and resumes only after another actual copy", async () => {
+  it("preserves both simultaneous changes and accepts an explicit re-copy of the same remote content", async () => {
     const f = fixture(); await f.sync.tick();
     f.setLocal(item("new local")); f.setRemote(item("new remote"));
     await expect(f.sync.tick()).rejects.toMatchObject({ reason: "conflict" });
     expect(f.local()).toBe(item("new local")); expect(f.remoteValue()).toBe(item("new remote"));
     expect(f.writeLocal).not.toHaveBeenCalled(); expect(f.remote.paste).not.toHaveBeenCalled();
-    await f.sync.tick(); expect(f.remote.paste).not.toHaveBeenCalled();
-    f.setLocal(item("next deliberate copy")); await f.sync.tick();
-    expect(f.remoteValue()).toBe(item("next deliberate copy"));
+    await f.sync.tick();
+    expect(f.writeLocal).not.toHaveBeenCalled(); expect(f.remote.paste).not.toHaveBeenCalled();
+    f.setRemote(item("new remote")); await f.sync.tick();
+    expect(f.writeLocal).toHaveBeenCalledExactlyOnceWith(item("new remote"), "2");
+    expect(f.local()).toBe(f.remoteValue());
   });
 
   it.each(["empty", "unsupported", "too-large"] as const)("skips one %s version while preserving the proven other baseline", async reason => {

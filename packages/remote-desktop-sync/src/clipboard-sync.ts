@@ -189,7 +189,7 @@ export class ClipboardSync {
       const remoteDigest = remoteContent?.digest ?? this.baseline.remoteDigest;
       if (localDigest && localDigest === remoteDigest) { localChanged = false; remoteChanged = false; }
       if (localChanged && remoteChanged) {
-        Object.assign(this.baseline, { local, remote, localDigest, remoteDigest });
+        Object.assign(this.baseline, { local, remote, localDigest: undefined, remoteDigest: undefined });
         throw new ClipboardSyncError("conflict");
       }
       if (localChanged && localContent) {
