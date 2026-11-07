@@ -689,6 +689,13 @@ export interface PartnerPrivateMessageView {
   readonly deliveredAt?: number;
 }
 
+export interface PartnerPrivateSentView {
+  readonly messageId: string;
+  readonly threadId: string;
+  readonly recipientPartnerId: string;
+  readonly recipientDisplayName: string;
+}
+
 export interface PartnerPrivateThreadReadStateView {
   readonly threadId: string;
   readonly partnerId: string;
@@ -1690,6 +1697,7 @@ export interface TimelineItemView {
     readonly recipientPartnerId: string;
     readonly senderDisplayName: string;
   };
+  readonly partnerPrivateSent?: PartnerPrivateSentView;
   /** Typed accepted-input semantics; absent only for untyped imported history. */
   readonly inputDelivery?: DeliveryMode | "scheduler";
   /** Service-owned continuation prompt; hidden in favor of its recovery activity row. */
