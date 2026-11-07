@@ -4833,6 +4833,19 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }
       return { models: localExtensionSettingsAgentModels(dependencies, application.providerGroups) };
     },
+    listExtensionSettingsImageModels: async (request, context) => {
+      const connection = authenticate(context);
+      const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+      if (!dependencies.extensionMainViews!.isSurfaceCurrent(surface.id, connection.id) || !surface.authority.runtime?.image) {
+        throw new ConnectError("Plugin image model access is unavailable.", Code.PermissionDenied);
+      }
+      assertCurrentExtensionMainViewAuthority(dependencies, surface.authority);
+      if (!dependencies.extensionCatalog!.get(surface.authority.extensionId).enabled || !application.extensionImageModels) {
+        throw new ConnectError("The plugin image model catalog is unavailable.", Code.FailedPrecondition);
+      }
+      return { models: [...application.extensionImageModels()] };
+    },
     beginExtensionSecretCheck: async (request, context) => {
       const connection = authenticate(context);
       const surface = await requireExtensionSettingsSurface(dependencies, request.surfaceId, connection.id);

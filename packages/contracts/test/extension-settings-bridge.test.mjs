@@ -8,10 +8,12 @@ test("author settings only accepts declared commands and bounded private input",
   const request = command => ({ type: "joko:extension-settings-request", version: 1, id: "settings-one", command });
   assert.ok(parseExtensionSettingsBridgeRequest(request({ kind: "secret.check", key: "token", value: "candidate" })));
   assert.ok(parseExtensionSettingsBridgeRequest(request({ kind: "agent-models.get" })));
+  assert.ok(parseExtensionSettingsBridgeRequest(request({ kind: "image-models.get" })));
   assert.ok(parseExtensionSettingsBridgeRequest(request({ kind: "directory.pick", title: "Select report files" })));
   for (const command of [
     { kind: "rpc", method: "deleteSession", arguments: {} },
     { kind: "agent-models.get", backendId: "remote" },
+    { kind: "image-models.get", type: "video" },
     { kind: "secret.set", fieldId: "network-secret:token", value: "x", resourceId: "other" },
     { kind: "oauth.connect", key: "account", scopes: new Array(33).fill("scope") },
     { kind: "secret.check", key: "token", value: "x".repeat(65_537) },
@@ -69,6 +71,25 @@ test("directory selection only sends a native choice request and requires a read
   assert.deepEqual(JSON.parse(JSON.stringify(current.requests[0].command)), { kind: "directory.pick", title: "Reports" });
   current.respond(current.requests[0].id, { dir_deposit: { token: "receipt", file_count: 1, total_bytes: 4, rel_paths: ["report.txt"] } });
   const response = await pending; assert.equal((await response.json()).dir_deposit.token, "receipt");
+});
+
+test("the authored media directory reads the single approved image query", async () => {
+  const current = page();
+  assert.equal((await current.context.fetch("/media-models?type=image", { method: "POST" })).status, 405);
+  for (const query of ["", "?type=video", "?type=image&type=image", "?type=image&provider=other", "?type=image#fragment"]) {
+    assert.equal((await current.context.fetch(`/media-models${query}`)).status, 400);
+  }
+  assert.equal(current.requests.length, 0);
+  const pending = current.context.fetch("/media-models?type=image");
+  const request = parseExtensionSettingsBridgeRequest(current.requests[0]);
+  assert.equal(request.command.kind, "image-models.get");
+  const result = { ok: true, type: "image", models: [{ id: "image", name: "Image", providerId: "provider",
+    modalities: { input: ["text"], output: ["image"] } }], defaultModelId: "image", defaultProviderId: "provider" };
+  current.respond(request.id, result);
+  const response = await pending;
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(await response.json(), result);
 });
 
 test("author connection token and deletion path use the protected v1 commands", async () => {

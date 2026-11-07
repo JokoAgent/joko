@@ -562,6 +562,7 @@ export interface OrchestratorApplication {
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionSettings?: ExtensionSettingsManager;
+  readonly extensionImageModels?: () => ReturnType<ImageGenerationBridgeToolProvider["listModels"]>;
   readonly desktopExtensionContext?: Pick<ExtensionCardRuntime, "desktopHostLocale" | "setDesktopHostLocale">;
   readonly extensionDirectoryPicker?: ExtensionDirectoryPicker;
   readonly extensionCards?: ExtensionCardsManager;
@@ -1167,6 +1168,7 @@ export async function createOrchestratorApplication(
       IMAGE_GENERATION_RESPONSE_MAXIMUM_BYTES
     )
   });
+  const listExtensionImageModels = () => imageGenerationBridge.listModels();
   const unregisterImageGenerationBridge = mcpRouter.registerBridgeToolProvider(imageGenerationBridge);
   const unregisterPersonalDevelopmentTools = mcpRouter.registerBridgeToolProvider(
     new PersonalDevelopmentReportTools(() => personalDevelopmentCoordinator)
@@ -2650,6 +2652,7 @@ export async function createOrchestratorApplication(
     vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, targets: extensionTargets, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
+    imageModels: listExtensionImageModels,
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
       environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }),
     resolveCredential: reference => credentials.resolve(reference),
@@ -3627,6 +3630,7 @@ export async function createOrchestratorApplication(
     extensionLibraries,
     extensionMainViews,
     extensionSettings,
+    extensionImageModels: listExtensionImageModels,
     ...(dependencies.desktopManagedExtensionContext ? { desktopExtensionContext: extensionCardRuntime } : {}),
     extensionDirectoryPicker,
     extensionCards,

@@ -19,7 +19,7 @@ async function fixture(operationCall?: (method: string, input: any) => Promise<R
   const calls: Array<{ method: string; input: unknown }> = [];
   const transport = { unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
     calls.push({ method: method.localName, input });
-    const value = operationCall && ["submitOperation", "getOperation", "listExtensionSettingsAgentModels"].includes(method.localName) ? await operationCall(method.localName, input)
+    const value = operationCall && ["submitOperation", "getOperation", "listExtensionSettingsAgentModels", "listExtensionSettingsImageModels"].includes(method.localName) ? await operationCall(method.localName, input)
       : method.localName === "getSnapshot" ? { snapshot: {} }
       : method.localName === "openExtensionSettings" || method.localName === "getExtensionMainViewSurface" ? { surface }
         : method.localName === "getExtension" ? { extension: entry } : method.localName === "closeExtensionMainView" ? { closed: true }
@@ -68,6 +68,30 @@ it("opens author settings for a disabled, incomplete installation and pins every
     f.surface.settings = false;
     await expect(api.call(surface, { kind: "routing.get" }, host, signal)).rejects.toThrow("surface changed");
     expect(f.calls.filter(call => call.method === "getExtensionSettingsRoutingData")).toHaveLength(1);
+  } finally { f.gateway.disconnect(); }
+});
+
+it("reads the image model identities and default from the original author settings surface", async () => {
+  const model = { id: "image", name: "Image", providerId: "provider" };
+  let permitted = true;
+  const f = await fixture(async () => {
+    if (!permitted) throw new ConnectError("No image permission", Code.PermissionDenied);
+    return { models: [model] };
+  });
+  f.entry.enabled = true;
+  try {
+    const api = f.settingsApi(), signal = new AbortController().signal;
+    const surface = await api.open(f.entry.extensionId, 4n, signal);
+    await expect(api.call(surface, { kind: "image-models.get" }, host, signal)).resolves.toEqual({
+      ok: true, type: "image", models: [{ ...model, modalities: { input: ["text"], output: ["image"] } }],
+      defaultModelId: "image", defaultProviderId: "provider"
+    });
+    permitted = false;
+    await expect(api.call(surface, { kind: "image-models.get" }, host, signal)).resolves.toMatchObject({ ok: false, errorCode: "PERMISSION_DENIED" });
+    expect(f.calls.filter(call => call.method === "listExtensionSettingsImageModels")).toEqual([
+      { method: "listExtensionSettingsImageModels", input: expect.objectContaining({ surfaceId: surface.id }) },
+      { method: "listExtensionSettingsImageModels", input: expect.objectContaining({ surfaceId: surface.id }) }
+    ]);
   } finally { f.gateway.disconnect(); }
 });
 

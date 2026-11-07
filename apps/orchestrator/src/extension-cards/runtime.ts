@@ -45,6 +45,7 @@ interface Options {
   readonly registerProvider: (provider: BridgeToolProvider) => () => void;
   readonly redact: (text: string) => string;
   readonly locale?: () => string;
+  readonly imageModels?: () => readonly { readonly id: string; readonly providerId: string }[];
   readonly fetch?: typeof fetch;
   readonly resolveCredential?: (reference: string) => string;
   readonly media?: ExtensionCardMedia;
@@ -318,6 +319,14 @@ export class ExtensionCardRuntime {
     const request = payload as Record<string, unknown>, id = instance.authority.surface.extensionId;
     const current = () => { this.#assert(instance); };
     switch (request.type) {
+      case "host-preference": {
+        if (request.capability !== "image.generate" || Object.keys(request).length !== 2) return { ok: false, errorCode: "INVALID_REQUEST" };
+        if (!instance.authority.runtime.image) return { ok: false, errorCode: "PERMISSION_DENIED" };
+        current();
+        const model = this.options.imageModels?.()[0];
+        if (!model) return { ok: false, errorCode: "NOT_AVAILABLE" };
+        return { ok: true, capability: "image.generate", modelId: model.id, providerId: model.providerId };
+      }
       case "device-sync-request": {
         if (!instance.authority.runtime.deviceSync || !this.options.deviceSync) return { ok: false, errorCode: "SYNC_NOT_ALLOWED" };
         const owner = this.#requestOwner(instance, request.callId);
