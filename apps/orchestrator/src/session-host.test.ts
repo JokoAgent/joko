@@ -10711,7 +10711,9 @@ describe("SessionHost", () => {
       try {
         await gate.entered;
         if (scenario === "edited") {
-          fixture.store.upsertSchedule({ ...schedule, expectedRevision: schedule.revision, expression: "180000", nextRunAt: editedNextAt });
+          const running = fixture.store.getSchedule(schedule.id);
+          expect(running).toMatchObject({ lastRunAt: startedAt, nextRunAt: startedAt });
+          fixture.store.upsertSchedule({ ...running, expectedRevision: running.revision, expression: "180000", nextRunAt: editedNextAt });
         }
         if (scenario === "cancelled") await coordinator.abortSchedule(schedule.id);
         now = startedAt + 50_000;
@@ -10723,7 +10725,9 @@ describe("SessionHost", () => {
       expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ firedAt: startedAt, finishedAt: now, status }]);
       const nextRunAt = scenario === "manual" || scenario === "cancelled" ? startedAt + interval
         : scenario === "edited" ? editedNextAt : now + interval;
-      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({ nextRunAt });
+      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({
+        nextRunAt, expression: scenario === "edited" ? "180000" : String(interval)
+      });
       if (scenario === "success" || scenario === "failed") {
         now = startedAt + interval;
         await coordinator.tick();
