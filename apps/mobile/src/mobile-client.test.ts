@@ -8236,7 +8236,7 @@ describe("mobile Home search and task mutations", () => {
     try {
       const catalog = create(TaskTagCatalogSchema, { revision: { value: 6n }, taskTags: [{ taskTagId: "tag-release",
         name: "Release", color: TaskTagColor.ORANGE, revision: { value: 6n } }] });
-      const changed = create(EventSchema, { ...event("tags-changed", 11n), identity: undefined,
+      const changed = create(EventSchema, { eventId: "tags-changed", cursor: { opaqueToken: "cursor-11", sequence: 11n, generation: 1n },
         payload: { kind: { case: "taskTagCatalogChanged", value: { catalog } } } });
       const current = create(SnapshotSchema, { ...snapshot, taskTagCatalog: catalog, resumeCursor: changed.cursor });
       vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: current });

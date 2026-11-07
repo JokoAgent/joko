@@ -6,7 +6,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { Alert } from "react-native";
 
 import { create } from "@bufbuild/protobuf";
-import { SessionSchema, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, TaskTagSchema, type TaskTag } from "@joko/contracts";
+import { RevisionSchema, SessionSchema, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, TaskTagSchema, type TaskTag } from "@joko/contracts";
 import { MobileTaskTagDots, MobileTaskTagsSheet, mobileTaskTagName } from "./MobileTaskTags";
 import type { MobileTaskTagsNativeProps } from "./MobileTaskTagsNative";
 import type { MobileClient } from "./mobile-client";
@@ -123,7 +123,7 @@ it.each([true, false])("keeps the name draft through a same-owner catalog update
       input.value = "Launch";
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await act(async () => render(create(TaskTagSchema, { ...original, revision: { value: 2n }, sortOrder: 1,
+    await act(async () => render(create(TaskTagSchema, { ...original, revision: create(RevisionSchema, { value: 2n }), sortOrder: 1,
       color: colorChanged ? TaskTagColor.ORANGE : original.color })));
     expect(host.querySelector("input")?.value).toBe("Launch");
     await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Save tag"]')!.click());
