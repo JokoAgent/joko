@@ -14093,6 +14093,15 @@ export class MobileClient {
     }));
   }
 
+  homeTaskTagSourceKey(sessionId: string): string | undefined {
+    const owner = this.#partnerPrivateAuthorityKey(this.#state);
+    if (!owner || this.#joinedTask) return undefined;
+    const session = this.#state.owner?.sessions.find(candidate => candidate.sessionId === sessionId);
+    if (!session) return undefined;
+    return JSON.stringify([owner, this.#epoch, session.sessionId, session.backendId, session.targetId,
+      session.nativeBinding?.runtimeGeneration.toString()]);
+  }
+
   async previewTaskTagDeletion(taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview> {
     return this.network.previewTaskTagDeletion(this.#ready(), taskTagId, signal);
   }

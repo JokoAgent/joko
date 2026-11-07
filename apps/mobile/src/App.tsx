@@ -1665,6 +1665,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       </View>
     </Modal>
     <MobileTaskTagsSheet
+      fromHome
       visible={state.status === "connected" && taskTagSessionId !== undefined}
       session={state.owner?.sessions.find((session) => session.sessionId === taskTagSessionId)}
       catalog={state.owner?.taskTagCatalog}
