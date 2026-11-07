@@ -138,7 +138,7 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
     const dispatch = command => { assertNotAborted(); return call(command); };
     assertNotAborted();
     const method = String(init && init.method || input && input.method || "GET").toUpperCase();
-    let body = init && init.body, command;
+    let body = init && init.body, command, authorConnectionHost, deleteConnection = false;
     if (body === undefined && input && typeof input.clone === "function" && method !== "GET" && method !== "HEAD") body = await input.clone().text();
     if (typeof body === "string" && body.length > 65536) throw new Error("Settings request is too large.");
     const json = () => typeof body === "string" ? JSON.parse(body || "{}") : {};
@@ -168,18 +168,39 @@ const EXTENSION_SETTINGS_SDK_FACTORY = String.raw`(checkableSecrets => {
       const secret = /^\/secrets\/([a-z][a-z0-9_]{0,31})(\/check)?$/.exec(url.pathname);
       const oauth = /^\/oauth\/([a-z][a-z0-9_]{0,31})\/(connect|remove|default|clearClient)$/.exec(url.pathname);
       const connection = /^\/connections\/([a-z][a-z0-9_]{0,31})(?:\/(remove|default))?$/.exec(url.pathname);
+      const connectionPath = /^\/connections\/([a-z][a-z0-9_]{0,31})\/([a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/.exec(url.pathname);
       if (secret) command = secret[2] && method === "POST" ? { kind: "secret.check", key: secret[1], value: json().value }
         : method === "PUT" ? { kind: "secret.set", fieldId: "network-secret:" + secret[1], value: json().value }
         : method === "DELETE" ? { kind: "secret.clear", fieldId: "network-secret:" + secret[1] } : undefined;
       else if (oauth && method === "POST") command = oauth[2] === "connect" ? { kind: "oauth.connect", key: oauth[1], ...(json().scopes ? { scopes: json().scopes } : {}) }
         : { kind: "oauth.change", key: oauth[1], action: oauth[2], ...(json().accountId ? { accountId: json().accountId } : {}) };
-      else if (connection && method === "POST") command = connection[2] ? { kind: "connections.change", key: connection[1], action: connection[2], connectionId: json().connectionId }
-        : { kind: "connections.set", key: connection[1], host: json().host, value: json().value, ...(json().label ? { label: json().label } : {}) };
+      else if (connection && method === "POST") {
+        const request = json();
+        if (connection[2]) command = { kind: "connections.change", key: connection[1], action: connection[2], connectionId: request.connectionId };
+        else {
+          const authorToken = request.value === undefined && typeof request.token === "string";
+          if (authorToken && typeof request.host === "string") authorConnectionHost = request.host.trim().toLowerCase();
+          command = { kind: "connections.set", key: connection[1], host: request.host,
+            value: authorToken ? request.token : request.value, ...(request.label ? { label: request.label } : {}) };
+        }
+      } else if (connectionPath && method === "DELETE") {
+        command = { kind: "connections.change", key: connectionPath[1], action: "remove", connectionId: connectionPath[2] };
+        deleteConnection = true;
+      }
     }
     if (!command) throw new Error("Settings endpoint is not supported.");
     try {
       const result = await dispatch(command);
       if (command.kind === "routing.set") revision = result.revision;
+      if (deleteConnection) return new Response(null, { status: 204 });
+      if (authorConnectionHost !== undefined) {
+        const slot = result?.slots?.find(slot => slot.key === command.key);
+        const saved = slot?.connections?.find(connection => connection.host === authorConnectionHost && connection.configured);
+        if (!saved || typeof saved.connectionId !== "string" || !saved.connectionId) throw new Error("Plugin connection receipt is unavailable.");
+        const connection = { id: saved.connectionId, host: saved.host, isDefault: saved.isDefault,
+          ...(saved.label ? { label: saved.label } : {}) };
+        return jsonResponse({ ...result, ok: true, connection });
+      }
       return jsonResponse(result);
     } catch (error) {
       if (command.kind === "secret.check" && !(signal && signal.aborted) && error?.message === "${EXTENSION_SECRET_CHECK_FAILED}") {
