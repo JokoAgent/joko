@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { AdapterContext, BlobRef, EventPayload, InteractionPayload, TargetDescriptor } from "@joko/core";
+import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { describe, expect, it, vi } from "vitest";
 
+import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableRunSnapshot, PiManagedDurableStore } from "./managed-durable-store.js";
 import {
@@ -563,6 +565,64 @@ describe("managed Subagent public observation", () => {
     expect(control).toMatchObject({ action: "approval", approvalId, value: "admitted" });
     expect(JSON.stringify(control)).not.toContain("arguments");
     observer.stop();
+  });
+
+  it("services release from one child while another waits, and drains an undelivered acquire on stop", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-subagent-command-wait-"));
+    const root = join(directory, "subagent-runs");
+    const sessionId = `session-${randomUUID()}`;
+    const gate = createCommandConcurrencyGate({ readMaximum: () => 1, maximumWaitMs: 60_000 });
+    const observer = new ManagedSubagentObserver({ root, context: context(sessionId, 6, []), commandConcurrencyGate: gate });
+    const title = (action: "acquire" | "release") => `${COMMAND_GATE_REQUEST_PREFIX}${action}/${Buffer.from("provider-call-one").toString("base64url")}`;
+    const approval = (taskId: string, id: string, action: "acquire" | "release") => ({
+      id, childId: `${taskId}:child`, method: "input", title: title(action), requestedAt: Date.now()
+    });
+    const createRun = async (taskId: string) => {
+      const { runId } = await physicalRun(root, sessionId, taskId, 5, 1, [], undefined, "running", {
+        pendingApproval: approval(taskId, `${taskId}-acquire`, "acquire")
+      });
+      return join(root, managedSubagentSessionKey(sessionId), runId);
+    };
+    const setApproval = async (run: string, pendingApproval?: ReturnType<typeof approval>) => {
+      const statusPath = join(run, "status.json");
+      const status = JSON.parse(await readFile(statusPath, "utf8")) as Record<string, unknown>;
+      await writeFile(statusPath, JSON.stringify({ ...status, heartbeatAt: Date.now(), pendingApproval }), { mode: 0o600 });
+    };
+    const readReply = async (run: string) => JSON.parse(await readFile(join(run, "approval-control.json"), "utf8")) as Record<string, unknown>;
+    try {
+      const first = await createRun("first");
+      await vi.waitFor(async () => {
+        await observer.refresh();
+        expect(await readReply(first)).toMatchObject({ approvalId: "first-acquire", value: "admitted" });
+      });
+      const second = await createRun("second");
+      await observer.refresh();
+      expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      await expect(readReply(second)).rejects.toMatchObject({ code: "ENOENT" });
+
+      await setApproval(first, approval("first", "first-release", "release"));
+      await vi.waitFor(async () => {
+        await observer.refresh();
+        expect(await readReply(first)).toMatchObject({ approvalId: "first-release", value: "released" });
+        expect(await readReply(second)).toMatchObject({ approvalId: "second-acquire", value: "admitted" });
+      });
+      await setApproval(first);
+      await setApproval(second, approval("second", "second-release", "release"));
+      await observer.refresh();
+      expect(gate.snapshot()).toEqual({ running: 0, queued: 0 });
+
+      await gate.acquire({ commandId: "outside", sessionId: "other-session" });
+      await setApproval(second, approval("second", "retire-waiter", "acquire"));
+      await observer.refresh();
+      expect(gate.snapshot()).toEqual({ running: 1, queued: 1 });
+      await observer.stopAndDrain();
+      expect(gate.snapshot()).toEqual({ running: 1, queued: 0 });
+      expect(await readReply(second)).toMatchObject({ approvalId: "second-release", value: "released" });
+    } finally {
+      await observer.stopAndDrain();
+      gate.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("evaluates current delegated policy requests and fails an older policy generation closed", async () => {
