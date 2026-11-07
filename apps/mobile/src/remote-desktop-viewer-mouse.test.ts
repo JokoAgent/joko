@@ -170,6 +170,33 @@ describe("actual floating mouse controls viewer", () => {
     expect(value.packets()).toHaveLength(0);
   });
 
+  it("starts pinching from the sustained span after a two-finger touch scroll", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    const value = viewer(false, { width: 1920, height: 1080 }, { width: 360, height: 600 });
+    const image = document.getElementById("image")!;
+    value.pointer(value.stage, "pointerdown", 8, 140, 300);
+    value.pointer(value.stage, "pointerdown", 9, 180, 300);
+    const move = (left: number, right: number) => {
+      value.pointer(value.stage, "pointermove", 8, left, 300);
+      value.pointer(value.stage, "pointermove", 9, right, 300);
+    };
+    move(160, 200);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(value.packets()[0]?.events).toEqual([
+      { kind: "move", x: .5, y: .5 },
+      { kind: "scroll", dx: -20, dy: 0 }
+    ]);
+    value.ack();
+
+    move(145, 215);
+    await vi.advanceTimersByTimeAsync(80);
+    expect(image.style.width).toBe("360px");
+    move(128, 232);
+    await vi.advanceTimersByTimeAsync(17);
+    expect(Number.parseFloat(image.style.width)).toBeCloseTo(360 * 104 / 70);
+    expect(value.packets()).toHaveLength(1);
+  });
+
   it("uses bounded displacement ticks and skips ACK time without accumulating a scroll backlog", async () => {
     const value = viewer(), wheel = value.button("wheel");
     value.pointer(wheel, "pointerdown", 7, 0, 100); value.pointer(wheel, "pointermove", 7, 0, 104);

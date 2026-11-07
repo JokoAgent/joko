@@ -122,13 +122,25 @@ const VIEWER_SCRIPT = String.raw`
   listenMouse(wheel,'click',event=>{if(event.detail===0&&control&&showMouseButtons){click(1);flush();}});
   listenMouse(wheel,'keydown',event=>{if(event.key==='ArrowUp'||event.key==='ArrowDown'){event.preventDefault();scrollMouse(event.key==='ArrowUp'?-120:120);}});
   function pair(){const [a,b]=[...pointers.values()];return{x:(a.x+b.x)/2,y:(a.y+b.y)/2,d:Math.hypot(a.x-b.x,a.y-b.y)};}
-  function movePair(){
+  function movePair(frameTime,finishing=false){
     gestureFrame=null;
     if(pointers.size<2||!multi)return;
     const next=pair(),span=Math.abs(next.d-multi.d),travel=Math.hypot(next.x-multi.x,next.y-multi.y);
+    const pinchMotion=span>8&&span>travel*.7;
     if(!multi.kind){
-      if(span>8&&span>travel*.7)multi.kind='pinch';
+      if(pinchMotion)multi.kind='pinch';
       else if(travel>8)multi.kind='scroll';
+    }else if(multi.kind==='scroll'){
+      if(!pinchMotion)multi.pinchCandidate=null;
+      else{
+        const candidate = multi.pinchCandidate ??= { at: frameTime, d: next.d, zoom, anchor: point(next) };
+        // Parallel scroll can deliver the two pointer updates in separate frames.
+        if(frameTime-candidate.at<40){
+          if(!finishing)gestureFrame=requestAnimationFrame(movePair);
+          return;
+        }
+        multi.kind='pinch';multi.d=candidate.d;multi.zoom=candidate.zoom;multi.anchor=candidate.anchor;
+      }
     }
     if(multi.kind==='pinch'){
       zoom=bounded(multi.zoom*next.d/Math.max(1,multi.d),1,5);
@@ -186,7 +198,7 @@ const VIEWER_SCRIPT = String.raw`
     clearTimeout(hold);
     if(pointers.size>=2&&multi&&gestureFrame!==null){
       pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
-      cancelAnimationFrame(gestureFrame);movePair();
+      cancelAnimationFrame(gestureFrame);movePair(performance.now(),true);
     }
     const wasTap=start&&!start.moved;
     pointers.delete(event.pointerId);
