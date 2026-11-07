@@ -26,10 +26,12 @@ async function render(patch: Partial<ExtensionTaskApi> = {}) {
     listBackgroundTasks: vi.fn(async () => create(ExtensionTaskServiceListBackgroundTasksResponseSchema)),
     revealTask: vi.fn(async () => create(ExtensionTaskServiceRevealTaskResponseSchema, { taskId: "background" })),
     retryWriteAccess: vi.fn(async () => create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences: state })), ...patch };
-  const controller = { extensionTaskApi: () => api, navigate: vi.fn(), refresh: vi.fn(async () => {}) } as unknown as AppController;
+  const controller = { extensionTaskApi: () => api, navigate: vi.fn(), refresh: vi.fn(async () => {}), state: {
+    connectionState: "connected", activeProfile: { id: "profile", serverId: "server" }, snapshot: { interactions: [] }
+  } } as unknown as AppController;
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
   const view: JSX.Element = <ExtensionTasksSection controller={controller} extension={{ id: "plugin", revision: 1n, permissions: [] } as unknown as ExtensionCatalogEntryView}
-    disabled={false} t={(key, values) => translate("en", key, values)} />;
+    disabled={false} t={(key, values) => translate("en", key, values)} runAction={(_key, action) => { void action(); }} />;
   await act(async () => root.render(view)); return { root, container, controller, api };
 }
 it("clears the model while preserving the approved directory and permission, retaining a failed draft", async () => {
