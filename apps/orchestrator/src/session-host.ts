@@ -2074,6 +2074,9 @@ export class SessionHost {
     if (current.state !== "active" || current.authKeyDigest !== connection.authKeyDigest || session.archived || session.deletedAt !== undefined
       || this.#store.sessionCreationServiceKind(sessionId) !== undefined || session.automationOrigin !== undefined
       || this.#partnerSessionPolicy?.(sessionId) !== undefined || this.isReviewReadOnlySession(sessionId) || this.hasDurableSessionWork(sessionId)) return;
+    // Cold ordinary tasks advance their native generation during activation.
+    // Let an admitted input own that transition and its replacement Attempt.
+    if (provisional === undefined && !this.#active.has(sessionId)) return;
     this.assertProvisionalCreationReady({ operationId: "prewarm", connection, title: session.title, targetId: session.targetId,
       provisionalDraftId: provisional?.draftId ?? "ordinary_user_task", providerId: session.providerId, modelId: session.modelId,
       effort: session.effort, fastMode: session.fastMode, permissionMode: session.permissionMode, planMode: session.planMode,
