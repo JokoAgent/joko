@@ -213,11 +213,18 @@ describe("workspace, artifact, and capability boundaries", () => {
       query: "literal+a+b",
       caseSensitive: true,
       regularExpression: false,
+      includeEntryRevisions: true,
       page: { pageSize: 1, pageToken: "" }
     });
     const textMatch = searched.matches.find((match) => match.relativePath === "mobile-search.txt");
     expect(textMatch?.linePreview).toContain(marker);
-    expect(textMatch?.revision?.opaqueRevision).not.toBe("");
+    expect(textMatch?.revision?.opaqueRevision).toMatch(/^sha256:/u);
+    expect(textMatch?.entryRevision?.opaqueRevision).toMatch(/^meta:/u);
+    expect(textMatch?.entryRevision).toEqual(entries.find(entry => entry.relativePath === "mobile-search.txt")?.revision);
+    const searchPreview = await paired.clients.workspace.readWorkspaceFile({
+      workspaceId, relativePath: "mobile-search.txt", expectedRevision: textMatch!.entryRevision, maximumBytes: 1024n
+    });
+    expect(searchPreview.preview?.content).toMatchObject({ case: "text", value: { utf8Text: `${marker}\n` } });
 
     const textBytes = Buffer.from(`${marker}\n`, "utf8");
     const beforeMaterialization = (await paired.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } })).snapshot!;

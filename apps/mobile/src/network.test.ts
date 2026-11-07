@@ -1853,8 +1853,9 @@ describe("mobile Workspace and Artifact paging", () => {
 
   it("keeps 501 stable content matches when the last page clears the continuation flag", async () => {
     const revision = create(FileRevisionSchema, { opaqueRevision: "sha256:fixture:5010", byteSize: 5_010n });
+    const entryRevision = create(FileRevisionSchema, { opaqueRevision: "remote-meta:report", byteSize: 5_010n });
     const matches = Array.from({ length: 501 }, (_value, index) => create(WorkspaceSearchMatchSchema, {
-      relativePath: "report.txt", revision, linePreview: `match ${index + 1}`
+      relativePath: "report.txt", revision, entryRevision, linePreview: `match ${index + 1}`
     }));
     const readPage = vi.fn(async (token: string) => ({
       matches: token === "" ? matches.slice(0, 500) : matches.slice(500), nextPageToken: token === "" ? "second" : "",
@@ -1868,6 +1869,10 @@ describe("mobile Workspace and Artifact paging", () => {
     await expect(collectWorkspaceSearchPages("workspace", async token => ({
       ...await readPage(token), ...(token === "" ? {} : { revision: "updated-search" })
     }))).rejects.toThrow(/changed while paging/u);
+    await expect(collectWorkspaceSearchPages("workspace", async token => ({
+      ...await readPage(token), ...(token === "" ? {} : { matches: [create(WorkspaceSearchMatchSchema, { ...matches[500]!,
+        entryRevision: { ...entryRevision, opaqueRevision: "remote-meta:new-report" } })] })
+    }))).rejects.toThrow(/file changed while search results were paging/u);
   });
 
   it("accepts only canonical Artifacts owned by the requested task", async () => {

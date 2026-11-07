@@ -294,6 +294,7 @@ import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import {
   artifactTitle,
   workspaceBasename,
+  workspaceSearchEntryRevision,
   type MobileFilePreview,
   type MobileFileSearchResult,
   type MobileFilesComposerSource,
@@ -7990,7 +7991,7 @@ function shareableBlobSize(byteSize: bigint | undefined): boolean {
 
 function shareableFileSearchResult(result: MobileFileSearchResult): boolean {
   if (result.kind === "artifact") return shareableBlobSize(result.artifact.blob?.byteSize);
-  if (result.kind === "workspace-content") return shareableBlobSize(result.match.revision?.byteSize);
+  if (result.kind === "workspace-content") return shareableBlobSize(workspaceSearchEntryRevision(result.match)?.byteSize);
   return true;
 }
 

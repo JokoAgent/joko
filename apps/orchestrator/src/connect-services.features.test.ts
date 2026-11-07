@@ -4661,6 +4661,10 @@ describe("Connect typed feature boundaries", () => {
       expect(scoped.changeSets).toHaveLength(1);
       expect(scoped.changeSets[0]?.changeSetId).toBe(captured.id);
       const changes = new Map(scoped.changeSets[0]?.changes.map(change => [change.relativePath, change]));
+      const original = captured.changes.find(change => change.path === "report.txt")!.before!;
+      const revision = changes.get("report.txt")!.beforeRevision!;
+      expect(revision.opaqueRevision).toBe(`${original.sha256}:${original.byteLength}:${original.modifiedAt}`);
+      expect(Number(revision.modifiedAt!.seconds) * 1_000 + revision.modifiedAt!.nanos / 1_000_000).toBe(Math.trunc(original.modifiedAt));
       expect(changes.get("report.txt")?.diff).toMatchObject({
         relativePath: "report.txt", source: contract.GitDiffSource.TURN_SET, status: contract.GitFileStatus.MODIFIED,
         hunks: [{ oldStart: 1, oldCount: 3, newStart: 1, newCount: 3, lines: [
