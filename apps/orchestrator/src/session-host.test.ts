@@ -15044,9 +15044,13 @@ describe("SessionHost", () => {
     const requests = (method: string) => fake.transport!.requests.filter(request => request.method === method);
     expect(requests("thread/start")).toHaveLength(1);
     expect(requests("thread/start")[0]?.params).toMatchObject({ developerInstructions: expect.stringContaining(handoff!) });
-    expect(requests("thread/resume").at(-1)?.params).toMatchObject({ threadId: replacement, developerInstructions: expect.stringContaining(handoff!) });
+    // The first resume attaches the replacement. Permission restoration also
+    // uses thread/resume once the native thread is already loaded.
+    const [attachment] = requests("thread/resume");
+    expect(attachment?.params).toMatchObject({ threadId: replacement, developerInstructions: expect.stringContaining(handoff!) });
     expect(requests("turn/start").map(request => request.params)).toEqual([expect.objectContaining({ threadId: replacement,
       input: [{ type: "text", text: "Next explicit request", text_elements: [] }] })]);
+    expect(fake.transport!.requests.indexOf(attachment!)).toBeLessThan(fake.transport!.requests.indexOf(requests("turn/start")[0]!));
     await fake.completeTurn(replacement, "New answer");
     await eventually(() => reopened.getRun(queued.runId).descriptor.state === "completed");
 
