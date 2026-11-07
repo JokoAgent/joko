@@ -1,4 +1,5 @@
 import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
+import { readExtensionLibraryVideo } from "@joko/connection-transport";
 import {
   allowMobileExtensionMainViewNavigation,
   type MobileExtension, type MobileExtensionMainViewSurface, type MobileExtensionTransport
@@ -147,6 +148,24 @@ export class MobileExtensionLibraryBridge {
     this.#retireSession();
   }
 
+  readVideo(path: string, maximumBytes: number, signal: AbortSignal): ReturnType<typeof readExtensionLibraryVideo> {
+    const work = this.#queue.then(async () => {
+      const session = await this.#ensureSession(signal);
+      const { extension, surface, transport } = this.context;
+      try {
+        return await readExtensionLibraryVideo(path, maximumBytes, (call, source) => {
+          if (!this.#current() || this.#session !== session) throw new Error("Library session retired.");
+          return transport.callLibrary(extension, surface, session, call, signal, source);
+        }, signal);
+      } catch (error) {
+        if (this.#session === session) this.#retireSession();
+        throw error;
+      }
+    });
+    this.#queue = work.then(() => undefined, () => undefined);
+    return work;
+  }
+
   #current(): boolean {
     return !this.#disposed && this.context.current() && this.context.surface.expiresAt > Date.now();
   }
@@ -155,6 +174,22 @@ export class MobileExtensionLibraryBridge {
     const session = this.#session;
     this.#session = undefined;
     if (session !== undefined) void this.context.transport.closeLibrary(session).catch(() => undefined);
+  }
+
+  async #ensureSession(signal: AbortSignal): Promise<MobileExtensionLibrarySession> {
+    const { extension, surface, transport } = this.context;
+    signal.throwIfAborted();
+    if (!this.#current() || this.#faulted) throw new Error("Library session retired.");
+    if (this.#session !== undefined && this.#session.expiresAt <= Date.now()) this.#retireSession();
+    if (this.#session === undefined) {
+      const session = await transport.openLibrary(extension, surface, signal);
+      if (signal.aborted || !this.#current() || this.#faulted) {
+        void transport.closeLibrary(session).catch(() => undefined);
+        throw new Error("Library session retired.");
+      }
+      this.#session = session;
+    }
+    return this.#session;
   }
 
   async #execute(request: MobileExtensionLibraryRequest, signal: AbortSignal): Promise<unknown> {
@@ -168,16 +203,7 @@ export class MobileExtensionLibraryBridge {
         orphaned: overview.orphaned, operation: overview.operation
       };
     }
-    if (this.#session !== undefined && this.#session.expiresAt <= Date.now()) this.#retireSession();
-    if (this.#session === undefined) {
-      const session = await transport.openLibrary(extension, surface, signal);
-      if (signal.aborted || !this.#current() || this.#faulted) {
-        void transport.closeLibrary(session).catch(() => undefined);
-        throw new Error("Library session retired.");
-      }
-      this.#session = session;
-    }
-    const session = this.#session;
+    const session = await this.#ensureSession(signal);
     if (request.command.kind === "open") return {
       extensionId: session.extensionId, expiresAt: session.expiresAt, bindingGeneration: session.bindingGeneration,
       limits: session.limits

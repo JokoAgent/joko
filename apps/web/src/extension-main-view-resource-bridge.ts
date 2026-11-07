@@ -1,3 +1,5 @@
+import { extensionLibraryVideoPath } from "@joko/connection-transport";
+
 /** A browser surface can read only media in its own already authorized directory.
  * Requests retain the current pinned connection and the current document epoch. */
 export function bindExtensionSurfaceResources(frame: HTMLIFrameElement, input: {
@@ -6,10 +8,12 @@ export function bindExtensionSurfaceResources(frame: HTMLIFrameElement, input: {
   readonly signal: AbortSignal;
   readonly current: () => boolean;
   readonly navigate: (url: string) => void;
+  readonly readLibraryVideo?: (path: string, maximumBytes: number, signal: AbortSignal) => Promise<Blob>;
 }): () => void {
   const owner = frame.ownerDocument.defaultView!, root = new URL(input.resourceRoot);
   let stopped = false;
   const pending = new Set<string>();
+  let libraryVideoTail = Promise.resolve(), libraryVideoBytes = 0;
   const current = () => !stopped && !input.signal.aborted && frame.isConnected && input.current();
   const reply = (id: string, result: { ok: false } | { ok: true; blob?: Blob; dataUrl?: string }) => {
     if (current()) frame.contentWindow?.postMessage({ type: "joko:extension-resource-result", version: 1, id, ...result }, "*");
@@ -36,11 +40,27 @@ export function bindExtensionSurfaceResources(frame: HTMLIFrameElement, input: {
       : request.kind !== "media" ? { headers: { "x-joko-isolated-document": request.kind! }, signal: input.signal } : { signal: input.signal };
     void input.fetch(url.href, init).then(async response => {
       const media = request.kind === "media", stylesheet = request.kind === "style" || request.kind === "style-text";
+      const maximum = 256 * 1024 * 1024;
+      const libraryPath = media && response.status === 404 ? extensionLibraryVideoPath(root, url) : undefined;
+      if (current() && libraryPath !== undefined && input.readLibraryVideo !== undefined) {
+        await response.body?.cancel();
+        const readVideo = input.readLibraryVideo;
+        const work = libraryVideoTail.then(async () => {
+          if (!current()) return;
+          const remaining = maximum - libraryVideoBytes;
+          const blob = await readVideo(libraryPath, remaining, input.signal);
+          if (blob.type !== "video/mp4" || blob.size < 1 || blob.size > remaining) throw new Error("Library video is unavailable.");
+          libraryVideoBytes += blob.size;
+          reply(id, { ok: true, blob });
+        });
+        libraryVideoTail = work.catch(() => undefined);
+        await work;
+        return;
+      }
       const mime = response.headers.get("content-type") ?? "";
       if (!current() || !response.ok || !(media ? /^(?:image|audio|video)\//u.test(mime) : stylesheet ? /^text\/css(?:;|$)/u.test(mime) : /^(?:text|application)\/javascript(?:;|$)/u.test(mime))) {
         await response.body?.cancel(); throw new Error("Surface media is unavailable.");
       }
-      const maximum = 256 * 1024 * 1024;
       const length = Number(response.headers.get("content-length"));
       if (Number.isFinite(length) && length > maximum) { await response.body?.cancel(); throw new Error("Surface media is too large."); }
       const parts: ArrayBuffer[] = [], reader = response.body?.getReader(); let bytes = 0, complete = false;

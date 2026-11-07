@@ -1,7 +1,7 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide-react";
-import { createConnectionFetch, ExtensionSettingsRejected, extensionSettingsReadOnly } from "@joko/connection-transport";
+import { createConnectionFetch, ExtensionSettingsRejected, extensionSettingsReadOnly, readExtensionLibraryVideo } from "@joko/connection-transport";
 import { parseExtensionSettingsBridgeRequest, type ExtensionSettingsDirectoryChoice } from "@joko/contracts";
 import { ExtensionSettingsDirectoryDialog } from "./ExtensionSettingsDirectoryDialog.js";
 import { sameExtensionSettingsOperation, type PendingExtensionSettingsOperation } from "../extension-settings-operation.js";
@@ -75,6 +75,7 @@ export function ExtensionMainViewPage({
   const frameRef = useRef<HTMLIFrameElement>(null);
   const libraryRef = useRef<{ readonly surfaceId: string; readonly extensionRevision: bigint; readonly session: ExtensionLibrarySessionView } | undefined>(undefined);
   const libraryOpeningRef = useRef<{ readonly surfaceId: string; readonly extensionRevision: bigint; readonly promise: Promise<ExtensionLibrarySessionView> } | undefined>(undefined);
+  const libraryVideo = useRef<((path: string, maximumBytes: number, signal: AbortSignal) => Promise<Blob>) | undefined>(undefined);
   const bridgeEpoch = useRef(0);
   const closeGuard = useRef<() => Promise<boolean>>(async () => true);
   const settingsApi = useRef<ExtensionSettingsApi | undefined>(undefined);
@@ -239,6 +240,10 @@ export function ExtensionMainViewPage({
     try { fetcher = profile === undefined ? undefined : createConnectionFetch(profile); } catch { failed(); return () => abort.abort(); }
     const resourceRoot = new URL(state.surface.endpoint.slice(0, state.surface.endpoint.lastIndexOf("/") + 1), profile?.origin ?? window.location.origin).href;
     const disposeResources = fetcher === undefined ? () => {} : bindExtensionSurfaceResources(frame, { resourceRoot, fetch: fetcher,
+      readLibraryVideo: (path, maximumBytes, signal) => {
+        if (settings || state.extension.library === undefined || !libraryVideo.current) throw new Error("Extension Library video is unavailable.");
+        return libraryVideo.current(path, maximumBytes, signal);
+      },
       signal: abort.signal, current, navigate: url => { if (current()) { closeLibrary(); setFrameLoaded(false); setFrameEndpoint(new URL(url).pathname + new URL(url).hash); setFrameRevision(value => value + 1); } } });
     const document = (async () => {
       if (profile === undefined || new URL(surfaceUrl).origin !== new URL(profile.origin).origin) throw new Error("Extension surface endpoint changed.");
@@ -251,7 +256,7 @@ export function ExtensionMainViewPage({
     })();
     const dispose = mountIsolatedSurface(frame, document, { signal: abort.signal, failed, bootstrapBaseUrl: window.location.href });
     return () => { abort.abort(); disposeResources(); dispose(); };
-  }, [closeLibrary, controller, frameRevision, releaseSurface, state, surfaceUrl, ownerDocument]);
+  }, [closeLibrary, controller, frameRevision, releaseSurface, state, surfaceUrl, ownerDocument, settings]);
 
   useEffect(() => {
     const frame = frameRef.current;
@@ -319,6 +324,18 @@ export function ExtensionMainViewPage({
         throw error;
       }
     };
+    const readVideo = async (path: string, maximumBytes: number, signal: AbortSignal): Promise<Blob> => {
+      const lifetime = AbortSignal.any([signal, abort.signal]);
+      lifetime.throwIfAborted();
+      const session = await ensureLibrary();
+      const result = await readExtensionLibraryVideo(path, maximumBytes, async (call, source) => {
+        if (!current() || libraryRef.current?.session.id !== session.id) throw new Error("Extension Library bridge was revoked.");
+        return callLibrary(session, call, source);
+      }, lifetime);
+      if (!current() || libraryRef.current?.session.id !== session.id) throw new Error("Extension Library bridge was revoked.");
+      return new Blob([...result.chunks], { type: result.mimeType });
+    };
+    libraryVideo.current = readVideo;
     const liveRoot = async (session: ExtensionLibrarySessionView): Promise<string> => {
       const overview = await controller.getExtensionLibraryOverview(state.extension.id, state.extension.revision, abort.signal);
       if (overview.state === "unavailable" || overview.location === undefined
@@ -452,6 +469,7 @@ export function ExtensionMainViewPage({
       bridgeEpoch.current += 1;
       abort.abort();
       pending.clear();
+      if (libraryVideo.current === readVideo) libraryVideo.current = undefined;
       bridgeWindow.removeEventListener("message", onMessage);
       closeLibrary();
     };

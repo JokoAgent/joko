@@ -1,5 +1,7 @@
 import { resolve } from "node:path";
 
+import { create } from "@bufbuild/protobuf";
+import { ExtensionLibraryCallSchema, type ExtensionCatalogEntry, type ExtensionLibraryCall } from "@joko/contracts";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -8,6 +10,7 @@ import {
   installLibraryExtension
 } from "./extension-library-system-fixture.js";
 import { waitFor } from "./fixture.js";
+import type { PairedClient } from "./connect-clients.js";
 
 const MOUNTED_CHAIN_ENABLED = nonBlankEnvironment("JOKO_BROWSER_EXECUTABLE") !== undefined
   && nonBlankEnvironment("JOKO_MOUNTED_WEB_DIR") !== undefined;
@@ -30,6 +33,7 @@ describe("mounted Extension Library main-view bridge", () => {
     fixture = await ExtensionLibrarySystemFixture.start({ webDirectory });
     const manager = await fixture.pair("Mounted Library manager");
     const extension = await installLibraryExtension(fixture, manager);
+    await writeLibraryVideo(manager, extension);
 
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted Library Web" });
     if (challenge.challenge === undefined) throw new Error("Mounted Web pairing returned no challenge.");
@@ -84,8 +88,94 @@ describe("mounted Extension Library main-view bridge", () => {
     expect(await result.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth))
       .toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
+
+    const video = await result.evaluate(async () => {
+      const element = document.createElement("video");
+      element.preload = "none";
+      document.body.append(element);
+      const blob = await new Promise<Blob>((resolveBlob, reject) => {
+        const original = URL.createObjectURL;
+        const cleanup = () => { clearTimeout(timer); URL.createObjectURL = original; element.removeEventListener("error", fail); };
+        const fail = () => { cleanup(); reject(new Error("The Library video did not load.")); };
+        const timer = setTimeout(fail, 20_000);
+        element.addEventListener("error", fail, { once: true });
+        URL.createObjectURL = value => {
+          const url = original.call(URL, value);
+          if (value instanceof Blob && value.type === "video/mp4") { cleanup(); resolveBlob(value); }
+          return url;
+        };
+        element.src = "library/clip.mp4";
+      });
+      const marker = new Uint8Array(await blob.slice(20 * 1024 * 1024, 20 * 1024 * 1024 + 1).arrayBuffer())[0];
+      const waitForMedia = (event: string, start: () => void) => new Promise<void>((resolveEvent, reject) => {
+        const timer = setTimeout(() => reject(new Error(`Video ${event} timed out.`)), 10_000);
+        element.addEventListener(event, () => { clearTimeout(timer); resolveEvent(); }, { once: true });
+        start();
+      });
+      const supported = element.canPlayType('video/mp4; codecs="avc1.42C00A"') !== "";
+      if (supported) {
+        element.preload = "metadata";
+        await waitForMedia("loadedmetadata", () => element.load());
+        await waitForMedia("seeked", () => { element.currentTime = 1.25; });
+      }
+      return { bytes: blob.size, mime: blob.type, marker, supported, time: element.currentTime };
+    });
+    expect(video).toMatchObject({ bytes: 24 * 1024 * 1024, mime: "video/mp4", marker: 0x53 });
+    if (video.supported) expect(video.time).toBeCloseTo(1.25);
+    console.info(`Mounted Library video ${video.supported ? "decoded and sought" : "assembled without a supported decoder"}.`);
+    expect(browserErrors.filter(error => error.startsWith("pageerror:"))).toEqual([]);
   }, 90_000);
 });
+
+async function writeLibraryVideo(manager: PairedClient, extension: ExtensionCatalogEntry): Promise<void> {
+  const clip = Buffer.alloc(24 * 1024 * 1024);
+  SYNTHETIC_VIDEO.copy(clip);
+  // Extend the fixture with a legal top-level free box without changing the video samples.
+  clip.writeUInt32BE(clip.length - SYNTHETIC_VIDEO.length, SYNTHETIC_VIDEO.length);
+  clip.write("free", SYNTHETIC_VIDEO.length + 4, "ascii");
+  clip[20 * 1024 * 1024] = 0x53;
+  const api = manager.clients.extension;
+  const owner = { extensionId: extension.extensionId, expectedRevision: extension.revision };
+  const { surface } = await api.openExtensionMainView(owner);
+  if (!surface) throw new Error("The video fixture did not receive a main view.");
+  try {
+    const { library } = await api.openExtensionLibrary({ ...owner, surfaceId: surface.surfaceId });
+    if (!library) throw new Error("The video fixture did not receive a Library.");
+    const call = async (operation: ExtensionLibraryCall["operation"]) => (await api.callExtensionLibrary({
+      sessionId: library.sessionId, call: create(ExtensionLibraryCallSchema, { operation })
+    })).result?.result;
+    const start = await call({ case: "writeBegin", value: { path: "clip.mp4", totalBytes: BigInt(clip.length), ifNotExists: true } });
+    if (start?.case !== "stream") throw new Error("The video fixture did not receive a write stream.");
+    const { streamId } = start.value;
+    const chunkBytes = 4 * 1024 * 1024;
+    for (let offset = 0; offset < clip.length; offset += chunkBytes) {
+      await call({ case: "writeChunk", value: { streamId, sequence: offset / chunkBytes, content: clip.subarray(offset, offset + chunkBytes) } });
+    }
+    expect(await call({ case: "writeCommit", value: { streamId } })).toMatchObject({ case: "write", value: { bytes: BigInt(clip.length) } });
+  } finally {
+    await api.closeExtensionMainView({ surfaceId: surface.surfaceId });
+  }
+}
+
+// A synthetic two-second 16 × 16 black H.264 clip, with no audio.
+const SYNTHETIC_VIDEO = Buffer.from(`
+AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMQbW9vdgAAAGxtdmhkAAAAAAAAAAAA
+AAAAAAAD6AAAB9AAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAA
+AABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAl90cmFrAAAAXHRraGQAAAADAAAA
+AAAAAAAAAAABAAAAAAAAB9AAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAA
+AAAAAAAAAABAAAAAABAAAAAQAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAfQAAAAAAABAAAA
+AAHXbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAgABVxAAAAAAALWhkbHIAAAAAAAAAAHZp
+ZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABgm1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAA
+ACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAUJzdGJsAAAAtnN0c2QAAAAAAAAA
+AQAAAKZhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAABAAEABIAAAASAAAAAAAAAABDExhdmMg
+bGlieDI2NAAAAAAAAAAAAAAAAAAAAAAAAAAAGP//AAAALGF2Y0MBQsAK/+EAFWdCwAraewEQAAAD
+ABAAAAMAQPEiagEABGjOD8gAAAAQcGFzcAAAAAEAAAABAAAAFGJ0cnQAAAAAAAAAvAAAAAAAAAAY
+c3R0cwAAAAAAAAABAAAABAAAIAAAAAAYc3RzcwAAAAAAAAACAAAAAQAAAAMAAAAcc3RzYwAAAAAA
+AAABAAAAAQAAAAQAAAABAAAAJHN0c3oAAAAAAAAAAAAAAAQAAAAOAAAACQAAAA8AAAAJAAAAFHN0
+Y28AAAAAAAAAAQAAA0AAAAA9dWR0YQAAADVtZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBw
+bAAAAAAAAAAAAAAAAAhpbHN0AAAACGZyZWUAAAA3bWRhdAAAAApliIQ6JigACQLgAAAABUGaIBKl
+AAAAC2WIggMomKAALC+AAAAABUGaIBKl
+`, "base64");
 
 function observeBrowserErrors(page: Page): string[] {
   const errors: string[] = [];

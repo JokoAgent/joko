@@ -4,10 +4,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
 import { create } from "@bufbuild/protobuf";
+import { base64Decode } from "@bufbuild/protobuf/wire";
 import { ExtensionDirectoryPickerPageSchema, ExtensionOAuthAuthorizationSchema } from "@joko/contracts";
 import type { MobileExtensionDirectoryPickerViewProps } from "./MobileExtensionDirectoryPickerView";
 import { decodeMobileLibraryMessage, encodeMobileLibraryMessage } from "./mobile-extension-library-bridge";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
+import { MobileExtensionMainViewResourceNotFound } from "./mobile-extension-main-view-resource";
 import type {
   MobileExtension,
   MobileExtensionMainViewSurface,
@@ -202,12 +204,7 @@ describe("MobileExtensionMainView", () => {
   it("delivers Library results to the current document and retires requests before reload or navigation", async () => {
     const extension = { ...fixtureExtension(), library: { schemaVersion: 1 as const } };
     const surface = fixtureSurface(extension), active = fixtureTransport(surface);
-    const session: MobileExtensionLibrarySession = { id: `library_session_${"c".repeat(32)}`, extensionId: extension.extensionId,
-      expiresAt: Date.now() + 60_000, bindingGeneration: 1n, limits: {
-        maximumReadBytes: 16n * 1024n ** 2n, maximumWriteBytes: 16n * 1024n ** 2n, maximumStreamBytes: 8n * 1024n ** 3n,
-        maximumPathCharacters: 512, maximumPathSegments: 32, maximumListPageSize: 500, maximumFiles: 50_000,
-        softLimitBytes: 8n * 1024n ** 3n, diskReserveBytes: 1024n ** 3n
-      } };
+    const session = fixtureLibrarySession(extension);
     vi.mocked(active.openLibrary).mockResolvedValue(session);
     vi.mocked(active.callLibrary).mockResolvedValue({ kind: "read", path: "mail", content: Uint8Array.of(128), sha256: "a".repeat(64) });
     await render(active, extension);
@@ -429,6 +426,49 @@ describe("MobileExtensionMainView", () => {
     await act(async () => finish({ bytes: Uint8Array.of(9), mimeType: "image/png" }));
     expect(native.messages.some(message => JSON.parse(message).id === "late")).toBe(false);
   });
+
+  it.each([false, true])("materializes an exact 24 MiB Library video only when its file stays current, changed=%s", async changed => {
+    const extension = { ...fixtureExtension(), library: { schemaVersion: 1 as const } };
+    const surface = fixtureSurface(extension), active = fixtureTransport(surface), session = fixtureLibrarySession(extension);
+    const size = 24 * 1024 * 1024, chunkSize = 4 * 1024 * 1024;
+    const path = "clip.mp4", tag = `"${"a".repeat(64)}"`;
+    vi.mocked(active.openLibrary).mockResolvedValue(session);
+    vi.mocked(active.callLibrary).mockImplementation(async (_extension, _surface, original, call, _signal, match) => {
+      expect(original).toBe(session);
+      expect(call).toMatchObject({ path });
+      if (call.kind === "stat") {
+        if (match?.tag === "*") match.capture?.(tag);
+        else expect(match?.tag).toBe(tag);
+        return { kind: "stat", entry: { kind: "file", path, bytes: BigInt(size), modifiedAt: 1 } };
+      }
+      if (call.kind !== "read") throw new Error("Unexpected video Library call.");
+      expect(match?.tag).toBe(tag);
+      const offset = Number(call.offset), length = Number(call.length);
+      if (changed && offset === chunkSize) throw new Error("Original video changed.");
+      const content = new Uint8Array(length);
+      content[0] = offset / chunkSize + 1;
+      return { kind: "read", path, content, sha256: "b".repeat(64) };
+    });
+    await render(active, extension);
+    vi.mocked(active.readMainViewResource).mockRejectedValueOnce(new MobileExtensionMainViewResourceNotFound());
+    const document = native.documents[0]!;
+    const receive = native.web!.onMessage as (event: { nativeEvent: { data: string; url: string } }) => void;
+    await act(async () => receive({ nativeEvent: { url: document.documentUrl, data: JSON.stringify({
+      type: "joko:extension-resource", version: 1, documentId: document.documentId, id: "video", kind: "media",
+      url: new URL("library/clip.mp4", surface.url).href
+    }) } }));
+
+    const messages = native.messages.map(raw => JSON.parse(raw));
+    if (changed) {
+      expect(messages).toMatchObject([{ id: "video", ok: false }]);
+      expect(active.closeLibrary).toHaveBeenCalledWith(session);
+    } else {
+      expect(messages).toHaveLength(7);
+      expect(messages.slice(0, -1).map(part => [part.offset, base64Decode(part.part)[0]])).toEqual(
+        Array.from({ length: 6 }, (_, index) => [index * chunkSize, index + 1]));
+      expect(messages.at(-1)).toMatchObject({ id: "video", ok: true, mimeType: "video/mp4", byteLength: size });
+    }
+  });
 });
 
 function fixtureExtension(): MobileExtension {
@@ -502,4 +542,13 @@ function fixtureTransport(surface: MobileExtensionMainViewSurface): MobileExtens
     reconcile: vi.fn(async () => undefined),
     dismiss: vi.fn(async () => undefined)
   };
+}
+
+function fixtureLibrarySession(extension: MobileExtension): MobileExtensionLibrarySession {
+  return { id: `library_session_${"c".repeat(32)}`, extensionId: extension.extensionId,
+    expiresAt: Date.now() + 60_000, bindingGeneration: 1n, limits: {
+      maximumReadBytes: 16n * 1024n ** 2n, maximumWriteBytes: 16n * 1024n ** 2n, maximumStreamBytes: 8n * 1024n ** 3n,
+      maximumPathCharacters: 512, maximumPathSegments: 32, maximumListPageSize: 500, maximumFiles: 50_000,
+      softLimitBytes: 8n * 1024n ** 3n, diskReserveBytes: 1024n ** 3n
+    } };
 }

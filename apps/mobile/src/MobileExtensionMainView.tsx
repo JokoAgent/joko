@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Alert, AppState, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { WebView } from "react-native-webview";
 import { base64Encode } from "@bufbuild/protobuf/wire";
+import { extensionLibraryVideoPath } from "@joko/connection-transport";
 import {
   allowMobileExtensionMainViewNavigation,
   mobileExtensionKey,
@@ -18,7 +19,7 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 import { allowExtensionDocumentNavigation, prepareExtensionMainViewDocument, type PreparedExtensionMainViewDocument } from "./mobile-extension-main-view-document";
-import { MOBILE_EXTENSION_RESOURCE_MAXIMUM_BYTES, MOBILE_EXTENSION_STYLE_MAXIMUM_BYTES } from "./mobile-extension-main-view-resource";
+import { MOBILE_EXTENSION_RESOURCE_MAXIMUM_BYTES, MOBILE_EXTENSION_STYLE_MAXIMUM_BYTES, MobileExtensionMainViewResourceNotFound } from "./mobile-extension-main-view-resource";
 
 type SurfaceState =
   | { readonly phase: "opening" }
@@ -313,7 +314,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     if (value.version !== 1 || value.documentId !== readyDocument.documentId || typeof value.id !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(value.id)
       || !["media", "navigate", "script", "module", "style", "style-text"].includes(value.kind as string) || typeof value.url !== "string" || value.url.length > 4096
       || !allowMobileExtensionMainViewNavigation(readySurface, value.url) || frame.resourceIds.has(value.id)) return true;
-    const reply = (result: { ok: boolean; dataUrl?: string }): void => {
+    const reply = (result: { ok: boolean; dataUrl?: string; part?: string; offset?: number; mimeType?: string; byteLength?: number }): void => {
       if (currentFrame()) webRef.current?.postMessage(JSON.stringify({ type: "joko:extension-resource-result", version: 1,
         documentId: readyDocument.documentId, id: value.id, ...result }));
     };
@@ -330,7 +331,24 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     frame.resourceQueue = frame.resourceQueue.then(async () => {
       request.signal.throwIfAborted();
       if (!currentFrame()) return;
-      const resource = await owner.readMainViewResource(readySurface, requestedUrl, kind, request.signal, text);
+      const resource = await owner.readMainViewResource(readySurface, requestedUrl, kind, request.signal, text).catch(async error => {
+        const bridge = bridgeRef.current;
+        if (!(error instanceof MobileExtensionMainViewResourceNotFound) || kind !== "media" || !bridge || !currentFrame()) throw error;
+        const path = extensionLibraryVideoPath(new URL(".", readySurface.url), new URL(requestedUrl));
+        if (path === undefined) throw error;
+        const video = await bridge.readVideo(path, MOBILE_EXTENSION_RESOURCE_MAXIMUM_BYTES - frame.resourceBytes, request.signal);
+        request.signal.throwIfAborted();
+        if (!currentFrame() || bridgeRef.current !== bridge) return undefined;
+        frame.resourceBytes += video.byteLength;
+        let offset = 0;
+        for (const chunk of video.chunks) {
+          reply({ ok: true, part: base64Encode(chunk), offset });
+          offset += chunk.byteLength;
+        }
+        reply({ ok: true, mimeType: video.mimeType, byteLength: video.byteLength });
+        return undefined;
+      });
+      if (resource === undefined) return;
       request.signal.throwIfAborted();
       if (!currentFrame()) return;
       frame.resourceBytes += resource.bytes.byteLength;

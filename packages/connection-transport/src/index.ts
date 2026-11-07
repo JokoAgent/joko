@@ -27,3 +27,4 @@ export function createConnectTransport(options: ConnectTransportOptions & Omit<E
   return createWebTransport({ ...rest, fetch: createConnectionFetch({ origin: options.baseUrl, endpointPublicKey, transportKind, endpointTransport }, { isolateFailures }) });
 }
 export * from "./extension-settings-client.js";
+export * from "./extension-library-media.js";

@@ -25,6 +25,7 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
   if (native && typeof documentId !== "string") return;
   const expectedParent = location.protocol + "//" + location.host;
   const pending = new Map<string, (value: { ok: boolean; blob?: Blob; dataUrl?: string }) => void>();
+  const videoParts = new Map<string, { chunks: Uint8Array<ArrayBuffer>[]; byteLength: number }>();
   const sources = new WeakMap<Element, Map<string, { raw: string; revision: number; objectUrls?: Set<string>; applied?: string }>>();
   const urls = new Set<string>();
   let sequence = 0;
@@ -47,10 +48,31 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
     let value: unknown = event.data;
     if (native && typeof value === "string") try { value = JSON.parse(value); } catch { return; }
     if (value === null || typeof value !== "object") return;
-    const message = value as { type?: string; version?: number; id?: string; ok?: boolean; blob?: Blob; dataUrl?: string; documentId?: string };
+    const message = value as { type?: string; version?: number; id?: string; ok?: boolean; blob?: Blob; dataUrl?: string; documentId?: string;
+      part?: string; offset?: number; mimeType?: string; byteLength?: number };
     if (message.type !== "joko:extension-resource-result" || message.version !== 1 || typeof message.id !== "string" || native && message.documentId !== documentId) return;
     const apply = pending.get(message.id); if (apply === undefined) return;
-    pending.delete(message.id); apply({ ok: message.ok === true, blob: message.blob, dataUrl: message.dataUrl });
+    const parts = videoParts.get(message.id);
+    if (native && message.part !== undefined) {
+      try {
+        const video = parts ?? { chunks: [], byteLength: 0 };
+        if (message.ok !== true || message.offset !== video.byteLength || typeof message.part !== "string"
+          || message.part.length > 4 * Math.ceil((4 * 1024 * 1024) / 3)) throw new Error("Invalid video chunk.");
+        const chunk = Uint8Array.from(atob(message.part), character => character.charCodeAt(0));
+        if (chunk.length === 0 || video.byteLength + chunk.length > 256 * 1024 * 1024) throw new Error("Invalid video size.");
+        video.chunks.push(chunk); video.byteLength += chunk.length;
+        videoParts.set(message.id, video);
+        return;
+      } catch { pending.delete(message.id); videoParts.delete(message.id); apply({ ok: false }); return; }
+    }
+    pending.delete(message.id); videoParts.delete(message.id);
+    if (parts !== undefined) {
+      if (message.ok === true && message.mimeType === "video/mp4" && message.byteLength === parts.byteLength) {
+        apply({ ok: true, blob: new Blob(parts.chunks, { type: message.mimeType }) });
+      } else apply({ ok: false });
+      return;
+    }
+    apply({ ok: message.ok === true, blob: message.blob, dataUrl: message.dataUrl });
   };
   addEventListener("message", receive); if (native) document.addEventListener("message", receive as EventListener);
   const originalSet = Element.prototype.setAttribute, originalGet = Element.prototype.getAttribute;
@@ -275,7 +297,7 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
     const url = resolve(raw); if (url === undefined || !url.pathname.endsWith(".html")) return;
     event.preventDefault(); request("navigate", url);
   });
-  addEventListener("pagehide", () => { pending.clear(); for (const url of urls) URL.revokeObjectURL(url); urls.clear(); }, { once: true });
+  addEventListener("pagehide", () => { pending.clear(); videoParts.clear(); for (const url of urls) URL.revokeObjectURL(url); urls.clear(); }, { once: true });
 }
 
 // Development's TS loader preserves function names through this helper. Keep the
