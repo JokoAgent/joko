@@ -96,7 +96,11 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
           </Section>
           {shownEfforts.length > 0 && <Section title={t("settings.modelAdvanced.effort")} hint={t("settings.modelAdvanced.effortHint")}>
             <div className="model-advanced-efforts">{shownEfforts.map(effort => <Button key={effort} aria-pressed={selectedEffort === effort} disabled={ownerId === undefined || !selectableEfforts.includes(effort) || pending} onClick={() => {
-              for (const route of chatRoutes) if (route.efforts.length > 0) { const current = readModelConfiguration(readModelPickerOwnerPreferences(ownerId), route.backendId, route.providerId, route.modelId); setModelConfiguration(ownerId, route.backendId, route.providerId, route.modelId, { effort: adaptedEffort(effort, route.efforts), fast: current?.fast === true }); }
+              for (const route of chatRoutes) {
+                if (route.efforts.length === 0) continue;
+                const current = readModelConfiguration(readModelPickerOwnerPreferences(ownerId), route.backendId, route.providerId, route.modelId);
+                setModelConfiguration(ownerId, route.backendId, route.providerId, route.modelId, { effort: adaptedEffort(effort, route.efforts), fast: current?.fast ?? false });
+              }
             }}>{effort}</Button>)}</div>
             {commonEfforts.length === 0 && selectableEfforts.length > 0 && <p role="status">{t("settings.modelAdvanced.effortMixed")}</p>}
             {effortCustomized && <Button tone="ghost" disabled={ownerId === undefined || pending} onClick={() => { for (const route of chatRoutes) clearModelEffort(ownerId, route); }}>{t("settings.modelAdvanced.resetEffort")}</Button>}
