@@ -53,7 +53,7 @@ describe("Schedule hook management owner", () => {
       const prepared = await f.api.prepareScheduleHook!(create(contract.PrepareScheduleHookRequestSchema, {
         context: f.scope, source: { case: "workspaceFile", value: name }
       }), context());
-      expect(prepared.hook?.command.startsWith(`${interpreter} ${quote}`)).toBe(true);
+      expect(prepared.hook?.command?.startsWith(`${interpreter} ${quote}`)).toBe(true);
       if (!windows && name.endsWith(".sh")) {
         const receipt = await f.api.testScheduleHook!(create(contract.TestScheduleHookRequestSchema, {
           operationId: "test-selected-bash", context: f.scope, hook: prepared.hook!
