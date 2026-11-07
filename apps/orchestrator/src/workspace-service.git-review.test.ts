@@ -269,13 +269,19 @@ describe("WorkspaceService Git Review backend", () => {
 
   it("keeps the four Git sources exact and revision-fences commit and branch reads", async () => {
     const root = await initializedRepository("joko-review-sources-");
+    const oldImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    const newImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=", "base64");
     await writeFile(join(root, "review.txt"), "base\n", "utf8");
-    await git(root, "add", "--", "review.txt");
+    await writeFile(join(root, "format.txt"), "a b\n", "utf8");
+    await writeFile(join(root, "photo.png"), oldImage);
+    await git(root, "add", "--", "review.txt", "format.txt", "photo.png");
     await git(root, "commit", "--quiet", "-m", "base");
     const base = await git(root, "rev-parse", "HEAD");
     await git(root, "branch", "base-branch", base);
     await writeFile(join(root, "review.txt"), "head\n", "utf8");
-    await git(root, "add", "--", "review.txt");
+    await writeFile(join(root, "format.txt"), "a  b\n", "utf8");
+    await writeFile(join(root, "photo.png"), newImage);
+    await git(root, "add", "--", "review.txt", "format.txt", "photo.png");
     await git(root, "commit", "--quiet", "-m", "head");
     const head = await git(root, "rev-parse", "HEAD");
     await writeFile(join(root, "review.txt"), "staged\n", "utf8");
@@ -300,6 +306,18 @@ describe("WorkspaceService Git Review backend", () => {
     await expect(service.gitReviewDiff("sources", { source: "commit", sourceRevision: "HEAD^" })).rejects.toMatchObject({ kind: "invalid" });
     expect(branch).toMatchObject({ source: "branch", sourceRevision: base, requestedBaseRef: "base-branch", resolvedBaseRef: "base-branch", baseRevision: base, headRevision: head, mergeBaseRevision: base });
     expect(filtered.repositoryRevision).toBe(branch.repositoryRevision);
+
+    for (const [source, sourceRevision, unfiltered] of [["commit", head, commit], ["branch", base, branch]] as const) {
+      const withoutWhitespace = await service.gitReviewDiff("sources", { source, sourceRevision, ignoreWhitespace: true });
+      expect(unfiltered.comparison).toContain("format.txt");
+      expect(withoutWhitespace.comparison).not.toContain("format.txt");
+      expect(withoutWhitespace.comparison).toContain("photo.png");
+      expect(withoutWhitespace.repositoryRevision).toBe(unfiltered.repositoryRevision);
+      const image = await service.readGitDiffImage("sources", { source, sourceRevision, path: "photo.png",
+        expectedRepositoryRevision: withoutWhitespace.repositoryRevision, expectedMergeBaseRevision: base });
+      expect(image.oldImage.bytes).toEqual(oldImage);
+      expect(image.newImage.bytes).toEqual(newImage);
+    }
 
     await expect(service.gitReviewDiff("sources", {
       source: "branch",
