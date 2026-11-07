@@ -432,18 +432,37 @@ it("pastes an image into the mounted group composer and reuses its uploaded byte
 });
 
 describe("MobilePartnerDirectoryScreen", () => {
-  it("opens the real import sheet and waits for native dismissal before opening its owned saved task", async () => {
+  it("preserves explicit import credentials and waits for native dismissal before opening the saved task", async () => {
     const active = transport(); const values = new Map<string, string>();
     const api: PartnerImportApi = { ownerKey: active.ownerKey, newRequestId: () => "mobile_directory_import_0001",
       sources: vi.fn(async () => [create(PartnerImportSourceSchema, { id: "source", name: "Native analyst" })]),
-      preview: vi.fn(async () => create(PartnerImportPreviewPageSchema, { id: "preview", source: { id: "source", name: "Native analyst" }, name: "Local analyst", total: 1,
-        entries: [{ id: "identity", index: 0, name: "Identity", category: PartnerImportCategory.PERSONALITY, selected: true }] })),
+      preview: vi.fn(async () => create(PartnerImportPreviewPageSchema, { id: "preview", source: { id: "source", name: "Native analyst" }, name: "Local analyst", total: 4,
+        entries: [
+          { id: "identity", index: 0, name: "Identity", category: PartnerImportCategory.PERSONALITY, selected: true },
+          { id: "work", index: 1, name: "Work credential", category: PartnerImportCategory.CONNECTIONS, exclusiveWith: ["personal"] },
+          { id: "personal", index: 2, name: "Personal credential", category: PartnerImportCategory.CONNECTIONS, exclusiveWith: ["work"] },
+          { id: "other", index: 3, name: "Independent credential", category: PartnerImportCategory.CONNECTIONS }
+        ] })),
       status: vi.fn(async () => undefined), retry: vi.fn(), start: vi.fn(async selection => create(PartnerImportResultSchema, { requestId: selection.requestId,
         partnerId: "imported", canonicalSessionId: "imported-task", saved: true, savedEntryIds: ["identity"], status: PartnerImportStatus.COMPLETE })) };
     const editor = new PartnerImportEditor(api, new PartnerImportReceipts({ getItem: async key => values.get(key) ?? null,
       setItem: async (key, value) => { values.set(key, value); }, removeItem: async key => { values.delete(key); } }, "node"));
     await render(active, undefined, undefined, undefined, undefined, undefined, undefined, () => editor);
-    await press("Import a local agent"); await press("Native analyst"); await press("Save Partner");
+    await press("Import a local agent"); await press("Native analyst");
+    await press("Connections");
+    expect([...editor.state.selected]).toEqual(["identity", "other"]);
+    expect(container.querySelector('[aria-label="Connections"]')?.getAttribute("aria-checked")).toBe("mixed");
+    await press("Connections · 1 / 3 ›"); await press("Work credential");
+    expect(container.querySelector('[aria-label="Select all"]')?.getAttribute("aria-checked")).toBe("true");
+    await press("Select all");
+    expect([...editor.state.selected]).toEqual(["identity"]);
+    await press("Work credential"); await press("Select all");
+    expect([...editor.state.selected]).toEqual(["identity", "work", "other"]);
+    await press("Back");
+    expect(container.querySelector('[aria-label="Connections"]')?.getAttribute("aria-checked")).toBe("true");
+    await press("Connections");
+    expect([...editor.state.selected]).toEqual(["identity"]);
+    await press("Save Partner");
     expect(api.start).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ name: "Local analyst", deferSetup: true, requestId: "mobile_directory_import_0001" }), expect.any(AbortSignal));
     expect(onOpenTask).not.toHaveBeenCalled(); expect(container.textContent).not.toContain("Save Partner"); expect(values.size).toBe(0);
     await act(async () => native.dismiss!()); expect(onOpenTask).toHaveBeenCalledExactlyOnceWith("imported-task"); expect(editor.active).toBe(false);
