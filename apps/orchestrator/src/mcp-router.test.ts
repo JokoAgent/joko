@@ -20,8 +20,11 @@ import { describe, expect, it, vi } from "vitest";
 import { ANDROID_BRIDGE_PROVIDER_ID, AndroidToolBridgeProvider } from "./android-tool-bridge.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { modelRoutingEnabled, providerRoutingEnabled, writeBackendModelAccess } from "./backend-model-access.js";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
+import { ImageGenerationBridgeToolProvider } from "./image-generation-bridge-tool-provider.js";
+import { ProviderCredentialSurfaceResolver, resolveDeclaredProviderCredentialSurface } from "./provider-credential-surface.js";
 import {
   MCP_AUDIO_RESULT_MAPPING_META_KEY,
   type McpAudioResultDownloader
@@ -3035,6 +3038,64 @@ describe("McpRouter", () => {
     expect(calls).toEqual(["list_tools"]);
     await router.dispose();
     store.close();
+  });
+
+  it.each(["model disabled", "credential replaced"] as const)("settles the original image request when %s during the provider wait", async change => {
+    const { root, store, router, credentials, artifacts } = await fixture();
+    const identity = { backendId: "codex", providerId: "openai", surfaceId: "image-generation" };
+    const modelId = "gpt-image-2";
+    store.upsertBackend({ ...store.getBackend("pi").descriptor, id: identity.backendId, adapterKind: "codex",
+      providers: [{ providerId: identity.providerId, displayName: "OpenAI", api: "openai-responses",
+        authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false,
+        supportsRefresh: false, supportsModelRefresh: false, credentialSurfaces: [{
+          surfaceId: identity.surfaceId, capability: "image_generation", kind: "api_key", executionApi: "openai-images",
+          models: [{ modelId, displayName: "GPT Image 2" }]
+        }] }] });
+    const owner = resolveDeclaredProviderCredentialSurface(store, credentials, identity)!;
+    const setKey = async (secret: string) => {
+      const ticket = credentials.createUploadTicket({ kind: "api_key", providerId: identity.providerId, credentialReferenceId: owner.credentialReferenceId });
+      credentials.upload(ticket.credentialUploadTicketId, secret);
+      return credentials.commitManagedUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, kind: "api_key",
+        providerId: identity.providerId, credentialReferenceId: owner.credentialReferenceId, displayName: "Image fixture" });
+    };
+    const response = deferred<Response>();
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => response.promise);
+    const ingest = vi.spyOn(artifacts, "ingestBytes");
+    try {
+      await setKey("original-synthetic-image-key");
+      const provider = new ImageGenerationBridgeToolProvider({ artifacts, fetch, credentialSurfaces: new ProviderCredentialSurfaceResolver({
+        store, credentials, providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
+        modelEnabled: (backendId, providerId, model) => modelRoutingEnabled(store, backendId, providerId, model)
+      }) });
+      router.registerBridgeToolProvider(provider);
+      const granted = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", targetId: "target-1" });
+      const call = () => router.executeBridgeCall({ ...bridgeScope(1), generation: 1, authorization: `Bearer ${granted.mcpBridge.token}`,
+        serverId: provider.id, toolName: "image_generate", arguments: { prompt: "A test image" } });
+      const generating = call();
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+      expect(fetch.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/images/generations");
+      if (change === "model disabled") writeBackendModelAccess(store, identity.backendId, { providerId: identity.providerId, modelId, enabled: false });
+      else await setKey("replacement-synthetic-image-key");
+      response.resolve(Response.json({ data: [{ b64_json: AUDIO_ARTWORK_PNG }] }));
+      const result = await generating;
+      if (change === "model disabled") {
+        expect(result).toMatchObject({ isError: false, details: { jokoMcpBridge: { imageOutputs: [{ blob: { mimeType: "image/png" } }] } } });
+        const staged = await ingest.mock.results[0]!.value;
+        expect(store.getArtifact(staged.id)).toMatchObject({ sessionId: "session-1", metadata: {} });
+        expect(store.getArtifact(staged.id).metadata).not.toHaveProperty("expiresAt");
+        expect(ingest.mock.calls[0]?.[1]).toMatchObject({ expiresAt: expect.any(Number) });
+        await expect(call()).resolves.toMatchObject({ isError: true });
+      } else {
+        expect(result).toMatchObject({ isError: true, error: expect.stringContaining("original image generation authority changed") });
+        expect(ingest).not.toHaveBeenCalled();
+      }
+      expect(fetch).toHaveBeenCalledOnce();
+    } finally {
+      response.resolve(Response.json({ data: [] }));
+      await router.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("keeps a disabled Android provider callable only through an already-frozen two-tool grant", async () => {
