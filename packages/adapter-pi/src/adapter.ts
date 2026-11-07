@@ -1357,8 +1357,10 @@ export class PiBackendAdapter implements
       });
     }
     const attached = this.#runtimes.get(context.sessionId);
+    // Threshold compaction owns the working context after the native turn
+    // settles. An admitted extension command can run on that same runtime.
     if (input.disposition === "prompt" && (attached === undefined || attached.lifecycle === undefined
-      && attached.runningExtensionCommand === undefined && attached.userShell === undefined)) {
+      && attached.thresholdCompaction === undefined && attached.runningExtensionCommand === undefined && attached.userShell === undefined)) {
       await this.refreshModelWorkingContext(context);
     }
     const runtime = this.#runtime(context);
