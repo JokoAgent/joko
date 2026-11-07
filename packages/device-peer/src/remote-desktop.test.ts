@@ -1786,6 +1786,31 @@ describe("managed viewer display ownership", () => {
     await fixture.controller.stopAndRestore(); expect(fixture.handle.restore).toHaveBeenCalledOnce();
   });
 
+  it("restores the first physical mode in the same lease after explicitly restoring its virtual display", async () => {
+    const fixture = viewerFixture(); const lease = await start(fixture); const control = await takeControl(fixture, lease);
+    const temporary = { ...fixture.source, width: 1024, height: 640 };
+    vi.mocked(fixture.dependencies.setDisplayMode!).mockImplementation(async (_id, _mode, beforeChange) => {
+      await beforeChange(); return temporary;
+    });
+    fixture.handle.restore.mockResolvedValueOnce(temporary);
+    const changed = await fixture.controller.request(AUTHORITY, { op: "resolution", lease: lease.lease,
+      controlGeneration: control.controlGeneration, modeId: "102", temporary: true }) as { lease: RemoteDesktopLease };
+    expect(changed.lease.display).toEqual(temporary);
+    const modeControl = await takeControl(fixture, changed.lease);
+    const fitted = await fit(fixture, lease, modeControl.controlGeneration);
+    const mirrorControl = await takeControl(fixture, fitted.lease);
+    const restored = await fixture.controller.request(AUTHORITY, { op: "restoreViewerDisplay", lease: lease.lease,
+      controlGeneration: mirrorControl.controlGeneration }) as { lease: RemoteDesktopLease };
+    expect(restored.lease).toMatchObject({ lease: lease.lease, controlling: false, display: fixture.source });
+    expect(restored.lease.controlGeneration).toBeGreaterThan(mirrorControl.controlGeneration);
+    const restore = vi.mocked(fixture.dependencies.restoreDisplayMode!);
+    expect(restore).toHaveBeenCalledExactlyOnceWith("display-1", "101", expect.any(Function),
+      expect.objectContaining({ width: 1280, height: 800 }), expect.objectContaining(AUTHORITY));
+    expect(fixture.handle.restore.mock.invocationCallOrder[0]).toBeLessThan(restore.mock.invocationCallOrder[0]!);
+    await fixture.controller.stopAndRestore();
+    expect(restore).toHaveBeenCalledOnce();
+  });
+
   it("restores the mirror before changing physical modes and retains the first physical original for stop", async () => {
     const fixture = viewerFixture(); const lease = await start(fixture); const control = await takeControl(fixture, lease);
     const fitted = await fit(fixture, lease, control.controlGeneration); const next = await takeControl(fixture, fitted.lease);

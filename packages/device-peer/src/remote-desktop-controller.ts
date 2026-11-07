@@ -1459,6 +1459,23 @@ export class RemoteDesktopController {
           if (display.id !== active.sourceDisplayId) throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
           this.#viewerDisplay = undefined;
           this.#viewerDisplayRevision += 1;
+          const original = this.#originalResolution;
+          if (original !== undefined) {
+            const restore = this.#dependencies.restoreDisplayMode;
+            const originalCurrent = () => current() && this.#originalResolution === original;
+            try {
+              if (!restore || original.displayId !== active.sourceDisplayId || !sameAuthority(original.authority, authority)
+                || (await this.#dependencies.displayPresent?.(original.displayId)) === false || !originalCurrent()) throw new Error();
+              const restored = await restore.call(this.#dependencies, original.displayId, original.modeId, originalCurrent, original, original.authority);
+              if (!originalCurrent()) throw new Error();
+              const observed = restored ?? parseRemoteDesktopHostCapabilities(
+                await this.#dependencies.capabilities(original.authority)).displays.find(candidate => candidate.id === original.displayId);
+              if (!originalCurrent() || observed === undefined) throw new Error();
+              display = parseRemoteDesktopDisplay(observed);
+              if (display.id !== original.displayId || display.width !== original.width || display.height !== original.height) throw new Error();
+            } catch { throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE"); }
+            this.#originalResolution = undefined;
+          }
         }
       }
       requireCurrent();
