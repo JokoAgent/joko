@@ -19,6 +19,7 @@ import {
   type PartnerDirectoryView,
   type PartnerCapabilitiesView,
   type PartnerMutationView,
+  type PartnerPrivateMessageView,
   type PartnerPrivateThreadView,
   type PartnerProfileView,
   type PartnerSessionView
@@ -824,6 +825,39 @@ describe("PartnersPage", () => {
     expect(markPartnerRead).toHaveBeenCalledWith(current.id, 9n);
     expect(view.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "session-one" });
     expect(view.host.textContent).not.toContain("partners.unreadReplies");
+  });
+
+  it("refreshes the selected private thread body together with its activity count", async () => {
+    const source = partner(), target = partner({ id: "partner-two", displayName: "Nova" });
+    let thread = privateThread();
+    const first: PartnerPrivateMessageView = {
+      id: "message-one", threadId: thread.id, sequence: 1, senderPartnerId: target.id, recipientPartnerId: source.id,
+      content: "First delivered private message", deliveryStatus: "delivered", createdAt: 7_000, deliveredAt: 7_100
+    };
+    let messages = [first];
+    const readThread = vi.fn<AppController["getPartnerPrivateThread"]>(async () => ({ thread, messages }));
+    const markRead = vi.fn<AppController["markPartnerPrivateThreadRead"]>(async (partnerId, threadId, throughSequence) =>
+      ({ partnerId, threadId, throughSequence, updatedAt: 8_000 }));
+    const view = await mount({ partners: [source, target], focusPartnerId: source.id, getPartner: vi.fn(async () => source),
+      controllerOverrides: {
+        listPartnerPrivateThreads: vi.fn(async () => [thread]),
+        getPartnerPrivateThread: readThread,
+        markPartnerPrivateThreadRead: markRead
+      } });
+    const detail = required(view.host.querySelector(".partner-private-thread"));
+    expect(detail.textContent).toContain(first.content);
+    expect(readThread).toHaveBeenCalledExactlyOnceWith(source.id, thread.id, expect.any(AbortSignal));
+
+    const second = { ...first, id: "message-two", sequence: 2, content: "New delivered private message", createdAt: 8_000, deliveredAt: 8_100 };
+    thread = { ...thread, messageCount: 2, updatedAt: 8_100 };
+    messages = [first, second];
+    await act(async () => { button(required(view.host.querySelector(".partner-activity__summary")), "common.refresh").click(); await settle(); });
+    expect(view.host.querySelector(".partner-private-list .is-selected")?.textContent).toContain("2/12");
+    expect(detail.textContent).toContain(first.content);
+    expect(detail.textContent).toContain(second.content);
+    expect(readThread).toHaveBeenCalledTimes(2);
+    expect(readThread).toHaveBeenLastCalledWith(source.id, thread.id, expect.any(AbortSignal));
+    expect(markRead).toHaveBeenLastCalledWith(source.id, thread.id, 2, expect.any(AbortSignal));
   });
 
   it("shows durable history, private reads, delegated work, and source-attributed files", async () => {
