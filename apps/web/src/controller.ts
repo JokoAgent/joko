@@ -1470,9 +1470,10 @@ export function useAppController(): AppController {
   useEffect(() => {
     if (!state.activeProfile?.endpointPublicKey) return;
     let busy = false, stopped = false, stableSince = 0, refreshedAt = Date.now();
+    const isForeground = () => document.visibilityState !== 'hidden';
     const check = async () => {
       const profile = activeProfileRef.current;
-      if (busy || stopped || entryAttemptRef.current || connectionLeaveRef.current || !profile?.endpointPublicKey || explicitDisconnectRef.current || document.visibilityState === 'hidden') return;
+      if (busy || stopped || entryAttemptRef.current || connectionLeaveRef.current || !profile?.endpointPublicKey || explicitDisconnectRef.current || !isForeground()) return;
       busy = true;
       let probedEntry: SavedConnectionEntries['entries'][number] | undefined;
       try {
@@ -1490,7 +1491,7 @@ export function useAppController(): AppController {
         probedEntry = preferred;
         await verifyConnectionEntry(webEntryOwner(profile), preferred, AbortSignal.timeout(6_000));
         if (stopped || activeProfileRef.current !== profile || entryAttemptRef.current || connectionLeaveRef.current
-          || connectionStateRef.current !== 'connected' || document.visibilityState === 'hidden') { stableSince = 0; return; }
+          || connectionStateRef.current !== 'connected' || !isForeground()) { stableSince = 0; return; }
         stableSince ||= Date.now();
         if (Date.now() - stableSince >= 30_000 && !await adoptConnection(profile, { entryId: preferred.id }, true)) stableSince = 0;
       } catch (error) {
