@@ -109,6 +109,66 @@ describe("MessagingManager", () => {
     await new Promise(resolve => setTimeout(resolve, 30)); expect(transport.sentText.length + transport.stream.edits.length).toBe(count);
   });
 
+  it.each([1, 2])("holds all %i Discord final parts while the poll worker competes with an in-flight edit", async (partCount) => {
+    const adapter = new ControlledReplyAdapter();
+    const transport = new StreamingDiscordTransport();
+    const fixture = await createFixture(undefined, () => adapter, () => transport,
+      undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
+    const secondPoll = deliveryGate();
+    const secondTyping = deliveryGate();
+    const progressReceipt = deliveryGate();
+    const secondMessageId = "999999999999999992";
+    const poll = transport.poll.bind(transport);
+    vi.spyOn(transport, "poll").mockImplementation(async (input) => {
+      if (input.cursor !== "discord-cursor-1") return poll(input);
+      await secondPoll.wait;
+      const update = (await poll({ ...input, cursor: null })).updates[0];
+      if (update?.message === undefined) throw new Error("Missing Discord message fixture.");
+      return {
+        updates: [{ ...update, sequence: 2, message: { ...update.message, id: secondMessageId, content: "Second Discord input" } }],
+        nextCursor: "discord-cursor-2"
+      };
+    });
+    const typing = vi.spyOn(transport, "sendTyping").mockImplementationOnce(async () => undefined)
+      .mockImplementationOnce(() => secondTyping.wait);
+    const editDispatched = vi.fn(({ text }: ReplyEditInput) => text === "Draft" ? progressReceipt.wait : undefined);
+    transport.stream.beforeEditReceipt = editDispatched;
+
+    const connection = await enableReplyStream(fixture, "discord");
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    const firstRequest = fixture.store.listMessagingInboundRequests()[0]!;
+    const opener = (requestId: string) => fixture.store.findMessagingDeliveryByDedupe({
+      connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${requestId}:progress:start`
+    });
+    await vi.waitFor(() => expect(opener(firstRequest.id)?.status).toBe("sent"));
+    const carrierId = opener(firstRequest.id)?.providerMessageId;
+
+    secondPoll.release();
+    await vi.waitFor(() => expect(typing).toHaveBeenCalledTimes(2));
+    await adapter.emit({ type: "text_delta", blockId: "answer", delta: "Draft" });
+    await vi.waitFor(() => expect(editDispatched).toHaveBeenCalledWith(expect.objectContaining({ messageId: carrierId, text: "Draft" })));
+    await adapter.finish(partCount === 1 ? "Final answer" : `Final ${"answer ".repeat(400)}`);
+    const final = () => fixture.store.listMessagingDeliveries({ connectionId: connection.id })
+      .filter((row) => row.dedupeKey === `run:${firstRequest.runId}:answer`);
+    const secondRequest = fixture.store.listMessagingInboundRequests().find((row) => row.providerMessageId === secondMessageId)!;
+
+    secondTyping.release();
+    await vi.waitFor(() => expect(opener(secondRequest.id)?.status).toBe("sent"));
+    expect(fixture.store.listMessagingDeliveries({ connectionId: connection.id, statuses: ["dispatching"] })).toMatchObject([
+      { kind: "notice", dedupeKey: expect.stringContaining(`request:${firstRequest.id}:progress:frame:`) }
+    ]);
+    expect(final().map((row) => row.status)).toEqual(Array(partCount).fill("pending"));
+    expect(transport.stream.edits).toEqual([]);
+
+    progressReceipt.release();
+    await vi.waitFor(() => expect(final().map((row) => row.status)).toEqual(Array(partCount).fill("sent")));
+    expect(transport.stream.edits).toMatchObject([
+      { messageId: carrierId, text: "Draft" },
+      { messageId: carrierId, text: expect.stringMatching(/^Final answer/u) }
+    ]);
+    expect(final().find((row) => row.partIndex === 0)?.providerMessageId).toBe(carrierId);
+  });
+
   it("retains a Telegram progress carrier when the independent final ACK is unknown, including after restart", async () => {
     const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
     const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
@@ -2130,12 +2190,14 @@ class FakeDiscordTransport {
     return waitForAbort(input.signal);
   }
 
-  normalize(_updates: readonly DiscordGatewayUpdate[]): DiscordNormalizationResult {
+  normalize(updates: readonly DiscordGatewayUpdate[]): DiscordNormalizationResult {
+    const message = updates[0]?.message;
+    const messageId = message?.id ?? "999999999999999991";
     return {
       events: [{
         kind: "message",
-        providerRequestIds: ["discord:message:999999999999999991"],
-        messageId: "999999999999999991",
+        providerRequestIds: [`discord:message:${messageId}`],
+        messageId,
         address: this.ownerAddress(),
         speaker: {
           providerUserId: "111111111111111111",
@@ -2145,7 +2207,7 @@ class FakeDiscordTransport {
           isOwner: true
         },
         occurredAt: Date.now(),
-        text: "Hello from Discord",
+        text: message?.content ?? "Hello from Discord",
         ambient: false,
         protectedContent: false,
         attachments: [],
@@ -2211,8 +2273,10 @@ interface ReplyEditInput {
 class ControlledReplyEffects {
   readonly attempts: ReplyEditInput[] = []; readonly edits: ReplyEditInput[] = []; readonly removed: string[] = [];
   beforeEdit?: (input: ReplyEditInput) => Promise<void>; unknownEdit = false;
+  beforeEditReceipt?: (input: ReplyEditInput) => Promise<void> | undefined;
   async edit(input: ReplyEditInput) {
     this.attempts.push(input); await this.beforeEdit?.(input); input.signal?.throwIfAborted(); input.assertCurrent?.();
+    if (this.beforeEditReceipt !== undefined) await this.beforeEditReceipt(input);
     if (this.unknownEdit) throw new MessagingTransportError("network", "Progress ACK lost.", { effect: "unknown", retryable: true });
     this.edits.push(input); return { providerMessageId: input.messageId, address: input.address };
   }
@@ -2220,6 +2284,13 @@ class ControlledReplyEffects {
     input.signal?.throwIfAborted(); input.assertCurrent?.(); this.removed.push(input.messageId);
     return { providerMessageId: input.messageId, address: input.address };
   }
+}
+
+function deliveryGate(): { readonly wait: Promise<void>; readonly release: () => void } {
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  cleanups.push(release);
+  return { wait, release };
 }
 class StreamingTelegramTransport extends FakeTelegramTransport {
   readonly stream = new ControlledReplyEffects(); unknownFinal = false; unknownStart = false;
