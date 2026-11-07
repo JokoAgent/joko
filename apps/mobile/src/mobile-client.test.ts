@@ -7,8 +7,10 @@ import type { MobileCollaborationRpc } from "./mobile-collaboration";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
 import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemoryKind, ReadPartnerMemoryResponseSchema, UpdatePartnerMemoryResponseSchema, DeletePartnerMemoryResponseSchema,
   GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
-import { Code } from "@connectrpc/connect";
-import { ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
+import { ConnectionService, DeviceAuthorizationState } from "@joko/contracts";
+import { formatDeviceInvitation, type DeviceAuthorizationDraft } from "@joko/connection-transport/device-authorization";
+import type { SavedConnectionEntries } from "@joko/connection-transport/entries";
 import { EndpointTrustError, rememberEndpointTransport, reportEndpointTrustFailure } from "@joko/connection-transport/trust";
 import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSchema, TaskShareEventBatchSchema,
   EventPayloadSchema, TaskShareAttachmentResultSchema, type TaskSharingApi } from "@joko/contracts";
@@ -20,7 +22,7 @@ import { ExtensionAuthorizationPhase, ExtensionOAuthFlowSchema, type ExtensionSe
 import { rebalanceSuggestionFixture } from "./test/provider-group-rebalance";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import sharp from "sharp";
 import {
   AuthenticationState, ProviderAccountUsageSnapshotSchema,
@@ -1851,8 +1853,85 @@ describe("mobile current task delegated reads", () => {
 const clients: MobileClient[] = [];
 vi.mock('@joko/connection-transport/entries', async original => {
   const entries = await original<typeof import('@joko/connection-transport/entries')>();
-  return { ...entries, resolvePreparedConnection: vi.fn(entries.resolvePreparedConnection) };
+  return { ...entries, prepareSelectedConnectionEntry: vi.fn(entries.prepareSelectedConnectionEntry),
+    resolvePreparedConnection: vi.fn(entries.resolvePreparedConnection) };
 });
+describe('automatic entry after device approval', () => {
+  it.each(['directory', 'preferred entrance'] as const)('waits for the chosen entrance after a %s failure and restart', async failure => {
+    const invitation = { origin: 'https://approval-bootstrap.example', serverId: node.serverId,
+      endpointPublicKey: `ed25519:${'f'.repeat(64)}`, invitationId: randomUUID(), invitationSecret: 'a'.repeat(64), expiresAt: Date.now() + 60_000 };
+    const selected = { id: 'chosen', origin: 'https://approval-chosen.example', provider: 'direct', name: 'Chosen', kind: 'https' as const, published: true, prepared: true };
+    const server = { ...node, endpointPublicKey: invitation.endpointPublicKey };
+    const expiresAt = { seconds: BigInt(Math.floor(invitation.expiresAt / 1_000)), nanos: 0 };
+    const memory = memoryStorage(), network = fakeNetwork();
+    let draft: DeviceAuthorizationDraft | undefined, savedEntries: SavedConnectionEntries | undefined, failOnce = true;
+    memory.storage.readDeviceAuthorization = async () => draft;
+    memory.storage.writeDeviceAuthorization = async next => { draft = next; };
+    memory.storage.readDeviceTransportRequest = async () => undefined;
+    memory.storage.readConnectionEntries = async () => savedEntries;
+    memory.storage.writeConnectionEntries = async (_profile, next) => {
+      if (failure === 'preferred entrance' && next.preferredId === selected.id && failOnce) {
+        failOnce = false;
+        throw new Error('Cannot save chosen entrance');
+      }
+      savedEntries = next;
+    };
+    const claim = vi.fn();
+    const transport = createRouterTransport(router => router.service(ConnectionService, {
+      getServerInfo: () => ({ server }),
+      requestDeviceAuthorization: request => {
+        expect(request.entryId).toBe(selected.id);
+        return { authorization: { invitationId: invitation.invitationId, requestId: request.requestId, expiresAt,
+          userCode: 'ABCD-EFGH', deviceName: request.deviceName, state: DeviceAuthorizationState.APPROVED } };
+      },
+      claimDeviceAuthorization: request => {
+        claim(request.requestId);
+        return { authorization: { invitationId: invitation.invitationId, requestId: request.requestId, connection, state: DeviceAuthorizationState.CLAIMED } };
+      }
+    }));
+    network.deviceAuthorizationTransport = () => transport;
+    const entries = await import('@joko/connection-transport/entries');
+    const prepare = vi.mocked(entries.prepareSelectedConnectionEntry).mockImplementation(async (_owner, saved, id, _active, _auth, storage) => {
+      expect(id).toBe(selected.id);
+      const next = { ...saved, entries: [...saved.entries.filter(entry => entry.id !== selected.id), selected] };
+      await storage.write(next);
+      return { entryId: selected.id, saved: next };
+    });
+    if (failure === 'directory') prepare.mockRejectedValueOnce(new ConnectError('Cannot read entrance directory', Code.Unavailable));
+    const resolve = vi.mocked(entries.resolvePreparedConnection).mockImplementation(async (_owner, saved, readAuthKey, supported, _signal, id) => {
+      const [entry] = entries.connectionEntryCandidates(saved, supported, id);
+      const authKey = await readAuthKey();
+      if (!entry || !authKey) throw new Error('No prepared entrance or credential');
+      return { entry, authKey, failures: [], saved };
+    });
+    try {
+      const app = client(network, memory.storage, undefined, undefined, randomUUID);
+      await app.start();
+      const request = await app.deviceAuthorization.start(formatDeviceInvitation(invitation), 'Phone', undefined, selected.id);
+      await expect(app.deviceAuthorization.finish(undefined, true)).rejects.toThrow(failure === 'directory' ? 'Cannot read entrance directory' : 'Cannot save chosen entrance');
+      expect(memory.key()?.origin).toBe(invitation.origin);
+      expect(draft?.requestId).toBe(request.requestId);
+      expect(memory.storage.saveAutomaticProfile).not.toHaveBeenCalled();
+
+      const restarted = client(network, memory.storage, undefined, undefined, randomUUID);
+      vi.spyOn(restarted, 'refreshConnectionEntries').mockResolvedValue(undefined);
+      await restarted.start();
+      expect(restarted.state.status).toBe('unpaired');
+      expect(network.readOwner).toHaveBeenCalledTimes(failure === 'directory' ? 1 : 2);
+      await restarted.deviceAuthorization.finish(undefined, true);
+      expect(claim.mock.calls).toEqual([[request.requestId], [request.requestId]]);
+      expect(savedEntries?.preferredId).toBe(selected.id);
+      expect(memory.automaticProfile()).toBe(credential.profileId);
+      expect(draft).toBeUndefined();
+
+      const cold = client(network, memory.storage);
+      vi.spyOn(cold, 'refreshConnectionEntries').mockResolvedValue(undefined);
+      await cold.start();
+      expect(cold.state).toMatchObject({ status: 'connected', origin: selected.origin, activeProfileId: credential.profileId });
+    } finally { prepare.mockRestore(); resolve.mockRestore(); }
+  });
+});
+
 describe('prepared connection entrance cancellation', () => {
   it.each([Code.Unavailable, Code.Unauthenticated])('ends automatic startup after entrance preflight rejects (%s)', async code => {
     const entries = await import('@joko/connection-transport/entries');
