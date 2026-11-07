@@ -69,6 +69,31 @@ describe("artifact URL gateway leases", () => {
     expect(revokeObjectUrl).toHaveBeenCalledWith("blob:late");
     gateway.disconnect();
   });
+
+  it("releases only the acquired URL when a failed request is replaced for the same Blob ID", async () => {
+    const fetchArtifact = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(new Response(new Blob(["image"], { type: "image/png" })));
+    vi.stubGlobal("fetch", fetchArtifact);
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:replacement");
+    const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const gateway = createOrchestratorGateway(
+      { id: "connection-artifact", deviceId: "device-test", name: "Desktop", origin: "http://127.0.0.1:4318", serverId: "server-test" },
+      "secret", {}, () => artifactTransport()
+    );
+    await gateway.connect();
+    const failed = gateway.acquireArtifactUrl("artifact");
+    await expect(failed.url).rejects.toThrow();
+    const replacement = gateway.acquireArtifactUrl("artifact");
+    await expect(replacement.url).resolves.toBe("blob:replacement");
+    failed.release();
+    expect(revokeObjectUrl).not.toHaveBeenCalled();
+    replacement.release();
+    replacement.release();
+    expect(revokeObjectUrl).toHaveBeenCalledExactlyOnceWith("blob:replacement");
+    expect(fetchArtifact).toHaveBeenCalledTimes(2);
+    gateway.disconnect();
+  });
 });
 
 function artifactTransport(): Transport {

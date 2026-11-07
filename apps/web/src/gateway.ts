@@ -10888,6 +10888,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return pending;
   }
 
+  acquireArtifactUrl(blobId: string): ReturnType<OperationApi["acquireArtifactUrl"]> {
+    const url = this.getArtifactUrl(blobId);
+    const lease = this.#artifactUrls.get(blobId);
+    let released = false;
+    return { url, release: () => {
+      if (released) return;
+      released = true;
+      if (lease !== undefined && this.#artifactUrls.get(blobId) === lease) this.releaseArtifactUrl(blobId);
+    } };
+  }
+
   releaseArtifactUrl(blobId: string): void {
     const lease = this.#artifactUrls.get(blobId);
     if (lease === undefined || lease.refs === 0) return;
