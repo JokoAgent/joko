@@ -10528,7 +10528,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     readonly backendId?: string;
     readonly backendEnabled?: boolean;
   }): Promise<void> {
-    await this.submit({
+    const operation = await this.submit({
       case: "updateMemorySettings",
       value: {
         restoreDefaults: false,
@@ -10539,6 +10539,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         }
       }
     }, true);
+    const result = operation.result?.payload;
+    if (patch.backendId === undefined || result?.case !== "settings") return;
+    const backend = result.value.memory?.backends.find(item => item.backendId === patch.backendId);
+    if (backend?.kind === BackendMemoryKind.NATIVE_AUTO_MEMORY && backend.updatesActiveLocalSessions
+      && backend.support === CapabilitySupport.SUPPORTED && backend.reason !== "") {
+      throw new GatewayError(backend.reason, { code: "NATIVE_MEMORY_APPLICATION_PENDING" });
+    }
   }
 
   async restoreMemoryDefaults(): Promise<void> {
@@ -10548,14 +10555,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, true);
   }
 
-  async resetMemory(scope: "curated" | "backend", backendId?: string): Promise<{
+  async resetMemory(scope: "curated" | "ordinary_local" | "backend", backendId?: string): Promise<{
     readonly removedEntries?: number;
     readonly removedTargets?: number;
   }> {
+    const resetScope = {
+      curated: MemoryResetScope.CURATED,
+      ordinary_local: MemoryResetScope.ORDINARY_LOCAL_WORKSPACES,
+      backend: MemoryResetScope.BACKEND
+    }[scope];
     const operation = await this.submit({
       case: "resetMemory",
       value: {
-        scope: scope === "curated" ? MemoryResetScope.CURATED : MemoryResetScope.BACKEND,
+        scope: resetScope,
         backendId: backendId ?? ""
       }
     }, true);

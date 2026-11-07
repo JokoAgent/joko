@@ -367,7 +367,7 @@ describe("Personalization visual harness", () => {
     const makerReset = required(container.querySelector<HTMLButtonElement>('button[aria-label="Reset Maker Memory?"]'));
     await act(async () => makerReset.click());
     await act(async () => buttonWithText(document.body, "Reset memory").click());
-    expect(document.documentElement.dataset.harnessLastAction).toBe("memory:reset:curated");
+    expect(document.documentElement.dataset.harnessLastAction).toBe("memory:reset:ordinary_local");
     expect(controlChecked(required(container.querySelector<HTMLButtonElement>('button[aria-label="Toggle Visual backend Auto Memory"]')))).toBe(true);
 
     const backendReset = required(container.querySelector<HTMLButtonElement>('button[aria-label="Reset Visual backend Auto Memory?"]'));

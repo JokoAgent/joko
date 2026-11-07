@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, open, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import { CODEX_PROJECT_SKILL_ROOTS } from "@joko/adapter-codex";
 import { isRemoteFileMissing, type RemoteFileStat } from "@joko/remote-ssh";
 import type { OperationalStore } from "@joko/store";
 import { isSensitiveSkillPath } from "./skill-content-policy.js";
 import type { RemoteSkillSourceAuthority } from "./remote-workspace-service.js";
+
+const CAPTURE_GENERATION_NAME = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u;
 
 /** Source provenance is service-private; no remote path is a public acquisition. */
 export interface StoredRemoteProjectSkillSource {
@@ -25,8 +27,13 @@ export interface RemoteProjectSkillCandidate {
   readonly source: StoredRemoteProjectSkillSource;
   readonly localPath: string;
   readonly name: string;
-  readonly assertCurrent: () => void;
   readonly discard: () => Promise<void>;
+}
+
+interface RemoteProjectSkillDiscovery {
+  readonly candidates: readonly RemoteProjectSkillCandidate[];
+  readonly assertCurrent: () => void;
+  readonly isMissing: (source: StoredRemoteProjectSkillSource) => Promise<boolean>;
 }
 
 export interface RemoteSkillSourceOwnerOptions {
@@ -71,15 +78,15 @@ export class RemoteSkillSourceOwner {
       || this.#store.getBackend(backendId).descriptor.adapterKind !== "codex") throw unavailable();
   }
 
-  async discover(targetId: string, signal?: AbortSignal): Promise<readonly RemoteProjectSkillCandidate[]> {
-    const captured = await this.#authority(targetId, signal);
+  async discover(targetId: string, signal?: AbortSignal): Promise<RemoteProjectSkillDiscovery> {
+    const { authority, assertCurrent } = await this.#authority(targetId, signal);
     const candidates: RemoteProjectSkillCandidate[] = [];
     try {
       for (const projectRoot of CODEX_PROJECT_SKILL_ROOTS) {
-        const root = posix.join(captured.authority.registration.root, projectRoot);
-        if (!await optionalDirectory(captured.authority, root, signal)) continue;
-        const entries = await captured.authority.files.list(root, signal);
-        captured.assertCurrent(); signal?.throwIfAborted();
+        const root = posix.join(authority.registration.root, projectRoot);
+        if (!await optionalDirectory(authority, root, signal)) continue;
+        const entries = await authority.files.list(root, signal);
+        assertCurrent(); signal?.throwIfAborted();
         if (entries.length > 500) throw unavailable();
         if (new Set(entries.map(entry => entry.name)).size !== entries.length) throw unavailable();
         for (const entry of [...entries].sort((a, b) => a.name.localeCompare(b.name, "en"))) {
@@ -87,22 +94,22 @@ export class RemoteSkillSourceOwner {
           if (entry.kind === "file") continue;
           if (entry.kind !== "directory" || isSensitiveSkillPath(entry.name)) throw unavailable();
           const sourcePath = posix.join(root, entry.name);
-          if (!await optionalSkillFile(captured.authority, posix.join(sourcePath, "SKILL.md"), signal)) continue;
+          if (!await optionalSkillFile(authority, posix.join(sourcePath, "SKILL.md"), signal)) continue;
           if (candidates.length >= 500) throw unavailable();
           const generationId = randomUUID();
           const localPath = await this.#generation(generationId);
           try {
-            const observed = await this.#tree(captured.authority, sourcePath, localPath, signal);
-            const confirmed = await this.#tree(captured.authority, sourcePath, undefined, signal);
+            const observed = await this.#tree(authority, sourcePath, localPath, signal);
+            const confirmed = await this.#tree(authority, sourcePath, undefined, signal);
             if (confirmed.incarnation !== observed.incarnation || confirmed.revision !== observed.revision) throw unavailable();
-            captured.assertCurrent(); signal?.throwIfAborted();
+            assertCurrent(); signal?.throwIfAborted();
             const source: StoredRemoteProjectSkillSource = Object.freeze({
-              kind: "remote_project", targetId, workspaceId: captured.authority.registration.id,
-              rootRegistrationId: captured.authority.rootRegistrationId, executionIdentity: captured.authority.executionIdentity,
+              kind: "remote_project", targetId, workspaceId: authority.registration.id,
+              rootRegistrationId: authority.rootRegistrationId, executionIdentity: authority.executionIdentity,
               projectRoot, packageKey: entry.name, sourceIncarnation: observed.incarnation,
               sourceRevision: observed.revision, generationId
             });
-            candidates.push(Object.freeze({ source, localPath, name: entry.name, assertCurrent: captured.assertCurrent,
+            candidates.push(Object.freeze({ source, localPath, name: entry.name,
               discard: () => this.discard(source) }));
           } catch (error) {
             await this.#removeGeneration(generationId);
@@ -110,8 +117,23 @@ export class RemoteSkillSourceOwner {
           }
         }
       }
-      captured.assertCurrent(); signal?.throwIfAborted();
-      return Object.freeze(candidates);
+      assertCurrent(); signal?.throwIfAborted();
+      return Object.freeze({
+        candidates: Object.freeze(candidates),
+        assertCurrent,
+        isMissing: async (source: StoredRemoteProjectSkillSource) => {
+          if (source.targetId !== targetId || source.workspaceId !== authority.registration.id
+            || source.rootRegistrationId !== authority.rootRegistrationId || source.executionIdentity !== authority.executionIdentity) return false;
+          const projectRoot = posix.join(authority.registration.root, source.projectRoot);
+          const packageRoot = posix.join(projectRoot, source.packageKey);
+          const present = await optionalDirectory(authority, projectRoot, signal)
+            && await optionalDirectory(authority, packageRoot, signal)
+            && await optionalSkillFile(authority, posix.join(packageRoot, "SKILL.md"), signal);
+          assertCurrent();
+          signal?.throwIfAborted();
+          return !present;
+        }
+      });
     } catch (error) {
       await Promise.allSettled(candidates.map(candidate => candidate.discard()));
       signal?.throwIfAborted();
@@ -154,6 +176,16 @@ export class RemoteSkillSourceOwner {
     await this.#removeGeneration(source.generationId);
   }
 
+  /** Only the startup owner can sweep unreferenced captures, before a scan can stage new ones. */
+  async recoverLocalGenerations(referenced: ReadonlySet<string>): Promise<void> {
+    const root = await optionalLstat(this.#root);
+    if (!root?.isDirectory() || root.isSymbolicLink() || await realpath(this.#root) !== this.#root) return;
+    for (const entry of await readdir(this.#root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !CAPTURE_GENERATION_NAME.test(entry.name) || referenced.has(entry.name)) continue;
+      await this.#removeGeneration(entry.name).catch(() => undefined);
+    }
+  }
+
   async #authority(targetId: string, signal?: AbortSignal): Promise<{ readonly authority: RemoteSkillSourceAuthority; readonly assertCurrent: () => void }> {
     signal?.throwIfAborted();
     const target = this.#store.getTarget(targetId);
@@ -194,9 +226,17 @@ export class RemoteSkillSourceOwner {
   async #removeGeneration(id: string): Promise<void> {
     if (!/^[a-f0-9-]{36}$/u.test(id)) throw unavailable();
     const container = join(this.#root, id);
-    const info = await lstat(container).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+    const info = await optionalLstat(container);
     if (info === undefined) return;
-    if (info.isSymbolicLink() || !info.isDirectory() || await realpath(this.#root) !== this.#root || await realpath(container) !== container) throw unavailable();
+    const root = await optionalLstat(this.#root);
+    if (!root?.isDirectory() || root.isSymbolicLink() || !info.isDirectory() || info.isSymbolicLink()
+      || await realpath(this.#root) !== this.#root || await realpath(container) !== container) throw unavailable();
+    const contents = await readdir(container, { withFileTypes: true });
+    if (contents.some(entry => entry.name !== "payload" || !entry.isDirectory())) throw unavailable();
+    const currentRoot = await lstat(this.#root, { bigint: true });
+    const current = await lstat(container, { bigint: true });
+    if (root.dev !== currentRoot.dev || root.ino !== currentRoot.ino || root.birthtimeNs !== currentRoot.birthtimeNs
+      || info.dev !== current.dev || info.ino !== current.ino || info.birthtimeNs !== current.birthtimeNs) throw unavailable();
     await rm(container, { recursive: true });
   }
 
@@ -253,6 +293,10 @@ export class RemoteSkillSourceOwner {
     authority.assertFilesCurrent(); signal?.throwIfAborted();
     return { incarnation: digest([authority.rootRegistrationId, authority.executionIdentity, source, rootBefore]), revision: digest(manifest) };
   }
+}
+
+async function optionalLstat(path: string) {
+  return lstat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
 }
 
 export function remoteProjectSkillSourceIdentity(source: StoredRemoteProjectSkillSource): string {

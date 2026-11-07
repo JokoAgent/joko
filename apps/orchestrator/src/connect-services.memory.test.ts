@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +19,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
-import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { CredentialManager } from "./credential-manager.js";
+import { CredentialVault } from "./credential-vault.js";
+import { MAKER_MEMORY_PROVIDER_ID, MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { McpRouter } from "./mcp-router.js";
 import { SessionHost } from "./session-host.js";
 
 const owner = {
@@ -31,6 +35,58 @@ const owner = {
 };
 
 describe("Connect Maker Memory owner and reset scopes", () => {
+  it("keeps two existing curated memory grants when the owner turns off only Pi digests", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-memory-digest-preference-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const host = new SessionHost(store, {} as never, []);
+    const refresh = vi.fn(async () => undefined);
+    const memory = new MakerMemoryController({ store, onSettingsChanged: refresh });
+    const vault = await CredentialVault.open(join(root, "vault.key"));
+    const credentials = new CredentialManager({ vault, storagePath: join(root, "credentials.json") });
+    const router = new McpRouter({ store, credentials });
+    try {
+      await credentials.initialize();
+      await router.initialize();
+      router.registerBridgeToolProvider(new MakerMemoryBridgeProvider(memory));
+      const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      store.upsertBackend({
+        id: "pi", displayName: "Pi", version: "test", adapterKind: "pi", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required",
+        capabilities: new Map([["memory.compaction_digest", { key: "memory.compaction_digest", supported: true }]]),
+        models: [], tools: [], diagnostics: []
+      });
+      const targetId = "memory-workspace";
+      store.upsertTarget({ id: targetId, backendId: "pi", displayName: "Workspace", workspaceRoot: root, trusted: true, managed: false });
+      const entry = memory.write(targetId, { kind: "project", name: "report-style", title: "Report style", description: "Stable preference", body: "Keep reports concise." });
+      const readers = ["first", "second"].map(sessionId => {
+        store.createSession({ id: sessionId, backendId: "pi", targetId, title: sessionId, binding: { opaqueRef: sessionId, generation: 1 },
+          pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+        const bridge = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId, targetId, expectedPiGeneration: 1 });
+        return () => router.executeBridgeCall({ authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: randomUUID(), sessionId, targetId,
+          generation: 1, serverId: MAKER_MEMORY_PROVIDER_ID, toolName: "memory_read", arguments: { entry_id: entry.id } });
+      });
+      const readOriginal = async (): Promise<void> => {
+        for (const read of readers) await expect(read()).resolves.toMatchObject({ isError: false,
+          details: { mcpStructuredContent: { entry: { id: entry.id, body: entry.body } } } });
+      };
+      await readOriginal();
+      const services = createConnectServices(stubApplication({ store, makerMemory: memory, sessionHost: host, connections: { authenticate: () => connection } }));
+      await submitMemoryUpdate(services.operation.submitOperation, { operationId: "disable-pi-digests", connectionId: connection.id, backendId: "pi", backendEnabled: false });
+      expect(memory.enabledForBackend("pi")).toBe(false);
+      expect(refresh).toHaveBeenCalledOnce();
+      await readOriginal();
+
+      await submitMemoryUpdate(services.operation.submitOperation, { operationId: "disable-maker", connectionId: connection.id, makerEnabled: false });
+      for (const read of readers) await expect(read()).resolves.toMatchObject({ isError: true });
+    } finally {
+      await router.dispose();
+      await host.dispose();
+      memory.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("clears ordinary curated memory and digests while retaining Partner Home memory across restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-scoped-memory-reset-"));
     const database = join(root, "orchestrator.db");
@@ -181,6 +237,58 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       backendId: "native-memory"
     })).rejects.toMatchObject({ code: Code.FailedPrecondition });
     expect(reset).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears ordinary local curated memory and digests in one receipt that an existing tool grant can observe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-ordinary-memory-reset-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const memory = new MakerMemoryController({ store });
+    const host = new SessionHost(store, {} as never, []);
+    const vault = await CredentialVault.open(join(root, "vault.key"));
+    const credentials = new CredentialManager({ vault, storagePath: join(root, "credentials.json") });
+    const router = new McpRouter({ store, credentials });
+    try {
+      await credentials.initialize(); await router.initialize();
+      router.registerBridgeToolProvider(new MakerMemoryBridgeProvider(memory));
+      const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      const backendId = "pi", targetId = "ordinary-workspace", sessionId = "ordinary-session";
+      store.upsertBackend({ id: backendId, displayName: "Pi", adapterKind: "pi", version: "test", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required", capabilities: new Map(),
+        models: [], tools: [], diagnostics: [] });
+      const protectedTargets = ["partner-home", "partner-task", "ssh-workspace"];
+      const put = (id: string) => memory.write(id, { kind: "project", name: "preference", title: "Preference",
+        description: "Stored preference", body: "Compassneedle stays aligned." });
+      for (const id of [targetId, ...protectedTargets]) {
+        const remoteWorkspace = id === "ssh-workspace" ? { kind: "ssh" as const, hostTargetId: id, hostId: "ssh-host", workspaceRoot: "/workspace" } : undefined;
+        const metadata = id === "partner-home" ? { kind: "partner_home" } : id === "partner-task" ? { kind: "partner_session_task", partnerId: "partner" } : {};
+        store.upsertTarget({ id, backendId, displayName: id, trusted: true, managed: false,
+          workspaceRoot: remoteWorkspace?.workspaceRoot ?? root, ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }) }, metadata);
+        put(id);
+        expect(memory.writeCompactionDigest({ backendId, targetId: id, sessionId, reason: "auto", summary: "Compassneedle summary." })).toBe(true);
+      }
+      store.createSession({ id: sessionId, backendId, targetId, title: "Memory reader", binding: { opaqueRef: sessionId, generation: 1 },
+        pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+      const bridge = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId, targetId, expectedPiGeneration: 1 });
+      const list = () => router.executeBridgeCall({ authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: randomUUID(), sessionId, targetId,
+        generation: 1, serverId: MAKER_MEMORY_PROVIDER_ID, toolName: "memory_list", arguments: {} });
+      expect((await list()).details?.mcpStructuredContent).toMatchObject({ entries: [expect.any(Object), expect.any(Object)] });
+
+      const services = createConnectServices(stubApplication({ store, makerMemory: memory, sessionHost: host, connections: { authenticate: () => connection } }));
+      const submit = () => submitReset<contract.SubmitOperationResponse>(services.operation.submitOperation, {
+        operationId: "clear-local-memory", connectionId: connection.id, scope: contract.MemoryResetScope.ORDINARY_LOCAL_WORKSPACES
+      });
+      const result = await submit();
+      expect(result.operation?.result?.payload).toMatchObject({ case: "memoryReset", value: { removedEntries: 2n, removedTargets: 1n } });
+      expect((await list()).details?.mcpStructuredContent).toMatchObject({ entries: [] });
+      expect(memory.search(targetId, "Compassneedle")).toEqual([]);
+      for (const id of protectedTargets) expect(memory.search(id, "Compassneedle")).toHaveLength(2);
+      const late = put(targetId);
+      expect((await submit()).operation?.result?.payload).toEqual(result.operation?.result?.payload);
+      expect(memory.read(targetId, late.id)).toEqual(late);
+    } finally {
+      await router.dispose(); await host.dispose(); memory.dispose(); store.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects a stale native-memory toggle while Maker Memory is enabled and accepts an atomic switch", async () => {
@@ -565,8 +673,8 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       connections.revokeDevice(original.deviceId);
       await expect(scan).resolves.toMatchObject({ entryCount: 1 });
       await expect(reset).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED,
-        error: { code: "CLAUDE_NATIVE_MEMORY_RESET_AUTHORIZATION_RETIRED", stateMayHaveChanged: false } } });
-      expect(store.getOperation(input.operationId).status).toBe("failed");
+        error: { code: "CLAUDE_NATIVE_MEMORY_RESET_AUTHORIZATION_RETIRED", workspaceImpact: contract.StateImpact.UNCHANGED } } });
+      expect(store.getOperation(input.operationId)).toMatchObject({ status: "failed", error: { stateMayHaveChanged: false } });
       await expect(readFile(entry, "utf8")).resolves.toBe("Preserve the original memory.");
       await expect(submitReset(services.operation.submitOperation, { ...input, operationId: "claude-memory-current",
         connectionId: observer.id, key: observerKey })).resolves.toMatchObject({ operation: {
@@ -653,7 +761,9 @@ describe("Connect Maker Memory owner and reset scopes", () => {
         dispose: async () => undefined
       } as unknown as BackendAdapter]);
       const restarted = servicesFor(host);
-      await expect(submitReset(restarted.operation.submitOperation, input)).resolves.toBeDefined();
+      await expect(submitReset(restarted.operation.submitOperation, input)).resolves.toMatchObject({ operation: {
+        result: { payload: { case: "memoryReset" } }
+      } });
       expect(restartedReset).not.toHaveBeenCalled();
 
       const failedInput = { ...input, operationId: "memory-native-durable-unknown" };
@@ -688,56 +798,51 @@ describe("Connect Maker Memory owner and reset scopes", () => {
     }
   });
 
-  it("keeps the durable native-memory choice and records a content-free diagnostic when live reconcile fails", async () => {
-    const current = { format: 1 as const, makerEnabled: false, backendEnabled: {} as Readonly<Record<string, boolean>> };
-    const descriptor = {
-      id: "native-memory",
-      capabilities: new Map([["memory.native", {
-        key: "memory.native",
-        supported: true,
-        options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION, MEMORY_NATIVE_DEFAULT_DISABLED_OPTION]
-      }]])
-    };
-    const setSetting = vi.fn();
-    const appendDiagnostic = vi.fn();
-    const store = {
-      findOperation: () => undefined,
-      setSetting,
-      getBackend: () => ({ descriptor }),
-      listBackends: () => [{ descriptor }],
-      appendDiagnostic
-    };
-    const services = createConnectServices(stubApplication({
-      store,
-      makerMemory: {
-        patchedSettings: (patch: { readonly backendId?: string; readonly backendEnabled?: boolean }) => ({
-          ...current,
-          backendEnabled: { [patch.backendId!]: patch.backendEnabled! }
-        }),
-        reconcileSettingsChange: vi.fn(async () => true)
-      },
-      sessionHost: immediateHost(store, {
-        id: descriptor.id,
-        reconcileNativeMemory: async () => { throw new Error("private runtime failure"); }
-      } as unknown as BackendAdapter)
-    }));
-
-    await expect(submitMemoryUpdate(services.operation.submitOperation, {
-      operationId: "memory-native-live-reconcile-failure",
-      connectionId: owner.id,
-      backendId: descriptor.id,
-      backendEnabled: true
-    })).resolves.toBeDefined();
-    expect(setSetting).toHaveBeenCalledWith("service", "orchestrator", "settings.memory", {
-      format: 1,
-      makerEnabled: false,
-      backendEnabled: { "native-memory": true }
-    });
-    expect(appendDiagnostic).toHaveBeenCalledWith(expect.objectContaining({
-      code: "NATIVE_MEMORY_RECONCILIATION_FAILED",
-      details: { backendIds: ["native-memory"] }
-    }));
-    expect(JSON.stringify(appendDiagnostic.mock.calls)).not.toContain("private runtime failure");
+  it("keeps a rejected live native-memory update pending through a failed status refresh and adopts a confirmed retry", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-native-memory-application-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const memory = new MakerMemoryController({ store });
+    const backendId = "codex";
+    try {
+      const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      store.upsertBackend({ id: backendId, displayName: "Codex", adapterKind: "codex", version: "test", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required",
+        capabilities: new Map([["memory.native", { key: "memory.native", supported: true, options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION] }]]),
+        models: [], tools: [], diagnostics: [] });
+      await memory.update({ makerEnabled: false, backendId, backendEnabled: false });
+      let rejectUpdate = false;
+      let effectiveEnabled = false;
+      const apply = () => {
+        if (rejectUpdate) throw new Error("private runtime failure");
+        effectiveEnabled = memory.nativeEnabledForBackend(backendId);
+      };
+      const adapter = { id: backendId, reconcileNativeMemory: async () => { apply(); return "immediate" as const; },
+        readNativeMemoryStatus: async () => { apply(); return { enabled: effectiveEnabled }; } } as unknown as BackendAdapter;
+      const services = createConnectServices(stubApplication({ store, makerMemory: memory, adapters: [adapter],
+        connections: { authenticate: () => connection }, sessionHost: immediateHost(store, adapter) }));
+      const getSettings = services.settings.getSettings as unknown as (
+        request: unknown, context: unknown
+      ) => Promise<contract.GetSettingsResponse>;
+      const row = async () => (await getSettings({}, context())).settings?.memory?.backends[0];
+      expect(await row()).toMatchObject({ enabled: false, reason: "" });
+      rejectUpdate = true;
+      const result = await submitMemoryUpdate<contract.SubmitOperationResponse>(services.operation.submitOperation, {
+        operationId: "memory-native-live-reconcile-failure", connectionId: connection.id, backendId, backendEnabled: true
+      });
+      const pending = { enabled: false, support: contract.CapabilitySupport.SUPPORTED, reason: "Live native memory confirmation is pending." };
+      expect(result.operation?.result?.payload).toMatchObject({ case: "settings", value: { memory: { backends: [pending] } } });
+      expect(memory.settings().backendEnabled[backendId]).toBe(true);
+      expect(effectiveEnabled).toBe(false);
+      expect(await row()).toMatchObject(pending);
+      const diagnostics = store.listDiagnostics();
+      expect(diagnostics).toContainEqual(expect.objectContaining({ code: "NATIVE_MEMORY_RECONCILIATION_FAILED", details: { backendIds: [backendId] } }));
+      expect(diagnostics.map(item => item.message).join("\n")).not.toContain("private runtime failure");
+      rejectUpdate = false;
+      expect(await row()).toMatchObject({ enabled: true, reason: "" });
+    } finally {
+      memory.dispose(); store.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects ambiguous reset scopes before deleting anything", async () => {

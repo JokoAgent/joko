@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import { CodexBackendAdapter } from "@joko/adapter-codex";
 import { PiBackendAdapter } from "@joko/adapter-pi";
 import { createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { RemoteHostAuthenticationMode, RemoteHostService, RemoteHostStatus, SshKeyService } from "@joko/contracts";
+import { OperationService, RemoteHostAuthenticationMode, RemoteHostService, RemoteHostStatus, SshKeyService } from "@joko/contracts";
 import { SshKeyManager, type ResolvedAgentAuthConnectorRequest } from "@joko/remote-ssh";
 import { VoiceDictionaryPeerStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -24,6 +25,7 @@ import {
 } from "./application.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import type { OrchestratorConfig } from "./config.js";
+import { MAKER_MEMORY_PROVIDER_ID } from "./maker-memory.js";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { createInternalServer, createPublicServer } from "./server.js";
 import { VoiceDictionaryPeerManager } from "./voice-dictionary-peer-manager.js";
@@ -36,6 +38,94 @@ afterEach(async () => {
 });
 
 describe("Orchestrator application composition", () => {
+  it("omits ordinary Maker Memory from a restored Pi runtime after the owner disables Pi memory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-application-pi-memory-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true, maxRetries: 3 }));
+    const workspace = join(root, "workspace");
+    const dataDirectory = join(root, "data");
+    await mkdir(workspace);
+    const config: OrchestratorConfig = {
+      host: "127.0.0.1", port: 0, internalPort: 4327,
+      publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4327",
+      dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"),
+      allowInsecureLoopback: true, allowInsecureLan: false, lanDiscoveryEnabled: false, voiceDictionaryLanDiscoveryEnabled: false,
+      codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
+      workspace: { id: "workspace-pi-memory", root: workspace, displayName: "Pi Memory", trusted: true },
+      artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web-build"), corsOrigins: []
+    };
+    const application = await createOrchestratorApplication(config);
+    cleanups.push(() => application.close());
+    const providerId = "pi-memory-fixture";
+    const modelId = "memory-test";
+    await application.providers!.upsert({
+      backendId: "pi", credentialOrigin: "http://127.0.0.1:1", displayName: "Pi memory fixture", enabled: true,
+      kind: "local_keyless", credentialBindings: {}, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+      provider: { id: providerId, baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", keyless: true,
+        models: [{ id: modelId, contextWindow: 32_000, maxTokens: 4_000, input: ["text"] }] }
+    });
+    await application.refreshPiGeneration?.();
+    const server = await createPublicServer(application);
+    cleanups.push(() => server.close());
+    server.log.level = "silent";
+    const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+    const challenge = application.connections.issuePairing("Pi memory owner");
+    const paired = application.connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Pi memory owner" });
+    const operations = createClient(OperationService, createConnectTransport({
+      baseUrl, httpVersion: "1.1", defaultTimeoutMs: 20_000,
+      interceptors: [next => request => {
+        request.header.set("authorization", `Bearer ${paired.authKey}`);
+        return next(request);
+      }]
+    }));
+    const targetId = config.workspace.id;
+    const memory = application.makerMemory!;
+    const entry = memory.write(targetId, { kind: "project", name: "report-style", title: "Report style",
+      description: "Curated startup index marker", body: "Keep reports concise." });
+    const router = application.mcpRouter!;
+    const snapshots = vi.spyOn(router, "createPiBridgeSnapshot");
+    cleanups.push(async () => { snapshots.mockRestore(); });
+    const { sessionId } = (await application.sessionHost.createSession({
+      operationId: "pi-memory-task", connection: paired.connection, targetId, title: "Memory preference task",
+      providerId, modelId, fastMode: false, permissionMode: "ask", planMode: false
+    })).value;
+    const original = application.store.getSession(sessionId).descriptor.binding;
+    // Seed the original native file without sending a Provider request.
+    await writeFile(original.opaqueRef, `${JSON.stringify({
+      type: "session", version: 3, id: original.nativeSessionId, timestamp: new Date().toISOString(), cwd: workspace
+    })}\n`);
+    const startupPrompt = async (generation: number): Promise<string> => {
+      const runtimeId = createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
+      const generationRoot = join(config.piAgentHome, "generations");
+      const runtimePath = join("runtime", `${runtimeId}-g${generation}`, "append-system-prompt.md");
+      const paths = (await readdir(generationRoot, { recursive: true })).filter(path => path.endsWith(runtimePath));
+      expect(paths).toHaveLength(1);
+      return readFile(join(generationRoot, paths[0]!), "utf8");
+    };
+    const readCurated = (generation: number) => {
+      const index = snapshots.mock.calls.findIndex(([input]) => input.sessionId === sessionId && input.expectedPiGeneration === generation);
+      const result = snapshots.mock.results[index];
+      if (result?.type !== "return") throw new Error("The Pi runtime has no scoped tool grant.");
+      return router.executeBridgeCall({ authorization: `Bearer ${result.value.mcpBridge.token}`, requestId: randomUUID(),
+        sessionId, targetId, generation, serverId: MAKER_MEMORY_PROVIDER_ID, toolName: "memory_read", arguments: { entry_id: entry.id } });
+    };
+    expect(await startupPrompt(original.generation)).toContain(entry.description);
+    const updated = await operations.submitOperation({
+      operationId: "disable-pi-memory", connectionId: paired.connection.id,
+      mutation: { payload: { case: "updateMemorySettings", value: { patch: { backendId: "pi", backendEnabled: false } } } }
+    });
+    expect(updated.operation?.error).toBeUndefined();
+    expect(memory.enabledForBackend("pi")).toBe(false);
+    await expect(readCurated(original.generation)).resolves.toMatchObject({ isError: false,
+      details: { mcpStructuredContent: { entry: { id: entry.id, body: entry.body } } } });
+
+    await application.sessionHost.restart(sessionId);
+    const restored = application.store.getSession(sessionId).descriptor.binding;
+    expect(restored).toMatchObject({ ...original, generation: original.generation + 1 });
+    expect(await startupPrompt(restored.generation)).not.toContain(entry.description);
+    await expect(readCurated(restored.generation)).rejects.toThrow("MCP server is not present in this Pi runtime snapshot.");
+    expect(memory.read(targetId, entry.id)).toEqual(entry);
+  }, 60_000);
+
   it("keeps a healthy Backend and the connection service available when Pi initialization fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-application-pi-unavailable-"));
     const workspace = join(root, "workspace"), dataDirectory = join(root, "data");

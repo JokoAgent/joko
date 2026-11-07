@@ -10,7 +10,7 @@ import { Button, IconButton, Modal, ModalBackButton, CheckboxControl, SwitchCont
 import "./PersonalizationMemorySettings.css";
 
 type ResetTarget =
-  | { readonly kind: "curated" }
+  | { readonly kind: "ordinary_local" }
   | { readonly kind: "backend"; readonly backendId: string; readonly backendName: string; readonly native: boolean };
 
 function BackendMemoryMark({ native }: { readonly native: boolean }): JSX.Element {
@@ -85,6 +85,9 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
         onSuccess(t(key, { backend: backendName }));
       } catch (error) {
         setBackendEnabled((current) => ({ ...current, [backendId]: previous }));
+        if (error instanceof Error && "code" in error && error.code === "NATIVE_MEMORY_APPLICATION_PENDING") {
+          throw new Error(t("settings.memory.nativeUpdatePending", { backend: backendName }), { cause: error });
+        }
         throw error;
       } finally {
         markPending(`backend:${backendId}`, false);
@@ -106,22 +109,22 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
     const target = resetTarget;
     if (target === undefined) return;
     setResetTarget(undefined);
-    const key = target.kind === "curated" ? "reset:curated" : `reset:${target.backendId}`;
+    const key = target.kind === "ordinary_local" ? "reset:ordinary-local" : `reset:${target.backendId}`;
     markPending(key, true);
     runAction(`memory-${key}`, async () => {
       try {
-        const result = target.kind === "curated"
-          ? await controller.resetMemory("curated")
+        const result = target.kind === "ordinary_local"
+          ? await controller.resetMemory("ordinary_local")
           : await controller.resetMemory("backend", target.backendId);
         const count = result.removedEntries;
         if (target.kind === "backend" && count === undefined) {
           onSuccess(t("settings.memory.toast.backendResetGeneric", { backend: target.backendName }));
         } else {
           onSuccess(t(
-            target.kind === "curated"
+            target.kind === "ordinary_local"
               ? count === 1 ? "settings.memory.toast.makerResetOne" : "settings.memory.toast.makerResetOther"
               : count === 1 ? "settings.memory.toast.backendResetOne" : "settings.memory.toast.backendResetOther",
-            target.kind === "curated"
+            target.kind === "ordinary_local"
               ? { count: count ?? 0 }
               : { backend: target.backendName, count: count ?? 0 }
           ));
@@ -178,8 +181,8 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
             <IconButton
               className="memory-settings__reset"
               label={t("settings.memory.resetMakerTitle")}
-              disabled={pending.has("reset:curated")}
-              onClick={() => setResetTarget({ kind: "curated" })}
+              disabled={pending.has("reset:ordinary-local")}
+              onClick={() => setResetTarget({ kind: "ordinary_local" })}
             ><RotateCcw aria-hidden="true" /></IconButton>
           </span>
         </div>
@@ -202,6 +205,8 @@ export function PersonalizationMemorySettings({ controller, snapshot, runAction,
               )}</span>
               {native && makerEnabled && <small role="status">{t("settings.memory.nativeBlocked")}</small>}
               {!backend.supported && <small role="status">{backend.reason || t("common.unavailable")}</small>}
+              {native && backend.supported && backend.updatesActiveLocalSessions && backend.reason !== ""
+                && <small role="status">{t("settings.memory.nativeStatusPending", { backend: backendName })}</small>}
             </span>
             <span className="memory-settings__actions">
               <SwitchControl

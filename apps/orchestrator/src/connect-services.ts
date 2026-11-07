@@ -666,6 +666,7 @@ class SerialTargetWorkspaceRuntime implements TargetWorkspaceRuntimeCoordinator 
 interface NativeMemoryStatusObservation {
   readonly backendInstanceGeneration: number;
   readonly status: NativeMemoryStatus;
+  readonly awaitingConfirmation?: true;
 }
 
 function toProtoRuntimeActivityKind(kind: SessionRuntimeActivityKind): contract.RuntimeActivityKind {
@@ -6601,7 +6602,7 @@ export function toProtoOperation(
 ): contract.Operation {
   const base = toProtoStoredOperation(record, Number(dependencies.generation ?? 0n));
   const sharedAuthor = dependencies.taskShares?.getAuthorForOperation(record.id);
-  const result = record.status === "started" ? undefined : operationResult(dependencies, outcome, at);
+  const result = record.status === "started" ? undefined : operationResult(dependencies, mutation, outcome, at);
   const rejected = record.status === "failed" || (record.status === "completed" && !outcome.accepted);
   return create(contract.OperationSchema, {
     ...base,
@@ -6682,6 +6683,7 @@ function browserKeyboardOperationBody(mutation: contract.OperationMutation, proj
 
 function operationResult(
   dependencies: ConnectServiceDependencies,
+  mutation: contract.OperationMutation,
   outcome: OperationOutcome,
   at: number
 ): contract.OperationResult {
@@ -6789,8 +6791,16 @@ function operationResult(
     };
     return create(contract.OperationResultSchema, { payload });
   }
-  if (!outcome.accepted || outcome.entityId === undefined) return create(contract.OperationResultSchema, { payload });
+  if (!outcome.accepted) return create(contract.OperationResultSchema, { payload });
   try {
+    if (outcome.resultCase === "settings" && mutation.payload.case === "updateMemorySettings") {
+      const patch = mutation.payload.value.patch;
+      if (patch?.backendEnabled !== undefined
+        && updatesActiveLocalMemorySessions(dependencies.store.getBackend(patch.backendId).descriptor)) {
+        return create(contract.OperationResultSchema, { payload: { case: "settings", value: settingsSnapshot(dependencies) } });
+      }
+    }
+    if (outcome.entityId === undefined) return create(contract.OperationResultSchema, { payload });
     switch (outcome.resultCase) {
       case "connection": payload = { case: "connection", value: toProtoConnection(dependencies.store.getConnection(outcome.entityId)) }; break;
       case "device": {
@@ -7245,6 +7255,7 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
     const commitHeadRevision = stringValue(gitCommit["headRevision"]);
     const gitPush = asRecord(response["workspaceGitPush"]);
     const scheduleDeletion = asRecord(response["scheduleDeletion"]);
+    const memoryReset = response["memoryReset"];
     return {
       accepted: response["accepted"],
       ...(response["pickedDirectory"] === undefined ? {} : { pickedDirectory: pickedExtensionDirectoryFromRecord(response["pickedDirectory"]) }),
@@ -7260,6 +7271,9 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
       ...(Object.keys(scheduleDeletion).length === 0 ? {} : {
         scheduleDeletion: scheduleDeletionOutcomeFromRecord(scheduleDeletion)
       }),
+      ...(record.kind === "resetMemory" && memoryReset !== null && typeof memoryReset === "object" && !Array.isArray(memoryReset)
+        ? { memoryReset: validateNativeMemoryResetResult(memoryReset as NativeMemoryResetResult) }
+        : {}),
       ...(Object.keys(rewind).length === 0 ? {} : {
         workspaceRewind: {
           workspaceId: stringValue(rewind["workspaceId"]) ?? "",
@@ -13689,9 +13703,14 @@ async function refreshNativeMemoryStatuses(
     .filter((item) => backendMemoryRole(item.descriptor) === "native_auto_memory");
   await Promise.all(nativeBackends.map(async ({ descriptor }) => {
     const refreshEpoch = beginNativeMemoryStatusRefresh(dependencies, descriptor.id);
+    const statusUnavailable = (): void => {
+      if (updatesActiveLocalMemorySessions(descriptor)) {
+        markNativeMemoryAwaitingConfirmation(dependencies, descriptor, refreshEpoch);
+      } else invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
+    };
     const advertisedAdapter = adapters.get(descriptor.id);
     if (advertisedAdapter?.readNativeMemoryStatus === undefined) {
-      invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
+      statusUnavailable();
       return;
     }
     try {
@@ -13705,18 +13724,39 @@ async function refreshNativeMemoryStatuses(
       );
       signal?.throwIfAborted();
       if (observation === undefined) {
-        invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
+        statusUnavailable();
         return;
       }
       const current = dependencies.store.getBackend(descriptor.id).descriptor;
       if (current.instanceGeneration !== observation.backendInstanceGeneration
         || dependencies.nativeMemoryStatusEpochs.get(descriptor.id) !== refreshEpoch) return;
+      if (updatesActiveLocalMemorySessions(descriptor) && observation.status.enabled === undefined) {
+        statusUnavailable();
+        return;
+      }
       dependencies.nativeMemoryStatuses.set(descriptor.id, observation);
     } catch {
-      invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
       signal?.throwIfAborted();
+      statusUnavailable();
     }
   }));
+}
+
+function markNativeMemoryAwaitingConfirmation(
+  dependencies: ConnectServiceDependencies,
+  descriptor: BackendDescriptor,
+  refreshEpoch: bigint
+): void {
+  if (dependencies.nativeMemoryStatusEpochs.get(descriptor.id) !== refreshEpoch) return;
+  const previous = dependencies.nativeMemoryStatuses.get(descriptor.id);
+  const enabled = previous !== undefined && previous.backendInstanceGeneration === descriptor.instanceGeneration
+    ? previous.status.enabled
+    : undefined;
+  dependencies.nativeMemoryStatuses.set(descriptor.id, {
+    backendInstanceGeneration: descriptor.instanceGeneration,
+    status: enabled === undefined ? {} : { enabled },
+    awaitingConfirmation: true
+  });
 }
 
 function invalidateNativeMemoryStatus(
@@ -13759,7 +13799,7 @@ async function reconcileNativeMemorySettings(
   await Promise.all(backends.map(async (descriptor) => {
     const backendId = descriptor.id;
     const statusEpoch = beginNativeMemoryStatusRefresh(dependencies, backendId);
-    invalidateNativeMemoryStatus(dependencies, backendId, undefined, statusEpoch);
+    markNativeMemoryAwaitingConfirmation(dependencies, descriptor, statusEpoch);
     try {
       await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
         if (adapter.reconcileNativeMemory === undefined) {
@@ -13767,6 +13807,7 @@ async function reconcileNativeMemorySettings(
         }
         await adapter.reconcileNativeMemory();
       });
+      invalidateNativeMemoryStatus(dependencies, backendId, descriptor.instanceGeneration, statusEpoch);
     } catch {
       failures.push(backendId);
     }
@@ -14168,24 +14209,23 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       entryCount: BigInt(memoryState?.entryCount ?? 0),
       backends: memoryBackendRecords.map(({ item, role }) => {
         const nativeStatus = dependencies.nativeMemoryStatuses.get(item.descriptor.id);
-        const currentNativeStatus = nativeStatus !== undefined
-            && nativeStatus.backendInstanceGeneration === item.descriptor.instanceGeneration
-          ? nativeStatus.status
+        const observation = role === "native_auto_memory" && nativeStatus?.backendInstanceGeneration === item.descriptor.instanceGeneration
+          ? nativeStatus
           : undefined;
+        const currentNativeStatus = observation?.status;
         const entryCount = role === "compaction_digest"
           ? memoryState?.backendEntryCount[item.descriptor.id] ?? 0
           : currentNativeStatus?.entryCount;
         return create(contract.BackendMemorySettingsSchema, {
           backendId: item.descriptor.id,
-          enabled: role === "native_auto_memory" && currentNativeStatus?.enabled !== undefined
-            ? currentNativeStatus.enabled
-            : memoryState?.backendEnabled[item.descriptor.id] ?? false,
+          enabled: currentNativeStatus?.enabled
+            ?? (observation?.awaitingConfirmation === true ? false : memoryState?.backendEnabled[item.descriptor.id] ?? false),
           support: dependencies.makerMemory === undefined
             ? contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE
             : contract.CapabilitySupport.SUPPORTED,
           reason: dependencies.makerMemory === undefined
             ? "Memory storage is unavailable on this Orchestrator node."
-            : "",
+            : observation?.awaitingConfirmation === true ? "Live native memory confirmation is pending." : "",
           ...(entryCount === undefined ? {} : { entryCount: BigInt(entryCount) }),
           kind: role === "native_auto_memory"
             ? contract.BackendMemoryKind.NATIVE_AUTO_MEMORY
@@ -19593,6 +19633,12 @@ async function dispatchMutation(
           }
           reset = () => memory.reset("curated");
           break;
+        case contract.MemoryResetScope.ORDINARY_LOCAL_WORKSPACES:
+          if (payload.value.backendId.trim() !== "") {
+            throw invalidArgument("reset_memory.backend_id must be empty for ORDINARY_LOCAL_WORKSPACES scope");
+          }
+          reset = () => memory.reset("ordinary_local");
+          break;
         case contract.MemoryResetScope.BACKEND: {
           const backendId = payload.value.backendId.trim();
           if (backendId === "") throw invalidArgument("reset_memory.backend_id is required for BACKEND scope");
@@ -19705,8 +19751,7 @@ async function dispatchMutation(
         return presented(execution);
       }
       if (reset === undefined) throw new StoreError("Memory reset owner was not resolved.");
-      // Store-owned curated/digest resets remain synchronous and never touch
-      // Backend-native persistence. No Memory body enters the Operation result.
+      // Store-owned resets and their receipts share one transaction.
       const execution = await host.mutate({
         operationId,
         connection,

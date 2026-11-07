@@ -15,7 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 
-describe("OrchestratorGateway Memory reset scopes", () => {
+describe("OrchestratorGateway Memory settings", () => {
   it("preserves the typed Backend memory role and reset authority", () => {
     const projected = mapSnapshot(create(SnapshotSchema, {
       settings: {
@@ -73,7 +73,27 @@ describe("OrchestratorGateway Memory reset scopes", () => {
     expect(settings(0n)).toHaveProperty("entryCount", 0);
   });
 
-  it("sends distinct CURATED and capability-owned BACKEND mutations", async () => {
+  it("surfaces a committed preference with an unconfirmed native-memory update", async () => {
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret", {}, () => transport((method, input) => response(method, create(SubmitOperationResponseSchema, {
+        operation: {
+          operationId: input.operationId, connectionId: input.connectionId, state: OperationState.SUCCEEDED,
+          result: { payload: { case: "settings", value: { memory: { backends: [{
+            backendId: "codex", enabled: false, support: CapabilitySupport.SUPPORTED, kind: BackendMemoryKind.NATIVE_AUTO_MEMORY,
+            updatesActiveLocalSessions: true, reason: "Live native memory confirmation is pending."
+          }] } } } }
+        }
+      })))
+    );
+    await gateway.connect();
+    try {
+      await expect(gateway.updateMemorySettings({ backendId: "codex", backendEnabled: true }))
+        .rejects.toMatchObject({ code: "NATIVE_MEMORY_APPLICATION_PENDING" });
+    } finally { gateway.disconnect(); }
+  });
+
+  it("sends distinct ordinary local, curated and capability-owned Backend resets", async () => {
     const mutations: any[] = [];
     const gateway = createOrchestratorGateway(
       { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example" , serverId: "server-test" },
@@ -81,7 +101,7 @@ describe("OrchestratorGateway Memory reset scopes", () => {
       {},
       () => transport((method, input) => {
         mutations.push(input.mutation.payload.value);
-        const nativeReset = mutations.length === 3;
+        const nativeReset = input.mutation.payload.value.backendId === "codex";
         return response(method, create(SubmitOperationResponseSchema, {
           operation: {
             operationId: input.operationId,
@@ -101,10 +121,12 @@ describe("OrchestratorGateway Memory reset scopes", () => {
     );
     await gateway.connect();
 
+    await expect(gateway.resetMemory("ordinary_local")).resolves.toEqual({ removedEntries: 2, removedTargets: 1 });
     await expect(gateway.resetMemory("curated")).resolves.toEqual({ removedEntries: 2, removedTargets: 1 });
     await expect(gateway.resetMemory("backend", "memory-capable")).resolves.toEqual({ removedEntries: 2, removedTargets: 1 });
     await expect(gateway.resetMemory("backend", "codex")).resolves.toEqual({});
     expect(mutations).toMatchObject([
+      { scope: MemoryResetScope.ORDINARY_LOCAL_WORKSPACES, backendId: "" },
       { scope: MemoryResetScope.CURATED, backendId: "" },
       { scope: MemoryResetScope.BACKEND, backendId: "memory-capable" },
       { scope: MemoryResetScope.BACKEND, backendId: "codex" }

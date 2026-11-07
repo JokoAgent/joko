@@ -654,8 +654,8 @@ export class PiResourceManager {
   readonly #remoteSourceGuards = new WeakMap<StoredResource, () => void>();
   readonly #records = new Map<string, StoredResource>();
   readonly #preparedMutations = new WeakMap<object, PreparedCatalogMutation<unknown>>();
-  readonly #installedGenerationLeases = new Map<string, number>();
-  readonly #retiredInstalledGenerations = new Map<string, { readonly record: StoredResource; readonly generation: string }>();
+  readonly #generationLeases = new Map<string, number>();
+  readonly #retiredGenerationCleanup = new Map<string, () => Promise<void>>();
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
   #extensionTaskRemoval?: (store: OperationalStore, resourceId: string) => void;
@@ -708,6 +708,7 @@ export class PiResourceManager {
       await assertContainedRegularDirectory(this.#managedRoot, join(this.#managedRoot, name), `Managed resource ${name} directory`);
     }
     const setting = this.#store.findSetting<StoredResourceCatalog>("service", this.#scopeId, "pi_resource_catalog");
+    const referencedRemoteGenerations = new Set<string>();
     if (setting !== undefined) {
       if (setting.value.format !== 1 || !Array.isArray(setting.value.records)) throw new Error("Pi resource catalog has an unsupported format.");
       for (const raw of setting.value.records) {
@@ -716,7 +717,10 @@ export class PiResourceManager {
           if (this.#remoteProjectSkills === undefined || record.canonicalPath !== this.#remoteProjectSkills.localPath(record.source)) {
             throw new Error("Stored remote project Skill generation has no owning source.");
           }
-          await this.#remoteProjectSkills.assertLocalGeneration(record.source);
+          if (record.state !== "removed") {
+            await this.#remoteProjectSkills.assertLocalGeneration(record.source);
+            referencedRemoteGenerations.add(record.source.generationId);
+          }
         }
         if (this.#records.has(record.id)) throw new Error("Pi resource catalog contains duplicate IDs.");
         this.#records.set(record.id, record);
@@ -725,6 +729,7 @@ export class PiResourceManager {
     await this.#recoverProjectSkillTransactions();
     await this.#recoverProjectMarketSkillTransactions();
     const recoveryChanged = await this.#recoverOrphanedFilesystemState();
+    await this.#remoteProjectSkills?.recoverLocalGenerations(referencedRemoteGenerations).catch(() => undefined);
     let compatibilityChanged = false;
     for (const [id, record] of this.#records) {
       const refreshed = await this.#refreshCompatibility(record);
@@ -787,7 +792,7 @@ export class PiResourceManager {
       await this.#assertInstalledSafe(record);
       const generation = installedGenerationContainer(this.#managedRoot, record);
       const generationKey = pathIdentity(generation);
-      this.#installedGenerationLeases.set(generationKey, (this.#installedGenerationLeases.get(generationKey) ?? 0) + 1);
+      this.#generationLeases.set(generationKey, (this.#generationLeases.get(generationKey) ?? 0) + 1);
       const resource = publicResource(record);
       let released = false;
       let releaseRequested = false;
@@ -815,7 +820,7 @@ export class PiResourceManager {
         release: async () => {
           if (released) return;
           releaseRequested = true;
-          releasePromise ??= this.#releaseInstalledPackageGeneration(generationKey).then(
+          releasePromise ??= this.#releaseGeneration(generationKey).then(
             () => { released = true; },
             (error: unknown) => {
               releasePromise = undefined;
@@ -845,12 +850,11 @@ export class PiResourceManager {
       if (!isDirectProjectResource(record) && inspection.revision !== record.discoveredRevision) {
         throw new Error("Installed Skill content changed and is fenced.");
       }
-      const generation = record.installedPath === undefined
-        ? undefined
-        : installedGenerationContainer(this.#managedRoot, record);
+      const generation = record.source.kind === "remote_project" ? root : record.installedPath === undefined
+        ? undefined : installedGenerationContainer(this.#managedRoot, record);
       const generationKey = generation === undefined ? undefined : pathIdentity(generation);
       if (generationKey !== undefined) {
-        this.#installedGenerationLeases.set(generationKey, (this.#installedGenerationLeases.get(generationKey) ?? 0) + 1);
+        this.#generationLeases.set(generationKey, (this.#generationLeases.get(generationKey) ?? 0) + 1);
       }
       const resource = publicResource(record);
       const observedRevision = inspection.revision;
@@ -895,7 +899,7 @@ export class PiResourceManager {
             released = true;
             return;
           }
-          releasePromise ??= this.#releaseInstalledPackageGeneration(generationKey).then(
+          releasePromise ??= this.#releaseGeneration(generationKey).then(
             () => { released = true; },
             (error: unknown) => {
               releasePromise = undefined;
@@ -2082,16 +2086,17 @@ export class PiResourceManager {
 
   async #prepareRemoteProjectSkills(backendId: string, targetId: string): Promise<PreparedPiResourceMutation<readonly PiResourceDescriptor[]>> {
     const owner = this.#remoteProjectSkills!;
-    const candidates = await owner.discover(targetId);
+    const beforeScan = new Map([...this.#records].filter(([, record]) => record.backendId === backendId && record.targetId === targetId));
+    const { candidates, assertCurrent, isMissing } = await owner.discover(targetId);
     const entries: PreparedCatalogEntry[] = [], values: PiResourceDescriptor[] = [];
     const retained = new Set<StoredRemoteProjectSkillSource>();
     try {
       for (const candidate of candidates) {
-        candidate.assertCurrent();
+        assertCurrent();
         const inspection = await inspectSkillPackage(candidate.localPath, this.#maximumFiles, this.#maximumBytes);
         const sourceIdentity = remoteProjectSkillSourceIdentity(candidate.source);
         const id = `resource_${createHash("sha256").update(JSON.stringify([backendId, targetId, sourceIdentity])).digest("hex")}`;
-        const previous = this.#records.get(id);
+        const previous = beforeScan.get(id);
         if (previous !== undefined && (previous.source.kind !== "remote_project" || previous.backendId !== backendId
           || previous.targetId !== targetId || previous.scope !== "project" || previous.kind !== "skill" || previous.sourceIdentity !== sourceIdentity)) {
           throw new Error("Remote project Resource identity is already owned.");
@@ -2100,13 +2105,13 @@ export class PiResourceManager {
           && previous.source.sourceIncarnation === candidate.source.sourceIncarnation
           && previous.source.sourceRevision === candidate.source.sourceRevision && previous.discoveredRevision === inspection.revision) {
           await owner.assertLocalGeneration(previous.source);
-          candidate.assertCurrent();
+          assertCurrent();
           await candidate.discard();
           entries.push({ id, expected: previous, next: previous }); values.push(publicResource(previous));
           continue;
         }
         const compatibility = await inspectPiResourceCompatibility("skill", inspection.canonicalPath, { contentFingerprint: inspection.revision });
-        candidate.assertCurrent();
+        assertCurrent();
         const workspaceRoot = this.#store.getTarget(targetId).descriptor.remoteWorkspace!.workspaceRoot;
         const record: StoredResource = {
           id, backendId, targetId, kind: "skill", scope: "project", name: candidate.name,
@@ -2117,13 +2122,23 @@ export class PiResourceManager {
           versionNumber: ((previous === undefined ? 0n : BigInt(previous.versionNumber)) + 1n).toString(), updatedAt: this.#now(),
           source: candidate.source, canonicalPath: candidate.localPath, workspaceRoot
         };
-        this.#remoteSourceGuards.set(record, candidate.assertCurrent);
+        this.#remoteSourceGuards.set(record, assertCurrent);
         entries.push({ id, expected: previous, next: record }); values.push(publicResource(record)); retained.add(candidate.source);
       }
-      const assertCurrent = (): void => { for (const candidate of candidates) candidate.assertCurrent(); };
+      const discoveredIds = new Set(entries.map(({ id }) => id));
+      for (const [id, previous] of beforeScan) {
+        if (previous.source.kind === "remote_project" && previous.state !== "removed"
+          && !discoveredIds.has(id) && await isMissing(previous.source)) {
+          entries.push({ id, expected: previous, next: this.#removedRecord(previous) });
+        }
+      }
       assertCurrent();
       return this.#prepareMutation(entries, Object.freeze(values), assertCurrent, {
-        rollback: async () => { await Promise.all(candidates.filter(candidate => retained.has(candidate.source)).map(candidate => candidate.discard())); }
+        rollback: async () => { await Promise.all(candidates.filter(candidate => retained.has(candidate.source)).map(candidate => candidate.discard())); },
+        cleanupAfterCommit: async () => {
+          await Promise.allSettled(entries.flatMap(({ expected, next }) =>
+            expected === undefined || expected === next ? [] : [this.#retireUnusedRemoteCapture(expected)]));
+        }
       });
     } catch (error) {
       await Promise.allSettled(candidates.map(candidate => candidate.discard()));
@@ -2414,29 +2429,33 @@ export class PiResourceManager {
       assertExpectedInstalledLocation(this.#managedRoot, current);
       await assertContainedPathIfPresent(this.#managedRoot, current.installedPath, "Installed resource");
     }
-    const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(current);
-    const updated: StoredResource = {
-      ...withoutPendingUpdate,
-      state: "removed",
-      enabled: false,
-      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
-      updatedAt: this.#now()
-    };
+    const updated = this.#removedRecord(current);
     return this.#prepareMutation(
       [{ id: resourceId, expected: current, next: updated }],
       publicResource(updated),
       undefined,
       {
         rollback: async () => undefined,
-        ...(current.installedPath === undefined
-          ? {}
-          : { cleanupAfterCommit: () => this.#removeResourceOwner(current) })
+        ...(current.source.kind === "remote_project"
+          ? { cleanupAfterCommit: () => this.#retireUnusedRemoteCapture(current) }
+          : current.installedPath === undefined ? {} : { cleanupAfterCommit: () => this.#removeResourceOwner(current) })
       }
     );
   }
 
   async remove(resourceId: string): Promise<PiResourceDescriptor> {
     return this.#completePreparedStandalone(await this.prepareRemove(resourceId));
+  }
+
+  #removedRecord(current: StoredResource): StoredResource {
+    const { pendingUpdate: _pendingUpdate, ...withoutPendingUpdate } = omitInstalledPath(current);
+    return {
+      ...withoutPendingUpdate,
+      state: "removed",
+      enabled: false,
+      versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
+      updatedAt: this.#now()
+    };
   }
 
   /** Callback passed directly to PiAdapterOptions.approveProjectSkill. */
@@ -3336,17 +3355,24 @@ export class PiResourceManager {
   async #removeInstalledIncarnation(record: StoredResource): Promise<void> {
     assertExpectedInstalledLocation(this.#managedRoot, record);
     const generation = installedGenerationContainer(this.#managedRoot, record);
-    const generationKey = pathIdentity(generation);
-    if ((this.#installedGenerationLeases.get(generationKey) ?? 0) > 0) {
-      this.#retiredInstalledGenerations.set(generationKey, { record, generation });
-      return;
-    }
-    await removeOwnedPath(
-      this.#managedRoot,
-      generation,
-      "Retired installed resource"
-    );
-    await this.#pruneResourceOwner(record);
+    await this.#retireGeneration(pathIdentity(generation), async () => {
+      await removeOwnedPath(this.#managedRoot, generation, "Retired installed resource");
+      await this.#pruneResourceOwner(record);
+    });
+  }
+
+  async #retireUnusedRemoteCapture(record: StoredResource): Promise<void> {
+    const { source } = record;
+    // Approved captures may still be supplying a native snapshot. Startup
+    // recovery can collect them after the old snapshot builders are gone.
+    if (source.kind !== "remote_project" || record.approvedAt !== undefined) return;
+    const owner = this.#remoteProjectSkills!;
+    await this.#retireGeneration(pathIdentity(owner.localPath(source)), () => owner.discard(source));
+  }
+
+  async #retireGeneration(generationKey: string, cleanup: () => Promise<void>): Promise<void> {
+    if (this.#generationLeases.has(generationKey)) this.#retiredGenerationCleanup.set(generationKey, cleanup);
+    else await cleanup();
   }
 
   async #removeResourceOwner(record: StoredResource): Promise<void> {
@@ -3357,21 +3383,17 @@ export class PiResourceManager {
     await this.#pruneResourceOwner(record);
   }
 
-  async #releaseInstalledPackageGeneration(generationKey: string): Promise<void> {
+  async #releaseGeneration(generationKey: string): Promise<void> {
     await this.#mutate(async () => {
-      const count = this.#installedGenerationLeases.get(generationKey);
-      if (count === undefined || count < 1) throw new Error("Installed package lease accounting is inconsistent.");
+      const count = this.#generationLeases.get(generationKey);
+      if (count === undefined || count < 1) throw new Error("Resource generation lease accounting is inconsistent.");
       if (count > 1) {
-        this.#installedGenerationLeases.set(generationKey, count - 1);
+        this.#generationLeases.set(generationKey, count - 1);
         return;
       }
-      const retired = this.#retiredInstalledGenerations.get(generationKey);
-      if (retired !== undefined) {
-        await removeOwnedPath(this.#managedRoot, retired.generation, "Retired leased resource generation");
-        await this.#pruneResourceOwner(retired.record);
-        this.#retiredInstalledGenerations.delete(generationKey);
-      }
-      this.#installedGenerationLeases.delete(generationKey);
+      await this.#retiredGenerationCleanup.get(generationKey)?.();
+      this.#retiredGenerationCleanup.delete(generationKey);
+      this.#generationLeases.delete(generationKey);
     });
   }
 

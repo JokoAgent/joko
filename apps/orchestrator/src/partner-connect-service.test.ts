@@ -645,14 +645,28 @@ describe("PartnerService", () => {
     const preferences = new PartnerMemoryPreferences(f.operationalStore, await CredentialVault.open(join(f.directory, "master.key")));
     const session = f.operationalStore.getSession(partner.canonicalSessionId!).descriptor;
     const read = vi.fn(async (_id: string, assertCurrent: () => void) => { assertCurrent(); return undefined as { profileProjection: { identity: string; user: string; instructions: string } } | undefined; });
-    const memory = new MakerMemoryController({ store: f.operationalStore, targetPreferences: preferences }); cleanups.push(() => memory.dispose());
+    const memory = new MakerMemoryController({ store: f.operationalStore, targetPreferences: preferences, partnerProfiles: f.partnerStore });
+    cleanups.push(() => memory.dispose());
     const resolver = new PartnerRuntimePromptResolver(f.partnerStore, f.operationalStore, preferences, read, memory);
     const before = f.operationalStore.getSession(session.id);
     expect(await resolver.resolve(session, () => undefined)).toContain(partner.identitySource);
     expect(await resolver.resolve(session, () => undefined)).toContain("Current index");
+    await memory.update({ makerEnabled: false });
+    const bridge = new MakerMemoryBridgeProvider(memory);
+    const toolContext = { targetId: partner.homeTargetId, sessionId: session.id, generation: session.binding.generation };
+    expect(memory.available).toBe(false);
+    expect(bridge.available && bridge.includeForTarget(partner.homeTargetId)).toBe(true);
+    expect(bridge.includeForTarget("ordinary-project")).toBe(false);
+    await expect(bridge.callTool("memory_write", {
+      type: "user", name: "writing-style", title: "Writing style", description: "An approved preference", body: "Use short paragraphs."
+    }, undefined, toolContext)).resolves.toMatchObject({ isError: false });
+    await expect(bridge.callTool("memory_list", {}, undefined, { ...toolContext, targetId: "ordinary-project" }))
+      .rejects.toThrow("disabled");
+    expect(await resolver.resolve(session, () => undefined)).toContain("Writing style");
     let saved = preferences.update(partner.homeTargetId, undefined, { enabled: false, userContext: "User profile stays independent of memory." });
     expect(await resolver.resolve(session, () => undefined)).toContain("User profile stays independent of memory.");
     expect(await resolver.resolve(session, () => undefined)).not.toContain("Current index");
+    await expect(bridge.callTool("memory_list", {}, undefined, toolContext)).rejects.toThrow("disabled");
     read.mockResolvedValue({ profileProjection: { identity: partner.identitySource, user: "Imported profile.", instructions: "Complete imported instructions." } });
     const overridden = await resolver.resolve(session, () => undefined);
     expect(overridden).toContain("Complete imported instructions."); expect(overridden).not.toContain("Imported profile.");
