@@ -44,6 +44,7 @@ import {
   ScheduleMisfirePolicy,
   ScheduleOverlapPolicy,
   ScheduleRecurrenceSchema,
+  ScheduleSessionMode,
   SendInputMutationSchema,
   SessionExportFormat,
   SetSessionPermissionMutationSchema,
@@ -440,7 +441,8 @@ export function planModeMutation(sessionId: string, enabled: boolean): Operation
 export function createManualScheduleMutation(input: {
   readonly backendId: string;
   readonly targetId: string;
-  readonly sessionId: string;
+  readonly sessionId?: string;
+  readonly sessionMode?: ScheduleSessionMode;
   readonly text: string;
   readonly execution?: MessageInitShape<typeof ScheduleExecutionSnapshotSchema>;
 }): OperationMutation {
@@ -452,6 +454,7 @@ export function createManualScheduleMutation(input: {
     backendId: input.backendId,
     targetId: input.targetId,
     sessionId: input.sessionId,
+    sessionMode: input.sessionMode,
     recurrence,
     timeZone: "UTC",
     input: textInput(input.text),
