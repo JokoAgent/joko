@@ -3517,9 +3517,11 @@ export class MobileClient {
             priorInteractionIds = undefined;
           }
         });
+        // The approval stream and its receipt belong to this live connection.
+        // A forced refresh here would retire the RPC waiting for the decision.
         return { result, interaction,
-          resolve: (displayed, submission) => settle(displayed, exact => this.#resolvePendingInteraction(exact, submission)),
-          dismiss: displayed => settle(displayed, exact => this.#dismissPendingInteraction(exact)) };
+          resolve: (displayed, submission) => settle(displayed, exact => this.#resolvePendingInteraction(exact, submission, false)),
+          dismiss: displayed => settle(displayed, exact => this.#dismissPendingInteraction(exact, false)) };
       },
       detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current, false)),
       setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
@@ -13849,7 +13851,7 @@ export class MobileClient {
     return this.#resolvePendingInteraction(this.#interactionContext(interactionId), submission);
   }
 
-  async #resolvePendingInteraction(interaction: Interaction, submission: MobileInteractionSubmission): Promise<boolean> {
+  async #resolvePendingInteraction(interaction: Interaction, submission: MobileInteractionSubmission, refreshAfter = true): Promise<boolean> {
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     const credential = this.#ready();
     const resolution = createMobileInteractionResolution(interaction, submission, credential.connectionId);
@@ -13864,7 +13866,7 @@ export class MobileClient {
           resolution
         }) }
       }), { kind: "interaction-resolve", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
-        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, !concurrentUserShell);
+        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, refreshAfter && !concurrentUserShell);
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -13873,7 +13875,7 @@ export class MobileClient {
     return this.#dismissPendingInteraction(this.#interactionContext(interactionId));
   }
 
-  async #dismissPendingInteraction(interaction: Interaction): Promise<boolean> {
+  async #dismissPendingInteraction(interaction: Interaction, refreshAfter = true): Promise<boolean> {
     this.#assertNoPendingInteractionMutation(interaction.sessionId, interaction.interactionId);
     this.#ready();
     const concurrentUserShell = this.#userShellFlight?.sessionId === interaction.sessionId;
@@ -13887,7 +13889,7 @@ export class MobileClient {
           reason: "Dismissed by user on mobile"
         }) }
       }), { kind: "interaction-dismiss", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
-        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, !concurrentUserShell);
+        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, refreshAfter && !concurrentUserShell);
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
