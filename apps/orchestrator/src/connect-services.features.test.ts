@@ -21,7 +21,7 @@ import { BrowserSettingsController } from "./browser-settings.js";
 import { createConnectServices, registerConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { ProviderAuthUnsupportedError, type CredentialManager } from "./credential-manager.js";
-import { McpRouter } from "./mcp-router.js";
+import { McpRouter, type McpClientFactoryInput } from "./mcp-router.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
@@ -2370,6 +2370,61 @@ describe("Connect typed feature boundaries", () => {
       await host.dispose();
       store.close();
       fetch.mockRestore();
+    }
+  });
+
+  it.each(["restartMcpServer", "deleteMcpServer"] as const)("blocks queued %s after device revocation", async (kind) => {
+    const store = new OperationalStore(":memory:");
+    const host = new SessionHost(store, {} as never, []);
+    const connections = new ConnectionManager(store);
+    const owner = store.createConnection({ id: "mcp-owner", name: "Owner", authKeyDigest: digestAuthKey("mcp-owner-key") });
+    const resolveCredential = vi.fn(() => "Bearer isolated-test-value");
+    let enter!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { enter = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const close = vi.fn(async () => undefined);
+    const connect = vi.fn(async ({ config }: McpClientFactoryInput) => {
+      if (config.id === "held") { enter(); await held; }
+      return { listTools: async () => ({ tools: [] }), callTool: async () => ({ content: [], isError: false }),
+        readResource: async () => ({ contents: [] }), close };
+    });
+    const credentials = { resolve: resolveCredential, find: () => ({ configured: true, generation: "test-generation" }) } as unknown as CredentialManager;
+    const router = new McpRouter({ store, credentials, clientFactory: { connect } });
+    const settings = { displayName: "Test server", enabled: true, transport: "streamable_http" as const, credentialBindings: [] };
+    const refreshPiGeneration = vi.fn(async () => undefined);
+    const services = createConnectServices(stubApplication({ store, connections, mcpRouter: router, refreshPiGeneration,
+      sessionHost: { mutate: host.mutate.bind(host) } }));
+    let first: ReturnType<McpRouter["upsert"]> | undefined;
+    try {
+      await router.initialize();
+      const original = await router.upsert({ ...settings, id: "kept", endpoint: "http://127.0.0.1:9999/kept",
+        credentialBindings: [{ target: "header", name: "Authorization", credentialReferenceId: "cred_isolated_test" }] });
+      expect(original.state).toBe("connected");
+      first = router.upsert({ ...settings, id: "held", endpoint: "http://127.0.0.1:9999/held" });
+      await Promise.race([started, first.then(() => { throw new Error("The blocking MCP mutation did not reach initialization."); })]);
+      const pending = invoke<contract.SubmitOperationResponse>(services.operation.submitOperation, create(contract.SubmitOperationRequestSchema, {
+        operationId: "queued-mcp-change", connectionId: owner.id, mutation: { payload: { case: kind, value: { mcpServerId: original.id } } }
+      }), { requestHeader: new Headers({ authorization: "Bearer mcp-owner-key" }) });
+      expect(store.getOperation("queued-mcp-change").status).toBe("started");
+      connections.revokeDevice(owner.deviceId);
+      release();
+      await first;
+      await expect(pending).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED } });
+      expect(router.get(original.id)).toEqual(original);
+      expect(store.getSetting("service", "orchestrator", "mcp_catalog").value).toMatchObject({ servers: [
+        { input: { id: "held" } }, { input: { id: original.id }, generation: original.runtimeGeneration }
+      ] });
+      expect(connect.mock.calls.map(([input]) => input.config.id)).toEqual(["kept", "held"]);
+      expect(resolveCredential).toHaveBeenCalledTimes(1);
+      expect(close).not.toHaveBeenCalled();
+      expect(refreshPiGeneration).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await first?.catch(() => undefined);
+      await router.dispose();
+      await host.dispose();
+      store.close();
     }
   });
 

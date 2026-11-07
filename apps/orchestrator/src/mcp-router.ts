@@ -797,9 +797,10 @@ export class McpRouter {
     });
   }
 
-  async restart(serverId: string): Promise<McpServerDescriptor> {
+  async restart(serverId: string, assertCurrent?: () => void): Promise<McpServerDescriptor> {
     this.#assertInitialized();
     return this.#mutate(async () => {
+      assertCurrent?.();
       const current = this.#requireServer(serverId);
       if (!current.input.enabled) throw new Error("Disabled MCP server cannot be restarted.");
       if (unsafeStdioArguments(current.input)) throw new Error(MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR);
@@ -818,15 +819,16 @@ export class McpRouter {
         throw error;
       }
       this.#states.set(serverId, { state: "starting", generation: next.generation });
-      try { await this.#start(next); } catch { /* descriptor contains failure */ }
+      try { await this.#start(next, assertCurrent); } catch { /* descriptor contains failure */ }
       await this.#retireUnused(serverId);
       return this.#descriptor(next);
     });
   }
 
-  async delete(serverId: string): Promise<boolean> {
+  async delete(serverId: string, assertCurrent?: () => void): Promise<boolean> {
     this.#assertInitialized();
     return this.#mutate(async () => {
+      assertCurrent?.();
       const existing = this.#servers.get(serverId);
       if (existing === undefined) return false;
       this.#servers.delete(serverId);
