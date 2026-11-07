@@ -264,6 +264,8 @@ export interface RemoteDirectoryEntry {
   readonly kind: RemoteFileKind;
 }
 
+export const MAXIMUM_MANAGED_PI_EXECUTABLE_BYTES = 128 * 1024 * 1024;
+
 export interface RemoteFileReadRequest {
   readonly path: string;
   readonly maximumBytes: number;
@@ -271,6 +273,8 @@ export interface RemoteFileReadRequest {
   readonly expectedVersion?: string;
   /** Return a bounded prefix when the file is larger instead of failing closed. */
   readonly allowTruncated?: boolean;
+  /** Internal transfer allowance for the staged SSH Pi release executable. */
+  readonly managedPiExecutable?: true;
   readonly signal?: AbortSignal;
 }
 
@@ -282,6 +286,8 @@ export interface RemoteFileWriteRequest {
   readonly atomic?: boolean;
   /** Atomically create a new regular file; existing files and symlinks fail. */
   readonly createOnly?: boolean;
+  /** Internal transfer allowance for the staged SSH Pi release executable. */
+  readonly managedPiExecutable?: true;
   readonly signal?: AbortSignal;
 }
 

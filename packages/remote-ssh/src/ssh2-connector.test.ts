@@ -323,6 +323,16 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
       allowTruncated: true
     })).toString("utf8")).toBe("remo");
 
+    const managedPi = `/.joko/runtime/${"a".repeat(32)}/bin/${"b".repeat(64)}/pi`;
+    const releaseSize = 104_974_464;
+    await expect(files.read({ path: "/workspace/nested/note.txt", maximumBytes: releaseSize, managedPiExecutable: true }))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    await expect(files.write({ path: "/workspace/nested/note.txt", content: Buffer.of(0), atomic: true, managedPiExecutable: true }))
+      .rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    await files.write({ path: managedPi, content: Buffer.from("fixture"), atomic: true, createParents: true, managedPiExecutable: true, mode: 0o700 });
+    await expect(files.read({ path: managedPi, maximumBytes: releaseSize })).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    expect(Buffer.from(await files.read({ path: managedPi, maximumBytes: releaseSize, managedPiExecutable: true })).toString()).toBe("fixture");
+
     await files.write({ path: "/workspace/nested/receipt.bin", content: Buffer.from("first"), createOnly: true });
     await expect(files.write({ path: "/workspace/nested/receipt.bin", content: Buffer.from("replacement"), createOnly: true })).rejects.toMatchObject({ code: "FILE_TRANSFER_FAILED" });
     expect(Buffer.from(await files.read({ path: "/workspace/nested/receipt.bin", maximumBytes: 16 })).toString()).toBe("first");

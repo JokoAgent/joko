@@ -34,12 +34,13 @@ import {
 } from "@joko/adapter-pi";
 import type { AdapterContext, NativeSessionBinding, NativeSessionDerivationLifecycle, RemoteWorkspaceBinding } from "@joko/core";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
-import type {
-  RemoteFileTransportPort,
-  RemoteForwardingTransportPort,
-  RemoteProcessHandle,
-  RemoteProcessTransportPort,
-  RemoteReverseForwardHandle
+import {
+  MAXIMUM_MANAGED_PI_EXECUTABLE_BYTES,
+  type RemoteFileTransportPort,
+  type RemoteForwardingTransportPort,
+  type RemoteProcessHandle,
+  type RemoteProcessTransportPort,
+  type RemoteReverseForwardHandle
 } from "@joko/remote-ssh";
 import type { OperationalStore } from "@joko/store";
 
@@ -56,6 +57,10 @@ import { REMOTE_PI_SESSION_SOURCE, REMOTE_PI_SESSION_SOURCE_SHA256 } from "./rem
 const MAXIMUM_SYNC_FILES = 20_000;
 const MAXIMUM_SYNC_BYTES = 128 * 1024 * 1024;
 const MAXIMUM_SYNC_FILE_BYTES = 64 * 1024 * 1024;
+const PI_RELEASE_STARTUP_MEMBERS: Readonly<Record<string, readonly string[]>> = {
+  "": ["package.json", "pi", "theme"],
+  theme: ["dark.json", "light.json"]
+};
 const MAXIMUM_BROKER_BOOTSTRAP_BYTES = 1024 * 1024;
 const MAXIMUM_AUTHORITY_BYTES = 64 * 1024;
 const AUTHORITY_CONTROL_TIMEOUT_MS = 10_000;
@@ -655,7 +660,11 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
 
     let commandSnapshot: LocalAssetSnapshot | undefined;
     if (isAbsolute(spec.command) && !/^(?:node|electron)(?:\.exe)?$/iu.test(basename(spec.command))) {
-      commandSnapshot = await snapshotAsset(spec.command);
+      const standaloneRelease = binding.kind === "ssh" && basename(spec.command) === "pi"
+        && (await lstat(spec.command)).size > MAXIMUM_SYNC_FILE_BYTES;
+      commandSnapshot = standaloneRelease
+        ? await snapshotLocalCompatibilityAsset(dirname(resolve(spec.command)), "pi_release")
+        : await snapshotAsset(spec.command);
       compatibilityAssets.push({
         role: "command",
         name: safeRemoteName(basename(spec.command)),
@@ -790,6 +799,9 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       }
     };
     const initialAttachment = await openAttachment(initialAuthority, assertStartupCurrent);
+    // Reattachment requires the attested child and never stages a replacement.
+    // Release launch bytes once the initial child has been accepted.
+    stagingPlans.length = 0;
     return new MappedRemotePiProcess({
       initialAttachment,
       reattach: async () => {
@@ -2847,6 +2859,7 @@ interface LocalAssetSnapshotEntry {
   readonly kind: "file" | "directory";
   readonly mode: number;
   readonly content?: Buffer;
+  readonly managedPiExecutable?: true;
 }
 
 interface LocalAssetSnapshot {
@@ -2955,14 +2968,15 @@ async function stageLocalAssetSnapshot(
     budget.bytes += content.byteLength;
     if (
       budget.files > MAXIMUM_SYNC_FILES || budget.bytes > MAXIMUM_SYNC_BYTES ||
-      content.byteLength > MAXIMUM_SYNC_FILE_BYTES
+      content.byteLength > (entry.managedPiExecutable === true ? MAXIMUM_MANAGED_PI_EXECUTABLE_BYTES : MAXIMUM_SYNC_FILE_BYTES)
     ) throw new Error("Remote runtime resource synchronization exceeded its safety limit.");
     await files.write({
       path: destination,
       content,
       mode: entry.mode & 0o777,
       createParents: true,
-      atomic: true
+      atomic: true,
+      ...(entry.managedPiExecutable === true ? { managedPiExecutable: true } : {})
     });
   }
   await verifyRemoteAssetSnapshot(files, remote, snapshot);
@@ -2987,11 +3001,12 @@ async function verifyRemoteAssetSnapshot(
       if (info.size !== expected.byteLength) {
         throw new Error("Remote runtime resource failed its staged size fence.");
       }
-      const actual = Buffer.from(await files.read({
+      const bytes = await files.read({
         path: destination,
-        maximumBytes: Math.max(1, expected.byteLength)
-      }));
-      if (!actual.equals(expected)) {
+        maximumBytes: Math.max(1, expected.byteLength),
+        ...(entry.managedPiExecutable === true ? { managedPiExecutable: true } : {})
+      });
+      if (!expected.equals(bytes)) {
         throw new Error("Remote runtime resource failed its staged content fence.");
       }
       continue;
@@ -3135,10 +3150,13 @@ function remoteCommand(
   if (executableName.toLowerCase() === "electron") return "node";
   if (!isAbsolute(localCommand)) return localCommand;
   if (executableName.toLowerCase() === "node") return "node";
-  const remote = remotePathsFor(remoteRuntime).join(remoteRuntime, "bin", safeRemoteName(executableName));
+  const paths = remotePathsFor(remoteRuntime);
+  const release = snapshot?.entries.some(entry => entry.managedPiExecutable === true) === true;
+  const remoteRoot = release ? paths.join(remoteRuntime, "bin", snapshot!.digest) : paths.join(remoteRuntime, "bin");
+  const remote = paths.join(remoteRoot, safeRemoteName(executableName));
   stagingPlans.push({
-    local: resolve(localCommand),
-    remote,
+    local: release ? dirname(resolve(localCommand)) : resolve(localCommand),
+    remote: release ? remoteRoot : remote,
     ...(snapshot === undefined ? {} : { snapshot })
   });
   pathMap.set(resolve(localCommand), remote);
@@ -3347,7 +3365,7 @@ function compatibilityAssetRole(
   return undefined;
 }
 
-async function snapshotLocalCompatibilityAsset(root: string): Promise<LocalAssetSnapshot> {
+async function snapshotLocalCompatibilityAsset(root: string, kind?: "pi_release"): Promise<LocalAssetSnapshot> {
   const entries: LocalAssetSnapshotEntry[] = [];
   const budget = { files: 0, bytes: 0 };
   const visit = async (path: string, relativePath: string, depth: number): Promise<void> => {
@@ -3356,13 +3374,16 @@ async function snapshotLocalCompatibilityAsset(root: string): Promise<LocalAsset
     if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) {
       throw new Error("Remote Pi compatibility assets must be regular files or directories.");
     }
+    const releaseMembers = kind === "pi_release" ? PI_RELEASE_STARTUP_MEMBERS[relativePath] : undefined;
+    if (kind === "pi_release" && info.isDirectory() !== (releaseMembers !== undefined)) {
+      throw new Error("Remote Pi release startup assets have an unexpected layout.");
+    }
     if (info.isDirectory()) {
       entries.push({ path: relativePath, kind: "directory", mode: info.mode });
-      const directoryEntries = await readdir(path, { withFileTypes: true });
-      directoryEntries.sort((left, right) => left.name.localeCompare(right.name));
-      for (const entry of directoryEntries) {
-        if (!/^[^/\\\0]+$/u.test(entry.name)) throw new Error("Remote Pi compatibility asset name is invalid.");
-        await visit(resolve(path, entry.name), relativePath === "" ? entry.name : `${relativePath}/${entry.name}`, depth + 1);
+      const names = releaseMembers ?? (await readdir(path)).sort((left, right) => left.localeCompare(right));
+      for (const name of names) {
+        if (!/^[^/\\\0]+$/u.test(name)) throw new Error("Remote Pi compatibility asset name is invalid.");
+        await visit(resolve(path, name), relativePath === "" ? name : `${relativePath}/${name}`, depth + 1);
       }
       const after = await lstat(path);
       if (
@@ -3373,9 +3394,10 @@ async function snapshotLocalCompatibilityAsset(root: string): Promise<LocalAsset
     }
     budget.files += 1;
     budget.bytes += info.size;
+    const managedPiExecutable = kind === "pi_release" && relativePath === "pi";
     if (
       budget.files > MAXIMUM_SYNC_FILES || budget.bytes > MAXIMUM_SYNC_BYTES ||
-      info.size > MAXIMUM_SYNC_FILE_BYTES
+      info.size > (managedPiExecutable ? MAXIMUM_MANAGED_PI_EXECUTABLE_BYTES : MAXIMUM_SYNC_FILE_BYTES)
     ) throw new Error("Remote Pi compatibility asset digest exceeded its safety limit.");
     const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
     const handle = await open(path, fsConstants.O_RDONLY | noFollow);
@@ -3385,14 +3407,23 @@ async function snapshotLocalCompatibilityAsset(root: string): Promise<LocalAsset
         throw new Error("Remote Pi compatibility asset is not a single-link regular file.");
       }
       assertStableResourceFile(info, opened);
-      const content = await handle.readFile();
+      const content = Buffer.allocUnsafe(opened.size);
+      for (let offset = 0; offset < content.byteLength;) {
+        const { bytesRead } = await handle.read(content, offset, content.byteLength - offset, offset);
+        if (bytesRead === 0) throw new Error("Remote Pi compatibility asset ended before its recorded size.");
+        offset += bytesRead;
+      }
       assertStableResourceFile(opened, await handle.stat());
       const pathAfterRead = await lstat(path);
       if (!pathAfterRead.isFile() || pathAfterRead.isSymbolicLink()) {
         throw new Error("Remote Pi compatibility asset changed while it was snapshotted.");
       }
       assertStableResourceFile(opened, pathAfterRead);
-      entries.push({ path: relativePath, kind: "file", mode: opened.mode, content });
+      if (managedPiExecutable && (content.byteLength < 20 || content.readUInt32BE(0) !== 0x7f454c46
+        || content[4] !== 2 || content[5] !== 1 || ![0x3e, 0xb7].includes(content.readUInt16LE(18)))) {
+        throw new Error("Remote Pi release requires a Linux x64 or arm64 executable.");
+      }
+      entries.push({ path: relativePath, kind: "file", mode: opened.mode, content, ...(managedPiExecutable ? { managedPiExecutable: true } : {}) });
     } finally {
       await handle.close();
     }
