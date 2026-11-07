@@ -63,9 +63,9 @@ let desktop: ElectronApplication | undefined;
 let desktopIdentity: OwnedDesktopProcess | undefined;
 let profileDirectory: string | undefined;
 
-afterEach(async () => {
+afterEach(async ({ task }) => {
   try {
-    await closeDesktop();
+    await closeDesktop(task.result?.state === "fail");
   } finally {
     await fixture?.close();
     fixture = undefined;
@@ -173,6 +173,7 @@ packagedIt("searches completed and paged older messages through packaged Desktop
   await waitFor(async () => { await searchIndex.drain(); return searchIndex.status(); },
     (status) => status.doneCount === 5 && status.pendingCount === 0, "indexed Desktop search turns");
   expect(searchIndex.status().vectorAvailable).toBe(true);
+  console.info("Packaged search fixture and index are ready.");
 
   const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Search Desktop" });
   if (challenge.challenge === undefined) throw new Error("Desktop pairing returned no challenge.");
@@ -199,6 +200,8 @@ packagedIt("searches completed and paged older messages through packaged Desktop
     throw new Error("Search Desktop did not use its isolated profile.");
   }
   const page = await desktop.firstWindow({ timeout: 60_000 });
+  page.setDefaultTimeout(30_000);
+  page.setDefaultNavigationTimeout(30_000);
   const pageErrors: string[] = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
@@ -209,6 +212,7 @@ packagedIt("searches completed and paged older messages through packaged Desktop
   await page.getByLabel("Device name").fill("Search Desktop");
   await page.locator("form.pair-form button[type=submit]").click();
   await page.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged search Desktop is paired.");
 
   const searchInput = page.locator("#conversation-search-input");
   await searchInput.fill("mosaicneedle");
@@ -263,6 +267,7 @@ packagedIt("searches completed and paged older messages through packaged Desktop
   await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 1_100));
   expect(embeddingQueries).toHaveLength(queryCountAfterLoss);
   expect(await page.locator(".sidebar-search__status--error").count()).toBe(0);
+  console.info("Packaged search lexical fallback is verified.");
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Connect", exact: true }).click({ timeout: 30_000 });
   await page.locator('.app').waitFor({ state: 'visible', timeout: 30_000 });
@@ -301,6 +306,7 @@ packagedIt("searches completed and paged older messages through packaged Desktop
   }
   expect(latestPage.nextBeforeCursor).toBeDefined();
   expect(latestPage.events.some((event) => earlyEventIds.has(event.eventId))).toBe(false);
+  console.info("Packaged search reached the older-page boundary.");
 
   await page.getByRole("button", { name: "Open navigation" }).click();
   await searchInput.waitFor({ state: "visible", timeout: 10_000 });
@@ -338,6 +344,7 @@ packagedIt("searches completed and paged older messages through packaged Desktop
   await oldAlphaFocus.waitFor({ state: "visible", timeout: 30_000 });
   expect(await oldAlphaFocus.innerText()).not.toContain("mosaicneedle beta one");
   expect(pageErrors).toEqual([]);
+  console.info("Packaged search is ready for normal Desktop exit.");
   await closeDesktop();
 });
 
@@ -355,7 +362,7 @@ async function openSearchFilter(page: Page): Promise<void> {
   if (await filter.getAttribute('open') === null) await filter.locator('summary').click();
 }
 
-async function closeDesktop(): Promise<void> {
+async function closeDesktop(afterFailure = false): Promise<void> {
   if (desktopIdentity === undefined) return;
   const original = desktopIdentity;
   const current = await readOwnedDesktopProcess(original.pid);
@@ -364,24 +371,29 @@ async function closeDesktop(): Promise<void> {
     throw new Error("Search Desktop cleanup refused a changed process identity.");
   }
   if (current !== undefined) {
-    await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    if (afterFailure) await stopDesktopProcess(original.pid);
+    else void desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
     try {
       await waitFor(() => readOwnedDesktopProcess(original.pid), (candidate) => candidate === undefined,
         "Search Desktop complete exit", 30_000);
     } catch (error) {
       const stillOwned = await readOwnedDesktopProcess(original.pid);
-      if (stillOwned !== undefined && stillOwned.executablePath.toLowerCase() === original.executablePath.toLowerCase()
+      if (!afterFailure && stillOwned !== undefined && stillOwned.executablePath.toLowerCase() === original.executablePath.toLowerCase()
         && stillOwned.startedAt === original.startedAt) {
-        await new Promise<void>((resolveKill, rejectKill) => {
-          execFile("taskkill.exe", ["/PID", String(original.pid), "/T", "/F"],
-            { windowsHide: true, timeout: 10_000 }, (killError) => killError ? rejectKill(killError) : resolveKill());
-        });
+        await stopDesktopProcess(original.pid);
       }
-      throw new Error("Search Desktop did not complete its normal exit.", { cause: error });
+      throw new Error(afterFailure ? "Search Desktop cleanup did not finish." : "Search Desktop did not complete its normal exit.", { cause: error });
     }
   }
   desktopIdentity = undefined;
   desktop = undefined;
+}
+
+function stopDesktopProcess(pid: number): Promise<void> {
+  return new Promise((resolveKill, rejectKill) => {
+    execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"],
+      { windowsHide: true, timeout: 10_000 }, (error) => error ? rejectKill(error) : resolveKill());
+  });
 }
 
 async function readOwnedDesktopProcess(pid: number): Promise<OwnedDesktopProcess | undefined> {
