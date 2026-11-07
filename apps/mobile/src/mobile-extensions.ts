@@ -5,7 +5,9 @@ import {
   ExtensionSetupFieldKind,
   ExtensionSetupState,
   type ExtensionCatalogEntry,
-  type ExtensionMainViewSurface
+  type ExtensionMainViewSurface,
+  type ExtensionTaskPreferences,
+  type ExtensionTaskRoute
 } from "@joko/contracts";
 import type { ExtensionLibraryFileMatch } from "@joko/connection-transport";
 import type {
@@ -28,6 +30,13 @@ const FORBIDDEN_RECOMMENDATION_LABEL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\
 const FORBIDDEN_RECOMMENDATION_PROMPT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const MAXIMUM_CATALOG_ENTRIES = 10_000;
 const MAXIMUM_CATALOG_PAGES = 10_000;
+
+export function mobileExtensionTaskTarget(preferences: ExtensionTaskPreferences, model: ExtensionTaskRoute | undefined): string | undefined {
+  const targetId = preferences.targetId;
+  if (model === undefined || targetId === undefined) return targetId;
+  const directoryBackend = preferences.directories.find(directory => directory.targetId === targetId)?.backendId ?? preferences.model?.backendId;
+  return directoryBackend !== undefined && model.backendId !== directoryBackend ? undefined : targetId;
+}
 
 export type MobileExtensionOwner =
   | {

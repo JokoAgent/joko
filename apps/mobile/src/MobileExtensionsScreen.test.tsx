@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { create } from "@bufbuild/protobuf";
+import { ExtensionTaskPreferencesSchema, PermissionMode } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileExtensionsScreen, type MobileExtensionsScreenProps } from "./MobileExtensionsScreen";
 import { MobileExtensionPackages } from "./MobileExtensionPackages";
@@ -64,6 +66,8 @@ vi.mock("react-native", async () => {
     Pressable: element("button"),
     ScrollView: element("div"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
+    Switch: ({ accessibilityLabel, disabled, value }: { accessibilityLabel: string; disabled: boolean; value: boolean }) =>
+      React.createElement("input", { "aria-label": accessibilityLabel, type: "checkbox", checked: value, disabled, readOnly: true }),
     Text: element("span"),
     TextInput: ({ accessibilityLabel, onChangeText, value, editable = true, secureTextEntry = false, testID,
       ...props }: {
@@ -292,6 +296,36 @@ describe("MobileExtensionsScreen", () => {
     });
     expect(container.textContent).not.toContain("Review Mail");
     expect(container.textContent).toContain("Calendar");
+  });
+
+  it("keeps the plugin task draft across same-owner renders and shows when the new model changes directories", async () => {
+    const model = { backendId: "pi", providerId: "local", modelId: "pi-model" };
+    const other = { backendId: "codex", providerId: "local", modelId: "codex-model" };
+    const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: mail.extensionId, revision: { value: 7n },
+      showPreferences: true, tasksAvailable: true, permissionMode: PermissionMode.ASK, model, targetId: "approved",
+      directories: [{ targetId: "approved", backendId: "pi", name: "Approved project" }],
+      models: [{ name: "Pi model", route: model }, { name: "Codex model", route: other }] });
+    const getTaskPreferences = vi.fn(async () => preferences);
+    const setTaskPreferences = vi.fn<NonNullable<MobileExtensionTransport["setTaskPreferences"]>>(async () => preferences);
+    const active = { ...transport(), getTaskPreferences, setTaskPreferences };
+    await render(active);
+    await press("View Mail");
+    const pressPreference = (label: string) => act(async () => {
+      const button = [...container.querySelectorAll<HTMLButtonElement>('[testid="extensions.task-preferences"] button')]
+        .find(value => value.textContent === label || value.textContent === `✓ ${label}`);
+      expect(button).toBeDefined();
+      button!.click();
+    });
+    await pressPreference("Accept file edits");
+    await pressPreference("Pi model · local");
+    await pressPreference("Codex model · codex · local");
+    expect(container.textContent).toContain("Saving this model will use the plugin’s private directory for new tasks.");
+
+    await render({ ...active });
+    expect(getTaskPreferences).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("✓ Accept file edits");
+    await pressPreference("Save");
+    expect(setTaskPreferences).toHaveBeenCalledExactlyOnceWith(mail, preferences, expect.objectContaining(other), PermissionMode.ACCEPT_EDITS, expect.any(AbortSignal));
   });
 
   it("opens a ready Resource main view in the narrow detail pane and returns without losing detail", async () => {
