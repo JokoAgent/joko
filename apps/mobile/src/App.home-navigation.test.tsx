@@ -9,6 +9,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
 import { mobileMessage } from "./mobile-messages";
+import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { plainTextMobileComposerDraft } from "./mobile-composer-document";
 import type { MobileComposerRichInput } from "./MobileComposerRichInput";
@@ -469,6 +470,37 @@ describe("actual Home navigation hosts", () => {
     expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.search")}"]`)?.value).toBe("Beta");
     expect(button(message("home.filter.archived")).getAttribute("aria-selected")).toBe("true");
     expect(host.textContent).not.toContain("Alpha");
+  });
+
+  it("reopens Home with the saved archive filter and the current node's task list", async () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn(async (key: string) => values.get(key) ?? null),
+      setItem: vi.fn(async (key: string, value: string) => { values.set(key, value); })
+    };
+    const Home = ({ source }: { source: string }) => {
+      const { view, change } = useMobileHomeViewPreference(source, storage);
+      return createElement(SessionsScreen, { ...props, state, viewState: view, onViewStateChange: change });
+    };
+    await act(async () => root.render(createElement(Home, { key: "before", source: "original-pairing" })));
+    await press(message("home.filter.archived"));
+    expect(host.textContent).toContain("Past");
+    await type(message("home.search"), "old search");
+    expect(storage.setItem).toHaveBeenCalledExactlyOnceWith(expect.any(String), "archived");
+
+    const owner = state.owner!;
+    state = { ...state, owner: create(SnapshotSchema, { ...owner, revision: { value: 2n }, sessions: [
+      ...owner.sessions.map(session => session.sessionId === "archived" ? create(SessionSchema, { ...session, archived: false }) : session),
+      create(SessionSchema, { sessionId: "still-archived", targetId: "project", backendId: "backend", displayName: "Still archived", archived: true, state: SessionState.IDLE })
+    ] }) };
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "original-pairing" })));
+    expect(button(message("home.filter.archived")).getAttribute("aria-selected")).toBe("true");
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.search")}"]`)?.value).toBe("");
+    expect(host.textContent).toContain("Still archived");
+    expect(host.textContent).not.toContain("Past");
+
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "another-pairing" })));
+    expect(button(message("home.filter.active")).getAttribute("aria-selected")).toBe("true");
   });
 
   it("hands row, new task, share and menu intents to the host before any navigation effect", async () => {
