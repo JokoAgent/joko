@@ -4784,7 +4784,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       if (!dependencies.extensionCatalog!.get(surface.authority.extensionId).enabled) {
         throw new ConnectError("The plugin is unavailable.", Code.FailedPrecondition);
       }
-      return { models: localExtensionSettingsAgentModels(dependencies) };
+      return { models: localExtensionSettingsAgentModels(dependencies, application.providerGroups) };
     },
     beginExtensionSecretCheck: async (request, context) => {
       const connection = authenticate(context);
@@ -11316,14 +11316,17 @@ async function requireExtensionSettingsSurface(dependencies: ConnectServiceDepen
   return surface;
 }
 
-function localExtensionSettingsAgentModels(dependencies: ConnectServiceDependencies): contract.ExtensionSettingsAgentModel[] {
+function localExtensionSettingsAgentModels(dependencies: ConnectServiceDependencies, providerGroups: OrchestratorApplication["providerGroups"]): contract.ExtensionSettingsAgentModel[] {
+  const sourceCatalog = { store: dependencies.store,
+    ...(dependencies.hostedAgentSources === undefined ? {} : { hostedAgentSources: dependencies.hostedAgentSources }),
+    ...(providerGroups === undefined ? {} : { providerGroups }) };
   return dependencies.store.listBackends().flatMap(({ descriptor: backend }) => {
     const agent = backend.adapterKind === "claude-agent-sdk-stdio" ? "claude-code" : backend.adapterKind;
     if (agent !== "codex" && agent !== "claude-code" && agent !== "pi") return [];
     return dependencies.sessionHost.listSelectableTaskModels(backend.id).flatMap(model => {
       const outputs = model.declaredOutputModalities;
       if (outputs?.length && !outputs.some(output => output.toLowerCase() === "text")) return [];
-      const source = projectModelSource(dependencies, toProtoModelDescriptor(backend.id, model));
+      const source = projectModelSource(sourceCatalog, toProtoModelDescriptor(backend.id, model));
       if (!source.available || source.source?.kind !== contract.ModelSourceKind.LOCAL || source.source.grouped) return [];
       const efforts = backend.capabilities.get("model.effort")?.supported === true ? [...model.thinkingLevels] : [];
       return [create(contract.ExtensionSettingsAgentModelSchema, {
