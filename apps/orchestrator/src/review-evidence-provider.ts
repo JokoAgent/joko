@@ -18,7 +18,7 @@ import {
   type ReviewSourceFileSnapshot
 } from "./review-evidence.js";
 import { MAX_REVIEW_ATTACHMENTS, type StartReviewRequest } from "./review-types.js";
-import { MAX_REVIEW_ARTIFACT_EXCERPT_CHARACTERS } from "./review-prompt.js";
+import { isCanonicalWorkspaceRelativePath, MAX_REVIEW_ARTIFACT_EXCERPT_CHARACTERS } from "./review-prompt.js";
 import type { WorkspaceChange, WorkspaceChangeSetRecord, WorkspaceChangeSetService } from "./workspace-change-set.js";
 import type { GitState, WorkspaceGitDiff, WorkspaceService } from "./workspace-service.js";
 import { listAllQueueItems, listAllVisibleSessionEvents } from "./operational-pagination.js";
@@ -50,7 +50,7 @@ export interface DurableReviewEvidenceProviderOptions {
   readonly pdfText?: (data: Uint8Array, maxChars: number) => Promise<PdfTextWorkerResult>;
 }
 
-/** Captures transient Review evidence; only its domain-separated seal is durable. */
+/** Captures transient Review evidence for the durable seal. */
 export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
   readonly #store: OperationalStore;
   readonly #workspaces: WorkspaceService;
@@ -68,7 +68,8 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
 
   async capture(
     request: StartReviewRequest,
-    purpose: "start" | "reobserve" = "start"
+    purpose: "start" | "reobserve" = "start",
+    focusedWorkspaceFile?: string
   ): Promise<BuildReviewEvidenceInput> {
     assertSourceIdle(this.#store, request.sourceSessionId);
     const source = this.#store.getSession(request.sourceSessionId);
@@ -151,6 +152,13 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
       if (diff.oldRelativePath !== undefined) addReviewPath(selectedPaths, diff.oldRelativePath);
     }
     for (const change of selectedChangeSet?.changes ?? []) addReviewPath(selectedPaths, change.path);
+    const focusCandidate = focusedWorkspaceFile
+      ?? request.focus?.trim().replace(/^(['"])(.*)\1$/u, "$2").replace(/^\.\//u, "").normalize("NFC");
+    const focusedPath = registration.trusted && registration.remote === undefined && target.descriptor.trusted
+      && !source.descriptor.remoteWorkspace && !target.descriptor.remoteWorkspace
+      ? await resolveFocusedReviewFile(registration.root, focusCandidate)
+      : undefined;
+    if (focusedPath !== undefined) selectedPaths.add(focusedPath);
     if (selectedPaths.size > MAX_SELECTED_PATHS) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review selected too many workspace paths.");
     }
@@ -166,7 +174,7 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
       } catch {
         throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review submodule could not be confirmed.");
       }
-    });
+    }, focusedPath);
 
     const attachments = collectAttachments(request, visible);
     assertArtifactBudget(attachments.values);
@@ -211,6 +219,7 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
 
     return {
       ...(request.focus === undefined ? {} : { focus: request.focus }),
+      ...(focusedPath === undefined ? {} : { focusedWorkspaceFile: focusedPath }),
       conversation: {
         sessionId: request.sourceSessionId,
         sessionGeneration: source.descriptor.binding.generation,
@@ -509,13 +518,18 @@ function changeSetEvidenceItem(change: WorkspaceChange): ReviewSourceDiffEvidenc
   };
 }
 
-async function hashSelectedFiles(root: string, paths: readonly string[], readGitlink: (path: string) => Promise<string | undefined>): Promise<ReviewSourceFileSnapshot[]> {
+async function hashSelectedFiles(
+  root: string,
+  paths: readonly string[],
+  readGitlink: (path: string) => Promise<string | undefined>,
+  focusedPath: string | undefined
+): Promise<ReviewSourceFileSnapshot[]> {
   const result: ReviewSourceFileSnapshot[] = [];
   const fileIdentities = new Set<string>();
   let totalBytes = 0;
   for (const path of paths) {
     if (isSensitiveReviewPath(path)) continue;
-    const snapshot = await stableFileSnapshot(root, path, readGitlink, fileIdentities);
+    const snapshot = await stableFileSnapshot(root, path, readGitlink, fileIdentities, path === focusedPath);
     totalBytes += snapshot.byteLength;
     if (totalBytes > MAX_SELECTED_TOTAL_BYTES) {
       throw new ReviewEvidenceCaptureError("artifact-unavailable", "Review selected files exceed the aggregate byte limit.");
@@ -529,7 +543,8 @@ async function stableFileSnapshot(
   root: string,
   path: string,
   readGitlink: (path: string) => Promise<string | undefined>,
-  fileIdentities: Set<string>
+  fileIdentities: Set<string>,
+  exactPath: boolean
 ): Promise<ReviewSourceFileSnapshot> {
   const canonical = canonicalReviewPath(path);
   const absolute = resolve(root, ...canonical.split("/"));
@@ -556,6 +571,9 @@ async function stableFileSnapshot(
     throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review file is unsafe or exceeds its byte limit.");
   }
   const actual = await realpath(absolute);
+  if (exactPath && relative(absolute, actual) !== "") {
+    throw new ReviewEvidenceCaptureError("source-changed", "The selected Review focus file changed its canonical path.");
+  }
   if (!isWithinRoot(root, actual)) throw new ReviewEvidenceCaptureError("artifact-unavailable", "A selected Review file escaped its workspace root.");
   const handle = await open(actual, "r");
   try {
@@ -591,6 +609,19 @@ function isWithinRoot(root: string, candidate: string): boolean {
 function isMissingFileError(error: unknown): boolean {
   return error !== null && typeof error === "object"
     && ((error as { readonly code?: unknown }).code === "ENOENT" || (error as { readonly code?: unknown }).code === "ENOTDIR");
+}
+
+/** A whole focus line may select an existing file. Prose, external paths and
+ * aliases are left as instructions with the original Review permissions. */
+async function resolveFocusedReviewFile(root: string, candidate: string | undefined): Promise<string | undefined> {
+  if (candidate === undefined || !isCanonicalWorkspaceRelativePath(candidate) || isSensitiveReviewPath(candidate)) return undefined;
+  const absolute = resolve(root, candidate);
+  const actual = await realpath(absolute).catch(() => undefined);
+  if (actual === undefined || relative(absolute, actual) !== "") return undefined;
+  const path = relative(root, actual).split(sep).join("/");
+  if (!isCanonicalWorkspaceRelativePath(path) || isSensitiveReviewPath(path)) return undefined;
+  const entry = await lstat(absolute).catch(() => undefined);
+  return entry?.isFile() ? path : undefined;
 }
 
 function addReviewPath(target: Set<string>, path: string): void {

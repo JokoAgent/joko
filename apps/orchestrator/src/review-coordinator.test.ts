@@ -1,4 +1,5 @@
-import { rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalStore, type ConnectionRecord, type OperationExecution } from "@joko/store";
 
+import type { ArtifactStore } from "./artifact-store.js";
 import {
   ReviewCoordinator,
   type CreateFreshReviewerInput,
@@ -15,8 +17,10 @@ import {
   type ReviewRuntimeOutcome
 } from "./review-coordinator.js";
 import { buildReviewEvidence as buildEvidence, type BuildReviewEvidenceInput } from "./review-evidence.js";
-import { ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
+import { DurableReviewEvidenceProvider, ReviewEvidenceCaptureError } from "./review-evidence-provider.js";
 import type { StartReviewRequest } from "./review-types.js";
+import type { WorkspaceChangeSetRecord, WorkspaceChangeSetService } from "./workspace-change-set.js";
+import { WorkspaceService } from "./workspace-service.js";
 
 const cleanups: Array<() => void> = [];
 const hash = (character: string): string => character.repeat(64);
@@ -129,6 +133,57 @@ describe("ReviewCoordinator", () => {
     }));
     expect(fixture.store.getReviewRunBundle(result.reviewRunId).sourceLease.state).toBe("released");
     expect(runtime.order.at(-1)).toBe("close");
+  });
+
+  it.each([
+    { savedFile: "review notes.txt", freshness: "stale" },
+    { savedFile: "unrelated.txt", freshness: "current" }
+  ] as const)("tracks only the explicit Git-ignored Review file when $savedFile is saved", { timeout: 30_000 }, async ({ savedFile, freshness }) => {
+    const { store, connection, directory } = setup();
+    const root = path.join(directory, "workspace"), focusedFile = "review notes.txt";
+    mkdirSync(root);
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    git("init", "--quiet");
+    git("config", "user.name", "Review Test");
+    git("config", "user.email", "review@example.test");
+    writeFileSync(path.join(root, ".gitignore"), `${focusedFile}\nunrelated.txt\n`);
+    writeFileSync(path.join(root, focusedFile), "first notes\n");
+    writeFileSync(path.join(root, "unrelated.txt"), "unrelated\n");
+    git("add", "--", ".gitignore");
+    git("commit", "--quiet", "-m", "Ignore local documents");
+    store.upsertTarget({ ...store.getTarget("target").descriptor, workspaceRoot: root });
+    const workspaces = new WorkspaceService();
+    let finish!: (outcome: ReviewRuntimeOutcome) => void;
+    const outcome = new Promise<ReviewRuntimeOutcome>(resolve => { finish = resolve; });
+    const runtime = new FakeRuntime(store, outcome);
+    const emptyChangeSet: WorkspaceChangeSetRecord = { id: "empty-change-set", baselineId: "empty-baseline",
+      workspaceId: "target", workspaceRoot: root, sessionId: "source", runId: "prior-run",
+      complete: true, gaps: [], changes: [], capturedAt: 1 };
+    const evidence = new DurableReviewEvidenceProvider({ store, workspaces, artifacts: {} as ArtifactStore,
+      workspaceChanges: { listChangeSets: async () => [emptyChangeSet] } as unknown as WorkspaceChangeSetService });
+    const coordinator = new ReviewCoordinator({ store, runtime, evidence });
+    try {
+      await workspaces.register({ id: "target", root, displayName: "Project", trusted: true });
+      const started = await coordinator.start({
+        operationId: "start-review-ignored-file", connection, request: { sourceSessionId: "source", focus: `"${focusedFile}"`, attachments: [] }
+      });
+      expect(started.run.state).toBe("running");
+      expect((await workspaces.preview("target", focusedFile)).text).toBe("first notes\n");
+      const before = await workspaces.preview("target", savedFile);
+      await workspaces.writeTextFile("target", { path: savedFile, expectedRevision: before.entry.revision, text: "second contents\n" });
+      expect(git("status", "--porcelain=v1")).toBe("");
+      finish({ state: "completed", visibleResult: "Conclusion from the original file" });
+      await coordinator.waitForFinalizations();
+      const result = { state: "completed", freshness, result: "Conclusion from the original file" };
+      expect(store.getReviewRun(started.reviewRunId)).toMatchObject(result);
+      const freshCoordinator = new ReviewCoordinator({ store, runtime, evidence });
+      const checked = await freshCoordinator.reobserve({ operationId: "reobserve-ignored-file", connection, reviewRunId: started.reviewRunId });
+      expect(checked.run).toMatchObject(result);
+    } finally {
+      finish({ state: "failed" });
+      await coordinator.waitForFinalizations();
+      await workspaces.close();
+    }
   });
 
   it("keeps a completed conclusion when final artifact evidence becomes unavailable", async () => {
@@ -471,7 +526,7 @@ function requireEvidence(value: BuildReviewEvidenceInput) {
   return buildEvidence(value).freshness;
 }
 
-function setup(): { readonly store: OperationalStore; readonly connection: ConnectionRecord } {
+function setup(): { readonly store: OperationalStore; readonly connection: ConnectionRecord; readonly directory: string } {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-review-coordinator-"));
   const store = new OperationalStore(path.join(directory, "store.sqlite"));
   cleanups.push(() => {
@@ -493,7 +548,7 @@ function setup(): { readonly store: OperationalStore; readonly connection: Conne
     createdAt: 1, updatedAt: 1
   });
   const connection = store.createConnection({ id: "review-test-connection", name: "Review test", authKeyDigest: "review-test-auth" });
-  return { store, connection };
+  return { store, connection, directory };
 }
 
 function startReview(coordinator: ReviewCoordinator, connection: ConnectionRecord, operationId = "start-review-op") {

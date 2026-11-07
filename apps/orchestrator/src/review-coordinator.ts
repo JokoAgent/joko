@@ -16,9 +16,11 @@ import { buildReviewPrompt } from "./review-prompt.js";
 import { readStartReviewRequest, type StartReviewRequest } from "./review-types.js";
 import { reviewTitlePrefix } from "./i18n/orchestration-language.js";
 
+const REVIEW_FOCUS_FILE_KEY = "review.focus-file:";
+
 export interface ReviewEvidenceProvider {
-  /** Captures fresh source truth. The coordinator never logs or persists this return value. */
-  capture(request: StartReviewRequest, purpose?: "start" | "reobserve"): Promise<BuildReviewEvidenceInput>;
+  /** Captures transient evidence and a validated locator for re-observation. */
+  capture(request: StartReviewRequest, purpose?: "start" | "reobserve", focusedWorkspaceFile?: string): Promise<BuildReviewEvidenceInput>;
 }
 
 export interface CreateFreshReviewerInput {
@@ -221,6 +223,7 @@ export class ReviewCoordinator {
       readonly expectedRevision: bigint;
       readonly originalFreshness: ReviewFreshnessSeal;
       readonly request: StartReviewRequest;
+      readonly focusedWorkspaceFile?: string;
     } | undefined;
     let observation: {
       readonly freshness: "current" | "stale" | "unavailable";
@@ -238,9 +241,13 @@ export class ReviewCoordinator {
           throw new InvalidStateTransitionError("review run freshness", "running", "reobserved");
         }
         if (snapshot === undefined) {
+          const focus = store.findSetting<{ readonly version: 1; readonly path: string }>(
+            "session", bundle.run.sourceSessionId, REVIEW_FOCUS_FILE_KEY + bundle.run.id
+          )?.value;
           snapshot = {
             expectedRevision: bundle.run.revision,
             originalFreshness: freshnessSealFromStore(bundle.evidenceSeal),
+            ...(focus?.version === 1 ? { focusedWorkspaceFile: focus.path } : {}),
             request: {
               sourceSessionId: bundle.run.sourceSessionId,
               attachments: bundle.attachments.map((attachment) => ({
@@ -262,7 +269,7 @@ export class ReviewCoordinator {
       effect: async () => {
         if (snapshot === undefined) throw new Error("Review reobservation was not durably admitted.");
         try {
-          const current = buildReviewEvidence(await this.#evidence.capture(snapshot.request, "reobserve"));
+          const current = buildReviewEvidence(await this.#evidence.capture(snapshot.request, "reobserve", snapshot.focusedWorkspaceFile));
           observation = {
             freshness: compareReviewFreshness(snapshot.originalFreshness, current.freshness) === undefined
               ? "current"
@@ -297,18 +304,27 @@ export class ReviewCoordinator {
     const initialEvidence = await this.#evidence.capture(request);
     const firstCapture = buildReviewEvidence(initialEvidence);
     const builtPrompt = buildReviewPrompt(firstCapture.promptInput);
-    const created = this.#store.createReviewRun({
-      id: reviewRunId,
-      sourceSessionId: request.sourceSessionId,
-      targetKind: builtPrompt.targetKind,
-      evidenceSeal: storeSeal(firstCapture.freshness),
-      attachments: request.attachments.map((attachment) => ({
-        kind: attachment.kind,
-        displayName: attachment.displayName,
-        blob: attachment.blob
-      })),
-      operationId,
-      traceId: `review:${reviewRunId}:running`
+    const created = this.#store.transaction(store => {
+      const bundle = store.createReviewRun({
+        id: reviewRunId,
+        sourceSessionId: request.sourceSessionId,
+        targetKind: builtPrompt.targetKind,
+        evidenceSeal: storeSeal(firstCapture.freshness),
+        attachments: request.attachments.map((attachment) => ({
+          kind: attachment.kind,
+          displayName: attachment.displayName,
+          blob: attachment.blob
+        })),
+        operationId,
+        traceId: `review:${reviewRunId}:running`
+      });
+      // Keep only the validated locator needed to re-observe the same file.
+      if (initialEvidence.focusedWorkspaceFile !== undefined) {
+        store.setSetting("session", request.sourceSessionId, REVIEW_FOCUS_FILE_KEY + reviewRunId, {
+          version: 1, path: initialEvidence.focusedWorkspaceFile
+        });
+      }
+      return bundle;
     });
     const fencingToken = created.sourceLease.fencingToken;
     let reviewerSessionId: string | undefined;
