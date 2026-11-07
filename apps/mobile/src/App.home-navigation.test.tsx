@@ -2,7 +2,7 @@
 import { act, createElement, forwardRef, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { SessionSchema, SessionState, SnapshotSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
+import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
   SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -489,7 +489,7 @@ describe("actual Home navigation hosts", () => {
     expect(storage.setItem).toHaveBeenCalledExactlyOnceWith(expect.any(String), "archived");
 
     const owner = state.owner!;
-    state = { ...state, owner: create(SnapshotSchema, { ...owner, revision: { value: 2n }, sessions: [
+    state = { ...state, owner: create(SnapshotSchema, { ...owner, revision: create(RevisionSchema, { value: 2n }), sessions: [
       ...owner.sessions.map(session => session.sessionId === "archived" ? create(SessionSchema, { ...session, archived: false }) : session),
       create(SessionSchema, { sessionId: "still-archived", targetId: "project", backendId: "backend", displayName: "Still archived", archived: true, state: SessionState.IDLE })
     ] }) };
