@@ -121,6 +121,17 @@ describe("Provider model discovery", () => {
     expect(request).toHaveBeenCalledOnce();
   });
 
+  it("bounds Anthropic pagination to the original catalog, deadline and unique cursors", async () => {
+    const modelsEndpoint = "https://api.example.test/model-catalog";
+    const cursor = "https://unrelated.example.test/v1/models";
+    const request = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      Response.json({ data: [{ id: "listed-model" }], has_more: true, last_id: cursor }));
+    await expect(fetchProviderModels({ baseUrl: "https://api.example.test/v1", modelsEndpoint,
+      api: "anthropic-messages", apiKey: "test-key" }, request as typeof fetch)).rejects.toMatchObject({ code: "invalid_response" });
+    expect(request.mock.calls.map(([url]) => url)).toEqual([modelsEndpoint, `${modelsEndpoint}?after_id=${encodeURIComponent(cursor)}`]);
+    expect(request.mock.calls[0]?.[1]?.signal).toBe(request.mock.calls[1]?.[1]?.signal);
+  });
+
   it("cancels an oversized streaming response without buffering the remaining upstream body", async () => {
     const cancel = vi.fn();
     let pulls = 0;
