@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ExtensionTargetRef, ExtensionTargetKind, ExtensionTargetView, ExtensionTargetDelivery } from "@joko/contracts";
 import type { OperationalStore, QueueItemRecord } from "@joko/store";
-import type { SessionDescriptor } from "@joko/core";
+import type { PublicError, SessionDescriptor } from "@joko/core";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { ExtensionCatalogManager } from "./extension-catalog.js";
 import type { ExtensionProjectPolicies } from "./extension-project-policy.js";
@@ -19,7 +19,9 @@ interface Receipt {
   readonly approval: string; readonly fingerprint: string | null; readonly status: "pending" | "accepted" | "cancelled";
   readonly target?: ExtensionTargetRef; readonly projectRevision?: string; readonly sessionId?: string; readonly generation?: number;
   readonly delivery?: ExtensionTargetDelivery; readonly runId?: string; readonly queueItemId?: string;
+  readonly steerSource?: { readonly runId: string; readonly attemptId: string };
 }
+interface InputLink { readonly version: 1; readonly operationId: string; readonly steerFallback?: true }
 interface Options {
   readonly store: OperationalStore; readonly host: Pick<SessionHost, "enqueueServiceInput">;
   readonly tasks: Pick<ExtensionTasks, "assertOwner" | "createForTarget">;
@@ -168,9 +170,14 @@ export class ExtensionTargets {
     }
     current();
     const session = this.options.store.getSession(receipt.sessionId!).descriptor;
-    const canSteer = this.options.store.getBackend(session.backendId).descriptor.capabilities.get("turn.steer")?.supported === true
-      && this.options.store.listRuns({ sessionId: session.id, activeOnly: true, limit: 100 }).some(run => ["running", "waiting", "retrying"].includes(run.descriptor.state));
-    const actual: ExtensionTargetDelivery = delivery === "steer" && canSteer ? "steer" : "queue";
+    const activeRuns = delivery === "steer"
+      && this.options.store.getBackend(session.backendId).descriptor.capabilities.get("turn.steer")?.supported === true
+      ? this.options.store.listRuns({ sessionId: session.id, activeOnly: true, limit: 100 })
+          .filter(run => ["running", "waiting", "retrying"].includes(run.descriptor.state))
+      : [];
+    const actual: ExtensionTargetDelivery = activeRuns.length > 0 ? "steer" : "queue";
+    const source = receipt.target?.kind === "task" && activeRuns.length === 1 ? activeRuns[0]?.descriptor : undefined;
+    const steerSource = source?.activeAttemptId === undefined ? undefined : { runId: source.id, attemptId: source.activeAttemptId };
     const staging = await stageExtensionMessageImages(images, this.options.artifacts, this.options.store, current);
     try {
       current();
@@ -178,7 +185,8 @@ export class ExtensionTargets {
         prompt: { text: `[Plugin input from ${owner.extensionId}: external application data]\n${message}`, images: staging.images, files: [], mentions: [], disposition: actual === "steer" ? "steer" : "prompt" },
         onAdmitted: (store, input) => {
           current(); staging.adopt(store, input);
-          const completed = { ...this.#current(owner, operationId), status: "accepted" as const, delivery: actual, runId: input.runId, queueItemId: input.queueItemId };
+          const completed = { ...this.#current(owner, operationId), status: "accepted" as const, delivery: actual, runId: input.runId, queueItemId: input.queueItemId,
+            ...(steerSource === undefined ? {} : { steerSource }) };
           store.completeDeferredEffectOperation(operationId, bodyHash, transaction => {
             current(); transaction.setSetting("service", RECEIPTS, operationId, completed);
             transaction.setSetting("service", INPUTS, input.queueItemId, { version: 1, operationId });
@@ -211,16 +219,45 @@ export class ExtensionTargets {
     const current = this.#receipt(operationId), item = current?.queueItemId ? this.options.store.getQueueItem(current.queueItemId) : undefined;
     return { cancelled: true, runningWorkMayHaveStarted: item ? !["accepted", "cancelled", "failed"].includes(item.state) : false };
   }
+  requeueInactiveSteer(item: QueueItemRecord, error: PublicError): boolean {
+    const store = this.options.store;
+    const link = store.findSetting<InputLink>("service", INPUTS, item.id)?.value;
+    if (link?.version !== 1) return false;
+    const receipt = this.#receipt(link.operationId);
+    if (receipt?.target?.kind !== "task" || receipt.status !== "accepted" || receipt.delivery !== "steer"
+      || receipt.queueItemId !== item.id || receipt.runId !== item.runId || receipt.sessionId !== item.sessionId
+      || !this.#steerSourceCurrent(receipt, true)) return false;
+    try { this.assertQueueCurrent(item); }
+    catch { return false; }
+    if (!store.requeueInactiveSteer(item, error)) return false;
+    store.setSetting("service", INPUTS, item.id, { ...link, steerFallback: true });
+    return true;
+  }
+
+  assertSteerFallbackCurrent(item: QueueItemRecord): void {
+    if (this.options.store.findSetting<InputLink>("service", INPUTS, item.id)?.value.steerFallback) {
+      this.assertQueueCurrent(item);
+    }
+  }
+
+  #steerSourceCurrent(receipt: Receipt, allowActive: boolean): boolean {
+    const source = receipt.steerSource;
+    if (source === undefined) return false;
+    const run = this.options.store.findRun(source.runId)?.descriptor;
+    return run !== undefined && run.sessionId === receipt.sessionId && run.activeAttemptId === source.attemptId
+      && (run.state === "completed" || allowActive && ["running", "waiting", "retrying"].includes(run.state));
+  }
+
   /** true means this target receipt owns admission; ordinary plugin-task
    * checks must not reinterpret it as a team-generated automatic input. */
   assertQueueCurrent(item: QueueItemRecord): boolean {
     const store = this.options.store;
-    let link = store.findSetting<{ readonly version: 1; readonly operationId: string }>("service", INPUTS, item.id)?.value;
+    let link = store.findSetting<InputLink>("service", INPUTS, item.id)?.value;
     let originRunId = item.runId;
     const seen = new Set<string>();
     while (!link && !seen.has(originRunId) && seen.size < 64) {
       seen.add(originRunId);
-      link = store.findSetting<{ readonly version: 1; readonly operationId: string }>("service", INPUTS, `run:${originRunId}`)?.value;
+      link = store.findSetting<InputLink>("service", INPUTS, `run:${originRunId}`)?.value;
       if (link) break;
       const parent = store.findRun(originRunId)?.descriptor.parentRunId;
       if (!parent) break; originRunId = parent;
@@ -230,6 +267,11 @@ export class ExtensionTargets {
     if (link.version !== 1 || !receipt || receipt.runId !== originRunId || receipt.sessionId !== item.sessionId) return failure("PERMISSION_DENIED");
     this.#current({ extensionId: receipt.extensionId, resourceId: receipt.resourceId, installation: receipt.installation,
       signal: new AbortController().signal, assertCurrent: () => {} }, receipt.operationId);
+    // Pi can reject before its terminal event reaches Store. An accepted
+    // fallback waits behind the original Run and requires its exact success.
+    if (link.steerFallback && !this.#steerSourceCurrent(receipt, item.state === "accepted")) {
+      return failure("TARGET_UNAVAILABLE", "The original turn did not complete.");
+    }
     return true;
   }
   async drain(): Promise<void> { await Promise.allSettled([...this.#flights.values()].map(flight => flight.result)); }

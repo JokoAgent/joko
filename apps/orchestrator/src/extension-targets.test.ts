@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { JokoError, type AdapterContext } from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, expect, it, vi } from "vitest";
@@ -38,11 +39,14 @@ async function fixture() {
   const options = { store, host, tasks, catalog, artifacts, partners: { listPartners: () => partners,
     getPartner: (id: string) => { const partner = partners.find(value => value.id === id); if (!partner) throw new Error("Missing partner"); return partner; } }, redact: (text: string) => text };
   const targets = new ExtensionTargets(options);
-  host.setExtensionTaskQueueGuard(item => { if (!targets.assertQueueCurrent(item)) tasks.assertQueueCurrent(item); });
+  host.setExtensionTaskQueueGuard(item => { if (!targets.assertQueueCurrent(item)) tasks.assertQueueCurrent(item); }, {
+    requeue: (item, error) => targets.requeueInactiveSteer(item, error),
+    assertCurrent: item => targets.assertSteerFallbackCurrent(item)
+  });
   cleanups.push(async () => { await targets.drain(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true, maxRetries: 3 }); });
   const request = (value: Record<string, unknown>, targetService = targets) => targetService.request(owner, { type: "targets-request", ...value });
   const pause = () => store.setQueuePaused({ sessionId: taskId, paused: true, reason: "Wait for owner", traceId: "test" });
-  return { root, store, artifacts, host, tasks, targets, taskId, route, owner, partners, options, request, pause,
+  return { root, store, artifacts, adapter, connection, host, tasks, targets, taskId, route, owner, partners, options, request, pause,
     grant: (value: boolean) => { granted = value; revision++; }, disable: () => { enabled = false; revision++; } };
 }
 
@@ -77,6 +81,45 @@ it("adopts plugin-supplied image bytes with the original Queue input and never d
   expect(await f.request({ kind: "cancel", requestKey: request.requestKey })).toEqual({ cancelled: true, runningWorkMayHaveStarted: false });
   expect(f.store.getQueueItem(queue.id).state).toBe("cancelled");
   await expect(f.request(request)).rejects.toMatchObject({ code: "SUPERSEDED" });
+});
+
+it.each(["completed", "aborted"] as const)("requeues a known inactive target steer and requires the original Run to complete (%s)", async outcome => {
+  const f = await fixture();
+  let original!: AdapterContext;
+  const send = vi.spyOn(f.adapter, "send")
+    .mockImplementationOnce(async (_input, context) => { original = context; })
+    .mockRejectedValueOnce(new JokoError({
+      code: "PI_STEER_REQUIRES_ACTIVE_RUN", message: "Steering input requires an active Pi agent lifecycle",
+      phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Submit a new prompt."
+    }));
+  const first = f.host.enqueueInput({
+    operationId: "target-steer-active-run", connection: f.connection, sessionId: f.taskId,
+    prompt: { text: "Original turn", disposition: "prompt", images: [], files: [], mentions: [] }
+  }).value;
+  await vi.waitFor(() => expect(f.store.getRun(first.runId).descriptor.state).toBe("running"));
+
+  const request = { kind: "send", requestKey: "settling-steer", target: { kind: "task", id: f.taskId }, text: "Follow this up", delivery: "steer" };
+  const result = await f.request(request) as { queueItemId: string; runId: string };
+  expect(result).toMatchObject({ delivery: "steer", accepted: true });
+  await vi.waitFor(() => expect(f.store.getQueueItem(result.queueItemId)).toMatchObject({
+    state: "accepted", disposition: "prompt", runId: result.runId
+  }));
+  const [steer, fallback] = f.store.listAttempts(result.runId);
+  expect(steer?.descriptor).toMatchObject({ ordinal: 1, error: { code: "PI_STEER_REQUIRES_ACTIVE_RUN", stateMayHaveChanged: false } });
+  expect(fallback?.descriptor).toMatchObject({ ordinal: 2, generation: steer?.descriptor.generation });
+  expect(f.store.getRun(result.runId).descriptor.activeAttemptId).toBe(fallback?.descriptor.id);
+  expect(send.mock.calls.map(([input]) => input.disposition)).toEqual(["prompt", "steer"]);
+
+  await original.emit({ type: "done", outcome });
+  const completed = outcome === "completed";
+  const finalState = completed ? "completed" : "failed";
+  await vi.waitFor(() => expect(f.store.getRun(result.runId).descriptor.state).toBe(finalState));
+  expect(f.store.getRun(first.runId).descriptor.state).toBe(outcome);
+  expect(f.store.getQueueItem(result.queueItemId).state).toBe(finalState);
+  expect(send.mock.calls.map(([input]) => input.disposition)).toEqual(completed ? ["prompt", "steer", "prompt"] : ["prompt", "steer"]);
+  if (completed) expect(send.mock.calls[2]?.[0].text).toBe(send.mock.calls[1]?.[0].text);
+  expect(await f.request(request)).toEqual(result);
+  expect(f.store.listQueueItems({ sessionId: f.taskId })).toHaveLength(2);
 });
 
 it("creates one visible project task through normal plugin ownership and dispatches its input", async () => {
