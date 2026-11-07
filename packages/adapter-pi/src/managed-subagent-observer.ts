@@ -1229,7 +1229,8 @@ async function readDurablePhysicalRun(
   const status = { ...snapshot.status };
   const claim = snapshot.claim === undefined ? undefined : { ...snapshot.claim };
   const taskId = requiredString(status["taskId"], 256);
-  const runnerScript = requiredRemotePath(config["runnerScript"], "runner script");
+  // The broker checks canonical runner and artifact paths on the remote host.
+  // Its projection binds them by identity and revision without returning paths.
   if (
     config["format"] !== FORMAT || owner["format"] !== FORMAT || status["format"] !== FORMAT
     || config["runId"] !== runId || owner["runId"] !== runId || status["runId"] !== runId
@@ -1239,7 +1240,6 @@ async function readDurablePhysicalRun(
     || status["productSessionId"] !== productSessionId || !Number.isSafeInteger(config["productGeneration"])
     || number(config["productGeneration"]) < 0 || number(config["productGeneration"]) > productGeneration
     || config["taskId"] !== taskId || owner["taskId"] !== taskId
-    || owner["runnerScript"] !== runnerScript || status["runnerScript"] !== runnerScript
     || config["runnerScriptSha256"] !== runnerScriptSha256
     || owner["runnerScriptSha256"] !== runnerScriptSha256 || status["runnerScriptSha256"] !== runnerScriptSha256
     || config["runnerInstanceId"] !== runnerInstanceId
@@ -1262,11 +1262,6 @@ async function readDurablePhysicalRun(
       || runnerPid > 0 && status["runnerInstanceId"] !== runnerInstanceId) {
     throw new Error("managed Subagent durable process identity mismatch");
   }
-  const transcriptPath = requiredRemotePath(config["transcriptPath"], "transcript");
-  if (status["transcriptPath"] !== transcriptPath) {
-    throw new Error("managed Subagent durable transcript identity mismatch");
-  }
-
   const cacheKey = `durable:${runId}:transcript:${transcriptRevision}`;
   let transcript = transcriptCache.get(cacheKey);
   if (transcript === undefined || transcript.size !== snapshot.transcriptBytes) {
@@ -1820,14 +1815,6 @@ function requiredDigest(value: unknown, label: string): string {
 
 function requiredRevision(value: unknown): string {
   return requiredDigest(value, "durable revision");
-}
-
-function requiredRemotePath(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length < 1 || value.length > 32_768
-      || !value.startsWith("/") || value.includes("\0")) {
-    throw new Error(`managed Subagent remote ${label} path is invalid`);
-  }
-  return value;
 }
 
 async function decisionOrCancellation(

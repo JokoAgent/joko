@@ -1838,6 +1838,12 @@ try {
         expect(runs[0]?.["runId"]).toBe(runner.runId);
         expect(runs[0]?.["resumeSafe"]).toBe(true);
         expect(runs[0]?.["controlSafe"]).toBe(true);
+        expect(runs[0]?.["runnerScriptSha256"]).toBe(fixture.trustedRunnerScriptSha256);
+        for (const manifest of ["config", "status", "owner"]) {
+          expect(runs[0]?.[manifest]).toMatchObject({ runnerScriptSha256: fixture.trustedRunnerScriptSha256 });
+          expect(runs[0]?.[manifest]).not.toHaveProperty("runnerScript");
+          expect(runs[0]?.[manifest]).not.toHaveProperty("transcriptPath");
+        }
         expect(JSON.stringify(scanned)).not.toContain(currentBearer);
         expect(JSON.stringify(scanned)).not.toContain("joko-broker-stable-bearer");
 

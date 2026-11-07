@@ -881,16 +881,11 @@ class DurableStoreFixture implements PiManagedDurableStore {
     expect(input.sessionId).toBe(this.#sessionId);
     expect(input.sessionKey).toBe(managedSubagentSessionKey(this.#sessionId));
     expect(input.limitBytes).toBeGreaterThanOrEqual(this.#transcript.byteLength);
-    const runDirectory = `/home/fixture/.joko/subagent-runs/${input.sessionKey}/${this.#runId}`;
-    const runnerScript = `${runDirectory}/joko-managed-subagent-runner.cjs`;
-    const transcriptPath = `${runDirectory}/transcript.jsonl`;
     const config = {
       format: 1,
       runId: this.#runId,
       launchToken: this.#launchToken,
       runnerInstanceId: this.#runnerInstanceId,
-      runDir: runDirectory,
-      runnerScript,
       runnerScriptSha256: this.#runnerScriptSha256,
       productSessionId: this.#sessionId,
       productGeneration: 3,
@@ -904,8 +899,7 @@ class DurableStoreFixture implements PiManagedDurableStore {
         route: this.#route ?? { provider: this.#providerId, model: "fixture", effort: "high" }
       }),
       nativeSessionId: randomUUID(),
-      turnCount: 1,
-      transcriptPath
+      turnCount: 1
     };
     const owner = {
       format: 1,
@@ -913,7 +907,6 @@ class DurableStoreFixture implements PiManagedDurableStore {
       launchToken: this.#launchToken,
       productSessionId: this.#sessionId,
       taskId: this.#taskId,
-      runnerScript,
       runnerScriptSha256: this.#runnerScriptSha256,
       state: "running",
       runnerPid: 42,
@@ -932,7 +925,6 @@ class DurableStoreFixture implements PiManagedDurableStore {
       task: "Inspect the remote fixture",
       readOnly: false,
       contextMode: "fork",
-      runnerScript,
       runnerScriptSha256: this.#runnerScriptSha256,
       runnerPid: 42,
       runnerInstanceId: this.#runnerInstanceId,
@@ -943,8 +935,6 @@ class DurableStoreFixture implements PiManagedDurableStore {
       ...(this.#state === "aborted" ? { endedAt: Date.now() } : {}),
       heartbeatAt: 1_002,
       nativeSessionId: config.nativeSessionId,
-      nativeSessionPath: `${runDirectory}/sessions/${config.nativeSessionId}.jsonl`,
-      transcriptPath,
       turnCount: 1,
       pendingApproval: {
         id: this.#approvalId,
