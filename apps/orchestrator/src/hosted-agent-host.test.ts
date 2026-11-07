@@ -104,6 +104,39 @@ it("preserves the original sharing usage turn through steer and queued follow-up
   }
 });
 
+it("keeps effect receipts available across repeated fresh hosted state reads", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-hosted-observation-")), database = new OperationalStore(":memory:");
+  const store = new HostedAgentStore(database);
+  const binding = { opaqueRef: "native-observation", nativeSessionId: "native-observation", generation: 1 };
+  const inspectSession = vi.fn(async () => ({ binding, streaming: false, compacting: false, pendingMessages: 0,
+    fastMode: false, permissionMode: "ask" as const }));
+  const abort = vi.fn(async () => {});
+  const adapter = { id: "native", hostedExecutionCapabilities: { toolsOnSource: true, isolatedGuests: true },
+    createSession: async () => binding, inspectSession, abort, dispose: async () => {} } satisfies Partial<BackendAdapter>;
+  let run: NativeRun | undefined;
+  try {
+    run = await NativeRun.create({ root, runId: "observation-host", nativeSessionId: "observation-alias", start: "create", store,
+      slots: new HostedAgentSessionSlots(), source: { authorityId: "owner", deviceId: "source", sessionId: "task", targetId: "workspace", generation: 1 },
+      trust: "owner", backendId: "native", providerId: "provider", modelId: "model", modelIds: ["model"], permissionMode: "ask", fastMode: false,
+      workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "native", isGitRepository: false }, artifactCapacityBytes: 1024,
+      assertCurrent: () => {}, assertModelAllowed: () => {}, createAdapter: () => adapter as unknown as BackendAdapter });
+    inspectSession.mockClear();
+    await expect(run.call("original-abort", { kind: "abort" })).resolves.toBeNull();
+    for (let index = 0; index < 300; index++) await run.call(`observe-${index}`, { kind: "state" });
+    await expect(run.call("original-abort", { kind: "abort" })).resolves.toBeNull();
+    expect(abort).toHaveBeenCalledOnce();
+    expect(() => run!.call("original-abort", { kind: "state" })).toThrow(/identity conflicts/u);
+    await expect(run.call("observe-0", { kind: "state" })).resolves.toMatchObject({ binding });
+    expect(inspectSession).toHaveBeenCalledTimes(301);
+    expect(store.call(run.id, "observe-0")).toBeUndefined();
+    await expect(run.call("new-abort", { kind: "abort" })).resolves.toBeNull();
+    expect(abort).toHaveBeenCalledTimes(2);
+  } finally {
+    await run?.close(); run?.disposeExchange(); database.close();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});
+
 it("protects background work from idle release and retries only the approved native close when its outcome is uncertain", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-hosted-idle-")), database = new OperationalStore(":memory:"), store = new HostedAgentStore(database);
   let now = 0, context!: AdapterContext, disposals = 0; const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
