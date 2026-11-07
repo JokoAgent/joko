@@ -76,11 +76,13 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
     const registration = exactWorkspaceRegistration(target.metadata, target.descriptor.id, this.#workspaces);
     const events = listAllVisibleSessionEvents(this.#store, request.sourceSessionId);
     const visible = visibleMessages(this.#store, request.sourceSessionId, events);
+    const supersededProgress = supersededPiToolMessages(events, visible);
     const messages = visible.map((event, ordinal) => ({
       id: event.id,
       ordinal,
       role: event.payload.role,
-      text: event.payload.blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join("")
+      text: event.payload.blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join(""),
+      ...(supersededProgress.has(event.id) ? { omitFromContext: true as const } : {})
     }));
 
     const git = await this.#workspaces.gitState(registration.id).catch(() => {
@@ -365,6 +367,33 @@ function visibleMessages(store: OperationalStore, sessionId: string, events: Lis
     if (event.payload.role === "user" && event.runId !== undefined && disposition.get(event.runId) !== "prompt") return [];
     return [event as MessageEvent];
   });
+}
+
+function supersededPiToolMessages(events: readonly ListedEvent[], messages: readonly MessageEvent[]): ReadonlySet<string> {
+  const settlements = new Map<string, bigint>();
+  for (const event of events) {
+    if (event.attemptId !== undefined && event.pi?.rpcEventType === "agent_settled"
+      && event.payload.type === "done" && event.payload.outcome === "completed") {
+      settlements.set(event.attemptId, event.globalCursor);
+    }
+  }
+  const superseded = new Set<string>();
+  if (settlements.size === 0) return superseded;
+  const hasFinalReply = new Map<string, boolean>();
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const event = messages[index]!;
+    if (event.attemptId === undefined || event.pi?.rpcEventType !== "message_end" || event.payload.role !== "assistant") continue;
+    const settlement = settlements.get(event.attemptId);
+    if (settlement === undefined || event.globalCursor >= settlement) continue;
+    const toolRound = event.payload.blocks.some(block => block.kind === "tool_call");
+    const final = hasFinalReply.get(event.attemptId);
+    if (final === undefined) {
+      hasFinalReply.set(event.attemptId, !toolRound && event.payload.blocks.some(block => block.kind === "text" && block.text.trim() !== ""));
+    } else if (final && toolRound) {
+      superseded.add(event.id);
+    }
+  }
+  return superseded;
 }
 
 function collectAttachments(request: StartReviewRequest, messages: readonly MessageEvent[]): {
