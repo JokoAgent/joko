@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 
-import { create } from "@bufbuild/protobuf";
-import { ExtensionLibraryCallSchema, type ExtensionCatalogEntry, type ExtensionLibraryCall } from "@joko/contracts";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { ExtensionLibraryCallSchema, type ExtensionCatalogEntry } from "@joko/contracts";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -141,7 +141,7 @@ async function writeLibraryVideo(manager: PairedClient, extension: ExtensionCata
   try {
     const { library } = await api.openExtensionLibrary({ ...owner, surfaceId: surface.surfaceId });
     if (!library) throw new Error("The video fixture did not receive a Library.");
-    const call = async (operation: ExtensionLibraryCall["operation"]) => (await api.callExtensionLibrary({
+    const call = async (operation: MessageInitShape<typeof ExtensionLibraryCallSchema>["operation"]) => (await api.callExtensionLibrary({
       sessionId: library.sessionId, call: create(ExtensionLibraryCallSchema, { operation })
     })).result?.result;
     const start = await call({ case: "writeBegin", value: { path: "clip.mp4", totalBytes: BigInt(clip.length), ifNotExists: true } });
