@@ -451,7 +451,8 @@ export async function executeScheduleScript(
       scheduleName: schedule.name,
       runId: input.runId,
       firedAt: input.firedAt,
-      workingDir: input.cwd
+      workingDir: input.cwd,
+      ...(schedule.sessionMode === "bound" && schedule.sessionId !== undefined ? { targetSessionId: schedule.sessionId } : {})
     },
     capabilities: [...granted]
   });
