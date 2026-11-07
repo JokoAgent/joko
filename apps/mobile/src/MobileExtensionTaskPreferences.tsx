@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { PermissionMode, encodeModelSpeed, decodeModelSpeed, type ExtensionTaskPreferences, type ExtensionTaskRoute } from "@joko/contracts";
+import { MobileInteractionSheet } from "./MobileInteractionSheet";
 import { MobileModelSpeedControl } from "./MobileModelSpeedControl";
-import { mobileExtensionTaskTarget, type MobileExtension, type MobileExtensionTransport } from "./mobile-extensions";
+import { mobileExtensionTaskTarget, type MobileExtension, type MobileExtensionTaskWriteRetry, type MobileExtensionTransport } from "./mobile-extensions";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 
@@ -13,6 +14,8 @@ export function MobileExtensionTaskPreferences({ extension, transport, colors, l
 }) {
   const [state, setState] = useState<ExtensionTaskPreferences>(), [model, setModel] = useState<ExtensionTaskRoute>();
   const [permission, setPermission] = useState(PermissionMode.ASK), [expanded, setExpanded] = useState(false), [error, setError] = useState(false), [busy, setBusy] = useState(false);
+  const [retry, setRetry] = useState<MobileExtensionTaskWriteRetry>();
+  const [approvalVisible, setApprovalVisible] = useState(false);
   const transportRef = useRef(transport);
   transportRef.current = transport;
   const canReadPreferences = transport.getTaskPreferences !== undefined;
@@ -25,6 +28,7 @@ export function MobileExtensionTaskPreferences({ extension, transport, colors, l
   }, [canReadPreferences, extension.extensionId, extension.revision, lifetime]);
   if (!state || !state.showPreferences && !state.writeRequests.length || state.extensionId !== extension.extensionId) return null;
   const zh = locale === "zh-CN", selected = state.models.find(value => value.route && model && key(value.route) === key(model));
+  const approval = retry?.interaction();
   const label = (en: string, cn: string) => zh ? cn : en;
   const action = (title: string, press: () => void, active = false) => <Pressable key={title} accessibilityRole="button" accessibilityState={{ disabled: disabled || busy, selected: active }} disabled={disabled || busy}
     onPress={press} style={[styles.action, { borderColor: colors.border, backgroundColor: colors.surface }]}><Text style={{ color: colors.ink }}>{active ? "✓ " : ""}{title}</Text></Pressable>;
@@ -51,9 +55,27 @@ export function MobileExtensionTaskPreferences({ extension, transport, colors, l
     })}</>}
     {state.writeRequests.map(request => action(`${label("Retry permission", "重试权限请求")} · ${request.title}`, () => {
       if (lifetime.busy || !transport.retryTaskWriteAccess) return; lifetime.busy = true; setBusy(true); setError(false);
-      void transport.retryTaskWriteAccess(extension, request.taskId, lifetime.abort.signal).then(value => { if (!lifetime.abort.signal.aborted) setState(value); })
-        .catch(() => { if (!lifetime.abort.signal.aborted) setError(true); }).finally(() => { lifetime.busy = false; if (!lifetime.abort.signal.aborted) setBusy(false); });
+      const pending = transport.retryTaskWriteAccess(extension, request.taskId, lifetime.abort.signal);
+      setRetry(pending);
+      setApprovalVisible(true);
+      void pending.result.then(({ preferences, granted }) => {
+        if (lifetime.abort.signal.aborted) return;
+        setState(preferences);
+        if (granted) setPermission(current => current === state.permissionMode ? preferences.permissionMode : current);
+        else setError(true);
+      }).catch(() => { if (!lifetime.abort.signal.aborted) setError(true); }).finally(() => {
+        lifetime.busy = false;
+        if (!lifetime.abort.signal.aborted) { setRetry(undefined); setBusy(false); }
+      });
     }))}
+    {approval !== undefined && retry !== undefined && <>
+      {!approvalVisible && <Pressable accessibilityRole="button" onPress={() => setApprovalVisible(true)} style={[styles.action, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+        <Text style={{ color: colors.ink }}>{label("Review permission request", "查看权限请求")}</Text>
+      </Pressable>}
+      <MobileInteractionSheet visible={approvalVisible} profileId={transport.ownerKey} interactions={[approval]} busy={false}
+        colors={colors} locale={locale} onSelect={() => undefined} onMinimize={() => setApprovalVisible(false)}
+        onResolve={retry.resolve} onDismiss={retry.dismiss} onError={() => setError(true)} />
+    </>}
     {error && <Text accessibilityRole="alert" style={{ color: colors.ink }}>{label("Could not save. Refresh and try again.", "保存失败，请刷新后重试。")}</Text>}
   </View>;
 }
