@@ -2304,6 +2304,9 @@ export class MessagingManager {
     if (command === "/new") {
       if (conversation.partnerId && this.#partnerRuntime) {
         if (!event.speaker.isOwner) return 'Only the connection owner can restart this Partner conversation.';
+        if (conversation.conversationKind === "direct" && connection.ownerProviderUserId === event.speaker.providerUserId) {
+          return "This chat shares the Partner's long-running task. To restart its context, use Joko.";
+        }
         await this.#partnerRuntime.restartFromMessage(connection, conversation, event, interactionId);
         return 'The original Partner context is restarting. History remains available.';
       }
