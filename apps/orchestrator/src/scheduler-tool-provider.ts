@@ -124,7 +124,7 @@ const CREATE_PROPERTIES = {
   prompt: { type: "string", minLength: 1, maxLength: 262_144, description: "Prompt sent for each agent run." },
   kind: { type: "string", enum: ["cron", "interval", "one_shot", "manual"], description: "Recurrence kind." },
   cronExpr: { type: "string", minLength: 1, maxLength: 256, description: "Five-field cron expression." },
-  intervalMs: { type: "integer", minimum: 1_000, description: "Anchored interval in milliseconds." },
+  intervalMs: { type: "integer", minimum: 1_000, description: "Interval in milliseconds. An automatically triggered script waits this long after completion." },
   runAt: { type: "integer", minimum: 0, description: "One-shot Unix timestamp in milliseconds." },
   timezone: { type: "string", minLength: 1, maxLength: 128, description: "IANA timezone identifier." },
   recurring: { type: "boolean", description: "False turns the next cron occurrence into a one-shot task." },

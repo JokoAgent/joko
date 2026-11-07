@@ -10689,6 +10689,52 @@ describe("SessionHost", () => {
     expect(coordinator.runtimeSnapshot().slotsInUse).toBe(0);
   });
 
+  it.each(["success", "failed", "manual", "edited", "cancelled"] as const)(
+    "settles an interval script with its owned next occurrence when %s", async scenario => {
+      const fixture = await createFixture();
+      const gate = new AsyncGate();
+      const startedAt = 60_000;
+      const interval = 60_000;
+      let now = startedAt;
+      const schedule = seedScriptSchedule(fixture, "script-interval", { kind: "interval", expression: String(interval),
+        anchorAt: startedAt, nextRunAt: scenario === "manual" ? startedAt + interval : startedAt });
+      const executeScript = vi.fn(async () => {
+        gate.enter();
+        await gate.wait;
+        if (scenario === "failed") throw new Error("Script failed");
+        return { durationMs: 50_000, stderr: "", stderrTruncated: false };
+      });
+      const coordinator = new ScheduleCoordinator(fixture.store, fixture.host, { executeScript, now: () => now });
+      cleanups.push(() => coordinator.stop());
+      const execution = scenario === "manual" ? coordinator.runNowWithResult(schedule.id, "manual-interval") : coordinator.tick();
+      const editedNextAt = startedAt + 180_000;
+      try {
+        await gate.entered;
+        if (scenario === "edited") {
+          fixture.store.upsertSchedule({ ...schedule, expectedRevision: schedule.revision, expression: "180000", nextRunAt: editedNextAt });
+        }
+        if (scenario === "cancelled") await coordinator.abortSchedule(schedule.id);
+        now = startedAt + 50_000;
+      } finally {
+        gate.release();
+      }
+      await execution;
+      const status = scenario === "failed" ? "failed" : scenario === "cancelled" ? "aborted" : "success";
+      expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ firedAt: startedAt, finishedAt: now, status }]);
+      const nextRunAt = scenario === "manual" || scenario === "cancelled" ? startedAt + interval
+        : scenario === "edited" ? editedNextAt : now + interval;
+      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({ nextRunAt });
+      if (scenario === "success" || scenario === "failed") {
+        now = startedAt + interval;
+        await coordinator.tick();
+        expect(executeScript).toHaveBeenCalledOnce();
+        now = nextRunAt;
+        await coordinator.tick();
+        expect(executeScript).toHaveBeenCalledTimes(2);
+      }
+    }
+  );
+
   it("freezes script task creation and retains later Schedule edits", async () => {
     const f = await createFixture(), gate = new AsyncGate(); let fire = 0;
     const otherRoot = join(f.directory, "other-project"); mkdirSync(otherRoot);
@@ -10920,6 +10966,24 @@ describe("SessionHost", () => {
     coordinator.start();
     coordinator.stop();
     expect(fixture.store.listScheduleRuns("schedule-script-recovery")).toHaveLength(1);
+  });
+
+  it("waits a full interval after recording an interrupted automatic script on restart", async () => {
+    const fixture = await createFixture();
+    const firedAt = 1_000, resumedAt = 91_000, interval = 60_000;
+    const schedule = seedScriptSchedule(fixture, "interrupted-interval", {
+      kind: "interval", expression: String(interval), anchorAt: firedAt, nextRunAt: firedAt
+    });
+    fixture.store.recordScheduleOccurrence({ scheduleId: schedule.id, runId: "interrupted-script", firedAt, status: "running",
+      detail: { script: { status: "running" }, cadence: { preserveNextRun: false, intervalFromFinish: true, nextRunAt: firedAt + interval } } });
+    const executeScript = vi.fn(async () => ({ durationMs: 1, stderr: "", stderrTruncated: false }));
+    const coordinator = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => resumedAt, executeScript });
+    cleanups.push(() => coordinator.stop());
+    coordinator.start();
+    await coordinator.tick();
+    expect(executeScript).not.toHaveBeenCalled();
+    expect(fixture.store.getSchedule(schedule.id).nextRunAt).toBe(resumedAt + interval);
+    expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ firedAt, finishedAt: resumedAt, status: "interrupted" }]);
   });
 
   it("creates a distinct product task for every fresh Schedule fire and records both task links", async () => {
