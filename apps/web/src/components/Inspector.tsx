@@ -220,6 +220,7 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
   const [terminalPending, setTerminalPending] = useState(false);
   const terminalPendingRef = useRef(false);
   const terminalCreationRef = useRef<{ readonly owner: string; readonly requestId: string; readonly shellId: string; readonly initialPalette: TerminalPaletteView } | undefined>(undefined);
+  const terminalListChangesRef = useRef<{ readonly owner: string; readonly records: Map<string, TerminalView | null> } | undefined>(undefined);
   const [terminalError, setTerminalError] = useState<string>();
   const [terminalRefresh, setTerminalRefresh] = useState(0);
   const [gamepadBrowserFocusRequest, setGamepadBrowserFocusRequest] = useState<BrowserInspectorFocusRequest>();
@@ -330,6 +331,11 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
   useEffect(() => {
     if (controller.state.connectionState !== "connected") return;
     const request = new AbortController();
+    const listChanges = { owner: terminalOwner, records: new Map<string, TerminalView | null>() };
+    terminalListChangesRef.current = listChanges;
+    const clearListChanges = (): void => {
+      if (terminalListChangesRef.current === listChanges) terminalListChangesRef.current = undefined;
+    };
     const source = inspectorControllerRef.current;
     setTerminalCatalogPending(true);
     void Promise.allSettled([
@@ -338,12 +344,19 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
       }),
       Promise.resolve().then(() => source.listTerminals(session.id, request.signal)).then((records) => {
         if (request.signal.aborted) return;
-        setTerminalRecords(Object.fromEntries(records.map((record) => [record.id, record])));
+        const merged = new Map(records.map((record) => [record.id, record]));
+        for (const [id, record] of listChanges.records) {
+          if (record === null) merged.delete(id);
+          else if (!merged.has(id)) merged.set(id, record);
+        }
+        clearListChanges();
+        const active = [...merged.values()].filter((record) => record.status !== "closed");
+        setTerminalRecords(Object.fromEntries(merged));
         setTabBuckets((current) => {
           let next = current[session.id] ?? createInitialInspectorTabBucket();
-          const ids = new Set(records.filter((record) => record.status !== "closed").map((record) => record.id));
+          const ids = new Set(active.map((record) => record.id));
           for (const tab of next.tabs) if (tab.kind === "terminal" && !ids.has(tab.id)) next = closeInspectorTab(next, tab.id);
-          for (const record of records) if (record.status !== "closed" && !next.tabs.some((tab) => tab.id === record.id)) {
+          for (const record of active) if (!next.tabs.some((tab) => tab.id === record.id)) {
             const activeTabId = next.activeTabId;
             next = addInspectorTerminalTab(next, record.id);
             if (activeTabId !== undefined) next = activateInspectorTab(next, activeTabId);
@@ -355,8 +368,11 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
       if (request.signal.aborted) return;
       const failure = results.find((result) => result.status === "rejected");
       setTerminalError(failure?.status === "rejected" ? messageOf(failure.reason) : undefined);
-    }).finally(() => { if (!request.signal.aborted) { setTerminalCatalogPending(false); setTerminalCatalogResolvedOwner(terminalOwner); } });
-    return () => request.abort();
+    }).finally(() => {
+      clearListChanges();
+      if (!request.signal.aborted) { setTerminalCatalogPending(false); setTerminalCatalogResolvedOwner(terminalOwner); }
+    });
+    return () => { request.abort(); clearListChanges(); };
   }, [controller.state.connectionState, controller.getTerminalCapabilities, session.id, terminalOwner, terminalRefresh]);
 
   const openTerminal = (preferExisting: boolean): void => {
@@ -395,6 +411,8 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
       const value = await controller.createTerminal(session.id, creation.requestId, creation.shellId, 80, 24, creation.initialPalette);
       if (terminalOwnerRef.current !== creation.owner) return;
       terminalCreationRef.current = undefined;
+      const listChanges = terminalListChangesRef.current;
+      if (listChanges?.owner === creation.owner) listChanges.records.set(value.id, value);
       setTerminalRecords((current) => ({ ...current, [value.id]: value }));
       setTabBuckets((current) => ({ ...current, [session.id]: addInspectorTerminalTab(current[session.id] ?? createInitialInspectorTabBucket(), value.id) }));
       setMenu(undefined);
@@ -801,6 +819,9 @@ function InspectorImplementation({ controller, snapshot, session, workspace, tim
           const value = terminalRecords[tab.id] ?? await inspectorControllerRef.current.getTerminal(session.id, tab.id, 0n);
           if (terminalOwnerRef.current !== owner) return;
           await inspectorControllerRef.current.closeTerminal(session.id, tab.id, value.generation);
+          if (terminalOwnerRef.current !== owner) return;
+          const listChanges = terminalListChangesRef.current;
+          if (listChanges?.owner === owner) listChanges.records.set(tab.id, null);
           closed.push(tab.id);
         } catch (error) { if (terminalOwnerRef.current === owner) setTerminalError(messageOf(error)); }
       }
