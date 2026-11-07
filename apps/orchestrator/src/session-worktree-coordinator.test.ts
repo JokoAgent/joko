@@ -22,8 +22,11 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { remoteBindingFromLease } from "./remote-claude-worktree-owner.js";
+import { ReviewCoordinator } from "./review-coordinator.js";
+import { DurableReviewEvidenceProvider } from "./review-evidence-provider.js";
 import { SessionHost } from "./session-host.js";
 import { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
+import type { WorkspaceChangeSetService } from "./workspace-change-set.js";
 import { WorkspaceService, type RemoteWorkspaceDelegate, type WorkspaceRegistration } from "./workspace-service.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -33,6 +36,69 @@ afterEach(async () => {
 });
 
 describe("SessionWorktreeCoordinator lifecycle", () => {
+  test("reviews a source task's actual checkout and retains its original worktree ownership", { timeout: 40_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-review-worktree-"));
+    const repositoryRoot = await createRepository(join(root, "project"));
+    const store = new OperationalStore(join(root, "store.db"));
+    const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+    const workspaces = new WorkspaceService();
+    const worktrees = new SessionWorktreeCoordinator({ store, workspaces, storageRoot: join(root, "isolated") });
+    const adapter = new TargetCaptureAdapter();
+    const host = new SessionHost(store, artifacts, [adapter], { worktrees });
+    cleanups.push(async () => {
+      await host.dispose().catch(() => undefined);
+      worktrees.dispose();
+      await workspaces.close();
+      store.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+    await artifacts.initialize();
+    await worktrees.initialize();
+    await host.initialize();
+    await host.registerTarget({ id: "target", backendId: adapter.id, displayName: "Project", workspaceRoot: repositoryRoot, managed: false, trusted: true });
+    await workspaces.register({ id: "target", root: repositoryRoot, displayName: "Project", trusted: true });
+    const connection = store.createConnection({ id: "owner", name: "Owner", authKeyDigest: "digest" });
+    const createNative = vi.spyOn(adapter, "createSession"), closeNative = vi.spyOn(adapter, "closeSession");
+    const sourceSessionId = (await host.createSession({ operationId: "create-review-worktree-source", connection, targetId: "target", title: "Checkout task",
+      fastMode: false, permissionMode: "ask", planMode: false, worktree: { sourceRef: "refs/heads/main", refreshRemote: false } })).value.sessionId;
+    const checkout = store.getSession(sourceSessionId).descriptor.worktree!;
+    await writeFile(join(repositoryRoot, "tracked.txt"), "Parent-only change\n");
+    await writeFile(join(checkout.path, "tracked.txt"), "Checkout-only change\n");
+
+    const evidence = new DurableReviewEvidenceProvider({ store, workspaces, artifacts,
+      workspaceChanges: { listChangeSets: async () => [] } as unknown as WorkspaceChangeSetService });
+    const coordinator = new ReviewCoordinator({ store, runtime: host, evidence });
+    const sendNative = adapter.send.bind(adapter);
+    let allowCompletion!: () => void;
+    const completionGate = new Promise<void>(resolve => { allowCompletion = resolve; });
+    const send = vi.spyOn(adapter, "send").mockImplementation(async (input, context) => {
+      await completionGate;
+      await sendNative(input, context);
+    });
+    const started = coordinator.start({ operationId: "review-worktree-source", connection, request: { sourceSessionId, attachments: [] } });
+    void started.catch(() => undefined);
+    try {
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce(), { timeout: 15_000 });
+      const [prompt, context] = send.mock.calls[0]!;
+      expect(prompt.text).toContain("+Checkout-only change\n");
+      expect(prompt.text).not.toContain("Parent-only change");
+      expect(context).toMatchObject({ target: { workspaceRoot: checkout.path }, runtimePolicy: "review_read_only" });
+      expect(createNative).toHaveBeenLastCalledWith(expect.objectContaining({ target: expect.objectContaining({ workspaceRoot: checkout.path }) }),
+        expect.objectContaining({ target: expect.objectContaining({ workspaceRoot: checkout.path }) }));
+      await expect(worktrees.archive(sourceSessionId)).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    } finally {
+      allowCompletion();
+    }
+    const result = await started;
+    await coordinator.waitForFinalizations();
+    expect(store.getReviewRun(result.reviewRunId)).toMatchObject({ state: "completed", freshness: "current" });
+    expect(store.getSession(result.reviewerSessionId!).descriptor.worktree).toBeUndefined();
+    expect(adapter.observedTrackedContents).toEqual(["Checkout-only change\n"]);
+    expect(closeNative).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ sessionId: result.reviewerSessionId,
+      target: expect.objectContaining({ workspaceRoot: checkout.path }) }));
+    expect(store.getSession(sourceSessionId).descriptor.worktree).toEqual(checkout);
+  });
+
   test.each(["archive", "delete"] as const)("retries only the exact %s lifecycle after native and source writers retire", { timeout: 40_000 }, async disposition => {
     const root = await mkdtemp(join(tmpdir(), "joko-worktree-recycle-"));
     const repositoryRoot = await createRepository(join(root, "project"));
