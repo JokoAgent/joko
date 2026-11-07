@@ -46,6 +46,13 @@
 .inspector-extension-menu { position: fixed; z-index: 1200; min-width: 200px; padding: 5px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: var(--shadow-lg); display: flex; flex-direction: column; }
 .inspector-extension-menu > button { padding: 7px 9px; text-align: start; background: transparent; color: var(--text); border-radius: 5px; }
 .inspector-extension-menu > button:hover, .inspector-extension-menu > button:focus-visible { background: var(--surface-hover); }
+@media (720px < width <= 980px) {
+  .app:has(> .inspector-dock-layout > .inspector-dock-group[data-edge]) {
+    --dock-navigation: 0px;
+    display: grid;
+    grid-template-columns: var(--dock-navigation) var(--dock-left) minmax(0, 1fr) var(--dock-right);
+  }
+}
 @media (max-width: 720px) {
   .app:has(.inspector-dock-layout) { --dock-navigation: 0px; --dock-left: 0px; --dock-right: 0px; --dock-top: 0px; --dock-bottom: 0px; }
   .inspector-dock-group[data-edge] { position: fixed; z-index: 650; inset: 48px 0 0 15%; }
