@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import { PartnerHomeService, PartnerHomeBusyAction, PartnerHomeMovePhase, PartnerService, PartnerTodoUiAction, PartnerTodoView,
@@ -104,8 +105,14 @@ describe("Partner home native integration", () => {
     const append = (id: string, payload: Parameters<OperationalStore["appendEvent"]>[0]["payload"], emittedAt: number) => f.store.appendEvent({
       id, sessionId: original.id, targetId: original.targetId, backendId: original.backendId, generation: original.binding.generation, traceId: id, emittedAt, payload });
     const read = append("visible-user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Keep these notes" }, { kind: "artifact", blob: user, label: "notes.txt" }, { kind: "artifact", blob: missing, label: "removed.txt" }] }, 1000);
-    append("visible-assistant", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Saved." }, { kind: "thinking", text: "Private reasoning", redacted: false }] }, 2000);
+    const topicMessage = append("visible-assistant", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Saved." }, { kind: "thinking", text: "Private reasoning", redacted: false }] }, 2000);
     append("hidden-continuation", { type: "message_complete", role: "user", automaticContinuation: { recoveryId: "hidden-recovery" }, blocks: [{ kind: "text", text: "Hidden recovery prompt" }] }, 3000);
+    const origin = f.store.findVisibleSessionMessageOrigin({ sessionId: original.id, eventId: topicMessage.id })!;
+    const topic = await f.partners.ensureTopic({ operationId: "before-home-change-topic", connection: f.store.getConnection("phone-connection"),
+      partnerId: f.profile.id, expectedRevision: f.profile.revision, assertCurrent: () => undefined,
+      root: { sessionId: original.id, generation: original.binding.generation, eventId: origin.eventId, messageId: origin.messageId } });
+    expect(topic).toMatchObject({ readOnly: false, link: { role: "topic" } });
+    vi.mocked(f.routines.resumePartner).mockImplementation(async partnerId => { f.partners.listSessions(partnerId); });
     f.profiles.markRead(f.profile.id, read.globalCursor);
     const memory = f.store.putMakerMemoryEntry({ targetId: original.targetId, kind: "user", slug: "preference", title: "Preference", description: "Keep a useful preference.", body: "Prefer brief answers." });
     f.memoryPreferences.update(original.targetId, undefined, { enabled: false, userContext: "Work context" });
@@ -146,10 +153,31 @@ describe("Partner home native integration", () => {
     expect((await f.workbenchStore.read(current.id)).projects).toEqual([]);
     expect(f.workbench.foreign(current.id, "computer")[0]!.projects[0]!.path).toBe("/work/original-project");
     expect(f.partners.listSessions(current.id).find(view => view.link.sessionId === original.id)).toMatchObject({ readOnly: true, link: { role: "history" } });
+    expect(f.owner.get(moved.requestId)?.sourceSessionIds).toContain(topic.link.sessionId);
+    expect(f.partners.listSessions(current.id).find(view => view.link.sessionId === topic.link.sessionId)).toMatchObject({
+      available: true, readOnly: true, link: { role: "history", profileVersion: f.profile.profileVersion },
+      session: { targetId: original.targetId, binding: topic.session?.binding }
+    });
+    expect(f.partners.getTopic(topic.link.sessionId)).toBeUndefined();
     expect(() => f.host.enqueueServiceInput({ operationId: "old-machine-must-not-dispatch", sessionId: original.id,
       prompt: { text: "Do not send", images: [], files: [], mentions: [], disposition: "prompt" }, source: "system" })).toThrow(/fenced|home changed/u);
     expect(f.store.findOperation("old-machine-must-not-dispatch")).toBeUndefined();
-    const receipt = await f.owner.retry(moved.requestId); expect(receipt.canonicalSessionId).toBe(session.id);
+    // Recreate the previously persisted committed failure for the same move.
+    const oldDatabase = new DatabaseSync(join(f.root, "partners.db"));
+    try {
+      oldDatabase.prepare(`UPDATE partner_session_links SET role = 'topic', parent_session_id = ?,
+        topic_root_json = ?, topic_operation_id = ? WHERE session_id = ?`)
+        .run(original.id, JSON.stringify(topic.link.topicRoot), topic.link.topicOperationId!, topic.link.sessionId);
+    } finally { oldDatabase.close(); }
+    const committed = f.owner.get(moved.requestId)!;
+    f.storage.save({ ...committed, phase: "needs-attention", sourceFenced: true, failure: "preparation-failed" });
+    expect(() => f.partners.listSessions(current.id)).toThrow("no longer belongs");
+    const createNative = vi.spyOn(f.adapter, "createSession");
+    const receipt = await f.owner.retry(moved.requestId);
+    expect(receipt).toMatchObject({ phase: "ready", canonicalSessionId: session.id });
+    expect(f.profiles.getSessionLink(topic.link.sessionId)?.role).toBe("history");
+    expect(createNative).not.toHaveBeenCalled();
+    expect(rebuild).toHaveBeenCalledOnce();
     expect(f.store.listEvents({ sessionId: session.id }).filter(event => event.payload.type === "message_complete")).toHaveLength(2);
     const updated = await f.partners.updatePartner(current.id, current.revision, { identitySource: "Updated after changing main computer." });
     const prompt = await new PartnerRuntimePromptResolver(f.profiles, f.store, f.memoryPreferences, async () => undefined)

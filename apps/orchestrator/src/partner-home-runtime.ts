@@ -217,6 +217,8 @@ export class PartnerHomeRuntimeAdapter implements PartnerHomeRuntime {
       assertCurrent(); const live = this.options.profiles.getPartner(profile.id);
       if (live.canonicalSessionId !== sessionId) this.options.profiles.moveHome({ partnerId: profile.id, expectedRevision: BigInt(move.partnerRevision),
         sourceSessionId: source.id, targetId, sessionId, capabilities: move.capabilities });
+      else this.options.profiles.retireMovedHomeTopics({ partnerId: profile.id, sourceSessionId: source.id,
+        targetId, sessionId, sourceSessionIds: move.sourceSessionIds });
     }); assertCurrent();
     await this.options.host.rebuildPartnerHomeContext(sessionId, `partner-home:${move.requestId}:context`, assertCurrent); assertCurrent();
     this.options.profiles.markRead(profile.id, restored.readThroughCursor);
