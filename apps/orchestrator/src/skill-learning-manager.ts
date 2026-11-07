@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 
-import { redactSecrets } from "@joko/core";
+import { redactSecrets, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type ConnectionRecord, type OperationalStore } from "@joko/store";
 
 import type { PiLearnedSkillPreview, PiMarketSkillDiffChange, PiResourceManager } from "./resource-manager.js";
@@ -233,21 +233,40 @@ export class SkillLearningManager {
         store.setSetting("service", SETTING_SCOPE, id, created);
       });
       try {
-        const evidence = await this.#collectEvidence(input, sourceKind, instruction);
+        const source = input.sourceSessionId === undefined ? undefined : this.#store.getSession(input.sourceSessionId).descriptor;
+        const inherited = source === undefined ? undefined : this.#sourceRoute(source.id, target.descriptor.backendId);
+        const routeDigest = inherited === undefined ? undefined : operationBodyHash(inherited);
+        const routeGeneration = inherited === undefined ? undefined : this.#store.getBackend(target.descriptor.backendId).descriptor.instanceGeneration;
+        const assertSource = source === undefined ? undefined : () => {
+          this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+          const current = this.#store.getSession(source.id).descriptor;
+          if (current.deletedAt !== undefined || current.targetId !== input.targetId || current.backendId !== source.backendId
+            || current.binding.generation !== source.binding.generation || current.binding.opaqueRef !== source.binding.opaqueRef
+            || this.#store.getTarget(input.targetId).revision !== target.revision
+            || routeDigest !== undefined && (this.#store.getBackend(target.descriptor.backendId).descriptor.instanceGeneration !== routeGeneration
+              || operationBodyHash(this.#sourceRoute(source.id, target.descriptor.backendId) ?? null) !== routeDigest)) {
+            throw new Error("The original Skill learning source or route changed.");
+          }
+        };
+        const evidence = await this.#collectEvidence(input, sourceKind, instruction, source);
+        assertSource?.();
         const createdSession = await this.#sessions.createServiceSession({
           operationId: `${id}_session`,
           serviceKind: "learning",
           targetId: input.targetId,
           title: `Learn Skill: ${summary.slice(0, 72)}`,
           fastMode: false,
+          ...inherited,
           permissionMode: "ask",
           planMode: false,
-          appendSystemPrompt: DISTILLATION_INSTRUCTION
+          appendSystemPrompt: DISTILLATION_INSTRUCTION,
+          ...(assertSource === undefined ? {} : { assertServiceScope: assertSource })
         });
         const withSession = this.#save(created, {
           state: "distilling",
           distillationSessionId: createdSession.value.sessionId
         });
+        assertSource?.();
         const queued = this.#sessions.enqueueServiceInput({
           operationId: `${id}_input`,
           sessionId: createdSession.value.sessionId,
@@ -420,11 +439,26 @@ export class SkillLearningManager {
     });
   }
 
-  async #collectEvidence(input: StartSkillLearningInput, sourceKind: SkillLearningSourceKind, instruction: string): Promise<string> {
+  #sourceRoute(sessionId: string, backendId: string) {
+    const route = this.#sessions.getSessionRuntimeControl(sessionId).effective;
+    if (route?.backendId !== backendId) return undefined;
+    const model = this.#sessions.listSelectableTaskModels(backendId).find(candidate =>
+      candidate.providerId === route.providerId && candidate.modelId === route.modelId);
+    if (model === undefined) return undefined;
+    const fastMode = route.fastMode === "ultrafast" && model.supportsUltrafastMode === true ? "ultrafast" as const
+      : route.fastMode === true && model.supportsFastMode === true;
+    return {
+      providerId: route.providerId,
+      modelId: route.modelId,
+      ...(route.effort !== undefined && model.thinkingLevels.includes(route.effort) ? { effort: route.effort } : {}),
+      fastMode
+    };
+  }
+
+  async #collectEvidence(input: StartSkillLearningInput, sourceKind: SkillLearningSourceKind, instruction: string, source?: SessionDescriptor): Promise<string> {
     if (sourceKind === "text") return instruction;
     if (sourceKind === "session") {
-      const source = this.#store.getSession(input.sourceSessionId!).descriptor;
-      if (source.deletedAt !== undefined || source.targetId !== input.targetId) {
+      if (source === undefined || source.deletedAt !== undefined || source.targetId !== input.targetId) {
         throw new Error("The source task is unavailable on the selected Target.");
       }
       const excerpts = this.#store.listEvents({ sessionId: source.id, order: "desc", limit: 200 })
