@@ -3042,7 +3042,8 @@ describe("McpRouter", () => {
     store.close();
   });
 
-  it.each(["model disabled", "credential replaced"] as const)("settles the original image request when %s during the provider wait", async change => {
+  it.each(["model disabled", "credential replaced", "response lost", "provider rejected", "result saved"] as const)(
+    "records the original image request once when %s", async scenario => {
     const { root, store, router, credentials, artifacts } = await fixture();
     const identity = { backendId: "codex", providerId: "openai", surfaceId: "image-generation" };
     const modelId = "gpt-image-2";
@@ -3061,11 +3062,15 @@ describe("McpRouter", () => {
         providerId: identity.providerId, credentialReferenceId: owner.credentialReferenceId, displayName: "Image fixture" });
     };
     const response = deferred<Response>();
-    const fetch = vi.fn<typeof globalThis.fetch>(async () => response.promise);
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => {
+      const result = await response.promise;
+      if (scenario === "response lost") throw new Error("The connection was lost after sending the request.");
+      return result;
+    });
     const ingest = vi.spyOn(artifacts, "ingestBytes");
     try {
       await setKey("original-synthetic-image-key");
-      const provider = new ImageGenerationBridgeToolProvider({ artifacts, fetch, credentialSurfaces: new ProviderCredentialSurfaceResolver({
+      const provider = new ImageGenerationBridgeToolProvider({ store, artifacts, fetch, credentialSurfaces: new ProviderCredentialSurfaceResolver({
         store, credentials, providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
         modelEnabled: (backendId, providerId, model) => modelRoutingEnabled(store, backendId, providerId, model)
       }) });
@@ -3073,28 +3078,52 @@ describe("McpRouter", () => {
       expect(fetch).not.toHaveBeenCalled();
       router.registerBridgeToolProvider(provider);
       const granted = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", targetId: "target-1" });
-      const call = () => router.executeBridgeCall({ ...bridgeScope(1), generation: 1, authorization: `Bearer ${granted.mcpBridge.token}`,
-        serverId: provider.id, toolName: "image_generate", arguments: { prompt: "A test image" } });
+      const scope = bridgeScope(1);
+      const call = (prompt = "A test image") => router.executeBridgeCall({ ...scope, generation: 1, authorization: `Bearer ${granted.mcpBridge.token}`,
+        serverId: provider.id, toolName: "image_generate", arguments: { prompt } });
+      const imageOperations = () => store.listOperations().filter(operation => operation.kind === "mcp_image_generate");
+      await expect(call("")).resolves.toMatchObject({ isError: true });
+      expect(imageOperations()).toHaveLength(0);
+      expect(fetch).not.toHaveBeenCalled();
       const generating = call();
       await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
       expect(fetch.mock.calls[0]?.[0]).toBe("https://api.openai.com/v1/images/generations");
-      if (change === "model disabled") {
+      const [claim] = imageOperations();
+      expect(claim).toMatchObject({ status: "started" });
+      expect(JSON.stringify(claim?.body)).not.toContain("A test image");
+      expect(JSON.stringify(claim?.body)).not.toContain("synthetic-image-key");
+      await expect(call()).resolves.toMatchObject({ isError: true, error: expect.stringContaining(claim!.id) });
+      if (scenario === "model disabled") {
         writeBackendModelAccess(store, identity.backendId, create(BackendModelAccessUpdateSchema, { providerId: identity.providerId, modelId, enabled: false }));
         expect(provider.listModels()).toEqual([]);
-      } else {
+      } else if (scenario === "credential replaced") {
         await setKey("replacement-synthetic-image-key");
       }
-      response.resolve(Response.json({ data: [{ b64_json: AUDIO_ARTWORK_PNG }] }));
+      response.resolve(scenario === "provider rejected" ? Response.json({}, { status: 401 })
+        : Response.json({ data: [{ b64_json: AUDIO_ARTWORK_PNG }] }));
       const result = await generating;
-      if (change === "model disabled") {
+      if (scenario === "model disabled" || scenario === "result saved") {
         expect(result).toMatchObject({ isError: false, details: { jokoMcpBridge: { imageOutputs: [{ blob: { mimeType: "image/png" } }] } } });
         const staged = await ingest.mock.results[0]!.value;
         expect(store.getArtifact(staged.id)).toMatchObject({ sessionId: "session-1", metadata: {} });
         expect(store.getArtifact(staged.id).metadata).not.toHaveProperty("expiresAt");
         expect(ingest.mock.calls[0]?.[1]).toMatchObject({ expiresAt: expect.any(Number) });
-        await expect(call()).resolves.toMatchObject({ isError: true });
-      } else {
+        expect(store.getOperation(claim!.id)).toMatchObject({ status: "completed", response: staged });
+        if (scenario === "result saved") {
+          await expect(call()).resolves.toEqual(result);
+          await expect(call("Different prompt on the original request ID")).resolves.toMatchObject({ isError: true });
+          expect(ingest).toHaveBeenCalledOnce();
+        } else await expect(call()).resolves.toMatchObject({ isError: true });
+      } else if (scenario === "credential replaced") {
         expect(result).toMatchObject({ isError: true, error: expect.stringContaining("original image generation authority changed") });
+        expect(ingest).not.toHaveBeenCalled();
+      } else {
+        expect(result).toMatchObject({ isError: true, error: expect.stringContaining(claim!.id) });
+        const rejected = scenario === "provider rejected";
+        expect(store.getOperation(claim!.id)).toMatchObject({ status: "failed", error: {
+          code: rejected ? "IMAGE_SUBMISSION_REJECTED" : "IMAGE_SUBMISSION_OUTCOME_UNKNOWN", stateMayHaveChanged: !rejected
+        } });
+        await expect(call()).resolves.toEqual(result);
         expect(ingest).not.toHaveBeenCalled();
       }
       expect(fetch).toHaveBeenCalledOnce();

@@ -1,4 +1,5 @@
-import type { BlobRef } from "@joko/core";
+import { JokoError, type BlobRef } from "@joko/core";
+import { OperationInProgressError, OperationPreviouslyFailedError, type OperationalStore } from "@joko/store";
 
 import type {
   BridgeToolCallContext,
@@ -43,6 +44,7 @@ export interface ExecutableImageGenerationModel {
 }
 
 export interface ImageGenerationBridgeToolProviderOptions {
+  readonly store: OperationalStore;
   readonly credentialSurfaces: ProviderCredentialSurfaceResolver;
   readonly artifacts: McpResultArtifactStore;
   readonly fetch?: typeof fetch;
@@ -56,12 +58,14 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   readonly id = IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID;
   readonly #credentialSurfaces: ProviderCredentialSurfaceResolver;
   readonly #artifacts: McpResultArtifactStore;
+  readonly #store: OperationalStore;
   readonly #fetch: typeof fetch;
   #generation = 1;
   #signature: string | undefined;
   #routes: readonly ImageGenerationRoute[] = [];
 
   constructor(options: ImageGenerationBridgeToolProviderOptions) {
+    this.#store = options.store;
     this.#credentialSurfaces = options.credentialSurfaces;
     this.#artifacts = options.artifacts;
     this.#fetch = options.fetch ?? globalThis.fetch;
@@ -148,28 +152,65 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       apiKey = this.#credentialSurfaces.resolveSecret(route.owner).trim();
       if (apiKey.length === 0) throw new Error("Image generation credential is not configured.");
       context.acceptDispatchedImageResult?.(() => this.#credentialSurfaces.assertDispatchedCredential(route.owner, route.modelId));
-      const generated = await this.#dispatch({
-        executionApi: route.owner.surface.executionApi,
-        apiKey,
-        model: route.modelId,
-        prompt,
-        ...(aspectRatio === undefined ? {} : { aspectRatio }),
-        ...(signal === undefined ? {} : { signal })
-      });
+      signal?.throwIfAborted();
       context.assertCurrent?.();
-      let blob: BlobRef;
+      const claim = this.#claimImageEffect(route, context);
+      if (!claim.claimed) {
+        const stored = this.#store.getArtifact(claim.value.id);
+        if (stored.deletedAt !== undefined) throw new Error("The original image result is no longer available.");
+        return imageResult(claim.value, route.modelId);
+      }
       try {
-        blob = await this.#artifacts.ingestBytes(generated.bytes, {
+        const generated = await this.#dispatch({
+          executionApi: route.owner.surface.executionApi,
+          apiKey,
+          model: route.modelId,
+          prompt,
+          ...(aspectRatio === undefined ? {} : { aspectRatio }),
+          ...(signal === undefined ? {} : { signal })
+        });
+        context.assertCurrent?.();
+        const blob = await this.#artifacts.ingestBytes(generated.bytes, {
           fileName: `generated-image${extensionForMime(generated.mimeType)}`,
           mimeType: generated.mimeType,
           ...(context.acceptDispatchedImageResult === undefined ? {} : { expiresAt: Date.now() + IMAGE_RESULT_STAGING_MS })
         });
-      } catch {
-        throw new Error("Generated image could not be stored.");
+        context.assertCurrent?.();
+        this.#store.completeDeferredEffectOperation(claim.operation.id, claim.operation.bodyHash, () => blob);
+        return imageResult(blob, route.modelId);
+      } catch (error) {
+        const failure = imageSubmissionFailure(claim.operation.id, error instanceof ImageProviderRejection);
+        try {
+          this.#store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, failure);
+        } catch {
+          // A lost terminal write leaves the original durable claim in place.
+        }
+        context.assertCurrent?.();
+        throw failure;
       }
-      return imageResult(blob, route.modelId);
     } finally {
       apiKey = undefined;
+    }
+  }
+
+  #claimImageEffect(route: ImageGenerationRoute, context: BridgeToolCallContext) {
+    const { requestIdentity, requestBodyHash } = context;
+    if (requestIdentity === undefined || requestBodyHash === undefined) throw new Error("Image request identity is unavailable.");
+    const operationId = `mcp-image:${requestIdentity}`;
+    const { backend, provider, surface, credential } = route.owner;
+    try {
+      return this.#store.claimDeferredEffectOperation<BlobRef>({ id: operationId, kind: "mcp_image_generate", body: {
+        requestBodyHash, sessionId: context.sessionId, targetId: context.targetId, generation: context.generation,
+        backendId: backend.id, backendGeneration: backend.instanceGeneration, providerId: provider.providerId,
+        surfaceId: surface.surfaceId, executionApi: surface.executionApi, modelId: route.modelId,
+        credentialReferenceId: route.owner.credentialReferenceId, credentialGeneration: credential.generation
+      } });
+    } catch (error) {
+      if (error instanceof OperationInProgressError) throw imageSubmissionFailure(operationId, false);
+      if (error instanceof OperationPreviouslyFailedError) {
+        throw imageSubmissionFailure(operationId, isRecord(error.storedError) && error.storedError["code"] === "IMAGE_SUBMISSION_REJECTED");
+      }
+      throw error;
     }
   }
 
@@ -271,6 +312,7 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       }
       if (response.status !== 200) {
         await response.body?.cancel().catch(() => undefined);
+        if ([400, 401, 403, 404, 413, 415, 422, 429].includes(response.status)) throw new ImageProviderRejection();
         throw new Error("Image generation request was rejected.");
       }
       if (mediaType(response.headers.get("content-type")) !== "application/json") {
@@ -293,6 +335,21 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       requestSignal.dispose();
     }
   }
+}
+
+class ImageProviderRejection extends Error {}
+
+function imageSubmissionFailure(operationId: string, rejected: boolean): JokoError {
+  return new JokoError({
+    code: rejected ? "IMAGE_SUBMISSION_REJECTED" : "IMAGE_SUBMISSION_OUTCOME_UNKNOWN",
+    message: rejected ? `The image Provider rejected request ${operationId}.`
+      : `Image request ${operationId} is still in progress or its result is unconfirmed. Check the original request before submitting a new one.`,
+    phase: "image_generation",
+    retryable: false,
+    stateMayHaveChanged: !rejected,
+    recovery: rejected ? "Correct the request or Provider settings before starting a new generation."
+      : "Query the original request. Reusing its identity will not send another generation."
+  });
 }
 
 function imageResult(blob: BlobRef, model: string): BridgeToolCallResult {
