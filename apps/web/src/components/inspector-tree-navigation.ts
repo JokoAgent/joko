@@ -72,8 +72,8 @@ export function useInspectorTreeNavigation(
       const tree = ref.current;
       const item = treeItemForTarget(tree, event.target);
       if (tree === null || item === undefined) return;
-      const target = event.target instanceof HTMLElement ? event.target : undefined;
-      if (target !== item && target?.hasAttribute("data-inspector-tree-secondary-action") !== true) {
+      const target = event.target;
+      if (target !== item && !target.hasAttribute("data-inspector-tree-secondary-action")) {
         focusItem(tree, item);
         return;
       }
@@ -180,8 +180,10 @@ function setActiveTreeItem(tree: HTMLDivElement, active: HTMLElement | undefined
 }
 
 function treeItemForTarget(tree: HTMLDivElement | null, target: EventTarget): HTMLElement | undefined {
-  if (tree === null || !(target instanceof Element)) return undefined;
-  const item = target.closest<HTMLElement>('[role="treeitem"]');
+  const element = target as Element;
+  // A detached Inspector may contain newly created and adopted nodes from different realms.
+  if (tree === null || element.nodeType !== Node.ELEMENT_NODE) return undefined;
+  const item = element.closest<HTMLElement>('[role="treeitem"]');
   return item?.closest('[role="tree"]') === tree ? item : undefined;
 }
 
@@ -211,6 +213,6 @@ function treeItemToggle(item: HTMLElement): HTMLElement | undefined {
 }
 
 function treeItemPrimaryAction(item: HTMLElement): HTMLElement {
-  if (item instanceof HTMLButtonElement || item instanceof HTMLAnchorElement) return item;
+  if (item.matches("button, a")) return item;
   return item.querySelector<HTMLElement>("[data-inspector-tree-primary]") ?? item;
 }
