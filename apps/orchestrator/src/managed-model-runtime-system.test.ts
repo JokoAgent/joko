@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createClient, Code } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import * as contract from "@joko/contracts";
-import { llamaCppModelId } from "@joko/local-model-runtime";
+import { OllamaLoopbackClient, OllamaRuntimeLauncher, llamaCppModelId, type LocalRuntimeStatus } from "@joko/local-model-runtime";
 import { OperationalStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import type { AdapterContext } from "@joko/core";
@@ -15,6 +15,7 @@ import { CredentialManager, ProviderCatalogManager } from "./credential-manager.
 import { CredentialVault } from "./credential-vault.js";
 import { createManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
 import { MANAGED_GGUF_PROVIDER_ID } from "./managed-gguf-provider.js";
+import { LocalModelProviderCoordinator, MANAGED_LOCAL_PROVIDER_ID } from "./local-model-runtime-coordinator.js";
 import { ConnectionManager } from "./connection-manager.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
@@ -106,5 +107,48 @@ describe("node-owned managed model runtime composition", () => {
         modelSelection: { providerId: MANAGED_GGUF_PROVIDER_ID, modelId: "missing" } } as unknown as AdapterContext)).rejects.toMatchObject({ code: "RUNTIME_ERROR" });
       expect(f.streaming).not.toHaveBeenCalled(); expect(f.providers.listConfigurations()).toEqual([]);
     } finally { await f.system.close(); f.store.close(); }
+  });
+  it("starts an installed managed Ollama route once for concurrent task uses and fences changed routes", async () => {
+    const f = await fixture();
+    const owner = { ownerId: "node-owner", generation: 1 };
+    const coordinator = new LocalModelProviderCoordinator({ providers: f.providers, backendId: "backend-a", currentOwner: () => owner });
+    const modelId = "fixture:latest";
+    await coordinator.sync(owner, [{ id: modelId, displayName: "Fixture model", supportsImages: false, supportsTools: false }]);
+    let status: LocalRuntimeStatus = { runtime: "ollama", source: "cli", state: "stopped", capabilities: {
+      canInstall: false, canStart: true, canListModels: false, canPullModels: false, canDeleteModels: false, canPausePulls: false
+    } };
+    const probe = vi.spyOn(OllamaRuntimeLauncher.prototype, "status").mockImplementation(async () => status);
+    let beforeLaunch: Promise<void> = Promise.resolve();
+    const start = vi.spyOn(OllamaRuntimeLauncher.prototype, "start").mockImplementation(async ({ assertCurrent }) => {
+      await beforeLaunch;
+      assertCurrent?.();
+      status = { ...status, state: "ready" };
+      return status;
+    });
+    const tags = vi.spyOn(OllamaLoopbackClient.prototype, "tags").mockResolvedValue([{ name: modelId }]);
+    try {
+      const prepare = (target: { backendId: string; remoteWorkspace?: unknown }) => f.system.prepareProviderRuntime({ target,
+        signal: new AbortController().signal, modelSelection: { providerId: MANAGED_LOCAL_PROVIDER_ID, modelId } } as AdapterContext);
+      await prepare({ backendId: "backend-a", remoteWorkspace: { kind: "ssh" } });
+      await expect(prepare({ backendId: "backend-b" })).rejects.toMatchObject({ code: "MODEL_UNAUTHORIZED" });
+      expect(start).not.toHaveBeenCalled();
+      await Promise.all([prepare({ backendId: "backend-a" }), prepare({ backendId: "backend-a" })]);
+      expect(start).toHaveBeenCalledOnce();
+      expect(tags).toHaveBeenCalledTimes(2);
+      status = { ...status, state: "port_conflict", publicErrorCode: "PORT_CONFLICT" };
+      await expect(prepare({ backendId: "backend-a" })).rejects.toMatchObject({ code: "PORT_CONFLICT" });
+      expect(start).toHaveBeenCalledOnce();
+      status = { ...status, state: "stopped" };
+      let release!: () => void;
+      beforeLaunch = new Promise<void>(resolve => { release = resolve; });
+      const waiting = expect(prepare({ backendId: "backend-a" })).rejects.toMatchObject({ code: "MODEL_UNAUTHORIZED" });
+      try {
+        await vi.waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+        await coordinator.sync(owner, []);
+      } finally { release(); }
+      await waiting;
+      expect(tags).toHaveBeenCalledTimes(2);
+      expect(f.streaming).not.toHaveBeenCalled();
+    } finally { tags.mockRestore(); start.mockRestore(); probe.mockRestore(); await f.system.close(); f.store.close(); }
   });
 });

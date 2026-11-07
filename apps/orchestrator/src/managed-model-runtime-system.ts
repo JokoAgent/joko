@@ -3,9 +3,11 @@ import { join } from "node:path";
 
 import {
   LocalModelRuntimeManager,
+  LocalRuntimeError,
   LlamaCppRuntimeManager,
   OllamaLoopbackClient,
   OllamaRuntimeLauncher,
+  canonicalModelName,
   type RuntimeAuditEvent,
   type RuntimeOwnerGeneration
 } from "@joko/local-model-runtime";
@@ -14,7 +16,7 @@ import type { OperationalStore } from "@joko/store";
 
 import type { ProviderCatalogManager } from "./credential-manager.js";
 import {
-  LocalModelProviderCoordinator
+  LocalModelProviderCoordinator, MANAGED_LOCAL_PROVIDER_ID, isOwnedProvider
 } from "./local-model-runtime-coordinator.js";
 import {
   activateLocalModelRuntimePersistence,
@@ -141,7 +143,27 @@ export async function createManagedModelRuntimeSystem(
   return {
     registry,
     async prepareProviderRuntime(context) {
-      if (context.target.remoteWorkspace !== undefined || context.modelSelection?.providerId !== MANAGED_GGUF_PROVIDER_ID) return;
+      const { target, modelSelection, signal } = context;
+      if (target.remoteWorkspace !== undefined || modelSelection === undefined) return;
+      if (modelSelection.providerId === MANAGED_LOCAL_PROVIDER_ID) {
+        const assertRoute = () => {
+          const provider = options.providers.list(target.backendId).find(item => item.provider.id === MANAGED_LOCAL_PROVIDER_ID);
+          if (target.backendId !== options.providers.nativeAuthenticationBackendId || !provider?.enabled || !isOwnedProvider(provider)
+            || !provider.provider.models.some(model => model.id === modelSelection.modelId)) {
+            throw new LocalRuntimeError("MODEL_UNAUTHORIZED", "The selected managed Ollama route is unavailable.");
+          }
+        };
+        const status = await controller.ensureReadyForUse(signal, assertRoute);
+        signal.throwIfAborted(); assertRoute();
+        if (status.state !== "ready") throw new LocalRuntimeError(status.publicErrorCode ?? "RUNTIME_UNREACHABLE", "The managed Ollama runtime is not ready.");
+        const models = await client.tags(signal);
+        signal.throwIfAborted(); assertRoute();
+        if (!models.some(model => canonicalModelName(model.name) === canonicalModelName(modelSelection.modelId))) {
+          throw new LocalRuntimeError("MODEL_NOT_FOUND", "The selected Ollama model is no longer installed.");
+        }
+        return;
+      }
+      if (modelSelection.providerId !== MANAGED_GGUF_PROVIDER_ID) return;
       ggufProviders.assertConnection(owner); context.signal.throwIfAborted();
       const route = ggufProviders.routes().find(item => item.backendId === context.target.backendId && item.providerId === context.modelSelection!.providerId);
       const state = await ggufManager.snapshot(owner); context.signal.throwIfAborted();

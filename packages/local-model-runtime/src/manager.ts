@@ -119,14 +119,14 @@ export class LocalModelRuntimeManager {
       : undefined;
   }
 
-  async start(owner: RuntimeOwnerGeneration, signal?: AbortSignal): Promise<LocalRuntimeStatus> {
+  async start(owner: RuntimeOwnerGeneration, signal?: AbortSignal, assertCurrent?: () => void): Promise<LocalRuntimeStatus> {
     this.assertOwner(owner);
     if (this.startOperation !== undefined) {
       if (!sameOwner(this.startOperation.owner, owner)) throw new LocalRuntimeError("START_FAILED", "Another runtime owner is starting the service.");
       return this.startOperation.promise;
     }
     this.audit(owner, "runtime_start", "started");
-    const promise = this.options.launcher.start({ owner, currentOwner: this.options.currentOwner, signal })
+    const promise = this.options.launcher.start({ owner, currentOwner: this.options.currentOwner, signal, ...(assertCurrent === undefined ? {} : { assertCurrent }) })
       .then((status) => {
         this.assertOwner(owner);
         this.audit(owner, "runtime_start", "succeeded");

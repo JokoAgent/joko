@@ -76,7 +76,7 @@ export interface ManagedModelRuntimeManagerPort {
   list(owner: RuntimeOwnerGeneration, signal?: AbortSignal): Promise<readonly InstalledLocalModel[]>;
   paused(owner: RuntimeOwnerGeneration): Promise<readonly ModelPullProgress[]>;
   activePulls(owner: RuntimeOwnerGeneration): readonly ModelPullProgress[];
-  start(owner: RuntimeOwnerGeneration, signal?: AbortSignal): Promise<LocalRuntimeStatus>;
+  start(owner: RuntimeOwnerGeneration, signal?: AbortSignal, assertCurrent?: () => void): Promise<LocalRuntimeStatus>;
   install(owner: RuntimeOwnerGeneration): Promise<LocalRuntimeStatus>;
   abortInstall(owner: RuntimeOwnerGeneration): void;
   pull(owner: RuntimeOwnerGeneration, modelName: string): Promise<void>;
@@ -109,7 +109,7 @@ export class ManagedModelRuntimeController {
   private readonly owner: RuntimeOwnerGeneration;
   private readonly now: () => number;
   private startAbort: AbortController | undefined;
-  private startTask: Promise<void> | undefined;
+  private startTask: Promise<LocalRuntimeStatus> | undefined;
   private installTask: Promise<void> | undefined;
   private readonly pullTasks = new Map<string, Promise<void>>();
   private lastError: RuntimePublicErrorCode | undefined;
@@ -163,7 +163,7 @@ export class ManagedModelRuntimeController {
       supportsCustomModels: status.capabilities.canPullModels,
       supportsCuratedCatalog: true,
       supportsModelPreflight: true,
-      canConfigure: true, canStop: false, canRestart: false, supportsRepositoryModels: false, startupPolicy: "explicit"
+      canConfigure: true, canStop: false, canRestart: false, supportsRepositoryModels: false, startupPolicy: "on_use"
     };
     const providerRoutes = this.options.providerRoutes?.().map(route => ({ ...route })) ?? [];
     const projection = JSON.stringify({
@@ -214,19 +214,30 @@ export class ManagedModelRuntimeController {
   async beginStart(): Promise<ManagedModelRuntimeSnapshot> {
     this.assertOpen();
     this.lastError = undefined;
-    if (this.startTask === undefined) {
-      const abort = new AbortController();
-      this.startAbort = abort;
-      const task = this.manager.start(this.owner, abort.signal)
-        .then(() => { this.lastError = undefined; })
-        .catch((error: unknown) => { this.captureError(error); })
-        .finally(() => {
-          if (this.startTask === task) this.startTask = undefined;
-          if (this.startAbort === abort) this.startAbort = undefined;
-        });
-      this.startTask = task;
-    }
+    void this.startRuntime().catch(() => undefined);
     return this.snapshot();
+  }
+
+  async ensureReadyForUse(signal: AbortSignal, assertCurrent: () => void): Promise<LocalRuntimeStatus> {
+    this.assertOpen(); signal.throwIfAborted(); assertCurrent();
+    const status = await this.manager.status(this.owner);
+    this.assertOpen(); signal.throwIfAborted(); assertCurrent();
+    return status.state === "stopped" ? this.startRuntime(assertCurrent) : status;
+  }
+
+  private startRuntime(assertCurrent?: () => void): Promise<LocalRuntimeStatus> {
+    if (this.startTask !== undefined) return this.startTask;
+    const abort = new AbortController();
+    this.startAbort = abort;
+    const pending = assertCurrent === undefined ? this.manager.start(this.owner, abort.signal) : this.manager.start(this.owner, abort.signal, assertCurrent);
+    const task = pending.then(status => { this.lastError = undefined; return status; })
+      .catch((error: unknown) => { this.captureError(error); throw error; })
+      .finally(() => {
+        if (this.startTask === task) this.startTask = undefined;
+        if (this.startAbort === abort) this.startAbort = undefined;
+      });
+    this.startTask = task;
+    return task;
   }
 
   async beginInstall(): Promise<ManagedModelRuntimeSnapshot> {
@@ -315,6 +326,7 @@ export class ManagedModelRuntimeController {
 
   async close(): Promise<void> {
     if (this.closed) return;
+    this.closed = true;
     this.startAbort?.abort();
     await this.manager.shutdown(this.owner);
     await Promise.allSettled([
@@ -322,7 +334,6 @@ export class ManagedModelRuntimeController {
       ...(this.installTask === undefined ? [] : [this.installTask]),
       ...this.pullTasks.values()
     ]);
-    this.closed = true;
   }
 
   private async preflightRuntimeInstall(): Promise<RuntimePreflight> {
