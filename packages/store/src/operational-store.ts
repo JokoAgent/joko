@@ -7202,11 +7202,35 @@ export class OperationalStore {
       if (!connection.enabled || connection.runtimeStatus !== "connected") return undefined;
       const claimToken = messagingClaimToken(input.claimToken);
       const at = messagingTimestamp(input.claimedAt ?? this.now(), "delivery claim time");
+      // A Discord final can edit the same carrier as an in-flight progress effect.
+      // Keep it pending through that effect's receipt, and keep its remaining parts behind the first.
       const row = this.database.prepare(`
-        SELECT * FROM messaging_deliveries
-        WHERE connection_id = ? AND channel_generation = ? AND status = 'pending' AND available_at <= ?
-        ORDER BY available_at, created_at, id LIMIT 1
-      `).get(connection.id, connection.generation, at) as Row | undefined;
+        SELECT delivery.* FROM messaging_deliveries AS delivery
+        WHERE delivery.connection_id = ? AND delivery.channel_generation = ?
+          AND delivery.status = 'pending' AND delivery.available_at <= ?
+          AND NOT EXISTS (
+            SELECT 1 FROM messaging_deliveries AS first_part
+            WHERE ? = 'discord' AND first_part.connection_id = delivery.connection_id
+              AND first_part.channel_generation = delivery.channel_generation
+              AND first_part.conversation_id = delivery.conversation_id
+              AND first_part.dedupe_key = delivery.dedupe_key AND first_part.part_index = 0
+              AND first_part.kind = 'text' AND json_type(first_part.payload_json, '$.streamFinalRequestId') = 'text'
+              AND (
+                (delivery.part_index > 0 AND first_part.status IN ('pending', 'dispatching'))
+                OR (delivery.part_index = 0 AND EXISTS (
+                  SELECT 1 FROM messaging_deliveries AS progress
+                  WHERE progress.connection_id = delivery.connection_id
+                    AND progress.channel_generation = delivery.channel_generation
+                    AND progress.conversation_id = delivery.conversation_id
+                    AND progress.status = 'dispatching' AND progress.kind = 'notice'
+                    AND json_extract(progress.payload_json, '$.replyStream.phase') IN ('start', 'edit')
+                    AND json_extract(progress.payload_json, '$.replyStream.requestId')
+                      = json_extract(first_part.payload_json, '$.streamFinalRequestId')
+                ))
+              )
+          )
+        ORDER BY delivery.available_at, delivery.created_at, delivery.id LIMIT 1
+      `).get(connection.id, connection.generation, at, connection.channel) as Row | undefined;
       if (row === undefined) return undefined;
       const current = messagingDeliveryFromRow(row);
       const result = this.database.prepare(`
