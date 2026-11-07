@@ -380,6 +380,40 @@ it("creates real hidden team workers only in the approved immutable plan and rev
   expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(2);
   expect(() => f.tasks.assertTeamWorkerCurrent(task.taskId)).toThrow();
 });
+it("returns the completed Worker Run timestamp so a plugin can release its plan slot", async () => {
+  const f = await fixture();
+  f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "auto" }, () => undefined);
+  const { taskId } = await f.request({ kind: "create", requestKey: "release-team", title: "Release team" }) as { taskId: string };
+  const first = { label: "First", workingDir: f.root, route: f.route, task: "Review the first document." };
+  const second = { ...first, label: "Second", task: "Review the second document." };
+  await f.request({ kind: "setTeamPlan", taskId, plan: { concurrency: 1, task: "Review two documents in order", items: [first, second] } });
+  const team = await f.request({ kind: "startTeam", taskId }) as ReturnType<CollaborationGoalManager["getTree"]>;
+  const target = f.store.listTargets().find(value => value.descriptor.id.startsWith("extension-team-target-"))!.descriptor;
+  const route = { ...f.route, targetId: target.id, permissionMode: "auto" as const, planMode: false };
+  const settle = f.store.updateQueueState.bind(f.store);
+  vi.spyOn(f.store, "updateQueueState").mockImplementation(input => {
+    if (input.state !== "completed") return settle(input);
+    const run = f.store.getRun(f.store.getQueueItem(input.queueItemId).runId).descriptor;
+    return settle({ ...input, at: Math.max(input.at ?? Date.now(), run.endedAt! + 1) });
+  });
+  const base = { goalId: team.goal.id, callerLeadSessionId: taskId, route, role: "Reviewer" };
+  const { worker } = await f.teams.createWorker({ ...base, operationId: "first-serial-worker", expectedGoalRevision: team.goal.revision,
+    label: first.label, assignment: first.task });
+  await vi.waitFor(() => expect(f.store.listQueueItems({ sessionId: worker.sessionId! })[0]?.state).toBe("completed"));
+  const endedAt = f.store.listRuns({ sessionId: worker.sessionId!, limit: 1 })[0]!.descriptor.endedAt;
+  const queueCompletedAt = f.store.listQueueItems({ sessionId: worker.sessionId! })[0]!.completedAt;
+  expect(queueCompletedAt).toBeGreaterThan(endedAt!);
+  const read = await f.request({ kind: "getTeam", taskId }) as { workers: readonly { id: string; completedAt?: number }[] };
+  const completedAt = read.workers.find(value => value.id === worker.id)?.completedAt;
+  expect(completedAt).toBe(endedAt);
+  const release = { kind: "releaseWorker", taskId, workerId: worker.id };
+  await expect(f.request({ ...release, completedAt: queueCompletedAt })).rejects.toMatchObject({ code: "STALE_REVISION" });
+  await expect(f.request({ ...release, completedAt })).resolves.toMatchObject({ worker: { id: worker.id, runtimeReleased: true } });
+
+  const current = f.teams.getTree(team.goal.id).goal;
+  await expect(f.teams.createWorker({ ...base, operationId: "second-serial-worker", expectedGoalRevision: current.revision,
+    label: second.label, assignment: second.task })).resolves.toMatchObject({ worker: { label: second.label } });
+});
 it("keeps account-wide history closed while an uninstalled plugin's Worker still runs behind a queued human input", async () => {
   const f = await fixture();
   f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "auto" }, () => undefined);

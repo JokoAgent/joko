@@ -552,7 +552,20 @@ export class ExtensionTasks {
           const plan: TeamPlan = { concurrency: Number(value.concurrency), task: text(value.task, 8000), items, scope, preferences: preferenceStamp, directories, coordinatorRoute };
           this.options.store.setSetting("service", PLANS, task.descriptor.id, { version: 1, fingerprint, plan }); return { ok: true };
         }
-        if (kind === "getTeam") return goal ? teams.getTree(goal.id) : { team: null };
+        if (kind === "getTeam") {
+          if (!goal) return { team: null };
+          const tree = teams.getTree(goal.id);
+          const completedRuns = new Map<string, string>();
+          for (const { dispatch, queueItem } of tree.queue) {
+            if (queueItem?.state === "completed") completedRuns.set(queueItem.runId, dispatch.workerId);
+          }
+          return { ...tree, workers: tree.workers.map(worker => {
+            if (!worker.sessionId || worker.runtimeReleased || (worker.status !== "idle" && worker.status !== "completed")) return worker;
+            const run = this.options.store.listRuns({ sessionId: worker.sessionId, limit: 1 })[0]?.descriptor;
+            return run?.state === "completed" && run.endedAt !== undefined && completedRuns.get(run.id) === worker.id
+              ? { ...worker, completedAt: run.endedAt } : worker;
+          }) };
+        }
         if (kind === "startTeam") {
           if (task.descriptor.permissionMode !== "auto" || this.preferences(owner.extensionId).config.permissionMode !== "auto" || task.descriptor.planMode) failure("PERMISSION_DENIED", "Task teams require explicitly approved Auto permission.");
           if (goal) return teams.getTree(goal.id);
