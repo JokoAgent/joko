@@ -145,8 +145,8 @@ function PartnerRow({ partner, selected, colors, locale, onPress }: {
   readonly locale: MobileSupportedLocale;
   readonly onPress: () => void;
 }) {
-  const state = partner.lifecycle === "archived"
-    ? mobileMessage(locale, "partner.lifecycle.archived")
+  const state = partner.lifecycle !== "active"
+    ? mobileMessage(locale, partner.lifecycle === "archived" ? "partner.lifecycle.archived" : "partner.lifecycle.paused")
     : partner.initializationState === "pending"
       ? mobileMessage(locale, "partner.initialization.pending")
       : partner.initializationState === "error"

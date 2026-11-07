@@ -129,8 +129,7 @@ export function projectMobilePartners(response: ListPartnersResponse): readonly 
   const directory = response.directory;
   if (!directory || response.partners.length > MAX_PARTNERS
     || !Number.isSafeInteger(directory.activeCount) || !Number.isSafeInteger(directory.archivedCount)
-    || directory.activeCount < 0 || directory.archivedCount < 0
-    || directory.activeCount + directory.archivedCount !== response.partners.length) {
+    || directory.activeCount < 0 || directory.archivedCount < 0) {
     throw new Error("The Joko node returned an invalid Partner directory.");
   }
   const ids = new Set<string>();
@@ -163,7 +162,9 @@ export function projectMobilePartners(response: ListPartnersResponse): readonly 
       profileVersion: positiveSafe(partner.profileVersion, "Partner profile version")
     };
   });
-  if (partners.filter((partner) => partner.lifecycle === "active").length !== directory.activeCount) {
+  // The service lists paused Partners without counting them in either bucket.
+  if (partners.filter((partner) => partner.lifecycle === "active").length !== directory.activeCount
+    || partners.filter((partner) => partner.lifecycle === "archived").length !== directory.archivedCount) {
     throw new Error("The Joko node returned inconsistent Partner counts.");
   }
   return partners;

@@ -35,6 +35,16 @@ const messages = [{
 }];
 
 describe("mobile Partner private projections", () => {
+  it("keeps paused Partners beside the exact active and archived directory counts", () => {
+    const directory = create(ListPartnersResponseSchema, { directory: { activeCount: 2, archivedCount: 1 }, partners: [
+      partner("partner-a", "session-a"), partner("partner-b", "session-b"),
+      { ...partner("partner-paused", "session-paused"), lifecycle: PartnerLifecycle.PAUSED, pauseCleanupPending: false },
+      { ...partner("partner-archived", "session-archived"), lifecycle: PartnerLifecycle.ARCHIVED }
+    ] });
+    expect(projectMobilePartners(directory).map(item => item.lifecycle)).toEqual(["active", "active", "paused", "archived"]);
+    expect(() => projectMobilePartners({ ...directory, directory: { ...directory.directory!, archivedCount: 0 } })).toThrow(/inconsistent Partner counts/u);
+  });
+
   it("keeps the immutable canonical link valid after profile edits but rejects future or unavailable links", () => {
     const current = projectMobilePartners(create(ListPartnersResponseSchema, {
       directory: { activeCount: 1 }, partners: [{ ...partner("partner-a", "session-a"), profileVersion: 4n }]
