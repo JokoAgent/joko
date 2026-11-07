@@ -111,6 +111,32 @@ describe("task tags", () => {
     }));
   });
 
+  it.each([false, true])("preserves a draft through concurrent sorting with content conflict=%s", async conflict => {
+    const original = tag("release", "Release", "teal"), other = tag("review", "Review", "blue");
+    const latest = { ...original, name: conflict ? "Shipped" : original.name, sortOrder: 1, revision: original.revision + 1n };
+    const updateTaskTag = vi.fn(async (_sessionId: string, _tagId: string, revision: bigint) => {
+      if (revision !== latest.revision) throw new Error("Tag changed concurrently.");
+    });
+    const controller = { updateTaskTag } as unknown as AppController;
+    const session = { id: "original", name: "Original", taskTags: [] } as unknown as SessionView;
+    const host = document.body.appendChild(document.createElement("div")), root = createRoot(host); roots.push(root);
+    const render = (catalog: readonly TaskTagView[], revision: bigint) => act(async () => root.render(<TaskTagDialog session={session} catalog={catalog}
+      catalogRevision={revision} controller={controller} t={t} onClose={vi.fn()} />));
+    await render([original, other], 7n);
+    await act(async () => buttonByLabel(document.body, t("taskTags.editLabel", { name: "Release" })).click());
+    const form = document.querySelector<HTMLFormElement>(".task-tag-editor__form")!;
+    const input = form.querySelector<HTMLInputElement>("input")!;
+    await change(input, "Launch");
+    await render([other, latest], 8n);
+    expect(input.value).toBe("Launch");
+    await act(async () => form.requestSubmit());
+    expect(updateTaskTag).toHaveBeenCalledExactlyOnceWith("original", original.id, conflict ? original.revision : latest.revision, { name: "Launch" });
+    if (conflict) {
+      expect(input.value).toBe("Launch");
+      expect(document.querySelector('[role="alert"]')?.textContent).toBe(t("taskTags.changeFailed"));
+    } else expect(document.querySelector(".task-tag-editor__form")).toBeNull();
+  });
+
   it("commits a pointer reorder once and cancels Escape, lost capture, and concurrent catalog changes", async () => {
     const callbacks = new Map<number, FrameRequestCallback>(); let sequence = 0;
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { callbacks.set(++sequence, callback); return sequence; });
