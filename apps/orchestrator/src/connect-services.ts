@@ -21067,22 +21067,26 @@ async function dispatchMutation(
     }
     case "deleteMcpServer": {
       if (dependencies.mcpRouter === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The MCP Router is not configured.");
+      const assertCurrent = () => { dependencies.connections.fence(connection); };
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
         resultCase: "acknowledgement"
       }, async () => {
-        if (!await dependencies.mcpRouter!.delete(payload.value.mcpServerId)) throw new ConnectError("MCP Server not found.", Code.NotFound);
+        if (!await dependencies.mcpRouter!.delete(payload.value.mcpServerId, assertCurrent)) throw new ConnectError("MCP Server not found.", Code.NotFound);
+        assertCurrent();
         await dependencies.refreshPiGeneration?.();
       });
     }
     case "restartMcpServer": {
       if (dependencies.mcpRouter === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The MCP Router is not configured.");
+      const assertCurrent = () => { dependencies.connections.fence(connection); };
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
         accepted: true,
         resultCase: "mcpServer",
         entityId: payload.value.mcpServerId
       }, async () => {
-        await dependencies.mcpRouter!.restart(payload.value.mcpServerId);
+        await dependencies.mcpRouter!.restart(payload.value.mcpServerId, assertCurrent);
+        assertCurrent();
         await dependencies.refreshPiGeneration?.();
       });
     }
