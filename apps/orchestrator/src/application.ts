@@ -1558,7 +1558,7 @@ export async function createOrchestratorApplication(
               captureSkillSourceAuthority: (workspaceId, signal) => remoteWorkspaceFiles.captureSkillSourceAuthority(workspaceId, signal),
               nativeSkillJournalRoot: join(config.dataDirectory, "remote-codex-skill-mounts", instanceId, String(generation))
             }),
-            resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
+            resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId),
             resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(instanceId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
             resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
             managedProviders,

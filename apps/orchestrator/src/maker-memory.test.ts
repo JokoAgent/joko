@@ -144,13 +144,14 @@ describe("MakerMemoryController", () => {
     expect(memory.enabledForBackend("memory-capable")).toBe(false);
     expect(memory.enabledForBackend("another-memory")).toBe(true);
     expect(memory.nativeEnabledForBackend("native-memory")).toBe(false);
+    expect(memory.nativeEnabledForBackend("codex-memory")).toBe(false);
     await memory.update({ makerEnabled: false });
     expect(memory.available).toBe(false);
     expect(memory.enabledForBackend("another-memory")).toBe(false);
     expect(memory.nativeEnabledForBackend("native-memory")).toBe(true);
-    expect(memory.nativeEnabledForBackend("codex-memory", false)).toBe(false);
-    await memory.update({ backendId: "codex-memory", backendEnabled: true });
-    expect(memory.nativeEnabledForBackend("codex-memory", false)).toBe(true);
+    expect(memory.nativeEnabledForBackend("codex-memory")).toBe(true);
+    await memory.update({ backendId: "codex-memory", backendEnabled: false });
+    expect(memory.nativeEnabledForBackend("codex-memory")).toBe(false);
     await memory.update({ backendId: "native-memory", backendEnabled: false });
     expect(memory.nativeEnabledForBackend("native-memory")).toBe(false);
     expect(refreshed).toHaveBeenCalledTimes(4);

@@ -4411,7 +4411,7 @@ describe("CodexBackendAdapter", () => {
     expect(descriptor.capabilities.get("memory.native")).toEqual({
       key: "memory.native",
       supported: true,
-      options: ["live_local", "default_disabled", "reset_local"]
+      options: ["live_local", "reset_local"]
     });
 
     const binding = await setup.adapter.createSession(
