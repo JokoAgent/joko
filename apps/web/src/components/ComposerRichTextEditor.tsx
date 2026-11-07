@@ -77,7 +77,7 @@ export type ComposerRouteReferenceDropAction =
   | { readonly kind: "cancel" };
 
 export interface ComposerRichTextEditorHandle {
-  readonly focus: (position?: "start" | "end") => void;
+  readonly focus: (position?: "start" | "end", options?: { readonly immediate: boolean }) => void;
   readonly inputKey: (key: "ArrowUp" | "ArrowDown" | "Enter") => boolean;
   readonly focusFromBlankSurface: () => void;
   readonly editPastedText: (nodePosition: number, expectedText: string, nextText: string, display: string) => boolean;
@@ -235,7 +235,20 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
   });
 
   useImperativeHandle(forwardedRef, () => ({
-    focus: (position = "end") => { editor?.commands.focus(position); },
+    focus: (position = "end", options) => {
+      if (editor === null || editor.isDestroyed) return;
+      if (options?.immediate !== true) {
+        editor.commands.focus(position);
+        return;
+      }
+      const view = editor.view;
+      if (!view.dom.isConnected || view.composing || !editor.isEditable) return;
+      const { doc, selection, tr } = view.state;
+      const target = position === "end" ? Selection.atEnd(doc) : Selection.atStart(doc);
+      if (!selection.eq(target)) view.dispatch(tr.setSelection(target));
+      view.focus();
+      editor.commands.scrollIntoView();
+    },
     inputKey: (key) => {
       if (editor === null || editor.isDestroyed || !editor.isEditable
         || !pasteRuntimeRef.current.editable || pasteRuntimeRef.current.disabled) return false;

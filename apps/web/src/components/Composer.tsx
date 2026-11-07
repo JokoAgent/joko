@@ -707,7 +707,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         activeElementMatchesAnchor: currentActive !== null && currentActive === focusAnchorRef.current,
         activeElementInsideComposer: currentActive !== null && currentContainer?.contains(currentActive) === true
       })) return;
-      richEditorRef.current?.focus("end");
+      // Keep the final focus decision and the DOM focus in this frame.
+      richEditorRef.current?.focus("end", { immediate: true });
     });
     return () => ownerWindow.cancelAnimationFrame(frame);
   }, [autoFocus, hydratedSession, readOnly, session.id]);
@@ -717,7 +718,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     const ownerWindow = composerStackRef.current?.ownerDocument.defaultView;
     if (ownerWindow === null || ownerWindow === undefined) return;
     const frame = ownerWindow.requestAnimationFrame(() => {
-      if (focusRequest()) richEditorRef.current?.focus("end");
+      if (focusRequest()) richEditorRef.current?.focus("end", { immediate: true });
     });
     return () => ownerWindow.cancelAnimationFrame(frame);
   }, [focusRequest, hydratedSession, readOnly, session.id]);
