@@ -206,6 +206,12 @@ describe("Inspector production trees", () => {
     const owner = location === "main"
       ? document
       : required(document.body.appendChild(document.createElement("iframe")).contentDocument);
+    if (owner !== document) {
+      Object.defineProperty(required(owner.defaultView).HTMLElement.prototype, "scrollIntoView", {
+        configurable: true,
+        value: vi.fn()
+      });
+    }
     const host = await render(<ReviewFileTree files={files} selectedKey={reviewFileKey(files[0]!)} onSelect={onSelect} t={t} />, owner);
     await settle();
 
