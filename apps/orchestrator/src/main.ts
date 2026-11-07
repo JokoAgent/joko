@@ -36,6 +36,11 @@ import {
 } from "./service-device-peer-agent.js";
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "run-task") {
+    const { runStandaloneTask } = await import("./standalone-task.js");
+    process.exitCode = await runStandaloneTask(process.argv.slice(3));
+    return;
+  }
   const desktopHostedPersistent = process.argv.includes("--desktop-hosted");
   const desktopHostedEphemeral = process.argv.includes("--desktop-hosted-ephemeral");
   if (desktopHostedPersistent && desktopHostedEphemeral) throw new Error("Desktop-hosted Orchestrator mode is ambiguous.");
