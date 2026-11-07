@@ -93,7 +93,7 @@ export class HostScheduleScriptCapabilityBroker implements ScheduleScriptCapabil
     return {
       target_session_id: sessionId,
       run_id: sent.value.runId,
-      wake_kind: requestedSessionId === undefined ? "created" : "resumed",
+      wake_kind: requestedSessionId === undefined ? "created" : "queued",
       target_title: this.store.getSession(sessionId).descriptor.title
     };
   }
