@@ -356,8 +356,31 @@ export class PartnerManager {
     return partner;
   }
 
-  resolveTaskModel(sessionId: string, explicit?: PartnerModelRouteRecord): { readonly route: PartnerModelRouteRecord; readonly assertCurrent: () => void } {
-    const profile = this.runtimeCaller(sessionId), session = this.#operationalStore.getSession(sessionId).descriptor;
+  independentTaskTopic(sessionId: string, allowPreparing = false) {
+    const link = this.#store.getSessionLink(sessionId);
+    if (link?.role !== "topic" || !link.parentSessionId || !link.topicOperationId || link.topicRoot?.sessionId !== link.parentSessionId) return undefined;
+    const profile = this.canonicalCaller(link.parentSessionId);
+    const home = this.#operationalStore.getTarget(profile.homeTargetId).descriptor;
+    if (profile.id !== link.partnerId || profile.profileVersion !== link.profileVersion || profile.pauseCleanupPending
+      || !home.trusted || home.remoteWorkspace !== undefined) return undefined;
+    const session = this.#operationalStore.findSession(sessionId)?.descriptor;
+    const creation = this.#operationalStore.findOperation(link.topicOperationId);
+    if (session === undefined ? !allowPreparing || creation?.status !== "started"
+      : creation?.status !== "completed" || session.targetId !== home.id || session.remoteWorkspace !== undefined
+        || session.archived || session.deletedAt !== undefined || this.#operationalStore.findPendingSessionLifecycleCleanup(sessionId) !== undefined) return undefined;
+    const backendId = session?.backendId ?? profile.capabilities.modelChain[0]?.backendId;
+    if (!backendId || this.#operationalStore.getBackend(backendId).descriptor.adapterKind !== "pi") return undefined;
+    return { profile, operationId: link.topicOperationId };
+  }
+
+  resolveTaskModel(sessionId: string, explicit?: PartnerModelRouteRecord, topicOperationId?: string): { readonly route: PartnerModelRouteRecord; readonly assertCurrent: () => void } {
+    const caller = () => {
+      if (topicOperationId === undefined) return this.runtimeCaller(sessionId);
+      const topic = this.independentTaskTopic(sessionId);
+      if (topic?.operationId !== topicOperationId) throw modelUnavailable();
+      return topic.profile;
+    };
+    const profile = caller(), session = this.#operationalStore.getSession(sessionId).descriptor;
     const target = this.#operationalStore.getTarget(session.targetId);
     const callerGeneration = this.#operationalStore.getBackend(session.backendId).descriptor.instanceGeneration;
     const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
@@ -374,7 +397,7 @@ export class PartnerManager {
     };
     const sourceCatalog = catalog();
     const assertCurrent = () => {
-      const current = this.runtimeCaller(sessionId), live = this.#operationalStore.getSession(sessionId).descriptor;
+      const current = caller(), live = this.#operationalStore.getSession(sessionId).descriptor;
       const home = this.#operationalStore.getTarget(session.targetId);
       if (current.revision !== profile.revision || current.profileVersion !== profile.profileVersion
         || live.binding.generation !== session.binding.generation || live.backendId !== session.backendId

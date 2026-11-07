@@ -276,12 +276,19 @@ export interface PiVisionBridgeTransform {
   } | undefined>;
 }
 
+/** The durable input of this parent RPC tool occurrence, when known. */
+export interface PiNativeRootQueueInput {
+  readonly queueItemId: string;
+  readonly assertCurrent: () => void;
+}
+
 export interface PiMcpBridgeOptions {
   readonly endpoint: string;
   readonly token: string;
   readonly tools: readonly PiMcpToolDescriptor[];
   /** Private host mint, never serialized into the native descriptor/environment. */
-  readonly captureRootCall?: (input: { readonly requestId: string; readonly serverId: string; readonly toolName: string; readonly arguments: Readonly<Record<string, unknown>>; readonly assertCurrent: () => void }) => string;
+  readonly captureRootCall?: (input: { readonly requestId: string; readonly serverId: string; readonly toolName: string;
+    readonly arguments: Readonly<Record<string, unknown>>; readonly assertCurrent: () => void; readonly queueInput?: PiNativeRootQueueInput }) => string;
   /** One-shot, model-invisible authority for registering an exact managed runner key. */
   readonly nativeAuthReservationToken?: string;
   /** Host-owned, generation-fenced lease channel for Pi-native credentials. */
@@ -5669,7 +5676,19 @@ export class PiBackendAdapter implements
         delete lifecycle!.currentUserOccurrence;
       }
       const capturedLearningTurn = lifecycle?.currentPartnerLearningTurn;
-      runtime.nativeRootTools.observe(rawEvent, lifecycle, () => isCurrent() && runtime.lifecycle === lifecycle && lifecycle !== undefined && !capturedEventContext.signal.aborted);
+      const rootInput = event.type === "tool_execution_start" ? lifecycle?.userOccurrences.at(-1) : undefined;
+      const queueItemId = capturedEventContext.inputQueueItemId;
+      const queueInput = lifecycle !== undefined && rootInput?.message !== undefined
+        && rootInput.participant.context === capturedEventContext && queueItemId !== undefined ? {
+          queueItemId,
+          assertCurrent: () => {
+            if (lifecycle.userOccurrences.at(-1) !== rootInput || lifecycle.currentContext !== capturedEventContext) {
+              throw new Error("The original native input changed.");
+            }
+          }
+        } : undefined;
+      runtime.nativeRootTools.observe(rawEvent, lifecycle,
+        () => isCurrent() && runtime.lifecycle === lifecycle && lifecycle !== undefined && !capturedEventContext.signal.aborted, queueInput);
       const rootRequest = isExtensionUiRequest(event) && isCurrent() ? runtime.nativeRootTools.request(rawEvent, lifecycle) : undefined;
       const learningRequest = isExtensionUiRequest(event) && isCurrent()
         ? capturePartnerLearningExtensionRequest(rawEvent, capturedLearningTurn, runtime.mcpTools) : undefined;
