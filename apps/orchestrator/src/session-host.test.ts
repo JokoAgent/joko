@@ -165,6 +165,34 @@ it("does not start a draft Agent when Project Trust or resource approval is miss
   expect(adapter.creations).toBe(0); expect(f.store.listSessions()).toEqual([]);
 });
 
+it("leaves an ordinary cold task generation available for its first input after close", async () => {
+  const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const describe = adapter.describe.bind(adapter);
+  vi.spyOn(adapter, "describe").mockImplementation(async () => {
+    const backend = await describe();
+    return { ...backend, adapterKind: "pi", capabilities: new Map(backend.capabilities)
+      .set("session.prewarm", { key: "session.prewarm", supported: true }) };
+  });
+  const f = await createFixture(adapter, { assertPrewarmResources: () => "approved-resources" });
+  const { providerId, modelId } = PI_LIKE_PROFILE.models[0]!;
+  const { value: { sessionId } } = await f.host.createSession({ operationId: "create-ordinary-prewarm-task", connection: f.connection,
+    targetId: "target-one", title: "Existing task", providerId, modelId, permissionMode: "ask", planMode: false, fastMode: false });
+  const send = (operationId: string, text: string) => f.host.enqueueInput({ operationId, connection: f.connection, sessionId,
+    prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+  const first = send("ordinary-before-close", "Use the original context");
+  await vi.waitFor(() => expect(f.store.getQueueItem(first.queueItemId).state).toBe("completed"));
+  await f.host.closeIfActive(sessionId);
+  const binding = f.store.getSession(sessionId).descriptor.binding;
+  const resume = vi.spyOn(adapter, "resumeSession");
+
+  await f.host.prewarmSession(sessionId, f.connection, "", binding.generation);
+  expect(resume).not.toHaveBeenCalled();
+  expect(f.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+  const input = send("ordinary-after-close", "Continue the original context");
+  await vi.waitFor(() => expect(f.store.getQueueItem(input.queueItemId).state).toBe("completed"));
+  expect(resume).toHaveBeenCalledExactlyOnceWith(binding, expect.objectContaining({ sessionId, generation: binding.generation + 1 }));
+});
+
 it("retains closed native usage through placeholder readings and fences it when the native binding changes", async () => {
   class UsageAdapter extends FakeBackendAdapter {
     placeholder = false;

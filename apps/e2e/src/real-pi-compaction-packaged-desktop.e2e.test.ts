@@ -636,8 +636,14 @@ describe("packaged Desktop Pi compaction", () => {
         "managed Desktop resumed UI generation", 30_000);
     }
     const requestsBeforeResume = requests.length;
+    const existingOperations = new Set((await resumedClients.operation.listOperations({ sessionId }))
+      .operations.map(operation => operation.operationId));
     await resumedPage.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
       .fill("The managed Desktop Pi task continues after process restart.");
+    await waitFor(async () => (await resumedClients.operation.listOperations({ sessionId })).operations
+      .find(operation => operation.mutation?.payload.case === "prewarmSession" && !existingOperations.has(operation.operationId)),
+    operation => operation?.state === OperationState.SUCCEEDED, "the resumed task's draft prewarm acknowledgement", 30_000);
+    expect((await resumedClients.session.getSession({ sessionId })).session?.nativeBinding?.runtimeGeneration).toBe(generationBeforeResume);
     await resumedPage.locator(".session-pane").getByRole("button", { name: "Send", exact: true }).click();
     try {
       await waitFor(() => Promise.resolve(requests.length), (count) => count > requestsBeforeResume,
