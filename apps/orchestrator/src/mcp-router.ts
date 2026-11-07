@@ -810,8 +810,14 @@ export class McpRouter {
         updatedAt: this.#now()
       };
       this.#servers.set(serverId, next);
+      try {
+        this.#persist();
+      } catch (error) {
+        this.#servers.set(serverId, current);
+        this.#lastGeneration -= 1;
+        throw error;
+      }
       this.#states.set(serverId, { state: "starting", generation: next.generation });
-      this.#persist();
       try { await this.#start(next); } catch { /* descriptor contains failure */ }
       await this.#retireUnused(serverId);
       return this.#descriptor(next);

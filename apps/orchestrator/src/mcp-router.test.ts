@@ -2217,6 +2217,47 @@ describe("McpRouter", () => {
     store.close();
   });
 
+  it("keeps the current MCP runtime available when restart cannot save its new generation", async () => {
+    const { store, router, factory, root } = await fixture();
+    const endpoint = "http://127.0.0.1:4318/internal/mcp";
+    const serverId = "search";
+    const grant = (generation: number) => router.createPiBridgeSnapshot({
+      endpoint, sessionId: `session-${generation}`, targetId: "target-1", expectedPiGeneration: generation
+    });
+    const echo = (generation: number, token: string) => router.executeBridgeCall({
+      ...bridgeScope(generation), authorization: `Bearer ${token}`, generation,
+      serverId, toolName: "echo", arguments: { value: "available" }
+    });
+    try {
+      const original = await router.upsert({ id: serverId, displayName: "Search MCP", transport: "streamable_http",
+        endpoint: "https://mcp.example.test/rpc", enabled: true, credentialBindings: [] });
+      const catalog = store.getSetting("service", "orchestrator", "mcp_catalog");
+      const oldBridge = grant(1);
+      const save = vi.spyOn(store, "setSetting").mockImplementationOnce(() => { throw new Error("MCP catalog write failed"); });
+      try {
+        await expect(router.restart(serverId)).rejects.toThrow("MCP catalog write failed");
+        expect(save).toHaveBeenCalledExactlyOnceWith("service", "orchestrator", "mcp_catalog", expect.anything());
+      } finally { save.mockRestore(); }
+
+      expect(router.list()).toEqual([original]);
+      expect(store.getSetting("service", "orchestrator", "mcp_catalog")).toEqual(catalog);
+      expect(factory.inputs).toHaveLength(1);
+      expect(factory.closed).toEqual([]);
+      const newBridge = grant(2);
+      for (const [generation, bridge] of [[1, oldBridge], [2, newBridge]] as const) {
+        await expect(echo(generation, bridge.mcpBridge.token)).resolves.toMatchObject({
+          content: [{ type: "text", text: `${original.runtimeGeneration}:available` }]
+        });
+      }
+      await expect(router.restart(serverId)).resolves.toMatchObject({ state: "connected",
+        runtimeGeneration: original.runtimeGeneration + 1, version: original.version + 1n });
+    } finally {
+      await router.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("pins bridge grants to MCP runtime generations across updates", async () => {
     const { store, router, factory } = await fixture();
     const first = await router.upsert({
