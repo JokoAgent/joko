@@ -562,7 +562,7 @@ export class ExtensionTasks {
       if (kind === "readMessages") {
         if (request.after !== undefined && !/^(?:0|[1-9][0-9]{0,19})$/u.test(text(request.after, 20))) failure("INVALID_REQUEST", "A decimal event cursor is required.");
         const after = request.after === undefined ? 0n : BigInt(text(request.after));
-        const events = this.options.store.listEvents({ sessionId: task.descriptor.id, afterCursor: after, limit: limit(request.limit) });
+        const events = this.options.store.listEvents({ sessionId: task.descriptor.id, afterCursor: after, limit: limit(request.limit), activeNativeTimeline: true });
         return { items: events.filter(event => event.payload.type === "message_complete").map(event => ({ id: event.id, cursor: event.globalCursor.toString(), createdAt: event.emittedAt, message: event.payload })), nextCursor: events.length === limit(request.limit) ? events.at(-1)?.globalCursor.toString() : null };
       }
       const view = this.#view(task);
