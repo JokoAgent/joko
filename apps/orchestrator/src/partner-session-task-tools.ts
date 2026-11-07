@@ -36,8 +36,16 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
   constructor(readonly manager: PartnerSessionTaskManager) {}
   includeForTarget(targetId: string) { const profile = this.manager.partners.partnerForHomeTarget(targetId); return profile?.lifecycle === "active" && profile.initializationState === "ready"; }
   includeForSession(sessionId: string, targetId: string) {
-    try { this.manager.caller(sessionId).assertCurrent(); return this.manager.store.getSession(sessionId).descriptor.targetId === targetId; }
+    try {
+      const topic = this.manager.partners.independentTaskTopic(sessionId, true);
+      if (topic !== undefined) return topic.profile.homeTargetId === targetId;
+      this.manager.caller(sessionId).assertCurrent(); return this.manager.store.getSession(sessionId).descriptor.targetId === targetId;
+    }
     catch { return false; }
+  }
+  toolsForSession(sessionId: string): readonly McpToolDescriptor[] {
+    return this.manager.partners.independentTaskTopic(sessionId, true) === undefined ? this.tools
+      : this.tools.map(tool => ({ ...tool, requiresNativeRoot: true }));
   }
   #caller(context: BridgeToolCallContext, signal: AbortSignal | undefined) {
     const caller = this.manager.caller(context.sessionId), { profile } = caller, store = this.manager.store;
@@ -48,7 +56,25 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
         || profile.revision !== current.revision || profile.profileVersion !== current.profileVersion || !caller.group && session.remoteWorkspace !== undefined
         || !store.getTarget(session.targetId).descriptor.trusted || context.providerGeneration !== undefined && context.providerGeneration !== this.generation
         || backendId !== session.backendId || backendGeneration !== store.getBackend(backendId).descriptor.instanceGeneration) throw new PartnerSessionTaskError("TASK_CALLER_CHANGED", "The independent task caller changed.");
+      if (caller.topic) this.#assertTopicOwnerTurn(context, backendGeneration);
     }; assertCurrent(); return assertCurrent;
+  }
+  #assertTopicOwnerTurn(context: BridgeToolCallContext, backendGeneration: number): void {
+    const deny = () => new PartnerSessionTaskError("TASK_CALLER_CHANGED", "This topic tool requires its original active owner input.");
+    const input = context.nativeRootQueueInput, store = this.manager.store;
+    if (!context.assertNativeRoot || !input) throw deny();
+    context.assertCurrent?.(); context.assertNativeRoot(); input.assertCurrent();
+    const queue = store.getQueueItem(input.queueItemId), run = store.getRun(queue.runId).descriptor;
+    if (queue.sessionId !== context.sessionId || run.sessionId !== context.sessionId || run.source !== "user"
+      || run.parentRunId !== undefined || queue.body.automaticContinuation !== undefined || queue.body.objectiveContinuation !== undefined
+      || queue.attemptId === undefined || run.activeAttemptId !== queue.attemptId
+      || queue.backendInstanceGeneration !== backendGeneration
+      || !["dispatching", "backend_accepted"].includes(queue.state)) throw deny();
+    const attempt = store.getAttempt(queue.attemptId).descriptor, operation = store.getOperation(queue.operationId);
+    if (attempt.runId !== run.id || attempt.generation !== context.generation || attempt.backendInstanceGeneration !== backendGeneration
+      || attempt.endedAt !== undefined || operation.kind !== "send_input" || operation.status !== "completed" || !operation.connectionId) throw deny();
+    const connection = store.getConnection(operation.connectionId);
+    store.authorizeConnection(connection.id, connection.authKeyDigest);
   }
   async callTool(name: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext) {
     try {

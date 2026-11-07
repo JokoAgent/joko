@@ -130,6 +130,66 @@ describe("mounted Partner collaboration product chain", () => {
     await waitFor(async () => page.url(), url => new URL(url).hash === `#/tasks/${encodeURIComponent(child)}`, "the original independent child task");
   }, 120_000);
 
+  mountedIt("starts and controls an independent Pi task only from the original owner's active topic input", async () => {
+    const start = "START_TOPIC_TASK_FIXTURE", blocked = "SERVICE_TOPIC_TASK_FIXTURE", inspect = "CHECK_TOPIC_TASK_FIXTURE";
+    const title = "Private topic inspection", objective = "Inspect the independent topic fixture.", result = "Independent topic output.";
+    let taskId: string | undefined;
+    fixture = await RealPiSystemFixture.start({ enableInternalServer: true, providerResponder: async ({ request, requestNumber }) => {
+      if (JSON.stringify(request.body).includes("You are a permission reviewer for one tool call")) {
+        return { kind: "text", text: JSON.stringify({ verdict: "allow", reason: "The fixture tool has the bounded local scope." }) };
+      }
+      if (lastMessageRole(request) === "tool") return { kind: "text", text: "Original tool result acknowledged." };
+      const input = latestUserText(request);
+      if (input.includes(start) || input.includes(blocked)) return { kind: "tool", name: requiredToolName(request, "start_session_task"),
+        arguments: { title, instruction: objective }, callId: `topic-start-${requestNumber}` };
+      if (input.includes(inspect)) return { kind: "tool", name: requiredToolName(request, "check_session_task"),
+        arguments: { task_id: required(taskId, "the original task ID") }, callId: `topic-check-${requestNumber}` };
+      const seed = /TOPIC_SEED_FIXTURE_[AB]/u.exec(input)?.[0];
+      if (seed !== undefined) return { kind: "text", text: `Root for ${seed}` };
+      return { kind: "text", text: input.includes(objective) ? result : "Private result received." };
+    } });
+    const active = fixture, { store, sessionHost, partnerSessionTasks } = active.application;
+    const manager = await active.pair("Topic fixture owner");
+    const partner = await createPartner(active, manager, "Aster", "orbit");
+    const makeTopic = async (suffix: string) => {
+      const seed = `TOPIC_SEED_FIXTURE_${suffix}`, sessionId = partner.canonicalSessionId;
+      await sendPartnerPrompt(active, manager, sessionId, seed);
+      const event = required(store.listEvents({ sessionId }).find(event => event.payload.type === "message_complete"
+        && event.payload.role === "assistant" && event.payload.blocks.some(block => block.kind === "text" && block.text === `Root for ${seed}`)), "the visible original message");
+      const origin = required(store.findVisibleSessionMessageOrigin({ sessionId, eventId: event.id }), "the original message identity");
+      const profile = required((await manager.clients.partner.getPartner({ partnerId: partner.partnerId })).partner, "the current Partner");
+      const topic = await manager.clients.partner.ensurePartnerTopic({ operationId: `owned-topic-${suffix}`, partnerId: partner.partnerId,
+        expectedPartnerRevision: profile.revision, root: { sessionId, eventId: event.id, messageId: origin.messageId, generation: BigInt(event.generation) } });
+      return required(topic.topic?.sessionId, "the original topic task");
+    };
+    const topic = await makeTopic("A"), sibling = await makeTopic("B");
+    const taskTool = (sessionId: string, name: string) => store.listEvents({ sessionId }).flatMap(event => event.payload.type === "tool_result"
+      && event.payload.name.endsWith(name) ? [event.payload] : []).at(-1);
+    const serviceInput = sessionHost.enqueueServiceInput({ operationId: "service-topic-fixture", sessionId: topic, source: "system",
+      prompt: { text: blocked, images: [], files: [], mentions: [], disposition: "prompt" } });
+    await waitFor(async () => store.getRun(serviceInput.value.runId).descriptor.state, state => state === "completed", "the service topic input to settle", 30_000);
+    expect(taskTool(topic, "start_session_task")).toMatchObject({ isError: true, output: expect.stringContaining("TASK_CALLER_CHANGED") });
+    expect(partnerSessionTasks!.list(partner.partnerId)).toEqual([]);
+
+    await sendPartnerPrompt(active, manager, topic, start);
+    const task = required(await waitFor(async () => partnerSessionTasks!.list(partner.partnerId)[0], item => item?.deliveredExecution === 1,
+      "the result to return to the original topic", 30_000), "the completed independent task");
+    taskId = task.id;
+    expect(task).toMatchObject({ parentSessionId: topic, status: "completed", result });
+    const returned = required(store.findOperation<{ runId: string }>(`${task.id}:result:1`)?.response, "the exact result Queue receipt");
+    expect(store.getRun(returned.runId).descriptor.sessionId).toBe(topic);
+    const receipts = (sessionId: string) => store.listEvents({ sessionId }).flatMap(event => event.payload.type === "partner_session_task_receipt" ? [event.payload.receipt] : []);
+    expect(receipts(topic)).toMatchObject([{ taskId, status: "preparing" }, { taskId, status: "completed", result }]);
+    expect(receipts(partner.canonicalSessionId)).toEqual([]);
+    expect(receipts(sibling)).toEqual([]);
+    await sendPartnerPrompt(active, manager, topic, inspect);
+    expect(taskTool(topic, "check_session_task")).toMatchObject({ isError: false, output: expect.stringContaining(taskId) });
+    await sendPartnerPrompt(active, manager, sibling, inspect);
+    expect(taskTool(sibling, "check_session_task")).toMatchObject({ isError: true, output: expect.stringContaining("TASK_INVALID") });
+    await sendPartnerPrompt(active, manager, partner.canonicalSessionId, inspect);
+    expect(taskTool(partner.canonicalSessionId, "check_session_task")).toMatchObject({ isError: true, output: expect.stringContaining("TASK_INVALID") });
+  }, 150_000);
+
   mountedIt("discovers, installs without a model, configures and reopens a bundled partner with disabled routines through production Web", async () => {
     fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), keepRoot: true, enableInternalServer: true });
     const manager = await fixture.pair("Partner package manager");

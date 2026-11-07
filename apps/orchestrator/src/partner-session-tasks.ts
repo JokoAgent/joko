@@ -43,6 +43,7 @@ export interface PartnerSessionTaskRecord {
   readonly sessionId?: string; readonly runId?: string; readonly pauseAt?: number; readonly queuePauseRevision?: string;
   readonly result?: string; readonly error?: string; readonly deliveredExecution?: number;
   readonly group?: PartnerSessionTaskGroupOrigin; readonly groupFallback?: true; readonly groupDeliveryError?: string;
+  readonly topicOperationId?: string;
 }
 export class PartnerSessionTaskError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = "PartnerSessionTaskError"; }
@@ -126,19 +127,22 @@ export class PartnerSessionTaskManager {
     return candidate === undefined ? { owned: true } : { owned: true, candidate };
   }
   caller(sessionId: string) {
-    const group = this.groupPublisher?.capture(sessionId), profile = group?.profile ?? this.partners.runtimeCaller(sessionId);
+    const group = this.groupPublisher?.capture(sessionId), topic = group ? undefined : this.partners.independentTaskTopic(sessionId);
+    const profile = group?.profile ?? topic?.profile ?? this.partners.runtimeCaller(sessionId);
     const assertCurrent = () => {
       group?.assertCurrent();
-      const current = group ? this.partners.getPartner(profile.id) : this.partners.runtimeCaller(sessionId);
+      const currentTopic = topic ? this.partners.independentTaskTopic(sessionId) : undefined;
+      if (topic && currentTopic?.operationId !== topic.operationId) throw changed();
+      const current = group ? this.partners.getPartner(profile.id) : currentTopic?.profile ?? this.partners.runtimeCaller(sessionId);
       const session = this.store.getSession(sessionId).descriptor;
       if (current.revision !== profile.revision || current.profileVersion !== profile.profileVersion || current.lifecycle !== "active"
         || current.initializationState !== "ready" || session.archived || session.deletedAt !== undefined) throw changed();
     };
-    assertCurrent(); return { profile, group, assertCurrent };
+    assertCurrent(); return { profile, group, topic, assertCurrent };
   }
   #resolveModel(sessionId: string, explicit?: PartnerModelRouteRecord) {
     const caller = this.caller(sessionId);
-    if (!caller.group) return this.partners.resolveTaskModel(sessionId, explicit);
+    if (!caller.group) return this.partners.resolveTaskModel(sessionId, explicit, caller.topic?.operationId);
     if (!caller.profile.canonicalSessionId) throw changed();
     const runtime = this.host.getSessionRuntimeControl(sessionId), selected = explicit ?? caller.profile.taskModelOverride ?? runtime.effective;
     const frozen = this.partners.resolveTaskModel(caller.profile.canonicalSessionId, selected);
@@ -197,6 +201,7 @@ export class PartnerSessionTaskManager {
         routes: selected || profile.taskModelOverride ? [route] : profile.capabilities.modelChain.map(item => ({ ...item })),
         explicitModel: selected !== undefined || profile.taskModelOverride !== undefined, permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode,
         timeoutMs: normalized.timeoutMs, deadlineAt: createdAt + normalized.timeoutMs, createdAt, updatedAt: createdAt, execution: 1, executionRunIds: [], status: "preparing", control: "active",
+        ...(caller.topic ? { topicOperationId: caller.topic.operationId } : {}),
         ...(caller.group ? { group: { version: 1, roomId: caller.group.roomId, joinId: caller.group.joinId, hostServerId: caller.group.hostServerId,
           actorId: caller.group.actorId, ownerId: caller.group.ownerId, sourceMessageId: caller.group.sourceMessageId, accessRevision: caller.group.accessRevision,
           fallbackSessionId: profile.canonicalSessionId! } } : {}) };
@@ -212,7 +217,8 @@ export class PartnerSessionTaskManager {
         const existing = this.store.listTargets(route.backendId).find(item => item.descriptor.id === targetId);
         if (existing === undefined) await this.host.registerTarget({ id: targetId, backendId: route.backendId, displayName: basename(directory), workspaceRoot: actual, managed: !normalized.workingDir, trusted: true,
           ...(binding ? { remoteWorkspace: binding } : {}) },
-          { workspaceId: targetId, kind: "partner_session_task", partnerId: profile.id, homeTargetId: home.id, homeCanonicalSessionId: sessionId });
+          { workspaceId: targetId, kind: "partner_session_task", partnerId: profile.id, homeTargetId: home.id,
+            homeCanonicalSessionId: caller.topic ? profile.canonicalSessionId! : sessionId });
         else if (!existing.descriptor.trusted || existing.descriptor.workspaceRoot !== actual || !sameComputer(existing.descriptor, home)) throw changed();
         const target = this.store.getTarget(targetId);
         const assertScope = () => { assertAdmission(); frozen.assertCurrent();
@@ -445,7 +451,7 @@ export class PartnerSessionTaskManager {
     const { sessionId, execution } = task;
     if (!sessionId) throw invalid("The task Session is unconfirmed.");
     const receipt = { taskId: task.id, sessionId, execution, status };
-    const assertOwner = () => { assertCurrent(); this.#assertTaskSession(task); };
+    const assertOwner = () => { assertCurrent(); this.#assertTaskSession(task, status === "timed-out"); };
     const claim = this.store.claimDeferredEffectOperation({
       id: operationId, kind: CANCEL_OPERATION, body: receipt
     }, () => {
@@ -482,7 +488,7 @@ export class PartnerSessionTaskManager {
   #recoverCancellation(task: PartnerSessionTaskRecord, intentRevision: bigint) {
     const { sessionId } = task;
     if (!sessionId) return;
-    try { this.#assertTaskSession(task); } catch { return; }
+    try { this.#assertTaskSession(task, true); } catch { return; }
     if (this.host.isSessionActive(sessionId) || this.store.listRuns({ sessionId, activeOnly: true, limit: 1 }).length
       || this.store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length) return;
     const aborted = new Set(this.#executionRuns(task).leaves.filter(run => run.state === "aborted").map(run => run.id));
@@ -565,7 +571,9 @@ export class PartnerSessionTaskManager {
           if (delivered !== "fallback") continue;
           task = { ...task, groupFallback: true }; this.#save(task);
         }
-        const profile = this.partners.getPartner(task.partnerId), parent = this.store.getSession(profile.canonicalSessionId ?? task.parentSessionId).descriptor;
+        const profile = this.partners.getPartner(task.partnerId), destination = this.#privateParentId(task, profile);
+        if (task.topicOperationId !== undefined && destination === undefined) continue;
+        const parent = this.store.getSession(destination ?? task.parentSessionId).descriptor;
         if (profile.lifecycle !== "active" || parent.archived || parent.deletedAt !== undefined) continue;
         this.host.enqueueServiceInput({ operationId: `${task.id}:interaction:${hash(JSON.stringify([interaction.id, interaction.generation]))}`, sessionId: parent.id, source: "system", originSessionId: task.sessionId,
           prompt: prompt(`Your independent task needs a decision. Inspect the exact pending interaction and respond through the task's normal interaction control. Do not start another task or replay its request.\n${redactSecrets(JSON.stringify({ taskId: task.id, sessionId: task.sessionId, interactionId: interaction.id, generation: interaction.generation, interaction: interaction.payload }))}`) });
@@ -614,8 +622,9 @@ export class PartnerSessionTaskManager {
         if (this.#returnGroupPrivate(task, delivery.id, delivery.fallbackSessionId) === "delivered") this.#save({ ...this.#read(task.id), deliveredExecution: task.execution, updatedAt: this.now() });
         return;
       }
-      const parent = this.store.getSession(profile.canonicalSessionId ?? task.parentSessionId).descriptor;
-      if (parent.archived || parent.deletedAt !== undefined || profile.lifecycle !== "active" || profile.canonicalSessionId !== parent.id) {
+      const destination = this.#privateParentId(task, profile);
+      const parent = destination === undefined ? undefined : this.store.findSession(destination)?.descriptor;
+      if (parent === undefined || parent.archived || parent.deletedAt !== undefined) {
         if (task.sessionId && task.runId) persistSessionTaskActivity(this.store, task.sessionId, { runId: task.runId, completionNotification: "none" });
         return;
       }
@@ -637,7 +646,7 @@ export class PartnerSessionTaskManager {
     if (task.group) return;
     const profile = this.partners.getPartner(task.partnerId);
     const parent = this.store.findSession(task.parentSessionId)?.descriptor;
-    if (parent === undefined || profile.lifecycle !== "active" || profile.canonicalSessionId !== parent.id
+    if (parent === undefined || profile.lifecycle !== "active" || this.#privateParentId(task, profile) !== parent.id
       || profile.homeTargetId !== parent.targetId || parent.archived || parent.deletedAt !== undefined
       || !this.store.getTarget(parent.targetId).descriptor.trusted) return;
     const common = { taskId: task.id, execution: task.execution, title: task.title };
@@ -719,27 +728,38 @@ export class PartnerSessionTaskManager {
     timer.unref(); this.#timers.set(task.id, timer);
   }
   #owned(sessionId: string, id: string) {
-    const { profile, group } = this.caller(sessionId), task = this.#read(id);
-    if (profile.id !== task.partnerId || group && (task.parentSessionId !== sessionId || !task.group
+    const { profile, group, topic } = this.caller(sessionId), task = this.#read(id);
+    if (profile.id !== task.partnerId || ((topic !== undefined || task.topicOperationId !== undefined)
+      && (topic?.operationId !== task.topicOperationId || task.parentSessionId !== sessionId))
+      || group && (task.parentSessionId !== sessionId || !task.group
       || task.group.roomId !== group.roomId || task.group.hostServerId !== group.hostServerId || task.group.actorId !== group.actorId
       || task.group.ownerId !== group.ownerId || task.group.accessRevision !== group.accessRevision || task.group.joinId !== group.joinId))
       throw invalid("Only the requesting Partner and authorized conversation can control this independent task."); return task;
   }
-  #assertTaskSession(task: PartnerSessionTaskRecord) {
+  #privateParentId(task: PartnerSessionTaskRecord, profile: PartnerProfileRecord): string | undefined {
+    if (task.topicOperationId === undefined) return profile.canonicalSessionId;
+    try {
+      const topic = this.partners.independentTaskTopic(task.parentSessionId);
+      return topic?.operationId === task.topicOperationId && topic.profile.id === profile.id ? task.parentSessionId : undefined;
+    } catch { return undefined; }
+  }
+  #assertTaskSession(task: PartnerSessionTaskRecord, allowRetiredTopic = false) {
     if (!task.sessionId) throw invalid("The independent task Session is unavailable.");
     const session = this.store.getSession(task.sessionId).descriptor, target = this.store.getTarget(task.targetId).descriptor;
     if (session.targetId !== task.targetId || session.backendId !== task.route.backendId || session.archived || session.deletedAt !== undefined
       || !target.trusted || target.workspaceRoot !== task.realDirectory) throw changed();
     const profile = this.partners.getPartner(task.partnerId), home = this.store.getTarget(profile.homeTargetId).descriptor;
-    if (!task.group && profile.canonicalSessionId !== task.parentSessionId || !sameComputer(target, home) || target.remoteWorkspace && !this.remoteProjects?.remote(target)) throw changed();
+    const requiresParent = !task.group && (!allowRetiredTopic || task.topicOperationId === undefined);
+    if (requiresParent && this.#privateParentId(task, profile) !== task.parentSessionId
+      || !sameComputer(target, home) || target.remoteWorkspace && !this.remoteProjects?.remote(target)) throw changed();
   }
   async #assertDirectory(task: PartnerSessionTaskRecord) {
     const profile = this.partners.getPartner(task.partnerId), home = this.store.getTarget(profile.homeTargetId).descriptor;
-    if (!task.group && profile.canonicalSessionId !== task.parentSessionId) throw changed();
+    if (!task.group && this.#privateParentId(task, profile) !== task.parentSessionId) throw changed();
     if (home.remoteWorkspace) {
       if (!this.remoteProjects?.remote(home) || await this.remoteProjects.executionDirectory(home, task.directory, () => {
         const current = this.partners.getPartner(task.partnerId);
-        if (current.homeTargetId !== home.id || !task.group && current.canonicalSessionId !== task.parentSessionId) throw changed();
+        if (current.homeTargetId !== home.id || !task.group && this.#privateParentId(task, current) !== task.parentSessionId) throw changed();
       }) !== task.realDirectory) throw changed();
     } else if (await realpath(task.directory) !== task.realDirectory || !(await stat(task.realDirectory)).isDirectory()) throw changed();
   }
@@ -784,7 +804,7 @@ function normalizeStart(input: StartPartnerSessionTask) {
 function readRecord(value: unknown): PartnerSessionTaskRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw changed(); const row = value as Record<string, unknown>;
   const required = ["version", "id", "partnerId", "parentSessionId", "requestFingerprint", "title", "objective", "contextRefs", "targetId", "directory", "realDirectory", "useWorktree", "route", "routes", "explicitModel", "permissionMode", "planMode", "timeoutMs", "deadlineAt", "createdAt", "updatedAt", "execution", "executionRunIds", "status", "control"];
-  const optional = ["sessionId", "runId", "pauseAt", "queuePauseRevision", "result", "error", "deliveredExecution", "group", "groupFallback", "groupDeliveryError"];
+  const optional = ["sessionId", "runId", "pauseAt", "queuePauseRevision", "result", "error", "deliveredExecution", "group", "groupFallback", "groupDeliveryError", "topicOperationId"];
   if (required.some(key => !Object.hasOwn(row, key)) || Object.keys(row).some(key => !required.includes(key) && !optional.includes(key)) || row["version"] !== 1
     || ["id", "partnerId", "parentSessionId", "title", "objective", "targetId", "directory", "realDirectory"].some(key => typeof row[key] !== "string" || !row[key])
     || !/^[a-f0-9]{64}$/u.test(String(row["requestFingerprint"])) || !["preparing", "queued", "running", "waiting", "completed", "failed", "cancelled", "timed-out", "unknown"].includes(String(row["status"]))
@@ -800,6 +820,8 @@ function readRecord(value: unknown): PartnerSessionTaskRecord {
     || ["sessionId", "runId", "queuePauseRevision", "result", "error", "groupDeliveryError"].some(key => row[key] !== undefined && typeof row[key] !== "string")
     || ["pauseAt", "deliveredExecution"].some(key => row[key] !== undefined && (!Number.isSafeInteger(row[key]) || Number(row[key]) < 1))
     || row["groupFallback"] !== undefined && row["groupFallback"] !== true) throw changed();
+  if (row["topicOperationId"] !== undefined && (typeof row["topicOperationId"] !== "string"
+    || row["topicOperationId"].length < 1 || row["topicOperationId"].length > 256 || row["group"] !== undefined)) throw changed();
   if (row["group"] !== undefined) readPartnerSessionTaskGroupOrigin(row["group"]);
   return value as PartnerSessionTaskRecord;
 }

@@ -8,7 +8,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { CallToolResultSchema, CreateTaskResultSchema, ListToolsResultSchema, type CallToolRequest, type CreateTaskResult, type Progress } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport, FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { PiMcpBridgeOptions, PiMcpToolDescriptor } from "@joko/adapter-pi";
+import type { PiMcpBridgeOptions, PiMcpToolDescriptor, PiNativeRootQueueInput } from "@joko/adapter-pi";
 import { validateMcpEndpoint } from "@joko/adapter-pi";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type BlobRef, type PolicySubjectKind, type PartnerLearningReceipt, type PartnerLearningTurnSource, type PartnerLearningToolAuthority, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type OperationalStore } from "@joko/store";
@@ -267,6 +267,8 @@ export interface BridgeToolCallContext {
   readonly acceptDispatchedImageResult?: (assertCredentialCurrent: () => void) => void;
   /** Present only after consuming a service-owned proof of the SDK root tool. */
   readonly assertNativeRoot?: () => void;
+  /** The original input when the parent Pi RPC tied it to this native root proof. */
+  readonly nativeRootQueueInput?: PiNativeRootQueueInput;
   readonly sessionId: string;
   readonly targetId: string;
   readonly generation: number;
@@ -338,6 +340,7 @@ interface BridgeGrant {
 interface NativeRootProof {
   readonly grant: BridgeGrant; readonly requestId: string; readonly serverId: string; readonly toolName: string;
   readonly argumentsHash: string; readonly assertCurrent: () => void; readonly expiresAt: number;
+  readonly queueInput?: PiNativeRootQueueInput;
 }
 interface ModelChannel extends McpModelChannel { readonly grant: BridgeGrant; readonly runtime: Runtime }
 interface AppModelInvocation {
@@ -1229,6 +1232,7 @@ export class McpRouter {
       throw new Error("An updated MCP tool catalog requires its original model channel.");
     }
     let assertNativeRoot: (() => void) | undefined;
+    let nativeRootQueueInput: PiNativeRootQueueInput | undefined;
     const rootRequired = grant.tools.some(tool => tool.serverId === input.serverId && tool.name === input.toolName && tool.requiresNativeRoot);
     if (rootRequired) {
       const proof = typeof input.nativeRootProof === "string" ? this.#nativeRootProofs.get(input.nativeRootProof) : undefined;
@@ -1237,6 +1241,7 @@ export class McpRouter {
       this.#nativeRootProofs.delete(input.nativeRootProof!);
       assertNativeRoot = () => { if (this.#grants.get(grant.digest.toString("hex")) !== grant || grant.expiresAt <= this.#now()) throw new Error("Native root tool authority retired."); proof.assertCurrent(); };
       assertNativeRoot();
+      nativeRootQueueInput = proof.queueInput;
     } else if (input.nativeRootProof !== undefined) throw new Error("Native root proof does not belong to this tool.");
     const audioResultMapping = grant.audioResultMappings.get(
       audioResultMappingKey(input.serverId, input.toolName)
@@ -1417,6 +1422,7 @@ export class McpRouter {
                 assertDispatchedImageCredential = assertCredential;
               },
               ...(assertNativeRoot === undefined ? {} : { assertNativeRoot }),
+              ...(nativeRootQueueInput === undefined ? {} : { nativeRootQueueInput }),
               ...(partnerLearningSave === undefined ? {} : { partnerLearningSave })
             },
             () => assertDispatchedImageCredential !== undefined
@@ -2761,7 +2767,7 @@ export class McpRouter {
       || this.#nativeRootProofs.size >= 1_024) throw new Error("Native root tool proof is unavailable.");
     const proof = randomBytes(32).toString("base64url");
     this.#nativeRootProofs.set(proof, { grant, requestId: input.requestId, serverId: input.serverId, toolName: input.toolName,
-      argumentsHash: operationBodyHash(input.arguments), assertCurrent: input.assertCurrent, expiresAt: this.#now() + 30_000 });
+      argumentsHash: operationBodyHash(input.arguments), assertCurrent: input.assertCurrent, queueInput: input.queueInput, expiresAt: this.#now() + 30_000 });
     return proof;
   }
   #retireModelChannels(): void {
