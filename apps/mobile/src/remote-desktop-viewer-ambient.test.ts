@@ -23,12 +23,13 @@ function viewer(options: { native?: boolean; rtc?: boolean; frames?: boolean; so
     return (this.id === "bg-canvas" ? backgroundContext : snapshot) as unknown as CanvasRenderingContext2D;
   });
   vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue("data:image/jpeg;base64,c25hcHNob3Q=");
-  const peers: { close: ReturnType<typeof vi.fn> }[] = [];
+  const channel = { close: vi.fn(), readyState: "connecting", bufferedAmount: 0, send: vi.fn<(wire: string) => void>() };
+  const peers: { close: ReturnType<typeof vi.fn>; connectionState: string }[] = [];
   vi.stubGlobal("RTCPeerConnection", class {
     localDescription = { sdp: "offer" }; connectionState = "new"; iceGatheringState = "complete";
     close = vi.fn();
     constructor() { peers.push(this); }
-    createDataChannel() { return { close: vi.fn(), readyState: "connecting" }; }
+    createDataChannel() { return channel; }
     addTransceiver() {}
     async createOffer() { return { type: "offer", sdp: "offer" }; }
     async setLocalDescription() {}
@@ -70,13 +71,45 @@ function viewer(options: { native?: boolean; rtc?: boolean; frames?: boolean; so
     video.dispatchEvent(new Event("playing")); flushFrames();
   };
   stop = () => receive({ type: "stop" });
-  return { receive, load, connect, flushFrames, backgroundContext, snapshot, image, video, posted, peers, raf,
+  return { receive, load, connect, flushFrames, backgroundContext, snapshot, image, video, posted, peers, channel, raf,
     requestFrame, cancelFrame, videoFrames, requestVideoFrame, cancelVideoFrame,
     background: document.getElementById("bg")!, canvas: document.getElementById("bg-canvas") as HTMLCanvasElement,
     setComplete(value: boolean) { complete = value; },
     setSource(width: number, height: number) { sourceWidth = width; sourceHeight = height; },
     reuseVideoFrame(id: number) { videoFrameId = id - 1; } };
 }
+
+it.each([false, true])("keeps keyboard input on its ordered channel with prolonged congestion=%s", async stalled => {
+  const value = viewer({ rtc: true });
+  await value.connect();
+  value.peers[0]!.connectionState = "connected";
+  value.channel.readyState = "open";
+  value.receive({ type: "control", enabled: true, controlGeneration: 1 });
+  value.receive({ type: "keyboard", enabled: true });
+  const keyboard = document.querySelector("textarea")!;
+  const text = "字".repeat(6000);
+  keyboard.value = text;
+  keyboard.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+  expect(value.channel.send).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(value.channel.send.mock.calls[0]![0])).toEqual({ controlGeneration: 1, sequence: 1,
+    events: [{ kind: "text", text: text.slice(0, 4096) }, { kind: "text", text: text.slice(4096) }] });
+
+  value.channel.bufferedAmount = 16_384;
+  keyboard.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertLineBreak" }));
+  await vi.advanceTimersByTimeAsync(stalled ? 2_100 : 99);
+  expect(value.channel.send).toHaveBeenCalledTimes(1);
+  value.channel.bufferedAmount = 0;
+  await vi.advanceTimersByTimeAsync(33);
+  expect(value.posted.some(message => message.type === "input")).toBe(false);
+  if (stalled) {
+    expect(value.channel.send).toHaveBeenCalledTimes(1);
+    expect(value.posted.some(message => message.type === "inputOverflow")).toBe(true);
+  } else {
+    expect(value.channel.send).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(value.channel.send.mock.calls[1]![0])).toEqual({ controlGeneration: 1, sequence: 2,
+      events: [{ kind: "key", code: "Enter", down: true }, { kind: "key", code: "Enter", down: false }] });
+  }
+});
 
 describe("actual ordinary Mobile ambient pixels", () => {
   it.each([

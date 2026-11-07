@@ -66,6 +66,7 @@ const VIEWER_SCRIPT = String.raw`
   let deadline=null,disconnectTimer=null,retryTimer=null,stableTimer=null,iceTimer=null;
   let localCandidates=[],localAck=0,remoteAfter=0,remoteComplete=false,remoteSeen=new Set(),icePending=null,exchangeId=0,exchangeUntil=0;
   let seq=0,sequenceLimit=Number.MAX_SAFE_INTEGER,pending=[],sending=false,drag=false,hold=null,start=null,last=null,multi=null,gestureFrame=null;
+  let congestionAt=null;
   const pointers=new Map();let cx=.5,cy=.5,composing=false,keyboardEnabled=false;
   const heldMouse=new Map(),mouseControlHandlers=new Map();let showMouseButtons=false,nativeMouseControls=false,wheelY=null;
   let nativeTouchpad=null,fitToInsets=false,topInset=0,bottomInset=0,cursorNeedsEntry=true;
@@ -101,10 +102,18 @@ const VIEWER_SCRIPT = String.raw`
   function moveTouchpad(dx,dy){const r=layout(),v=cursorViewport(),area=viewport();if(cursorNeedsEntry){cx=clamp((bounded(r.x+cx*r.w,v.minX,v.maxX)-r.x)/r.w);cy=clamp((bounded(r.y+cy*r.h,v.minY,v.maxY)-r.y)/r.h);cursorNeedsEntry=false;}cx=clamp(cx+dx/r.w);cy=clamp(cy+dy/r.h);const x=r.x+cx*r.w,y=r.y+cy*r.h;if(zoom>1||r.w>area.width||r.h>area.height){panX+=bounded(x,v.minX,v.maxX)-x;panY+=bounded(y,v.minY,v.maxY)-y;}queue({kind:'move',x:cx,y:cy});render();}
   function queue(event){if(!control)return;if(event.kind==='key'||event.kind==='text'){localCursorAwake=false;render();}if(event.kind==='move'||event.kind==='button')noteLocalCursorActivity();const tail=pending[pending.length-1];if(event.kind==='move'&&tail?.kind==='move')pending[pending.length-1]=event;else if(event.kind==='scroll'&&tail?.kind==='scroll'){tail.dx=Math.max(-2000,Math.min(2000,tail.dx+event.dx));tail.dy=Math.max(-2000,Math.min(2000,tail.dy+event.dy));}else pending.push(event);if(pending.length>64){pending=[{kind:'release'}];control=false;post({type:'inputOverflow'});}}
   function flush(releaseViaRelay=false){
-    if(!pending.length||sending||controlGeneration<1)return;
-    if(seq>=sequenceLimit){pending=[];control=false;post({type:'inputOverflow'});render();return;}
+    if(!pending.length){congestionAt=null;return;}
+    if(sending||controlGeneration<1)return;
+    const direct=!releaseViaRelay&&pc?.connectionState==='connected'&&dc?.readyState==='open';
+    const stalled=!releaseViaRelay&&congestionAt!==null&&(!direct||performance.now()-congestionAt>=2000);
+    if(seq>=sequenceLimit||stalled){pending=[];congestionAt=null;control=false;post({type:'inputOverflow'});render();return;}
+    if(direct&&dc.bufferedAmount>=16384){
+      congestionAt??=performance.now();
+      return;
+    }
+    congestionAt=null;
     const events=pending.splice(0,64),sequence=++seq;
-    if(!releaseViaRelay&&pc?.connectionState==='connected'&&dc?.readyState==='open'&&dc.bufferedAmount<16384){
+    if(direct){
       dc.send(JSON.stringify({controlGeneration,sequence,events}));
     }else{
       sending=true;post({type:'input',controlGeneration,sequence,events});
@@ -256,7 +265,7 @@ const VIEWER_SCRIPT = String.raw`
         try{dc.send(wire);}catch{post({type:'channelReply',attemptId,reply:{type:'reply',id:request.id,ok:false,error:'REMOTE_DESKTOP_REQUEST_RESULT_UNKNOWN'}});}break;
       }
       case'init':
-        release();showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();cursorOverlay=message.cursorOverlay===true;resetCursor();pending=[];sending=false;
+        release();showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();cursorOverlay=message.cursorOverlay===true;resetCursor();pending=[];sending=false;congestionAt=null;
         control=false;controlGeneration=0;
         seq=Number.isSafeInteger(message.sequenceBase)&&message.sequenceBase>=0?message.sequenceBase:0;
         sequenceLimit=Number.isSafeInteger(message.sequenceLimit)&&message.sequenceLimit>seq?message.sequenceLimit:Number.MAX_SAFE_INTEGER;
@@ -317,7 +326,7 @@ const VIEWER_SCRIPT = String.raw`
         const generation=message.enabled===true&&Number.isSafeInteger(message.controlGeneration)&&message.controlGeneration>0?message.controlGeneration:0;
         if(generation!==controlGeneration||generation===0){
           const releaseHost=control&&generation===0&&message.release===true;
-          pending=[];release(false);sending=false;
+          pending=[];congestionAt=null;release(false);sending=false;
           if(releaseHost){
             // The newer release sequence fences the outstanding relay batch.
             pending=[{kind:'release'}];flush(true);sending=false;
@@ -329,13 +338,13 @@ const VIEWER_SCRIPT = String.raw`
       case'fit':zoom=1;panX=panY=0;cursorNeedsEntry=true;render();break;
       case'keyboard':showKeyboard(message.enabled===true);break;
       case'click':if(message.button===0||message.button===1||message.button===2)click(message.button);break;
-      case'releaseInput':pending=[];release();break;
+      case'releaseInput':pending=[];congestionAt=null;release();break;
       case'events':for(const event of message.events||[])queue(event);flush();break;
       case'ack':if(message.epoch===epoch&&message.sequence===seq)sending=false;break;
       case'videoSettings':video.muted=message.audio!==true;retries=0;if(!nativeMedia)connect();break;
       case'presentation':void setPresentation(message.enabled===true);break;
       case'stop':
-        void setPresentation(false);showKeyboard(false);release();control=false;controlGeneration=0;showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();resetCursor();cursorOverlay=false;pending=[];sending=false;epoch=null;closeRtc(message.preserveFrame===true);render();break;
+        void setPresentation(false);showKeyboard(false);release();control=false;controlGeneration=0;showMouseButtons=false;nativeMouseControls=false;updateMouseButtons();nativeAttempt=null;hideNativeVideo();resetCursor();cursorOverlay=false;pending=[];sending=false;congestionAt=null;epoch=null;closeRtc(message.preserveFrame===true);render();break;
     }
   }
   window.__jokoRemoteDesktop={receive};window.addEventListener('message',event=>{try{receive(typeof event.data==='string'?JSON.parse(event.data):event.data);}catch{}});document.addEventListener('message',event=>{try{receive(typeof event.data==='string'?JSON.parse(event.data):event.data);}catch{}});render();post({type:'ready'});
