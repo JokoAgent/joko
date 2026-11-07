@@ -95,7 +95,7 @@ export function parseProviderModels(value: unknown, sourceUrl?: string): readonl
     const name = typeof google?.["displayName"] === "string" && validLabel(google["displayName"]) ? google["displayName"]
       : typeof record?.["display_name"] === "string" && validLabel(record["display_name"])
       ? record["display_name"]
-      : typeof record?.["name"] === "string" && validLabel(record["name"])
+      : google === undefined && typeof record?.["name"] === "string" && validLabel(record["name"])
         ? record["name"]
         : id;
     const rawWindow = record === undefined
