@@ -8698,6 +8698,9 @@ async function buildForwardWorkspaceFileDiff(
   if (pair === undefined) return undefined;
   const file = create(contract.FileDiffSchema, {
     relativePath: change.path,
+    oldRelativePath: "",
+    binary: false,
+    hunks: [],
     status: change.kind === "created" ? contract.GitFileStatus.ADDED
       : change.kind === "deleted" ? contract.GitFileStatus.DELETED : contract.GitFileStatus.MODIFIED,
     source: contract.GitDiffSource.TURN_SET
@@ -8723,7 +8726,9 @@ async function buildForwardWorkspaceFileDiff(
       oldStart: hunk.oldLines === 0 ? hunk.oldStart - 1 : hunk.oldStart,
       oldCount: hunk.oldLines,
       newStart: hunk.newLines === 0 ? hunk.newStart - 1 : hunk.newStart,
-      newCount: hunk.newLines
+      newCount: hunk.newLines,
+      heading: "",
+      lines: []
     });
     const position = { old: mapped.oldStart, next: mapped.newStart };
     for (const line of hunk.lines) appendWorkspaceDiffLine(mapped, line.replace(/\r$/u, ""), position);
