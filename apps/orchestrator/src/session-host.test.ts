@@ -165,6 +165,23 @@ it("does not start a draft Agent when Project Trust or resource approval is miss
   expect(adapter.creations).toBe(0); expect(f.store.listSessions()).toEqual([]);
 });
 
+it("acknowledges draft prewarm for an active existing task without draft startup capability", async () => {
+  const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const f = await createFixture(adapter);
+  const { providerId, modelId } = PI_LIKE_PROFILE.models[0]!;
+  const { value: { sessionId } } = await f.host.createSession({
+    operationId: "create-active-existing-prewarm-task", connection: f.connection, targetId: "target-one", title: "Existing task",
+    providerId, modelId, permissionMode: "ask", planMode: false, fastMode: false
+  });
+  expect(f.host.isSessionActive(sessionId)).toBe(true);
+  expect(f.store.getBackend(adapter.id).descriptor.capabilities.get("session.prewarm")?.supported).not.toBe(true);
+  const original = f.store.getSession(sessionId).descriptor.binding;
+  const resume = vi.spyOn(adapter, "resumeSession");
+  await f.host.prewarmSession(sessionId, f.connection, "", original.generation);
+  expect(f.store.getSession(sessionId).descriptor.binding).toEqual(original);
+  expect(resume).not.toHaveBeenCalled();
+});
+
 it("leaves an ordinary cold task generation available for its first input after close", async () => {
   const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
   const describe = adapter.describe.bind(adapter);
