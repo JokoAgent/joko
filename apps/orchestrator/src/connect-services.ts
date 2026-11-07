@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
+import { structuredPatch } from "diff";
 import { captureModelPriceReference, createModelPriceOverrideValues, modelPriceOverrideConflict, modelPricesWithOverride, modelTokenPricesAt, type ModelPriceReferenceSnapshot } from "@joko/core";
 import { priceMicros, toProtoModelPriceOverrideValues } from "./model-pricing-projection.js";
 import type { ExtensionSettingsManager } from "./extension-settings.js";
@@ -16,6 +17,7 @@ import { readTaskBackgroundOutput } from "./background-task-output.js";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
 import { createHelpConnectService } from "./help-connect-service.js";
 import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
+import { isSensitiveCredentialPath } from "./hosted-agent-credential-paths.js";
 import { createInputHandoffConnectService } from "./input-handoff-connect-service.js";
 import { createProviderSharingConnectService, createProviderSharingGuestConnectService } from "./provider-sharing-connect-service.js";
 import { createProviderGroupConnectService } from "./provider-group-connect-service.js";
@@ -3756,13 +3758,30 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }
     },
     listWorkspaceChangeSets: async (request, context) => {
-      authenticate(context);
-      const values = (await dependencies.workspaceChanges.listChangeSets({
+      const connection = authenticate(context);
+      const values = await dependencies.workspaceChanges.listChangeSets({
         ...(request.workspaceId === "" ? {} : { workspaceId: request.workspaceId }),
         ...(request.sessionId === "" ? {} : { sessionId: request.sessionId })
-      })).map(mapWorkspaceChangeSet);
+      });
       const result = paginate(values, request.page);
-      return { changeSets: result.values, page: result.page };
+      const scoped = request.workspaceId !== "" && request.sessionId !== "";
+      const budget = { bytes: WORKSPACE_SNAPSHOT_DIFF_MAXIMUM_BYTES, lines: WORKSPACE_SNAPSHOT_DIFF_MAXIMUM_LINES, files: 128 };
+      const changeSets: contract.WorkspaceChangeSet[] = [];
+      for (const value of result.values) {
+        const mapped = mapWorkspaceChangeSet(value);
+        if (scoped && value.complete) {
+          for (const [index, change] of value.changes.entries()) {
+            if (budget.files === 0 || budget.lines === 0 || budget.bytes === 0) break;
+            context.signal.throwIfAborted();
+            dependencies.connections.fence(connection);
+            const diff = await buildForwardWorkspaceFileDiff(dependencies.workspaceChanges, change, budget);
+            if (diff !== undefined) mapped.changes[index]!.diff = diff;
+          }
+        }
+        changeSets.push(mapped);
+      }
+      dependencies.connections.fence(connection);
+      return { changeSets, page: result.page };
     },
     previewWorkspaceRewind: async (request, context) => {
       authenticate(context);
@@ -8591,8 +8610,7 @@ function mapWorkspaceChange(item: WorkspaceChange): contract.FileChange {
       ? contract.FileChangeKind.CREATED
       : item.kind === "deleted" ? contract.FileChangeKind.DELETED : contract.FileChangeKind.UPDATED,
     beforeRevision: item.before === undefined ? undefined : snapshotFileRevision(item.before),
-    afterRevision: item.after === undefined ? undefined : snapshotFileRevision(item.after),
-    diff: undefined
+    afterRevision: item.after === undefined ? undefined : snapshotFileRevision(item.after)
   });
 }
 
@@ -8657,12 +8675,66 @@ function mapWorkspaceRewindPreview(
   });
 }
 
-const REWIND_DIFF_MAXIMUM_BYTES = 1024 * 1024;
-const REWIND_DIFF_MAXIMUM_LINES = 4_000;
+const WORKSPACE_SNAPSHOT_DIFF_MAXIMUM_BYTES = 1024 * 1024;
+const WORKSPACE_SNAPSHOT_DIFF_MAXIMUM_LINES = 4_000;
+
+async function buildForwardWorkspaceFileDiff(
+  workspaceChanges: WorkspaceChangeSetService,
+  change: WorkspaceChange,
+  budget: { bytes: number; lines: number; files: number }
+): Promise<contract.FileDiff | undefined> {
+  const { before, after } = change;
+  if (isSensitiveCredentialPath(change.path)
+    || (before === undefined ? change.kind !== "created" : before.path !== change.path)
+    || (after === undefined ? change.kind !== "deleted" : after.path !== change.path)) return undefined;
+  const byteLength = (before?.byteLength ?? 0) + (after?.byteLength ?? 0);
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > budget.bytes) return undefined;
+  budget.bytes -= byteLength;
+  budget.files -= 1;
+  const pair = await Promise.all([
+    before === undefined ? Buffer.alloc(0) : workspaceChanges.readChangeSetFile(before, byteLength),
+    after === undefined ? Buffer.alloc(0) : workspaceChanges.readChangeSetFile(after, byteLength)
+  ]).catch(() => undefined);
+  if (pair === undefined) return undefined;
+  const file = create(contract.FileDiffSchema, {
+    relativePath: change.path,
+    status: change.kind === "created" ? contract.GitFileStatus.ADDED
+      : change.kind === "deleted" ? contract.GitFileStatus.DELETED : contract.GitFileStatus.MODIFIED,
+    source: contract.GitDiffSource.TURN_SET
+  });
+  if (pair.some(bytes => bytes.includes(0))) return { ...file, binary: true };
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let oldText: string, newText: string;
+  try {
+    oldText = decoder.decode(pair[0]);
+    newText = decoder.decode(pair[1]);
+  } catch {
+    return { ...file, binary: true };
+  }
+  if (containsRecognizedCredential(oldText) || containsRecognizedCredential(newText)) return undefined;
+  const patch = structuredPatch(change.path, change.path, oldText, newText, undefined, undefined,
+    { context: 3, timeout: 25, maxEditLength: WORKSPACE_SNAPSHOT_DIFF_MAXIMUM_LINES });
+  if (patch === undefined) return undefined;
+  const lineCount = patch.hunks.reduce((total, hunk) => total + hunk.lines.length, 0);
+  if (lineCount > budget.lines) return undefined;
+  budget.lines -= lineCount;
+  file.hunks = patch.hunks.map(hunk => {
+    const mapped = create(contract.DiffHunkSchema, {
+      oldStart: hunk.oldLines === 0 ? hunk.oldStart - 1 : hunk.oldStart,
+      oldCount: hunk.oldLines,
+      newStart: hunk.newLines === 0 ? hunk.newStart - 1 : hunk.newStart,
+      newCount: hunk.newLines
+    });
+    const position = { old: mapped.oldStart, next: mapped.newStart };
+    for (const line of hunk.lines) appendWorkspaceDiffLine(mapped, line.replace(/\r$/u, ""), position);
+    return mapped;
+  });
+  return file;
+}
 
 async function buildInverseWorkspaceDiff(changeSet: WorkspaceChangeSetRecord): Promise<contract.WorkspaceDiff> {
-  let remainingBytes = REWIND_DIFF_MAXIMUM_BYTES;
-  let remainingLines = REWIND_DIFF_MAXIMUM_LINES;
+  let remainingBytes = WORKSPACE_SNAPSHOT_DIFF_MAXIMUM_BYTES;
+  let remainingLines = WORKSPACE_SNAPSHOT_DIFF_MAXIMUM_LINES;
   let truncated = false;
   const files: contract.FileDiff[] = [];
   for (const change of changeSet.changes) {
@@ -8860,8 +8932,7 @@ function parseWorkspaceDiff(
   const files: contract.FileDiff[] = [];
   let current: contract.FileDiff | undefined;
   let currentHunk: contract.DiffHunk | undefined;
-  let oldLine = 0;
-  let newLine = 0;
+  const position = { old: 0, next: 0 };
   const lines = raw.split(/\r?\n/u);
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
@@ -8899,35 +8970,37 @@ function parseWorkspaceDiff(
     else if (line.startsWith("@@")) {
       const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@\s?(.*)$/u.exec(line);
       if (match === null) continue;
-      oldLine = Number(match[1]);
-      newLine = Number(match[3]);
+      position.old = Number(match[1]);
+      position.next = Number(match[3]);
       currentHunk = create(contract.DiffHunkSchema, {
-        oldStart: oldLine,
+        oldStart: position.old,
         oldCount: Number(match[2] ?? "1"),
-        newStart: newLine,
+        newStart: position.next,
         newCount: Number(match[4] ?? "1"),
         heading: match[5] ?? "",
         lines: []
       });
       if (currentHunk !== undefined) current.hunks.push(currentHunk);
     } else if (currentHunk !== undefined && (line.startsWith("+") || line.startsWith("-") || line.startsWith(" ") || line === "\\ No newline at end of file")) {
-      const kind = line.startsWith("+")
-        ? contract.DiffLineKind.ADDED
-        : line.startsWith("-")
-          ? contract.DiffLineKind.REMOVED
-          : line.startsWith("\\") ? contract.DiffLineKind.NO_NEWLINE : contract.DiffLineKind.CONTEXT;
-      currentHunk.lines.push(create(contract.DiffLineSchema, {
-        kind,
-        oldLine: kind === contract.DiffLineKind.ADDED ? 0 : oldLine,
-        newLine: kind === contract.DiffLineKind.REMOVED ? 0 : newLine,
-        text: line.startsWith("\\") ? line : line.slice(1)
-      }));
-      if (kind !== contract.DiffLineKind.ADDED && kind !== contract.DiffLineKind.NO_NEWLINE) oldLine += 1;
-      if (kind !== contract.DiffLineKind.REMOVED && kind !== contract.DiffLineKind.NO_NEWLINE) newLine += 1;
+      appendWorkspaceDiffLine(currentHunk, line, position);
     }
   }
   if (current !== undefined) files.push(current);
   return create(contract.WorkspaceDiffSchema, { workspaceId, files, truncated: false });
+}
+
+function appendWorkspaceDiffLine(hunk: contract.DiffHunk, line: string, position: { old: number; next: number }): void {
+  const kind = line.startsWith("+") ? contract.DiffLineKind.ADDED
+    : line.startsWith("-") ? contract.DiffLineKind.REMOVED
+      : line.startsWith("\\") ? contract.DiffLineKind.NO_NEWLINE : contract.DiffLineKind.CONTEXT;
+  hunk.lines.push(create(contract.DiffLineSchema, {
+    kind,
+    oldLine: kind === contract.DiffLineKind.ADDED ? 0 : position.old,
+    newLine: kind === contract.DiffLineKind.REMOVED ? 0 : position.next,
+    text: kind === contract.DiffLineKind.NO_NEWLINE ? line : line.slice(1)
+  }));
+  if (kind !== contract.DiffLineKind.ADDED && kind !== contract.DiffLineKind.NO_NEWLINE) position.old += 1;
+  if (kind !== contract.DiffLineKind.REMOVED && kind !== contract.DiffLineKind.NO_NEWLINE) position.next += 1;
 }
 
 function directArtifactBlob(
