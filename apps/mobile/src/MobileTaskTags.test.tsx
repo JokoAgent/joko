@@ -37,6 +37,7 @@ vi.mock("./MobileTaskTagsNative", async () => {
     visible ? element("div", {}, edit ? element("div", {},
       element("button", { onClick: onDelete }, "Delete tag"),
       element("input", { value: edit.name, "aria-label": "Tag name", onInput: (event: { currentTarget: HTMLInputElement }) => edit.onName(event.currentTarget.value) }),
+      element("button", { onClick: () => edit.onColor(TaskTagColor.ORANGE), "aria-label": "Choose orange" }, "Choose orange"),
       element("button", { disabled: !edit.canSave, onClick: edit.onSave, "aria-label": "Save tag" }, "Save tag"),
       error && element("span", { role: "alert" }, error))
       : items.map(item => element("button", { key: item.id, onClick: item.onEdit }, item.name))) : null };
@@ -134,6 +135,27 @@ it.each([true, false])("keeps the name draft through a same-owner catalog update
     } else {
       expect(host.querySelector("input")).toBeNull();
     }
+  } finally { await act(async () => root.unmount()); }
+});
+
+it("edits a preset using its displayed name and sends only the changed color", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const updateTaskTag = vi.fn(async () => true);
+  const client = { state: { status: "connected", selectedId: "session" }, taskHeaderSourceKey: () => "task-owner",
+    updateTaskTag } as unknown as MobileClient;
+  const session = create(SessionSchema, { sessionId: "session", displayName: "Task" });
+  const catalog = create(TaskTagCatalogSchema, { taskTags: [tag("preset:work", "Work", TaskTagColor.INDIGO, "work", false)] });
+  const colors = { background: "white", surface: "white", ink: "black", muted: "gray", border: "gray", accent: "blue", brandBackground: "white", negative: "red" };
+  const host = document.body.appendChild(document.createElement("div")), root = createRoot(host);
+  try {
+    await act(async () => root.render(createElement(MobileTaskTagsSheet, { visible: true, session, catalog, client, colors, locale: "zh-CN", onClose() {} })));
+    await act(async () => host.querySelector("button")!.click());
+    expect(host.querySelector("input")?.value).toBe("工作");
+    const save = host.querySelector<HTMLButtonElement>('[aria-label="Save tag"]')!;
+    expect(save.disabled).toBe(true);
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Choose orange"]')!.click());
+    await act(async () => save.click());
+    expect(updateTaskTag).toHaveBeenCalledExactlyOnceWith("session", "preset:work", 1n, { color: TaskTagColor.ORANGE });
   } finally { await act(async () => root.unmount()); }
 });
 
