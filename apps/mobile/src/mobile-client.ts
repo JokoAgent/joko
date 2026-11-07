@@ -2959,9 +2959,12 @@ export class MobileClient {
     };
     const probeMainView = (
       expected: MobileExtensionMainViewSurface,
-      signal: AbortSignal
+      signal: AbortSignal,
+      keepAlive?: true
     ): Promise<MobileExtensionMainViewSurface> => owned(signal, async (current) => {
-      const surface = await this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current);
+      const surface = await (keepAlive && expected.purpose === undefined
+        ? this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current, true)
+        : this.network.getExtensionMainViewSurface(context.credential, expected.surfaceId, current));
       requireCurrent(current);
       if (!sameMobileExtensionMainViewSurface(expected, surface) || surface.expiresAt <= Date.now()) {
         throw new Error("The Extension main-view surface changed or expired.");

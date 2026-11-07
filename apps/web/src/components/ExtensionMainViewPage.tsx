@@ -188,24 +188,23 @@ export function ExtensionMainViewPage({
   useEffect(() => {
     if (state.phase !== "ready") return undefined;
     const expected = state.surface;
+    const abort = new AbortController();
+    let probing = false;
     const timer = window.setInterval(() => {
+      if (probing || (!settings && ownerDocument.visibilityState === "hidden")) return;
       const request = requestRevision.current;
-      void controller.getExtensionMainViewSurface(expected.id).then((current) => {
-        if (request !== requestRevision.current || surfaceRef.current?.id !== expected.id) return;
-        if (!sameExtensionMainViewSurface(expected, current)) {
-          releaseSurface(expected);
-          setState({ phase: "revoked", extension: state.extension });
-          setFrameLoaded(false);
-        }
+      probing = true;
+      void controller.getExtensionMainViewSurface(expected.id, abort.signal, settings ? undefined : true).then((current) => {
+        if (!sameExtensionMainViewSurface(expected, current)) throw new Error("Extension main view changed.");
       }).catch(() => {
-        if (request !== requestRevision.current || surfaceRef.current?.id !== expected.id) return;
+        if (abort.signal.aborted || request !== requestRevision.current || surfaceRef.current?.id !== expected.id) return;
         releaseSurface(expected);
         setState({ phase: "revoked", extension: state.extension });
         setFrameLoaded(false);
-      });
+      }).finally(() => { probing = false; });
     }, 15_000);
-    return () => window.clearInterval(timer);
-  }, [controller, releaseSurface, state]);
+    return () => { abort.abort(); window.clearInterval(timer); };
+  }, [controller, ownerDocument, releaseSurface, settings, state]);
 
   const surfaceUrl = useMemo(() => {
     if (state.phase !== "ready") return undefined;
@@ -721,6 +720,7 @@ export function sameExtensionMainViewSurface(left: ExtensionMainViewSurfaceView,
     && left.owner.resourceId === right.owner.resourceId && left.owner.resourceRevision === right.owner.resourceRevision
     && left.owner.discoveredRevision === right.owner.discoveredRevision && left.backendId === right.backendId
     && left.backendRevision === right.backendRevision && left.backendGeneration === right.backendGeneration
-    && left.expiresAt === right.expiresAt && left.title === right.title && left.icon === right.icon
+    && (left.purpose === undefined ? right.expiresAt >= left.expiresAt : left.expiresAt === right.expiresAt)
+    && left.title === right.title && left.icon === right.icon
     && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings;
 }

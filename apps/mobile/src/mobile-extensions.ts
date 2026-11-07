@@ -247,7 +247,7 @@ export interface MobileExtensionTransport {
     signal: AbortSignal
   ): Promise<MobileExtensionUseResult>;
   openMainView(expected: MobileExtension, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
-  probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionMainViewSurface>;
+  probeMainView(expected: MobileExtensionMainViewSurface, signal: AbortSignal, keepAlive?: true): Promise<MobileExtensionMainViewSurface>;
   readMainViewResource(expected: MobileExtensionMainViewSurface, url: string, kind: MobileExtensionResourceKind, signal: AbortSignal, text?: string): Promise<MobileExtensionMainViewResource>;
   closeMainView(expected: MobileExtensionMainViewSurface): Promise<boolean>;
   openLibrary(expected: MobileExtension, surface: MobileExtensionMainViewSurface, signal: AbortSignal): Promise<MobileExtensionLibrarySession>;
@@ -397,7 +397,7 @@ export function sameMobileExtensionMainViewSurface(
     && left.owner.resourceRevision === right.owner.resourceRevision
     && left.backendId === right.backendId && left.backendRevision === right.backendRevision
     && left.backendGeneration === right.backendGeneration && left.url === right.url
-    && left.title === right.title && left.icon === right.icon && left.expiresAt === right.expiresAt
+    && left.title === right.title && left.icon === right.icon && (left.purpose === undefined || left.expiresAt === right.expiresAt)
     && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings;
 }
 

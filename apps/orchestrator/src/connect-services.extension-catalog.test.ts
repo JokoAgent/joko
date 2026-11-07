@@ -19,8 +19,8 @@ const connection = {
   revision: 1n
 };
 
-function context(): unknown {
-  return { requestHeader: new Headers({ authorization: "Bearer extension-test" }), signal: new AbortController().signal };
+function context(headers: Record<string, string> = {}) {
+  return { requestHeader: new Headers({ authorization: "Bearer extension-test", ...headers }), signal: new AbortController().signal };
 }
 
 function stubApplication(overrides: Record<string, unknown>): OrchestratorApplication {
@@ -41,9 +41,9 @@ function stubApplication(overrides: Record<string, unknown>): OrchestratorApplic
   } as unknown as OrchestratorApplication;
 }
 
-async function invoke<T>(handler: unknown, request: unknown): Promise<T> {
+async function invoke<T>(handler: unknown, request: unknown, handlerContext = context()): Promise<T> {
   if (typeof handler !== "function") throw new Error("RPC handler is missing.");
-  return await (handler as (input: unknown, handlerContext: unknown) => T | Promise<T>)(request, context());
+  return await (handler as (input: unknown, handlerContext: unknown) => T | Promise<T>)(request, handlerContext);
 }
 
 function completedRecord(id: string, kind: string, body: unknown, response: unknown): OperationRecord<unknown> {
@@ -1156,6 +1156,9 @@ describe("Connect Extension catalog boundary", () => {
       surfaceId: nativeSurface.id
     });
     expect(probed.surface?.surfaceId).toBe(nativeSurface.id);
+    const heartbeat = context({ [contract.EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER]: "1" });
+    await invoke(services.extension.getExtensionMainViewSurface, { surfaceId: nativeSurface.id }, heartbeat);
+    expect(getSurface).toHaveBeenCalledWith(nativeSurface.id, connection.id, "visible", heartbeat.signal);
     const closed = await invoke<contract.CloseExtensionMainViewResponse>(services.extension.closeExtensionMainView, {
       surfaceId: nativeSurface.id
     });

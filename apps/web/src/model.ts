@@ -6483,7 +6483,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   }): Promise<ExtensionCatalogView>;
   getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal, includeProjectDisabled?: boolean): Promise<ExtensionCatalogView>;
   openExtensionMainView(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
-  getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal, keepAlive?: true): Promise<ExtensionMainViewSurfaceView>;
   closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean>;
   getExtensionLibraryOverview(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibraryOverviewView>;
   validateExtensionLibraryLocation(extensionId: string, expectedRevision: bigint, candidate: string, signal?: AbortSignal): Promise<ExtensionLibraryLocationValidationView>;

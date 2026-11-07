@@ -97,7 +97,7 @@ interface ActiveSurface {
   readonly viewRoot: string;
   readonly lease: PiInstalledPackageLease;
   readonly assertAuthorityCurrent: () => void | Promise<void>;
-  readonly expiresAt: number;
+  expiresAt: number;
   readonly lifetime: AbortController;
 }
 
@@ -317,12 +317,13 @@ export class ExtensionMainViewManager {
     });
   }
 
-  async getSurface(surfaceId: string, connectionId: string, renewPublisher = false): Promise<ExtensionMainViewSurface> {
+  async getSurface(surfaceId: string, connectionId: string, renew?: "publisher" | "visible", signal?: AbortSignal): Promise<ExtensionMainViewSurface> {
     this.#assertReady();
     if (!SURFACE_ID.test(surfaceId) || !SAFE_CONNECTION_ID.test(connectionId)) {
       throw new ExtensionMainViewError(404, "Extension main view not found.");
     }
     return this.#mutate(async () => {
+      signal?.throwIfAborted();
       await this.#destroyExpired(this.#now());
       const surface = this.#surfaces.get(surfaceId);
       if (surface === undefined || surface.connectionId !== connectionId) {
@@ -335,8 +336,17 @@ export class ExtensionMainViewManager {
         await this.#destroy(surface);
         throw new ExtensionMainViewError(410, "Extension main view was revoked.");
       }
-      if (renewPublisher && (surface.authority.routineEvents || surface.authority.runtime)) {
-        const renewed = { ...surface, expiresAt: this.#now() + this.#ttlMs }; this.#surfaces.set(surface.id, renewed);
+      signal?.throwIfAborted();
+      const publisher = surface.authority.routineEvents !== undefined || surface.authority.runtime !== undefined;
+      if (renew === "visible" && !publisher && surface.authority.settings === undefined) {
+        const now = this.#now();
+        if (this.#closed || surface.expiresAt <= now) {
+          await this.#destroy(surface);
+          throw new ExtensionMainViewError(410, "Extension main view was revoked.");
+        }
+        surface.expiresAt = Math.max(surface.expiresAt, now + this.#ttlMs);
+      } else if (renew === "publisher" && publisher) {
+        surface.expiresAt = this.#now() + this.#ttlMs;
       }
       return {
         id: surface.id,
@@ -345,7 +355,7 @@ export class ExtensionMainViewManager {
         endpoint: surface.endpoint,
         ...(surface.authority.mainView.title === undefined ? {} : { title: surface.authority.mainView.title }),
         ...(surface.authority.mainView.icon === undefined ? {} : { icon: surface.authority.mainView.icon }),
-        expiresAt: this.#surfaces.get(surface.id)!.expiresAt
+        expiresAt: surface.expiresAt
       };
     });
   }

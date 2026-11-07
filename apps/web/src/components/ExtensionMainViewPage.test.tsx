@@ -251,6 +251,26 @@ describe("Extension main view", () => {
     expect(closeExtensionMainView).toHaveBeenCalledWith(surface.id);
   });
 
+  it("keeps the mounted document when the foreground probe extends its lease", async () => {
+    const extension = readyExtension(EXTENSION_A, "Review"), surface = mainViewSurface(extension);
+    const intervals = vi.spyOn(window, "setInterval");
+    const read = vi.fn(async () => ({ ...surface, expiresAt: surface.expiresAt + 15_000 }));
+    const close = vi.fn(async () => true);
+    const rendered = await renderMainView(controllerFor({ getExtension: vi.fn(async () => catalog(extension)),
+      openExtensionMainView: vi.fn(async () => surface), getExtensionMainViewSurface: read, closeExtensionMainView: close }), EXTENSION_A);
+    const frame = required(rendered.container.querySelector("iframe"));
+    const tick = intervals.mock.calls.find(([, delay]) => delay === 15_000)?.[0];
+    if (typeof tick !== "function") throw new Error("Expected a foreground surface probe.");
+    await act(async () => { tick(); });
+    expect(read).toHaveBeenCalledExactlyOnceWith(surface.id, expect.any(AbortSignal), true);
+    expect(rendered.container.querySelector("iframe")).toBe(frame);
+    expect(close).not.toHaveBeenCalled();
+
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => { tick(); });
+    expect(read).toHaveBeenCalledOnce();
+  });
+
   it("closes a surface returned after its route request became stale", async () => {
     const extensionA = readyExtension(EXTENSION_A, "Review");
     const extensionB = readyExtension(EXTENSION_B, "Build");

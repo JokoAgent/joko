@@ -87,7 +87,7 @@ export class ExtensionRoutineRuntime {
         if (!publisher.current || desired.get(id)?.key !== publisher.authority.key || publisher.page?.isClosed()) {
           this.#retire(publisher); await this.#close(publisher); this.#publishers.delete(id);
         } else if (publisher.surface) {
-          try { await this.options.surfaces.getSurface(publisher.surface.id, publisher.connectionId, true); }
+          try { await this.options.surfaces.getSurface(publisher.surface.id, publisher.connectionId, "publisher"); }
           catch { this.#retire(publisher); await this.#close(publisher); this.#publishers.delete(id); }
         }
       }

@@ -5,7 +5,7 @@ import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/con
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
 import { readMobileExtensionMainViewResource } from "./mobile-extension-main-view-resource";
 import { projectMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
-import { ExtensionOAuthService, ExtensionNetworkService, type CredentialUploadTicket } from "@joko/contracts";
+import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, ExtensionOAuthService, ExtensionNetworkService, type CredentialUploadTicket } from "@joko/contracts";
 import type { MobileConnectionProfile } from "./connection-storage";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
@@ -366,7 +366,8 @@ export interface MobileNetwork {
   getExtensionMainViewSurface(
     credential: PairedCredential,
     surfaceId: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    keepAlive?: true
   ): Promise<MobileExtensionMainViewSurface>;
   readExtensionMainViewResource(credential: PairedCredential, surface: MobileExtensionMainViewSurface, url: string,
     kind: import("./mobile-extensions").MobileExtensionResourceKind, signal?: AbortSignal, text?: string): Promise<import("./mobile-extensions").MobileExtensionMainViewResource>;
@@ -2412,12 +2413,12 @@ export const mobileNetwork: MobileNetwork = {
     return surface;
   },
   readExtensionMainViewResource: readMobileExtensionMainViewResource,
-  async getExtensionMainViewSurface(credential, surfaceId, signal) {
+  async getExtensionMainViewSurface(credential, surfaceId, signal, keepAlive) {
     if (!/^extension_surface_[a-f0-9]{32}$/u.test(surfaceId)) {
       throw new Error("A current Extension main-view surface is required.");
     }
     const response = await createClient(ExtensionService, credentialTransport(credential))
-      .getExtensionMainViewSurface({ surfaceId }, options(signal));
+      .getExtensionMainViewSurface({ surfaceId }, { signal, ...(keepAlive ? { headers: { [EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER]: "1" } } : {}) });
     signal?.throwIfAborted();
     if (response.surface === undefined) throw new Error("The Joko node returned an empty Extension main-view probe.");
     const surface = projectMobileExtensionMainViewSurface(response.surface, credential.origin);
