@@ -48,6 +48,7 @@ const suggestTaskTitle = vi.fn(async (_key: string, _signal: AbortSignal) => cre
 }));
 const alert = vi.fn();
 const reconcile = vi.fn(async () => {});
+const dismissUnconfirmed = vi.fn(async (_operationId: string) => {});
 const refresh = vi.fn(async () => {});
 const writeClipboard = vi.fn(async () => true);
 const draftValues = new Map<string, string>();
@@ -93,7 +94,7 @@ let learningPartner: typeof profilePartner | undefined;
 let collaborationApi: import("./mobile-collaboration").MobileCollaborationApi | undefined;
 let learningProfileProps: ComponentProps<typeof import("./MobilePartnerProfileSheet").MobilePartnerProfileSheet> | undefined;
 const client = new Proxy({
-  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, refresh,
+  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
   taskQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
@@ -250,7 +251,7 @@ beforeEach(async () => {
   headerSourceEpoch = 0;
   vi.useFakeTimers();
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
-  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, refresh,
+  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -501,6 +502,23 @@ describe("actual Home navigation hosts", () => {
     await option(message("common.archive"));
     expect(prepareSessionArchive).toHaveBeenCalledExactlyOnceWith("current");
     expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true, archiveConfirmation);
+  });
+
+  it("opens the original tag operation recovery from Home without selecting a task", async () => {
+    await render({ currentSessionId: undefined, state: { ...state, selectedId: undefined, detail: undefined,
+      pending: [{ operationId: "original-tag-receipt", kind: "task-tag", state: "unknown", connectionId: homeConnectionId, sessionId: "other" }] } });
+    expect(host.textContent).toContain("original-tag-receipt");
+    await press(message("receipt.check"));
+    expect(reconcile).toHaveBeenCalledOnce();
+    await press(message("receipt.verify"));
+    const confirm = (alert.mock.calls.at(-1)?.[2] as { text: string; onPress?: () => void }[])
+      .find(action => action.text === message("receipt.verify"))?.onPress;
+    expect(confirm).toBeDefined();
+    expect(dismissUnconfirmed).not.toHaveBeenCalled();
+    await act(async () => confirm!());
+    expect(dismissUnconfirmed).toHaveBeenCalledExactlyOnceWith("original-tag-receipt");
+    expect(select).not.toHaveBeenCalled();
+    expect(runNavigation).not.toHaveBeenCalled();
   });
 
   it("retires debounced reads on unmount and does not read or navigate while hidden", async () => {

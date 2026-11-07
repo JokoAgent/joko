@@ -1574,7 +1574,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     {copyNotice && <Notice text={copyNotice} colors={colors} locale={locale}
       dismissAccessibilityLabel={mobileMessage(locale, "actions.dismissCopyNotice")}
       onDismiss={() => setCopyNotice("")} />}
-    <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete"].includes(item.kind))}
+    <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete", "task-tag"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
       ListHeaderComponent={onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
