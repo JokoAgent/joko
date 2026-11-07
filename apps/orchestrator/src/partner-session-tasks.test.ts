@@ -75,7 +75,11 @@ describe("Partner independent Session tasks", () => {
 
     expect(await f.partners.restartPartner({ requestId: "restart-receipt-parent", partnerId: f.partner.id, expectedRevision: f.partner.revision }))
       .toMatchObject({ phase: "ready" });
-    expect(f.store.getSession(f.parent).descriptor.binding.generation).toBeGreaterThan(parentGeneration);
+    expect(f.host.isSessionActive(f.parent)).toBe(false);
+    // The ordinary restart keeps the binding. Exercise a later binding
+    // generation as well, without sending a new public prompt to the parent.
+    const { binding } = f.store.getSession(f.parent).descriptor;
+    f.store.updateSession(f.parent, { binding: { ...binding, generation: parentGeneration + 1 } });
     await f.tasks.close();
     f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now);
     await f.tasks.initialize();
