@@ -122,7 +122,29 @@ const VIEWER_SCRIPT = String.raw`
   listenMouse(wheel,'click',event=>{if(event.detail===0&&control&&showMouseButtons){click(1);flush();}});
   listenMouse(wheel,'keydown',event=>{if(event.key==='ArrowUp'||event.key==='ArrowDown'){event.preventDefault();scrollMouse(event.key==='ArrowUp'?-120:120);}});
   function pair(){const [a,b]=[...pointers.values()];return{x:(a.x+b.x)/2,y:(a.y+b.y)/2,d:Math.hypot(a.x-b.x,a.y-b.y)};}
-  function movePair(){gestureFrame=null;if(pointers.size<2||!multi)return;const next=pair(),span=Math.abs(next.d-multi.d),travel=Math.hypot(next.x-multi.x,next.y-multi.y);if(!multi.kind){if(span>8&&span>travel*.7)multi.kind='pinch';else if(travel>8)multi.kind='scroll';}if(multi.kind==='pinch'){zoom=Math.max(1,Math.min(5,multi.zoom*next.d/Math.max(1,multi.d)));boundPan();render();}else if(multi.kind==='scroll'){const dx=next.x-multi.lastX,dy=next.y-multi.lastY;if(control&&mode!=='pan')queue({kind:'scroll',dx:Math.max(-2000,Math.min(2000,-dx)),dy:Math.max(-2000,Math.min(2000,-dy))});else pan(dx,dy);}multi.lastX=next.x;multi.lastY=next.y;}
+  function movePair(){
+    gestureFrame=null;
+    if(pointers.size<2||!multi)return;
+    const next=pair(),span=Math.abs(next.d-multi.d),travel=Math.hypot(next.x-multi.x,next.y-multi.y);
+    if(!multi.kind){
+      if(span>8&&span>travel*.7)multi.kind='pinch';
+      else if(travel>8)multi.kind='scroll';
+    }
+    if(multi.kind==='pinch'){
+      zoom=Math.max(1,Math.min(5,multi.zoom*next.d/Math.max(1,multi.d)));boundPan();render();
+    }else if(multi.kind==='scroll'){
+      const dx=next.x-multi.lastX,dy=next.y-multi.lastY;
+      if(control&&mode!=='pan'){
+        if(!multi.aimed&&inside(next)){
+          const target=point(next);cx=target.x;cy=target.y;
+          queue({kind:'move',x:cx,y:cy});render();
+          multi.aimed=true;
+        }
+        if(multi.aimed)queue({kind:'scroll',dx:bounded(-dx,-2000,2000),dy:bounded(-dy,-2000,2000)});
+      }else pan(dx,dy);
+    }
+    multi.lastX=next.x;multi.lastY=next.y;
+  }
   stage.addEventListener('pointerdown',event=>{
     if(pointers.has(event.pointerId))return;
     event.preventDefault();stage.setPointerCapture(event.pointerId);
@@ -138,7 +160,7 @@ const VIEWER_SCRIPT = String.raw`
       },400);
     }else{
       clearTimeout(hold);if(drag)queue({kind:'release'});drag=false;start=null;
-      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,kind:null};
+      const p=pair();multi={...p,lastX:p.x,lastY:p.y,zoom,kind:null,aimed:mode!=='touch'};
     }
   });
   stage.addEventListener('pointermove',event=>{
