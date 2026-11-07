@@ -1851,6 +1851,25 @@ describe("mobile Workspace and Artifact paging", () => {
     }))).rejects.toThrow(/cyclic workspace-search page token/);
   });
 
+  it("keeps 501 stable content matches when the last page clears the continuation flag", async () => {
+    const revision = create(FileRevisionSchema, { opaqueRevision: "sha256:fixture:5010", byteSize: 5_010n });
+    const matches = Array.from({ length: 501 }, (_value, index) => create(WorkspaceSearchMatchSchema, {
+      relativePath: "report.txt", revision, linePreview: `match ${index + 1}`
+    }));
+    const readPage = vi.fn(async (token: string) => ({
+      matches: token === "" ? matches.slice(0, 500) : matches.slice(500), nextPageToken: token === "" ? "second" : "",
+      totalSize: 501n, totalFiles: 1n, revision: "search-501", truncated: token === ""
+    }));
+    await expect(collectWorkspaceSearchPages("workspace", readPage)).resolves.toEqual({
+      matches, revision: "search-501", truncated: false, totalFiles: 1
+    });
+    expect(readPage.mock.calls).toEqual([[""], ["second"]]);
+
+    await expect(collectWorkspaceSearchPages("workspace", async token => ({
+      ...await readPage(token), ...(token === "" ? {} : { revision: "updated-search" })
+    }))).rejects.toThrow(/changed while paging/u);
+  });
+
   it("accepts only canonical Artifacts owned by the requested task", async () => {
     const artifact = create(ArtifactSchema, {
       artifactId: "artifact-1", sessionId: "session", kind: ArtifactKind.FILE, title: "Export"
