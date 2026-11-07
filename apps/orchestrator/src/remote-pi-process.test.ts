@@ -769,10 +769,10 @@ describe("RemotePiProcessFactory", () => {
       env: { JOKO_PI_TARGET_ID: "target-a", JOKO_PI_SPAWN_IDENTITY: "a".repeat(64), JOKO_PI_REMOTE_RECOVERY_IDENTITY: "b".repeat(64),
         JOKO_PI_GENERATION: "1", JOKO_PI_MCP_TOKEN: "bridge-token-a", JOKO_PI_CONTROL_FILE: control, PI_CODING_AGENT_SESSION_DIR: sessions }
     });
-    const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as { command: string };
-    const remoteRelease = remotePath.dirname(bootstrap.command);
-    expect(bootstrap.command).toMatch(/\/bin\/[a-f0-9]{64}\/pi$/u);
-    expect(reads).toHaveBeenCalledWith({ path: bootstrap.command, maximumBytes: size, managedPiExecutable: true });
+    const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as { executable: string };
+    expect(bootstrap.executable).toMatch(/\/bin\/[a-f0-9]{64}\/pi$/u);
+    const remoteRelease = remotePath.dirname(bootstrap.executable);
+    expect(reads).toHaveBeenCalledWith({ path: bootstrap.executable, maximumBytes: size, managedPiExecutable: true });
     expect(files.text(`${remoteRelease}/package.json`)).toBe(packageJson);
     expect(files.text(`${remoteRelease}/theme/dark.json`)).toBe('{"name":"dark"}');
     expect(files.text(`${remoteRelease}/theme/light.json`)).toBe('{"name":"light"}');
