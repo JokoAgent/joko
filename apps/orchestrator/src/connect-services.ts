@@ -6680,7 +6680,7 @@ export function toProtoOperation(
 ): contract.Operation {
   const base = toProtoStoredOperation(record, Number(dependencies.generation ?? 0n));
   const sharedAuthor = dependencies.taskShares?.getAuthorForOperation(record.id);
-  const result = record.status === "started" ? undefined : operationResult(dependencies, outcome, at);
+  const result = record.status === "started" ? undefined : operationResult(dependencies, mutation, outcome, at);
   const rejected = record.status === "failed" || (record.status === "completed" && !outcome.accepted);
   return create(contract.OperationSchema, {
     ...base,
@@ -6761,6 +6761,7 @@ function browserKeyboardOperationBody(mutation: contract.OperationMutation, proj
 
 function operationResult(
   dependencies: ConnectServiceDependencies,
+  mutation: contract.OperationMutation,
   outcome: OperationOutcome,
   at: number
 ): contract.OperationResult {
@@ -6868,8 +6869,16 @@ function operationResult(
     };
     return create(contract.OperationResultSchema, { payload });
   }
-  if (!outcome.accepted || outcome.entityId === undefined) return create(contract.OperationResultSchema, { payload });
+  if (!outcome.accepted) return create(contract.OperationResultSchema, { payload });
   try {
+    if (outcome.resultCase === "settings" && mutation.payload.case === "updateMemorySettings") {
+      const patch = mutation.payload.value.patch;
+      if (patch?.backendEnabled !== undefined
+        && updatesActiveLocalMemorySessions(dependencies.store.getBackend(patch.backendId).descriptor)) {
+        return create(contract.OperationResultSchema, { payload: { case: "settings", value: settingsSnapshot(dependencies) } });
+      }
+    }
+    if (outcome.entityId === undefined) return create(contract.OperationResultSchema, { payload });
     switch (outcome.resultCase) {
       case "connection": payload = { case: "connection", value: toProtoConnection(dependencies.store.getConnection(outcome.entityId)) }; break;
       case "device": {
