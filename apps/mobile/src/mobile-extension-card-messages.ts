@@ -21,4 +21,11 @@ const mail = {
   ja: { attachFile: "ファイルを添付", mailFailed: "メールを読み取れません。プラグインのアカウントを確認して再試行してください。", mailAmbiguous: "複数のプラグインがこのメールリンクを処理します。設定で一つを選択してください。", mailPartial: "会話または既読状態の一部を取得できません。", mailOriginal: "元のメールを開く", mailThread: "スレッド", mailTo: "宛先", mailCc: "Cc", mailBcc: "Bcc", mailSubject: "件名" },
   ko: { attachFile: "파일 첨부", mailFailed: "메일을 읽을 수 없습니다. 플러그인 계정을 확인하고 다시 시도하세요.", mailAmbiguous: "여러 플러그인이 이 메일 링크를 처리합니다. 설정에서 하나를 선택하세요.", mailPartial: "일부 대화 또는 읽음 상태를 확인할 수 없습니다.", mailOriginal: "원본 메일 열기", mailThread: "대화", mailTo: "받는 사람", mailCc: "참조", mailBcc: "숨은 참조", mailSubject: "제목" }
 };
-export function mobileExtensionCardMessages(locale: MobileSupportedLocale) { return { ...cardMessages(locale), ...mail[locale] }; }
+const reader = {
+  en: { mailChooseReader: "Choose a plugin to read this message", mailSourceChanged: "The selected plugin changed. Choose the source again." },
+  "zh-CN": { mailChooseReader: "选择读取此邮件的插件", mailSourceChanged: "所选插件已更改，请重新选择来源。" },
+  "zh-TW": { mailChooseReader: "選擇讀取此郵件的外掛", mailSourceChanged: "所選外掛已變更，請重新選擇來源。" },
+  ja: { mailChooseReader: "このメールを読むプラグインを選択", mailSourceChanged: "選択したプラグインが変更されました。もう一度選択してください。" },
+  ko: { mailChooseReader: "이 메일을 읽을 플러그인 선택", mailSourceChanged: "선택한 플러그인이 변경되었습니다. 다시 선택하세요." }
+};
+export function mobileExtensionCardMessages(locale: MobileSupportedLocale) { return { ...cardMessages(locale), ...mail[locale], ...reader[locale] }; }

@@ -42,6 +42,9 @@
 .extension-card__expanded .extension-card-form { padding: 0; }
 @media (max-width: 480px) { .extension-card__failure { align-items: flex-start; } .extension-card-form__field.is-grouped { flex-basis: 100%; } }
 .extension-card__mail-meta { padding: 0 12px; color: var(--text-soft); font-size: 12px; overflow-wrap: anywhere; }
+.extension-card__mail-readers { display: grid; justify-items: start; gap: 8px; }
+.extension-card__mail-readers > p { margin: 0; color: var(--text-soft); }
+.extension-card__mail-readers > button { max-width: 100%; height: auto; white-space: normal; overflow-wrap: anywhere; }
 .extension-card__mail-thread { margin: 12px; }
 .extension-card__mail-thread > button { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%; padding: 12px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--text); text-align: left; overflow-wrap: anywhere; }
 .extension-card__mail-thread > button > span, .extension-card__mail-thread > button > small { color: var(--text-soft); }

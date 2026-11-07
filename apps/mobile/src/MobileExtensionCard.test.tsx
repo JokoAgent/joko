@@ -2,7 +2,7 @@
 import { act, createElement, StrictMode, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { ExtensionCardSchema, ExtensionCardServiceGetResponseSchema, extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
+import { ExtensionCardSchema, ExtensionCardServiceGetResponseSchema, ExtensionCardServicePreviewMailResponseSchema, extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { MobileExtensionCardApi } from "./mobile-extension-card-api";
 
@@ -23,6 +23,7 @@ vi.mock("react-native-webview", () => ({ WebView: (props: Record<string, any>) =
 } }));
 vi.mock("./MobileMediaPlayer", () => ({ MobileMediaPlayer: ({ uri }: { uri: string }) => createElement("div", { "data-audio": uri }) }));
 import { MobileExtensionCard, MobileExtensionCardsProvider } from "./MobileExtensionCard";
+import { MobileExtensionMailReaderProvider, useMobileMailLink } from "./MobileExtensionMailReader";
 
 const colors = { background: "#fff", surface: "#fafafa", ink: "#111", muted: "#666", border: "#ccc", accent: "#ff9800", negative: "#b00", brandBackground: "#fff4df", dark: false };
 const escape = (value: unknown) => JSON.stringify(value).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
@@ -40,6 +41,31 @@ it("shows the computer callback requirement and never opens a loopback authoriza
   api.get.mockResolvedValue(create(ExtensionCardServiceGetResponseSchema, { card: value, interactive: true, hostAuthorization: true }));
   await render(api); expect(element.textContent).toContain("Open Joko Desktop");
   const current = poster(); await message(current.props, current.id, { type: "action", action: "host:connect-account" }); expect(api.dispatch).not.toHaveBeenCalled();
+});
+it("opens overlapping mail through the chosen native reader and retires its view on backgrounding", async () => {
+  const url = "https://mail.example.test/messages/one";
+  const previewMail = vi.fn(async (request: { read?: boolean; readerSelectionId?: string }) => create(ExtensionCardServicePreviewMailResponseSchema,
+    request.readerSelectionId === "two" ? { supported: true, messageJson: JSON.stringify({ accountId: "one", messageId: "one", from: "Sender two",
+      to: "Owner", cc: "", bcc: "", subject: "Second reader's message", date: "Today", bodyText: "Private fixture", bodyHtml: "", attachments: [] }) }
+      : request.read ? { supported: true, error: "MAIL_PROVIDER_AMBIGUOUS", readerChoices: [
+        { selectionId: "one", displayName: "First reader" }, { selectionId: "two", displayName: "Second reader" }
+      ] } : { supported: true }));
+  function Link() {
+    const open = useMobileMailLink();
+    return <button onClick={() => void open?.(url)}>Open mail link</button>;
+  }
+  const button = (label: string) => [...element.querySelectorAll("button")].find(item => item.textContent === label)!;
+  await act(async () => root.render(<MobileExtensionMailReaderProvider ownerKey="mail-owner" sessionId="task"
+    bind={() => ({ previewMail }) as unknown as MobileExtensionCardApi} colors={colors} locale="en"><Link /></MobileExtensionMailReaderProvider>));
+  await act(async () => button("Open mail link").click());
+  expect(element.textContent).toContain("Choose a plugin to read this message");
+  expect(previewMail.mock.calls.map(([request]) => request.readerSelectionId)).toEqual([undefined, undefined]);
+  await act(async () => button("Second reader").click());
+  expect(previewMail).toHaveBeenLastCalledWith({ sessionId: "task", url, read: true, opened: true, readerSelectionId: "two" }, expect.any(Object));
+  expect(element.textContent).toContain("Second reader's message");
+  await act(async () => { native.state = "background"; for (const listener of native.listeners) listener("background"); });
+  expect(element.textContent).toBe("Open mail link");
+  expect(previewMail).toHaveBeenCalledTimes(3);
 });
 async function render(api: ReturnType<typeof apiFixture>, ownerKey = "owner", value = card(), readOnly = false) {
   await act(async () => root.render(<StrictMode><MobileExtensionCardsProvider ownerKey={ownerKey} bind={() => api as unknown as MobileExtensionCardApi}>

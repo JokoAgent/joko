@@ -61,12 +61,16 @@ export function createExtensionCardConnectService(manager: ExtensionCardsManager
     previewMail: async (request, context) => {
       const connection = connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
       if (!request.sessionId || request.sessionId.length > 256 || !request.url || request.url.length > 2048) throw new ConnectError("Invalid mail preview request.", Code.InvalidArgument);
+      if (request.readerSelectionId !== undefined && (!request.read || !/^[a-f0-9]{64}$/u.test(request.readerSelectionId))) {
+        throw new ConnectError("Invalid mail reader selection.", Code.InvalidArgument);
+      }
       context.signal.throwIfAborted();
       return effect(async () => {
-        const result = await required().previewMail(request.sessionId, request.url, request.read, request.opened, context.signal, () => connections.fence(connection));
+        const result = await required().previewMail({ ...request, connectionId: connection.id }, context.signal, () => connections.fence(connection));
         connections.fence(connection); context.signal.throwIfAborted();
         return create(contract.ExtensionCardServicePreviewMailResponseSchema, { supported: result.supported,
-          messageJson: result.message ? JSON.stringify(result.message) : "", error: result.error ?? "", extensionId: result.extensionId ?? "" });
+          messageJson: result.message ? JSON.stringify(result.message) : "", error: result.error ?? "", extensionId: result.extensionId ?? "",
+          readerChoices: result.readerChoices?.map(choice => create(contract.ExtensionMailReaderChoiceSchema, choice)) ?? [] });
       });
     },
     beginAttachment: async (request, context) => {

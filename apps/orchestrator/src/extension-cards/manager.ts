@@ -8,7 +8,7 @@ import type { ExtensionRuntimeDescriptor } from "../extension-surface-manifest.j
 import { ExtensionCardService, type ExtensionCardScope, type ExtensionCardRow, type ExtensionCardPush } from "./service.js";
 import { MailCardService } from "./mail-cards.js";
 import { EXTENSION_CARD_ACTION_ID_RE, EXTENSION_CARD_ACTION_PROMPT_MAX_LEN, extensionCardRootCallId, isExtensionCardLinkAllowed } from "./protocol.js";
-import type { ExtensionMailPreview } from "./mail-reader.js";
+import type { ExtensionMailPreview, ExtensionMailPreviewRequest } from "./mail-reader.js";
 import { extensionCardMediaUris, type ExtensionCardMedia, type ExtensionMailAttachment, type ExtensionMailUploadMetadata } from "./media.js";
 import type { ExtensionOAuthCards } from "./oauth-cards.js";
 
@@ -38,7 +38,7 @@ interface Options {
   readonly assertProject?: (extensionId: string, sessionId: string) => void;
   readonly redact: (text: string) => string;
   readonly dispatch: (scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void) => Promise<void>;
-  readonly previewMail?: (sessionId: string, url: string, read: boolean, opened: boolean, signal: AbortSignal, assertCurrent: () => void) => Promise<ExtensionMailPreview>;
+  readonly previewMail?: (request: ExtensionMailPreviewRequest, signal: AbortSignal, assertCurrent: () => void) => Promise<ExtensionMailPreview>;
   readonly media?: ExtensionCardMedia;
   readonly oauthCards?: () => ExtensionOAuthCards | undefined;
 }
@@ -73,9 +73,9 @@ export class ExtensionCardsManager {
     if (session.createdAt !== scope.sessionCreatedAt || session.targetId !== scope.targetId || session.archived || session.deletedAt !== undefined
       || this.options.store.findPendingSessionLifecycleCleanup(session.id) !== undefined) throw new Error("Extension card task changed.");
   }
-  async previewMail(sessionId: string, url: string, read: boolean, opened: boolean, signal: AbortSignal, assertCurrent: () => void): Promise<ExtensionMailPreview> {
+  async previewMail(request: ExtensionMailPreviewRequest, signal: AbortSignal, assertCurrent: () => void): Promise<ExtensionMailPreview> {
     if (!this.options.previewMail || this.#closed) throw new Error("Mail preview unavailable.");
-    return this.options.previewMail(sessionId, url, read, opened, signal, assertCurrent);
+    return this.options.previewMail(request, signal, assertCurrent);
   }
   assertAuthority(scope: ExtensionCardScope): ExtensionCardAuthority {
     this.assertScope(scope);
