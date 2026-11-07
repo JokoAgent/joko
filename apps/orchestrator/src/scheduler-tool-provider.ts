@@ -186,6 +186,14 @@ export const SCHEDULER_TOOLS: readonly McpToolDescriptor[] = [
       id: ID_SCHEMA,
       expectedRevision: REVISION_SCHEMA,
       ...CREATE_PROPERTIES,
+      intervalMs: {
+        anyOf: [CREATE_PROPERTIES.intervalMs, { type: "null" }],
+        description: "Set an interval in milliseconds, or pass null with cronExpr to clear the interval. Omit to keep it."
+      },
+      targetSessionId: {
+        anyOf: [CREATE_PROPERTIES.targetSessionId, { type: "null" }],
+        description: "Set an existing task binding, or pass null to clear it. Omit to keep it."
+      },
       expireAt: { anyOf: [CREATE_PROPERTIES.expireAt, { type: "null" }] },
       preRunHook: { anyOf: [PRE_RUN_HOOK_SCHEMA, { type: "null" }] },
       scriptConfig: { anyOf: [SCRIPT_CONFIG_SCHEMA, { type: "null" }] }

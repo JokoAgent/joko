@@ -13,6 +13,7 @@ import {
   OperationMutationSchema,
   OperationState,
   OwnerSnapshotScopeSchema,
+  PermissionMode,
   PiMessageRole,
   QueueDeliveryMode,
   ResourceAcquisitionSourceSchema,
@@ -44,7 +45,8 @@ import {
   REAL_PI_MODEL_ID,
   REAL_PI_PROVIDER_ID,
   REAL_PI_RESPONSE_TEXT,
-  RealPiSystemFixture
+  RealPiSystemFixture,
+  type RealPiProviderReply
 } from "./real-pi-fixture.js";
 import { installLocalSkill } from "./skill-system-fixture.js";
 
@@ -57,6 +59,56 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     releaseCompactionGate = undefined;
     await fixture?.close();
     fixture = undefined;
+  });
+
+  it("preserves omitted, explicit and null Schedule patches through the published Pi tool bridge", { timeout: 60_000 }, async () => {
+    let reply: RealPiProviderReply = { kind: "text", text: "No pending Schedule tool call." };
+    fixture = await RealPiSystemFixture.start({ enableInternalServer: true, providerResponder: ({ request }) => {
+      const messages = request.body["messages"] as readonly { readonly role: string }[];
+      return messages.at(-1)?.role === "tool" ? { kind: "text", text: "Schedule tool result received." } : reply;
+    } });
+    const { store } = fixture.application;
+    const targetId = "workspace-real-pi";
+    const target = store.getTarget(targetId);
+    store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
+    const { clients, connectionId } = await fixture.pair("Schedule tool owner");
+    const newTask = async () => sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: "pi", targetId, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID,
+      permissionMode: PermissionMode.BYPASS_PERMISSIONS
+    })));
+    const sessionId = await newTask();
+    const otherSessionId = await newTask();
+    const generation = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+    const callTool = async (name: string, args: Readonly<Record<string, unknown>>) => {
+      reply = { kind: "tool", name, arguments: args };
+      const accepted = await submit(clients.operation, connectionId, sendInputMutation(sessionId, generation, `Apply the next ${name} patch.`));
+      expect(accepted.state).toBe(OperationState.SUCCEEDED);
+      const runId = queueRunIdFrom(accepted);
+      const { run } = await waitForRealSystem(() => clients.run.getRun({ runId }),
+        value => value.run?.state === RunState.SUCCEEDED || value.run?.state === RunState.FAILED,
+        `${name} to settle`, 15_000);
+      expect(run?.state).toBe(RunState.SUCCEEDED);
+      expect(store.listEvents({ sessionId }).filter(event => event.runId === runId).map(event => event.payload))
+        .toContainEqual(expect.objectContaining({ type: "tool_result", name, isError: false }));
+    };
+
+    await callTool("schedule_create", { name: "Bound interval", prompt: "Scheduled work", intervalMs: 3_600_000,
+      targetSessionId: sessionId, enabled: false });
+    const [schedule] = store.listSchedules();
+    expect(schedule).toMatchObject({ targetId, kind: "interval", expression: "3600000", sessionMode: "bound", sessionId });
+    const id = schedule!.id;
+
+    await callTool("schedule_update", { id, name: "Renamed interval" });
+    expect(store.getSchedule(id)).toMatchObject({ name: "Renamed interval", kind: "interval", expression: "3600000",
+      sessionMode: "bound", sessionId });
+
+    await callTool("schedule_update", { id, intervalMs: 7_200_000, targetSessionId: otherSessionId });
+    expect(store.getSchedule(id)).toMatchObject({ kind: "interval", expression: "7200000", sessionMode: "bound", sessionId: otherSessionId });
+
+    await callTool("schedule_update", { id, intervalMs: null, cronExpr: "0 9 * * *", targetSessionId: null });
+    const updated = store.getSchedule(id);
+    expect(updated).toMatchObject({ kind: "cron", expression: "0 9 * * *", sessionMode: "fresh" });
+    expect(updated.sessionId).toBeUndefined();
   });
 
   it("pairs, creates, sends, settles, and projects public plus Pi-native context", { timeout: 60_000 }, async () => {
