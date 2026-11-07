@@ -282,7 +282,8 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
       if (stored.byteLength > MAX_ARTIFACT_EXCERPT_BYTES) {
         return { ...attachment, warning: "File exceeds the bounded Review excerpt limit." };
       }
-      if (!isTextMime(read.mimeType) || read.data.includes(0)) {
+      const content = isTextMime(read.mimeType) ? decodeReviewText(read.data) : undefined;
+      if (content === undefined) {
         return { ...attachment, warning: "Binary file has no textual Review excerpt." };
       }
       return {
@@ -290,7 +291,7 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
         excerpt: {
           format: read.mimeType,
           coverage: "full file",
-          content: new TextDecoder("utf-8", { fatal: false }).decode(read.data)
+          content
         }
       };
     } catch {
@@ -603,4 +604,16 @@ function sha256(value: string | Uint8Array): string {
 
 function isTextMime(value: string): boolean {
   return value.startsWith("text/") || /(?:json|javascript|typescript|xml|yaml|toml|markdown)/iu.test(value);
+}
+
+function decodeReviewText(bytes: Uint8Array): string | undefined {
+  if (bytes[0] !== 0xff || bytes[1] !== 0xfe) {
+    return bytes.includes(0) ? undefined : new TextDecoder("utf-8").decode(bytes);
+  }
+  try {
+    const content = new TextDecoder("utf-16le", { fatal: true }).decode(bytes);
+    return content.includes("\0") ? undefined : content;
+  } catch {
+    return undefined;
+  }
 }
