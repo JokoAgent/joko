@@ -618,11 +618,13 @@ describe("MessagingManager", () => {
         contextToken: `private-command-${index}`
       }))
     });
+    const permissionModes = ["ask", "acceptEdits", "auto", "bypassPermissions"] as const;
     const adapter = new FakeBackendAdapter({
       ...PI_LIKE_PROFILE,
+      permissionModes,
       capabilities: [
         ...PI_LIKE_PROFILE.capabilities.map((capability) => capability.key === "permission.modes"
-          ? { key: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto", "bypassPermissions"] }
+          ? { key: "permission.modes", supported: true, options: [...permissionModes] }
           : capability),
         { key: "permission.change", supported: true }
       ]
