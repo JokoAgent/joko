@@ -257,7 +257,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [rewindPreview, setRewindPreview] = useState<WorkspaceRewindPreviewView & { readonly workspaceId: string; readonly execute: AppController["executeWorkspaceRewind"]; readonly isCurrent: () => boolean }>();
   const [dialogueOnlyRewind, setDialogueOnlyRewind] = useState(false);
   const [followLatestSignal, setFollowLatestSignal] = useState(0);
-  const [composerFocusRequest, setComposerFocusRequest] = useState(0);
+  const [composerFocusRequest, setComposerFocusRequest] = useState<() => boolean>();
   const [liveCommands, setLiveCommands] = useState<readonly RuntimeCommandView[]>([]);
   const [liveResourceCatalog, setLiveResourceCatalog] = useState<{
     readonly owner: object;
@@ -2004,7 +2004,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         fastEnabled={!!controller.setRuntimeModel || canSetFast}
         useMorphPopover
         retainCurrentSource
-        onSelectionFocus={() => setComposerFocusRequest((current) => current + 1)}
+        onSelectionFocus={(canRestoreFocus) => {
+          const canFocusThisTask = () => activeSessionIdRef.current === session.id && canRestoreFocus();
+          setComposerFocusRequest(() => canFocusThisTask);
+        }}
         t={t}
         providerGroupUsage={providerGroupUsage}
         onOpen={() => Promise.allSettled([controller.refreshProviderModels(session.backendId, undefined, true), refreshTaskProviderGroupUsage(),
