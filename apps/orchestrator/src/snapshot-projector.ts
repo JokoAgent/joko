@@ -880,7 +880,7 @@ export function activeNativeTimeline(
     if (currentBinding === undefined) return deduplicateNativeLive(events);
     const currentFingerprint = nativeBindingFingerprint(currentBinding.opaqueRef);
     return deduplicateNativeLive(events.filter((event) => {
-      if (retainedContext?.has(event.globalCursor)) return true;
+      if (event.payload.type === "partner_session_task_receipt" || retainedContext?.has(event.globalCursor)) return true;
       const identity = nativeHistoryEventContext(event.payload)?.identity;
       if (identity !== undefined || event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== undefined) {
         return event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === currentFingerprint;
@@ -889,7 +889,8 @@ export function activeNativeTimeline(
     }));
   }
   if (currentBinding !== undefined && marker.payload.opaqueRef !== currentBinding.opaqueRef) {
-    return deduplicateNativeLive(events.filter((event) => retainedContext?.has(event.globalCursor) || (
+    return deduplicateNativeLive(events.filter((event) => event.payload.type === "partner_session_task_receipt"
+      || retainedContext?.has(event.globalCursor) || (
       (nativeHistoryEventContext(event.payload)?.identity === undefined
         || (event.metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true
           && event.globalCursor > marker.globalCursor)) &&
@@ -925,7 +926,7 @@ export function activeNativeTimeline(
     cursor = parents.has(cursor) ? parents.get(cursor) : deletedParents?.get(cursor);
   }
   return deduplicateNativeLive(events.filter((event) => {
-    if (retainedContext?.has(event.globalCursor)) return true;
+    if (event.payload.type === "partner_session_task_receipt" || retainedContext?.has(event.globalCursor)) return true;
     const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
     if (entryId !== undefined) {
       const eventBindingFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];

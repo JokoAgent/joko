@@ -2999,6 +2999,18 @@ export function fromProtoEvent(event: ProtoEvent): AppendEventInput {
 function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext): ProtoEventPayload {
   const payload = event.payload;
   switch (payload.type) {
+    case "partner_session_task_receipt": {
+      const status = {
+        preparing: contract.PartnerSessionTaskStatus.PREPARING,
+        completed: contract.PartnerSessionTaskStatus.COMPLETED,
+        failed: contract.PartnerSessionTaskStatus.FAILED,
+        cancelled: contract.PartnerSessionTaskStatus.CANCELLED,
+        "timed-out": contract.PartnerSessionTaskStatus.TIMED_OUT
+      }[payload.receipt.status];
+      return protoPayload("partnerSessionTaskReceipt", message<contract.PartnerSessionTaskReceiptEvent>(
+        "joko.v1.PartnerSessionTaskReceiptEvent", { ...payload.receipt, status }
+      ));
+    }
     case "extension_card_changed":
       return protoPayload("extensionCardChanged", message<contract.ExtensionCardChangedEvent>("joko.v1.ExtensionCardChangedEvent", {
         card: message<contract.ExtensionCard>("joko.v1.ExtensionCard", {
@@ -3517,6 +3529,8 @@ function fromProtoEventPayload(
   runId: string
 ): EventPayload {
   switch (payload.kind.case) {
+    case "partnerSessionTaskReceipt":
+      throw new ProtoMappingError("invalid_argument", "event.payload.partner_session_task_receipt", "Partner task receipts are service-owned and cannot be imported as Session events.");
     case "extensionCardChanged":
       throw new ProtoMappingError("invalid_argument", "event.payload.extension_card_changed", "Extension cards are service-owned and cannot be imported as Session events.");
     case "mcpAppChanged":

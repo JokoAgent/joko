@@ -27,6 +27,7 @@ import type {
   DeviceContentProjection,
   EventPayload,
   PartnerLearningFeedback,
+  PartnerSessionTaskReceipt,
   PartnerLearningReceipt,
   PartnerLearningTurnSource,
   InteractionDecision,
@@ -10816,7 +10817,28 @@ export class OperationalStore {
     if (input.payload.type === "partner_learning_changed") {
       throw new StoreError("Learning feedback is owned by the Store, not Session adapters.");
     }
+    if (input.payload.type === "partner_session_task_receipt") {
+      throw new StoreError("Partner task receipts are owned by the Partner service, not Session adapters.");
+    }
     return this.appendSessionEvent(input);
+  }
+
+  recordPartnerSessionTaskReceipt(id: string, sessionId: string, receipt: PartnerSessionTaskReceipt): void {
+    if (!Number.isInteger(receipt.execution) || receipt.execution < 1 || receipt.execution > 0xffff_ffff) {
+      throw new StoreError("Partner task receipt execution is invalid.");
+    }
+    this.write(() => {
+      const existing = this.findEvent(id, { includeTombstoned: true });
+      if (existing !== undefined) {
+        if (existing.sessionId !== sessionId || existing.payload.type !== "partner_session_task_receipt"
+          || existing.payload.receipt.taskId !== receipt.taskId || existing.payload.receipt.execution !== receipt.execution
+          || existing.payload.receipt.status !== receipt.status) throw new StoreError("The Partner task receipt identity belongs to another execution.");
+        return;
+      }
+      const session = this.getSession(sessionId).descriptor;
+      this.appendSessionEvent({ id, sessionId, backendId: session.backendId, targetId: session.targetId,
+        generation: session.binding.generation, traceId: id, payload: { type: "partner_session_task_receipt", receipt } });
+    });
   }
 
   private appendSessionEvent(input: AppendEventInput): PersistedEvent {
@@ -12730,6 +12752,9 @@ export class OperationalStore {
               WHERE inherited.session_id = side_chat.id AND inherited.entry_id = json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'))
           )
       ) AND (
+        (json_extract(${eventAlias}.payload_json, '$.payload.type') = 'partner_session_task_receipt'
+          AND EXISTS (SELECT 1 FROM product_sessions AS receipt_session
+            WHERE receipt_session.id = ${eventAlias}.session_id AND receipt_session.deleted_at IS NULL)) OR
         EXISTS (
           SELECT 1 FROM retained_context_events AS retained
           WHERE retained.session_id = ${eventAlias}.session_id AND retained.event_cursor = ${eventAlias}.global_cursor

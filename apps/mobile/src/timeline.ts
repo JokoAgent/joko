@@ -1,5 +1,6 @@
 import { MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
+import { projectPartnerSessionTaskReceipt, type PartnerSessionTaskReceiptView } from "@joko/contracts";
 import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
 import { mobileInputSummary, mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 import { normalizeMobileReplyQuote, type MobilePartnerReplyQuote, normalizeMobileTodoQuote, type MobilePartnerTodoQuote } from './mobile-composer-document';
@@ -39,6 +40,7 @@ export interface TimelineRow {
   readonly todoQuote?: MobilePartnerTodoQuote;
   readonly mcpApp?: import("@joko/contracts").McpAppCard;
   readonly extensionCard?: import("@joko/contracts").ExtensionCard;
+  readonly partnerTaskReceipt?: PartnerSessionTaskReceiptView;
   readonly learning?: PartnerLearningFeedbackView;
   readonly assistantBodyPresent?: boolean;
   readonly runtimeHandoff?: { readonly fromBackendId: string; readonly toBackendId: string; readonly modelId: string; readonly resumed: boolean };
@@ -123,6 +125,14 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
     const sequence = event.cursor?.sequence ?? 0n;
     if (!kind?.case) continue;
     switch (kind.case) {
+      case "partnerSessionTaskReceipt": {
+        const receipt = projectPartnerSessionTaskReceipt(kind.value);
+        const owner = event.identity?.sessionId;
+        if (!owner || receipt === undefined || receipt.taskSessionId === owner) break;
+        byId.set(event.eventId, { id: event.eventId, label: receipt.title, text: receipt.result || receipt.error || "",
+          kind: "status", completed: true, sequence, eventId: event.eventId, partnerTaskReceipt: receipt });
+        break;
+      }
       case "extensionCardChanged": {
         const card = kind.value.card;
         if (!card || !card.cardId || card.sessionId !== event.identity?.sessionId) break;
