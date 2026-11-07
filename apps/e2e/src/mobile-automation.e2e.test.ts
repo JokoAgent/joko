@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import {
@@ -15,6 +17,7 @@ import {
   ScheduleGeneratedSessionDisposition,
   ScheduleInputSchema,
   ScheduleRunOutcome,
+  ScheduleSessionMode,
   ScheduleSource,
   ScheduleState,
   SetScheduleEnabledMutationSchema,
@@ -192,6 +195,7 @@ describe("Mobile Automation product chain", () => {
       backendId,
       targetId,
       sessionId: "",
+      sessionMode: ScheduleSessionMode.PERSISTENT,
       text: "Inspect the mobile authoring chain"
     });
     const created = resultSchedule(await submit(
@@ -245,6 +249,24 @@ describe("Mobile Automation product chain", () => {
     ));
     expect(cloned).toMatchObject({ source: ScheduleSource.USER, displayName: "E2E mobile personal copy", targetId });
 
+    const scheduleId = promoted.scheduleId;
+    const readProject = async () => required((await mobile.clients.scheduler.getSchedule({ scheduleId })).schedule, "project Schedule");
+    const triggerProject = async (schedule: Schedule, expectedCount: number) => {
+      const trigger = await submit(mobile.clients.operation, mobile.connectionId, scheduleMutation(schedule, {
+        case: "triggerSchedule", value: create(TriggerScheduleMutationSchema, { scheduleId })
+      }));
+      expect(trigger.state).toBe(OperationState.SUCCEEDED);
+      return (await waitFor(
+        () => mobile.clients.scheduler.listScheduleRunHistory({ scheduleId }),
+        response => response.history.length === expectedCount && response.history.every(run => run.outcome === ScheduleRunOutcome.SUCCEEDED),
+        "persistent project Schedule runs"
+      )).history;
+    };
+    const [first] = await triggerProject(promoted, 1);
+    const bound = await readProject();
+    expect(bound.sessionId).not.toBe("");
+    expect(bound.sessionId).toBe(first!.sessionId);
+
     const reconciled = await submit(
       mobile.clients.operation,
       mobile.connectionId,
@@ -255,10 +277,21 @@ describe("Mobile Automation product chain", () => {
     );
     expect(reconciled.result?.payload).toMatchObject({ case: "acknowledgement", value: { accepted: true } });
 
-    const currentProject = required(
-      (await mobile.clients.scheduler.getSchedule({ scheduleId: promoted.scheduleId })).schedule,
-      "reconciled project Schedule"
-    );
+    const afterReconcile = await readProject();
+    expect(afterReconcile.sessionId).toBe(bound.sessionId);
+    expect(afterReconcile.version?.revision?.value).toBe(bound.version!.revision!.value);
+    const editedProject = resultSchedule(await submit(mobile.clients.operation, mobile.connectionId,
+      scheduleMutation(afterReconcile, { case: "updateSchedule", value: create(UpdateScheduleMutationSchema, {
+        scheduleId, schedule: scheduleInput(afterReconcile, "Edited persistent project automation")
+      }) })
+    ));
+    expect(editedProject).toMatchObject({ sessionId: bound.sessionId, displayName: "Edited persistent project automation" });
+    const config = await readFile(join(initialTarget.workspaceRoot, promoted.projectConfigPath), "utf8");
+    expect(config).toContain("Edited persistent project automation");
+    expect(config).not.toContain(bound.sessionId);
+    expect((await triggerProject(editedProject, 2)).map(run => run.sessionId)).toEqual([bound.sessionId, bound.sessionId]);
+
+    const currentProject = await readProject();
     const personalCopy = resultSchedule(await submit(
       mobile.clients.operation,
       mobile.connectionId,
