@@ -74,7 +74,6 @@ export class DeviceAuthorizationStore {
     return this.store.transaction(() => {
       const row = this.current(this.get(input.invitationId));
       this.admit(row, input, !row.request || row.request.id !== input.requestId || !equal(row.request.digest, digest(input.requesterSecret)));
-      if (input.entryId && row.entryIds?.length && !row.entryIds.includes(input.entryId)) throw denied();
       if (row.request) {
         const request = row.request;
         if (request.id !== input.requestId || !equal(request.digest, digest(input.requesterSecret))
@@ -83,6 +82,7 @@ export class DeviceAuthorizationStore {
         return row;
       }
       if (row.state !== 'invited') return row;
+      if (!allowsEntry(row, input.entryId)) throw denied();
       const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
       let code: string;
       do { code = [...randomBytes(8)].map(value => alphabet[value % 32]).join(''); }
@@ -170,6 +170,7 @@ export class DeviceAuthorizationStore {
   private current(row: DeviceAuthorizationRecord): DeviceAuthorizationRecord {
     if (['claimed', 'denied', 'cancelled', 'expired'].includes(row.state)) return row;
     if (row.expiresAt <= this.now()) return this.save({ ...row, state: 'expired' });
+    if (row.request && !allowsEntry(row, row.request.entryId)) return this.save({ ...row, state: 'cancelled' });
     try {
       this.store.authorizeConnection(row.issuerId, row.issuerDigest);
       if (row.state === 'approved') this.store.authorizeConnection(row.approverId!, row.approverDigest!);
@@ -192,6 +193,9 @@ export class DeviceAuthorizationStore {
   }
 }
 
+function allowsEntry(row: DeviceAuthorizationRecord, entryId: string | undefined): boolean {
+  return !row.entryIds?.length || row.entryIds.includes(entryId ?? '');
+}
 function digest(value: string): string { return createHash('sha256').update(value).digest('hex'); }
 function equal(a: string, b: string): boolean { return a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b)); }
 function requireId(value: string): void { if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(value)) throw denied(); }

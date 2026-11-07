@@ -923,7 +923,8 @@ export async function createOrchestratorApplication(
     defaultSshUser: dependencies.defaultSshUser ?? userInfo().username,
     connector: dependencies.remoteSshConnector ?? new Ssh2ResolvedAgentAuthConnector()
   });
-  const devicePeers = new DevicePeerOwner({ store, localDesktopHostConnection: connection => connections.isLocalDesktopHostConnection(connection) });
+  const devicePeers = new DevicePeerOwner({ store, localDesktopHostConnection: connection => connections.isLocalDesktopHostConnection(connection),
+    onDeviceRevoked: (deviceId, listener) => connections.onDeviceRevoked(deviceId, listener) });
   const serverAccessMedia = new ServerAccessMedia({ config, store, serverId, credentials,
     isLocalDesktopRoute: identity => devicePeers.isLocalDesktopRoute(identity),
     fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES),

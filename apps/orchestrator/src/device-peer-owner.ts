@@ -88,13 +88,16 @@ export class DevicePeerOwner {
   readonly #store: OperationalStore;
   readonly #routes: DevicePeerRouteRegistry;
   readonly #localDesktopHostConnection: ((connection: ConnectionRecord) => boolean) | undefined;
+  readonly #onDeviceRevoked: ((deviceId: string, listener: () => void) => () => void) | undefined;
   readonly #localDesktopRoutes = new Map<string, { readonly connection: ConnectionRecord; readonly generation: number }>();
 
   constructor(options: { readonly store: OperationalStore; readonly routes?: DevicePeerRouteRegistry;
-    readonly localDesktopHostConnection?: (connection: ConnectionRecord) => boolean }) {
+    readonly localDesktopHostConnection?: (connection: ConnectionRecord) => boolean;
+    readonly onDeviceRevoked?: (deviceId: string, listener: () => void) => () => void }) {
     this.#store = options.store;
     this.#routes = options.routes ?? new DevicePeerRouteRegistry();
     this.#localDesktopHostConnection = options.localDesktopHostConnection;
+    this.#onDeviceRevoked = options.onDeviceRevoked;
   }
 
   registerRoute(
@@ -271,8 +274,15 @@ export class DevicePeerOwner {
       action: input.action,
       payload: injectControllerIdentity(input.payload, authority.controllerDeviceId)
     });
+    let stopRevocation: (() => void) | undefined;
     try {
-      const response = await this.#routes.dispatch(claim, input.signal);
+      let signal = input.signal;
+      if (input.capability === "files" && input.action === "renameFile" && this.#onDeviceRevoked !== undefined) {
+        const revoked = new AbortController();
+        stopRevocation = this.#onDeviceRevoked(authority.controllerDeviceId, () => revoked.abort(accessRevoked()));
+        signal = signal === undefined ? revoked.signal : AbortSignal.any([signal, revoked.signal]);
+      }
+      const response = await this.#routes.dispatch(claim, signal);
       try {
         authority.assertCurrent([input.capability]);
       } catch (error) {
@@ -291,6 +301,7 @@ export class DevicePeerOwner {
       }
       return response;
     } finally {
+      stopRevocation?.();
       try { this.#routes.forgetClaim(claim); } catch (error) {
         if (!(error instanceof DevicePeerRegistryError)) throw error;
       }

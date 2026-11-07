@@ -48,6 +48,7 @@ export class ConnectionManager {
   readonly #consumedRetentionMs: number;
   readonly #pairingListeners = new Set<(challenge: PairingChallengeRecord) => void>();
   readonly #revocationListeners = new Map<string, Set<() => void>>();
+  readonly #deviceRevocationListeners = new Map<string, Set<() => void>>();
   readonly #pairingRequestTimes: number[] = [];
   readonly #pairingAttemptTimes: number[] = [];
   #pairingWindowExpiresAt = 0;
@@ -557,6 +558,16 @@ export class ConnectionManager {
     };
   }
 
+  onDeviceRevoked(deviceId: string, listener: () => void): () => void {
+    const listeners = this.#deviceRevocationListeners.get(deviceId) ?? new Set<() => void>();
+    listeners.add(listener);
+    this.#deviceRevocationListeners.set(deviceId, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0 && this.#deviceRevocationListeners.get(deviceId) === listeners) this.#deviceRevocationListeners.delete(deviceId);
+    };
+  }
+
   revoke(connectionId: string): ConnectionRecord {
     const connection = this.#store.revokeConnection(connectionId, undefined, this.#now());
     this.#notifyRevoked(connection.id);
@@ -593,6 +604,17 @@ export class ConnectionManager {
 
   revokeDevice(deviceId: string, expectedRevision?: bigint): RevokedDeviceResult {
     const result = this.#store.revokeDevice(deviceId, expectedRevision, this.#now());
+    if (this.#deviceRevocationListeners.has(deviceId)) {
+      // The caller may own an outer Store transaction.
+      queueMicrotask(() => {
+        const listeners = this.#deviceRevocationListeners.get(deviceId);
+        if (listeners === undefined) return;
+        try { if (this.#store.getDevice(deviceId).state !== "revoked") return; }
+        catch { return; }
+        this.#deviceRevocationListeners.delete(deviceId);
+        for (const listener of listeners) listener();
+      });
+    }
     for (const connection of result.connections) this.#notifyRevoked(connection.id);
     return result;
   }

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { Code, ConnectError } from '@connectrpc/connect';
 import { ArrowRight, Check, Cloud, Network } from 'lucide-react';
 import { authorizationView, formatDeviceInvitation, formatDeviceTarget, formatWebDeviceLink, type DeviceInvitation, type DeviceAuthorizationView, type DeviceAuthorizationReview } from '@joko/connection-transport/device-authorization';
 import type { AppController } from '../controller.js';
@@ -48,7 +49,8 @@ function DeviceAuthorizationSettingsBody({ controller, t, reviewRequest }: { rea
     return () => { alive.current = false; clearInterval(timer); };
   }, []);
   const create = async (allowKnock = false) => {
-    if (prepared.current && prepared.current.allowKnock !== allowKnock) throw new Error(t('authorization.retry'));
+    const previous = prepared.current;
+    if (previous && previous.allowKnock !== allowKnock) throw new Error(t('authorization.retry'));
     const current = available.find(entry => entry.origin === controller.state.activeProfile?.origin && entry.transportKind === (controller.state.activeProfile?.transportKind ?? 'https'));
     const entryIds = scope === 'all' ? [] : scope === 'current' ? current ? [current.entryId] : [] : allowedIds;
     if (!prepared.current && scope !== 'all' && (!entryIds.length || entryIds.some(id => !available.some(entry => entry.entryId === id)))) throw new Error(t('entries.scopeRequired'));
@@ -56,7 +58,10 @@ function DeviceAuthorizationSettingsBody({ controller, t, reviewRequest }: { rea
       shortCode: [...crypto.getRandomValues(new Uint8Array(8))].map(byte => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[byte % 32]).join(''), allowKnock, entryIds: [...entryIds] };
     const seed = prepared.current;
     const result = await api.current!.create({ invitationId: seed.invitationId, invitationSecretDigest: await sha256Hex(new TextEncoder().encode(seed.invitationSecret).buffer),
-      invitationCodeDigest: await sha256Hex(new TextEncoder().encode(seed.shortCode).buffer), allowKnock: seed.allowKnock, entryIds: seed.entryIds });
+      invitationCodeDigest: await sha256Hex(new TextEncoder().encode(seed.shortCode).buffer), allowKnock: seed.allowKnock, entryIds: seed.entryIds }).catch((failure: unknown) => {
+      if (previous === undefined && prepared.current === seed && failure instanceof ConnectError && failure.code === Code.FailedPrecondition) prepared.current = undefined;
+      throw failure;
+    });
     const row = authorizationView(result.authorization);
     if (!alive.current) return;
     setEntrances(result.entries ?? []); setRequestLink('');

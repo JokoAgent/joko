@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { Code, ConnectError } from '@connectrpc/connect';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { formatDeviceInvitation, formatDeviceTarget, parseDeviceInvitation, formatDeviceTransportRequest, type DeviceAuthorizationPort, type DeviceAuthorizationProgress } from '@joko/connection-transport/device-authorization';
 import { DeviceAuthorizationState } from '@joko/contracts';
@@ -73,6 +74,38 @@ describe('request-bound device authorization UI', () => {
     expect(create.mock.calls[0]?.[0]).toMatchObject({ entryIds: ['private'] });
     expect(element.textContent).toContain('Request link from the new device');
     expect(button('Prepare this invitation').disabled).toBe(true);
+  });
+  it.each([Code.FailedPrecondition, Code.Unavailable])('handles a knock admission error before switching invitation modes (%s)', async code => {
+    setup({});
+    const node = parseDeviceInvitation(link);
+    const create = vi.fn(async (input: { invitationId: string; allowKnock: boolean }) => ({ ...node, authorization: {
+      invitationId: input.invitationId, state: DeviceAuthorizationState.INVITED, requestId: '', userCode: '', deviceName: '', platform: '',
+      expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 600), nanos: 0 }
+    } })).mockRejectedValueOnce(new ConnectError('The first knock attempt failed.', code));
+    const controller = { state: { activeProfile: { id: 'owner', origin: node.origin }, connectionGeneration: 1 },
+      deviceAuthorizationOwner: () => ({ list: async () => [], create }) } as unknown as AppController;
+    await act(async () => root!.render(<DeviceAuthorizationSettings controller={controller} t={t} />));
+    await act(async () => {
+      button('Allow knocking for 10 minutes').click();
+      await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    });
+    const first = create.mock.calls[0]![0];
+    expect(first.allowKnock).toBe(true);
+    await act(async () => {
+      button('Add a device').click();
+      if (code === Code.FailedPrecondition) await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+    });
+    if (code === Code.Unavailable) {
+      expect(create).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        button('Allow knocking for 10 minutes').click();
+        await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+      });
+      expect(create.mock.calls[1]?.[0]).toEqual(first);
+    } else {
+      expect(create.mock.calls[1]?.[0]).toMatchObject({ allowKnock: false });
+      expect(create.mock.calls[1]?.[0].invitationId).not.toBe(first.invitationId);
+    }
   });
   it('opens only the exact requested review and never approves automatically or shows a replacement request', async () => {
     setup({}); const resolve = vi.fn(); let rows = [progress];

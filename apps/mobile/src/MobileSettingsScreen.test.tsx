@@ -2,10 +2,12 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ConnectionSchema,
   ConnectionState,
+  DeviceAuthorizationState,
   DeviceKind,
   DevicePresenceState,
   DeviceSchema,
@@ -114,7 +116,7 @@ vi.mock("react-native", async () => {
 });
 
 vi.mock("expo-clipboard", () => ({ setStringAsync: native.copied }));
-vi.mock("expo-crypto", () => ({ randomUUID: () => "settings-pairing-request" }));
+vi.mock("expo-crypto", async () => ({ randomUUID: (await import("node:crypto")).randomUUID }));
 vi.mock('react-native-svg', () => ({ default: 'svg', Rect: 'rect' }));
 vi.mock("expo-constants", () => ({ default: { expoConfig: { version: "0.1.0-test" } } }));
 
@@ -478,6 +480,34 @@ describe("MobileSettingsScreen", () => {
     await act(async () => Array.from(container.querySelectorAll("button")).find(button => button.textContent === "Cancel invitation")!.click());
     expect(resolve).toHaveBeenCalledExactlyOnceWith(invitation.invitationId, "", "cancelled");
     expect(container.textContent).not.toContain("Unused invitation");
+  });
+  it.each([Code.FailedPrecondition, Code.Unavailable])("handles a knock admission error before switching invitation modes (%s)", async code => {
+    const container = document.createElement("div"); root = createRoot(container);
+    const press = (label: string) => act(async () => {
+      const target = Array.from(container.querySelectorAll("button")).find(button => button.textContent === label);
+      if (!target) throw new Error(`Missing button ${label}`);
+      target.click();
+    });
+    const createInvitation = vi.fn(async (input: { invitationId: string; allowKnock: boolean }) => ({
+      origin: "https://node.example", serverId: "node", endpointPublicKey: `ed25519:${"a".repeat(64)}`, authorization: {
+        invitationId: input.invitationId, state: DeviceAuthorizationState.INVITED, requestId: "", userCode: "", deviceName: "", platform: "",
+        expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 600), nanos: 0 }
+      }
+    })).mockRejectedValueOnce(new ConnectError("The first knock attempt failed.", code));
+    const api = { list: async () => [], create: createInvitation } as unknown as DeviceAuthorizationOwner;
+    await act(async () => root!.render(<MobileDeviceAuthorizationSettings getApi={() => api} colors={colors} locale="en" node="Node" />));
+    await press("Allow knocking for 10 minutes");
+    const first = createInvitation.mock.calls[0]![0];
+    expect(first.allowKnock).toBe(true);
+    await press("Create invitation");
+    if (code === Code.Unavailable) {
+      expect(createInvitation).toHaveBeenCalledTimes(1);
+      await press("Allow knocking for 10 minutes");
+      expect(createInvitation.mock.calls[1]?.[0]).toEqual(first);
+    } else {
+      expect(createInvitation.mock.calls[1]?.[0]).toMatchObject({ allowKnock: false });
+      expect(createInvitation.mock.calls[1]?.[0].invitationId).not.toBe(first.invitationId);
+    }
   });
   it("opens the readonly shared dictionary from Settings and voice preferences, and returns to the initiating surface", async () => {
     const mounted = mount();
