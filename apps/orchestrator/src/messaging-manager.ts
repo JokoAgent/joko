@@ -2463,7 +2463,8 @@ export class MessagingManager {
     let activeConversation = await this.#activateConversation(conversation, event);
     if (connection.channel === "wechat") {
       if (contextToken === undefined) throw invalid("WeChat inbound reply context is missing.");
-      this.#putWeChatConversationContext(connection, activeConversation, { sourceRequestId: request.id }, contextToken);
+      const plainText = event.text.trim() !== "" && event.attachments.length === 0 && event.unsupported.length === 0 && !event.protectedContent;
+      this.#putWeChatConversationContext(connection, activeConversation, { sourceRequestId: request.id }, contextToken, plainText);
     }
 
     if (activeConversation.conversationKind !== "direct" && transport.loadGroupHistory !== undefined) {
@@ -3057,7 +3058,8 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     conversation: MessagingConversationRecord,
     source: { readonly sourceRequestId: string } | { readonly sourceInteractionId: string },
-    contextToken: string
+    contextToken: string,
+    wakeTextRepliesOnChange = false
   ): void {
     if (connection.channel !== "wechat" || this.#contextVault === undefined
       || connection.credentialGeneration === undefined
@@ -3074,6 +3076,11 @@ export class MessagingManager {
     });
     const sealed = this.#contextVault.seal(contextToken, aad);
     const latest = this.#store.findMessagingConversationContext(conversation.id);
+    let wakeWeChatTextReplies = false;
+    if (wakeTextRepliesOnChange && latest !== undefined) {
+      try { wakeWeChatTextReplies = this.#openWeChatConversationContext(connection, conversation) !== contextToken; }
+      catch { /* A new context can replace unreadable material without changing a retry deadline. */ }
+    }
     this.#store.putMessagingConversationContext({
       connectionId: connection.id,
       expectedChannelGeneration: connection.generation,
@@ -3081,6 +3088,7 @@ export class MessagingManager {
       conversationId: conversation.id,
       expectedRevision: latest?.revision ?? null,
       sealed,
+      wakeWeChatTextReplies,
       ...source,
       updatedAt: this.#now()
     });

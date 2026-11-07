@@ -6457,6 +6457,18 @@ export class OperationalStore {
         at,
         revision
       );
+      if (input.wakeWeChatTextReplies === true && connection.channel === "wechat" && sourceKind === "request"
+        && conversation.conversationKind === "direct" && conversation.status === "active"
+        && current?.materialGeneration === materialGeneration) {
+        // An attempted row returns to pending only through the known-failure retry path.
+        this.database.prepare(`
+          UPDATE messaging_deliveries
+          SET available_at = ?, updated_at = ?, revision = ?
+          WHERE connection_id = ? AND channel_generation = ? AND conversation_id = ?
+            AND status = 'pending' AND attempts > 0 AND available_at > ?
+            AND kind = 'text' AND dedupe_key GLOB 'run:*:answer'
+        `).run(at, at, revision, connection.id, connection.generation, conversation.id, at);
+      }
       return this.getMessagingConversationContext(conversation.id);
     });
   }
