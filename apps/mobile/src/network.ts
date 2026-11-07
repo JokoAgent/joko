@@ -885,6 +885,7 @@ export async function collectWorkspaceSearchPages(
   if (!workspaceId) throw new Error("A current Workspace is required.");
   const matches: WorkspaceSearchMatch[] = [];
   const tokens = new Set<string>();
+  const entryRevisions = new Map<string, string>();
   let pageToken = "";
   let revision: string | undefined;
   let totalSize: bigint | undefined;
@@ -902,8 +903,14 @@ export async function collectWorkspaceSearchPages(
       throw new Error("Workspace search results changed while paging.");
     }
     for (const match of page.matches) {
-      canonicalWorkspacePath(match.relativePath);
+      const path = canonicalWorkspacePath(match.relativePath);
       if (!match.revision?.opaqueRevision) throw new Error("The Joko node returned an unfenced workspace-search match.");
+      if (match.entryRevision !== undefined) {
+        const observed = workspaceEntryRevisionKey(match.entryRevision);
+        const prior = entryRevisions.get(path);
+        if (prior !== undefined && prior !== observed) throw new Error("A workspace file changed while search results were paging.");
+        entryRevisions.set(path, observed);
+      }
       matches.push(match);
     }
     if (!page.nextPageToken) {
@@ -2946,6 +2953,7 @@ export const mobileNetwork: MobileNetwork = {
         relativePathPrefix: "",
         caseSensitive,
         regularExpression: false,
+        includeEntryRevisions: true,
         page: { pageSize: WORKSPACE_PAGE_SIZE, pageToken }
       }, options(signal));
       if (!response.page) throw new Error("The Joko node did not return workspace-search page metadata.");

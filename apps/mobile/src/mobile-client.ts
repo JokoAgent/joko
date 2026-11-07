@@ -198,6 +198,7 @@ import {
   workspaceBasename,
   workspaceEntryRevisionKey,
   workspaceParentPath,
+  workspaceSearchEntryRevision,
   type MobileFileSearchResult,
   type MobileFilePreview,
   type MobileFilesComposerResult,
@@ -7356,8 +7357,10 @@ export class MobileClient {
         const entry = directory.entries.find((item) => item.relativePath === path);
         if (!directory.revision || !entry?.revision || entry.kind !== FileKind.REGULAR) throw new Error("The selected preview file is no longer available.");
         if (source.kind === "workspace-entry" && !sameFilesWorkspaceEntry(entry, source.entry)) throw new Error("The selected preview file changed.");
-        if (source.kind === "search-result" && source.result.kind === "workspace-content"
-          && (!source.result.match.revision || workspaceEntryRevisionKey(source.result.match.revision) !== workspaceEntryRevisionKey(entry.revision))) throw new Error("The file search result changed.");
+        if (source.kind === "search-result" && source.result.kind === "workspace-content") {
+          const observed = workspaceSearchEntryRevision(source.result.match);
+          if (!observed || workspaceEntryRevisionKey(observed) !== workspaceEntryRevisionKey(entry.revision)) throw new Error("The file search result changed.");
+        }
         pages = mobileWorkspacePreviewPages(directory.entries, sort, entry, source.kind === "search-result" ? source : { kind: "workspace-entry", entry });
         window = { kind: "workspace", parent, revision: directory.revision }; selectedKey = JSON.stringify(["workspace", entry.workspaceId, path]);
       }
@@ -7497,10 +7500,11 @@ export class MobileClient {
       return;
     }
     if (result.kind === "workspace-content") {
-      if (!result.match.revision) throw new Error("The search result is missing its observed file revision.");
+      const revision = workspaceSearchEntryRevision(result.match);
+      if (!revision) throw new Error("The search result is missing its observed file revision.");
       await this.#previewWorkspaceFile(
         result.match.relativePath,
-        result.match.revision,
+        revision,
         workspaceBasename(result.match.relativePath)
       );
       return;
@@ -15496,7 +15500,7 @@ export class MobileClient {
       throw new Error("The selected Workspace file is no longer in the current file index.");
     }
     if (source.kind === "search-result" && source.result.kind === "workspace-content") {
-      const revision = source.result.match.revision;
+      const revision = workspaceSearchEntryRevision(source.result.match);
       if (!revision || workspaceEntryRevisionKey(revision) !== workspaceEntryRevisionKey(entry.revision)) {
         throw new Error("The selected Workspace search result changed before it could be shared.");
       }
@@ -15862,7 +15866,7 @@ export class MobileClient {
     }
     workspaceEntryRevisionKey(entry.revision);
     if (source.result.kind === "workspace-content") {
-      const observed = source.result.match.revision;
+      const observed = workspaceSearchEntryRevision(source.result.match);
       if (!observed || workspaceEntryRevisionKey(observed) !== workspaceEntryRevisionKey(entry.revision)) {
         throw new Error("The Workspace search result changed before it could be added.");
       }
@@ -17305,8 +17309,9 @@ function mobileGalleryPageMatchesFilesSource(
     ? source.result.match.relativePath
     : source.result.relativePath;
   if (page.source.relativePath !== path) return false;
-  return source.result.kind !== "workspace-content" || !source.result.match.revision
-    || page.source.revisionKey === workspaceEntryRevisionKey(source.result.match.revision);
+  if (source.result.kind !== "workspace-content") return true;
+  const revision = workspaceSearchEntryRevision(source.result.match);
+  return revision !== undefined && page.source.revisionKey === workspaceEntryRevisionKey(revision);
 }
 
 function mobileFilesGalleryWindowKey(files: MobileFilesState): string {
@@ -17331,7 +17336,8 @@ function mobileFilesGalleryWindowKey(files: MobileFilesState): string {
   const search = files.searchResults.map((result) => {
     if (result.kind === "artifact") return `artifact:${result.artifact.artifactId}`;
     if (result.kind === "workspace-name") return `name:${result.relativePath}`;
-    return `content:${result.match.relativePath}:${result.match.revision ? workspaceEntryRevisionKey(result.match.revision) : ""}`;
+    const revision = workspaceSearchEntryRevision(result.match);
+    return `content:${result.match.relativePath}:${revision ? workspaceEntryRevisionKey(revision) : ""}`;
   }).join("\u001d");
   return [
     files.authorityKey ?? "",

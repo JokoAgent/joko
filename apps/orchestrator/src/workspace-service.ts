@@ -166,8 +166,9 @@ export interface WorkspaceSearchResult {
   readonly preview: string;
   /** Every authoritative rg UTF-8 byte range, relative to the preview line. */
   readonly submatches: readonly WorkspaceSearchSubmatch[];
-  /** File metadata fence observed immediately after ripgrep completed. */
+  /** Search-specific revision, including the original text digest for replacement. */
   readonly revision: string;
+  readonly entryRevision?: WorkspaceEntryRecord;
 }
 
 export interface WorkspaceSearchSubmatch {
@@ -183,6 +184,7 @@ export interface WorkspaceSearchOptions {
   readonly caseSensitive?: boolean;
   /** Defaults to false so untrusted user input is always a literal string. */
   readonly regularExpression?: boolean;
+  readonly includeEntryRevisions?: boolean;
 }
 
 export interface WorkspaceSearchPage {
@@ -1241,7 +1243,7 @@ export class WorkspaceService {
         const parsed = workspaceSearchResultFromRipgrep(event.match);
         let revision = revisions.get(parsed.path);
         if (revision === undefined) {
-          revision = await this.#workspaceSearchResultRevision(workspace, parsed.path);
+          revision = (await this.#workspaceSearchResultRevision(workspace, parsed.path)).revision;
           revisions.set(parsed.path, revision);
         }
         parsedMatches.push(parsed);
@@ -1254,9 +1256,10 @@ export class WorkspaceService {
     }
   }
 
-  async searchPage(workspaceId: string, query: string, options?: WorkspaceSearchOptions): Promise<WorkspaceSearchPage> {
+  async searchPage(workspaceId: string, query: string, options?: WorkspaceSearchOptions, request?: WorkspaceFileRequestAuthority): Promise<WorkspaceSearchPage> {
+    request?.assertCurrent();
     if (this.#isRemote(workspaceId)) {
-      return this.#remoteInvoke(workspaceId, "searchPage", [query, options]);
+      return this.#remoteInvoke(workspaceId, "searchPage", [query, options], request);
     }
     if (query.trim() === "") return {
       matches: [],
@@ -1266,6 +1269,12 @@ export class WorkspaceService {
       revision: workspaceSearchResultSetRevision([])
     };
     const workspace = this.requireWorkspace(workspaceId);
+    const assertCurrent = (): void => {
+      request?.assertCurrent();
+      if (options?.includeEntryRevisions && this.#workspaces.get(workspaceId) !== workspace) {
+        throw new WorkspaceSearchError("The workspace changed while resolving search entries.", "result_changed");
+      }
+    };
     const pageSize = normalizeWorkspaceSearchPageSize(options?.maximumResults);
     const offset = normalizeWorkspaceSearchOffset(options?.offset);
     const scanLimit = offset + pageSize + 1;
@@ -1287,6 +1296,7 @@ export class WorkspaceService {
     args.push("--glob", "!.git/**", "--", query, ".");
     try {
       const result = await runProcess(this.#ripgrepExecutable, args, workspace.root, 30_000, 16 * 1024 * 1024, new Set([0, 1, 2]));
+      assertCurrent();
       if (result.exitCode === 2) {
         throw new WorkspaceSearchError(
           options?.regularExpression === true
@@ -1311,18 +1321,20 @@ export class WorkspaceService {
       parsedMatches.sort(compareWorkspaceSearchResults);
       const selected = parsedMatches.slice(offset, offset + pageSize);
       const matches: WorkspaceSearchResult[] = [];
-      const revisions = new Map<string, string>();
+      const versions = new Map<string, { readonly revision: string; readonly entryRevision: WorkspaceEntryRecord }>();
       for (const match of selected) {
-        let revision = revisions.get(match.path);
-        if (revision === undefined) {
+        let version = versions.get(match.path);
+        if (version === undefined) {
           try {
-            revision = await this.#workspaceSearchResultRevision(workspace, match.path);
+            version = await this.#workspaceSearchResultRevision(workspace, match.path);
           } catch {
             throw new WorkspaceSearchError(`Workspace search result changed before it could be revision-fenced: ${match.path}`, "result_changed");
           }
-          revisions.set(match.path, revision);
+          assertCurrent();
+          versions.set(match.path, version);
         }
-        matches.push({ ...match, revision });
+        matches.push({ ...match, revision: version.revision,
+          ...(options?.includeEntryRevisions ? { entryRevision: version.entryRevision } : {}) });
       }
       const truncated = parsedMatches.length > offset + matches.length;
       return {
@@ -1334,6 +1346,7 @@ export class WorkspaceService {
         ...(truncated ? { nextOffset: offset + matches.length } : {})
       };
     } catch (error) {
+      request?.assertCurrent();
       throw workspaceSearchErrorFromUnknown(error);
     }
   }
@@ -2986,13 +2999,16 @@ export class WorkspaceService {
     }
   }
 
-  async #workspaceSearchResultRevision(workspace: WorkspaceRegistration, canonicalPath: string): Promise<string> {
+  async #workspaceSearchResultRevision(workspace: WorkspaceRegistration, canonicalPath: string): Promise<{ readonly revision: string; readonly entryRevision: WorkspaceEntryRecord }> {
     const resolved = await this.#resolveWorkspaceTextFile(workspace, canonicalPath);
     const mediaType = inferMediaType(canonicalPath);
     if (
       resolved.info.size > WORKSPACE_TEXT_FILE_MAXIMUM_BYTES
       || (!isTextMediaType(mediaType) && mediaType !== "application/octet-stream")
-    ) return metadataFileRevision(resolved.info);
+    ) {
+      const revision = metadataFileRevision(resolved.info);
+      return { revision, entryRevision: workspaceFileEntry(canonicalPath, resolved.info, revision) };
+    }
 
     const handle = await open(resolved.absolute, "r");
     try {
@@ -3006,7 +3022,7 @@ export class WorkspaceService {
       if (current.absolute !== resolved.absolute || !sameFileState(after, current.info)) {
         throw new WorkspaceSearchError("Workspace search result changed while its revision was computed.", "result_changed");
       }
-      return workspaceTextFileRevision(bytes);
+      return { revision: workspaceTextFileRevision(bytes), entryRevision: workspaceFileEntry(canonicalPath, after, metadataFileRevision(after)) };
     } finally {
       await handle.close();
     }
