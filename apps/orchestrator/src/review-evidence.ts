@@ -14,6 +14,7 @@ import type {
   ReviewEvidenceWarning,
   ReviewWorkspaceEvidence
 } from "./review-prompt.js";
+import { isCanonicalWorkspaceRelativePath } from "./review-prompt.js";
 import type { ReviewAttachmentKind, ReviewFailureCode } from "./review-types.js";
 import { MAX_REVIEW_ATTACHMENTS, MAX_REVIEW_FOCUS_CHARACTERS } from "./review-types.js";
 
@@ -25,7 +26,6 @@ export const MAX_REVIEW_SOURCE_TEXT_CHARACTERS = 4_000_000;
 
 const SHA256 = /^[a-f0-9]{64}$/u;
 const OBJECT_ID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
-const ALIAS_SEGMENT = /^[\p{L}\p{N} ._+@()\[\]{}'!,=-]+$/u;
 const DOMAIN = "joko.review.freshness/v1";
 
 export interface ReviewSourceMessage {
@@ -199,7 +199,7 @@ export function compareReviewFreshness(expected: ReviewFreshnessSeal, current: R
 }
 
 export function isSensitiveReviewPath(relativePath: string): boolean {
-  const path = canonicalRelativePath(relativePath).toLowerCase();
+  const path = canonicalRelativePath(relativePath).toLowerCase().replaceAll("#", ".");
   const segments = path.split("/");
   return segments.some((segment) => segment === ".ssh"
     || segment === ".npmrc"
@@ -263,9 +263,8 @@ function normalizeFiles(files: readonly ReviewSourceFileSnapshot[]): readonly No
   const seen = new Set<string>();
   return files.map((file) => {
     const path = canonicalRelativePath(file.relativePath);
-    const collisionKey = path.toLocaleLowerCase("en-US");
-    if (seen.has(collisionKey)) throw new TypeError(`Review source file alias collision: ${path}`);
-    seen.add(collisionKey);
+    if (seen.has(path)) throw new TypeError(`Review source file alias collision: ${path}`);
+    seen.add(path);
     return { path, sha256: requireSha256(file.sha256, "Review source file sha256"), byteLength: requireCount(file.byteLength, "Review source file byteLength") };
   }).sort((left, right) => left.path.localeCompare(right.path, "en-US"));
 }
@@ -416,8 +415,8 @@ function canonicalRelativePath(value: string): string {
   if (segments.length === 0 || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
     throw new TypeError("Review evidence paths must not contain empty or traversal segments.");
   }
-  if (segments.some((segment) => !ALIAS_SEGMENT.test(segment))) throw new TypeError("Review evidence paths contain characters unsupported by stable aliases.");
-  return segments.join("/");
+  if (!isCanonicalWorkspaceRelativePath(normalized)) throw new TypeError("Review evidence paths contain characters unsupported by stable aliases.");
+  return normalized;
 }
 
 function validateBoundaries(input: BuildReviewEvidenceInput): void {

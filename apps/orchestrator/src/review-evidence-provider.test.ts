@@ -23,10 +23,12 @@ const cleanups: Array<() => void> = [];
 afterEach(() => cleanups.splice(0).reverse().forEach((cleanup) => cleanup()));
 
 describe("DurableReviewEvidenceProvider", () => {
-  it("captures the text diff and file fingerprint for a real Git C-quoted path", async () => {
+  it.each([
+    ["报告.txt", /^diff --git "a\/\\[0-7]{3}.*\n[\s\S]*\n-old\n\+new\n$/u],
+    ["report#1.txt", /^diff --git a\/report#1\.txt b\/report#1\.txt\n[\s\S]*\n-old\n\+new\n$/u]
+  ] as const)("captures the file fingerprint and Review prompt for the real Git path %s", async (file, patchPattern) => {
     const fixture = setup();
     const workspaces = new WorkspaceService();
-    const file = "报告.txt";
     try {
       const git = initWorkspaceRepository(fixture.root);
       git("config", "core.quotePath", "true");
@@ -39,11 +41,42 @@ describe("DurableReviewEvidenceProvider", () => {
       const capture = await providerFor(fixture.store, workspaces, []).capture(request());
       expect(capture.workspaceEvidence?.diffs).toEqual([{
         relativePath: file, source: "unstaged", status: "modified", additions: 1, deletions: 1,
-        patch: expect.stringMatching(/^diff --git "a\/\\[0-7]{3}.*\n[\s\S]*\n-old\n\+new\n$/u)
+        patch: expect.stringMatching(patchPattern)
       }]);
       expect(capture.workspace.files).toEqual([{
         relativePath: file, byteLength: 4, sha256: createHash("sha256").update("new\n").digest("hex")
       }]);
+      expect(buildReviewPrompt(buildReviewEvidence(capture).promptInput).prompt).toContain(`### ${file} (unstaged`);
+    } finally {
+      await workspaces.close();
+    }
+  }, 30_000);
+
+  it.skipIf(process.platform !== "linux")("keeps distinct case-sensitive Git files in the evidence and prompt", async () => {
+    const fixture = setup();
+    const workspaces = new WorkspaceService();
+    try {
+      const git = initWorkspaceRepository(fixture.root);
+      writeWorkspaceFile(fixture.root, "A.txt", "old upper\n");
+      writeWorkspaceFile(fixture.root, "a.txt", "old lower\n");
+      git("add", "--", "A.txt", "a.txt");
+      git("commit", "--quiet", "-m", "base");
+      writeWorkspaceFile(fixture.root, "A.txt", "new upper\n");
+      writeWorkspaceFile(fixture.root, "a.txt", "new lower\n");
+      await workspaces.register({ id: "workspace", root: fixture.root, displayName: "Workspace", trusted: true });
+
+      const provider = providerFor(fixture.store, workspaces, []);
+      const capture = await provider.capture(request());
+      expect(new Set(capture.workspace.files.map(file => file.relativePath))).toEqual(new Set(["A.txt", "a.txt"]));
+      const evidence = buildReviewEvidence(capture);
+      const prompt = buildReviewPrompt(evidence.promptInput).prompt;
+      expect(prompt).toContain("### A.txt (unstaged");
+      expect(prompt).toContain("+new upper\n");
+      expect(prompt).toContain("### a.txt (unstaged");
+      expect(prompt).toContain("+new lower\n");
+      writeWorkspaceFile(fixture.root, "a.txt", "newer lower\n");
+      const refreshed = buildReviewEvidence(await provider.capture(request(), "reobserve"));
+      expect(refreshed.freshness.filesSha256).not.toBe(evidence.freshness.filesSha256);
     } finally {
       await workspaces.close();
     }

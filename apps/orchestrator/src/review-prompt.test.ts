@@ -68,7 +68,9 @@ describe("review prompt", () => {
 
   it("rejects absolute and incorrectly scoped evidence paths", () => {
     expect(isReviewEvidenceAlias("src/a.ts")).toBe(true);
+    expect(isReviewEvidenceAlias("src/report#1.txt")).toBe(true);
     expect(isReviewEvidenceAlias("[review-artifact]/a.txt")).toBe(true);
+    expect(isReviewEvidenceAlias("[review-artifact]/report#1.txt")).toBe(false);
     expect(isReviewEvidenceAlias("D:\\service\\a.ts")).toBe(false);
     expect(isReviewEvidenceAlias("../secret.txt")).toBe(false);
     expect(isReviewEvidenceAlias("src/./a.ts")).toBe(false);
