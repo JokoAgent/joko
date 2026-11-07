@@ -2609,6 +2609,7 @@ message GetExtensionResponse {
   ExtensionCatalogEntry extension = 1;
   Revision catalog_revision = 2;
   bool recovered_from_corruption = 3;
+  ExtensionUsageSummary usage = 4;
 }
 
 message GetExtensionSourceGitPreflightRequest {}

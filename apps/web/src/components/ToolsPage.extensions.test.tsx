@@ -45,6 +45,38 @@ afterEach(async () => {
 });
 
 describe("Extension catalog interactions", () => {
+  it("refreshes local usage after a failed detail read and clears only the confirmed history", async () => {
+    const extension = readyExtension();
+    const lastUsedAt = Date.UTC(2026, 0, 1);
+    let usage: NonNullable<ExtensionCatalogEntryView["usage"]> = { historyGeneration: 3n, callsLast7Days: 2n, lastUsedAt };
+    const getExtension = vi.fn(async () => catalog({ ...extension, usage }));
+    const clearExtensionUsage = vi.fn(async () => { usage = { historyGeneration: 4n, callsLast7Days: 0n }; });
+    const view = await renderExtensions({ extension, controller: { listExtensions: async () => catalog(extension), getExtension, clearExtensionUsage } });
+    const summary = () => view.container.querySelector<HTMLElement>('section[aria-label="Local usage"]')!;
+    expect(summary().querySelector("time")?.dateTime).toBe(new Date(lastUsedAt).toISOString());
+    expect(summary().textContent).toContain("Calls in the last 7 days2");
+
+    getExtension.mockRejectedValueOnce(new Error("Usage read failed"));
+    await act(async () => buttonWithText(summary(), "Refresh").click());
+    await settle();
+    expect(view.container.textContent).toContain("Usage read failed");
+    await act(async () => buttonWithText(view.container, "Retry").click());
+    await settle();
+    await act(async () => buttonWithText(summary(), "Clear usage history").click());
+    const cancelDialog = requiredDialog();
+    expect(cancelDialog.textContent).toContain(`Clear usage history for ${extension.name}?`);
+    await act(async () => buttonWithText(cancelDialog, "Cancel").click());
+    expect(clearExtensionUsage).not.toHaveBeenCalled();
+
+    await act(async () => buttonWithText(summary(), "Clear usage history").click());
+    await act(async () => buttonWithText(requiredDialog(), "Clear usage history").click());
+    await settleMany();
+    expect(clearExtensionUsage).toHaveBeenCalledExactlyOnceWith(extension.id, extension.revision, 3n);
+    expect(summary().textContent).toContain("Never used");
+    expect(summary().textContent).toContain("Calls in the last 7 days0");
+    expect(view.actionErrors).toEqual([]);
+  });
+
   it("keeps plugin permission recovery open on its own live interaction event", async () => {
     const extension = readyExtension();
     const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: extension.id, revision: { value: 1n }, showPreferences: true,

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 
-import type { OperationalStore } from "@joko/store";
+import { EXTENSION_USAGE_SETTINGS_PREFIX, type OperationalStore } from "@joko/store";
 
 import type { ArtifactRecord, ArtifactStore } from "./artifact-store.js";
 import type { CredentialManager } from "./credential-manager.js";
@@ -56,7 +56,9 @@ export class DiagnosticsBundleService {
     const snapshot = this.#store.getSnapshot(now);
     const health = this.#store.health();
     const selected = this.#selectDiagnostics(input.diagnosticIds);
-    const settings = this.#store.listSettings().map((setting) => ({
+    const settings = this.#store.listSettings().filter((setting) =>
+      setting.scopeType !== "service" || !setting.scopeId.startsWith(EXTENSION_USAGE_SETTINGS_PREFIX)
+    ).map((setting) => ({
       scopeType: setting.scopeType,
       scopeIdFingerprint: fingerprint(setting.scopeId),
       key: setting.key,

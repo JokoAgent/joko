@@ -904,6 +904,13 @@ export function VisualHarness(): JSX.Element {
         });
         record(`extension-sidebar:${extensionId}:${visible ? "shown" : "hidden"}`);
       },
+      clearExtensionUsage: async (extensionId, expectedRevision, expectedHistoryGeneration): Promise<void> => {
+        mutateVisualExtension(extensionId, expectedRevision, (extension) => {
+          if (extension.usage?.historyGeneration !== expectedHistoryGeneration) throw new Error("The visual plugin usage history changed.");
+          return { ...extension, usage: { historyGeneration: expectedHistoryGeneration + 1n, callsLast7Days: 0n } };
+        });
+        record(`extension-usage-clear:${extensionId}`);
+      },
       beginExtensionSetup: async (extensionId, expectedRevision): Promise<void> => {
         const attemptId = `visual-extension-setup-${sequence.current++}`;
         mutateVisualExtension(extensionId, expectedRevision, (extension) => {

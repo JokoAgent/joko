@@ -4269,6 +4269,11 @@ export interface ExtensionProjectStateView {
 export interface ExtensionCatalogEntryView {
   readonly id: string;
   readonly revision: bigint;
+  readonly usage?: {
+    readonly historyGeneration: bigint;
+    readonly callsLast7Days: bigint;
+    readonly lastUsedAt?: number;
+  };
   readonly owner:
     | { readonly kind: "resource"; readonly resourceId: string; readonly discoveredRevision: string; readonly resourceRevision: bigint }
     | { readonly kind: "mcp"; readonly serverId: string; readonly serverRevision: bigint }
@@ -6531,6 +6536,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   getExtensionProjectState(projectId: string, signal?: AbortSignal): Promise<ExtensionProjectStateView>;
   listExtensionProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView>;
   setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint, project?: ExtensionProjectStateView): Promise<void>;
+  clearExtensionUsage(extensionId: string, expectedRevision: bigint, expectedHistoryGeneration: bigint): Promise<void>;
   setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void>;
   beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;
   submitExtensionSetupInteraction(

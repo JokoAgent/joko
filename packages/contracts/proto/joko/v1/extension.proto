@@ -724,6 +724,12 @@ message ExtensionCatalogSnapshot {
   bool recovered_from_corruption = 3;
 }
 
+message ExtensionUsageSummary {
+  google.protobuf.Timestamp last_used_at = 1;
+  uint64 calls_last_7_days = 2;
+  uint64 history_generation = 3;
+}
+
 message ExtensionProject {
   string project_id = 1;
   string name = 2;

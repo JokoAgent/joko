@@ -43,7 +43,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const projects = new ExtensionProjectPolicies(store);
   const id = "extension_0123456789abcdef0123456789abcdef", revision = `sha256:${"a".repeat(64)}`;
   let enabled = true, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
-  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "targets", "text", "sync"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
+  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "targets", "text", "sync", "missing_handler", "usage"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
     card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, targets: true, deviceSync: true, text: { oneshot: true }, showTaskPreferences: false,
     network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
   const extension = () => ({ id, revision: 1n, name: "Fixture mail", installed: true, enabled, owner: { kind: "resource", resourceId: "resource", resourceVersion: 1n, discoveredRevision: revision },
@@ -121,6 +121,10 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
         joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes } }));
+        joko.tools.register('usage', async message => {
+          await window.__jokoExtensionToolAccepted(message.callId, 'forged');
+          return { ok: false, result: { nonceVisible: 'usageNonce' in message } };
+        });
       `);
       return { discoveredRevision: revision, files: 4, bytes: 5000, entries: [] };
     }
@@ -198,6 +202,15 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   try {
     await surfaces.initialize(); await runtime.start();
     const provider = providers.get(`${id}-runtime`)!; expect(provider, startupErrors.join("; ")).toBeDefined();
+    const subject = { extensionId: id, packageName: "@sample/mail" };
+    await expect(provider.callTool("missing_handler", {}, undefined, context)).rejects.toThrow("Tool handler unavailable");
+    expect(store.readExtensionUsage(subject)).toEqual({ historyGeneration: 0n, callsLast7Days: 0n });
+    await expect(provider.callTool("usage", {}, undefined, context)).resolves.toMatchObject({ isError: true, structuredContent: { nonceVisible: false } });
+    expect(store.readExtensionUsage(subject)).toMatchObject({ historyGeneration: 0n, callsLast7Days: 1n, lastUsedAt: expect.any(Number) });
+    const admittedBeforeClear = provider.callTool("inspect", {}, undefined, context);
+    expect(store.clearExtensionUsage(subject, 0n)).toBe(true);
+    await expect(admittedBeforeClear).resolves.toMatchObject({ isError: false });
+    expect(store.readExtensionUsage(subject)).toEqual({ historyGeneration: 1n, callsLast7Days: 0n });
     const managed = await provider.callTool("tasks", {}, undefined, context);
     expect(managed.structuredContent).toMatchObject({ task: { taskId: "managed-task", revision: "configuration", hidden: true, usage: "1" },
       text: { ok: true, text: '{"summary":"Done"}' }, failureCode: "TASK_NOT_FOUND", hasCredentials: false });
@@ -306,7 +319,9 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect(() => delayedText.get(pendingKey)!.owner.assertCurrent()).toThrow("disabled");
     delayedText.get(pendingKey)!.release(); expect(await pendingResult).toBe(true);
     expect(textEffects).not.toContain(pendingKey);
+    const usageBeforeDeniedCall = store.readExtensionUsage(subject);
     await expect(provider.callTool("card", {}, undefined, context)).rejects.toThrow("disabled");
+    expect(store.readExtensionUsage(subject)).toEqual(usageBeforeDeniedCall);
     const other = await provider.callTool("card", {}, undefined, { sessionId: "other-task", targetId: "other-target", generation: 1 });
     expect(other.isError).toBe(false); expect(provider.available).toBe(true);
     projects.setEnabled(project.id, "connection", extension(), true, projects.state(project.id, "connection").revision);
