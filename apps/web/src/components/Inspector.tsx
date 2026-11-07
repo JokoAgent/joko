@@ -2069,10 +2069,10 @@ function WorkspaceChangesPanel({ controller, session, workspace, focusRequest, c
     return () => { current = false; };
   }, [canDiff, changeSets, changeSetsLoaded, commitRef, branchRef, hideWhitespace, sourceDescriptor, sourceKind, turnSetId, workspace?.id]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setMarkdownPreview(undefined);
     setImagePreview(undefined);
-  }, [diff?.repositoryRevision, sourceKind]);
+  }, [diff?.repositoryRevision, hideWhitespace, sourceDescriptor]);
 
   useEffect(() => {
     const blobIds = [imagePreview?.value?.oldImage.blobId, imagePreview?.value?.newImage.blobId]
@@ -2186,19 +2186,23 @@ function WorkspaceChangesPanel({ controller, session, workspace, focusRequest, c
     if (diff === undefined) return;
     const key = `${diff.repositoryRevision}:${reviewFileKey(file)}`;
     if (markdownPreview?.key === key && (markdownPreview.loading || markdownPreview.text !== undefined)) return;
-    setMarkdownPreview({ key, loading: true });
-    void controller.readWorkspaceDiffFile(workspace.id, file, diff).then((result) => {
-      setMarkdownPreview({ key, loading: false, text: result.text ?? "", truncated: result.truncated });
-    }).catch((cause: unknown) => setMarkdownPreview({ key, loading: false, error: messageOf(cause) }));
+    const pending = { key, loading: true };
+    setMarkdownPreview(pending);
+    void controller.readWorkspaceDiffFile(workspace.id, file, diff).then(
+      (result) => setMarkdownPreview((current) => current === pending ? { key, loading: false, text: result.text ?? "", truncated: result.truncated } : current),
+      (cause: unknown) => setMarkdownPreview((current) => current === pending ? { key, loading: false, error: messageOf(cause) } : current)
+    );
   };
   const loadImagePreview = (file: WorkspaceFileDiffView): void => {
     if (diff === undefined || !canDiffImagePreview || !sourceCapabilities.canRichPreview) return;
     const key = `${diff.repositoryRevision}:${reviewFileKey(file)}`;
     if (imagePreview?.key === key && (imagePreview.loading || imagePreview.value !== undefined)) return;
-    setImagePreview({ key, loading: true });
-    void controller.readWorkspaceDiffImage(workspace.id, file, diff).then((value) => {
-      setImagePreview({ key, loading: false, value });
-    }).catch((cause: unknown) => setImagePreview({ key, loading: false, error: messageOf(cause) }));
+    const pending = { key, loading: true };
+    setImagePreview(pending);
+    void controller.readWorkspaceDiffImage(workspace.id, file, diff).then(
+      (value) => setImagePreview((current) => current === pending ? { key, loading: false, value } : current),
+      (cause: unknown) => setImagePreview((current) => current === pending ? { key, loading: false, error: messageOf(cause) } : current)
+    );
   };
   const currentMutationFence = (): Promise<WorkspaceDiffView> => controller.getWorkspaceDiff(workspace.id, { source: "unstaged" });
   const displayedRemote = remote ?? diff?.pushTarget?.remote ?? "";
@@ -2547,6 +2551,7 @@ function StructuredWorkspaceDiffPreview({ diff, t, viewMode = "unified", wordWra
 
   const renderFile = (file: WorkspaceFileDiffView): JSX.Element => {
     const key = reviewFileKey(file);
+    const previewKey = `${diff.repositoryRevision}:${key}`;
     return <WorkspaceReviewFile
       file={file}
       t={t}
@@ -2560,10 +2565,10 @@ function StructuredWorkspaceDiffPreview({ diff, t, viewMode = "unified", wordWra
       canRevert={canRevert}
       pendingHunkKey={pendingHunkKey}
       onDiffAction={onDiffAction}
-      markdownPreview={markdownPreview}
+      markdownPreview={markdownPreview?.key === previewKey ? markdownPreview : undefined}
       onLoadMarkdown={onLoadMarkdown}
       canImagePreview={canImagePreview}
-      imagePreview={imagePreview}
+      imagePreview={imagePreview?.key === previewKey ? imagePreview : undefined}
       onLoadImage={onLoadImage}
       getArtifactUrl={getArtifactUrl}
     />;
@@ -2742,7 +2747,7 @@ function ReviewFileJump({ files, selectedKey, onSelect, t }: {
   </div>;
 }
 
-function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, onExpandedChange, canStage, canUnstage, canRevert, pendingHunkKey, onDiffAction, markdownPreview, onLoadMarkdown, canImagePreview, imagePreview, onLoadImage, getArtifactUrl }: {
+function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, onExpandedChange, canStage, canUnstage, canRevert, pendingHunkKey, onDiffAction, markdownPreview: activeMarkdown, onLoadMarkdown, canImagePreview, imagePreview: activeImage, onLoadImage, getArtifactUrl }: {
   readonly file: WorkspaceFileDiffView;
   readonly t: Translator;
   readonly viewMode: "unified" | "split";
@@ -2764,9 +2769,6 @@ function WorkspaceReviewFile({ file, t, viewMode, wordWrap, wordDiff, expanded, 
 }): JSX.Element {
   const additions = file.hunks.reduce((total, hunk) => total + hunk.lines.filter((line) => line.kind === "added").length, 0);
   const deletions = file.hunks.reduce((total, hunk) => total + hunk.lines.filter((line) => line.kind === "removed").length, 0);
-  const markdownKeySuffix = `:${reviewFileKey(file)}`;
-  const activeMarkdown = markdownPreview?.key.endsWith(markdownKeySuffix) === true ? markdownPreview : undefined;
-  const activeImage = imagePreview?.key.endsWith(markdownKeySuffix) === true ? imagePreview : undefined;
   const sourceLabel = file.source === "staged"
     ? t("workspace.diffStaged")
     : file.source === "unstaged"

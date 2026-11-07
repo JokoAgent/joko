@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
-import type { SessionView, WorkspaceDiffView, WorkspaceGitPushResultView, WorkspaceView } from "../model.js";
+import type { SessionView, WorkspaceDiffImageView, WorkspaceDiffView, WorkspaceFilePreviewView, WorkspaceGitPushResultView, WorkspaceView } from "../model.js";
 import { ChangesPanel } from "./Inspector.js";
 
 const roots: Root[] = [];
@@ -25,6 +25,47 @@ const remoteWorkspace: WorkspaceView = { ...workspace,
   remoteWorkspace: { kind: "ssh", hostId: "ssh-host", hostTargetId: "ssh-target", workspaceRoot: "/project" } };
 
 describe("Inspector Git push destinations", () => {
+  it("keeps Markdown and image previews with their original Review commit", async () => {
+    const commitA = "a".repeat(40), commitB = "b".repeat(40);
+    const comparison = (commit: string): WorkspaceDiffView => ({ ...diff, source: "commit", sourceRevision: commit,
+      repositoryRevision: commit, headRevision: commit, files: [
+        { path: "README.md", oldPath: "README.md", source: "commit", status: "modified", binary: false, text: "", hunks: [] },
+        { path: "photo.png", oldPath: "photo.png", source: "commit", status: "modified", binary: true, text: "", hunks: [] }
+      ] });
+    const markdown = (text: string): WorkspaceFilePreviewView => ({ path: "README.md", name: "README.md", kind: "text", text, truncated: false });
+    const image = (commit: string): WorkspaceDiffImageView => ({ repositoryRevision: commit, maximumBytes: 4096,
+      oldImage: { present: false, tooLarge: false }, newImage: { present: true, tooLarge: false, blobId: `photo-${commit[0]}` } });
+    const view = await mount(diff, false, true);
+    view.api.getWorkspaceDiff.mockImplementation(async (_workspaceId, query) => comparison(query?.sourceRevision ?? commitA));
+    let finishMarkdown!: (value: WorkspaceFilePreviewView) => void;
+    let finishImage!: (value: WorkspaceDiffImageView) => void;
+    view.api.readWorkspaceDiffFile.mockReturnValueOnce(new Promise(resolve => { finishMarkdown = resolve; })).mockResolvedValueOnce(markdown("Current Markdown"));
+    view.api.readWorkspaceDiffImage.mockReturnValueOnce(new Promise(resolve => { finishImage = resolve; })).mockResolvedValueOnce(image(commitB));
+
+    await act(async () => view.host.querySelector<HTMLButtonElement>('[aria-label="workspace.reviewSource"]')!.click());
+    await act(async () => [...document.querySelectorAll<HTMLElement>('[role="option"]')]
+      .find(option => option.textContent === "workspace.reviewSourceCommit")!.click());
+    const field = view.host.querySelector<HTMLInputElement>('input[placeholder="HEAD"]')!;
+    const selectCommit = (commit: string) => act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(field, commit);
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const loadPreviews = () => act(async () => {
+      button(view.host, "workspace.reviewMarkdownPreview").click();
+      button(view.host, "workspace.reviewImagePreview").click();
+    });
+    await selectCommit(commitA);
+    await loadPreviews();
+    await selectCommit(commitB);
+    await loadPreviews();
+    await act(async () => { finishMarkdown(markdown("Retired Markdown")); finishImage(image(commitA)); });
+
+    expect(view.host.querySelector(".review-markdown-preview")?.textContent).toContain("Current Markdown");
+    expect(view.host.textContent).not.toContain("Retired Markdown");
+    expect(view.host.querySelector(".review-image-preview img")?.getAttribute("src")).toBe("blob:photo-b");
+    expect(view.api.getArtifactUrl).toHaveBeenCalledExactlyOnceWith("photo-b");
+  });
+
   it("replaces a settled Review diff when the same workspace is rebound to SSH", async () => {
     const file = (path: string) => ({ path, source: "unstaged" as const, status: "modified" as const, binary: false, text: "", hunks: [] });
     const view = await mount({ ...diff, files: [file("local-only.txt")] });
@@ -117,10 +158,13 @@ describe("Inspector Git push destinations", () => {
   });
 });
 
-async function mount(initial = diff, canCommitDiff = false) {
+async function mount(initial = diff, canCommitDiff = false, canDiffImagePreview = false) {
   const api = {
     getWorkspaceDiff: vi.fn<AppController["getWorkspaceDiff"]>(async () => initial),
     listWorkspaceChangeSets: vi.fn(async () => []),
+    readWorkspaceDiffFile: vi.fn<AppController["readWorkspaceDiffFile"]>(),
+    readWorkspaceDiffImage: vi.fn<AppController["readWorkspaceDiffImage"]>(),
+    getArtifactUrl: vi.fn(async (blobId: string) => `blob:${blobId}`),
     commitWorkspaceDiff: vi.fn<AppController["commitWorkspaceDiff"]>(async () => undefined),
     pushWorkspaceBranch: vi.fn<AppController["pushWorkspaceBranch"]>(async () => ({ outcome: "pushed", remote: pushTarget.remote, remoteRef: pushTarget.remoteRef,
       repositoryRevision: "repository-1", headRevision: "a".repeat(40), ahead: 0, behind: 0 } satisfies WorkspaceGitPushResultView)),
@@ -130,7 +174,7 @@ async function mount(initial = diff, canCommitDiff = false) {
   const root = createRoot(host); roots.push(root);
   const pending: Promise<void>[] = [];
   const render = (selectedWorkspace = workspace) => act(async () => root.render(<ChangesPanel controller={api as unknown as AppController} session={session} workspace={selectedWorkspace}
-    canDiff canPushDiff canCommitDiff={canCommitDiff} canDiffImagePreview={false} canStageDiff={false} canUnstageDiff={false} canRevertDiff={false} canRewind={false}
+    canDiff canPushDiff canCommitDiff={canCommitDiff} canDiffImagePreview={canDiffImagePreview} canStageDiff={false} canUnstageDiff={false} canRevertDiff={false} canRewind={false}
     t={(key) => key} runAction={(_key, action) => { pending.push(action().catch(() => undefined)); }} />));
   await render();
   const flush = () => act(async () => { await Promise.all(pending); });
