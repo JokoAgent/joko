@@ -980,6 +980,14 @@ function memoryOfflineCache(now: () => number = () => 1_500) {
   };
 }
 
+function configureNewTaskWorktree(network: MobileNetwork) {
+  vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: automationAuthoringOwnerSnapshot });
+  vi.mocked(network.listTargetWorktreeSources).mockResolvedValue([
+    { ref: "refs/heads/review", displayName: "review", commit: "a".repeat(40), remote: false, current: false }
+  ]);
+  return { sourceRef: "refs/heads/review", refreshRemote: true };
+}
+
 function fakeNetwork(): MobileNetwork {
   return {
     inspect: vi.fn(async () => node),
@@ -7055,8 +7063,37 @@ describe("native mobile connection and operation ownership", () => {
     expect(saved.pending()).toEqual([]);
   });
 
-  it("retains a first message, creates with the exact Target revision, and sends with the creation result generation", async () => {
+  it("keeps a selected Worktree draft without creating when its branch disappears", async () => {
+    const network = fakeNetwork(), drafts = memoryDraftStores();
+    const worktree = configureNewTaskWorktree(network);
+    vi.mocked(network.listTargetWorktreeSources).mockResolvedValue([]);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, undefined, undefined, drafts);
+    await app.start();
+    await expect(app.create("target", "Review", plainTextMobileComposerDraft("Keep this input"),
+      undefined, undefined, undefined, worktree)).rejects.toThrow(/Worktree source is unavailable/);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toEqual({
+      targetId: "target", name: "Review", input: plainTextMobileComposerDraft("Keep this input"), worktree
+    });
+  });
+
+  it("retires a pending new-task Worktree lookup on background before loading its branches", async () => {
+    const network = fakeNetwork(); configureNewTaskWorktree(network);
+    let release!: (value: Awaited<ReturnType<MobileNetwork["probeTargetWorktree"]>>) => void;
+    vi.mocked(network.probeTargetWorktree).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const reading = app.loadNewTaskWorktree("target");
+    app.setForeground(false);
+    release({ targetId: "target", eligibility: "eligible", canRefreshRemote: true });
+    await expect(reading).rejects.toThrow(/project or saved node changed/);
+    expect(network.listTargetWorktreeSources).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("retains a first message, creates with the exact Target revision, and sends with the creation result generation, Worktree=%s", async isolated => {
     const network = fakeNetwork();
+    const worktree = isolated ? configureNewTaskWorktree(network) : undefined;
     const drafts = memoryDraftStores();
     let operation = 0;
     vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
@@ -7085,13 +7122,16 @@ describe("native mobile connection and operation ownership", () => {
     const app = client(network, memoryStorage(credential).storage, undefined, undefined,
       () => `operation-${++operation}`, undefined, drafts);
     await app.start();
-    await expect(app.create("target", "Work", plainTextMobileComposerDraft("hello"))).resolves.toEqual({
+    await expect(app.create("target", "Work", plainTextMobileComposerDraft("hello"), undefined, undefined, undefined, worktree)).resolves.toEqual({
       sessionId: "session", created: true, sent: true, definitive: true
     });
-    expect(network.prepareTarget).toHaveBeenCalledWith(credential, snapshot.targets[0], expect.any(AbortSignal));
+    expect(network.prepareTarget).toHaveBeenCalledWith(credential,
+      (isolated ? automationAuthoringOwnerSnapshot : snapshot).targets[0], expect.any(AbortSignal));
+    expect(network.probeTargetWorktree).toHaveBeenCalledTimes(isolated ? 1 : 0);
     expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
       preconditions: [{ entity: { id: "target" }, expectedRevision: { value: 3n } }],
-      payload: { case: "createSession", value: { backendId: "backend", targetId: "target", displayName: "Work" } }
+      payload: { case: "createSession", value: { backendId: "backend", targetId: "target", displayName: "Work",
+        useWorktree: isolated, ...(isolated ? { worktreeSourceRef: worktree!.sourceRef, refreshWorktreeRemote: true } : {}) } }
     });
     expect(vi.mocked(network.submit).mock.calls[1]?.[2]).toMatchObject({
       preconditions: [{ entity: { id: "session" }, expectedGeneration: 8n }],
@@ -7575,8 +7615,9 @@ describe("native mobile connection and operation ownership", () => {
     })).rejects.toThrow(/authority changed/u);
   });
 
-  it("retains an editable new-task draft after a definitive creation failure", async () => {
+  it.each([false, true])("retains an editable new-task draft after a definitive creation failure, Worktree=%s", async isolated => {
     const network = fakeNetwork();
+    const worktree = isolated ? configureNewTaskWorktree(network) : undefined;
     const drafts = memoryDraftStores();
     vi.mocked(network.submit).mockResolvedValueOnce(create(OperationSchema, {
       operationId: "operation-create",
@@ -7588,12 +7629,12 @@ describe("native mobile connection and operation ownership", () => {
       () => "operation-create", undefined, drafts);
     await app.start();
 
-    await expect(app.create("target", "Work", plainTextMobileComposerDraft("keep this first message"))).resolves.toEqual({
+    await expect(app.create("target", "Work", plainTextMobileComposerDraft("keep this first message"), undefined, undefined, undefined, worktree)).resolves.toEqual({
       created: false, sent: false, definitive: true
     });
     expect(network.submit).toHaveBeenCalledOnce();
     expect(drafts.newTask.readSync({ profileId: credential.profileId })).toEqual({
-      targetId: "target", name: "Work", input: plainTextMobileComposerDraft("keep this first message")
+      targetId: "target", name: "Work", input: plainTextMobileComposerDraft("keep this first message"), ...(worktree ? { worktree } : {})
     });
     expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
   });
@@ -7626,26 +7667,28 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.error).toMatch(/wrong durable identity/);
   });
 
-  it("reconciles an unknown creation after restart and sends the retained text only once", async () => {
+  it.each([false, true])("reconciles an unknown creation after restart and sends the retained text only once, Worktree=%s", async isolated => {
     const saved = memoryStorage(credential);
     const drafts = memoryDraftStores();
     let operation = 0;
     const nextId = () => `operation-${++operation}`;
     const firstNetwork = fakeNetwork();
+    const worktree = isolated ? configureNewTaskWorktree(firstNetwork) : undefined;
     vi.mocked(firstNetwork.submit).mockRejectedValueOnce(new Error("creation reply lost"));
     const first = client(firstNetwork, saved.storage, undefined, undefined, nextId, undefined, drafts);
     await first.start();
 
-    await expect(first.create("target", "Recovered", plainTextMobileComposerDraft("resume this exact input"))).resolves.toEqual({
+    await expect(first.create("target", "Recovered", plainTextMobileComposerDraft("resume this exact input"), undefined, undefined, undefined, worktree)).resolves.toEqual({
       created: false, sent: false, definitive: false
     });
     expect(saved.pending()).toMatchObject([{ operationId: "operation-1", kind: "create", state: "unknown" }]);
     expect(drafts.newTask.readSync({ profileId: credential.profileId })?.submission).toMatchObject({
-      phase: "creating", createOperationId: "operation-1", input: plainTextMobileComposerDraft("resume this exact input")
+      phase: "creating", createOperationId: "operation-1", input: plainTextMobileComposerDraft("resume this exact input"), ...(worktree ? { worktree } : {})
     });
     first.dispose();
 
     const recoveredNetwork = fakeNetwork();
+    if (isolated) configureNewTaskWorktree(recoveredNetwork);
     vi.mocked(recoveredNetwork.getOperation).mockImplementation(async (_credential, operationId) => create(OperationSchema, {
       operationId,
       connectionId: credential.connectionId,
@@ -7671,6 +7714,7 @@ describe("native mobile connection and operation ownership", () => {
     await recovered.start();
 
     expect(recoveredNetwork.submit).toHaveBeenCalledOnce();
+    expect(recoveredNetwork.probeTargetWorktree).not.toHaveBeenCalled();
     expect(vi.mocked(recoveredNetwork.submit).mock.calls[0]?.[2]).toMatchObject({
       preconditions: [{ entity: { id: "session" }, expectedGeneration: 8n }],
       payload: { case: "sendInput", value: { input: { parts: [{ content: { case: "text", value: "resume this exact input" } }] } } }
