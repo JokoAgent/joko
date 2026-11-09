@@ -101,6 +101,7 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
       if (command.kind === "infer" && !options.host.infer) throw new ConnectError("Isolated native inference is unavailable.", Code.Unimplemented);
       try {
         const result = command.kind === "infer" ? await options.host.infer!(principal, command.request, context.signal)
+          : command.kind === "workflow_progress" ? await options.host.call(principal, identity(request.runId), identity(request.callId), command, context.signal)
           : await options.host.call(principal, identity(request.runId), identity(request.callId), command);
         return create(contract.CallHostedAgentResponseSchema, { format, resultJson: encodeHostedAgentValue(result) });
       } catch (error) {

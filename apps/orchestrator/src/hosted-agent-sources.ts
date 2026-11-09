@@ -16,6 +16,11 @@ import type { SessionHost } from "./session-host.js";
 import type { HostedAgentExecutorPolicy } from "./hosted-agent-executor.js";
 import { HostedAgentConnectClient } from "./hosted-agent-connect-client.js";
 import { HostedAgentPoller } from "./hosted-agent-poller.js";
+import { ExecutorWorkspace } from "./hosted-agent-workspace.js";
+import { HostedAgentProjection } from "./hosted-agent-projection.js";
+import { boundHostedWorkflowProgress, decodeHostedWorkflowProgress } from "./hosted-agent-workflow-wire.js";
+import type { BackgroundWorkflowReadInput, BackgroundTaskOutputResult } from "@joko/core";
+import type { HostedNativeCommand } from "@joko/adapter-hosted";
 import { createHostedAgentPeerTransport } from "./hosted-agent-peer-transport.js";
 import { createHostedAgentSourceController } from "./hosted-agent-source-controller.js";
 import { fromProtoCapability, fromProtoTimestamp } from "./proto-mapper.js";
@@ -226,6 +231,35 @@ export class HostedAgentSources {
     const mcps = new Map<string, HostedAgentSourceMcp>(), mcpKey = (context: AdapterContext) => JSON.stringify([context.sessionId, context.generation, context.backendInstanceGeneration]);
     const snapshot = await this.#options.registry.add({ instanceId: entry.id, adapterKind: "hosted", displayName: entry.catalog.displayName,
       create: ({ generation }) => new HostedAgentSourceAdapter({ id: entry.id, source: entry.record.source, describe: () => this.#descriptor(entry),
+        ...(entry.catalog.nativeAdapterKind !== "claude-agent-sdk-stdio" ? {} : { readWorkflowProgress: async (
+          command: Extract<HostedNativeCommand, { kind: "workflow_progress" }>, input: BackgroundWorkflowReadInput
+        ): Promise<BackgroundTaskOutputResult> => {
+          const nativeGeneration = Number(entry.catalog.instanceGeneration), owner = new AbortController();
+          const signal = AbortSignal.any([owner.signal, AbortSignal.timeout(10_000), ...(input.signal ? [input.signal] : [])]);
+          const assertCurrent = (): void => {
+            signal.throwIfAborted(); input.assertCurrent();
+            if (this.#closed || !entry.available || !entry.record.remoteControlEnabled || this.#entries.get(entry.id) !== entry
+              || this.#options.store.getBackend(entry.id).descriptor.instanceGeneration !== generation
+              || entry.catalog.nativeAdapterKind !== "claude-agent-sdk-stdio" || Number(entry.catalog.instanceGeneration) !== nativeGeneration) throw new Error("The workflow Source route changed.");
+          };
+          assertCurrent();
+          const remote = input.target.remoteWorkspace;
+          if (remote?.kind === "ssh") throw new Error("SSH workflow history is unavailable.");
+          const peer = remote ? await (this.#options.remoteExecution ?? missingPeerWorkspace()).workspace(remote) : undefined;
+          assertCurrent(); peer?.assertCurrent(); peer?.assertFilesCurrent();
+          const id = randomUUID(), captured = this.#capture(entry, `workflow:${id}`);
+          const guard = (): void => { assertCurrent(); captured.assertCurrent(); peer?.assertCurrent(); peer?.assertFilesCurrent(); }; guard();
+          const timer = setInterval(() => { try { guard(); } catch (error) { owner.abort(error); } }, 100); timer.unref();
+          try {
+            const response = decodeHostedWorkflowProgress(await captured.client.call(`workflow:${id}`, id, command, signal)); guard();
+            if (response.output.status !== "available") return response.output;
+            const workspace = new ExecutorWorkspace({ workingDir: input.target.workspaceRoot,
+              ...(peer ? { remote: { pathStyle: peer.pathStyle, home: input.target.workspaceRoot, temporary: input.target.workspaceRoot } } : {}) });
+            workspace.setVirtualRoot(response.virtualRoot);
+            const projection = new HostedAgentProjection(workspace, { sessionId: input.sessionId, target: input.target }, () => input.bindings[0]!);
+            const output = boundHostedWorkflowProgress(projection.value(response.output), input.maximumBytes); guard(); return output;
+          } finally { clearInterval(timer); owner.abort(); }
+        } }),
         manageDerivation: async (command, signal) => {
           const captured = this.#capture(entry, `derivation:${command.nativeSessionId}`); captured.assertCurrent();
           await captured.client.call(`derivation:${command.nativeSessionId}`, randomUUID(), command, signal); captured.assertCurrent();

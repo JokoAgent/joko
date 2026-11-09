@@ -19,7 +19,7 @@ import {
 } from "@joko/core";
 import type { DurableProcessUsage } from "@joko/runtime-governance";
 import { describe, expect, test, vi } from "vitest";
-import { ClaudeCodeAdapter, claudeWorkspaceAuthority, type ClaudeCodeAdapterOptions } from "./adapter.js";
+import { ClaudeCodeAdapter, claudeWorkspaceAuthority, readClaudeWorkflowProgressFromProfile, type ClaudeCodeAdapterOptions } from "./adapter.js";
 import {
   ClaudeSessionStoreError,
   type ClaudeSessionStoreOperationAccess,
@@ -4312,6 +4312,8 @@ describe("ClaudeCodeAdapter", () => {
       await adapter.closeSession(binding, contextFor(binding, { target: workspace }).context);
       const result = await restarted.getBackgroundWorkflowProgress(read);
       expect(result.workflow?.status).toBe("done"); expect(JSON.stringify(result)).not.toContain("workflow-private-marker");
+      const profile = await readClaudeWorkflowProgressFromProfile(read, { configurationDirectory, redactValues: ["workflow-private-marker"] });
+      expect(profile.workflow?.agents[0]?.attempt).toBe(2); expect(JSON.stringify(profile)).not.toContain("workflow-private-marker");
       expect(restartedRuntime.queries).toHaveLength(0);
       expect((await restarted.getBackgroundWorkflowProgress({ ...read, bindings: [] })).status).toBe("unavailable");
       expect((await restarted.getBackgroundWorkflowProgress({ ...read, target: { ...workspace, workspaceRoot: join(root, "other-workspace") } })).status).toBe("unavailable");

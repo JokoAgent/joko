@@ -2909,20 +2909,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (input.target.remoteWorkspace !== undefined) return absent();
     const runtime = this.#sessions.get(input.sessionId);
     if (runtime && (runtime.remote || runtime.runtimePolicy !== "standard" || runtime.nativeTasks.isWorkflowTask(input.taskId) === false)) return absent();
-    const authority = claudeWorkspaceAuthority(input.target);
-    const ids = new Set<string>();
-    for (const binding of input.bindings) {
-      try {
-        const route = parseBindingRoute(binding);
-        if (route.kind === "stored" && route.workspaceAuthority !== authority) continue;
-        ids.add(route.nativeSessionId);
-      } catch { /* An uninitialized binding does not authorize native files. */ }
-    }
-    if (ids.size === 0) return absent();
-    const result = await readBackgroundWorkflowProgress({ configurationDirectory: this.#nativeMemoryConfigDirectory,
+    const result = await readOwnedWorkflowProgress({ ...input, assertCurrent }, { configurationDirectory: this.#nativeMemoryConfigDirectory,
       projectDirectoryName: this.#environment["CLAUDE_CODE_PROJECT_DIR_NAME"],
-      workingDirectory: input.target.workspaceRoot, nativeSessionIds: [...ids], taskId: input.taskId,
-      maximumBytes: input.maximumBytes, project: (value, maximum) => this.#projection.text(value, maximum), assertCurrent });
+      project: (value, maximum) => this.#projection.text(value, maximum) });
     assertCurrent(); return result;
   }
 
@@ -8005,6 +7994,41 @@ function parseBindingRoute(binding: NativeSessionBinding): ParsedBindingRoute {
   const nativeSessionId = route.nativeSessionId;
   if (binding.nativeSessionId !== undefined && binding.nativeSessionId !== nativeSessionId) throw continuityGap();
   return route;
+}
+
+export interface ClaudeWorkflowProfile {
+  readonly configurationDirectory: string;
+  readonly projectDirectoryName?: string;
+  readonly redactValues?: readonly string[];
+  readonly redactText?: (value: string) => string;
+}
+
+/** Trusted native Host read port. It never constructs an SDK, process owner,
+ * credential proxy or writable native SessionStore. */
+export async function readClaudeWorkflowProgressFromProfile(input: BackgroundWorkflowReadInput, profile: ClaudeWorkflowProfile): Promise<BackgroundTaskOutputResult> {
+  const projection = new SafeProjection([profile.configurationDirectory, ...(profile.redactValues ?? [])]);
+  return readOwnedWorkflowProgress(input, { configurationDirectory: profile.configurationDirectory, projectDirectoryName: profile.projectDirectoryName,
+    project: (value, maximum) => projection.text(typeof value === "string" && profile.redactText ? profile.redactText(value) : value, maximum) });
+}
+
+async function readOwnedWorkflowProgress(input: BackgroundWorkflowReadInput, profile: {
+  readonly configurationDirectory: string; readonly projectDirectoryName?: string; readonly project: (value: unknown, maximum: number) => string;
+}): Promise<BackgroundTaskOutputResult> {
+  const assertCurrent = (): void => { input.signal?.throwIfAborted(); input.assertCurrent(); }; assertCurrent();
+  const absent = (): BackgroundTaskOutputResult => ({ status: "unavailable", text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
+  if (input.target.remoteWorkspace !== undefined || input.bindings.length > 200) return absent();
+  const authority = claudeWorkspaceAuthority(input.target), ids = new Set<string>();
+  for (const binding of input.bindings) {
+    try {
+      const route = parseBindingRoute(binding);
+      if (route.kind === "stored" && route.workspaceAuthority !== authority) continue;
+      ids.add(route.nativeSessionId);
+    } catch { /* An uninitialized binding does not authorize native files. */ }
+  }
+  if (ids.size === 0) return absent();
+  const result = await readBackgroundWorkflowProgress({ configurationDirectory: profile.configurationDirectory, projectDirectoryName: profile.projectDirectoryName,
+    workingDirectory: input.target.workspaceRoot, nativeSessionIds: [...ids], taskId: input.taskId, maximumBytes: input.maximumBytes, project: profile.project, assertCurrent });
+  assertCurrent(); return result;
 }
 
 export function claudeWorkspaceAuthority(target: TargetDescriptor): string {

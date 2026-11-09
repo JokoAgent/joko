@@ -10042,15 +10042,18 @@ export class SessionHost {
     if (adapter?.getBackgroundWorkflowProgress === undefined) return undefined;
     const generation = this.requireAdapterGeneration(observed.backendId, adapter);
     const registeredTarget = this.#store.getTarget(observed.targetId);
-    if (stored.descriptor.remoteWorkspace !== undefined || registeredTarget.descriptor.remoteWorkspace !== undefined) return undefined;
-    const target = stored.descriptor.worktree?.state === "preserved" && stored.descriptor.worktree.remote === undefined
-      ? { ...workerWorkspaceTarget(this.#store, stored.descriptor, { ...registeredTarget.descriptor, workspaceRoot: stored.descriptor.worktree.path }),
-          backendId: observed.backendId, remoteWorkspace: stored.descriptor.remoteWorkspace }
+    if (stored.descriptor.remoteWorkspace?.kind === "ssh" || registeredTarget.descriptor.remoteWorkspace?.kind === "ssh") return undefined;
+    const worktree = stored.descriptor.worktree;
+    const target = worktree?.state === "preserved"
+      ? worktree.remote
+        ? { ...registeredTarget.descriptor, workspaceRoot: worktree.path, backendId: observed.backendId,
+            remoteWorkspace: { ...worktree.remote.binding, workspaceRoot: worktree.path } }
+        : { ...workerWorkspaceTarget(this.#store, stored.descriptor, { ...registeredTarget.descriptor, workspaceRoot: worktree.path }),
+            backendId: observed.backendId, remoteWorkspace: stored.descriptor.remoteWorkspace }
       : { ...this.targetForSession(stored), backendId: observed.backendId };
     const bindings = this.#store.listSessionNativeBindings(sessionId, observed.backendId, observed.generation, observed.emittedAt);
     if (bindings.length === 0) return undefined;
-    const worktreeOwner = (session: StoredSession) => JSON.stringify([session.descriptor.worktree?.leaseId,
-      session.descriptor.worktree?.workspaceId, session.descriptor.worktree?.path]);
+    const worktreeOwner = (session: StoredSession) => JSON.stringify([session.descriptor.remoteWorkspace, session.descriptor.worktree]);
     const originalWorktree = worktreeOwner(stored);
     const originalWorkerWorkspace = JSON.stringify(readWorkerWorkspaceBinding(this.#store, sessionId));
     const assertCurrent = (): void => {

@@ -56,6 +56,8 @@ const callSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("dispatch_during_compaction"), input: prompt }),
   z.strictObject({ kind: z.literal("cancel_background"), taskId: id }),
   z.strictObject({ kind: z.literal("background_output"), taskId: id, maximumBytes: z.number().int().min(1).max(1024 * 1024) }),
+  z.strictObject({ kind: z.literal("workflow_progress"), backendId: id, providerId: id, sessionId: id, targetId: id, nativeSessionId: id,
+    taskId: z.string().regex(/^claude-task-[0-9a-f]{32}$/u), maximumBytes: z.number().int().min(1).max(262_144) }),
   z.strictObject({ kind: z.literal("shell"), input: z.strictObject({ command: text, excludeFromContext: z.boolean() }) }),
   z.strictObject({ kind: z.literal("control_subagent"), input: z.strictObject({ runId: id, childId: id.optional(),
     action: z.enum(["stop", "steer", "follow_up", "resume"]), message: text.optional() }) })

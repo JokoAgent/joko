@@ -151,9 +151,10 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     this.#entries.set(key, entry); exchange.onOutput(() => this.#notify()); void entry.opening.catch(() => {});
     return { workspaceRoot: virtualRoot };
   }
-  async call(principal: HostedAgentPrincipal, runId: string, callId: string, command: HostedAgentCall): Promise<unknown> {
+  async call(principal: HostedAgentPrincipal, runId: string, callId: string, command: HostedAgentCall, signal?: AbortSignal): Promise<unknown> {
     if (command.kind === "derivation_lifecycle") return this.#derivationLifecycle(principal, runId, callId, command);
-    const entry = this.#entries.get(this.#key(principal, runId)); if (!entry) return this.options.base.call(principal, runId, callId, command);
+    const entry = this.#entries.get(this.#key(principal, runId));
+    if (!entry) return signal === undefined ? this.options.base.call(principal, runId, callId, command) : this.options.base.call(principal, runId, callId, command, signal);
     this.#assertEntry(entry, principal); const digest = hash(command), previous = entry.calls.get(callId);
     if (!callId || callId.length > 512 || /[\0\r\n]/u.test(callId)) throw new HostedAgentHostError("INVALID_REQUEST");
     if (previous) { if (previous.digest !== digest) throw new HostedAgentHostError("CONFLICT"); return previous.value; }

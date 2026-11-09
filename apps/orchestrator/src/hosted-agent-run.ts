@@ -55,7 +55,7 @@ export interface HostedAgentRunOptions {
 }
 interface CallReceipt { readonly digest: string; readonly result: Promise<unknown>; settled: boolean }
 const READ_ONLY_HOSTED_CALLS = new Set<HostedAgentCall["kind"]>([
-  "state", "commands", "resources", "tools", "tree", "history", "background_output"
+  "state", "commands", "resources", "tools", "tree", "history", "background_output", "workflow_progress"
 ]);
 const MAXIMUM_OBSERVATION_RECEIPTS = 64;
 export class HostedAgentCleanupError extends Error {
@@ -310,6 +310,8 @@ export class HostedAgentRun {
     }
     if (["done", "run_state", "tool_start", "tool_result", "background_task", "subagent_run", "subagent_transcript"].includes(event.type)) this.#lastActivity = Date.now();
     this.#observeBackground(event);
+    if (event.type === "background_task" && this.#adapter?.getBackgroundWorkflowProgress) this.#options.store.observeBackgroundTaskBinding(this.id, this.#leaseId, event.taskId,
+      event.startedAt, event.state === "running" || event.state === "waiting" || event.state === "queued");
     if (event.type === "usage") { this.#lastUsage = event.usage; this.#usageObserved = true; }
     if (this.#usageTurn && (event.type === "done" || event.type === "run_state" && ["completed", "aborted", "failed"].includes(event.state))) {
       this.#options.usage?.finish(this.#usageTurn, this.#usageObserved ? this.#lastUsage : undefined); this.#usageTurn = undefined;
@@ -574,6 +576,7 @@ export class HostedAgentRun {
       }
       case "cancel_background": if (!adapter.cancelBackgroundTask) throw new Error("Hosted background task cancellation is unsupported."); await adapter.cancelBackgroundTask(context, command.taskId); return null;
       case "background_output": if (!adapter.getBackgroundTaskOutput) throw new Error("Hosted background task output is unsupported."); return adapter.getBackgroundTaskOutput(context, command.taskId, command.maximumBytes);
+      case "workflow_progress": throw new Error("Workflow history requires its durable native owner read port.");
     }
   }
   async #derive(id: string, command: Extract<HostedAgentCall, { kind: "derive" }>, context: AdapterContext): Promise<{ readonly editorText?: string }> {

@@ -8,6 +8,30 @@ import { OperationalStore } from "./operational-store.js";
 const owner: HostedNativeSessionOwner = { authorityId: "approved-share", deviceId: "task-device", sessionId: "task", targetId: "workspace",
   nativeSessionId: "source-owned-native-id", backendId: "native", trust: "guest" };
 const binding = { opaqueRef: "private-native-reference", nativeSessionId: "native-sdk-identity", generation: 1 };
+it("retains each observed task's actual SDK binding across identity changes and cold restart, then purges only that owner", () => {
+  const root = mkdtempSync(join(tmpdir(), "joko-hosted-task-binding-")), path = join(root, "operations.sqlite");
+  let database = new OperationalStore(path);
+  try {
+    let store = new HostedAgentStore(database); const session = store.claim(owner, "original-process", "create");
+    store.bind(session.key, session.leaseId, binding); store.observeBackgroundTaskBinding(session.key, session.leaseId, "workflow-one", 100, true);
+    store.observeBackgroundTaskBinding(session.key, session.leaseId, "reused-id", 100, true);
+    const next = { opaqueRef: "next-native-reference", nativeSessionId: "next-sdk-identity", generation: 2 };
+    store.bind(session.key, session.leaseId, next); store.observeBackgroundTaskBinding(session.key, session.leaseId, "workflow-two");
+    store.observeBackgroundTaskBinding(session.key, session.leaseId, "workflow-one", 100, false);
+    store.observeBackgroundTaskBinding(session.key, session.leaseId, "reused-id", 200, true);
+    expect(store.backgroundTaskBinding(session.key, "workflow-one")).toEqual(binding); expect(store.backgroundTaskBinding(session.key, "reused-id")).toEqual(next);
+    const other = store.claim({ ...owner, sessionId: "foreign-task", nativeSessionId: "foreign-alias" }, "foreign-process", "create");
+    store.bind(other.key, other.leaseId, next); store.observeBackgroundTaskBinding(other.key, other.leaseId, "foreign-workflow");
+    store.close(session.key, session.leaseId); database.close(); database = new OperationalStore(path); store = new HostedAgentStore(database);
+    expect(store.backgroundTaskBinding(session.key, "workflow-one")).toEqual(binding); expect(store.backgroundTaskBinding(session.key, "workflow-two")).toEqual(next);
+    expect(store.backgroundTaskBinding(other.key, "workflow-one")).toBeUndefined(); expect(store.backgroundTaskBinding(session.key, "foreign-workflow")).toBeUndefined();
+    const resumed = store.claim(owner, "replacement-process", "resume");
+    expect(() => store.observeBackgroundTaskBinding(session.key, "original-process", "late-task")).toThrow("changed");
+    store.beginPurge(session.key, resumed.leaseId); store.finishPurge(session.key, resumed.leaseId);
+    expect(store.backgroundTaskBinding(session.key, "workflow-one")).toBeUndefined(); expect(store.backgroundTaskBinding(other.key, "foreign-workflow")).toEqual(next);
+  } finally { database.close(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); rmSync(root, { recursive: true, force: true }); }
+});
+
 it("restores the exact native binding after SQLite restart and fences its previous process lease", () => {
   const root = mkdtempSync(join(tmpdir(), "joko-hosted-store-")), path = join(root, "operations.sqlite");
   let database = new OperationalStore(path);

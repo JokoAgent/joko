@@ -10,6 +10,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
   createClaudeCodeAdapter,
+  readClaudeWorkflowProgressFromProfile,
   CLAUDE_MANAGED_PROVIDER_SUPPORT,
   type ClaudeCodeCredentialPort
 } from "@joko/adapter-claude-code";
@@ -1865,6 +1866,8 @@ export async function createOrchestratorApplication(
       providerDisplayName: providerId => store.getBackend(claudeCodeBackendId).descriptor.providers?.find(provider => provider.providerId === providerId)?.displayName ?? providerId,
       capabilities: () => store.getBackend(claudeCodeBackendId).descriptor.capabilities, version: () => store.getBackend(claudeCodeBackendId).descriptor.version,
       models: () => nativeRemoteModels(claudeCodeBackendId),
+      readWorkflowProgress: (home, input) => readClaudeWorkflowProgressFromProfile(input, { configurationDirectory: join(home, "claude"),
+        projectDirectoryName: process.env["CLAUDE_CODE_PROJECT_DIR_NAME"], redactValues: [home], redactText: value => credentials.redactText(value) }),
       create: creation => createHostedAgentClaudeAdapter({ creation, backendId: claudeCodeBackendId, providers, credentialPort: claudeCodeCredentialPort,
         fetch: claudeCodeOAuthFetch, ...(config.claudeCodeExecutable === undefined ? {} : { pathToExecutable: config.claudeCodeExecutable }) })
     }] });

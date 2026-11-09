@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { BackendAdapter, BackendDescriptor, BlobRef, CapabilityManifest, ProviderModel, HostedExecution, NativeTextInferenceInput } from "@joko/core";
+import type { BackendAdapter, BackendDescriptor, BlobRef, CapabilityManifest, ProviderModel, HostedExecution, NativeTextInferenceInput, BackgroundWorkflowReadInput, BackgroundTaskOutputResult } from "@joko/core";
 import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
@@ -15,6 +15,7 @@ import { HOSTED_AGENT_WIRE_FORMAT } from "./hosted-agent-wire.js";
 import { purgeHostedAgentStorage } from "./hosted-agent-run.js";
 import type { HostedAgentNativeMcp } from "./hosted-agent-native-mcp.js";
 import { HostedAgentDerivations } from "./hosted-agent-derivations.js";
+import { HostedAgentWorkflowProgress } from "./hosted-agent-workflow-progress.js";
 
 export interface HostedAgentBackendFactory {
   readonly backendId: string;
@@ -28,6 +29,7 @@ export interface HostedAgentBackendFactory {
   /** Current enabled, authenticated models on the actual native Provider node. */
   readonly models: () => readonly ProviderModel[];
   readonly create: (input: HostedAgentBackendCreation) => BackendAdapter | Promise<BackendAdapter>;
+  readonly readWorkflowProgress?: (home: string, input: BackgroundWorkflowReadInput) => Promise<BackgroundTaskOutputResult>;
 }
 export interface HostedAgentBackendCreation {
   readonly home: string; readonly trust: "owner" | "guest"; readonly providerId: string;
@@ -92,7 +94,24 @@ export class HostedAgentRuntime {
         return factory.create({ ...creation, trust: record.owner.trust, providerId: route.providerId, providerIds: [route.providerId], modelIds: [route.modelId], assertModelAllowed,
           readBlob: async () => { throw new Error("Native cleanup has no input Blob authority."); } });
       } });
+    const workflow = new HostedAgentWorkflowProgress({ root: options.root, store: new HostedAgentStore(options.store),
+      authorize: (principal, command) => {
+        const factory = this.#factories.get(command.backendId), generation = options.store.getBackend(command.backendId).descriptor.instanceGeneration;
+        if (!factory?.readWorkflowProgress || principal.trust === "guest" && factory.isolatedGuests?.() !== true) throw new HostedAgentHostError("UNAVAILABLE");
+        const computer = this.settings.captureComputer(), provider = this.settings.captureProvider(command.backendId, command.providerId);
+        const assertCurrent = (): void => {
+          principal.assertCurrent(); computer(); provider();
+          if (options.store.getBackend(command.backendId).descriptor.instanceGeneration !== generation || this.#factories.get(command.backendId) !== factory) throw new HostedAgentHostError("UNAVAILABLE");
+          if (principal.trust === "guest") {
+            const grant = principal.providerGrant;
+            if (!grant || grant.backendId !== command.backendId || grant.providerId !== command.providerId) throw new HostedAgentHostError("ACCESS_DENIED");
+            grant.assertCurrent();
+          }
+        };
+        assertCurrent(); return { read: factory.readWorkflowProgress.bind(factory), assertCurrent };
+      } });
     this.host = new HostedAgentHost({ authorize: this.#authorize, infer: this.#infer, authorizeInference: this.#inferenceAccess,
+      readWorkflowProgress: (principal, command, signal) => workflow.read(principal, command, signal),
       manageDerivation: (principal, command) => derivations.manage(principal, command, AbortSignal.timeout(25_000)) });
   }
   connectOptions(): HostedAgentConnectOptions {
