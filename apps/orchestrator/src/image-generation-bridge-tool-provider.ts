@@ -21,6 +21,7 @@ const IMAGE_GENERATION_TOOL_NAME = "image_generate";
 const IMAGE_EDIT_TOOL_NAME = "image_edit";
 const OPENAI_IMAGES_GENERATION_ENDPOINT = "https://api.openai.com/v1/images/generations";
 const OPENAI_IMAGES_EDIT_ENDPOINT = "https://api.openai.com/v1/images/edits";
+const GEMINI_IMAGES_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
 const IMAGE_GENERATION_TIMEOUT_MS = 10 * 60_000;
 const IMAGE_RESULT_STAGING_MS = 10 * 60_000;
 const MAXIMUM_PROMPT_BYTES = 32 * 1024;
@@ -29,6 +30,11 @@ const REFERENCE_IMAGE_BYTE_LIMIT = 50_000_000;
 const MAXIMUM_REFERENCE_TOTAL_BYTES = 64 * 1024 * 1024;
 const ASPECT_RATIOS = ["1:1", "3:2", "2:3"] as const;
 const EXACT_IMAGE_QUALITIES = ["auto", "low", "medium", "high"] as const;
+const GEMINI_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
+const GEMINI_FLASH_ASPECT_RATIOS = [...GEMINI_ASPECT_RATIOS, "1:4", "4:1", "1:8", "8:1"] as const;
+const GEMINI_RESOLUTIONS = ["512", "1K", "2K", "4K"] as const;
+const GEMINI_FLASH_MODEL = "gemini/gemini-3.1-flash-image";
+const GEMINI_PRO_MODEL = "gemini/gemini-3-pro-image";
 
 type ImageAspectRatio = (typeof ASPECT_RATIOS)[number];
 type ImageQuality = (typeof EXACT_IMAGE_QUALITIES)[number];
@@ -39,6 +45,20 @@ interface ImageEditReference {
   readonly blob: BlobRef;
   readonly file: Blob;
   readonly extension: string;
+}
+
+interface ImageDispatchInput {
+  readonly executionApi: ConfiguredProviderCredentialSurface["surface"]["executionApi"];
+  readonly apiKey: string;
+  readonly model: string;
+  readonly prompt: string;
+  readonly size?: string;
+  readonly quality?: ImageQuality;
+  readonly aspectRatio?: string;
+  readonly resolution?: string;
+  readonly references?: readonly ImageEditReference[];
+  readonly signal?: AbortSignal;
+  readonly beforeDispatch: () => void;
 }
 
 type ImageProviderFetch = (input: RequestInfo | URL, init: RequestInit, beforeDispatch: () => void) => Promise<Response>;
@@ -109,7 +129,7 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     this.#refreshSnapshot();
     if (this.#routes.length === 0) return [];
     const tools = [describeImageTool(IMAGE_GENERATION_TOOL_NAME, this.#routes)];
-    const editRoutes = this.#routes.filter(isGptImage2Route);
+    const editRoutes = this.#routes.filter(route => isGptImage2Route(route) || isGeminiImageRoute(route));
     if (editRoutes.length > 0) tools.push(describeImageTool(IMAGE_EDIT_TOOL_NAME, editRoutes));
     return tools;
   }
@@ -134,14 +154,13 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       throw new Error("The image tool is unavailable in this runtime snapshot.");
     }
     const editing = name === IMAGE_EDIT_TOOL_NAME;
-    const routes = editing ? this.#routes.filter(isGptImage2Route) : this.#routes;
+    const routes = editing ? this.#routes.filter(route => isGptImage2Route(route) || isGeminiImageRoute(route)) : this.#routes;
     const multipleRoutes = routes.length > 1;
-    const allowed = ["prompt", "aspect_ratio", "size", "quality"];
+    const allowed = ["prompt", "aspect_ratio", "size", "quality", "resolution"];
     if (editing) allowed.push("image");
     if (multipleRoutes) allowed.push("model");
     assertOnlyKeys(arguments_, allowed);
     const prompt = requiredUtf8String(arguments_["prompt"], MAXIMUM_PROMPT_BYTES, "Image prompt is invalid.");
-    const aspectRatio = optionalAspectRatio(arguments_["aspect_ratio"]);
     const selectedModel = multipleRoutes ? requiredModel(arguments_["model"]) : undefined;
     const route = multipleRoutes
       ? routes.find((candidate) => candidate.modelId === selectedModel)
@@ -152,8 +171,16 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     if (!isGptImage2Route(route) && (arguments_["size"] !== undefined || arguments_["quality"] !== undefined)) {
       throw new Error("The selected image model does not support size and quality options.");
     }
-    const size = imageSize(arguments_["size"], aspectRatio);
+    const gemini = isGeminiImageRoute(route);
+    const openAiAspectRatio = gemini ? undefined : optionalAspectRatio(arguments_["aspect_ratio"]);
+    const aspectRatio = gemini ? optionalGeminiAspectRatio(arguments_["aspect_ratio"], route.modelId) : openAiAspectRatio;
+    if (!gemini && arguments_["resolution"] !== undefined) throw new Error("The selected image model does not support resolution.");
+    const resolution = gemini ? optionalGeminiResolution(arguments_["resolution"], route.modelId) : undefined;
+    const size = gemini ? undefined : imageSize(arguments_["size"], openAiAspectRatio);
     const quality = optionalImageQuality(arguments_["quality"]);
+    if (editing && gemini && Array.isArray(arguments_["image"]) && arguments_["image"].length > 14) {
+      throw new Error("Gemini image editing accepts at most 14 reference images.");
+    }
     const references = editing ? await this.#readEditReferences(arguments_["image"], context, signal) : undefined;
 
     let apiKey: string | undefined;
@@ -171,7 +198,9 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
           apiKey,
           model: route.modelId,
           prompt,
-          size,
+          ...(size === undefined ? {} : { size }),
+          ...(aspectRatio === undefined ? {} : { aspectRatio }),
+          ...(resolution === undefined ? {} : { resolution }),
           ...(quality === undefined ? {} : { quality }),
           ...(references === undefined ? {} : { references: references.images }),
           ...(signal === undefined ? {} : { signal }),
@@ -332,10 +361,10 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
   }
 
   #readSnapshot(): ImageGenerationSnapshot {
-    const owners = this.#credentialSurfaces.listConfigured({
-      capability: "image_generation",
-      executionApi: "openai-images"
-    });
+    const owners = [
+      ...this.#credentialSurfaces.listConfigured({ capability: "image_generation", executionApi: "openai-images" }),
+      ...this.#credentialSurfaces.listConfigured({ capability: "image_generation", executionApi: "gemini-images" })
+    ];
     if (owners.length > 64 || owners.some((owner) => owner.surface.models.length > 64)) {
       return { signature: "catalog-limit", routes: [] };
     }
@@ -343,7 +372,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       if (!boundedIdentifier(model.modelId, 256)
         || !boundedDisplayName(model.displayName, 512)
         || !this.#credentialSurfaces.modelEnabled(owner, model.modelId)) return [];
-      return [{ owner, modelId: model.modelId, displayName: model.displayName }];
+      const route = { owner, modelId: model.modelId, displayName: model.displayName };
+      return owner.surface.executionApi === "gemini-images" && !isGeminiImageRoute(route) ? [] : [route];
     }));
     const counts = new Map<string, number>();
     for (const candidate of candidates) {
@@ -365,38 +395,21 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
     return { signature, routes };
   }
 
-  async #dispatch(input: {
-    readonly executionApi: ConfiguredProviderCredentialSurface["surface"]["executionApi"];
-    readonly apiKey: string;
-    readonly model: string;
-    readonly prompt: string;
-    readonly size: string;
-    readonly quality?: ImageQuality;
-    readonly references?: readonly ImageEditReference[];
-    readonly signal?: AbortSignal;
-    readonly beforeDispatch: () => void;
-  }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
+  async #dispatch(input: ImageDispatchInput): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
     switch (input.executionApi) {
       case "openai-images":
         return await this.#dispatchOpenAiImages(input);
+      case "gemini-images":
+        return await this.#dispatchGeminiImages(input);
       default:
         throw new Error("Image generation execution protocol is unsupported.");
     }
   }
 
-  async #dispatchOpenAiImages(input: {
-    readonly apiKey: string;
-    readonly model: string;
-    readonly prompt: string;
-    readonly size: string;
-    readonly quality?: ImageQuality;
-    readonly references?: readonly ImageEditReference[];
-    readonly signal?: AbortSignal;
-    readonly beforeDispatch: () => void;
-  }): Promise<{ readonly bytes: Uint8Array; readonly mimeType: SupportedImageMime }> {
+  async #dispatchOpenAiImages(input: ImageDispatchInput) {
     const endpoint = input.references === undefined ? OPENAI_IMAGES_GENERATION_ENDPOINT : OPENAI_IMAGES_EDIT_ENDPOINT;
     const options = {
-      model: input.model, prompt: input.prompt, n: 1, size: input.size,
+      model: input.model, prompt: input.prompt, n: 1, size: input.size ?? "auto",
       ...(input.quality === undefined ? {} : { quality: input.quality })
     };
     let body: string | FormData;
@@ -407,6 +420,35 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       input.references.forEach(({ file, extension }, index) => form.append("image[]", file, `reference-${index + 1}${extension}`));
       body = form;
     }
+    return this.#requestImage(input, endpoint, {
+      authorization: `Bearer ${input.apiKey}`,
+      ...(typeof body === "string" ? { "content-type": "application/json" } : {})
+    }, body);
+  }
+
+  async #dispatchGeminiImages(input: ImageDispatchInput) {
+    const parts: Record<string, unknown>[] = [{ text: input.prompt }];
+    for (const reference of input.references ?? []) {
+      input.signal?.throwIfAborted();
+      const data = Buffer.from(await reference.file.arrayBuffer()).toString("base64");
+      parts.push({ inlineData: { mimeType: reference.file.type, data } });
+    }
+    const body = JSON.stringify({
+      contents: [{ parts }],
+      generationConfig: {
+        responseModalities: ["TEXT", "IMAGE"],
+        ...(input.aspectRatio === undefined && input.resolution === undefined ? {} : { imageConfig: {
+          ...(input.aspectRatio === undefined ? {} : { aspectRatio: input.aspectRatio }),
+          ...(input.resolution === undefined ? {} : { imageSize: input.resolution })
+        } })
+      }
+    });
+    if (Buffer.byteLength(body, "utf8") > 20_000_000) throw new Error("Gemini inline image input exceeds its request size limit.");
+    const endpoint = `${GEMINI_IMAGES_BASE}${encodeURIComponent(input.model.slice("gemini/".length))}:generateContent`;
+    return this.#requestImage(input, endpoint, { "x-goog-api-key": input.apiKey, "content-type": "application/json" }, body);
+  }
+
+  async #requestImage(input: ImageDispatchInput, endpoint: string, headers: Record<string, string>, body: string | FormData) {
     const requestSignal = boundedSignal(input.signal, IMAGE_GENERATION_TIMEOUT_MS);
     let response: Response;
     let dispatchGuardFailure: { readonly error: unknown } | undefined;
@@ -414,9 +456,8 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       response = await this.#fetch(endpoint, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${input.apiKey}`,
           accept: "application/json",
-          ...(typeof body === "string" ? { "content-type": "application/json" } : {})
+          ...headers
         },
         body,
         redirect: "error",
@@ -460,10 +501,13 @@ export class ImageGenerationBridgeToolProvider implements BridgeToolProvider {
       } catch {
         throw new Error("Image generation returned an invalid response.");
       }
-      const base64 = imageBase64(parsed);
-      const bytes = decodeCanonicalBase64(base64, this.#artifacts.maximumBlobBytes);
+      const encoded: { readonly base64: string; readonly mimeType?: string } = input.executionApi === "gemini-images"
+        ? geminiImageData(parsed) : { base64: imageBase64(parsed) };
+      const bytes = decodeCanonicalBase64(encoded.base64, this.#artifacts.maximumBlobBytes);
       const mimeType = sniffImageMime(bytes);
-      if (mimeType === undefined) throw new Error("Image generation returned an unsupported image format.");
+      if (mimeType === undefined || encoded.mimeType !== undefined && encoded.mimeType !== mimeType) {
+        throw new Error("Image generation returned an unsupported image format.");
+      }
       return { bytes, mimeType };
     } finally {
       requestSignal.dispose();
@@ -509,6 +553,7 @@ function describeImageTool(name: ImageToolName, routes: readonly ImageGeneration
   const editing = name === IMAGE_EDIT_TOOL_NAME;
   const multipleRoutes = routes.length > 1;
   const exactOptions = routes.some(isGptImage2Route);
+  const geminiOptions = routes.some(isGeminiImageRoute);
   return {
     serverId: IMAGE_GENERATION_BRIDGE_TOOL_PROVIDER_ID,
     name,
@@ -523,7 +568,7 @@ function describeImageTool(name: ImageToolName, routes: readonly ImageGeneration
           type: "string", minLength: 1,
           description: editing ? "A complete description of the image edits." : "A complete description of the image to generate."
         },
-        aspect_ratio: { type: "string", enum: [...ASPECT_RATIOS], description: "Optional output aspect ratio." },
+        aspect_ratio: { type: "string", enum: geminiOptions ? [...GEMINI_FLASH_ASPECT_RATIOS] : [...ASPECT_RATIOS], description: "Optional output aspect ratio supported by the selected model." },
         ...(editing ? { image: {
           type: "array", minItems: 1, maxItems: MAXIMUM_REFERENCE_IMAGES,
           items: { type: "string", minLength: 1, maxLength: 512 },
@@ -536,6 +581,10 @@ function describeImageTool(name: ImageToolName, routes: readonly ImageGeneration
           },
           quality: { type: "string", enum: [...EXACT_IMAGE_QUALITIES], description: "Optional GPT Image 2 quality." }
         } : {}),
+        ...(geminiOptions ? { resolution: {
+          type: "string", enum: [...GEMINI_RESOLUTIONS],
+          description: "Optional Gemini output resolution. Only Gemini 3.1 Flash Image supports 512."
+        } } : {}),
         ...(multipleRoutes ? {
           model: { type: "string", enum: routes.map(route => route.modelId), description: "The configured image model to use." }
         } : {})
@@ -587,6 +636,41 @@ function optionalAspectRatio(value: unknown): ImageAspectRatio | undefined {
 
 function isGptImage2Route(route: ImageGenerationRoute): boolean {
   return route.owner.surface.executionApi === "openai-images" && route.modelId === "gpt-image-2";
+}
+
+function isGeminiImageRoute(route: ImageGenerationRoute): boolean {
+  return route.owner.surface.executionApi === "gemini-images"
+    && (route.modelId === GEMINI_FLASH_MODEL || route.modelId === GEMINI_PRO_MODEL);
+}
+
+function optionalGeminiAspectRatio(value: unknown, model: string): string | undefined {
+  if (value === undefined) return undefined;
+  const ratios: readonly string[] = model === GEMINI_FLASH_MODEL ? GEMINI_FLASH_ASPECT_RATIOS : GEMINI_ASPECT_RATIOS;
+  if (typeof value !== "string" || !ratios.includes(value)) throw new Error("The selected Gemini image model does not support this aspect ratio.");
+  return value;
+}
+
+function optionalGeminiResolution(value: unknown, model: string): string | undefined {
+  if (value === undefined) return undefined;
+  const resolution = typeof value === "string" ? value.trim().toUpperCase() : "";
+  if (!(GEMINI_RESOLUTIONS as readonly string[]).includes(resolution) || resolution === "512" && model !== GEMINI_FLASH_MODEL) {
+    throw new Error("The selected Gemini image model does not support this resolution.");
+  }
+  return resolution;
+}
+
+function geminiImageData(value: unknown): { readonly base64: string; readonly mimeType?: string } {
+  if (!isRecord(value)) throw new Error("Gemini image response is invalid.");
+  if (isRecord(value["promptFeedback"]) && value["promptFeedback"]["blockReason"]) throw new ImageProviderRejection();
+  const candidate = Array.isArray(value["candidates"]) ? value["candidates"][0] : undefined;
+  const content = isRecord(candidate) && isRecord(candidate["content"]) ? candidate["content"] : undefined;
+  const parts: unknown[] = content !== undefined && Array.isArray(content["parts"]) ? content["parts"] : [];
+  const image = parts.find(part => isRecord(part) && part["thought"] !== true
+    && isRecord(part["inlineData"]) && typeof part["inlineData"]["data"] === "string");
+  if (!isRecord(image) || !isRecord(image["inlineData"])) throw new Error("Gemini image response contains no image.");
+  const data = image["inlineData"];
+  if (typeof data["data"] !== "string" || typeof data["mimeType"] !== "string") throw new Error("Gemini image data is invalid.");
+  return { base64: data["data"], mimeType: data["mimeType"] };
 }
 
 function imageSize(value: unknown, aspectRatio: ImageAspectRatio | undefined): string {

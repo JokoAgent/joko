@@ -506,7 +506,7 @@ export interface BackendProviderCredentialSurface {
   readonly capability: "image_generation";
   readonly kind: "api_key";
   /** Typed service-side execution protocol. Shared dispatch must never infer it from Provider identity. */
-  readonly executionApi: "openai-images";
+  readonly executionApi: "openai-images" | "gemini-images";
   readonly models: readonly {
     readonly modelId: string;
     readonly displayName: string;

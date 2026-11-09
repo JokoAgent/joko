@@ -3132,11 +3132,11 @@ describe("McpRouter", () => {
     }
   });
 
-  it("edits exact images through the native task tool and retires an undispatched edit when its input connection is revoked", async () => {
+  it.each(["openai-images", "gemini-images"] as const)("edits exact images through %s and retires an undispatched edit when its input connection is revoked", async executionApi => {
     const { root, store, router, credentials, artifacts } = await fixture();
-    const { modelId, setKey, credentialSurfaces } = configureImageTestRoute(store, credentials);
+    const { modelId, setKey, credentialSurfaces } = configureImageTestRoute(store, credentials, executionApi);
     const proxyEntered = deferred<void>(), releaseProxy = deferred<void>();
-    const requests: { readonly request: Request; readonly multipart: FormData }[] = [];
+    const requests: Request[] = [];
     let holdProxy = false;
     try {
       await setKey("synthetic-image-edit-key");
@@ -3144,9 +3144,10 @@ describe("McpRouter", () => {
         fetch: async (input, init, beforeDispatch) => {
           if (holdProxy) { proxyEntered.resolve(); await releaseProxy.promise; }
           beforeDispatch();
-          const request = new Request(input, init);
-          requests.push({ request, multipart: await request.formData() });
-          return Response.json({ data: [{ b64_json: AUDIO_ARTWORK_PNG }] });
+          requests.push(new Request(input, init));
+          return executionApi === "openai-images" ? Response.json({ data: [{ b64_json: AUDIO_ARTWORK_PNG }] })
+            : Response.json({ candidates: [{ content: { parts: [{ text: "Edited image" },
+              { inlineData: { mimeType: "image/png", data: AUDIO_ARTWORK_PNG } }] } }] });
         }
       });
       router.registerBridgeToolProvider(provider);
@@ -3178,7 +3179,8 @@ describe("McpRouter", () => {
       expect(store.claimNextQueueItem({ sessionId: scope.sessionId, backendInstanceGeneration: 0 })?.id).toBe(queueItemId);
 
       const edit = (image: readonly string[], requestId = randomUUID()) => {
-        const arguments_ = { image, prompt: "Replace the background", quality: "high" };
+        const arguments_ = { image, prompt: "Replace the background", ...(executionApi === "openai-images"
+          ? { quality: "high" } : { aspect_ratio: "1:8", resolution: "512" }) };
         const call = { ...scope, requestId, serverId: provider.id, toolName: "image_edit" };
         const nativeRootProof = granted.mcpBridge.captureRootCall!({ ...call, arguments: arguments_, assertCurrent: () => {},
           queueInput: { queueItemId, assertCurrent: () => {} } });
@@ -3198,15 +3200,29 @@ describe("McpRouter", () => {
       expect(result).toMatchObject({ isError: false, details: { mcpStructuredContent: { edited: true },
         jokoMcpBridge: { imageOutputs: [{ blob: { mimeType: "image/png" } }] } } });
       expect(requests).toHaveLength(1);
-      const { request, multipart } = requests[0]!;
-      expect(request.url).toBe("https://api.openai.com/v1/images/edits");
-      expect(request.headers.get("authorization")).toBe("Bearer synthetic-image-edit-key");
-      expect(multipart.get("model")).toBe(modelId);
-      expect(multipart.get("prompt")).toBe("Replace the background");
-      expect(multipart.get("quality")).toBe("high");
-      const images = multipart.getAll("image[]");
-      expect(images).toMatchObject([{ name: "reference-1.png", type: "image/png" }, { name: "reference-2.png", type: "image/png" }]);
-      expect(await Promise.all(images.map(async image => Buffer.from(await (image as Blob).arrayBuffer())))).toEqual([originalBytes, secondBytes]);
+      const request = requests[0]!;
+      if (executionApi === "openai-images") {
+        expect(request.url).toBe("https://api.openai.com/v1/images/edits");
+        expect(request.headers.get("authorization")).toBe("Bearer synthetic-image-edit-key");
+        expect(request.headers.has("x-goog-api-key")).toBe(false);
+        const multipart = await request.formData();
+        expect(multipart.get("model")).toBe(modelId);
+        expect(multipart.get("prompt")).toBe("Replace the background");
+        expect(multipart.get("quality")).toBe("high");
+        const images = multipart.getAll("image[]");
+        expect(images).toMatchObject([{ name: "reference-1.png", type: "image/png" }, { name: "reference-2.png", type: "image/png" }]);
+        expect(await Promise.all(images.map(async image => Buffer.from(await (image as Blob).arrayBuffer())))).toEqual([originalBytes, secondBytes]);
+      } else {
+        expect(request.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent");
+        expect(request.headers.get("x-goog-api-key")).toBe("synthetic-image-edit-key");
+        expect(request.headers.has("authorization")).toBe(false);
+        expect(await request.json()).toEqual({
+          contents: [{ parts: [{ text: "Replace the background" },
+            { inlineData: { mimeType: "image/png", data: originalBytes.toString("base64") } },
+            { inlineData: { mimeType: "image/png", data: secondBytes.toString("base64") } }] }],
+          generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "1:8", imageSize: "512" } }
+        });
+      }
       const [operation] = imageOperations();
       expect(operation).toMatchObject({ status: "completed", body: { referenceImages: [
         { id: source.id, sha256: source.sha256 }, { id: prior.id, sha256: prior.sha256 }
@@ -3227,6 +3243,58 @@ describe("McpRouter", () => {
       expect(imageOperations()).toHaveLength(1);
     } finally {
       releaseProxy.resolve();
+      await router.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("generates a Gemini image on its separate credential surface and rejects a blocked response without replay", async () => {
+    const { root, store, router, credentials, artifacts } = await fixture();
+    const { identity, modelId, setKey, credentialSurfaces } = configureImageTestRoute(store, credentials, "gemini-images");
+    const requests: Request[] = [];
+    let blocked = false;
+    try {
+      await setKey("synthetic-gemini-generation-key");
+      const provider = new ImageGenerationBridgeToolProvider({ store, artifacts, credentialSurfaces,
+        fetch: async (input, init, beforeDispatch) => {
+          beforeDispatch();
+          requests.push(new Request(input, init));
+          return Response.json(blocked ? { promptFeedback: { blockReason: "SAFETY" } }
+            : { candidates: [{ content: { parts: [{ thought: true, inlineData: { mimeType: "image/png", data: "private-thought-image" } },
+              { inlineData: { mimeType: "image/png", data: AUDIO_ARTWORK_PNG } }] } }] });
+        }
+      });
+      router.registerBridgeToolProvider(provider);
+      const granted = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", targetId: "target-1" });
+      const scope = bridgeScope(1);
+      const arguments_ = { prompt: "A test image", aspect_ratio: "16:9", resolution: "2k" };
+      const call = (requestId: string, argumentsOverride = arguments_) => router.executeBridgeCall({ ...scope, requestId,
+        generation: 1, authorization: `Bearer ${granted.mcpBridge.token}`, serverId: provider.id,
+        toolName: "image_generate", arguments: argumentsOverride });
+      expect(provider.listModels()).toEqual([{ id: modelId, name: "Gemini 3.1 Flash Image", providerId: identity.providerId }]);
+      await expect(call("invalid-resolution", { ...arguments_, resolution: "8K" })).resolves.toMatchObject({ isError: true });
+      expect(requests).toHaveLength(0);
+      const generated = await call("gemini-generation");
+      expect(generated).toMatchObject({ isError: false, details: { jokoMcpBridge: { imageOutputs: [{ blob: { mimeType: "image/png" } }] } } });
+      expect(requests[0]?.headers.get("x-goog-api-key")).toBe("synthetic-gemini-generation-key");
+      expect(await requests[0]!.json()).toEqual({
+        contents: [{ parts: [{ text: "A test image" }] }],
+        generationConfig: { responseModalities: ["TEXT", "IMAGE"], imageConfig: { aspectRatio: "16:9", imageSize: "2K" } }
+      });
+      await expect(call("gemini-generation")).resolves.toEqual(generated);
+      expect(requests).toHaveLength(1);
+      blocked = true;
+      const rejected = await call("gemini-blocked");
+      expect(rejected).toMatchObject({ isError: true, error: expect.stringContaining("rejected request") });
+      await expect(call("gemini-blocked")).resolves.toEqual(rejected);
+      expect(requests).toHaveLength(2);
+      store.transaction(transaction => writeBackendModelAccess(transaction, identity.backendId,
+        create(BackendModelAccessUpdateSchema, { providerId: identity.providerId, modelId, enabled: false })));
+      expect(provider.listModels()).toEqual([]);
+      await expect(call("disabled-gemini")).resolves.toMatchObject({ isError: true });
+      expect(requests).toHaveLength(2);
+    } finally {
       await router.dispose();
       store.close();
       await rm(root, { recursive: true, force: true });
@@ -3554,15 +3622,17 @@ function bridgeScope(generation: number) {
   return { requestId: randomUUID(), sessionId: `session-${generation}`, targetId: "target-1" } as const;
 }
 
-function configureImageTestRoute(store: OperationalStore, credentials: CredentialManager) {
-  const identity = { backendId: "codex", providerId: "openai", surfaceId: "image-generation" };
-  const modelId = "gpt-image-2";
-  store.upsertBackend({ ...store.getBackend("pi").descriptor, id: identity.backendId, adapterKind: "codex",
-    providers: [{ providerId: identity.providerId, displayName: "OpenAI", api: "openai-responses",
+function configureImageTestRoute(store: OperationalStore, credentials: CredentialManager, executionApi: "openai-images" | "gemini-images" = "openai-images") {
+  const gemini = executionApi === "gemini-images";
+  const identity = { backendId: gemini ? "pi" : "codex", providerId: gemini ? "gemini" : "openai", surfaceId: "image-generation" };
+  const modelId = gemini ? "gemini/gemini-3.1-flash-image" : "gpt-image-2";
+  const displayName = gemini ? "Gemini 3.1 Flash Image" : "GPT Image 2";
+  store.upsertBackend({ ...store.getBackend("pi").descriptor, id: identity.backendId, adapterKind: gemini ? "pi" : "codex",
+    providers: [{ providerId: identity.providerId, displayName: gemini ? "Google Gemini" : "OpenAI", api: gemini ? "google-generative-ai" : "openai-responses",
       authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false,
       supportsRefresh: false, supportsModelRefresh: false, credentialSurfaces: [{
-        surfaceId: identity.surfaceId, capability: "image_generation", kind: "api_key", executionApi: "openai-images",
-        models: [{ modelId, displayName: "GPT Image 2" }]
+        surfaceId: identity.surfaceId, capability: "image_generation", kind: "api_key", executionApi,
+        models: [{ modelId, displayName }]
       }] }] });
   const owner = resolveDeclaredProviderCredentialSurface(store, credentials, identity)!;
   return {

@@ -190,6 +190,15 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       installationState: InstallationState.INSTALLED
     });
     expect(pi?.version).toMatch(/^\d+\.\d+\.\d+(?:[-+].*)?$/u);
+    const gemini = (await paired.clients.backend.getProvider({ backendId: "pi", providerId: "gemini" })).provider;
+    expect(gemini).toMatchObject({
+      providerId: "gemini", displayName: "Google Gemini", supportsLogin: false,
+      credentialSurfaces: [{ surfaceId: "image-generation", configured: false }]
+    });
+    expect(gemini?.credentialSurfaces[0]?.models.map(model => model.modelId)).toEqual([
+      "gemini/gemini-3-pro-image", "gemini/gemini-3.1-flash-image"
+    ]);
+    expect(fixture.application.store.getBackend("pi").descriptor.models.some(model => model.providerId === "gemini")).toBe(false);
 
     const ownerScope = create(SnapshotScopeSchema, {
       kind: { case: "owner", value: create(OwnerSnapshotScopeSchema, {}) }

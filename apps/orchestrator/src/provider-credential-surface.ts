@@ -295,10 +295,11 @@ function validatedProviderCredentialSurface(value: unknown): BackendProviderCred
   if (!isRecord(value)) return undefined;
   const surfaceId = value["surfaceId"];
   const modelValues = value["models"];
+  const executionApi = value["executionApi"];
   if (!boundedIdentifier(surfaceId, 256)
     || value["capability"] !== "image_generation"
     || value["kind"] !== "api_key"
-    || value["executionApi"] !== "openai-images"
+    || (executionApi !== "openai-images" && executionApi !== "gemini-images")
     || !Array.isArray(modelValues)
     || modelValues.length === 0
     || modelValues.length > 64) return undefined;
@@ -318,7 +319,7 @@ function validatedProviderCredentialSurface(value: unknown): BackendProviderCred
     surfaceId,
     capability: "image_generation",
     kind: "api_key",
-    executionApi: "openai-images",
+    executionApi,
     models
   };
 }

@@ -936,6 +936,18 @@ export class PiBackendAdapter implements
           "model_input_modalities", "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode"]
       },
       models: mergeProviderModels(catalog.models, this.#options.nativeModels ?? []),
+      providers: [{
+        providerId: "gemini", displayName: "Google Gemini", accessKind: "apiKey", api: "google-generative-ai",
+        authenticationState: "signed_out", loginMethods: [], supportsLogin: false, supportsLogout: false,
+        supportsRefresh: false, supportsModelRefresh: false, providesModelPricing: false,
+        credentialSurfaces: [{
+          surfaceId: "image-generation", capability: "image_generation", kind: "api_key", executionApi: "gemini-images",
+          models: [
+            { modelId: "gemini/gemini-3-pro-image", displayName: "Gemini 3 Pro Image" },
+            { modelId: "gemini/gemini-3.1-flash-image", displayName: "Gemini 3.1 Flash Image" }
+          ]
+        }]
+      }],
       tools: [...tools, ASK_USER_QUESTION_TOOL, ...MANAGED_SUBAGENT_TOOL_DESCRIPTORS],
       diagnostics
     };
