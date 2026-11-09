@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
   SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
-  TargetState, CapabilitySupport, capabilityNames } from "@joko/contracts";
+  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, TargetSchema, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -324,9 +324,10 @@ async function option(label: string): Promise<void> {
 
 it("restores the Worktree branch in the actual new-task form, submits it and clears it when another project is selected", async () => {
   state = { ...state, owner: create(SnapshotSchema, { ...state.owner!,
-    backends: [{ backendId: "backend", capabilities: { capabilities: [{ name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }] } }],
-    targets: [...state.owner!.targets.map(target => ({ ...target, state: TargetState.ACTIVE })),
-      { targetId: "project-other", backendId: "backend", displayName: "Another project", state: TargetState.ACTIVE }] }) };
+    backends: [create(BackendDescriptorSchema, { backendId: "backend", capabilities: { capabilities: [create(CapabilitySchema,
+      { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED })] } })],
+    targets: [...state.owner!.targets.map(target => create(TargetSchema, { ...target, state: TargetState.ACTIVE })),
+      create(TargetSchema, { targetId: "project-other", backendId: "backend", displayName: "Another project", state: TargetState.ACTIVE })] }) };
   newTaskDrafts.save({ profileId: "profile" }, { targetId: "project", name: "Review",
     input: plainTextMobileComposerDraft("Inspect this branch") });
   await newTaskDrafts.flush({ profileId: "profile" });

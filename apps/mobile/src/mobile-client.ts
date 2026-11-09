@@ -68,7 +68,7 @@ import {
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
-  FileKind, ImageRefSchema, ResourceKind, RuntimeCommandInputMode, WorkspaceFileChangeKind,
+  FileKind, ImageRefSchema, ResourceKind, RuntimeCommandInputMode, WorkspaceFileChangeKind, WorkspaceKind,
   type Artifact, type BackendDescriptor, type BlobRef, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target, type TaskTagDeletePreview,
   type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceSearchMatch
