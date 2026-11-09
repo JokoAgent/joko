@@ -33,8 +33,8 @@ function button(label: string): HTMLButtonElement {
   const result = [...document.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === label);
   if (!result) throw new Error(`Missing button: ${label}`); return result;
 }
-function control<T extends HTMLElement>(label: string, selector: string): T {
-  const owner = [...document.querySelectorAll("label")].find((item) => item.querySelector("span")?.textContent === label);
+function control<T extends HTMLElement>(label: string, selector: string, scope: ParentNode = document): T {
+  const owner = [...scope.querySelectorAll("label")].find((item) => item.querySelector("span")?.textContent === label);
   const result = owner?.querySelector<T>(selector); if (!result) throw new Error(`Missing field: ${label}`); return result;
 }
 async function fill(input: HTMLInputElement, value: string): Promise<void> {
@@ -54,7 +54,7 @@ describe("Provider runtime editor", () => {
     const { saveProvider } = await render(configuration);
     await act(async () => button("Save").click());
     expect(saveProvider.mock.calls[0]?.[0]).toMatchObject({ runtimes: [{ models: [{ inheritedFields }] }, { models: [{ inheritedFields }] }] });
-    await fill(control<HTMLInputElement>("Display name", "input"), "Owner model label");
+    await fill(control<HTMLInputElement>("Display name", "input", document.querySelector(".provider-model-card")!), "Owner model label");
     await act(async () => button("Save").click());
     expect(saveProvider.mock.calls[1]?.[0]).toMatchObject({ runtimes: [{ models: [{ name: "Owner model label",
       inheritedFields: inheritedFields.filter(field => field !== "name") }] }, { models: [{ inheritedFields }] }] });
