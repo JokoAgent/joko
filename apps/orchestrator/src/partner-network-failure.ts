@@ -24,7 +24,7 @@ export function partnerNetworkRuntimeFailureCode(error: unknown): PartnerNetwork
   if (reason === "upstream-overload" || data?.["code"] === "UPSTREAM_OVERLOAD" || tag === "serverOverloaded" || status === 529
     || /\bat capacity\b|\boverloaded_error\b|\b529\b/iu.test(text)) return "UPSTREAM_OVERLOADED";
   if (status === 402 || exhaustion.some(pattern => pattern.test(text))
-    || /\b(?:QUOTA_EXCEEDED|USAGE_LIMIT_EXCEEDED|INSUFFICIENT_BALANCE|insufficient_quota|billing_error|provider_quota_limit|usageLimitExceeded|sessionBudgetExceeded)\b/iu.test(text)) return "QUOTA_EXCEEDED";
+    || /\b(?:QUOTA_EXCEEDED|SESSION_BUDGET_EXCEEDED|USAGE_LIMIT_EXCEEDED|INSUFFICIENT_BALANCE|insufficient_quota|billing_error|provider_quota_limit|usageLimitExceeded|sessionBudgetExceeded)\b/iu.test(text)) return "QUOTA_EXCEEDED";
   if (/\b(?:RATE_LIMITED|RATE_LIMIT_EXCEEDED|rate_limit_error|rate_limit|provider_rate_limit)\b|(?:^|_)RATE_LIMITED\b|rate limit(?:ed|ing)?|too many requests/imu.test(text)) return "RATE_LIMITED";
   if (data?.["usageLimit"] === true) return "QUOTA_EXCEEDED";
   if (status === 429) return "RATE_LIMITED";

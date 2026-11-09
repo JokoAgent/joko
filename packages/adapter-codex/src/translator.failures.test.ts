@@ -6,7 +6,7 @@ const privateData = { message: "Authorization: Bearer sk-private-value C:\\priva
   additionalDetails: "private upstream response body", response: { token: "private-token", path: "/private/account" } };
 const failures: readonly [string, JsonValue, string][] = [
   ["usage exhaustion", "usageLimitExceeded", "QUOTA_EXCEEDED"],
-  ["session budget", "sessionBudgetExceeded", "QUOTA_EXCEEDED"],
+  ["session budget", "sessionBudgetExceeded", "SESSION_BUDGET_EXCEEDED"],
   ["authentication", "unauthorized", "AUTH_REQUIRED"],
   ["upstream overload", "serverOverloaded", "UPSTREAM_OVERLOADED"],
   ["invalid request", "badRequest", "INVALID_REQUEST"],
@@ -19,7 +19,7 @@ const failures: readonly [string, JsonValue, string][] = [
   ["stream disconnected", { responseStreamDisconnected: {} }, "NETWORK_ERROR"],
   ["unauthorized connection", { httpConnectionFailed: { httpStatusCode: 401 } }, "AUTH_REQUIRED"],
   ["forbidden stream", { responseStreamConnectionFailed: { httpStatusCode: 403 } }, "AUTH_REQUIRED"],
-  ["billing connection", { responseStreamDisconnected: { httpStatusCode: 402 } }, "QUOTA_EXCEEDED"],
+  ["billing connection", { responseStreamDisconnected: { httpStatusCode: 402 } }, "BILLING_ERROR"],
   ["temporary limit", { responseTooManyFailedAttempts: { httpStatusCode: 429 } }, "RATE_LIMITED"],
   ["limited connection", { httpConnectionFailed: { httpStatusCode: 429 } }, "RATE_LIMITED"],
   ["overloaded stream", { responseStreamConnectionFailed: { httpStatusCode: 529 } }, "UPSTREAM_OVERLOADED"]
