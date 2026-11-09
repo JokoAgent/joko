@@ -733,7 +733,7 @@ describe("mounted Partner collaboration product chain", () => {
       ]);
     } catch (cause) {
       const run = fixture.application.store.findRun(cancellable.runId)?.descriptor;
-      const queue = run === undefined ? undefined : fixture.application.store.findQueueItemByRunId(run.sessionId, run.id);
+      const queue = run?.sessionId === undefined ? undefined : fixture.application.store.findQueueItemByRunId(run.sessionId, run.id);
       throw new Error(`The inline delegation cancellation did not settle: ${JSON.stringify({
         clicked: cancellationClicked, pointer: await pointerReceipt.evaluate(receipt => receipt.events).catch(() => []),
         requests: cancellationRequests, failures: cancellationFailures,
