@@ -587,9 +587,32 @@ describe("packaged Desktop Pi compaction", () => {
     const secondReply = page.locator(`[data-timeline-session-id='${sessionId}'] .message-assistant__body`)
       .getByText(secondTurnReply, { exact: true });
     const replyDeadline = Date.now() + 30_000;
-    await waitFor(() => secondReply.count(), count => count === 1,
-      "one completed second-turn reply in the current task", 30_000);
-    await secondReply.waitFor({ state: "visible", timeout: Math.max(1, replyDeadline - Date.now()) });
+    try {
+      await waitFor(() => secondReply.count(), count => count === 1,
+        "one completed second-turn reply in the current task", 30_000);
+      await secondReply.waitFor({ state: "visible", timeout: Math.max(1, replyDeadline - Date.now()) });
+    } catch (cause) {
+      const rendered = await secondReply.evaluateAll(elements => elements.slice(0, 8).map(element => {
+        const message = element.closest(".message-assistant");
+        const row = element.closest("[data-timeline-item-id]");
+        const owner = element.closest("[data-timeline-session-id]");
+        const style = getComputedStyle(element), bounds = element.getBoundingClientRect();
+        return { messageId: message?.getAttribute("data-message-client-id"), sourceEventId: message?.getAttribute("data-selection-quote-source-event-id"),
+          rowId: row?.getAttribute("data-timeline-item-id"), rowIds: row?.getAttribute("data-timeline-item-ids"),
+          timelineSessionId: owner?.getAttribute("data-timeline-session-id"), ownerParentClass: owner?.parentElement?.className,
+          connected: element.isConnected, textLength: element.textContent?.length, display: style.display, visibility: style.visibility,
+          opacity: style.opacity, width: bounds.width, height: bounds.height,
+          streaming: message?.querySelector(".streaming-cursor") != null };
+      })).catch(() => [{ unavailable: true }]);
+      const history = await managedClients.session.listSessionTimeline({ sessionId, limit: 80 }, { timeoutMs: 3_000 })
+        .then(response => response.events.filter(event => event.payload?.kind.case === "messageCompleted"
+          && event.payload.kind.value.role === MessageRole.ASSISTANT).slice(-12).map(event => ({
+          eventId: event.eventId, runId: event.identity?.runId, generation: event.identity?.generation?.toString()
+        }))).catch(() => [{ unavailable: true }]);
+      console.error("Managed packaged Pi: original second-turn reply observations.", JSON.stringify({ sessionId, rendered, history,
+        providerRequests: requests.length, summaryRequests: requests.filter(request => JSON.stringify(request.body).includes("You are a context summarization assistant")).length }));
+      throw cause;
+    }
     secondTurn = false;
 
     await page.evaluate(() => { window.location.hash = "/tasks/new?dialogue=pi"; });
