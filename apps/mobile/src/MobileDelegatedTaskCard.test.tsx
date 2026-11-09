@@ -105,7 +105,7 @@ describe("native delegated inline card", () => {
     expect(host.querySelector('button[aria-label="Expand Investigate"]')).not.toBeNull(); expect(host.textContent).not.toContain("Current text");
   });
   it("opens persisted workflow progress for a completed task and retains all structured facts", async () => {
-    const client = fixture(), task = create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session", displayName: "Review", state: BackgroundTaskState.COMPLETED });
+    const client = fixture(), task = create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session", displayName: "Review", state: BackgroundTaskState.SUCCEEDED });
     client.loadTaskBackgroundOutput = vi.fn(async () => create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background",
       state: BackgroundTaskOutputState.AVAILABLE, capturedAtMs: BigInt(Date.now()), workflow: { runId: "workflow-run", status: "done", workflowName: "Investigation",
         totalTokens: 0n, totalToolCalls: 4n, durationMs: 3_200n, phases: [{ index: 1, title: "Inspect", detail: "Durable evidence" }],
