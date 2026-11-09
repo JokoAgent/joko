@@ -32,7 +32,7 @@ async function fixture(options: { readonly backendId?: string; readonly origin?:
   database.createConnection({ id: "owner", name: "Owner", authKeyDigest: hash("private-owner-key") });
   let sharing!: ProviderSharingHost, captured: AdapterContext | undefined, created = 0, disposed = 0, cleanupUnknown = false;
   let beforeCreate: (() => Promise<void>) | undefined;
-  const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions", contextWindow: 32768,
+  const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions", contextWindow: 32768, contextWindowMax: 262144,
     maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
   const backendId = options.backendId ?? "native";
   database.upsertBackend({ id: backendId, adapterKind: "native-test", instanceGeneration: 1, displayName: "Provider host",
@@ -92,6 +92,19 @@ async function fixture(options: { readonly backendId?: string; readonly origin?:
     restart: async () => { await home.close(); home = new ProviderSharingHome({ directory: homeDirectory, serverId: "recipient-home", vault, connect }); await home.initialize(); },
     close: async () => { await home.close(); sharing.close(); await native.close(); database.close(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe fixture cleanup."); await rm(root, { recursive: true, force: true }); } };
 }
+
+it("retains separate working and maximum capacities through the original shared catalog and recipient restart", async () => {
+  const f = await fixture();
+  try {
+    const intent = await f.apply(f.issue().link);
+    await f.approve(intent.request!.requestId);
+    expect(f.home().received()[0]!.models[0]).toMatchObject({ modelId: "model", contextWindow: 32768, contextWindowMax: 262144 });
+    await f.restart();
+    expect(f.home().received()[0]!.models[0]).toMatchObject({ modelId: "model", contextWindow: 32768, contextWindowMax: 262144 });
+    await f.home().refresh(f.authority);
+    expect(f.home().received()[0]!.models[0]).toMatchObject({ modelId: "model", contextWindow: 32768, contextWindowMax: 262144 });
+  } finally { await f.close(); }
+});
 
 it("intersects Provider and member selections at catalogs, native dispatch and revoked existing runs", async () => {
   const f = await fixture(); try {

@@ -59,6 +59,14 @@ export function emptyProviderModel(backend: BackendView): ProviderModelConfigura
     thinkingLevels: [], supportsFastMode: false };
 }
 
+export function updateProviderModelMetadata(model: ProviderModelConfigurationView, patch: Partial<ProviderModelConfigurationView>): ProviderModelConfigurationView {
+  const changedIdentity = patch.modelId !== undefined && patch.modelId !== model.modelId;
+  return { ...model, ...patch,
+    ...(model.inheritedFields === undefined ? {} : { inheritedFields: changedIdentity ? []
+      : model.inheritedFields.filter(field => !Object.hasOwn(patch, field)) }),
+    ...(changedIdentity ? { contextWindowMaxTokens: undefined } : {}) };
+}
+
 export function providerCompatibilityLabel(compatibility: ProviderCompatibilityView): string {
   switch (compatibility) {
     case "openaiResponses": return "OpenAI Responses";
@@ -76,8 +84,8 @@ function transferModels(source: ProviderRuntimeConfigurationView, target: Provid
   const allowed = (field: ProviderConfigurationFieldView): boolean => supportsProviderField(sourceBackend, field) && supportsProviderField(targetBackend, field);
   return source.models.filter((model) => model.modelId.trim() && model.name.trim()).map((model) => {
     const retained = target.models.find((candidate) => candidate.modelId === model.modelId) ?? emptyProviderModel(targetBackend);
-    return {
-      ...retained, modelId: model.modelId, name: model.name,
+    return updateProviderModelMetadata(retained, {
+      modelId: model.modelId, name: model.name,
       ...(allowed("modelLimits") ? { contextWindowTokens: model.contextWindowTokens, maximumOutputTokens: model.maximumOutputTokens } : {}),
       ...(allowed("modelCosts") ? { inputCostMicrosPerMillion: model.inputCostMicrosPerMillion, outputCostMicrosPerMillion: model.outputCostMicrosPerMillion,
         cacheReadCostMicrosPerMillion: model.cacheReadCostMicrosPerMillion, cacheWriteCostMicrosPerMillion: model.cacheWriteCostMicrosPerMillion } : {}),
@@ -87,7 +95,7 @@ function transferModels(source: ProviderRuntimeConfigurationView, target: Provid
       ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
       ...(allowed("modelSampling") ? { sampling: model.sampling } : {}),
       ...(allowed("modelCompatibility") ? { compatibility: model.compatibility, compatibilityOptions: model.compatibilityOptions } : {})
-    };
+    });
   });
 }
 

@@ -52,6 +52,15 @@ const identity = {
 };
 
 describe("mobile runtime controls", () => {
+  it("retains the exact route's capacity without replacing its estimated working window", () => {
+    const reported = create(ModelDescriptorSchema, { ...model("alpha", "a", "Alpha Model"), contextWindowTokens: 128_000n,
+      contextWindowMaxTokens: 1_000_000n, contextWindowSource: "estimated" });
+    const { owner, detail } = snapshots({ models: [reported] });
+    const controls = resolveMobileRuntimeControls(identity, owner, detail, "session");
+    expect(controls?.models[0]).toMatchObject({ providerId: "alpha", modelId: "a", contextWindowTokens: 128_000n,
+      contextWindowMaxTokens: 1_000_000n, contextWindowSource: "estimated" });
+  });
+
   it("keeps native Ultrafast readback distinct and rejects it when that exact capability is withdrawn", () => {
     const current = create(ModelDescriptorSchema, { ...model("alpha", "a", "Alpha Model", { fast: true }), supportsUltrafastMode: true });
     const { owner, detail } = snapshots({ models: [current] });

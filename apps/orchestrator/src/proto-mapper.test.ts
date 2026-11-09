@@ -140,13 +140,13 @@ describe("proto mapper", () => {
   });
   it("preserves declared model metadata presence, exact effort defaults and estimated capacities", () => {
     const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-responses", contextWindow: 128000,
-      maxOutputTokens: 16000, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", supportsImages: true, supportsFastMode: true,
+      maxOutputTokens: 16000, contextWindowMax: 1_000_000, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", supportsImages: true, supportsFastMode: true,
       thinkingLevels: ["low", "high"], defaultEffort: "high", displayThinkingLevels: ["medium"], description: "Native description",
       declaredSupportsImages: false, declaredSupportsFastMode: false, declaredInputModalities: [], referenceApi: "anthropic-messages",
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     const value = toProtoModelDescriptor("backend", model);
     expect(value).toMatchObject({ description: "Native description", defaultEffort: "high", declaredSupportsImages: false, declaredSupportsFastMode: false,
-      contextWindowSource: "estimated", maxOutputTokensSource: "estimated", api: "openai-responses", referenceApi: "anthropic-messages", protocolMode: "compatibility" });
+      contextWindowSource: "estimated", contextWindowTokens: 128000n, contextWindowMaxTokens: 1_000_000n, maxOutputTokensSource: "estimated", api: "openai-responses", referenceApi: "anthropic-messages", protocolMode: "compatibility" });
     expect(value.declaredModalities?.input?.values).toEqual([]); expect(value.declaredModalities?.output).toBeUndefined();
     expect(value.effortLevels.map(level => level.defaultLevel)).toEqual([false, true]);
     const unknown = toProtoModelDescriptor("backend", { ...model, defaultEffort: undefined, declaredInputModalities: undefined, declaredSupportsImages: undefined, declaredSupportsFastMode: undefined, referenceApi: undefined });

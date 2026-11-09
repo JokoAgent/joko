@@ -521,6 +521,7 @@ function fromModel(model: contract.ModelDescriptor): ProviderModel {
     ...(model.referenceApi === undefined ? {} : { referenceApi: model.referenceApi }),
     ...(["matching", "compatibility", "unknown"].includes(model.protocolMode ?? "") ? { protocolMode: model.protocolMode as ProviderModel["protocolMode"] } : {}),
     ...(["declared", "estimated"].includes(model.contextWindowSource ?? "") ? { contextWindowSource: model.contextWindowSource as "declared" | "estimated" } : {}),
+    ...(model.contextWindowMaxTokens === undefined ? {} : { contextWindowMax: number(model.contextWindowMaxTokens) }),
     ...(["declared", "estimated"].includes(model.maxOutputTokensSource ?? "") ? { maxOutputTokensSource: model.maxOutputTokensSource as "declared" | "estimated" } : {}),
     ...(model.priceSource === contract.ModelPriceSource.UNSPECIFIED ? {} : { pricing: {
       source: model.priceSource === contract.ModelPriceSource.PROVIDER_REFERENCE ? "providerReference" as const : "upstream" as const,

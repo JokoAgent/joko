@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { OperationalStore } from "@joko/store";
+import { provisionManagedCatalog } from "@joko/adapter-pi";
 import { describe, expect, it, vi } from "vitest";
 
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
@@ -519,13 +520,15 @@ describe("ProviderCatalogManager", () => {
     await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toEqual({
       providerId: "discoverable",
       addedModelIds: ["new-model"],
+      updatedModelIds: ["kept"],
       modelCount: 2
     });
     expect(providers.get("pi", "discoverable")).toMatchObject({ supportsModelRefresh: true });
-    expect(providers.get("pi", "discoverable").provider.models).toEqual([
-      { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000, defaultVisible: false },
+    expect(providers.get("pi", "discoverable").provider.models).toMatchObject([
       { id: "new-model", name: "New model", contextWindow: 1_000_000, maxTokens: 16_384, defaultVisible: true,
-        contextWindowSource: "declared", maxOutputTokensSource: "estimated" }
+        contextWindowSource: "declared", maxOutputTokensSource: "estimated", metadataOverrides: [] },
+      { id: "kept", name: "Kept", contextWindow: 32_000, maxTokens: 4_000, defaultVisible: false,
+        metadataOverrides: ["name", "contextWindow", "maxTokens"], discoveredMetadata: { name: "Renamed upstream" } }
     ]);
     await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toMatchObject({
       addedModelIds: [],
@@ -550,20 +553,123 @@ describe("ProviderCatalogManager", () => {
     ] }))) as typeof fetch);
     try {
       await refresh();
-      const kept = providers.get("pi", "local").provider.models[0];
-      expect(kept).toEqual({ id: "kept", contextWindow: 32_000, maxTokens: 4_000, input: ["text"], supportsFastMode: false });
+      const kept = providers.get("pi", "local").provider.models.find(model => model.id === "kept");
+      expect(kept).toMatchObject({ id: "kept", contextWindow: 32_000, maxTokens: 4_000, input: ["text"], supportsFastMode: false,
+        discoveredMetadata: { contextWindow: 128_000, supportsImages: true }, metadataOverrides: ["contextWindow", "maxTokens", "input", "supportsFastMode"] });
       const restored = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); restored.initialize();
-      expect(restored.get("pi", "local").provider.models[1]).toMatchObject({ id: "new", contextWindow: 64_000, contextWindowSource: "estimated",
+      expect(restored.get("pi", "local").provider.models.find(model => model.id === "new")).toMatchObject({ id: "new", contextWindow: 64_000, contextWindowMax: 64_000, contextWindowSource: "estimated",
         maxTokens: 8_000, maxOutputTokensSource: "declared", reasoning: true, defaultEffort: "max", input: ["text", "image"],
         supportsTools: true, referenceApi: "anthropic-messages", supportsFastMode: false, defaultVisible: false });
       const snapshot = await restored.createPiGenerationSnapshot({ snapshotsRoot: join(root, "snapshots") });
       const native = JSON.parse(await readFile(join(snapshot.agentHome, "models.json"), "utf8")).providers.local;
       expect(native.api).toBe("openai-completions");
-      expect(native.models[1]).toMatchObject({ id: "new", contextWindow: 64_000, maxTokens: 8_000,
+      const nativeNew = native.models.find((model: { id: string }) => model.id === "new");
+      expect(nativeNew).toMatchObject({ id: "new", contextWindow: 64_000, maxTokens: 8_000,
         input: ["text", "image"], thinkingLevelMap: { off: null, low: null, high: "high", max: "max" } });
-      for (const key of ["referenceApi", "defaultEffort", "contextWindowSource", "maxOutputTokensSource", "supportsFastMode", "supportsTools", "defaultVisible"]) expect(native.models[1]).not.toHaveProperty(key);
-      await refresh(); expect(providers.get("pi", "local").provider.models[0]).toEqual(kept);
+      for (const key of ["referenceApi", "defaultEffort", "contextWindowSource", "maxOutputTokensSource", "supportsFastMode", "supportsTools", "defaultVisible", "discoveredMetadata", "metadataOverrides", "contextWindowMax", "declaredInputModalities"]) expect(nativeNew).not.toHaveProperty(key);
+      await refresh(); expect(providers.get("pi", "local").provider.models.find(model => model.id === "kept")).toEqual(kept);
     } finally { store.close(); }
+  });
+
+  it("refreshes known discovery facts through owner edits, sparse denials, restart and the native catalog", async () => {
+    const { root, store, credentials } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
+    await providers.upsert({ backendId: "pi", credentialOrigin: "", displayName: "Local", enabled: true,
+      kind: "local_keyless", credentialBindings: {}, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+      provider: { id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "manual", name: "Owner model", contextWindow: 32_000, maxTokens: 4_000, input: ["text"],
+          reasoning: false, supportsFastMode: false, supportsTools: false }] } });
+    const refresh = (data: unknown[]) => providers.discoverProviderModels("pi", "local", (async () => Response.json({ data })) as typeof fetch);
+    const first = [
+      { id: "same", name: "Upstream", context_window: 128_000, max_context_window: 256_000, max_output_tokens: 8_000,
+        input_modalities: ["text", "image"], supports_image_input: true, architecture: { output_modalities: ["text"] },
+        reasoning: { supportedEfforts: ["high"], defaultEffort: "high" }, supports_fast_mode: true },
+      { id: "wide", context_window: 128_000, max_context_window: 1_000_000 },
+      { id: "small", max_context_window: 16_000 },
+      { id: "manual", name: "Upstream manual", context_window: 256_000, max_output_tokens: 32_000, input_modalities: ["text", "image"],
+        reasoning: { supportedEfforts: ["high"] }, supports_fast_mode: true, capabilities: { trained_for_tool_use: true } }
+    ];
+    try {
+      expect(await refresh(first)).toMatchObject({ addedModelIds: ["same", "wide", "small"], updatedModelIds: ["manual"] });
+      const initial = providers.get("pi", "local");
+      expect(initial.provider.models.map(model => model.id)).toEqual(["same", "wide", "small", "manual"]);
+      expect(initial.provider.models[0]).toMatchObject({ contextWindow: 128_000, contextWindowMax: 256_000, contextWindowSource: "declared", input: ["text", "image"], defaultEffort: "high" });
+      expect(initial.provider.models[1]).toMatchObject({ contextWindow: 128_000, contextWindowMax: 1_000_000 });
+      expect(initial.provider.models[2]).toMatchObject({ contextWindow: 16_000, contextWindowMax: 16_000, contextWindowSource: "estimated" });
+      expect(initial.provider.models[3]).toMatchObject({ name: "Owner model", contextWindow: 32_000, maxTokens: 4_000,
+        input: ["text"], reasoning: false, supportsFastMode: false, supportsTools: false });
+      await providers.upsertConfiguration({ providerId: "local", displayName: "Local renamed", kind: "local_keyless", enabled: true,
+        expectedVersion: initial.version, runtimes: [{ backendId: "pi", credentialOrigin: "", credentialBindings: {},
+          provider: { ...initial.provider, models: initial.provider.models.map(model => model.id !== "same" ? model : {
+            id: model.id, name: "Owner label", contextWindow: 128_000, maxTokens: 8_000, input: ["text", "image"],
+            reasoning: true, supportsFastMode: true, metadataOverrides: ["name"]
+          }) } }] });
+      const sparse = [{ id: "same", name: "New upstream label", context_window: 256_000, supports_image_input: false,
+        reasoning: { supportedEfforts: [], defaultEffort: null }, architecture: { output_modalities: [] },
+        supports_fast_mode: false, capabilities: { trained_for_tool_use: false } }];
+      expect(await refresh(sparse)).toEqual({ providerId: "local", addedModelIds: [], updatedModelIds: ["same"], modelCount: 4 });
+      const current = providers.get("pi", "local");
+      expect(current.provider.models[0]).toMatchObject({ name: "Owner label", contextWindow: 256_000, contextWindowMax: 256_000,
+        maxTokens: 8_000, input: ["text"], reasoning: false, declaredOutputModalities: [], supportsTools: false, supportsFastMode: false,
+        metadataOverrides: ["name"], discoveredMetadata: { inputModalities: ["text"], efforts: [], defaultEffort: null, outputModalities: [] } });
+      expect(current.provider.models[0]).not.toHaveProperty("defaultEffort");
+      const before = current.version;
+      expect(await refresh(sparse)).toMatchObject({ addedModelIds: [], updatedModelIds: [] });
+      expect(providers.get("pi", "local").version).toBe(before);
+      const restored = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); restored.initialize();
+      expect(restored.get("pi", "local").provider.models).toEqual(current.provider.models);
+      const generation = await restored.createPiGenerationSnapshot({ snapshotsRoot: join(root, "snapshots") });
+      const native = JSON.parse(await readFile(join(generation.agentHome, "models.json"), "utf8")).providers.local.models;
+      expect(native[0]).toMatchObject({ id: "same", name: "Owner label", contextWindow: 256_000, input: ["text"], reasoning: false });
+      for (const model of native) for (const key of ["discoveredMetadata", "metadataOverrides", "contextWindowMax", "declaredInputModalities"]) expect(model).not.toHaveProperty(key);
+      const catalog = await provisionManagedCatalog(join(root, "projected"), [restored.get("pi", "local").provider]);
+      expect(catalog.models[0]).toMatchObject({ contextWindow: 256_000, contextWindowMax: 256_000, declaredInputModalities: ["text"],
+        declaredOutputModalities: [], supportsImages: false, thinkingLevels: [], supportsFastMode: false });
+      expect(catalog.models[1]).toMatchObject({ contextWindow: 128_000, contextWindowMax: 1_000_000 });
+      expect(catalog.models[2]).toMatchObject({ contextWindow: 16_000, contextWindowMax: 16_000, contextWindowSource: "estimated" });
+      expect(await refresh([{ id: "same", context_window: 512_000 }])).toMatchObject({ updatedModelIds: ["same"] });
+      expect(providers.get("pi", "local").provider.models[0]).not.toHaveProperty("contextWindowMax");
+      expect(providers.get("pi", "local").provider.models[0]!.discoveredMetadata).not.toHaveProperty("contextWindowMax");
+      const latest = providers.get("pi", "local");
+      await providers.upsertConfiguration({ providerId: "local", displayName: "Local renamed", kind: "local_keyless", enabled: true,
+        expectedVersion: latest.version, runtimes: [{ backendId: "pi", credentialOrigin: "", credentialBindings: {}, provider: {
+          ...latest.provider, models: latest.provider.models.map(model => model.id !== "small" ? model : {
+            ...model, contextWindow: 8_000, metadataOverrides: ["contextWindow"]
+          }) } }] });
+      expect(providers.get("pi", "local").provider.models.find(model => model.id === "small"))
+        .toMatchObject({ contextWindow: 8_000, contextWindowMax: 16_000, contextWindowSource: "declared" });
+    } finally { store.close(); }
+  });
+
+  it.each(["configuration", "credential"] as const)("rejects a late model refresh after the original %s changes", async change => {
+    const { store, credentials } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
+    const saveKey = async (secret: string) => {
+      const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
+      await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "catalog-key", displayName: "Key", kind: "api_key" });
+    };
+    await saveKey("initial-key-value");
+    await providers.upsert({ backendId: "pi", credentialOrigin: "https://catalog.example.test", displayName: "Catalog", enabled: true,
+      kind: "custom_endpoint", credentialBindings: { CATALOG_KEY: "catalog-key" }, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+      provider: { id: "catalog", baseUrl: "https://catalog.example.test/v1", api: "openai-responses", apiKeyEnv: "CATALOG_KEY", models: [{ id: "manual" }] } });
+    let finish!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    const pending = providers.discoverProviderModels("pi", "catalog", (async () => { entered(); await held; return Response.json({ data: [{ id: "late-model" }] }); }) as typeof fetch);
+    try {
+      await started;
+      const original = providers.get("pi", "catalog");
+      if (change === "credential") await saveKey("replacement-key-value");
+      else await providers.upsertConfiguration({ providerId: "catalog", displayName: "Changed", kind: "custom_endpoint", enabled: true,
+        expectedVersion: original.version, runtimes: [{ backendId: "pi", credentialOrigin: "https://catalog.example.test",
+          credentialBindings: { CATALOG_KEY: "catalog-key" }, provider: original.provider }] });
+      finish();
+      await expect(pending).rejects.toThrow(/changed during model catalog refresh/u);
+      expect(providers.get("pi", "catalog").provider.models.map(model => model.id)).toEqual(["manual"]);
+      const restored = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); restored.initialize();
+      expect(restored.get("pi", "catalog").provider.models.map(model => model.id)).toEqual(["manual"]);
+    } finally { finish(); await pending.catch(() => undefined); store.close(); }
   });
 
   it("requires an unambiguous pinned HTTPS embedding route, with loopback HTTP as the only exception", async () => {

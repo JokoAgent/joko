@@ -25,9 +25,12 @@ describe("managed Pi catalog", () => {
   it("keeps estimated limits labeled in the public catalog while passing only numeric limits to Pi", async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-pi-estimated-limits-"));
     const result = await provisionManagedCatalog(home, [{ id: "local", models: [{ id: "capacity-only", contextWindow: 64_000,
+      contextWindowMax: 64_000, discoveredMetadata: { contextWindowMax: 64_000 }, metadataOverrides: [],
       maxTokens: 16_384, contextWindowSource: "estimated", maxOutputTokensSource: "estimated" }] }]);
     expect(result.models[0]).toMatchObject({ contextWindow: 64_000, maxOutputTokens: 16_384, contextWindowSource: "estimated", maxOutputTokensSource: "estimated" });
+    expect(result.models[0]).toMatchObject({ contextWindow: 64_000, contextWindowMax: 64_000 });
     const model = JSON.parse(await readFile(join(home, "models.json"), "utf8")).providers.local.models[0];
+    for (const key of ["contextWindowMax", "discoveredMetadata", "metadataOverrides"]) expect(model).not.toHaveProperty(key);
     expect(model).toMatchObject({ contextWindow: 64_000, maxTokens: 16_384 });
     expect(model).not.toHaveProperty("contextWindowSource"); expect(model).not.toHaveProperty("maxOutputTokensSource");
   });

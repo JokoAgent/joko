@@ -6,6 +6,7 @@ export interface DiscoveredProviderModel {
 }
 
 export interface DiscoveredProviderModelMetadata {
+  readonly name?: string;
   readonly contextWindowMax?: number;
   readonly maxOutputTokens?: number;
   readonly description?: string;
@@ -97,7 +98,7 @@ export function parseProviderModels(value: unknown, sourceUrl?: string): readonl
       ? record["display_name"]
       : google === undefined && typeof record?.["name"] === "string" && validLabel(record["name"])
         ? record["name"]
-        : id;
+        : undefined;
     const rawWindow = record === undefined
       ? undefined
       : [
@@ -109,10 +110,13 @@ export function parseProviderModels(value: unknown, sourceUrl?: string): readonl
         google?.["inputTokenLimit"],
         info["max_input_tokens"]
       ].find(validPositiveInteger);
-    const metadata = discoveredMetadata(record ?? {}, info, architecture, google, vercel, typeof rawWindow === "number" ? Math.floor(rawWindow) : undefined);
+    const metadata = {
+      ...discoveredMetadata(record ?? {}, info, architecture, google, vercel, typeof rawWindow === "number" ? Math.floor(rawWindow) : undefined),
+      ...(name === undefined ? {} : { name })
+    };
     result.push({
       id,
-      name,
+      name: name ?? id,
       ...(typeof rawWindow === "number" ? { contextWindow: Math.floor(rawWindow) } : {}),
       ...(Object.keys(metadata).length ? { metadata } : {})
     });
