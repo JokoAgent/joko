@@ -6,7 +6,7 @@ import { DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES, type DevicePeerNativeAgentPort 
 import type { HostedAgentPrincipal } from "./hosted-agent-host.js";
 import type { HostedAgentRuntime } from "./hosted-agent-runtime.js";
 import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
-import { HostedAgentWireError } from "./hosted-agent-wire.js";
+import { decodeHostedAgentInvocation, HostedAgentWireError } from "./hosted-agent-wire.js";
 
 /** Closed same-owner group relay. The owner Device authenticates the group
  * computer; it never makes the onward person an owner native principal. */
@@ -24,9 +24,19 @@ export function createHostedAgentGuestPeerPort(runtime: HostedAgentRuntime, cont
       const method = hostedAgentGuestPeerDescriptor(kind); if (!method || !(bytes instanceof Uint8Array) || bytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES) throw new HostedAgentWireError();
       const envelope = fromBinary(contract.HostedAgentGuestRelayRequestSchema, bytes), scope = envelope.scope;
       if (!scope || !/^[a-f0-9]{64}$/u.test(scope.relayId) || !validId(scope.backendId) || !validId(scope.providerId)
-        || !scope.modelIds.length || scope.modelIds.length > 4096 || scope.modelIds.some(model => !validId(model)) || new Set(scope.modelIds).size !== scope.modelIds.length
+        || scope.modelIds.length > 4096 || scope.modelIds.some(model => !validId(model)) || new Set(scope.modelIds).size !== scope.modelIds.length
         || !validId(authority.controllerDeviceId) || envelope.requestBytes.byteLength > 64 * 1024 * 1024
         || envelope.purge && kind !== contract.HostedAgentPeerMethod.GUEST_RELAY_CLOSE) throw new HostedAgentWireError();
+      let workflowRead = false;
+      if (kind === contract.HostedAgentPeerMethod.GUEST_RELAY_CALL) {
+        const request = fromBinary(contract.CallHostedAgentRequestSchema, envelope.requestBytes);
+        const command = decodeHostedAgentInvocation(request.commandJson);
+        if (command.kind === "workflow_progress") {
+          workflowRead = true;
+          if (command.backendId !== scope.backendId || command.providerId !== scope.providerId) throw new HostedAgentWireError();
+        }
+      }
+      if (!scope.modelIds.length && !workflowRead) throw new HostedAgentWireError();
       const ownerId = `owner-guest-relay:${hash([controllerServerId, authority.controllerDeviceId, scope.relayId, scope.backendId, scope.providerId])}`;
       if (kind === contract.HostedAgentPeerMethod.GUEST_RELAY_CLOSE) {
         const request = fromBinary(contract.CloseHostedAgentRequestSchema, envelope.requestBytes);
@@ -37,16 +47,21 @@ export function createHostedAgentGuestPeerPort(runtime: HostedAgentRuntime, cont
         assertAuthorityCurrent(); signal.throwIfAborted();
         return toBinary(contract.CloseHostedAgentResponseSchema, create(contract.CloseHostedAgentResponseSchema, { format: 1 }));
       }
-      const scopeKey = JSON.stringify([ownerId, [...scope.modelIds].sort()]); let entry = scopes.get(scopeKey);
+      const scopeKey = JSON.stringify([ownerId, workflowRead, [...scope.modelIds].sort()]); let entry = scopes.get(scopeKey);
       if (entry) { try { entry.principal.assertCurrent(); } catch { entry = undefined; } }
       if (!entry) {
         if (owners.size >= 65_536) throw new HostedAgentWireError();
         const computer = runtime.settings.captureComputer(), providerPermission = runtime.settings.captureProvider(scope.backendId, scope.providerId);
+        const backendGeneration = workflowRead ? runtime.settings.store.getBackend(scope.backendId).descriptor.instanceGeneration : undefined;
         const assertCurrent = () => { assertAuthorityCurrent(); lifetime.signal.throwIfAborted(); computer(); providerPermission();
+          if (workflowRead) {
+            if (runtime.settings.store.getBackend(scope.backendId).descriptor.instanceGeneration !== backendGeneration) throw new HostedAgentWireError();
+            return;
+          }
           const provider = runtime.shareableProvider(scope.backendId, scope.providerId); provider.assertCurrent();
           if (scope.modelIds.some(modelId => !provider.models.some(model => model.modelId === modelId))) throw new HostedAgentWireError(); };
         const principal: HostedAgentPrincipal = { id: ownerId, deviceId: authority.controllerDeviceId, trust: "guest", assertCurrent,
-          providerGrant: { backendId: scope.backendId, providerId: scope.providerId, modelIds: [...scope.modelIds], groupMember: true, assertCurrent } };
+          providerGrant: { backendId: scope.backendId, providerId: scope.providerId, modelIds: workflowRead ? [] : [...scope.modelIds], groupMember: true, assertCurrent } };
         entry = { principal, client: clientFor(principal) }; scopes.set(scopeKey, entry); owners.add(principal);
       }
       entry.principal.assertCurrent();

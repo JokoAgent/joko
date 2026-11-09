@@ -2142,6 +2142,7 @@ export async function createOrchestratorApplication(
       const computer = hostedAgents.settings.captureComputer(), provider = hostedAgents.settings.captureProvider(input.backendId, input.providerId);
       const assertCurrent = () => { computer(); provider(); hostedAgents.assertGuestSelection(principal, input); }; assertCurrent(); return assertCurrent;
     },
+    captureWorkflowReadAccess: (principal, input) => hostedAgents.captureWorkflowReadAccess(principal, input),
     capture: (member, principal, modelIds, assertCurrent) => providerGroups!.captureHosted(member, principal, modelIds, assertCurrent) }));
   const personalDevelopmentRoot = join(config.dataDirectory, "personal-development");
   personalDevelopmentNativeBroker = new PersonalDevelopmentNativeBroker({

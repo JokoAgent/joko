@@ -96,17 +96,11 @@ export class HostedAgentRuntime {
       } });
     const workflow = new HostedAgentWorkflowProgress({ root: options.root, store: new HostedAgentStore(options.store),
       authorize: (principal, command) => {
-        const factory = this.#factories.get(command.backendId), generation = options.store.getBackend(command.backendId).descriptor.instanceGeneration;
+        const factory = this.#factories.get(command.backendId);
         if (!factory?.readWorkflowProgress || principal.trust === "guest" && factory.isolatedGuests?.() !== true) throw new HostedAgentHostError("UNAVAILABLE");
-        const computer = this.settings.captureComputer(), provider = this.settings.captureProvider(command.backendId, command.providerId);
+        const access = this.captureWorkflowReadAccess(principal, command);
         const assertCurrent = (): void => {
-          principal.assertCurrent(); computer(); provider();
-          if (options.store.getBackend(command.backendId).descriptor.instanceGeneration !== generation || this.#factories.get(command.backendId) !== factory) throw new HostedAgentHostError("UNAVAILABLE");
-          if (principal.trust === "guest") {
-            const grant = principal.providerGrant;
-            if (!grant || grant.backendId !== command.backendId || grant.providerId !== command.providerId) throw new HostedAgentHostError("ACCESS_DENIED");
-            grant.assertCurrent();
-          }
+          access(); if (this.#factories.get(command.backendId) !== factory) throw new HostedAgentHostError("UNAVAILABLE");
         };
         assertCurrent(); return { read: factory.readWorkflowProgress.bind(factory), assertCurrent };
       } });
@@ -227,6 +221,20 @@ export class HostedAgentRuntime {
   sharingUsage(backendId: string, providerId: string, memberId: string, fromDay: string) {
     return new ProviderGroupUsageStore(this.#options.store, `provider-sharing:${this.#options.nodeId ?? "node"}`)
       .rows({ group: { backendId, providerId }, partyId: memberId, fromDay });
+  }
+  captureWorkflowReadAccess(principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId">): () => void {
+    const generation = this.#options.store.getBackend(input.backendId).descriptor.instanceGeneration;
+    const computer = this.settings.captureComputer(), provider = this.settings.captureProvider(input.backendId, input.providerId);
+    const assertCurrent = (): void => {
+      principal.assertCurrent(); computer(); provider();
+      if (this.#options.store.getBackend(input.backendId).descriptor.instanceGeneration !== generation) throw new HostedAgentHostError("UNAVAILABLE");
+      if (principal.trust === "guest") {
+        const grant = principal.providerGrant;
+        if (!grant || grant.backendId !== input.backendId || grant.providerId !== input.providerId) throw new HostedAgentHostError("ACCESS_DENIED");
+        grant.assertCurrent();
+      }
+    };
+    assertCurrent(); return assertCurrent;
   }
   assertGuestSelection(principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId" | "modelId">): void {
     if (!this.settings.allowsModel(input.backendId, input.providerId, input.modelId)) throw new HostedAgentHostError("ACCESS_DENIED");

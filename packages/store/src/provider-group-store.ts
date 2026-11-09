@@ -134,6 +134,22 @@ export class ProviderGroupStore {
   settleHostedBinding(id: string, phase: ProviderGroupHostedBinding["phase"]): void {
     const previous = this.hostedBinding(id); if (!previous) throw invalid(); this.#saveHosted({ ...previous, phase });
   }
+  /** An opaque witness of the first admitted native route and its grant. It
+   * neither grants model access nor stores workflow or product task state. */
+  observeHostedWorkflowAuthority(id: string, authority: string): void {
+    identity(id); if (!/^[a-f0-9]{64}$/u.test(authority)) throw invalid();
+    this.store.transaction(() => {
+      if (this.hostedWorkflowAuthority(id) !== undefined) return;
+      this.store.setSetting("service", SCOPE, this.#prefix + "workflow-owner:" + digest(id), { format: 1, id, authority });
+    });
+  }
+  hostedWorkflowAuthority(id: string): string | undefined {
+    identity(id); const value = this.store.findSetting("service", SCOPE, this.#prefix + "workflow-owner:" + digest(id))?.value;
+    if (value === undefined) return undefined;
+    if (!object(value) || !keys(value, ["format", "id", "authority"]) || value["format"] !== 1 || value["id"] !== id
+      || typeof value["authority"] !== "string" || !/^[a-f0-9]{64}$/u.test(value["authority"])) throw invalid();
+    return value["authority"];
+  }
   #saveHosted(value: ProviderGroupHostedBinding): void { parseHostedBinding(value); this.store.setSetting("service", SCOPE, this.#prefix + "hosted:" + digest(value.id), value); }
   binding(sessionId: string): ProviderGroupBinding | undefined {
     const row = this.bindingRecord(sessionId); if (!row?.binding || row.released) return undefined;

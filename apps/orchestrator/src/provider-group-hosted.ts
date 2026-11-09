@@ -14,6 +14,7 @@ import type { HostedAgentRunPort } from "./hosted-agent-controller.js";
 import type { HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { HostedAgentLimitError } from "./hosted-agent-limits.js";
+import type { HostedWorkflowProgressCommand } from "./hosted-agent-workflow-progress.js";
 
 interface NativeClient extends HostedAgentTransport {
   open(input: HostedAgentOpen, signal: AbortSignal): Promise<{ readonly virtualRoot: string }>;
@@ -27,6 +28,7 @@ export interface ProviderGroupNativeCapture {
 export interface ProviderGroupHostedOptions {
   readonly base: HostedAgentHost; readonly runtime: ProviderGroupRuntime; readonly root: string;
   readonly assertSelection: (principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId" | "modelId">) => void | (() => void);
+  readonly captureWorkflowReadAccess?: (principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId">) => () => void;
   /** Captured native-only authority, never a URL, bearer or caller-selected trust. */
   readonly capture: (member: ProviderGroupMember, principal: HostedAgentPrincipal, modelIds: readonly string[], assertCurrent: () => void) => ProviderGroupNativeCapture;
   readonly now?: () => number;
@@ -152,6 +154,7 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     return { workspaceRoot: virtualRoot };
   }
   async call(principal: HostedAgentPrincipal, runId: string, callId: string, command: HostedAgentCall, signal?: AbortSignal): Promise<unknown> {
+    if (command.kind === "workflow_progress") return this.#workflowProgress(principal, runId, callId, command, signal);
     if (command.kind === "derivation_lifecycle") return this.#derivationLifecycle(principal, runId, callId, command);
     const entry = this.#entries.get(this.#key(principal, runId));
     if (!entry) return signal === undefined ? this.options.base.call(principal, runId, callId, command) : this.options.base.call(principal, runId, callId, command, signal);
@@ -204,6 +207,45 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
     });
     entry.calls.set(callId, { digest, value }); void value.catch(() => {}); return value;
   }
+  async #workflowProgress(principal: HostedAgentPrincipal, runId: string, callId: string,
+    command: HostedWorkflowProgressCommand, signal?: AbortSignal): Promise<unknown> {
+    this.#assert(principal); signal?.throwIfAborted();
+    const base = this.options.base;
+    if (principal.providerGrant?.groupMember) return base.call(principal, runId, callId, command, signal);
+    const store = this.options.runtime.store;
+    const scope = hash([principal.id, principal.deviceId, command.backendId, command.providerId, command.sessionId, command.targetId, command.nativeSessionId]);
+    const binding = store.hostedBinding(scope);
+    if (!binding) return base.call(principal, runId, callId, command, signal);
+    const authority = workflowAuthority(principal, binding);
+    if (!this.options.captureWorkflowReadAccess || binding.id !== scope || !["ready", "closed"].includes(binding.phase)
+      || binding.group.backendId !== command.backendId || binding.group.providerId !== command.providerId
+      || store.hostedWorkflowAuthority(scope) !== authority) throw new HostedAgentHostError("UNAVAILABLE");
+    const access = this.options.captureWorkflowReadAccess(principal, command), retired = new AbortController();
+    const active = AbortSignal.any([retired.signal, AbortSignal.timeout(10_000), ...(signal ? [signal] : [])]);
+    const assertCurrent = (): void => {
+      this.#assert(principal); active.throwIfAborted(); access();
+      const current = store.hostedBinding(scope);
+      if (!current || current.id !== scope || !["ready", "closed"].includes(current.phase) || workflowAuthority(principal, current) !== authority
+        || store.hostedWorkflowAuthority(scope) !== authority) throw new HostedAgentHostError("UNAVAILABLE");
+    };
+    const timer = setInterval(() => { try { assertCurrent(); } catch (error) { retired.abort(error); } }, 100); timer.unref();
+    try {
+      assertCurrent(); const member = binding.member;
+      const forwarded = { ...command, backendId: member.nativeBackendId, providerId: member.providerId,
+        nativeSessionId: hash([command.nativeSessionId, member.key]) };
+      let result: unknown;
+      if (member.kind === "local") {
+        const localPrincipal: HostedAgentPrincipal = { ...principal, id: "group-native:" + hash([principal.id, member.key]), assertCurrent,
+          ...(principal.providerGrant ? { providerGrant: { ...principal.providerGrant, groupMember: true, backendId: member.nativeBackendId,
+            providerId: member.providerId, modelIds: [], assertCurrent } } : {}) };
+        result = await base.call(localPrincipal, runId, callId, forwarded, active);
+      } else {
+        const capture = this.options.capture(member, principal, [], assertCurrent); capture.assertCurrent();
+        result = await capture.client.call(runId, callId, forwarded, active); capture.assertCurrent();
+      }
+      assertCurrent(); return result;
+    } finally { clearInterval(timer); }
+  }
   async #derivationLifecycle(principal: HostedAgentPrincipal, runId: string, callId: string,
     command: Extract<HostedAgentCall, { kind: "derivation_lifecycle" }>): Promise<unknown> {
     this.#assert(principal);
@@ -233,7 +275,11 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
       const capture = this.options.capture(member, principal, [binding.modelId], assertCurrent); capture.assertCurrent();
       result = await capture.client.call(runId, callId, forwarded, AbortSignal.timeout(30_000)); capture.assertCurrent();
     }
-    assertCurrent(); store.settleHostedBinding(childScope, command.action === "cleanup" ? "closed" : "ready"); return result;
+    assertCurrent(); store.store.transaction(() => {
+      store.settleHostedBinding(childScope, command.action === "cleanup" ? "closed" : "ready");
+      if (command.action !== "cleanup") store.observeHostedWorkflowAuthority(childScope, workflowAuthority(principal, store.hostedBinding(childScope)!));
+    });
+    return result;
   }
   async poll(principal: HostedAgentPrincipal, cursors: readonly HostedAgentPollCursor[], signal: AbortSignal, waitMs = 30_000): Promise<readonly HostedAgentPollRun[]> {
     this.#assert(principal); signal.throwIfAborted();
@@ -365,7 +411,11 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
         entry.actualRoot = opened.virtualRoot; this.#pump(entry);
         const state = await entry.capture.client.call(entry.input.runId, randomUUID(), { kind: "state" }, entry.lifetime.signal) as NativeSessionState;
         this.#assertEntry(entry); entry.capture.assertCurrent(); source.assertCurrent(); assignment?.assertCurrent(); entry.lastUsage = state.usage;
-        runtime.store.settleHostedBinding(entry.scope, "ready"); entry.binding = runtime.store.hostedBinding(entry.scope)!; entry.startupComplete = true; assignment?.release(); return;
+        runtime.store.store.transaction(() => {
+          runtime.store.settleHostedBinding(entry.scope, "ready"); entry.binding = runtime.store.hostedBinding(entry.scope)!;
+          runtime.store.observeHostedWorkflowAuthority(entry.scope, workflowAuthority(entry.principal, entry.binding));
+        });
+        entry.startupComplete = true; assignment?.release(); return;
       } catch (error) {
         assignment?.release();
         try { await this.#closeNative(entry); } catch { runtime.store.settleHostedBinding(entry.scope, "unknown"); throw unknown(); }
@@ -503,6 +553,13 @@ export class ProviderGroupHostedEndpoint implements HostedAgentEndpointPort {
 }
 export function createProviderGroupHostedEndpoint(options: ProviderGroupHostedOptions): ProviderGroupHostedEndpoint { return new ProviderGroupHostedEndpoint(options); }
 function hash(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
+function workflowAuthority(principal: HostedAgentPrincipal, binding: ProviderGroupHostedBinding): string {
+  const member = binding.member, grant = principal.providerGrant, owner = grant?.cleanupOwner, received = member.received;
+  return hash([principal.id, principal.deviceId, principal.trust, binding.group.backendId, binding.group.providerId,
+    member.key, member.kind, member.nodeId, member.backendId, member.nativeBackendId, member.providerId,
+    received ? [received.joinId, received.shareId, received.memberId, received.generation, received.hostServerId, received.nativeBackendId, received.providerId] : null,
+    owner ? [owner.shareId, owner.memberId, owner.incarnation, owner.cleanupKey] : grant?.cleanupKey ?? null]);
+}
 function unknown(): JokoError { return new JokoError({ code: "NATIVE_DISPATCH_UNKNOWN", message: "The original native group effect could not be confirmed.", phase: "session_start", retryable: false, stateMayHaveChanged: true, recovery: "Inspect the original native context before another creation." }); }
 function closedFailure(message: string): JokoError { return new JokoError({ code: "HOSTED_AGENT_UNAVAILABLE", message, phase: "dispatch", retryable: true, stateMayHaveChanged: false, recovery: "Use the offered native handoff." }); }
 async function allClosed(promises: readonly Promise<unknown>[]): Promise<void> { const results = await Promise.allSettled(promises); if (results.some(result => result.status === "rejected")) throw new HostedAgentHostError("UNAVAILABLE"); }
