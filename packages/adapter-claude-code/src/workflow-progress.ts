@@ -90,7 +90,7 @@ export async function readBackgroundWorkflowProgress(input: {
     || !isAbsolute(input.configurationDirectory) || !isAbsolute(input.workingDirectory) || !/^claude-task-[0-9a-f]{32}$/u.test(input.taskId)
     || input.nativeSessionIds.length > 200 || input.nativeSessionIds.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id))
     || input.projectDirectoryName !== undefined && (!/^[a-zA-Z0-9._-]{1,1024}$/u.test(input.projectDirectoryName) || [".", ".."].includes(input.projectDirectoryName))) return absent();
-  const root = resolve(input.configurationDirectory), projectDirectory = join(root, "projects", input.projectDirectoryName ?? input.workingDirectory.replace(/[^a-zA-Z0-9]/gu, "-"));
+  const root = resolve(input.configurationDirectory), projectDirectory = join(root, "projects", input.projectDirectoryName ?? input.workingDirectory.replace(/[^a-zA-Z0-9]/g, "-"));
   let filesRead = 0, bytesRead = 0, entriesRead = 0;
   for (const sessionId of input.nativeSessionIds) {
     input.assertCurrent();

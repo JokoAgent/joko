@@ -38,8 +38,10 @@ it("prefers explicit workflow phases, rejects malformed numeric facts and tolera
 });
 
 it("reads only adopted SDK directories and the exact native task, including a terminal file after reload", async () => {
-  const root = await mkdtemp(join(tmpdir(), "joko-workflow-progress-")), configurationDirectory = join(root, "config"), workingDirectory = join(root, "workspace");
-  const directory = (id: string) => join(configurationDirectory, "projects", workingDirectory.replace(/[^a-zA-Z0-9]/gu, "-"), id, "workflows");
+  const root = await mkdtemp(join(tmpdir(), "joko-workflow-progress-")), configurationDirectory = join(root, "config"), workingDirectory = join(root, "workspace-🧩");
+  // The native profile encodes both UTF-16 code units of the supplementary character.
+  const namespace = `${root.replace(/[^a-zA-Z0-9]/g, "-")}-workspace---`;
+  const directory = (id: string) => join(configurationDirectory, "projects", namespace, id, "workflows");
   const read = (ids = [sdkId]) => readBackgroundWorkflowProgress({ configurationDirectory, workingDirectory, nativeSessionIds: ids,
     taskId, maximumBytes: 16_384, project, assertCurrent() {} });
   try {

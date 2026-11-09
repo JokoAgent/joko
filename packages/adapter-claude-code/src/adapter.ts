@@ -2919,10 +2919,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       } catch { /* An uninitialized binding does not authorize native files. */ }
     }
     if (ids.size === 0) return absent();
-    return readBackgroundWorkflowProgress({ configurationDirectory: this.#nativeMemoryConfigDirectory,
+    const result = await readBackgroundWorkflowProgress({ configurationDirectory: this.#nativeMemoryConfigDirectory,
       projectDirectoryName: this.#environment["CLAUDE_CODE_PROJECT_DIR_NAME"],
       workingDirectory: input.target.workspaceRoot, nativeSessionIds: [...ids], taskId: input.taskId,
       maximumBytes: input.maximumBytes, project: (value, maximum) => this.#projection.text(value, maximum), assertCurrent });
+    assertCurrent(); return result;
   }
 
   async getBackgroundTaskOutput(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult> {
