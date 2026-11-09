@@ -8294,6 +8294,22 @@ export class OperationalStore {
     return undefined;
   }
 
+  /** Native read-only history may use only bindings actually adopted by this task. */
+  listSessionNativeBindings(sessionId: string, backendId: string, throughGeneration: number, adoptedThrough: number, limit = 200): NativeSessionBinding[] {
+    this.assertOpen();
+    this.getSession(sessionId);
+    if (!Number.isSafeInteger(throughGeneration) || throughGeneration < 0 || !Number.isSafeInteger(adoptedThrough) || adoptedThrough < 0
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new StoreError("Native binding history bounds are invalid.");
+    return (this.database.prepare(`
+      SELECT native_opaque_ref, native_session_id, first_generation FROM native_binding_adoptions
+      WHERE session_id = ? AND backend_id = ? AND first_generation <= ? AND adopted_at <= ?
+      ORDER BY adopted_at DESC, revision DESC, native_opaque_ref LIMIT ?
+    `).all(sessionId, nonBlank(backendId, "Native binding Backend ID"), throughGeneration, adoptedThrough, limit) as Row[]).map(row => ({
+      opaqueRef: stringValue(row["native_opaque_ref"]), generation: numberValue(row["first_generation"]),
+      ...(row["native_session_id"] === null ? {} : { nativeSessionId: stringValue(row["native_session_id"]) })
+    }));
+  }
+
   private recordNativeBindingAdoption(sessionId: string, backendId: string, binding: NativeSessionBinding, at: number): void {
     this.database.prepare(`
       INSERT OR IGNORE INTO native_binding_adoptions(
@@ -12092,6 +12108,19 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.type') = 'background_task'
       ORDER BY event.global_cursor
     `).all(normalizedSessionId) as Row[]).map(eventFromRow);
+  }
+
+  findSessionBackgroundTaskEvent(sessionId: string, taskId: string): PersistedEvent | undefined {
+    this.assertOpen(); this.getSession(sessionId);
+    const row = this.database.prepare(`
+      SELECT event.* FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ? AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'background_task'
+        AND json_extract(event.payload_json, '$.payload.taskId') = ?
+      ORDER BY event.global_cursor DESC LIMIT 1
+    `).get(sessionId, nonBlank(taskId, "Background task ID")) as Row | undefined;
+    return row === undefined ? undefined : eventFromRow(row);
   }
 
   /**

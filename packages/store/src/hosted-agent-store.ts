@@ -100,6 +100,36 @@ export class HostedAgentStore {
       this.store.setSetting("service", SCOPE, `session:${key}`, { ...value, state: "ready", binding: { ...binding } });
     });
   }
+  /** Native observations retain only an opaque task-to-binding association;
+   * product task state remains on the original Source computer. */
+  observeBackgroundTaskBinding(key: string, leaseId: string, taskId: string, startedAt?: number, active = false): void {
+    identity(taskId);
+    if (typeof active !== "boolean" || startedAt !== undefined && (!Number.isSafeInteger(startedAt) || startedAt < 0)) throw new StoreError("The hosted background observation time is invalid.");
+    this.store.transaction(() => {
+      const owner = this.assertLease(key, leaseId);
+      if (!owner.binding || owner.state !== "ready") return;
+      const previous = this.#backgroundObservation(key, taskId), binding = owner.binding;
+      // Finishing an old workflow after a parent SDK identity change must not
+      // move its file owner. Only a known newer active lifecycle can reuse it.
+      if (previous && (!active || startedAt === undefined || previous.startedAt === undefined || startedAt <= previous.startedAt)) return;
+      this.store.setSetting("service", SCOPE, this.#backgroundKey(key, taskId), { format: 1, sessionKey: key, taskId, binding,
+        ...(startedAt === undefined ? {} : { startedAt }) });
+    });
+  }
+  backgroundTaskBinding(key: string, taskId: string): NativeSessionBinding | undefined {
+    return this.#backgroundObservation(key, taskId)?.binding;
+  }
+  #backgroundObservation(key: string, taskId: string): { readonly binding: NativeSessionBinding; readonly startedAt?: number } | undefined {
+    assertDigest(key); identity(taskId);
+    const row = this.store.findSetting<unknown>("service", SCOPE, this.#backgroundKey(key, taskId));
+    if (!row) return undefined;
+    const value = record(row.value);
+    if (value.format !== 1 || value.sessionKey !== key || value.taskId !== taskId
+      || value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isSafeInteger(value.startedAt) || value.startedAt < 0)
+      || Object.keys(value).some(name => !["format", "sessionKey", "taskId", "binding", "startedAt"].includes(name))) throw new StoreError("The hosted background observation is invalid.");
+    validateBinding(value.binding as NativeSessionBinding); return { binding: value.binding as NativeSessionBinding,
+      ...(value.startedAt === undefined ? {} : { startedAt: value.startedAt as number }) };
+  }
   close(key: string, leaseId: string): void {
     this.store.transaction(() => {
       const value = this.assertLease(key, leaseId);
@@ -163,6 +193,7 @@ export class HostedAgentStore {
     this.store.transaction(() => { const value = this.assertLease(key, leaseId);
       if (value.state !== "purging") throw new StoreError("The hosted native cleanup is not fenced.");
       for (const row of this.store.listSettingsByKeyPrefix("service", SCOPE, `call:${key}:`)) this.store.deleteSetting("service", SCOPE, row.key);
+      for (const row of this.store.listSettingsByKeyPrefix("service", SCOPE, `background:${key}:`)) this.store.deleteSetting("service", SCOPE, row.key);
       this.store.deleteSetting("service", SCOPE, `session:${key}`); });
   }
   claimCall(key: string, leaseId: string, callId: string, bodyDigest: string): HostedNativeCallReceipt {
@@ -196,6 +227,7 @@ export class HostedAgentStore {
     });
   }
   #callKey(key: string, callId: string): string { return `call:${key}:${createHash("sha256").update(callId).digest("hex")}`; }
+  #backgroundKey(key: string, taskId: string): string { return `background:${key}:${createHash("sha256").update(taskId).digest("hex")}`; }
 }
 function record(value: unknown): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw new StoreError("The hosted native record is invalid."); return value as Record<string, unknown>; }
 function identity(value: unknown): asserts value is string { if (typeof value !== "string" || !value || value.length > 2048 || /[\0\r\n]/u.test(value)) throw new StoreError("The hosted native identity is invalid."); }

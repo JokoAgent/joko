@@ -6,8 +6,34 @@ import { expect, it, vi } from "vitest";
 import { HostedAgentSourceAdapter, HostedNativeCapacityError, type HostedAgentSourceConnection, type HostedAgentSourceController, type HostedAgentSourceAdapterOptions } from "./adapter.js";
 import { HostedAgentConnectionPool } from "./connection-pool.js";
 
+it("reads an adopted workflow after Source close without reopening or resuming the native runtime", async () => {
+  const result = { status: "available" as const, text: "", totalBytes: 100, truncated: false, capturedAtMs: Date.now(),
+    workflow: { runId: "workflow", status: "done", phases: [], agents: [], logs: ["Durable log"] } };
+  const read = vi.fn<NonNullable<HostedAgentSourceAdapterOptions["readWorkflowProgress"]>>(async () => result);
+  const f = await fixture(undefined, undefined, { readWorkflowProgress: read });
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask" }, f.context);
+    await f.adapter.closeSession(binding, f.context);
+    const opens = f.open.mock.calls.length, calls = f.call.mock.calls.length;
+    const input = { sessionId: f.context.sessionId, target: f.context.target, bindings: [binding, binding], taskId: `claude-task-${"a".repeat(32)}`, maximumBytes: 16_384, assertCurrent() {} };
+    expect((await f.adapter.getBackgroundWorkflowProgress!(input)).workflow?.logs).toEqual(["Durable log"]);
+    expect(read).toHaveBeenCalledOnce(); expect(read.mock.calls[0]![0]).toMatchObject({ kind: "workflow_progress", backendId: "native", providerId: "provider",
+      sessionId: "task", targetId: "target", nativeSessionId: binding.nativeSessionId, taskId: input.taskId, maximumBytes: 16_384 });
+    expect(f.open).toHaveBeenCalledTimes(opens); expect(f.call).toHaveBeenCalledTimes(calls);
+    expect((await f.adapter.getBackgroundWorkflowProgress!({ ...input, sessionId: "foreign-task" })).status).toBe("unavailable"); expect(read).toHaveBeenCalledOnce();
+    let finish!: (value: typeof result) => void;
+    read.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const abort = new AbortController(), pending = f.adapter.getBackgroundWorkflowProgress!({ ...input, signal: abort.signal });
+    const rejected = expect(pending).rejects.toThrow(); abort.abort(); finish(result); await rejected;
+  } finally { await f.cleanup(); }
+});
+
+it("does not add a workflow read port to Source Backends that do not provide it", async () => {
+  const f = await fixture(); try { expect(f.adapter.getBackgroundWorkflowProgress).toBeUndefined(); } finally { await f.cleanup(); }
+});
+
 async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareInput"], commands?: HostedAgentSourceAdapterOptions["commands"],
-  options: Pick<HostedAgentSourceAdapterOptions, "connectionPool" | "isCapacityError" | "manageDerivation"> = {}) {
+  options: Pick<HostedAgentSourceAdapterOptions, "connectionPool" | "isCapacityError" | "manageDerivation" | "readWorkflowProgress"> = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-source-adapter-")));
   const context: AdapterContext = { sessionId: "task", generation: 1, target: { id: "target", backendId: "source-native", displayName: "Task", workspaceRoot: root,
     managed: true, trusted: true }, operationId: "create-task", modelSelection: { providerId: "provider", modelId: "model" }, signal: new AbortController().signal,

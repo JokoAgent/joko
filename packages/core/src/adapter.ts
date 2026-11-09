@@ -535,6 +535,51 @@ export function nativeTextInferenceImages(input: NativeTextInferenceInput): NonN
   return images;
 }
 
+export interface BackgroundWorkflowPhase {
+  readonly index: number;
+  readonly title: string;
+  readonly detail?: string;
+}
+
+export interface BackgroundWorkflowAgent {
+  readonly label: string;
+  readonly state: string;
+  readonly agentId?: string;
+  readonly model?: string;
+  readonly phaseTitle?: string;
+  readonly phaseIndex?: number;
+  readonly attempt?: number;
+  readonly lastToolName?: string;
+  readonly lastToolSummary?: string;
+  readonly resultPreview?: string;
+  readonly durationMs?: number;
+  readonly error?: string;
+}
+
+export interface BackgroundWorkflowProgress {
+  readonly runId: string;
+  readonly status: string;
+  readonly workflowName?: string;
+  readonly agentCount?: number;
+  readonly totalTokens?: number;
+  readonly totalToolCalls?: number;
+  readonly durationMs?: number;
+  readonly phases: readonly BackgroundWorkflowPhase[];
+  readonly agents: readonly BackgroundWorkflowAgent[];
+  readonly logs: readonly string[];
+}
+
+/** Only the Host supplies adopted bindings; clients never choose native paths. */
+export interface BackgroundWorkflowReadInput {
+  readonly sessionId: SessionId;
+  readonly target: TargetDescriptor;
+  readonly bindings: readonly NativeSessionBinding[];
+  readonly taskId: string;
+  readonly maximumBytes: number;
+  readonly signal?: AbortSignal;
+  assertCurrent(): void;
+}
+
 export interface BackgroundTaskOutputResult {
   readonly status: "available" | "unavailable" | "failed";
   readonly text: string;
@@ -542,6 +587,7 @@ export interface BackgroundTaskOutputResult {
   readonly truncated: boolean;
   readonly modifiedAtMs?: number;
   readonly capturedAtMs: number;
+  readonly workflow?: BackgroundWorkflowProgress;
 }
 
 export interface BackendAdapter {
@@ -739,6 +785,7 @@ export interface BackendAdapter {
   cancelBackgroundTask?(context: AdapterContext, taskId: string): Promise<void>;
   /** Read only the tail of an active task's privately registered local output. */
   getBackgroundTaskOutput?(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult>;
+  getBackgroundWorkflowProgress?(input: BackgroundWorkflowReadInput): Promise<BackgroundTaskOutputResult>;
   /**
    * Control an observed delegated run owned by this exact product Session.
    * The Host verifies durable ownership and per-action capabilities before the

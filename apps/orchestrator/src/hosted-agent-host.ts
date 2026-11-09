@@ -4,6 +4,7 @@ import { HOSTED_AGENT_UNREAD_LIMIT, type HostedAgentFrame } from "./hosted-agent
 import type { HostedNativeOpen, HostedNativeInferenceRequest } from "@joko/adapter-hosted";
 import { decodeHostedAgentInference } from "./hosted-agent-wire.js";
 import type { HostedNativeProviderGrantOwner } from "@joko/store";
+import type { HostedWorkflowProgressCommand, HostedWorkflowProgressResult } from "./hosted-agent-workflow-progress.js";
 
 /** Captured by the authenticated service, never deserialized from a caller's
  * payload. A shared Provider grant is separate from Device or task access. */
@@ -30,6 +31,7 @@ export interface HostedAgentPollCursor { readonly runId: string; readonly after:
 export interface HostedAgentPollRun { readonly runId: string; readonly cursor: number; readonly finished: boolean; readonly frames: readonly HostedAgentFrame[] }
 type AuthorizedRun = Omit<HostedAgentRunOptions, "runId" | "nativeSessionId" | "start" | "source" | "trust" | "backendId" | "providerId" | "modelId" | "name" | "permissionMode" | "fastMode" | "effort" | "workspace" | "onCreated">;
 export interface HostedAgentHostOptions {
+  readonly readWorkflowProgress?: (principal: HostedAgentPrincipal, command: HostedWorkflowProgressCommand, signal: AbortSignal) => Promise<HostedWorkflowProgressResult>;
   readonly manageDerivation?: (principal: HostedAgentPrincipal, command: Extract<HostedAgentCall, { kind: "derivation_lifecycle" }>) => Promise<void>;
   readonly authorizeInference?: (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest) => () => void;
   readonly infer?: (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest, signal: AbortSignal) => Promise<string>;
@@ -153,8 +155,14 @@ export class HostedAgentHost {
     void this.open(principal, input).catch(() => {});
     return this.#entry(principal, input.runId).prepared;
   }
-  async call(principal: HostedAgentPrincipal, runId: string, callId: string, command: HostedAgentCall): Promise<unknown> {
+  async call(principal: HostedAgentPrincipal, runId: string, callId: string, command: HostedAgentCall, signal?: AbortSignal): Promise<unknown> {
     this.#assertPrincipal(principal);
+    if (command.kind === "workflow_progress") {
+      if (!this.#options.readWorkflowProgress) throw new HostedAgentHostError("UNAVAILABLE");
+      const active = signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
+      const result = await this.#options.readWorkflowProgress({ ...principal, assertCurrent: () => this.#assertPrincipal(principal) }, command, active);
+      this.#assertPrincipal(principal); active.throwIfAborted(); return result;
+    }
     if (command.kind === "derivation_lifecycle") {
       if (!this.#options.manageDerivation) throw new HostedAgentHostError("UNAVAILABLE");
       await this.#options.manageDerivation(principal, command); this.#assertPrincipal(principal); return null;

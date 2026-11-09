@@ -7,6 +7,7 @@ import type { AdapterContext, BackendAdapter, BackendDescriptor, BlobRef, Create
   NativeSessionNavigation, NativeSessionNavigationResult, NativeSessionState, PromptInput, ProviderModel, RuntimeCommand, RuntimeResource,
   RuntimeToolCatalog, SessionTree, SubagentControlInput, TargetDescriptor, UserShellInput, UserShellResult, NativeTextInferenceInput } from "@joko/core";
 import type { HostedNativeCommand, HostedNativeOpen, HostedNativeDerivationLifecycle } from "./protocol.js";
+import type { BackgroundWorkflowReadInput } from "@joko/core";
 import { JokoError, toPublicError } from "@joko/core";
 import type { HostedAgentConnectionPool } from "./connection-pool.js";
 
@@ -37,6 +38,7 @@ export interface HostedAgentSourceConnection {
   readonly close: () => Promise<void>;
 }
 export interface HostedAgentSourceAdapterOptions {
+  readonly readWorkflowProgress?: (command: Extract<HostedNativeCommand, { kind: "workflow_progress" }>, input: BackgroundWorkflowReadInput) => Promise<BackgroundTaskOutputResult>;
   readonly inferNativeText?: (input: NativeTextInferenceInput) => Promise<string>;
   readonly id: string;
   readonly source: HostedAgentDeviceSource;
@@ -82,6 +84,7 @@ interface ActiveSourceSession {
  * The captured native-only connection is supplied by the Device route owner. */
 export class HostedAgentSourceAdapter implements BackendAdapter {
   readonly id: string;
+  readonly getBackgroundWorkflowProgress?: (input: BackgroundWorkflowReadInput) => Promise<BackgroundTaskOutputResult>;
   readonly #options: HostedAgentSourceAdapterOptions;
   readonly #sessions = new Map<string, ActiveSourceSession>();
   readonly #opening = new Map<string, Promise<ActiveSourceSession>>();
@@ -90,6 +93,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   constructor(options: HostedAgentSourceAdapterOptions) {
     identity.parse(options.id); sourceSchema.parse(options.source);
     this.id = options.id; this.#options = { ...options, source: Object.freeze(sourceSchema.parse(options.source)) };
+    if (options.readWorkflowProgress) this.getBackgroundWorkflowProgress = input => this.#readWorkflowProgress(input);
   }
   async describe(): Promise<BackendDescriptor> {
     this.#assertOpen(); const descriptor = await this.#options.describe();
@@ -186,6 +190,23 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   async cancelBackgroundTask(context: AdapterContext, taskId: string): Promise<void> { await this.#call(this.#active(context), { kind: "cancel_background", taskId }, context); }
   async getBackgroundTaskOutput(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult> {
     return await this.#call(this.#active(context), { kind: "background_output", taskId, maximumBytes }, context) as BackgroundTaskOutputResult;
+  }
+  async #readWorkflowProgress(input: BackgroundWorkflowReadInput): Promise<BackgroundTaskOutputResult> {
+    const assertCurrent = (): void => { this.#assertOpen(); input.signal?.throwIfAborted(); input.assertCurrent(); }; assertCurrent();
+    const absent = (): BackgroundTaskOutputResult => ({ status: "unavailable", text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
+    if (input.target.backendId !== this.id || input.target.remoteWorkspace?.kind === "ssh" || input.bindings.length > 200
+      || !/^claude-task-[0-9a-f]{32}$/u.test(input.taskId) || !Number.isSafeInteger(input.maximumBytes) || input.maximumBytes < 1 || input.maximumBytes > 262_144) return absent();
+    const seen = new Set<string>();
+    for (const binding of input.bindings) {
+      let source: SourceBinding;
+      try { source = this.#parse(binding, { sessionId: input.sessionId, target: input.target }); } catch { continue; }
+      const identity = JSON.stringify([source.nativeSessionId, source.providerId]); if (seen.has(identity)) continue; seen.add(identity);
+      assertCurrent();
+      const output = await this.#options.readWorkflowProgress!({ kind: "workflow_progress", backendId: source.source.backendId, providerId: source.providerId,
+        sessionId: source.sessionId, targetId: source.targetId, nativeSessionId: source.nativeSessionId, taskId: input.taskId, maximumBytes: input.maximumBytes }, { ...input, bindings: [binding], assertCurrent });
+      assertCurrent(); if (output.status === "available" && output.workflow !== undefined) return output;
+    }
+    return absent();
   }
   async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     const active = await this.#activate(binding, context, "resume"); await this.#call(active, { kind: "delete" }, context); await this.#close(active); await this.#options.deleteWorkspace?.(context);
