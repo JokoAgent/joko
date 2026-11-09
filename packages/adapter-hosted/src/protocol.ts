@@ -32,6 +32,8 @@ export interface HostedNativeDerivationLifecycle {
  * Adapter. Public clients use the generated protobuf service envelopes. */
 export type HostedNativeCommand =
   | HostedNativeDerivationLifecycle
+  | { readonly kind: "workflow_progress"; readonly backendId: string; readonly providerId: string; readonly sessionId: string;
+      readonly targetId: string; readonly nativeSessionId: string; readonly taskId: string; readonly maximumBytes: number }
   | { readonly kind: "derive"; readonly derivationKind: "fork" | "clone"; readonly sessionId: string; readonly targetId: string; readonly nativeSessionId: string; readonly entryId?: string;
       readonly completedSnapshot?: { readonly kind: "completed_assistant"; readonly nativeBoundaryId: string } }
   | { readonly kind: "state" }

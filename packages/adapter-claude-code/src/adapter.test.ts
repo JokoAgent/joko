@@ -19,7 +19,7 @@ import {
 } from "@joko/core";
 import type { DurableProcessUsage } from "@joko/runtime-governance";
 import { describe, expect, test, vi } from "vitest";
-import { ClaudeCodeAdapter, claudeWorkspaceAuthority, type ClaudeCodeAdapterOptions } from "./adapter.js";
+import { ClaudeCodeAdapter, claudeWorkspaceAuthority, readClaudeWorkflowProgressFromProfile, type ClaudeCodeAdapterOptions } from "./adapter.js";
 import {
   ClaudeSessionStoreError,
   type ClaudeSessionStoreOperationAccess,
@@ -4285,6 +4285,43 @@ describe("ClaudeCodeAdapter", () => {
     } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
 
+  test("reads an owned persisted workflow after terminal notification, runtime close and Adapter restart without creating a query", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-native-workflow-")), configurationDirectory = join(root, "config");
+    const workspace = { ...target, workspaceRoot: root }, runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime, { environment: { CLAUDE_CONFIG_DIR: configurationDirectory }, redactValues: ["workflow-private-marker"] });
+    const restartedRuntime = new FakeSdkRuntime(), restarted = adapterFor(restartedRuntime, { environment: { CLAUDE_CONFIG_DIR: configurationDirectory }, redactValues: ["workflow-private-marker"] });
+    try {
+      const initial = contextFor(undefined, { target: workspace });
+      const binding = await adapter.createSession(createInput({ target: workspace }), initial.context);
+      const active = contextFor(binding, { target: workspace, operationId: "original-workflow" });
+      await adapter.send(textPrompt("run workflow"), active.context);
+      const query = runtime.queries[0]!;
+      query.push(taskStarted(binding.nativeSessionId!, "persisted-workflow", "workflow-tool", { taskType: "local_workflow", description: "Review evidence" }));
+      await eventually(() => active.events.some(event => event.type === "background_task"));
+      const taskId = active.events.find((event): event is Extract<EventPayload, { type: "background_task" }> => event.type === "background_task")!.taskId;
+      const directory = join(configurationDirectory, "projects", root.replace(/[^a-zA-Z0-9]/gu, "-"), binding.nativeSessionId!, "workflows");
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, "wf_original.json"), JSON.stringify({ taskId: "persisted-workflow", runId: "workflow-run", status: "done",
+        phases: [{ title: "Review", detail: "Original evidence" }], workflowProgress: [{ type: "workflow_agent", label: "Reviewer", state: "done",
+          phaseIndex: 1, attempt: 2, resultPreview: "workflow-private-marker found", model: "actual-native-model", durationMs: 200 }], logs: ["workflow-private-marker log"] }));
+      const read = { sessionId: active.context.sessionId, target: workspace, bindings: [binding], taskId, maximumBytes: 16_384, assertCurrent() {} };
+      expect((await adapter.getBackgroundWorkflowProgress(read)).workflow?.agents[0]).toMatchObject({ label: "Reviewer", state: "done", model: "actual-native-model", attempt: 2 });
+      query.push(taskNotification(binding.nativeSessionId!, "persisted-workflow", "workflow-tool", { status: "completed", summary: "Reviewed", outputFile: join(root, "workflow.output"), totalTokens: 0, toolUses: 0, durationMs: 200 }));
+      await eventually(() => active.events.some(event => event.type === "background_task" && event.state === "completed"));
+      expect((await adapter.getBackgroundWorkflowProgress(read)).status).toBe("available");
+      await adapter.closeSession(binding, contextFor(binding, { target: workspace }).context);
+      const result = await restarted.getBackgroundWorkflowProgress(read);
+      expect(result.workflow?.status).toBe("done"); expect(JSON.stringify(result)).not.toContain("workflow-private-marker");
+      const profile = await readClaudeWorkflowProgressFromProfile(read, { configurationDirectory, redactValues: ["workflow-private-marker"] });
+      expect(profile.workflow?.agents[0]?.attempt).toBe(2); expect(JSON.stringify(profile)).not.toContain("workflow-private-marker");
+      expect(restartedRuntime.queries).toHaveLength(0);
+      expect((await restarted.getBackgroundWorkflowProgress({ ...read, bindings: [] })).status).toBe("unavailable");
+      expect((await restarted.getBackgroundWorkflowProgress({ ...read, target: { ...workspace, workspaceRoot: join(root, "other-workspace") } })).status).toBe("unavailable");
+      const abort = new AbortController(); abort.abort();
+      await expect(restarted.getBackgroundWorkflowProgress({ ...read, signal: abort.signal })).rejects.toThrow();
+    } finally { await adapter.dispose(); await restarted.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
+
   test("projects native task lifecycle and child work without mixing child text into the parent turn", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime, { redactValues: ["task-secret"] });
@@ -6836,6 +6873,89 @@ describe("ClaudeCodeAdapter", () => {
     )).rejects.toMatchObject({ publicError: { code: "EXTRA_DIRECTORY_ACCESS_UNSUPPORTED" } });
 
     await adapter.closeSession(binding, context);
+  });
+
+  test("adopts added directories on the next input without interrupting accepted work or deferring removals", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-directory-addition-")));
+    const sdk = new FakeSdkRuntime({ autoAdmitTurns: true }), adapter = adapterFor(sdk);
+    try {
+      const directories = await Promise.all(["first", "second", "third"].map(async id => {
+        const path = join(root, id);
+        await mkdir(path);
+        return { id, path, access: "read_write" as const };
+      }));
+      const initial = [directories[0]!];
+      const binding = await adapter.createSession(createInput(), { ...contextFor().context, extraDirectories: initial });
+      const first = contextFor(binding, { operationId: "before-directory-addition" });
+      await adapter.send(textPrompt("Continue the accepted work"), { ...first.context, extraDirectories: initial });
+      const query = sdk.queries[0]!;
+      const control = contextFor(binding).context;
+      await adapter.setExtraDirectories(directories.slice(0, 2), control);
+      await adapter.setExtraDirectories(directories, control);
+      expect(query.settingCalls).toEqual([]);
+      expect(query.interruptCalls).toBe(0);
+      expect(sdk.retiredQueries).toEqual([]);
+      expect(first.events.some(event => event.type === "done")).toBe(false);
+
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Original work finished", totalCostUsd: 0 }));
+      await eventually(() => first.events.some(event => event.type === "done"));
+      const second = contextFor(binding, { operationId: "after-directory-addition" });
+      await adapter.send(textPrompt("Use the newly approved directories"), { ...second.context, extraDirectories: directories });
+      expect(query.settingCalls).toEqual([{ permissions: { additionalDirectories: directories.map(directory => directory.path) } }]);
+      expect(query.interruptCalls).toBe(0);
+      expect(sdk.queries).toHaveLength(1);
+      await expect(adapter.setExtraDirectories(initial, control))
+        .rejects.toMatchObject({ publicError: { code: "SESSION_BUSY", stateMayHaveChanged: false } });
+
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Second work finished", totalCostUsd: 0 }));
+      await eventually(() => second.events.some(event => event.type === "done"));
+      vi.spyOn(query, "applyFlagSettings").mockRejectedValueOnce(new Error("Native acknowledgement lost"));
+      await expect(adapter.setExtraDirectories(initial, control))
+        .rejects.toMatchObject({ publicError: { code: "NATIVE_CONTROL_UNKNOWN", stateMayHaveChanged: true } });
+      await expect(adapter.send(textPrompt("Must not use an unknown scope"), contextFor(binding, { operationId: "unknown-directory-scope" }).context))
+        .rejects.toMatchObject({ publicError: { code: "NATIVE_CONTROL_UNKNOWN" } });
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retains a later directory addition while an idle native update is awaiting its acknowledgement", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-directory-update-")));
+    const sdk = new FakeSdkRuntime({ autoAdmitTurns: true }), adapter = adapterFor(sdk);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    try {
+      const directories = await Promise.all(["first", "second"].map(async id => {
+        const path = join(root, id);
+        await mkdir(path);
+        return { id, path, access: "read_write" as const };
+      }));
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const query = sdk.queries[0]!;
+      const apply = query.applyFlagSettings.bind(query);
+      const updating = vi.spyOn(query, "applyFlagSettings").mockImplementationOnce(async settings => {
+        await held;
+        await apply(settings);
+      });
+      const first = adapter.setExtraDirectories(directories.slice(0, 1), contextFor(binding).context);
+      await eventually(() => updating.mock.calls.length === 1);
+      await adapter.setExtraDirectories(directories, contextFor(binding).context);
+      release();
+      await first;
+      await adapter.send(textPrompt("Use the latest directory list"), {
+        ...contextFor(binding, { operationId: "latest-directories" }).context, extraDirectories: directories
+      });
+      expect(query.settingCalls).toEqual([
+        { permissions: { additionalDirectories: [directories[0]!.path] } },
+        { permissions: { additionalDirectories: directories.map(directory => directory.path) } }
+      ]);
+      expect(query.interruptCalls).toBe(0);
+    } finally {
+      release();
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("rejects stale Backend instance contexts and drops late output from a retired Query generation", async () => {

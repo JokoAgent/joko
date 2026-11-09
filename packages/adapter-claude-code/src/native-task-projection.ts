@@ -264,6 +264,11 @@ export class ClaudeNativeTaskProjection {
     return task !== undefined && activeState(task.state) ? task.outputFile : undefined;
   }
 
+  isWorkflowTask(publicTaskId: string): boolean | undefined {
+    const task = this.#publicTaskIds.get(publicTaskId);
+    return task === undefined ? undefined : task.taskType === "local_workflow";
+  }
+
   childId(publicTaskId: string): string | undefined {
     return this.#publicTaskIds.has(publicTaskId) ? childIdFor(publicTaskId) : undefined;
   }

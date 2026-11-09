@@ -30,6 +30,7 @@ import {
   type BackendDescriptor,
   type BlobRef,
   type BackgroundTaskOutputResult,
+  type BackgroundWorkflowReadInput,
   type Capability,
   type CreateNativeSessionInput,
   type DurableNativeDispatchPreparation,
@@ -83,6 +84,7 @@ import { claudeCodeError } from "./errors.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpCallResult, ClaudeMcpRuntimeLease, ClaudeMcpTool } from "./mcp-bridge.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import { readRegisteredBackgroundTaskOutput } from "./background-task-output.js";
+import { readBackgroundWorkflowProgress } from "./workflow-progress.js";
 import type { ClaudeFreshContextBindingLookup, ClaudeFreshContextIdentity, ClaudeFreshContextSnapshot } from "./fresh-context-owner.js";
 import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
 import { claudeNativeDispatchFingerprint } from "./native-dispatch-fingerprint.js";
@@ -637,6 +639,7 @@ interface NativeRuntime {
   permissionMode: PermissionMode;
   planMode: boolean;
   additionalDirectories: readonly ApprovedDirectory[];
+  pendingAdditionalDirectories?: readonly ApprovedDirectory[];
   lastUsage?: UsageSnapshot;
 }
 
@@ -1860,6 +1863,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (input.disposition === "steer") return this.#steer(input, context, persistFence);
     if (this.#workingContextRecoveries.has(context.sessionId)) await this.refreshModelWorkingContext(context);
     let runtime = this.#requireIdleRuntime(context);
+    if (runtime.pendingAdditionalDirectories !== undefined) {
+      await this.setExtraDirectories(context.extraDirectories ?? runtime.pendingAdditionalDirectories, context);
+      runtime = this.#requireIdleRuntime(context);
+    }
     assertRemotePromptSupported(input, runtime);
     if (runtime.managedRoute !== undefined && (context.modelSelection?.providerId !== runtime.managedRoute.providerId
       || context.modelSelection.modelId !== runtime.managedRoute.model.modelId)) throw managedRouteUnavailable();
@@ -2900,6 +2907,19 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       retryable: true, recovery: "Refresh the completed assistant boundary and open a new Side Chat operation." });
   }
 
+  async getBackgroundWorkflowProgress(input: BackgroundWorkflowReadInput): Promise<BackgroundTaskOutputResult> {
+    const absent = (): BackgroundTaskOutputResult => ({ status: "unavailable", text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
+    const assertCurrent = (): void => { this.#assertUsable(); input.signal?.throwIfAborted(); input.assertCurrent(); };
+    assertCurrent();
+    if (input.target.remoteWorkspace !== undefined) return absent();
+    const runtime = this.#sessions.get(input.sessionId);
+    if (runtime && (runtime.remote || runtime.runtimePolicy !== "standard" || runtime.nativeTasks.isWorkflowTask(input.taskId) === false)) return absent();
+    const result = await readOwnedWorkflowProgress({ ...input, assertCurrent }, { configurationDirectory: this.#nativeMemoryConfigDirectory,
+      projectDirectoryName: this.#environment["CLAUDE_CODE_PROJECT_DIR_NAME"],
+      project: (value, maximum) => this.#projection.text(value, maximum) });
+    assertCurrent(); return result;
+  }
+
   async getBackgroundTaskOutput(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult> {
     const unavailable = (): BackgroundTaskOutputResult => ({ status: "unavailable", text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
     const runtime = this.#sessions.get(context.sessionId);
@@ -3408,16 +3428,35 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     directories: readonly ApprovedDirectory[],
     context: AdapterContext
   ): Promise<void> {
-    const runtime = this.#requireIdleRuntime(context);
+    const runtime = this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change additional directories");
     const validated = await this.#validateExtraDirectories(directories, runtime.target);
+    this.#assertCurrent(runtime, context, context.binding);
+    context.signal.throwIfAborted();
+    context.assertExtraDirectoriesCurrent?.(validated);
+    try {
+      this.#requireIdleRuntime(context);
+    } catch (error) {
+      // An addition changes the next input's scope. Keep the accepted turn and
+      // its installed permissions intact; removals still require immediate
+      // retirement when the native control cannot be applied safely.
+      if (!(error instanceof JokoError) || error.publicError.code !== "SESSION_BUSY"
+        || !runtime.additionalDirectories.every(previous => validated.some(next =>
+          next.id === previous.id && next.access === previous.access
+          && canonicalPathKey(next.path) === canonicalPathKey(previous.path)))) throw error;
+      context.assertExtraDirectoriesCurrent?.(runtime.additionalDirectories);
+      runtime.pendingAdditionalDirectories = validated;
+      return;
+    }
     const paths = validated.map((directory) => directory.path);
+    const pending = runtime.pendingAdditionalDirectories;
     await this.#runIdleControl(runtime, context, "extra_directories", async (acknowledge) => {
       context.assertExtraDirectoriesCurrent?.(validated);
       await runtime.query.applyFlagSettings({ permissions: { additionalDirectories: paths } });
       acknowledge();
       runtime.additionalDirectories = validated;
       context.assertExtraDirectoriesCurrent?.(validated);
+      if (runtime.pendingAdditionalDirectories === pending) runtime.pendingAdditionalDirectories = undefined;
     });
   }
 
@@ -7987,6 +8026,41 @@ function parseBindingRoute(binding: NativeSessionBinding): ParsedBindingRoute {
   const nativeSessionId = route.nativeSessionId;
   if (binding.nativeSessionId !== undefined && binding.nativeSessionId !== nativeSessionId) throw continuityGap();
   return route;
+}
+
+export interface ClaudeWorkflowProfile {
+  readonly configurationDirectory: string;
+  readonly projectDirectoryName?: string;
+  readonly redactValues?: readonly string[];
+  readonly redactText?: (value: string) => string;
+}
+
+/** Trusted native Host read port. It never constructs an SDK, process owner,
+ * credential proxy or writable native SessionStore. */
+export async function readClaudeWorkflowProgressFromProfile(input: BackgroundWorkflowReadInput, profile: ClaudeWorkflowProfile): Promise<BackgroundTaskOutputResult> {
+  const projection = new SafeProjection([profile.configurationDirectory, ...(profile.redactValues ?? [])]);
+  return readOwnedWorkflowProgress(input, { configurationDirectory: profile.configurationDirectory, projectDirectoryName: profile.projectDirectoryName,
+    project: (value, maximum) => projection.text(typeof value === "string" && profile.redactText ? profile.redactText(value) : value, maximum) });
+}
+
+async function readOwnedWorkflowProgress(input: BackgroundWorkflowReadInput, profile: {
+  readonly configurationDirectory: string; readonly projectDirectoryName?: string; readonly project: (value: unknown, maximum: number) => string;
+}): Promise<BackgroundTaskOutputResult> {
+  const assertCurrent = (): void => { input.signal?.throwIfAborted(); input.assertCurrent(); }; assertCurrent();
+  const absent = (): BackgroundTaskOutputResult => ({ status: "unavailable", text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
+  if (input.target.remoteWorkspace !== undefined || input.bindings.length > 200) return absent();
+  const authority = claudeWorkspaceAuthority(input.target), ids = new Set<string>();
+  for (const binding of input.bindings) {
+    try {
+      const route = parseBindingRoute(binding);
+      if (route.kind === "stored" && route.workspaceAuthority !== authority) continue;
+      ids.add(route.nativeSessionId);
+    } catch { /* An uninitialized binding does not authorize native files. */ }
+  }
+  if (ids.size === 0) return absent();
+  const result = await readBackgroundWorkflowProgress({ configurationDirectory: profile.configurationDirectory, projectDirectoryName: profile.projectDirectoryName,
+    workingDirectory: input.target.workspaceRoot, nativeSessionIds: [...ids], taskId: input.taskId, maximumBytes: input.maximumBytes, project: profile.project, assertCurrent });
+  assertCurrent(); return result;
 }
 
 export function claudeWorkspaceAuthority(target: TargetDescriptor): string {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
@@ -14,6 +14,67 @@ import { SessionHost } from "./session-host.js";
 import { HostedAgentSources } from "./hosted-agent-sources.js";
 import { toProtoCapability } from "./proto-mapper.js";
 import { decodeHostedAgentInvocation, encodeHostedAgentValue } from "./hosted-agent-wire.js";
+
+it("reads a completed retained workflow through the actual paired Source without opening a native run and drops a revoked relation's late result", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-paired-workflow-"))), store = new OperationalStore(join(root, "source.sqlite"));
+  const peers = new DevicePeerOwner({ store }), registry = new BackendInstanceRegistry(store);
+  const host = new SessionHost(store, new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }), []);
+  const sources = new HostedAgentSources({ store, peers, registry, host, temporaryRoot: join(root, "incoming"),
+    readPolicy: () => ({ revision: "source-policy", permissionMode: "ask", planMode: false, approvedRoots: [], confirmCredentials: true }),
+    readBlob: async () => { throw new Error("A workflow read has no image authority."); } });
+  const controller = store.createConnection({ id: "source-connection", deviceId: "original-device", device: { defaultName: "Original", kind: "web", platform: "web" }, name: "Original", authKeyDigest: "original-digest" });
+  const target = store.createConnection({ id: "native-connection", deviceId: "native-device", device: { defaultName: "Native", kind: "service", platform: process.platform }, name: "Native", authKeyDigest: "native-digest" });
+  store.setDeviceRemoteControlEnabled(target.deviceId, true); await writeFile(join(root, "evidence.txt"), "Owned Source evidence");
+  const taskId = `claude-task-${"a".repeat(32)}`, virtualRoot = "/provider-private/workspace", calls: string[] = [];
+  let block = false, entered!: () => void, release!: () => void;
+  const reached = new Promise<void>(resolve => { entered = resolve; }), delayed = new Promise<void>(resolve => { release = resolve; });
+  const native = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "recent.json"), nativeAgents: {
+    invoke: async (method, bytes) => {
+      if (method === contract.HostedAgentPeerMethod.GET_CATALOG) return toBinary(contract.GetHostedAgentCatalogResponseSchema, create(contract.GetHostedAgentCatalogResponseSchema,
+        { format: 1, remoteControlEnabled: true, backends: [{ backendId: "native-claude", nativeAdapterKind: "claude-agent-sdk-stdio", instanceGeneration: 1n,
+          displayName: "Native Claude", version: "1", capabilities: [{ name: contract.capabilityNames.backgroundTasks, support: contract.CapabilitySupport.SUPPORTED }],
+          providers: [{ providerId: "provider", connected: true, remoteInvocationEnabled: true, models: [{ backendId: "native-claude", key: { providerId: "provider", modelId: "model" },
+            displayName: "Model", api: "anthropic-messages", contextWindowTokens: 32768n, maximumOutputTokens: 1024n, inputModalities: [contract.ModelInputModality.TEXT] }] }] }] }));
+      expect(method).toBe(contract.HostedAgentPeerMethod.CALL);
+      const request = fromBinary(contract.CallHostedAgentRequestSchema, bytes), command = decodeHostedAgentInvocation(request.commandJson); calls.push(command.kind);
+      expect(command).toMatchObject({ kind: "workflow_progress", sessionId: "retained-task", targetId: "source-target", nativeSessionId: "retained-native-alias", taskId, backendId: "native-claude" });
+      if (block) { entered(); await delayed; }
+      return toBinary(contract.CallHostedAgentResponseSchema, create(contract.CallHostedAgentResponseSchema, { format: 1, resultJson: encodeHostedAgentValue({ virtualRoot,
+        output: { status: "available", text: "", totalBytes: 500, truncated: false, capturedAtMs: Date.now(), workflow: { runId: "workflow", status: "done", totalTokens: 0,
+          phases: [{ index: 1, title: "Review" }], agents: [{ label: "Reviewer", state: "done", phaseIndex: 1, attempt: 2, resultPreview: `${virtualRoot}/evidence.txt` }],
+          logs: [block ? "Late retired relation" : `${virtualRoot}/evidence.txt`] } } }) }));
+    }, retire: async () => {}
+  } });
+  const harness = createInProcessDevicePeerHarness({ targetDeviceId: target.deviceId, capabilities: ["native_agents"], agent: {
+    handle: async (frame, signal) => {
+      let value: contract.DevicePeerAgentResult["payload"] | undefined;
+      await native.execute(frame.payload as contract.DevicePeerCommand, signal, async result => { if (result.phase === contract.DevicePeerResponsePhase.COMPLETED) value = result.payload; });
+      return { outcome: "completed", value };
+    }, retire: () => native.retire()
+  } }); peers.registerRoute(target, harness.transport);
+  try {
+    await sources.initialize(); await host.initialize(); await sources.refresh(controller);
+    const backend = store.listBackends()[0]!.descriptor, source = sources.source(backend.id)!;
+    await host.registerTarget({ id: "source-target", backendId: backend.id, displayName: "Source", workspaceRoot: root, trusted: true, managed: false });
+    const binding = { generation: 1, nativeSessionId: "retained-native-alias", opaqueRef: JSON.stringify({ format: 1, backendId: backend.id, source,
+      sessionId: "retained-task", targetId: "source-target", nativeSessionId: "retained-native-alias", providerId: "provider" }) };
+    store.createSession({ id: "retained-task", backendId: backend.id, targetId: "source-target", title: "Workflow", binding,
+      pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    store.appendEvent({ backendId: backend.id, targetId: "source-target", sessionId: "retained-task", generation: 1, traceId: "retained-workflow",
+      payload: { type: "background_task", taskId, title: "Workflow", state: "completed" } });
+    const value = await host.getBackgroundTaskOutput("retained-task", taskId);
+    expect(value.workflow).toMatchObject({ status: "done", totalTokens: 0, agents: [{ attempt: 2, resultPreview: join(root, "evidence.txt") }], logs: [join(root, "evidence.txt")] });
+    expect(JSON.stringify(value)).not.toContain(virtualRoot); expect(calls).toEqual(["workflow_progress"]);
+    block = true; const pending = host.getBackgroundTaskOutput("retained-task", taskId);
+    await Promise.race([reached, pending.then(() => { throw new Error("The workflow read did not enter the original paired route."); })]);
+    store.setDeviceRemoteControlEnabled(target.deviceId, false); release();
+    const retired = await pending; expect(retired.status).toBe("unavailable"); expect(JSON.stringify(retired)).not.toContain("Late retired relation");
+    expect(calls).toEqual(["workflow_progress", "workflow_progress"]);
+  } finally {
+    release(); await host.dispose(); await sources.close(); await peers.shutdown(); store.close();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});
 
 it("publishes actual paired native sources, retains paused and offline choices, and restores the same identity from the Source database", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-native-source-catalog-"));

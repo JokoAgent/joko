@@ -1036,6 +1036,39 @@ message BackgroundTaskOutput {
   bool truncated = 6;
   int64 captured_at_ms = 7;
   optional int64 modified_at_ms = 8;
+  // Structured native workflow history can remain available after its runtime ends.
+  optional BackgroundWorkflowProgress workflow = 9;
+}
+message BackgroundWorkflowProgress {
+  string run_id = 1;
+  string status = 2;
+  optional string workflow_name = 3;
+  optional uint64 agent_count = 4;
+  optional uint64 total_tokens = 5;
+  optional uint64 total_tool_calls = 6;
+  optional uint64 duration_ms = 7;
+  repeated BackgroundWorkflowPhase phases = 8;
+  repeated BackgroundWorkflowAgent agents = 9;
+  repeated string logs = 10;
+}
+message BackgroundWorkflowPhase {
+  uint32 index = 1;
+  string title = 2;
+  optional string detail = 3;
+}
+message BackgroundWorkflowAgent {
+  string label = 1;
+  string state = 2;
+  optional string agent_id = 3;
+  optional string model = 4;
+  optional string phase_title = 5;
+  optional uint32 phase_index = 6;
+  optional uint32 attempt = 7;
+  optional string last_tool_name = 8;
+  optional string last_tool_summary = 9;
+  optional string result_preview = 10;
+  optional uint64 duration_ms = 11;
+  optional string error = 12;
 }
 message GetBackgroundTaskOutputRequest {
   string session_id = 1;

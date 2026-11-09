@@ -2137,7 +2137,8 @@ describe("CodexBackendAdapter", () => {
       status: { type: "idle" },
       createdAt: 1,
       updatedAt: 1,
-      config: {}
+      config: {},
+      memoryEnabled: setup.fake.nativeMemoryEnabled
     });
     await expect(setup.fake.requestCommandApproval(threadId, "turn-unowned")).resolves.toEqual({ decision: "cancel" });
   });
@@ -2155,7 +2156,8 @@ describe("CodexBackendAdapter", () => {
       status: { type: "idle" },
       createdAt: 1,
       updatedAt: 1,
-      config: {}
+      config: {},
+      memoryEnabled: setup.fake.nativeMemoryEnabled
     });
     await expect(setup.fake.requestCommandApproval(threadId, "turn-unowned", ["accept"]))
       .rejects.toMatchObject({ rpcCode: -32602 });
@@ -2640,7 +2642,8 @@ describe("CodexBackendAdapter", () => {
       status: { type: "idle" },
       createdAt: 1,
       updatedAt: 1,
-      config: {}
+      config: {},
+      memoryEnabled: setup.fake.nativeMemoryEnabled
     });
     const discovered = await setup.adapter.listNativeSessions(setup.target);
     expect(discovered.map((candidate) => candidate.nativeSessionId)).toEqual([binding.nativeSessionId]);

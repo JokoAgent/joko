@@ -6,6 +6,7 @@ import type { BackgroundTaskHistoryView, Locale, TimelineItemView } from "../mod
 import { backgroundTaskDuration, isActiveBackgroundTask, projectBackgroundTaskGroups, type ProjectedBackgroundTask } from "./background-task-panel.js";
 import type { Translator } from "./types.js";
 import { Button, Pill, StatusDot, formatRelativeTime } from "./ui.js";
+import { BackgroundWorkflowTree } from "./BackgroundWorkflowTree.js";
 
 export function BackgroundTasksPanel({ timeline, history, historyState, historyError, onRefresh, canCancel, onCancel, onReadOutput, outputOwner, locale, t }: {
   readonly timeline: readonly TimelineItemView[];
@@ -141,14 +142,14 @@ function BackgroundTaskDetail({ task, canCancel, cancelling, cancelError, locale
       <header><h3>{t("background.activity")}</h3></header>
       <div><StatusDot state={task.state} label={backgroundTaskStateLabel(task.state, t)} /><span><strong>{backgroundTaskStateLabel(task.state, t)}</strong>{task.detail !== undefined && <small>{task.detail}</small>}</span><time dateTime={new Date(task.endedAt ?? startedAt).toISOString()}>{formatRelativeTime(task.endedAt ?? startedAt, locale)}</time></div>
     </section>
-    {onReadOutput && <BackgroundTaskRecentOutput key={`${outputOwner}:${task.id}`} taskId={task.id} owner={outputOwner} read={onReadOutput} locale={locale} t={t} />}
+    {onReadOutput && <BackgroundTaskRecentOutput key={`${outputOwner}:${task.id}`} taskId={task.id} taskState={task.state} owner={outputOwner} read={onReadOutput} locale={locale} t={t} />}
     {cancelError !== undefined && <div className="background-task-error" role="alert"><strong>{t("background.cancelFailed")}</strong><span>{cancelError}</span></div>}
     {task.error !== undefined && <div className="background-task-error" role="alert"><strong>{task.error.code}</strong><span>{task.error.message}</span></div>}
   </div>;
 }
 
-function BackgroundTaskRecentOutput({ taskId, owner, read, locale, t }: {
-  readonly taskId: string; readonly owner?: string;
+function BackgroundTaskRecentOutput({ taskId, taskState, owner, read, locale, t }: {
+  readonly taskId: string; readonly taskState: string; readonly owner?: string;
   readonly read: (taskId: string, signal: AbortSignal) => Promise<BackgroundTaskOutput>;
   readonly locale: Locale; readonly t: Translator;
 }): JSX.Element {
@@ -175,7 +176,7 @@ function BackgroundTaskRecentOutput({ taskId, owner, read, locale, t }: {
     {loading && !value && <p role="status">{t("common.loading")}</p>}
     {error || value?.state === BackgroundTaskOutputState.FAILED ? <p role="alert">{t("background.outputFailed")}</p>
       : value?.state === BackgroundTaskOutputState.UNAVAILABLE ? <p role="status">{t("background.outputUnavailable")}</p>
-      : value && <>{value.text ? <pre>{value.text}</pre> : <p role="status">{t("background.outputEmpty")}</p>}{value.truncated && <Pill>{t("background.outputTruncated")}</Pill>}<time dateTime={new Date(Number(value.modifiedAtMs ?? value.capturedAtMs)).toISOString()}>{formatRelativeTime(Number(value.modifiedAtMs ?? value.capturedAtMs), locale)}</time></>}
+      : value && <>{value.workflow ? <BackgroundWorkflowTree workflow={value.workflow} taskState={taskState} locale={locale} /> : value.text ? <pre>{value.text}</pre> : <p role="status">{t("background.outputEmpty")}</p>}{value.truncated && <Pill>{t("background.outputTruncated")}</Pill>}<time dateTime={new Date(Number(value.modifiedAtMs ?? value.capturedAtMs)).toISOString()}>{formatRelativeTime(Number(value.modifiedAtMs ?? value.capturedAtMs), locale)}</time></>}
   </section>;
 }
 

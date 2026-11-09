@@ -100,7 +100,7 @@ jobs:
           src/extension-catalog.test.ts src/extension-device-sync.test.ts
           src/hosted-agent-executor.test.ts src/hosted-agent-host.test.ts src/hosted-agent-peer-port.test.ts src/model-favorite-settings.test.ts
           src/partner-autonomy.test.ts src/partner-messaging.test.ts src/partner-network-plan-runtime.test.ts
-          src/provider-group-hosted-lifecycle.test.ts src/provider-group-session-host.test.ts src/provider-group-source-native.test.ts src/provider-sharing-service.test.ts
+          src/hosted-agent-guest-peer-workflow.test.ts src/provider-group-hosted-lifecycle.test.ts src/provider-group-session-host.test.ts src/provider-group-source-native.test.ts src/provider-sharing-service.test.ts
           src/remote-workspace-service.test.ts src/scheduler.test.ts
           src/voice-conversation/dashscope-voices.test.ts src/voice-conversation/manager.test.ts
           src/workspace-html-snapshot.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/service.log"

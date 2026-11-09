@@ -38,6 +38,19 @@ it("preserves the four current strategies and exact soft-capacity and weight bou
     expect(groups.update(key, config([]), 1n).config).toBeUndefined();
   } finally { db.close(); }
 });
+it("retains the first admitted workflow authority across a cold reopen without adopting another grant or store owner", () => {
+  const root = mkdtempSync(join(tmpdir(), "joko-group-workflow-owner-")), path = join(root, "store.db"); let db = new OperationalStore(path);
+  try {
+    let groups = new ProviderGroupStore(db, "original-owner");
+    groups.observeHostedWorkflowAuthority("original-alias", "a".repeat(64));
+    groups.observeHostedWorkflowAuthority("original-alias", "b".repeat(64));
+    expect(() => groups.observeHostedWorkflowAuthority("original-alias", "untrusted-grant")).toThrow();
+    db.close(); db = new OperationalStore(path); groups = new ProviderGroupStore(db, "original-owner");
+    expect(groups.hostedWorkflowAuthority("original-alias")).toBe("a".repeat(64));
+    expect(groups.hostedWorkflowAuthority("other-alias")).toBeUndefined();
+    expect(new ProviderGroupStore(db, "other-owner").hostedWorkflowAuthority("original-alias")).toBeUndefined();
+  } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
+});
 it("attributes actual SDK usage before dispatch and folds a completion once across restarts", () => {
   const root = mkdtempSync(join(tmpdir(), "joko-group-usage-")), path = join(root, "store.db"); let db = new OperationalStore(path);
   try {

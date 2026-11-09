@@ -21,6 +21,26 @@ afterEach(async () => {
 });
 
 describe("BackgroundTasksPanel cancellation", () => {
+  it("renders persisted phases, models, attempts, results and logs when an ended task is reopened", async () => {
+    const read = vi.fn(async (backgroundTaskId: string) => create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId,
+      state: BackgroundTaskOutputState.AVAILABLE, capturedAtMs: BigInt(Date.now()), workflow: { runId: "workflow-run", status: "done", workflowName: "Investigation",
+        agentCount: 1n, totalTokens: 0n, totalToolCalls: 4n, durationMs: 3_200n, phases: [{ index: 1, title: "Review", detail: "Check durable evidence" }],
+        agents: [{ label: "Reviewer", state: "queued", phaseIndex: 1, model: "native-model", attempt: 2, lastToolName: "Read",
+          lastToolSummary: "Opened the record", resultPreview: "Original result", durationMs: 3_000n }, { label: "Unassigned", state: "done" }], logs: ["Durable log"] } }));
+    const container = await renderPanel({ canCancel: false, onCancel: vi.fn(), onRefresh: vi.fn(), onReadOutput: read });
+    const finished = Array.from(container.querySelectorAll<HTMLButtonElement>(".background-task-row__select")).find(button => button.textContent?.includes("Finished"))!;
+    await act(async () => finished.click());
+    const tree = container.querySelector(".background-workflow")!;
+    for (const expected of ["Investigation", "Review", "Check durable evidence", "Reviewer", "native-model", "Attempt", "Read", "Opened the record", "Original result", "3s", "Durable log", "Other agents"]) expect(tree.textContent).toContain(expected);
+    expect(tree.querySelector('[data-workflow-state="error"]')?.textContent).toContain("Ended before");
+    expect(tree.querySelector(".background-workflow__totals")?.textContent).toContain("Agents2");
+    expect(tree.querySelector(".background-workflow__totals")?.textContent).toContain("Tokens0");
+    expect(container.textContent).not.toContain("No output yet");
+    await act(async () => container.querySelector<HTMLButtonElement>(".background-task-detail__back")!.click());
+    await act(async () => Array.from(container.querySelectorAll<HTMLButtonElement>(".background-task-row__select")).find(button => button.textContent?.includes("Finished"))!.click());
+    expect(read).toHaveBeenCalledTimes(2); expect(container.querySelector(".background-workflow")?.textContent).toContain("Durable log");
+  });
+
   it("shows bounded recent-output states and cancels late reads when another task is selected", async () => {
     let resolve!: (value: BackgroundTaskOutput) => void, signal!: AbortSignal;
     const read = vi.fn((_id: string, owned: AbortSignal) => { signal = owned; return new Promise<BackgroundTaskOutput>(value => { resolve = value; }); });

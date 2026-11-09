@@ -146,6 +146,29 @@ async function completedNavigation(...args: Parameters<SessionHost["navigateTree
 }
 
 describe("Connect typed feature boundaries", () => {
+  it("reads typed workflow history through the existing output service and rejects a retired connection before returning it", async () => {
+    const fence = vi.fn(), host = { getBackgroundTaskOutput: vi.fn(async (_sessionId: string, _taskId: string, _maximum: number,
+      authority: { signal?: AbortSignal; assertCurrent?: () => void }) => {
+      authority.assertCurrent?.(); authority.signal?.throwIfAborted();
+      return { status: "available", text: "", totalBytes: 300, truncated: false, capturedAtMs: Date.now(), workflow: { runId: "workflow-run", status: "done",
+        totalTokens: 0, phases: [{ index: 1, title: "Review", detail: "Evidence" }], agents: [{ label: "Reviewer", state: "done", phaseIndex: 1,
+          attempt: 2, model: "native-model", lastToolName: "Read", resultPreview: "Result", durationMs: 0 }], logs: ["Durable log"] } };
+    }) };
+    const services = createConnectServices(stubApplication({ sessionHost: host, connections: { authenticate: () => connection, fence } }));
+    const request = fromBinary(contract.GetBackgroundTaskOutputRequestSchema, toBinary(contract.GetBackgroundTaskOutputRequestSchema,
+      create(contract.GetBackgroundTaskOutputRequestSchema, { sessionId: "session", backgroundTaskId: "workflow", maximumBytes: 4_096 })));
+    const response = await invoke<{ output: contract.BackgroundTaskOutput }>(services.session.getBackgroundTaskOutput, request);
+    const restored = fromBinary(contract.GetBackgroundTaskOutputResponseSchema, toBinary(contract.GetBackgroundTaskOutputResponseSchema,
+      create(contract.GetBackgroundTaskOutputResponseSchema, response)));
+    expect(restored.output).toMatchObject({ sessionId: "session", backgroundTaskId: "workflow", state: contract.BackgroundTaskOutputState.AVAILABLE,
+      workflow: { totalTokens: 0n, agents: [{ model: "native-model", attempt: 2, durationMs: 0n }], logs: ["Durable log"] } });
+    expect(host.getBackgroundTaskOutput.mock.calls[0]!.slice(0, 3)).toEqual(["session", "workflow", 4_096]);
+    expect(fence).toHaveBeenCalledWith(connection);
+    fence.mockImplementation(() => { throw new Error("retired connection"); });
+    await expect(invoke(services.session.getBackgroundTaskOutput, request)).rejects.toThrow("retired connection");
+    expect(host.getBackgroundTaskOutput).toHaveBeenCalledTimes(1);
+  });
+
   it("saves a discovered model through the typed settings form without freezing untouched facts or accepting a posted maximum", async () => {
     const root = mkdtempSync(join(tmpdir(), "joko-provider-discovery-connect-")); cleanupPaths.push(root);
     const credentials = new CredentialManager({ vault: await CredentialVault.open(join(root, "vault.key")), storagePath: join(root, "credentials.json") });
