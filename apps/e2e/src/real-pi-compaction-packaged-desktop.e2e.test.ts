@@ -108,6 +108,22 @@ describe("packaged Desktop Pi compaction", () => {
     if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
       throw new Error("Packaged Desktop did not use its isolated test profile.");
     }
+    await desktop.evaluate(({ app, BrowserWindow }) => {
+      const startedAt = Date.now(), events: unknown[] = [], observed = new Set<number>();
+      const state = (window: Electron.BrowserWindow) => window.isDestroyed() ? { id: window.id, destroyed: true }
+        : { id: window.id, visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized(), loading: window.webContents.isLoading() };
+      const observe = (window: Electron.BrowserWindow): void => {
+        if (observed.has(window.id)) return;
+        observed.add(window.id);
+        const record = (type: string): void => { if (events.length < 32) events.push({ type, elapsedMs: Date.now() - startedAt, ...state(window) }); };
+        record("observed");
+        for (const name of ["ready-to-show", "show", "hide", "focus", "blur", "minimize", "restore", "closed"] as const) window.on(name, () => record(name));
+        for (const name of ["did-finish-load", "render-process-gone"] as const) window.webContents.on(name, () => record(name));
+      };
+      BrowserWindow.getAllWindows().forEach(observe); app.on("browser-window-created", (_event, window) => observe(window));
+      (globalThis as typeof globalThis & { __jokoPairingWindowObservation?: { events: unknown[]; current: () => unknown[] } })
+        .__jokoPairingWindowObservation = { events, current: () => BrowserWindow.getAllWindows().map(state) };
+    });
     const page = await desktop.firstWindow({ timeout: 60_000 });
     await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
     const pairingTab = page.locator(".connection-tabs > button").nth(2);
@@ -134,6 +150,11 @@ describe("packaged Desktop Pi compaction", () => {
         new Promise<undefined>(resolveObservation => { deadline = setNodeTimeout(() => resolveObservation(undefined), 2_000); })
       ]).finally(() => clearNodeTimeout(deadline));
       console.info("Packaged Pi pairing control:", JSON.stringify(observation ?? null));
+      const native = await desktop.evaluate(() => {
+        const receipt = (globalThis as typeof globalThis & { __jokoPairingWindowObservation?: { events: unknown[]; current: () => unknown[] } }).__jokoPairingWindowObservation;
+        return receipt ? { events: receipt.events, windows: receipt.current() } : undefined;
+      }).catch(() => undefined);
+      console.info("Packaged Pi pairing window lifecycle:", JSON.stringify(native ?? null));
       throw error;
     }
     await page.locator('details.device-authorization__manual > summary').click();
