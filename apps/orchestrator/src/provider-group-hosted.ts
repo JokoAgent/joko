@@ -2,8 +2,8 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { JokoError, type NativeSessionState, type UsageSnapshot } from "@joko/core";
 import type { ProviderGroupHostedBinding, ProviderGroupMember } from "@joko/store";
-import type { HostedAgentEndpointPort } from "./hosted-agent-connect-service.js";
-import { HostedAgentHostError, type HostedAgentHost, type HostedAgentOpen, type HostedAgentPrincipal, type HostedAgentPollCursor, type HostedAgentPollRun } from "./hosted-agent-host.js";
+import type { HostedAgentEndpointPort, HostedAgentLifecycleEndpointPort } from "./hosted-agent-connect-service.js";
+import { HostedAgentHostError, type HostedAgentOpen, type HostedAgentPrincipal, type HostedAgentPollCursor, type HostedAgentPollRun } from "./hosted-agent-host.js";
 import type { HostedAgentCall } from "./hosted-agent-run.js";
 import { HostedAgentExchange, HOSTED_AGENT_UNREAD_LIMIT, type HostedAgentFrame } from "./hosted-agent-exchange.js";
 import { HostedAgentPoller, type HostedAgentTransport } from "./hosted-agent-poller.js";
@@ -26,7 +26,7 @@ export interface ProviderGroupNativeCapture {
   close(runId: string, signal: AbortSignal): Promise<void>;
 }
 export interface ProviderGroupHostedOptions {
-  readonly base: HostedAgentHost; readonly runtime: ProviderGroupRuntime; readonly root: string;
+  readonly base: HostedAgentLifecycleEndpointPort; readonly runtime: ProviderGroupRuntime; readonly root: string;
   readonly assertSelection: (principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId" | "modelId">) => void | (() => void);
   readonly captureWorkflowReadAccess?: (principal: HostedAgentPrincipal, input: Pick<HostedAgentOpen, "backendId" | "providerId">) => () => void;
   /** Captured native-only authority, never a URL, bearer or caller-selected trust. */
