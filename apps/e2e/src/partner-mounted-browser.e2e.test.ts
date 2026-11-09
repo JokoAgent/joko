@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
+import { PiAdapterError, PiRpcTransport } from "@joko/adapter-pi";
 import {
   CreatePartnerRequestSchema,
   PartnerCapabilitiesSchema,
@@ -18,7 +19,7 @@ import {
   RunState
 } from "@joko/contracts";
 import { chromium, type Browser, type Page, type Request, type Response, type Route } from "playwright-core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { queueRunIdFrom, resolvePermissionMutation, sendInputMutation, submit } from "./operations.js";
 import {
@@ -49,8 +50,10 @@ const mountedIt = MOUNTED_CHAIN_ENABLED ? it : it.skip;
 describe("mounted Partner collaboration product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
+  let restoreNativeRpcObservation: (() => void) | undefined;
 
   afterEach(async ({ task }) => {
+    restoreNativeRpcObservation?.(); restoreNativeRpcObservation = undefined;
     if (task.result?.state === "fail" && process.env.RUNNER_TEMP !== undefined) {
       try {
         const page = browser?.contexts()[0]?.pages()[0];
@@ -460,6 +463,23 @@ describe("mounted Partner collaboration product chain", () => {
     let releaseCancelledChild: (() => void) | undefined;
     const cancelledChildGate = new Promise<void>((resolve) => { releaseCancelledChild = resolve; });
     const responder = partnerResponder(() => targetPartnerId, cancelledChildGate);
+    const nativeRpcs: Array<{ runtime: number; command: string; startedAt: number; endedAt?: number;
+      state: "pending" | "fulfilled" | "rejected"; errorCode?: string }> = [];
+    const runtimeIds = new WeakMap<PiRpcTransport, number>(); let runtimeCount = 0;
+    const originalRequest = PiRpcTransport.prototype.request;
+    const observation = vi.spyOn(PiRpcTransport.prototype, "request").mockImplementation(function (this: PiRpcTransport, command, options) {
+      let runtime = runtimeIds.get(this);
+      if (runtime === undefined) { runtime = ++runtimeCount; runtimeIds.set(this, runtime); }
+      const receipt: (typeof nativeRpcs)[number] = { runtime, command: command.type, startedAt: Date.now(), state: "pending" };
+      nativeRpcs.push(receipt); if (nativeRpcs.length > 96) nativeRpcs.shift();
+      const pending = originalRequest.call(this, command, options);
+      void pending.then(() => { receipt.state = "fulfilled"; receipt.endedAt = Date.now(); }, error => {
+        receipt.state = "rejected"; receipt.endedAt = Date.now();
+        receipt.errorCode = error instanceof PiAdapterError ? error.publicError.code : "UNCLASSIFIED";
+      });
+      return pending;
+    });
+    restoreNativeRpcObservation = () => observation.mockRestore();
 
     fixture = await RealPiSystemFixture.start({
       webDirectory,
@@ -712,10 +732,17 @@ describe("mounted Partner collaboration product chain", () => {
         stopDelegation.click().then(() => { cancellationClicked = true; })
       ]);
     } catch (cause) {
+      const run = fixture.application.store.findRun(cancellable.runId)?.descriptor;
+      const queue = run === undefined ? undefined : fixture.application.store.findQueueItemByRunId(run.sessionId, run.id);
       throw new Error(`The inline delegation cancellation did not settle: ${JSON.stringify({
         clicked: cancellationClicked, pointer: await pointerReceipt.evaluate(receipt => receipt.events).catch(() => []),
         requests: cancellationRequests, failures: cancellationFailures,
-        card: (await cancelCard.textContent({ timeout: 5_000 }))?.slice(-2_000), browserErrors
+        card: (await cancelCard.textContent({ timeout: 5_000 }))?.slice(-2_000), browserErrors,
+        nativeRpcs: nativeRpcs.slice(-48),
+        run: run === undefined ? undefined : { id: run.id, sessionId: run.sessionId, state: run.state,
+          activeAttemptId: run.activeAttemptId, endedAt: run.endedAt, errorCode: run.error?.code },
+        queue: queue === undefined ? undefined : { id: queue.id, state: queue.state, attemptId: queue.attemptId,
+          backendInstanceGeneration: queue.backendInstanceGeneration }
       })}`, { cause });
     } finally {
       page.off("request", observeCancellation); page.off("requestfailed", observeCancellationFailure);
