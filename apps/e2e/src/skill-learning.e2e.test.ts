@@ -11,6 +11,7 @@ import {
   BackendSettingsPatchSchema,
   OperationMutationSchema,
   OperationState,
+  SetWorkspaceTrustMutationSchema,
   SkillLearningSourceKind,
   SkillLearningState,
   SkillMarketSort
@@ -201,6 +202,7 @@ describe("production Skill learning", () => {
       sort: SkillMarketSort.UPDATED, page: { pageSize: 100 }
     })).entries[0];
     if (marketEntry?.identity === undefined) throw new Error("Catalog Skill identity is unavailable.");
+    expect(fixture.application.store.getTarget("workspace-real-pi").descriptor.trusted).toBe(false);
     const marketRun = (await paired.clients.skill.startSkillLearning({
       requestId: randomUUID(), targetId: "workspace-real-pi", instruction: "", marketIdentity: marketEntry.identity
     })).run!;
@@ -216,13 +218,36 @@ describe("production Skill learning", () => {
     expect(marketPrompt).toContain("Omitted catalog reference files");
     expect(marketPrompt).toContain("references/unreadable.bin");
     const [marketQueue] = fixture.application.store.listQueueItems({ sessionId: marketRun.distillationSessionId! });
-    expect(marketQueue?.body.files).toHaveLength(1);
-    const reference = marketQueue!.body.files[0]!.blob;
-    const referencePath = await fixture.application.artifacts.resolveBlobPath(reference);
-    expect(marketPrompt).toContain(JSON.stringify(referencePath).slice(1, -1));
-    expect(Buffer.from((await fixture.application.artifacts.readBlob(reference)).data).toString("utf8")).toBe("Guide for 1.0.0\n");
+    expect(marketQueue?.body.files).toEqual([]);
+    expect(marketPrompt).toContain("Guide for 1.0.0");
     expect((await paired.clients.skill.discardSkillLearning({
       operationId: randomUUID(), runId: marketReview.runId, expectedRunRevision: marketReview.revision
+    })).run?.state).toBe(SkillLearningState.DISCARDED);
+
+    expect((await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: { case: "setWorkspaceTrust", value: create(SetWorkspaceTrustMutationSchema, {
+        workspaceId: "workspace-real-pi", trusted: true
+      }) }
+    }))).state).toBe(OperationState.SUCCEEDED);
+    const attachedRun = (await paired.clients.skill.startSkillLearning({
+      requestId: randomUUID(), targetId: "workspace-real-pi", instruction: "", marketIdentity: marketEntry.identity
+    })).run!;
+    const attachedReview = (await waitFor(
+      () => paired.clients.skill.getSkillLearningRun({ runId: attachedRun.runId }),
+      response => response.run?.state === SkillLearningState.AWAITING_REVIEW,
+      "trusted catalog Skill learning proposal", 45_000
+    )).run!;
+    const attachedPrompt = JSON.stringify(fixture.providerRequests.at(-1)?.body);
+    const [attachedQueue] = fixture.application.store.listQueueItems({ sessionId: attachedRun.distillationSessionId! });
+    expect(attachedQueue?.body.files).toHaveLength(1);
+    expect(attachedPrompt).toContain(catalogTail);
+    expect(attachedPrompt).toContain("references/guide.md");
+    const reference = attachedQueue!.body.files[0]!.blob;
+    const referencePath = await fixture.application.artifacts.resolveBlobPath(reference);
+    expect(attachedPrompt).toContain(JSON.stringify(referencePath).slice(1, -1));
+    expect(Buffer.from((await fixture.application.artifacts.readBlob(reference)).data).toString("utf8")).toBe("Guide for 1.0.0\n");
+    expect((await paired.clients.skill.discardSkillLearning({
+      operationId: randomUUID(), runId: attachedReview.runId, expectedRunRevision: attachedReview.revision
     })).run?.state).toBe(SkillLearningState.DISCARDED);
 
     const sourceOperation = await submit(paired.clients.operation, paired.connectionId, createSessionMutation({
