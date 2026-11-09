@@ -399,6 +399,7 @@ export interface ModelAdvancedMetadataView {
   readonly outboundProtocol?: string;
   readonly protocolMode?: "matching" | "compatibility" | "unknown";
   readonly contextWindowSource?: "declared" | "estimated";
+  readonly contextWindowMax?: number;
   readonly maxOutputTokensSource?: "declared" | "estimated";
 }
 
@@ -3932,7 +3933,12 @@ export interface ProviderModelConfigurationView {
   readonly supportsFastMode: boolean;
   readonly defaultVisible?: boolean;
   readonly supportsTools?: boolean;
+  readonly inheritedFields?: readonly ProviderModelInheritedFieldView[];
+  readonly contextWindowMaxTokens?: number;
 }
+
+export type ProviderModelInheritedFieldView = "name" | "contextWindowTokens" | "maximumOutputTokens" | "inputModalities"
+  | "reasoning" | "thinkingLevels" | "supportsFastMode" | "supportsTools";
 
 export interface ProviderSamplingConfigurationView {
   readonly temperature?: number;

@@ -10,6 +10,31 @@ export type PiSupportedApi =
   | "openai-completions"
   | "google-generative-ai";
 
+/** Host-owned discovery facts. Undefined inherits; false, null and [] replace. */
+export interface PiModelDiscoveryMetadata {
+  readonly name?: string;
+  readonly contextWindow?: number;
+  readonly contextWindowMax?: number;
+  readonly maxOutputTokens?: number;
+  readonly description?: string;
+  readonly nativeApi?: PiSupportedApi;
+  readonly inputModalities?: readonly string[];
+  readonly outputModalities?: readonly string[];
+  readonly efforts?: readonly string[];
+  readonly defaultEffort?: string | null;
+  readonly supportsImages?: boolean;
+  readonly supportsTools?: boolean;
+  readonly supportsFastMode?: boolean;
+}
+
+export const PI_EDITABLE_MODEL_METADATA_FIELDS = [
+  "name", "contextWindow", "maxTokens", "input", "reasoning", "thinkingLevelMap", "supportsFastMode", "supportsTools"
+] as const;
+export const PI_MODEL_METADATA_FIELDS = [
+  ...PI_EDITABLE_MODEL_METADATA_FIELDS, "description", "defaultEffort", "referenceApi", "declaredOutputModalities", "contextWindowMax"
+] as const;
+export type PiModelMetadataField = typeof PI_MODEL_METADATA_FIELDS[number];
+
 export interface PiManagedModel {
   readonly id: string;
   /** Joko-owned identity used to merge route-specific copies in settings. */
@@ -21,6 +46,9 @@ export interface PiManagedModel {
   readonly displayThinkingLevels?: readonly string[];
   readonly referenceApi?: PiSupportedApi;
   readonly declaredOutputModalities?: readonly string[];
+  readonly declaredInputModalities?: readonly string[];
+  readonly discoveredMetadata?: PiModelDiscoveryMetadata;
+  readonly metadataOverrides?: readonly PiModelMetadataField[];
   readonly api?: PiSupportedApi;
   readonly reasoning?: boolean;
   /** Explicit BYOM declaration; never inferred from an arbitrary endpoint. */
@@ -32,6 +60,7 @@ export interface PiManagedModel {
   readonly thinkingLevelMap?: Readonly<Record<string, string | null>>;
   readonly input?: readonly ("text" | "image")[];
   readonly contextWindow?: number;
+  readonly contextWindowMax?: number;
   readonly maxTokens?: number;
   readonly contextWindowSource?: "declared" | "estimated";
   readonly maxOutputTokensSource?: "declared" | "estimated";
@@ -531,9 +560,11 @@ function validateProvider(provider: PiManagedProvider): void {
     }
     if (ids.has(model.id)) throw piError("PI_MODEL_DUPLICATE", `Duplicate model '${provider.id}/${model.id}'`, "provision");
     ids.add(model.id);
-    if (!isPositiveSafeInteger(model.contextWindow ?? 1) || !isPositiveSafeInteger(model.maxTokens ?? 1)) {
+    if (!isPositiveSafeInteger(model.contextWindow ?? 1) || !isPositiveSafeInteger(model.maxTokens ?? 1)
+      || !isPositiveSafeInteger(model.contextWindowMax ?? 1)) {
       throw piError("PI_MODEL_INVALID_LIMIT", `Model '${provider.id}/${model.id}' has invalid token limits`, "provision");
     }
+    validateModelDiscoveryMetadata(model);
     if (model.input && (model.input.length === 0 || model.input.some((input) => input !== "text" && input !== "image"))) {
       throw piError("PI_MODEL_INVALID_INPUT", `Model '${provider.id}/${model.id}' has invalid input modalities`, "provision");
     }
@@ -599,10 +630,13 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
       referenceApi: model.referenceApi,
       protocolMode: model.referenceApi === api ? "matching" as const : "compatibility" as const
     }),
-    ...(model.input === undefined ? {} : { declaredInputModalities: [...model.input], declaredSupportsImages: model.input.includes("image") }),
+    ...(model.declaredInputModalities === undefined && model.input === undefined ? {} : {
+      declaredInputModalities: [...(model.declaredInputModalities ?? model.input!)], declaredSupportsImages: model.input?.includes("image") === true
+    }),
     ...(model.declaredOutputModalities === undefined ? {} : { declaredOutputModalities: [...model.declaredOutputModalities] }),
     ...(model.supportsFastMode === undefined ? {} : { declaredSupportsFastMode: model.supportsFastMode }),
     contextWindow,
+    ...(model.contextWindowMax === undefined ? {} : { contextWindowMax: model.contextWindowMax }),
     maxOutputTokens: piModelOutputTokenLimit(model.maxTokens, contextWindow),
     ...(model.contextWindow === undefined ? {} : { contextWindowSource: model.contextWindowSource ?? "declared" as const }),
     ...(model.maxTokens === undefined ? {} : { maxOutputTokensSource: model.maxOutputTokensSource ?? "declared" as const }),
@@ -635,6 +669,10 @@ function managedPiModelConfiguration(model: PiManagedModel): Record<string, unkn
     displayThinkingLevels: _displayThinkingLevels,
     referenceApi: _referenceApi,
     declaredOutputModalities: _declaredOutputModalities,
+    declaredInputModalities: _declaredInputModalities,
+    discoveredMetadata: _discoveredMetadata,
+    metadataOverrides: _metadataOverrides,
+    contextWindowMax: _contextWindowMax,
     contextWindowSource: _contextWindowSource,
     maxOutputTokensSource: _maxOutputTokensSource,
     ...piModel
@@ -645,6 +683,29 @@ function managedPiModelConfiguration(model: PiManagedModel): Record<string, unkn
     contextWindow,
     maxTokens: piModelOutputTokenLimit(model.maxTokens, contextWindow)
   });
+}
+
+function validateModelDiscoveryMetadata(model: PiManagedModel): void {
+  const invalid = (): never => { throw piError("PI_MODEL_INVALID_METADATA", `Model '${model.id}' has invalid discovery metadata`, "provision"); };
+  if (model.metadataOverrides !== undefined && (!Array.isArray(model.metadataOverrides)
+    || new Set(model.metadataOverrides).size !== model.metadataOverrides.length
+    || model.metadataOverrides.some(field => !PI_MODEL_METADATA_FIELDS.includes(field)))) invalid();
+  const metadata = model.discoveredMetadata;
+  if (metadata === undefined) return;
+  if (!hasPlainObjectPrototype(metadata) || model.metadataOverrides === undefined) invalid();
+  const keys = ["name", "contextWindow", "contextWindowMax", "maxOutputTokens", "description", "nativeApi", "inputModalities",
+    "outputModalities", "efforts", "defaultEffort", "supportsImages", "supportsTools", "supportsFastMode"];
+  if (Object.keys(metadata).some(key => !keys.includes(key))) invalid();
+  for (const value of [metadata.contextWindow, metadata.contextWindowMax, metadata.maxOutputTokens]) if (value !== undefined && !isPositiveSafeInteger(value)) invalid();
+  for (const value of [metadata.name, metadata.description]) if (value !== undefined && (typeof value !== "string" || value.length > 16_384 || /[\0-\x1f\x7f]/u.test(value))) invalid();
+  for (const value of [metadata.inputModalities, metadata.outputModalities, metadata.efforts]) {
+    if (value !== undefined && (!Array.isArray(value) || value.length > 16 || new Set(value).size !== value.length
+      || value.some(item => typeof item !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(item)))) invalid();
+  }
+  if (metadata.nativeApi !== undefined && !["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"].includes(metadata.nativeApi)) invalid();
+  for (const value of [metadata.supportsImages, metadata.supportsTools, metadata.supportsFastMode]) if (value !== undefined && typeof value !== "boolean") invalid();
+  if (metadata.defaultEffort !== undefined && metadata.defaultEffort !== null
+    && !["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(metadata.defaultEffort)) invalid();
 }
 
 function assertEnvironmentName(value: string): void {

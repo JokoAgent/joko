@@ -421,6 +421,7 @@ export interface ProviderModel {
     | "openai-completions"
     | string;
   readonly contextWindow: number;
+  readonly contextWindowMax?: number;
   readonly maxOutputTokens: number;
   readonly contextWindowSource?: "declared" | "estimated";
   readonly maxOutputTokensSource?: "declared" | "estimated";

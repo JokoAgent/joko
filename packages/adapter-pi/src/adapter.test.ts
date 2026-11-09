@@ -4579,7 +4579,7 @@ describe("PiBackendAdapter", () => {
         baseUrl: "http://127.0.0.1:11434/v1",
         api: "openai-completions",
         keyless: true,
-        models: [{ id: "test-model", reasoning: true, contextWindow: 32_768, maxTokens: 4_096 }]
+        models: [{ id: "test-model", reasoning: true, contextWindow: 32_768, contextWindowMax: 262_144, maxTokens: 4_096 }]
       }],
       processFactory: (spec) => {
         scripted = new ScriptedPiProcess(spec, {
@@ -4642,6 +4642,8 @@ describe("PiBackendAdapter", () => {
       const stateRequestsBefore = scripted.commands.filter((command) => command.type === "get_state").length;
       const models = await adapter.getAvailableModels({ ...context, binding });
       const byIdentity = Object.fromEntries(models.map((model) => [`${model.providerId}/${model.modelId}`, model.thinkingLevels]));
+      expect(models.find(model => model.providerId === "local" && model.modelId === "test-model")).toMatchObject({ contextWindow: 32_768, contextWindowMax: 262_144 });
+      for (const model of models.filter(model => model.providerId !== "local")) expect(model.contextWindowMax).toBeUndefined();
 
       expect(byIdentity).toEqual({
         "local/test-model": ["off", "high", "max"],

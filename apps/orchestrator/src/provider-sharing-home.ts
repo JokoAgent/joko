@@ -319,6 +319,7 @@ function fromModel(row: contract.ModelDescriptor): ProviderModel {
     ...(row.referenceApi === undefined ? {} : { referenceApi: row.referenceApi }),
     ...(["matching", "compatibility", "unknown"].includes(row.protocolMode ?? "") ? { protocolMode: row.protocolMode as ProviderModel["protocolMode"] } : {}),
     ...(["declared", "estimated"].includes(row.contextWindowSource ?? "") ? { contextWindowSource: row.contextWindowSource as "declared" | "estimated" } : {}),
+    ...(row.contextWindowMaxTokens === undefined ? {} : { contextWindowMax: number(row.contextWindowMaxTokens) }),
     ...(["declared", "estimated"].includes(row.maxOutputTokensSource ?? "") ? { maxOutputTokensSource: row.maxOutputTokensSource as "declared" | "estimated" } : {}),
     ...(row.priceSource === contract.ModelPriceSource.UNSPECIFIED ? {} : { pricing: { source: row.priceSource === contract.ModelPriceSource.PROVIDER_REFERENCE ? "providerReference" as const : "upstream" as const,
       currencyCode: row.currencyCode, ...(row.priceUpdatedAt === undefined ? {} : { updatedAt: Number(row.priceUpdatedAt.seconds) * 1000 + row.priceUpdatedAt.nanos / 1_000_000 }),

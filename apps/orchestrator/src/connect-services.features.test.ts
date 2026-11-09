@@ -20,7 +20,8 @@ import { ArtifactStore } from "./artifact-store.js";
 import { BrowserSettingsController } from "./browser-settings.js";
 import { createConnectServices, registerConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
-import { ProviderAuthUnsupportedError, type CredentialManager } from "./credential-manager.js";
+import { CredentialManager, ProviderAuthUnsupportedError, ProviderCatalogManager } from "./credential-manager.js";
+import { CredentialVault } from "./credential-vault.js";
 import { McpRouter, type McpClientFactoryInput } from "./mcp-router.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
@@ -145,6 +146,49 @@ async function completedNavigation(...args: Parameters<SessionHost["navigateTree
 }
 
 describe("Connect typed feature boundaries", () => {
+  it("saves a discovered model through the typed settings form without freezing untouched facts or accepting a posted maximum", async () => {
+    const root = mkdtempSync(join(tmpdir(), "joko-provider-discovery-connect-")); cleanupPaths.push(root);
+    const credentials = new CredentialManager({ vault: await CredentialVault.open(join(root, "vault.key")), storagePath: join(root, "credentials.json") });
+    await credentials.initialize();
+    const store = new OperationalStore(":memory:");
+    store.upsertBackend({ id: "pi", adapterKind: "pi", instanceGeneration: 1, displayName: "Pi", version: "0.1.0", health: "healthy",
+      installationState: "installed", authenticationState: "not_required", models: [], tools: [], diagnostics: [],
+      capabilities: new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]]),
+      providerRuntimeSupport: { protocols: ["openai-completions"], fields: ["keyless", "model_limits", "model_input_modalities", "model_thinking_levels", "model_fast_mode"] } });
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
+    await providers.upsert({ backendId: "pi", credentialOrigin: "", displayName: "Local", enabled: true, kind: "local_keyless", credentialBindings: {},
+      supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+      provider: { id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true, models: [{ id: "manual" }] } });
+    const refresh = (row: unknown) => providers.discoverProviderModels("pi", "local", (async () => Response.json({ data: [row] })) as typeof fetch);
+    const refreshPiGeneration = vi.fn(async () => undefined);
+    const services = createConnectServices(stubApplication({ store, credentials, providers, refreshPiGeneration, sessionHost: immediateHost(store) }));
+    const read = async () => {
+      const response = await invoke<{ settings: contract.SettingsSnapshot }>(services.settings.getSettings, {});
+      return fromBinary(contract.SettingsSnapshotSchema, toBinary(contract.SettingsSnapshotSchema, response.settings));
+    };
+    try {
+      await refresh({ id: "same", name: "Discovered label", context_window: 128_000, max_context_window: 256_000, input_modalities: ["text", "image"] });
+      const configuration = (await read()).providers.find(provider => provider.providerId === "local")!;
+      const model = configuration.runtimes[0]!.models.find(model => model.modelId === "same")!;
+      expect(model).toMatchObject({ contextWindowTokens: 128_000n, contextWindowMaxTokens: 256_000n,
+        inheritedFields: expect.arrayContaining([contract.ProviderModelInheritedField.CONTEXT_WINDOW, contract.ProviderModelInheritedField.INPUT_MODALITIES]) });
+      model.displayName = "Owner label";
+      model.inheritedFields = model.inheritedFields.filter(field => field !== contract.ProviderModelInheritedField.DISPLAY_NAME);
+      model.contextWindowMaxTokens = 999_999_999n;
+      const request = create(contract.SubmitOperationRequestSchema, { operationId: "save-discovered-model", connectionId: connection.id,
+        mutation: { payload: { case: "upsertProvider", value: { provider: configuration } } } });
+      await invoke(services.operation.submitOperation, fromBinary(contract.SubmitOperationRequestSchema, toBinary(contract.SubmitOperationRequestSchema, request)));
+      expect(refreshPiGeneration).toHaveBeenCalledOnce();
+      await refresh({ id: "same", name: "New upstream label", context_window: 256_000, supports_image_input: false });
+      const saved = (await read()).providers.find(provider => provider.providerId === "local")!.runtimes[0]!.models.find(model => model.modelId === "same")!;
+      expect(saved).toMatchObject({ displayName: "Owner label", contextWindowTokens: 256_000n, contextWindowMaxTokens: 256_000n,
+        inputModalities: [contract.ModelInputModality.TEXT] });
+      expect(saved.inheritedFields).toContain(contract.ProviderModelInheritedField.CONTEXT_WINDOW);
+      expect(saved.inheritedFields).toContain(contract.ProviderModelInheritedField.INPUT_MODALITIES);
+      expect(saved.inheritedFields).not.toContain(contract.ProviderModelInheritedField.DISPLAY_NAME);
+    } finally { store.close(); }
+  });
+
   it("preserves an exact Interaction oneof and maps Host validation failures to invalid-argument", async () => {
     const resolveInteraction = vi.fn(() => {
       throw new InteractionDecisionValidationError("Plan review response does not match the open permission request.");

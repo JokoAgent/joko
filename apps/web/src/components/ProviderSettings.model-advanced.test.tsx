@@ -87,7 +87,7 @@ describe("ProviderSettings model advanced journey", () => {
     await edit(input, "150"); await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
     expect(mounted.api.setModelWorkingContext).toHaveBeenCalledTimes(1);
     expect(mounted.api.setModelWorkingContext).toHaveBeenCalledWith({ backendId: "a", providerId: "provider", modelId: "model-primary", relatedTargets: [{ backendId: "b", providerId: "provider", modelId: "model-secondary" }] }, expect.objectContaining({ revision: 7n, sourceRevision: "source-7" }), 150_000, expect.any(AbortSignal));
-    expect(document.body.textContent).toContain("exceeds the declared model window");
+    expect(document.body.textContent).toContain("exceeds the reported model capacity");
     expect(document.body.textContent).toContain("100,123");
     await clickText("Restore default context", ".model-working-context");
     expect(mounted.api.resetModelWorkingContext).toHaveBeenCalledTimes(1);
@@ -103,6 +103,18 @@ describe("ProviderSettings model advanced journey", () => {
     await clickText("Retry", ".model-working-context");
     expect(mounted.api.getModelWorkingContext).toHaveBeenCalledTimes(3);
     expect(mounted.api.setModelWorkingContext).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the working default distinct from capacity and warns only above the reported maximum", async () => {
+    await mount({}, undefined, { metadata: { contextWindowSource: "estimated", contextWindowMax: 256_000 } }); await open();
+    expect(document.body.textContent).toContain("Maximum context capacity");
+    expect(document.body.textContent).toContain("256,000");
+    expect(document.body.textContent).toContain("Estimated");
+    expect(contextInput().value).toBe("100");
+    await edit(contextInput(), "200");
+    expect(document.body.textContent).not.toContain("exceeds the reported model capacity");
+    await edit(contextInput(), "300");
+    expect(document.body.textContent).toContain("exceeds the reported model capacity");
   });
 
   it("shows a load failure, retries explicitly and leaves a capability readonly budget visible", async () => {

@@ -1922,6 +1922,7 @@ export function toProtoModelDescriptor(backendId: string, model: ProviderModel):
     api: model.api,
     protocolMode: model.referenceApi === undefined || model.api === "" ? "unknown" : model.api === model.referenceApi ? "matching" : "compatibility",
     contextWindowSource: model.contextWindowSource,
+    contextWindowMaxTokens: model.contextWindowMax === undefined ? undefined : BigInt(model.contextWindowMax),
     maxOutputTokensSource: model.maxOutputTokensSource,
     defaultVisible: model.defaultVisible,
     available: true,

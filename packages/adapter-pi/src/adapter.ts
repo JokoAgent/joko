@@ -2127,7 +2127,8 @@ export class PiBackendAdapter implements
         }
         await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
-        const projected = modelFromRpc(responseData(response) as PiRpcModel, levels, supportsFastMode);
+        const projected = modelFromRpc(responseData(response) as PiRpcModel, levels, supportsFastMode,
+          this.#runtimeModelMaximumContext(runtime, providerId, modelId));
         const profile = this.#spawnProfiles.get(context.sessionId);
         if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, providerId, modelId });
         return projected;
@@ -4173,7 +4174,8 @@ export class PiBackendAdapter implements
       modelFromRpc(
         model,
         samePiRpcModelIdentity(piRpcModelIdentity(model), stableCurrentModel) ? levels : undefined,
-        await this.#runtimeModelSupportsFastMode(runtime, model.provider, model.id)
+        await this.#runtimeModelSupportsFastMode(runtime, model.provider, model.id),
+        this.#runtimeModelMaximumContext(runtime, model.provider, model.id)
       )));
   }
 
@@ -4216,7 +4218,8 @@ export class PiBackendAdapter implements
         }
         if (!policyAdvanced) await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
-        const projected = modelFromRpc(rpcModel, levels, supportsFastMode);
+        const projected = modelFromRpc(rpcModel, levels, supportsFastMode,
+          this.#runtimeModelMaximumContext(runtime, identity.provider, identity.id));
         const responseEffort = typeof data.thinkingLevel === "string"
           && canonicalPiThinkingLevels([data.thinkingLevel]).length === 1
           ? data.thinkingLevel
@@ -4753,6 +4756,12 @@ export class PiBackendAdapter implements
       runtime.generationLease.generation.options.nativeModels ?? []
     ).some((model) =>
       model.providerId === providerId && model.modelId === modelId && model.supportsFastMode === true);
+  }
+
+  #runtimeModelMaximumContext(runtime: PiRuntime, providerId: string, modelId: string): number | undefined {
+    const options = runtime.generationLease.generation.options;
+    return options.providers?.find(provider => provider.id === providerId)?.models.find(model => model.id === modelId)?.contextWindowMax
+      ?? options.nativeModels?.find(model => model.providerId === providerId && model.modelId === modelId)?.contextWindowMax;
   }
 
   async #initializeSessionStore(): Promise<void> {
@@ -7575,7 +7584,7 @@ function usageFromStats(
   };
 }
 
-function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[], supportsFastMode = false): ProviderModel {
+function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[], supportsFastMode = false, contextWindowMax?: number): ProviderModel {
   const metadata = createPiModelCatalogAdditions().referenceCatalogMetadata({ id: model.id, provider: model.provider, api: model.api,
     ...(typeof model["baseUrl"] === "string" ? { baseUrl: model["baseUrl"] } : {}) });
   const thinkingLevelMap = isRecord(model.thinkingLevelMap)
@@ -7595,6 +7604,7 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     ...(Array.isArray(model.input) ? { declaredInputModalities: [...model.input], declaredSupportsImages: model.input.includes("image") } : {}),
     ...(thinkingLevels.includes(metadata?.defaultEffort ?? "medium") ? { defaultEffort: metadata?.defaultEffort ?? "medium" } : {}),
     contextWindow,
+    ...(contextWindowMax === undefined || contextWindowMax < contextWindow ? {} : { contextWindowMax }),
     maxOutputTokens: piModelOutputTokenLimit(optionalNumeric(model.maxTokens), contextWindow),
     ...(model.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const }),
     ...(model.maxTokens === undefined ? {} : { maxOutputTokensSource: "declared" as const }),

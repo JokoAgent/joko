@@ -435,6 +435,8 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
       <Text style={[styles.modelTitle, { color: colors.ink }]}>{route.displayName}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{route.providerName} · {route.providerId}/{route.modelId}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, route.contextWindowSource === "declared" ? "controls.contextDeclared" : route.contextWindowSource === "estimated" ? "controls.contextEstimated" : "controls.contextUnknown")}</Text>
+      {route.contextWindowMaxTokens !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "controls.maximumContext", { tokens: formatMobileTokenLimit(route.contextWindowMaxTokens, locale) })}</Text>}
     </View>
     {(route.canSetEffort ?? controls.canSetEffort) && route.efforts.length > 0 && <>
       <SectionTitle label={mobileMessage(locale, "common.effort")} colors={colors} />

@@ -22,7 +22,7 @@ function provider(): ProviderConfigurationView {
   }) };
 }
 async function render(configuration: ProviderConfigurationView) {
-  const saveCredential = vi.fn(async () => undefined); const saveProvider = vi.fn(async () => undefined);
+  const saveCredential = vi.fn(async () => undefined); const saveProvider = vi.fn(async (_configuration: ProviderConfigurationView) => undefined);
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
   const updateBackends = async (available: readonly BackendView[]) => act(async () => root.render(<ProviderEditor open provider={configuration} backends={available} credentials={credentials} providerIds={[configuration.id]}
     saveCredential={saveCredential} saveProvider={saveProvider} onClose={() => undefined} onSaved={() => undefined} t={(key, values) => translate("en", key, values)} />));
@@ -33,8 +33,8 @@ function button(label: string): HTMLButtonElement {
   const result = [...document.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent === label);
   if (!result) throw new Error(`Missing button: ${label}`); return result;
 }
-function control<T extends HTMLElement>(label: string, selector: string): T {
-  const owner = [...document.querySelectorAll("label")].find((item) => item.querySelector("span")?.textContent === label);
+function control<T extends HTMLElement>(label: string, selector: string, scope: ParentNode = document): T {
+  const owner = [...scope.querySelectorAll("label")].find((item) => item.querySelector("span")?.textContent === label);
   const result = owner?.querySelector<T>(selector); if (!result) throw new Error(`Missing field: ${label}`); return result;
 }
 async function fill(input: HTMLInputElement, value: string): Promise<void> {
@@ -46,6 +46,20 @@ async function select(control: HTMLButtonElement, label: string): Promise<void> 
 }
 
 describe("Provider runtime editor", () => {
+  it("preserves discovery inheritance on an unchanged save and overrides only the edited model field", async () => {
+    const initial = provider();
+    const inheritedFields = ["name", "contextWindowTokens", "maximumOutputTokens", "inputModalities", "reasoning", "thinkingLevels", "supportsFastMode", "supportsTools"] as const;
+    const configuration = { ...initial, runtimes: initial.runtimes.map(runtime => ({ ...runtime,
+      models: runtime.models.map(model => ({ ...model, inheritedFields, contextWindowMaxTokens: 1_000_000 })) })) };
+    const { saveProvider } = await render(configuration);
+    await act(async () => button("Save").click());
+    expect(saveProvider.mock.calls[0]?.[0]).toMatchObject({ runtimes: [{ models: [{ inheritedFields }] }, { models: [{ inheritedFields }] }] });
+    await fill(control<HTMLInputElement>("Display name", "input", document.querySelector(".provider-model-card")!), "Owner model label");
+    await act(async () => button("Save").click());
+    expect(saveProvider.mock.calls[1]?.[0]).toMatchObject({ runtimes: [{ models: [{ name: "Owner model label",
+      inheritedFields: inheritedFields.filter(field => field !== "name") }] }, { models: [{ inheritedFields }] }] });
+  });
+
   it.each([false, true])("reviews overwrites and replaces a target draft key when copying authentication (keyless=%s)", async (keyless) => {
     const initial = provider(); const configuration = { ...initial, runtimes: initial.runtimes.map((runtime, index) => index !== 0 || !keyless ? keyless
       ? { ...runtime, headers: [{ headerName: "X-Header", credentialId: "old-header", environmentName: "HEADER_KEY" }] } : runtime
