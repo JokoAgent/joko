@@ -8,7 +8,7 @@ import { create } from "@bufbuild/protobuf";
 import { capabilityNames, CreateTargetMutationSchema, OperationMutationSchema, TargetWorkspaceInputSchema,
   WorkspaceKind, WorktreeEligibility } from "@joko/contracts";
 import { _electron, type ElectronApplication, type Locator, type Page } from "playwright-core";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
@@ -270,6 +270,15 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
   const direct = await OrchestratorE2eFixture.start({ profiles: [profile] });
   fixture = direct;
   const proxy = await OrchestratorE2eFixture.start({ httpConnect: true });
+  const writeReceipts: { at: number; state: "pending" | "fulfilled" | "rejected" }[] = [];
+  const originalWrite = direct.application.workspaces.writeTextFile;
+  const observeWrite = vi.spyOn(direct.application.workspaces, "writeTextFile").mockImplementation((...args) => {
+    const receipt = { at: Date.now(), state: "pending" as "pending" | "fulfilled" | "rejected" };
+    if (writeReceipts.length < 12) writeReceipts.push(receipt);
+    const pending = originalWrite.apply(direct.application.workspaces, args);
+    void pending.then(() => { receipt.state = "fulfilled"; }, () => { receipt.state = "rejected"; });
+    return pending;
+  });
   try {
     const locator = proxy.httpConnectTransport;
     if (locator === undefined) throw new Error("The separate native CONNECT fixture did not start.");
@@ -299,6 +308,23 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
     await main.evaluate(hash => { location.hash = hash; }, `#/files/${encodeURIComponent(sessionId)}?file=${fileName}`);
     const pane = main.locator(".workspace-file-editor-pane");
     const editor = pane.locator(".cm-content");
+    const saveRequests: { phase: string; at: number; status?: number }[] = [];
+    const isFileWrite = (url: string): boolean => new URL(url).pathname === "/joko.v1.WorkspaceService/WriteWorkspaceTextFile";
+    main.on("request", request => { if (isFileWrite(request.url()) && saveRequests.length < 12) saveRequests.push({ phase: "request", at: Date.now() }); });
+    main.on("response", response => { if (isFileWrite(response.url()) && saveRequests.length < 12) saveRequests.push({ phase: "response", at: Date.now(), status: response.status() }); });
+    main.on("requestfailed", request => { if (isFileWrite(request.url()) && saveRequests.length < 12) saveRequests.push({ phase: "requestfailed", at: Date.now() }); });
+    await main.evaluate(() => {
+      const probe = { unloads: 0, keys: [] as { key: string; ctrl: boolean; meta: boolean; target: string; prevented: boolean }[] };
+      Object.assign(window, { __jokoQuitDraftProbe: probe });
+      window.addEventListener("beforeunload", () => { probe.unloads += 1; }, { capture: true });
+      document.addEventListener("keydown", event => {
+        if (event.key.toLowerCase() !== "s" || !event.ctrlKey && !event.metaKey || probe.keys.length >= 8) return;
+        const key = { key: event.key, ctrl: event.ctrlKey, meta: event.metaKey,
+          target: event.target instanceof Element ? event.target.tagName : "", prevented: event.defaultPrevented };
+        probe.keys.push(key);
+        setTimeout(() => { key.prevented = event.defaultPrevented; }, 0);
+      }, { capture: true });
+    });
     await editor.click();
     await editor.press("Control+a");
     await editor.pressSequentially("Draft survived quit");
@@ -341,7 +367,26 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
     expect(await readFile(file, "utf8")).toBe("Original text");
     expect(await pane.getAttribute("data-dirty")).toBe("true");
     await editor.press("Control+s");
-    await waitFor(() => readFile(file, "utf8"), text => text === "Draft survived quit", "the vetoed window's file save");
+    try {
+      await waitFor(() => readFile(file, "utf8"), text => text === "Draft survived quit", "the vetoed window's file save");
+    } catch (cause) {
+      const projection = await main.evaluate(() => {
+        const pane = document.querySelector(".workspace-file-editor-pane");
+        const editor = pane?.querySelector(".cm-content");
+        return {
+          probe: (window as unknown as { __jokoQuitDraftProbe?: unknown }).__jokoQuitDraftProbe,
+          visibility: document.visibilityState, focused: document.hasFocus(), activeTag: document.activeElement?.tagName,
+          editorFocused: editor?.contains(document.activeElement), editorConnected: editor?.isConnected,
+          draftLength: editor?.textContent?.length, dirty: pane?.getAttribute("data-dirty"),
+          status: pane?.querySelector(".workspace-file-editor-pane__status")?.textContent,
+          alert: pane?.querySelector('[role="alert"]')?.textContent?.slice(0, 2048)
+        };
+      }).catch(() => ({ unavailable: true }));
+      console.error("Packaged settings: original vetoed save state.", JSON.stringify({ projection, saveRequests, writeReceipts,
+        nativeConnectRequests: proxy.httpConnectRequests,
+        operations: direct.application.store.listOperations({ limit: 8 }).map(operation => ({ id: operation.id, kind: operation.kind, status: operation.status })) }));
+      throw cause;
+    }
     await main.locator(".workspace-file-editor-pane[data-dirty=false]").waitFor({ state: "visible" });
     expect(await connect()).toMatchObject({ success: true });
     expect(proxy.httpConnectRequests).toBe(beforeQuit + 1);
@@ -349,6 +394,7 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
     await closeDesktop();
     expect(unexpectedDialogs).toEqual([]);
   } finally {
+    observeWrite.mockRestore();
     await proxy.close();
   }
 });
