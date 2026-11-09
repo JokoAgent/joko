@@ -255,6 +255,7 @@ import { MobileInputHandoffPanel } from "./MobileInputHandoffPanel";
 import { MobileInputHandoffTasks } from "./MobileInputHandoffTasks";
 import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
 import { MobileNewTaskModelSelector } from "./MobileNewTaskModelSelector";
+import { MobileNewTaskWorktree } from "./MobileNewTaskWorktree";
 import { MobileAccountUsageSummary } from "./MobileAccountUsageSummary";
 import { mobileUsageProviderKey } from "./mobile-account-usage";
 import { useMobileAccountUsage } from "./use-mobile-account-usage";
@@ -1927,7 +1928,7 @@ function SavedPendingOperations({ profile, colors, locale }: {
   </Text>;
 }
 
-function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExistingTask,
+export function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExistingTask,
   showIncomingShareEmpty }: ScreenProps & {
   onBack: () => void; onCreated: () => void; onImportedExistingTask: () => void;
   showIncomingShareEmpty: boolean;
@@ -1942,6 +1943,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     targetId: initialDraft?.targetId ?? "",
     name: initialDraft?.name ?? "",
     input: initialDraft?.input ?? emptyMobileComposerDraft(),
+    ...(initialDraft?.worktree ? { worktree: initialDraft.worktree } : {}),
     ...(initialDraft?.collaboration ? { collaboration: initialDraft.collaboration } : {})
   }));
   const [composerSelection, setComposerSelection] = useState<MobileComposerSelection>(() => ({
@@ -2000,6 +2002,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     // A definitive create failure returns all local messages to the editable form.
     if (retainedDraft && !retained) {
       const restored = { targetId: retainedDraft.targetId, name: retainedDraft.name, input: retainedDraft.input,
+        ...(retainedDraft.worktree ? { worktree: retainedDraft.worktree } : {}),
         ...(retainedDraft.collaboration ? { collaboration: retainedDraft.collaboration } : {}) };
       draftRef.current = restored; setDraft(restored);
       setComposerSelection({ start: restored.input.text.length, end: restored.input.text.length });
@@ -2010,13 +2013,14 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     state.owner?.backends.some((backend) => backend.backendId === target.backendId
       && backend.capabilities?.capabilities.some((capability) => capability.name === capabilityNames.inputText && capability.support === CapabilitySupport.SUPPORTED))) ?? [];
   const targetAvailable = targets.some((target) => target.targetId === draft.targetId);
+  const worktreeOwnerKey = targetAvailable ? client.newTaskWorktreeOwnerKey?.(draft.targetId) : undefined;
   useEffect(() => {
     if (!draftReady || !targetAvailable || !client.restoreNewTaskModel) return;
     let current = true;
     const targetId = draft.targetId;
     void client.restoreNewTaskModel(targetId).then(restoredTargetId => {
       if (!current || !mountedRef.current || draftRef.current.targetId !== targetId || restoredTargetId === targetId) return;
-      const next = { ...draftRef.current, targetId: restoredTargetId };
+      const next = { ...draftRef.current, targetId: restoredTargetId, worktree: undefined };
       draftRef.current = next; setDraft(next);
       if (identity) mobileNewTaskDrafts.save(identity, next);
     }).catch(() => undefined);
@@ -2054,7 +2058,8 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
   }, []);
   const patchDraft = (patch: Partial<typeof draft>): void => {
     setDraft((current) => {
-      const next = { ...current, ...patch, ...(patch.targetId !== undefined && patch.targetId !== current.targetId ? { collaboration: undefined } : {}) };
+      const next = { ...current, ...patch, ...(patch.targetId !== undefined && patch.targetId !== current.targetId
+        ? { collaboration: undefined, worktree: undefined } : {}) };
       draftRef.current = next;
       if (identity) mobileNewTaskDrafts.save(identity, next);
       return next;
@@ -2087,7 +2092,8 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     let current = true;
     const cached = mobileNewTaskDrafts.readSync(identity);
     const cachedInput = cached?.input ?? emptyMobileComposerDraft();
-    setDraft({ targetId: cached?.targetId ?? "", name: cached?.name ?? "", input: cachedInput, ...(cached?.collaboration ? { collaboration: cached.collaboration } : {}) });
+    setDraft({ targetId: cached?.targetId ?? "", name: cached?.name ?? "", input: cachedInput,
+      ...(cached?.worktree ? { worktree: cached.worktree } : {}), ...(cached?.collaboration ? { collaboration: cached.collaboration } : {}) });
     setComposerSelection({ start: cachedInput.text.length, end: cachedInput.text.length });
     setLoadedProfileId(profileId);
     setComposerAtomId(undefined);
@@ -2095,7 +2101,8 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     void mobileNewTaskDrafts.read(identity).then((stored) => {
       if (!current || !mountedRef.current || state.activeProfileId !== identity.profileId) return;
       const input = stored?.input ?? emptyMobileComposerDraft();
-      const next = { targetId: stored?.targetId ?? "", name: stored?.name ?? "", input, ...(stored?.collaboration ? { collaboration: stored.collaboration } : {}) };
+      const next = { targetId: stored?.targetId ?? "", name: stored?.name ?? "", input,
+        ...(stored?.worktree ? { worktree: stored.worktree } : {}), ...(stored?.collaboration ? { collaboration: stored.collaboration } : {}) };
       draftRef.current = next;
       setDraft(next);
       setComposerSelection({ start: input.text.length, end: input.text.length });
@@ -3103,7 +3110,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
       onUploadingChange: uploading => { if (mountedRef.current && uploadLeaveDecisionRef.current === decision) {
         uploadingSubmissionRef.current = uploading; setUploadingSubmission(uploading);
       } }
-    })).then((result) => {
+    }, draft.worktree)).then((result) => {
       if (result.sessionId && result.definitive && !mobileNewTaskDrafts.readSync(identity)?.submission && mountedRef.current
         && client.state.activeProfileId === identity.profileId && client.state.selectedId === result.sessionId) onCreated();
     }).catch((failure) => { if (mountedRef.current && !decision.controller.signal.aborted) setError(errorText(failure)); });
@@ -3303,6 +3310,11 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
       <Text style={[styles.caption, { color: colors.muted }]}>{state.owner?.backends.find((backend) => backend.backendId === target.backendId)?.displayName}</Text>
     </Pressable>)}
     {draft.targetId && !targetAvailable && <Banner text={mobileMessage(locale, "newTask.retainedProject")} colors={colors} />}
+    {ownerReady && targetAvailable && (worktreeOwnerKey || draft.worktree) && <MobileNewTaskWorktree
+      key={worktreeOwnerKey ?? `retained-${profileId}-${draft.targetId}`} ownerKey={worktreeOwnerKey}
+      value={draft.worktree} colors={colors} locale={locale}
+      disabled={!worktreeOwnerKey || state.busy || attachmentBusy || voice.busy || retained !== undefined || pendingCreate}
+      load={signal => client.loadNewTaskWorktree(draft.targetId, signal)} onChange={worktree => patchDraft({ worktree })} />}
     <Field label={mobileMessage(locale, "newTask.name")} value={draft.name} onChange={(name) => patchDraft({ name })}
       placeholder={mobileMessage(locale, "newTask.title")} colors={colors}
       editable={ownerReady && !state.busy && !attachmentBusy && !voice.busy && retained === undefined} maxLength={256} />
@@ -3452,7 +3464,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
           if (!currentIdentity || !sourceOwner) throw new Error(mobileMessage(locale, "newTask.returnActive"));
           mobileNewTaskDrafts.save(currentIdentity, source); await mobileNewTaskDrafts.flush(currentIdentity);
           if (client.newTaskObjectiveOwnerKey(source.targetId) !== sourceOwner) throw new Error(mobileMessage(locale, "newTask.returnActive"));
-          const result = await client.create(source.targetId, source.name, source.input, input, source.collaboration);
+          const result = await client.create(source.targetId, source.name, source.input, input, source.collaboration, undefined, source.worktree);
           if (result.sessionId && mountedRef.current && client.state.activeProfileId === currentIdentity.profileId) {
             setNewObjectiveVisible(false); onCreated();
           } else if (!result.created) throw new Error(client.state.error || mobileMessage(locale, "objective.error"));

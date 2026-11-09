@@ -334,13 +334,15 @@ import {
 } from "./mobile-workspace-path-paste";
 import {
   mergeMobileNewTaskUnsentInput,
+  normalizeMobileNewTaskWorktree,
   type MobileNewTaskCreateSubmission,
   type MobileNewTaskDraft,
   type MobileNewTaskDraftIdentity,
   type MobileNewTaskDraftSnapshot,
   type MobileNewTaskDraftStore,
   type MobileNewTaskSendSubmission,
-  type MobileNewTaskSubmission
+  type MobileNewTaskSubmission,
+  type MobileNewTaskWorktree
 } from "./new-task-draft-store";
 import {
   assertMobileModelSelection,
@@ -9674,6 +9676,40 @@ export class MobileClient {
     return key && this.network.objectiveRpc ? `${key}\u001fobjective-create\u001f${this.#epoch}` : undefined;
   }
 
+  newTaskWorktreeOwnerKey(targetId: string): string | undefined {
+    const key = this.#newTaskAuthorityKey(targetId), owner = this.#state.owner;
+    const target = uniqueValue(owner?.targets ?? [], candidate => candidate.targetId === targetId);
+    const workspace = uniqueValue(owner?.workspaces ?? [], candidate => candidate.workspaceId === target?.workspaceId
+      && candidate.targetId === targetId);
+    return key && target?.location?.kind.case === "serviceNode" && workspace?.kind === WorkspaceKind.USER_PROJECT
+      ? `${key}\u001fnew-task-worktree\u001f${this.#epoch}` : undefined;
+  }
+
+  async loadNewTaskWorktree(targetId: string, signal?: AbortSignal): Promise<MobileAutomationWorktreeProof> {
+    const credential = this.#ready(), key = this.newTaskWorktreeOwnerKey(targetId);
+    if (!key) throw new Error("Choose a current local project before loading Worktree options.");
+    const assertCurrent = () => {
+      if (signal?.aborted || this.#credential !== credential || this.newTaskWorktreeOwnerKey(targetId) !== key) {
+        throw new Error("The project or saved node changed while Worktree options were loading.");
+      }
+    };
+    let probe: Awaited<ReturnType<MobileNetwork["probeTargetWorktree"]>>;
+    try {
+      probe = await this.network.probeTargetWorktree(credential, targetId, signal ?? this.#abort?.signal);
+    } catch (error) {
+      const code = (error as { readonly code?: number }).code;
+      if (code !== Code.Unimplemented && code !== Code.Unavailable) throw error;
+      probe = { targetId, eligibility: "unavailable", canRefreshRemote: false };
+    }
+    assertCurrent();
+    if (probe.targetId !== targetId) throw new Error("The Worktree probe returned a different project.");
+    const sources = probe.eligibility === "eligible"
+      ? await this.network.listTargetWorktreeSources(credential, targetId, signal ?? this.#abort?.signal) : [];
+    assertCurrent();
+    return { targetId, eligibility: probe.eligibility, canRefreshRemote: probe.canRefreshRemote,
+      sources: sources.map(source => ({ ...source })) };
+  }
+
   newTaskModels(targetId: string) {
     if (!this.#newTaskAuthorityKey(targetId)) return [];
     const owner = this.#state.owner;
@@ -9803,8 +9839,9 @@ export class MobileClient {
   }
 
   async create(targetId: string, name: string, firstInput: MobileComposerDraft, objective?: MobileObjectiveInput, collaboration?: MobileWorkerForm,
-    uploadObserver?: MobileNewTaskUploadObserver): Promise<MobileNewTaskResult> {
+    uploadObserver?: MobileNewTaskUploadObserver, worktree?: MobileNewTaskWorktree): Promise<MobileNewTaskResult> {
     const input = normalizeMobileComposerDraft(firstInput);
+    const worktreeInput = worktree === undefined ? undefined : normalizeMobileNewTaskWorktree(worktree);
     const objectiveInput = objective === undefined ? undefined : normalizeMobileObjectiveInput(objective);
     const workerForm = collaboration === undefined ? undefined : normalizeMobileWorkerForm(collaboration);
     if (workerForm && (!this.newTaskCollaborationOwnerKey(targetId) || workerForm.sourceScope !== this.newTaskCollaborationScope(targetId, workerForm.targetId))) throw new Error("The collaboration projects or saved node changed. Confirm the retained configuration again.");
@@ -9836,6 +9873,7 @@ export class MobileClient {
     }
     const authorityKey = this.#newTaskAuthorityKey(targetId);
     if (!authorityKey) throw new Error("The selected project authority is unavailable.");
+    if (worktreeInput && !this.newTaskWorktreeOwnerKey(targetId)) throw new Error("This project cannot create an isolated Worktree task.");
     const receivingModel = resolveMobileExplicitNewTaskModelAuthority(owner, backend.backendId, this.newTaskModelSelection(targetId))
       ?? resolveMobileNewTaskDefaultModelAuthority(owner, backend.backendId);
     const attachmentControls = this.newTaskAttachmentControls(targetId);
@@ -9854,7 +9892,8 @@ export class MobileClient {
     this.#newTaskSubmissionActive = true;
     this.#newTaskUploadObserver = uploadObserver;
     try {
-      const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, input, ...(workerForm ? { collaboration: workerForm } : {}) }, {
+      const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, input,
+        ...(worktreeInput === undefined ? {} : { worktree: worktreeInput }), ...(workerForm ? { collaboration: workerForm } : {}) }, {
         connectionId: credential.connectionId,
         serverId: credential.serverId,
         backendId: target.backendId,
@@ -9870,6 +9909,15 @@ export class MobileClient {
       }
       try {
         await this.network.prepareTarget(credential, target, this.#abort?.signal);
+        if (submission.worktree) {
+          const proof = await this.loadNewTaskWorktree(targetId);
+          this.#assertNewTaskCreateAuthority(submission);
+          if (proof.eligibility !== "eligible" || submission.worktree.sourceRef !== undefined
+            && !proof.sources.some(source => source.ref === submission.worktree!.sourceRef)
+            || submission.worktree.refreshRemote && !proof.canRefreshRemote) {
+            throw new Error("The selected Worktree source is unavailable. Review the retained draft and reload its branches.");
+          }
+        }
         if (objectiveInput === undefined) await this.#validateNewTaskSubmissionInput(submission, authorityKey);
         else this.#assertNewTaskCreateAuthority(submission);
       } catch (error) {
@@ -9918,7 +9966,10 @@ export class MobileClient {
           })
         }),
         permissionMode: PermissionMode.ASK,
-        initialPlacement: NativeSessionPlacement.PROJECT
+        initialPlacement: NativeSessionPlacement.PROJECT,
+        useWorktree: submission.worktree !== undefined,
+        ...(submission.worktree?.sourceRef === undefined ? {} : { worktreeSourceRef: submission.worktree.sourceRef }),
+        refreshWorktreeRemote: submission.worktree?.refreshRemote ?? false
       }) }
     });
   }
@@ -9936,7 +9987,8 @@ export class MobileClient {
       || !target || target.backendId !== submission.backendId || target.state !== TargetState.ACTIVE
       || !revision || revision.value.toString(10) !== submission.targetRevision
       || (revision.etag || undefined) !== submission.targetRevisionEtag
-      || !backend || !supportsText(backend) || submission.model !== null && !model) {
+      || !backend || !supportsText(backend) || submission.model !== null && !model
+      || submission.worktree !== undefined && !this.newTaskWorktreeOwnerKey(submission.targetId)) {
       throw new Error("The project or Backend changed while this task was being prepared. Review the retained draft and try again.");
     }
   }

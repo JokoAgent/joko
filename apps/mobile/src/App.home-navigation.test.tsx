@@ -3,7 +3,8 @@ import { act, createElement, forwardRef, useEffect, useRef, useState, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
-  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema } from "@joko/contracts";
+  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
+  TargetState, CapabilitySupport, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -11,6 +12,7 @@ import type { MobileHomeViewState } from "./mobile-task-home-navigation";
 import { mobileMessage } from "./mobile-messages";
 import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
 import { MobileComposerDraftStore } from "./composer-draft-store";
+import { MobileNewTaskDraftStore } from "./new-task-draft-store";
 import { plainTextMobileComposerDraft } from "./mobile-composer-document";
 import type { MobileComposerRichInput } from "./MobileComposerRichInput";
 import type { MobileDrawerProps } from "./MobileDrawer";
@@ -57,7 +59,11 @@ const drafts = new MobileComposerDraftStore({ getItem: async key => draftValues.
   setItem: async (key, value) => { draftValues.set(key, value); }, removeItem: async key => { draftValues.delete(key); } });
 const originalDraftFlush = drafts.flush.bind(drafts);
 const draftFlush = vi.spyOn(drafts, "flush");
-const newTaskFlush = vi.fn(async () => {});
+const newTaskDraftValues = new Map<string, string>();
+const newTaskDrafts = new MobileNewTaskDraftStore({ getItem: async key => newTaskDraftValues.get(key) ?? null,
+  setItem: async (key, value) => { newTaskDraftValues.set(key, value); }, removeItem: async key => { newTaskDraftValues.delete(key); } });
+const newTaskFlush = vi.spyOn(newTaskDrafts, "flush");
+const createNewTask = vi.fn<MobileClient["create"]>(async () => ({ created: false, sent: false, definitive: true }));
 const onBack = vi.fn(), onSearchFocus = vi.fn(), onNavigated = vi.fn();
 let dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 };
 let platformOS = "android";
@@ -103,9 +109,16 @@ const client = new Proxy({
   taskDraftProfileId: () => state.activeProfileId,
   taskHeaderSourceKey: () => state.status === "connected" && state.selectedId ? `${state.activeProfileId}/${state.selectedId}/${headerSourceEpoch}` : undefined,
   readTaskHeaderRole: async () => observedHeaderRole,
-  taskCollaborationApi: () => collaborationApi
+  taskCollaborationApi: () => collaborationApi,
+  newTaskModels: () => empty,
+  restoreNewTaskModel: async (targetId: string) => targetId,
+  newTaskWorktreeOwnerKey: (targetId: string) => `worktree-${targetId}`,
+  loadNewTaskWorktree: async (targetId: string) => ({ targetId, eligibility: "eligible", canRefreshRemote: true,
+    sources: [{ ref: "refs/heads/review", displayName: "review", commit: "a".repeat(40), remote: false, current: false }] }),
+  create: createNewTask
 }, { get: (object, key) => key in object ? object[key as keyof typeof object] : () => undefined });
 let SessionsScreen: typeof import("./App").SessionsScreen;
+let NewTaskScreen: typeof import("./App").NewTaskScreen;
 type ScreenProps = ComponentProps<typeof import("./App").SessionsScreen>;
 let host: HTMLDivElement;
 let root: Root;
@@ -140,9 +153,10 @@ beforeAll(async () => {
       ? createElement("div", { "data-testid": "native-modal" }, children) : null,
     Pressable: ({ children, onPress, disabled, accessibilityLabel, accessibilityState, accessibilityRole }: {
       children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean;
-      accessibilityLabel?: string; accessibilityState?: { selected?: boolean; disabled?: boolean }; accessibilityRole?: string;
+      accessibilityLabel?: string; accessibilityState?: { selected?: boolean; disabled?: boolean; checked?: boolean | "mixed" }; accessibilityRole?: string;
     }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel,
-      role: accessibilityRole === "tab" ? "tab" : undefined, "aria-selected": accessibilityState?.selected },
+      role: accessibilityRole === "tab" || accessibilityRole === "checkbox" ? accessibilityRole : undefined,
+      "aria-selected": accessibilityState?.selected, "aria-checked": accessibilityState?.checked },
       typeof children === "function" ? children({ pressed: false }) : children),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 },
     Platform: { get OS() { return platformOS; }, select: (value: Record<string, unknown>) => value[platformOS] ?? value.default },
@@ -180,7 +194,7 @@ beforeAll(async () => {
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
   vi.doMock("./storage", () => new Proxy({ mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } },
     mobileReplyQuotePreferences: { snapshot: { ready: true, visible: true, saving: false, failed: false }, subscribe: () => () => {}, hydrate: async () => {} },
-    mobileComposerDrafts: drafts, mobileNewTaskDrafts: { flush: newTaskFlush } }, {
+    mobileComposerDrafts: drafts, mobileNewTaskDrafts: newTaskDrafts }, {
     get: (object, key) => key in object ? object[key as keyof typeof object] : {}, has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} })
   }));
@@ -188,6 +202,10 @@ beforeAll(async () => {
     "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache", "mobile-incoming-share"])
     vi.doMock(`./${name}`, () => new Proxy({}, { get: () => ({}), has: () => true,
       getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
+  const incomingShare = { snapshot: { supported: false, busy: false }, subscribe: () => () => {} };
+  vi.doMock("./mobile-incoming-share", () => new Proxy({ mobileIncomingShare: incomingShare }, {
+    get: (object, key) => key in object ? object[key as keyof typeof object] : {}, has: () => true,
+    getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
   vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {} }));
   vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
   for (const name of ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage",
@@ -239,7 +257,7 @@ beforeAll(async () => {
   vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: shareSelectionActive, busy: false, allSelected: false, toggleAll() {},
     selectedIds: [], enterVisible() {} }) }));
   vi.doMock("./use-mobile-screenshot-selection", () => ({ useMobileScreenshotSelection() {} }));
-  ({ SessionsScreen, TaskScreen } = await import("./App"));
+  ({ SessionsScreen, TaskScreen, NewTaskScreen } = await import("./App"));
 });
 
 beforeEach(async () => {
@@ -250,6 +268,8 @@ beforeEach(async () => {
   platformOS = "android";
   observedHeaderRole = "ordinary"; shareSelectionActive = false;
   headerSourceEpoch = 0;
+  createNewTask.mockClear();
+  await newTaskDrafts.clear({ profileId: "profile" });
   vi.useFakeTimers();
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
   for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
@@ -301,6 +321,34 @@ async function option(label: string): Promise<void> {
   await press(mobileMessage("en", "home.optionsFor", { name: "Alpha" }));
   await press(label); await act(async () => vi.advanceTimersByTimeAsync(2));
 }
+
+it("restores the Worktree branch in the actual new-task form, submits it and clears it when another project is selected", async () => {
+  state = { ...state, owner: create(SnapshotSchema, { ...state.owner!,
+    backends: [{ backendId: "backend", capabilities: { capabilities: [{ name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED }] } }],
+    targets: [...state.owner!.targets.map(target => ({ ...target, state: TargetState.ACTIVE })),
+      { targetId: "project-other", backendId: "backend", displayName: "Another project", state: TargetState.ACTIVE }] }) };
+  newTaskDrafts.save({ profileId: "profile" }, { targetId: "project", name: "Review",
+    input: plainTextMobileComposerDraft("Inspect this branch") });
+  await newTaskDrafts.flush({ profileId: "profile" });
+  const form = () => createElement(NewTaskScreen, { colors, state, locale: "en", onBack, onCreated: onNew,
+    onImportedExistingTask() {}, showIncomingShareEmpty: false });
+  await act(async () => root.render(form()));
+  await press("Isolated Worktree"); await press("review");
+  await newTaskDrafts.flush({ profileId: "profile" });
+  await act(async () => root.unmount()); root = createRoot(host);
+  await act(async () => root.render(form()));
+  expect(button("Isolated Worktree").getAttribute("aria-checked")).toBe("true");
+  expect(button("review").getAttribute("aria-checked")).toBe("true");
+  await press(message("newTask.createAndSend"));
+  await act(async () => { await vi.waitFor(() => expect(createNewTask).toHaveBeenCalledOnce()); });
+  expect(createNewTask).toHaveBeenCalledWith("project", "Review", plainTextMobileComposerDraft("Inspect this branch"),
+    undefined, undefined, expect.objectContaining({ optimisticConversation: true }),
+    { refreshRemote: false, sourceRef: "refs/heads/review" });
+  await press(mobileMessage("en", "newTask.projectAccessibility", { name: "Another project" }));
+  expect(button("Isolated Worktree").getAttribute("aria-checked")).toBe("false");
+  expect(newTaskDrafts.readSync({ profileId: "profile" })).toMatchObject({ targetId: "project-other" });
+  expect(newTaskDrafts.readSync({ profileId: "profile" })?.worktree).toBeUndefined();
+});
 
 async function renderTask(patch: Partial<TaskProps> = {}): Promise<void> {
   taskProps = { colors, state, locale: "en", onBack, onHome: onMenu, onNew, onFiles() {}, onOpenPartnerThread() {},
