@@ -173,7 +173,7 @@ describe("native import service and owning effects", () => {
     expect(rejected).toMatchObject({ creationRejected: "IMPORT_NAME_EXISTS", checkpointCleared: true, partnerCreated: false });
     expect(() => f.partners.getPartner(rejected.result.partnerId)).toThrow();
     expect(f.partners.getPartner("competing-partner").displayName).toBe("Contested partner");
-    await expect(f.storage.environment.read(rejected.result.partnerId, () => {})).resolves.toBeNull();
+    await expect(f.storage.environment.read(rejected.result.partnerId, () => {})).resolves.toBeUndefined();
     expect(await f.api.retry(firstId, false, signal)).toMatchObject({ requestId: firstId, saved: false,
       checks: expect.arrayContaining([expect.objectContaining({
         entryId: "creation", status: PartnerImportCheckStatus.NEEDS_ATTENTION, message: "IMPORT_NAME_EXISTS"

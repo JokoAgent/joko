@@ -226,6 +226,7 @@ describe("Contacts sync node lifecycle", () => {
     let recipientOnline = true;
     const delivered: string[][] = [];
     const manager = new ContactSyncManager({ store, vault, nodeId: senderId, displayName: "Sender",
+      now: () => Date.now(),
       codec: inProcessContactSyncCodec, transportFactory: () => ({
         start: async () => undefined, stop: () => undefined,
         candidates: () => [candidate], onlinePeerIds: () => recipientOnline ? [recipientId] : [],
