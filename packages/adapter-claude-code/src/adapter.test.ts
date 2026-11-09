@@ -4306,7 +4306,7 @@ describe("ClaudeCodeAdapter", () => {
           phaseIndex: 1, attempt: 2, resultPreview: "workflow-private-marker found", model: "actual-native-model", durationMs: 200 }], logs: ["workflow-private-marker log"] }));
       const read = { sessionId: active.context.sessionId, target: workspace, bindings: [binding], taskId, maximumBytes: 16_384, assertCurrent() {} };
       expect((await adapter.getBackgroundWorkflowProgress(read)).workflow?.agents[0]).toMatchObject({ label: "Reviewer", state: "done", model: "actual-native-model", attempt: 2 });
-      query.push(taskNotification(binding.nativeSessionId!, "persisted-workflow", "workflow-tool", { status: "completed", summary: "Reviewed", totalTokens: 0, toolUses: 0, durationMs: 200 }));
+      query.push(taskNotification(binding.nativeSessionId!, "persisted-workflow", "workflow-tool", { status: "completed", summary: "Reviewed", outputFile: join(root, "workflow.output"), totalTokens: 0, toolUses: 0, durationMs: 200 }));
       await eventually(() => active.events.some(event => event.type === "background_task" && event.state === "completed"));
       expect((await adapter.getBackgroundWorkflowProgress(read)).status).toBe("available");
       await adapter.closeSession(binding, contextFor(binding, { target: workspace }).context);
