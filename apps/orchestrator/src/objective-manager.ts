@@ -31,6 +31,7 @@ const DISPATCH_REJECTION_BASE_DELAY_MS = 500;
 const DISPATCH_REJECTION_MAX_DELAY_MS = 4_000;
 const OVERLOAD_RESUME_DELAY_MS = 60_000;
 const OVERLOAD_MAXIMUM = 3;
+const OVERLOAD_WAIT_REASON = "upstream capacity is temporarily unavailable";
 const DEFAULT_NO_PROGRESS_TURN_LIMIT = 3;
 
 type ObjectiveSessionHost = Pick<
@@ -553,7 +554,7 @@ export class ObjectiveManager {
         usageResetAt = limit.resetsAt ?? null;
       } else if (overload && current.dispatchRejections + 1 < OVERLOAD_MAXIMUM) {
         status = "usage_limited";
-        reason = "upstream capacity is temporarily unavailable";
+        reason = OVERLOAD_WAIT_REASON;
         usageResetAt = this.#now() + OVERLOAD_RESUME_DELAY_MS;
         dispatchRejections = current.dispatchRejections + 1;
       } else {
@@ -792,7 +793,9 @@ export class ObjectiveManager {
             status: "active",
             usageResetAt: null,
             noProgressTurns: 0,
-            lastReason: "usage limit reset; resuming objective",
+            lastReason: owner.lastReason === OVERLOAD_WAIT_REASON
+              ? "upstream capacity wait ended; resuming objective"
+              : "usage limit reset; resuming objective",
             advanceOwnerGeneration: true,
             updatedAt: this.#now()
           });
@@ -1161,7 +1164,7 @@ function objectiveInternalOperationId(kind: string, objective: ObjectiveRecord, 
 }
 
 function isOverload(error: PublicError): boolean {
-  return error.code === "UPSTREAM_OVERLOAD";
+  return error.code === "UPSTREAM_OVERLOAD" || error.code === "UPSTREAM_OVERLOADED";
 }
 
 function safeErrorMessage(error: unknown): string {

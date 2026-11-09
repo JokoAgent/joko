@@ -2,6 +2,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { publicNativeTurnError } from "@joko/adapter-codex";
 import type { PublicError, PromptInput, UsageSnapshot } from "@joko/core";
 import { OperationalStore, type OperationExecution } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -337,13 +338,17 @@ describe("ObjectiveManager", () => {
     });
   });
 
-  it("persists consecutive overloads across manager restart and blocks at the bounded threshold", async () => {
+  it.each([
+    { name: "Pi", error: overloadError() },
+    { name: "Codex overload", error: publicNativeTurnError({ codexErrorInfo: "serverOverloaded" }) },
+    { name: "Codex HTTP 529", error: publicNativeTurnError({ codexErrorInfo: { responseStreamConnectionFailed: { httpStatusCode: 529 } } }) }
+  ])("persists $name failures across manager restart and blocks at the bounded threshold", async ({ error }) => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
     const fixture = createFixture();
     await fixture.manager.set(setInput("overload-start", fixture));
     let pending = fixture.host.admissions.at(-1)!;
-    failRun(fixture.store, pending, overloadError());
+    failRun(fixture.store, pending, error);
     await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "failed" });
     expect(fixture.store.getObjective(fixture.sessionId).dispatchRejections).toBe(1);
 
@@ -355,12 +360,32 @@ describe("ObjectiveManager", () => {
     for (const expectedFailureCount of [2, 3]) {
       await vi.advanceTimersByTimeAsync(60_000);
       pending = fixture.host.admissions.at(-1)!;
-      failRun(fixture.store, pending, overloadError());
+      expect(fixture.store.getObjective(fixture.sessionId).lastReason).toBe("upstream capacity wait ended; resuming objective");
+      failRun(fixture.store, pending, error);
       await recovered.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "failed" });
       const current = fixture.store.getObjective(fixture.sessionId);
       if (expectedFailureCount < 3) expect(current.dispatchRejections).toBe(expectedFailureCount);
       else expect(current).toMatchObject({ status: "blocked", dispatchRejections: 0 });
     }
+  });
+
+  it.each([
+    { info: "usageLimitExceeded", status: "usage_limited" },
+    { info: { httpConnectionFailed: { httpStatusCode: 429 } }, status: "usage_limited" },
+    { info: "sessionBudgetExceeded", status: "blocked" },
+    { info: { httpConnectionFailed: { httpStatusCode: 402 } }, status: "blocked" },
+    { info: "unknownNativeFailure", status: "blocked" }
+  ])("retains the native Codex category $info through the durable failed Run", async ({ info, status }) => {
+    const fixture = createFixture();
+    await fixture.manager.set(setInput("native-failure", fixture));
+    const pending = fixture.host.admissions[0]!;
+    const error = publicNativeTurnError({ codexErrorInfo: info });
+    failRun(fixture.store, pending, error);
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "failed" });
+    expect(fixture.store.getRun(pending.runId).descriptor.error).toEqual(error);
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status });
+    expect(fixture.store.getObjective(fixture.sessionId).usageResetAt).toBeUndefined();
+    expect(fixture.host.admissions).toHaveLength(1);
   });
 
   it("uses the exact Run ledger, ignores unsafe refinement, and persists lifecycle evidence", async () => {

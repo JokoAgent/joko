@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { publicNativeTurnError } from "@joko/adapter-codex";
 import type { PublicError } from "@joko/core";
 import {
   currentProviderRateLimit,
@@ -38,6 +39,17 @@ describe("Provider rate-limit observations", () => {
     const stored = { limited: true, resetsAt: NOW + 1_000, observedAt: NOW };
     expect(currentProviderRateLimit(stored, NOW + 999)).toEqual(stored);
     expect(currentProviderRateLimit(stored, NOW + 1_000)).toBeUndefined();
+  });
+
+  it.each(["usageLimitExceeded", { httpConnectionFailed: { httpStatusCode: 429 } }])("uses the public native Codex category after diagnostic text is removed", info => {
+    const error = publicNativeTurnError({ codexErrorInfo: info, message: "private diagnostic" });
+    expect(error.message).not.toContain("private");
+    expect(providerRateLimitFromError(error, NOW)).toEqual({ limited: true, observedAt: NOW });
+  });
+
+  it("keeps the previously persisted ambiguous session budget category out of quota recovery", () => {
+    expect(providerRateLimitFromError({ ...failure("The active Codex account reached its usage or session budget limit."),
+      code: "QUOTA_EXCEEDED" }, NOW)).toBeUndefined();
   });
 });
 
