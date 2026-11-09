@@ -104,6 +104,22 @@ describe("native delegated inline card", () => {
     client.taskDelegatedControls = vi.fn(() => newOwner); await render(client, newOwner);
     expect(host.querySelector('button[aria-label="Expand Investigate"]')).not.toBeNull(); expect(host.textContent).not.toContain("Current text");
   });
+  it("opens persisted workflow progress for a completed task and retains all structured facts", async () => {
+    const client = fixture(), task = create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session", displayName: "Review", state: BackgroundTaskState.COMPLETED });
+    client.loadTaskBackgroundOutput = vi.fn(async () => create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background",
+      state: BackgroundTaskOutputState.AVAILABLE, capturedAtMs: BigInt(Date.now()), workflow: { runId: "workflow-run", status: "done", workflowName: "Investigation",
+        totalTokens: 0n, totalToolCalls: 4n, durationMs: 3_200n, phases: [{ index: 1, title: "Inspect", detail: "Durable evidence" }],
+        agents: [{ label: "Reviewer", state: "running", model: "native-model", phaseIndex: 1, attempt: 2, lastToolName: "Read", lastToolSummary: "Opened record",
+          resultPreview: "Original result", durationMs: 3_000n }], logs: ["Persisted log"] } }));
+    await act(async () => root.render(createElement(MobileDelegatedTaskCard, { entry: { key: "background:background", task }, readClient: client,
+      controls, colors, locale: "en", enabled: true })));
+    await click("Expand Review");
+    for (const expected of ["Investigation", "Inspect", "Durable evidence", "Reviewer", "native-model", "Attempt: 2", "Tokens: 0", "Tools: 4", "Read", "Opened record", "Original result", "3s", "Persisted log", "Ended before"]) expect(host.textContent).toContain(expected);
+    expect(host.textContent).not.toContain("No output yet");
+    await click("Collapse Review"); await click("Expand Review");
+    expect(client.loadTaskBackgroundOutput).toHaveBeenCalledTimes(2); expect(host.textContent).toContain("Persisted log");
+  });
+
   it("shows finite recent background output states and retires the read on collapse or background", async () => {
     const client = fixture(), task = create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session", displayName: "Build", state: BackgroundTaskState.RUNNING });
     client.loadTaskBackgroundOutput = vi.fn(async () => create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background",

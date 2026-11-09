@@ -52,7 +52,7 @@ import { createConnectTransport, createConnectionFetch, endpointTransportForNewD
 import { assertTrustedEndpointServerId, EndpointTrustError, formatTrustedNodeInvitation, irohTransportForRecipient, isEndpointTrustError, isLoopbackEndpoint, normalizeEndpointPublicKey, observeEndpointTrustFailure, pairingVerificationOrigin, requireIrohRelayInvitationRequest, type NewDeviceAuthorizationOptions, type NodePairingInvitation } from "@joko/connection-transport/trust";
 import { createWebTaskSharingApi } from "./task-sharing-api.js";
 import type { TaskSharingApi } from "@joko/contracts";
-import { TaskShareRuntimeService, BackgroundTaskOutputState, type BackgroundTaskOutput, type TaskShareRuntimeControl } from "@joko/contracts";
+import { TaskShareRuntimeService, BackgroundTaskOutputState, BackgroundWorkflowProgressSchema, type BackgroundTaskOutput, type TaskShareRuntimeControl } from "@joko/contracts";
 import { streamSharedOwnerEvents } from "./shared-owner-events.js";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createPersonalDevelopmentGateway } from "./personal-development-gateway.js";
@@ -6825,7 +6825,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const output = result.output;
     if (!output || output.sessionId !== sessionId || output.backgroundTaskId !== backgroundTaskId
       || ![BackgroundTaskOutputState.AVAILABLE, BackgroundTaskOutputState.UNAVAILABLE, BackgroundTaskOutputState.FAILED].includes(output.state)
-      || new TextEncoder().encode(output.text).byteLength > 262_144) throw new GatewayError("The background output response changed owner or exceeded its limit.");
+      || new TextEncoder().encode(output.text).byteLength > 262_144
+      || output.workflow !== undefined && toBinary(BackgroundWorkflowProgressSchema, output.workflow).byteLength > 262_144) throw new GatewayError("The background output response changed owner or exceeded its limit.");
     return output;
   }
 

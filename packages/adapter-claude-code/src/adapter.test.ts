@@ -4285,6 +4285,41 @@ describe("ClaudeCodeAdapter", () => {
     } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
 
+  test("reads an owned persisted workflow after terminal notification, runtime close and Adapter restart without creating a query", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-native-workflow-")), configurationDirectory = join(root, "config");
+    const workspace = { ...target, workspaceRoot: root }, runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime, { environment: { CLAUDE_CONFIG_DIR: configurationDirectory }, redactValues: ["workflow-private-marker"] });
+    const restartedRuntime = new FakeSdkRuntime(), restarted = adapterFor(restartedRuntime, { environment: { CLAUDE_CONFIG_DIR: configurationDirectory }, redactValues: ["workflow-private-marker"] });
+    try {
+      const initial = contextFor(undefined, { target: workspace });
+      const binding = await adapter.createSession(createInput({ target: workspace }), initial.context);
+      const active = contextFor(binding, { target: workspace, operationId: "original-workflow" });
+      await adapter.send(textPrompt("run workflow"), active.context);
+      const query = runtime.queries[0]!;
+      query.push(taskStarted(binding.nativeSessionId!, "persisted-workflow", "workflow-tool", { taskType: "local_workflow", description: "Review evidence" }));
+      await eventually(() => active.events.some(event => event.type === "background_task"));
+      const taskId = active.events.find((event): event is Extract<EventPayload, { type: "background_task" }> => event.type === "background_task")!.taskId;
+      const directory = join(configurationDirectory, "projects", root.replace(/[^a-zA-Z0-9]/gu, "-"), binding.nativeSessionId!, "workflows");
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, "wf_original.json"), JSON.stringify({ taskId: "persisted-workflow", runId: "workflow-run", status: "done",
+        phases: [{ title: "Review", detail: "Original evidence" }], workflowProgress: [{ type: "workflow_agent", label: "Reviewer", state: "done",
+          phaseIndex: 1, attempt: 2, resultPreview: "workflow-private-marker found", model: "actual-native-model", durationMs: 200 }], logs: ["workflow-private-marker log"] }));
+      const read = { sessionId: active.context.sessionId, target: workspace, bindings: [binding], taskId, maximumBytes: 16_384, assertCurrent() {} };
+      expect((await adapter.getBackgroundWorkflowProgress(read)).workflow?.agents[0]).toMatchObject({ label: "Reviewer", state: "done", model: "actual-native-model", attempt: 2 });
+      query.push(taskNotification(binding.nativeSessionId!, "persisted-workflow", "workflow-tool", { status: "completed", summary: "Reviewed", totalTokens: 0, toolUses: 0, durationMs: 200 }));
+      await eventually(() => active.events.some(event => event.type === "background_task" && event.state === "completed"));
+      expect((await adapter.getBackgroundWorkflowProgress(read)).status).toBe("available");
+      await adapter.closeSession(binding, contextFor(binding, { target: workspace }).context);
+      const result = await restarted.getBackgroundWorkflowProgress(read);
+      expect(result.workflow?.status).toBe("done"); expect(JSON.stringify(result)).not.toContain("workflow-private-marker");
+      expect(restartedRuntime.queries).toHaveLength(0);
+      expect((await restarted.getBackgroundWorkflowProgress({ ...read, bindings: [] })).status).toBe("unavailable");
+      expect((await restarted.getBackgroundWorkflowProgress({ ...read, target: { ...workspace, workspaceRoot: join(root, "other-workspace") } })).status).toBe("unavailable");
+      const abort = new AbortController(); abort.abort();
+      await expect(restarted.getBackgroundWorkflowProgress({ ...read, signal: abort.signal })).rejects.toThrow();
+    } finally { await adapter.dispose(); await restarted.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
+
   test("projects native task lifecycle and child work without mixing child text into the parent turn", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime, { redactValues: ["task-secret"] });

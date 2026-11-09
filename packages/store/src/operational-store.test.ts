@@ -45,6 +45,24 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("keeps read-only native binding history scoped to the adopted task, Backend, generation and time after reopen", () => {
+    const f = createFixture(), original = f.store.getSession("session-1");
+    const first = { opaqueRef: "native/owned-one", nativeSessionId: "sdk-one", generation: 1 };
+    const second = { opaqueRef: "native/owned-two", nativeSessionId: "sdk-two", generation: 2 };
+    f.store.updateSession("session-1", { binding: first }, original.revision);
+    const firstHistory = f.store.listSessionNativeBindings("session-1", "pi", 1, Date.now());
+    expect(firstHistory).toContainEqual(first);
+    f.store.createSession({ ...original.descriptor, id: "other-session", binding: { opaqueRef: "native/foreign", nativeSessionId: "sdk-foreign", generation: 1 } });
+    f.store.upsertBackend({ ...f.store.getBackend("pi").descriptor, id: "other-backend" });
+    const updated = f.store.getSession("session-1"); f.store.updateSession("session-1", { binding: second }, updated.revision);
+    const path = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(path));
+    expect(f.store.listSessionNativeBindings("session-1", "pi", 1, Date.now())).toEqual(firstHistory);
+    expect(f.store.listSessionNativeBindings("session-1", "pi", 2, Date.now())).toContainEqual(second);
+    expect(f.store.listSessionNativeBindings("session-1", "pi", 2, 0)).toEqual([]);
+    expect(f.store.listSessionNativeBindings("session-1", "other-backend", 2, Date.now())).toEqual([]);
+    expect(f.store.listSessionNativeBindings("other-session", "pi", 2, Date.now())).not.toContainEqual(first);
+  });
+
   it("keeps a Side Chat's native prefix private across pagination, search, quotes and a cold restart", () => {
     const f = createFixture(), source = f.store.getSession("session-1").descriptor;
     const fingerprint = (reference: string) => `sha256:${createHash("sha256").update(reference).digest("hex")}`;

@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import { BackgroundTaskOutputState, type BackgroundTaskOutput } from "@joko/contracts";
+import { toBinary } from "@bufbuild/protobuf";
+import { BackgroundTaskOutputState, BackgroundWorkflowProgressSchema, type BackgroundTaskOutput } from "@joko/contracts";
 import type { MobileDelegatedControls, MobileDelegatedReadClient } from "./mobile-delegated-reader";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { MobileBackgroundWorkflowTree } from "./MobileBackgroundWorkflowTree";
 
-export function MobileBackgroundTaskOutput({ client, controls, taskId, enabled, colors, locale }: {
+export function MobileBackgroundTaskOutput({ client, controls, taskId, taskState, enabled, colors, locale }: {
   readonly client: MobileDelegatedReadClient; readonly controls: MobileDelegatedControls; readonly taskId: string;
-  readonly enabled: boolean; readonly colors: MobileInteractionSheetColors; readonly locale: MobileSupportedLocale;
+  readonly taskState?: string; readonly enabled: boolean; readonly colors: MobileInteractionSheetColors; readonly locale: MobileSupportedLocale;
 }) {
   const key = JSON.stringify([controls.authorityKey, taskId]), current = useRef(key); current.current = key;
   const [state, setState] = useState<{ readonly key: string; readonly loading: boolean; readonly output?: BackgroundTaskOutput; readonly failed?: boolean }>({ key, loading: true });
@@ -29,6 +31,7 @@ export function MobileBackgroundTaskOutput({ client, controls, taskId, enabled, 
         if (!valid()) return;
         if (output.sessionId !== controls.sessionId || output.backgroundTaskId !== taskId
           || new TextEncoder().encode(output.text).length > 262_144 || output.totalBytes < 0n
+          || output.workflow !== undefined && toBinary(BackgroundWorkflowProgressSchema, output.workflow).byteLength > 262_144
           || ![BackgroundTaskOutputState.AVAILABLE, BackgroundTaskOutputState.UNAVAILABLE, BackgroundTaskOutputState.FAILED].includes(output.state)) throw new Error("The background output response is invalid.");
         setState({ key, loading: false, output });
       } catch { if (valid()) setState({ key, loading: false, failed: true }); }
@@ -48,10 +51,12 @@ export function MobileBackgroundTaskOutput({ client, controls, taskId, enabled, 
   const age = output ? Math.max(0, Math.floor((Date.now() - Number(output.modifiedAtMs ?? output.capturedAtMs)) / 1_000)) : 0;
   return <View style={{ gap: 8 }}>
     <Text style={{ color: colors.muted }}>{t[0]}</Text>
-    <Text selectable style={{ color: value.failed || output?.state === BackgroundTaskOutputState.FAILED ? colors.negative : colors.ink, fontSize: 12 }}>
+    {!value.failed && output?.state === BackgroundTaskOutputState.AVAILABLE && output.workflow
+      ? <MobileBackgroundWorkflowTree workflow={output.workflow} taskState={taskState} colors={colors} locale={locale} />
+      : <Text selectable style={{ color: value.failed || output?.state === BackgroundTaskOutputState.FAILED ? colors.negative : colors.ink, fontSize: 12 }}>
       {value.loading ? t[1] : value.failed || output?.state === BackgroundTaskOutputState.FAILED ? t[4]
         : output?.state === BackgroundTaskOutputState.UNAVAILABLE ? t[3] : output?.text ? output.text.split("\n").slice(-12).join("\n") : t[2]}
-    </Text>
+    </Text>}
     {output?.state === BackgroundTaskOutputState.AVAILABLE && <Text style={{ color: colors.muted, fontSize: 12 }}>
       {`${t[7]} ${age}s · ${output.totalBytes} B${output.truncated ? ` · ${t[6]}` : ""}`}
     </Text>}

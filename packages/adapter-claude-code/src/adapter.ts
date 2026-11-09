@@ -30,6 +30,7 @@ import {
   type BackendDescriptor,
   type BlobRef,
   type BackgroundTaskOutputResult,
+  type BackgroundWorkflowReadInput,
   type Capability,
   type CreateNativeSessionInput,
   type DurableNativeDispatchPreparation,
@@ -83,6 +84,7 @@ import { claudeCodeError } from "./errors.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpCallResult, ClaudeMcpRuntimeLease, ClaudeMcpTool } from "./mcp-bridge.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import { readRegisteredBackgroundTaskOutput } from "./background-task-output.js";
+import { readBackgroundWorkflowProgress } from "./workflow-progress.js";
 import type { ClaudeFreshContextBindingLookup, ClaudeFreshContextIdentity, ClaudeFreshContextSnapshot } from "./fresh-context-owner.js";
 import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
 import { claudeNativeDispatchFingerprint } from "./native-dispatch-fingerprint.js";
@@ -2898,6 +2900,29 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const current = history.entries.slice(0, position + 1).filter(entry => !entry.child && entry.type !== "system");
     if (position < 0 || !isDeepStrictEqual(current, prefix)) throw claudeCodeError("NATIVE_COMPLETED_SNAPSHOT_CHANGED", "The completed native history prefix changed.", "session_fork", {
       retryable: true, recovery: "Refresh the completed assistant boundary and open a new Side Chat operation." });
+  }
+
+  async getBackgroundWorkflowProgress(input: BackgroundWorkflowReadInput): Promise<BackgroundTaskOutputResult> {
+    const absent = (): BackgroundTaskOutputResult => ({ status: "unavailable", text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
+    const assertCurrent = (): void => { this.#assertUsable(); input.signal?.throwIfAborted(); input.assertCurrent(); };
+    assertCurrent();
+    if (input.target.remoteWorkspace !== undefined) return absent();
+    const runtime = this.#sessions.get(input.sessionId);
+    if (runtime && (runtime.remote || runtime.runtimePolicy !== "standard" || runtime.nativeTasks.isWorkflowTask(input.taskId) === false)) return absent();
+    const authority = claudeWorkspaceAuthority(input.target);
+    const ids = new Set<string>();
+    for (const binding of input.bindings) {
+      try {
+        const route = parseBindingRoute(binding);
+        if (route.kind === "stored" && route.workspaceAuthority !== authority) continue;
+        ids.add(route.nativeSessionId);
+      } catch { /* An uninitialized binding does not authorize native files. */ }
+    }
+    if (ids.size === 0) return absent();
+    return readBackgroundWorkflowProgress({ configurationDirectory: this.#nativeMemoryConfigDirectory,
+      projectDirectoryName: this.#environment["CLAUDE_CODE_PROJECT_DIR_NAME"],
+      workingDirectory: input.target.workspaceRoot, nativeSessionIds: [...ids], taskId: input.taskId,
+      maximumBytes: input.maximumBytes, project: (value, maximum) => this.#projection.text(value, maximum), assertCurrent });
   }
 
   async getBackgroundTaskOutput(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult> {

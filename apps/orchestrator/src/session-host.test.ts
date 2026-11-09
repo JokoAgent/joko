@@ -8304,6 +8304,56 @@ describe("SessionHost", () => {
     expect(adapter.resumeCalls).toBe(resumes);
   });
 
+  it("reads the durable workflow owner after task termination, runtime close and Host restart without resuming it", async () => {
+    const adapter = new BackgroundTaskRuntimeFakeAdapter(), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-durable-workflow", connection: fixture.connection,
+      targetId: "target-one", title: "Workflow", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const result = { status: "available" as const, text: "", totalBytes: 300, truncated: false, capturedAtMs: Date.now(),
+      workflow: { runId: "workflow-run", status: "done", phases: [{ index: 1, title: "Review" }], agents: [{ label: "Reviewer", state: "done" }], logs: ["Durable log"] } };
+    const output = vi.fn(async (input: import("@joko/core").BackgroundWorkflowReadInput) => { input.assertCurrent(); return result; });
+    Object.assign(adapter, { getBackgroundWorkflowProgress: output });
+    expect((await fixture.host.getBackgroundTaskOutput(sessionId, "missing-workflow")).status).toBe("unavailable"); expect(output).not.toHaveBeenCalled();
+    await adapter.emitBackgroundTask({ taskId: "owned-workflow", title: "Review", state: "running" });
+    expect((await fixture.host.getBackgroundTaskOutput(sessionId, "owned-workflow")).workflow).toEqual(result.workflow);
+    const adopted = fixture.store.getSession(sessionId).descriptor.binding;
+    expect(output.mock.calls[0]![0].bindings).toContainEqual(adopted);
+    expect(output.mock.calls[0]![0].target.workspaceRoot).toBe(fixture.directory);
+    await adapter.emitBackgroundTask({ taskId: "owned-workflow", title: "Review", state: "completed" });
+    await fixture.host.close(sessionId);
+    const resumes = adapter.resumeCalls;
+    expect((await fixture.host.getBackgroundTaskOutput(sessionId, "owned-workflow")).workflow).toEqual(result.workflow);
+    expect(adapter.resumeCalls).toBe(resumes);
+    await fixture.host.dispose();
+    const restartedAdapter = new BackgroundTaskRuntimeFakeAdapter(); Object.assign(restartedAdapter, { getBackgroundWorkflowProgress: output });
+    const restarted = new SessionHost(fixture.store, fixture.artifacts, [restartedAdapter]);
+    cleanups.push(() => restarted.dispose()); await restarted.initialize();
+    expect((await restarted.getBackgroundTaskOutput(sessionId, "owned-workflow")).workflow?.logs).toEqual(["Durable log"]);
+    expect(restartedAdapter.resumeCalls).toBe(0);
+    expect(fixture.store.findSessionBackgroundTaskEvent(sessionId, "owned-workflow")?.payload).toMatchObject({ state: "completed" });
+  });
+
+  it("rejects workflow observations when their task generation, target revision or caller authority retires during IO", async () => {
+    const adapter = new BackgroundTaskRuntimeFakeAdapter(), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-workflow-race", connection: fixture.connection,
+      targetId: "target-one", title: "Workflow", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    await adapter.emitBackgroundTask({ taskId: "owned-workflow", title: "Review", state: "running" });
+    let mutate: () => Promise<void> | void = () => undefined;
+    const output = vi.fn(async (input: import("@joko/core").BackgroundWorkflowReadInput) => {
+      await mutate(); input.assertCurrent(); return { status: "available" as const, text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now(),
+        workflow: { runId: "workflow-run", status: "running", phases: [], agents: [], logs: [] } };
+    });
+    Object.assign(adapter, { getBackgroundWorkflowProgress: output });
+    const abort = new AbortController(); mutate = () => abort.abort();
+    await expect(fixture.host.getBackgroundTaskOutput(sessionId, "owned-workflow", 16_384, { signal: abort.signal })).rejects.toThrow();
+    mutate = async () => { await fixture.host.registerTarget({ ...fixture.store.getTarget("target-one").descriptor, displayName: "Replaced target" }); };
+    await expect(fixture.host.getBackgroundTaskOutput(sessionId, "owned-workflow")).rejects.toThrow(/owner changed/u);
+    mutate = () => {
+      const session = fixture.store.getSession(sessionId);
+      fixture.store.updateSession(sessionId, { binding: { ...session.descriptor.binding, generation: session.descriptor.binding.generation + 1 } }, session.revision);
+    };
+    await expect(fixture.host.getBackgroundTaskOutput(sessionId, "owned-workflow")).rejects.toThrow(/owner changed/u);
+  });
+
   it("persists one observable active-to-terminal background task edge", async () => {
     const adapter = new BackgroundTaskRuntimeFakeAdapter();
     const fixture = await createFixture(adapter);

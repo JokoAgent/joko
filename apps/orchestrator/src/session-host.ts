@@ -10007,11 +10007,17 @@ export class SessionHost {
     }
   }
 
-  async getBackgroundTaskOutput(sessionId: string, taskId: string, maximumBytes = 16_384): Promise<BackgroundTaskOutputResult> {
+  async getBackgroundTaskOutput(sessionId: string, taskId: string, maximumBytes = 16_384,
+    authority: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void } = {}): Promise<BackgroundTaskOutputResult> {
     this.#assertOpen();
     const absent = (status: "unavailable" | "failed" = "unavailable"): BackgroundTaskOutputResult => ({ status, text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
     if (!taskId || !Number.isSafeInteger(maximumBytes) || maximumBytes < 1 || maximumBytes > 256 * 1024) return absent();
     const stored = this.#store.getSession(sessionId), active = this.#active.get(sessionId);
+    authority.signal?.throwIfAborted(); authority.assertCurrent?.();
+    if (stored.descriptor.deletedAt !== undefined) return absent();
+    const workflow = await this.readBackgroundWorkflowOutput(stored, taskId, maximumBytes, authority);
+    if (workflow !== undefined) return workflow;
+    authority.signal?.throwIfAborted(); authority.assertCurrent?.();
     if (!active || !active.adapter.getBackgroundTaskOutput || stored.descriptor.archived || stored.descriptor.deletedAt !== undefined) return absent();
     const observed = this.#store.listActiveSessionBackgroundTaskEvents(sessionId).find(event => event.payload.type === "background_task" && event.payload.taskId === taskId);
     if (!observed || observed.generation !== stored.descriptor.binding.generation) return absent();
@@ -10024,6 +10030,55 @@ export class SessionHost {
       return this.#store.listActiveSessionBackgroundTaskEvents(sessionId).some(event => event.payload.type === "background_task"
         && event.payload.taskId === taskId && event.generation === lease.productGeneration) ? output : absent();
     } finally { lease.release(); }
+  }
+
+  private async readBackgroundWorkflowOutput(stored: StoredSession, taskId: string, maximumBytes: number,
+    authority: { readonly signal?: AbortSignal; readonly assertCurrent?: () => void }): Promise<BackgroundTaskOutputResult | undefined> {
+    const sessionId = stored.descriptor.id;
+    const latest = () => this.#store.findSessionBackgroundTaskEvent(sessionId, taskId);
+    const observed = latest();
+    if (observed === undefined || observed.targetId !== stored.descriptor.targetId) return undefined;
+    const adapter = this.#adapters.get(observed.backendId);
+    if (adapter?.getBackgroundWorkflowProgress === undefined) return undefined;
+    const generation = this.requireAdapterGeneration(observed.backendId, adapter);
+    const registeredTarget = this.#store.getTarget(observed.targetId);
+    if (stored.descriptor.remoteWorkspace !== undefined || registeredTarget.descriptor.remoteWorkspace !== undefined) return undefined;
+    const target = stored.descriptor.worktree?.state === "preserved" && stored.descriptor.worktree.remote === undefined
+      ? { ...workerWorkspaceTarget(this.#store, stored.descriptor, { ...registeredTarget.descriptor, workspaceRoot: stored.descriptor.worktree.path }),
+          backendId: observed.backendId, remoteWorkspace: stored.descriptor.remoteWorkspace }
+      : { ...this.targetForSession(stored), backendId: observed.backendId };
+    const bindings = this.#store.listSessionNativeBindings(sessionId, observed.backendId, observed.generation, observed.emittedAt);
+    if (bindings.length === 0) return undefined;
+    const worktreeOwner = (session: StoredSession) => JSON.stringify([session.descriptor.worktree?.leaseId,
+      session.descriptor.worktree?.workspaceId, session.descriptor.worktree?.path]);
+    const originalWorktree = worktreeOwner(stored);
+    const originalWorkerWorkspace = JSON.stringify(readWorkerWorkspaceBinding(this.#store, sessionId));
+    const assertCurrent = (): void => {
+      this.#assertOpen(); authority.signal?.throwIfAborted(); authority.assertCurrent?.();
+      const current = this.#store.getSession(sessionId), task = latest();
+      if (current.descriptor.deletedAt !== undefined || current.descriptor.binding.generation !== stored.descriptor.binding.generation
+        || current.descriptor.backendId !== stored.descriptor.backendId || current.descriptor.targetId !== stored.descriptor.targetId
+        || worktreeOwner(current) !== originalWorktree
+        || JSON.stringify(readWorkerWorkspaceBinding(this.#store, sessionId)) !== originalWorkerWorkspace
+        || this.#store.getTarget(observed.targetId).revision !== registeredTarget.revision
+        || task?.backendId !== observed.backendId || task.targetId !== observed.targetId || task.generation !== observed.generation
+        || this.#adapters.get(observed.backendId) !== adapter || this.#adapterGenerations.get(observed.backendId) !== generation) {
+        throw new StoreError("The native workflow observation owner changed.");
+      }
+    };
+    assertCurrent();
+    let result: BackgroundTaskOutputResult | undefined;
+    try {
+      result = await this.invokeBackendAdapter(observed.backendId, async current => {
+        if (current !== adapter) throw new StoreError("The native workflow Backend changed.");
+        assertCurrent();
+        const result = await current.getBackgroundWorkflowProgress!({ sessionId, target: structuredClone(target), bindings,
+          taskId, maximumBytes, signal: authority.signal, assertCurrent });
+        assertCurrent(); return result;
+      });
+    } catch { assertCurrent(); }
+    assertCurrent();
+    return result?.status === "available" && result.workflow !== undefined ? result : undefined;
   }
 
   private trackBackgroundTask(

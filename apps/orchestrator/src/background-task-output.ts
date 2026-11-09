@@ -13,18 +13,29 @@ export async function readTaskBackgroundOutput(host: SessionHost, sessionId: str
     throw new ConnectError("The background output request is invalid.", Code.InvalidArgument);
   }
   assertCurrent(); signal?.throwIfAborted();
-  const result = await host.getBackgroundTaskOutput(sessionId, backgroundTaskId, maximumBytes);
+  const result = await host.getBackgroundTaskOutput(sessionId, backgroundTaskId, maximumBytes, { signal, assertCurrent });
   assertCurrent(); signal?.throwIfAborted();
   if (result.status === "available" && Buffer.byteLength(result.text, "utf8") > maximumBytes + 3
     || !Number.isSafeInteger(result.totalBytes) || result.totalBytes < 0
     || !Number.isSafeInteger(result.capturedAtMs) || result.capturedAtMs < 0
-    || result.modifiedAtMs !== undefined && (!Number.isSafeInteger(result.modifiedAtMs) || result.modifiedAtMs < 0)) {
+    || result.modifiedAtMs !== undefined && (!Number.isSafeInteger(result.modifiedAtMs) || result.modifiedAtMs < 0)
+    || result.workflow !== undefined && Buffer.byteLength(JSON.stringify(result.workflow), "utf8") > maximumBytes) {
     throw new ConnectError("The native background output observation is invalid.", Code.FailedPrecondition);
   }
   return create(BackgroundTaskOutputSchema, { sessionId, backgroundTaskId,
     state: result.status === "available" ? BackgroundTaskOutputState.AVAILABLE
       : result.status === "unavailable" ? BackgroundTaskOutputState.UNAVAILABLE : BackgroundTaskOutputState.FAILED,
     text: result.status === "available" ? result.text : "", totalBytes: BigInt(result.totalBytes),
+    ...(result.status !== "available" || result.workflow === undefined ? {} : { workflow: {
+      ...result.workflow,
+      agentCount: result.workflow.agentCount === undefined ? undefined : BigInt(result.workflow.agentCount),
+      totalTokens: result.workflow.totalTokens === undefined ? undefined : BigInt(result.workflow.totalTokens),
+      totalToolCalls: result.workflow.totalToolCalls === undefined ? undefined : BigInt(result.workflow.totalToolCalls),
+      durationMs: result.workflow.durationMs === undefined ? undefined : BigInt(result.workflow.durationMs),
+      phases: result.workflow.phases.map(phase => ({ ...phase })),
+      agents: result.workflow.agents.map(agent => ({ ...agent,
+        durationMs: agent.durationMs === undefined ? undefined : BigInt(agent.durationMs) })), logs: [...result.workflow.logs]
+    } }),
     truncated: result.status === "available" && result.truncated, capturedAtMs: BigInt(result.capturedAtMs),
     ...(result.modifiedAtMs === undefined ? {} : { modifiedAtMs: BigInt(result.modifiedAtMs) }) });
 }
