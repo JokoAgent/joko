@@ -62,16 +62,21 @@ it("honors a Codex schedule admitted before model disablement and rejects later 
       value => value.run?.state === RunState.SUCCEEDED, "admitted Schedule completion");
 
     for (const scheduleId of [explicitId, inheritedId]) {
+      const prior = (await clients.scheduler.listScheduleRunHistory({ scheduleId })).history.map(run => run.runId);
       expect((await mutate(triggerScheduleMutation(scheduleId))).state).toBe(OperationState.SUCCEEDED);
-      const { history } = await clients.scheduler.listScheduleRunHistory({ scheduleId });
-      expect(history).toContainEqual(expect.objectContaining({
-        sessionId, state: RunState.FAILED, error: expect.objectContaining({ code: "TURN_OVERRIDE_MODEL_UNAVAILABLE" })
-      }));
+      const { history } = await waitFor(() => clients.scheduler.listScheduleRunHistory({ scheduleId }),
+        value => value.history.some(run => !prior.includes(run.runId) && run.finishedAt !== undefined),
+        "disabled model Schedule conclusion");
+      expect(history.find(run => !prior.includes(run.runId))).toMatchObject({
+        sessionId, state: RunState.FAILED, error: { code: "TURN_OVERRIDE_MODEL_UNAVAILABLE" }
+      });
     }
     expect((await setAccess(true, model.modelId)).state).toBe(OperationState.SUCCEEDED);
     expect((await setAccess(false)).state).toBe(OperationState.SUCCEEDED);
     expect((await mutate(triggerScheduleMutation(inheritedId))).state).toBe(OperationState.SUCCEEDED);
-    const { history } = await clients.scheduler.listScheduleRunHistory({ scheduleId: inheritedId });
+    const { history } = await waitFor(() => clients.scheduler.listScheduleRunHistory({ scheduleId: inheritedId }),
+      value => value.history.length === 2 && value.history.every(run => run.finishedAt !== undefined),
+      "disabled Provider Schedule conclusion");
     expect(history).toHaveLength(2);
     for (const run of history) expect(run).toMatchObject({ state: RunState.FAILED, error: { code: "TURN_OVERRIDE_MODEL_UNAVAILABLE" } });
     expect(turnStarts()).toHaveLength(1);

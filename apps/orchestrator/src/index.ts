@@ -6,6 +6,7 @@ export * from "./deferred-backend-restart.js";
 export * from "./personalization-inference.js";
 export * from "./session-navigation-coordinator.js";
 export * from "./backend-instance-registry.js";
+export { modelRoutingEnabled } from "./backend-model-access.js";
 export * from "./artifact-maintenance.js";
 export * from "./portable-session-package.js";
 export * from "./portable-session-projection.js";
