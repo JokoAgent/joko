@@ -114,7 +114,7 @@ describe("packaged Desktop Pi compaction", () => {
     try {
       await pairingTab.click();
     } catch (error) {
-      let deadline: ReturnType<typeof setNodeTimeout> | undefined;
+      let deadline: NodeJS.Timeout | number | undefined;
       const observation = await Promise.race([
         pairingTab.evaluate(element => {
           const bounds = element.getBoundingClientRect();
@@ -131,7 +131,7 @@ describe("packaged Desktop Pi compaction", () => {
             pointerEvents: getComputedStyle(element).pointerEvents
           };
         }, undefined, { timeout: 1_000 }).catch(() => undefined),
-        new Promise<undefined>(resolveObservation => { deadline = setNodeTimeout(resolveObservation, 2_000); })
+        new Promise<undefined>(resolveObservation => { deadline = setNodeTimeout(() => resolveObservation(undefined), 2_000); })
       ]).finally(() => clearNodeTimeout(deadline));
       console.info("Packaged Pi pairing control:", JSON.stringify(observation ?? null));
       throw error;
