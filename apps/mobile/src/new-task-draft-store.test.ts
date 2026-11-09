@@ -29,6 +29,24 @@ const authority = {
   createOperationId: "operation-create"
 };
 
+it("restores the selected Worktree and freezes its source through an unknown creation and an explicit failure", async () => {
+  const { driver } = memoryDriver(), store = new MobileNewTaskDraftStore(driver);
+  const worktree = { sourceRef: "refs/heads/review", refreshRemote: true };
+  const draft = { targetId: "project", name: "Task", input: input("Review this branch"), worktree };
+  store.save(first, draft); await store.flush(first);
+  const restored = new MobileNewTaskDraftStore(driver);
+  expect((await restored.read(first))?.worktree).toEqual(worktree);
+  expect(await restored.read(second)).toBeNull();
+  const submission = await restored.beginSubmission(first, draft, authority);
+  worktree.sourceRef = "refs/heads/other";
+  expect(submission.worktree).toEqual({ sourceRef: "refs/heads/review", refreshRemote: true });
+  const restarted = new MobileNewTaskDraftStore(driver);
+  expect((await restarted.read(first))?.submission?.worktree).toEqual(submission.worktree);
+  const editable = await restarted.clearSubmission(first, authority.createOperationId);
+  expect(editable).toMatchObject({ input: input("Review this branch"), worktree: submission.worktree });
+  expect((await new MobileNewTaskDraftStore(driver).read(first))?.worktree).toEqual(submission.worktree);
+});
+
 function memoryDriver() {
   const values = new Map<string, string>();
   const writes: Array<{ readonly key: string; readonly value?: string }> = [];
