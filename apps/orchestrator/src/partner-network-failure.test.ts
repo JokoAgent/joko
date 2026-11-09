@@ -14,6 +14,7 @@ it.each([
   [{ sdkError: "rate_limit", message: "ExceededBudget", usageLimit: true, errorStatus: 429 }, "QUOTA_EXCEEDED"],
   [{ codexErrorInfo: "usageLimitExceeded", errorStatus: 401, sdkError: "rate_limit" }, "QUOTA_EXCEEDED"],
   [{ codexErrorInfo: "sessionBudgetExceeded" }, "QUOTA_EXCEEDED"], [{ codexErrorInfo: "unauthorized", sdkError: "billing_error" }, "AUTH_REQUIRED"],
+  [{ code: "SESSION_BUDGET_EXCEEDED" }, "QUOTA_EXCEEDED"], [{ code: "BILLING_ERROR" }, "QUOTA_EXCEEDED"],
   [{ codexErrorInfo: "httpConnectionFailed", errorStatus: 401 }, "AUTH_REQUIRED"], [{ codexErrorInfo: "serverOverloaded" }, "UPSTREAM_OVERLOADED"],
   [{ reason: "upstream-overload" }, "UPSTREAM_OVERLOADED"], [{ errorStatus: 529 }, "UPSTREAM_OVERLOADED"], [new Error("Selected model is at capacity."), "UPSTREAM_OVERLOADED"],
   [new Error("overloaded_error"), "UPSTREAM_OVERLOADED"], [new Error("The private queue is overloaded"), "RUNTIME_ERROR"],

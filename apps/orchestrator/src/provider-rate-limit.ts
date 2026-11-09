@@ -7,7 +7,7 @@ export interface StoredProviderRateLimit {
   readonly observedAt: number;
 }
 
-const EXCLUDED_FAILURE = /\b(?:insufficient_quota|billing[_ -]?error|credit(?:s| balance)?\s+(?:depleted|exhausted|too low)|at capacity|overloaded(?:_error)?|server overloaded)\b/iu;
+const EXCLUDED_FAILURE = /\b(?:insufficient_quota|billing[_ -]?error|session budget|credit(?:s| balance)?\s+(?:depleted|exhausted|too low)|at capacity|overloaded(?:_error)?|server overloaded)\b/iu;
 const LIMIT_FAILURE = /\b(?:usage[_ -]?limit(?:[_ -]?(?:reached|exceeded))?|rate[_ -]?limit(?:[_ -]?(?:reached|exceeded))?|too many requests|quota\s+(?:exceeded|exhausted)|you(?:'|’)ve hit your (?:(?:session|weekly) )?limit|you have hit your .*?usage limit)\b/iu;
 
 export function providerRateLimitSettingKey(backendId: string, providerId: string): string {
@@ -23,7 +23,8 @@ export function providerRateLimitFromError(
   observedAt = Date.now()
 ): StoredProviderRateLimit | undefined {
   const text = `${error.code}\n${error.message}\n${error.recovery}`;
-  if (EXCLUDED_FAILURE.test(text) || !LIMIT_FAILURE.test(text)) return undefined;
+  const limitCode = error.code === "QUOTA_EXCEEDED" || error.code === "RATE_LIMITED";
+  if (EXCLUDED_FAILURE.test(text) || !limitCode && !LIMIT_FAILURE.test(text)) return undefined;
   const resetsAt = resetAtFromText(text, observedAt);
   return {
     limited: true,

@@ -29,14 +29,15 @@ export function publicNativeTurnError(error: unknown): PublicError {
   const networkTag = tag === "httpConnectionFailed" || tag === "responseStreamConnectionFailed" || tag === "responseStreamDisconnected";
   const rawStatus = networkTag || tag === "responseTooManyFailedAttempts" ? details?.["httpStatusCode"] : undefined;
   const status = typeof rawStatus === "number" && Number.isInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599 ? rawStatus : undefined;
-  const code = tag === "usageLimitExceeded" || tag === "sessionBudgetExceeded" ? "QUOTA_EXCEEDED"
+  const code = tag === "usageLimitExceeded" ? "QUOTA_EXCEEDED"
+    : tag === "sessionBudgetExceeded" ? "SESSION_BUDGET_EXCEEDED"
     : tag === "contextWindowExceeded" ? "CONTEXT_OVERFLOW"
     : tag === "badRequest" || status === 400 || status === 413 || status === 422 ? "INVALID_REQUEST"
     : tag === "cyberPolicy" ? "CONTENT_POLICY"
     : tag === "sandboxError" ? "SANDBOX_ERROR"
     : tag === "unauthorized" || status === 401 || status === 403 ? "AUTH_REQUIRED"
     : tag === "serverOverloaded" || status === 529 ? "UPSTREAM_OVERLOADED"
-    : status === 402 ? "QUOTA_EXCEEDED"
+    : status === 402 ? "BILLING_ERROR"
     : status === 429 ? "RATE_LIMITED"
     : networkTag ? "NETWORK_ERROR"
     : "CODEX_TURN_FAILED";
@@ -46,7 +47,9 @@ export function publicNativeTurnError(error: unknown): PublicError {
     CONTENT_POLICY: "The model service declined the request under its content policy.",
     SANDBOX_ERROR: "The native runtime could not execute within its sandbox.",
     AUTH_REQUIRED: "Codex authentication is required.",
-    QUOTA_EXCEEDED: "The active Codex account reached its usage or session budget limit.",
+    QUOTA_EXCEEDED: "The active Codex account reached its usage limit.",
+    SESSION_BUDGET_EXCEEDED: "The Codex task reached its session budget.",
+    BILLING_ERROR: "The Codex account requires billing attention.",
     RATE_LIMITED: "The Codex provider temporarily limited requests.",
     UPSTREAM_OVERLOADED: "The Codex model service is temporarily busy.",
     NETWORK_ERROR: "Codex could not maintain its provider connection.",
@@ -56,7 +59,7 @@ export function publicNativeTurnError(error: unknown): PublicError {
     code,
     message: messages[code],
     phase: "stream",
-    retryable: !["AUTH_REQUIRED", "CONTEXT_OVERFLOW", "INVALID_REQUEST", "CONTENT_POLICY", "SANDBOX_ERROR"].includes(code),
+    retryable: !["AUTH_REQUIRED", "CONTEXT_OVERFLOW", "INVALID_REQUEST", "CONTENT_POLICY", "SANDBOX_ERROR", "SESSION_BUDGET_EXCEEDED", "BILLING_ERROR"].includes(code),
     stateMayHaveChanged: true,
     recovery: code === "AUTH_REQUIRED"
       ? "Sign in to the Codex account and explicitly retry the queued input."
