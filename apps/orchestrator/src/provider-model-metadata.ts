@@ -27,8 +27,8 @@ export function saveDiscoveredModelConfiguration(current: PiManagedModel | undef
   const privateOverrides = current.metadataOverrides!.filter(field => !editable.has(field));
   const editableOverrides = (input.metadataOverrides ?? PI_EDITABLE_MODEL_METADATA_FIELDS).filter(field => editable.has(field));
   return materializeDiscoveredModel({ ...current, ...input, discoveredMetadata: current.discoveredMetadata,
-    ...(editableOverrides.includes("contextWindow") && input.contextWindow !== undefined ? { contextWindowSource: "declared" } : {}),
-    ...(editableOverrides.includes("maxTokens") && input.maxTokens !== undefined ? { maxOutputTokensSource: "declared" } : {}),
+    ...(editableOverrides.includes("contextWindow") && input.contextWindow !== undefined ? { contextWindowSource: "declared" as const } : {}),
+    ...(editableOverrides.includes("maxTokens") && input.maxTokens !== undefined ? { maxOutputTokensSource: "declared" as const } : {}),
     metadataOverrides: [...privateOverrides, ...editableOverrides] });
 }
 
@@ -54,7 +54,7 @@ export function materializeDiscoveredModel(model: PiManagedModel): PiManagedMode
     ...(metadata.contextWindowMax === undefined ? {} : { contextWindowMax: metadata.contextWindowMax }),
     ...(metadata.description === undefined ? {} : { description: metadata.description }),
     ...(metadata.nativeApi === undefined ? {} : { referenceApi: metadata.nativeApi }),
-    ...(reportedInput === undefined && metadata.supportsImages === undefined ? {} : { input: input?.length ? input : ["text"],
+    ...(reportedInput === undefined && metadata.supportsImages === undefined ? {} : { input: input?.length ? input : ["text" as const],
       declaredInputModalities: reportedInput ?? ["text"] }),
     ...(metadata.outputModalities === undefined ? {} : { declaredOutputModalities: metadata.outputModalities }),
     ...(metadata.supportsTools === undefined ? {} : { supportsTools: metadata.supportsTools }),
