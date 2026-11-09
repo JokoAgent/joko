@@ -4986,7 +4986,9 @@ describe("Connect typed feature boundaries", () => {
       connectionId: connection.id,
       mutation: mutation(create(contract.ScheduleInputSchema, {
         ...schedule([]),
-        recurrence: { kind: { case: "cron", value: { expression: "0 9 31 * *" } } }
+        recurrence: create(contract.ScheduleRecurrenceSchema, {
+          kind: { case: "cron", value: create(contract.CronRecurrenceSchema, { expression: "0 9 31 * *" }) }
+        })
       }))
     });
     expect(captured).toMatchObject({ kind: "cron", expression: "0 9 31 * *", nextRunAt: Date.UTC(2027, 1, 28, 9) });
