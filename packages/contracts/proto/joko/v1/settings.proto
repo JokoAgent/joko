@@ -202,6 +202,23 @@ message ProviderModelConfiguration {
   optional bool default_visible = 16;
   // Explicit false excludes the model from tool-dependent smart routing.
   optional bool supports_tools = 17;
+  // These displayed values follow the server-owned discovery snapshot. Saving
+  // an unchanged form must not convert them into explicit user overrides.
+  repeated ProviderModelInheritedField inherited_fields = 18;
+  // Read-only reported capacity; mutations cannot supply discovery facts.
+  optional uint64 context_window_max_tokens = 19;
+}
+
+enum ProviderModelInheritedField {
+  PROVIDER_MODEL_INHERITED_FIELD_UNSPECIFIED = 0;
+  PROVIDER_MODEL_INHERITED_FIELD_DISPLAY_NAME = 1;
+  PROVIDER_MODEL_INHERITED_FIELD_CONTEXT_WINDOW = 2;
+  PROVIDER_MODEL_INHERITED_FIELD_MAXIMUM_OUTPUT = 3;
+  PROVIDER_MODEL_INHERITED_FIELD_INPUT_MODALITIES = 4;
+  PROVIDER_MODEL_INHERITED_FIELD_REASONING = 5;
+  PROVIDER_MODEL_INHERITED_FIELD_THINKING_LEVELS = 6;
+  PROVIDER_MODEL_INHERITED_FIELD_FAST_MODE = 7;
+  PROVIDER_MODEL_INHERITED_FIELD_TOOLS = 8;
 }
 
 message ProviderThinkingLevelMapping {

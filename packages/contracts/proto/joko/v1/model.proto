@@ -176,6 +176,8 @@ message ModelDescriptor {
   ModelReferenceTariffs reference_tariffs = 36;
   // Owner-only presentation. Never replace shared reference prices or route metadata.
   ModelPriceQuote owner_price_override = 37;
+  // Reported model capacity, independent from the configured working window.
+  optional uint64 context_window_max_tokens = 38;
 }
 
 // Absence means no tariff metadata; a present empty list withdraws all tariffs.

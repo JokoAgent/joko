@@ -118,6 +118,7 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
         </>}
           <Section title={t("settings.modelAdvanced.specifications")}>
             <Fact label={t("settings.contextWindow")}>{primary.contextWindow > 0 ? <>{formatTokens(primary.contextWindow)} {t("settings.modelAdvanced.tokens")} <small>{t(metadata?.contextWindowSource === "estimated" ? "settings.modelAdvanced.estimated" : metadata?.contextWindowSource === "declared" ? "settings.modelAdvanced.declared" : "settings.modelAdvanced.sourceUnknown")}</small></> : t("settings.modelAdvanced.undeclared")}</Fact>
+            {metadata?.contextWindowMax !== undefined && <Fact label={t("settings.modelAdvanced.maximumContext")}>{formatTokens(metadata.contextWindowMax)} {t("settings.modelAdvanced.tokens")}</Fact>}
             {primary.maximumOutputTokens > 0 && <Fact label={t("settings.maximumOutput")}>{formatTokens(primary.maximumOutputTokens)} {t("settings.modelAdvanced.tokens")} <small>{t(metadata?.maxOutputTokensSource === "estimated" ? "settings.modelAdvanced.estimated" : metadata?.maxOutputTokensSource === "declared" ? "settings.modelAdvanced.declared" : "settings.modelAdvanced.sourceUnknown")}</small></Fact>}
           </Section>
       </div>
@@ -194,7 +195,7 @@ function WorkingContextSettings({ controller, target, routes, ownerKey, disabled
       }
     } finally { if (!signal.aborted) { flight.current = false; setWriting(false); } }
   };
-  const capacity = routes[0]?.contextWindow ?? 0;
+  const capacity = routes[0]?.metadata?.contextWindowMax ?? routes[0]?.contextWindow ?? 0;
   const shown = dirty.current ? tokens : context?.limitTokens ?? context?.effectiveContextWindowTokens;
   const exact = (value: number): string => new Intl.NumberFormat(controller.state.effectiveLocale === "zh-CN" ? "zh-CN" : "en").format(value);
   return <div className="model-working-context" aria-busy={loading || writing}>

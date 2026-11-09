@@ -22,8 +22,8 @@ describe("Provider model discovery", () => {
         { id: "bad id" }
       ]
     })).toEqual([
-      { id: "kept", name: "Kept", contextWindow: 128_000 },
-      { id: "new", name: "New", contextWindow: 1_000_000 }
+      { id: "kept", name: "Kept", contextWindow: 128_000, metadata: { name: "Kept" } },
+      { id: "new", name: "New", contextWindow: 1_000_000, metadata: { name: "New" } }
     ]);
   });
 
@@ -38,7 +38,7 @@ describe("Provider model discovery", () => {
       headers: { "X-Tenant": "tenant-secret", Authorization: "stale" }
     }, request as typeof fetch)).resolves.toEqual([
       { id: "model-a", name: "model-a" },
-      { id: "model-b", name: "Model B" }
+      { id: "model-b", name: "Model B", metadata: { name: "Model B" } }
     ]);
     expect(request).toHaveBeenCalledWith("https://api.example.test/v1/models", expect.objectContaining({
       headers: expect.objectContaining({
@@ -56,7 +56,7 @@ describe("Provider model discovery", () => {
     }])).toEqual([
       { id: "plain", name: "plain" },
       { id: "local", name: "local", contextWindow: 48_000, metadata: { maxOutputTokens: 8_000, supportsImages: false, supportsTools: false } },
-      { id: "gemini-test", name: "Gemini Test", contextWindow: 256_000, metadata: { maxOutputTokens: 32_000 } }
+      { id: "gemini-test", name: "Gemini Test", contextWindow: 256_000, metadata: { maxOutputTokens: 32_000, name: "Gemini Test" } }
     ]);
     expect(parseProviderModels({ data: [{ id: "explicit", reasoning: { supportedEfforts: [], defaultEffort: null },
       supports_fast_mode: false, native_api: "openai-responses", context_window: 64_000, max_context_window: 32_000 }] })[0])
@@ -161,7 +161,7 @@ describe("Provider model discovery", () => {
     });
     await expect(fetchProviderModels({
       baseUrl: "http://127.0.0.1:11434/v1"
-    }, vi.fn(async () => new Response(body)) as typeof fetch)).resolves.toEqual([{ id: "model", name: MULTILINGUAL_FIXTURES.modelName }]);
+    }, vi.fn(async () => new Response(body)) as typeof fetch)).resolves.toEqual([{ id: "model", name: MULTILINGUAL_FIXTURES.modelName, metadata: { name: MULTILINGUAL_FIXTURES.modelName } }]);
     expect(body.locked).toBe(false);
   });
 });

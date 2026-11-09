@@ -46,7 +46,7 @@ it("publishes actual paired native sources, retains paused and offline choices, 
         toProtoCapability({ key: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto", "bypassPermissions"] })
       ], providers: [{ providerId: "provider", displayName: "Provider", connected: true, remoteInvocationEnabled: remoteEnabled,
         models: [{ backendId: "native-sdk", key: { providerId: "provider", modelId: "native-model" }, displayName: "Model", logicalId: "stable-model", api: "openai-responses",
-          contextWindowTokens: 32768n, maximumOutputTokens: 1024n, inputModalities: [contract.ModelInputModality.TEXT], description: "Native model description",
+          contextWindowTokens: 32768n, contextWindowMaxTokens: 262144n, maximumOutputTokens: 1024n, inputModalities: [contract.ModelInputModality.TEXT], description: "Native model description",
           displayThinkingLevels: ["low", "high"], defaultVisible: false, declaredSupportsFastMode: false, referenceApi: "openai-responses",
           inputCostMicrosPerMillion: 2500000n, currencyCode: "USD", priceSource: contract.ModelPriceSource.UPSTREAM }] }] };
       return toBinary(contract.GetHostedAgentCatalogResponseSchema, create(contract.GetHostedAgentCatalogResponseSchema, {
@@ -77,7 +77,7 @@ it("publishes actual paired native sources, retains paused and offline choices, 
     expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["resource"] });
     expect(descriptor.providers?.[0]?.displayName).toBe("Provider · Native Agent · Native computer");
     expect(descriptor.models[0]).toMatchObject({ logicalId: "stable-model", displayThinkingLevels: ["low", "high"], defaultVisible: false,
-      declaredSupportsFastMode: false, cost: { input: 2.5 }, pricing: { source: "upstream", currencyCode: "USD" } });
+      contextWindow: 32768, contextWindowMax: 262144, declaredSupportsFastMode: false, cost: { input: 2.5 }, pricing: { source: "upstream", currencyCode: "USD" } });
     expect(host.currentAdapter(id)?.id).toBe(id); expect(sources.modelAvailable(id, "provider", "native-model")).toBe(true);
     expect(await host.currentAdapter(id)!.inferNativeText!({ backendInstanceGeneration: descriptor.instanceGeneration, providerId: "provider", modelId: "native-model",
       system: "Private reply", user: "Hello", maxTokens: 256, timeoutMs: 10_000, signal: new AbortController().signal,

@@ -3,6 +3,7 @@ import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
 import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
+import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
   parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
 import { readSessionArchivePreview } from "@joko/contracts";
@@ -7801,6 +7802,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       inputModalities: model.inputModalities.map(protoInputModality),
       contextWindowTokens: safeUnsignedBigInt(model.contextWindowTokens),
       maximumOutputTokens: safeUnsignedBigInt(model.maximumOutputTokens),
+      inheritedFields: model.inheritedFields?.map(protoProviderModelInheritedField) ?? [],
       inputCostMicrosPerMillion: safeSignedBigInt(model.inputCostMicrosPerMillion),
       outputCostMicrosPerMillion: safeSignedBigInt(model.outputCostMicrosPerMillion),
       cacheReadCostMicrosPerMillion: safeSignedBigInt(model.cacheReadCostMicrosPerMillion),
@@ -14897,6 +14899,7 @@ function mapModel(
       ...(model.api ? { outboundProtocol: model.api } : {}),
       ...(model.protocolMode === "matching" || model.protocolMode === "compatibility" || model.protocolMode === "unknown" ? { protocolMode: model.protocolMode } : {}),
       ...(model.contextWindowSource === "declared" || model.contextWindowSource === "estimated" ? { contextWindowSource: model.contextWindowSource } : {}),
+      ...(model.contextWindowMaxTokens === undefined ? {} : { contextWindowMax: numberValue(model.contextWindowMaxTokens) }),
       ...(model.maxOutputTokensSource === "declared" || model.maxOutputTokensSource === "estimated" ? { maxOutputTokensSource: model.maxOutputTokensSource } : {})
     }
   };
@@ -19864,6 +19867,8 @@ function mapProviderRuntimeConfiguration(provider: ProviderRuntimeConfiguration)
       inputModalities: model.inputModalities.map(inputModality),
       contextWindowTokens: numberValue(model.contextWindowTokens),
       maximumOutputTokens: numberValue(model.maximumOutputTokens),
+      ...(model.inheritedFields.length === 0 ? {} : { inheritedFields: model.inheritedFields.map(providerModelInheritedField) }),
+      ...(model.contextWindowMaxTokens === undefined ? {} : { contextWindowMaxTokens: numberValue(model.contextWindowMaxTokens) }),
       inputCostMicrosPerMillion: numberValueSigned(model.inputCostMicrosPerMillion),
       outputCostMicrosPerMillion: numberValueSigned(model.outputCostMicrosPerMillion),
       cacheReadCostMicrosPerMillion: numberValueSigned(model.cacheReadCostMicrosPerMillion),

@@ -4,7 +4,6 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
   provisionManagedCatalog,
-  supportedPiThinkingLevels,
   type PiManagedModel,
   type PiManagedProvider,
   type PiManagedSettings
@@ -20,6 +19,7 @@ import {
   type DiscoveredProviderModel,
   type ProviderModelDiscoverySpec
 } from "./provider-model-discovery.js";
+import { materializeDiscoveredModel, refreshDiscoveredModel, saveDiscoveredModelConfiguration } from "./provider-model-metadata.js";
 import {
   PROVIDER_ACCOUNT_USAGE_CAPABILITY,
   type ProviderAccountUsageCredential,
@@ -1012,6 +1012,7 @@ export interface ProviderDescriptor extends Omit<ManagedProviderEntry, "credenti
 export interface ProviderModelDiscoveryResult {
   readonly providerId: string;
   readonly addedModelIds: readonly string[];
+  readonly updatedModelIds: readonly string[];
   readonly modelCount: number;
 }
 
@@ -1336,8 +1337,15 @@ export class ProviderCatalogManager {
       const revision = existing.reduce((maximum, [, entry]) => entry.version > maximum ? entry.version : maximum, 0n);
       if (revision !== input.expectedVersion) throw new Error("Provider configuration changed concurrently.");
       const updatedAt = this.#now();
+      const runtimes = input.runtimes.map(runtime => {
+        const previous = existing.find(([, entry]) => entry.backendId === runtime.backendId)?.[1];
+        const sameSource = previous?.provider.baseUrl === runtime.provider.baseUrl
+          && previous?.provider.api === runtime.provider.api && previous?.modelsEndpoint === runtime.modelsEndpoint;
+        return { ...runtime, provider: { ...runtime.provider, models: runtime.provider.models.map(model =>
+          saveDiscoveredModelConfiguration(sameSource ? previous?.provider.models.find(candidate => candidate.id === model.id) : undefined, model)) } };
+      });
       for (const [key] of existing) this.#entries.delete(key);
-      for (const runtime of input.runtimes) {
+      for (const runtime of runtimes) {
         this.#entries.set(managedProviderKey(runtime.backendId, input.providerId), {
           ...structuredClone(runtime), displayName: input.displayName, kind: input.kind, enabled: input.enabled,
           version: revision === 0n ? BigInt(this.#generation) + 1n : revision + 1n, updatedAt, supportsLogin: false, supportsLogout: false, supportsRefresh: false
@@ -1647,31 +1655,48 @@ export class ProviderCatalogManager {
       throw new ProviderModelDiscoveryError("unsafe_endpoint");
     }
     const spec = this.#modelDiscoverySpec(captured);
+    const credentialGenerations = [...new Set(Object.values(captured.credentialBindings))]
+      .map(reference => ({ reference, generation: this.#credentials.find(reference)?.generation }));
     const discovered = await fetchProviderModels(spec, fetchImpl);
     return this.#mutate(async () => {
       const current = this.#entries.get(normalized);
       if (current === undefined || current.version !== captured.version) {
         throw new Error("Provider configuration changed during model catalog refresh.");
       }
-      const known = new Set(current.provider.models.map((model) => model.id));
-      const additions = discovered.filter((model) => !known.has(model.id));
-      if (additions.length === 0) {
-        return {
-          providerId,
-          addedModelIds: [],
-          modelCount: current.provider.models.length
-        };
-      }
+      if (credentialGenerations.some(({ reference, generation }) => {
+        const credential = this.#credentials.find(reference);
+        return credential?.configured !== true || credential.generation !== generation;
+      })) throw new Error("Provider credentials changed during model catalog refresh.");
       const customPiApi = current.backendId === this.#nativeBackendId && current.kind === "custom_endpoint"
         ? current.provider.api
         : undefined;
+      const updates = new Map(discovered.map(model => [model.id, model]));
+      const known = new Set(current.provider.models.map(model => model.id));
+      const additions = discovered.filter(model => !known.has(model.id));
+      const updatedModelIds: string[] = [];
+      const retained = current.provider.models.map(model => {
+        const update = updates.get(model.id);
+        if (update === undefined) return model;
+        const next = refreshDiscoveredModel(model, { ...update.metadata,
+          ...(update.contextWindow === undefined ? {} : { contextWindow: update.contextWindow }) });
+        if (JSON.stringify(next) !== JSON.stringify(model)) updatedModelIds.push(model.id);
+        return next;
+      });
+      if (additions.length === 0 && updatedModelIds.length === 0) {
+        return {
+          providerId,
+          addedModelIds: [],
+          updatedModelIds: [],
+          modelCount: current.provider.models.length
+        };
+      }
       const next: ManagedProviderEntry = {
         ...current,
         provider: {
           ...current.provider,
           models: [
-            ...current.provider.models,
-            ...additions.map(model => discoveredManagedModel(model, customPiApi))
+            ...additions.map(model => discoveredManagedModel(model, customPiApi)),
+            ...retained
           ]
         },
         version: current.version + 1n,
@@ -1683,6 +1708,7 @@ export class ProviderCatalogManager {
       return {
         providerId,
         addedModelIds: additions.map((model) => model.id),
+        updatedModelIds,
         modelCount: next.provider.models.length
       };
     });
@@ -2684,29 +2710,9 @@ function discoveredManagedModel(model: DiscoveredProviderModel, customPiApi: PiM
     && (metadata?.nativeApi === undefined || metadata.nativeApi === customPiApi)
     && (metadata?.inputModalities?.includes("text") ?? true)
     && (metadata?.outputModalities?.includes("text") ?? true);
-  const levels = metadata?.efforts;
-  const thinkingLevelMap = levels === undefined ? undefined : Object.fromEntries(
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => [level, levels.includes(level) ? level : null]));
-  const input = metadata?.inputModalities?.filter((value): value is "text" | "image" => value === "text" || value === "image");
-  const supportsImages = metadata?.supportsImages;
-  const modalities = supportsImages === false ? input?.filter(value => value !== "image") ?? ["text" as const]
-    : supportsImages === true ? [...new Set([...(input ?? ["text" as const]), "image" as const])] : input;
-  const result: PiManagedModel = {
-    id: model.id, name: model.name, defaultVisible,
-    contextWindow: model.contextWindow ?? metadata?.contextWindowMax ?? 128_000,
-    contextWindowSource: model.contextWindow === undefined ? "estimated" : "declared",
-    maxTokens: metadata?.maxOutputTokens ?? 16_384,
-    maxOutputTokensSource: metadata?.maxOutputTokens === undefined ? "estimated" : "declared",
-    ...(metadata?.description === undefined ? {} : { description: metadata.description }),
-    ...(metadata?.nativeApi === undefined ? {} : { referenceApi: metadata.nativeApi }),
-    ...(modalities === undefined ? {} : { input: modalities.length ? modalities : ["text"] }),
-    ...(metadata?.outputModalities === undefined ? {} : { declaredOutputModalities: metadata.outputModalities }),
-    ...(metadata?.supportsTools === undefined ? {} : { supportsTools: metadata.supportsTools }),
-    ...(metadata?.supportsFastMode === undefined ? {} : { supportsFastMode: metadata.supportsFastMode }),
-    ...(thinkingLevelMap === undefined ? {} : { reasoning: levels!.some(level => level !== "ultra"), thinkingLevelMap })
-  };
-  return metadata?.defaultEffort != null && supportedPiThinkingLevels(result.reasoning, result.thinkingLevelMap).includes(metadata.defaultEffort)
-    ? { ...result, defaultEffort: metadata.defaultEffort } : result;
+  return materializeDiscoveredModel({ id: model.id, defaultVisible, metadataOverrides: [], discoveredMetadata: {
+    ...metadata, ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow })
+  } });
 }
 
 function validateProviderEntry(entry: ManagedProviderEntry): void {

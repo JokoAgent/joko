@@ -43,6 +43,8 @@ export interface MobileModelRoute {
   readonly displayName: string;
   readonly family: string;
   readonly contextWindowTokens: bigint;
+  readonly contextWindowMaxTokens?: bigint;
+  readonly contextWindowSource?: "declared" | "estimated";
   readonly maximumOutputTokens: bigint;
   readonly efforts: readonly MobileEffortOption[];
   readonly supportsFastMode: boolean;
@@ -689,6 +691,8 @@ function mobileModelRoute(
     displayName: model.displayName,
     family: strictText(model.family) ? model.family : modelId,
     contextWindowTokens: model.contextWindowTokens,
+    ...(model.contextWindowMaxTokens === undefined ? {} : { contextWindowMaxTokens: model.contextWindowMaxTokens }),
+    ...(model.contextWindowSource === "declared" || model.contextWindowSource === "estimated" ? { contextWindowSource: model.contextWindowSource } : {}),
     maximumOutputTokens: model.maximumOutputTokens,
     efforts,
     supportsFastMode: model.supportsFastMode,

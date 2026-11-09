@@ -13,6 +13,15 @@ function route(backend: BackendView, patch: Partial<ProviderRuntimeConfiguration
 }
 
 describe("Provider runtime draft transfer", () => {
+  it("copies selected model facts as explicit values while preserving untouched inheritance in the destination", () => {
+    const source = route(sourceBackend);
+    const target = route(sourceBackend, { models: [{ ...source.models[0]!, name: "Old", inheritedFields: ["name", "contextWindowTokens", "supportsFastMode"] }] });
+    const copied = transferProviderRuntime(source, target, sourceBackend, sourceBackend, ["models"]);
+    expect(copied.models[0]).toMatchObject({ name: "Model", contextWindowTokens: source.models[0]!.contextWindowTokens,
+      inheritedFields: ["supportsFastMode"] });
+    expect(target.models[0]!.inheritedFields).toEqual(["name", "contextWindowTokens", "supportsFastMode"]);
+  });
+
   it("keeps endpoint fields together and transfers only supported model declarations", () => {
     const source = route(sourceBackend, { requestPath: "/responses" });
     const target = route(targetBackend, { endpoint: "", credentialId: "", credentialOrigin: "", models: [] });

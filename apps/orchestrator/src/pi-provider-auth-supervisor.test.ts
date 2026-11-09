@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { OperationalStore } from "@joko/store";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   CredentialManager,
@@ -264,6 +264,36 @@ class FakeApiKeyRuntime implements PiProviderAuthRuntime {
 }
 
 describe("PiProviderAuthSupervisor", () => {
+  it("activates a metadata-only managed refresh and leaves an identical catalog generation alone", async () => {
+    const { root, store, providers } = await fixture("unused", false);
+    await providers.upsert({ backendId: "managed-runtime", credentialOrigin: "", displayName: "Local", enabled: true,
+      kind: "local_keyless", credentialBindings: {}, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+      provider: { id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true, models: [{ id: "seed" }] } });
+    const discover = providers.discoverProviderModels.bind(providers);
+    await discover("managed-runtime", "local", (async () => Response.json({ data: [
+      { id: "same", context_window: 128_000, input_modalities: ["text", "image"] }
+    ] })) as typeof fetch);
+    const spy = vi.spyOn(providers, "discoverProviderModels").mockImplementation((backendId, providerId) => discover(backendId, providerId,
+      (async () => Response.json({ data: [{ id: "same", context_window: 256_000, supports_image_input: false }] })) as typeof fetch));
+    let activations = 0;
+    let activeHome = "";
+    const supervisor = await PiProviderAuthSupervisor.create({ store, backendId: "managed-runtime", providers, now: () => NOW,
+      runtimeFactory: async credentials => new FakePiRuntime(credentials, "unused"), refreshPiGeneration: async () => {
+        activations += 1;
+        activeHome = (await providers.createPiGenerationSnapshot({ snapshotsRoot: join(root, "generations") })).agentHome;
+      } });
+    try {
+      await expect(supervisor.refreshModelCatalogs({ providerId: "local", automatic: false })).resolves.toMatchObject({
+        refreshedProviderIds: ["local"], addedModelCount: 0
+      });
+      expect(activations).toBe(1);
+      expect(JSON.parse(await readFile(join(activeHome, "models.json"), "utf8")).providers.local.models[0])
+        .toMatchObject({ id: "same", contextWindow: 256_000, input: ["text"] });
+      await supervisor.refreshModelCatalogs({ providerId: "local", automatic: false });
+      expect(activations).toBe(1);
+    } finally { spy.mockRestore(); await supervisor.close(); store.close(); }
+  });
+
   it("refreshes a native model source, activates the new catalog, and exposes its capability", async () => {
     const { store, providers, providerId } = await fixture();
     let runtime!: FakePiRuntime;

@@ -22,7 +22,7 @@ function provider(): ProviderConfigurationView {
   }) };
 }
 async function render(configuration: ProviderConfigurationView) {
-  const saveCredential = vi.fn(async () => undefined); const saveProvider = vi.fn(async () => undefined);
+  const saveCredential = vi.fn(async () => undefined); const saveProvider = vi.fn(async (_configuration: ProviderConfigurationView) => undefined);
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
   const updateBackends = async (available: readonly BackendView[]) => act(async () => root.render(<ProviderEditor open provider={configuration} backends={available} credentials={credentials} providerIds={[configuration.id]}
     saveCredential={saveCredential} saveProvider={saveProvider} onClose={() => undefined} onSaved={() => undefined} t={(key, values) => translate("en", key, values)} />));
@@ -46,6 +46,20 @@ async function select(control: HTMLButtonElement, label: string): Promise<void> 
 }
 
 describe("Provider runtime editor", () => {
+  it("preserves discovery inheritance on an unchanged save and overrides only the edited model field", async () => {
+    const initial = provider();
+    const inheritedFields = ["name", "contextWindowTokens", "maximumOutputTokens", "inputModalities", "reasoning", "thinkingLevels", "supportsFastMode", "supportsTools"] as const;
+    const configuration = { ...initial, runtimes: initial.runtimes.map(runtime => ({ ...runtime,
+      models: runtime.models.map(model => ({ ...model, inheritedFields, contextWindowMaxTokens: 1_000_000 })) })) };
+    const { saveProvider } = await render(configuration);
+    await act(async () => button("Save").click());
+    expect(saveProvider.mock.calls[0]?.[0]).toMatchObject({ runtimes: [{ models: [{ inheritedFields }] }, { models: [{ inheritedFields }] }] });
+    await fill(control<HTMLInputElement>("Display name", "input"), "Owner model label");
+    await act(async () => button("Save").click());
+    expect(saveProvider.mock.calls[1]?.[0]).toMatchObject({ runtimes: [{ models: [{ name: "Owner model label",
+      inheritedFields: inheritedFields.filter(field => field !== "name") }] }, { models: [{ inheritedFields }] }] });
+  });
+
   it.each([false, true])("reviews overwrites and replaces a target draft key when copying authentication (keyless=%s)", async (keyless) => {
     const initial = provider(); const configuration = { ...initial, runtimes: initial.runtimes.map((runtime, index) => index !== 0 || !keyless ? keyless
       ? { ...runtime, headers: [{ headerName: "X-Header", credentialId: "old-header", environmentName: "HEADER_KEY" }] } : runtime

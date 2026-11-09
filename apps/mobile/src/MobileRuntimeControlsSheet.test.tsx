@@ -205,6 +205,15 @@ async function clickText(text: string): Promise<void> {
 }
 
 describe("MobileRuntimeControlsSheet model favorites", () => {
+  it("shows reported capacity separately from the estimated working window in the actual model editor", async () => {
+    await render({ ...controls, models: controls.models.map(route => ({ ...route, contextWindowMaxTokens: 1_000_000n, contextWindowSource: "estimated" })) });
+    await click("Alpha Model, Saved favorite");
+    expect(host.textContent).toContain("128K context");
+    expect(host.textContent).toContain("Estimated working window");
+    expect(host.textContent).toContain("Maximum capacity: 1M context");
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
   it("applies the exact new-task source configuration and keeps the selector available after a failed save", async () => {
     const route = { ...controls.models[0]!, backendId: "opaque-device", key: "other-source-model", canSetEffort: true, canSetFastMode: true };
     const select = vi.fn(async () => { throw new Error("Source changed"); });

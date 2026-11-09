@@ -988,7 +988,7 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
         if (this.#providers.canDiscoverProviderModels(this.#backendId, providerId)) {
           const result = await this.#providers.discoverProviderModels(this.#backendId, providerId);
           this.#modelRefreshFailures.delete(providerId);
-          return { added: result.addedModelIds.length, activate: result.addedModelIds.length > 0 };
+          return { added: result.addedModelIds.length, activate: result.addedModelIds.length > 0 || result.updatedModelIds.length > 0 };
         }
         const runtime = this.#requireRuntime();
         if (typeof runtime.getProvider(providerId)?.refreshModels !== "function" || runtime.refresh === undefined) {

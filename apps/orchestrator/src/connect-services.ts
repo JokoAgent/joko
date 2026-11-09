@@ -53,6 +53,8 @@ import {
   PiBackendAdapter,
   piProviderModel,
   type PiManagedModel,
+  type PiModelMetadataField,
+  PI_EDITABLE_MODEL_METADATA_FIELDS,
   type PiManagedProvider,
   type PiSupportedApi
 } from "@joko/adapter-pi";
@@ -10252,6 +10254,9 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
     supportsFastMode: item.supportsFastMode === true,
     defaultVisible: item.defaultVisible,
     supportsTools: item.supportsTools,
+    inheritedFields: item.discoveredMetadata === undefined ? [] : PI_EDITABLE_MODEL_METADATA_FIELDS
+      .filter(field => !item.metadataOverrides!.includes(field)).map(protoInheritedModelField),
+    contextWindowMaxTokens: item.contextWindowMax === undefined ? undefined : BigInt(item.contextWindowMax),
     inputModalities: (item.input ?? ["text"]).map((value) => value === "image" ? contract.ModelInputModality.IMAGE : contract.ModelInputModality.TEXT),
     contextWindowTokens: item.contextWindow === undefined ? 0n : BigInt(item.contextWindow),
     maximumOutputTokens: item.maxTokens === undefined ? 0n : BigInt(item.maxTokens),
@@ -10429,8 +10434,10 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
     cacheControlFormat: input.compatibility.cacheControlFormat
   });
   const hasCost = [input.inputCostMicrosPerMillion, input.outputCostMicrosPerMillion, input.cacheReadCostMicrosPerMillion, input.cacheWriteCostMicrosPerMillion].some((value) => value !== 0n);
+  const inherited = new Set(input.inheritedFields.map(inheritedModelFieldFromProto));
   return {
     id: input.modelId,
+    ...(inherited.size === 0 ? {} : { metadataOverrides: PI_EDITABLE_MODEL_METADATA_FIELDS.filter(field => !inherited.has(field)) }),
     ...(input.displayName === "" ? {} : { name: input.displayName }),
     ...(input.apiCompatibility === undefined ? {} : { api: nativeProviderApi(input.apiCompatibility, false)! }),
     reasoning: input.reasoning,
@@ -10450,6 +10457,27 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
     ...(sampling === undefined || Object.keys(sampling).length === 0 ? {} : { samplingParams: sampling }),
     ...(compatibility === undefined || Object.keys(compatibility).length === 0 ? {} : { compat: compatibility })
   };
+}
+
+const INHERITED_MODEL_FIELDS = [
+  ["name", contract.ProviderModelInheritedField.DISPLAY_NAME],
+  ["contextWindow", contract.ProviderModelInheritedField.CONTEXT_WINDOW],
+  ["maxTokens", contract.ProviderModelInheritedField.MAXIMUM_OUTPUT],
+  ["input", contract.ProviderModelInheritedField.INPUT_MODALITIES],
+  ["reasoning", contract.ProviderModelInheritedField.REASONING],
+  ["thinkingLevelMap", contract.ProviderModelInheritedField.THINKING_LEVELS],
+  ["supportsFastMode", contract.ProviderModelInheritedField.FAST_MODE],
+  ["supportsTools", contract.ProviderModelInheritedField.TOOLS]
+] as const;
+function protoInheritedModelField(field: PiModelMetadataField): contract.ProviderModelInheritedField {
+  const mapped = INHERITED_MODEL_FIELDS.find(([key]) => key === field)?.[1];
+  if (mapped === undefined) throw new Error("Unknown inherited model field.");
+  return mapped;
+}
+function inheritedModelFieldFromProto(field: contract.ProviderModelInheritedField): PiModelMetadataField {
+  const mapped = INHERITED_MODEL_FIELDS.find(([, key]) => key === field)?.[0];
+  if (mapped === undefined) throw invalidArgument("provider.models.inherited_fields is invalid");
+  return mapped;
 }
 
 function nativeProviderKind(value: contract.ProviderKind): ManagedProviderEntry["kind"] {
