@@ -11313,6 +11313,34 @@ describe("SessionHost", () => {
     });
   });
 
+  it("runs a monthly script in a short month and keeps the next configured date after coordinator restart", async () => {
+    const fixture = await createFixture();
+    let now = Date.UTC(2027, 0, 31, 9);
+    const schedule = seedScriptSchedule(fixture, "monthly-script", {
+      kind: "cron", expression: "0 9 31 * *", nextRunAt: now
+    });
+    const executeScript = vi.fn(async () => ({ durationMs: 1, stderr: "", stderrTruncated: false }));
+    const first = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, executeScript });
+    try {
+      await first.tick();
+      expect(executeScript).toHaveBeenCalledTimes(1);
+      expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ status: "success", firedAt: now }]);
+      expect(fixture.store.getSchedule(schedule.id).nextRunAt).toBe(Date.UTC(2027, 1, 28, 9));
+    } finally { first.stop(); }
+    now = Date.UTC(2027, 1, 28, 9);
+    const restarted = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, executeScript });
+    try {
+      await restarted.tick();
+      await restarted.tick();
+      expect(executeScript).toHaveBeenCalledTimes(2);
+      expect(fixture.store.listScheduleRuns(schedule.id)).toHaveLength(2);
+      expect(fixture.store.listScheduleRuns(schedule.id).every(run => run.status === "success")).toBe(true);
+      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({
+        expression: "0 9 31 * *", lastRunAt: now, nextRunAt: Date.UTC(2027, 2, 31, 9)
+      });
+    } finally { restarted.stop(); }
+  });
+
   it("does not dispatch the later fold after a persisted automatic cron Run consumed the earlier one", async () => {
     const fixture = await createFixture();
     const sessionId = (await fixture.host.createSession({

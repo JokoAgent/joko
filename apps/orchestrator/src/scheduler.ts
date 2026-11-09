@@ -25,6 +25,8 @@ export function nextOccurrence(timing: ScheduleTiming, after: number): number | 
       // Durable schedules must advance from the persisted occurrence, including
       // during replay, tests, and recovery of an older missed execution.
       try {
+        const monthly = nextMonthlyOccurrence(timing.expression, timing.timezone, after);
+        if (monthly !== undefined) return monthly;
         const repeated = nextRepeatedOccurrence(wallClockCron, timing.timezone, after);
         let cursor = after;
         for (;;) {
@@ -44,6 +46,33 @@ export function nextOccurrence(timing: ScheduleTiming, after: number): number | 
       } finally { wallClockCron.stop(); cron.stop(); }
     }
   }
+}
+
+function nextMonthlyOccurrence(expression: string, timezone: string, after: number): number | undefined {
+  // Only the fixed monthly preset clamps missing days. Lists, ranges, seconds
+  // and restricted months or weekdays retain the ordinary cron semantics.
+  const preset = /^(\d+)\s+(\d+)\s+(\d+)\s+\*\s+\*$/.exec(expression.trim());
+  if (preset === null) return undefined;
+  const minute = Number(preset[1]), hour = Number(preset[2]), day = Number(preset[3]);
+  if (minute > 59 || hour > 23 || day < 1 || day > 31) return undefined;
+  const start = Math.floor(after / 60_000) * 60_000 + 60_000;
+  const wallClock = new CronDate(new Date(start), timezone);
+  for (let offset = 0; offset < 13; offset++) {
+    const month = new Date(Date.UTC(wallClock.year, wallClock.month + offset, 1));
+    const candidate = new CronDate(wallClock);
+    candidate.year = month.getUTCFullYear();
+    candidate.month = month.getUTCMonth();
+    candidate.day = Math.min(day, new Date(Date.UTC(candidate.year, candidate.month + 1, 0)).getUTCDate());
+    candidate.hour = hour;
+    candidate.minute = minute;
+    candidate.second = candidate.ms = 0;
+    // CronDate moves a nonexistent wall time forward across a spring gap.
+    // Monthly presets keep that occurrence; overlaps still use the later one.
+    const at = candidate.getTime();
+    const canonical = repeatedWallTime(at, timezone)?.later ?? at;
+    if (canonical >= start) return canonical;
+  }
+  throw new Error("Monthly recurrence has no future occurrence within thirteen months.");
 }
 
 function wallClockTime(epoch: number, timezone: string): number {

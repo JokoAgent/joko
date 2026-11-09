@@ -246,6 +246,29 @@ describe("SchedulerToolBridgeProvider", () => {
     expect(store.getSchedule(id).enabled).toBe(true);
   });
 
+  it("retains the monthly configured day through creation, editing, pause and later resume", async () => {
+    let now = Date.UTC(2027, 1, 15);
+    const { store, provider } = fixture({}, undefined, () => now);
+    const created = resultData(await call(provider, "schedule_create", {
+      ...baseCron(), cronExpr: "0 9 31 * *"
+    })) as Record<string, unknown>;
+    expect(created["nextFireAt"]).toBe(Date.UTC(2027, 1, 28, 9));
+    const id = String(created["id"]);
+    const edited = resultData(await call(provider, "schedule_update", {
+      id, expectedRevision: created["revision"], cronExpr: "0 9 30 * *"
+    })) as Record<string, unknown>;
+    expect(edited["nextFireAt"]).toBe(Date.UTC(2027, 1, 28, 9));
+    const paused = resultData(await call(provider, "schedule_pause", {
+      id, expectedRevision: edited["revision"]
+    })) as Record<string, unknown>;
+    now = Date.UTC(2027, 1, 28, 9, 0, 30);
+    const resumed = resultData(await call(provider, "schedule_resume", {
+      id, expectedRevision: paused["revision"]
+    })) as Record<string, unknown>;
+    expect(resumed).toMatchObject({ status: "active", cronExpr: "0 9 30 * *", nextFireAt: Date.UTC(2027, 2, 30, 9) });
+    expect(store.getSchedule(id)).toMatchObject({ expression: "0 9 30 * *", nextRunAt: Date.UTC(2027, 2, 30, 9) });
+  });
+
   it("preserves service-validated isolated workspace fields across tool-authored patches", async () => {
     const { store, provider } = fixture();
     const created = resultData(await call(provider, "schedule_create", baseCron())) as Record<string, unknown>;
@@ -535,7 +558,7 @@ describe("SchedulerToolBridgeProvider", () => {
   });
 });
 
-function fixture(coordinatorOverrides: Partial<SchedulerToolCoordinator> = {}, hookScripts = new ScheduleHookScriptInstaller()) {
+function fixture(coordinatorOverrides: Partial<SchedulerToolCoordinator> = {}, hookScripts = new ScheduleHookScriptInstaller(), now = () => NOW) {
   const store = new OperationalStore(":memory:");
   openStores.push(store);
   const workspaceBase = mkdtempSync(join(tmpdir(), "joko-scheduler-tools-"));
@@ -611,7 +634,7 @@ function fixture(coordinatorOverrides: Partial<SchedulerToolCoordinator> = {}, h
       coordinator: () => coordinator,
       hookScripts,
       runNotifications,
-      now: () => NOW
+      now
     })
   };
 }

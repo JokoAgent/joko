@@ -4809,6 +4809,7 @@ describe("Connect typed feature boundaries", () => {
   });
 
   it("normalizes Schedule execution snapshots including scoped extra directories", async () => {
+    const now = Date.UTC(2027, 1, 15);
     let captured: any;
     let targetManaged = false;
     let targetRemote = false;
@@ -4844,6 +4845,7 @@ describe("Connect typed feature boundaries", () => {
     const services = createConnectServices(stubApplication({
       store,
       sessionHost: immediateHost(store),
+      now: () => now,
       sessionWorktrees: { probe: probeWorktree, listSources: listWorktreeSources }
     }));
     const schedule = (extraDirectoryIds: string[]) => create(contract.ScheduleInputSchema, {
@@ -4909,7 +4911,7 @@ describe("Connect typed feature boundaries", () => {
     });
     expect(captured.executionSnapshot.extraDirectoryIds).toEqual(["extra-1"]);
 
-    const anchorAt = Date.now() + 60 * 60_000;
+    const anchorAt = now + 60 * 60_000;
     const intervalSchedule = create(contract.ScheduleInputSchema, {
       ...schedule([]),
       displayName: "Anchored interval",
@@ -4934,6 +4936,16 @@ describe("Connect typed feature boundaries", () => {
       anchorAt,
       nextRunAt: anchorAt
     });
+
+    await invoke(services.operation.submitOperation, {
+      operationId: "operation-schedule-monthly",
+      connectionId: connection.id,
+      mutation: mutation(create(contract.ScheduleInputSchema, {
+        ...schedule([]),
+        recurrence: { kind: { case: "cron", value: { expression: "0 9 31 * *" } } }
+      }))
+    });
+    expect(captured).toMatchObject({ kind: "cron", expression: "0 9 31 * *", nextRunAt: Date.UTC(2027, 1, 28, 9) });
 
     await expect(invoke(services.operation.submitOperation, {
       operationId: "operation-schedule-unbound",
