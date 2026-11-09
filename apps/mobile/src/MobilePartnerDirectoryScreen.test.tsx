@@ -117,7 +117,7 @@ vi.mock("react-native", async () => {
     Pressable: element("button"),
     Modal: ({ visible, children, onDismiss }: { visible: boolean; children: React.ReactNode; onDismiss?: () => void }) => {
       if (onDismiss) native.dismiss = onDismiss;
-      return visible ? React.createElement("div", { "data-testid": "partnerDeletion.sheet" }, children) : null;
+      return visible ? React.createElement("div", { role: "dialog", "data-testid": "partnerDeletion.sheet" }, children) : null;
     },
     ScrollView: element("div"),
     RefreshControl: () => null,
@@ -215,8 +215,8 @@ async function render(active?: MobilePartnerDirectoryTransport, initializationTr
   });
 }
 
-async function press(label: string) {
-  const button = Array.from(container.querySelectorAll("button"))
+async function press(label: string, scope: ParentNode = container) {
+  const button = Array.from(scope.querySelectorAll("button"))
     .find((candidate) => candidate.getAttribute("aria-label") === label || candidate.textContent === label);
   expect(button, `Missing accessible button ${label}`).toBeTruthy();
   await act(async () => button!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
@@ -458,7 +458,9 @@ describe("MobilePartnerDirectoryScreen", () => {
     expect([...editor.state.selected]).toEqual(["identity"]);
     await press("Work credential"); await press("Select all");
     expect([...editor.state.selected]).toEqual(["identity", "work", "other"]);
-    await press("Back");
+    const importSheet = container.querySelector('[role="dialog"]');
+    expect(importSheet).not.toBeNull();
+    await press("Back", importSheet!);
     expect(container.querySelector('[aria-label="Connections"]')?.getAttribute("aria-checked")).toBe("true");
     await press("Connections");
     expect([...editor.state.selected]).toEqual(["identity"]);
