@@ -4,6 +4,7 @@ import { type Server } from "node:http";
 import { type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
 import { create } from "@bufbuild/protobuf";
 import {
   CompactionState,
@@ -129,7 +130,7 @@ describe("packaged Desktop Pi compaction", () => {
     try {
       await pairingTab.click();
     } catch (error) {
-      let deadline: ReturnType<typeof setTimeout> | undefined;
+      let deadline: NodeJS.Timeout | number | undefined;
       const observation = await Promise.race([
         pairingTab.evaluate(element => {
           const bounds = element.getBoundingClientRect();
@@ -146,8 +147,8 @@ describe("packaged Desktop Pi compaction", () => {
             pointerEvents: getComputedStyle(element).pointerEvents
           };
         }, undefined, { timeout: 1_000 }).catch(() => undefined),
-        new Promise<undefined>(resolveObservation => { deadline = setTimeout(resolveObservation, 2_000); })
-      ]).finally(() => clearTimeout(deadline));
+        new Promise<undefined>(resolveObservation => { deadline = setNodeTimeout(() => resolveObservation(undefined), 2_000); })
+      ]).finally(() => clearNodeTimeout(deadline));
       console.info("Packaged Pi pairing control:", JSON.stringify(observation ?? null));
       const native = await desktop.evaluate(() => {
         const receipt = (globalThis as typeof globalThis & { __jokoPairingWindowObservation?: { events: unknown[]; current: () => unknown[] } }).__jokoPairingWindowObservation;
