@@ -109,10 +109,11 @@ describe("packaged Desktop Pi compaction", () => {
       throw new Error("Packaged Desktop did not use its isolated test profile.");
     }
     await desktop.evaluate(({ app, BrowserWindow }) => {
+      type ObservedWindow = ReturnType<typeof BrowserWindow.getAllWindows>[number];
       const startedAt = Date.now(), events: unknown[] = [], observed = new Set<number>();
-      const state = (window: Electron.BrowserWindow) => window.isDestroyed() ? { id: window.id, destroyed: true }
+      const state = (window: ObservedWindow) => window.isDestroyed() ? { id: window.id, destroyed: true }
         : { id: window.id, visible: window.isVisible(), focused: window.isFocused(), minimized: window.isMinimized(), loading: window.webContents.isLoading() };
-      const observe = (window: Electron.BrowserWindow): void => {
+      const observe = (window: ObservedWindow): void => {
         if (observed.has(window.id)) return;
         observed.add(window.id);
         const record = (type: string): void => { if (events.length < 32) events.push({ type, elapsedMs: Date.now() - startedAt, ...state(window) }); };
