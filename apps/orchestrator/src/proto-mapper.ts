@@ -5536,7 +5536,7 @@ function toProtoScheduleHistory(record: ScheduleRunRecord, run: StoredRun | unde
     state: run === undefined ? scheduleRunState(record.status) : toProtoRunState(run.descriptor.state),
     error: optionalError(error),
     sessionId: record.sessionId ?? "",
-    finishedAt: optionalTimestamp(record.finishedAt),
+    finishedAt: optionalTimestamp(finishedAt),
     resultText: typeof script["resultText"] === "string"
       ? redactSecrets(script["resultText"])
       : "",

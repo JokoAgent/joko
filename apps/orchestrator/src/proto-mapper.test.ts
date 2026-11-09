@@ -2157,6 +2157,18 @@ describe("proto mapper", () => {
     expect(protoSchedule.recentRuns[0]?.resultText).not.toContain("super-secret-schedule-history");
     expect(protoSchedule.recentRuns[0]?.error?.message).not.toContain("super-secret-schedule-history");
 
+    const failedRun: StoredRun = {
+      descriptor: { id: history.runId, sessionId: "session-1", source: "schedule", state: "failed",
+        createdAt: history.firedAt, endedAt: 67_000 },
+      revision: 1n
+    };
+    const runs = new Map([[history.runId, failedRun]]);
+    const admissionFailure = toProtoSchedule(schedule, [{ ...history, finishedAt: undefined }], runs).recentRuns[0];
+    expect(admissionFailure).toMatchObject({
+      state: RunState.FAILED, finishedAt: toProtoTimestamp(67_000), duration: { seconds: 2n }
+    });
+    expect(toProtoSchedule(schedule, [history], runs).recentRuns[0]?.finishedAt).toEqual(toProtoTimestamp(66_000));
+
     const mappedSchedule = fromProtoSchedule(protoSchedule, 9n);
     expect(mappedSchedule).toMatchObject({
       id: "schedule-1",
