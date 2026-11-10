@@ -778,7 +778,7 @@ describe("mounted Partner collaboration product chain", () => {
         stopDelegation.click().then(() => { cancellationClicked = true; })
       ]);
     } catch (cause) {
-      const run = fixture.application.store.findRun(cancellable.runId)?.descriptor;
+      const run = cancellable.runId === undefined ? undefined : fixture.application.store.findRun(cancellable.runId)?.descriptor;
       const queue = run?.sessionId === undefined ? undefined : fixture.application.store.findQueueItemByRunId(run.sessionId, run.id);
       const pendingAbort = nativeRpcs.findLast(receipt => receipt.command === "abort" && receipt.state === "pending");
       const transport = pendingAbort && activeTransports.get(pendingAbort.runtime);

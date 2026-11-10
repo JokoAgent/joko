@@ -33,7 +33,7 @@ it("reads a completed retained workflow through the actual paired Source without
       if (method === contract.HostedAgentPeerMethod.GET_CATALOG) return toBinary(contract.GetHostedAgentCatalogResponseSchema, create(contract.GetHostedAgentCatalogResponseSchema,
         { format: 1, remoteControlEnabled: true, backends: [{ backendId: "native-claude", nativeAdapterKind: "claude-agent-sdk-stdio", instanceGeneration: 1n,
           displayName: "Native Claude", version: "1", capabilities: [{ name: contract.capabilityNames.backgroundTasks, support: contract.CapabilitySupport.SUPPORTED }],
-          providers: [{ providerId: "provider", connected: true, remoteInvocationEnabled: true, models: [{ backendId: "native-claude", key: { providerId: "provider", modelId: "model" },
+          providers: [{ providerId: "provider", displayName: "Provider", connected: true, remoteInvocationEnabled: true, models: [{ backendId: "native-claude", key: { providerId: "provider", modelId: "model" },
             displayName: "Model", api: "anthropic-messages", contextWindowTokens: 32768n, maximumOutputTokens: 1024n, inputModalities: [contract.ModelInputModality.TEXT] }] }] }] }));
       expect(method).toBe(contract.HostedAgentPeerMethod.CALL);
       const request = fromBinary(contract.CallHostedAgentRequestSchema, bytes), command = decodeHostedAgentInvocation(request.commandJson); calls.push(command.kind);

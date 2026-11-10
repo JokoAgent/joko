@@ -27,7 +27,7 @@ it("round-trips inherited discovery fields through the real Gateway and submits 
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
       const message = method.localName === "getSnapshot" ? create(GetSnapshotResponseSchema, { snapshot })
         : method.localName === "submitOperation" ? (() => {
-          writes.push(fromBinary(SubmitOperationRequestSchema, toBinary(SubmitOperationRequestSchema, input)));
+          writes.push(fromBinary(SubmitOperationRequestSchema, toBinary(SubmitOperationRequestSchema, create(SubmitOperationRequestSchema, input))));
           return create(SubmitOperationResponseSchema, { operation: { operationId: input.operationId, connectionId: input.connectionId, state: OperationState.SUCCEEDED } });
         })() : (() => { throw new Error("Optional service unavailable"); })();
       return { stream: false, service: method.parent, method, header: new Headers(), trailer: new Headers(), message };

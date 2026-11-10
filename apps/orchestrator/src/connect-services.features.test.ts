@@ -4879,6 +4879,7 @@ describe("Connect typed feature boundaries", () => {
 
   it("normalizes Schedule execution snapshots including scoped extra directories", async () => {
     const now = Date.UTC(2027, 1, 15);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now); cleanups.push(() => clock.mockRestore());
     let captured: any;
     let targetManaged = false;
     let targetRemote = false;
@@ -4914,7 +4915,6 @@ describe("Connect typed feature boundaries", () => {
     const services = createConnectServices(stubApplication({
       store,
       sessionHost: immediateHost(store),
-      now: () => now,
       sessionWorktrees: { probe: probeWorktree, listSources: listWorktreeSources }
     }));
     const schedule = (extraDirectoryIds: string[]) => create(contract.ScheduleInputSchema, {

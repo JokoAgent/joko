@@ -98,11 +98,11 @@ it("retains separate working and maximum capacities through the original shared 
   try {
     const intent = await f.apply(f.issue().link);
     await f.approve(intent.request!.requestId);
-    expect(f.home().received()[0]!.models[0]).toMatchObject({ modelId: "model", contextWindow: 32768, contextWindowMax: 262144 });
+    expect(f.home().received()[0]!.models[0]).toMatchObject({ key: { modelId: "model" }, contextWindowTokens: 32768n, contextWindowMaxTokens: 262144n });
     await f.restart();
-    expect(f.home().received()[0]!.models[0]).toMatchObject({ modelId: "model", contextWindow: 32768, contextWindowMax: 262144 });
+    expect(f.home().received()[0]!.models[0]).toMatchObject({ key: { modelId: "model" }, contextWindowTokens: 32768n, contextWindowMaxTokens: 262144n });
     await f.home().refresh(f.authority);
-    expect(f.home().received()[0]!.models[0]).toMatchObject({ modelId: "model", contextWindow: 32768, contextWindowMax: 262144 });
+    expect(f.home().received()[0]!.models[0]).toMatchObject({ key: { modelId: "model" }, contextWindowTokens: 32768n, contextWindowMaxTokens: 262144n });
   } finally { await f.close(); }
 });
 
