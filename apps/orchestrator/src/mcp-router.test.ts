@@ -3627,7 +3627,7 @@ function configureImageTestRoute(store: OperationalStore, credentials: Credentia
   const identity = { backendId: gemini ? "pi" : "codex", providerId: gemini ? "gemini" : "openai", surfaceId: "image-generation" };
   const modelId = gemini ? "gemini/gemini-3.1-flash-image" : "gpt-image-2";
   const displayName = gemini ? "Gemini 3.1 Flash Image" : "GPT Image 2";
-  store.upsertBackend({ ...store.getBackend("pi").descriptor, id: identity.backendId, adapterKind: gemini ? "pi" : "codex",
+  store.upsertBackend({ ...store.getBackend("pi").descriptor, id: identity.backendId, adapterKind: gemini ? store.getBackend("pi").descriptor.adapterKind : "codex",
     providers: [{ providerId: identity.providerId, displayName: gemini ? "Google Gemini" : "OpenAI", api: gemini ? "google-generative-ai" : "openai-responses",
       authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false,
       supportsRefresh: false, supportsModelRefresh: false, credentialSurfaces: [{

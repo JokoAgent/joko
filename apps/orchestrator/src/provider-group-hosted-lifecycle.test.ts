@@ -67,7 +67,7 @@ function fixture(localMember = false) {
   const called = vi.fn(async (_runId: string, _callId: string, command: HostedAgentCall, _signal: AbortSignal): Promise<unknown> => {
     if (command.kind === "state") return nativeState;
     if (command.kind === "send") return null;
-    if (command.kind === "workflow_progress") return workflow;
+    if (command.kind === "workflow_progress") { expect(_signal.aborted).toBe(false); return workflow; }
     throw new Error("This native fixture permits only the original state and turn calls.");
   });
   const client: ProviderGroupNativeCapture["client"] = { open: opened, call: called,
@@ -170,7 +170,7 @@ it("reads an ended group workflow through the persisted member after the relay c
   const forwarded = f.called.mock.calls.at(-1)!;
   expect(forwarded[2]).toEqual({ ...f.command, backendId: "native-remote",
     nativeSessionId: createHash("sha256").update(JSON.stringify([f.input.nativeSessionId, "remote"])).digest("hex") });
-  expect(forwarded[3].aborted).toBe(false); expect(pick).not.toHaveBeenCalled();
+  expect(forwarded[3].aborted).toBe(true); expect(pick).not.toHaveBeenCalled();
   expect(f.opened).toHaveBeenCalledOnce(); expect(f.nativeClosures()).toBe(1); expect(f.leases.count("remote")).toBe(0);
   expect(f.binding()).toMatchObject({ phase: "closed", member: { key: "remote" } });
 });

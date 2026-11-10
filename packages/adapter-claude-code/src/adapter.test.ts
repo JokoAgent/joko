@@ -4287,7 +4287,7 @@ describe("ClaudeCodeAdapter", () => {
 
   test("reads an owned persisted workflow after terminal notification, runtime close and Adapter restart without creating a query", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-native-workflow-")), configurationDirectory = join(root, "config");
-    const workspace = { ...target, workspaceRoot: root }, runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const workspace = { ...target, workspaceRoot: root }, runtime = new FakeSdkRuntime({ autoAdmitTurns: true, initialFrameOverrides: { cwd: root } });
     const adapter = adapterFor(runtime, { environment: { CLAUDE_CONFIG_DIR: configurationDirectory }, redactValues: ["workflow-private-marker"] });
     const restartedRuntime = new FakeSdkRuntime(), restarted = adapterFor(restartedRuntime, { environment: { CLAUDE_CONFIG_DIR: configurationDirectory }, redactValues: ["workflow-private-marker"] });
     try {
