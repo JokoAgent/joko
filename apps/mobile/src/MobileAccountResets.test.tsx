@@ -3,6 +3,7 @@ import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { ProviderAccountResetStateSchema, ProviderAccountResetResultSchema, ProviderAccountResetAvailability, ProviderAccountResetOutcome,
+  ProviderAccountResetOfferSchema, ProviderAccountResetAutomaticSettingsSchema,
   DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS, type ProviderAccountResetApi, type ProviderAccountResetState } from "@joko/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const native = vi.hoisted(() => ({ alert: vi.fn() }));
@@ -35,7 +36,7 @@ async function click(label: string) { const button = [...host.querySelectorAll("
 async function confirm() { const buttons = native.alert.mock.calls.at(-1)![2] as { onPress?: () => void }[]; await act(async () => buttons[1]!.onPress?.()); }
 it("mounts resets in the original mobile usage summary, confirms consumption, and keeps unknown retries on the same offer", async () => {
   const f = fixture(); await f.render(); await click("Use reset"); expect(f.consume).not.toHaveBeenCalled(); expect(native.alert.mock.calls[0]![1]).toContain("…ccount");
-  f.consume.mockImplementationOnce(async () => { f.state = create(ProviderAccountResetStateSchema, { ...f.state, defaultOffer: { offerId, retryOnly: true } }); throw new Error("Unknown"); });
+  f.consume.mockImplementationOnce(async () => { f.state = create(ProviderAccountResetStateSchema, { ...f.state, defaultOffer: create(ProviderAccountResetOfferSchema, { offerId, retryOnly: true }) }); throw new Error("Unknown"); });
   await confirm(); expect(host.textContent).toContain("unconfirmed result"); await click("Retry original reset"); await confirm();
   expect(f.consume.mock.calls.map(call => call[1].offerId)).toEqual([offerId, offerId]); expect(host.textContent).toContain("The original reset already completed.");
 });
@@ -47,7 +48,8 @@ it("retires the original mobile account read and ignores its late result after t
 });
 
 it("disables mobile automation with its last condition and preserves the failed settings draft", async () => {
-  const f = fixture(); f.state = create(ProviderAccountResetStateSchema, { ...f.state, automaticSettings: { ...DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS, enabled: true } });
+  const f = fixture(); f.state = create(ProviderAccountResetStateSchema, { ...f.state,
+    automaticSettings: create(ProviderAccountResetAutomaticSettingsSchema, { ...DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS, enabled: true }) });
   await f.render(); f.save.mockRejectedValueOnce(new Error("Settings save failed"));
   const toggle = (label: string) => host.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!;
   await act(async () => toggle("When the ordinary weekly quota is almost exhausted").click());
