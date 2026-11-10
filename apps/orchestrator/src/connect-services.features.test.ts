@@ -4875,9 +4875,9 @@ describe("Connect typed feature boundaries", () => {
     });
   });
 
-  it("normalizes Schedule execution snapshots including scoped extra directories", async () => {
+  it("normalizes Schedule execution snapshots including scoped extra directories", async ({ onTestFinished }) => {
     const now = Date.UTC(2027, 1, 15);
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now); cleanups.push(() => clock.mockRestore());
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now); onTestFinished(() => clock.mockRestore());
     let captured: any;
     let targetManaged = false;
     let targetRemote = false;
