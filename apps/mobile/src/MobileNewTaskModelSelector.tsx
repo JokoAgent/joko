@@ -9,7 +9,7 @@ import { mobileMessage } from "./mobile-messages";
 import type { MobileModelRoute } from "./mobile-runtime-controls";
 import type { MobileNewTaskSourceSelection } from "./mobile-new-task-model-memory";
 import { useMobileAccountUsage } from "./use-mobile-account-usage";
-import { mobileAccountUsageWindows, mobileUsageProviderKey, type MobileProviderUsageTransport } from "./mobile-account-usage";
+import { mobileAccountUsageWindows, mobileUsageProviderKey, mobileAccountResetControls, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import { MobileAccountUsageSummary, mobileModelAccountQuotaLabel } from "./MobileAccountUsageSummary";
 import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
 
@@ -87,6 +87,7 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
         <Text style={{ color: colors.ink }}>{route.displayName}</Text>
         {providerUsageTransport?.providers.some(provider => provider.backendId === route.backendId && provider.providerId === route.providerId)
           && <MobileAccountUsageSummary snapshot={accountUsage.snapshots[mobileUsageProviderKey(route)]} modelId={route.modelId} providerName={route.providerName}
+            reset={mobileAccountResetControls(providerUsageTransport, route.backendId, route.providerId, route.source?.kind)}
             loading={accountUsage.loading} failed={accountUsage.failed} now={accountUsage.now} colors={colors} locale={locale} />}
         {route.canSetEffort && <View style={styles.options}>{route.efforts.map(effort => <Pressable key={effort.id} disabled={busy || disabled}
           accessibilityRole="radio" accessibilityState={{ selected: choice.effortId === effort.id }} onPress={() => setChoice({ ...choice, effortId: effort.id })}

@@ -257,7 +257,7 @@ import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
 import { MobileNewTaskModelSelector } from "./MobileNewTaskModelSelector";
 import { MobileNewTaskWorktree } from "./MobileNewTaskWorktree";
 import { MobileAccountUsageSummary } from "./MobileAccountUsageSummary";
-import { mobileUsageProviderKey } from "./mobile-account-usage";
+import { mobileUsageProviderKey, mobileAccountResetControls } from "./mobile-account-usage";
 import { useMobileAccountUsage } from "./use-mobile-account-usage";
 import { MobileContextSheet } from "./MobileContextSheet";
 import { MobileObjectiveSheet } from "./MobileObjectiveSheet";
@@ -6516,6 +6516,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         onOpen: () => { if (!taskHomeNavigator.busy) setDrawerOpen(true); } } : undefined}
       disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
       menuHeader={usageProvider && <MobileAccountUsageSummary snapshot={taskAccountUsage.snapshots[mobileUsageProviderKey(usageProvider)]}
+        reset={mobileAccountResetControls(providerUsageTransport, usageProvider.backendId, usageProvider.providerId, runtimeControls?.currentModel?.route?.source?.kind)}
         modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
         failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
       actions={([

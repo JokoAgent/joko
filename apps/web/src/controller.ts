@@ -3786,6 +3786,7 @@ export function useAppController(): AppController {
     ...inputApi,
     refreshProviderAccountUsage: (backendId, providerId) => gateway().refreshProviderAccountUsage(backendId, providerId),
     readProviderAccountBalance: (backendId, providerId, forceRefresh, signal) => gateway().readProviderAccountBalance(backendId, providerId, forceRefresh, signal),
+    providerAccountResets: () => gateway().providerAccountResets?.(),
     getSessionContextBudget: (sessionId, generation, signal) => gateway().getSessionContextBudget(sessionId, generation, signal),
     setSessionContextBudget: (observed, tokens, signal) => gateway().setSessionContextBudget(observed, tokens, signal),
     readTaskProviderGroupUsage: (sessionId, generation, signal) => gateway().readTaskProviderGroupUsage?.(sessionId, generation, signal) ?? Promise.resolve(undefined),

@@ -29,6 +29,8 @@ import { SessionHost } from "./session-host.js";
 import { nativeStateObservation, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
+import { ProviderAccountResets } from "./provider-account-resets.js";
+import { JokoError, type NativeAccountRateLimitResetOperations } from "@joko/core";
 
 const cleanups: Array<() => void> = [];
 
@@ -130,6 +132,67 @@ async function invoke(handler: unknown, request: unknown, handlerContext: unknow
   }
   return await result;
 }
+
+it("recovers only the original authorized account-reset Operation after a cold Store with the exact native credit and key", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "joko-account-reset-service-")), file = join(directory, "operations.db");
+  let store = new OperationalStore(file), lost = true;
+  const accountKey = "a".repeat(64), sdkCalls: { idempotencyKey: string; creditId?: string }[] = [];
+  store.upsertBackend({ id: "codex", adapterKind: "codex", instanceGeneration: 1, displayName: "Codex", version: "0.159.2", health: "healthy",
+    installationState: "installed", authenticationState: "authenticated", capabilities: new Map([["provider.account_resets", { key: "provider.account_resets", supported: true }]]), models: [], tools: [], diagnostics: [] });
+  const token = "private-reset-owner", otherToken = "private-reset-observer";
+  const owner = store.createConnection({ id: "reset-owner", name: "Owner", authKeyDigest: digestAuthKey(token) });
+  const observer = store.createConnection({ id: "reset-observer", name: "Observer", authKeyDigest: digestAuthKey(otherToken) });
+  const port: NativeAccountRateLimitResetOperations = {
+    readAccountRateLimitResets: async input => { input.assertCurrent(); return { providerId: "openai", accountKey, accountLabel: "…ccount",
+      usage: { providerId: "openai", observedAt: Date.now() }, credits: { availableCount: 1, details: [
+        { creditId: "private-sdk-credit", resetType: "codexRateLimits", status: "available", grantedAt: 1_800_000_000_000 }
+      ] } }; },
+    consumeAccountRateLimitReset: async input => {
+      input.assertCurrent(); sdkCalls.push({ idempotencyKey: input.idempotencyKey, ...(input.creditId ? { creditId: input.creditId } : {}) });
+      if (lost) throw new JokoError({ code: "RESET_RESPONSE_UNKNOWN", message: "Original reset response lost", phase: "dispatch", retryable: true, stateMayHaveChanged: true, recovery: "Retry the original reset." });
+      return "alreadyRedeemed";
+    }
+  };
+  const setup = () => {
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [] });
+    const host = new SessionHost(store, artifacts, []), connections = new ConnectionManager(store);
+    const resets = new ProviderAccountResets({ store, withAccount: async (backendId, providerId, action) => {
+      if (backendId !== "codex" || providerId !== "openai") throw new Error("Foreign account route");
+      return action(port, () => { store.getBackend(backendId); });
+    } });
+    const services = createConnectServices({ ...stubApplication({ store }), connections, sessionHost: host, providerAccountResets: resets });
+    return { host, resets, services };
+  };
+  let runtime = setup();
+  const auth = (value = token) => ({ requestHeader: new Headers({ authorization: `Bearer ${value}` }), signal: new AbortController().signal });
+  try {
+    const reading = fromBinary(contract.GetProviderAccountResetStateRequestSchema, toBinary(contract.GetProviderAccountResetStateRequestSchema,
+      create(contract.GetProviderAccountResetStateRequestSchema, { backendId: "codex", providerId: "openai" })));
+    const response = await invoke(runtime.services.backend.getProviderAccountResetState, reading, auth()) as contract.GetProviderAccountResetStateResponse;
+    const state = fromBinary(contract.GetProviderAccountResetStateResponseSchema, toBinary(contract.GetProviderAccountResetStateResponseSchema,
+      create(contract.GetProviderAccountResetStateResponseSchema, response))).state!;
+    expect(state.availability).toBe(contract.ProviderAccountResetAvailability.AVAILABLE);
+    expect(Buffer.from(toBinary(contract.ProviderAccountResetStateSchema, state)).includes(Buffer.from("private-sdk-credit"))).toBe(false);
+    const offerId = state.defaultOffer!.offerId, operationId = contract.providerAccountResetOperationId(offerId, owner.id);
+    const submit = create(contract.SubmitOperationRequestSchema, { operationId, connectionId: owner.id, mutation: { payload: { case: "consumeProviderAccountReset",
+      value: { backendId: "codex", providerId: "openai", accountKey, offerId } } } });
+    const original = fromBinary(contract.SubmitOperationRequestSchema, toBinary(contract.SubmitOperationRequestSchema, submit));
+    await expect(invoke(runtime.services.operation.submitOperation, original, auth())).rejects.toBeDefined();
+    expect(store.getOperation(operationId).status).toBe("started");
+    expect(JSON.stringify(store.getOperation(operationId).body)).not.toContain("private-sdk-credit");
+    await runtime.resets.dispose(); await runtime.host.dispose(); store.close();
+    store = new OperationalStore(file); store.recoverStartup("account-reset-service-recovery"); runtime = setup(); lost = false;
+    await expect(invoke(runtime.services.operation.submitOperation, { ...original, connectionId: observer.id }, auth(otherToken))).rejects.toBeDefined();
+    expect(sdkCalls).toHaveLength(1);
+    const result = await invoke(runtime.services.operation.submitOperation, original, auth()) as contract.SubmitOperationResponse;
+    const completed = fromBinary(contract.SubmitOperationResponseSchema, toBinary(contract.SubmitOperationResponseSchema, create(contract.SubmitOperationResponseSchema, result)));
+    expect(completed.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    expect(completed.operation?.result?.payload).toMatchObject({ case: "providerAccountReset", value: { offerId, accountKey, outcome: contract.ProviderAccountResetOutcome.ALREADY_REDEEMED } });
+    expect(sdkCalls).toEqual([0, 1].map(() => ({ idempotencyKey: offerId, creditId: "private-sdk-credit" })));
+    await invoke(runtime.services.operation.submitOperation, original, auth()); expect(sdkCalls).toHaveLength(2);
+    expect(store.listSessions()).toEqual([]);
+  } finally { await runtime.resets.dispose(); await runtime.host.dispose(); store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
 
 it("rejects escaped settings credentials before claiming an operation and hides earlier routing data from receipts", async () => {
   const directory = mkdtempSync(join(tmpdir(), "joko-settings-credentials-"));

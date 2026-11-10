@@ -90,20 +90,24 @@ export class TransportFault extends Error {
 export class RpcRemoteFault extends Error {
   readonly rpcCode: number;
   readonly archivedResumeThreadId: string | undefined;
+  readonly accountTokenExpired: boolean;
 
-  constructor(rpcCode: number, archivedResumeThreadId?: string) {
+  constructor(rpcCode: number, archivedResumeThreadId?: string, accountTokenExpired = false) {
     super("The Codex app-server rejected the request.");
     this.name = "RpcRemoteFault";
     this.rpcCode = rpcCode;
     this.archivedResumeThreadId = archivedResumeThreadId;
+    this.accountTokenExpired = accountTokenExpired;
   }
 }
 
 /** Retain only an exact protocol refusal; remote error text/data can contain secrets. */
-export function remoteRpcFault(code: number, message: unknown, data: unknown, resumeThreadId?: string): RpcRemoteFault {
+export function remoteRpcFault(code: number, message: unknown, data: unknown, resumeThreadId?: string, requestMethod?: string): RpcRemoteFault {
   const archived = code === -32600 && data === undefined && resumeThreadId !== undefined
     && message === `session ${resumeThreadId} is archived. Run \`codex unarchive ${resumeThreadId}\` to unarchive it first.`;
-  return new RpcRemoteFault(code, archived ? resumeThreadId : undefined);
+  const expired = requestMethod === "account/rateLimits/read" && typeof message === "string" && message.length <= 16_384
+    && /\b401\b/u.test(message) && /\btoken_expired\b/u.test(message) && !/token_revoked|token_invalidated|refresh_token_reused/u.test(message);
+  return new RpcRemoteFault(code, archived ? resumeThreadId : undefined, expired);
 }
 
 export function isAmbiguousDispatchFailure(error: unknown): boolean {

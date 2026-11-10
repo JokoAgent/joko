@@ -17,7 +17,7 @@ import { ModelSourceKind, PermissionMode } from "@joko/contracts";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
-import { mobileUsageProviderKey, type MobileProviderUsageTransport } from "./mobile-account-usage";
+import { mobileUsageProviderKey, mobileAccountResetControls, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import { MobileAccountUsageSummary, mobileModelAccountQuotaLabel } from "./MobileAccountUsageSummary";
 import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
 import { mobileAccountUsageWindows } from "./mobile-account-usage";
@@ -245,6 +245,7 @@ export function MobileRuntimeControlsSheet({
             onRemoveFavorite={() => activeFavorite && mutateFavorite({ kind: "remove", favoriteId: activeFavorite.favoriteId })} />}
           {view.kind === "model" && activeRoute && providerUsageTransport?.providers.some(provider => provider.backendId === activeRoute.backendId && provider.providerId === activeRoute.providerId)
             && <MobileAccountUsageSummary snapshot={accountUsage.snapshots[mobileUsageProviderKey(activeRoute)]}
+              reset={mobileAccountResetControls(providerUsageTransport, activeRoute.backendId, activeRoute.providerId, activeRoute.source?.kind)}
               modelId={activeRoute.modelId} providerName={activeRoute.providerName} loading={accountUsage.loading} failed={accountUsage.failed}
               now={accountUsage.now} colors={colors} locale={locale} />}
           {view.kind === "permission" && <PermissionOptions controls={controls} disabled={disabled} locale={locale}
@@ -340,6 +341,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
           {showProvider && <Text style={[styles.providerHeading, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
           {showProvider && providerUsageTransport?.providers.some(provider => provider.backendId === route.backendId && provider.providerId === route.providerId)
             && <MobileAccountUsageSummary snapshot={accountUsage.snapshots[mobileUsageProviderKey(route)]} providerName={route.providerName}
+              reset={mobileAccountResetControls(providerUsageTransport, route.backendId, route.providerId, route.source?.kind)}
               loading={accountUsage.loading} failed={accountUsage.failed} now={accountUsage.now} colors={colors} locale={locale} />}
           <Pressable accessibilityRole="radio" accessibilityState={{ selected, disabled }} disabled={disabled}
             accessibilityLabel={`${route.displayName}, ${route.providerName}`}

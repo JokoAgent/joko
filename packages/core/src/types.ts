@@ -77,6 +77,7 @@ export const CAPABILITIES = [
   "model.working_context",
   "provider.managed_catalog",
   "provider.account_usage",
+  "provider.account_resets",
   "provider.login",
   "provider.logout",
   "provider.refresh",

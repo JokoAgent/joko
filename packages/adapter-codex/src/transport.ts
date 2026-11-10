@@ -706,7 +706,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
         ));
         return true;
       }
-      pending.reject(remoteRpcFault(error["code"], error["message"], error["data"], pending.resumeThreadId));
+      pending.reject(remoteRpcFault(error["code"], error["message"], error["data"], pending.resumeThreadId, pending.method));
       return true;
     }
     pending.resolve(value["result"] as JsonValue);

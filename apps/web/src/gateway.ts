@@ -1,7 +1,8 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
+import type { ProviderAccountResetApi } from "@joko/contracts";
 import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
-import { executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
+import { createProviderAccountResetApi, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
@@ -1531,6 +1532,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (this.#transport !== scope.transport || this.#snapshot?.providers.find(value => value.backendId === backendId && value.id === providerId)?.accountBalanceRevision !== identity
       || !response.result) throw new GatewayError("The original Provider changed.");
     return response.result;
+  }
+
+  providerAccountResets(): ProviderAccountResetApi | undefined {
+    const profile = this.#profile, transport = this.#transport;
+    if (!profile || !transport || this.#taskSharing) return undefined;
+    return createProviderAccountResetApi({ ownerKey: JSON.stringify([profile.id, profile.serverId, profile.origin]), connectionId: profile.id,
+      transport, newId: randomUuid, assertCurrent: (backendId, providerId) => {
+        if (this.#transport !== transport || this.#profile !== profile || this.#abort?.signal.aborted || this.#taskSharing
+          || !this.#snapshot?.providers.some(provider => provider.backendId === backendId && provider.id === providerId
+            && provider.capabilities.has("provider.account_resets"))) throw new GatewayError("The original account reset Provider is unavailable.");
+      } });
   }
 
   async readTaskProviderGroupUsage(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<TaskProviderGroupUsageView | undefined> {

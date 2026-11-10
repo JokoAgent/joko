@@ -250,6 +250,26 @@ message OperationMutation {
     SetSessionTaskTagsMutation set_session_task_tags = 221;
     DeleteTaskTagMutation delete_task_tag = 222;
     UpdateModelFavoritesMutation update_model_favorites = 223;
+    ConsumeProviderAccountResetMutation consume_provider_account_reset = 232;
+    UpdateProviderAccountResetSettingsMutation update_provider_account_reset_settings = 233;
+  }
+}
+
+message ConsumeProviderAccountResetMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+  string account_key = 3;
+  string offer_id = 4;
+}
+
+message UpdateProviderAccountResetSettingsMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+  string account_key = 3;
+  Revision expected_settings_revision = 4;
+  oneof update {
+    ProviderAccountResetAutomaticSettings settings = 5;
+    bool restore_defaults = 6;
   }
 }
 
@@ -1691,6 +1711,7 @@ message OperationResult {
     SkillMutationResult skill = 35;
     ExtensionPickedDirectoryDeposit picked_directory = 36;
     WorkspaceGitCommitResult workspace_git_commit = 37;
+    ProviderAccountResetResult provider_account_reset = 38;
   }
 }
 

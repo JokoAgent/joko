@@ -3,8 +3,10 @@ import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
 import { deviceAuthorizationEnglish, deviceAuthorizationChinese } from './i18n/device-authorization.js';
 import { connectionEntriesEnglish, connectionEntriesChinese } from './i18n/connection-entries.js';
 import { serverAccessEnglish, serverAccessChinese } from '@joko/contracts/server-access';
+import { providerAccountResetEnglish, providerAccountResetChinese } from '@joko/contracts';
 
 const en = {
+  ...providerAccountResetEnglish,
   "contextBudget.title": "Task context budget",
   "contextBudget.help": "Applies to this task at a safe runtime boundary. The context ring continues to show the Backend's actual window. Model limits and physical capacity take precedence.",
   "contextBudget.default": "Model default ({tokens})",
@@ -6612,6 +6614,7 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  ...providerAccountResetChinese,
   "contextBudget.title": "任务上下文预算",
   "contextBudget.help": "仅用于本任务，在安全的运行边界生效。上下文圆环继续显示 Backend 的实际窗口；模型级上限和物理容量优先。",
   "contextBudget.default": "跟随模型默认（{tokens}）",
