@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { ProviderAccountResetStateSchema, ProviderAccountResetResultSchema, ProviderAccountResetAvailability, ProviderAccountResetOutcome,
+  ProviderAccountResetOfferSchema, ProviderAccountResetAutomaticSettingsSchema, RevisionSchema,
   DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS, type ProviderAccountResetApi, type ProviderAccountResetState } from "@joko/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
@@ -33,7 +34,7 @@ function fixture() {
 it("requires confirmation, retains the original offer after an ambiguous result, and retries only that offer", async () => {
   const f = fixture(); await f.render(); await f.click(t("accountReset.use")); expect(f.consume).not.toHaveBeenCalled();
   await f.click(t("accountReset.cancel"), document.querySelector('[role="alertdialog"]')!); expect(f.consume).not.toHaveBeenCalled();
-  f.consume.mockImplementationOnce(async () => { f.state = create(ProviderAccountResetStateSchema, { ...f.state, defaultOffer: { offerId, retryOnly: true } }); throw new Error("Unknown native result"); });
+  f.consume.mockImplementationOnce(async () => { f.state = create(ProviderAccountResetStateSchema, { ...f.state, defaultOffer: create(ProviderAccountResetOfferSchema, { offerId, retryOnly: true }) }); throw new Error("Unknown native result"); });
   await f.click(t("accountReset.use")); await f.click(t("accountReset.use"), document.querySelector('[role="alertdialog"]')!);
   expect(f.container.textContent).toContain(t("accountReset.pending")); expect(f.container.textContent).toContain(t("accountReset.failed"));
   await f.click(t("accountReset.retry")); await f.click(t("accountReset.retry"), document.querySelector('[role="alertdialog"]')!);
@@ -41,7 +42,8 @@ it("requires confirmation, retains the original offer after an ambiguous result,
   expect(f.container.textContent).toContain(t("accountReset.outcome.alreadyRedeemed"));
 });
 it("disables automatic use when its last rule is cleared, validates day bounds, and saves the original settings revision", async () => {
-  const f = fixture(); f.state = create(ProviderAccountResetStateSchema, { ...f.state, automaticSettings: { ...DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS, enabled: true }, settingsRevision: { value: 7n } });
+  const f = fixture(); f.state = create(ProviderAccountResetStateSchema, { ...f.state,
+    automaticSettings: create(ProviderAccountResetAutomaticSettingsSchema, { ...DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS, enabled: true }), settingsRevision: create(RevisionSchema, { value: 7n }) });
   await f.render();
   const checkbox = (label: string) => [...f.container.querySelectorAll<HTMLLabelElement>("label")].find(node => node.textContent === label)!.querySelector<HTMLInputElement>("input")!;
   await act(async () => { checkbox(t("accountReset.lowQuota")).click(); checkbox(t("accountReset.expiring")).click(); });

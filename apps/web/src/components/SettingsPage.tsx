@@ -3754,7 +3754,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
           {selectedProviderEnabled && providerRuntime?.error !== undefined && <div className="provider-detail__banner provider-detail__banner--error" role="alert"><span>{providerRuntime.error}</span>{providerRuntime.supportsModelRefresh === true && <Button disabled={refreshingProviderKey !== undefined} onClick={() => void refreshModels(selectedProviderEntry!)}>{t("common.retry")}</Button>}</div>}
           {selectedProviderEnabled && <div className="provider-detail__scroll">
             {relatedProviderRuntimes.filter(runtime => runtime.capabilities.has("provider.account_resets")).map(runtime => <section key={`resets:${runtime.backendId}`} className="provider-detail-section">
-              <ProviderAccountResets controller={controller} runtime={runtime} locale={locale} t={t} />
+              <ProviderAccountResets controller={controller} runtime={runtime} locale={controller.state.effectiveLocale} t={t} />
             </section>)}
             {relatedProviderRuntimes.filter(runtime => runtime.capabilities.has("provider.account_balance")).map(runtime => <section key={runtime.backendId} className="provider-detail-section">
               <strong>{snapshot.backends.find(backend => backend.id === runtime.backendId)?.name ?? runtime.backendId}</strong>
