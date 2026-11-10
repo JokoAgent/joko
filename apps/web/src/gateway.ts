@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import type { ProviderAccountResetApi } from "@joko/contracts";
-import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
+import { assistantStreamAttempt, isAssistantStreamBlock } from "@joko/contracts";
 import { createProviderAccountResetApi, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
@@ -12475,7 +12475,7 @@ function projectTimelineEvent(
     }
     case "textDelta": {
       const contentIndex = kind.value.contentIndex;
-      const streamAttempt = isClaudeStreamBlock(kind.value.messageId) ? assistantStreamAttempt(event) : undefined;
+      const streamAttempt = isAssistantStreamBlock(kind.value.messageId) ? assistantStreamAttempt(event) : undefined;
       const existing = items.find((item) =>
         item.kind === "assistant"
         && isProjectedMessageItem(item, kind.value.messageId)

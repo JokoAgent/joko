@@ -2626,15 +2626,15 @@ describe("incremental event projection", () => {
     expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).refresh).toBe("authoritative");
   });
 
-  it("preserves interrupted Claude text and replaces only the completed attempt's live row", () => {
+  it.each(["claude-block", "assistant-b324bbdc-36f8-4014-a181-76bee0e27d4e"])("preserves interrupted %s text and replaces only the completed attempt's live row", (prefix) => {
     const identity = { sessionId: "session-1", runId: "run", attemptId: "first", generation: 2n };
     const first = create(EventSchema, { eventId: "partial-1", identity, cursor: { generation: 1n, sequence: 1n },
-      payload: { kind: { case: "textDelta", value: { messageId: "claude-block-1-0", delta: "First reply." } } } });
+      payload: { kind: { case: "textDelta", value: { messageId: `${prefix}-1-0`, delta: "First reply." } } } });
     const failed = create(EventSchema, { eventId: "failed", identity, cursor: { generation: 1n, sequence: 2n },
       payload: { kind: { case: "terminalError", value: { error: { message: "The stream ended." } } } } });
     const retry = { ...identity, attemptId: "second" };
     const next = create(EventSchema, { eventId: "partial-2", identity: retry, cursor: { generation: 1n, sequence: 3n },
-      payload: { kind: { case: "textDelta", value: { messageId: "claude-block-2-0", delta: "Next reply" } } } });
+      payload: { kind: { case: "textDelta", value: { messageId: `${prefix}-2-0`, delta: "Next reply" } } } });
     const final = create(EventSchema, { eventId: "final", identity: retry, cursor: { generation: 1n, sequence: 4n },
       payload: { kind: { case: "messageCompleted", value: { messageId: "final", role: MessageRole.ASSISTANT,
         blocks: [{ content: { case: "text", value: "Next reply finished." } }] } } } });
@@ -2646,6 +2646,20 @@ describe("incremental event projection", () => {
     const projected = projectSnapshotEvent(raw, current, final);
     expect(projected.snapshot.timelineBySession.get("session-1")?.filter(item => item.kind === "assistant")).toMatchObject([
       { text: "First reply.", streaming: false }, { id: "final", text: "Next reply finished.", streaming: false }
+    ]);
+    expect(mapSnapshot(projected.rawSnapshot).timelineBySession.get("session-1"))
+      .toEqual(projected.snapshot.timelineBySession.get("session-1"));
+    const nextRun = { ...retry, runId: "next-run" };
+    const nextDelta = create(EventSchema, { eventId: "next-run-delta", identity: nextRun, cursor: { generation: 1n, sequence: 5n },
+      payload: { kind: { case: "textDelta", value: { messageId: `${prefix}-3-0`, delta: "Another turn." } } } });
+    const nextFinal = create(EventSchema, { eventId: "next-run-final", identity: nextRun, cursor: { generation: 1n, sequence: 6n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "next-final", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Another turn." } }] } } } });
+    const streaming = projectSnapshotEvent(projected.rawSnapshot, projected.snapshot, nextDelta);
+    const completed = projectSnapshotEvent(streaming.rawSnapshot, streaming.snapshot, nextFinal);
+    expect(completed.snapshot.timelineBySession.get("session-1")?.filter(item => item.kind === "assistant")).toMatchObject([
+      { text: "First reply.", streaming: false }, { id: "final", text: "Next reply finished.", streaming: false },
+      { id: "next-final", text: "Another turn.", streaming: false }
     ]);
   });
 

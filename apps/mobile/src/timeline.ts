@@ -1,7 +1,7 @@
 import { MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt, type PartnerSessionTaskReceiptView } from "@joko/contracts";
-import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
+import { assistantStreamAttempt, isAssistantStreamBlock } from "@joko/contracts";
 import { mobileInputSummary, mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 import { normalizeMobileReplyQuote, type MobilePartnerReplyQuote, normalizeMobileTodoQuote, type MobilePartnerTodoQuote } from './mobile-composer-document';
 import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents } from "./mobile-timeline-content";
@@ -116,7 +116,7 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
   const byId = new Map<string, TimelineRow>();
   const toolStarts = new Map<string, Event[]>();
   const acceptedUserInputs = new Set<string>();
-  const claudeStreams = new Map<string, Set<string>>();
+  const assistantStreams = new Map<string, Set<string>>();
   const unique = new Map(events.map((event) => [event.eventId, event]));
   const ordered = [...unique.values()].sort((a, b) => (a.cursor?.sequence ?? 0n) < (b.cursor?.sequence ?? 0n) ? -1
     : (a.cursor?.sequence ?? 0n) > (b.cursor?.sequence ?? 0n) ? 1 : 0);
@@ -206,11 +206,11 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
         byId.set(messageId, previous === undefined
           ? { id: messageId, label: "Assistant", kind: "assistant", text: delta, sequence, eventId: event.eventId, completed: false }
           : { ...previous, text: previous.text === "…" ? delta : previous.text + delta });
-        const attempt = isClaudeStreamBlock(messageId) ? assistantStreamAttempt(event) : undefined;
+        const attempt = isAssistantStreamBlock(messageId) ? assistantStreamAttempt(event) : undefined;
         if (attempt !== undefined) {
-          const blocks = claudeStreams.get(attempt) ?? new Set<string>();
+          const blocks = assistantStreams.get(attempt) ?? new Set<string>();
           blocks.add(messageId);
-          claudeStreams.set(attempt, blocks);
+          assistantStreams.set(attempt, blocks);
         }
         break;
       }
@@ -220,10 +220,10 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
         const attempt = message.role === MessageRole.ASSISTANT && message.nativeIdentity === undefined
           && message.blocks.some(block => block.content.case === "text") ? assistantStreamAttempt(event) : undefined;
         if (attempt !== undefined) {
-          for (const blockId of claudeStreams.get(attempt) ?? []) {
+          for (const blockId of assistantStreams.get(attempt) ?? []) {
             if (!byId.get(blockId)?.completed) byId.delete(blockId);
           }
-          claudeStreams.delete(attempt);
+          assistantStreams.delete(attempt);
         }
         const completedGalleryPages = mobileTimelineGalleryPages(event);
         const completedImages = completedGalleryPages.map(mobileImageGalleryPageSummary);
