@@ -1,5 +1,5 @@
 import type { JsonObject, JsonValue, RpcNotification, RpcServerRequest } from "./protocol.js";
-import type { DurableProcessUsage } from "@joko/runtime-governance";
+import type { DurableProcessOwner, DurableProcessUsage } from "@joko/runtime-governance";
 import {
   commandApprovalAvailability,
   isJsonObject,
@@ -124,6 +124,10 @@ export class AppServerHost {
     return this.#transport?.running === true
       && this.#transport.processInspectionSupported === true
       && this.#transport.inspectProcessUsage !== undefined;
+  }
+
+  get processOwner(): DurableProcessOwner | undefined {
+    return this.#transport instanceof StdioJsonRpcTransport ? this.#transport.processOwner : undefined;
   }
 
   async inspectProcessUsage(): Promise<readonly DurableProcessUsage[]> {

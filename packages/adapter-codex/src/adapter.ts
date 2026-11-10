@@ -3001,6 +3001,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const authority = await this.captureHostedAuthentication(); assertCurrent();
     if (authority.kind !== "chatgpt") throw new Error("The account reset requires the original subscription account.");
     const base = this.#accountHostOptions, transport = base.transport ?? {};
+    const processOwner = originalHost.processOwner;
+    if (transport.processOwner !== undefined && processOwner === undefined) throw new Error("The original native process owner is unavailable.");
     let accessTokenUsed: string | undefined;
     const environmentValues: Record<string, string> = {};
     for (const [name, value] of Object.entries(transport.env ?? createChildRuntimeEnvironment().environment)) if (value !== undefined) environmentValues[name] = value;
@@ -3018,7 +3020,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       transport: { ...(transport.command === undefined ? {} : { command: transport.command }), cwd: home,
         args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="ephemeral"'],
         env: useCodexHistoryHome(environmentValues, home),
-        ...(transport.processOwner === undefined ? {} : { processOwner: { ...transport.processOwner, recoverStale: false } }) }
+        ...(processOwner === undefined ? {} : { processOwner }) }
     });
     this.#accountResetHosts.add(host);
     const cancel = () => { void host.forceShutdown().catch(() => undefined); };

@@ -93,7 +93,7 @@ export interface StdioJsonRpcTransportOptions {
   readonly maxTombstones?: number;
   readonly shutdownTimeoutMs?: number;
   /** Adapter-private crash recovery authority for the exact local child. */
-  readonly processOwner?: DurableProcessOwnerOptions;
+  readonly processOwner?: DurableProcessOwnerOptions | DurableProcessOwner;
   /** Alternate process boundary; JSON-RPC parsing, limits, and receipts stay here. */
   readonly channelFactory?: () => JsonRpcRecordChannel;
 }
@@ -168,7 +168,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     };
     this.#processOwner = options.processOwner === undefined
       ? undefined
-      : new DurableProcessOwner(options.processOwner);
+      : options.processOwner instanceof DurableProcessOwner ? options.processOwner : new DurableProcessOwner(options.processOwner);
     if (options.channelFactory !== undefined && (
       options.command !== undefined
       || options.args !== undefined
@@ -199,6 +199,9 @@ export class StdioJsonRpcTransport implements RpcTransport {
   get running(): boolean {
     return (this.#child !== undefined || this.#channel?.running === true) && !this.#fatal && !this.#closing;
   }
+
+  /** Sibling SDKs in one Backend generation share its prepared lease registry. */
+  get processOwner(): DurableProcessOwner | undefined { return this.#processOwner; }
 
   get processInspectionSupported(): boolean {
     return this.#processOwner?.inspectionSupported === true;
