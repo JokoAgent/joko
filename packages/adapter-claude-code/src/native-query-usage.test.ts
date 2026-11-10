@@ -8,12 +8,32 @@ const assistant = (id: string, name: string, input: number, output: number) => (
 } });
 
 describe("native Query accounting", () => {
+  it("keeps missing native model cost in an unattributed remainder instead of charging a later model baseline twice", () => {
+    const query = new NativeQueryUsage(true);
+    const first = query.observeResult({ modelUsage: { root: model(10, 5, 0.02), child: { ...model(2, 1, 0), costUSD: undefined } }, total_cost_usd: 0.03 })!;
+    expect(first.nativeAccounting?.models).toEqual(expect.arrayContaining([
+      expect.objectContaining({ modelId: "root", cost: 0.02, costComplete: true }),
+      expect.objectContaining({ modelId: "child", cost: 0, costComplete: false })
+    ]));
+    query.observeResult({ modelUsage: { root: model(20, 10, 0.03), child: model(2, 1, 0.01) }, total_cost_usd: 0.04 });
+    const last = query.observeResult({ modelUsage: { root: model(20, 10, 0.03), child: model(4, 2, 0.02) }, total_cost_usd: 0.05 })!;
+    expect(last.cost).toBe(0.05);
+    expect(last.nativeAccounting?.models).toEqual(expect.arrayContaining([
+      expect.objectContaining({ modelId: "root", inputTokens: 20, outputTokens: 10, cost: 0.03 }),
+      expect.objectContaining({ modelId: "child", inputTokens: 4, outputTokens: 2, cost: 0.01 })
+    ]));
+  });
+
   it("keeps fresh inclusive counters monotonic and duplicate results independent of request replays", () => {
     const query = new NativeQueryUsage(true);
     const first = { modelUsage: { root: model(10, 5, 0.02), child: model(2, 1, 0.01) }, total_cost_usd: 0.03 };
     const observed = query.observeResult(first)!;
     expect(observed).toMatchObject({ inputTokens: 12, outputTokens: 6, totalTokens: 18, cost: 0.03,
       nativeAccounting: { tokensComplete: true, costComplete: true, costEstimated: true } });
+    expect(observed.nativeAccounting?.models).toEqual([
+      { modelId: "root", inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 15, cost: 0.02, tokensComplete: true, costComplete: true },
+      { modelId: "child", inputTokens: 2, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0.01, tokensComplete: true, costComplete: true }
+    ]);
     expect(query.observeResult(first)).toEqual(observed);
     expect(query.observeResult({ modelUsage: { root: model(20, 10, 0.04), child: model(2, 1, 0.01) }, total_cost_usd: 0.05 }))
       .toMatchObject({ totalTokens: 33, cost: 0.05 });

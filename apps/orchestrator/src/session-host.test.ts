@@ -5519,6 +5519,47 @@ describe("SessionHost", () => {
     });
   });
 
+  it("records actual native models, unknown remainder and independent child models once through the owned Run", async () => {
+    const adapter = new NativeModelUsageFakeAdapter(), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-native-models", connection: fixture.connection,
+      targetId: "target-one", title: "Native models", providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: "send-native-models", connection: fixture.connection, sessionId,
+      prompt: { text: "account native models", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    const rows = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
+    expect(rows).toHaveLength(4);
+    expect(rows.find(row => row.providerId === "test" && row.modelId === "text")).toMatchObject({ totalTokens: 15, costMicros: 20_000 });
+    expect(rows.find(row => row.modelId === "native-internal")).toMatchObject({ totalTokens: 3, costMicros: 10_000 });
+    expect(rows.find(row => row.modelId === "")).toMatchObject({ totalTokens: 1, costMicros: 5_000, costComplete: false });
+    expect(rows.find(row => row.providerId === "vision" && row.modelId === "native-child")).toMatchObject({ totalTokens: 8, costMicros: 40_000 });
+    expect(rows.some(row => row.modelId === "multimodal")).toBe(false);
+    expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({ totalTokens: 27, costMicros: 75_000, tokensComplete: false });
+    const runtime = materializedSessionRuntimeState(fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value)?.usage;
+    expect(runtime).toMatchObject({ totalTokens: 19, contextTokens: 19, nativeAccounting: { models: [
+      expect.objectContaining({ modelId: "text", totalTokens: 15 }), expect.objectContaining({ modelId: "native-internal", totalTokens: 3 })
+    ] } });
+  });
+
+  it("keeps native model baselines across later Runs and duplicate observations without charging the cumulative prefix again", async () => {
+    const adapter = new NativeModelUsageFakeAdapter(false), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-native-model-baselines", connection: fixture.connection,
+      targetId: "target-one", title: "Native baselines", providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const run = async (id: string) => {
+      const queued = fixture.host.enqueueInput({ operationId: id, connection: fixture.connection, sessionId,
+        prompt: { text: id, images: [], files: [], mentions: [], disposition: "prompt" } });
+      await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+      return fixture.store.getRun(queued.value.runId).descriptor;
+    };
+    expect((await run("first-native-model-observation")).usage).toMatchObject({ totalTokens: 19, costMicros: 35_000 });
+    adapter.observation = nativeModelUsageFixture(20, 10, 0.04);
+    expect((await run("later-native-model-observation")).usage).toMatchObject({ totalTokens: 15, costMicros: 20_000 });
+    expect(fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" })).toMatchObject({ totalTokens: 34, costMicros: 55_000 });
+    const rows = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
+    expect(rows.find(row => row.modelId === "text")).toMatchObject({ totalTokens: 30, costMicros: 40_000 });
+    expect(rows.find(row => row.modelId === "native-internal")).toMatchObject({ totalTokens: 3, costMicros: 10_000 });
+    expect(rows.find(row => row.modelId === "")).toMatchObject({ totalTokens: 1, costMicros: 5_000 });
+  });
+
   it("accounts cumulative delegated-run usage independently without inflating parent context", async () => {
     let phase = "create-fixture";
     let inspectBoundary: () => Record<string, unknown> = () => ({});
@@ -18130,6 +18171,43 @@ function hostServiceZeroUsage(): Record<string, unknown> {
     totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
   };
+}
+
+function nativeModelUsageFixture(input = 10, output = 5, cost = 0.02): UsageSnapshot {
+  return { inputTokens: input + 3, outputTokens: output + 1, cacheReadTokens: 0, cacheWriteTokens: 0,
+    totalTokens: input + output + 4, contextTokens: input + output + 4, contextWindow: 32_000, cost: cost + 0.015,
+    nativeAccounting: { sourceId: "native-parent-query", tokensComplete: false, costComplete: false, costEstimated: true, models: [
+      { modelId: "text", inputTokens: input, outputTokens: output, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: input + output, cost, tokensComplete: true, costComplete: true },
+      { modelId: "native-internal", inputTokens: 2, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, cost: 0.01, tokensComplete: true, costComplete: true }
+    ] } };
+}
+
+class NativeModelUsageFakeAdapter extends FakeBackendAdapter {
+  observation = nativeModelUsageFixture();
+  constructor(readonly children = true) { super({ ...PI_LIKE_PROFILE, id: "native-model-usage-fake", capabilities: [
+    ...PI_LIKE_PROFILE.capabilities, { key: "subagents.list", supported: true }, { key: "subagents.detail", supported: true }
+  ] }); }
+  override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+    const { usage: _initialUsage, ...state } = await super.inspectSession(binding, context); return state;
+  }
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    await context.emit({ type: "usage", usage: this.observation }); await context.emit({ type: "usage", usage: this.observation });
+    if (this.children) {
+      const base = portableWorkerRun(context.sessionId, 0);
+      await context.emit({ type: "subagent_run", run: { ...base, id: "native-included-child", logicalAgentId: "native-included-child", usage: {
+        inputTokens: 2, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 3, costUsd: 0.01, accountingIncludedInParent: true
+      } } });
+      const usage = { inputTokens: 5, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 8, costUsd: 0.04,
+        accountingIncludedInParent: false, tokensComplete: true, costComplete: true, costEstimated: true, nativeAccounting: {
+          sourceId: "native-independent-query", tokensComplete: true, costComplete: true, costEstimated: true,
+          models: [{ modelId: "native-child", inputTokens: 5, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 8, cost: 0.04, tokensComplete: true, costComplete: true }]
+        } };
+      for (const index of [0, 1]) await context.emit({ type: "subagent_run", run: { ...base, id: "native-independent-child", logicalAgentId: "native-independent-child",
+        route: { providerId: "vision", modelId: "multimodal" }, state: index === 0 ? "running" : "completed", updatedAt: base.updatedAt + index,
+        ...(index === 0 ? { endedAt: undefined } : {}), usage } });
+    }
+    await context.emit({ type: "done", outcome: "completed" });
+  }
 }
 
 class DelegatedUsageFakeAdapter extends FakeBackendAdapter {

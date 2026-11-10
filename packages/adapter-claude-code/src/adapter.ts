@@ -5734,6 +5734,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens,
         cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens, costUsd: usage.cost,
         ...(usage.nativeAccounting === undefined ? {} : {
+          nativeAccounting: usage.nativeAccounting,
           tokensComplete: usage.nativeAccounting.tokensComplete, costComplete: usage.nativeAccounting.costComplete,
           costEstimated: usage.nativeAccounting.costEstimated
         }),

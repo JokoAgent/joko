@@ -1,4 +1,4 @@
-import type { UsageSnapshot } from "@joko/core";
+import { parseNativeModelUsage, type UsageSnapshot } from "@joko/core";
 
 export const SESSION_RUNTIME_STATE_SETTING_KEY = "runtime.backend.materialized_state";
 
@@ -65,16 +65,19 @@ function usageSnapshot(value: unknown): UsageSnapshot | undefined {
     || pricing["cacheWrite1hTokens"] !== undefined && (cacheWrite1hTokens === undefined || cacheWrite1hTokens > cacheWriteTokens)
     || cacheWriteTtl !== undefined && cacheWriteTtl !== "5m" && cacheWriteTtl !== "1h")) return undefined;
   const native = value["nativeAccounting"];
-  if (native !== undefined && (!isRecord(native) || Object.keys(native).length !== 4
+  if (native !== undefined && (!isRecord(native) || Object.keys(native).some(key => !["sourceId", "tokensComplete", "costComplete", "costEstimated", "models"].includes(key))
     || typeof native["sourceId"] !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(native["sourceId"])
     || [native["tokensComplete"], native["costComplete"], native["costEstimated"]].some(flag => typeof flag !== "boolean"))) return undefined;
+  const models = isRecord(native) && native["models"] !== undefined
+    ? parseNativeModelUsage(native["models"], { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, cost }) : undefined;
+  if (isRecord(native) && native["models"] !== undefined && models === undefined) return undefined;
   return {
     inputTokens,
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
-    ...(native === undefined ? {} : { nativeAccounting: native as unknown as NonNullable<UsageSnapshot["nativeAccounting"]> }),
+    ...(native === undefined ? {} : { nativeAccounting: { ...native as unknown as NonNullable<UsageSnapshot["nativeAccounting"]>, ...(models === undefined ? {} : { models }) } }),
     ...(contextTokens === undefined ? {} : { contextTokens }),
     ...(contextWindow === undefined ? {} : { contextWindow }),
     ...(requestInputTokens === undefined ? {} : { pricingContext: {

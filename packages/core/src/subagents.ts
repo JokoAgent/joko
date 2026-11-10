@@ -1,4 +1,4 @@
-import type { PublicError, SessionId, UnixMillis } from "./types.js";
+import type { PublicError, SessionId, UnixMillis, UsageSnapshot } from "./types.js";
 
 export type SubagentRunState = "queued" | "running" | "completed" | "failed" | "stopped";
 
@@ -30,6 +30,8 @@ export interface SubagentCapabilities {
 }
 
 export interface SubagentUsage {
+  /** Private Adapter/Host accounting; public task projections keep their summary. */
+  readonly nativeAccounting?: UsageSnapshot["nativeAccounting"];
   readonly tokensComplete?: boolean;
   readonly costComplete?: boolean;
   readonly costEstimated?: boolean;

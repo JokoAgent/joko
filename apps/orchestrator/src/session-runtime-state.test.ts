@@ -6,6 +6,19 @@ import {
 } from "./session-runtime-state.js";
 
 describe("materialized session runtime state", () => {
+  it("restores the bounded native model partition and rejects duplicate or excessive portions before using a saved counter", () => {
+    const model = { modelId: "actual-model", inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
+      totalTokens: 15, cost: 0.02, tokensComplete: true, costComplete: true };
+    const usage = { inputTokens: 12, outputTokens: 6, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 18, cost: 0.03,
+      nativeAccounting: { sourceId: "native-query", tokensComplete: false, costComplete: false, costEstimated: true, models: [model] } };
+    const saved = JSON.parse(JSON.stringify({ updatedAt: 10, usage }));
+    expect(materializedSessionRuntimeState(saved)).toEqual({ updatedAt: 10, usage });
+    for (const models of [[model, model], [{ ...model, inputTokens: 13, totalTokens: 18 }], [{ ...model, cost: 0.04 }],
+      [{ ...model, modelId: "bad\nmodel" }], [{ ...model, privateCredential: "discard" }]]) {
+      expect(materializedSessionRuntimeState({ ...saved, usage: { ...usage, nativeAccounting: { ...usage.nativeAccounting, models } } })).toEqual({ updatedAt: 10 });
+    }
+  });
+
   it("round-trips bounded cumulative usage and supports explicit leaf clearing", () => {
     const usage = {
       inputTokens: 10,

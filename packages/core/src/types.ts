@@ -637,6 +637,18 @@ export interface ProviderAccountUsageSnapshot {
   readonly observedAt: number;
 }
 
+export interface NativeModelUsage {
+  readonly modelId: string;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly totalTokens: number;
+  readonly cost: number;
+  readonly tokensComplete: boolean;
+  readonly costComplete: boolean;
+}
+
 export interface UsageSnapshot {
   /** Native accounting-stream provenance for the Adapter/Host port, never a service Run total. */
   readonly nativeAccounting?: {
@@ -644,6 +656,8 @@ export interface UsageSnapshot {
     readonly tokensComplete: boolean;
     readonly costComplete: boolean;
     readonly costEstimated: boolean;
+    /** Cumulative per-model portions of this same stream, including native internal tasks. */
+    readonly models?: readonly NativeModelUsage[];
   };
   readonly inputTokens: number;
   readonly outputTokens: number;

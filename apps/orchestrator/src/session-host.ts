@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { modelPricesWithOverride, type ModelPriceOverride } from "@joko/core";
+import { modelPricesWithOverride, parseNativeModelUsage, type ModelPriceOverride } from "@joko/core";
 import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
   type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import type { McpAppMessageGuard } from "./mcp-apps/message.js";
@@ -16081,6 +16081,38 @@ export class SessionHost {
       || [native.tokensComplete, native.costComplete, native.costEstimated].some(value => typeof value !== "boolean"))) {
       throw new StoreError("The native usage accounting provenance is invalid.");
     }
+    if (native?.models !== undefined) {
+      return store.transaction(() => {
+        const models = parseNativeModelUsage(native.models, usage);
+        if (!models) throw new StoreError("The native per-model usage partition is invalid.");
+        if (provesProviderAvailable) clearProviderRateLimit(store, session.descriptor.backendId, providerId);
+        const remaining = { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens,
+          cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens, costMicros: Math.round(usage.cost * 1_000_000) };
+        const parts = models.map(model => {
+          for (const key of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens"] as const) remaining[key] -= model[key];
+          remaining.costMicros -= Math.round(model.cost * 1_000_000);
+          return { ...model, source: `model:${createHash("sha256").update(model.modelId).digest("hex")}` };
+        });
+        parts.push({ modelId: "", source: "unattributed", inputTokens: remaining.inputTokens, outputTokens: remaining.outputTokens,
+          cacheReadTokens: remaining.cacheReadTokens, cacheWriteTokens: remaining.cacheWriteTokens, totalTokens: remaining.totalTokens,
+          cost: remaining.costMicros / 1_000_000, tokensComplete: native.tokensComplete, costComplete: native.costComplete });
+        let combined: ReturnType<OperationalStore["recordUsageObservation"]> | undefined;
+        for (const part of parts) {
+          const result = this.recordUsageObservation(store, session, generation, {
+            inputTokens: part.inputTokens, outputTokens: part.outputTokens, cacheReadTokens: part.cacheReadTokens,
+            cacheWriteTokens: part.cacheWriteTokens, totalTokens: part.totalTokens, cost: part.cost,
+            nativeAccounting: { sourceId: createHash("sha256").update(JSON.stringify([native.sourceId, part.source])).digest("hex"), tokensComplete: part.tokensComplete,
+              costComplete: part.costComplete, costEstimated: native.costEstimated }
+          }, measuredAt, sourceId, providerId, part.modelId, false, scheduleUsage, runUsageId, false, childAccounting);
+          combined = combined === undefined ? result : { ...combined, changed: combined.changed || result.changed,
+            inputTokens: combined.inputTokens + result.inputTokens, outputTokens: combined.outputTokens + result.outputTokens,
+            cacheReadTokens: combined.cacheReadTokens + result.cacheReadTokens, cacheWriteTokens: combined.cacheWriteTokens + result.cacheWriteTokens,
+            totalTokens: combined.totalTokens + result.totalTokens, costMicros: combined.costMicros + result.costMicros,
+            costComplete: combined.costComplete && result.costComplete, estimated: combined.estimated || result.estimated };
+        }
+        return combined!;
+      });
+    }
     const accountingSourceId = native === undefined ? sourceId : `native-accounting:${native.sourceId}`;
     const substitution = runUsageId === undefined ? undefined : store.findRunModelSubstitution(runUsageId);
     const canPriceReference = referencePricingKnown && native?.costComplete !== false
@@ -19236,7 +19268,8 @@ function sameUsageSnapshot(left: UsageSnapshot | undefined, right: UsageSnapshot
     left.nativeAccounting?.sourceId === right.nativeAccounting?.sourceId &&
     left.nativeAccounting?.tokensComplete === right.nativeAccounting?.tokensComplete &&
     left.nativeAccounting?.costComplete === right.nativeAccounting?.costComplete &&
-    left.nativeAccounting?.costEstimated === right.nativeAccounting?.costEstimated;
+    left.nativeAccounting?.costEstimated === right.nativeAccounting?.costEstimated &&
+    JSON.stringify(left.nativeAccounting?.models) === JSON.stringify(right.nativeAccounting?.models);
 }
 
 function scheduleRunUsageTarget(
@@ -19263,7 +19296,8 @@ function subagentUsageSnapshot(usage: NonNullable<SubagentRunDetail["usage"]>): 
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens: usage.totalTokens ?? inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
-    cost: usage.costUsd ?? 0
+    cost: usage.costUsd ?? 0,
+    ...(usage.nativeAccounting === undefined ? {} : { nativeAccounting: usage.nativeAccounting })
   };
 }
 
