@@ -1,5 +1,6 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { encodeModelSpeed } from "@joko/contracts";
+import { createProviderAccountResetApi } from "@joko/connection-transport";
 import { ProviderGroupService, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/contracts";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
@@ -219,6 +220,7 @@ export interface MobileNetwork {
   extensionCardApi?(credential: PairedCredential): import("./mobile-extension-card-api").MobileExtensionCardApi;
   getProviderUsage?(credential: PairedCredential, backendId: string, providerId: string,
     signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountUsageSnapshot | undefined>;
+  providerAccountResets?(credential: PairedCredential, ownerKey: string, newId: () => string, assertCurrent: (backendId: string, providerId: string) => void): import("@joko/contracts").ProviderAccountResetApi;
   getTaskProviderGroupRebalance?(credential: PairedCredential, sessionId: string, generation: bigint,
     signal: AbortSignal): Promise<ProviderGroupRebalanceSuggestion | undefined>;
   objectiveRpc?(credential: PairedCredential, sessionId: string, generation: bigint,
@@ -1747,6 +1749,10 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     if (result.accountUsage && result.accountUsage.providerId !== providerId) throw new Error("The account usage Provider changed.");
     return result.accountUsage;
+  },
+  providerAccountResets(credential, ownerKey, newId, assertCurrent) {
+    return createProviderAccountResetApi({ ownerKey, connectionId: credential.connectionId, transport: credentialTransport(credential),
+      newId, assertCurrent });
   },
   async listRemoteDesktopHosts(credential, signal) {
     const client = createClient(RemoteDesktopService, credentialTransport(credential));

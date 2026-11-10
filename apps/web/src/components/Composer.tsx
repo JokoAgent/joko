@@ -46,6 +46,7 @@ import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../compos
 import { ContextCapacityRing } from "./ContextCapacityRing.js";
 import { SessionUsageChip } from "./SessionUsageChip.js";
 import { ProviderAccountBalance } from "./ProviderAccountBalance.js";
+import { ProviderAccountResets } from "./ProviderAccountResets.js";
 import { SessionContextBudget } from "./SessionContextBudget.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
@@ -3047,6 +3048,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         />
         {controller.state.snapshot?.providers.filter(runtime => runtime.backendId === session.backendId && runtime.id === session.model?.providerId)
           .map(runtime => <ProviderAccountBalance key={`${runtime.backendId}:${runtime.id}`} controller={controller} runtime={runtime} t={t} />)}
+        {!guest && !readOnly && session.remoteWorkspace === undefined && session.model?.source?.kind === "local"
+          && controller.state.snapshot?.providers.filter(runtime => runtime.backendId === session.backendId && runtime.id === session.model?.providerId)
+            .map(runtime => <ProviderAccountResets key={`reset:${runtime.backendId}:${runtime.id}`} controller={controller} runtime={runtime} locale={controller.state.effectiveLocale} t={t} compact />)}
         <ContextCapacityRing context={session.context} modelContextWindow={session.model?.contextWindow} onCompact={onCompact} t={t} />
         <SessionContextBudget controller={controller} session={session} supported={!guest && !readOnly && backend?.capabilities.get("model.working_context")?.supported === true} t={t} />
       </div>}

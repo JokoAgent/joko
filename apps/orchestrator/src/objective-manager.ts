@@ -370,6 +370,44 @@ export class ObjectiveManager {
     return this.#store.getObjective(input.sessionId);
   }
 
+  /** Resume only an existing quota wait after its actual local account recovers. */
+  async resumeRestoredQuota(accountKey: string,
+    isRestored: (sessionId: string, assertCurrent: () => void) => Promise<boolean>, assertAccountCurrent: () => void): Promise<void> {
+    for (const candidate of this.#store.listObjectives(["usage_limited"])) {
+      let resumed = false;
+      await this.#withLock(candidate.sessionId, async () => {
+        this.#assertOpen(); assertAccountCurrent();
+        const current = this.#store.findObjective(candidate.sessionId);
+        if (!current || current.status !== "usage_limited" || current.lastReason !== "usage limit reached"
+          || current.pendingRunId !== undefined || !objectiveSessionEligible(this.#store, current.sessionId)) return;
+        const generation = this.#store.getSession(current.sessionId).descriptor.binding.generation;
+        const assertCurrent = () => {
+          this.#assertOpen(); assertAccountCurrent();
+          const owner = this.#store.getObjective(current.sessionId), session = this.#store.getSession(current.sessionId).descriptor;
+          if (owner.status !== "usage_limited" || owner.revision !== current.revision || owner.ownerGeneration !== current.ownerGeneration
+            || owner.pendingRunId !== undefined || session.binding.generation !== generation || !objectiveSessionEligible(this.#store, current.sessionId)) {
+            throw new StoreError("The original Objective quota wait changed.");
+          }
+        };
+        if (!await isRestored(current.sessionId, assertCurrent)) return;
+        assertCurrent();
+        this.#store.runOperation({ id: objectiveInternalOperationId("quota-restored", current, accountKey), kind: "resume_objective_after_usage_limit",
+          body: { sessionId: current.sessionId, ownerGeneration: current.ownerGeneration, accountKey } }, store => {
+          assertCurrent(); clearObjectiveProviderLimit(store, current.sessionId);
+          const updated = store.updateObjective({ sessionId: current.sessionId, expectedRevision: current.revision,
+            expectedOwnerGeneration: current.ownerGeneration, status: "active", usageResetAt: null, noProgressTurns: 0,
+            dispatchRejections: 0, lastReason: "usage limit reset; resuming objective", advanceOwnerGeneration: true, updatedAt: this.#now() });
+          appendObjectiveLifecycle(store, updated, "resumed", this.#now(), updated.lastReason); return { sessionId: current.sessionId };
+        });
+        resumed = true;
+      });
+      if (resumed) {
+        this.#cancelUsageTimer(candidate.sessionId); this.#publish(candidate.sessionId);
+        assertAccountCurrent(); await this.#kick(candidate.sessionId, true);
+      }
+    }
+  }
+
   async clear(input: ObjectiveFenceInput): Promise<void> {
     let abortRunId: string | undefined;
     await this.#withLock(input.sessionId, async () => {

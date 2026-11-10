@@ -206,6 +206,7 @@ export interface ManagedRuntimeModel {
   readonly id: string;
   readonly displayName: string;
   readonly contextWindow?: number;
+  readonly requiredRuntimeVersion?: string;
   readonly supportsTools: boolean;
   readonly supportsImages: boolean;
 }

@@ -14186,6 +14186,7 @@ export class OperationalStore {
     const pendingEffects = this.database.prepare(`
       SELECT operation.id FROM operations AS operation
       WHERE operation.status = 'started' AND operation.completion_mode = 'external_effect'
+        AND operation.kind NOT IN ('consumeProviderAccountReset', 'automaticProviderAccountReset')
         AND NOT EXISTS (
           SELECT 1 FROM schedule_deletion_cleanups AS cleanup
           WHERE cleanup.operation_id = operation.id AND cleanup.state = 'pending'
@@ -14279,6 +14280,7 @@ export class OperationalStore {
       const effectRows = this.database.prepare(`
         SELECT operation.id FROM operations AS operation
         WHERE operation.status = 'started' AND operation.completion_mode = 'external_effect'
+          AND operation.kind NOT IN ('consumeProviderAccountReset', 'automaticProviderAccountReset')
           AND NOT EXISTS (
             SELECT 1 FROM schedule_deletion_cleanups AS cleanup
             WHERE cleanup.operation_id = operation.id AND cleanup.state = 'pending'

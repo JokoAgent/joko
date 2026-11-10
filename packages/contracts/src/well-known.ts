@@ -48,6 +48,7 @@ export const capabilityNames = {
   modelPricing: "model.pricing",
   providerManagedCatalog: "provider.managed_catalog",
   providerAccountUsage: "provider.account_usage",
+  providerAccountResets: "provider.account_resets",
   permissionModes: "permission.modes",
   permissionChange: "permission.change",
   planMode: "plan_mode",

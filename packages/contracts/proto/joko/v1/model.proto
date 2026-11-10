@@ -378,6 +378,69 @@ message ProviderAccountResetCredits {
   google.protobuf.Timestamp earliest_expiry_at = 2;
 }
 
+enum ProviderAccountResetAvailability {
+  PROVIDER_ACCOUNT_RESET_AVAILABILITY_UNSPECIFIED = 0;
+  PROVIDER_ACCOUNT_RESET_AVAILABILITY_UNSUPPORTED = 1;
+  PROVIDER_ACCOUNT_RESET_AVAILABILITY_UNAVAILABLE = 2;
+  PROVIDER_ACCOUNT_RESET_AVAILABILITY_AVAILABLE = 3;
+}
+
+// This short-lived handle never contains the native credit identifier.
+message ProviderAccountResetOffer {
+  string offer_id = 1;
+  google.protobuf.Timestamp valid_until = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  bool retry_only = 4;
+}
+
+message ProviderAccountResetCredit {
+  string title = 1;
+  google.protobuf.Timestamp granted_at = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  ProviderAccountResetOffer offer = 4;
+}
+
+message ProviderAccountResetAutomaticSettings {
+  bool enabled = 1;
+  bool low_quota = 2;
+  uint32 minimum_days = 3;
+  bool expiring = 4;
+  uint32 expiry_minutes = 5;
+}
+
+message ProviderAccountResetState {
+  string backend_id = 1;
+  string provider_id = 2;
+  ProviderAccountResetAvailability availability = 3;
+  string account_key = 4;
+  string account_label = 5;
+  optional uint32 available_count = 6;
+  bool details_available = 7;
+  repeated ProviderAccountResetCredit credits = 8;
+  ProviderAccountResetOffer default_offer = 9;
+  ProviderAccountResetAutomaticSettings automatic_settings = 10;
+  Revision settings_revision = 11;
+  bool customized = 12;
+  google.protobuf.Timestamp last_automatic_use = 13;
+  google.protobuf.Timestamp captured_at = 14;
+}
+
+enum ProviderAccountResetOutcome {
+  PROVIDER_ACCOUNT_RESET_OUTCOME_UNSPECIFIED = 0;
+  PROVIDER_ACCOUNT_RESET_OUTCOME_RESET = 1;
+  PROVIDER_ACCOUNT_RESET_OUTCOME_NOTHING_TO_RESET = 2;
+  PROVIDER_ACCOUNT_RESET_OUTCOME_NO_CREDIT = 3;
+  PROVIDER_ACCOUNT_RESET_OUTCOME_ALREADY_REDEEMED = 4;
+}
+
+message ProviderAccountResetResult {
+  string backend_id = 1;
+  string provider_id = 2;
+  string account_key = 3;
+  string offer_id = 4;
+  ProviderAccountResetOutcome outcome = 5;
+}
+
 // API-key account data stays separate from subscription quotas and local usage.
 message ProviderAccountBalanceResult {
   // unsupported / unavailable / ready

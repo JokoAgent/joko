@@ -20,6 +20,33 @@ afterEach(async () => {
 });
 
 describe("ObjectiveManager", () => {
+  it("resumes only the existing quota wait after its account is freshly proven restored", async () => {
+    const fixture = createFixture(), original = fixture.store.putObjective({ sessionId: fixture.sessionId, text: "Continue the existing work" });
+    fixture.store.updateObjective({ sessionId: fixture.sessionId, expectedRevision: original.revision, expectedOwnerGeneration: original.ownerGeneration,
+      status: "usage_limited", lastReason: "usage limit reached", usageResetAt: null });
+    await fixture.manager.resumeRestoredQuota("a".repeat(64), async () => false, () => {});
+    expect(fixture.host.admissions).toHaveLength(0); expect(fixture.store.getObjective(fixture.sessionId).status).toBe("usage_limited");
+    await fixture.manager.resumeRestoredQuota("a".repeat(64), async (_sessionId, assertCurrent) => { assertCurrent(); return true; }, () => {});
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "active", text: original.text });
+    expect(fixture.host.admissions).toHaveLength(1);
+    await fixture.manager.resumeRestoredQuota("a".repeat(64), async () => true, () => {});
+    expect(fixture.host.admissions).toHaveLength(1);
+  });
+
+  it("rejects a late quota-restored result after account authority ends and leaves overload waits alone", async () => {
+    const fixture = createFixture(), original = fixture.store.putObjective({ sessionId: fixture.sessionId, text: "Original quota wait" });
+    let current = fixture.store.updateObjective({ sessionId: fixture.sessionId, expectedRevision: original.revision, expectedOwnerGeneration: original.ownerGeneration,
+      status: "usage_limited", lastReason: "usage limit reached", usageResetAt: null });
+    let allowed = true;
+    await expect(fixture.manager.resumeRestoredQuota("a".repeat(64), async () => { allowed = false; return true; }, () => { if (!allowed) throw new Error("Account retired"); })).rejects.toThrow("Account retired");
+    expect(fixture.host.admissions).toHaveLength(0); expect(fixture.store.getObjective(fixture.sessionId).revision).toBe(current.revision);
+    current = fixture.store.updateObjective({ sessionId: fixture.sessionId, expectedRevision: current.revision, expectedOwnerGeneration: current.ownerGeneration,
+      status: "usage_limited", lastReason: "upstream capacity is temporarily unavailable" });
+    const inspect = vi.fn(async () => true);
+    await fixture.manager.resumeRestoredQuota("a".repeat(64), inspect, () => {});
+    expect(inspect).not.toHaveBeenCalled(); expect(fixture.store.getObjective(fixture.sessionId).revision).toBe(current.revision);
+  });
+
   it("starts with default no-progress protection or explicitly unlimited turns without a second mutation", async () => {
     const fixture = createFixture();
     const defaults = await fixture.manager.set(setInput("default-limits", fixture));

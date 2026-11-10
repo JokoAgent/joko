@@ -101,6 +101,7 @@ export class ManagedProviderProxy {
   readonly #server: Server;
   readonly #providers: ProviderCatalogManager;
   readonly #fetch: typeof fetch;
+  readonly #fetchForRoute: ((route: ProviderInferenceRoute) => typeof fetch | undefined) | undefined;
   readonly #assertOwner: (owner: ManagedProviderRouteOwner) => void;
   readonly #bindings = new Map<string, BindingState>();
   readonly #smartBindings = new Map<string, SmartBindingState>();
@@ -111,10 +112,12 @@ export class ManagedProviderProxy {
     readonly providers: ProviderCatalogManager;
     readonly assertOwner: (owner: ManagedProviderRouteOwner) => void;
     readonly fetch?: typeof fetch;
+    readonly fetchForRoute?: (route: ProviderInferenceRoute) => typeof fetch | undefined;
   }) {
     this.#providers = options.providers;
     this.#assertOwner = options.assertOwner;
     this.#fetch = options.fetch ?? fetch;
+    this.#fetchForRoute = options.fetchForRoute;
     this.#server = createServer({ maxHeaderSize: 32 * 1024 }, (request, response) => {
       void this.#handle(request, response).catch(() => { if (!response.destroyed) response.destroy(); });
     });
@@ -767,7 +770,8 @@ export class ManagedProviderProxy {
       const upstreamBody = appliedOutputTokens !== undefined
         ? Buffer.from(JSON.stringify({ ...(parsed as Record<string, unknown>), max_tokens: appliedOutputTokens }))
         : body;
-      const upstream = await this.#fetch(endpoint, { method: "POST", headers, body: upstreamBody, redirect: "manual", signal });
+      const fetchUpstream = this.#fetchForRoute?.(route) ?? this.#fetch;
+      const upstream = await fetchUpstream(endpoint, { method: "POST", headers, body: upstreamBody, redirect: "manual", signal });
       if (subtask === undefined) this.#assertOperation(state, operation);
       else this.#assertSubtask(state, operation, subtask);
       if (!upstream.ok || upstream.body === null) {

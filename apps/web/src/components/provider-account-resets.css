@@ -1,0 +1,10 @@
+.provider-account-resets { display: grid; gap: 10px; min-width: 0; overflow-wrap: anywhere; }
+.provider-account-resets :is(h3,p) { margin: 0; }
+.provider-account-resets ul { display: grid; gap: 12px; margin: 0; padding-inline-start: 20px; }
+.provider-account-resets li { min-width: 0; }
+.provider-account-resets fieldset { display: grid; gap: 10px; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.provider-account-resets label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.provider-account-resets :is(input[type="number"],select) { max-width: 100%; width: 120px; }
+.provider-account-resets button { justify-self: start; max-width: 100%; white-space: normal; }
+.composer-statusbar:has(.provider-account-resets-trigger) { flex-wrap: wrap; }
+.provider-account-resets-trigger { max-width: 100%; white-space: normal; font-size: 11px; }

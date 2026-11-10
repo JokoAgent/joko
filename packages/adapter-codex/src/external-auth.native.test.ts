@@ -7,11 +7,12 @@ import { CodexBackendAdapter } from "./adapter.js";
 import { AppServerHost } from "./host.js";
 import { useCodexHistoryHome } from "./external-auth.js";
 import type { JsonObject } from "./protocol.js";
+import { StdioJsonRpcTransport } from "./transport.js";
 
 const binary = process.env["JOKO_CODEX_HOSTED_TEST_BINARY"];
-function token(revision = "initial") {
-  return `test.${Buffer.from(JSON.stringify({ sub: "owned-user", email: "owned@example.invalid", revision, exp: 4102444800,
-    "https://api.openai.com/auth": { chatgpt_account_id: "owned-account", chatgpt_plan_type: "enterprise" } })).toString("base64url")}.not-a-signature`;
+function token(revision = "initial", accountId = "owned-account", email = "owned@example.invalid") {
+  return `test.${Buffer.from(JSON.stringify({ sub: "owned-user", email, revision, exp: 4102444800,
+    "https://api.openai.com/auth": { chatgpt_account_id: accountId, chatgpt_plan_type: "enterprise" } })).toString("base64url")}.not-a-signature`;
 }
 function environment(home: string) {
   return useCodexHistoryHome({ PATH: process.env["PATH"] ?? "", SystemRoot: process.env["SystemRoot"] ?? "",
@@ -19,6 +20,43 @@ function environment(home: string) {
 }
 
 describe.skipIf(!binary)("published native ephemeral account contract", () => {
+  it("pins reset control-plane auth to the current workspace in a separate published SDK without making quota or model requests", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-reset-identity-"))), auth = join(home, "auth.json");
+    const credentials = (account: string, email: string) => JSON.stringify({ auth_mode: "chatgpt", tokens: {
+      id_token: token("fixture", account, email), access_token: token("fixture", account, email), refresh_token: "private-original-refresh", account_id: account
+    } });
+    await writeFile(auth, credentials("first-workspace", "first@example.invalid"));
+    const original = new AppServerHost({ transport: { command: binary!, cwd: home, env: environment(home),
+      args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="file"'] } });
+    const observations: unknown[] = [], transports: StdioJsonRpcTransport[] = [];
+    const owner = new CodexBackendAdapter({ host: original, profileDirectory: home, instanceGeneration: 1, appServer: {
+      transportFactory: () => {
+        const transport = new StdioJsonRpcTransport({ command: binary!, cwd: home, env: environment(home),
+          args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="ephemeral"'] });
+        transports.push(transport); const request = transport.request.bind(transport);
+        transport.request = async (method, params, options = {}) => {
+          if (method !== "account/rateLimits/read") return request(method, params, options);
+          // Only auth is exercised against the binary. Quota facts use the
+          // documented RPC fixture, without sending an account HTTP request.
+          options.beforeDispatch?.(); await options.beforeDispatchAsync?.(options.signal ?? new AbortController().signal); options.beforeDispatch?.();
+          observations.push(await request("account/read", { refreshToken: false }));
+          return { rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1_900_000_000 } }, rateLimitResetCredits: { availableCount: 0, credits: [] } };
+        };
+        return transport;
+      }
+    } });
+    try {
+      await original.ensureStarted();
+      expect((await original.request("account/read", { refreshToken: false })).value).toMatchObject({ account: { email: "first@example.invalid" } });
+      const replacement = credentials("selected-workspace", "selected@example.invalid"); await writeFile(auth, replacement);
+      const facts = await owner.readAccountRateLimitResets({ providerId: "openai", assertCurrent() {} });
+      expect(facts.accountLabel).toBe("…kspace"); expect(facts.credits?.availableCount).toBe(0);
+      expect(observations).toEqual([expect.objectContaining({ account: expect.objectContaining({ type: "chatgpt", email: "selected@example.invalid" }) })]);
+      expect(await readFile(auth, "utf8")).toBe(replacement);
+      expect(original.isActiveGeneration(original.generation)).toBe(true); expect(transports).toHaveLength(1); expect(transports[0]!.running).toBe(false);
+    } finally { await owner.dispose(); await original.shutdown(); await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }); }
+  }, 60_000);
+
   it("installs a private API key in memory and leaves the native history credential file untouched", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-ephemeral-key-"))), auth = join(home, "auth.json");
     const sentinel = "unrelated private history credential sentinel"; await writeFile(auth, sentinel);

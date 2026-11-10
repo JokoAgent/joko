@@ -4,6 +4,7 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileAccountUsageStale, mobileAccountUsageWindows, mobileUsageTimestamp } from "./mobile-account-usage";
 import { mobileAccountUsageCopy } from "./mobile-account-usage-messages";
 import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
+import { MobileAccountResets } from "./MobileAccountResets";
 
 export function mobileModelAccountQuotaLabel(snapshot: ProviderAccountUsageSnapshot | undefined, modelId: string, now: number, locale: MobileSupportedLocale, failed = false): string | undefined {
   if (!snapshot) return undefined;
@@ -14,7 +15,7 @@ export function mobileModelAccountQuotaLabel(snapshot: ProviderAccountUsageSnaps
   return failed || mobileAccountUsageStale(snapshot, now) ? `${copy.stale} · ${text}` : text;
 }
 
-export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loading = false, failed = false, now, colors, locale }: {
+export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loading = false, failed = false, now, colors, locale, reset }: {
   readonly snapshot?: ProviderAccountUsageSnapshot;
   readonly modelId?: string;
   readonly providerName?: string;
@@ -23,6 +24,7 @@ export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loa
   readonly now: number;
   readonly colors: { readonly ink: string; readonly muted: string; readonly border: string; readonly negative?: string };
   readonly locale: MobileSupportedLocale;
+  readonly reset?: { readonly api: import("@joko/contracts").ProviderAccountResetApi; readonly backendId: string; readonly providerId: string };
 }) {
   const copy = mobileAccountUsageCopy(locale);
   const number = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
@@ -60,13 +62,14 @@ export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loa
     </View>}
     {credits && <Text style={[styles.note, { color: colors.muted }]}>{copy.credits} · {credits.unlimited === true ? copy.unlimited
       : credits.balance !== undefined ? credits.balance.slice(0, 128) : credits.hasCredits === true ? copy.available : credits.hasCredits === false ? copy.none : "—"}</Text>}
-    {hasResetCredits && <Text style={[styles.note, { color: colors.muted }]}>{copy.resetCredits.replace("{count}", number.format(resetCredits.availableCount))}
+    {hasResetCredits && !reset && <Text style={[styles.note, { color: colors.muted }]}>{copy.resetCredits.replace("{count}", number.format(resetCredits.availableCount))}
       {expiry === undefined ? "" : ` · ${copy.expiry.replace("{time}", time(expiry))}`}</Text>}
     {!snapshot && <Text style={[styles.note, { color: colors.muted }]}>{loading && !failed ? copy.reading : copy.unavailable}</Text>}
     {snapshot && windows.length === 0 && !extra && !credits && !hasResetCredits
       && <Text style={[styles.note, { color: colors.muted }]}>{copy.unavailable}</Text>}
     {snapshot && <Text style={[styles.note, { color: colors.muted }]}>{stale ? `${copy.stale} · ` : ""}
       {observedAt === undefined ? copy.freshness : copy.observed.replace("{time}", time(observedAt))}</Text>}
+    {reset && <MobileAccountResets {...reset} colors={colors} locale={locale} />}
   </View>;
 }
 

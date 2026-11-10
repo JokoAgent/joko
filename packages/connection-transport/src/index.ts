@@ -2,6 +2,7 @@ import { createConnectTransport as createWebTransport, type ConnectTransportOpti
 import { endpointConnector } from './channel.js';
 import { endpointOrigin, normalizeEndpointPublicKey, requireEndpointTrust, type EndpointTrust } from './trust.js';
 export * from './trust.js';
+export * from './provider-account-resets.js';
 
 export function createConnectionFetch(input: EndpointTrust, options: { readonly isolateFailures?: boolean } = {}): typeof globalThis.fetch {
   const origin = endpointOrigin(input.origin);

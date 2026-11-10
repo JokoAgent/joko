@@ -1,0 +1,40 @@
+export const providerAccountResetEnglish = {
+  "accountReset.title": "Earned quota resets", "accountReset.account": "Subscription account: {account}",
+  "accountReset.count": "Available reset credits: {count}", "accountReset.unknownCount": "Reset credit count is unavailable.",
+  "accountReset.use": "Use reset", "accountReset.retry": "Retry original reset", "accountReset.refresh": "Refresh",
+  "accountReset.confirm": "Confirm quota reset", "accountReset.confirmRetry": "Confirm original reset retry", "accountReset.cancel": "Cancel",
+  "accountReset.confirmBody": "Account {account}. Use one {credit}. Expiry: {expiry}. This may consume the selected earned credit.",
+  "accountReset.confirmRetryBody": "Confirm the original reset for account {account}. This retry keeps the original credit and redemption attempt.",
+  "accountReset.pending": "A previous reset has an unconfirmed result. Retry that reset to confirm it before using another credit.",
+  "accountReset.reading": "Reading account reset credits…", "accountReset.unavailable": "Account resets are unavailable. Refresh after checking the original account.",
+  "accountReset.unsupported": "This Provider does not support account resets.", "accountReset.failed": "Could not confirm this action. Refresh the account and retry the original reset if its result is unknown.",
+  "accountReset.expires": "Expires: {time}", "accountReset.granted": "Granted: {time}", "accountReset.credit": "Quota reset credit",
+  "accountReset.automatic": "Automatic use", "accountReset.enabled": "Use reset credits automatically",
+  "accountReset.lowQuota": "When the ordinary weekly quota is almost exhausted",
+  "accountReset.minimumDays": "Minimum days until weekly quota resets (0–365)",
+  "accountReset.expiring": "When a reset credit is about to expire", "accountReset.expiryMinutes": "Minutes before a credit expires",
+  "accountReset.help": "Runs on the service node for this account, including when this screen is closed. A future quota window must have some usage.",
+  "accountReset.save": "Save automatic settings", "accountReset.defaults": "Restore defaults", "accountReset.customized": "Custom settings",
+  "accountReset.lastUsed": "Last automatic use: {time}", "accountReset.invalid": "Enter whole days from 0 to 365 and select at least one rule before enabling automatic use.",
+  "accountReset.outcome.reset": "Quota reset completed.", "accountReset.outcome.nothingToReset": "No eligible quota window needs a reset.",
+  "accountReset.outcome.noCredit": "No reset credit is available.", "accountReset.outcome.alreadyRedeemed": "The original reset already completed."
+} as const;
+
+export const providerAccountResetChinese: Record<keyof typeof providerAccountResetEnglish, string> = {
+  "accountReset.title": "获赠额度重置", "accountReset.account": "订阅账户：{account}", "accountReset.count": "可用重置次数：{count}",
+  "accountReset.unknownCount": "暂时无法读取重置次数。", "accountReset.use": "使用重置", "accountReset.retry": "重试原重置", "accountReset.refresh": "刷新",
+  "accountReset.confirm": "确认重置额度", "accountReset.confirmRetry": "确认重试原重置", "accountReset.cancel": "取消",
+  "accountReset.confirmBody": "账户 {account}。使用一次{credit}。到期时间：{expiry}。此操作可能消耗所选获赠次数。",
+  "accountReset.confirmRetryBody": "确认账户 {account} 的原重置结果。本次重试保留原次数和兑换操作。",
+  "accountReset.pending": "上一次重置的结果尚未确认。请先重试原重置，确认结果后再使用其他次数。",
+  "accountReset.reading": "正在读取账户重置次数…", "accountReset.unavailable": "暂时无法使用账户重置。请检查原账户后刷新。",
+  "accountReset.unsupported": "此供应商不支持账户重置。", "accountReset.failed": "无法确认此操作。请刷新账户；若重置结果未知，请重试原重置。",
+  "accountReset.expires": "到期时间：{time}", "accountReset.granted": "获得时间：{time}", "accountReset.credit": "额度重置次数",
+  "accountReset.automatic": "自动使用", "accountReset.enabled": "自动使用重置次数", "accountReset.lowQuota": "普通周额度即将耗尽时",
+  "accountReset.minimumDays": "距离周额度恢复的最少天数（0–365）", "accountReset.expiring": "重置次数即将到期时", "accountReset.expiryMinutes": "到期前的分钟数",
+  "accountReset.help": "服务节点会为此账户检查，即使已关闭此界面。至少一个未来恢复的额度窗口须有实际用量。",
+  "accountReset.save": "保存自动设置", "accountReset.defaults": "恢复默认值", "accountReset.customized": "自定义设置",
+  "accountReset.lastUsed": "上次自动使用：{time}", "accountReset.invalid": "请输入 0–365 的整数天数，并在启用自动使用前选择至少一条规则。",
+  "accountReset.outcome.reset": "额度重置已完成。", "accountReset.outcome.nothingToReset": "没有需要重置的额度窗口。",
+  "accountReset.outcome.noCredit": "当前没有可用重置次数。", "accountReset.outcome.alreadyRedeemed": "原重置已经完成。"
+};

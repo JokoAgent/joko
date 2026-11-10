@@ -48,6 +48,7 @@ import {
   type BackendDescriptor,
   type KnownCapability,
   type ProviderAccountUsageSnapshot,
+  type NativeAccountRateLimitResetOperations,
   type TargetDescriptor
 } from "@joko/core";
 import { JOKO_API_VERSION } from "@joko/contracts";
@@ -59,6 +60,7 @@ import {
   type SshConfigFilePort
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
+import { OLLAMA_LOOPBACK_ORIGIN } from "@joko/local-model-runtime";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
 import { ContactStore, NotFoundError, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner, ProjectGitBootstrap } from "@joko/git-safety";
@@ -196,6 +198,7 @@ import { MessagingManager, type MessagingManagerOptions } from "./messaging-mana
 import type { WeChatAuthorizationPort } from "./wechat-authorization-manager.js";
 import type { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
 import { createManagedModelRuntimeSystem, type ManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
+import { MANAGED_LOCAL_PROVIDER_ID } from "./local-model-runtime-coordinator.js";
 import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { composeModelWorkingContext } from "./model-working-context-system.js";
 import { createOutboundStreamingFetch } from "./outbound-streaming-fetch.js";
@@ -254,6 +257,9 @@ import { CollaborationManager } from "./collaboration-manager.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { ExtensionTargets } from "./extension-targets.js";
 import { ObjectiveManager } from "./objective-manager.js";
+import { AccountResetError, ProviderAccountResets, accountResetQuotaRestored } from "./provider-account-resets.js";
+import { workerWorkspaceTarget } from "./collaboration-worker-workspace.js";
+import { materializedNativeStateObservation, nativeStateObservationIsCurrent, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY } from "./native-state-observation.js";
 import { CollaborationToolBridgeProvider } from "./collaboration-tool-provider.js";
 import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
@@ -536,6 +542,7 @@ export interface OrchestratorApplication {
   readonly collaborationGoals?: CollaborationGoalManager;
   /** Durable autonomous continuation authority for one existing Session. */
   readonly objectives?: ObjectiveManager;
+  readonly providerAccountResets?: ProviderAccountResets;
   /** Node-local structured authority for people and organizations. */
   readonly contacts?: ContactManager;
   /** Explicitly granted, encrypted node-to-node Contacts convergence owner. */
@@ -1537,6 +1544,9 @@ export async function createOrchestratorApplication(
   const managedProviderProxy = new ManagedProviderProxy({
     providers,
     fetch: createOutboundFetch(dependencies.resolveOutboundProxy),
+    fetchForRoute: route => route.backendId === claudeCodeBackendId && route.providerId === MANAGED_LOCAL_PROVIDER_ID
+      && route.api === "anthropic-messages" && route.baseUrl === OLLAMA_LOOPBACK_ORIGIN && route.requestPath === undefined
+      ? fetch : undefined,
     assertOwner: (owner) => {
       const session = store.getSession(owner.sessionId).descriptor;
       const target = store.getTarget(owner.targetId).descriptor;
@@ -1549,13 +1559,25 @@ export async function createOrchestratorApplication(
     }
   });
   await managedProviderProxy.start();
-  const managedRuntime = (backendId: string, generation: number, support: import("@joko/core").ProviderRuntimeSupport) => managedProviderProxy.createRuntime({
-    backendId, generation, support,
-    assertCurrent: () => {
-      const instance = backendInstances.get(backendId);
-      if (instance.state !== "available" || instance.generation !== generation) throw new Error("Managed Provider Backend instance is no longer current.");
-    }
-  });
+  const managedRuntime = (backendId: string, generation: number, support: import("@joko/core").ProviderRuntimeSupport) => {
+    const port = managedProviderProxy.createRuntime({
+      backendId, generation, support,
+      assertCurrent: () => {
+        const instance = backendInstances.get(backendId);
+        if (instance.state !== "available" || instance.generation !== generation) throw new Error("Managed Provider Backend instance is no longer current.");
+      }
+    });
+    if (backendId !== claudeCodeBackendId) return port;
+    return {
+      ...port,
+      prepare: async (owner: Parameters<typeof port.prepare>[0]) => {
+        if (owner.providerId === MANAGED_LOCAL_PROVIDER_ID && store.getTarget(owner.targetId).descriptor.remoteWorkspace !== undefined) {
+          throw new Error("The managed Ollama Provider requires a local Claude workspace.");
+        }
+        return port.prepare(owner);
+      }
+    };
+  };
   await backendInstances.provision([
     {
       instanceId: piBackendId,
@@ -1775,6 +1797,7 @@ export async function createOrchestratorApplication(
     return startupBackendCleanup;
   };
   let closed = false;
+  let providerAccountResets: ProviderAccountResets | undefined;
   let startupPartnerImports: PartnerImportManager | undefined;
   let startupPartnerHomes: PartnerHomeOwner | undefined;
   let startupPartnerImportRuntime: PartnerImportRuntime | undefined;
@@ -2228,6 +2251,47 @@ export async function createOrchestratorApplication(
     (sessionId, target, check) => sessionHost.refreshModelWorkingContexts([target], check, undefined, sessionId),
     sessionId => { const session = store.getSession(sessionId).descriptor; return store.findSessionRuntimePolicy(sessionId)?.policy === "review_read_only" || session.derivationOrigin?.sideChat === true && session.worktree === undefined; });
   objectives = new ObjectiveManager({ store, sessionHost });
+  providerAccountResets = new ProviderAccountResets({ store,
+    redactText: value => credentials.redactText(value),
+    warn: () => { if (!closed) store.appendDiagnostic({ severity: "warning", component: "provider-account",
+      code: "ACCOUNT_RESET_REFRESH_FAILED", message: "An account quota check could not be completed.", details: {} }); },
+    withAccount: (backendId, providerId, effect) => sessionHost.invokeBackendAdapter(backendId, async (adapter, generation) => {
+      const port = adapter as BackendAdapter & Partial<NativeAccountRateLimitResetOperations>;
+      const assertCurrent = () => {
+        const instance = backendInstances.get(backendId);
+        if (closed || instance.state !== "available" || instance.generation !== generation || backendInstances.adapter(backendId) !== adapter
+          || !instance.descriptor.capabilities.get("provider.account_resets")?.supported
+          || !instance.descriptor.providers?.some(provider => provider.providerId === providerId)
+          || providers.hasManagedProvider(backendId, providerId)) throw new AccountResetError("unsupported");
+      };
+      assertCurrent();
+      if (typeof port.readAccountRateLimitResets !== "function" || typeof port.consumeAccountRateLimitReset !== "function") throw new AccountResetError("unsupported");
+      return effect({ readAccountRateLimitResets: port.readAccountRateLimitResets.bind(adapter),
+        consumeAccountRateLimitReset: port.consumeAccountRateLimitReset.bind(adapter) }, assertCurrent);
+    }),
+    restored: async (backendId, providerId, facts, assertCurrent, signal) => {
+      await objectives!.resumeRestoredQuota(facts.accountKey, async (sessionId, assertWaiterCurrent) => {
+        const route = () => {
+          signal.throwIfAborted(); assertCurrent(); assertWaiterCurrent(); const session = store.getSession(sessionId).descriptor;
+          if (session.backendId !== backendId || session.remoteWorkspace !== undefined) return undefined;
+          const observation = materializedNativeStateObservation(store.findSetting("session", sessionId, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY)?.value);
+          const observed = observation && nativeStateObservationIsCurrent(observation, session.binding.generation, session.binding.opaqueRef) ? observation.state : undefined;
+          const actualProvider = session.providerId ?? observed?.providerId ?? (store.getBackend(backendId).descriptor.adapterKind === "codex" ? "openai" : undefined);
+          if (actualProvider !== providerId || observed?.providerId !== undefined && observed.providerId !== providerId) return undefined;
+          const target = workerWorkspaceTarget(store, session, sessionWorktrees.effectiveTarget(store.getSession(sessionId)));
+          if (target.backendId !== backendId || target.remoteWorkspace !== undefined) return undefined;
+          return { key: JSON.stringify([session.backendId, session.providerId, session.modelId, observed?.providerId, observed?.modelId, session.binding.generation, session.targetId, target.workspaceRoot]),
+            modelId: observed?.modelId ?? session.modelId };
+        };
+        const original = route(); if (original === undefined) return false;
+        return providerAccountResets!.options.withAccount(backendId, providerId, async (port, assertBackend) => {
+          const guard = () => { assertBackend(); if (route()?.key !== original.key) throw new Error("The original quota waiter route changed."); };
+          const current = await port.readAccountRateLimitResets({ providerId, assertCurrent: guard, signal }); guard();
+          return current.accountKey === facts.accountKey && accountResetQuotaRestored(current, original.modelId);
+        });
+      }, assertCurrent);
+    }
+  });
   let reconcileLearnedResourceRuntime: (backendId: string, resourceId: string, fence: symbol) => Promise<void> = async () => undefined;
   const skillLearning = new SkillLearningManager({
     store,
@@ -3120,7 +3184,7 @@ export async function createOrchestratorApplication(
     dataDirectory: config.dataDirectory,
     ownerId: serverId,
     ownerGeneration: durableRuntimeGeneration(),
-    onModelsChanged: refreshPiGeneration,
+    claudeBackendId: claudeCodeBackendId,
     onProviderChanged: async backendIds => {
       for (const backendId of backendIds) {
         if (backendId === providers.nativeAuthenticationBackendId) await refreshPiGeneration();
@@ -3271,6 +3335,7 @@ export async function createOrchestratorApplication(
       }
     }
     await objectives.initialize();
+    providerAccountResets.initialize();
     await messaging.initialize();
     await collaborationGoals.initialize();
     await partners.recoverPending();
@@ -3502,6 +3567,7 @@ export async function createOrchestratorApplication(
       try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
     };
     closed = true;
+    await attempt(() => providerAccountResets?.dispose());
     await attempt(closePersonalDevelopment);
     await attempt(() => taskSharingHome.dispose());
     await attempt(() => partnerImports?.close());
@@ -3695,6 +3761,7 @@ export async function createOrchestratorApplication(
     collaboration,
     collaborationGoals,
     objectives,
+    providerAccountResets,
     contacts,
     contactSync,
     partners,
@@ -3791,6 +3858,7 @@ export async function createOrchestratorApplication(
           try { await cleanup(); } catch (error) { failures.push(error); }
         };
         const cleanups = [...serviceCleanups];
+        await attempt(() => providerAccountResets?.dispose());
         serviceCleanups.clear();
         deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
@@ -3928,6 +3996,7 @@ export async function createOrchestratorApplication(
     const attempt = async (cleanup: () => unknown): Promise<void> => {
       try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
     };
+    await attempt(() => providerAccountResets?.dispose());
     await attempt(() => startupPartnerImports?.close());
     await attempt(() => startupPartnerHomes?.close());
     await attempt(closePersonalDevelopment);
