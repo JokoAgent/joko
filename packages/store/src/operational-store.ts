@@ -15,7 +15,7 @@ import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
 import { TaskShareStore, taskShareQueueLockOwner, type TaskShareGuestProof } from "./task-share-store.js";
-import { captureModelPriceReference, validateModelPriceOverrideValues, validModelSubstitution } from "@joko/core";
+import { captureModelPriceReference, parseNativeModelUsage, validateModelPriceOverrideValues, validModelSubstitution } from "@joko/core";
 import { SIDE_CHAT_HISTORY_BOUNDARY_KEY } from "./side-chat-history.js";
 import { parseCurrentRunUsageEventPayload, parseRunUsageSummary, runUsageSettingKey } from "./run-usage-shape.js";
 
@@ -21625,6 +21625,19 @@ function validateSubagentUsage(usage: SubagentRunDetail["usage"]): void {
   }
   if (usage.costUsd !== undefined && (!Number.isFinite(usage.costUsd) || usage.costUsd < 0)) {
     throw new StoreError("Subagent cost must be a finite non-negative number.");
+  }
+  const native = usage.nativeAccounting;
+  if (native !== undefined) {
+    if (typeof native !== "object" || native === null || Array.isArray(native) || !/^[A-Za-z0-9._:-]{1,128}$/u.test(native.sourceId)
+      || Object.keys(native).some(key => !["sourceId", "tokensComplete", "costComplete", "costEstimated", "models"].includes(key))
+      || [native.tokensComplete, native.costComplete, native.costEstimated].some(value => typeof value !== "boolean")) {
+      throw new StoreError("Subagent native accounting provenance is invalid.");
+    }
+    if (native.models !== undefined && !parseNativeModelUsage(native.models, {
+      inputTokens: usage.inputTokens ?? 0, outputTokens: usage.outputTokens ?? 0,
+      cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+      totalTokens: usage.totalTokens ?? 0, cost: usage.costUsd ?? 0
+    })) throw new StoreError("Subagent native per-model usage is invalid.");
   }
 }
 

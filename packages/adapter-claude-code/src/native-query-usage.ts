@@ -12,6 +12,12 @@ interface ModelUsage extends Tokens {
   readonly costMicros?: number;
 }
 
+interface ModelDelta extends Tokens {
+  readonly costMicros: number;
+  readonly tokensComplete: boolean;
+  readonly costComplete: boolean;
+}
+
 const tokenKeys = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] as const;
 const emptyTokens = (): Tokens => ({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
 const record = (value: unknown): Record<string, unknown> | undefined =>
@@ -30,6 +36,7 @@ export class NativeQueryUsage {
   #observed = new Map<string, Tokens>();
   #requests = new Map<string, { readonly model: string; readonly tokens: Tokens }>();
   #total: Tokens = emptyTokens();
+  #modelTotals = new Map<string, ModelUsage>();
   #costMicros = 0;
   #previousTotalCost?: number;
   #baselineUnavailable = false;
@@ -63,6 +70,7 @@ export class NativeQueryUsage {
     const totalCost = nativeCostMicros(value["total_cost_usd"]);
     let delta: Tokens = emptyTokens();
     let deltaCost = 0;
+    const modelDeltas = new Map<string, ModelDelta>();
     const modelSnapshotValid = models !== undefined && Object.keys(models).length <= 256;
     let tokensComplete = modelSnapshotValid;
     let costComplete = tokensComplete;
@@ -120,6 +128,9 @@ export class NativeQueryUsage {
         next.set(model, current);
         const moneyKnown = contributionScopeProven && current.costMicros !== undefined && (unbaselined
           ? startsAtZero || matches : prior.costMicros !== undefined);
+        modelDeltas.set(model, { ...contribution,
+          costMicros: moneyKnown ? unbaselined ? current.costMicros! : current.costMicros! - prior.costMicros! : 0,
+          tokensComplete: contributionScopeProven && (!unbaselined || startsAtZero || matches), costComplete: moneyKnown });
         if (moneyKnown) deltaCost = safeAdd(deltaCost, unbaselined ? current.costMicros! : current.costMicros! - prior.costMicros!);
         else costComplete = false;
         if (unbaselined && !startsAtZero && !matches) {
@@ -141,6 +152,7 @@ export class NativeQueryUsage {
     }
     for (const [model, tokens] of observed) if (!included.has(model)) {
       delta = add(delta, tokens);
+      if (this.#modelTotals.has(model) || modelDeltas.has(model) || modelDeltas.size < 256) modelDeltas.set(model, { ...tokens, costMicros: 0, tokensComplete: false, costComplete: false });
       tokensComplete = false;
       costComplete = false;
       firstSnapshotProven = false;
@@ -162,6 +174,14 @@ export class NativeQueryUsage {
       costComplete = true;
     }
     if (!moneyScopeProven) { deltaCost = 0; costComplete = false; }
+    const namedCost = [...modelDeltas.values()].reduce((sum, item) => safeAdd(sum, item.costMicros), 0);
+    const namedMoneyProven = moneyScopeProven && namedCost <= deltaCost;
+    for (const [model, item] of modelDeltas) {
+      const previous = this.#modelTotals.get(model);
+      if (!previous && this.#modelTotals.size >= 256) continue;
+      this.#modelTotals.set(model, { ...add(previous ?? emptyTokens(), item),
+        costMicros: safeAdd(previous?.costMicros ?? 0, namedMoneyProven ? item.costMicros : 0) });
+    }
     this.#previousTotalCost = totalCost;
     this.#previous = next;
     this.#baselineUnavailable = !modelSnapshotValid;
@@ -171,7 +191,13 @@ export class NativeQueryUsage {
     this.#hasContribution ||= tokenKeys.some(key => delta[key] > 0) || deltaCost > 0;
     if (!this.#hasContribution) return undefined;
     return { ...this.#total, totalTokens: safeAdd(this.#total.inputTokens, this.#total.outputTokens), cost: this.#costMicros / 1_000_000,
-      nativeAccounting: { sourceId: this.sourceId, tokensComplete, costComplete, costEstimated: true } };
+      nativeAccounting: { sourceId: this.sourceId, tokensComplete, costComplete, costEstimated: true,
+        models: [...this.#modelTotals].map(([modelId, totals]) => ({ modelId, inputTokens: totals.inputTokens, outputTokens: totals.outputTokens,
+          cacheReadTokens: totals.cacheReadTokens, cacheWriteTokens: totals.cacheWriteTokens,
+          totalTokens: safeAdd(totals.inputTokens, totals.outputTokens), cost: (totals.costMicros ?? 0) / 1_000_000,
+          tokensComplete: modelDeltas.get(modelId)?.tokensComplete ?? true,
+          costComplete: modelDeltas.has(modelId) ? namedMoneyProven && modelDeltas.get(modelId)!.costComplete : true
+        })) } };
   }
 }
 
