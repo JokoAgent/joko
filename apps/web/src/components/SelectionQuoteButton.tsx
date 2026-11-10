@@ -73,9 +73,14 @@ export function readSelectionInStream(
   const range = selection.getRangeAt(0);
   if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) return undefined;
 
-  const rawText = options.getQuoteText === undefined
-    ? selection.toString()
-    : safeQuoteText(options.getQuoteText);
+  const renderedFileText = options.sourcePath !== undefined
+    && (isRenderedFileQuoteNode(range.startContainer) || isRenderedFileQuoteNode(range.endContainer));
+  let rawText: string | null | undefined;
+  if (renderedFileText) {
+    rawText = selection.rangeCount === 1 ? selection.toString() : range.toString();
+  } else {
+    rawText = options.getQuoteText === undefined ? selection.toString() : safeQuoteText(options.getQuoteText);
+  }
   if (typeof rawText !== "string") return undefined;
   const text = boundedTimelineSelectionText(rawText);
   if (text === undefined) return undefined;
@@ -84,7 +89,7 @@ export function readSelectionInStream(
 
   let quote: ComposerSelectionQuoteDraft | undefined;
   if (options.sourcePath !== undefined) {
-    const metadata = safeQuoteMetadata(options.getQuoteMetadata);
+    const metadata = renderedFileText ? undefined : safeQuoteMetadata(options.getQuoteMetadata);
     quote = normalizeSelectionQuoteDrafts([{
       id: randomUuid(),
       kind: "file",
@@ -223,6 +228,11 @@ export function SelectionQuoteButton({
     </div>,
     ownerDocument.body
   );
+}
+
+function isRenderedFileQuoteNode(node: Node): boolean {
+  const element = node.nodeType === 1 ? node as Element : node.parentElement;
+  return Boolean(element?.closest("[data-workspace-file-quote-rendered]"));
 }
 
 function selectionSourceElement(node: Node): HTMLElement | null {
