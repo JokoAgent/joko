@@ -1,10 +1,11 @@
-import { AuthenticationState, CapabilitySupport, capabilityNames, type ProviderAccountUsageSnapshot,
+import { AuthenticationState, CapabilitySupport, ModelSourceKind, capabilityNames, type ProviderAccountUsageSnapshot,
   type ProviderAccountUsageWindow, type ProviderDescriptor } from "@joko/contracts";
 
 export interface MobileProviderUsageTransport {
   readonly ownerKey: string;
   readonly providers: readonly ProviderDescriptor[];
   readonly read: (backendId: string, providerId: string, signal: AbortSignal) => Promise<ProviderAccountUsageSnapshot | undefined>;
+  readonly resets?: import("@joko/contracts").ProviderAccountResetApi;
 }
 
 export interface MobileAccountUsageWindow {
@@ -14,6 +15,13 @@ export interface MobileAccountUsageWindow {
   readonly remainingPercent: number;
   readonly resetAt?: number;
   readonly model: boolean;
+}
+
+export function mobileAccountResetControls(transport: MobileProviderUsageTransport | undefined, backendId: string, providerId: string, sourceKind: ModelSourceKind | undefined) {
+  const api = transport?.resets;
+  if (!api || !transport || sourceKind !== ModelSourceKind.LOCAL) return undefined;
+  return transport.providers.some(provider => provider.backendId === backendId && provider.providerId === providerId
+    && provider.capabilities?.capabilities.some(capability => capability.name === "provider.account_resets" && capability.support === CapabilitySupport.SUPPORTED)) ? { api, backendId, providerId } : undefined;
 }
 
 export function mobileUsageProviderKey(provider: Pick<ProviderDescriptor, "backendId" | "providerId">): string {

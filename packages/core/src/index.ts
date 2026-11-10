@@ -1,5 +1,6 @@
 export * from "./adapter.js";
 export * from "./adapter-base.js";
+export * from "./account-rate-limit-resets.js";
 export * from "./audio-artifact.js";
 export * from "./errors.js";
 export * from "./events.js";

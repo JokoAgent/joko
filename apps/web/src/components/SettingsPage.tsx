@@ -3,6 +3,7 @@ import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import { LocalBackendRuntimeSetup } from "./LocalBackendRuntimeSetup.js";
 import { UsageHistorySection } from "./UsageHistorySection.js";
 import { ProviderAccountBalance } from "./ProviderAccountBalance.js";
+import { ProviderAccountResets } from "./ProviderAccountResets.js";
 import { NativeCatalogAdoptionRecovery } from "./NativeCatalogAdoptionRecovery.js";
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { capabilityNames } from "@joko/contracts";
@@ -3752,6 +3753,9 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
           {!selectedProviderEnabled && <div className="provider-detail__banner"><span>{t("settings.providerDisabledBody")}</span><Button onClick={() => runAction(`enable-provider:${selectedProviderEntry!.id}`, () => setSelectedProviderEnabled(true))}>{t("settings.providerEnableAction")}</Button></div>}
           {selectedProviderEnabled && providerRuntime?.error !== undefined && <div className="provider-detail__banner provider-detail__banner--error" role="alert"><span>{providerRuntime.error}</span>{providerRuntime.supportsModelRefresh === true && <Button disabled={refreshingProviderKey !== undefined} onClick={() => void refreshModels(selectedProviderEntry!)}>{t("common.retry")}</Button>}</div>}
           {selectedProviderEnabled && <div className="provider-detail__scroll">
+            {relatedProviderRuntimes.filter(runtime => runtime.capabilities.has("provider.account_resets")).map(runtime => <section key={`resets:${runtime.backendId}`} className="provider-detail-section">
+              <ProviderAccountResets controller={controller} runtime={runtime} locale={locale} t={t} />
+            </section>)}
             {relatedProviderRuntimes.filter(runtime => runtime.capabilities.has("provider.account_balance")).map(runtime => <section key={runtime.backendId} className="provider-detail-section">
               <strong>{snapshot.backends.find(backend => backend.id === runtime.backendId)?.name ?? runtime.backendId}</strong>
               <ProviderAccountBalance controller={controller} runtime={runtime} t={t} />

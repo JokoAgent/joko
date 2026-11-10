@@ -18,8 +18,10 @@ export async function readCodexOwnedAuthentication(home: string, environmentApiK
     handle = await open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const before = await handle.stat();
     if (!before.isFile() || before.dev !== pathInfo.dev || before.ino !== pathInfo.ino || before.size > 1024 * 1024) throw new Error();
-    const bytes = await handle.readFile(), after = await handle.stat();
-    if (bytes.byteLength > 1024 * 1024 || before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw new Error();
+    const bytes = await handle.readFile(), after = await handle.stat(), currentPath = await lstat(target);
+    if (bytes.byteLength > 1024 * 1024 || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+      || !currentPath.isFile() || currentPath.isSymbolicLink() || currentPath.dev !== after.dev || currentPath.ino !== after.ino
+      || currentPath.size !== after.size || currentPath.mtimeMs !== after.mtimeMs) throw new Error();
     const decoded: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     if (!record(decoded)) throw new Error();
     const tokens = decoded["tokens"];

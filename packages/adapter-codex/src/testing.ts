@@ -135,6 +135,8 @@ export class FakeCodexAppServer {
   threadNextCursor: JsonValue = null;
   threadListPages: readonly (readonly JsonObject[])[] | undefined;
   account: JsonObject | null = { type: "chatgpt", email: null, planType: "plus" };
+  resetCreditOutcome: JsonValue = "reset";
+  loseNextResetCreditResponse = false;
   accountRateLimits: JsonObject = {
     rateLimits: {
       planType: "plus",
@@ -370,8 +372,14 @@ export class FakeCodexAppServer {
         return { account: this.account, requiresOpenaiAuth: true };
       case "account/rateLimits/read":
         return this.accountRateLimits;
+      case "account/rateLimitResetCredit/consume":
+        if (this.loseNextResetCreditResponse) {
+          this.loseNextResetCreditResponse = false;
+          throw new TransportFault("request_timeout", "The reset response was lost.", { stateMayHaveChanged: true });
+        }
+        return { outcome: this.resetCreditOutcome };
       case "account/login/start":
-        return record["type"] === "chatgptDeviceCode"
+        return record["type"] === "chatgptAuthTokens" ? { type: "chatgptAuthTokens" } : record["type"] === "chatgptDeviceCode"
           ? { type: "chatgptDeviceCode", loginId: "login-device", verificationUrl: "https://example.invalid/device", userCode: "ABCD" }
           : record["type"] === "chatgpt"
             ? { type: "chatgpt", loginId: "login-browser", authUrl: "https://example.invalid/auth" }

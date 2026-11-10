@@ -248,6 +248,8 @@ import {
   type ProviderAccountUsageSnapshot as NativeProviderAccountUsageSnapshot
 } from "./provider-account-usage.js";
 import type { ProviderAccountBalanceProvider, AccountBalanceResult } from "./provider-account-balance.js";
+import { AccountResetError, type ProviderAccountResets, type AccountResetResult, type AccountResetRequest } from "./provider-account-resets.js";
+import { accountResetResultFromRecord, toProtoAccountResetResult, toProtoAccountResetState, unavailableAccountResetState } from "./provider-account-resets-wire.js";
 import { SessionContextBudgetError, type SessionContextBudgetCoordinator, type SessionContextBudgetView } from "./session-context-budget.js";
 import {
   MCP_STDIO_ARGUMENT_CREDENTIAL_ERROR,
@@ -595,6 +597,7 @@ export interface ConnectServiceDependencies {
   readonly providerAuth?: PiProviderAuthSupervisor;
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
   readonly providerAccountBalance?: ProviderAccountBalanceProvider;
+  readonly providerAccountResets?: ProviderAccountResets;
   readonly sessionContextBudget?: SessionContextBudgetCoordinator;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
@@ -1071,6 +1074,7 @@ interface OperationOutcome {
     readonly userCode?: string;
     readonly expiresAt?: number;
   };
+  readonly providerAccountReset?: AccountResetResult;
   readonly browserTransferBinaryBase64?: string;
   readonly skillReplacedId?: string;
   readonly skillRecoveryId?: string;
@@ -1394,6 +1398,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.diagnosticsBundles === undefined ? {} : { diagnosticsBundles: application.diagnosticsBundles }),
     ...(application.providerAuth === undefined ? {} : { providerAuth: application.providerAuth }),
     ...(application.providerAccountUsage === undefined ? {} : { providerAccountUsage: application.providerAccountUsage }),
+    ...(application.providerAccountResets === undefined ? {} : { providerAccountResets: application.providerAccountResets }),
     ...(application.providerAccountBalance === undefined ? {} : { providerAccountBalance: application.providerAccountBalance }),
     ...(application.sessionContextBudget === undefined ? {} : { sessionContextBudget: application.sessionContextBudget }),
     ...(application.messageSearch === undefined ? {} : { messageSearch: application.messageSearch }),
@@ -2035,6 +2040,11 @@ export function createConnectServices(application: OrchestratorApplication, proj
         if (existing.bodyHash !== presentedHash) {
           throw new OperationConflictError(request.operationId, existing.bodyHash, presentedHash);
         }
+        if (existing.status === "started" && request.mutation.payload.case === "consumeProviderAccountReset" && dependencies.providerAccountResets) {
+          const resumed = await consumeProviderAccountResetOperation(dependencies, request.operationId, stableConnection(authenticated), request.mutation, existing);
+          operationMutations.set(existing.id, publicMutation); operationOutcomes.set(existing.id, resumed.outcome);
+          return { operation: toProtoOperation(dependencies, resumed.record, publicMutation, resumed.outcome, now()) };
+        }
         const existingOutcome = operationOutcomes.get(existing.id) ?? outcomeFromRecord(existing);
         operationMutations.set(existing.id, publicMutation);
         if (existing.status !== "started") operationOutcomes.set(existing.id, existingOutcome);
@@ -2382,6 +2392,14 @@ export function createConnectServices(application: OrchestratorApplication, proj
         return { result: mapAccountBalance(result) };
       } finally { stop(); }
     },
+    getProviderAccountResetState: (request, context) => readAuthorized(context, async (connection, signal) => {
+      const backendId = nonBlankRequest(request.backendId, "backend_id"), providerId = nonBlankRequest(request.providerId, "provider_id");
+      dependencies.store.getBackend(backendId);
+      if (!dependencies.providerAccountResets || managedProviderCatalogApplies(dependencies, backendId, providerId)) return { state: unavailableAccountResetState(backendId, providerId, true) };
+      const assertCurrent = () => { signal.throwIfAborted(); dependencies.connections.fence(connection); };
+      try { return { state: toProtoAccountResetState(await dependencies.providerAccountResets.read(backendId, providerId, assertCurrent, signal)) }; }
+      catch (error) { assertCurrent(); return { state: unavailableAccountResetState(backendId, providerId, error instanceof AccountResetError && error.reason === "unsupported") }; }
+    }),
     getProviderUsage: (request, context) => readAuthorized(context, async (_connection, signal) => {
       const records = request.backendId === ""
         ? dependencies.store.listBackends().filter((record) => backendOwnsUsageProvider(dependencies, record.descriptor, request.providerId))
@@ -6802,6 +6820,9 @@ function operationResult(
     case: "acknowledgement",
     value: create(contract.AcknowledgementSchema, { accepted: outcome.accepted })
   };
+  if (outcome.accepted && outcome.providerAccountReset) return create(contract.OperationResultSchema, {
+    payload: { case: "providerAccountReset", value: toProtoAccountResetResult(outcome.providerAccountReset) }
+  });
   if (outcome.accepted && outcome.pickedDirectory) {
     const value = outcome.pickedDirectory;
     return create(contract.OperationResultSchema, { payload: { case: "pickedDirectory", value: create(contract.ExtensionPickedDirectoryDepositSchema, {
@@ -7369,6 +7390,7 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
     const memoryReset = response["memoryReset"];
     return {
       accepted: response["accepted"],
+      ...(response["providerAccountReset"] === undefined ? {} : { providerAccountReset: accountResetResultFromRecord(response["providerAccountReset"]) }),
       ...(response["pickedDirectory"] === undefined ? {} : { pickedDirectory: pickedExtensionDirectoryFromRecord(response["pickedDirectory"]) }),
       resultCase: stringValue(response["resultCase"]) as OperationOutcome["resultCase"],
       entityId: stringValue(response["entityId"]),
@@ -9693,6 +9715,12 @@ async function backendProviderDescriptorWithAccountUsage(
   signal?: AbortSignal
 ): Promise<contract.ProviderDescriptor> {
   provider = configureProviderCredentialSurfaces(dependencies, descriptor, provider);
+  if (dependencies.providerAccountResets && descriptor.capabilities.get("provider.account_resets")?.supported === true
+    && !managedProviderCatalogApplies(dependencies, descriptor.id, providerId)) provider = create(contract.ProviderDescriptorSchema, {
+      ...provider, capabilities: create(contract.CapabilityManifestSchema, { schemaVersion: "joko.provider.v1",
+        revision: toProtoRevision(revision), capabilities: [...(provider.capabilities?.capabilities ?? []).filter(item => item.name !== "provider.account_resets"),
+          { name: "provider.account_resets", support: contract.CapabilitySupport.SUPPORTED, reason: "" }] })
+    });
   if (!backendProviderAccountUsageAvailable(dependencies, descriptor, providerId)) return provider;
   const accountUsage = await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
   const capabilities = [
@@ -20938,6 +20966,25 @@ async function dispatchMutation(
         }
       });
     }
+    case "consumeProviderAccountReset":
+      return consumeProviderAccountResetOperation(dependencies, operationId, connection, mutation);
+    case "updateProviderAccountResetSettings": {
+      const control = dependencies.providerAccountResets;
+      if (!control || managedProviderCatalogApplies(dependencies, payload.value.backendId, payload.value.providerId)) throw new ConnectError("Account resets are unavailable for this Provider.", Code.Unimplemented);
+      const input = payload.value;
+      if (input.expectedSettingsRevision === undefined || !/^[a-f0-9]{64}$/u.test(input.accountKey)) throw invalidArgument("The account reset settings owner is required.");
+      let settings: contract.ProviderAccountResetAutomaticSettings | null;
+      if (input.update.case === "restoreDefaults" && input.update.value) settings = null;
+      else if (input.update.case === "settings") settings = input.update.value;
+      else throw invalidArgument("Account reset settings or restore_defaults is required.");
+      const prepared = await control.prepareSettings({ backendId: nonBlankRequest(input.backendId, "backend_id"), providerId: nonBlankRequest(input.providerId, "provider_id"),
+        accountKey: input.accountKey, expectedRevision: input.expectedSettingsRevision.value, settings: settings === null ? null : {
+          enabled: settings.enabled, lowQuota: settings.lowQuota, minimumDays: settings.minimumDays, expiring: settings.expiring, expiryMinutes: settings.expiryMinutes
+        } }, () => dependencies.connections.fence(connection));
+      return presented(await dependencies.sessionHost.mutate({ operationId, connection, kind: payload.case, body: mutation,
+        commit: () => { prepared(); return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome; },
+        afterCommit: () => { void control.checkAutomatic(); } }));
+    }
     case "beginProviderLogin": {
       const backendId = nonBlankRequest(payload.value.backendId, "backend_id");
       const providerId = nonBlankRequest(payload.value.providerId, "provider_id");
@@ -23233,6 +23280,43 @@ function withOperationPreconditions(
 
 function presented(execution: OperationExecution<OperationOutcome>): PresentedOperation {
   return { record: execution.operation, outcome: execution.value };
+}
+
+async function consumeProviderAccountResetOperation(
+  dependencies: ConnectServiceDependencies, operationId: string, connection: ConnectionRecord, mutation: contract.OperationMutation,
+  existing?: OperationRecord<unknown>
+): Promise<PresentedOperation> {
+  if (mutation.payload.case !== "consumeProviderAccountReset") throw invalidArgument("The account reset mutation is required.");
+  const control = dependencies.providerAccountResets, payload = mutation.payload.value;
+  const input: AccountResetRequest = { backendId: nonBlankRequest(payload.backendId, "backend_id"), providerId: nonBlankRequest(payload.providerId, "provider_id"), accountKey: payload.accountKey, offerId: payload.offerId };
+  if (!control || managedProviderCatalogApplies(dependencies, input.backendId, input.providerId)) throw new ConnectError("Account resets are unavailable for this Provider.", Code.Unimplemented);
+  const assertCurrent = () => { dependencies.connections.fence(connection); validatePreconditions(dependencies.store, mutation); };
+  if (existing) {
+    try {
+      assertCurrent(); control.validateRequest(input);
+      const result = await control.consume(input, operationId, assertCurrent); assertCurrent();
+      return presented(dependencies.store.completeAuthorizedDeferredEffectOperation<OperationOutcome>(connection.id, connection.authKeyDigest,
+        operationId, existing.bodyHash, () => { assertCurrent(); return { accepted: true, resultCase: "providerAccountReset", providerAccountReset: result }; }));
+    } catch (error) {
+      const uncertain = control.preserveFailure(input), failure = accountResetFailure(error, uncertain);
+      if (!uncertain) dependencies.store.failEffectOperation(operationId, existing.bodyHash, failure);
+      throw failure;
+    }
+  }
+  assertCurrent(); control.validateRequest(input); let result: AccountResetResult | undefined;
+  return presented(await dependencies.sessionHost.mutate({ operationId, connection, kind: "consumeProviderAccountReset", body: mutation,
+    precondition: assertCurrent,
+    effect: async () => { try { result = await control.consume(input, operationId, assertCurrent); } catch (error) { throw accountResetFailure(error, control.preserveFailure(input)); } },
+    preserveClaimOnEffectFailure: () => control.preserveFailure(input),
+    commit: () => { if (!result) throw new StoreError("The account reset has no native receipt."); return { accepted: true, resultCase: "providerAccountReset", providerAccountReset: result } satisfies OperationOutcome; }
+  }));
+}
+function accountResetFailure(error: unknown, uncertain: boolean): JokoError {
+  if (error instanceof JokoError) return uncertain && !error.publicError.stateMayHaveChanged
+    ? new JokoError({ ...error.publicError, stateMayHaveChanged: true, retryable: true, recovery: "Keep the original reset offer and operation identity until its result is confirmed." }) : error;
+  return new JokoError({ code: error instanceof AccountResetError ? `ACCOUNT_RESET_${error.reason.toUpperCase()}` : "ACCOUNT_RESET_UNCONFIRMED",
+    message: uncertain ? "The original account reset could not be confirmed." : "The account reset was not dispatched.", phase: "dispatch", retryable: true,
+    stateMayHaveChanged: uncertain, recovery: uncertain ? "Retry the same reset offer with its original operation identity." : "Refresh the original account and reset offers before trying again." });
 }
 
 async function effectOperation(

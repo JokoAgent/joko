@@ -11400,7 +11400,19 @@ export class MobileClient {
     if (!credential || !ownerKey || !session || !this.network.getProviderUsage) return undefined;
     const providers = this.#state.owner!.providers.filter(provider => provider.backendId === session.backendId
       && mobileProviderUsageSupported(provider));
-    return { ownerKey, providers, read: async (backendId, providerId, signal) => {
+    const selectedSource = this.#state.owner?.models.find(model => model.backendId === session.backendId && model.key?.providerId === session.model?.model?.providerId
+      && model.key?.modelId === session.model?.model?.modelId)?.source;
+    const resets = session.location?.kind.case === "serviceNode" && selectedSource?.kind === ModelSourceKind.LOCAL ? this.network.providerAccountResets?.(credential, ownerKey, this.newId, (backendId, providerId) => {
+      const source = this.#state.owner?.models.find(model => model.backendId === session.backendId && model.key?.providerId === session.model?.model?.providerId
+        && model.key?.modelId === session.model?.model?.modelId)?.source;
+      if (this.#disposed || this.#credential !== credential || this.#taskProviderUsageOwnerKey() !== ownerKey
+        || source?.kind !== ModelSourceKind.LOCAL || source.nodeId !== selectedSource.nodeId
+        || !providers.some(provider => provider.backendId === backendId && provider.providerId === providerId
+          && provider.capabilities?.capabilities.some(capability => capability.name === "provider.account_resets" && capability.support === CapabilitySupport.SUPPORTED))) {
+        throw new Error("The original account reset task owner changed.");
+      }
+    }) : undefined;
+    return { ownerKey, providers, ...(resets ? { resets } : {}), read: async (backendId, providerId, signal) => {
       const current = (): void => {
         signal.throwIfAborted();
         if (this.#disposed || this.#credential !== credential || this.#taskProviderUsageOwnerKey() !== ownerKey) {
@@ -11429,7 +11441,14 @@ export class MobileClient {
     };
     const captured = key();
     if (!credential || !captured || !this.network.getProviderUsage) return undefined;
-    return { ...captured, read: async (backendId, providerId, signal) => {
+    const target = this.#state.owner?.targets.find(value => value.targetId === targetId);
+    const resets = target?.location?.kind.case === "serviceNode" ? this.network.providerAccountResets?.(credential, captured.ownerKey, this.newId, (backendId, providerId) => {
+      if (this.#disposed || key()?.ownerKey !== captured.ownerKey || !captured.providers.some(provider => provider.backendId === backendId && provider.providerId === providerId
+        && provider.capabilities?.capabilities.some(capability => capability.name === "provider.account_resets" && capability.support === CapabilitySupport.SUPPORTED))) {
+        throw new Error("The original account reset draft owner changed.");
+      }
+    }) : undefined;
+    return { ...captured, ...(resets ? { resets } : {}), read: async (backendId, providerId, signal) => {
       const current = () => { signal.throwIfAborted(); if (this.#disposed || key()?.ownerKey !== captured.ownerKey) throw new Error("The account usage draft owner changed."); };
       current();
       if (captured.providers.filter(provider => provider.backendId === backendId && provider.providerId === providerId).length !== 1) throw new Error("The account usage Provider is unavailable.");

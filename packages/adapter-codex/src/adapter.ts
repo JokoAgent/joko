@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises
 import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, normalize, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { createChildRuntimeEnvironment } from "@joko/runtime-governance";
 import {
   CAPABILITIES,
   catalogModelReferencePricing,
@@ -51,6 +52,11 @@ import {
   type NativeSessionNavigationResult,
   type NativeMemoryResetResult,
   type NativeMemoryStatus,
+  type NativeAccountRateLimitResetOperations,
+  type NativeAccountRateLimitResetRead,
+  type NativeAccountRateLimitResetSnapshot,
+  type NativeAccountRateLimitResetConsume,
+  type NativeAccountRateLimitResetOutcome,
   type NativeTextInferenceInput,
   type NativeHistoryProjection,
   type NativeNavigationTarget,
@@ -86,6 +92,7 @@ import {
 } from "./protocol.js";
 import { codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
 import { readCodexNativeSessionPreview } from "./native-session-preview.js";
+import { codexAccountResetFacts } from "./account-rate-limit-resets.js";
 import {
   inspectCodexCatalogMaterialization,
   materializeCodexCatalogSession,
@@ -131,6 +138,7 @@ import { CodexNativeExecutionEnvironment, type CodexNativeExecutionOptions, type
 import { nativeWebPolicy, nativeWebPolicyConfiguration } from "./native-web-policy.js";
 import { withoutCodexSpawnModelOverrides } from "./hosted-guest.js";
 import { captureCodexHostedAuthentication, readCodexOwnedAuthentication, type CodexHostedAuthenticationAuthority } from "./hosted-authentication.js";
+import { useCodexHistoryHome } from "./external-auth.js";
 
 export interface CodexAdapterOptions extends Omit<CodexInputResolvers, "resolveSkillMention"> {
   readonly taskShellEnv?: (context: AdapterContext) => Readonly<Record<string, string>>;
@@ -272,7 +280,7 @@ export type CodexLoginResult =
   | { readonly method: "device_code"; readonly loginId: string; readonly url: string; readonly userCode: string };
 
 /** Adapter-local port that callers can capability-detect without branching on a Backend ID. */
-export interface CodexNativeAccountOperations {
+export interface CodexNativeAccountOperations extends NativeAccountRateLimitResetOperations {
   captureHostedAuthentication(): Promise<CodexHostedAuthenticationAuthority>;
   readAccount(refreshToken?: boolean): Promise<CodexAccountSnapshot>;
   readAccountUsage(providerId: string, signal?: AbortSignal): Promise<CodexAccountUsageSnapshot>;
@@ -581,6 +589,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #host: AppServerHost;
   readonly #ownsHost: boolean;
   readonly #ownedHostOptions: AppServerHostOptions | undefined;
+  readonly #accountHostOptions: AppServerHostOptions;
+  readonly #accountResetHosts = new Set<AppServerHost>();
+  #accountResetQueue: Promise<void> = Promise.resolve();
+  #accountResetPending = 0;
   readonly #resolvers: CodexInputResolvers;
   readonly #translator = new CodexEventTranslator();
   readonly #maximumModels: number;
@@ -670,6 +682,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#host = options.host ?? new AppServerHost(ownedHostOptions);
     this.#ownsHost = options.host === undefined;
     this.#ownedHostOptions = options.host === undefined ? ownedHostOptions : undefined;
+    this.#accountHostOptions = options.appServer ?? {};
     this.#smartRoutingUnavailableReason = options.smartRouting?.unavailableReason
       ?? "Smart subagent routing is not configured on this Orchestrator node.";
     this.#smartRoutingRuntimeRevision = options.smartRouting?.revision ?? "unconfigured";
@@ -805,7 +818,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Use a service node with exact local process inspection support."
       });
     }
-    const usage = await host.inspectProcessUsage();
+    const usage = (await Promise.all([host, ...this.#accountResetHosts].filter(candidate => candidate.processInspectionSupported)
+      .map(candidate => candidate.inspectProcessUsage()))).flat();
     if (host !== this.#host) return { capturedAt: this.#now(), processes: [] };
     return {
       capturedAt: this.#now(),
@@ -2896,6 +2910,134 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     };
   }
 
+  async readAccountRateLimitResets(input: NativeAccountRateLimitResetRead): Promise<NativeAccountRateLimitResetSnapshot> {
+    return this.#withAccountResetControl(input, async () => {
+      let owner = await this.#accountResetOwner(input);
+      const read = async () => {
+        const response = await owner.host.request("account/rateLimits/read", undefined, { signal: input.signal,
+          beforeDispatch: owner.assertCurrent, beforeDispatchAsync: async () => { await owner.readAccount(); } });
+        const account = await owner.readAccount();
+        const usage = { providerId: input.providerId, ...parseAccountRateLimits(response.value, this.#now()) };
+        owner.assertCurrent(); return { providerId: input.providerId, ...account, usage, ...codexAccountResetFacts(response.value, usage) };
+      };
+      try {
+        try { return await read(); }
+        catch (error) {
+          if (!(error instanceof RpcRemoteFault) || !error.accountTokenExpired) throw error;
+          const account = await owner.readAccount(); await owner.refreshAuthentication(); await owner.close();
+          owner = await this.#accountResetOwner(input, account.accountKey);
+          return await read();
+        }
+      } finally { await owner.close().catch(() => undefined); }
+    });
+  }
+
+  async consumeAccountRateLimitReset(input: NativeAccountRateLimitResetConsume): Promise<NativeAccountRateLimitResetOutcome> {
+    if (!/^[a-f0-9]{64}$/u.test(input.accountKey) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(input.idempotencyKey)
+      || input.creditId !== undefined && (!input.creditId.trim() || input.creditId.length > 1024 || /[\0\r\n]/u.test(input.creditId))) throw new TypeError("The account reset attempt is invalid.");
+    let mayHaveDispatched = false;
+    try {
+      return await this.#withAccountResetControl(input, async () => {
+        const owner = await this.#accountResetOwner(input, input.accountKey);
+        try {
+          const response = await owner.host.request("account/rateLimitResetCredit/consume", { idempotencyKey: input.idempotencyKey,
+            ...(input.creditId === undefined ? {} : { creditId: input.creditId }) }, { mutation: true, signal: input.signal,
+            beforeDispatch: owner.assertCurrent, beforeDispatchAsync: async () => { await owner.readAccount(); owner.assertCurrent(); mayHaveDispatched = true; } });
+          const outcome = objectValue(response.value, "account reset outcome")["outcome"];
+          if (outcome !== "reset" && outcome !== "nothingToReset" && outcome !== "noCredit" && outcome !== "alreadyRedeemed") throw new ProtocolShapeError("account reset outcome is invalid");
+          await owner.readAccount(); owner.assertCurrent(); return outcome;
+        } finally { await owner.close().catch(() => undefined); }
+      });
+    } catch {
+      throw adapterError({ code: "CODEX_ACCOUNT_RESET_FAILED", message: "The account reset could not be confirmed.", phase: "dispatch", retryable: true,
+        stateMayHaveChanged: mayHaveDispatched, recovery: "Keep the original reset offer and retry it after verifying the same account." });
+    }
+  }
+
+  async #withAccountResetControl<T>(input: NativeAccountRateLimitResetRead, action: () => Promise<T>): Promise<T> {
+    this.#assertOpen(); input.signal?.throwIfAborted(); input.assertCurrent();
+    if (this.#accountResetPending >= 32) throw adapterError({ code: "CODEX_ACCOUNT_CONTROL_BUSY", message: "The native account control plane is busy.",
+      phase: "probe", retryable: true, recovery: "Wait for the original account checks to finish, then refresh." });
+    const epoch = this.#nativeAuthenticationEpoch; this.#accountResetPending++;
+    const flight = this.#accountResetQueue.then(async () => {
+      // A failed close keeps its process owner. Do not start another control SDK
+      // until the preceding owned process has confirmed its exit.
+      try { for (const host of this.#accountResetHosts) await this.#closeAccountResetHost(host); }
+      catch { throw adapterError({ code: "CODEX_ACCOUNT_CONTROL_BUSY", message: "The previous native account check is still closing.",
+        phase: "probe", retryable: true, recovery: "Wait for the original account check to close, then refresh." }); }
+      this.#assertOpen(); input.signal?.throwIfAborted(); input.assertCurrent(); this.#assertNativeAuthenticationAdmission(epoch); return action();
+    });
+    this.#accountResetQueue = flight.then(() => undefined, () => undefined);
+    try { return await flight; } finally { this.#accountResetPending--; }
+  }
+
+  async #closeAccountResetHost(host: AppServerHost): Promise<void> {
+    // forceShutdown also retries an unconfirmed previous close. These isolated
+    // hosts own no model threads; completed SDK receipts survive cleanup faults.
+    await host.forceShutdown(); this.#accountResetHosts.delete(host);
+  }
+
+  async #accountResetOwner(input: NativeAccountRateLimitResetRead, expectedAccountKey?: string) {
+    this.#assertOpen(); input.signal?.throwIfAborted(); input.assertCurrent();
+    if (this.#hosted || input.providerId !== this.#providerId || !this.#ownsHost
+      && this.#accountHostOptions.transportFactory === undefined && this.#accountHostOptions.transport?.command === undefined) throw new Error("The selected native account reset is unavailable.");
+    const generation = await this.#ensureLocalHostStarted(), originalHost = this.#host, epoch = this.#nativeAuthenticationEpoch;
+    const home = originalHost.initializeResult?.codexHome;
+    if (!home || versionFromUserAgent(originalHost.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) throw new Error("The selected native account reset protocol is unavailable.");
+    const assertCurrent = () => {
+      this.#assertOpen(); input.signal?.throwIfAborted(); input.assertCurrent(); this.#assertNativeAuthenticationAdmission(epoch);
+      if (this.#host !== originalHost || !originalHost.isActiveGeneration(generation) || this.#account?.authenticationState === "pending") throw nativeAuthenticationObservationStale();
+    };
+    const environment = this.#ownedHostOptions?.transport?.env ?? process.env, environmentApiKey = environment["OPENAI_API_KEY"] ?? environment["CODEX_API_KEY"];
+    let originalKey = expectedAccountKey;
+    const readAccount = async () => {
+      assertCurrent(); const account = await readCodexOwnedAuthentication(home, environmentApiKey); assertCurrent();
+      if (account.kind !== "chatgpt") throw new Error("The account reset requires the original subscription account.");
+      const accountKey = createHash("sha256").update(JSON.stringify([this.id, this.#providerId, account.principal])).digest("hex");
+      if (originalKey !== undefined && originalKey !== accountKey) throw new Error("The original reset account changed.");
+      originalKey = accountKey; return { accountKey, accountLabel: `…${account.tokens.chatgptAccountId.slice(-6)}` };
+    };
+    await readAccount();
+    const authority = await this.captureHostedAuthentication(); assertCurrent();
+    if (authority.kind !== "chatgpt") throw new Error("The account reset requires the original subscription account.");
+    const base = this.#accountHostOptions, transport = base.transport ?? {};
+    let accessTokenUsed: string | undefined;
+    const environmentValues: Record<string, string> = {};
+    for (const [name, value] of Object.entries(transport.env ?? createChildRuntimeEnvironment().environment)) if (value !== undefined) environmentValues[name] = value;
+    // A control-plane request has its own frozen account. It cannot borrow the
+    // model host's cached auth or the managed Provider's proxy credentials.
+    const host = new AppServerHost({
+      ...(base.transportFactory === undefined ? {} : { transportFactory: base.transportFactory }),
+      ...(base.clientName === undefined ? {} : { clientName: base.clientName }),
+      ...(base.clientTitle === undefined ? {} : { clientTitle: base.clientTitle }),
+      ...(base.clientVersion === undefined ? {} : { clientVersion: base.clientVersion }),
+      requireEphemeralAuth: true,
+      externalAuth: { readTokens: async (refresh, staleAccessToken) => {
+        await readAccount(); const tokens = await authority.readTokens(refresh, staleAccessToken); await readAccount(); accessTokenUsed = tokens.accessToken; return tokens;
+      } },
+      transport: { ...(transport.command === undefined ? {} : { command: transport.command }), cwd: home,
+        args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="ephemeral"'],
+        env: useCodexHistoryHome(environmentValues, home),
+        ...(transport.processOwner === undefined ? {} : { processOwner: { ...transport.processOwner, recoverStale: false } }) }
+    });
+    this.#accountResetHosts.add(host);
+    const cancel = () => { void host.forceShutdown().catch(() => undefined); };
+    input.signal?.addEventListener("abort", cancel, { once: true });
+    const close = async () => { input.signal?.removeEventListener("abort", cancel); await this.#closeAccountResetHost(host); };
+    try {
+      input.signal?.throwIfAborted();
+      const isolatedGeneration = await host.ensureStarted(); await readAccount();
+      if (versionFromUserAgent(host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) throw new Error("The selected native account reset protocol is unavailable.");
+      const assertIsolated = () => { assertCurrent(); if (!host.isActiveGeneration(isolatedGeneration)) throw nativeAuthenticationObservationStale(); };
+      const refreshAuthentication = async () => {
+        assertIsolated(); await readAccount();
+        if (!accessTokenUsed) throw new Error("The original account refresh is unavailable.");
+        await authority.readTokens(true, accessTokenUsed); await readAccount(); assertIsolated();
+      };
+      assertIsolated(); return { host, assertCurrent: assertIsolated, readAccount, close, refreshAuthentication };
+    } catch (error) { await close(); throw error; }
+  }
+
   async beginLogin(input: CodexLoginInput): Promise<CodexLoginResult> {
     await this.#ensureLocalHostStarted();
     const authenticationEpoch = this.#nativeAuthenticationEpoch;
@@ -3075,7 +3217,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   dispose(): Promise<void> {
     if (this.#disposeFlight !== undefined) return this.#disposeFlight;
-    if (this.#disposed && this.#nativeEnvironments.size === 0) return Promise.resolve();
+    if (this.#disposed && this.#nativeEnvironments.size === 0 && this.#accountResetHosts.size === 0) return Promise.resolve();
     this.#disposed = true;
     for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
@@ -3131,6 +3273,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }));
     await Promise.all([
       ...(this.#ownsHost ? [this.#host.shutdown()] : []),
+      ...[...this.#accountResetHosts].map(host => this.#closeAccountResetHost(host)),
       ...(this.#remoteRuntimes === undefined ? [] : [this.#remoteRuntimes.shutdown()])
     ]);
   }
@@ -3181,6 +3324,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     await Promise.allSettled(runtimes.map((runtime) => this.#releaseRuntimeSubscription(runtime, false)));
     await Promise.all([
       ...(this.#ownsHost ? [this.#host.forceShutdown()] : []),
+      ...[...this.#accountResetHosts].map(host => this.#closeAccountResetHost(host)),
       ...(this.#remoteRuntimes === undefined
         ? []
         : [this.#remoteRuntimes.forceShutdown?.() ?? this.#remoteRuntimes.shutdown()])
@@ -6030,6 +6174,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#models.some((model) => model.supportsFastMode || model.supportsUltrafastMode)) supported.add("model.fast_mode");
     if (this.#account?.supportsLogin === true) supported.add("provider.login");
     if (this.#account?.supportsLogout === true) supported.add("provider.logout");
+    if (this.#hosted === undefined && this.#account?.authenticationState === "authenticated" && this.#account.authMode === "chatgpt"
+      && (this.#ownsHost || this.#accountHostOptions.transportFactory !== undefined || this.#accountHostOptions.transport?.command !== undefined)
+      && versionFromUserAgent(this.#host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION) supported.add("provider.account_resets");
     if (this.#resolvers.readBlob !== undefined) supported.add("input.image");
     if (this.#host.processInspectionSupported) supported.add("runtime.process_usage");
     const isolatedReviewSupported = supportsIsolatedReview(this.#host.initializeResult?.userAgent);
