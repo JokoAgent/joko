@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { UsageSnapshot } from "@joko/core";
+import type { NativeUsageRequest, UsageSnapshot } from "@joko/core";
 
 interface Tokens {
   readonly inputTokens: number;
@@ -16,6 +16,16 @@ interface ModelDelta extends Tokens {
   readonly costMicros: number;
   readonly tokensComplete: boolean;
   readonly costComplete: boolean;
+}
+
+interface StreamRequest {
+  readonly requestId: string;
+  readonly modelId: string;
+  readonly epoch: number;
+  readonly fastMode?: boolean;
+  readonly requestedAt: number;
+  usage: Record<string, unknown>;
+  invalid: boolean;
 }
 
 const tokenKeys = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] as const;
@@ -43,6 +53,10 @@ export class NativeQueryUsage {
   #hasContribution = false;
   #hasResult = false;
   #suppressNextMoney = false;
+  #epoch = 0;
+  #streams = new Map<string, StreamRequest>();
+  #closed = new Map<string, NativeUsageRequest>();
+  #referenceRequests = new Map<string, NativeUsageRequest>();
 
   constructor(startsAtZero: boolean) {
     this.#startsAtZero = startsAtZero;
@@ -62,7 +76,59 @@ export class NativeQueryUsage {
     this.#requests.set(requestId, { model, tokens });
   }
 
+  observeStream(envelope: unknown, context: { readonly fastMode?: boolean; readonly requestedAt: number }): void {
+    const value = record(envelope), event = record(value?.["event"]);
+    const parent = value?.["parent_tool_use_id"];
+    if (!event || parent !== undefined && parent !== null && !identity(parent)) return;
+    const scope = typeof parent === "string" ? `child:${parent}` : "root";
+    if (event["type"] === "message_start") {
+      const message = record(event["message"]), requestId = message?.["id"], modelId = message?.["model"], usage = record(message?.["usage"]);
+      if (!identity(requestId) || !identity(modelId) || !usage || counter(context.requestedAt) === undefined
+        || context.requestedAt > 8_640_000_000_000_000 || this.#referenceRequests.has(requestId) || this.#closed.has(requestId)
+        || !this.#streams.has(scope) && this.#streams.size >= 256) return;
+      const existing = this.#streams.get(scope);
+      if (existing?.requestId === requestId) return;
+      this.#streams.set(scope, { requestId, modelId, usage: { ...usage }, epoch: this.#epoch,
+        fastMode: context.fastMode, requestedAt: context.requestedAt, invalid: false });
+      return;
+    }
+    const request = this.#streams.get(scope);
+    if (!request) return;
+    if (event["type"] === "message_delta") {
+      const usage = record(event["usage"]);
+      if (!usage) return;
+      for (const key of ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
+        if (usage[key] !== undefined && (counter(usage[key]) === undefined
+          || counter(request.usage[key]) !== undefined && (usage[key] as number) < (request.usage[key] as number))) request.invalid = true;
+      }
+      request.usage = { ...request.usage, ...usage };
+      return;
+    }
+    if (event["type"] !== "message_stop") return;
+    this.#streams.delete(scope);
+    const tokens = nativeTokens(request.usage);
+    if (request.invalid || !tokens) return;
+    // Per-block assistant frames can carry placeholder output counts. The raw
+    // closed request supplies the independent final count before Result joins it.
+    this.observeAssistant({ message: { id: request.requestId, model: request.modelId, usage: request.usage } });
+    const speed = request.usage["speed"], tier = request.usage["service_tier"];
+    const fastMode = speed === "fast" ? true : speed === "standard" ? false : request.fastMode;
+    if (request.epoch !== this.#epoch || typeof fastMode !== "boolean" || this.#closed.size >= 4096
+      || speed !== undefined && speed !== null && speed !== "fast" && speed !== "standard"
+      || tier !== undefined && tier !== null && tier !== "standard"
+      || ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"].some(key => counter(request.usage[key]) === undefined)) return;
+    const cache = record(request.usage["cache_creation"]), oneHour = counter(cache?.["ephemeral_1h_input_tokens"]), fiveMinutes = counter(cache?.["ephemeral_5m_input_tokens"]);
+    const cacheWrite1hTokens = tokens.cacheWriteTokens === 0 ? 0
+      : oneHour !== undefined && fiveMinutes !== undefined && oneHour + fiveMinutes === tokens.cacheWriteTokens ? oneHour : undefined;
+    this.#closed.set(request.requestId, { requestId: request.requestId, modelId: request.modelId, ...tokens,
+      totalTokens: safeAdd(tokens.inputTokens, tokens.outputTokens), fastMode, requestedAt: request.requestedAt,
+      ...(cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens }) });
+  }
+
   observeResult(envelope: unknown): UsageSnapshot | undefined {
+    const closed = this.#closed;
+    this.#closed = new Map();
+    this.#epoch += 1;
     const value = record(envelope) ?? {};
     const models = record(value["modelUsage"]);
     const observed = this.#observed;
@@ -182,6 +248,23 @@ export class NativeQueryUsage {
       this.#modelTotals.set(model, { ...add(previous ?? emptyTokens(), item),
         costMicros: safeAdd(previous?.costMicros ?? 0, namedMoneyProven ? item.costMicros : 0) });
     }
+    const requestGroups = new Map<string, NativeUsageRequest[]>();
+    for (const request of closed.values()) {
+      if (ambiguousObserved.has(request.modelId)) continue;
+      const candidates = modelDeltas.has(request.modelId) ? [request.modelId]
+        : [...modelDeltas.keys()].filter(model => model.replace(/\[[^\]]*\]\s*$/u, "") === request.modelId.replace(/\[[^\]]*\]\s*$/u, ""));
+      if (candidates.length !== 1 || this.#referenceRequests.has(request.requestId)) continue;
+      const modelId = candidates[0]!, requests = requestGroups.get(modelId) ?? [];
+      requests.push({ ...request, modelId }); requestGroups.set(modelId, requests);
+    }
+    for (const [modelId, requests] of requestGroups) {
+      const sum = requests.reduce((sum, request) => add(sum, request), emptyTokens()), contribution = modelDeltas.get(modelId)!;
+      if (tokenKeys.some(key => sum[key] > contribution[key]) || !this.#modelTotals.has(modelId)) continue;
+      for (const request of requests) {
+        if (this.#referenceRequests.size >= 4096) break;
+        this.#referenceRequests.set(request.requestId, request);
+      }
+    }
     this.#previousTotalCost = totalCost;
     this.#previous = next;
     this.#baselineUnavailable = !modelSnapshotValid;
@@ -192,6 +275,7 @@ export class NativeQueryUsage {
     if (!this.#hasContribution) return undefined;
     return { ...this.#total, totalTokens: safeAdd(this.#total.inputTokens, this.#total.outputTokens), cost: this.#costMicros / 1_000_000,
       nativeAccounting: { sourceId: this.sourceId, tokensComplete, costComplete, costEstimated: true,
+        ...(this.#referenceRequests.size === 0 ? {} : { requests: [...this.#referenceRequests.values()] }),
         models: [...this.#modelTotals].map(([modelId, totals]) => ({ modelId, inputTokens: totals.inputTokens, outputTokens: totals.outputTokens,
           cacheReadTokens: totals.cacheReadTokens, cacheWriteTokens: totals.cacheWriteTokens,
           totalTokens: safeAdd(totals.inputTokens, totals.outputTokens), cost: (totals.costMicros ?? 0) / 1_000_000,

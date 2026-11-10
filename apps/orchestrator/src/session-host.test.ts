@@ -47,6 +47,7 @@ import {
   type PartnerLearningTurnSource,
   type PartnerLearningToolAuthority,
   type ProviderModel,
+  type NativeUsageRequest,
   type RuntimeCommand,
   type RuntimeToolCatalog,
   type SubagentControlInput,
@@ -5558,6 +5559,81 @@ describe("SessionHost", () => {
     expect(rows.find(row => row.modelId === "text")).toMatchObject({ totalTokens: 30, costMicros: 40_000 });
     expect(rows.find(row => row.modelId === "native-internal")).toMatchObject({ totalTokens: 3, costMicros: 10_000 });
     expect(rows.find(row => row.modelId === "")).toMatchObject({ totalTokens: 1, costMicros: 5_000 });
+  });
+
+  it.each([
+    { name: "subscription zero spend", kind: "subscription-value" as const, sdkCost: 0, expected: 450_189, currency: "EUR", complete: true },
+    { name: "subscription positive SDK estimate", kind: "subscription-value" as const, sdkCost: 0.5, expected: 450_189, currency: "EUR", complete: true },
+    { name: "subscription cached long context", kind: "subscription-value" as const, sdkCost: 0, cachedLongContext: true, expected: 612_209, currency: "EUR", complete: true },
+    { name: "subscription unknown cache TTL", kind: "subscription-value" as const, sdkCost: 0, unknownTtl: true, expected: 450_172, currency: "EUR", complete: false },
+    { name: "subscription without prices", kind: "subscription-value" as const, sdkCost: 0, missingPrices: true, expected: 0, currency: "USD", complete: false },
+    { name: "subscription quoted free prices", kind: "subscription-value" as const, sdkCost: 0, free: true, expected: 0, currency: "EUR", complete: true },
+    { name: "API zero estimate", kind: "actual-cost" as const, sdkCost: 0, expected: 0, currency: "USD", complete: true },
+    { name: "API positive estimate", kind: "actual-cost" as const, sdkCost: 0.5, expected: 500_000, currency: "USD", complete: true }
+  ])("prices closed native requests as $name without treating cumulative input as one call", async (testCase) => {
+    const adapter = new NativeModelUsageFakeAdapter(false, nativeReferenceModels(testCase));
+    adapter.observation = nativeReferenceUsageFixture({ sdkCost: testCase.sdkCost, unknownTtl: testCase.unknownTtl, cachedLongContext: testCase.cachedLongContext });
+    const fixture = await createFixture(adapter, { usageMoneyKind: () => testCase.kind });
+    const sessionId = (await fixture.host.createSession({ operationId: "create-native-reference", connection: fixture.connection,
+      targetId: "target-one", title: "Native reference", providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: "send-native-reference", connection: fixture.connection, sessionId,
+      prompt: { text: "measure closed requests", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    const rows = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
+    expect(rows.reduce((sum, row) => sum + row.totalTokens, 0)).toBe(300_125);
+    expect(rows.reduce((sum, row) => sum + row.costMicros, 0)).toBe(testCase.expected);
+    expect(rows.every(row => row.currencyCode === testCase.currency)).toBe(true);
+    expect(rows.every(row => ["text[1m]", "native-internal"].includes(row.modelId))).toBe(true);
+    expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({ totalTokens: 300_125,
+      costMicros: testCase.expected, ...(testCase.missingPrices ? {} : { currencyCode: testCase.currency }),
+      costComplete: testCase.complete, tokensComplete: true, estimated: true });
+    if (testCase.missingPrices) expect(fixture.store.getRun(queued.value.runId).descriptor.usage?.currencyCode).toBeUndefined();
+    expect(materializedSessionRuntimeState(fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value)?.usage?.nativeAccounting?.requests)
+      .toEqual(adapter.observation.nativeAccounting?.requests);
+  });
+
+  it("freezes the native request prefix when reference prices and currency change before another Run", async () => {
+    const adapter = new NativeModelUsageFakeAdapter(false, nativeReferenceModels({}));
+    adapter.observation = nativeReferenceUsageFixture({});
+    const fixture = await createFixture(adapter, { usageMoneyKind: () => "subscription-value" });
+    const sessionId = (await fixture.host.createSession({ operationId: "create-native-reference-prefix", connection: fixture.connection,
+      targetId: "target-one", title: "Native price prefix", providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const run = async (id: string) => {
+      const queued = fixture.host.enqueueInput({ operationId: id, connection: fixture.connection, sessionId,
+        prompt: { text: id, images: [], files: [], mentions: [], disposition: "prompt" } });
+      await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+      return fixture.store.getRun(queued.value.runId).descriptor;
+    };
+    expect((await run("first-native-reference")).usage).toMatchObject({ totalTokens: 300_125, costMicros: 450_189, currencyCode: "EUR" });
+    fixture.store.upsertModelPriceOverride({ ownerId: "orchestrator", backendId: adapter.id, providerId: "test", modelId: "text",
+      values: { currencyCode: "CNY", input: 3, output: 4, cacheRead: 0.3, cacheWrite: 3.75 } });
+    adapter.observation = nativeReferenceUsageFixture({ later: true });
+    expect((await run("later-native-reference")).usage).toMatchObject({ totalTokens: 102, costMicros: 308, currencyCode: "CNY", costComplete: true });
+    const rows = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
+    expect(rows.filter(row => row.currencyCode === "EUR").reduce((sum, row) => sum + row.costMicros, 0)).toBe(450_189);
+    expect(rows.filter(row => row.currencyCode === "CNY")).toEqual([expect.objectContaining({ modelId: "text[1m]", totalTokens: 102, costMicros: 308 })]);
+  });
+
+  it("retains native tokens without a closed request as an unpriced remainder instead of inventing a zero subscription value", async () => {
+    const adapter = new NativeModelUsageFakeAdapter(false, nativeReferenceModels({}));
+    adapter.observation = nativeReferenceUsageFixture({ extraInput: 5 });
+    const fixture = await createFixture(adapter, { usageMoneyKind: () => "subscription-value" });
+    const sessionId = (await fixture.host.createSession({ operationId: "create-native-partial-reference", connection: fixture.connection,
+      targetId: "target-one", title: "Native partial value", providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: "send-native-partial-reference", connection: fixture.connection, sessionId,
+      prompt: { text: "retain unknown pricing", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    const rows = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
+    expect(rows.find(row => row.currencyCode === "USD")).toMatchObject({ modelId: "text[1m]", inputTokens: 5, totalTokens: 5, costMicros: 0, costComplete: false });
+    expect(rows.filter(row => row.currencyCode === "EUR").reduce((sum, row) => sum + row.costMicros, 0)).toBe(450_189);
+    expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({ totalTokens: 300_130, costComplete: false });
+    adapter.observation = nativeReferenceUsageFixture({ extraInput: 5, later: true });
+    const next = fixture.host.enqueueInput({ operationId: "send-known-native-reference", connection: fixture.connection, sessionId,
+      prompt: { text: "measure a later closed request", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(next.value.runId).descriptor.state === "completed");
+    expect(fixture.store.getRun(next.value.runId).descriptor.usage).toMatchObject({ totalTokens: 102, costMicros: 104, currencyCode: "EUR", costComplete: true });
+    expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" }).find(row => row.currencyCode === "USD"))
+      .toMatchObject({ inputTokens: 5, totalTokens: 5, costMicros: 0, costComplete: false });
   });
 
   it("accounts cumulative delegated-run usage independently without inflating parent context", async () => {
@@ -18182,9 +18258,44 @@ function nativeModelUsageFixture(input = 10, output = 5, cost = 0.02): UsageSnap
     ] } };
 }
 
+function nativeReferenceModels(options: { readonly missingPrices?: boolean; readonly free?: boolean }): readonly ProviderModel[] {
+  const base = PI_LIKE_PROFILE.models.find(model => model.modelId === "text")!;
+  return ["text", "native-internal"].map(modelId => ({ ...base, modelId, contextWindow: 1_000_000, supportsFastMode: true,
+    cost: options.missingPrices ? {} : options.free ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0 }
+      : { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1.25, cacheWrite1h: 2 },
+    ...(options.missingPrices ? { pricing: undefined } : { pricing: { source: "providerReference" as const, currencyCode: "EUR", fastModeMultiplier: 2,
+      longContext: { inputTokenThreshold: 200_000, inputMultiplier: 2, outputMultiplier: 2, cacheReadMultiplier: 2, cacheWriteMultiplier: 2 } } }) }));
+}
+
+function nativeReferenceUsageFixture(options: { readonly sdkCost?: number; readonly unknownTtl?: boolean; readonly later?: boolean; readonly extraInput?: number; readonly cachedLongContext?: boolean }): UsageSnapshot {
+  const requests: NativeUsageRequest[] = [
+    { requestId: "first", modelId: "text[1m]", inputTokens: 150_000, outputTokens: 10, cacheReadTokens: options.cachedLongContext ? 60_000 : 0, cacheWriteTokens: 0,
+      totalTokens: 150_010, fastMode: false, requestedAt: 100, cacheWrite1hTokens: 0 },
+    { requestId: "second", modelId: "text[1m]", inputTokens: 150_000, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0,
+      totalTokens: 150_010, fastMode: true, requestedAt: 200, cacheWrite1hTokens: 0 },
+    { requestId: "internal", modelId: "native-internal", inputTokens: 100, outputTokens: 5, cacheReadTokens: 20, cacheWriteTokens: 10,
+      totalTokens: 105, fastMode: false, requestedAt: 200, ...(options.unknownTtl ? {} : { cacheWrite1hTokens: 6 }) }
+  ];
+  if (options.later) requests.push({ requestId: "later", modelId: "text[1m]", inputTokens: 100, outputTokens: 2, cacheReadTokens: 0,
+    cacheWriteTokens: 0, totalTokens: 102, fastMode: false, requestedAt: 300, cacheWrite1hTokens: 0 });
+  const models = ["text[1m]", "native-internal"].map(modelId => {
+    const totals = requests.filter(request => request.modelId === modelId).reduce((sum, request) => ({ inputTokens: sum.inputTokens + request.inputTokens,
+      outputTokens: sum.outputTokens + request.outputTokens, cacheReadTokens: sum.cacheReadTokens + request.cacheReadTokens,
+      cacheWriteTokens: sum.cacheWriteTokens + request.cacheWriteTokens, totalTokens: sum.totalTokens + request.totalTokens }),
+    { inputTokens: modelId === "text[1m]" ? options.extraInput ?? 0 : 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      totalTokens: modelId === "text[1m]" ? options.extraInput ?? 0 : 0 });
+    return { ...totals, modelId, cost: modelId === "text[1m]" ? options.sdkCost ?? 0 : 0, tokensComplete: true, costComplete: true };
+  });
+  const totals = models.reduce((sum, model) => ({ inputTokens: sum.inputTokens + model.inputTokens, outputTokens: sum.outputTokens + model.outputTokens,
+    cacheReadTokens: sum.cacheReadTokens + model.cacheReadTokens, cacheWriteTokens: sum.cacheWriteTokens + model.cacheWriteTokens,
+    totalTokens: sum.totalTokens + model.totalTokens }), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 });
+  return { ...totals, cost: options.sdkCost ?? 0, nativeAccounting: { sourceId: "native-reference-query", tokensComplete: true,
+    costComplete: true, costEstimated: true, models, requests } };
+}
+
 class NativeModelUsageFakeAdapter extends FakeBackendAdapter {
   observation = nativeModelUsageFixture();
-  constructor(readonly children = true) { super({ ...PI_LIKE_PROFILE, id: "native-model-usage-fake", capabilities: [
+  constructor(readonly children = true, models = PI_LIKE_PROFILE.models) { super({ ...PI_LIKE_PROFILE, models, id: "native-model-usage-fake", capabilities: [
     ...PI_LIKE_PROFILE.capabilities, { key: "subagents.list", supported: true }, { key: "subagents.detail", supported: true }
   ] }); }
   override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {

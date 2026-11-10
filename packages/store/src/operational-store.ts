@@ -15,7 +15,7 @@ import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
 import { TaskShareStore, taskShareQueueLockOwner, type TaskShareGuestProof } from "./task-share-store.js";
-import { captureModelPriceReference, parseNativeModelUsage, validateModelPriceOverrideValues, validModelSubstitution } from "@joko/core";
+import { captureModelPriceReference, parseNativeModelUsage, parseNativeUsageRequests, validateModelPriceOverrideValues, validModelSubstitution } from "@joko/core";
 import { SIDE_CHAT_HISTORY_BOUNDARY_KEY } from "./side-chat-history.js";
 import { parseCurrentRunUsageEventPayload, parseRunUsageSummary, runUsageSettingKey } from "./run-usage-shape.js";
 
@@ -18365,6 +18365,18 @@ export class OperationalStore {
     return row === undefined ? undefined : numberValue(row["measured_at"]);
   }
 
+  findUsageObservationCounters(ownerId: string, sessionId: string, sourceId: string): {
+    readonly inputTokens: number; readonly outputTokens: number; readonly cacheReadTokens: number;
+    readonly cacheWriteTokens: number; readonly totalTokens: number; readonly providerId: string; readonly modelId: string;
+  } | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, provider_id, model_id
+      FROM usage_session_cursors WHERE owner_id = ? AND session_id = ? AND source_id = ?`).get(ownerId, sessionId, sourceId) as Row | undefined;
+    return row === undefined ? undefined : { inputTokens: numberValue(row["input_tokens"]), outputTokens: numberValue(row["output_tokens"]),
+      cacheReadTokens: numberValue(row["cache_read_tokens"]), cacheWriteTokens: numberValue(row["cache_write_tokens"]), totalTokens: numberValue(row["total_tokens"]),
+      providerId: stringValue(row["provider_id"]), modelId: stringValue(row["model_id"]) };
+  }
+
   recordUsageObservation(input: RecordUsageObservationInput): UsageObservationResult {
     this.assertOpen();
     const ownerId = usageIdentity(input.ownerId, "usage owner ID", 256, false);
@@ -21629,15 +21641,19 @@ function validateSubagentUsage(usage: SubagentRunDetail["usage"]): void {
   const native = usage.nativeAccounting;
   if (native !== undefined) {
     if (typeof native !== "object" || native === null || Array.isArray(native) || !/^[A-Za-z0-9._:-]{1,128}$/u.test(native.sourceId)
-      || Object.keys(native).some(key => !["sourceId", "tokensComplete", "costComplete", "costEstimated", "models"].includes(key))
+      || Object.keys(native).some(key => !["sourceId", "tokensComplete", "costComplete", "costEstimated", "models", "requests"].includes(key))
       || [native.tokensComplete, native.costComplete, native.costEstimated].some(value => typeof value !== "boolean")) {
       throw new StoreError("Subagent native accounting provenance is invalid.");
     }
-    if (native.models !== undefined && !parseNativeModelUsage(native.models, {
+    const models = native.models === undefined ? undefined : parseNativeModelUsage(native.models, {
       inputTokens: usage.inputTokens ?? 0, outputTokens: usage.outputTokens ?? 0,
       cacheReadTokens: usage.cacheReadTokens ?? 0, cacheWriteTokens: usage.cacheWriteTokens ?? 0,
       totalTokens: usage.totalTokens ?? 0, cost: usage.costUsd ?? 0
-    })) throw new StoreError("Subagent native per-model usage is invalid.");
+    });
+    if (native.models !== undefined && !models) throw new StoreError("Subagent native per-model usage is invalid.");
+    if (native.requests !== undefined && (!models || !parseNativeUsageRequests(native.requests, models))) {
+      throw new StoreError("Subagent native request usage is invalid.");
+    }
   }
 }
 
