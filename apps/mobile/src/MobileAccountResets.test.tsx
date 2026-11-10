@@ -32,7 +32,7 @@ function fixture() {
   return { read, consume, save, get state() { return state; }, set state(value) { state = value; }, replaceOwner: () => { api = { ...api, ownerKey: "replacement" }; },
     render: async () => { await act(async () => root.render(createElement(MobileAccountUsageSummary, { colors, locale: "en", now: Date.now(), reset: { api, backendId: "codex", providerId: "openai" } }))); } };
 }
-async function click(label: string) { const button = [...host.querySelectorAll("button")].find(value => value.textContent === label); if (!button) throw new Error(`Missing ${label}`); await act(async () => button.click()); }
+async function click(label: string) { const button = Array.from(host.querySelectorAll("button")).find(value => value.textContent === label); if (!button) throw new Error(`Missing ${label}`); await act(async () => button.click()); }
 async function confirm() { const buttons = native.alert.mock.calls.at(-1)![2] as { onPress?: () => void }[]; await act(async () => buttons[1]!.onPress?.()); }
 it("mounts resets in the original mobile usage summary, confirms consumption, and keeps unknown retries on the same offer", async () => {
   const f = fixture(); await f.render(); await click("Use reset"); expect(f.consume).not.toHaveBeenCalled(); expect(native.alert.mock.calls[0]![1]).toContain("…ccount");
