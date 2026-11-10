@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { modelPricesWithOverride, parseNativeModelUsage, type ModelPriceOverride } from "@joko/core";
+import { modelPricesWithOverride, parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
   type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import type { McpAppMessageGuard } from "./mcp-apps/message.js";
@@ -16072,7 +16072,8 @@ export class SessionHost {
     scheduleUsage?: { readonly runId: string; readonly attribution: "exact" | "direct" },
     runUsageId?: string,
     referencePricingKnown = true,
-    childAccounting?: { readonly tokensComplete: boolean; readonly costComplete?: boolean; readonly costEstimated?: boolean }
+    childAccounting?: { readonly tokensComplete: boolean; readonly costComplete?: boolean; readonly costEstimated?: boolean },
+    nativeReferenceRequest = false
   ): ReturnType<OperationalStore["recordUsageObservation"]> {
     const providerId = observedProviderId ?? session.descriptor.providerId ?? "";
     const modelId = observedModelId ?? session.descriptor.modelId ?? "";
@@ -16081,10 +16082,14 @@ export class SessionHost {
       || [native.tokensComplete, native.costComplete, native.costEstimated].some(value => typeof value !== "boolean"))) {
       throw new StoreError("The native usage accounting provenance is invalid.");
     }
+    if (native?.requests !== undefined && native.models === undefined) throw new StoreError("Native requests require their per-model accounting partition.");
     if (native?.models !== undefined) {
       return store.transaction(() => {
         const models = parseNativeModelUsage(native.models, usage);
         if (!models) throw new StoreError("The native per-model usage partition is invalid.");
+        const requests = native.requests === undefined ? [] : parseNativeUsageRequests(native.requests, models);
+        if (!requests) throw new StoreError("The native request usage partition is invalid.");
+        const subscriptionValue = this.#usageMoneyKind(session.descriptor.backendId, providerId) === "subscription-value";
         if (provesProviderAvailable) clearProviderRateLimit(store, session.descriptor.backendId, providerId);
         const remaining = { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens,
           cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens, costMicros: Math.round(usage.cost * 1_000_000) };
@@ -16097,43 +16102,80 @@ export class SessionHost {
           cacheReadTokens: remaining.cacheReadTokens, cacheWriteTokens: remaining.cacheWriteTokens, totalTokens: remaining.totalTokens,
           cost: remaining.costMicros / 1_000_000, tokensComplete: native.tokensComplete, costComplete: native.costComplete });
         let combined: ReturnType<OperationalStore["recordUsageObservation"]> | undefined;
-        for (const part of parts) {
-          const result = this.recordUsageObservation(store, session, generation, {
-            inputTokens: part.inputTokens, outputTokens: part.outputTokens, cacheReadTokens: part.cacheReadTokens,
-            cacheWriteTokens: part.cacheWriteTokens, totalTokens: part.totalTokens, cost: part.cost,
-            nativeAccounting: { sourceId: createHash("sha256").update(JSON.stringify([native.sourceId, part.source])).digest("hex"), tokensComplete: part.tokensComplete,
-              costComplete: part.costComplete, costEstimated: native.costEstimated }
-          }, measuredAt, sourceId, providerId, part.modelId, false, scheduleUsage, runUsageId, false, childAccounting);
+        const include = (result: ReturnType<OperationalStore["recordUsageObservation"]>): void => {
           combined = combined === undefined ? result : { ...combined, changed: combined.changed || result.changed,
             inputTokens: combined.inputTokens + result.inputTokens, outputTokens: combined.outputTokens + result.outputTokens,
             cacheReadTokens: combined.cacheReadTokens + result.cacheReadTokens, cacheWriteTokens: combined.cacheWriteTokens + result.cacheWriteTokens,
             totalTokens: combined.totalTokens + result.totalTokens, costMicros: combined.costMicros + result.costMicros,
             costComplete: combined.costComplete && result.costComplete, estimated: combined.estimated || result.estimated };
+        };
+        if (subscriptionValue) {
+          for (const request of requests) {
+            const part = parts.find(part => part.modelId === request.modelId)!;
+            for (const key of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens"] as const) part[key] -= request[key];
+            const requestSourceId = `native-reference:${createHash("sha256").update(JSON.stringify([native.sourceId, request.requestId])).digest("hex")}`;
+            const previous = store.findUsageObservationCounters(this.#usageOwnerId, session.descriptor.id, requestSourceId);
+            if (previous !== undefined) {
+              if (previous.providerId !== providerId || previous.modelId !== request.modelId
+                || (["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens"] as const).some(key => previous[key] !== request[key])) {
+                throw new StoreError("A closed native request changed its accounted model or counters.");
+              }
+              continue;
+            }
+            include(this.recordUsageObservation(store, session, generation, {
+              inputTokens: request.inputTokens, outputTokens: request.outputTokens, cacheReadTokens: request.cacheReadTokens,
+              cacheWriteTokens: request.cacheWriteTokens, totalTokens: request.totalTokens, cost: 0,
+              pricingContext: { inputTokens: request.inputTokens + request.cacheReadTokens + request.cacheWriteTokens,
+                fastMode: request.fastMode, requestedAt: request.requestedAt,
+                ...(request.cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens: request.cacheWrite1hTokens }) }
+            }, measuredAt, requestSourceId,
+            providerId, request.modelId, false, scheduleUsage, runUsageId, true, { tokensComplete: true }, true));
+          }
+        }
+        for (const part of parts) {
+          const referenceRemainderComplete = [part.inputTokens, part.outputTokens, part.cacheReadTokens, part.cacheWriteTokens].every(value => value === 0);
+          const result = this.recordUsageObservation(store, session, generation, {
+            inputTokens: part.inputTokens, outputTokens: part.outputTokens, cacheReadTokens: part.cacheReadTokens,
+            cacheWriteTokens: part.cacheWriteTokens, totalTokens: part.totalTokens, cost: subscriptionValue ? 0 : part.cost,
+            nativeAccounting: { sourceId: createHash("sha256").update(JSON.stringify([native.sourceId, part.source])).digest("hex"), tokensComplete: part.tokensComplete,
+              costComplete: subscriptionValue ? referenceRemainderComplete : part.costComplete, costEstimated: native.costEstimated }
+          }, measuredAt, sourceId, providerId, part.modelId, false, scheduleUsage, runUsageId, false, childAccounting);
+          include(result);
         }
         return combined!;
       });
     }
     const accountingSourceId = native === undefined ? sourceId : `native-accounting:${native.sourceId}`;
     const substitution = runUsageId === undefined ? undefined : store.findRunModelSubstitution(runUsageId);
-    const canPriceReference = referencePricingKnown && native?.costComplete !== false
-      && childAccounting?.costComplete !== false && !(substitution?.selectedModelId === modelId);
+    const canPriceReference = referencePricingKnown && (nativeReferenceRequest || native?.costComplete !== false
+      && childAccounting?.costComplete !== false && !(substitution?.selectedModelId === modelId));
     const usageMoneyKind = this.#usageMoneyKind(session.descriptor.backendId, providerId);
+    const nativeSubscriptionValue = native !== undefined && usageMoneyKind === "subscription-value";
     if (provesProviderAvailable) {
       clearProviderRateLimit(store, session.descriptor.backendId, providerId);
     }
     const backend = store.getBackend(session.descriptor.backendId).descriptor;
+    const pricingModelId = nativeReferenceRequest ? modelId.replace(/\[[^\]]*\]\s*$/u, "") : modelId;
     const model = backend.models.find((candidate) =>
       candidate.providerId === providerId && candidate.modelId === modelId
-    );
+    ) ?? (nativeReferenceRequest ? backend.models.find(candidate => candidate.providerId === providerId && candidate.modelId === pricingModelId) : undefined);
     const priceOverride = providerId === "" || modelId === ""
       ? undefined
-      : store.findModelPriceOverride(this.#usageOwnerId, session.descriptor.backendId, providerId, modelId);
-    const reportedCostMicros = usage.cost > 0 || native !== undefined || childAccounting?.costComplete !== undefined
+      : store.findModelPriceOverride(this.#usageOwnerId, session.descriptor.backendId, providerId, modelId)
+        ?? (nativeReferenceRequest && pricingModelId !== modelId
+          ? store.findModelPriceOverride(this.#usageOwnerId, session.descriptor.backendId, providerId, pricingModelId) : undefined);
+    const reportedCostMicros = nativeSubscriptionValue ? 0 : usage.cost > 0 || native !== undefined || childAccounting?.costComplete !== undefined
       ? Math.round(usage.cost * 1_000_000)
       : undefined;
     const priced = !canPriceReference ? undefined : modelUsageCostRates(model, priceOverride, usage,
       usage.pricingContext?.requestedAt ?? (runUsageId === undefined ? measuredAt : store.getRun(runUsageId).descriptor.startedAt ?? measuredAt));
-    const costRates = priced?.rates;
+    const costRates = nativeReferenceRequest && usage.cacheWriteTokens > 0 && usage.pricingContext?.cacheWrite1hTokens === undefined
+      ? priced === undefined ? undefined : {
+          ...(priced.rates.inputMicrosPerMillion === undefined ? {} : { inputMicrosPerMillion: priced.rates.inputMicrosPerMillion }),
+          ...(priced.rates.outputMicrosPerMillion === undefined ? {} : { outputMicrosPerMillion: priced.rates.outputMicrosPerMillion }),
+          ...(priced.rates.cacheReadMicrosPerMillion === undefined ? {} : { cacheReadMicrosPerMillion: priced.rates.cacheReadMicrosPerMillion })
+        }
+      : priced?.rates;
     const currencyCode = reportedCostMicros === undefined
       ? priced?.currencyCode ?? model?.pricing?.currencyCode ?? "USD"
       : "USD";
@@ -16143,6 +16185,13 @@ export class SessionHost {
     // arrive in one clock tick; retain their order without weakening ledger conflicts.
     const previousMeasuredAt = store.findUsageObservationMeasuredAt(this.#usageOwnerId, session.descriptor.id, accountingSourceId);
     const orderedMeasuredAt = previousMeasuredAt === undefined ? measuredAt : Math.max(measuredAt, previousMeasuredAt + 1);
+    const previousReferenceCounters = nativeSubscriptionValue
+      ? store.findUsageObservationCounters(this.#usageOwnerId, session.descriptor.id, accountingSourceId) : undefined;
+    const unpricedReferenceDelta = nativeSubscriptionValue
+      && (["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens"] as const).some(key => {
+        const prior = previousReferenceCounters?.[key] ?? 0;
+        return usage[key] >= prior ? usage[key] > prior : usage[key] > 0;
+      });
     const result = store.recordUsageObservation({
       ownerId: this.#usageOwnerId,
       sessionId: session.descriptor.id,
@@ -16164,7 +16213,9 @@ export class SessionHost {
         ? {}
         : { reportedCostEstimated: true }),
       ...(costRates === undefined ? {} : { costRates }),
-      ...(native === undefined && childAccounting?.costComplete === undefined ? {} : { observedCostComplete: native?.costComplete ?? childAccounting?.costComplete }),
+      ...(native === undefined && childAccounting?.costComplete === undefined ? {} : { observedCostComplete: nativeSubscriptionValue
+        ? !unpricedReferenceDelta
+        : native?.costComplete ?? childAccounting?.costComplete }),
       ...(runUsageId === undefined ? {} : { runUsage: { runId: runUsageId,
         tokensComplete: native?.tokensComplete ?? childAccounting?.tokensComplete ?? true,
         ...(runCurrencyCode === undefined ? {} : { currencyCode: runCurrencyCode }) } }),
@@ -19269,7 +19320,8 @@ function sameUsageSnapshot(left: UsageSnapshot | undefined, right: UsageSnapshot
     left.nativeAccounting?.tokensComplete === right.nativeAccounting?.tokensComplete &&
     left.nativeAccounting?.costComplete === right.nativeAccounting?.costComplete &&
     left.nativeAccounting?.costEstimated === right.nativeAccounting?.costEstimated &&
-    JSON.stringify(left.nativeAccounting?.models) === JSON.stringify(right.nativeAccounting?.models);
+    JSON.stringify(left.nativeAccounting?.models) === JSON.stringify(right.nativeAccounting?.models) &&
+    JSON.stringify(left.nativeAccounting?.requests) === JSON.stringify(right.nativeAccounting?.requests);
 }
 
 function scheduleRunUsageTarget(

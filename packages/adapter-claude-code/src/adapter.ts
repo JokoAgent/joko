@@ -4311,6 +4311,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (turn !== undefined && !turn.nativeIdentityConfirmed) throw continuityGap();
       if (turn !== undefined) turn.childOutputObserved = true;
       if (type === "assistant" && turn !== undefined && this.#isTurnCurrent(runtime, turn)) runtime.nativeUsage.observeAssistant(envelope);
+      if (type === "stream_event" && turn !== undefined && this.#isTurnCurrent(runtime, turn)) runtime.nativeUsage.observeStream(envelope,
+        { fastMode: nativeRequestFastMode(runtime), requestedAt: this.#now() });
       if (!runtime.nativeTaskProjectionEnabled) return;
       const emissions = type === "assistant"
         ? runtime.nativeTasks.observeChildAssistant(envelope)
@@ -4364,6 +4366,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (turn.frameCount > MAX_TURN_FRAMES) throw nativeEventLimit();
     }
     if (type === "stream_event") {
+      runtime.nativeUsage.observeStream(envelope, { fastMode: nativeRequestFastMode(runtime), requestedAt: this.#now() });
       await this.#handlePartial(runtime, turn, message);
     } else if (type === "assistant") {
       await this.#handleAssistant(runtime, turn, message);
@@ -5614,7 +5617,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         child.identity.resolve(undefined);
         continue;
       }
-      if (!identityConfirmed && (type === "assistant" || type === "user" || type === "tool_progress" || type === "result"
+      if (!identityConfirmed && (type === "stream_event" || type === "assistant" || type === "user" || type === "tool_progress" || type === "result"
         || type === "system" && isNativeTaskSystemSubtype(subtype))) {
         throw new Error("The delegated Query emitted work before initialization identity.");
       }
@@ -5627,6 +5630,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         child.continuationTimer = undefined;
         text.splice(0);
         assistantError = undefined;
+      }
+      if (type === "stream_event") {
+        child.nativeUsage.observeStream(envelope, { fastMode: false, requestedAt: this.#now() });
+        continue;
       }
       if (type === "assistant") {
         child.nativeUsage.observeAssistant(envelope);
@@ -8707,6 +8714,14 @@ interface FastModeObservation {
 function clearFastModeObservation(runtime: NativeRuntime): void {
   runtime.fastModeObservation = undefined;
   runtime.publishedFastModeStatus = undefined;
+}
+
+function nativeRequestFastMode(runtime: NativeRuntime): boolean | undefined {
+  const observation = runtime.fastModeObservation;
+  if (observation?.state === "on") return true;
+  if (observation?.state === "off") return false;
+  if (observation?.state === "cooldown" || observation?.disabledReason !== undefined) return undefined;
+  return runtime.fastMode;
 }
 
 function readFastModeObservation(value: {

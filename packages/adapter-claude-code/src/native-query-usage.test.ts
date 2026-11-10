@@ -8,6 +8,69 @@ const assistant = (id: string, name: string, input: number, output: number) => (
 } });
 
 describe("native Query accounting", () => {
+  it("joins closed root and child requests to actual models, uses final streamed output, and deduplicates cumulative replays", () => {
+    const query = new NativeQueryUsage(true);
+    const close = (id: string, name: string, input: number, output: number, parent: string | null, fastMode: boolean, cache = false) => {
+      const usage = { input_tokens: input, output_tokens: 0, cache_read_input_tokens: cache ? 2 : 0,
+        cache_creation_input_tokens: cache ? 3 : 0,
+        ...(cache ? { cache_creation: { ephemeral_1h_input_tokens: 1, ephemeral_5m_input_tokens: 2 } } : {}) };
+      const emit = (event: unknown) => query.observeStream({ type: "stream_event", parent_tool_use_id: parent, event }, { fastMode, requestedAt: 100 });
+      emit({ type: "message_start", message: { id, model: name, usage } });
+      query.observeAssistant({ message: { id, model: name, usage: { ...usage, output_tokens: 1 } } });
+      emit({ type: "message_delta", usage: { output_tokens: output } }); emit({ type: "message_stop" });
+    };
+    close("root-request", "root", 10, 5, null, false, true);
+    close("child-request", "child", 2, 1, "owned-tool", true);
+    const native = { modelUsage: { "root[1m]": { ...model(10, 5, 0), cacheReadInputTokens: 2, cacheCreationInputTokens: 3 }, child: model(2, 1, 0) }, total_cost_usd: 0 };
+    const first = query.observeResult(native)!;
+    expect(first).toMatchObject({ inputTokens: 12, outputTokens: 6, cacheReadTokens: 2, cacheWriteTokens: 3, totalTokens: 18 });
+    expect(first.nativeAccounting?.requests).toEqual([
+      { requestId: "root-request", modelId: "root[1m]", inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 3,
+        totalTokens: 15, fastMode: false, requestedAt: 100, cacheWrite1hTokens: 1 },
+      { requestId: "child-request", modelId: "child", inputTokens: 2, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0,
+        totalTokens: 3, fastMode: true, requestedAt: 100, cacheWrite1hTokens: 0 }
+    ]);
+    close("root-request", "root", 10, 5, null, false, true);
+    expect(query.observeResult(native)).toEqual(first);
+    close("later-request", "root", 10, 7, null, true, true);
+    const later = query.observeResult({ modelUsage: { "root[1m]": { ...model(20, 12, 0), cacheReadInputTokens: 4, cacheCreationInputTokens: 6 }, child: model(2, 1, 0) }, total_cost_usd: 0 })!;
+    expect(later).toMatchObject({ inputTokens: 22, outputTokens: 13, totalTokens: 35, nativeAccounting: { tokensComplete: true } });
+    expect(later.nativeAccounting?.requests).toHaveLength(3);
+  });
+
+  it("keeps unclosed, cross-result, ambiguous and unobserved Fast requests out of reference pricing", () => {
+    for (const kind of ["unclosed", "cross-result", "ambiguous", "unknown-fast"] as const) {
+      const query = new NativeQueryUsage(false);
+      const emit = (event: unknown) => query.observeStream({ event, parent_tool_use_id: null }, { requestedAt: 0,
+        ...(kind === "unknown-fast" ? {} : { fastMode: false }) });
+      emit({ type: "message_start", message: { id: "current", model: "root", usage: {
+        input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0
+      } } });
+      if (kind === "cross-result") query.observeResult({ modelUsage: { root: model(1000, 500, 0) }, total_cost_usd: 0 });
+      emit({ type: "message_delta", usage: { output_tokens: 5 } });
+      if (kind !== "unclosed") emit({ type: "message_stop" });
+      const models = kind === "ambiguous" ? { "root[1m]": model(10, 5, 0), "root[2m]": model(10, 5, 0) } : { root: model(1010, 505, 0) };
+      expect(query.observeResult({ modelUsage: models, total_cost_usd: 0 })?.nativeAccounting?.requests).toBeUndefined();
+    }
+  });
+
+  it.each([
+    { speed: "standard", requestedFast: true, observedFast: false },
+    { speed: "fast", requestedFast: false, observedFast: true },
+    { speed: "unknown", requestedFast: false, observedFast: undefined },
+    { speed: "standard", requestedFast: false, tier: "priority", observedFast: undefined }
+  ])("uses the request's observed $speed speed and keeps unsupported tiers unpriced", ({ speed, requestedFast, tier, observedFast }) => {
+    const query = new NativeQueryUsage(true), context = { fastMode: requestedFast, requestedAt: 0 };
+    const emit = (event: unknown) => query.observeStream({ event }, context);
+    emit({ type: "message_start", message: { id: "request", model: "root", usage: { input_tokens: 10, output_tokens: 0,
+      cache_read_input_tokens: 0, cache_creation_input_tokens: 0, speed, service_tier: tier } } });
+    emit({ type: "message_delta", usage: { output_tokens: 5 } }); emit({ type: "message_stop" });
+    const usage = query.observeResult({ modelUsage: { root: model(10, 5, 0) }, total_cost_usd: 0 })!;
+    expect(usage).toMatchObject({ inputTokens: 10, outputTokens: 5, totalTokens: 15 });
+    if (observedFast === undefined) expect(usage.nativeAccounting?.requests).toBeUndefined();
+    else expect(usage.nativeAccounting?.requests).toEqual([expect.objectContaining({ fastMode: observedFast, requestedAt: 0 })]);
+  });
+
   it("keeps missing native model cost in an unattributed remainder instead of charging a later model baseline twice", () => {
     const query = new NativeQueryUsage(true);
     const first = query.observeResult({ modelUsage: { root: model(10, 5, 0.02), child: { ...model(2, 1, 0), costUSD: undefined } }, total_cost_usd: 0.03 })!;
