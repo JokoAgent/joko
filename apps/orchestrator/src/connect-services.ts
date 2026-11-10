@@ -9719,7 +9719,7 @@ async function backendProviderDescriptorWithAccountUsage(
     && !managedProviderCatalogApplies(dependencies, descriptor.id, providerId)) provider = create(contract.ProviderDescriptorSchema, {
       ...provider, capabilities: create(contract.CapabilityManifestSchema, { schemaVersion: "joko.provider.v1",
         revision: toProtoRevision(revision), capabilities: [...(provider.capabilities?.capabilities ?? []).filter(item => item.name !== "provider.account_resets"),
-          { name: "provider.account_resets", support: contract.CapabilitySupport.SUPPORTED, reason: "" }] })
+          create(contract.CapabilitySchema, { name: "provider.account_resets", support: contract.CapabilitySupport.SUPPORTED, reason: "" })] })
     });
   if (!backendProviderAccountUsageAvailable(dependencies, descriptor, providerId)) return provider;
   const accountUsage = await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
