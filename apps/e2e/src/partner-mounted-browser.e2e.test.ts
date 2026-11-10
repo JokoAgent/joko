@@ -465,11 +465,27 @@ describe("mounted Partner collaboration product chain", () => {
     const responder = partnerResponder(() => targetPartnerId, cancelledChildGate);
     const nativeRpcs: Array<{ runtime: number; command: string; startedAt: number; endedAt?: number;
       state: "pending" | "fulfilled" | "rejected"; errorCode?: string }> = [];
+    const nativeEvents: Array<{ runtime: number; type: string; at: number }> = [];
+    const activeTransports = new Map<number, PiRpcTransport>(), stopEventObservers: Array<() => void> = [];
+    const nativeState = (response: unknown) => {
+      const data = (response as { readonly data?: Record<string, unknown> }).data;
+      return data === undefined ? undefined : { isStreaming: data["isStreaming"], isCompacting: data["isCompacting"],
+        pendingMessageCount: data["pendingMessageCount"] };
+    };
     const runtimeIds = new WeakMap<PiRpcTransport, number>(); let runtimeCount = 0;
     const originalRequest = PiRpcTransport.prototype.request;
     const observation = vi.spyOn(PiRpcTransport.prototype, "request").mockImplementation(function (this: PiRpcTransport, command, options) {
       let runtime = runtimeIds.get(this);
       if (runtime === undefined) { runtime = ++runtimeCount; runtimeIds.set(this, runtime); }
+      // The Adapter already owns the event subscription by prompt admission.
+      // Observing earlier would consume its buffered initialization events.
+      if (command.type === "prompt" && !activeTransports.has(runtime)) {
+        const observedRuntime = runtime; activeTransports.set(runtime, this);
+        stopEventObservers.push(this.onEvent(event => {
+          nativeEvents.push({ runtime: observedRuntime, type: event.type, at: Date.now() });
+          if (nativeEvents.length > 96) nativeEvents.shift();
+        }));
+      }
       const receipt: (typeof nativeRpcs)[number] = { runtime, command: command.type, startedAt: Date.now(), state: "pending" };
       nativeRpcs.push(receipt); if (nativeRpcs.length > 96) nativeRpcs.shift();
       const pending = originalRequest.call(this, command, options);
@@ -479,7 +495,7 @@ describe("mounted Partner collaboration product chain", () => {
       });
       return pending;
     });
-    restoreNativeRpcObservation = () => observation.mockRestore();
+    restoreNativeRpcObservation = () => { observation.mockRestore(); for (const stop of stopEventObservers) stop(); };
 
     fixture = await RealPiSystemFixture.start({
       webDirectory,
@@ -734,11 +750,16 @@ describe("mounted Partner collaboration product chain", () => {
     } catch (cause) {
       const run = cancellable.runId === undefined ? undefined : fixture.application.store.findRun(cancellable.runId)?.descriptor;
       const queue = run?.sessionId === undefined ? undefined : fixture.application.store.findQueueItemByRunId(run.sessionId, run.id);
+      const pendingAbort = nativeRpcs.findLast(receipt => receipt.command === "abort" && receipt.state === "pending");
+      const transport = pendingAbort && activeTransports.get(pendingAbort.runtime);
+      const afterAbort = transport === undefined ? undefined : await originalRequest.call(transport, { type: "get_state" }, { timeoutMs: 2_000 })
+        .then(response => ({ state: nativeState(response) }), error => ({ errorCode: error instanceof PiAdapterError ? error.publicError.code : "UNCLASSIFIED" }));
       throw new Error(`The inline delegation cancellation did not settle: ${JSON.stringify({
         clicked: cancellationClicked, pointer: await pointerReceipt.evaluate(receipt => receipt.events).catch(() => []),
         requests: cancellationRequests, failures: cancellationFailures,
         card: (await cancelCard.textContent({ timeout: 5_000 }))?.slice(-2_000), browserErrors,
-        nativeRpcs: nativeRpcs.slice(-48),
+        nativeRpcs: nativeRpcs.slice(-48), nativeEvents: nativeEvents.slice(-48), afterAbort,
+        cancelledChildProviderRequests: fixture.providerRequests.filter(request => latestUserText(request).includes(CANCEL_OBJECTIVE)).length,
         run: run === undefined ? undefined : { id: run.id, sessionId: run.sessionId, state: run.state,
           activeAttemptId: run.activeAttemptId, endedAt: run.endedAt, errorCode: run.error?.code },
         queue: queue === undefined ? undefined : { id: queue.id, state: queue.state, attemptId: queue.attemptId,
