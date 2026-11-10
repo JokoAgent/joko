@@ -118,8 +118,16 @@ describe("packaged Desktop Pi compaction", () => {
         observed.add(window.id);
         const record = (type: string): void => { if (events.length < 32) events.push({ type, elapsedMs: Date.now() - startedAt, ...state(window) }); };
         record("observed");
-        for (const name of ["ready-to-show", "show", "hide", "focus", "blur", "minimize", "restore", "closed"] as const) window.on(name, () => record(name));
-        for (const name of ["did-finish-load", "render-process-gone"] as const) window.webContents.on(name, () => record(name));
+        window.on("ready-to-show", () => record("ready-to-show"));
+        window.on("show", () => record("show"));
+        window.on("hide", () => record("hide"));
+        window.on("focus", () => record("focus"));
+        window.on("blur", () => record("blur"));
+        window.on("minimize", () => record("minimize"));
+        window.on("restore", () => record("restore"));
+        window.on("closed", () => record("closed"));
+        window.webContents.on("did-finish-load", () => record("did-finish-load"));
+        window.webContents.on("render-process-gone", () => record("render-process-gone"));
       };
       BrowserWindow.getAllWindows().forEach(observe); app.on("browser-window-created", (_event, window) => observe(window));
       (globalThis as typeof globalThis & { __jokoPairingWindowObservation?: { events: unknown[]; current: () => unknown[] } })
