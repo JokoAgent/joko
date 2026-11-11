@@ -232,14 +232,18 @@ export default function installSilentEncryptedRetry(pi?: PiExtensionApi): void {
     if (new Headers(suppliedHeaders).get(PROVIDER_MARKER_HEADER) !== "1") return originalFetch(input, init);
     let request: Request;
     try { request = new Request(input, init); } catch { return originalFetch(input, init); }
+    const suppliedSignal = init?.signal === undefined && input instanceof Request ? input.signal : init?.signal;
+    const signal = suppliedSignal ?? request.signal;
+    // Keep the wire request tied to the caller across intermediate Request clones.
+    const fetchRequest = (next: Request) => originalFetch(next, { signal });
     const providerHeaders = new Headers(request.headers);
     providerHeaders.delete(PROVIDER_MARKER_HEADER);
     request = new Request(request, { headers: providerHeaders });
-    if (!isResponsesRequest(request) || !readEnabled(controlPath, generation)) return originalFetch(request);
-    throwIfAborted(request.signal);
+    if (!isResponsesRequest(request) || !readEnabled(controlPath, generation)) return fetchRequest(request);
+    throwIfAborted(signal);
 
     let originalBody: string;
-    try { originalBody = await request.clone().text(); } catch { return originalFetch(request); }
+    try { originalBody = await request.clone().text(); } catch { return fetchRequest(request); }
     const model = modelFromBody(originalBody);
     const route = routeFromRequest(request);
     const current = model === undefined || route === undefined ? undefined : { route, model };
@@ -249,13 +253,13 @@ export default function installSilentEncryptedRetry(pi?: PiExtensionApi): void {
     }
     const proactive = sameRoute(installed.active, current) ? stripReasoning(originalBody) : undefined;
     const firstRequest = proactive === undefined ? undefined : requestWithBody(request, proactive.body);
-    const first = await (firstRequest === undefined ? originalFetch(request) : originalFetch(firstRequest));
+    const first = await fetchRequest(firstRequest ?? request);
 
     if ((first.status !== 400 && first.status !== 422) || !readEnabled(controlPath, generation)) return first;
-    throwIfAborted(request.signal);
+    throwIfAborted(signal);
     let errorText: string | undefined;
-    try { errorText = await boundedErrorText(first, request.signal); } catch (error) {
-      throwIfAborted(request.signal);
+    try { errorText = await boundedErrorText(first, signal); } catch (error) {
+      throwIfAborted(signal);
       return first;
     }
     if (errorText === undefined || !INVALID_ENCRYPTED_CONTENT_RE.test(errorText)) return first;
@@ -266,9 +270,9 @@ export default function installSilentEncryptedRetry(pi?: PiExtensionApi): void {
     const stripped = stripReasoning(originalBody);
     if (stripped === undefined) return first;
     if (sameRoute(installed.current, current)) installed.active = current;
-    throwIfAborted(request.signal);
+    throwIfAborted(signal);
     void first.body?.cancel().catch(() => undefined);
-    return originalFetch(requestWithBody(request, stripped.body));
+    return fetchRequest(requestWithBody(request, stripped.body));
   };
 }
 `;
