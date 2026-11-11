@@ -947,7 +947,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
 
   useEffect(() => {
     const content = contentRef.current;
-    if (content === null || typeof ResizeObserver === "undefined") return;
+    const node = scrollRef.current;
+    if (content === null || node === null || typeof ResizeObserver === "undefined") return;
     const owner = navigationOwnerRef.current;
     let active = true;
     let frame: number | undefined;
@@ -958,8 +959,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
       frame = requestAnimationFrame(() => {
         frame = undefined;
         if (!active || !navigationDocumentActiveRef.current || navigationOwnerRef.current !== owner || navigationGenerationRef.current !== generation || scrollbarDragRef.current !== undefined) return;
-        const node = scrollRef.current;
-        if (node === null) return;
+        if (scrollRef.current !== node) return;
         const anchor = viewportAnchorRef.current;
         let anchorOffsetDelta = 0;
         if (!followingRef.current && anchor !== undefined) {
@@ -984,6 +984,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
         }
       });
     });
+    observer.observe(node);
     observer.observe(content);
     for (const row of content.querySelectorAll<HTMLElement>("[data-timeline-item-id]")) observer.observe(row);
     return () => {

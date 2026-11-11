@@ -980,16 +980,23 @@ async function browserFrames(page: Page): Promise<void> {
 
 async function settledViewportGeometry(page: Page) {
   let previous: Awaited<ReturnType<typeof viewportGeometry>> | undefined;
+  const changes: Array<{ frame: number; geometry: Awaited<ReturnType<typeof viewportGeometry>> }> = [];
   let stableFrames = 0;
   for (let frame = 0; frame < 120; frame += 1) {
     await browserFrames(page);
     const geometry = await viewportGeometry(page);
+    if (previous === undefined || geometry.scrollHeight !== previous.scrollHeight || geometry.scrollTop !== previous.scrollTop
+        || geometry.height !== previous.height || geometry.width !== previous.width) {
+      changes.push({ frame, geometry });
+      if (changes.length > 12) changes.shift();
+    }
     stableFrames = geometry.distanceFromEnd <= 2 && geometry.scrollHeight === previous?.scrollHeight
       && geometry.scrollTop === previous.scrollTop ? stableFrames + 1 : 0;
     if (stableFrames >= 8) return geometry;
     previous = geometry;
   }
-  throw new Error(`The mounted Timeline layout did not settle: ${JSON.stringify(previous)}`);
+  const jumpLatestVisible = await page.locator(".jump-latest").isVisible().catch(() => undefined);
+  throw new Error(`The mounted Timeline layout did not settle: ${JSON.stringify({ changes, jumpLatestVisible })}`);
 }
 
 async function unreadCount(page: Page): Promise<number> {
