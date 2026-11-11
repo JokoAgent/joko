@@ -120,6 +120,48 @@ describe("DesktopPageSearchBar", () => {
     expect(highlights.has(PAGE_SEARCH_HIGHLIGHT)).toBe(false);
   });
 
+  it("finds a mounted Timeline word above the pane and reveals it without leaving Find", async () => {
+    document.body.innerHTML = `<section id="pane" style="overflow-y:hidden">
+      <div id="live-timeline" class="timeline" data-timeline-session-id="task" style="overflow-y:auto">
+        <p id="reading-row" data-top="210">needle</p>
+        <div id="permanent-clip" style="overflow-y:clip"><p data-top="210">needle</p></div>
+      </div>
+      <div id="clipped-timeline" class="timeline" data-timeline-session-id="other" style="overflow-y:auto">
+        <p data-top="210">needle</p>
+      </div>
+    </section>`;
+    const viewport = document.querySelector<HTMLElement>("#live-timeline")!;
+    const clipped = document.querySelector<HTMLElement>("#clipped-timeline")!;
+    const rect = (top: number, height: number) => new DOMRect(0, top, 300, height);
+    for (const [element, top] of [[viewport, 100], [clipped, 400]] as const) {
+      replaceProperty(element, "getBoundingClientRect", () => rect(top, 100));
+      replaceProperty(element, "clientHeight", 100);
+      replaceProperty(element, "scrollHeight", 700);
+      element.scrollTop = 300;
+    }
+    replaceProperty(document.querySelector("#pane")!, "getBoundingClientRect", () => rect(100, 100));
+    replaceProperty(document.querySelector("#permanent-clip")!, "getBoundingClientRect", () => rect(420 - viewport.scrollTop, 50));
+    function rangeBox(this: Range): DOMRect {
+      const row = this.startContainer.parentElement;
+      const owner = row?.closest(".timeline");
+      return owner ? rect(owner.getBoundingClientRect().top + Number(row?.getAttribute("data-top")) - owner.scrollTop, 20) : rect(10, 20);
+    }
+    replaceProperty(window.Range.prototype, "getClientRects", function (this: Range) { return [rangeBox.call(this)]; });
+    replaceProperty(window.Range.prototype, "getBoundingClientRect", rangeBox);
+
+    await render();
+    await pressFindShortcut();
+    await typeQuery("needle");
+    expect(count()).toBe("1/1");
+    const match = [...highlights.get(PAGE_SEARCH_ACTIVE_HIGHLIGHT)!][0]!;
+    expect(match.startContainer.parentElement?.id).toBe("reading-row");
+    expect(match.getBoundingClientRect().top).toBeGreaterThanOrEqual(100);
+    expect(match.getBoundingClientRect().bottom).toBeLessThanOrEqual(200);
+    expect(viewport.scrollTop).toBeLessThan(300);
+    expect(clipped.scrollTop).toBe(300);
+    expect(document.activeElement).toBe(searchInput());
+  });
+
   it("leaves document Find to a visible owner and leaves ordinary browsers to native Find", async () => {
     await render();
     const owner = document.createElement("section");
