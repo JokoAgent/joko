@@ -741,7 +741,7 @@ describe("actual Task Home navigation composition", () => {
       } } } } });
     state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, timeline: [plan],
       sessions: state.detail!.sessions.map(session => session.sessionId === "current"
-        ? create(SessionSchema, { ...session, nativeBinding: create(NativeSessionBindingSchema, { ...session.nativeBinding, runtimeGeneration: 7n }) }) : session) }) };
+        ? create(SessionSchema, { ...session, nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 7n }) }) : session) }) };
     await renderTask();
     expect(host.textContent).toContain(completedStep);
     await press("Collapse plan");

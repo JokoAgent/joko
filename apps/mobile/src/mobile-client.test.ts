@@ -6001,7 +6001,8 @@ describe("native mobile connection and operation ownership", () => {
     const cache = {
       load: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
-      clear: vi.fn(async () => undefined)
+      clear: vi.fn(async () => undefined),
+      retireTaskTimeline: vi.fn(async () => undefined)
     };
     const firstNetwork = fakeNetwork();
     const firstSaved = memoryStorage(credential);
@@ -12195,7 +12196,7 @@ describe("native message rewinds", () => {
     const writeGate = new Promise<void>(resolve => { release = resolve; });
     const savePending = saved.storage.savePending;
     let paused = false;
-    saved.storage.savePending = vi.fn(async (items) => {
+    saved.storage.savePending = vi.fn<MobileStorage["savePending"]>(async (items) => {
       if (!paused && items.some(item => item.kind === "workspace-rewind")) { paused = true; await writeGate; }
       await savePending(items);
     });
