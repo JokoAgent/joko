@@ -224,7 +224,8 @@ export class ExtensionCardRuntime {
           callTool: (name, args, signal, context) => this.#call(instance, name, args, signal, context) };
         try {
           if (provider.tools.length) instance.unregister = this.options.registerProvider(provider);
-          if (authority.runtime.tasks || authority.runtime.text || authority.runtime.deviceSync) await this.#ensure(instance);
+          if (authority.runtime.tasks || authority.runtime.text || authority.runtime.deviceSync
+            || provider.tools.length === 0 && authority.taskViewInstallation !== undefined) await this.#ensure(instance);
         }
         catch { this.#retire(instance); this.#instances.delete(id); }
       }
