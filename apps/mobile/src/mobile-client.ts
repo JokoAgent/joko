@@ -565,6 +565,8 @@ export interface MobileTaskSendObserver {
   readonly deliveryMode?: QueueDeliveryMode;
   /** Presentation of the original input, before any disk/upload wait. */
   readonly onProgress?: (progress: import("./mobile-pending-send").MobilePendingSendProgress) => void;
+  /** Presentation-only guard for the exact accepted input's own projection refresh. */
+  readonly onAcceptedRefresh?: (isCurrent: () => boolean) => void;
   readonly confirmRebalance?: (suggestion: ProviderGroupRebalanceSuggestion, signal: AbortSignal) => Promise<"keep" | "cancel" | { readonly remember: boolean }>;
   /** Presentation-only notification after validation/upload and immediately before durable submit. */
   readonly onDispatch?: (draft: MobileComposerDraft) => void;
@@ -10754,6 +10756,27 @@ export class MobileClient {
       observer.onDispatch?.(sendDraft);
       observer.onProgress?.({ phase: "sending", input: sendDraft, sentAt });
       if (!isCurrent()) return false;
+      const observeAcceptedRefresh = (operation: Operation): void => {
+        const notify = observer.onAcceptedRefresh;
+        const queued = operation.result?.payload;
+        const binding = session.nativeBinding?.opaqueReference;
+        if (!notify || this.#joinedTask || !binding || !sourceGeneration || !isCurrent()
+          || operation.state !== OperationState.SUCCEEDED || operation.operationId !== observer.operationId
+          || queued?.case !== "queueItem" || !queued.value.queueItemId || queued.value.sourceId !== operation.operationId
+          || queued.value.sessionId !== sessionId || queued.value.backendId !== session.backendId || queued.value.targetId !== session.targetId) return;
+        const refreshEpoch = this.#epoch + 1;
+        const refreshCurrent = (): boolean => {
+          const current = this.#selectedSession();
+          return this.#current(refreshEpoch) && this.#credential === credential && !this.#joinedTask
+            && (this.#state.status === "connecting" || this.#state.status === "connected" && this.#taskAuthorityKey() !== undefined)
+            && this.#state.window === undefined && this.#taskGeneration() === sourceGeneration
+            && this.#state.selectedId === sessionId && current?.sessionId === sessionId
+            && current.backendId === session.backendId && current.targetId === session.targetId
+            && current.nativeBinding?.runtimeGeneration === generation && current.nativeBinding.opaqueReference === binding;
+        };
+        try { notify(refreshCurrent); }
+        catch { /* Presentation cannot change the original send or its refresh. */ }
+      };
       const receipt = await this.#submitTracked(create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
           entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }), expectedGeneration: generation
@@ -10765,7 +10788,7 @@ export class MobileClient {
           ...(providerGroupRebalance ? { providerGroupRebalance } : {})
         }) }
       }), { kind: "send", sessionId }, false, observer.operationId, true, true,
-        { signal, isCurrent: connectionCurrent, beforeDispatch: isCurrent });
+        { signal, isCurrent: connectionCurrent, beforeDispatch: isCurrent, beforeRefresh: observeAcceptedRefresh });
       const accepted = receipt.accepted;
       if (accepted) {
         try {
@@ -16859,7 +16882,8 @@ export class MobileClient {
     refreshAfter = true,
     authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean;
       readonly beforeDispatch?: () => boolean;
-      readonly beforeTerminalReceipt?: (operation: Operation) => Promise<void> }
+      readonly beforeTerminalReceipt?: (operation: Operation) => Promise<void>;
+      readonly beforeRefresh?: (operation: Operation) => void }
   ): Promise<TrackedMutationResult> {
     const requestCurrent = (): boolean => authority === undefined || !authority.signal.aborted && authority.isCurrent();
     if (!requestCurrent()) return { accepted: false, definitive: false };
@@ -16928,7 +16952,10 @@ export class MobileClient {
     const rejectionMessage = rejected ? operation.error?.message || "The operation was rejected." : undefined;
     if (this.#current(epoch)) {
       if (markBusy) this.#set({ busy: false });
-      if (refreshAfter) await this.refresh();
+      if (refreshAfter) {
+        authority?.beforeRefresh?.(operation);
+        await this.refresh();
+      }
       if (rejectionMessage && this.#credential?.connectionId === pending.connectionId && this.#state.status === "connected") {
         this.#set({ error: rejectionMessage });
       }
