@@ -98,7 +98,7 @@ export class PartnerMessagingRuntime {
     });
   }
 
-  async resolve(conversation: MessagingConversationRecord, event: MessagingInboundEvent): Promise<MessagingConversationRecord | undefined> {
+  #destination(conversation: MessagingConversationRecord) {
     const binding = this.binding(conversation.connectionId);
     if (!binding.partnerId) return undefined;
     const partner = this.options.partners.getPartner(binding.partnerId), connection = this.options.store.getMessagingConnection(binding.connectionId);
@@ -110,6 +110,13 @@ export class PartnerMessagingRuntime {
         || profile.lifecycle !== 'active' || profile.initializationState !== 'ready' || profile.pauseCleanupPending) throw new StoreError('The Partner message destination changed.');
     };
     assertCurrent();
+    return { binding, partner, connection, assertCurrent };
+  }
+
+  async resolve(conversation: MessagingConversationRecord, event: MessagingInboundEvent): Promise<MessagingConversationRecord | undefined> {
+    const destination = this.#destination(conversation);
+    if (!destination) return undefined;
+    const { binding, partner, connection, assertCurrent } = destination;
     const ownerDm = conversation.conversationKind === 'direct' && event.speaker.isOwner && event.speaker.providerUserId === connection.ownerProviderUserId;
     let session: SessionDescriptor;
     if (ownerDm) {
@@ -117,7 +124,12 @@ export class PartnerMessagingRuntime {
       this.options.partners.canonicalCaller(partner.canonicalSessionId);
       session = this.options.store.getSession(partner.canonicalSessionId).descriptor;
     } else {
-      const key = `im:${digest([connection.channel, connection.id, binding.revision, conversation.id])}`;
+      const baseKey = channelKey(connection, binding.revision, conversation.id);
+      const link = connection.channel === 'telegram' && conversation.conversationKind === 'group' && conversation.sessionId
+        && conversation.partnerId === partner.id && conversation.partnerBindingRevision === binding.revision
+        ? this.options.profiles.getSessionLink(conversation.sessionId) : undefined;
+      const key = link?.partnerId === partner.id && link.role === 'channel' && matchesChannelKey(link.channelKey, baseKey)
+        ? link.channelKey : baseKey;
       session = await this.options.partners.ensureChannel({ partnerId: partner.id, key,
         title: `${connection.channel} ${conversation.providerThreadId ? 'topic' : conversation.conversationKind === 'direct' ? event.speaker.displayName : conversation.providerConversationId}`,
         assertCurrent });
@@ -129,6 +141,47 @@ export class PartnerMessagingRuntime {
     return this.options.store.bindPartnerMessagingConversation({ conversationId: current.id, expectedRevision: current.revision,
       expectedChannelGeneration: connection.generation, sessionId: session.id, expectedSessionGeneration: session.binding.generation,
       partnerId: partner.id, bindingRevision: binding.revision, targetId: partner.homeTargetId });
+  }
+
+  prepareTelegramGroupRotation(conversation: MessagingConversationRecord, assertOwner: () => void) {
+    const destination = this.#destination(conversation);
+    if (!destination || destination.connection.channel !== 'telegram' || conversation.conversationKind !== 'group') return undefined;
+    const { binding, partner, connection } = destination;
+    const previousId = conversation.sessionId;
+    const baseKey = channelKey(connection, binding.revision, conversation.id);
+    const previousLink = previousId === undefined ? undefined : this.options.profiles.getSessionLink(previousId);
+    if (previousId !== undefined && (conversation.partnerId !== partner.id || conversation.partnerBindingRevision !== binding.revision
+      || previousLink?.partnerId !== partner.id || previousLink.role !== 'channel' || !matchesChannelKey(previousLink.channelKey, baseKey))) return undefined;
+
+    const assertCurrent = () => {
+      assertOwner();
+      destination.assertCurrent();
+      const current = this.options.store.getMessagingConversation(conversation.id);
+      if (current.revision !== conversation.revision || current.status === 'retired' || current.sessionId !== previousId
+        || current.channelGeneration !== connection.generation) throw new StoreError('The original Partner group changed.');
+    };
+    assertCurrent();
+
+    return {
+      assertCurrent,
+      create: async (assertIdle: () => void, onAdmitted: (store: OperationalStore) => void) => {
+        // Derive the next key from the adopted task so recovery can find the
+        // same candidate, and keep the archived task's private link intact.
+        const key = previousId === undefined ? baseKey : `${baseKey}:${digest(previousId)}`;
+        const assertAdoption = () => { assertCurrent(); assertIdle(); };
+        await this.options.partners.ensureChannel({ partnerId: partner.id, key,
+          title: `telegram ${conversation.providerThreadId ? 'topic' : conversation.providerConversationId}`, assertCurrent: assertAdoption,
+          onMessagingAdmitted: (store, { descriptor: session }) => {
+            assertAdoption();
+            if (session.id === previousId || session.permissionMode !== 'ask') throw new StoreError('The Partner replacement is outside this group.');
+            store.bindPartnerMessagingConversation({ conversationId: conversation.id, expectedRevision: conversation.revision,
+              expectedChannelGeneration: connection.generation, sessionId: session.id, expectedSessionGeneration: session.binding.generation,
+              partnerId: partner.id, bindingRevision: binding.revision, targetId: partner.homeTargetId });
+            onAdmitted(store);
+          }
+        });
+      }
+    };
   }
 
   origin(conversation: MessagingConversationRecord, event: MessagingInboundMessage, requestId: string): NonNullable<PromptInput['messagingOrigin']> | undefined {
@@ -186,9 +239,15 @@ export class PartnerMessagingRuntime {
       const connection = this.options.store.getMessagingConnection(binding.connectionId);
       if (connection.channel !== channel || !connection.enabled || !connection.credentialReferenceId || !connection.credentialGeneration) return [];
       if (link.role === 'channel' && !this.options.store.listMessagingConversations({ connectionId: connection.id, statuses: ['observed', 'active'] })
-        .some(conversation => conversation.channelGeneration === connection.generation
-          && link.channelKey === `im:${digest([connection.channel, connection.id, binding.revision, conversation.id])}`
-          && (conversation.status === 'observed' || conversation.sessionId === sessionId && conversation.partnerId === profile.id && conversation.partnerBindingRevision === binding.revision))) return [];
+        .some(conversation => {
+          if (conversation.channelGeneration !== connection.generation) return false;
+          const baseKey = channelKey(connection, binding.revision, conversation.id);
+          if (conversation.status === 'observed') return link.channelKey === baseKey;
+          const keyMatches = connection.channel === 'telegram' && conversation.conversationKind === 'group'
+            ? matchesChannelKey(link.channelKey, baseKey) : link.channelKey === baseKey;
+          return keyMatches && conversation.sessionId === sessionId && conversation.partnerId === profile.id
+            && conversation.partnerBindingRevision === binding.revision;
+        })) return [];
       return [connection];
     });
   }
@@ -462,6 +521,12 @@ function keys(value: object, allowed: readonly string[]): void { if (Object.keys
 function field(value: unknown): string { if (typeof value !== 'string' || !value || value.length > 256 || /[\u0000-\u001f\u007f]/u.test(value)) throw new StoreError('The message identity is invalid.'); return value; }
 
 function digest(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
+function channelKey(connection: MessagingConnectionRecord, bindingRevision: number, conversationId: string): string {
+  return `im:${digest([connection.channel, connection.id, bindingRevision, conversationId])}`;
+}
+function matchesChannelKey(key: string | undefined, base: string): key is string {
+  return key === base || key !== undefined && key.startsWith(`${base}:`) && /^[a-f0-9]{64}$/u.test(key.slice(base.length + 1));
+}
 
 const READ_ONLY_MESSAGE_TOOLS = new Set(['read', 'glob', 'grep', 'ls', 'notebookread', 'list_tools']);
 /** A wrapper must not hide a write from a remote-channel confirmation. */

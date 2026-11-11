@@ -46,7 +46,7 @@ describe("Discord Messaging production product chain", () => {
     discord = undefined;
   });
 
-  it("uses authenticated Connect, direct REST + Gateway, an approved thread, attachments, resume, and restart recovery", { timeout: 120_000 }, async () => {
+  it("uses authenticated Connect, REST + Gateway, thread recovery, and a fresh context in the original owner task", { timeout: 120_000 }, async () => {
     discord = await DiscordSystemFixture.start();
     const attachmentBytes = new TextEncoder().encode("discord attachment product-chain evidence\n");
     discord.addAttachment({
@@ -61,7 +61,7 @@ describe("Discord Messaging production product chain", () => {
     const paired = await fixture.pair("Discord Messaging E2 owner");
     const authKey = paired.authKey;
 
-    await paired.clients.messaging.putMessagingRoute({
+    const initialRoute = {
       targetId: "workspace-real-pi",
       providerId: REAL_PI_PROVIDER_ID,
       modelId: REAL_PI_MODEL_ID,
@@ -69,7 +69,8 @@ describe("Discord Messaging production product chain", () => {
       fastMode: false,
       permissionMode: PermissionMode.ASK,
       planMode: false
-    });
+    };
+    await paired.clients.messaging.putMessagingRoute(initialRoute);
     const created = required((await paired.clients.messaging.createMessagingConnection({
       channel: MessagingChannel.DISCORD,
       ownerProviderUserId: DISCORD_SYSTEM_OWNER_ID,
@@ -277,6 +278,49 @@ describe("Discord Messaging production product chain", () => {
     expect(fixture.providerRequests).toHaveLength(2);
     const audioPath = await fixture.application.artifacts.resolveBlobPath(storedAudio.blob);
     expect(JSON.stringify(fixture.providerRequests[1]?.body)).toContain(JSON.stringify(audioPath).slice(1, -1));
+
+    const store = fixture.application.store;
+    const direct = store.getMessagingConversation(audioRequest.conversationId!);
+    const directSessionId = required(direct.sessionId, "Discord owner task Session");
+    await waitFor(async () => {
+      try { fixture!.application.sessionHost.assertSessionLifecycleIdle(directSessionId); return true; }
+      catch { return false; }
+    }, ready => ready, "the original Discord owner task to settle", 10_000);
+    const originalDirect = store.getSession(directSessionId).descriptor;
+    const restartRoute = required((await restartedClients.messaging.putMessagingRoute({
+      ...initialRoute, connectionId: created.connectionId, permissionMode: PermissionMode.AUTO
+    })).route, "Discord connection default for the restart");
+    expect(restartRoute.scopeKey).not.toBe(direct.routeScopeKey);
+    const resetId = "900000000000000004";
+    discord.enqueueMessage({ messageId: resetId, channelId: DISCORD_SYSTEM_DM_ID, text: "/new" });
+    await waitFor(async () => discord?.outboundMessages ?? [], messages => messages.some(message =>
+      message.channelId === DISCORD_SYSTEM_DM_ID && message.replyToMessageId === resetId && message.text === "A new conversation is ready."),
+    "the original Discord owner task to start a fresh context", 25_000);
+    const resetDirect = store.getSession(directSessionId).descriptor;
+    expect(resetDirect).toMatchObject({ id: directSessionId, targetId: originalDirect.targetId,
+      backendId: originalDirect.backendId, permissionMode: "auto", binding: { generation: originalDirect.binding.generation + 1 } });
+    expect(resetDirect.binding.opaqueRef).not.toBe(originalDirect.binding.opaqueRef);
+    expect(store.getMessagingConversation(direct.id)).toMatchObject({ status: "active", sessionId: directSessionId,
+      sessionGeneration: resetDirect.binding.generation, routeScopeKey: restartRoute.scopeKey, permissionMode: "auto" });
+    expect(store.getMessagingConversation(restartedConversation.id).sessionGeneration).toBe(restartedConversation.sessionGeneration);
+    expect(store.listEvents({ sessionId: directSessionId }).map(event => event.payload.type)).not.toContain("message_complete");
+    expect(store.listEvents({ sessionId: directSessionId, includeTombstoned: true }).map(event => event.payload.type)).toContain("message_complete");
+    expect((await fixture.application.artifacts.readBlob(storedAudio.blob)).data).toEqual(audio);
+    expect(fixture.providerRequests).toHaveLength(2);
+
+    const freshId = "900000000000000005";
+    const freshPrompt = "Read this newly started Discord conversation.";
+    discord.enqueueMessage({ messageId: freshId, channelId: DISCORD_SYSTEM_DM_ID, text: freshPrompt });
+    await waitFor(async () => discord?.outboundMessages ?? [], messages => messages.some(message =>
+      message.channelId === DISCORD_SYSTEM_DM_ID && message.replyToMessageId === freshId && message.text === SECOND_REPLY),
+    "the first Pi turn in the new Discord context", 25_000);
+    const fresh = required(store.listMessagingInboundRequests().find(request => request.providerMessageId === freshId), "fresh Discord request");
+    expect(store.getQueueItem(fresh.queueItemId!).sessionId).toBe(directSessionId);
+    expect(store.listMessagingInboundRequests().some(request => request.providerMessageId === resetId)).toBe(false);
+    expect(fixture.providerRequests).toHaveLength(3);
+    const freshProviderBody = JSON.stringify(fixture.providerRequests[2]?.body);
+    expect(freshProviderBody).toContain(freshPrompt);
+    expect(freshProviderBody).not.toContain("Inspect this direct audio attachment.");
 
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),

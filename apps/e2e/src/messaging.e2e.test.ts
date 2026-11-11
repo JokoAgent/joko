@@ -158,7 +158,11 @@ describe("Telegram Messaging production product chain", () => {
     await fixture.close({ removeRoot: false });
     fixture = undefined;
 
-    fixture = await startSystem(telegram, () => SECOND_REPLY, rootDirectory);
+    let heldProviderReply: Promise<void> | undefined;
+    fixture = await startSystem(telegram, async () => {
+      await heldProviderReply;
+      return SECOND_REPLY;
+    }, rootDirectory);
     const restartedClients = fixture.clients(authKey);
     await waitFor(
       async () => fixture!.application.store.getMessagingConnection(created.connectionId),
@@ -196,26 +200,174 @@ describe("Telegram Messaging production product chain", () => {
     const audio = await readFile(new URL("../../desktop/resources/native-task-status-sounds/ring-chime.mp3", import.meta.url));
     telegram.addFile({ fileId: "native-audio-102", path: "music/chime.mp3", bytes: audio, mimeType: "audio/mpeg" });
     telegram.enqueueDirectMessage({
-      updateId: 12, messageId: 102, text: "Inspect this native audio.",
-      fileId: "native-audio-102", attachmentKind: "audio", mimeType: "application/octet-stream"
+      updateId: 12, messageId: 102, text: "Compare this native audio and the quoted note.",
+      fileId: "native-audio-102", attachmentKind: "audio", mimeType: "application/octet-stream", replyToMessageId: 100
     });
     await waitFor(
       async () => telegram?.outboundMessages ?? [],
       (messages) => messages.some((message) => message.replyToMessageId === 102 && message.text === SECOND_REPLY),
-      "the native Telegram audio turn to finish",
+      "the native Telegram audio and quoted attachment turn to finish",
       30_000
     );
     const audioRequest = required(fixture.application.store.listMessagingInboundRequests()
       .find((request) => request.providerMessageId === "102"), "native Telegram audio request");
     expect(audioRequest).toMatchObject({ status: "completed", conversationId: restartedConversation.id });
-    expect(audioRequest.artifactIds).toHaveLength(1);
+    expect(audioRequest.artifactIds).toHaveLength(2);
     const storedAudio = fixture.application.store.getArtifact(audioRequest.artifactIds[0]!);
     expect(storedAudio.blob).toMatchObject({ fileName: "chime.mp3", mimeType: "audio/mpeg", byteLength: audio.byteLength });
     expect((await fixture.application.artifacts.readBlob(storedAudio.blob)).data).toEqual(audio);
-    expect(telegram.methodCount("getFile")).toBe(2);
+    const quoted = fixture.application.store.getArtifact(audioRequest.artifactIds[1]!);
+    expect(quoted).toMatchObject({
+      blob: { fileName: "product-chain-note.txt", mimeType: "text/plain" },
+      sessionId, runId: audioRequest.runId
+    });
+    expect(quoted.blob.id).not.toBe(staged.blob.id);
+    expect((await fixture.application.artifacts.readBlob(quoted.blob)).data).toEqual(Buffer.from(attachmentBytes));
+    expect(telegram.methodCount("getFile")).toBe(3);
     expect(fixture.providerRequests).toHaveLength(2);
     const audioPath = await fixture.application.artifacts.resolveBlobPath(storedAudio.blob);
-    expect(JSON.stringify(fixture.providerRequests[1]?.body)).toContain(JSON.stringify(audioPath).slice(1, -1));
+    const quotedPath = await fixture.application.artifacts.resolveBlobPath(quoted.blob);
+    const messages = fixture.providerRequests[1]?.body["messages"];
+    expect(Array.isArray(messages)).toBe(true);
+    const lastUser = Array.isArray(messages) ? messages.findLast((message: unknown) =>
+      typeof message === "object" && message !== null && "role" in message && message.role === "user") : undefined;
+    const userInput = JSON.stringify(lastUser);
+    expect(userInput).toContain("Compare this native audio and the quoted note.");
+    expect(userInput).toContain(JSON.stringify(audioPath).slice(1, -1));
+    expect(userInput).toContain(JSON.stringify(quotedPath).slice(1, -1));
+
+    const photo = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"
+    );
+    telegram.addFile({ fileId: "group-photo-103", path: "photos/group-photo.png", bytes: photo, mimeType: "image/png" });
+    const chatId = -100123;
+    const threadId = 7;
+    const groupPrompt = "Describe the earlier group photo.";
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 13, messageId: 103, text: "Photo from the group", photoFileId: "group-photo-103" });
+    await waitFor(
+      async () => fixture?.application.store.getMessagingConnection(created.connectionId).cursor,
+      (cursor) => cursor === "14", "Telegram to observe the group photo", 15_000
+    );
+    expect(telegram.methodCount("getFile")).toBe(3);
+    expect(fixture.providerRequests).toHaveLength(2);
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 14, messageId: 104, text: `@joko_system_bot ${groupPrompt}` });
+    await waitFor(
+      async () => telegram?.outboundMessages ?? [],
+      (replies) => replies.some((message) => message.chatId === chatId && message.threadId === threadId
+        && message.replyToMessageId === 104 && message.text === SECOND_REPLY),
+      "the Telegram group photo turn to finish", 30_000
+    );
+    const groupRequest = required(fixture.application.store.listMessagingInboundRequests()
+      .find((request) => request.providerMessageId === "104"), "Telegram group request");
+    expect(groupRequest).toMatchObject({ status: "completed", artifactIds: [] });
+    const groupQueue = fixture.application.store.getQueueItem(groupRequest.queueItemId!);
+    expect(groupQueue.body).toMatchObject({ images: [], files: [] });
+    expect(groupQueue.body.text).toContain("Photo from the group");
+    expect(fixture.application.store.listArtifacts({ sessionId: groupQueue.sessionId })).toEqual([]);
+    expect(telegram.methodCount("getFile")).toBe(4);
+    expect(fixture.providerRequests).toHaveLength(3);
+    const providerGroupInput = JSON.stringify(fixture.providerRequests[2]?.body["messages"]);
+    expect(providerGroupInput).toContain(groupPrompt);
+    expect(providerGroupInput).toContain(`data:image/png;base64,${photo.toString("base64")}`);
+    const nativeGroupFile = fixture.application.store.getSession(groupQueue.sessionId).descriptor.binding.opaqueRef;
+    const nativeGroupHistory = await readFile(nativeGroupFile, "utf8");
+    expect(nativeGroupHistory).toContain(groupPrompt);
+    expect(nativeGroupHistory).not.toContain(photo.toString("base64"));
+
+    let releaseProvider!: () => void;
+    heldProviderReply = new Promise<void>(resolve => { releaseProvider = resolve; });
+    try {
+      const store = fixture.application.store;
+      const requestFor = (id: string) => store.listMessagingInboundRequests().find(request => request.providerMessageId === id);
+      telegram.enqueueDirectMessage({ updateId: 15, messageId: 105, text: "Keep this original turn running." });
+      await waitFor(async () => fixture?.providerRequests.length ?? 0, count => count === 4, "the held Pi request", 15_000);
+      const active = required(requestFor("105"), "active Telegram request");
+      await waitFor(async () => store.getQueueItem(active.queueItemId!).state, state => state === "backend_accepted",
+        "Pi to accept the original Telegram input", 15_000);
+      telegram.enqueueDirectMessage({ updateId: 16, messageId: 106, text: "This queued input must be cancelled." });
+      const queued = required(await waitFor(async () => requestFor("106"), request => request?.status === "queued",
+        "the next Telegram message to queue", 15_000), "queued Telegram request");
+      expect(store.getQueueItem(queued.queueItemId!).state).toBe("accepted");
+
+      telegram.enqueueDirectMessage({ updateId: 17, messageId: 107, text: "!stop" });
+      const replies = await waitFor(async () => telegram?.outboundMessages ?? [],
+        messages => messages.some(message => message.replyToMessageId === 107),
+        "the stop receipt on the original Telegram message", 20_000);
+      expect(replies.find(message => message.replyToMessageId === 107)?.text)
+        .toMatch(/^(?:Stopped the current turn|Stop requested for the current turn)\. Cancelled 1 queued message\.$/u);
+      await waitFor(async () => requestFor("105")?.status, status => status === "cancelled", "Pi to settle the aborted turn", 15_000);
+      expect(store.getRun(active.runId!).descriptor.state).toBe("aborted");
+      expect(store.getQueueItem(queued.queueItemId!).state).toBe("cancelled");
+      expect(requestFor("106")?.status).toBe("cancelled");
+      expect(requestFor("107")).toBeUndefined();
+      expect(store.getMessagingConversation(restartedConversation.id).sessionId).toBe(sessionId);
+      expect(fixture.providerRequests).toHaveLength(4);
+    } finally {
+      releaseProvider();
+    }
+
+    telegram.enqueueDirectMessage({ updateId: 18, messageId: 108, text: "/new" });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.replyToMessageId === 108 && message.text === "A new conversation is ready. Previous task history was archived."),
+    "the new direct Telegram conversation", 25_000);
+    const freshId = required(fixture.application.store.getMessagingConversation(restartedConversation.id).sessionId, "fresh Telegram task");
+    expect(freshId).not.toBe(sessionId);
+    expect(fixture.application.store.getSession(sessionId).descriptor.archived).toBe(true);
+    expect(fixture.application.store.getArtifact(staged.blob.id).sessionId).toBe(sessionId);
+    expect(fixture.providerRequests).toHaveLength(4);
+
+    const freshPrompt = "Use only this fresh conversation.";
+    telegram.enqueueDirectMessage({ updateId: 19, messageId: 109, text: freshPrompt });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.replyToMessageId === 109 && message.text === SECOND_REPLY), "a reply from the fresh Telegram task", 25_000);
+    const freshRequest = required(fixture.application.store.listMessagingInboundRequests()
+      .find(request => request.providerMessageId === "109"), "fresh Telegram request");
+    expect(fixture.application.store.getQueueItem(freshRequest.queueItemId!).sessionId).toBe(freshId);
+    expect(fixture.providerRequests).toHaveLength(5);
+    const freshProviderInput = JSON.stringify(fixture.providerRequests[4]?.body["messages"]);
+    expect(freshProviderInput).toContain(freshPrompt);
+    expect(freshProviderInput).not.toContain("Keep this original turn running.");
+    expect(freshProviderInput).not.toContain("Compare this native audio and the quoted note.");
+
+    const store = fixture.application.store;
+    const topic = store.getMessagingConversation(groupRequest.conversationId!);
+    const otherTopicText = "A message in the neighboring topic.";
+    const newBackground = "An update since the last accepted topic message.";
+    telegram.enqueueGroupMessage({ chatId, threadId: 8, updateId: 20, messageId: 110, text: otherTopicText });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 21, messageId: 111, text: newBackground });
+    await waitFor(async () => store.getMessagingConnection(created.connectionId).cursor, cursor => cursor === "22",
+      "the two topic observations", 15_000);
+    const otherTopic = required(store.listMessagingConversations({ connectionId: created.connectionId })
+      .find(conversation => conversation.providerThreadId === "8"), "the neighboring Telegram topic");
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 22, messageId: 112, text: "/new" });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.chatId === chatId && message.threadId === threadId && message.replyToMessageId === 112
+      && message.text === "A new conversation is ready. Previous task history was archived."), "the new Telegram topic task", 25_000);
+    const newTopic = store.getMessagingConversation(topic.id);
+    const newTopicId = required(newTopic.sessionId, "the replacement Telegram topic task");
+    expect(newTopicId).not.toBe(groupQueue.sessionId);
+    expect(store.getSession(groupQueue.sessionId).descriptor.archived).toBe(true);
+    expect(store.getMessagingConversation(otherTopic.id)).toEqual(otherTopic);
+    expect(store.getMessagingConversation(restartedConversation.id).sessionId).toBe(freshId);
+    expect(fixture.providerRequests).toHaveLength(5);
+
+    const newTopicPrompt = "Summarize the new topic update.";
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 23, messageId: 113, text: `@joko_system_bot ${newTopicPrompt}` });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.chatId === chatId && message.threadId === threadId && message.replyToMessageId === 113
+      && message.text === SECOND_REPLY), "the reply from the replacement Telegram topic task", 25_000);
+    const newTopicRequest = required(store.listMessagingInboundRequests().find(request => request.providerMessageId === "113"),
+      "the replacement topic input");
+    expect(store.getQueueItem(newTopicRequest.queueItemId!).sessionId).toBe(newTopicId);
+    expect(fixture.providerRequests).toHaveLength(6);
+    expect(telegram.methodCount("getFile")).toBe(4);
+    const replacementTopicInput = JSON.stringify(fixture.providerRequests[5]?.body["messages"]);
+    expect(replacementTopicInput).toContain(newBackground);
+    expect(replacementTopicInput).toContain(newTopicPrompt);
+    expect(replacementTopicInput).not.toContain(otherTopicText);
+    expect(replacementTopicInput).not.toContain("Photo from the group");
+    expect(replacementTopicInput).not.toContain(groupPrompt);
+    expect(replacementTopicInput).not.toContain(photo.toString("base64"));
 
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),
@@ -230,7 +382,7 @@ describe("Telegram Messaging production product chain", () => {
 
 async function startSystem(
   telegram: TelegramSystemFixture,
-  reply: (input: { readonly requestNumber: number }) => string,
+  reply: (input: { readonly requestNumber: number }) => string | Promise<string>,
   rootDirectory?: string
 ): Promise<RealPiSystemFixture> {
   return RealPiSystemFixture.start({
@@ -238,7 +390,8 @@ async function startSystem(
     keepRoot: rootDirectory === undefined,
     telegramApiBaseUrl: telegram.baseUrl,
     messagingRetryDelayMs: 250,
-    providerResponder: ({ requestNumber }) => ({ kind: "text", text: reply({ requestNumber }) })
+    providerSupportsImages: true,
+    providerResponder: async ({ requestNumber }) => ({ kind: "text", text: await reply({ requestNumber }) })
   });
 }
 

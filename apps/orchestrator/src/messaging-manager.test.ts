@@ -1,12 +1,14 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
+import { mkdir, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   MessagingTransportError,
   TelegramTransport,
+  normalizeDiscordUpdates,
   normalizeTelegramUpdates,
   type DingTalkCallbackUpdate,
   type DingTalkNormalizationResult,
@@ -150,6 +152,327 @@ describe("MessagingManager", () => {
     expect(transport.sentText.length + transport.stream.edits.length + card.mock.calls.length).toBe(effects);
   });
 
+  it.each(["telegram", "discord"] as const)("stops the exact %s turn and cancels its queued inputs before the Backend can drain them", async channel => {
+    const telegram = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const discord = new FakeDiscordTransport();
+    const adapter = new ControlledReplyAdapter();
+    const input = [
+      { id: 1, text: "/stop" },
+      { id: 2, text: "Keep this turn active" },
+      { id: 3, text: "!stop", sticker: true },
+      { id: 4, text: "！STOP" },
+      { id: 4, text: "！STOP" }
+    ];
+    const date = Math.floor(Date.now() / 1_000);
+    const messageId = (id: number) => channel === "telegram" ? String(id) : `99999999999999999${id}`;
+    const gates = input.map(() => deliveryGate());
+    const telegramPoll = vi.spyOn(telegram, "poll");
+    const discordPoll = vi.spyOn(discord, "poll");
+    vi.spyOn(telegram, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: telegram.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    vi.spyOn(discord, "normalize").mockImplementation(updates => normalizeDiscordUpdates(updates, {
+      connectionId: discord.connectionId, ownerUserId: "111111111111111111", ownerConversationId: "444444444444444444",
+      bot: { id: "222222222222222222", username: "joko_test_bot", displayName: "Joko" }, groupActivation: {}
+    }));
+    input.forEach((message, index) => {
+      telegramPoll.mockImplementationOnce(async ({ signal }) => {
+        await gates[index]!.wait;
+        signal?.throwIfAborted();
+        return { nextCursor: String(index + 11), updates: [{ update_id: message.id + 10, message: {
+          message_id: message.id, chat: { id: 42, type: "private" }, date,
+          from: { id: 42, first_name: "Owner", is_bot: false }, text: message.text,
+          ...(message.sticker ? { sticker: { emoji: "📎" } } : {})
+        } }] };
+      });
+      discordPoll.mockImplementationOnce(async ({ signal }) => {
+        await gates[index]!.wait;
+        signal?.throwIfAborted();
+        return { nextCursor: `discord-stop-${index}`, updates: [{ sequence: message.id, eventType: "MESSAGE_CREATE",
+          channel: { id: "444444444444444444", type: 1 },
+          message: { id: messageId(message.id), channel_id: "444444444444444444", timestamp: new Date().toISOString(),
+            author: { id: "111111111111111111", username: "owner" }, content: message.text,
+            ...(message.sticker ? { sticker_items: [{ id: "888888888888888888", name: "Sticker" }] } : {})
+          }
+        }] };
+      });
+    });
+    const fixture = await createFixture(() => telegram, () => adapter, () => discord);
+    cleanups.push(() => gates.forEach(gate => gate.release()));
+    const transport = channel === "telegram" ? telegram : discord;
+    const send = vi.spyOn(adapter, "send");
+    const connection = await enableReplyStream(fixture, channel);
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    const repliesTo = (id: number) => transport.sentText.filter(row => row.replyToMessageId === messageId(id));
+    gates[0]!.release();
+    await vi.waitFor(() => expect(repliesTo(1)).toMatchObject([{ text: "No active task needed stopping." }]));
+    expect(fixture.store.listSessions()).toEqual([]);
+
+    gates[1]!.release();
+    await vi.waitFor(() => {
+      const runId = requests().find(request => request.providerMessageId === messageId(2))?.runId;
+      expect(runId).toBeDefined();
+      expect(fixture.store.getRun(runId!).descriptor.state).toBe("running");
+    }, { timeout: 5_000 });
+    const active = requests().find(request => request.providerMessageId === messageId(2))!;
+    const activeQueue = fixture.store.getQueueItem(active.queueItemId!);
+    gates[2]!.release();
+    await vi.waitFor(() => expect(requests().find(request => request.providerMessageId === messageId(3))?.status).toBe("queued"));
+    const pending = requests().find(request => request.providerMessageId === messageId(3))!;
+    expect(fixture.store.getQueueItem(pending.queueItemId!).body.text).toContain("Sticker");
+    const independent = fixture.host.enqueueServiceInput({
+      operationId: "independent-input", sessionId: activeQueue.sessionId, source: "system",
+      prompt: { disposition: "prompt", text: "Independent input", images: [], files: [], mentions: [] }
+    }).value;
+    const nativeAbort = adapter.abort.bind(adapter);
+    const abortRun = vi.spyOn(fixture.host, "abort");
+    const abort = vi.spyOn(adapter, "abort").mockImplementation(async context => {
+      expect(context.sessionId).toBe(activeQueue.sessionId);
+      expect(context.assertRunControlCurrent).toBeDefined();
+      context.assertRunControlCurrent?.();
+      expect(fixture.store.getQueueItem(pending.queueItemId!).state).toBe("cancelled");
+      expect(fixture.store.getQueueItem(independent.queueItemId).state).toBe("accepted");
+      return nativeAbort(context);
+    });
+    gates[3]!.release();
+    await vi.waitFor(() => expect(repliesTo(4)).toMatchObject([{ text: "Stopped the current turn. Cancelled 1 queued message." }]), { timeout: 5_000 });
+    expect(abortRun).toHaveBeenCalledExactlyOnceWith(activeQueue.sessionId, active.runId, expect.any(Function));
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getRun(active.runId!).descriptor.state).toBe("aborted");
+    expect(requests()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ providerMessageId: messageId(2), status: "cancelled" }),
+      expect.objectContaining({ providerMessageId: messageId(3), status: "cancelled" })
+    ]));
+    await vi.waitFor(() => expect(send.mock.calls.map(([prompt]) => prompt.text)).toEqual(["Keep this turn active", "Independent input"]));
+
+    gates[4]!.release();
+    const cursor = channel === "telegram" ? "15" : "discord-stop-4";
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(connection.id).cursor).toBe(cursor));
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(repliesTo(4)).toHaveLength(1);
+    expect(requests()).toHaveLength(2);
+    const receipts = fixture.store.listMessagingInteractions({ connectionId: connection.id });
+    expect(receipts.map(({ status, payload }) => ({ status, payload }))).toEqual([
+      { status: "completed", payload: { format: 1, action: "stop" } },
+      { status: "completed", payload: { format: 1, action: "stop" } }
+    ]);
+  }, 15_000);
+
+  it("opens a fresh Telegram direct task, archives the original lane, and replays /new once", async () => {
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const adapter = new ControlledReplyAdapter();
+    const inputs = [
+      { id: 1, text: "/new" },
+      { id: 2, text: "Work in the original task" },
+      { id: 3, text: "Queue for the original task" },
+      { id: 4, text: "/new" },
+      { id: 4, text: "/new" },
+      { id: 5, text: "/new", senderId: 7 },
+      { id: 6, text: "Work in the fresh task" },
+      { id: 7, text: "/new" }
+    ];
+    const gates = inputs.map(() => deliveryGate());
+    const poll = vi.spyOn(transport, "poll");
+    const date = Math.floor(Date.now() / 1_000);
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    inputs.forEach((input, index) => poll.mockImplementationOnce(async ({ signal }) => {
+      await gates[index]!.wait;
+      signal?.throwIfAborted();
+      return { nextCursor: String(index + 11), updates: [{ update_id: index + 10, message: {
+        message_id: input.id, chat: { id: 42, type: "private" }, date,
+        from: { id: input.senderId ?? 42, first_name: "Owner", is_bot: false }, text: input.text
+      } }] };
+    }));
+    const fixture = await createFixture(() => transport, () => adapter);
+    cleanups.push(() => gates.forEach(gate => gate.release()));
+    const send = vi.spyOn(adapter, "send");
+    const connection = await enableTelegramReply(fixture, "telegram-direct-new");
+    const notice = (id: string) => transport.sentText.filter(row => row.replyToMessageId === id);
+    const requestFor = (id: string) => fixture.store.listMessagingInboundRequests({ connectionId: connection.id })
+      .find(request => request.providerMessageId === id);
+
+    gates[0]!.release();
+    await vi.waitFor(() => expect(notice("1")).toMatchObject([{ text: "A new conversation is ready." }]), { timeout: 5_000 });
+    const original = fixture.store.listMessagingConversations({ connectionId: connection.id })[0]!;
+    const originalSession = original.sessionId!;
+    expect(send).not.toHaveBeenCalled();
+
+    gates[1]!.release();
+    await vi.waitFor(() => expect(fixture.store.getRun(requestFor("2")!.runId!).descriptor.state).toBe("running"));
+    await adapter.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Output in the original task" }] });
+    gates[2]!.release();
+    await vi.waitFor(() => expect(requestFor("3")?.status).toBe("queued"));
+    gates[3]!.release();
+    await vi.waitFor(() => expect(notice("4")).toMatchObject([{ text: "A new conversation is ready. Previous task history was archived." }]), { timeout: 8_000 });
+    const freshSession = fixture.store.getMessagingConversation(original.id).sessionId!;
+    expect(freshSession).not.toBe(originalSession);
+    expect(fixture.store.getSession(originalSession).descriptor.archived).toBe(true);
+    expect(fixture.store.getQueueItem(requestFor("2")!.queueItemId!)).toMatchObject({ sessionId: originalSession, state: "cancelled" });
+    expect(fixture.store.getQueueItem(requestFor("3")!.queueItemId!)).toMatchObject({ sessionId: originalSession, state: "cancelled" });
+    expect(fixture.store.listEvents({ sessionId: originalSession }).map(({ payload }) => payload))
+      .toContainEqual(expect.objectContaining({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Output in the original task" }] }));
+
+    gates[4]!.release();
+    gates[5]!.release();
+    gates[6]!.release();
+    await vi.waitFor(() => expect(adapter.context?.sessionId).toBe(freshSession));
+    expect(send.mock.calls.map(([prompt, context]) => [prompt.text, context.sessionId])).toEqual([
+      ["Work in the original task", originalSession], ["Work in the fresh task", freshSession]
+    ]);
+    expect(notice("4")).toHaveLength(1);
+    expect(notice("5")).toHaveLength(0);
+    expect(fixture.store.listMessagingInteractions({ connectionId: connection.id }).map(({ status, payload }) => ({ status, payload })))
+      .toEqual(Array.from({ length: 2 }, () => ({ status: "completed", payload: { format: 1, action: "new" } })));
+    expect(fixture.store.listSessions({ includeArchived: true })).toHaveLength(2);
+
+    const foreign = fixture.host.enqueueServiceInput({ operationId: "new-command-other-input", sessionId: freshSession, source: "system",
+      prompt: { disposition: "prompt", text: "Keep this other input", images: [], files: [], mentions: [] } }).value;
+    gates[7]!.release();
+    await vi.waitFor(() => expect(notice("7")).toMatchObject([{ text: "Finish the other work in the original task before starting a new conversation." }]));
+    expect(fixture.store.getMessagingConversation(original.id).sessionId).toBe(freshSession);
+    expect(fixture.store.getQueueItem(foreign.queueItemId).state).toBe("accepted");
+    expect(fixture.store.getRun(requestFor("6")!.runId!).descriptor.state).toBe("running");
+  }, 20_000);
+
+  it("restarts the original Discord direct task on the current default with only its old timeline hidden", async () => {
+    const transport = new FakeDiscordTransport();
+    const originalAdapter = new ControlledReplyAdapter();
+    const destinationAdapter = new ControlledReplyAdapter({
+      ...PI_LIKE_PROFILE, id: "discord-default-backend",
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "session.reset"
+        ? { ...capability, supported: false } : capability.key === "permission.modes"
+          ? { ...capability, options: PI_LIKE_PROFILE.permissionModes } : capability)
+    });
+    const inputs = [
+      { id: 1, text: "/new" },
+      { id: 2, text: "Original Discord prompt" },
+      { id: 3, text: "/new" },
+      { id: 4, text: "/new" },
+      { id: 4, text: "/new" },
+      { id: 5, text: "New Discord prompt" },
+      { id: 6, text: "/new" },
+      { id: 7, text: "/new" }
+    ];
+    const gates = inputs.map(() => deliveryGate());
+    const poll = vi.spyOn(transport, "poll");
+    const messageId = (id: number) => `99999999999999999${id}`;
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeDiscordUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "111111111111111111", ownerConversationId: "444444444444444444",
+      bot: { id: "222222222222222222", username: "joko_test_bot", displayName: "Joko" }, groupActivation: {}
+    }));
+    inputs.forEach((message, index) => poll.mockImplementationOnce(async ({ signal }) => {
+      await gates[index]!.wait;
+      signal?.throwIfAborted();
+      return { nextCursor: `discord-new-${index}`, updates: [{
+        sequence: index + 1, eventType: "MESSAGE_CREATE", channel: { id: "444444444444444444", type: 1 },
+        message: { id: messageId(message.id), channel_id: "444444444444444444", timestamp: new Date().toISOString(),
+          author: { id: "111111111111111111", username: "owner" }, content: message.text }
+      }] };
+    }));
+    const fixture = await createFixture(undefined, () => [originalAdapter, destinationAdapter], () => transport);
+    cleanups.push(() => gates.forEach(gate => gate.release()));
+    const { store, host } = fixture;
+    const alternateRoot = join(fixture.root, "alternate-workspace");
+    await mkdir(alternateRoot);
+    await host.registerTarget({ id: "target-two", backendId: destinationAdapter.id, displayName: "Other workspace",
+      workspaceRoot: alternateRoot, managed: true, trusted: true });
+    const connection = await enableReplyStream(fixture, "discord");
+    const requestFor = (id: number) => store.listMessagingInboundRequests({ connectionId: connection.id })
+      .find(request => request.providerMessageId === messageId(id));
+    const notices = (id: number) => transport.sentText.filter(row => row.replyToMessageId === messageId(id));
+    const nativeCreate = vi.spyOn(destinationAdapter, "createSession");
+
+    gates[0]!.release();
+    await vi.waitFor(() => expect(notices(1)).toMatchObject([{ text: "A new conversation is ready." }]), { timeout: 5_000 });
+    const conversation = store.listMessagingConversations({ connectionId: connection.id })[0]!;
+    const sessionId = conversation.sessionId!;
+    expect(requestFor(1)).toBeUndefined();
+    gates[1]!.release();
+    await vi.waitFor(() => expect(originalAdapter.context?.sessionId).toBe(sessionId), { timeout: 5_000 });
+    await originalAdapter.finish("Original Discord answer");
+    await vi.waitFor(() => expect(requestFor(2)?.status).toBe("completed"), { timeout: 5_000 });
+    await vi.waitFor(() => host.assertSessionLifecycleIdle(sessionId));
+    const original = store.getSession(sessionId).descriptor;
+    const oldMessage = store.listEvents({ sessionId }).find(event => event.payload.type === "message_complete"
+      && event.payload.role === "assistant")!;
+    const oldRun = requestFor(2)!.runId!;
+    const artifact = await fixture.artifacts.ingestBytes(pngBytes(), {
+      fileName: "original.png", mimeType: "image/png", expiresAt: Date.now() + 60_000
+    });
+    store.transaction(() => store.adoptSessionArtifact({ blob: store.getArtifact(artifact.id).blob, sessionId, runId: oldRun }));
+    const newRoute = fixture.manager.putRoute({ connectionId: connection.id, targetId: "target-two", providerId: "vision", modelId: "multimodal",
+      effort: "high", permissionMode: "auto", fastMode: false, planMode: true });
+    const originalConversation = store.getMessagingConversation(conversation.id);
+
+    const enqueue = store.enqueueMessagingDelivery.bind(store);
+    const rejectSuccessNotice = vi.fn(() => { throw new Error("The command receipt could not be committed."); });
+    const notice = vi.spyOn(store, "enqueueMessagingDelivery").mockImplementation(input => {
+      const payload = input.payload;
+      if (input.kind === "notice" && input.dedupeKey.startsWith("command:") && typeof payload === "object" && payload !== null
+        && "text" in payload && payload.text === "A new conversation is ready."
+        && "replyToMessageId" in payload && payload.replyToMessageId === messageId(3)) {
+        notice.mockRestore();
+        return rejectSuccessNotice();
+      }
+      return enqueue(input);
+    });
+    gates[2]!.release();
+    await vi.waitFor(() => expect(notices(3)).toMatchObject([{ text: "The original Discord task is still available." }]), { timeout: 5_000 });
+    expect(rejectSuccessNotice).toHaveBeenCalledOnce();
+    expect(nativeCreate).toHaveBeenCalledOnce();
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(original.binding);
+    expect(store.getMessagingConversation(conversation.id)).toEqual(originalConversation);
+    expect(store.listEvents({ sessionId }).map(event => event.id)).toContain(oldMessage.id);
+    expect(store.findUnresolvedDiscordConversationRestart(sessionId)).toBeUndefined();
+
+    gates[3]!.release();
+    await vi.waitFor(() => expect(notices(4)).toMatchObject([{ text: "A new conversation is ready.",
+      address: { providerConversationId: "444444444444444444" } }]), { timeout: 5_000 });
+    const restarted = store.getSession(sessionId).descriptor;
+    expect(restarted).toMatchObject({ id: sessionId, targetId: original.targetId, backendId: destinationAdapter.id,
+      providerId: "vision", modelId: "multimodal", effort: "high", permissionMode: "auto", planMode: true, archived: false,
+      binding: { generation: original.binding.generation + 1 } });
+    expect(restarted.binding.opaqueRef).not.toBe(original.binding.opaqueRef);
+    expect(store.getMessagingConversation(conversation.id)).toMatchObject({ status: "active", sessionId, targetId: original.targetId,
+      routeScopeKey: newRoute.scopeKey, backendId: destinationAdapter.id, sessionGeneration: restarted.binding.generation,
+      providerId: "vision", modelId: "multimodal", effort: "high", permissionMode: "auto", planMode: true });
+    expect(store.listSessions({ includeArchived: true })).toHaveLength(1);
+    expect(store.listEvents({ sessionId }).map(event => event.id)).not.toContain(oldMessage.id);
+    expect(store.listEvents({ sessionId, includeTombstoned: true }).map(event => event.id)).toContain(oldMessage.id);
+    expect(store.listRuns({ sessionId }).map(run => run.descriptor.id)).toContain(oldRun);
+    expect(store.listArtifacts({ sessionId })).toContainEqual(expect.objectContaining({
+      blob: expect.objectContaining({ id: artifact.id }), sessionId, runId: oldRun
+    }));
+    expect(nativeCreate.mock.calls).toHaveLength(2);
+    expect(nativeCreate).toHaveBeenLastCalledWith(expect.objectContaining({
+      nativeStart: { kind: "new" }, target: expect.objectContaining({ id: original.targetId, workspaceRoot: fixture.root })
+    }), expect.objectContaining({ sessionId, generation: restarted.binding.generation }));
+
+    gates[4]!.release();
+    await vi.waitFor(() => expect(store.getMessagingConnection(connection.id).cursor).toBe("discord-new-4"));
+    expect(notices(4)).toHaveLength(1);
+    expect(nativeCreate.mock.calls).toHaveLength(2);
+    gates[5]!.release();
+    await vi.waitFor(() => expect(destinationAdapter.context?.sessionId).toBe(sessionId), { timeout: 5_000 });
+    await destinationAdapter.finish("New Discord answer");
+    await vi.waitFor(() => expect(requestFor(5)?.status).toBe("completed"), { timeout: 5_000 });
+    await vi.waitFor(() => host.assertSessionLifecycleIdle(sessionId));
+
+    nativeCreate.mockRejectedValueOnce(new Error("The native creation receipt was lost."));
+    gates[6]!.release();
+    await vi.waitFor(() => expect(notices(6)).toMatchObject([{ text: "The new conversation could not be confirmed. Check the original task." }]));
+    const unknown = store.findUnresolvedDiscordConversationRestart(sessionId);
+    expect(unknown).toBeDefined();
+    expect(store.getOperation(unknown!)).toMatchObject({ status: "failed", error: { stateMayHaveChanged: true } });
+    gates[7]!.release();
+    await vi.waitFor(() => expect(notices(7)).toMatchObject([{ text: "The new conversation could not be confirmed. Check the original task." }]));
+    expect(nativeCreate.mock.calls).toHaveLength(3);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(restarted.binding);
+    expect(store.listMessagingInboundRequests({ connectionId: connection.id })).toHaveLength(2);
+  }, 25_000);
+
   it.each(["telegram", "discord"] as const)("serializes %s progress before the final and retains the channel's final-message lifecycle", async channel => {
     const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
     const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
@@ -248,6 +571,117 @@ describe("MessagingManager", () => {
     expect(final().find((row) => row.partIndex === 0)?.providerMessageId).toBe(carrierId);
   });
 
+  it("rotates only the owner's original Partner Telegram topic and keeps the adopted task after restart", async () => {
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const pending: TelegramUpdate[] = [];
+    vi.spyOn(transport, "poll").mockImplementation(async ({ signal }) => {
+      while (pending.length === 0) {
+        signal?.throwIfAborted();
+        await new Promise<void>(resolve => setTimeout(resolve, 5));
+      }
+      const updates = pending.splice(0);
+      return { updates, nextCursor: String(updates.at(-1)!.update_id + 1) };
+    });
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE,
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+        ? { ...capability, options: ["ask"] } : capability) });
+    const fixture = await createFixture(() => transport, () => adapter);
+    const { store, host } = fixture;
+    const profiles = new PartnerStore(join(fixture.root, "partners.db"));
+    cleanups.push(async () => { try { await fixture.manager.close(); } finally { profiles.close(); } });
+    const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host,
+      homesRoot: join(fixture.root, "homes"), workspaceService: { register: async input => input, unregister: () => undefined } });
+    const partner = await partners.createPartner({ requestId: "telegram-topic-partner", expectedDirectoryRevision: profiles.directoryState().revision,
+      displayName: "Ada", avatar: "orbit", identitySource: "A Partner who replies to the owner.", templateId: "general", usesDirectoryDefaults: false,
+      capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }],
+        permissionMode: "ask", planMode: false } });
+    const attachRuntime = (messaging: MessagingManager) => {
+      const runtime = new PartnerMessagingRuntime({ store, profiles, partners, host, messaging, pauseGoal: async () => undefined });
+      messaging.setPartnerRuntime(runtime);
+      host.setMessagingQueueGuard(item => runtime.assertQueueCurrent(item), (item, request) => runtime.reviewTool(item, request));
+      return runtime;
+    };
+    const runtime = attachRuntime(fixture.manager);
+    const owner = store.createConnection({ id: "telegram-ui-owner", name: "Owner", authKeyDigest: "telegram-ui-auth" });
+    const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42" });
+    const bound = await runtime.setBinding({ operationId: "telegram-topic-binding", owner, connectionId: created.id, partnerId: partner.id,
+      expectedBindingRevision: 0, expectedConnectionRevision: created.revision, expectedConnectionGeneration: created.generation,
+      expectedPartnerRevision: partner.revision });
+    const connection = await replaceCredential(fixture, bound.connection, "telegram-topic-partner", true);
+    const mention = "@joko_test_bot";
+    const accept = async (updateId: number, messageId: number, threadId: number, text: string, senderId = 42) => {
+      pending.push({ update_id: updateId, message: {
+        message_id: messageId, message_thread_id: threadId, is_topic_message: true, date: Math.floor(Date.now() / 1_000),
+        chat: { id: -100555, type: "supergroup" }, from: { id: senderId, first_name: "Sender", is_bot: false }, text,
+        ...(text.startsWith(mention) ? { entities: [{ type: "mention", offset: 0, length: mention.length }] } : {})
+      } });
+      await vi.waitFor(() => expect(store.getMessagingConnection(connection.id).cursor).toBe(String(updateId + 1)), { timeout: 5_000 });
+    };
+    const topic = (id: string) => store.listMessagingConversations({ connectionId: connection.id }).find(row => row.providerThreadId === id)!;
+    const requests = () => store.listMessagingInboundRequests({ connectionId: connection.id });
+    const notices = (id: string) => transport.sentText.filter(row => row.replyToMessageId === id);
+
+    await accept(10, 10, 7, "/new");
+    await accept(11, 11, 8, "/new");
+    await vi.waitFor(() => expect(notices("10")).toMatchObject([{ address: { providerThreadId: "7" }, text: "A new conversation is ready." }]), { timeout: 5_000 });
+    const original = topic("7");
+    const sibling = topic("8");
+    expect(original.sessionId).toBeDefined();
+    expect(sibling.sessionId).toBeDefined();
+    expect(sibling.sessionId).not.toBe(original.sessionId);
+    expect(requests()).toHaveLength(0);
+
+    await accept(12, 12, 7, `${mention} Work in the first topic task`);
+    await vi.waitFor(() => expect(requests().find(row => row.providerMessageId === "12")?.status).toBe("completed"), { timeout: 5_000 });
+    const enqueue = store.enqueueMessagingDelivery.bind(store);
+    const admission = vi.spyOn(store, "enqueueMessagingDelivery").mockImplementation(input => {
+      if (input.kind === "notice" && input.dedupeKey.startsWith("command:")) {
+        admission.mockRestore();
+        throw new Error("The command notice could not be committed.");
+      }
+      return enqueue(input);
+    });
+    await accept(13, 13, 7, "/new");
+    await vi.waitFor(() => expect(notices("13")).toMatchObject([{ address: { providerThreadId: "7" },
+      text: "The new conversation could not be confirmed. Check the original task." }]), { timeout: 5_000 });
+    expect(topic("7").sessionId).toBe(original.sessionId);
+    expect(store.getSession(original.sessionId!).descriptor.archived).toBe(false);
+    const failedLink = profiles.listSessionLinks(partner.id, "channel")
+      .find(link => link.sessionId !== original.sessionId && link.sessionId !== sibling.sessionId)!;
+    expect(host.isPrivateSessionCreationClosed(failedLink.channelOperationId!, failedLink.sessionId)).toBe(true);
+
+    await accept(14, 14, 7, "/new");
+    await vi.waitFor(() => expect(notices("14")).toMatchObject([{ address: { providerThreadId: "7" },
+      text: "A new conversation is ready. Previous task history was archived." }]), { timeout: 5_000 });
+    const replacement = topic("7");
+    expect(replacement).toMatchObject({ id: original.id, partnerId: partner.id, permissionMode: "ask" });
+    expect(replacement.sessionId).not.toBe(original.sessionId);
+    expect(store.getSession(original.sessionId!).descriptor.archived).toBe(true);
+    expect(profiles.getSessionLink(failedLink.sessionId)).toBeUndefined();
+    expect(profiles.getSessionLink(original.sessionId!)).toMatchObject({ partnerId: partner.id, role: "channel" });
+    expect(profiles.getSessionLink(replacement.sessionId!)).toMatchObject({ partnerId: partner.id, role: "channel" });
+    expect(topic("8").sessionId).toBe(sibling.sessionId);
+    expect(store.getSession(sibling.sessionId!).descriptor.archived).toBe(false);
+    expect(store.getSession(partner.canonicalSessionId!).descriptor.archived).toBe(false);
+    expect(runtime.connectionsForSession(replacement.sessionId!, partner.homeTargetId, "telegram").map(row => row.id)).toEqual([connection.id]);
+
+    await accept(15, 14, 7, "/new");
+    await accept(16, 16, 7, "/new", 56);
+    expect(notices("14")).toHaveLength(1);
+    expect(notices("16")).toHaveLength(0);
+    expect(topic("7").sessionId).toBe(replacement.sessionId);
+    await fixture.restartManager(attachRuntime);
+    await accept(17, 17, 7, `${mention} Work in the adopted topic task`);
+    await vi.waitFor(() => expect(requests().find(row => row.providerMessageId === "17")?.status).toBe("completed"), { timeout: 5_000 });
+    expect(requests()).toHaveLength(2);
+    expect(store.getQueueItem(requests().find(row => row.providerMessageId === "12")!.queueItemId!).sessionId).toBe(original.sessionId);
+    expect(store.getQueueItem(requests().find(row => row.providerMessageId === "17")!.queueItemId!).sessionId).toBe(replacement.sessionId);
+  }, 20_000);
+
   it.each([{ finalStatus: "sent", continuations: 1 }, { finalStatus: "unknown", continuations: 2 }] as const)(
     "preserves the Discord carrier for a $finalStatus final after $continuations Partner continuations",
     async ({ finalStatus, continuations }) => {
@@ -255,6 +689,18 @@ describe("MessagingManager", () => {
         capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
           ? { ...capability, options: ["ask"] } : capability) });
       const transport = new StreamingDiscordTransport();
+      const originalPoll = transport.poll.bind(transport);
+      vi.spyOn(transport, "poll").mockImplementationOnce(async input => {
+        const first = await originalPoll(input);
+        const update = first.updates[0]!;
+        return { ...first, updates: [...first.updates, { ...update, sequence: 2, message: {
+          ...update.message!, id: "999999999999999992", content: "/new"
+        } }] };
+      });
+      vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeDiscordUpdates(updates, {
+        connectionId: transport.connectionId, ownerUserId: "111111111111111111", ownerConversationId: "444444444444444444",
+        bot: { id: "222222222222222222", username: "joko_test_bot", displayName: "Joko" }, groupActivation: {}
+      }));
       const fixture = await createFixture(undefined, () => adapter, () => transport,
         undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 }, () => 10);
       const profiles = new PartnerStore(join(fixture.root, "partners.db"));
@@ -281,6 +727,10 @@ describe("MessagingManager", () => {
         expectedPartnerRevision: partner.revision });
       const connection = await replaceCredential(fixture, bound.connection, "discord-recovery", true);
       await vi.waitFor(() => expect(adapter.context?.sessionId).toBe(partner.canonicalSessionId), { timeout: 5_000 });
+      await vi.waitFor(() => expect(transport.sentText).toContainEqual(expect.objectContaining({ replyToMessageId: "999999999999999992",
+        text: "This chat shares the Partner's long-running task. To restart its context, use Joko." })));
+      expect(fixture.store.findPendingContextRebuild(partner.canonicalSessionId!)).toBeUndefined();
+      expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toHaveLength(1);
       const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
       const activeRunId = () => {
         const queueId = adapter.context?.inputQueueItemId;
@@ -1299,12 +1749,15 @@ describe("MessagingManager", () => {
     expect((await fixture.artifacts.readBlob(queue.body.files[0]!.blob)).data).toEqual(clip);
   });
 
-  it("releases staged Telegram media when the connection is disabled before adoption", async () => {
-    const batch = normalizeTelegramUpdates([{ update_id: 9, message: {
-      message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
-      chat: { id: 42, type: "private" }, date: Math.floor(Date.now() / 1_000),
-      voice: { file_id: "voice-77", file_unique_id: "unique-voice" }
-    } }], { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+  it.each(["current", "quoted"] as const)("releases staged %s Telegram media when the connection is disabled before adoption", async source => {
+    const sender = { from: { id: 42, first_name: "Owner", is_bot: false },
+      chat: { id: 42, type: "private" as const }, date: Math.floor(Date.now() / 1_000) };
+    const voice = { file_id: "voice-77", file_unique_id: "unique-voice" };
+    const message: NonNullable<TelegramUpdate["message"]> = source === "current"
+      ? { ...sender, message_id: 77, voice }
+      : { ...sender, message_id: 77, text: "Review this", reply_to_message: { ...sender, message_id: 76, voice } };
+    const batch = normalizeTelegramUpdates([{ update_id: 9, message }],
+      { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
     const transport = new FakeTelegramTransport(batch);
     vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => ({
       bytes: Buffer.from("OggS"), fileName: attachment.fileName, mimeType: "audio/ogg"
@@ -1332,6 +1785,240 @@ describe("MessagingManager", () => {
     expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toMatchObject([{ artifactIds: [] }]);
     expect(send).not.toHaveBeenCalled();
   });
+
+  it.each(["available", "missing", "protected"] as const)("preserves a Telegram reply turn with %s quoted media", async condition => {
+    const chat = { id: 42, type: "private" as const }, date = Math.floor(Date.now() / 1_000);
+    const quoted = { message_id: 76, chat, date, caption: "The original image", has_protected_content: condition === "protected",
+      photo: [{ file_id: "quote-photo", file_unique_id: "unique-quote", width: 1, height: 1 }] };
+    const update: TelegramUpdate = { update_id: 9, message: { message_id: 77, chat, date,
+      from: { id: 42, first_name: "Owner", is_bot: false },
+      text: "Describe that image.", reply_to_message: quoted } };
+    const batch = normalizeTelegramUpdates([update], { connectionId: "placeholder", ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+    const transport = new FakeTelegramTransport(batch);
+    vi.spyOn(transport, "poll").mockImplementationOnce(async () => ({ updates: [update], nextCursor: "10" }));
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      if (condition === "missing") throw new MessagingTransportError("provider_rejected", "Quoted media was removed.",
+        { effect: "none", retryable: false });
+      return { bytes: jpeg, fileName: attachment.fileName, mimeType: "image/jpeg" };
+    });
+    const fixture = await createFixture(() => transport, () => new AttachmentFakeAdapter(true));
+    const persistPoll = vi.spyOn(fixture.store, "saveMessagingPollBatch");
+    const connection = await enableTelegramReply(fixture, "telegram-quoted-photo");
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    await vi.waitFor(() => expect(requests()).toMatchObject([{ status: "completed", providerMessageId: "77" }]));
+    const request = requests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue.body.text).toContain("Describe that image.");
+    if (condition === "available") {
+      expect(download).toHaveBeenCalledTimes(1);
+      expect(download).toHaveBeenCalledWith(expect.objectContaining({ providerFileId: "quote-photo" }), expect.any(AbortSignal));
+      expect(queue.body.images).toHaveLength(1);
+      const blob = queue.body.images[0]!.blob;
+      expect(request.artifactIds).toEqual([blob.id]);
+      expect(fixture.store.getArtifact(blob.id)).toMatchObject({ sessionId: queue.sessionId, runId: queue.runId });
+      expect((await fixture.artifacts.readBlob(blob)).data).toEqual(jpeg);
+    } else {
+      expect(request.artifactIds).toEqual([]);
+      expect(queue.body.images).toEqual([]);
+      if (condition === "missing") {
+        expect(download).toHaveBeenCalledTimes(1);
+        expect(queue.body.text).toContain("[Unsupported download] Quoted attachment:");
+      } else {
+        expect(download).not.toHaveBeenCalled();
+        expect(persistPoll).not.toHaveBeenCalled();
+        expect(queue.body.text).not.toContain("The original image");
+      }
+    }
+  });
+
+  it.each(["completed", "failed"] as const)("sends only the selected Telegram topic media when the first dispatch is %s", async firstOutcome => {
+    const chat = { id: -100123, type: "supergroup" as const, title: "Design" };
+    const date = Math.floor(Date.now() / 1_000);
+    const sender = { id: 53, first_name: "Participant", is_bot: false };
+    const topic = { chat, date, is_topic_message: true, message_thread_id: 7, from: sender };
+    const photo = (id: number, overrides: Partial<NonNullable<TelegramUpdate["message"]>> = {}): TelegramUpdate => ({
+      update_id: id, message: { ...topic, message_id: id, caption: `Photo ${id}`,
+        photo: [{ file_id: `photo-${id}`, file_unique_id: `photo-unique-${id}`, width: 1, height: 1 }], ...overrides }
+    });
+    const document = (id: number): TelegramUpdate => ({ update_id: id, message: { ...topic, message_id: id,
+      caption: `Document ${id}`, document: { file_id: `file-${id}`, file_unique_id: `file-unique-${id}`,
+        file_name: `notes-${id}.txt`, mime_type: "text/plain" } } });
+    const summon = (id: number): TelegramUpdate => ({ update_id: id, message: { ...topic, message_id: id,
+      text: `@joko_test_bot Review the attachments for ${id}.`, entities: [{ type: "mention", offset: 0, length: "@joko_test_bot".length }] } });
+    const longMessages: TelegramUpdate[] = [25, 26, 27].map(id => ({ update_id: id, message: {
+      ...topic, message_id: id, text: `Discussion ${id} ${"x".repeat(1_000)}`
+    } }));
+    const first = [photo(1, { date: date - 25 * 3_600 }), photo(2, { has_protected_content: true }),
+      photo(3, { message_thread_id: 8 }), ...[10, 11, 12, 13, 14, 15, 16].map(id => photo(id)),
+      ...[20, 21, 22, 23, 24].map(document), ...longMessages, photo(29, { caption: `Photo outside window ${"x".repeat(1_000)}` }),
+      summon(30), photo(31)];
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const next = deliveryGate();
+    vi.spyOn(transport, "poll").mockResolvedValueOnce({ updates: first, nextCursor: "32" })
+      .mockImplementationOnce(async ({ signal }) => {
+        await next.wait;
+        signal?.throwIfAborted();
+        return { updates: [summon(32)], nextCursor: "33" };
+      });
+    cleanups.push(next.release);
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    const adapter = new AttachmentFakeAdapter(true);
+    const fixture = await createFixture(() => transport, () => adapter);
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const fileBytes = Buffer.from("group document\n");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      const request = fixture.store.listMessagingInboundRequests().find(item => item.status === "queued");
+      expect(fixture.store.getQueueItem(request!.queueItemId!).state).toBe("dispatching");
+      if (attachment.providerFileId === "file-24") throw new MessagingTransportError("provider_rejected", "The file was removed.",
+        { effect: "none", retryable: false });
+      return { bytes: attachment.kind === "image" ? jpeg : fileBytes, fileName: attachment.fileName,
+        mimeType: attachment.kind === "image" ? "image/jpeg" : "text/plain" };
+    });
+    const nativeSend = adapter.send.bind(adapter);
+    const paths: string[] = [];
+    let firstDispatch = true;
+    const send = vi.spyOn(adapter, "send").mockImplementation(async (prompt, context) => {
+      const reject = firstDispatch && firstOutcome === "failed";
+      firstDispatch = false;
+      for (const { blob } of prompt.images) expect((await fixture.artifacts.readBlob(blob)).data).toEqual(jpeg);
+      for (const { blob } of prompt.files) {
+        const path = await fixture.artifacts.resolveBlobPath(blob);
+        expect(await readFile(path)).toEqual(fileBytes);
+        paths.push(path);
+      }
+      if (reject) throw new Error("Backend declined the first group turn.");
+      await context.emit({ type: "message_complete", role: "user", blocks: [
+        { kind: "text", text: prompt.text }, ...prompt.images.map(({ blob }) => ({ kind: "image" as const, blob }))
+      ] });
+      return nativeSend(prompt, context);
+    });
+    const connection = await enableTelegramReply(fixture, "telegram-group-media");
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    await vi.waitFor(() => expect(requests()).toMatchObject([{ status: firstOutcome, providerMessageId: "30" }]), { timeout: 5_000 });
+    const firstPrompt = send.mock.calls[0]![0];
+    expect(firstPrompt).toMatchObject({ images: Array.from({ length: 6 }, () => ({ blob: { mimeType: "image/jpeg" } })),
+      files: [21, 22, 23].map(id => ({ blob: { fileName: `notes-${id}.txt` } })) });
+    expect(firstPrompt.text).toContain("[Unavailable group attachment download] notes-24.txt");
+    expect(firstPrompt.text).toContain("Additional group attachments omitted by the media limit: 2.");
+    expect(firstPrompt.text).toContain("Discussion 27");
+    expect(firstPrompt.text).not.toContain("Photo outside window");
+    expect(firstPrompt.text).not.toContain("Photo 31");
+    expect(download.mock.calls.map(([attachment]) => attachment.providerFileId)).toEqual([
+      "photo-11", "photo-12", "photo-13", "photo-14", "photo-15", "photo-16", "file-21", "file-22", "file-23", "file-24"
+    ]);
+    const request = requests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(request.artifactIds).toEqual([]);
+    expect(queue.body).toMatchObject({ images: [], files: [] });
+    expect(fixture.store.getOperation(request.operationId!).body).toMatchObject({ prompt: queue.body });
+    const userMessages = fixture.store.listEvents({ sessionId: queue.sessionId }).map(event => event.payload)
+      .filter(event => event.type === "message_complete" && event.role === "user");
+    if (firstOutcome === "completed") {
+      expect(queue.backendAcceptedAt).toBeDefined();
+      expect(userMessages).toContainEqual(expect.objectContaining({ acceptedInput: queue.body,
+        blocks: [{ kind: "text", text: queue.body.text }] }));
+    } else {
+      expect(queue.backendAcceptedAt).toBeUndefined();
+      expect(userMessages).toEqual([]);
+    }
+    expect(fixture.store.listArtifacts()).toEqual([]);
+    expect(paths).toHaveLength(3);
+    for (const path of paths) await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+
+    next.release();
+    await vi.waitFor(() => expect(requests().find(item => item.providerMessageId === "32")?.status).toBe("completed"), { timeout: 5_000 });
+    expect(send).toHaveBeenCalledTimes(2);
+    const secondPrompt = send.mock.calls[1]![0];
+    const secondDownloads = download.mock.calls.slice(10).map(([attachment]) => attachment.providerFileId);
+    if (firstOutcome === "completed") {
+      expect(secondPrompt).toMatchObject({ images: [{ blob: { mimeType: "image/jpeg" } }], files: [] });
+      expect(secondDownloads).toEqual(["photo-31"]);
+    } else {
+      expect(secondPrompt.images).toHaveLength(6);
+      expect(secondPrompt.files).toHaveLength(3);
+      expect(secondDownloads).toEqual(["photo-12", "photo-13", "photo-14", "photo-15", "photo-16",
+        "file-21", "file-22", "file-23", "file-24", "photo-31"]);
+    }
+  }, 12_000);
+
+  it.each(["connection retirement", "owner stop"] as const)("releases Telegram group bytes before dispatch on %s", async cause => {
+    const sender = { chat: { id: -100124, type: "supergroup" as const }, date: Math.floor(Date.now() / 1_000),
+      is_topic_message: true, message_thread_id: 7, from: { id: 53, first_name: "Participant", is_bot: false } };
+    const updates: TelegramUpdate[] = [1, 2].map(id => ({ update_id: id, message: { ...sender, message_id: id,
+      caption: `Background photo ${id}`, photo: [{ file_id: `photo-${id}`, file_unique_id: `unique-${id}`, width: 1, height: 1 }] } }));
+    updates.push({ update_id: 3, message: { ...sender, message_id: 3,
+      text: "@joko_test_bot Review the photos.", entities: [{ type: "mention", offset: 0, length: "@joko_test_bot".length }] } });
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const poll = vi.spyOn(transport, "poll").mockResolvedValueOnce({ updates, nextCursor: "4" });
+    const otherTopic = deliveryGate(), ownTopic = deliveryGate();
+    const owner = { ...sender, from: { id: 42, first_name: "Owner", is_bot: false } };
+    if (cause === "owner stop") {
+      poll.mockImplementationOnce(async () => {
+        await otherTopic.wait;
+        return { updates: [
+          { update_id: 4, message: { ...sender, message_id: 4, text: "!stop" } },
+          { update_id: 5, message: { ...owner, message_id: 5, message_thread_id: 8, text: "!stop" } }
+        ], nextCursor: "6" };
+      }).mockImplementationOnce(async () => {
+        await ownTopic.wait;
+        return { updates: [{ update_id: 6, message: { ...owner, message_id: 6, text: "!stop" } }], nextCursor: "7" };
+      });
+    }
+    vi.spyOn(transport, "normalize").mockImplementation(messages => normalizeTelegramUpdates(messages, {
+      connectionId: transport.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    const held = deliveryGate();
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      if (attachment.providerFileId === "photo-2") await held.wait;
+      return { bytes: jpeg, fileName: attachment.fileName, mimeType: "image/jpeg" };
+    });
+    const adapter = new AttachmentFakeAdapter(true);
+    const send = vi.spyOn(adapter, "send");
+    const abort = vi.spyOn(adapter, "abort");
+    const fixture = await createFixture(() => transport, () => adapter);
+    cleanups.push(held.release, otherTopic.release, ownTopic.release);
+    const connection = await enableTelegramReply(fixture, "telegram-retired-group-media");
+    await vi.waitFor(() => expect(download).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+    const incoming = join(fixture.root, "artifacts", "incoming");
+    const staged = (await readdir(incoming)).filter(name => name.startsWith("dispatch-input-"));
+    expect(staged).toHaveLength(1);
+    expect(await readFile(join(incoming, staged[0]!))).toEqual(jpeg);
+    expect(send).not.toHaveBeenCalled();
+
+    const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    if (cause === "owner stop") {
+      otherTopic.release();
+      await vi.waitFor(() => expect(transport.sentText.find(row => row.replyToMessageId === "5"))
+        .toMatchObject({ address: { providerThreadId: "8" }, text: "No active task needed stopping." }));
+      expect(transport.sentText.some(row => row.replyToMessageId === "4")).toBe(false);
+      expect(fixture.store.getQueueItem(queue.id).state).toBe("dispatching");
+      ownTopic.release();
+      await vi.waitFor(() => expect(transport.sentText.find(row => row.replyToMessageId === "6"))
+        .toMatchObject({ address: { providerThreadId: "7" }, text: "Cancelled 1 queued message." }));
+      expect(fixture.store.getQueueItem(queue.id).state).toBe("cancelled");
+      await expect(readFile(join(incoming, staged[0]!))).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      const current = fixture.store.getMessagingConnection(connection.id);
+      await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision,
+        expectedGeneration: current.generation, enabled: false });
+    }
+    held.release();
+    await vi.waitFor(async () => expect((await readdir(incoming)).filter(name => name.startsWith("dispatch-input-"))).toEqual([]));
+    await vi.waitFor(() => expect(fixture.host.observeQueueDispatch(queue)).toBeUndefined());
+    expect(send.mock.calls.every(([prompt]) => prompt.images.length === 0 && prompt.files.length === 0)).toBe(true);
+    if (cause === "owner stop") {
+      expect(send).not.toHaveBeenCalled();
+      expect(abort).not.toHaveBeenCalled();
+    }
+    expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toMatchObject([{ status: "cancelled", artifactIds: [] }]);
+    expect(fixture.store.listArtifacts()).toEqual([]);
+  }, 12_000);
 
   it("runs protected Telegram text once without downloading its voice or retaining the input", async () => {
     const privateText = "protectedtelegrambodya17c";
@@ -4209,7 +4896,7 @@ class SequentialInteractionAdapter extends FakeBackendAdapter {
 
 async function createFixture(
   transportFactory?: (options: TelegramTransportOptions) => FakeTelegramTransport,
-  adapterFactory?: () => FakeBackendAdapter,
+  adapterFactory?: () => FakeBackendAdapter | readonly [FakeBackendAdapter, ...FakeBackendAdapter[]],
   discordTransportFactory?: (options: DiscordTransportOptions) => FakeDiscordTransport,
   dingTalkTransportFactory?: (options: DingTalkTransportOptions) => FakeDingTalkTransport,
   feishuTransportFactory?: (options: FeishuTransportOptions) => FakeFeishuTransport,
@@ -4235,10 +4922,13 @@ async function createFixture(
     storagePath: join(root, "credentials.json")
   });
   await credentials.initialize();
-  const adapter = adapterFactory?.() ?? new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const providedAdapters = adapterFactory?.() ?? new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const adapters = providedAdapters instanceof FakeBackendAdapter ? [providedAdapters] : providedAdapters;
+  const adapter = adapters[0]!;
   let manager: MessagingManager | undefined;
-  const host = new SessionHost(store, artifacts, [adapter], {
+  const host = new SessionHost(store, artifacts, adapters, {
     ...(sessionRuntimeRecoveryDelayMs === undefined ? {} : { sessionRuntimeRecoveryDelayMs }),
+    prepareTelegramHistory: async input => manager?.prepareTelegramHistory(input),
     onServiceRunSettled: (input) => manager?.onRunSettled(input),
     onServiceInteractionOpened: (input) => manager?.onInteractionOpened(input),
     onServiceInteractionSettled: (input) => manager?.onInteractionSettled(input)

@@ -270,6 +270,47 @@ describe("normalizeTelegramUpdates", () => {
       })
     ]);
   });
+
+  it("collects three quoted attachments in the current Telegram topic and excludes duplicate media", () => {
+    const quoted: TelegramMessage = {
+      ...message({ id: 50, from: STRANGER, chatId: -10, chatType: "supergroup", threadId: 55, isTopic: true, photoId: "quote-photo" }),
+      document: { file_id: "quote-doc", file_unique_id: "quote-doc", file_name: "note.txt", mime_type: "text/plain" },
+      voice: { file_id: "quote-voice", file_unique_id: "quote-voice" },
+      video: { file_id: "quote-video", file_unique_id: "quote-video" }
+    };
+    const current = message({
+      id: 51, from: OWNER, chatId: -10, chatType: "supergroup", threadId: 55, isTopic: true,
+      text: "@jokobot inspect", entities: [{ type: "mention", offset: 0, length: 8 }]
+    });
+    const normalize = (incoming: TelegramMessage) => normalizeTelegramUpdates([update(51, incoming)], options()).events[0];
+    const event = normalize({ ...current, reply_to_message: quoted });
+    expect(event).toMatchObject({
+      attachments: [],
+      replyContext: { providerMessageId: "50", attachmentCount: 4 },
+      telegramReplyParts: {
+        attachments: [
+          { providerFileId: "quote-photo", kind: "image" },
+          { providerFileId: "quote-doc", kind: "file" },
+          { providerFileId: "quote-voice", kind: "file", audioVideo: "audio" }
+        ],
+        unsupported: [{ code: "attachment_limit", label: "video-50.mp4" }]
+      }
+    });
+    expect(normalize({ ...current, photo: [{ file_id: "new-photo-id", file_unique_id: "quote-photo-unique", width: 1, height: 1 }],
+      reply_to_message: quoted })).toMatchObject({
+      telegramReplyParts: {
+        attachments: [{ providerFileId: "quote-doc" }, { providerFileId: "quote-voice" }, { providerFileId: "quote-video" }],
+        unsupported: []
+      }
+    });
+    expect(normalize({ ...current, reply_to_message: { ...quoted, message_thread_id: 56 } })).not.toHaveProperty("telegramReplyParts");
+    expect(normalize({ ...current, reply_to_message: { ...quoted, chat: { ...quoted.chat, id: -11 } } })).not.toHaveProperty("telegramReplyParts");
+    expect(normalize({ ...current, media_group_id: "album", reply_to_message: { ...quoted, media_group_id: "album" } }))
+      .not.toHaveProperty("telegramReplyParts");
+    expect(normalize({ ...current, reply_to_message: { ...quoted, has_protected_content: true } }))
+      .toMatchObject({ replyContext: null, attachments: [] });
+    expect(normalize({ ...current, has_protected_content: true, reply_to_message: quoted })).not.toHaveProperty("telegramReplyParts");
+  });
 });
 
 function options(overrides: Partial<TelegramNormalizationOptions> = {}): TelegramNormalizationOptions {

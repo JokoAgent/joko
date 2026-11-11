@@ -2116,6 +2116,7 @@ export async function createOrchestratorApplication(
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
     },
     onUserInputAdmitted: (transactionStore, result) => objectives?.onUserInputAdmitted(transactionStore, result),
+    prepareTelegramHistory: async input => messaging?.prepareTelegramHistory(input),
     onServiceRunSettled: async (input) => {
       personalDevelopmentCoordinator?.onRunSettled(input);
       const settlements: Promise<void>[] = [];
