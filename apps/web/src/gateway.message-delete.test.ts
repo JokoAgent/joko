@@ -2,10 +2,12 @@ import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
   EntityKind,
+  EntityVersionSchema,
   EventPayloadSchema,
   EventSchema,
   GetSnapshotResponseSchema,
   MessageRole,
+  OperationResultSchema,
   OperationSchema,
   OperationState,
   SessionState,
@@ -186,7 +188,11 @@ describe("message deletion gateway", () => {
 type EventKind = NonNullable<MessageInitShape<typeof EventPayloadSchema>["kind"]>;
 
 function harness(directReceipt = false) {
-  vi.stubGlobal("window", { location: { href: "https://joko.test/#/tasks/current" } });
+  vi.stubGlobal("window", {
+    location: { href: "https://joko.test/#/tasks/current" },
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout
+  });
   const submissions: SubmitOperationRequest[] = [];
   const snapshots: AppSnapshot[] = [];
   const errors: string[] = [];
@@ -267,8 +273,9 @@ function harness(directReceipt = false) {
     complete: (receipt: MessageInitShape<typeof OperationSchema> = {}) => {
       const request = submissions[0]!;
       terminal.resolve({ operationId: request.operationId, connectionId: request.connectionId, mutation: request.mutation,
-        state: OperationState.SUCCEEDED, result: { payload: { case: "acknowledgement", value: { accepted: true } } },
-        version: { revision: { value: 5n } }, ...receipt });
+        state: OperationState.SUCCEEDED,
+        result: create(OperationResultSchema, { payload: { case: "acknowledgement", value: { accepted: true } } }),
+        version: create(EntityVersionSchema, { revision: { value: 5n } }), ...receipt });
     },
     answer: (sourceSessionId: string, sourceEventId: string, text: string) => emit(sourceSessionId, sourceEventId, { case: "messageCompleted", value: {
       messageId: sourceEventId, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: text } }]

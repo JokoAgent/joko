@@ -35,7 +35,7 @@ import {
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
-  EventCursorSchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema, ManagedResourceSchema,
@@ -1363,18 +1363,18 @@ function eventFeed(network: MobileNetwork) {
 
 function historyRetirementFixture() {
   const session = messageActionSnapshot.sessions[0]!;
-  const identity = { sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
-    generation: session.nativeBinding!.runtimeGeneration };
+  const identity = create(EventIdentitySchema, { sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
+    generation: session.nativeBinding!.runtimeGeneration });
   const input = (id: string, sequence: bigint, text: string) => create(EventSchema, { ...event(id, sequence), identity,
-    payload: { kind: { case: "messageStarted", value: { messageId: id, role: MessageRole.USER, userInputAccepted: true,
-      userInput: { parts: [{ content: { case: "text", value: text } }] } } } } });
+    payload: create(EventPayloadSchema, { kind: { case: "messageStarted", value: { messageId: id, role: MessageRole.USER, userInputAccepted: true,
+      userInput: { parts: [{ content: { case: "text", value: text } }] } } } }) });
   const deletedText = "former unique prompt";
   const deleted = input("retired-input", 7n, deletedText);
   const neighbor = input("neighbor-input", 8n, "surviving neighbor");
   const owner = create(SnapshotSchema, { ...messageActionSnapshot, snapshotId: "history-owner", timeline: [],
-    scope: { kind: { case: "owner", value: {} } } });
+    scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: {} } }) });
   const detail = create(SnapshotSchema, { ...owner, snapshotId: "history-detail", timeline: [deleted, neighbor],
-    scope: { kind: { case: "session", value: { sessionId: session.sessionId, recentTimelineItems: 120 } } } });
+    scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: session.sessionId, recentTimelineItems: 120 } } }) });
   const network = projectedNetwork(owner);
   vi.mocked(network.readSession).mockResolvedValue(detail);
   const saved = memoryStorage(credential), offline = memoryOfflineCache();
@@ -8116,9 +8116,10 @@ describe("native mobile connection and operation ownership", () => {
   it.each([120, 4])("uses the first event cursor for the first older request with %i recent events", async (count) => {
     const network = fakeNetwork();
     const timeline = Array.from({ length: count }, (_, index) => event(`recent-${index}`, BigInt(index + 10)));
-    const resumeCursor = { opaqueToken: "cursor-130", sequence: 130n, generation: 1n };
+    const resumeCursor = create(EventCursorSchema, { opaqueToken: "cursor-130", sequence: 130n, generation: 1n });
     const owner = create(SnapshotSchema, { ...snapshot, resumeCursor });
-    const detail = create(SnapshotSchema, { ...owner, scope: { kind: { case: "session", value: { sessionId: "session", recentTimelineItems: 120 } } }, timeline });
+    const detail = create(SnapshotSchema, { ...owner,
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: "session", recentTimelineItems: 120 } } }), timeline });
     vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: owner });
     vi.mocked(network.readSession).mockResolvedValue(detail);
     const app = client(network, memoryStorage(credential).storage);
@@ -8274,11 +8275,11 @@ describe("native mobile connection and operation ownership", () => {
     emit(live);
     await vi.waitFor(() => expect(network.readSession).toHaveBeenCalledTimes(2));
     expect(hits()).toHaveLength(2);
-    emit(create(EventSchema, { ...event("retirement", 12n), identity: { ...identity,
-      generation: change === "reset" ? identity.generation + 1n : identity.generation },
-      payload: { kind: change === "reset" ? { case: "sessionReset", value: { productSessionId: identity.sessionId } }
+    emit(create(EventSchema, { ...event("retirement", 12n), identity: create(EventIdentitySchema, { ...identity,
+      generation: change === "reset" ? identity.generation + 1n : identity.generation }),
+      payload: create(EventPayloadSchema, { kind: change === "reset" ? { case: "sessionReset", value: { productSessionId: identity.sessionId } }
         : { case: "messageDeleted", value: { productSessionId: identity.sessionId, requestedEventId: deleted.eventId,
-          deletedEventIds: [deleted.eventId, live.eventId] } } } }));
+          deletedEventIds: [deleted.eventId, live.eventId] } } }) }));
     await vi.waitFor(() => expect(app.state.live.some(item => item.eventId === "retirement")).toBe(true));
     expect(hits()).toEqual([]);
     const observed: number[] = [];
@@ -8363,7 +8364,7 @@ describe("native mobile connection and operation ownership", () => {
 describe("mobile Home search and task mutations", () => {
   it.each([true, false])("adopts an in-flight Home search only while a polled projection has the same revision (%s)", async (sameRevision) => {
     vi.useFakeTimers();
-    const owner = create(SnapshotSchema, { ...snapshot, snapshotId: "first", revision: { value: 11n } });
+    const owner = create(SnapshotSchema, { ...snapshot, snapshotId: "first", revision: create(RevisionSchema, { value: 11n }) });
     const network = projectedNetwork(owner);
     network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
     const app = client(network, memoryStorage(credential).storage);
@@ -8375,7 +8376,7 @@ describe("mobile Home search and task mutations", () => {
     vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise(resolve => { resolveSearch = resolve; }));
     const search = app.searchHome("needle", "active");
     expect(app.state.homeSearchStatus).toBe("searching");
-    const polled = create(SnapshotSchema, { ...owner, snapshotId: "polled", revision: { value: sameRevision ? 11n : 12n } });
+    const polled = create(SnapshotSchema, { ...owner, snapshotId: "polled", revision: create(RevisionSchema, { value: sameRevision ? 11n : 12n }) });
     vi.mocked(network.readOwner).mockResolvedValueOnce({ connection, device, snapshot: polled });
     vi.mocked(network.readSession).mockResolvedValueOnce(polled);
     await vi.advanceTimersByTimeAsync(4_000);
@@ -12008,13 +12009,13 @@ describe("native message rewinds", () => {
         nativeBinding: create(NativeSessionBindingSchema, { ...state.source.nativeBinding!, runtimeGeneration: 9n }),
         version: create(EntityVersionSchema, { revision: { value: 10n }, generation: 9n }) }); state.events = [];
     };
-    const ancestor = create(EventSchema, { ...event("retained-assistant", 19n), payload: { kind: { case: "messageCompleted", value: {
+    const ancestor = create(EventSchema, { ...event("retained-assistant", 19n), payload: create(EventPayloadSchema, { kind: { case: "messageCompleted", value: {
       messageId: "public-boundary", role: MessageRole.ASSISTANT, nativeIdentity: { entryId: "public-boundary" },
       blocks: [{ content: { case: "text", value: "Retained answer" } }]
-    } } } });
+    } } }) });
     const inPlaceReceipt = (operationId: string, mutation: OperationMutation) => create(OperationSchema, {
       ...operation(operationId), mutation, generation: state.serviceGeneration,
-      version: { revision: { value: 25n }, generation: state.serviceGeneration }
+      version: create(EntityVersionSchema, { revision: { value: 25n }, generation: state.serviceGeneration })
     });
     return { state, backend, workspace, files, network, operation, advance, input, ancestor, inPlaceReceipt };
   }
