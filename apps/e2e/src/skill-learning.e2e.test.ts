@@ -133,6 +133,7 @@ describe("production Skill learning", () => {
     const currentSkill = (await paired.clients.skill.listSkills({ query: "learned-review", page: { pageSize: 100 } }))
       .skills.find((skill) => skill.skillId === proposed.resourceId);
     if (currentSkill === undefined) throw new Error("Learned Skill was not listed for editing.");
+    expect(currentSkill).toMatchObject({ contentAvailable: true, canEdit: true, canDelete: true });
     const editSession = (await paired.clients.skill.openSkill({
       skillId: currentSkill.skillId, expectedResourceRevision: currentSkill.entityVersion?.revision
     })).skill;
