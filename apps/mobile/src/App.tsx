@@ -60,7 +60,7 @@ import {
   mobileConnectionStageRequired,
   mobileNativeIntentMessageMatches,
   parseMobileNativeIntent,
-  projectMobileNativeIntentSnapshot,
+  projectMobileHomeSearchMessageFocus, projectMobileNativeIntentSnapshot,
   type MobileNativeIntentMessageFocus,
   type MobileNativeIntentRecovery
 } from "./mobile-native-intent";
@@ -288,10 +288,10 @@ import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selecti
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
-  type MobileHomeSearchSort, type MobileHomeStatusFilter
+  type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeStatusFilter
 } from "./home-navigation";
 import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
-  type MobileTaskHomeNavigationScope } from "./mobile-task-home-navigation";
+  type MobileTaskHomeNavigationPorts } from "./mobile-task-home-navigation";
 import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import {
   artifactTitle,
@@ -646,7 +646,8 @@ export function App() {
   const [incomingShareRequestRevision, setIncomingShareRequestRevision] = useState(0);
   const [nativeIntentRevision, setNativeIntentRevision] = useState(0);
   const [nativeIntentRecovery, setNativeIntentRecovery] = useState<MobileNativeIntentRecovery>();
-  const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus>();
+  const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus & { readonly homeSourceKey?: string }>();
+  const homeMessageFocusRequest = useRef(0);
   const [nativeIntentGroupSelection, setNativeIntentGroupSelection] = useState<MobilePartnerGroupSelection>();
   const [deviceId, setDeviceId] = useState<string>();
   const [remoteDesktopEntry, setRemoteDesktopEntry] = useState<MobileRemoteDesktopEntry>();
@@ -930,10 +931,11 @@ export function App() {
   }, [page, state.partnerPrivate.open]);
 
   useEffect(() => {
-    if (nativeIntentMessageFocus && nativeIntentMessageFocus.sessionId !== state.selectedId) {
+    if (nativeIntentMessageFocus && (nativeIntentMessageFocus.sessionId !== state.selectedId
+      || (nativeIntentMessageFocus.homeSourceKey !== undefined && nativeIntentMessageFocus.homeSourceKey !== homeSourceKey))) {
       setNativeIntentMessageFocus(undefined);
     }
-  }, [nativeIntentMessageFocus, state.selectedId]);
+  }, [homeSourceKey, nativeIntentMessageFocus, state.selectedId]);
 
   useEffect(() => {
     if (updates.prompt || updates.forced) setMenuOpen(false);
@@ -976,6 +978,12 @@ export function App() {
     setMenuOpen(false);
   };
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
+  const focusHomeSearchMatch = (match?: MobileHomeSearchMatch): void => {
+    const current = client.state;
+    const focus = match !== undefined && AppState.currentState === "active"
+      ? projectMobileHomeSearchMessageFocus(current, match, --homeMessageFocusRequest.current) : undefined;
+    setNativeIntentMessageFocus(focus ? { ...focus, homeSourceKey: mobileHomeSourceKey(current) } : undefined);
+  };
   return (
     <SafeAreaProvider>
       <MobileLinkspanHost />
@@ -1048,7 +1056,7 @@ export function App() {
                   homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, incomingShare,
                     menuButtonRef: homeMenuButtonRef, searchFocusRequest: homeSearchFocusRequest,
                     onSearchFocus: () => setHomeSearchFocusRequest((value) => value + 1),
-                    onNavigated: () => { setNativeIntentMessageFocus(undefined); setFocusTaskComposer(false); setPartnerSettingsEntry(undefined); },
+                    onNavigated: match => { focusHomeSearchMatch(match); setFocusTaskComposer(false); setPartnerSettingsEntry(undefined); },
                     onMenu: () => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); },
                     onOpenShare: () => setPage("new"), onPartners: entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }, registerNavigation: registerTaskHomeNavigation }}
                   partnerSettingsEntry={partnerSettingsEntry} onPartnerSettingsEntryConsumed={() => setPartnerSettingsEntry(undefined)}
@@ -1065,7 +1073,8 @@ export function App() {
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
                   onOpenDerivationOrigin={openDerivationOrigin}
                   onRemoteDesktop={(targetDeviceId) => openRemoteDesktop("task", targetDeviceId)}
-                  messageFocus={nativeIntentMessageFocus} /> :
+                  messageFocus={nativeIntentMessageFocus?.homeSourceKey === undefined || nativeIntentMessageFocus.homeSourceKey === homeSourceKey
+                    ? nativeIntentMessageFocus : undefined} /> :
                 page === "remote-desktop" && remoteDesktopEntry ? <View style={styles.fill} /> :
                 page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
                   onAdded={() => {
@@ -1176,7 +1185,7 @@ export function App() {
                   onDevice={(id) => { setDeviceId(id); setPage("device"); }} /> :
                 page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")}
                   onRemoteDesktop={() => openRemoteDesktop("device", deviceId)} /> :
-                <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={() => setPage("task")}
+                <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={match => { focusHomeSearchMatch(match); setPage("task"); }}
                   onPartners={entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }}
                   viewState={homeViewState} onViewStateChange={setHomeViewState} foreground={foreground}
                   incomingShare={incomingShare} onOpenShare={() => setPage("new")}
@@ -1253,13 +1262,19 @@ export interface TaskHomeNavigationProps {
   readonly onMenu: () => void;
   readonly onOpenShare: () => void;
   readonly onPartners?: (entry: MobileHomePartnerEntry) => void;
-  readonly onNavigated?: () => void;
+  readonly onNavigated?: (match?: MobileHomeSearchMatch) => void;
   readonly registerNavigation?: (port: TaskHomeNavigationPort) => () => void;
 }
 
 function mobileHomeSourceKey(state: MobileClient["state"]): string {
   const profile = state.saved.find((candidate) => candidate.profileId === state.activeProfileId);
   return profile ? mobilePartnerRosterSourceKey(profile) : JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId]);
+}
+
+function currentHomeSearchMatch(state: MobileClient["state"], intent: Extract<MobileHomeNavigationIntent, { kind: "session" }>): MobileHomeSearchMatch | undefined {
+  const match = intent.searchMatch;
+  return state.status === "connected" && state.homeSearchStatus === "ready" && match?.eventId && match.sessionId === intent.sessionId
+    && state.homeSearchMatches.includes(match) ? match : undefined;
 }
 
 function mobileHomeSectionLabels(locale: MobileSupportedLocale) {
@@ -1304,7 +1319,7 @@ function ConnectionScreen({ state, locale, dark, onBack, onConnected, invitation
 export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomingShare, onOpenShare,
   menuButtonRef, searchFocusRequest, viewState, onViewStateChange, currentSessionId, runNavigation,
   foreground = AppState.currentState === "active", host = "home", newTaskInSystemBar = false, onPartners }: ScreenProps & {
-  onNew: () => void; onSelect: () => void; onMenu: () => void;
+  onNew: () => void; onSelect: (match?: MobileHomeSearchMatch) => void; onMenu: () => void;
   incomingShare: MobileIncomingShareSnapshot; onOpenShare: () => void;
   menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
   viewState?: MobileHomeViewState; onViewStateChange?: MobileHomeViewChange;
@@ -1323,6 +1338,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const [localError, setLocalError] = useState("");
   const [copyNotice, setCopyNotice] = useState("");
   const [copyBusy, setCopyBusy] = useState(false);
+  const selectionOccurrence = useRef(0);
   const [optionsSession, setOptionsSession] = useState<Session>();
   const optionsSessionRef = useRef<Session | undefined>(undefined);
   const optionsGenerationRef = useRef(0);
@@ -1338,18 +1354,18 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const searchRef = useRef<TextInput>(null);
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
   const normalizedSearch = search.trim();
-  const currentMessageIds = useMemo(() => (
-    state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter
-      ? new Set(state.homeSearchSessionIds) : new Set<string>()
-  ), [normalizedSearch, state.homeSearchFilter, state.homeSearchQuery, state.homeSearchSessionIds, statusFilter]);
+  const currentMessageMatches = useMemo(() => new Map<string, MobileHomeSearchMatch>(
+    state.homeSearchStatus === "ready" && state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter
+      ? state.homeSearchMatches.map(match => [match.sessionId, match] as const) : []
+  ), [normalizedSearch, state.homeSearchFilter, state.homeSearchMatches, state.homeSearchQuery, state.homeSearchStatus, statusFilter]);
   const sections = useMemo(() => buildMobileHomeSections({
     snapshot: state.owner,
     statusFilter,
     query: search,
     searchSort,
-    messageSessionIds: currentMessageIds,
+    messageSessionIds: new Set(currentMessageMatches.keys()),
     labels: mobileHomeSectionLabels(locale)
-  }), [currentMessageIds, locale, search, searchSort, state.owner, statusFilter]);
+  }), [currentMessageMatches, locale, search, searchSort, state.owner, statusFilter]);
   const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
 
   useEffect(() => {
@@ -1385,9 +1401,14 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     if (intent.kind === "session") {
       setLocalError("");
       const sourceKey = homeScopeKey;
+      const generation = client.state.owner?.generation;
+      const match = currentHomeSearchMatch(client.state, intent);
+      const occurrence = ++selectionOccurrence.current;
+      const current = () => mountedRef.current && selectionOccurrence.current === occurrence && homeScopeRef.current === sourceKey
+        && mobileHomeSourceKey(client.state) === sourceKey && AppState.currentState === "active";
       void client.select(intent.sessionId).then(() => {
-        if (mountedRef.current && homeScopeRef.current === sourceKey && AppState.currentState === "active") onSelect();
-      }).catch((error) => { if (mountedRef.current) setLocalError(errorText(error, locale)); });
+        if (current() && client.state.selectedId === intent.sessionId) onSelect(client.state.owner?.generation === generation ? match : undefined);
+      }).catch((error) => { if (current()) setLocalError(errorText(error, locale)); });
     } else if (intent.kind === "new-task") onNew();
     else if (intent.kind === "incoming-share") onOpenShare();
     else if (intent.kind === "menu") onMenu();
@@ -1608,7 +1629,12 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
             accessibilityState={{ selected: item.session.sessionId === currentSessionId }}
             onPress={() => {
               if (swipeRegistry.closeOpenRow()) return;
-              navigate({ kind: "session", sessionId: item.session.sessionId });
+              const sessionId = item.session.sessionId;
+              const query = normalizedSearch.toLocaleLowerCase();
+              const targetName = state.owner?.targets.find(target => target.targetId === item.session.targetId)?.displayName;
+              const matchesName = item.session.displayName.toLocaleLowerCase().includes(query) || targetName?.toLocaleLowerCase().includes(query);
+              const match = matchesName ? undefined : currentMessageMatches.get(sessionId);
+              navigate({ kind: "session", sessionId, ...(match?.eventId ? { searchMatch: match } : {}) });
             }} style={styles.sessionRowBody}>
             <View style={styles.fill}><View style={styles.statusTitle}>
               <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName
@@ -3591,15 +3617,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const fallbackHomeMenuRef = useRef<View>(null);
   const [fallbackHomeSearchFocus, setFallbackHomeSearchFocus] = useState(0);
   const taskHomeNavigatorRef = useRef<MobileTaskHomeNavigation | null>(null);
-  const taskHomeNavigationPortsRef = useRef<{
-    readScope(): MobileTaskHomeNavigationScope | undefined;
-    prepare(current: () => boolean): Promise<void>;
-    execute(intent: MobileHomeNavigationIntent, sourceCurrent: () => boolean): Promise<void>;
-  } | null>(null);
+  const taskHomeNavigationPortsRef = useRef<Pick<MobileTaskHomeNavigationPorts, "readScope" | "prepare" | "execute"> | null>(null);
   if (taskHomeNavigatorRef.current === null) taskHomeNavigatorRef.current = new MobileTaskHomeNavigation({
     readScope: () => taskHomeNavigationPortsRef.current?.readScope(),
     close: () => setDrawerOpen(false),
-    prepare: (current) => taskHomeNavigationPortsRef.current!.prepare(current),
+    prepare: (current, intent) => taskHomeNavigationPortsRef.current!.prepare(current, intent),
     execute: (intent, current) => taskHomeNavigationPortsRef.current!.execute(intent, current),
     failed: (error) => { if (taskMountedRef.current) setLocalError(errorText(error)); },
     changed: () => { if (taskMountedRef.current) setNavigationBusy(taskHomeNavigatorRef.current!.busy); }
@@ -6236,8 +6258,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           selected?.backendId, selected?.targetId, selected?.nativeBinding?.runtimeGeneration?.toString(),
           current.status === "revoked" || current.status === "unpaired" ? current.status : ""]) };
     },
-    prepare: async (current) => {
+    prepare: async (current, intent) => {
       if (!current()) return;
+      if (intent.kind === "session" && intent.searchMatch !== undefined && client.state.selectedId === intent.sessionId
+        && client.state.taskSource?.kind !== "joined") return;
       const identity = draftIdentityRef.current;
       const editing = queueEditRef.current;
       if (editing) {
@@ -6264,9 +6288,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (!taskMountedRef.current || AppState.currentState !== "active") return;
       }
       if (intent.kind === "session") {
-        await client.select(intent.sessionId);
+        const generation = client.state.owner?.generation;
+        const match = currentHomeSearchMatch(client.state, intent);
+        const focusCurrent = intent.searchMatch !== undefined && client.state.selectedId === intent.sessionId && client.state.taskSource?.kind !== "joined";
+        if (focusCurrent && match === undefined) return;
+        if (!focusCurrent) await client.select(intent.sessionId);
         if (!sourceCurrent() || client.state.selectedId !== intent.sessionId) return;
-        homeNavigation?.onNavigated?.();
+        if (match !== undefined) setReplyQuoteFocus(undefined);
+        homeNavigation?.onNavigated?.(client.state.owner?.generation === generation ? match : undefined);
       } else if (intent.kind === "new-task") { homeNavigation?.onNavigated?.(); onNew(); }
       else if (intent.kind === "incoming-share") { homeNavigation?.onNavigated?.(); (homeNavigation?.onOpenShare ?? onNew)(); }
       else if (intent.kind === "home") { homeNavigation?.onNavigated?.(); onBack(); }

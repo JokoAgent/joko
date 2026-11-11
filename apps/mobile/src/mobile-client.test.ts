@@ -8349,7 +8349,8 @@ describe("mobile Home search and task mutations", () => {
     let resolveOld!: (value: readonly SessionMessageSearchMatch[]) => void;
     vi.mocked(network.searchSessionMessages)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
-      .mockResolvedValueOnce([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-new" })]);
+      .mockResolvedValueOnce([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-new" }),
+        create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-secondary" })]);
 
     const oldSearch = app.searchHome("old words", "active");
     await vi.waitFor(() => expect(app.state.homeSearchStatus).toBe("searching"));
@@ -8361,7 +8362,7 @@ describe("mobile Home search and task mutations", () => {
       homeSearchQuery: "new words",
       homeSearchFilter: "all",
       homeSearchStatus: "ready",
-      homeSearchSessionIds: ["session"]
+      homeSearchMatches: [{ sessionId: "session", eventId: "event-new" }]
     });
     resolveOld([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-old" })]);
     await oldSearch;
@@ -8374,7 +8375,7 @@ describe("mobile Home search and task mutations", () => {
     await app.refresh();
     resolveOwnerSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "late" })]);
     await ownerSearch;
-    expect(app.state.homeSearchSessionIds).toEqual([]);
+    expect(app.state.homeSearchMatches).toEqual([]);
     expect(app.state.homeSearchStatus).toBe("idle");
 
     let resolveClearedSearch!: (value: readonly SessionMessageSearchMatch[]) => void;
@@ -8388,11 +8389,11 @@ describe("mobile Home search and task mutations", () => {
       homeSearchQuery: "",
       homeSearchFilter: "archived",
       homeSearchStatus: "idle",
-      homeSearchSessionIds: []
+      homeSearchMatches: []
     });
     resolveClearedSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "cleared" })]);
     await clearedSearch;
-    expect(app.state.homeSearchSessionIds).toEqual([]);
+    expect(app.state.homeSearchMatches).toEqual([]);
   });
 
   it("submits every task action with the exact current Session revision", async () => {

@@ -4,6 +4,11 @@ import { safeWindowRect, windowDivision, type MobileWindowGeometry } from "./mob
 export type MobileHomeStatusFilter = "active" | "archived" | "all";
 export type MobileHomeSearchSort = "relevance" | "activityDesc" | "activityAsc";
 
+export interface MobileHomeSearchMatch {
+  readonly sessionId: string;
+  readonly eventId: string;
+}
+
 export interface MobileHomeSessionItem {
   readonly session: Session;
   readonly targetName: string;
