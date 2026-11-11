@@ -135,6 +135,42 @@ describe("RemoteBackendRuntimeSetupManager", () => {
     expect(uninstall).toHaveBeenCalledOnce();
     await fixture.manager.close();
   });
+
+  it("lets only the same scope observe an in-flight uninstall before a fresh probe", async () => {
+    let finish!: () => void;
+    const readback = new Promise<void>((resolve) => { finish = resolve; });
+    let markerPresent = true;
+    const probe = vi.fn<RemoteBackendRuntimeSetupProvider["probe"]>(async () => markerPresent
+      ? { state: "ready", installedVersion: "1.2.3" }
+      : { state: "not_installed" });
+    const uninstall = vi.fn<RemoteBackendRuntimeSetupProvider["uninstall"]>(async () => {
+      markerPresent = false;
+      await readback;
+      return { state: "not_installed" };
+    });
+    const fixture = setupFixture({ probe, uninstall });
+    const current = scope(fixture);
+    const operation = fixture.manager.uninstall({ ...current, requestId: "uninstall-in-flight" });
+    try {
+      await vi.waitFor(() => expect(uninstall).toHaveBeenCalledOnce());
+      await expect(fixture.manager.probe(current)).resolves.toMatchObject({
+        targetId: current.targetId, hostId: current.hostId, targetRevision: current.expectedTargetRevision,
+        hostRevision: current.expectedHostRevision, state: "probing", canInstall: false, canReinstall: false, canUninstall: false
+      });
+      expect(probe).not.toHaveBeenCalled();
+      await expect(fixture.manager.probe({ ...current, hostId: "same-endpoint-alias" })).rejects.toMatchObject({ code: "busy" });
+      expect(() => fixture.manager.install({ ...current, requestId: "install-while-uninstalling", reinstall: false }))
+        .toThrowError(RemoteBackendRuntimeSetupError);
+      finish();
+      await expect(operation).resolves.toMatchObject({ state: "not_installed", canInstall: true });
+      await expect(fixture.manager.probe(current)).resolves.toMatchObject({ state: "not_installed", canInstall: true });
+      expect(probe).toHaveBeenCalledOnce();
+      expect(uninstall).toHaveBeenCalledOnce();
+    } finally {
+      finish();
+      await fixture.manager.close();
+    }
+  });
 });
 
 function setupFixture(overrides: Partial<RemoteBackendRuntimeSetupProvider> = {}) {
@@ -179,7 +215,7 @@ function setupFixture(overrides: Partial<RemoteBackendRuntimeSetupProvider> = {}
   const manager = new RemoteBackendRuntimeSetupManager({
     store: { getTarget: () => target },
     registry: {
-      get: () => host,
+      get: (targetId: string, hostId: string) => ({ ...host, targetId, id: hostId }),
       captureProcessAuthority: capture
     } as unknown as Pick<RemoteHostRegistry, "get" | "captureProcessAuthority">,
     providers: [provider],
