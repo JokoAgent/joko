@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { SessionDescriptor } from "@joko/core";
-import { ContactStore, OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore, type ContactDraft } from "@joko/store";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ContactManager } from "./contact-manager.js";
@@ -200,6 +200,53 @@ describe("ContactToolBridgeProvider", () => {
       expected_revision: fixture.manager.get(aliceId).revision.toString(),
       unknown: true
     }))).toMatchObject({ errorCode: "INVALID_ARGS" });
+  });
+
+  it("resolves exact identities and names before a bounded page of weak full-text matches", async () => {
+    const { manager, provider } = createFixture();
+    enable(manager);
+    const create = (draft: Omit<ContactDraft, "kind">) => {
+      const profile = manager.create({ ...draft, kind: "person", expectedDirectoryRevision: manager.directory().revision }).contact;
+      if (profile === undefined) throw new Error("Fixture contact was not created.");
+      return profile;
+    };
+    const exact = create({
+      displayName: "Zoe",
+      aliases: ["星河", "Ａster"],
+      narrative: "Background details kept for the contact record. ".repeat(240).trim()
+    });
+    for (let i = 0; i < 26; i += 1) {
+      create({ displayName: `Colleague ${i}`, summary: "Met Zoe at the industry event." });
+    }
+    const oldWindow = manager.list({ query: "Zoe", limit: 25 });
+    expect(oldWindow.contacts).toHaveLength(25);
+    expect(oldWindow.contacts.map(({ id }) => id)).not.toContain(exact.id);
+
+    const resolve = async (args: Record<string, unknown>) =>
+      (resultData(await callOrdinary(provider, "contacts_resolve", args)) as {
+        matches: readonly { match_type: string; profile: { id: string } }[];
+      }).matches;
+    for (const value of ["zoe", "星河", "aster"]) {
+      expect(await resolve({ value })).toEqual([
+        expect.objectContaining({ match_type: "name", profile: expect.objectContaining({ id: exact.id }) })
+      ]);
+    }
+
+    const github = create({ displayName: "Taylor", identities: [{ platform: "github", value: "Zoe" }] });
+    const slack = create({ displayName: "Morgan", identities: [{ platform: "slack", value: "Zoe" }] });
+    const identities = await resolve({ value: "Zoe" });
+    expect(identities.map(match => [match.match_type, match.profile.id]))
+      .toEqual(expect.arrayContaining([["identity", github.id], ["identity", slack.id]]));
+    expect(identities).toHaveLength(2);
+    expect(await resolve({ value: "Zoe", platform: "github" })).toEqual([
+      expect.objectContaining({ match_type: "identity", profile: expect.objectContaining({ id: github.id }) })
+    ]);
+    expect(await resolve({ value: "Zoe", platform: "email" })).toEqual([]);
+
+    const fallback = await resolve({ value: "industry", limit: 20 });
+    expect(fallback).toHaveLength(20);
+    expect(fallback.every(match => match.match_type === "fts")).toBe(true);
+    expect(await resolve({ value: "industry" })).toEqual(fallback.slice(0, 5));
   });
 
   it("returns the adopted narrative and an explicit atomic error when exact-identity enrichment is too large", async () => {

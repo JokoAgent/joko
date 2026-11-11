@@ -163,6 +163,9 @@ export class ContactManager {
   resolveIdentities(value: string, limit: number) {
     return this.store.findIdentitiesByValue(value, limit);
   }
+  resolveNameIds(value: string, limit: number): readonly string[] {
+    return this.store.findContactIdsByExactName(value, limit);
+  }
   findSimilar(contact: ContactDraft): readonly ContactDuplicateCandidate[] { return this.store.findSimilar(contact); }
   create(input: ContactDraft & { readonly expectedDirectoryRevision: bigint; readonly confirmedNameCandidateIds?: readonly string[] }) {
     return this.store.createContact(input);

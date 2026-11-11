@@ -225,6 +225,8 @@ export class ContactStore {
     this.#idFactory = options.idFactory ?? randomUUID;
     try {
       this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA trusted_schema = OFF;");
+      this.#database.function("contact_name_key", { deterministic: true },
+        (value) => typeof value === "string" ? folded(value) : null);
       if (filePath !== ":memory:") this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
       this.#initialize();
     } catch (error) {
@@ -853,6 +855,18 @@ export class ContactStore {
       WHERE normalized_value IN (${placeholders})
       ORDER BY created_at, id LIMIT ?
     `).all(...normalizedValues, limit) as Row[]).map(contactIdentityFromRow);
+  }
+
+  findContactIdsByExactName(value: string, limitValue = 5): readonly string[] {
+    this.#assertOpen();
+    const limit = boundedInteger(limitValue, 1, 20, "Contact name match limit");
+    const key = folded(text(value, 1, 256, "Contact name lookup"));
+    return (this.#database.prepare(`
+      SELECT id FROM contacts
+      WHERE contact_name_key(display_name) = ?
+        OR EXISTS (SELECT 1 FROM json_each(contacts.aliases_json) alias WHERE contact_name_key(alias.value) = ?)
+      ORDER BY updated_at DESC, id LIMIT ?
+    `).all(key, key, limit) as Row[]).map((row) => string(row["id"]));
   }
 
   contactSyncConfiguration(): ContactSyncConfigurationRecord | undefined {
