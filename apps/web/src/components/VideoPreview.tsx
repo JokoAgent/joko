@@ -20,6 +20,7 @@ export interface VideoPreviewProps {
   readonly src: string;
   readonly ownerKey: string;
   readonly labels: VideoPreviewLabels;
+  readonly pauseWhenHidden?: boolean;
   readonly onError?: () => void;
   readonly actions?: ReactNode;
 }
@@ -29,7 +30,7 @@ export function VideoPreview(props: VideoPreviewProps): JSX.Element {
   return <VideoPreviewContent key={`${props.ownerKey}\u0000${props.src}`} {...props} />;
 }
 
-function VideoPreviewContent({ src, labels, onError, actions }: VideoPreviewProps): JSX.Element {
+function VideoPreviewContent({ src, labels, pauseWhenHidden = false, onError, actions }: VideoPreviewProps): JSX.Element {
   const coverRef = useRef<HTMLVideoElement>(null);
   const [trigger, setTrigger] = useState<HTMLButtonElement>();
   const [loaded, setLoaded] = useState(false);
@@ -65,13 +66,14 @@ function VideoPreviewContent({ src, labels, onError, actions }: VideoPreviewProp
       {!loaded && <span className="video-preview__loading"><Spinner label={labels.loading} /></span>}
     </button>}
     {trigger === undefined && actions}
-    {trigger !== undefined && <VideoLightbox src={src} labels={labels} trigger={trigger} onClose={() => setTrigger(undefined)} onError={fail} actions={actions} />}
+    {trigger !== undefined && <VideoLightbox src={src} labels={labels} pauseWhenHidden={pauseWhenHidden} trigger={trigger} onClose={() => setTrigger(undefined)} onError={fail} actions={actions} />}
   </div>;
 }
 
-function VideoLightbox({ src, labels, trigger, onClose, onError, actions }: {
+function VideoLightbox({ src, labels, pauseWhenHidden, trigger, onClose, onError, actions }: {
   readonly src: string;
   readonly labels: VideoPreviewLabels;
+  readonly pauseWhenHidden: boolean;
   readonly trigger: HTMLButtonElement;
   readonly onClose: () => void;
   readonly onError: () => void;
@@ -126,6 +128,10 @@ function VideoLightbox({ src, labels, trigger, onClose, onError, actions }: {
       }
     };
     ownerDocument.addEventListener("keydown", onKeyDown, true);
+    const onVisibilityChange = (): void => {
+      if (ownerDocument.hidden) video.pause();
+    };
+    if (pauseWhenHidden) ownerDocument.addEventListener("visibilitychange", onVisibilityChange);
     void video.play().catch((error: unknown) => {
       if (!alive || closedRef.current) return;
       const name = (error as { readonly name?: string } | null)?.name;
@@ -137,11 +143,12 @@ function VideoLightbox({ src, labels, trigger, onClose, onError, actions }: {
       releasePlayback?.();
       releaseVideoSource(video);
       ownerDocument.removeEventListener("keydown", onKeyDown, true);
+      if (pauseWhenHidden) ownerDocument.removeEventListener("visibilitychange", onVisibilityChange);
       body.classList.remove("video-lightbox-open");
       if (ownedModalLock && ![...ownerDocument.querySelectorAll('[aria-modal="true"]')].some((element) => element !== dialog)) body.classList.remove("modal-open");
       if (restoreFocusRef.current && trigger.isConnected && trigger.ownerDocument === ownerDocument) trigger.focus({ preventScroll: true });
     };
-  }, [close, fail, ownerDocument, src, trigger]);
+  }, [close, fail, ownerDocument, pauseWhenHidden, src, trigger]);
 
   return createPortal(<div
     ref={dialogRef}

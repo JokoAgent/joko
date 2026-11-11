@@ -58,7 +58,7 @@ function OwnedMedia({ node, source, actions }: { readonly node: RichNode; readon
   if (node.kind === "audio") return <AudioPreview src={url} ownerKey={ownerKey} name={name}
     labels={{ player: t("timeline.audioPlayer", { name }), loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"),
       copyDescription: t("media.copyDescription"), copying: t("media.copyingDescription"), copied: t("media.descriptionCopied"), copyFailed: t("media.descriptionCopyFailed") }} />;
-  return <VideoPreview src={url} ownerKey={ownerKey} onError={() => setFailed(true)} labels={{ open: t("media.openVideo", { name }),
+  return <VideoPreview src={url} ownerKey={ownerKey} pauseWhenHidden onError={() => setFailed(true)} labels={{ open: t("media.openVideo", { name }),
     player: t("timeline.videoPlayer", { name }), loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), close: t("common.close"), playBlocked: t("media.playBlocked") }} />;
 }
 

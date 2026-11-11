@@ -123,20 +123,32 @@ it("retires open playback and late play failures on source or task changes witho
   }
 });
 
-it("uses the invoking document for its portal, modal lock, playback, keyboard and focus restoration", async () => {
+it("pauses message playback when its invoking document is hidden and restores focus on close", async () => {
   const frame = document.body.appendChild(document.createElement("iframe"));
   const childDocument = frame.contentDocument!;
   const childPrototype = Object.getPrototypeOf(childDocument.createElement("video"));
   const play = vi.spyOn(childPrototype, "play").mockResolvedValue(undefined);
-  vi.spyOn(childPrototype, "pause").mockImplementation(() => undefined);
+  const pause = vi.spyOn(childPrototype, "pause").mockImplementation(() => undefined);
   vi.spyOn(childPrototype, "load").mockImplementation(() => undefined);
-  await mount(undefined, childDocument)();
+  const hidden = vi.spyOn(childDocument, "hidden", "get").mockReturnValue(false);
+  await mount(undefined, childDocument, false, true)();
   const trigger = childDocument.querySelector<HTMLButtonElement>("button")!;
   trigger.focus();
   await act(async () => trigger.click());
   expect(play).toHaveBeenCalledTimes(1);
   expect(document.querySelector('[role="dialog"]')).toBeNull();
   expect(childDocument.querySelector('[role="dialog"]')).not.toBeNull();
+  const player = childDocument.querySelector<HTMLVideoElement>('[role="dialog"] video')!;
+  player.currentTime = 4;
+  hidden.mockReturnValue(true);
+  document.dispatchEvent(new Event("visibilitychange"));
+  expect(pause).not.toHaveBeenCalled();
+  childDocument.dispatchEvent(new Event("visibilitychange"));
+  expect(pause).toHaveBeenCalledExactlyOnceWith();
+  expect(player.currentTime).toBe(4);
+  hidden.mockReturnValue(false);
+  childDocument.dispatchEvent(new Event("visibilitychange"));
+  expect(play).toHaveBeenCalledTimes(1);
   expect(childDocument.body.classList.contains("modal-open")).toBe(true);
   expect(document.body.classList.contains("modal-open")).toBe(false);
   await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
@@ -145,13 +157,17 @@ it("uses the invoking document for its portal, modal lock, playback, keyboard an
   expect(childDocument.querySelector('[role="dialog"]')).toBeNull();
   expect(childDocument.activeElement).toBe(trigger);
   expect(childDocument.body.classList.contains("modal-open")).toBe(false);
+  pause.mockClear();
+  hidden.mockReturnValue(true);
+  childDocument.dispatchEvent(new Event("visibilitychange"));
+  expect(pause).not.toHaveBeenCalled();
 });
 
-function mount(onError?: () => void, ownerDocument = document, strict = false) {
+function mount(onError?: () => void, ownerDocument = document, strict = false, pauseWhenHidden = false) {
   const host = document.body.appendChild(document.createElement("div"));
   root = createRoot(host);
   return async (ownerKey = "task-one", src = "blob:first") => act(async () => {
-    const preview = <VideoPreview src={src} ownerKey={ownerKey} labels={labels} onError={onError} />;
+    const preview = <VideoPreview src={src} ownerKey={ownerKey} labels={labels} pauseWhenHidden={pauseWhenHidden} onError={onError} />;
     const content = ownerDocument === document ? preview : createPortal(preview, ownerDocument.body);
     root!.render(strict ? <StrictMode>{content}</StrictMode> : content);
   });

@@ -73,7 +73,7 @@ export function TimelineArtifactMedia({ artifact, playbackOwnerKey, loadUrl, t, 
           metadata={artifact.audioMetadata}
           labels={{ player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), copyDescription: t("media.copyDescription"), copying: t("media.copyingDescription"), copied: t("media.descriptionCopied"), copyFailed: t("media.descriptionCopyFailed") }}
         />
-        : <VideoPreview src={urlState.url} ownerKey={sourceKey} labels={{ open: t("media.openVideo", { name: artifact.title || artifact.fileName }), player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), close: t("common.close"), playBlocked: t("media.playBlocked") }} onError={failMedia} actions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={sourceKey} t={t} />} />}
+        : <VideoPreview src={urlState.url} ownerKey={sourceKey} pauseWhenHidden labels={{ open: t("media.openVideo", { name: artifact.title || artifact.fileName }), player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), close: t("common.close"), playBlocked: t("media.playBlocked") }} onError={failMedia} actions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={sourceKey} t={t} />} />}
     </>}
   </div>;
 }
