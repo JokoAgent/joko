@@ -20,6 +20,32 @@ afterEach(() => {
 });
 
 describe("current-v1 Contacts store", () => {
+  it("preserves month and day precision with optional event sources through sync and reopen", () => {
+    const { store, filePath } = createFixture();
+    let person = createContact(store, { kind: "person", displayName: "Event owner" });
+    for (const source of [undefined, "", "  ", " archive "]) {
+      const eventText = `Event ${person.events.length}`;
+      person = store.appendEvent(person.id, person.revision, { date: source === undefined ? "2026-10" : "2026-10-12",
+        text: eventText, ...(source === undefined ? {} : { source }) });
+      expect(person.events.find(event => event.text === eventText)).toMatchObject({ source: source?.trim() ?? "" });
+    }
+    expect(person.events.map(event => event.date)).toContain("2026-10");
+    const directory = store.directoryState();
+    for (const event of [{ date: "2026-13", text: "Invalid month" },
+      { date: "2026-10", text: "Oversized source", source: "x".repeat(65) }]) {
+      expectContactError(() => store.appendEvent(person.id, person.revision, event), "CONTACT_INVALID");
+    }
+    expect(store.directoryState()).toEqual(directory);
+    const mirror = createFixture().store;
+    mirror.mergeContactSyncState("event-peer-b", store.readContactSyncState("event-peer-a").state);
+    const eventValues = (profile: ContactProfileRecord) => profile.events.map(({ id, date, text, source }) => ({ id, date, text, source }));
+    expect(eventValues(mirror.getContact(person.id))).toEqual(eventValues(person));
+    store.close();
+    const reopened = new ContactStore(filePath);
+    cleanups.push(() => reopened.close());
+    expect(reopened.getContact(person.id).events).toEqual(person.events);
+  });
+
   it("searches both relation directions and refreshes names, notes and removed edges", () => {
     const { store } = createFixture();
     let person = createContact(store, { kind: "person", displayName: "Alice", status: "pending" });

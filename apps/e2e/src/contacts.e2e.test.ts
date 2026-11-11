@@ -48,11 +48,18 @@ it("serves and restarts the complete authenticated local Contact chain", async (
     contactId: personId,
     expectedRevision: created.contact!.summary!.revision
   });
-  const withEvent = await contact.appendContactEvent({
+  let withEvent = await contact.appendContactEvent({
     contactId: personId,
     expectedContactRevision: confirmed.contact!.summary!.revision,
     event: { date: "1843-01-01", text: "Published notes", source: "archive" }
   });
+  for (const source of [undefined, "", "   "]) {
+    withEvent = await contact.appendContactEvent({ contactId: personId,
+      expectedContactRevision: withEvent.contact!.summary!.revision,
+      event: { date: "1842-10", text: "Month precision with optional source", ...(source === undefined ? {} : { source }) } });
+  }
+  expect(withEvent.contact!.events.filter(event => event.text === "Month precision with optional source"))
+    .toEqual(Array.from({ length: 3 }, () => expect.objectContaining({ date: "1842-10", source: "" })));
   const group = await contact.createContactGroup({
     expectedDirectoryRevision: withEvent.directory!.revision,
     name: "Computing pioneers",
@@ -130,7 +137,8 @@ it("serves and restarts the complete authenticated local Contact chain", async (
   expect(restarted).toMatchObject({
     summary: { contactId: personId, aliases: expect.arrayContaining(["Augusta Ada King", "Ada L."]), status: ContactStatus.CONFIRMED },
     identities: [expect.objectContaining({ normalizedValue: "ada@example.test" })],
-    events: [expect.objectContaining({ text: "Published notes" })],
+    events: expect.arrayContaining([expect.objectContaining({ text: "Published notes" }),
+      expect.objectContaining({ date: "1842-10", text: "Month precision with optional source", source: "" })]),
     groups: [expect.objectContaining({ name: "Computing pioneers" })],
     relations: [expect.objectContaining({ relatedDisplayName: "Analytical Engines", relation: "works at" })]
   });
@@ -173,9 +181,29 @@ mountedIt("refreshes the mounted Contacts list and selected profile after anothe
   expect(await panel.locator(".contacts-directory-card__stats").textContent()).toMatch(/1\s*Groups/u);
 
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  for (const [width, date, source] of [[1440, "2026-10", ""], [390, "2026-10-12", "meeting"]] as const) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 960 });
+    const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation" });
+    if (await closeNavigation.isVisible()) await closeNavigation.click();
+    const events = details.locator(".contact-detail__section").filter({ has: page.getByRole("heading", { name: "Events", exact: true }) });
+    await events.getByRole("button", { name: "Add", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Add event", exact: true });
+    await dialog.getByLabel("Date", { exact: true }).fill(date);
+    await dialog.getByLabel("Event", { exact: true }).fill(`Recorded ${date}`);
+    if (source !== "") await dialog.getByLabel("Source", { exact: true }).fill(source);
+    await dialog.getByRole("button", { name: "Add", exact: true }).click();
+    await dialog.waitFor({ state: "hidden" });
+    await events.getByText(`Recorded ${date}`, { exact: true }).waitFor({ state: "visible" });
+    expect(await events.locator(`time[datetime="${date}"]`).textContent()).toBe(date);
+  }
+  const afterEvents = (await contact.getContact({ contactId: original.contactId })).contact!;
+  expect(afterEvents.events).toEqual(expect.arrayContaining([
+    expect.objectContaining({ date: "2026-10", text: "Recorded 2026-10", source: "" }),
+    expect.objectContaining({ date: "2026-10-12", text: "Recorded 2026-10-12", source: "meeting" })
+  ]));
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
-  await contact.deleteContact({ contactId: original.contactId, expectedRevision: updated.contact!.summary!.revision });
+  await contact.deleteContact({ contactId: original.contactId, expectedRevision: afterEvents.summary!.revision });
   await details.getByText("Select a contact", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
   expect(await selected.count()).toBe(0);
 });

@@ -1561,7 +1561,7 @@ function eventDraft(input: ContactEventDraft): { readonly date: string; readonly
   return {
     date,
     text: text(input.text, 1, MAX_EVENT_TEXT, "Contact event text"),
-    source: text(input.source ?? "manual", 1, 64, "Contact event source")
+    source: text(typeof input.source === "string" ? input.source.trim() : input.source ?? "", 0, 64, "Contact event source")
   };
 }
 
