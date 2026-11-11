@@ -70,7 +70,7 @@ import {
   type NodeIdentity,
   type PairedCredential
 } from "./network";
-import type { Event, Operation, Schedule, ScheduleInput, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
+import type { Event, Operation, OperationMutation, Schedule, ScheduleInput, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
 import { mobileDeviceNameSource, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -11975,7 +11975,7 @@ describe("native message rewinds", () => {
       } } } });
     const state = { source: create(SessionSchema, { ...runtimeSession, state: SessionState.IDLE,
       nativeBinding: create(NativeSessionBindingSchema, { backendId: "backend", opaqueReference: "native-task", runtimeGeneration: 8n }) }),
-      events: [started, completed] };
+      events: [started, completed], serviceGeneration: 1n, ownerRevision: 30n };
     const backend = create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
       ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
         create(CapabilitySchema, { name: "workspace.rewind", support: CapabilitySupport.SUPPORTED })]
@@ -11983,8 +11983,13 @@ describe("native message rewinds", () => {
     const workspace = create(WorkspaceDescriptorSchema, { workspaceId: "rewind-workspace", targetId: "target", serverPathDisplay: "D:\\project",
       location: { kind: { case: "serviceNode", value: {} } }, version: { revision: { value: 3n }, generation: 1n } });
     const target = create(TargetSchema, { ...snapshot.targets[0]!, workspaceId: workspace.workspaceId });
-    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.source, detail),
-      backends: [backend], targets: [target], workspaces: [workspace], ...(detail ? { timeline: state.events } : {}) });
+    const projection = (detail: boolean) => {
+      const base = runtimeControlProjection(state.source, detail);
+      return create(SnapshotSchema, { ...base, generation: state.serviceGeneration,
+        resumeCursor: { ...base.resumeCursor!, generation: state.serviceGeneration },
+        revision: detail ? base.revision : { ...base.revision!, value: state.ownerRevision },
+        backends: [backend], targets: [target], workspaces: [workspace], ...(detail ? { timeline: state.events } : {}) });
+    };
     const network = fakeNetwork(); network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
     network.readSession = vi.fn(async () => projection(true));
     network.listWorkspaceChangeSets = vi.fn(async () => [create(WorkspaceChangeSetSchema, { workspaceId: workspace.workspaceId,
@@ -12003,7 +12008,15 @@ describe("native message rewinds", () => {
         nativeBinding: create(NativeSessionBindingSchema, { ...state.source.nativeBinding!, runtimeGeneration: 9n }),
         version: create(EntityVersionSchema, { revision: { value: 10n }, generation: 9n }) }); state.events = [];
     };
-    return { state, backend, workspace, files, network, operation, advance, input };
+    const ancestor = create(EventSchema, { ...event("retained-assistant", 19n), payload: { kind: { case: "messageCompleted", value: {
+      messageId: "public-boundary", role: MessageRole.ASSISTANT, nativeIdentity: { entryId: "public-boundary" },
+      blocks: [{ content: { case: "text", value: "Retained answer" } }]
+    } } } });
+    const inPlaceReceipt = (operationId: string, mutation: OperationMutation) => create(OperationSchema, {
+      ...operation(operationId), mutation, generation: state.serviceGeneration,
+      version: { revision: { value: 25n }, generation: state.serviceGeneration }
+    });
+    return { state, backend, workspace, files, network, operation, advance, input, ancestor, inPlaceReceipt };
   }
   async function preview(app: MobileClient) {
     const controls = app.taskMessageRewindControls("rewind-complete")!;
@@ -12047,6 +12060,88 @@ describe("native message rewinds", () => {
     await expect(drafts.composer.readOperationInput(identity, "operation-1")).resolves.toBeNull();
     expect(f.network.readAround).not.toHaveBeenCalled(); expect(f.network.submit).toHaveBeenCalledOnce();
   });
+
+  it.each(["direct", "lost"] as const)("restores the original input after a %s in-place rewind receipt", async (delivery) => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep current draft")); await drafts.composer.flush(identity);
+    f.state.events.unshift(f.ancestor);
+    let receipt!: Operation;
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      receipt = f.inPlaceReceipt(operationId, mutation);
+      f.state.events = [f.ancestor];
+      if (delivery === "lost") throw new Error("response lost after native navigation");
+      return receipt;
+    });
+    let activeDrafts = drafts;
+    let app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, activeDrafts); await app.start();
+    const result = await app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal);
+    if (delivery === "lost") {
+      expect(result).toEqual({ kind: "unknown" });
+      expect(saved.pending()).toMatchObject([{ operationId: receipt.operationId, kind: "session-rewind", sourceGeneration: "8" }]);
+      const retained = await drafts.composer.readOperationInput(identity, receipt.operationId);
+      expect(mobileComposerInput(retained!)).toEqual(mobileComposerInput(f.input));
+      app.dispose();
+      const stale = clone(OperationSchema, receipt);
+      stale.mutation!.preconditions[0]!.expectedGeneration = 7n;
+      vi.mocked(f.network.getOperation).mockResolvedValueOnce(stale).mockResolvedValue(receipt);
+      activeDrafts = { ...drafts, composer: new MobileComposerDraftStore(drafts.composer.driver) };
+      app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, activeDrafts); await app.start();
+      expect(saved.pending()).toMatchObject([{ operationId: receipt.operationId, kind: "session-rewind", sourceGeneration: "8" }]);
+      expect(app.state.detail?.timeline.map(item => item.eventId)).toEqual([f.ancestor.eventId]);
+      expect((await activeDrafts.composer.readDurable(identity))?.text).toBe("Keep current draft");
+      await app.reconcile();
+      expect(f.network.getOperation).toHaveBeenCalledWith(credential, receipt.operationId, expect.any(AbortSignal));
+    } else {
+      expect(result).toEqual({ kind: "rewound", mode: "dialogue" });
+    }
+    const restored = await activeDrafts.composer.readDurable(identity);
+    expect(restored).toMatchObject({ mentions: [{ sessionId: "related" }], atoms: [{ kind: "pasted-text" }], attachments: [] });
+    expect(restored?.text).toContain("Keep current draft");
+    expect(app.state.restoredComposerDraft).toMatchObject(identity);
+    expect(app.state.detail?.sessions[0]?.nativeBinding).toMatchObject({ opaqueReference: "native-task", runtimeGeneration: 8n });
+    expect(app.state.detail?.timeline.map(item => item.eventId)).toEqual([f.ancestor.eventId]);
+    expect(saved.pending()).toEqual([]);
+    await expect(activeDrafts.composer.readOperationInput(identity, receipt.operationId)).resolves.toBeNull();
+    expect(f.network.submit).toHaveBeenCalledOnce(); expect(f.network.readAround).not.toHaveBeenCalled();
+  });
+
+  it.each(["wrong-entry", "changed-binding", "old-snapshot", "different-service"] as const)(
+    "retains the in-place rewind input after %s proof and recovers the original Operation", async (mismatch) => {
+      const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+      const identity = { profileId: credential.profileId, sessionId: "session" };
+      const original = f.state.source;
+      drafts.composer.save(identity, plainTextMobileComposerDraft("Newer draft")); await drafts.composer.flush(identity);
+      let receipt!: Operation;
+      vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+        receipt = f.inPlaceReceipt(operationId, mutation);
+        f.state.events = [f.ancestor];
+        if (mismatch === "changed-binding") {
+          f.state.source = create(SessionSchema, { ...original, nativeBinding: { ...original.nativeBinding!, opaqueReference: "other-binding" } });
+        }
+        if (mismatch === "old-snapshot") f.state.ownerRevision = 24n;
+        if (mismatch === "different-service") f.state.serviceGeneration = 2n;
+        if (mismatch !== "wrong-entry") return receipt;
+        const wrong = clone(OperationMutationSchema, mutation);
+        if (wrong.payload.case !== "navigateSessionBranch") throw new Error("Expected a branch navigation.");
+        wrong.payload.value.target!.kind = { case: "nativeEntryId", value: "other-entry" };
+        return f.inPlaceReceipt(operationId, wrong);
+      });
+      const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+      await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+      expect(saved.pending()).toMatchObject([{ operationId: receipt.operationId, kind: "session-rewind", state: "unknown" }]);
+      expect((await drafts.composer.readDurable(identity))?.text).toBe("Newer draft");
+      const retained = await drafts.composer.readOperationInput(identity, receipt.operationId);
+      expect(mobileComposerInput(retained!)).toEqual(mobileComposerInput(f.input));
+      expect(app.state.restoredComposerDraft).toBeUndefined();
+      f.state.source = original; f.state.ownerRevision = 30n; f.state.serviceGeneration = 1n;
+      vi.mocked(f.network.getOperation).mockResolvedValueOnce(receipt);
+      await app.reconcile();
+      expect(saved.pending()).toEqual([]);
+      expect(app.state.restoredComposerDraft).toMatchObject(identity);
+      expect((await drafts.composer.readDurable(identity))?.text).toContain("Newer draft");
+      expect(f.network.submit).toHaveBeenCalledOnce();
+    });
 
   it("restores files independently at the exact Workspace/Run checkpoint when the backend lacks the message dialogue boundary", async () => {
     const f = fixture(false); const saved = memoryStorage(credential); const drafts = memoryDraftStores();

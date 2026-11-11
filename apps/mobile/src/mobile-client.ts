@@ -745,6 +745,13 @@ type TrackedMutationResult =
   | { readonly accepted: true; readonly definitive: boolean; readonly operation?: Operation }
   | { readonly accepted: false; readonly definitive: boolean; readonly operation?: Operation };
 
+interface MobileDialogueRewindDispatch {
+  readonly session: Session;
+  readonly serviceGeneration: bigint;
+  readonly mutation: OperationMutation;
+  readonly isCurrent: () => boolean;
+}
+
 export interface MobileNewTaskResult {
   readonly sessionId?: string;
   readonly created: boolean;
@@ -13403,6 +13410,7 @@ export class MobileClient {
     if (mode === "files" && !fileCurrent()) throw new Error("The Workspace rewind preview is blocked or expired. Open a new preview.");
     const credential = this.#ready(); const epoch = this.#epoch; const profileId = this.#activeProfileId!;
     const session = this.#selectedSession()!; const operationId = this.newId(); const identity = { profileId, sessionId: session.sessionId };
+    const serviceGeneration = this.#state.owner!.generation;
     const current = (): boolean => !signal.aborted && this.#current(epoch) && this.#foreground && this.#credential === credential
       && this.#state.status === "connected" && this.#state.selectedId === session.sessionId
       && this.#selectedSession()?.backendId === session.backendId && this.#selectedSession()?.targetId === session.targetId;
@@ -13436,7 +13444,8 @@ export class MobileClient {
         signal, isCurrent: current, beforeDispatch: dispatchCurrent,
         beforeTerminalReceipt: async (operation) => {
           if (operation.state !== OperationState.SUCCEEDED) return;
-          await this.#recoverMessageRewindReceipt({ ...receipt, operationId, connectionId: credential.connectionId, state: "unknown" }, operation, epoch, current);
+          await this.#recoverMessageRewindReceipt({ ...receipt, operationId, connectionId: credential.connectionId, state: "unknown" },
+            operation, epoch, { session, serviceGeneration, mutation, isCurrent: current });
         }
       });
       if (!current()) return { kind: "retired" };
@@ -13478,29 +13487,70 @@ export class MobileClient {
     throw new Error("The Joko node completed rewind without the exact typed outcome. Its operation was not resent.");
   }
 
-  async #recoverMessageRewindReceipt(pending: PendingOperation, operation: Operation, epoch: number, isCurrent?: () => boolean): Promise<void> {
+  async #recoverMessageRewindReceipt(pending: PendingOperation, operation: Operation, epoch: number, dispatch?: MobileDialogueRewindDispatch): Promise<void> {
     this.#assertMessageRewindResult(operation, pending);
     if (pending.kind !== "session-rewind") return;
     const credential = this.#ready(); const profileId = this.#activeProfileId!;
+    const originalOwner = this.#state.owner;
     const current = (): boolean => this.#current(epoch) && this.#foreground && this.#credential === credential && this.#activeProfileId === profileId
-      && (isCurrent?.() ?? true);
+      && (dispatch?.isCurrent() ?? true);
     const owner = await this.network.readOwner(credential, this.deviceNameSource(), this.#abort?.signal);
     if (!current()) return;
     this.#assertOwner(credential, owner, this.#state.node!);
     const sessions = owner.snapshot.sessions.filter((value) => value.sessionId === pending.sessionId);
     const session = sessions[0];
+    const binding = session?.nativeBinding;
+    const sourceGeneration = pending.sourceGeneration ? BigInt(pending.sourceGeneration) : 0n;
     if (sessions.length !== 1 || !session || session.backendId !== pending.backendId || session.targetId !== pending.targetId
-      || session.nativeBinding?.backendId !== pending.backendId || !session.nativeBinding.opaqueReference
-      || !mobileSessionOriginSourceAvailable(session) || !pending.sourceGeneration
-      || (session.nativeBinding?.runtimeGeneration ?? 0n) <= BigInt(pending.sourceGeneration) || !this.composerDrafts) {
+      || !binding || binding.backendId !== pending.backendId || !binding.opaqueReference
+      || !mobileSessionOriginSourceAvailable(session) || sourceGeneration < 1n
+      || binding.runtimeGeneration < sourceGeneration || !this.composerDrafts) {
       throw new Error("The saved conversation rewind no longer has its exact task authority. Its operation was not resent.");
+    }
+    let restoreCurrent = current;
+    if (binding.runtimeGeneration === sourceGeneration) {
+      const serviceGeneration = dispatch?.serviceGeneration ?? originalOwner?.generation ?? 0n;
+      const mutation = operation.mutation, payload = mutation?.payload;
+      const target = payload?.case === "navigateSessionBranch" ? payload.value.target?.kind : undefined;
+      const condition = mutation?.preconditions.length === 1 ? mutation.preconditions[0] : undefined;
+      const sourceRevision = condition?.expectedRevision?.value ?? 0n;
+      const receiptRevision = operation.version?.revision?.value ?? 0n;
+      const sameBinding = (candidate: Session | undefined): boolean => candidate !== undefined
+        && candidate.sessionId === session.sessionId && candidate.backendId === session.backendId && candidate.targetId === session.targetId
+        && candidate.nativeBinding?.backendId === session.backendId && candidate.nativeBinding.opaqueReference === binding.opaqueReference
+        && candidate.nativeBinding.runtimeGeneration === sourceGeneration && candidate.version?.generation === sourceGeneration
+        && mobileSessionOriginSourceAvailable(candidate);
+      const sameOwner = (snapshot: Snapshot | undefined): boolean => {
+        const matches = snapshot?.sessions.filter(candidate => candidate.sessionId === session.sessionId);
+        return snapshot?.scope?.kind.case === "owner" && snapshot.generation === serviceGeneration
+          && snapshot.server?.serverId === credential.serverId && !!snapshot.snapshotId && (snapshot.revision?.value ?? 0n) > 0n
+          && matches?.length === 1 && sameBinding(matches[0]);
+      };
+      if (this.#joinedTask || pending.taskJoinId !== undefined || !pending.eventId || operation.state !== OperationState.SUCCEEDED
+        || !this.#operationReceiptMatches(operation, pending) || serviceGeneration < 1n || operation.generation !== serviceGeneration
+        || mutation === undefined || payload?.case !== "navigateSessionBranch" || payload.value.sessionId !== session.sessionId
+        || payload.value.summarize || payload.value.customInstructions !== "" || target?.case !== "nativeEntryId"
+        || !target.value || target.value.length > 1_024 || target.value !== target.value.trim() || /[\u0000-\u001f\u007f]/u.test(target.value)
+        || condition?.entity?.kind !== EntityKind.SESSION || condition.entity.id !== session.sessionId
+        || condition.expectedGeneration !== sourceGeneration || sourceRevision < 1n || receiptRevision <= sourceRevision
+        || (session.version?.revision?.value ?? 0n) < sourceRevision || (owner.snapshot.revision?.value ?? 0n) < receiptRevision
+        || !sameOwner(originalOwner) || !sameOwner(owner.snapshot)
+        || (dispatch && (!sameBinding(dispatch.session) || !equals(OperationMutationSchema, mutation, dispatch.mutation)))) {
+        throw new Error("The saved in-place conversation rewind no longer has its exact task authority. Its operation was not resent.");
+      }
+      // Store only replaces an opaque native binding at a higher generation.
+      // After restart, the original Operation's precondition still proves this binding.
+      restoreCurrent = () => current() && this.#state.status === "connected" && sameOwner(this.#state.owner);
+      if (!restoreCurrent()) throw new Error("The saved in-place conversation rewind lost its task authority.");
     }
     const draft = await this.composerDrafts.readOperationInput({ profileId, sessionId: session.sessionId }, pending.operationId);
     if (!current()) return;
-    if (!draft || !await this.#restoreForkDraft(draft, profileId, session.sessionId, current)) {
+    if (!draft || !await this.#restoreForkDraft(draft, profileId, session.sessionId, restoreCurrent)) {
       throw new Error("The conversation was rewound, but its retained input could not be restored safely. The newer draft was kept.");
     }
-    if (current()) this.#notifyRewindDraftRestored(profileId, session.sessionId);
+    if (!current()) return;
+    if (!restoreCurrent()) throw new Error("The saved in-place conversation rewind lost its task authority.");
+    this.#notifyRewindDraftRestored(profileId, session.sessionId);
   }
 
   #notifyRewindDraftRestored(profileId: string, sessionId: string): void {
