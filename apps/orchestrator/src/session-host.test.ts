@@ -18295,13 +18295,16 @@ function nativeReferenceUsageFixture(options: { readonly sdkCost?: number; reado
 
 class NativeModelUsageFakeAdapter extends FakeBackendAdapter {
   observation = nativeModelUsageFixture();
+  #observedUsage?: UsageSnapshot;
   constructor(readonly children = true, models = PI_LIKE_PROFILE.models) { super({ ...PI_LIKE_PROFILE, models, id: "native-model-usage-fake", capabilities: [
     ...PI_LIKE_PROFILE.capabilities, { key: "subagents.list", supported: true }, { key: "subagents.detail", supported: true }
   ] }); }
   override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
-    const { usage: _initialUsage, ...state } = await super.inspectSession(binding, context); return state;
+    const { usage: _initialUsage, ...state } = await super.inspectSession(binding, context);
+    return { ...state, ...(this.#observedUsage === undefined ? {} : { usage: this.#observedUsage }) };
   }
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    this.#observedUsage = this.observation;
     await context.emit({ type: "usage", usage: this.observation }); await context.emit({ type: "usage", usage: this.observation });
     if (this.children) {
       const base = portableWorkerRun(context.sessionId, 0);

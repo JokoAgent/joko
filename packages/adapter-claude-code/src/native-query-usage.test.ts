@@ -14,7 +14,7 @@ describe("native Query accounting", () => {
       const usage = { input_tokens: input, output_tokens: 0, cache_read_input_tokens: cache ? 2 : 0,
         cache_creation_input_tokens: cache ? 3 : 0,
         ...(cache ? { cache_creation: { ephemeral_1h_input_tokens: 1, ephemeral_5m_input_tokens: 2 } } : {}) };
-      const emit = (event: unknown) => query.observeStream({ type: "stream_event", parent_tool_use_id: parent, event }, { fastMode, requestedAt: 100 });
+      const emit = (event: unknown) => query.observeStream({ type: "stream_event", parent_tool_use_id: parent, event }, { fastMode, requestedAt: () => 100 });
       emit({ type: "message_start", message: { id, model: name, usage } });
       query.observeAssistant({ message: { id, model: name, usage: { ...usage, output_tokens: 1 } } });
       emit({ type: "message_delta", usage: { output_tokens: output } }); emit({ type: "message_stop" });
@@ -41,7 +41,7 @@ describe("native Query accounting", () => {
   it("keeps unclosed, cross-result, ambiguous and unobserved Fast requests out of reference pricing", () => {
     for (const kind of ["unclosed", "cross-result", "ambiguous", "unknown-fast"] as const) {
       const query = new NativeQueryUsage(false);
-      const emit = (event: unknown) => query.observeStream({ event, parent_tool_use_id: null }, { requestedAt: 0,
+      const emit = (event: unknown) => query.observeStream({ event, parent_tool_use_id: null }, { requestedAt: () => 0,
         ...(kind === "unknown-fast" ? {} : { fastMode: false }) });
       emit({ type: "message_start", message: { id: "current", model: "root", usage: {
         input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0
@@ -60,7 +60,7 @@ describe("native Query accounting", () => {
     { speed: "unknown", requestedFast: false, observedFast: undefined },
     { speed: "standard", requestedFast: false, tier: "priority", observedFast: undefined }
   ])("uses the request's observed $speed speed and keeps unsupported tiers unpriced", ({ speed, requestedFast, tier, observedFast }) => {
-    const query = new NativeQueryUsage(true), context = { fastMode: requestedFast, requestedAt: 0 };
+    const query = new NativeQueryUsage(true), context = { fastMode: requestedFast, requestedAt: () => 0 };
     const emit = (event: unknown) => query.observeStream({ event }, context);
     emit({ type: "message_start", message: { id: "request", model: "root", usage: { input_tokens: 10, output_tokens: 0,
       cache_read_input_tokens: 0, cache_creation_input_tokens: 0, speed, service_tier: tier } } });

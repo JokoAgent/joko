@@ -56,7 +56,8 @@ const unknown = () => new JokoError({ code: "RESET_RESPONSE_LOST", message: "Nat
 describe("account reset operational ownership", () => {
   it("keeps private credit parameters and the same SDK attempt across an ambiguous response and a cold Store", async () => {
     const f = fixture(), view = await f.read(), offer = view.defaultOffer!;
-    expect(offer.offerId).toMatch(/^[a-f0-9-]{36}$/u); expect(JSON.stringify(view)).not.toContain("private-credit");
+    expect(offer.offerId).toMatch(/^[a-f0-9-]{36}$/u);
+    expect(JSON.stringify(view, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).not.toContain("private-credit");
     expect(view.credits.map(credit => credit.expiresAt)).toEqual([NOW + 60_000, NOW + 3_600_000]);
     const operationId = f.claim(offer.offerId); f.onConsume = () => { throw unknown(); };
     await expect(f.manager.consume(request(offer.offerId), operationId, () => {})).rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
@@ -111,7 +112,7 @@ describe("account reset operational ownership", () => {
     const first = await prepare(), stale = await prepare();
     f.store.runOperation({ id: "settings-first", kind: "updateProviderAccountResetSettings", body: settings }, () => { first(); return { accepted: true }; });
     expect(() => f.store.runOperation({ id: "settings-stale", kind: "updateProviderAccountResetSettings", body: settings }, () => { stale(); return { accepted: true }; })).toThrow(RevisionConflictError);
-    expect(f.store.findOperation("settings-stale")).toBeUndefined();
+    expect(f.store.findOperation("settings-stale")).toMatchObject({ status: "failed", error: { name: "RevisionConflictError" } });
     expect((await f.read()).automaticSettings.enabled).toBe(true);
     f.facts = { ...f.facts, accountKey: OTHER };
     expect((await f.read()).automaticSettings).toEqual(DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS);

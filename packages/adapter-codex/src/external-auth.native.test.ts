@@ -23,10 +23,28 @@ function environment(home: string) {
 describe.skipIf(!binary)("published native ephemeral account contract", () => {
   it("pins reset control-plane auth and independent process leases to the current published SDK generation without quota or model requests", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-reset-identity-"))), auth = join(home, "auth.json");
-    const credentials = (account: string, email: string) => JSON.stringify({ auth_mode: "chatgpt", tokens: {
+    const credentials = (account: string, email: string) => JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null,
+      last_refresh: new Date().toISOString(), tokens: {
       id_token: token("fixture", account, email), access_token: token("fixture", account, email), refresh_token: "private-original-refresh", account_id: account
     } });
-    await writeFile(auth, credentials("first-workspace", "first@example.invalid"));
+    // Even refreshToken:false discovers the workspace on this SDK. Answer that
+    // read on loopback for both auth owners and reject every other route.
+    let workspaceReads = 0, unexpectedRequests = 0;
+    const server = createServer((request, response) => {
+      request.resume();
+      if (request.method !== "GET" || !request.url?.split("?")[0]?.endsWith("/accounts/check")) {
+        unexpectedRequests += 1;
+        response.writeHead(404).end();
+        return;
+      }
+      workspaceReads += 1;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ accounts: ["first-workspace", "selected-workspace"].map(id => ({ id,
+        workspace_backend_origin: `https://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`,
+        account_routing_override: "NO_CONSTRAINT"
+      })) }));
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const processRoot = join(home, "processes"), processOwner: DurableProcessOwnerOptions = {
       rootDirectory: processRoot, instanceId: "native-reset-owner", generation: 1, recoverStale: false,
       supervisor: { capture: async pid => `owned-${pid}`, captureSync: pid => `owned-${pid}`,
@@ -53,6 +71,10 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
     const owner = new CodexBackendAdapter({ host: original, profileDirectory: home, instanceGeneration: 1,
       appServer: { transport: { command: binary!, cwd: home, env: environment(home), processOwner } } });
     try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Missing private account routing listener.");
+      await writeFile(join(home, "config.toml"), `chatgpt_base_url = "http://127.0.0.1:${address.port}/backend-api/"\n[features]\nplugins = false\nremote_plugin = false\n`);
+      await writeFile(auth, credentials("first-workspace", "first@example.invalid"));
       await original.ensureStarted();
       expect((await original.request("account/read", { refreshToken: false })).value).toMatchObject({ account: { email: "first@example.invalid" } });
       const replacement = credentials("selected-workspace", "selected@example.invalid"); await writeFile(auth, replacement);
@@ -62,9 +84,16 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
       expect(await readFile(auth, "utf8")).toBe(replacement);
       expect(original.isActiveGeneration(original.generation)).toBe(true); expect(transports).toHaveLength(1); expect(transports[0]!.running).toBe(false);
       expect(await readdir(join(processRoot, "1"))).toHaveLength(1);
+      expect(workspaceReads).toBeGreaterThanOrEqual(2);
+      expect(unexpectedRequests).toBe(0);
     } finally {
       try { await owner.dispose(); await original.shutdown(); }
-      finally { observation.mockRestore(); await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }); }
+      finally {
+        observation.mockRestore();
+        server.closeAllConnections();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
+      }
     }
   }, 60_000);
 
