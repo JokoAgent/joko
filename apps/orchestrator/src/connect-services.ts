@@ -17764,6 +17764,12 @@ async function dispatchMutation(
         payload.value.sourceEventId,
         "fork_session"
       );
+      const generation = sourceMessage === undefined ? undefined : mutation.preconditions.find((condition) =>
+        condition.entity?.kind === contract.EntityKind.SESSION && condition.entity.id === payload.value.sourceSessionId
+        && condition.expectedGeneration > 0n)?.expectedGeneration;
+      if (generation !== undefined && generation > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw invalidArgument("fork_session has an invalid source Session generation precondition");
+      }
       const nestedId = nestedOperationId(payload.case, operationId);
       const sessionId = stableId("session", nestedId);
       const execution = await host.mutate({
@@ -17780,7 +17786,8 @@ async function dispatchMutation(
             title: payload.value.newDisplayName || "",
             kind: "fork",
             entryId: payload.value.nativeEntryId,
-            ...(sourceMessage === undefined ? {} : { sourceMessage })
+            ...(sourceMessage === undefined ? {} : { sourceMessage }),
+            ...(generation === undefined ? {} : { expectedGeneration: Number(generation) })
           });
           if (nested.value.sessionId !== sessionId) throw new Error("ForkSession returned a non-deterministic Session ID.");
         }

@@ -5098,6 +5098,21 @@ export class SessionHost {
     if (input.kind === "fork" && sourceMessage === undefined) {
       throw new StoreError("A fork requires a visible source message anchor.");
     }
+    const assertSourceMessageVisible = (store: OperationalStore): void => {
+      if (sourceMessage === undefined) return;
+      const visible = store.findVisibleSessionMessageOrigin({
+        sessionId: input.sourceSessionId,
+        eventId: sourceMessage.eventId,
+        includeRetainedContext: input.kind !== "fork"
+      });
+      if (visible?.messageId !== sourceMessage.messageId) throw new StoreError("The derivation source message is no longer visible.");
+    };
+    const fencedMessageFork = !input.sideChat && input.kind === "fork" && input.expectedGeneration !== undefined;
+    const assertMessageForkSource = (store: OperationalStore, source: StoredSession): void => {
+      if (!fencedMessageFork) return;
+      if (source.descriptor.binding.generation !== input.expectedGeneration) throw new StoreError("The message fork source generation changed.");
+      assertSourceMessageVisible(store);
+    };
     const logicalBody = {
       sourceSessionId: input.sourceSessionId,
       title: input.title,
@@ -5116,23 +5131,16 @@ export class SessionHost {
       (store) => {
         const source = store.getSession(input.sourceSessionId);
         this.assertSessionDerivationSource(source, input.sideChat === true);
-        if (input.expectedGeneration !== undefined && source.descriptor.binding.generation !== input.expectedGeneration) throw new StoreError("The Side Chat source generation changed.");
+        if (input.expectedGeneration !== undefined && source.descriptor.binding.generation !== input.expectedGeneration) {
+          throw new StoreError(input.sideChat ? "The Side Chat source generation changed." : "The message fork source generation changed.");
+        }
         if (input.sideChat) {
           if (input.kind !== "fork" || source.descriptor.derivationOrigin?.sideChat || this.#store.getBackend(source.descriptor.backendId).descriptor.capabilities.get("session.side_chat")?.supported !== true) throw new StoreError("This native Session cannot open a completed-history Side Chat.");
           const completion = store.findCompletedSessionAssistantOrigin(source.descriptor.id);
           if (persistedOperation === undefined && (completion?.eventId !== sourceMessage?.eventId || completion?.nativeEntryId !== input.entryId)) throw new StoreError("The completed Side Chat source changed before its operation was prepared.");
         }
         if (input.kind === "fork") requiredEntryId(input.entryId);
-        if (sourceMessage !== undefined) {
-          const visible = store.findVisibleSessionMessageOrigin({
-            sessionId: input.sourceSessionId,
-            eventId: sourceMessage.eventId,
-            includeRetainedContext: input.kind !== "fork"
-          });
-          if (visible?.messageId !== sourceMessage.messageId) {
-            throw new StoreError("The derivation source message is no longer visible.");
-          }
-        }
+        assertSourceMessageVisible(store);
       }
     );
     if (!claim.claimed) {
@@ -5173,6 +5181,7 @@ export class SessionHost {
       sideEffectLease = this.beginActiveBackendSideEffect(input.sourceSessionId, active, input.operationId);
       const source = sideEffectLease.stored;
       this.assertSessionDerivationSource(source, input.sideChat === true);
+      assertMessageForkSource(this.#store, source);
       const sourceContext = sideEffectLease.context;
       this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
       const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
@@ -5278,6 +5287,10 @@ export class SessionHost {
           });
         }
       };
+      if (fencedMessageFork) {
+        this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+        assertMessageForkSource(this.#store, this.assertActiveBackendSideEffectLease(sideEffectLease));
+      }
       const forkResult: NativeSessionForkResult | undefined = input.kind === "fork"
         ? await active.adapter.fork(requiredEntryId(input.entryId), sourceContext, derivation)
         : undefined;
@@ -5303,6 +5316,7 @@ export class SessionHost {
           const currentSource = store.getSession(input.sourceSessionId);
           assertBindingFence(source, currentSource);
           this.assertSessionDerivationSource(currentSource, input.sideChat === true);
+          assertMessageForkSource(store, currentSource);
           this.assertSessionDerivationTarget(admittedTarget, currentSource, sourceContext);
           if (
             store.getBackend(currentSource.descriptor.backendId).descriptor.instanceGeneration
