@@ -9,6 +9,11 @@ import {
   type DecorationSet,
   type ViewUpdate
 } from "@codemirror/view";
+import {
+  workspaceActiveSearchField,
+  type WorkspaceDocumentSearchRange,
+  type WorkspaceDocumentSearchSelection
+} from "./workspace-document-search.js";
 
 export type WorkspaceMarkdownTableAction =
   | "add-row-above"
@@ -77,6 +82,7 @@ const tableLabelsFacet = Facet.define<WorkspaceMarkdownTableLabels, WorkspaceMar
 });
 
 const menuCleanup = new WeakMap<HTMLElement, () => void>();
+const tableCellInlinePattern = /(\*\*([^*\n]+)\*\*|`([^`\n]+)`|<br\s*\/?>)/giu;
 
 /** Markdown-only extensions used by the shared workspace CodeMirror surface. */
 export function workspaceMarkdownLivePreviewExtensions(labels: WorkspaceMarkdownTableLabels): readonly Extension[] {
@@ -667,24 +673,53 @@ function workspaceMarkdownVisibleContentStart(text: string): number {
     ?? 0;
 }
 
-const workspaceMarkdownTableField = StateField.define<DecorationSet>({
-  create: (state) => buildWorkspaceMarkdownTableDecorations(state.doc),
-  update(value, transaction) {
-    return transaction.docChanged ? buildWorkspaceMarkdownTableDecorations(transaction.state.doc) : value;
-  },
-  provide: (field) => EditorView.decorations.from(field)
-});
-
-function buildWorkspaceMarkdownTableDecorations(doc: Text): DecorationSet {
-  return Decoration.set(collectWorkspaceMarkdownTables(doc).map((block) => Decoration.replace({
-    block: true,
-    widget: new WorkspaceMarkdownTableWidget(block)
-  }).range(block.from, block.to)), true);
+interface WorkspaceMarkdownTableDecorations {
+  readonly blocks: readonly WorkspaceMarkdownTableBlock[];
+  readonly decorations: DecorationSet;
 }
 
-function collectWorkspaceMarkdownTables(doc: Text): readonly WorkspaceMarkdownTableBlock[] {
+const workspaceMarkdownTableField = StateField.define<WorkspaceMarkdownTableDecorations>({
+  create(state) {
+    const blocks = collectWorkspaceMarkdownTables(state.doc);
+    return { blocks, decorations: buildWorkspaceMarkdownTableDecorations(blocks, state.field(workspaceActiveSearchField, false)) };
+  },
+  update(value, transaction) {
+    const search = transaction.state.field(workspaceActiveSearchField, false);
+    const previous = transaction.startState.field(workspaceActiveSearchField, false);
+    if (!transaction.docChanged && search?.matches === previous?.matches && search?.activeIndex === previous?.activeIndex) return value;
+    const blocks = transaction.docChanged ? collectWorkspaceMarkdownTables(transaction.state.doc) : value.blocks;
+    return { blocks, decorations: buildWorkspaceMarkdownTableDecorations(blocks, search) };
+  },
+  provide: (field) => EditorView.decorations.from(field, (value) => value.decorations)
+});
+
+interface WorkspaceMarkdownTableMatch extends WorkspaceDocumentSearchRange {
+  readonly active: boolean;
+}
+
+function buildWorkspaceMarkdownTableDecorations(
+  blocks: readonly WorkspaceMarkdownTableBlock[],
+  search: WorkspaceDocumentSearchSelection | undefined
+): DecorationSet {
+  const matches = search?.matches ?? [];
+  let index = 0;
+  return Decoration.set(blocks.map((block) => {
+    while (index < matches.length && matches[index]!.from < block.from) index += 1;
+    const highlights: WorkspaceMarkdownTableMatch[] = [];
+    while (index < matches.length && matches[index]!.from < block.to) {
+      highlights.push({ ...matches[index]!, active: index === search?.activeIndex });
+      index += 1;
+    }
+    return Decoration.replace({ block: true, widget: new WorkspaceMarkdownTableWidget(block, highlights) })
+      .range(block.from, block.to);
+  }));
+}
+
+function collectWorkspaceMarkdownTables(
+  doc: Text,
+  fenceLines = computeWorkspaceMarkdownFenceLines(doc)
+): readonly WorkspaceMarkdownTableBlock[] {
   const blocks: WorkspaceMarkdownTableBlock[] = [];
-  const fenceLines = computeWorkspaceMarkdownFenceLines(doc);
   let lineNumber = 1;
   while (lineNumber < doc.lines) {
     const header = doc.line(lineNumber);
@@ -705,6 +740,57 @@ function collectWorkspaceMarkdownTables(doc: Text): readonly WorkspaceMarkdownTa
   return blocks;
 }
 
+/** Find source spans hidden by the preview when the editor is outside source-line focus. */
+export function collectWorkspaceMarkdownConcealedRanges(doc: Text): readonly WorkspaceDocumentSearchRange[] {
+  const hidden: WorkspaceDocumentSearchRange[] = [];
+  const fenceLines = computeWorkspaceMarkdownFenceLines(doc);
+  const blocks = collectWorkspaceMarkdownTables(doc, fenceLines);
+  let tableIndex = 0;
+  for (let number = 1; number <= doc.lines; number += 1) {
+    const block = blocks[tableIndex];
+    if (block?.startLine === number) {
+      addWorkspaceTableConcealedRanges(block, hidden);
+      number = block.endLine;
+      tableIndex += 1;
+      continue;
+    }
+    const line = doc.line(number);
+    const fence = fenceLines.get(number);
+    if (fence !== undefined) {
+      if (fence !== "body" && line.from < line.to) hidden.push({ from: line.from, to: line.to });
+      continue;
+    }
+    const preview = classifyWorkspaceMarkdownLine(line.text);
+    if (preview.prefixFrom < preview.prefixTo) hidden.push({ from: line.from + preview.prefixFrom, to: line.from + preview.prefixTo });
+    if (preview.kind === "horizontal-rule") continue;
+    for (const marker of inlineMarkdownMarkerRanges(line.text, preview.prefixTo)) {
+      hidden.push({ from: line.from + marker.from, to: line.from + marker.to });
+    }
+  }
+  return hidden;
+}
+
+function addWorkspaceTableConcealedRanges(block: WorkspaceMarkdownTableBlock, hidden: WorkspaceDocumentSearchRange[]): void {
+  let position = 0;
+  const cells = [...(block.model.headerSources ?? []), ...(block.model.rowSources ?? []).flat()];
+  for (const cell of cells) {
+    if (cell === undefined || cell.from >= cell.to) continue;
+    if (position < cell.from) hidden.push({ from: block.from + position, to: block.from + cell.from });
+    for (const token of block.source.slice(cell.from, cell.to).matchAll(tableCellInlinePattern)) {
+      const from = block.from + cell.from + (token.index ?? 0);
+      const to = from + token[0].length;
+      if (token[0].startsWith("<")) {
+        hidden.push({ from, to });
+      } else {
+        const width = token[2] === undefined ? 1 : 2;
+        hidden.push({ from, to: from + width }, { from: to - width, to });
+      }
+    }
+    position = cell.to;
+  }
+  if (block.from + position < block.to) hidden.push({ from: block.from + position, to: block.to });
+}
+
 function workspaceMarkdownTableLineNumbers(doc: Text): ReadonlySet<number> {
   const lines = new Set<number>();
   for (const block of collectWorkspaceMarkdownTables(doc)) {
@@ -714,12 +800,28 @@ function workspaceMarkdownTableLineNumbers(doc: Text): ReadonlySet<number> {
 }
 
 class WorkspaceMarkdownTableWidget extends WidgetType {
-  constructor(private readonly block: WorkspaceMarkdownTableBlock) {
+  constructor(
+    private readonly block: WorkspaceMarkdownTableBlock,
+    private readonly highlights: readonly WorkspaceMarkdownTableMatch[]
+  ) {
     super();
   }
 
   override eq(other: WorkspaceMarkdownTableWidget): boolean {
-    return other.block.from === this.block.from && other.block.source === this.block.source;
+    return other.block.from === this.block.from && other.block.source === this.block.source
+      && sameWorkspaceMarkdownTableMatches(other.highlights, this.highlights);
+  }
+
+  override updateDOM(root: HTMLElement, _view: EditorView, previous: this): boolean {
+    if (previous.block.from !== this.block.from || previous.block.source !== this.block.source) return false;
+    for (const cell of root.querySelectorAll<HTMLTableCellElement>("th, td")) {
+      if (!setWorkspaceMarkdownTableCellSearch(cell, this.block, this.highlights)) continue;
+      // Keep edits and composition in their existing nodes. Focusout uses the
+      // current search state when it redraws the cell.
+      if (workspaceMarkdownTableCellIsComposing(cell) || cell.ownerDocument.activeElement === cell) continue;
+      renderWorkspaceInlineMarkdown(cell, cell.dataset.sourceText ?? "");
+    }
+    return true;
   }
 
   toDOM(view: EditorView): HTMLElement {
@@ -802,6 +904,7 @@ class WorkspaceMarkdownTableWidget extends WidgetType {
     cell.dataset.row = String(row);
     cell.dataset.column = String(column);
     cell.dataset.sourceText = text;
+    setWorkspaceMarkdownTableCellSearch(cell, this.block, this.highlights);
     renderWorkspaceInlineMarkdown(cell, text);
 
     if (tag === "th") {
@@ -1197,6 +1300,52 @@ function workspaceMarkdownTableCellIsComposing(cell: HTMLTableCellElement): bool
   return cell.dataset.composing === "true";
 }
 
+const tableCellSearch = new WeakMap<HTMLTableCellElement, {
+  readonly source: string;
+  readonly matches: readonly WorkspaceMarkdownTableMatch[];
+}>();
+
+function sameWorkspaceMarkdownTableMatches(
+  left: readonly WorkspaceMarkdownTableMatch[],
+  right: readonly WorkspaceMarkdownTableMatch[]
+): boolean {
+  return left.length === right.length && left.every((match, index) => {
+    const other = right[index]!;
+    return match.from === other.from && match.to === other.to && match.active === other.active;
+  });
+}
+
+function setWorkspaceMarkdownTableCellSearch(
+  cell: HTMLTableCellElement,
+  block: WorkspaceMarkdownTableBlock,
+  highlights: readonly WorkspaceMarkdownTableMatch[]
+): boolean {
+  const row = Number(cell.dataset.row);
+  const column = Number(cell.dataset.column);
+  const source = row === 0 ? block.model.headerSources?.[column] : block.model.rowSources?.[row - 1]?.[column];
+  const matches: WorkspaceMarkdownTableMatch[] = [];
+  if (source !== undefined) {
+    const start = block.from + source.from;
+    const end = block.from + source.to;
+    let low = 0, high = highlights.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (highlights[middle]!.from < start) low = middle + 1;
+      else high = middle;
+    }
+    for (let index = low; index < highlights.length; index += 1) {
+      const match = highlights[index]!;
+      if (match.from >= end) break;
+      if (match.to <= end) matches.push({ from: match.from - start, to: match.to - start, active: match.active });
+    }
+  }
+  const previous = tableCellSearch.get(cell);
+  if (sameWorkspaceMarkdownTableMatches(previous?.matches ?? [], matches)) return false;
+  if (matches.length === 0 || source === undefined) tableCellSearch.delete(cell);
+  else tableCellSearch.set(cell, { source: block.source.slice(source.from, source.to), matches });
+  return true;
+}
+
 function renderWorkspaceInlineMarkdown(
   cell: HTMLTableCellElement,
   source: string,
@@ -1206,36 +1355,54 @@ function renderWorkspaceInlineMarkdown(
   handle?.remove();
   cell.textContent = "";
   cell.dataset.revealRanges = serializeWorkspaceMarkdownRevealRanges(revealRanges);
+  const ownerDocument = cell.ownerDocument;
+  const search = tableCellSearch.get(cell);
+  // An uncommitted cell draft has its own offsets until the source changes.
+  const highlights = search?.source === source ? search.matches : [];
 
   let position = 0;
-  const pattern = /(\*\*([^*\n]+)\*\*|`([^`\n]+)`|<br\s*\/?>)/giu;
-  for (const match of source.matchAll(pattern)) {
+  for (const match of source.matchAll(tableCellInlinePattern)) {
     const start = match.index ?? 0;
     const end = start + match[0].length;
-    if (start > position) cell.append(document.createTextNode(source.slice(position, start)));
+    appendWorkspaceMarkdownTableText(cell, source, position, start, highlights);
     if (match[0].toLowerCase().startsWith("<br")) {
-      cell.append(document.createElement("br"));
-      position = end;
-      continue;
-    }
-    if (workspaceMarkdownInlineTokenIsRevealed(start, end, revealRanges)) {
-      cell.append(document.createTextNode(match[0]));
-      position = end;
-      continue;
-    }
-    if (match[2] !== undefined) {
-      const strong = document.createElement("strong");
-      strong.textContent = match[2];
-      cell.append(strong);
-    } else if (match[3] !== undefined) {
-      const code = document.createElement("code");
-      code.textContent = match[3];
-      cell.append(code);
+      cell.append(ownerDocument.createElement("br"));
+    } else if (workspaceMarkdownInlineTokenIsRevealed(start, end, revealRanges)) {
+      appendWorkspaceMarkdownTableText(cell, source, start, end, highlights);
+    } else {
+      const width = match[2] === undefined ? 1 : 2;
+      const formatted = ownerDocument.createElement(width === 2 ? "strong" : "code");
+      appendWorkspaceMarkdownTableText(formatted, source, start + width, end - width, highlights);
+      cell.append(formatted);
     }
     position = end;
   }
-  if (position < source.length) cell.append(document.createTextNode(source.slice(position)));
+  appendWorkspaceMarkdownTableText(cell, source, position, source.length, highlights);
   if (handle !== null) cell.append(handle);
+}
+
+function appendWorkspaceMarkdownTableText(
+  parent: HTMLElement,
+  source: string,
+  from: number,
+  to: number,
+  highlights: readonly WorkspaceMarkdownTableMatch[]
+): void {
+  if (from >= to) return;
+  let cursor = from;
+  for (const match of highlights) {
+    if (match.from >= to) break;
+    if (match.to <= cursor) continue;
+    const start = Math.max(cursor, match.from);
+    const end = Math.min(to, match.to);
+    if (cursor < start) parent.append(source.slice(cursor, start));
+    const highlight = parent.ownerDocument.createElement("span");
+    highlight.className = match.active ? "cm-doc-search-match cm-doc-search-active" : "cm-doc-search-match";
+    highlight.textContent = source.slice(start, end);
+    parent.append(highlight);
+    cursor = end;
+  }
+  if (cursor < to) parent.append(source.slice(cursor, to));
 }
 
 function workspaceMarkdownInlineTokenIsRevealed(
@@ -1453,8 +1620,7 @@ export function renderedOffsetToSourceOffset(
 ): number {
   let sourcePosition = 0;
   let rendered = 0;
-  const pattern = /(\*\*([^*\n]+)\*\*|`([^`\n]+)`|<br\s*\/?>)/giu;
-  for (const match of source.matchAll(pattern)) {
+  for (const match of source.matchAll(tableCellInlinePattern)) {
     const start = match.index ?? 0;
     const end = start + match[0].length;
     if (start > sourcePosition) {
@@ -1495,8 +1661,7 @@ export function sourceOffsetToRenderedOffset(
 ): number {
   let sourcePosition = 0;
   let rendered = 0;
-  const pattern = /(\*\*([^*\n]+)\*\*|`([^`\n]+)`|<br\s*\/?>)/giu;
-  for (const match of source.matchAll(pattern)) {
+  for (const match of source.matchAll(tableCellInlinePattern)) {
     const start = match.index ?? 0;
     const end = start + match[0].length;
     if (start > sourcePosition) {
