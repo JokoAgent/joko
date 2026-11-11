@@ -202,6 +202,33 @@ describe("ContactToolBridgeProvider", () => {
     }))).toMatchObject({ errorCode: "INVALID_ARGS" });
   });
 
+  it("returns the adopted narrative and an explicit atomic error when exact-identity enrichment is too large", async () => {
+    const fixture = createFixture();
+    enable(fixture.manager);
+    const original = fixture.manager.create({ expectedDirectoryRevision: fixture.manager.directory().revision,
+      kind: "person", displayName: "Alice", narrative: "去年在会议认识",
+      identities: [{ platform: "email", value: "alice@example.test" }] }).contact!;
+    const enrich = (narrative: string) => callOrdinary(fixture.provider, "contacts_create", {
+      expected_directory_revision: revision(fixture.manager), kind: "person", display_name: "Alice",
+      narrative, identities: [{ platform: "email", value: "ALICE@example.test" }]
+    });
+    const adopted = resultData(await enrich("现在负责采购"));
+    expect(adopted).toMatchObject({ merged: true, merged_contact_id: original.id,
+      contact: { narrative: "去年在会议认识\n\n<!-- agent enrich 2026-09-21 -->\n现在负责采购" } });
+    const current = fixture.manager.get(original.id);
+    const afterAppend = fixture.manager.directory();
+    for (const invalid of [" \t\n ", " 现在负责采购 "]) {
+      expect(errorData(await enrich(invalid))).toMatchObject({ errorCode: "INVALID_ARGS" });
+    }
+    expect(fixture.manager.get(original.id)).toEqual(current);
+    expect(fixture.manager.directory()).toEqual(afterAppend);
+    const full = fixture.manager.update(current.id, current.revision, { narrative: "界".repeat(5_461) });
+    const before = fixture.manager.directory();
+    expect(errorData(await enrich("new context"))).toMatchObject({ errorCode: "INVALID_ARGS", message: "Contact narrative is too large." });
+    expect(fixture.manager.get(original.id)).toEqual(full);
+    expect(fixture.manager.directory()).toEqual(before);
+  });
+
   it("maintains events, directed relations, atomic group membership, and sensitive removals", async () => {
     const fixture = createFixture();
     enable(fixture.manager);
@@ -274,6 +301,12 @@ describe("ContactToolBridgeProvider", () => {
       event_id: eventId
     })) as { contact: { events: unknown[] } };
     expect(withoutEvent.contact.events).toEqual([]);
+    expect(resultData(await callOrdinary(fixture.provider, "contacts_append_event", {
+      contact_id: alice.id,
+      expected_revision: fixture.manager.get(alice.id).revision.toString(),
+      date: "2026-09",
+      text: "Agent observation"
+    }))).toMatchObject({ contact: { events: [expect.objectContaining({ date: "2026-09", text: "Agent observation", source: "agent" })] } });
   });
 
   it("previews paged vCards, atomically commits through the sensitive entry, and exports portable text", async () => {

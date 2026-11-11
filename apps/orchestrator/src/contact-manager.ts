@@ -506,10 +506,17 @@ export class ContactManager {
       ...(folded(current.displayName) === folded(draft.displayName) ? [] : [draft.displayName]),
       ...(draft.aliases ?? [])
     ], current.displayName).slice(0, 20);
+    const incomingNarrative = draft.narrative ?? "";
+    const narrative = incomingNarrative === "" || current.narrative.includes(incomingNarrative)
+      ? current.narrative
+      : current.narrative === "" ? incomingNarrative
+        : draft.source === "agent"
+          ? `${current.narrative}\n\n<!-- agent enrich ${new Date(this.#now()).toISOString().slice(0, 10)} -->\n${incomingNarrative}`
+          : current.narrative;
     const patch: ContactPatch = {
       ...(sameFoldedNames(aliases, current.aliases) ? {} : { aliases }),
       ...(current.summary === "" && draft.summary !== undefined && draft.summary !== "" ? { summary: draft.summary } : {}),
-      ...(current.narrative === "" && draft.narrative !== undefined && draft.narrative !== "" ? { narrative: draft.narrative } : {}),
+      ...(narrative === current.narrative ? {} : { narrative }),
       ...(current.agentNotes === "" && draft.agentNotes !== undefined && draft.agentNotes !== "" ? { agentNotes: draft.agentNotes } : {}),
       ...(current.status === "pending" && draft.status === "confirmed" ? { status: "confirmed" as ContactStatus } : {})
     };

@@ -2,7 +2,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { ContactStore } from "@joko/store";
+import { ContactStore, type ContactDraft } from "@joko/store";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ContactManager, ContactManagerError } from "./contact-manager.js";
@@ -16,6 +16,62 @@ afterEach(() => {
 });
 
 describe("ContactManager portable address-book boundary", () => {
+  it("fills and appends exact-identity agent narratives once while keeping independent merge rules", () => {
+    const { manager, store, advance } = createFixture();
+    const original = store.createContact({ expectedDirectoryRevision: store.directoryState().revision,
+      kind: "person", displayName: "Alice", status: "pending",
+      identities: [{ platform: "email", value: "alice@example.test" }] }).contact!;
+    const enrich = (narrative: string, extra: Pick<ContactDraft, "summary" | "agentNotes" | "status"> = {}) => manager.createOrEnrichFromAgent({
+      expectedDirectoryRevision: manager.directory().revision, kind: "person", displayName: "Alice",
+      identities: [{ platform: "email", value: "ALICE@example.test" }], narrative, ...extra
+    });
+    const filled = enrich("去年在会议认识", { summary: "Original summary", agentNotes: "Use the work address." });
+    expect(filled).toMatchObject({ merged: true, mergedContactId: original.id,
+      contact: { narrative: "去年在会议认识", status: "pending", source: "manual" } });
+    advance(24 * 60 * 60_000);
+    const appended = enrich("现在负责采购", { summary: "Replacement summary", agentNotes: "Replacement instructions", status: "confirmed" });
+    const combined = "去年在会议认识\n\n<!-- agent enrich 2026-09-22 -->\n现在负责采购";
+    expect(appended.contact).toMatchObject({ narrative: combined, summary: "Original summary",
+      agentNotes: "Use the work address.", status: "confirmed", source: "manual" });
+    expect(manager.list({ query: "负责采购" }).contacts.map(contact => contact.id)).toEqual([original.id]);
+    const beforeRepeat = manager.directory();
+    expect(enrich("现在负责采购").contact).toEqual(appended.contact);
+    expect(enrich("在会议认识").contact).toEqual(appended.contact);
+    expect(enrich("").contact).toEqual(appended.contact);
+    for (const invalid of [" \t\n ", " 现在负责采购 "]) {
+      expect(() => enrich(invalid)).toThrowError(expect.objectContaining({ code: "CONTACT_INVALID" }));
+    }
+    expect(manager.get(original.id)).toEqual(appended.contact);
+    expect(manager.directory()).toEqual(beforeRepeat);
+
+    const preview = manager.previewVCardImport("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEMAIL:alice@example.test\r\nNOTE:Imported note\\nOther imported context\r\nEND:VCARD\r\n");
+    manager.commitVCardImport({ previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision, decisions: [] });
+    expect(manager.get(original.id).narrative).toBe(combined);
+  });
+
+  it.each([14, 15])("enforces the combined UTF-8 narrative limit atomically for %i new emoji", (count) => {
+    const { manager, store } = createFixture();
+    const original = store.createContact({ expectedDirectoryRevision: store.directoryState().revision,
+      kind: "person", displayName: "Alice", narrative: "界".repeat(5_430), status: "pending",
+      identities: [{ platform: "email", value: "alice@example.test" }] }).contact!;
+    const before = manager.directory();
+    const enrich = () => manager.createOrEnrichFromAgent({ expectedDirectoryRevision: before.revision,
+      kind: "person", displayName: "Alias on enrichment", summary: "New summary", agentNotes: "New instruction",
+      status: "confirmed", narrative: "😀".repeat(count),
+      identities: [{ platform: "email", value: "alice@example.test" }, { platform: "github", value: "alice" }] });
+    if (count === 14) {
+      const result = enrich();
+      expect(result.contact).toMatchObject({ id: original.id, aliases: ["Alias on enrichment"], summary: "New summary",
+        agentNotes: "New instruction", status: "confirmed", identityCount: 2 });
+      expect(Buffer.byteLength(result.contact!.narrative, "utf8")).toBe(16_381);
+    } else {
+      expect(enrich).toThrowError(expect.objectContaining({ code: "CONTACT_INVALID", message: "Contact narrative is too large." }));
+      expect(manager.get(original.id)).toEqual(original);
+      expect(manager.directory()).toEqual(before);
+      expect(manager.resolveIdentity("github", "alice")).toBeUndefined();
+    }
+  });
+
   it("previews exact enrichment and staged name review before importing vCard groups and employment", () => {
     const fixture = createFixture();
     const alice = fixture.store.createContact({
