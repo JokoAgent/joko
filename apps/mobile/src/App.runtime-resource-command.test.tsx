@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, createElement, forwardRef, type ComponentProps, type ReactNode } from "react";
+import { act, createElement, forwardRef, useImperativeHandle, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
@@ -9,7 +9,7 @@ import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
 import type { MobileComposerRichInput } from "./MobileComposerRichInput";
 import type { MobileRuntimeCommandPalette } from "./MobileRuntimeCommandPalette";
-import type { MobileState } from "./mobile-client";
+import type { MobileState, MobileTaskSendObserver } from "./mobile-client";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import type { MobileObjectiveApi } from "./mobile-objective";
@@ -21,7 +21,13 @@ import type { MobileContextSheet } from "./MobileContextSheet";
 import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
-let timelineList: { data: readonly unknown[]; onViewableItemsChanged: TimelineVisibility } | undefined;
+type TimelineScrollFailure = (event: { index: number; averageItemLength: number }) => void;
+let timelineList: { data: readonly unknown[]; onViewableItemsChanged: TimelineVisibility;
+  onScrollBeginDrag?: () => void; onContentSizeChange?: (width: number, height: number) => void;
+  onScrollToIndexFailed?: TimelineScrollFailure } | undefined;
+const scrollTimelineToIndex = vi.fn<(options: { index: number; animated: boolean; viewPosition?: number }) => void>();
+const scrollTimelineToOffset = vi.fn();
+let sendFollowSourceKey: string | undefined;
 let receiveAppMessage: ((event: { nativeEvent: { data: string } }) => void) | undefined;
 let appBridgeKey = "";
 let MobileMcpAppViewsProvider: typeof import("./MobileMcpAppViews").MobileMcpAppViewsProvider;
@@ -56,7 +62,7 @@ let current = true;
 const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(SessionSchema, { sessionId: "session" }),
   policy: { help: true as const, jumpSession: true as const, userShell: false, sessionReset: false, review: false }, jumpSessionIds: ["session"] };
 const resolveResource = vi.fn(async () => resource);
-const send = vi.fn(async () => true);
+const send = vi.fn(async (_draft: MobileComposerDraft, _observer?: MobileTaskSendObserver) => true);
 const empty = Object.freeze([]);
 let activePartner: MobilePartnerDirectoryProfile | undefined;
 const peer: MobilePartnerDirectoryProfile = {
@@ -73,6 +79,8 @@ const openPrivateThread = vi.fn();
 const client = new Proxy({
   get state() { return renderedState; },
   taskDraftProfileId: () => renderedState.activeProfileId,
+  taskHeaderSourceKey: () => sendFollowSourceKey,
+  taskPresentationOwnerKey: () => sendFollowSourceKey,
   taskAppCommandControls: () => current ? appControls : undefined,
   taskRuntimeCommandControls: () => current ? runtime : undefined,
   listTaskRuntimeCommands: vi.fn(async () => catalog),
@@ -104,9 +112,12 @@ beforeAll(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
     View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
-    FlatList: forwardRef(({ data, renderItem, onViewableItemsChanged }: { data?: readonly unknown[];
-      renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility }) => {
-      if (onViewableItemsChanged) timelineList = { data: data ?? [], onViewableItemsChanged };
+    FlatList: forwardRef(({ data, renderItem, onViewableItemsChanged, onScrollBeginDrag, onContentSizeChange, onScrollToIndexFailed }: { data?: readonly unknown[];
+      renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility;
+      onScrollBeginDrag?: () => void; onContentSizeChange?: (width: number, height: number) => void;
+      onScrollToIndexFailed?: TimelineScrollFailure }, ref) => {
+      useImperativeHandle(ref, () => ({ scrollToIndex: scrollTimelineToIndex, scrollToOffset: scrollTimelineToOffset }), []);
+      if (onViewableItemsChanged) timelineList = { data: data ?? [], onViewableItemsChanged, onScrollBeginDrag, onContentSizeChange, onScrollToIndexFailed };
       return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))));
     }), TextInput: forwardRef(() => null),
     Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
@@ -185,7 +196,8 @@ beforeAll(async () => {
   ({ MobileMcpAppViewsProvider } = await import("./MobileMcpAppViews"));
 });
 beforeEach(async () => {
-  current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockClear();
+  current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
+  timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); sendFollowSourceKey = undefined;
   activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
   activeObjectiveApi = undefined;
   activeCollaborationApi = undefined; activeInputHandoffApi = undefined; taskRole = "ordinary";
@@ -250,6 +262,75 @@ describe("actual App slash Skill selection", () => {
     expect(input.draft.mentions).toEqual([]); expect(send).not.toHaveBeenCalled();
   });
 });
+
+it.each(["unmeasured input", "fast answer", "manual drag", "newer input", "unconfirmed send"] as const)(
+  "hands an accepted ordinary send to the actual task list once with %s", async (arrival) => {
+    sendFollowSourceKey = "task-source";
+    const draft = plainTextMobileComposerDraft("Show the latest accepted input");
+    const oldPrompt = taskUserInput("old-prompt", "previous-operation", 10n, "Older prompt");
+    renderedState = { ...state, live: [oldPrompt] };
+    let finish!: (accepted: boolean) => void;
+    const receipt = new Promise<boolean>((resolve) => { finish = resolve; });
+    send.mockImplementationOnce(async (value, observer) => {
+      observer?.onProgress?.({ phase: "sending", input: value, sentAt: 2 });
+      return receipt;
+    });
+    await render(false);
+    await act(async () => input.onEdit(draft, input.draft));
+    const sendButton = [...host.querySelectorAll("button")].find(button => button.textContent === mobileMessage("en", "composer.send"));
+    expect(sendButton).toBeDefined();
+    await act(async () => sendButton!.click());
+    const operationId = send.mock.calls[0]?.[1]?.operationId;
+    expect(operationId).toBe("selected-occurrence");
+    const initialRows = timelineList!.data as readonly { operationId?: string; optimistic?: boolean }[];
+    const provisional = initialRows.findIndex(row => row.operationId === operationId && row.optimistic);
+    expect(provisional).toBeGreaterThanOrEqual(0);
+    expect(provisional).toBeGreaterThan(initialRows.findIndex(row => row.operationId === "previous-operation"));
+    expect(scrollTimelineToIndex).not.toHaveBeenCalled();
+
+    if (arrival === "manual drag") await act(async () => timelineList?.onScrollBeginDrag?.());
+    if (arrival === "unmeasured input") {
+      scrollTimelineToIndex.mockImplementationOnce(({ index }) => timelineList?.onScrollToIndexFailed?.({ index, averageItemLength: 40 }));
+      await act(async () => finish(true));
+      expect(scrollTimelineToIndex).toHaveBeenCalledExactlyOnceWith({ index: provisional, animated: false, viewPosition: 0.2 });
+      expect(scrollTimelineToOffset).toHaveBeenCalledExactlyOnceWith({ offset: provisional * 40, animated: false });
+    } else if (arrival === "unconfirmed send") {
+      await act(async () => finish(false));
+      expect(scrollTimelineToIndex).not.toHaveBeenCalled();
+    }
+    const accepted = taskUserInput("accepted-prompt", operationId!, 11n, draft.text);
+    const reply = create(EventSchema, { eventId: "quick-answer", identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 12n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "quick-answer", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Reply already arrived" } }] } } } });
+    renderedState = { ...state, live: [oldPrompt, accepted, reply,
+      ...(arrival === "newer input" ? [taskUserInput("other-prompt", "another-operation", 13n, "Newer independent prompt")] : [])] };
+    await act(async () => root.render(taskScreen()));
+    const rows = timelineList!.data as readonly { operationId?: string }[];
+    const index = rows.findIndex(row => row.operationId === operationId);
+    expect(index).toBeGreaterThan(rows.findIndex(row => row.operationId === "previous-operation"));
+    expect(index).toBeLessThan(rows.length - 1);
+
+    if (arrival !== "unmeasured input" && arrival !== "unconfirmed send") {
+      expect(scrollTimelineToIndex).not.toHaveBeenCalled();
+      await act(async () => finish(true));
+    }
+    if (arrival === "fast answer" || arrival === "unmeasured input") {
+      expect(scrollTimelineToIndex).toHaveBeenCalledExactlyOnceWith({ index, animated: false, viewPosition: 0.2 });
+    } else {
+      expect(scrollTimelineToIndex).not.toHaveBeenCalled();
+    }
+    await act(async () => {
+      timelineList?.onContentSizeChange?.(400, 800);
+      timelineList?.onContentSizeChange?.(400, 900);
+    });
+    expect(scrollTimelineToIndex).toHaveBeenCalledTimes(arrival === "unmeasured input" ? 2 : arrival === "fast answer" ? 1 : 0);
+  });
+
+function taskUserInput(eventId: string, operationId: string, sequence: bigint, text: string) {
+  return create(EventSchema, { eventId, identity: { sessionId: "session", operationId }, cursor: { generation: 1n, sequence },
+    payload: { kind: { case: "messageStarted", value: { messageId: eventId, role: MessageRole.USER, userInputAccepted: true,
+      userInput: { parts: [{ content: { case: "text", value: text } }] } } } } });
+}
 
 it("mounts owner input handoff above the actual composer and removes it when its task connection retires", async () => {
   activeInputHandoffApi = { ownerKey: "current-native-owner", sessionId: "session", deviceId: "phone", isCurrent: () => current,

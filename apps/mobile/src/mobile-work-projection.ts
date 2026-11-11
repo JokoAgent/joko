@@ -9,6 +9,7 @@ export interface MobileWorkCandidate {
   readonly kind: string;
   readonly text: string;
   readonly completed: boolean;
+  readonly optimistic?: boolean;
   readonly thinking?: MobileThinkingView;
   readonly tool?: MobileToolCallView;
   readonly ownerScope?: string;
@@ -48,10 +49,23 @@ export type MobileWorkItem<T extends MobileWorkCandidate> = T | MobileWorkGroup<
 export function mobileWorkItems<T extends MobileWorkCandidate>(rows: readonly T[], sessionStreaming: boolean): MobileWorkItem<T>[] {
   const segments: T[][] = [];
   let current: T[] = [];
+  const reservations = new Map<T, { readonly sequence: bigint; readonly index: number }>();
+  let precedingSequence: bigint | undefined;
+  for (const row of rows) {
+    const sequence = row.planSequence ?? row.answerSequence ?? row.sequence;
+    // Optimistic inputs already have a reserved position in this projection.
+    // Their placeholder cursor must not put them before the observed history.
+    if (row.optimistic === true) reservations.set(row, { sequence: precedingSequence ?? sequence, index: reservations.size });
+    else if (precedingSequence === undefined || sequence > precedingSequence) precedingSequence = sequence;
+  }
   const ordered = [...rows].sort((a, b) => {
-    const first = a.planSequence ?? a.answerSequence ?? a.sequence;
-    const second = b.planSequence ?? b.answerSequence ?? b.sequence;
-    return first < second ? -1 : first > second ? 1 : a.id.localeCompare(b.id);
+    const aReservation = reservations.get(a), bReservation = reservations.get(b);
+    const first = aReservation?.sequence ?? a.planSequence ?? a.answerSequence ?? a.sequence;
+    const second = bReservation?.sequence ?? b.planSequence ?? b.answerSequence ?? b.sequence;
+    if (first < second) return -1;
+    if (first > second) return 1;
+    if (aReservation || bReservation) return (aReservation?.index ?? -1) - (bReservation?.index ?? -1);
+    return a.id.localeCompare(b.id);
   });
   for (const row of ordered) {
     const previous = current.at(-1);

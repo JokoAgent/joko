@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactElement, type ReactNode, type RefObject } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactElement, type ReactNode, type RefObject } from "react";
 import {
   AccessibilityInfo, ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
@@ -3533,6 +3533,13 @@ export function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImpo
   </ScrollView>;
 }
 
+interface MobileTaskSendFollow {
+  readonly owner: { readonly sourceKey: string };
+  readonly operationId: string;
+  readonly list: FlatList<MobileWorkItem<TimelineRow>>;
+  seek?: { readonly index: number; waitingForMeasurement: boolean };
+}
+
 export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused, onTaskSharing,
   messageFocus, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
@@ -3676,6 +3683,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const copyGenerationRef = useRef(0);
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
+  const latestSendFollowRef = useRef<MobileTaskSendFollow | undefined>(undefined);
+  const [acceptedSendFollowId, setAcceptedSendFollowId] = useState<string>();
   const timelineViewportRef = useRef<View>(null);
   const queueViewportRef = useRef<View>(null);
   const partnerConversationTransport = client.partnerConversationTransport();
@@ -3931,6 +3940,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   };
   const openConversationSearch = (): void => {
     if (!partnerIdentity.ready || !state.detail || AppState.currentState !== "active") return;
+    latestSendFollowRef.current = undefined;
     Keyboard.dismiss(); setMessageFocusHighlight(undefined); setSearchOwner(searchScope);
   };
   const focusSearchHit = (hit: MobileConversationSearchHit): void => {
@@ -3998,6 +4008,45 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const messageFocusKey = activeMessageFocus && messageFocusIndex >= 0
     ? `${activeMessageFocus.requestId}\u001f${activeMessageFocus.messageId}\u001f${activeMessageFocus.messageEventId ?? ""}`
     : undefined;
+  const sendFollowSource = state.status === "connected" && state.taskSource?.kind !== "joined" && state.window === undefined
+    && partnerIdentity.ready && !partnerIdentity.partner && headerRole.role === "ordinary" && !searchVisible
+    ? headerSourceKey : undefined;
+  const sendFollowOwner = useMemo(() => sendFollowSource ? { sourceKey: sendFollowSource } : undefined,
+    [sendFollowSource, timelineListKey]);
+  const currentSendFollow = useCallback((request: MobileTaskSendFollow): boolean =>
+    taskMountedRef.current && AppState.currentState === "active" && client.state.status === "connected"
+    && client.state.window === undefined && latestSendFollowRef.current === request && timelineListRef.current === request.list
+    && client.taskHeaderSourceKey() === request.owner.sourceKey, []);
+  const acceptedFollow = latestSendFollowRef.current;
+  const hasAcceptedFollow = acceptedFollow !== undefined && acceptedFollow.operationId === acceptedSendFollowId
+    && acceptedFollow.owner === sendFollowOwner;
+  const latestUserIndex = hasAcceptedFollow ? displayRows.findLastIndex((row) => !isWorkGroup(row) && row.kind === "user" && !row.internalInput) : -1;
+  const latestUser = displayRows[latestUserIndex];
+  const sendFollowTarget = hasAcceptedFollow && latestUser !== undefined && !isWorkGroup(latestUser)
+    && latestUser.operationId === acceptedFollow.operationId
+    && latestUser.pendingSend?.phase !== "failed" && latestUser.pendingSend?.phase !== "unknown" ? latestUser : undefined;
+  const sendFollowVisible = sendFollowTarget !== undefined && visibleTimelineRows?.has(sendFollowTarget.id) === true;
+  useLayoutEffect(() => () => {
+    if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
+  }, [sendFollowOwner, activeMessageFocus?.requestId]);
+  useLayoutEffect(() => {
+    if (!hasAcceptedFollow || !currentSendFollow(acceptedFollow)) return;
+    if (sendFollowTarget === undefined) {
+      if (acceptedFollow.seek || latestObservedRows.some(row => row.kind === "user" && row.operationId === acceptedFollow.operationId)) {
+        latestSendFollowRef.current = undefined;
+      }
+      return;
+    }
+    if (sendFollowVisible) {
+      latestSendFollowRef.current = undefined;
+      return;
+    }
+    if (acceptedFollow.seek) return;
+    const seek = { index: latestUserIndex, waitingForMeasurement: false };
+    acceptedFollow.seek = seek;
+    acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+    if (!seek.waitingForMeasurement && latestSendFollowRef.current === acceptedFollow) latestSendFollowRef.current = undefined;
+  }, [acceptedFollow, currentSendFollow, hasAcceptedFollow, latestObservedRows, latestUserIndex, sendFollowTarget, sendFollowVisible]);
   const focusedWorkKey = JSON.stringify(activeMessageFocus === undefined ? [] : mobileWorkExpansionKeys(displayRows,
     (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
   useEffect(() => {
@@ -4562,6 +4611,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const subscription = client.subscribe(() => taskHomeNavigator.observeScope());
     const lifecycle = AppState.addEventListener("change", (status) => {
       if (status === "active") return;
+      latestSendFollowRef.current = undefined;
       taskHomeNavigator.retire();
       if (drawerMountedRef.current) taskHomeNavigator.close();
     });
@@ -5985,6 +6035,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     setLocalError("");
     const active = queueEditRef.current;
     let appCommandStarted = false;
+    let sendFollow: MobileTaskSendFollow | undefined;
     let optimisticLease: { readonly sessionId: string; readonly operationId: string; readonly ownerKey: string; progress: MobilePendingSendProgress } | undefined;
     const retireOptimisticLease = (): void => {
       const lease = optimisticLease;
@@ -6047,6 +6098,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }
         const operationId = randomUUID();
         const rebalanceSource = client.taskHeaderSourceKey();
+        const list = timelineListRef.current;
+        if (list && sendFollowOwner && rebalanceSource === sendFollowOwner.sourceKey
+          && client.state.window === undefined && AppState.currentState === "active") {
+          sendFollow = { owner: sendFollowOwner, operationId, list };
+        }
+        latestSendFollowRef.current = sendFollow;
         const accepted = await client.send(sourceDraft, {
           operationId,
           deliveryMode,
@@ -6084,6 +6141,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           }
         });
         if (!accepted) {
+          if (latestSendFollowRef.current === sendFollow) latestSendFollowRef.current = undefined;
           if (optimisticLease && identity && client.state.activeProfileId === identity.profileId && client.state.selectedId === identity.sessionId) {
             const lease = optimisticLease;
             const unknown = client.state.pending.some(item => item.operationId === operationId && item.state === "unknown");
@@ -6098,6 +6156,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           }
           return;
         }
+        if (sendFollow && currentSendFollow(sendFollow)) setAcceptedSendFollowId(sendFollow.operationId);
         if (optimisticLease) {
           const lease = optimisticLease;
           setOptimisticUserRows((current) => markMobileOptimisticUserRowSubmitted(
@@ -6128,6 +6187,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       setDraft(active.stashedDraft);
       setComposerSelection({ start: active.stashedDraft.text.length, end: active.stashedDraft.text.length });
     } catch (error) {
+      if (latestSendFollowRef.current === sendFollow) latestSendFollowRef.current = undefined;
       const failed = optimisticLease;
       if (failed && taskMountedRef.current && client.taskPresentationOwnerKey(client.state.status === "offline") === failed.ownerKey) {
         setOptimisticUserRows(rows => updateMobileOptimisticUserRow(rows, failed.ownerKey, failed.sessionId, failed.operationId,
@@ -6640,7 +6700,22 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       extraData={{ selection: conversationShare.selectedIds, visibleTimelineRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => !isWorkGroup(row) && row.kind === "user" && row.operationId ? `local-send:${row.operationId}` : row.id} style={styles.fill} contentContainerStyle={styles.list}
       viewabilityConfig={timelineViewability} onViewableItemsChanged={onTimelineRowsVisible}
       scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
+      onScrollBeginDrag={() => {
+        if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
+      }}
+      onContentSizeChange={() => {
+        if (!acceptedFollow?.seek?.waitingForMeasurement || !sendFollowTarget || sendFollowVisible || !currentSendFollow(acceptedFollow)) return;
+        latestSendFollowRef.current = undefined;
+        acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+      }}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
+        if (acceptedFollow?.seek?.index === index && sendFollowTarget && currentSendFollow(acceptedFollow)) {
+          // Seek into the native measurement window once. A content layout
+          // can then retry the same user row at its current index.
+          acceptedFollow.seek.waitingForMeasurement = true;
+          acceptedFollow.list.scrollToOffset({ offset: Math.max(0, averageItemLength * index), animated: false });
+          return;
+        }
         const search = searchScrollRef.current;
         if (search && searchOwnerRef.current.open && searchOwnerRef.current.scope === search.scope && search.index === index) {
           if (search.retried) return;
