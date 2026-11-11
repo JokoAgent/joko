@@ -433,7 +433,7 @@ async function runNativeScenario(): Promise<void> {
   await tap("Connect", true);
   await openFixtureTask();
   await waitNode((node) => node.text === taskName, "restored native task title");
-  await scrollToNode((node) => node.text?.includes(prompt) === true, "persisted native task input");
+  await scrollToNode((node) => node.text?.includes(prompt) === true, "persisted native task input", "earlier");
   await completeStep();
   await beginStep("restore-canonical-file");
   await tap("README.md:2:4", true, true);
@@ -683,7 +683,11 @@ async function waitNode(predicate: (node: AndroidUiNode) => boolean, label: stri
   return found;
 }
 
-async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: string): Promise<AndroidUiNode> {
+async function scrollToNode(
+  predicate: (node: AndroidUiNode) => boolean,
+  label: string,
+  direction: "earlier" | "later" = "later",
+): Promise<AndroidUiNode> {
   for (let attempt = 0; attempt < 7; attempt += 1) {
     const items = await nodes();
     const node = items.find(entry => entry.bounds.x2 > entry.bounds.x1 && entry.bounds.y2 > entry.bounds.y1 && predicate(entry));
@@ -696,8 +700,10 @@ async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: 
     const x = Math.round((viewport.bounds.x1 + viewport.bounds.x2) / 2);
     const inset = Math.max(1, Math.round((viewport.bounds.y2 - viewport.bounds.y1) * 0.15));
     // Stay inside the observed app viewport: a bottom-edge swipe invokes Home.
-    await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(viewport.bounds.y2 - inset),
-      String(x), String(viewport.bounds.y1 + inset), "300"));
+    const top = viewport.bounds.y1 + inset;
+    const bottom = viewport.bounds.y2 - inset;
+    const [start, end] = direction === "earlier" ? [top, bottom] : [bottom, top];
+    await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(start), String(x), String(end), "300"));
   }
   return waitNode(predicate, label);
 }
