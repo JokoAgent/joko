@@ -380,6 +380,77 @@ describe("Desktop system handoff App boundary", () => {
     }
   });
 
+  it.each(["continues reading", "scrolls again"] as const)("restores a freshly read neighbor of the deleted viewport anchor when the reader %s", async (reading) => {
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.classList.contains("timeline")) return new DOMRect(0, 100, 720, 600);
+      if (this.dataset?.timelineItemId === "deleted-anchor") return new DOMRect(0, 92, 720, 40);
+      if (this.dataset?.timelineItemId === "surviving-neighbor") return new DOMRect(0, 140, 720, 40);
+      return new DOMRect(0, 280, 720, 40);
+    });
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const task = session("task-old-history");
+    const deleted = { ...timelineItem("deleted-anchor"), sourceEventId: "deleted-event" };
+    const neighbor = { ...timelineItem("surviving-neighbor"), sourceEventId: "neighbor-event", sequence: 2n };
+    const latest = { ...timelineItem("latest-answer"), sequence: 510n };
+    const before = { opaqueToken: "before-latest", generation: 1n, sequence: 510n };
+    const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>()
+      .mockResolvedValueOnce({ items: [latest], nextBeforeCursor: before })
+      .mockResolvedValueOnce({ items: [deleted, neighbor] })
+      .mockResolvedValueOnce({ items: [latest] });
+    const around = deferred<readonly TimelineItemView[]>();
+    const loadSessionTimelineAround = vi.fn<AppController["loadSessionTimelineAround"]>(() => around.promise);
+    const base = connectedState({ route: { kind: "session", sessionId: task.id }, sessions: [task] });
+    const initial: ControllerState = {
+      ...base, preferences: { ...base.preferences, messageNavRailEnabled: false },
+      snapshot: { ...base.snapshot, timelineBySession: new Map([[task.id, [latest]]]) }
+    };
+    const fixture = renderApp(initial, { loadSessionTimelinePage, loadSessionTimelineAround,
+      listPartners: async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0,
+        errorCount: 0, updatedAt: 1, templates: [], avatarPresets: [] } }) });
+    await fixture.render();
+    const earlier = Array.from(fixture.container.querySelectorAll("button")).find((button) => button.textContent === "Load earlier activity");
+    expect(earlier).toBeInstanceOf(HTMLButtonElement);
+    await act(async () => earlier?.click());
+    expect(loadSessionTimelinePage).toHaveBeenLastCalledWith(task.id, before, 240);
+    expect(fixture.container.textContent).toContain(deleted.text);
+    const viewport = fixture.container.querySelector<HTMLDivElement>(".timeline")!;
+    now = 1_000;
+    await act(async () => {
+      viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -180 }));
+      viewport.scrollTop = 240;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    const scrollTo = vi.mocked(viewport.scrollTo);
+    scrollTo.mockClear();
+
+    await fixture.render({ ...initial, snapshot: { ...initial.snapshot,
+      timelineHistoryRevisionBySession: new Map([[task.id, 12n]]),
+      timelineMessageDeletionBySession: new Map([[task.id, { previousRevision: 0n, revision: 12n, eventIds: [deleted.sourceEventId] }]])
+    } });
+    expect(loadSessionTimelineAround).toHaveBeenCalledExactlyOnceWith(task.id, neighbor.sourceEventId, 160);
+    expect(fixture.container.textContent).not.toContain(deleted.text);
+    expect(fixture.container.textContent).not.toContain(neighbor.text);
+    if (reading === "scrolls again") {
+      await act(async () => viewport.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -180 })));
+    }
+    await act(async () => around.resolve([neighbor]));
+    if (reading === "continues reading") {
+      expect(fixture.container.textContent).toContain(neighbor.text);
+      expect(scrollTo).toHaveBeenCalledWith({ top: 288, behavior: "auto" });
+    } else {
+      expect(fixture.container.textContent).not.toContain(neighbor.text);
+    }
+    expect(fixture.container.textContent).toContain(latest.text);
+    await fixture.dispose();
+  });
+
   it.each(["succeeds", "fails"])("keeps the first message location when the later around read %s", async (outcome) => {
     vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
       return this.classList.contains("timeline") ? 600 : 0;

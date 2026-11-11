@@ -79,6 +79,9 @@ describe("message deletion gateway", () => {
       await view.deletionEvent();
       const revision = view.latest().timelineHistoryRevisionBySession.get(sessionId);
       expect(revision).toBeGreaterThan(0n);
+      expect(view.latest().timelineMessageDeletionBySession?.get(sessionId)).toEqual({
+        previousRevision: 0n, revision, eventIds: [eventId, "buffered-deleted-output"]
+      });
       await view.answer(sessionId, "later-event", "A later answer");
 
       view.complete();

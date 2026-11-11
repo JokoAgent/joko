@@ -714,7 +714,34 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     canContactOwner,
     sessionAvailable: true
   };
-  const recoveryPresentationTimeline = useMemo(() => projectRuntimeRecoveryTimeline(timeline), [timeline]);
+  const state = controller.state;
+  const historyRevision = state.snapshot.timelineHistoryRevisionBySession.get(session.id) ?? 0n;
+  const historyOwner = timelineHistoryOwnerKey(state.activeProfile, state.snapshot.generation, session.id, session.generation, historyRevision);
+  const deletion = state.snapshot.timelineMessageDeletionBySession?.get(session.id);
+  const previousDeletionHistoryOwner = deletion?.revision === historyRevision
+    ? timelineHistoryOwnerKey(state.activeProfile, state.snapshot.generation, session.id, session.generation, deletion.previousRevision)
+    : undefined;
+  const canRestoreDeletionReading = !guest && !reviewReadOnly && !nativeRuntimeLocked && presentation === "standard"
+    && state.connectionState === "connected" && state.route.kind === "session" && state.route.sessionId === session.id
+    && state.route.messageId === undefined && state.route.partnerId === undefined && state.route.backgroundExtensionId === undefined;
+  const [deletionHistoryWindow, setDeletionHistoryWindow] = useState<{
+    readonly owner: string;
+    readonly navigationRevision: number | undefined;
+    readonly items: readonly TimelineItemView[];
+  }>();
+  const restoredDeletionItems = canRestoreDeletionReading && deletionHistoryWindow?.owner === historyOwner
+    && deletionHistoryWindow?.navigationRevision === state.navigationRevision ? deletionHistoryWindow?.items : undefined;
+  const readDeletionNeighbor = async (itemId: string, eventId: string, adopt: () => boolean): Promise<void> => {
+    if (!canRestoreDeletionReading || historyOwner === undefined) return;
+    const sourceIsCurrent = capturePaneMessageAction(false);
+    const around = await controller.loadSessionTimelineAround(session.id, eventId, 160).catch(() => undefined);
+    if (around === undefined || !sourceIsCurrent()
+      || controllerRef.current.state.snapshot.timelineHistoryRevisionBySession.get(session.id) !== historyRevision
+      || !around.some((item) => item.id === itemId && item.sourceEventId === eventId) || !adopt()) return;
+    setDeletionHistoryWindow({ owner: historyOwner, navigationRevision: state.navigationRevision, items: around });
+  };
+  const recoveryPresentationTimeline = useMemo(() => projectRuntimeRecoveryTimeline(restoredDeletionItems === undefined
+    ? timeline : mergeTimelineWindows(timeline, restoredDeletionItems)), [restoredDeletionItems, timeline]);
   const errorTailProjection = useMemo(() => {
     const candidate = resolveErrorTail(session.id, recoveryPresentationTimeline, queue, running, "none", session.attention);
     return candidate === undefined
@@ -2363,8 +2390,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         hasEarlier={timelineHasEarlier}
         historyLoading={timelineHistoryLoading}
         historyError={timelineHistoryError}
-        historyOwnerKey={timelineHistoryOwnerKey(controller.state.activeProfile, controller.state.snapshot.generation, session.id,
-          session.generation, controller.state.snapshot.timelineHistoryRevisionBySession.get(session.id) ?? 0n)}
+        historyOwnerKey={historyOwner}
+        historyDeletion={!canRestoreDeletionReading || deletion === undefined || previousDeletionHistoryOwner === undefined ? undefined : {
+          previousHistoryOwnerKey: previousDeletionHistoryOwner,
+          deletedEventIds: deletion.eventIds,
+          readNeighbor: readDeletionNeighbor
+        }}
         onLoadEarlier={onLoadEarlierTimeline}
         onInlinePlanVisibilityChange={handleInlinePlanVisibilityChange}
         followLatestSignal={followLatestSignal}
