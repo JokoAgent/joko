@@ -221,7 +221,7 @@ beforeAll(async () => {
     "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker",
     "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet",
     "MobileRuntimeControlsSheet", "MobileContextSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet",
-    "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar",
+    "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileConversationShareBar",
     "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer",
     "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen",
     "MobilePartnerWorkingStatus", "MobilePartnerResourcesScreen",
@@ -229,6 +229,9 @@ beforeAll(async () => {
     "MobileUpdateSurface", "MobileRuntimeCommandPalette"])
     vi.doMock(`./${name}`, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => null,
       has: () => true, getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null }) }));
+  vi.doMock("./MobileMarkdownMessage", () => ({
+    MobileMarkdownMessage: ({ text }: { readonly text: string }) => createElement("span", null, text)
+  }));
   vi.doMock("./SwipeableSessionRow", () => ({ SwipeableSessionRow: surface }));
   vi.doMock("./MobileActionSheet", () => ({ MobileActionSheet: (props: NonNullable<typeof messageActionsProps>) => {
     if (props.items.some(item => item.id === "copy-text" || item.id === "add-to-composer")) messageActionsProps = props;
@@ -729,7 +732,8 @@ describe("actual Task Home navigation composition", () => {
     await act(async () => { vi.advanceTimersToNextFrame(); });
     expect(scrollToIndex).toHaveBeenCalledWith({ index: 1, animated: false, viewPosition: 0.5 });
     const focused = Array.from(host.querySelectorAll('[aria-live="polite"]')).find(row => row.textContent?.includes("Original needle reply"));
-    expect(focused?.getAttribute("data-native-style")).toContain('"borderWidth":2');
+    expect(focused).toBeDefined();
+    expect(focused!.getAttribute("data-native-style")).toContain('"borderWidth":2');
     expect(projectMobileHomeSearchMessageFocus(state, { ...match, eventId: "retired-event" }, -2)).toBeUndefined();
   });
 
