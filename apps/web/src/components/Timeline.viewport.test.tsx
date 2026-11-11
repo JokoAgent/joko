@@ -201,7 +201,7 @@ describe("Timeline viewport journeys", () => {
 
   it.each(["matching history", "a new history revision", "a manual scroll"] as const)("handles a saved old row after reopen and %s", async (arrival) => {
     const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
-    viewportHeight = 240;
+    viewportHeight = 140;
     extent = 640;
     const fullHistory = props.items;
     const historyOwnerKey = `${props.viewportOwnerKey}:history:1`;
@@ -235,11 +235,13 @@ describe("Timeline viewport journeys", () => {
     if (arrival === "a new history revision") {
       await render({ historyOwnerKey: `${historyOwnerKey}:revised` });
     } else if (arrival === "a manual scroll") {
+      await wheel(reopened, 64);
       await act(async () => {
         reopened.scrollTop = 64;
         reopened.dispatchEvent(new Event("scroll"));
       });
       manualOffset = reopened.querySelector<HTMLElement>(recentRowSelector)!.getBoundingClientRect().top - reopened.getBoundingClientRect().top;
+      expectUnread(0);
     }
     extent = 640;
     await render({ items: fullHistory, historyLoading: false });
@@ -297,15 +299,14 @@ describe("Timeline viewport journeys", () => {
   });
 
   it("finds a loaded message outside the virtual window and retires its text on close", async () => {
-    extent = 6_400;
+    extent = 6_320;
     const artifact: ArtifactView = { id: "find-image", blobId: "find-blob", kind: "image", fileName: "image.png",
       title: "Image attachment", mediaType: "image/png", byteSize: 8, sourceRevealAvailable: false };
     const loadArtifact = vi.fn(async () => "blob:find-image");
     const loadEarlier = vi.fn(async () => undefined);
+    const olderMessage = { ...item("first-search-row", 1, "assistant"), text: "The **loaded needle** is here.", attachments: [artifact] };
     props = { ...props, sessionActive: false, messageNavRailEnabled: false, hasEarlier: true, onLoadEarlier: loadEarlier,
-      onArtifactUrl: loadArtifact, items: Array.from({ length: 68 }, (_, index) => index === 0
-        ? { ...item("first-search-row", 1, "assistant"), text: "The **loaded needle** is here.", attachments: [artifact] }
-        : item(`search-row-${index}`, index + 1, "user")) };
+      onArtifactUrl: loadArtifact, items: Array.from({ length: 67 }, (_, index) => item(`search-row-${index + 1}`, index + 2, "user")) };
     const highlights = new Map<string, Set<Range>>();
     vi.stubGlobal("jokoDesktop", { capabilities: ["page.search"] });
     vi.stubGlobal("CSS", { highlights });
@@ -329,12 +330,23 @@ describe("Timeline viewport journeys", () => {
       const viewport = timeline();
       const firstSelector = '[data-timeline-item-id="first-search-row"]';
       const tailSelector = '[data-timeline-item-id="search-row-67"]';
-      expect(viewport.querySelector(firstSelector)).toBeNull();
-      expect(viewport.querySelector(tailSelector)).not.toBeNull();
       viewport.style.overflowY = "auto";
       let top = viewport.scrollTop;
       Object.defineProperty(viewport, "scrollTop", { configurable: true, get: () => top,
         set: (value: number) => { top = Math.max(0, Math.min(extent - viewportHeight, value)); } });
+      // Deliver the browser scroll notification to the real virtualizer before the cached older message arrives.
+      await act(async () => viewport.dispatchEvent(new Event("scroll")));
+      await flushFrames();
+      expect(viewport.querySelector(tailSelector)).not.toBeNull();
+
+      extent += 80;
+      props = { ...props, items: [olderMessage, ...props.items] };
+      await act(async () => root.render(<FindableTimeline />));
+      await flushFrames();
+      await act(async () => viewport.dispatchEvent(new Event("scroll")));
+      await flushFrames();
+      expect(viewport.querySelector(firstSelector)).toBeNull();
+      expect(viewport.querySelector(tailSelector)).not.toBeNull();
 
       await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", code: "KeyF", ctrlKey: true, bubbles: true, cancelable: true })));
       await flushFrames();
@@ -352,6 +364,7 @@ describe("Timeline viewport journeys", () => {
       expect([...highlights.get(PAGE_SEARCH_ACTIVE_HIGHLIGHT)!][0]?.toString()).toBe("loaded needle");
       expect(viewport.scrollTop).toBeLessThanOrEqual(56);
       expect(viewport.querySelector(firstSelector)?.hasAttribute("inert")).toBe(false);
+      expect(loadArtifact).toHaveBeenCalledExactlyOnceWith(artifact.blobId);
       expect(loadEarlier).not.toHaveBeenCalled();
       expect(document.activeElement).toBe(input);
 
