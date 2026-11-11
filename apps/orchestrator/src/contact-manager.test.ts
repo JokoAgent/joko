@@ -162,6 +162,104 @@ describe("ContactManager portable address-book boundary", () => {
     expect(fixture.store.directoryState().people).toBe(2);
   });
 
+  it("skips new, exact-match and reviewed cards without changing contacts, organizations or groups", () => {
+    const fixture = createFixture();
+    const existing = fixture.store.createContact({
+      expectedDirectoryRevision: fixture.store.directoryState().revision,
+      kind: "person",
+      displayName: "Existing Person",
+      identities: [{ platform: "email", value: "existing@example.com" }]
+    }).contact!;
+    const organization = fixture.store.createContact({
+      expectedDirectoryRevision: fixture.store.directoryState().revision,
+      kind: "organization",
+      displayName: "Northwind Labs"
+    }).contact!;
+    const before = fixture.store.directoryState();
+    const preview = fixture.manager.previewVCardImport([
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Skipped New Person", "EMAIL:new@example.com",
+      "ORG:New Organization", "CATEGORIES:Skipped New Group", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "EMAIL:existing@example.com",
+      "TEL:+1 555 010 0199", "NOTE:Skipped enrichment", "ORG:Northwind Labs Europe",
+      "CATEGORIES:Skipped Existing Group", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "NOTE:Skipped name review", "END:VCARD"
+    ].join("\r\n"));
+    expect(preview.entries.map((entry) => entry.disposition)).toEqual(["create", "auto_enrich", "needs_review"]);
+    expect(preview.entries[1]!.organizationCandidates).toEqual([
+      expect.objectContaining({ contactId: organization.id, matchType: "name" })
+    ]);
+
+    const result = fixture.manager.commitVCardImport({
+      previewId: preview.previewId,
+      expectedDirectoryRevision: preview.directoryRevision,
+      decisions: preview.entries.map((entry) => ({ entryId: entry.entryId, decision: "skip" }))
+    });
+
+    expect(result).toEqual({
+      created: 0,
+      enriched: 0,
+      skipped: 3,
+      contactIds: [],
+      entries: preview.entries.map((entry) => ({
+        entryId: entry.entryId,
+        displayName: entry.contact.displayName,
+        outcome: "skipped"
+      })),
+      directory: before
+    });
+    expect(fixture.manager.get(existing.id)).toEqual(existing);
+    expect(fixture.manager.get(organization.id)).toEqual(organization);
+    expect(fixture.store.directoryState()).toEqual(before);
+    expect(fixture.manager.groups()).toEqual([]);
+    expect(fixture.manager.list({ query: "Skipped New Person" })).toMatchObject({ contacts: [], total: 0 });
+  });
+
+  it("keeps skipped cards out of a mixed import while applying the selected cards", () => {
+    const fixture = createFixture();
+    const existing = fixture.store.createContact({
+      expectedDirectoryRevision: fixture.store.directoryState().revision,
+      kind: "person",
+      displayName: "Existing Person",
+      identities: [{ platform: "email", value: "existing@example.com" }]
+    }).contact!;
+    const preview = fixture.manager.previewVCardImport([
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Skipped Person", "EMAIL:skipped@example.com",
+      "ORG:Skipped Organization", "CATEGORIES:Skipped Group", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Selected Person", "EMAIL:selected@example.com", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "EMAIL:existing@example.com",
+      "NOTE:Skipped enrichment", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "EMAIL:existing@example.com",
+      "TEL:+1 555 010 0111", "END:VCARD"
+    ].join("\r\n"));
+
+    const result = fixture.manager.commitVCardImport({
+      previewId: preview.previewId,
+      expectedDirectoryRevision: preview.directoryRevision,
+      decisions: [
+        { entryId: preview.entries[0]!.entryId, decision: "skip" },
+        { entryId: preview.entries[2]!.entryId, decision: "skip" },
+        { entryId: preview.entries[3]!.entryId, decision: "merge", targetContactId: existing.id, expectedTargetRevision: existing.revision }
+      ]
+    });
+
+    expect(result).toMatchObject({ created: 1, enriched: 1, skipped: 2, directory: { people: 2, organizations: 0, groups: 0 } });
+    expect(result.entries).toEqual([
+      { entryId: preview.entries[0]!.entryId, displayName: "Skipped Person", outcome: "skipped" },
+      { entryId: preview.entries[1]!.entryId, displayName: "Selected Person", outcome: "created", contactId: expect.any(String) },
+      { entryId: preview.entries[2]!.entryId, displayName: "Existing Person", outcome: "skipped" },
+      { entryId: preview.entries[3]!.entryId, displayName: "Existing Person", outcome: "enriched", contactId: existing.id }
+    ]);
+    expect(result.contactIds).toEqual([result.entries[1]!.contactId, existing.id]);
+    expect(fixture.manager.resolveIdentity("email", "skipped@example.com")).toBeUndefined();
+    expect(fixture.manager.resolveIdentity("email", "selected@example.com")?.id).toBe(result.entries[1]!.contactId);
+    expect(fixture.manager.get(existing.id)).toMatchObject({
+      summary: "",
+      narrative: "",
+      identities: expect.arrayContaining([expect.objectContaining({ platform: "phone", normalizedValue: "+15550100111" })])
+    });
+    expect(fixture.manager.groups()).toEqual([]);
+  });
+
   it("expires previews and rejects a directory that changed after review", () => {
     const fixture = createFixture();
     const card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Fresh Person\r\nEND:VCARD\r\n";

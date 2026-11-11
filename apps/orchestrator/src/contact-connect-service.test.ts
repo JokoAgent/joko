@@ -236,6 +236,53 @@ describe("ContactService", () => {
     );
   });
 
+  it("preserves explicit skip decisions and their receipts for new and exact-match vCards", async () => {
+    const fixture = createFixture();
+    const existing = fixture.store.createContact({
+      expectedDirectoryRevision: fixture.store.directoryState().revision,
+      kind: "person",
+      displayName: "Existing Person",
+      identities: [{ platform: "email", value: "existing@example.com" }]
+    }).contact!;
+    const before = fixture.store.directoryState();
+    const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
+    const service = createContactConnectService(fixture.manager, authenticate);
+    const preview = await service.previewContactVCardImport(create(contract.PreviewContactVCardImportRequestSchema, {
+      vcardText: [
+        "BEGIN:VCARD", "VERSION:3.0", "FN:New Person", "EMAIL:new@example.com", "END:VCARD",
+        "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "EMAIL:existing@example.com",
+        "TEL:+1 555 010 0199", "END:VCARD"
+      ].join("\r\n")
+    }), context());
+    const newEntryId = preview.entries?.[0]?.entryId;
+    const existingEntryId = preview.entries?.[1]?.entryId;
+    if (!newEntryId || !existingEntryId) throw new Error("ContactService returned no vCard preview entry IDs.");
+
+    const result = await service.commitContactVCardImport(create(contract.CommitContactVCardImportRequestSchema, {
+      previewId: preview.previewId,
+      expectedDirectoryRevision: preview.directoryRevision,
+      decisions: [
+        { entryId: newEntryId, decision: contract.ContactVCardImportDecisionKind.SKIP },
+        { entryId: existingEntryId, decision: contract.ContactVCardImportDecisionKind.SKIP }
+      ]
+    }), context());
+
+    expect(result).toMatchObject({
+      created: 0,
+      enriched: 0,
+      skipped: 2,
+      contactIds: [],
+      entries: [
+        { entryId: newEntryId, displayName: "New Person", outcome: contract.ContactVCardImportOutcome.SKIPPED },
+        { entryId: existingEntryId, displayName: "Existing Person", outcome: contract.ContactVCardImportOutcome.SKIPPED }
+      ]
+    });
+    expect(result.entries?.map((entry) => entry.contactId)).toEqual([undefined, undefined]);
+    expect(fixture.store.directoryState()).toEqual(before);
+    expect(fixture.manager.get(existing.id)).toEqual(existing);
+    expect(authenticate).toHaveBeenCalledTimes(2);
+  });
+
   it("authenticates and maps device-sync status, grants, revocation, and manual retry", async () => {
     const fixture = createFixture();
     const status = contactSyncStatus();

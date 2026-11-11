@@ -371,7 +371,9 @@ export class ContactManager {
       for (const entry of preview.entries) {
         const decision = decisions.get(entry.entryId);
         let contact: ContactProfileRecord | undefined;
-        const action = entry.disposition === "needs_review" ? decision!.decision : entry.disposition === "create" ? "create" : "merge";
+        const action = decision?.decision === "skip" ? "skip"
+          : entry.disposition === "needs_review" ? decision!.decision
+            : entry.disposition === "create" ? "create" : "merge";
         if (action === "skip") {
           skipped += 1;
           entryResults.push({ entryId: entry.entryId, displayName: entry.contact.displayName, outcome: "skipped" });
