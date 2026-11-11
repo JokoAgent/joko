@@ -40,6 +40,7 @@ describe("Application native-memory adoption", () => {
     await vi.waitFor(() => expect(application.store.getRun(first.runId).descriptor.state).toBe("running"));
     const beforeSet = setup.featureWrites();
     const update = await setup.memory("enable-shared-memory", { makerEnabled: true });
+    expect(update.operation).toMatchObject({ operationId: "enable-shared-memory" });
     expect(update.operation?.error).toBeUndefined();
     expect(application.makerMemory!.settings().makerEnabled).toBe(true);
     expect(application.nativeMemoryRestartPending("codex")).toBe(true);
@@ -72,7 +73,7 @@ describe("Application native-memory adoption", () => {
     expect(application.store.getQueueItem(second.queueItemId).state).toBe("accepted");
     expect(originalTransport.requests.filter(request => request.method === "turn/start")).toHaveLength(1);
     const replay = await setup.memory("enable-shared-memory", { makerEnabled: true });
-    expect(replay.operation?.id).toBe(update.operation?.id);
+    expect(replay.operation).toMatchObject({ operationId: "enable-shared-memory" });
     expect(setup.featureWrites()).toBe(beforeSet);
 
     const candidatesBefore = setup.candidateAttempts();
