@@ -223,7 +223,7 @@ describe("mounted Timeline history windows", () => {
       const bytes = route.request().postDataBuffer();
       if (bytes === null) throw new Error("History request has no protobuf body.");
       const request = fromBinary(ListSessionTimelineRequestSchema, bytes);
-      if (request.beforeCursor !== undefined) {
+      if (request.sessionId === sessionId && request.beforeCursor !== undefined) {
         olderRequests += 1;
         if (rejectOlder) {
           rejectOlder = false;
@@ -304,7 +304,7 @@ describe("mounted Timeline history windows", () => {
     const retainedOffset = await rowOffset(page, latestReadingAnchor.id!);
     expect(afterRetry.id, JSON.stringify({ beforeRetry, latestReadingAnchor, afterRetry, retainedOffset })).toBe(latestReadingAnchor.id);
     expect(Math.abs(afterRetry.offset - latestReadingAnchor.offset)).toBeLessThanOrEqual(3);
-    await loadAllEarlier(page, 56);
+    await loadAllEarlier(page, 56, () => olderRequests);
     const allInitialIds = await navIds(page);
     expect(new Set(allInitialIds).size).toBe(56);
     await send(56);
@@ -334,15 +334,7 @@ describe("mounted Timeline history windows", () => {
     expect(afterOffline.id, JSON.stringify({ beforeOffline, afterOffline })).toBe(beforeOffline.id);
     expect(Math.abs(afterOffline.offset - beforeOffline.offset)).toBeLessThanOrEqual(3);
     expect((await navIds(page)).filter((id) => allInitialIds.includes(id))).toEqual(allInitialIds);
-    if ((await navIds(page)).length < 113) {
-      await goToHistoryStart(page);
-      await waitFor(async () => ({
-        ids: await navIds(page),
-        earlier: await page.getByRole("button", { name: "Load earlier activity", exact: true }).isVisible(),
-        history: await page.locator(".timeline-history").allTextContents()
-      }), (value) => value.ids.length === 113 || value.earlier, "history replay or an older page after reconnect", 20_000);
-    }
-    await loadAllEarlier(page, 113);
+    await loadAllEarlier(page, 113, () => olderRequests, 20_000);
     const finalIds = await navIds(page);
     expect(new Set(finalIds).size).toBe(113);
     await page.locator(".jump-latest").click();
@@ -484,14 +476,42 @@ async function goToHistoryStart(page: Page): Promise<void> {
   await frames(page);
 }
 
-async function loadAllEarlier(page: Page, expectedCount: number): Promise<void> {
+async function loadAllEarlier(page: Page, expectedCount: number, olderRequests: () => number, readyTimeout?: number): Promise<void> {
+  const timeline = page.locator(".timeline-shell");
+  const button = timeline.getByRole("button", { name: "Load earlier activity", exact: true });
+  const readProgress = () => timeline.evaluate((shell) => ({
+    count: shell.querySelectorAll(".message-nav-rail__tick").length,
+    loading: shell.querySelector(".timeline-history [role=status]") !== null,
+    failed: shell.querySelector(".timeline-history--error") !== null
+  }));
   for (let round = 0; round < 12; round += 1) {
-    if ((await navIds(page)).length === expectedCount) return;
-    await goToHistoryStart(page);
-    const button = page.getByRole("button", { name: "Load earlier activity", exact: true });
-    if (await button.isVisible()) await button.click();
-    await frames(page);
-    await waitFor(() => page.locator(".timeline-history [role=status]").count(), (value) => value === 0, "history page to settle");
+    const beforeRequests = olderRequests();
+    const before = await readProgress();
+    if (before.count === expectedCount) return;
+    if (!before.loading) await goToHistoryStart(page);
+    const ready = await waitFor(async () => ({
+      ...await readProgress(),
+      manual: await button.isVisible(),
+      requested: olderRequests() > beforeRequests
+    }), (state) => state.count > before.count || state.loading || state.failed || state.manual || state.requested,
+    "history progress or the older-page control", readyTimeout);
+    expect(ready.failed).toBe(false);
+    if (ready.manual && !ready.loading && !ready.requested && ready.count === before.count) {
+      // Home can start a read that retires this control. Keep the click tied to the current button.
+      const [control] = await button.elementHandles();
+      if (control !== undefined) {
+        try {
+          if (olderRequests() === beforeRequests) await control.click();
+        } catch (error) {
+          if (olderRequests() === beforeRequests || await control.evaluate(node => node.isConnected)) throw error;
+        } finally {
+          await control.dispose();
+        }
+      }
+    }
+    const settled = await waitFor(readProgress, (state) => state.failed || !state.loading && state.count > before.count,
+      "additional history to render and settle");
+    expect(settled.failed).toBe(false);
     await frames(page);
   }
   expect((await navIds(page)).length).toBe(expectedCount);
