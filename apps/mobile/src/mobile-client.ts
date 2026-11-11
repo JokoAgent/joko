@@ -999,6 +999,7 @@ export class MobileClient {
   #projectionTimer?: ReturnType<typeof setTimeout>;
   #streamAbort?: AbortController;
   #historyOwner?: symbol;
+  #timelineRetirement = 0;
   #projectionReading = false;
   #projectionMisses = 0;
   #streamSequence?: bigint;
@@ -1112,7 +1113,7 @@ export class MobileClient {
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
-    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
     filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
     private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform),
@@ -3838,12 +3839,12 @@ export class MobileClient {
     return () => this.#listeners.delete(listener);
   }
 
-  #set(patch: Partial<MobileState>): void {
+  #set(patch: Partial<MobileState>, retainHistory = true): void {
     if (this.#disposed) return;
     const previousAuthority = this.filesAuthorityKey();
     const previousPartnerAuthority = this.#partnerPrivateAuthorityKey(this.#state);
     let next = { ...this.#state, ...patch };
-    if (patch.detail && next.activeProfileId === this.#state.activeProfileId && next.selectedId === this.#state.selectedId
+    if (retainHistory && patch.detail && next.activeProfileId === this.#state.activeProfileId && next.selectedId === this.#state.selectedId
       && next.taskSource?.kind === this.#state.taskSource?.kind) {
       next = { ...next, detail: retainMobileHistoryPrefix(patch.detail, this.#state.detail) };
     }
@@ -5918,7 +5919,9 @@ export class MobileClient {
         }
         if (cursor.sequence <= (this.#streamSequence ?? 0n)) continue;
         this.#streamSequence = cursor.sequence;
-        if (event.identity?.sessionId === this.#state.selectedId && historyInvalidated(event)) this.#clearHistory();
+        if (event.identity?.sessionId === this.#state.selectedId && historyInvalidated(event)) {
+          if (!this.#retireStreamTimeline(event, cursor)) this.#clearHistory();
+        }
         if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
         this.#proofTimer = undefined;
         this.#set({ liveStatus: "streaming" });
@@ -5961,6 +5964,7 @@ export class MobileClient {
   async #syncProjection(epoch: number, credential: PairedCredential, snapshotPoll = false): Promise<void> {
     this.#projectionReading = true;
     const selectedId = this.#state.selectedId;
+    const timelineRetirement = this.#timelineRetirement;
     const generation = snapshotPoll ? this.#taskGeneration() : this.#streamGeneration;
     const edge = snapshotPoll ? this.#state.owner?.resumeCursor?.sequence ?? 0n : this.#streamSequence ?? 0n;
     try {
@@ -5981,6 +5985,10 @@ export class MobileClient {
       if (owner.snapshot.generation !== generation || detail && detail.generation !== generation
         || selectedId && !owner.snapshot.sessions.some((item) => item.sessionId === selectedId)) {
         void this.refresh();
+        return;
+      }
+      if (timelineRetirement !== this.#timelineRetirement) {
+        this.#scheduleProjection(epoch, credential);
         return;
       }
       const ownerCursor = owner.snapshot.resumeCursor;
@@ -9577,6 +9585,55 @@ export class MobileClient {
     this.#set({ window: undefined, older: [], before: undefined, historyEnd: false, historyBusy: false });
   }
 
+  #retireStreamTimeline(event: Event, cursor: EventCursor): boolean {
+    const session = this.#selectedSession(), identity = event.identity, payload = event.payload?.kind;
+    const nativeGeneration = session?.nativeBinding?.runtimeGeneration;
+    if (this.#joinedTask || !session || !identity || !nativeGeneration || cursor.generation !== this.#taskGeneration()
+      || identity.sessionId !== session.sessionId || identity.backendId !== session.backendId || identity.targetId !== session.targetId) return false;
+    if (payload?.case === "sessionReset" && payload.value.productSessionId === session.sessionId
+      && identity.generation >= nativeGeneration) {
+      void this.#retireSelectedTimeline(session, events => events.filter(item => item.identity?.sessionId !== session.sessionId
+        || item.cursor?.generation === cursor.generation && item.cursor.sequence > cursor.sequence),
+      (detail, source) => detail.generation === cursor.generation || (source.nativeBinding?.runtimeGeneration ?? 0n) < identity.generation);
+      return true;
+    }
+    if (payload?.case === "messageDeleted" && payload.value.productSessionId === session.sessionId
+      && identity.generation === nativeGeneration && payload.value.requestedEventId
+      && payload.value.deletedEventIds.includes(payload.value.requestedEventId)) {
+      const deleted = new Set(payload.value.deletedEventIds);
+      void this.#retireSelectedTimeline(session, events => events.filter(item => item.identity?.sessionId !== session.sessionId
+        || !deleted.has(item.eventId)));
+      return true;
+    }
+    return false;
+  }
+
+  async #retireSelectedTimeline(session: Session, project: (events: readonly Event[]) => Event[],
+    canProjectDetail?: (detail: Snapshot, source: Session) => boolean): Promise<void> {
+    const credential = this.#credential;
+    if (!credential || this.#joinedTask || session.sessionId !== this.#state.selectedId) return;
+    const projectDetail = (detail: Snapshot): Snapshot => {
+      const source = detail.sessions.find(item => item.sessionId === session.sessionId);
+      if (!source || source.backendId !== session.backendId || source.targetId !== session.targetId
+        || canProjectDetail?.(detail, source) === false) return detail;
+      const timeline = project(detail.timeline);
+      return timeline.length === detail.timeline.length ? detail : create(SnapshotSchema, { ...detail, timeline });
+    };
+    this.#timelineRetirement += 1;
+    this.#historyOwner = undefined;
+    const detail = this.#state.detail;
+    this.#set({ detail: detail && projectDetail(detail), live: project(this.#state.live), window: undefined, older: [],
+      before: undefined, historyEnd: false, historyBusy: false }, false);
+    const profile = this.#profiles.find(candidate => candidate.profileId === credential.profileId) ?? profileFromCredential(credential);
+    try {
+      await this.offlineCache?.retireTaskTimeline(profile, session.sessionId, projectDetail);
+    } catch (error) {
+      if (this.#credential === credential && this.#state.selectedId === session.sessionId) {
+        this.#set({ error: `Joko could not update the saved offline history: ${message(error)}` });
+      }
+    }
+  }
+
   async logoutConnection(connectionId: string): Promise<boolean> {
     if (this.#queueEditLease?.connectionId === connectionId) await this.#releaseQueueEditBeforeTransition();
     const connection = this.#state.owner?.connections.find((candidate) => candidate.connectionId === connectionId);
@@ -11313,6 +11370,7 @@ export class MobileClient {
       && item.sessionId === session.sessionId && item.eventId === eventId)) {
       throw new Error("This message deletion is already pending. Check its operation before trying again.");
     }
+    const credential = this.#credential;
     const action = this.#claimMutation();
     try {
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
@@ -11325,7 +11383,7 @@ export class MobileClient {
           eventId
         }) }
       }), { kind: "message-delete", sessionId: session.sessionId, eventId });
-      if (result.accepted && result.definitive) this.#clearHistory();
+      if (result.accepted && result.definitive && this.#credential === credential && this.#state.selectedId === session.sessionId) this.#clearHistory();
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -16844,6 +16902,22 @@ export class MobileClient {
     if (operation.state === OperationState.SUCCEEDED && pending.kind === "device-rename") {
       confirmedMobileDeviceName(operation, pending.targetDeviceId!, pending.connectionId);
     }
+    if (operation.state === OperationState.SUCCEEDED && pending.kind === "message-delete") {
+      const session = this.#selectedSession();
+      const generation = mobileMessageDeletionGeneration(operation, pending);
+      if (session && pending.eventId && pending.sessionId === session.sessionId && generation !== undefined
+        && generation === session.nativeBinding?.runtimeGeneration) {
+        const target = this.#completedMessageEvent(pending.eventId)?.payload?.kind;
+        // The accepted user row carries the requested durable event ID. The
+        // affected assistant-turn IDs come from the authoritative stream marker.
+        if ((target?.case === "messageStarted" || target?.case === "messageCompleted") && target.value.role === MessageRole.USER) {
+          const eventId = pending.eventId;
+          await this.#retireSelectedTimeline(session, events => events.filter(item => item.identity?.sessionId !== session.sessionId
+            || item.eventId !== eventId));
+          if (!this.#current(epoch) || this.#credential?.connectionId !== pending.connectionId) return;
+        }
+      }
+    }
     const next = isTerminal(operation.state)
       ? this.#state.pending.filter((item) => item.operationId !== pending.operationId)
       : this.#state.pending.map((item) => item.operationId === pending.operationId ? { ...item, state: "accepted" as const } : item);
@@ -16892,7 +16966,9 @@ export class MobileClient {
       try { assertMobileSharedTaskOperation(this.#joinedTask.source, pending.operationId, operation); return true; }
       catch { return false; }
     }
-    return !this.#joinedTask && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
+    return !this.#joinedTask && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId
+      && (pending.kind !== "message-delete" || operation.state !== OperationState.SUCCEEDED
+        || mobileMessageDeletionGeneration(operation, pending) !== undefined);
   }
 
   async reconcile(epoch = this.#epoch): Promise<void> {
@@ -16974,9 +17050,9 @@ export class MobileClient {
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
               "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
-            && this.#current(epoch)) {
+            && this.#current(epoch) && (pending.kind !== "message-delete" || this.#operationReceiptMatches(operation, pending))) {
             await this.refresh();
-            if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground
+            if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground && this.#credential === credential
               && this.#state.selectedId === pending.sessionId) this.#clearHistory();
             return;
           }
@@ -17731,4 +17807,13 @@ function historyInvalidated(event: Event): boolean {
     case "nativeBranchChanged": return event.payload.kind.value.timelineRebuilt;
     default: return false;
   }
+}
+
+function mobileMessageDeletionGeneration(operation: Operation, pending: PendingOperation): bigint | undefined {
+  const mutation = operation.mutation?.payload, result = operation.result?.payload;
+  if (mutation?.case !== "deleteSessionMessage" || mutation.value.sessionId !== pending.sessionId
+    || mutation.value.eventId !== pending.eventId || result?.case !== "acknowledgement" || !result.value.accepted) return undefined;
+  const generation = operation.mutation?.preconditions.find(condition => condition.entity?.kind === EntityKind.SESSION
+    && condition.entity.id === pending.sessionId)?.expectedGeneration;
+  return generation !== undefined && generation > 0n ? generation : undefined;
 }
