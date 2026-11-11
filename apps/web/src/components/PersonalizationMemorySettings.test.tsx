@@ -106,8 +106,8 @@ describe("PersonalizationMemorySettings", () => {
     await act(async () => toggle.click());
     expect(update).toHaveBeenCalledWith({ backendId: "codex", backendEnabled: true });
     expect(toggle.getAttribute("aria-checked")).toBe("false");
-    expect(container.textContent).toContain("Waiting for Codex to confirm the live memory setting.");
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "Saved the preference. Codex could not confirm the live memory update." }));
+    expect(container.textContent).toContain("Waiting for Codex to confirm the memory setting. Current work can finish first.");
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "Saved the preference. The local memory update is pending; current work can finish first." }));
     expect(onSuccess).not.toHaveBeenCalled();
   });
 
@@ -129,7 +129,7 @@ describe("PersonalizationMemorySettings", () => {
     expect(update).toHaveBeenCalledWith({ backendId: "claude-code", backendEnabled: false });
 
     const live = await render(controller, nativeSnapshot(false, true, true), undefined, onSuccess);
-    expect(live.textContent).toContain("Active local sessions update immediately");
+    expect(live.textContent).toContain("Changes apply to local sessions after current work finishes.");
     expect(live.textContent).toContain("Remote hosts keep their own setting.");
     const liveToggle = live.querySelector<HTMLButtonElement>('button[aria-label="Toggle Codex Auto Memory"]')!;
     await act(async () => liveToggle.click());

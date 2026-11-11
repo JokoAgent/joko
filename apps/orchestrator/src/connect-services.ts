@@ -612,6 +612,9 @@ export interface ConnectServiceDependencies {
   readonly modelFavorites?: ModelFavoriteSettings;
   readonly holdSubagentSmartRoutingDispatch?: (backendId: string) => void;
   readonly refreshSubagentSmartRouting?: (backendId: string) => Promise<void>;
+  readonly holdNativeMemoryDispatch?: (backendId: string) => void;
+  readonly refreshNativeMemory?: (backendId: string) => Promise<boolean>;
+  readonly nativeMemoryRestartPending?: (backendId: string) => boolean;
   readonly sessionNavigation?: SessionNavigationCoordinator;
   readonly reviewCoordinator?: ReviewCoordinator;
   readonly devicePeers: DevicePeerOwner;
@@ -1338,6 +1341,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
     projectBackendProviderAuthentication: application.projectBackendProviderAuthentication,
     holdSubagentSmartRoutingDispatch: application.holdSubagentSmartRoutingDispatch,
     refreshSubagentSmartRouting: application.refreshSubagentSmartRouting,
+    holdNativeMemoryDispatch: application.holdNativeMemoryDispatch,
+    refreshNativeMemory: application.refreshNativeMemory,
+    nativeMemoryRestartPending: application.nativeMemoryRestartPending,
     runtimeProcesses: new RuntimeProcessControl(
       application.store,
       (backendId, effect) => application.sessionHost.invokeBackendAdapter(backendId, effect)
@@ -14045,6 +14051,10 @@ async function refreshNativeMemoryStatuses(
         markNativeMemoryAwaitingConfirmation(dependencies, descriptor, refreshEpoch);
       } else invalidateNativeMemoryStatus(dependencies, descriptor.id, descriptor.instanceGeneration, refreshEpoch);
     };
+    if (dependencies.nativeMemoryRestartPending?.(descriptor.id)) {
+      statusUnavailable();
+      return;
+    }
     const advertisedAdapter = adapters.get(descriptor.id);
     if (advertisedAdapter?.readNativeMemoryStatus === undefined) {
       statusUnavailable();
@@ -14067,6 +14077,10 @@ async function refreshNativeMemoryStatuses(
       const current = dependencies.store.getBackend(descriptor.id).descriptor;
       if (current.instanceGeneration !== observation.backendInstanceGeneration
         || dependencies.nativeMemoryStatusEpochs.get(descriptor.id) !== refreshEpoch) return;
+      if (dependencies.nativeMemoryRestartPending?.(descriptor.id)) {
+        statusUnavailable();
+        return;
+      }
       if (updatesActiveLocalMemorySessions(descriptor) && observation.status.enabled === undefined) {
         statusUnavailable();
         return;
@@ -14126,24 +14140,38 @@ function backendMemoryDefaultEnabled(descriptor: BackendDescriptor): boolean {
     ?.includes(MEMORY_NATIVE_DEFAULT_DISABLED_OPTION) !== true;
 }
 
+function holdNativeMemorySettings(dependencies: ConnectServiceDependencies, backendId?: string): void {
+  for (const { descriptor } of dependencies.store.listBackends()) {
+    if (!updatesActiveLocalMemorySessions(descriptor) || backendId !== undefined && descriptor.id !== backendId) continue;
+    const statusEpoch = beginNativeMemoryStatusRefresh(dependencies, descriptor.id);
+    markNativeMemoryAwaitingConfirmation(dependencies, descriptor, statusEpoch);
+    dependencies.holdNativeMemoryDispatch?.(descriptor.id);
+  }
+}
+
 async function reconcileNativeMemorySettings(
-  dependencies: ConnectServiceDependencies
+  dependencies: ConnectServiceDependencies,
+  selectedBackendId?: string
 ): Promise<void> {
   const backends = dependencies.store.listBackends()
     .map((item) => item.descriptor)
-    .filter(updatesActiveLocalMemorySessions);
+    .filter(descriptor => updatesActiveLocalMemorySessions(descriptor)
+      && (selectedBackendId === undefined || descriptor.id === selectedBackendId));
   const failures: string[] = [];
   await Promise.all(backends.map(async (descriptor) => {
     const backendId = descriptor.id;
     const statusEpoch = beginNativeMemoryStatusRefresh(dependencies, backendId);
     markNativeMemoryAwaitingConfirmation(dependencies, descriptor, statusEpoch);
     try {
-      await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
+      const pending = dependencies.refreshNativeMemory !== undefined
+        ? await dependencies.refreshNativeMemory(backendId)
+        : await dependencies.sessionHost.invokeBackendAdapter(backendId, async (adapter) => {
         if (adapter.reconcileNativeMemory === undefined) {
           throw new Error("The advertised native-memory live reconcile owner is unavailable.");
         }
-        await adapter.reconcileNativeMemory();
+        return await adapter.reconcileNativeMemory() !== "immediate";
       });
+      if (pending) return;
       invalidateNativeMemoryStatus(dependencies, backendId, descriptor.instanceGeneration, statusEpoch);
     } catch {
       failures.push(backendId);
@@ -14550,19 +14578,21 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
           ? nativeStatus
           : undefined;
         const currentNativeStatus = observation?.status;
+        const awaitingConfirmation = dependencies.nativeMemoryRestartPending?.(item.descriptor.id) === true
+          || observation?.awaitingConfirmation === true;
         const entryCount = role === "compaction_digest"
           ? memoryState?.backendEntryCount[item.descriptor.id] ?? 0
           : currentNativeStatus?.entryCount;
         return create(contract.BackendMemorySettingsSchema, {
           backendId: item.descriptor.id,
           enabled: currentNativeStatus?.enabled
-            ?? (observation?.awaitingConfirmation === true ? false : memoryState?.backendEnabled[item.descriptor.id] ?? false),
+            ?? (awaitingConfirmation ? false : memoryState?.backendEnabled[item.descriptor.id] ?? false),
           support: dependencies.makerMemory === undefined
             ? contract.CapabilitySupport.TEMPORARILY_UNAVAILABLE
             : contract.CapabilitySupport.SUPPORTED,
           reason: dependencies.makerMemory === undefined
             ? "Memory storage is unavailable on this Orchestrator node."
-            : observation?.awaitingConfirmation === true ? "Live native memory confirmation is pending." : "",
+            : awaitingConfirmation ? "Live native memory confirmation is pending." : "",
           ...(entryCount === undefined ? {} : { entryCount: BigInt(entryCount) }),
           kind: role === "native_auto_memory"
             ? contract.BackendMemoryKind.NATIVE_AUTO_MEMORY
@@ -19902,12 +19932,17 @@ async function dispatchMutation(
           commit: (store) => {
             store.deleteSetting("service", "orchestrator", MAKER_MEMORY_SETTING_KEY);
             return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
+          },
+          afterCommit: committed => {
+            if (!committed.replayed && memory !== undefined) holdNativeMemorySettings(dependencies);
           }
         });
         // Restoring the durable default remains available even while the
         // optional runtime owner is absent. Reconcile only when it exists.
-        await memory?.reconcileSettingsChange();
-        if (memory !== undefined) await reconcileNativeMemorySettings(dependencies);
+        if (!execution.replayed) {
+          await memory?.reconcileSettingsChange();
+          if (memory !== undefined) await reconcileNativeMemorySettings(dependencies);
+        }
         return presented(execution);
       }
       if (memory === undefined) {
@@ -19966,10 +20001,16 @@ async function dispatchMutation(
         commit: (store) => {
           store.setSetting("service", "orchestrator", MAKER_MEMORY_SETTING_KEY, nextSettings!);
           return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
+        },
+        afterCommit: committed => {
+          if (!committed.replayed) holdNativeMemorySettings(dependencies,
+            patch.makerEnabled === undefined ? patch.backendId : undefined);
         }
       });
-      await memory.reconcileSettingsChange();
-      await reconcileNativeMemorySettings(dependencies);
+      if (!execution.replayed) {
+        await memory.reconcileSettingsChange();
+        await reconcileNativeMemorySettings(dependencies, patch.makerEnabled === undefined ? patch.backendId : undefined);
+      }
       return presented(execution);
     }
     case "resetMemory": {

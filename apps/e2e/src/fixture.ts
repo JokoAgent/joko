@@ -329,11 +329,13 @@ export class OrchestratorE2eFixture {
     });
     await sessionWorktrees.initialize();
     let objectives: ObjectiveManager | undefined;
+    const nativeMemoryPending = new Map<string, number>();
     const sessionHost = new SessionHost(store, artifacts, backendInstances.availableAdapters(), {
       backendDescriptors: backendInstances.descriptors(),
       backendDescriptorsAlreadyPublished: true,
       workspaceCapture: new DurableWorkspaceRunCapture(store, workspaceChanges),
       worktrees: sessionWorktrees,
+      backendDispatchBlocked: backendId => nativeMemoryPending.has(backendId),
       modelRoutingEnabled: (backendId, providerId, modelId) => modelRoutingEnabled(store, backendId, providerId, modelId),
       onUserInputAdmitted: (transactionStore, result) =>
         objectives?.onUserInputAdmitted(transactionStore, result),
@@ -531,6 +533,25 @@ export class OrchestratorE2eFixture {
       projectBackendProviderAuthentication,
       holdSubagentSmartRoutingDispatch: () => undefined,
       refreshSubagentSmartRouting: restartBackend,
+      holdNativeMemoryDispatch: backendId => {
+        nativeMemoryPending.set(backendId, (nativeMemoryPending.get(backendId) ?? 0) + 1);
+      },
+      refreshNativeMemory: async backendId => {
+        const token = nativeMemoryPending.get(backendId);
+        if (token === undefined) return false;
+        // This fixture owns explicit runtime transitions. A next_session
+        // receipt stays held; only the real Application models idle replacement.
+        const immediate = await sessionHost.invokeBackendAdapter(backendId, async adapter => {
+          if (adapter.reconcileNativeMemory === undefined) throw new Error("The fixture native-memory owner is unavailable.");
+          return await adapter.reconcileNativeMemory() === "immediate";
+        });
+        if (immediate && nativeMemoryPending.get(backendId) === token) {
+          nativeMemoryPending.delete(backendId);
+          sessionHost.wakeBackendQueues(backendId);
+        }
+        return nativeMemoryPending.has(backendId);
+      },
+      nativeMemoryRestartPending: backendId => nativeMemoryPending.has(backendId),
       modelFavorites,
       browserActivity: [],
       contacts,
