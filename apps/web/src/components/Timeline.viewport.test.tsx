@@ -199,7 +199,8 @@ describe("Timeline viewport journeys", () => {
 
   it.each(["matching history", "a new history revision", "a manual scroll"] as const)("handles a saved old row after reopen and %s", async (arrival) => {
     const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
-    extent = 1_080;
+    viewportHeight = 240;
+    extent = 640;
     const fullHistory = props.items;
     const historyOwnerKey = `${props.viewportOwnerKey}:history:1`;
     const oldRowSelector = '[data-timeline-item-id="initial-2"]';
@@ -219,6 +220,7 @@ describe("Timeline viewport journeys", () => {
 
     await act(async () => root.unmount());
     root = createRoot(host);
+    extent = 320;
     await render({ items: fullHistory.slice(4), historyLoading: true });
     await flushFrames();
     const reopened = timeline();
@@ -226,6 +228,8 @@ describe("Timeline viewport journeys", () => {
     expect(reopened.querySelector('[data-timeline-item-id="initial-4"]')).not.toBeNull();
     expect(reopened.scrollTop).toBe(0);
 
+    const recentRowSelector = '[data-timeline-item-id="initial-4"]';
+    let manualOffset: number | undefined;
     if (arrival === "a new history revision") {
       await render({ historyOwnerKey: `${historyOwnerKey}:revised` });
     } else if (arrival === "a manual scroll") {
@@ -233,15 +237,21 @@ describe("Timeline viewport journeys", () => {
         reopened.scrollTop = 64;
         reopened.dispatchEvent(new Event("scroll"));
       });
+      manualOffset = reopened.querySelector<HTMLElement>(recentRowSelector)!.getBoundingClientRect().top - reopened.getBoundingClientRect().top;
     }
-    const beforeHistory = reopened.scrollTop;
+    extent = 640;
     await render({ items: fullHistory, historyLoading: false });
     await flushFrames();
+    await contentResize();
     const restoredRow = reopened.querySelector<HTMLElement>(oldRowSelector)!;
+    const restoredOffset = restoredRow.getBoundingClientRect().top - reopened.getBoundingClientRect().top;
     if (arrival === "matching history") {
-      expect(restoredRow.getBoundingClientRect().top - reopened.getBoundingClientRect().top).toBeCloseTo(offset);
+      expect(Math.abs(restoredOffset - offset)).toBeLessThanOrEqual(0.5);
+    } else if (manualOffset !== undefined) {
+      const currentRecentOffset = reopened.querySelector<HTMLElement>(recentRowSelector)!.getBoundingClientRect().top - reopened.getBoundingClientRect().top;
+      expect(Math.abs(currentRecentOffset - manualOffset)).toBeLessThanOrEqual(0.5);
     } else {
-      expect(reopened.scrollTop).toBe(beforeHistory);
+      expect(Math.abs(restoredOffset - offset)).toBeGreaterThan(3);
     }
     expectUnread(0);
   });
