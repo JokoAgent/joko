@@ -1455,6 +1455,10 @@ function isContactCategory(value: unknown): value is ContactToolCategory {
   return value === "search" || value === "read" || value === "write" || value === "manage";
 }
 
+function folded(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase("en-US");
+}
+
 function iso(value: number): string {
   return new Date(value).toISOString();
 }
