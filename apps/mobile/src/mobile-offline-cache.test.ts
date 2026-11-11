@@ -16,7 +16,7 @@ import {
   SnapshotScopeSchema,
   type Snapshot
 } from "@joko/contracts";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { MobileConnectionProfile } from "./connection-storage";
 import {
   MobileOfflineCache,
@@ -152,6 +152,51 @@ function cacheFixture() {
 }
 
 describe("current-v1 mobile offline content cache", () => {
+  it("retires the exact task timeline ahead of a reopen while an older write is still pending", async () => {
+    const { cache, memory } = cacheFixture();
+    const selected = "session-one", other = "session-two";
+    const projection = owner([session(selected), session(other)]);
+    const before = detail();
+    const message = (eventId: string, text: string) => create(EventSchema, { eventId, identity: { sessionId: selected },
+      payload: { kind: { case: "messageCompleted", value: { messageId: eventId, role: MessageRole.USER,
+        blocks: [{ content: { case: "text", value: text } }] } } } });
+    const removed = message("old", "removed message body"), retained = message("keep", "retained message body");
+    before.timeline = [removed, retained];
+    await cache.save(profile, node, projection, before);
+    await cache.save(profile, node, projection, detail(other));
+    memory.blockNextDetailWrite();
+    const pendingWrite = cache.save(profile, node, projection, before);
+    await memory.detailReached;
+    const retirement = cache.retireTaskTimeline(profile, selected, snapshot =>
+      create(SnapshotSchema, { ...snapshot, timeline: snapshot.timeline.filter(item => item.eventId !== removed.eventId) }));
+    const reopened = cache.load(profile, selected);
+    memory.releaseDetail();
+    await Promise.all([pendingWrite, retirement]);
+    expect((await reopened)?.detail?.timeline.map(item => item.eventId)).toEqual([retained.eventId]);
+    expect((await cache.load(profile, other))?.detail?.snapshotId).toBe(`detail-${other}-7`);
+    expect([...memory.values.values()].join("\n")).not.toContain("removed message body");
+  });
+
+  it("keeps a known stale task out of offline history after storage removal fails", async () => {
+    const { cache, memory } = cacheFixture();
+    const selected = "session-one", other = "session-two";
+    const projection = owner([session(selected), session(other)]);
+    const before = detail();
+    before.timeline = [create(EventSchema, { eventId: "deleted" }), create(EventSchema, { eventId: "survives" })];
+    await cache.save(profile, node, projection, before);
+    await cache.save(profile, node, projection, detail(other));
+    const removal = vi.spyOn(memory.storage, "removeItem").mockRejectedValueOnce(new Error("storage unavailable"));
+    const withoutDeleted = (snapshot: Snapshot) => create(SnapshotSchema, {
+      ...snapshot, timeline: snapshot.timeline.filter((item) => item.eventId !== "deleted")
+    });
+    await expect(cache.retireTaskTimeline(profile, selected, withoutDeleted)).rejects.toThrow("storage unavailable");
+    expect((await cache.load(profile, selected))?.detail).toBeUndefined();
+    expect((await cache.load(profile, other))?.detail?.snapshotId).toBe(`detail-${other}-7`);
+    removal.mockRestore();
+    await cache.save(profile, node, projection, withoutDeleted(before));
+    expect((await cache.load(profile, selected))?.detail?.timeline.map((item) => item.eventId)).toEqual(["survives"]);
+  });
+
   it("keeps a cached history prefix through overlapping background refresh and replaces it on reset", async () => {
     const fixture = cacheFixture();
     const event = (id: string, sequence: bigint) => create(EventSchema, { eventId: id, identity: { sessionId: "session-one" },

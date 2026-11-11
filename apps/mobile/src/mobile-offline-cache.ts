@@ -75,6 +75,8 @@ class MobileOfflineCacheReadError extends Error {}
 export class MobileOfflineCache {
   readonly #tails = new Map<string, Promise<void>>();
   readonly #epochs = new Map<string, number>();
+  readonly #timelineEpochs = new Map<string, Map<string, number>>();
+  readonly #unavailableTimelines = new Map<string, Set<string>>();
 
   constructor(
     private readonly storage: MobileOfflineCacheStorage,
@@ -85,6 +87,7 @@ export class MobileOfflineCache {
   load(profile: MobileConnectionProfile, selectedSessionId?: string, signal?: AbortSignal): Promise<MobileOfflineCacheSnapshot | undefined> {
     assertIdentity(profile);
     if (selectedSessionId !== undefined) assertLocalId(selectedSessionId, "task");
+    const timelineEpoch = this.#timelineEpoch(profile.profileId, selectedSessionId);
     const read = (key: string) => {
       signal?.throwIfAborted();
       return waitForCacheRead(this.storage.getItem(key), signal);
@@ -105,11 +108,14 @@ export class MobileOfflineCache {
         const manifest = readManifest(raw, profile);
         const owner = readSnapshot(manifest.owner, "owner snapshot");
         assertOwnerSnapshot(profile, manifest.node, owner);
-        if (selectedSessionId === undefined || !regularOwnerSession(owner, selectedSessionId)) {
-          return { node: manifest.node, owner, cachedAt: manifest.cachedAt };
+        const ownerView = { node: manifest.node, owner, cachedAt: manifest.cachedAt };
+        const timelineCurrent = () => this.#timelineEpoch(profile.profileId, selectedSessionId) === timelineEpoch
+          && (selectedSessionId === undefined || !this.#unavailableTimelines.get(profile.profileId)?.has(selectedSessionId));
+        if (selectedSessionId === undefined || !regularOwnerSession(owner, selectedSessionId) || !timelineCurrent()) {
+          return ownerView;
         }
         const entry = manifest.details.find((candidate) => candidate.sessionId === selectedSessionId);
-        if (!entry) return { node: manifest.node, owner, cachedAt: manifest.cachedAt };
+        if (!entry) return ownerView;
         try {
           let detailRaw: string | null;
           try { detailRaw = await read(entry.key); }
@@ -134,11 +140,10 @@ export class MobileOfflineCache {
           ];
           const next = { ...manifest, details: newestFirst(touched) } satisfies CacheManifest;
           await this.storage.setItem(manifestKey(profile.profileId), stringifyManifest(next)).catch(() => undefined);
+          if (!timelineCurrent()) return ownerView;
           return {
-            node: manifest.node,
-            owner,
+            ...ownerView,
             detail,
-            cachedAt: manifest.cachedAt,
             detailCachedAt: record.cachedAt
           };
         } catch (error) {
@@ -186,8 +191,11 @@ export class MobileOfflineCache {
       assertDetailSnapshot(owner, detailSessionId, detail);
     }
     const epoch = this.#epoch(profile.profileId);
+    const timelineEpoch = this.#timelineEpoch(profile.profileId, detailSessionId);
+    const current = () => this.#epoch(profile.profileId) === epoch
+      && this.#timelineEpoch(profile.profileId, detailSessionId) === timelineEpoch;
     return this.#serialized(profile.profileId, async () => {
-      if (this.#epoch(profile.profileId) !== epoch) return;
+      if (!current()) return;
       const cachedAt = validTimestamp(this.now());
       let prior: CacheManifest | undefined;
       const priorRaw = await this.storage.getItem(manifestKey(profile.profileId));
@@ -204,8 +212,9 @@ export class MobileOfflineCache {
       const regularGenerations = new Map(owner.sessions
         .filter((session) => session.automationOrigin === undefined && session.nativeBinding?.runtimeGeneration)
         .map((session) => [session.sessionId, session.nativeBinding!.runtimeGeneration.toString(10)] as const));
+      const unavailable = this.#unavailableTimelines.get(profile.profileId);
       let details = (prior?.details ?? []).filter((entry) =>
-        regularGenerations.get(entry.sessionId) === entry.sessionGeneration);
+        regularGenerations.get(entry.sessionId) === entry.sessionGeneration && !unavailable?.has(entry.sessionId));
       const createdKeys: string[] = [];
       if (detailSessionId !== undefined) {
         let retainedDetail = detail!;
@@ -244,7 +253,10 @@ export class MobileOfflineCache {
           const size = utf8Size(raw, maximumDetailBytes, "current task");
           await this.storage.setItem(key, raw);
           createdKeys.push(key);
-          if (this.#epoch(profile.profileId) !== epoch) return;
+          if (!current()) {
+            await this.storage.removeItem(key).catch(() => undefined);
+            return;
+          }
           details.unshift({
             sessionId: detailSessionId,
             sessionGeneration: detail!.sessions[0]!.nativeBinding!.runtimeGeneration.toString(10),
@@ -263,9 +275,10 @@ export class MobileOfflineCache {
         owner: cacheableSnapshotJson(owner),
         details
       };
-      if (this.#epoch(profile.profileId) !== epoch) return;
+      if (!current()) return;
       await this.storage.setItem(manifestKey(profile.profileId), stringifyManifest(manifest));
-      if (this.#epoch(profile.profileId) !== epoch) return;
+      if (!current()) return;
+      if (detailSessionId !== undefined && createdKeys.length > 0) unavailable?.delete(detailSessionId);
       await this.storage.removeItem(tombstoneKey(profile.profileId));
       const retained = new Set(details.map((entry) => entry.key));
       await this.#removeUnreferencedDetailKeys(profile.profileId, retained);
@@ -275,9 +288,56 @@ export class MobileOfflineCache {
     });
   }
 
+  retireTaskTimeline(profile: MobileConnectionProfile, sessionId: string, project: (snapshot: Snapshot) => Snapshot): Promise<void> {
+    assertIdentity(profile);
+    assertLocalId(sessionId, "task");
+    const profileId = profile.profileId;
+    const timelines = this.#timelineEpochs.get(profileId) ?? new Map<string, number>();
+    this.#timelineEpochs.set(profileId, timelines);
+    timelines.set(sessionId, this.#timelineEpoch(profileId, sessionId) + 1);
+    const epoch = this.#epoch(profileId);
+    return this.#serialized(profileId, async () => {
+      if (this.#epoch(profileId) !== epoch) return;
+      try {
+        const key = manifestKey(profileId);
+        const raw = await this.storage.getItem(key);
+        if (raw === null) return;
+        const manifest = readManifest(raw, profile);
+        const entry = manifest.details.find(candidate => candidate.sessionId === sessionId);
+        if (entry === undefined) return;
+        const owner = readSnapshot(manifest.owner, "owner snapshot");
+        assertOwnerSnapshot(profile, manifest.node, owner);
+        const previousRaw = await this.storage.getItem(entry.key);
+        if (previousRaw === null) return;
+        const record = readDetail(previousRaw, profile, entry);
+        const previous = readSnapshot(record.snapshot, "task snapshot");
+        assertDetailSnapshot(owner, sessionId, previous);
+        const next = project(previous);
+        if (next === previous || this.#epoch(profileId) !== epoch) return;
+        const replacement = JSON.stringify({ ...record, snapshot: cacheableSnapshotJson(next) });
+        const size = utf8Size(replacement, maximumDetailBytes, "current task");
+        // Retire the old file first so a failed replacement cannot restore its text.
+        await this.storage.removeItem(entry.key);
+        await this.storage.setItem(entry.key, replacement);
+        if (this.#epoch(profileId) !== epoch) return;
+        await this.storage.setItem(key, stringifyManifest({ ...manifest,
+          details: manifest.details.map(candidate => candidate === entry ? { ...entry, size } : candidate) }));
+      } catch (error) {
+        if (this.#epoch(profileId) === epoch) {
+          const unavailable = this.#unavailableTimelines.get(profileId) ?? new Set<string>();
+          unavailable.add(sessionId);
+          this.#unavailableTimelines.set(profileId, unavailable);
+        }
+        throw error;
+      }
+    });
+  }
+
   clear(profileId: string): Promise<void> {
     assertLocalId(profileId, "connection profile");
     this.#epochs.set(profileId, this.#epoch(profileId) + 1);
+    this.#timelineEpochs.delete(profileId);
+    this.#unavailableTimelines.delete(profileId);
     const retire = this.storage.setItem(tombstoneKey(profileId), "1");
     return this.#serialized(profileId, async () => {
       let retirementError: unknown;
@@ -289,6 +349,10 @@ export class MobileOfflineCache {
   }
 
   #epoch(profileId: string): number { return this.#epochs.get(profileId) ?? 0; }
+
+  #timelineEpoch(profileId: string, sessionId: string | undefined): number {
+    return sessionId === undefined ? 0 : this.#timelineEpochs.get(profileId)?.get(sessionId) ?? 0;
+  }
 
   #serialized<T>(profileId: string, action: () => Promise<T>): Promise<T> {
     const previous = this.#tails.get(profileId) ?? Promise.resolve();
