@@ -1,7 +1,8 @@
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 
-import { Code } from "@connectrpc/connect";
+import { Code, type Transport } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
 import {
   RunState,
   SessionMessageSearchSemanticMode,
@@ -62,6 +63,86 @@ afterEach(async () => {
     embeddingServer = undefined;
   }
 });
+
+it("restarts a real stale search cursor without returning retired pages or retrying revoked authorization", async () => {
+  const serverId = "search-cursor-recovery";
+  fixture = await OrchestratorE2eFixture.start({ profiles: [PI_LIKE_PROFILE], serverId });
+  const paired = await fixture.pair();
+  const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+    createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId: fixture.targetId() })));
+  const { store } = fixture.application;
+  const session = store.getSession(sessionId).descriptor;
+  for (const id of ["cursor-first", "cursor-second"]) {
+    store.appendEvent({ id, backendId: session.backendId, targetId: session.targetId, sessionId,
+      generation: session.binding.generation, traceId: id,
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "cursorwitness" }] } });
+  }
+  let afterFirstPage: (() => void) | undefined;
+  const pageTokens: string[] = [];
+  const transportFor = (origin: string, secret?: string): Transport => createConnectTransport({
+    baseUrl: origin, httpVersion: "1.1", useBinaryFormat: true,
+    interceptors: [next => async request => {
+      if (secret !== undefined) request.header.set("authorization", `Bearer ${secret}`);
+      const searching = request.method.name === "SearchSessionMessages" && !request.stream;
+      const pageToken = searching ? (request.message as { page?: { pageToken?: string } }).page?.pageToken ?? "" : undefined;
+      if (pageToken !== undefined) pageTokens.push(pageToken);
+      const response = await next(request);
+      if (pageToken === "") {
+        const mutate = afterFirstPage;
+        afterFirstPage = undefined;
+        mutate?.();
+      }
+      return response;
+    }]
+  });
+  const { createOrchestratorGateway } = await import(new URL("../../web/src/gateway.ts", import.meta.url).href);
+  const gateway = createOrchestratorGateway({ id: paired.connectionId, deviceId: paired.deviceId,
+    serverId, name: "Search recovery", origin: fixture.baseUrl }, paired.authKey, {}, transportFor);
+  try {
+    await gateway.connect({ snapshotOnly: true });
+    const search = (signal?: AbortSignal) => gateway.searchAllSessionMessages("cursorwitness", {
+      semanticMode: "keyword", pageSize: 1, ...(signal === undefined ? {} : { signal })
+    });
+    afterFirstPage = () => { store.renameDevice(paired.deviceId, "Renamed during search"); };
+    const recovered = await search();
+    expect(recovered.matches).toHaveLength(2);
+    expect(new Set(recovered.matches.map((match: { eventId: string }) => match.eventId)))
+      .toEqual(new Set(["cursor-first", "cursor-second"]));
+    expect(pageTokens).toEqual(["", expect.any(String), "", expect.any(String)]);
+    expect(pageTokens[1]).not.toBe("");
+    expect(pageTokens[3]).not.toBe("");
+
+    pageTokens.length = 0;
+    afterFirstPage = () => { store.updateSession(sessionId, { hidden: true }); };
+    expect((await search()).matches).toEqual([]);
+    expect(pageTokens).toEqual(["", expect.any(String), ""]);
+    store.updateSession(sessionId, { hidden: false });
+
+    pageTokens.length = 0;
+    const controller = new AbortController();
+    afterFirstPage = () => controller.abort();
+    await expect(search(controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+    expect(pageTokens).toEqual([""]);
+
+    pageTokens.length = 0;
+    afterFirstPage = () => gateway.disconnect();
+    await expect(search()).rejects.toMatchObject({ name: "AbortError" });
+    expect(pageTokens).toEqual([""]);
+    await gateway.connect({ snapshotOnly: true });
+
+    await expect(paired.clients.session.searchSessionMessages({
+      scope: { case: "owner", value: {} }, query: "cursorwitness",
+      semanticMode: SessionMessageSearchSemanticMode.KEYWORD, page: { pageToken: "malformed" }
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+
+    pageTokens.length = 0;
+    afterFirstPage = () => { store.revokeConnection(paired.connectionId); };
+    await expect(search()).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(pageTokens).toEqual(["", expect.any(String)]);
+  } finally {
+    gateway.disconnect();
+  }
+}, 30_000);
 
 it("searches durable Session turns through authenticated HTTP, sqlite-vec, and a generation-fenced Provider route", async () => {
   const requests: Array<{ readonly inputType: string; readonly input: readonly string[] }> = [];

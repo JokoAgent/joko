@@ -12,6 +12,13 @@ export class StoreClosedError extends StoreError {
   }
 }
 
+export class MessageSearchRevisionConflictError extends StoreError {
+  constructor() {
+    super("Message search page token is stale because durable state changed.");
+    this.name = "MessageSearchRevisionConflictError";
+  }
+}
+
 export class ActiveWriterError extends StoreError {
   constructor(options?: ErrorOptions) {
     super("The operational store is already owned by another active writer.", options);
