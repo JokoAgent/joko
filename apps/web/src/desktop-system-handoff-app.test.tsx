@@ -273,8 +273,12 @@ describe("Desktop system handoff App boundary", () => {
       await act(async () => {
         more?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
         more?.click();
-        row?.querySelector<HTMLButtonElement>('button[aria-label="Delete message"]')?.click();
       });
+      const remove = pane.querySelector<HTMLButtonElement>(
+        '[data-message-client-id="answer-b"] button[role="menuitem"][aria-label="Delete this message"]'
+      );
+      expect(remove).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => remove?.click());
       expect(dialog()).not.toBeNull();
     };
     const clickConfirm = async (): Promise<void> => {

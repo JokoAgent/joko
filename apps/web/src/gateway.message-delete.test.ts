@@ -188,7 +188,11 @@ describe("message deletion gateway", () => {
 type EventKind = NonNullable<MessageInitShape<typeof EventPayloadSchema>["kind"]>;
 
 function harness(directReceipt = false) {
-  vi.stubGlobal("window", { location: { href: "https://joko.test/#/tasks/current" } });
+  vi.stubGlobal("window", {
+    location: { href: "https://joko.test/#/tasks/current" },
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout
+  });
   const submissions: SubmitOperationRequest[] = [];
   const snapshots: AppSnapshot[] = [];
   const errors: string[] = [];
