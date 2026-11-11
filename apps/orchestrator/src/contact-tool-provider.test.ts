@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { SessionDescriptor } from "@joko/core";
-import { ContactStore, OperationalStore } from "@joko/store";
+import { ContactStore, OperationalStore, type ContactDraft } from "@joko/store";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ContactManager } from "./contact-manager.js";
@@ -202,6 +202,80 @@ describe("ContactToolBridgeProvider", () => {
     }))).toMatchObject({ errorCode: "INVALID_ARGS" });
   });
 
+  it("resolves exact identities and names before a bounded page of weak full-text matches", async () => {
+    const { manager, provider } = createFixture();
+    enable(manager);
+    const create = (draft: Omit<ContactDraft, "kind">) => {
+      const profile = manager.create({ ...draft, kind: "person", expectedDirectoryRevision: manager.directory().revision }).contact;
+      if (profile === undefined) throw new Error("Fixture contact was not created.");
+      return profile;
+    };
+    const exact = create({
+      displayName: "Zoe",
+      aliases: ["星河", "Ａster"],
+      narrative: "Background details kept for the contact record. ".repeat(240).trim()
+    });
+    for (let i = 0; i < 26; i += 1) {
+      create({ displayName: `Colleague ${i}`, summary: "Met Zoe at the industry event." });
+    }
+    const oldWindow = manager.list({ query: "Zoe", limit: 25 });
+    expect(oldWindow.contacts).toHaveLength(25);
+    expect(oldWindow.contacts.map(({ id }) => id)).not.toContain(exact.id);
+
+    const resolve = async (args: Record<string, unknown>) =>
+      (resultData(await callOrdinary(provider, "contacts_resolve", args)) as {
+        matches: readonly { match_type: string; profile: { id: string } }[];
+      }).matches;
+    for (const value of ["zoe", "星河", "aster"]) {
+      expect(await resolve({ value })).toEqual([
+        expect.objectContaining({ match_type: "name", profile: expect.objectContaining({ id: exact.id }) })
+      ]);
+    }
+
+    const github = create({ displayName: "Taylor", identities: [{ platform: "github", value: "Zoe" }] });
+    const slack = create({ displayName: "Morgan", identities: [{ platform: "slack", value: "Zoe" }] });
+    const identities = await resolve({ value: "Zoe" });
+    expect(identities.map(match => [match.match_type, match.profile.id]))
+      .toEqual(expect.arrayContaining([["identity", github.id], ["identity", slack.id]]));
+    expect(identities).toHaveLength(2);
+    expect(await resolve({ value: "Zoe", platform: "github" })).toEqual([
+      expect.objectContaining({ match_type: "identity", profile: expect.objectContaining({ id: github.id }) })
+    ]);
+    expect(await resolve({ value: "Zoe", platform: "email" })).toEqual([]);
+
+    const fallback = await resolve({ value: "industry", limit: 20 });
+    expect(fallback).toHaveLength(20);
+    expect(fallback.every(match => match.match_type === "fts")).toBe(true);
+    expect(await resolve({ value: "industry" })).toEqual(fallback.slice(0, 5));
+  });
+
+  it("returns the adopted narrative and an explicit atomic error when exact-identity enrichment is too large", async () => {
+    const fixture = createFixture();
+    enable(fixture.manager);
+    const original = fixture.manager.create({ expectedDirectoryRevision: fixture.manager.directory().revision,
+      kind: "person", displayName: "Alice", narrative: "去年在会议认识",
+      identities: [{ platform: "email", value: "alice@example.test" }] }).contact!;
+    const enrich = (narrative: string) => callOrdinary(fixture.provider, "contacts_create", {
+      expected_directory_revision: revision(fixture.manager), kind: "person", display_name: "Alice",
+      narrative, identities: [{ platform: "email", value: "ALICE@example.test" }]
+    });
+    const adopted = resultData(await enrich("现在负责采购"));
+    expect(adopted).toMatchObject({ merged: true, merged_contact_id: original.id,
+      contact: { narrative: "去年在会议认识\n\n<!-- agent enrich 2026-09-21 -->\n现在负责采购" } });
+    const current = fixture.manager.get(original.id);
+    const afterAppend = fixture.manager.directory();
+    for (const invalid of [" \t\n ", " 现在负责采购 "]) {
+      expect(errorData(await enrich(invalid))).toMatchObject({ errorCode: "INVALID_ARGS" });
+    }
+    expect(fixture.manager.get(original.id)).toEqual(current);
+    expect(fixture.manager.directory()).toEqual(afterAppend);
+    const full = fixture.manager.update(current.id, current.revision, { narrative: "界".repeat(5_461) });
+    const before = fixture.manager.directory();
+    expect(errorData(await enrich("new context"))).toMatchObject({ errorCode: "INVALID_ARGS", message: "Contact narrative is too large." });
+    expect(fixture.manager.get(original.id)).toEqual(full);
+    expect(fixture.manager.directory()).toEqual(before);
+  });
+
   it("maintains events, directed relations, atomic group membership, and sensitive removals", async () => {
     const fixture = createFixture();
     enable(fixture.manager);
@@ -274,6 +348,44 @@ describe("ContactToolBridgeProvider", () => {
       event_id: eventId
     })) as { contact: { events: unknown[] } };
     expect(withoutEvent.contact.events).toEqual([]);
+    expect(resultData(await callOrdinary(fixture.provider, "contacts_append_event", {
+      contact_id: alice.id,
+      expected_revision: fixture.manager.get(alice.id).revision.toString(),
+      date: "2026-09",
+      text: "Agent observation"
+    }))).toMatchObject({ contact: { events: [expect.objectContaining({ date: "2026-09", text: "Agent observation", source: "agent" })] } });
+  });
+
+  it("pages rejected and valid vCards together and reports rejection reasons through the approved commit", async () => {
+    const fixture = createFixture();
+    enable(fixture.manager);
+    const card = (name: string) => `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${name}\r\nEND:VCARD\r\n`;
+    const first = resultData(await callOrdinary(fixture.provider, "contacts_preview_vcard_import", {
+      vcard_text: card("x".repeat(101)) + card("Bob") + card("y".repeat(101)), limit: 1
+    })) as { preview_id: string; directory_revision: string; next_offset: number };
+    expect(first).toMatchObject({ entry_total: 3, entries: [], rejected_entry_count: 2, next_offset: 1,
+      rejected_entries: [{ entry_id: "vcard-entry-1", reason: "Contact display name is invalid." }] });
+    const second = resultData(await callOrdinary(fixture.provider, "contacts_get_vcard_import_preview", {
+      preview_id: first.preview_id, offset: first.next_offset, limit: 1
+    }));
+    expect(second).toMatchObject({ entries: [{ entry_id: "vcard-entry-2", disposition: "create" }], rejected_entries: [], next_offset: 2 });
+    const last = resultData(await callOrdinary(fixture.provider, "contacts_get_vcard_import_preview", {
+      preview_id: first.preview_id, offset: 2, limit: 1
+    }));
+    expect(last).toMatchObject({ entries: [], rejected_entries: [{ entry_id: "vcard-entry-3", reason: "Contact display name is invalid." }] });
+    expect(last).not.toHaveProperty("next_offset");
+    expect(errorData(await callOrdinary(fixture.provider, "contacts_get_vcard_import_preview", {
+      preview_id: first.preview_id, offset: 4, limit: 1
+    }))).toMatchObject({ errorCode: "INVALID_ARGS" });
+    const commit = { preview_id: first.preview_id, expected_directory_revision: first.directory_revision, decisions: [] };
+    expect(errorData(await callOrdinary(fixture.provider, "contacts_commit_vcard_import", commit))).toMatchObject({ errorCode: "CONFIRMATION_REQUIRED" });
+    expect(resultData(await callSensitive(fixture.provider, "contacts_commit_vcard_import", commit))).toMatchObject({
+      created: 1, enriched: 0, skipped: 2, entries: [
+        { entry_id: "vcard-entry-1", outcome: "skipped", reason: "Contact display name is invalid." },
+        { entry_id: "vcard-entry-2", outcome: "created" },
+        { entry_id: "vcard-entry-3", outcome: "skipped", reason: "Contact display name is invalid." }
+      ]
+    });
   });
 
   it("previews paged vCards, atomically commits through the sensitive entry, and exports portable text", async () => {

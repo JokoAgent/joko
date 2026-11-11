@@ -5,6 +5,8 @@ import {
   ContactStoreError,
   normalizeContactIdentityValue,
   normalizeContactPlatform,
+  validateContactDraft,
+  validateContactRelationText,
   type ContactDirectoryState,
   type ContactDraft,
   type ContactDuplicateCandidate,
@@ -51,7 +53,14 @@ export interface ContactVCardImportPreview {
   readonly previewId: string;
   readonly directoryRevision: bigint;
   readonly entries: readonly ContactVCardImportPreviewEntry[];
+  readonly rejectedEntries?: readonly ContactVCardImportRejectedEntry[];
   readonly expiresAt: number;
+}
+
+export interface ContactVCardImportRejectedEntry {
+  readonly entryId: string;
+  readonly displayName: string;
+  readonly reason: string;
 }
 
 export interface ContactVCardImportDecision {
@@ -82,6 +91,7 @@ export interface ContactVCardImportEntryResult {
   readonly displayName: string;
   readonly outcome: "created" | "enriched" | "skipped";
   readonly contactId?: string;
+  readonly reason?: string;
 }
 
 export interface ContactVCardExport {
@@ -153,10 +163,44 @@ export class ContactManager {
   resolveIdentities(value: string, limit: number) {
     return this.store.findIdentitiesByValue(value, limit);
   }
+  resolveNameIds(value: string, limit: number): readonly string[] {
+    return this.store.findContactIdsByExactName(value, limit);
+  }
   findSimilar(contact: ContactDraft): readonly ContactDuplicateCandidate[] { return this.store.findSimilar(contact); }
   create(input: ContactDraft & { readonly expectedDirectoryRevision: bigint; readonly confirmedNameCandidateIds?: readonly string[] }) {
     return this.store.createContact(input);
   }
+  registerTelegramGroupSpeaker(input: {
+    readonly providerUserId: string;
+    readonly displayName: string;
+    readonly username: string | null;
+  }): boolean {
+    return this.store.runInTransaction(() => {
+      const directory = this.directory();
+      if (!directory.enabled) return false;
+      if (this.resolveIdentity("telegram", input.providerUserId) !== undefined) return true;
+
+      const draft: ContactDraft = {
+        kind: "person",
+        displayName: input.displayName.trim() || input.providerUserId,
+        source: "agent",
+        summary: "Telegram group member",
+        identities: [
+          { platform: "telegram", value: input.providerUserId },
+          ...(input.username === null ? [] : [{ platform: "telegram", value: `@${input.username}` }])
+        ]
+      };
+      const candidates = this.findSimilar(draft);
+      // A reused username does not grant authority over the existing contact.
+      if (candidates.some(candidate => candidate.matchType === "identity")) return false;
+      return this.create({
+        ...draft,
+        expectedDirectoryRevision: directory.revision,
+        confirmedNameCandidateIds: candidates.map(candidate => candidate.contactId)
+      }).contact !== undefined;
+    });
+  }
+
   createOrEnrichFromAgent(input: Omit<ContactDraft, "source"> & {
     readonly expectedDirectoryRevision: bigint;
     readonly allowDuplicate?: boolean;
@@ -289,9 +333,23 @@ export class ContactManager {
     }
 
     const entries: ContactVCardImportPreviewEntry[] = [];
+    const rejectedEntries: ContactVCardImportRejectedEntry[] = [];
     const stagedIdentities = new Map<string, string>();
     for (const [index, card] of parsed.entries()) {
       const entryId = `vcard-entry-${index + 1}`;
+      try {
+        validateContactDraft(card.draft);
+        if (card.organizationName !== undefined) {
+          validateContactDraft({ kind: "organization", displayName: card.organizationName, source: "import" });
+          validateContactRelationText("works at", card.title ?? "");
+        }
+      } catch (error) {
+        if (!(error instanceof ContactStoreError && error.code === "CONTACT_INVALID")) throw error;
+        const displayName = card.draft.displayName.replace(/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, " ")
+          .trim().slice(0, 100).replace(/[\uD800-\uDBFF]$/u, "").trim();
+        rejectedEntries.push({ entryId, displayName: displayName || entryId, reason: error.message.slice(0, 120) });
+        continue;
+      }
       const candidates = this.store.findSimilar(card.draft);
       const existingIdentityIds = unique(candidates.filter((candidate) => candidate.matchType === "identity")
         .map((candidate) => candidate.contactId));
@@ -331,6 +389,7 @@ export class ContactManager {
       previewId: `contact-import-${this.#idFactory()}`,
       directoryRevision: this.store.directoryState().revision,
       entries: Object.freeze(entries),
+      ...(rejectedEntries.length === 0 ? {} : { rejectedEntries: Object.freeze(rejectedEntries) }),
       expiresAt: now + PREVIEW_LIFETIME_MS
     });
     this.#previews.set(preview.previewId, preview);
@@ -364,14 +423,16 @@ export class ContactManager {
     const result = this.store.runInTransaction(() => {
       const resolvedEntries = new Map<string, string>();
       const contactIds = new Set<string>();
-      const entryResults: ContactVCardImportEntryResult[] = [];
+      const entryResults: ContactVCardImportEntryResult[] = (preview.rejectedEntries ?? []).map((entry) => ({ ...entry, outcome: "skipped" }));
       let created = 0;
       let enriched = 0;
-      let skipped = 0;
+      let skipped = entryResults.length;
       for (const entry of preview.entries) {
         const decision = decisions.get(entry.entryId);
         let contact: ContactProfileRecord | undefined;
-        const action = entry.disposition === "needs_review" ? decision!.decision : entry.disposition === "create" ? "create" : "merge";
+        const action = decision?.decision === "skip" ? "skip"
+          : entry.disposition === "needs_review" ? decision!.decision
+            : entry.disposition === "create" ? "create" : "merge";
         if (action === "skip") {
           skipped += 1;
           entryResults.push({ entryId: entry.entryId, displayName: entry.contact.displayName, outcome: "skipped" });
@@ -423,6 +484,7 @@ export class ContactManager {
           contactId: contact.id
         });
       }
+      entryResults.sort((left, right) => Number(left.entryId.slice("vcard-entry-".length)) - Number(right.entryId.slice("vcard-entry-".length)));
       return { created, enriched, skipped, contactIds: [...contactIds], entries: entryResults };
     });
     this.#previews.delete(preview.previewId);
@@ -504,10 +566,17 @@ export class ContactManager {
       ...(folded(current.displayName) === folded(draft.displayName) ? [] : [draft.displayName]),
       ...(draft.aliases ?? [])
     ], current.displayName).slice(0, 20);
+    const incomingNarrative = draft.narrative ?? "";
+    const narrative = incomingNarrative === "" || current.narrative.includes(incomingNarrative)
+      ? current.narrative
+      : current.narrative === "" ? incomingNarrative
+        : draft.source === "agent"
+          ? `${current.narrative}\n\n<!-- agent enrich ${new Date(this.#now()).toISOString().slice(0, 10)} -->\n${incomingNarrative}`
+          : current.narrative;
     const patch: ContactPatch = {
       ...(sameFoldedNames(aliases, current.aliases) ? {} : { aliases }),
       ...(current.summary === "" && draft.summary !== undefined && draft.summary !== "" ? { summary: draft.summary } : {}),
-      ...(current.narrative === "" && draft.narrative !== undefined && draft.narrative !== "" ? { narrative: draft.narrative } : {}),
+      ...(narrative === current.narrative ? {} : { narrative }),
       ...(current.agentNotes === "" && draft.agentNotes !== undefined && draft.agentNotes !== "" ? { agentNotes: draft.agentNotes } : {}),
       ...(current.status === "pending" && draft.status === "confirmed" ? { status: "confirmed" as ContactStatus } : {})
     };
@@ -579,7 +648,7 @@ export class ContactManager {
     let current = contact;
     for (const name of names) {
       try {
-        let group = this.store.listGroups().find((candidate) => folded(candidate.name) === folded(name));
+        let group = this.store.listGroups().find((candidate) => candidate.name === name);
         group ??= this.store.createGroup(this.store.directoryState().revision, name);
         if (!current.groups.some((candidate) => candidate.id === group.id)) {
           current = this.store.setGroupMembership(current.id, current.revision, group.id, true);

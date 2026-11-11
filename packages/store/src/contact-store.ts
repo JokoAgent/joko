@@ -136,7 +136,7 @@ CREATE TABLE contact_events (
 CREATE TABLE contact_groups (
   id TEXT PRIMARY KEY,
   revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
-  name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  name TEXT NOT NULL UNIQUE,
   description TEXT NOT NULL,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
@@ -225,6 +225,8 @@ export class ContactStore {
     this.#idFactory = options.idFactory ?? randomUUID;
     try {
       this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA trusted_schema = OFF;");
+      this.#database.function("contact_name_key", { deterministic: true },
+        (value) => typeof value === "string" ? folded(value) : null);
       if (filePath !== ":memory:") this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
       this.#initialize();
     } catch (error) {
@@ -298,12 +300,23 @@ export class ContactStore {
       clauses.push("EXISTS (SELECT 1 FROM contact_group_members member WHERE member.contact_id = contact.id AND member.group_id = ?)");
       params.push(groupId);
     }
-    if (fts !== undefined) { clauses.push("contact_search_fts MATCH ?"); params.push(fts); }
+    const search = fts === undefined ? "" : `WITH fts_matches AS MATERIALIZED (
+      SELECT contact_id, bm25(contact_search_fts) AS score FROM contact_search_fts WHERE contact_search_fts MATCH ?
+    ), search_matches AS (
+      SELECT contact_id, 0 AS match_kind, score FROM fts_matches
+      UNION ALL
+      SELECT contact_id, 1 AS match_kind, 0 AS score FROM contact_search_fts
+      WHERE content LIKE ? ESCAPE '\\'
+        AND contact_id NOT IN (SELECT contact_id FROM fts_matches)
+    )`;
+    if (fts !== undefined) params.unshift(fts, `%${query!.replace(/[\\%_]/gu, character => `\\${character}`)}%`);
     const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
-    const join = fts === undefined ? "" : "JOIN contact_search_fts ON contact_search_fts.contact_id = contact.id";
-    const totalRow = this.#database.prepare(`SELECT COUNT(*) AS count FROM contacts contact ${join} ${where}`).get(...params) as Row;
-    const order = fts === undefined ? "contact.updated_at DESC, contact.id" : "bm25(contact_search_fts), contact.updated_at DESC, contact.id";
+    const join = fts === undefined ? "" : "JOIN search_matches ON search_matches.contact_id = contact.id";
+    const totalRow = this.#database.prepare(`${search} SELECT COUNT(*) AS count FROM contacts contact ${join} ${where}`).get(...params) as Row;
+    const order = fts === undefined ? "contact.updated_at DESC, contact.id"
+      : "search_matches.match_kind, search_matches.score, contact.updated_at DESC, contact.id";
     const rows = this.#database.prepare(`
+      ${search}
       SELECT contact.*, (SELECT COUNT(*) FROM contact_identities identity WHERE identity.contact_id = contact.id) AS identity_count
       FROM contacts contact ${join} ${where}
       ORDER BY ${order} LIMIT ? OFFSET ?
@@ -456,6 +469,13 @@ export class ContactStore {
       `).run(revision, next.kind, next.displayName, JSON.stringify(next.aliases), next.summary,
         next.narrative, next.agentNotes, next.status, at, id);
       this.#rebuildSearch(id);
+      if (next.displayName !== current["display_name"]) {
+        const related = this.#database.prepare(`
+          SELECT to_contact_id AS id FROM contact_relations WHERE from_contact_id = ?
+          UNION SELECT from_contact_id AS id FROM contact_relations WHERE to_contact_id = ?
+        `).all(id, id);
+        for (const row of related) this.#rebuildSearch(string(row["id"]));
+      }
       return this.getContact(id);
     });
   }
@@ -491,7 +511,6 @@ export class ContactStore {
       const at = this.#now();
       this.#insertIdentity(id, revision, identityDraft(input), at);
       this.#touchContacts([id], revision, at);
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -507,7 +526,6 @@ export class ContactStore {
       const revision = this.#advanceDirectoryRevision();
       this.#database.prepare("DELETE FROM contact_identities WHERE id = ? AND contact_id = ?").run(identity, id);
       this.#touchContacts([id], revision, this.#now());
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -526,7 +544,6 @@ export class ContactStore {
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(this.#newId("contact_event"), id, revision, draft.date, draft.text, draft.source, at);
       this.#touchContacts([id], revision, at);
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -543,7 +560,6 @@ export class ContactStore {
       const revision = this.#advanceDirectoryRevision();
       this.#database.prepare("DELETE FROM contact_events WHERE id = ? AND contact_id = ?").run(event, id);
       this.#touchContacts([id], revision, this.#now());
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -563,7 +579,7 @@ export class ContactStore {
       if (this.#count("contact_groups") >= MAX_GROUPS) throw invalid("The contact group limit was reached.");
       const name = text(nameValue, 1, MAX_GROUP_NAME, "Contact group name");
       const description = text(descriptionValue, 0, MAX_SUMMARY, "Contact group description");
-      if (this.#database.prepare("SELECT id FROM contact_groups WHERE name = ? COLLATE NOCASE").get(name) !== undefined) {
+      if (this.#database.prepare("SELECT id FROM contact_groups WHERE name = ?").get(name) !== undefined) {
         throw new ContactStoreError("CONTACT_ALREADY_EXISTS", "A contact group with this name already exists.");
       }
       const revision = this.#advanceDirectoryRevision();
@@ -583,7 +599,7 @@ export class ContactStore {
       this.#assertEntityRevision("Contact group", id, current, expectedRevision);
       const name = text(nameValue, 1, MAX_GROUP_NAME, "Contact group name");
       const description = text(descriptionValue, 0, MAX_SUMMARY, "Contact group description");
-      const duplicate = this.#database.prepare("SELECT id FROM contact_groups WHERE name = ? COLLATE NOCASE AND id <> ?").get(name, id);
+      const duplicate = this.#database.prepare("SELECT id FROM contact_groups WHERE name = ? AND id <> ?").get(name, id);
       if (duplicate !== undefined) throw new ContactStoreError("CONTACT_ALREADY_EXISTS", "A contact group with this name already exists.");
       const revision = this.#advanceDirectoryRevision();
       this.#database.prepare("UPDATE contact_groups SET revision = ?, name = ?, description = ?, updated_at = ? WHERE id = ?")
@@ -643,8 +659,7 @@ export class ContactStore {
       if (this.#count("contact_relations", "from_contact_id", from) + this.#count("contact_relations", "to_contact_id", from) >= MAX_RELATIONS) {
         throw invalid("The contact relation limit was reached.");
       }
-      const relation = text(input.relation, 1, MAX_RELATION, "Contact relation");
-      const note = text(input.note ?? "", 0, MAX_NOTE, "Contact relation note");
+      const { relation, note } = contactRelationText(input.relation, input.note ?? "");
       if (this.#database.prepare(`
         SELECT id FROM contact_relations WHERE from_contact_id = ? AND to_contact_id = ? AND relation = ?
       `).get(from, to, relation) !== undefined) throw new ContactStoreError("CONTACT_ALREADY_EXISTS", "This contact relation already exists.");
@@ -677,8 +692,7 @@ export class ContactStore {
         throw notFound("Contact relation", relationId);
       }
       this.#assertEntityRevision("Contact relation", relationId, current, input.expectedRelationRevision);
-      const relation = text(input.relation, 1, MAX_RELATION, "Contact relation");
-      const note = text(input.note ?? "", 0, MAX_NOTE, "Contact relation note");
+      const { relation, note } = contactRelationText(input.relation, input.note ?? "");
       const from = string(current["from_contact_id"]);
       const to = string(current["to_contact_id"]);
       const duplicate = this.#database.prepare(`
@@ -841,6 +855,18 @@ export class ContactStore {
       WHERE normalized_value IN (${placeholders})
       ORDER BY created_at, id LIMIT ?
     `).all(...normalizedValues, limit) as Row[]).map(contactIdentityFromRow);
+  }
+
+  findContactIdsByExactName(value: string, limitValue = 5): readonly string[] {
+    this.#assertOpen();
+    const limit = boundedInteger(limitValue, 1, 20, "Contact name match limit");
+    const key = folded(text(value, 1, 256, "Contact name lookup"));
+    return (this.#database.prepare(`
+      SELECT id FROM contacts
+      WHERE contact_name_key(display_name) = ?
+        OR EXISTS (SELECT 1 FROM json_each(contacts.aliases_json) alias WHERE contact_name_key(alias.value) = ?)
+      ORDER BY updated_at DESC, id LIMIT ?
+    `).all(key, key, limit) as Row[]).map((row) => string(row["id"]));
   }
 
   contactSyncConfiguration(): ContactSyncConfigurationRecord | undefined {
@@ -1224,6 +1250,13 @@ export class ContactStore {
     if (integrity.length !== 1 || string(integrity[0]?.["quick_check"]) !== "ok") {
       throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The Contacts database failed its integrity check.");
     }
+    // Relations are part of the existing derived document, not a new schema.
+    // Repair older documents without changing the durable directory revision.
+    this.#write(() => {
+      const related = this.#database.prepare(`SELECT from_contact_id AS id FROM contact_relations
+        UNION SELECT to_contact_id AS id FROM contact_relations`).iterate();
+      for (const row of related) this.#rebuildSearch(string(row["id"]));
+    });
   }
 
   #write<T>(callback: () => T): T {
@@ -1289,6 +1322,7 @@ export class ContactStore {
   #touchContacts(ids: readonly string[], revision: number, at: number): void {
     for (const id of new Set(ids)) {
       this.#database.prepare("UPDATE contacts SET revision = ?, updated_at = ? WHERE id = ?").run(revision, at, id);
+      this.#rebuildSearch(id);
     }
   }
 
@@ -1306,6 +1340,14 @@ export class ContactStore {
     const eventRows = this.#database.prepare(`
       SELECT event_date, text, source FROM contact_events WHERE contact_id = ? ORDER BY id
     `).all(contactId) as Row[];
+    const relationRows = this.#database.prepare(`
+      SELECT relation_value.relation, relation_value.note, related.display_name
+      FROM contact_relations relation_value
+      JOIN contacts related ON related.id = CASE WHEN relation_value.from_contact_id = ?
+        THEN relation_value.to_contact_id ELSE relation_value.from_contact_id END
+      WHERE relation_value.from_contact_id = ? OR relation_value.to_contact_id = ?
+      ORDER BY relation_value.id
+    `).all(contactId, contactId, contactId) as Row[];
     const content = [
       string(contact["display_name"]),
       ...aliases(contact["aliases_json"]),
@@ -1313,8 +1355,11 @@ export class ContactStore {
       string(contact["narrative"]),
       string(contact["agent_notes"]),
       ...identityRows.flatMap((row) => [string(row["platform"]), string(row["value"]), string(row["label"]), string(row["note"])]),
-      ...eventRows.flatMap((row) => [string(row["event_date"]), string(row["text"]), string(row["source"])])
+      ...eventRows.flatMap((row) => [string(row["event_date"]), string(row["text"]), string(row["source"])]),
+      ...relationRows.flatMap((row) => [string(row["relation"]), string(row["display_name"]), string(row["note"])])
     ].filter(Boolean).join("\n");
+    const indexed = this.#database.prepare("SELECT content FROM contact_search_fts WHERE contact_id = ?").get(contactId);
+    if (indexed?.["content"] === content) return;
     this.#database.prepare("DELETE FROM contact_search_fts WHERE contact_id = ?").run(contactId);
     this.#database.prepare("INSERT INTO contact_search_fts(contact_id, content) VALUES (?, ?)").run(contactId, content);
   }
@@ -1439,6 +1484,19 @@ export function normalizeContactIdentityValue(value: string, platformValue?: str
   return normalized;
 }
 
+/** Validate an import candidate without reading or changing the directory. */
+export function validateContactDraft(input: ContactDraft): void {
+  contactDraft(input);
+}
+
+export function validateContactRelationText(relation: string, note: string): void {
+  contactRelationText(relation, note);
+}
+
+function contactRelationText(relation: string, note: string): { readonly relation: string; readonly note: string } {
+  return { relation: text(relation, 1, MAX_RELATION, "Contact relation"), note: text(note, 0, MAX_NOTE, "Contact relation note") };
+}
+
 function contactDraft(input: ContactDraft): {
   readonly kind: ContactKind;
   readonly displayName: string;
@@ -1528,7 +1586,7 @@ function eventDraft(input: ContactEventDraft): { readonly date: string; readonly
   return {
     date,
     text: text(input.text, 1, MAX_EVENT_TEXT, "Contact event text"),
-    source: text(input.source ?? "manual", 1, 64, "Contact event source")
+    source: text(typeof input.source === "string" ? input.source.trim() : input.source ?? "", 0, 64, "Contact event source")
   };
 }
 

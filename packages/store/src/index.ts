@@ -13,7 +13,9 @@ export {
   ContactStore,
   contactSyncPublicKeyFingerprint,
   normalizeContactIdentityValue,
-  normalizeContactPlatform
+  normalizeContactPlatform,
+  validateContactDraft,
+  validateContactRelationText
 } from "./contact-store.js";
 export type { ContactListOptions, ContactStoreOptions } from "./contact-store.js";
 export { ContactStoreError } from "./contact-types.js";

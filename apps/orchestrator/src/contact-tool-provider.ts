@@ -7,6 +7,7 @@ import {
   type ContactDuplicateCandidate,
   type ContactGroupRecord,
   type ContactIdentityDraft,
+  type ContactIdentityRecord,
   type ContactProfileRecord,
   type ContactSummaryRecord,
   type OperationalStore
@@ -109,7 +110,7 @@ const VCARD_RULE =
 
 const CONTACT_NESTED_TOOLS: readonly ContactNestedToolDescriptor[] = Object.freeze([
   nestedTool("contacts_resolve", "search",
-    "Resolve an exact platform identity, name, alias, or full-text clue to compact Contacts profiles ranked by identity, name, then full-text confidence.",
+    "Return compact Contacts profiles from the first matching tier: exact platform identity, exact display name or alias, then full-text clues.",
     objectSchema({
       value: { type: "string", minLength: 1, maxLength: 320 },
       platform: { type: "string", minLength: 1, maxLength: 32, pattern: "^[a-z0-9_-]+$" },
@@ -245,18 +246,18 @@ const CONTACT_NESTED_TOOLS: readonly ContactNestedToolDescriptor[] = Object.free
       add: { type: "array", items: CONTACT_MEMBER_SCHEMA, maxItems: 200 },
       remove: { type: "array", items: CONTACT_MEMBER_SCHEMA, maxItems: 200 }
     }, ["group_id", "expected_group_revision"]), "conditional", [COLLECTION_RULE, SENSITIVE_RULE]),
-  nestedTool("contacts_preview_vcard_import", "manage", "Parse portable vCard text into a revision-fenced, paged import preview.",
+  nestedTool("contacts_preview_vcard_import", "manage", "Preview vCards with valid entries and rejected_entries with reasons. next_offset pages both lists together.",
     objectSchema({
       vcard_text: { type: "string", minLength: 1, maxLength: 2 * 1024 * 1024 },
       limit: { type: "integer", minimum: 1, maximum: MAXIMUM_PREVIEW_PAGE_SIZE, default: DEFAULT_PREVIEW_PAGE_SIZE }
     }, ["vcard_text"]), "never", [VCARD_RULE]),
-  nestedTool("contacts_get_vcard_import_preview", "manage", "Read another bounded page from an unexpired vCard import preview.",
+  nestedTool("contacts_get_vcard_import_preview", "manage", "Read the next bounded page of valid and rejected entries from an unexpired vCard import preview.",
     objectSchema({
       preview_id: ID_SCHEMA,
       offset: { type: "integer", minimum: 0, maximum: 2_000, default: 0 },
       limit: { type: "integer", minimum: 1, maximum: MAXIMUM_PREVIEW_PAGE_SIZE, default: DEFAULT_PREVIEW_PAGE_SIZE }
     }, ["preview_id"]), "never", [VCARD_RULE]),
-  nestedTool("contacts_commit_vcard_import", "manage", "Atomically commit exact create/merge/skip decisions for an unexpired vCard preview.",
+  nestedTool("contacts_commit_vcard_import", "manage", "Atomically commit decisions for valid preview entries. Rejected entries are skipped with reasons and need no decisions.",
     objectSchema({
       preview_id: ID_SCHEMA,
       expected_directory_revision: REVISION_SCHEMA,
@@ -504,28 +505,27 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
     }
     if (value.length > 256) throw new ContactToolError("INVALID_ARGS", "value exceeds the full-text lookup limit; specify platform.");
     const exactIdentities = this.#contacts.resolveIdentities(value, limit);
-    const exactByContact = new Map(exactIdentities.map((identity) => [identity.contactId, identity]));
-    const page = this.#contacts.list({ query: value, limit: Math.min(100, Math.max(20, limit * 5)), offset: 0 });
-    const foldedValue = folded(value);
-    const ranked = [
-      ...exactIdentities.map((identity) => ({ contactId: identity.contactId, rank: 0, identity })),
-      ...page.contacts.filter((summary) => !exactByContact.has(summary.id)).map((summary) => ({
-        contactId: summary.id,
-        rank: folded(summary.displayName) === foldedValue || summary.aliases.some((alias) => folded(alias) === foldedValue) ? 1 : 2,
-        identity: undefined
-      }))
-    ].sort((left, right) => left.rank - right.rank);
-    const selected = new Map<string, typeof ranked[number]>();
-    for (const entry of ranked) {
-      if (!selected.has(entry.contactId)) selected.set(entry.contactId, entry);
-      if (selected.size >= limit) break;
+    if (exactIdentities.length > 0) {
+      const byContact = new Map<string, ContactIdentityRecord>();
+      for (const identity of exactIdentities) {
+        if (!byContact.has(identity.contactId)) byContact.set(identity.contactId, identity);
+      }
+      return { matches: [...byContact.values()].map((identity) => ({
+        match_type: "identity",
+        matched_identity: publicIdentity(identity),
+        profile: compactProfile(this.#contacts.get(identity.contactId))
+      })) };
     }
-    const matches = [...selected.values()].map((entry) => ({
-      match_type: entry.rank === 0 ? "identity" : entry.rank === 1 ? "name" : "fts",
-      ...(entry.identity === undefined ? {} : { matched_identity: publicIdentity(entry.identity) }),
-      profile: compactProfile(this.#contacts.get(entry.contactId))
-    }));
-    return { matches };
+    const nameIds = this.#contacts.resolveNameIds(value, limit);
+    if (nameIds.length > 0) return { matches: nameIds.map((id) => ({
+      match_type: "name",
+      profile: compactProfile(this.#contacts.get(id))
+    })) };
+    const page = this.#contacts.list({ query: value, limit });
+    return { matches: page.contacts.map(({ id }) => ({
+      match_type: "fts",
+      profile: compactProfile(this.#contacts.get(id))
+    })) };
   }
 
   #search(input: Readonly<Record<string, unknown>>): unknown {
@@ -832,7 +832,8 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
         entry_id: entry.entryId,
         display_name: entry.displayName,
         outcome: entry.outcome,
-        ...(entry.contactId === undefined ? {} : { contact_id: entry.contactId })
+        ...(entry.contactId === undefined ? {} : { contact_id: entry.contactId }),
+        ...(entry.reason === undefined ? {} : { reason: entry.reason })
       })),
       entry_count: result.entries.length,
       results_truncated: result.entries.length > COMMIT_RESULT_LIMIT || result.contactIds.length > COMMIT_RESULT_LIMIT,
@@ -1127,16 +1128,25 @@ function publicCandidate(value: ContactDuplicateCandidate): Readonly<Record<stri
 }
 
 function publicPreviewPage(preview: ContactVCardImportPreview, offset: number, limit: number): Readonly<Record<string, unknown>> {
-  if (offset > preview.entries.length) throw new ContactToolError("INVALID_ARGS", "Preview offset exceeds the entry count.");
-  const entries = preview.entries.slice(offset, offset + limit);
+  const rejected = preview.rejectedEntries ?? [];
+  const ordered = [...preview.entries.map((entry) => ({ kind: "entry" as const, entryId: entry.entryId, entry })),
+    ...rejected.map((rejection) => ({ kind: "rejected" as const, entryId: rejection.entryId, rejection }))]
+    .sort((left, right) => Number(left.entryId.slice("vcard-entry-".length)) - Number(right.entryId.slice("vcard-entry-".length)));
+  if (offset > ordered.length) throw new ContactToolError("INVALID_ARGS", "Preview offset exceeds the entry count.");
+  const page = ordered.slice(offset, offset + limit);
   return {
     preview_id: preview.previewId,
     directory_revision: preview.directoryRevision.toString(),
     expires_at: iso(preview.expiresAt),
-    entry_total: preview.entries.length,
+    entry_total: ordered.length,
     offset,
-    entries: entries.map(publicPreviewEntry),
-    ...(offset + entries.length < preview.entries.length ? { next_offset: offset + entries.length } : {})
+    entries: page.flatMap((item) => item.kind === "entry" ? [publicPreviewEntry(item.entry)] : []),
+    ...(rejected.length === 0 ? {} : {
+      rejected_entry_count: rejected.length,
+      rejected_entries: page.flatMap((item) => item.kind === "rejected" ? [{ entry_id: item.rejection.entryId,
+        display_name: item.rejection.displayName, reason: item.rejection.reason }] : [])
+    }),
+    ...(offset + page.length < ordered.length ? { next_offset: offset + page.length } : {})
   };
 }
 

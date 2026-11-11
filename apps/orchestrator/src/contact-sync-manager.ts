@@ -30,6 +30,7 @@ import {
 
 const PRIVATE_KEY_ASSOCIATION_PREFIX = "joko:contacts-device-sync:x25519-private-key:v1:";
 const AUTOMATIC_SYNC_INTERVAL_MILLISECONDS = 30_000;
+const FULL_SYNC_INTERVAL_MILLISECONDS = 30 * 60_000;
 
 export type ContactSyncPhase = "off" | "waiting" | "syncing" | "up_to_date" | "error";
 export type ContactSyncErrorCode = "identity_unavailable" | "peer_identity_changed" | "sync_failed";
@@ -118,6 +119,7 @@ export class ContactSyncManager {
   readonly #onChanged: () => void;
   readonly #now: () => number;
   readonly #peerKnownClocks = new Map<string, readonly ContactSyncClock[]>();
+  readonly #peerFullSyncAt = new Map<string, number>();
   #configuration?: ContactSyncConfigurationRecord;
   #privateKey?: string;
   #transport?: ContactSyncTransportPort;
@@ -274,7 +276,6 @@ export class ContactSyncManager {
     this.#assertReady();
     const peerId = nodeId(peerIdValue);
     this.#store.revokeContactSyncPeer(peerId, expectedRevision);
-    this.#peerKnownClocks.delete(peerId);
     this.#revokeRuntimeAuthority();
     if (this.#configuration?.enabled === true) this.#scheduleAutomaticSync(500);
     this.#errorCode = undefined;
@@ -282,7 +283,11 @@ export class ContactSyncManager {
     return this.status();
   }
 
-  async syncNow(peerIdValue?: string): Promise<ContactSyncStatus> {
+  syncNow(peerIdValue?: string): Promise<ContactSyncStatus> {
+    return this.#sync(peerIdValue, true);
+  }
+
+  async #sync(peerIdValue: string | undefined, calibrate: boolean): Promise<ContactSyncStatus> {
     this.#assertReady();
     const configuration = this.#requireConfiguration();
     if (!configuration.enabled) throw new ContactSyncManagerError("DISABLED", "Contacts sync is disabled.");
@@ -298,6 +303,9 @@ export class ContactSyncManager {
       }
     }
     const online = new Set(this.#transport?.onlinePeerIds(this.#now()) ?? []);
+    for (const peerId of this.#peerFullSyncAt.keys()) {
+      if (!online.has(peerId)) this.#peerFullSyncAt.delete(peerId);
+    }
     const peerIds = peerIdValue === undefined
       ? this.#store.listContactSyncPeers().map((peer) => peer.peerId).filter((peerId) => online.has(peerId))
       : [nodeId(peerIdValue)];
@@ -313,7 +321,11 @@ export class ContactSyncManager {
     this.#activeSyncs += 1;
     this.#emitChanged();
     try {
-      for (const peerId of peerIds) await this.#sendState(peerId, true, generation);
+      for (const peerId of peerIds) {
+        const lastFullSyncAt = this.#peerFullSyncAt.get(peerId);
+        const sendFullState = calibrate || lastFullSyncAt === undefined || this.#now() - lastFullSyncAt >= FULL_SYNC_INTERVAL_MILLISECONDS;
+        await this.#sendState(peerId, true, generation, sendFullState);
+      }
       this.#errorCode = undefined;
     } catch (error) {
       if (generation === this.#generation) this.#setError(error);
@@ -375,7 +387,7 @@ export class ContactSyncManager {
     }
   }
 
-  async #sendState(peerId: string, requestReply: boolean, generation: number): Promise<void> {
+  async #sendState(peerId: string, requestReply: boolean, generation: number, calibrate = false): Promise<void> {
     this.#assertGeneration(generation);
     const peer = this.#store.contactSyncPeer(peerId);
     if (peer === undefined) throw new ContactSyncManagerError("NOT_FOUND", "The Contacts sync peer is no longer granted.");
@@ -391,7 +403,8 @@ export class ContactSyncManager {
     };
     const local = this.#store.readContactSyncState(configuration.nodeId);
     if (local.materialized) this.#emitChanged();
-    const state = createContactSyncDelta(local.state, this.#peerKnownClocks.get(peerId) ?? []);
+    // An explicit sync repairs a restored peer even if we still remember its previous clocks.
+    const state = calibrate ? local.state : createContactSyncDelta(local.state, this.#peerKnownClocks.get(peerId) ?? []);
     const frames = await this.#codec.encode({
       message: { version: 1, type: "state", state, ...(requestReply ? { requestReply: true } : {}) },
       ownPrivateKey: privateKey,
@@ -408,7 +421,9 @@ export class ContactSyncManager {
       this.#assertGeneration(generation);
     }
     this.#peerKnownClocks.set(peer.peerId, local.state.clocks.map((clock) => ({ ...clock })));
-    this.#store.recordContactSyncSuccess(peer.peerId, "lan", this.#now());
+    const syncedAt = this.#now();
+    if (calibrate) this.#peerFullSyncAt.set(peer.peerId, syncedAt);
+    this.#store.recordContactSyncSuccess(peer.peerId, "lan", syncedAt);
     this.#emitChanged();
   }
 
@@ -507,6 +522,8 @@ export class ContactSyncManager {
     this.#abortController = new AbortController();
     this.#wireDecoder.reset();
     this.#codec.reset?.();
+    this.#peerKnownClocks.clear();
+    this.#peerFullSyncAt.clear();
     this.#activeSyncs = 0;
     if (this.#automaticSyncTimer !== undefined) clearTimeout(this.#automaticSyncTimer);
     this.#automaticSyncTimer = undefined;
@@ -528,7 +545,7 @@ export class ContactSyncManager {
       if (this.#closed || this.#configuration?.enabled !== true || this.#automaticSyncRunning) return;
       const generation = this.#generation;
       this.#automaticSyncRunning = true;
-      void this.syncNow().catch(() => undefined).finally(() => {
+      void this.#sync(undefined, false).catch(() => undefined).finally(() => {
         if (generation !== this.#generation) return;
         this.#automaticSyncRunning = false;
         this.#scheduleAutomaticSync(AUTOMATIC_SYNC_INTERVAL_MILLISECONDS);

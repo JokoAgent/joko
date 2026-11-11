@@ -2,8 +2,8 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { ContactStore } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { ContactStore, ContactStoreError, type ContactDraft } from "@joko/store";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ContactManager, ContactManagerError } from "./contact-manager.js";
 import { parseContactVCards } from "./contact-vcard.js";
@@ -16,6 +16,127 @@ afterEach(() => {
 });
 
 describe("ContactManager portable address-book boundary", () => {
+  it.each([0, 1, 2])("isolates an invalid vCard at position %i without poisoning staged identities", (position) => {
+    const { manager } = createFixture();
+    const cards = [vcard("FN:Bob", "EMAIL:bob@example.test"), vcard("FN:Bob Alias", "EMAIL:BOB@example.test")];
+    cards.splice(position, 0, vcard(`FN:${"x".repeat(101)}`, "EMAIL:bob@example.test"));
+    const preview = manager.previewVCardImport(cards.join("") + vcard("BROKEN:missing name"));
+    expect(preview.entries.map(entry => entry.disposition)).toEqual(["create", "auto_enrich"]);
+    expect(preview.entries[1]!.existingEntryId).toBe(preview.entries[0]!.entryId);
+    expect(preview.rejectedEntries).toEqual([{ entryId: `vcard-entry-${position + 1}`, displayName: "x".repeat(100),
+      reason: "Contact display name is invalid." }]);
+    const result = manager.commitVCardImport({ previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision, decisions: [] });
+    expect(result).toMatchObject({ created: 1, enriched: 1, skipped: 1, directory: { people: 1 } });
+    expect(result.entries[position]).toMatchObject({ entryId: `vcard-entry-${position + 1}`, outcome: "skipped", reason: "Contact display name is invalid." });
+    expect(result.entries.map(entry => entry.entryId)).toEqual(["vcard-entry-1", "vcard-entry-2", "vcard-entry-3"]);
+    expect(manager.get(result.contactIds[0]!)).toMatchObject({ displayName: "Bob", aliases: ["Bob Alias"], identityCount: 1 });
+  });
+
+  it("reports an entirely invalid import with zero effects and bounded labels", () => {
+    const { manager } = createFixture();
+    const before = manager.directory();
+    const preview = manager.previewVCardImport([
+      vcard("FN:Bad identities", "EMAIL:duplicate@example.test", "EMAIL:DUPLICATE@example.test"),
+      vcard("FN:Bad prose", `NOTE:${"界".repeat(5_462)}`),
+      vcard("FN:Bad employer", `ORG:${"x".repeat(101)}`),
+      vcard("FN:Bad title", "ORG:Example", `TITLE:${"x".repeat(1_001)}`),
+      vcard(`FN:${"a".repeat(99)}😀\u202e`),
+      vcard("FN:\u0000\u0001")
+    ].join(""));
+    expect(preview.entries).toEqual([]);
+    expect(preview.rejectedEntries).toHaveLength(6);
+    for (const entry of preview.rejectedEntries!) {
+      expect(entry.displayName.length).toBeGreaterThan(0);
+      expect(entry.displayName.length).toBeLessThanOrEqual(100);
+      expect(entry.displayName).not.toMatch(/[\u0000-\u001f\u202e\uD800-\uDBFF]$/u);
+      expect(entry.reason.length).toBeLessThanOrEqual(120);
+    }
+    expect(() => manager.commitVCardImport({ previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision,
+      decisions: [{ entryId: preview.rejectedEntries![0]!.entryId, decision: "create" }] })).toThrow(/decisions are invalid/u);
+    const result = manager.commitVCardImport({ previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision, decisions: [] });
+    expect(result).toMatchObject({ created: 0, enriched: 0, skipped: 6, contactIds: [], directory: before });
+    expect(result.entries).toEqual(preview.rejectedEntries!.map(entry => ({ ...entry, outcome: "skipped" })));
+    expect(manager.directory()).toEqual(before);
+  });
+
+  it("keeps rejected cards inside the original batch, size and revision limits", () => {
+    const { manager, store } = createFixture();
+    const invalid = vcard(`FN:${"x".repeat(101)}`);
+    const maximum = manager.previewVCardImport(invalid.repeat(2_000));
+    expect(maximum.rejectedEntries).toHaveLength(2_000);
+    expect(() => manager.previewVCardImport(invalid.repeat(2_001))).toThrow(/2,000/u);
+    expect(() => manager.previewVCardImport(`BEGIN:VCARD\nFN:${"x".repeat(2 * 1024 * 1024)}\nEND:VCARD`)).toThrow(/2 MiB/u);
+    expect(() => manager.previewVCardImport(vcard("BROKEN:no name"))).toThrow(/usable vCard/u);
+    store.createContact({ expectedDirectoryRevision: store.directoryState().revision, kind: "person", displayName: "Concurrent" });
+    expectManagerError(() => manager.commitVCardImport({ previewId: maximum.previewId,
+      expectedDirectoryRevision: maximum.directoryRevision, decisions: [] }), "CONTACT_IMPORT_CHANGED");
+    expect(manager.directory().people).toBe(1);
+  });
+
+  it.each(["CONTACT_INVALID", "CONTACT_STORE_UNAVAILABLE"] as const)("does not classify a directory lookup failure %s as a rejected card", (code) => {
+    const { manager, store } = createFixture();
+    const error = new ContactStoreError(code, "The directory lookup failed.");
+    vi.spyOn(store, "findSimilar").mockImplementationOnce(() => { throw error; });
+    expect(() => manager.previewVCardImport(vcard("FN:Valid person"))).toThrow(error);
+    expect(manager.directory().people).toBe(0);
+  });
+
+  it("fills and appends exact-identity agent narratives once while keeping independent merge rules", () => {
+    const { manager, store, advance } = createFixture();
+    const original = store.createContact({ expectedDirectoryRevision: store.directoryState().revision,
+      kind: "person", displayName: "Alice", status: "pending",
+      identities: [{ platform: "email", value: "alice@example.test" }] }).contact!;
+    const enrich = (narrative: string, extra: Pick<ContactDraft, "summary" | "agentNotes" | "status"> = {}) => manager.createOrEnrichFromAgent({
+      expectedDirectoryRevision: manager.directory().revision, kind: "person", displayName: "Alice",
+      identities: [{ platform: "email", value: "ALICE@example.test" }], narrative, ...extra
+    });
+    const filled = enrich("去年在会议认识", { summary: "Original summary", agentNotes: "Use the work address." });
+    expect(filled).toMatchObject({ merged: true, mergedContactId: original.id,
+      contact: { narrative: "去年在会议认识", status: "pending", source: "manual" } });
+    advance(24 * 60 * 60_000);
+    const appended = enrich("现在负责采购", { summary: "Replacement summary", agentNotes: "Replacement instructions", status: "confirmed" });
+    const combined = "去年在会议认识\n\n<!-- agent enrich 2026-09-22 -->\n现在负责采购";
+    expect(appended.contact).toMatchObject({ narrative: combined, summary: "Original summary",
+      agentNotes: "Use the work address.", status: "confirmed", source: "manual" });
+    expect(manager.list({ query: "负责采购" }).contacts.map(contact => contact.id)).toEqual([original.id]);
+    const beforeRepeat = manager.directory();
+    expect(enrich("现在负责采购").contact).toEqual(appended.contact);
+    expect(enrich("在会议认识").contact).toEqual(appended.contact);
+    expect(enrich("").contact).toEqual(appended.contact);
+    for (const invalid of [" \t\n ", " 现在负责采购 "]) {
+      expect(() => enrich(invalid)).toThrowError(expect.objectContaining({ code: "CONTACT_INVALID" }));
+    }
+    expect(manager.get(original.id)).toEqual(appended.contact);
+    expect(manager.directory()).toEqual(beforeRepeat);
+
+    const preview = manager.previewVCardImport("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice\r\nEMAIL:alice@example.test\r\nNOTE:Imported note\\nOther imported context\r\nEND:VCARD\r\n");
+    manager.commitVCardImport({ previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision, decisions: [] });
+    expect(manager.get(original.id).narrative).toBe(combined);
+  });
+
+  it.each([14, 15])("enforces the combined UTF-8 narrative limit atomically for %i new emoji", (count) => {
+    const { manager, store } = createFixture();
+    const original = store.createContact({ expectedDirectoryRevision: store.directoryState().revision,
+      kind: "person", displayName: "Alice", narrative: "界".repeat(5_430), status: "pending",
+      identities: [{ platform: "email", value: "alice@example.test" }] }).contact!;
+    const before = manager.directory();
+    const enrich = () => manager.createOrEnrichFromAgent({ expectedDirectoryRevision: before.revision,
+      kind: "person", displayName: "Alias on enrichment", summary: "New summary", agentNotes: "New instruction",
+      status: "confirmed", narrative: "😀".repeat(count),
+      identities: [{ platform: "email", value: "alice@example.test" }, { platform: "github", value: "alice" }] });
+    if (count === 14) {
+      const result = enrich();
+      expect(result.contact).toMatchObject({ id: original.id, aliases: ["Alias on enrichment"], summary: "New summary",
+        agentNotes: "New instruction", status: "confirmed", identityCount: 2 });
+      expect(Buffer.byteLength(result.contact!.narrative, "utf8")).toBe(16_381);
+    } else {
+      expect(enrich).toThrowError(expect.objectContaining({ code: "CONTACT_INVALID", message: "Contact narrative is too large." }));
+      expect(manager.get(original.id)).toEqual(original);
+      expect(manager.directory()).toEqual(before);
+      expect(manager.resolveIdentity("github", "alice")).toBeUndefined();
+    }
+  });
+
   it("previews exact enrichment and staged name review before importing vCard groups and employment", () => {
     const fixture = createFixture();
     const alice = fixture.store.createContact({
@@ -131,6 +252,23 @@ describe("ContactManager portable address-book boundary", () => {
     });
   });
 
+  it("reuses exact vCard categories and preserves differently spelled groups on export", () => {
+    const { manager } = createFixture();
+    const original = manager.createGroup(manager.directory().revision, "A", "Existing");
+    const preview = manager.previewVCardImport([
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Category owner", "CATEGORIES:A,a,Ａ,A", "END:VCARD"
+    ].join("\r\n"));
+    const result = manager.commitVCardImport({
+      previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision, decisions: []
+    });
+    expect(result).toMatchObject({ created: 1, skipped: 0, directory: { groups: 3 } });
+    const owner = manager.get(result.entries[0]!.contactId!);
+    expect(owner.groups.find(({ name }) => name === "A")?.id).toBe(original.id);
+    expect(new Set(owner.groups.map(({ name }) => name))).toEqual(new Set(["A", "a", "Ａ"]));
+    const exported = parseContactVCards(manager.exportVCards([owner.id]).text)[0]!;
+    expect(new Set(exported.groups)).toEqual(new Set(["A", "a", "Ａ"]));
+  });
+
   it("keeps similar names pending until an explicit create or merge decision", () => {
     const fixture = createFixture();
     const existing = fixture.store.createContact({
@@ -160,6 +298,104 @@ describe("ContactManager portable address-book boundary", () => {
     });
     expect(result).toMatchObject({ created: 1, enriched: 0, skipped: 0 });
     expect(fixture.store.directoryState().people).toBe(2);
+  });
+
+  it("skips new, exact-match and reviewed cards without changing contacts, organizations or groups", () => {
+    const fixture = createFixture();
+    const existing = fixture.store.createContact({
+      expectedDirectoryRevision: fixture.store.directoryState().revision,
+      kind: "person",
+      displayName: "Existing Person",
+      identities: [{ platform: "email", value: "existing@example.com" }]
+    }).contact!;
+    const organization = fixture.store.createContact({
+      expectedDirectoryRevision: fixture.store.directoryState().revision,
+      kind: "organization",
+      displayName: "Northwind Labs"
+    }).contact!;
+    const before = fixture.store.directoryState();
+    const preview = fixture.manager.previewVCardImport([
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Skipped New Person", "EMAIL:new@example.com",
+      "ORG:New Organization", "CATEGORIES:Skipped New Group", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "EMAIL:existing@example.com",
+      "TEL:+1 555 010 0199", "NOTE:Skipped enrichment", "ORG:Northwind Labs Europe",
+      "CATEGORIES:Skipped Existing Group", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "NOTE:Skipped name review", "END:VCARD"
+    ].join("\r\n"));
+    expect(preview.entries.map((entry) => entry.disposition)).toEqual(["create", "auto_enrich", "needs_review"]);
+    expect(preview.entries[1]!.organizationCandidates).toEqual([
+      expect.objectContaining({ contactId: organization.id, matchType: "name" })
+    ]);
+
+    const result = fixture.manager.commitVCardImport({
+      previewId: preview.previewId,
+      expectedDirectoryRevision: preview.directoryRevision,
+      decisions: preview.entries.map((entry) => ({ entryId: entry.entryId, decision: "skip" }))
+    });
+
+    expect(result).toEqual({
+      created: 0,
+      enriched: 0,
+      skipped: 3,
+      contactIds: [],
+      entries: preview.entries.map((entry) => ({
+        entryId: entry.entryId,
+        displayName: entry.contact.displayName,
+        outcome: "skipped"
+      })),
+      directory: before
+    });
+    expect(fixture.manager.get(existing.id)).toEqual(existing);
+    expect(fixture.manager.get(organization.id)).toEqual(organization);
+    expect(fixture.store.directoryState()).toEqual(before);
+    expect(fixture.manager.groups()).toEqual([]);
+    expect(fixture.manager.list({ query: "Skipped New Person" })).toMatchObject({ contacts: [], total: 0 });
+  });
+
+  it("keeps skipped cards out of a mixed import while applying the selected cards", () => {
+    const fixture = createFixture();
+    const existing = fixture.store.createContact({
+      expectedDirectoryRevision: fixture.store.directoryState().revision,
+      kind: "person",
+      displayName: "Existing Person",
+      identities: [{ platform: "email", value: "existing@example.com" }]
+    }).contact!;
+    const preview = fixture.manager.previewVCardImport([
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Skipped Person", "EMAIL:skipped@example.com",
+      "ORG:Skipped Organization", "CATEGORIES:Skipped Group", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Selected Person", "EMAIL:selected@example.com", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "EMAIL:existing@example.com",
+      "NOTE:Skipped enrichment", "END:VCARD",
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Existing Person", "EMAIL:existing@example.com",
+      "TEL:+1 555 010 0111", "END:VCARD"
+    ].join("\r\n"));
+
+    const result = fixture.manager.commitVCardImport({
+      previewId: preview.previewId,
+      expectedDirectoryRevision: preview.directoryRevision,
+      decisions: [
+        { entryId: preview.entries[0]!.entryId, decision: "skip" },
+        { entryId: preview.entries[2]!.entryId, decision: "skip" },
+        { entryId: preview.entries[3]!.entryId, decision: "merge", targetContactId: existing.id, expectedTargetRevision: existing.revision }
+      ]
+    });
+
+    expect(result).toMatchObject({ created: 1, enriched: 1, skipped: 2, directory: { people: 2, organizations: 0, groups: 0 } });
+    expect(result.entries).toEqual([
+      { entryId: preview.entries[0]!.entryId, displayName: "Skipped Person", outcome: "skipped" },
+      { entryId: preview.entries[1]!.entryId, displayName: "Selected Person", outcome: "created", contactId: expect.any(String) },
+      { entryId: preview.entries[2]!.entryId, displayName: "Existing Person", outcome: "skipped" },
+      { entryId: preview.entries[3]!.entryId, displayName: "Existing Person", outcome: "enriched", contactId: existing.id }
+    ]);
+    expect(result.contactIds).toEqual([result.entries[1]!.contactId, existing.id]);
+    expect(fixture.manager.resolveIdentity("email", "skipped@example.com")).toBeUndefined();
+    expect(fixture.manager.resolveIdentity("email", "selected@example.com")?.id).toBe(result.entries[1]!.contactId);
+    expect(fixture.manager.get(existing.id)).toMatchObject({
+      summary: "",
+      narrative: "",
+      identities: expect.arrayContaining([expect.objectContaining({ platform: "phone", normalizedValue: "+15550100111" })])
+    });
+    expect(fixture.manager.groups()).toEqual([]);
   });
 
   it("expires previews and rejects a directory that changed after review", () => {
@@ -205,9 +441,11 @@ describe("ContactManager portable address-book boundary", () => {
       "BEGIN:VCARD",
       "VERSION:3.0",
       "FN:Blocked Target",
-      "END:VCARD"
+      "END:VCARD",
+      ...vcard(`FN:${"x".repeat(101)}`).trim().split("\r\n")
     ].join("\r\n"));
     expect(preview.entries.map((entry) => entry.disposition)).toEqual(["create", "needs_review", "needs_review"]);
+    expect(preview.rejectedEntries).toHaveLength(1);
 
     expectManagerError(() => fixture.manager.commitVCardImport({
       previewId: preview.previewId,
@@ -222,6 +460,10 @@ describe("ContactManager portable address-book boundary", () => {
     expect(fixture.manager.list({ query: "Fresh Contact" })).toMatchObject({ contacts: [], total: 0 });
   });
 });
+
+function vcard(...fields: readonly string[]): string {
+  return ["BEGIN:VCARD", "VERSION:3.0", ...fields, "END:VCARD", ""].join("\r\n");
+}
 
 function createFixture(): {
   readonly store: ContactStore;

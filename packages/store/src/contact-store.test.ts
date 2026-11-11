@@ -20,6 +20,159 @@ afterEach(() => {
 });
 
 describe("current-v1 Contacts store", () => {
+  it("keeps exact group names and their members across concurrent sync and restart", () => {
+    const { store: east, filePath } = createFixture("groups-east");
+    const { store: west } = createFixture("groups-west");
+    const alice = createContact(east, { kind: "person", displayName: "Alice" });
+    const bea = createContact(west, { kind: "person", displayName: "Bea" });
+    const attach = (store: ContactStore, contactId: string, name: string) => {
+      const group = store.createGroup(store.directoryState().revision, name);
+      store.setGroupMembership(contactId, store.getContact(contactId).revision, group.id, true);
+      return store.listGroups().find(({ id }) => id === group.id)!;
+    };
+    const upper = attach(east, alice.id, "A");
+    const lowerOnEast = attach(east, alice.id, "a");
+    const wide = east.updateGroup(lowerOnEast.id, lowerOnEast.revision, "Ａ", "Full width");
+    expectContactError(() => east.createGroup(east.directoryState().revision, "A"), "CONTACT_ALREADY_EXISTS");
+    expectContactError(() => east.updateGroup(wide.id, wide.revision, "A", ""), "CONTACT_ALREADY_EXISTS");
+    const lower = attach(west, bea.id, "a");
+    const exact = new Map([
+      [attach(east, alice.id, "Shared").id, alice.id],
+      [attach(west, bea.id, "Shared").id, bea.id]
+    ]);
+
+    const merged = east.mergeContactSyncState("east", west.readContactSyncState("west").state);
+    west.mergeContactSyncState("west", merged.state);
+    const groupIds = (store: ContactStore, contactId: string) => new Set(store.getContact(contactId).groups.map(group => group.id));
+    const verify = (store: ContactStore, expectedSharedId?: string) => {
+      expect(new Set(store.listGroups().map(({ name }) => name))).toEqual(new Set(["A", "a", "Ａ", "Shared"]));
+      expect(store.listGroups()).toHaveLength(4);
+      const shared = store.listGroups().find(({ name }) => name === "Shared")!;
+      if (expectedSharedId !== undefined) expect(shared.id).toBe(expectedSharedId);
+      expect(exact.has(shared.id)).toBe(true);
+      expect(groupIds(store, alice.id)).toEqual(new Set([upper.id, wide.id, ...(exact.get(shared.id) === alice.id ? [shared.id] : [])]));
+      expect(groupIds(store, bea.id)).toEqual(new Set([lower.id, ...(exact.get(shared.id) === bea.id ? [shared.id] : [])]));
+      return shared;
+    };
+    const winner = verify(east);
+    verify(west, winner.id);
+
+    east.close();
+    const reopened = new ContactStore(filePath);
+    cleanups.push(() => reopened.close());
+    const liveWinner = verify(reopened, winner.id);
+    expect(reopened.deleteGroup(liveWinner.id, liveWinner.revision)).toBe(true);
+    west.mergeContactSyncState("west", reopened.readContactSyncState("east").state);
+    const otherId = [...exact.keys()].find(id => id !== winner.id)!;
+    verify(reopened, otherId);
+    verify(west, otherId);
+  });
+
+  it("preserves month and day precision with optional event sources through sync and reopen", () => {
+    const { store, filePath } = createFixture();
+    let person = createContact(store, { kind: "person", displayName: "Event owner" });
+    for (const source of [undefined, "", "  ", " archive "]) {
+      const eventText = `Event ${person.events.length}`;
+      person = store.appendEvent(person.id, person.revision, { date: source === undefined ? "2026-10" : "2026-10-12",
+        text: eventText, ...(source === undefined ? {} : { source }) });
+      expect(person.events.find(event => event.text === eventText)).toMatchObject({ source: source?.trim() ?? "" });
+    }
+    expect(person.events.map(event => event.date)).toContain("2026-10");
+    const directory = store.directoryState();
+    for (const event of [{ date: "2026-13", text: "Invalid month" },
+      { date: "2026-10", text: "Oversized source", source: "x".repeat(65) }]) {
+      expectContactError(() => store.appendEvent(person.id, person.revision, event), "CONTACT_INVALID");
+    }
+    expect(store.directoryState()).toEqual(directory);
+    const mirror = createFixture().store;
+    mirror.mergeContactSyncState("event-peer-b", store.readContactSyncState("event-peer-a").state);
+    const eventValues = (profile: ContactProfileRecord) => profile.events.map(({ id, date, text, source }) => ({ id, date, text, source }));
+    expect(eventValues(mirror.getContact(person.id))).toEqual(eventValues(person));
+    store.close();
+    const reopened = new ContactStore(filePath);
+    cleanups.push(() => reopened.close());
+    expect(reopened.getContact(person.id).events).toEqual(person.events);
+  });
+
+  it("searches both relation directions and refreshes names, notes and removed edges", () => {
+    const { store } = createFixture();
+    let person = createContact(store, { kind: "person", displayName: "Alice", status: "pending" });
+    let organization = createContact(store, { kind: "organization", displayName: "Acme" });
+    const unrelated = store.createContact({ expectedDirectoryRevision: store.directoryState().revision,
+      kind: "organization", displayName: "Acme", confirmedNameCandidateIds: [organization.id] }).contact!;
+    const group = store.createGroup(store.directoryState().revision, "Partners", "");
+    person = store.setGroupMembership(person.id, person.revision, group.id, true);
+    person = store.addRelation({ fromContactId: person.id, expectedFromRevision: person.revision, toContactId: organization.id,
+      relation: "works at", note: "cobaltmemorandum" });
+    const ids = (query: string) => store.listContacts({ query }).contacts.map(contact => contact.id);
+    expect(new Set(ids("Acme"))).toEqual(new Set([person.id, organization.id, unrelated.id]));
+    expect(new Set(ids("Alice"))).toEqual(new Set([person.id, organization.id]));
+    expect(new Set(ids("cobaltmemorandum"))).toEqual(new Set([person.id, organization.id]));
+    expect(store.listContacts({ query: "cobaltmemorandum", kind: "person", status: "pending", groupId: group.id }).contacts)
+      .toEqual([expect.objectContaining({ id: person.id })]);
+    expect(store.listContacts({ query: "cobaltmemorandum", status: "confirmed", groupId: group.id }).contacts).toEqual([]);
+    organization = store.getContact(organization.id);
+    organization = store.updateContact(organization.id, organization.revision, { displayName: "Novacorp" });
+    expect(ids("Acme")).toEqual([unrelated.id]);
+    expect(new Set(ids("Novacorp"))).toEqual(new Set([person.id, organization.id]));
+    const relation = person.relations[0]!;
+    person = store.updateRelation({ ownerContactId: person.id, expectedOwnerRevision: person.revision,
+      relationId: relation.id, expectedRelationRevision: relation.revision, relation: "advises", note: "violetmemorandum" });
+    expect(ids("cobaltmemorandum")).toEqual([]);
+    expect(new Set(ids("violetmemorandum"))).toEqual(new Set([person.id, organization.id]));
+    expect(new Set(ids("advises"))).toEqual(new Set([person.id, organization.id]));
+    const mirror = createFixture().store;
+    mirror.mergeContactSyncState("peer-b", store.readContactSyncState("peer-a").state);
+    expect(new Set(mirror.listContacts({ query: "violetmemorandum" }).contacts.map(contact => contact.id)))
+      .toEqual(new Set([person.id, organization.id]));
+    person = store.removeRelation(person.id, person.revision, relation.id);
+    expect(ids("violetmemorandum")).toEqual([]);
+    expect(ids("Novacorp")).toEqual([organization.id]);
+    expect(person.relations).toEqual([]);
+  });
+
+  it("repairs relation search documents on reopen without changing source revisions", () => {
+    const { store, filePath } = createFixture();
+    let person = createContact(store, { kind: "person", displayName: "Alice" });
+    const organization = createContact(store, { kind: "organization", displayName: "Novacorp" });
+    person = store.addRelation({ fromContactId: person.id, expectedFromRevision: person.revision, toContactId: organization.id,
+      relation: "advisor", note: "recoveredrelationwitness" });
+    const revision = store.directoryState().revision;
+    store.close();
+    const previous = new DatabaseSync(filePath);
+    try { previous.prepare("UPDATE contact_search_fts SET content = ? WHERE contact_id = ?").run(person.displayName, person.id); }
+    finally { previous.close(); }
+    const recovered = new ContactStore(filePath);
+    cleanups.push(() => recovered.close());
+    expect(recovered.directoryState().revision).toBe(revision);
+    expect(recovered.getContact(person.id).revision).toBe(person.revision);
+    expect(new Set(recovered.listContacts({ query: "recoveredrelationwitness" }).contacts.map(contact => contact.id)))
+      .toEqual(new Set([person.id, organization.id]));
+  });
+
+  it("adds literal substring matches after token matches with stable filtered pagination", () => {
+    const { store } = createFixture();
+    const whole = createContact(store, { kind: "person", displayName: "Whole", summary: "alpha", status: "pending" });
+    const substring = createContact(store, { kind: "person", displayName: "Substring", summary: "projectalpha", status: "pending" });
+    const chinese = createContact(store, { kind: "person", displayName: "Chinese", summary: "通讯录设计方案" });
+    createContact(store, { kind: "organization", displayName: "Outside", summary: "alpha" });
+    const group = store.createGroup(store.directoryState().revision, "Search group", "");
+    for (const contact of [whole, substring]) store.setGroupMembership(contact.id, contact.revision, group.id, true);
+    const options = { query: "alpha", kind: "person" as const, status: "pending" as const, groupId: group.id, limit: 1 };
+    const first = store.listContacts(options);
+    expect(first).toMatchObject({ contacts: [{ id: whole.id }], total: 2, nextOffset: 1 });
+    const second = store.listContacts({ ...options, offset: first.nextOffset });
+    expect(second).toMatchObject({ contacts: [{ id: substring.id }], total: 2 });
+    expect(second.nextOffset).toBeUndefined();
+    expect(store.listContacts({ query: "设计方案" }).contacts.map(contact => contact.id)).toEqual([chinese.id]);
+    const literal = createContact(store, { kind: "person", displayName: "Literal", summary: "100% stage_name path\\leaf" });
+    createContact(store, { kind: "person", displayName: "Ordinary", summary: "1000 stageXname pathXleaf" });
+    for (const query of ["%", "_", "\\"]) {
+      expect(store.listContacts({ query }).contacts.map(contact => contact.id)).toEqual([literal.id]);
+    }
+    expectContactError(() => store.listContacts({ query: "x".repeat(257) }), "CONTACT_INVALID");
+  });
+
   it("persists the exact baseline and rejects an incompatible development database", () => {
     const fixture = createFixture();
     expect(CONTACT_SCHEMA_BASELINE_ID).toMatch(/^[a-f0-9]{64}$/u);
@@ -261,6 +414,8 @@ describe("current-v1 Contacts store", () => {
     });
     expect(result.target.groups).toEqual([expect.objectContaining({ id: group.id, memberCount: 1 })]);
     expect(result.target.relations).toEqual([expect.objectContaining({ relatedContactId: counterpart.id, relation: "partner" })]);
+    expect(store.listContacts({ query: "partner" }).contacts.map(contact => contact.id)).toEqual(expect.arrayContaining([target.id, counterpart.id]));
+    expect(store.listContacts({ query: "Samuel" }).contacts.map(contact => contact.id)).not.toContain(counterpart.id);
     const synced = store.readContactSyncState("node-a").state;
     expect(synced.contacts).toContainEqual(expect.objectContaining({
       id: target.id, narrative: expect.objectContaining({ value: "Target narrative\n\n---\n\nMerged narrative" })
@@ -280,6 +435,7 @@ describe("current-v1 Contacts store", () => {
     const counterpartAfterDelete = store.getContact(counterpart.id);
     expect(counterpartAfterDelete.revision).toBeGreaterThan(counterpartAfterMerge.revision);
     expect(counterpartAfterDelete.relations).toEqual([]);
+    expect(store.listContacts({ query: "partner" }).contacts).toEqual([]);
     const groupAfterDelete = store.listGroups()[0]!;
     expect(groupAfterDelete.revision).toBeGreaterThan(groupAfterMerge.revision);
     expect(groupAfterDelete.memberCount).toBe(0);
@@ -287,13 +443,13 @@ describe("current-v1 Contacts store", () => {
   });
 });
 
-function createFixture(): { readonly store: ContactStore; readonly filePath: string } {
+function createFixture(idPrefix = "fixture"): { readonly store: ContactStore; readonly filePath: string } {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-contact-store-"));
   const filePath = path.join(directory, "contacts.db");
   let seed = 0;
   let now = 1_000;
   const store = new ContactStore(filePath, {
-    idFactory: () => `fixture-${seed += 1}`,
+    idFactory: () => `${idPrefix}-${seed += 1}`,
     now: () => now += 1
   });
   cleanups.push(() => {
