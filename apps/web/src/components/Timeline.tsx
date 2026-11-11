@@ -202,6 +202,15 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
+interface TimelineReadingAnchor {
+  readonly itemId: string;
+  readonly offset: number;
+}
+
+interface TimelineAnchorRestore extends TimelineReadingAnchor {
+  readonly earlierPage?: { readonly firstItemId: string; loadingObserved: boolean };
+}
+
 export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly ownerKey: string;
@@ -334,8 +343,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const unreadCountRef = useRef(restoredViewport.unreadCount);
   const knownUnreadItemIdsRef = useRef<ReadonlySet<string>>(restoredViewport.knownUnreadItemIds);
   const maximumSequenceRef = useRef<bigint | undefined>(restoredViewport.maximumSequence);
-  const viewportAnchorRef = useRef<{ readonly itemId: string; readonly offset: number } | undefined>(restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset });
-  const restoreAnchorRef = useRef<{ readonly itemId: string; readonly offset: number } | undefined>(restoredViewport.following || restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset });
+  const viewportAnchorRef = useRef<TimelineReadingAnchor | undefined>(restoredViewport.anchorItemId === undefined ? undefined : { itemId: restoredViewport.anchorItemId, offset: restoredViewport.anchorOffset });
+  const restoreAnchorRef = useRef<TimelineAnchorRestore | undefined>(restoredViewport.following ? undefined : viewportAnchorRef.current);
   const itemsRef = useRef(items);
   itemsRef.current = items;
   if (viewportOwnerRef.current !== viewportOwnerKey) {
@@ -559,8 +568,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const requestEarlier = useCallback((): boolean => {
     if (!hasEarlier || historyLoading || loadEarlierInFlightRef.current) return false;
     captureViewportAnchor();
-    if (!followingRef.current && viewportAnchorRef.current !== undefined) {
-      restoreAnchorRef.current = viewportAnchorRef.current;
+    const anchor = viewportAnchorRef.current;
+    const firstItemId = itemsRef.current[0]?.id;
+    if (!followingRef.current && anchor !== undefined && firstItemId !== undefined) {
+      restoreAnchorRef.current = { ...anchor, earlierPage: { firstItemId, loadingObserved: false } };
     }
     loadEarlierInFlightRef.current = true;
     void onLoadEarlier().catch(() => {
@@ -660,6 +671,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
         const focus = activeFocusRequestRef.current;
         if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
         setFocusedItemId(undefined);
+        if (restoreAnchorRef.current?.earlierPage !== undefined) restoreAnchorRef.current = undefined;
       }
       touchYRef.current = undefined;
       cancelTimelineNavigation(false);
@@ -672,6 +684,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     const onPageHide = (): void => {
       navigationDocumentActiveRef.current = false;
       touchYRef.current = undefined;
+      if (restoreAnchorRef.current?.earlierPage !== undefined) restoreAnchorRef.current = undefined;
       cancelTimelineNavigation();
       setFocusedItemId(undefined);
     };
@@ -881,6 +894,20 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     const desired = restoreAnchorRef.current;
     const node = scrollRef.current;
     if (desired === undefined || node === null || items.length === 0 || scrollbarDragRef.current !== undefined) return;
+    const earlierPage = desired.earlierPage;
+    if (earlierPage !== undefined) {
+      if (historyLoading) {
+        earlierPage.loadingObserved = true;
+        return;
+      }
+      if (!earlierPage.loadingObserved && loadEarlierInFlightRef.current) return;
+      const previousFirstIndex = items.findIndex((item) => item.id === earlierPage.firstItemId);
+      if (historyError !== undefined || previousFirstIndex <= 0) {
+        if (earlierPage.loadingObserved || previousFirstIndex < 0) restoreAnchorRef.current = undefined;
+        return;
+      }
+      restoreAnchorRef.current = { itemId: desired.itemId, offset: desired.offset };
+    }
     const index = findTimelineRenderItemIndex(renderItems, desired.itemId);
     if (index < 0) {
       restoreAnchorRef.current = undefined;
@@ -898,7 +925,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     viewportAnchorRef.current = desired;
     if (Math.abs(nextScrollTop - node.scrollTop) >= 0.5) writeScrollTop(nextScrollTop);
     else captureViewportAnchor();
-  }, [captureViewportAnchor, items, positionVirtualRow, renderItems, renderedRowsKey, viewportOwnerKey, writeScrollTop]);
+  }, [captureViewportAnchor, historyError, historyLoading, items, positionVirtualRow, renderItems, renderedRowsKey, viewportOwnerKey, writeScrollTop]);
 
   useLayoutEffect(() => {
     if (focusRequest === undefined) {
@@ -1022,7 +1049,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   }, [hasEarlier, historyError, historyLoading, items.length, requestEarlier]);
 
   useEffect(() => {
-    if (!historyLoading && (historyError !== undefined || !hasEarlier)) restoreAnchorRef.current = undefined;
+    if (!historyLoading && (historyError !== undefined || !hasEarlier) && restoreAnchorRef.current?.earlierPage !== undefined) {
+      restoreAnchorRef.current = undefined;
+    }
   }, [hasEarlier, historyError, historyLoading]);
 
   const onScroll = (): void => {
@@ -1049,6 +1078,11 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     });
     if (nextFollowing !== followingRef.current) setTimelineFollowing(nextFollowing);
     captureViewportAnchor();
+    const earlierPage = restoreAnchorRef.current?.earlierPage;
+    if (earlierPage !== undefined && scrollDelta !== 0) {
+      const anchor = viewportAnchorRef.current;
+      restoreAnchorRef.current = nextFollowing || anchor === undefined ? undefined : { ...anchor, earlierPage };
+    }
     saveViewport(nextFollowing, nextFollowing ? 0 : unreadCountRef.current);
     if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: currentScrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
   };
