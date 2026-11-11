@@ -4,6 +4,7 @@ import {
   Check,
   Download,
   FileUp,
+  GitMerge,
   Link2,
   MonitorSmartphone,
   Pencil,
@@ -99,7 +100,11 @@ export function ContactsSettings({ controller, locale, t }: {
   const [deleteContact, setDeleteContact] = useState<ContactProfileView>();
   const [pendingCreate, setPendingCreate] = useState<PendingCreateReview>();
   const [duplicatePairs, setDuplicatePairs] = useState<readonly ContactDuplicatePairView[]>();
+  const [manualMergeTarget, setManualMergeTarget] = useState<ContactSummaryView>();
   const [mergeConfirmation, setMergeConfirmation] = useState<MergeConfirmation>();
+  const [mergeError, setMergeError] = useState<string>();
+  const mergeInFlight = useRef(false);
+  const mergeButtonRef = useRef<HTMLButtonElement>(null);
   const [importPreview, setImportPreview] = useState<ContactVCardImportPreviewView>();
   const [importResult, setImportResult] = useState<ContactVCardImportResultView>();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -370,18 +375,42 @@ export function ContactsSettings({ controller, locale, t }: {
     }
   };
 
-  const mergeContacts = async (): Promise<void> => {
-    if (mergeConfirmation === undefined) return;
-    const result = await run("contact-merge", () => controller.mergeContacts(
-      mergeConfirmation.target.id,
-      mergeConfirmation.target.revision,
-      mergeConfirmation.merged.id,
-      mergeConfirmation.merged.revision
-    ));
-    if (result === undefined) return;
+  const confirmMerge = (target: ContactSummaryView, merged: ContactSummaryView): void => {
+    if (target.id === merged.id || mergeInFlight.current) return;
+    setMergeError(undefined);
+    setMergeConfirmation({ target, merged });
+  };
+
+  const closeMergeConfirmation = (): void => {
+    if (mergeInFlight.current) return;
     setMergeConfirmation(undefined);
-    setDuplicatePairs((pairs) => pairs?.filter((pair) => pair.first.id !== result.mergedContactId && pair.second.id !== result.mergedContactId));
-    applyContactMutation(result.target, result.directory);
+    if (mergeError !== undefined) {
+      setMergeError(undefined);
+      setManualMergeTarget(undefined);
+      setDuplicatePairs(undefined);
+      setLoading(true);
+      refresh();
+    }
+  };
+
+  const mergeContacts = async (): Promise<void> => {
+    if (mergeConfirmation === undefined || mergeInFlight.current || busy !== undefined || mergeError !== undefined) return;
+    const { target, merged } = mergeConfirmation;
+    mergeInFlight.current = true;
+    setBusy("contact-merge");
+    setError(undefined);
+    try {
+      const result = await controller.mergeContacts(target.id, target.revision, merged.id, merged.revision);
+      setMergeConfirmation(undefined);
+      setManualMergeTarget(undefined);
+      setDuplicatePairs((pairs) => pairs?.filter((pair) => pair.first.id !== result.mergedContactId && pair.second.id !== result.mergedContactId));
+      applyContactMutation(result.target, result.directory);
+    } catch (reason) {
+      setMergeError(errorMessage(reason, t("contacts.actionFailed")));
+    } finally {
+      mergeInFlight.current = false;
+      setBusy(undefined);
+    }
   };
 
   const selectVCard = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
@@ -566,6 +595,8 @@ export function ContactsSettings({ controller, locale, t }: {
             <div className="contact-detail__actions">
               {profile.status === "pending" && <Button tone="primary" onClick={() => void confirmSelected()} disabled={busy !== undefined}><Check aria-hidden="true" />{t("contacts.confirmContact")}</Button>}
               <IconButton label={t("contacts.exportSelected")} onClick={() => void exportContacts([profile.id])} disabled={busy !== undefined}><Download aria-hidden="true" /></IconButton>
+              <IconButton label={t("contacts.mergeInto")} buttonRef={mergeButtonRef} onClick={() => setManualMergeTarget(profile)}
+                disabled={busy !== undefined || loading || detailLoading || profile.id !== selectedId}><GitMerge aria-hidden="true" /></IconButton>
               <IconButton label={t("common.edit")} onClick={() => setEditor({ mode: "edit", contact: profile })}><Pencil aria-hidden="true" /></IconButton>
               <IconButton label={t("common.delete")} onClick={() => setDeleteContact(profile)}><Trash2 aria-hidden="true" /></IconButton>
             </div>
@@ -623,7 +654,10 @@ export function ContactsSettings({ controller, locale, t }: {
       onChanged={() => refresh(profile?.id)}
     />
     <CandidateReviewDialog review={pendingCreate} busy={busy === "contact-save"} t={t} onClose={() => setPendingCreate(undefined)} onOpen={(id) => { setSelectedId(id); setPendingCreate(undefined); setEditor(undefined); }} onCreate={() => void createDespiteCandidates()} />
-    <DuplicateDialog pairs={duplicatePairs} busy={busy} t={t} onClose={() => setDuplicatePairs(undefined)} onMerge={(target, merged) => setMergeConfirmation({ target, merged })} />
+    <DuplicateDialog pairs={duplicatePairs} busy={busy} t={t} onClose={() => setDuplicatePairs(undefined)} onMerge={confirmMerge} />
+    {manualMergeTarget !== undefined && <ContactMergePicker controller={controller} target={manualMergeTarget} t={t}
+      onClose={() => { if (mergeConfirmation === undefined) setManualMergeTarget(undefined); }}
+      onChoose={(merged) => confirmMerge(manualMergeTarget, merged)} />}
     <ImportDialog preview={importPreview} busy={busy === "vcard-commit"} t={t} onClose={() => setImportPreview(undefined)} onCommit={(selections) => void commitImport(selections)} />
     <ImportResultDialog result={importResult} t={t} onClose={() => setImportResult(undefined)} onOpen={(contactId) => { setImportResult(undefined); refresh(contactId); }} />
     <ConfirmDialog
@@ -637,16 +671,25 @@ export function ContactsSettings({ controller, locale, t }: {
       onClose={() => setDeleteContact(undefined)}
       onConfirm={() => void deleteSelected()}
     />
-    <ConfirmDialog
+    <Modal
       open={mergeConfirmation !== undefined}
       title={t("contacts.mergeTitle")}
-      body={t("contacts.mergeBody", { target: mergeConfirmation?.target.displayName ?? "", merged: mergeConfirmation?.merged.displayName ?? "" })}
-      confirm={t("contacts.merge")}
-      busy={busy === "contact-merge"}
-      t={t}
-      onClose={() => setMergeConfirmation(undefined)}
-      onConfirm={() => void mergeContacts()}
-    />
+      description={t("contacts.mergeBody", { target: mergeConfirmation?.target.displayName ?? "", merged: mergeConfirmation?.merged.displayName ?? "" })}
+      dialogRole="alertdialog"
+      dismissOnBackdrop={busy !== "contact-merge"}
+      restoreFocusFallback={manualMergeTarget === undefined ? undefined : () => mergeButtonRef.current}
+      onClose={closeMergeConfirmation}
+    >
+      {mergeError !== undefined && <ErrorBanner message={mergeError} />}
+      <div className="modal__actions">
+        <Button disabled={busy === "contact-merge"} onClick={closeMergeConfirmation}>
+          {t(mergeError === undefined ? "common.cancel" : "contacts.mergeReviewAgain")}
+        </Button>
+        <Button tone="danger" disabled={busy !== undefined || mergeError !== undefined} onClick={() => void mergeContacts()}>
+          {t(busy === "contact-merge" ? "common.working" : "contacts.merge")}
+        </Button>
+      </div>
+    </Modal>
     <ConfirmDialog
       open={candidateToGrant !== undefined}
       title={t("contacts.syncGrantTitle")}
@@ -1036,6 +1079,61 @@ function DuplicateDialog({ pairs, busy, t, onClose, onMerge }: {
       <ContactCandidateSummary contact={pair.second} t={t} />
       <div><Button disabled={busy !== undefined} onClick={() => onMerge(pair.first, pair.second)}>{t("contacts.keepNamed", { name: pair.first.displayName })}</Button><Button disabled={busy !== undefined} onClick={() => onMerge(pair.second, pair.first)}>{t("contacts.keepNamed", { name: pair.second.displayName })}</Button></div>
     </div>)}</div>}
+  </Modal>;
+}
+
+const MERGE_PICKER_PAGE_SIZE = 20;
+
+function ContactMergePicker({ controller, target, t, onClose, onChoose }: {
+  readonly controller: AppController; readonly target: ContactSummaryView; readonly t: Translator;
+  readonly onClose: () => void; readonly onChoose: (contact: ContactSummaryView) => void;
+}): JSX.Element {
+  const searchInput = useRef<HTMLInputElement>(null);
+  const [query, setQuery] = useState("");
+  const [request, setRequest] = useState({ query: "", offset: 0 });
+  const [result, setResult] = useState<{ request: typeof request; page?: ContactListPageView; error?: string }>();
+
+  useEffect(() => {
+    const abort = new AbortController();
+    void controller.listContacts({
+      ...(request.query === "" ? {} : { query: request.query }),
+      pageSize: MERGE_PICKER_PAGE_SIZE,
+      pageOffset: request.offset
+    }, abort.signal).then((page) => {
+      if (!abort.signal.aborted) setResult({ request, page });
+    }).catch((reason: unknown) => {
+      if (!abort.signal.aborted) setResult({ request, error: errorMessage(reason, t("contacts.loadFailed")) });
+    });
+    return () => abort.abort();
+  }, [controller, request, t]);
+
+  const current = result?.request === request ? result : undefined;
+  const candidates = current?.page?.contacts.filter(({ id }) => id !== target.id) ?? [];
+  const nextOffset = current?.page?.nextPageOffset;
+  return <Modal open title={t("contacts.mergePickerTitle")} description={t("contacts.mergePickerBody", { target: target.displayName })}
+    initialFocus={() => searchInput.current} onClose={onClose} showClose>
+    <div className="contact-merge-picker">
+      <form className="contacts-search" onSubmit={(event) => { event.preventDefault(); setRequest({ query: query.trim(), offset: 0 }); }}>
+        <Search aria-hidden="true" />
+        <input ref={searchInput} type="search" value={query} maxLength={256} aria-label={t("contacts.mergeSearch")}
+          placeholder={t("contacts.searchPlaceholder")} onChange={(event) => setQuery(event.currentTarget.value)} />
+        <Button type="submit" tone="ghost">{t("common.search")}</Button>
+      </form>
+      {current === undefined && <p className="contact-muted" role="status">{t("common.loading")}</p>}
+      {current?.error !== undefined && <ErrorBanner message={current.error} onRetry={() => setRequest({ ...request })} />}
+      {current?.page !== undefined && candidates.length === 0 && <p className="contact-muted" role="status">{t("contacts.empty")}</p>}
+      <div className="contact-target-results" aria-busy={current === undefined}>
+        {candidates.map((candidate) => <button key={candidate.id} type="button" onClick={() => onChoose(candidate)}>
+          <ContactCandidateSummary contact={candidate} t={t} />
+        </button>)}
+      </div>
+      <div className="modal__actions">
+        <Button disabled={request.offset === 0 || current === undefined}
+          onClick={() => setRequest({ ...request, offset: Math.max(0, request.offset - MERGE_PICKER_PAGE_SIZE) })}>{t("common.previous")}</Button>
+        <Button disabled={nextOffset === undefined}
+          onClick={() => { if (nextOffset !== undefined) setRequest({ ...request, offset: nextOffset }); }}>{t("common.next")}</Button>
+      </div>
+    </div>
   </Modal>;
 }
 

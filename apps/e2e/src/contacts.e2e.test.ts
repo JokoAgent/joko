@@ -259,3 +259,117 @@ mountedIt("refreshes the mounted Contacts list and selected profile after anothe
   await details.getByText("Select a contact", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
   expect(await selected.count()).toBe(0);
 });
+
+mountedIt("merges unrelated names from Contact details only after reviewing both current records", { timeout: 90_000 }, async () => {
+  fixture = await OrchestratorE2eFixture.start({ webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!) });
+  const dataRoot = fixture.rootDirectory;
+  rootDirectory = dataRoot;
+  const { clients: { contact } } = await fixture.pair("Contact merge observer");
+  const directory = async () => (await contact.getContactDirectory({})).directory!;
+  await contact.setContactDirectoryEnabled({ expectedDirectoryRevision: (await directory()).revision, enabled: true });
+  const createContact = async (displayName: string, kind: ContactKind, email?: string) => (await contact.createContact({
+    expectedDirectoryRevision: (await directory()).revision,
+    contact: { kind, displayName, ...(email === undefined ? {} : { identities: [{ platform: "email", value: email }] }) }
+  })).contact!.summary!;
+  const targetId = (await createContact("张三", ContactKind.PERSON, "target@example.test")).contactId;
+  const sourceId = (await createContact("Alex", ContactKind.PERSON, "source@example.test")).contactId;
+  const orgId = (await createContact("Northwind", ContactKind.ORGANIZATION)).contactId;
+  const read = async (contactId: string) => (await contact.getContact({ contactId })).contact!;
+  const group = (await contact.createContactGroup({ expectedDirectoryRevision: (await directory()).revision, name: "Colleagues" })).group!;
+  await contact.setContactGroupMembership({ contactId: sourceId, expectedContactRevision: (await read(sourceId)).summary!.revision,
+    contactGroupId: group.contactGroupId, member: true });
+  await contact.appendContactEvent({ contactId: sourceId, expectedContactRevision: (await read(sourceId)).summary!.revision,
+    event: { date: "2026-09", text: "Mentor meeting" } });
+  await contact.addContactRelation({ fromContactId: sourceId, expectedFromRevision: (await read(sourceId)).summary!.revision,
+    toContactId: orgId, relation: "works at", note: "Product team" });
+  expect((await contact.scanContactDuplicates({})).pairs).toEqual([]);
+
+  browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+  const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Contacts merge window" })).challenge!;
+  await page.goto(`${fixture.baseUrl}/#/settings/contacts`, { waitUntil: "domcontentloaded" });
+  await page.locator(".connection-tabs > button").nth(2).click();
+  await page.locator("details.device-authorization__manual > summary").click();
+  await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+  await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+  await page.getByLabel("Device name").fill("Contacts merge window");
+  await page.locator("form.pair-form button[type=submit]").click();
+
+  const catalog = page.locator(".contacts-catalog");
+  await catalog.getByRole("textbox", { name: "Search", exact: true }).fill("张三");
+  await catalog.getByRole("button", { name: "Search", exact: true }).click();
+  const details = page.locator(".contact-detail");
+  await details.getByRole("heading", { name: "张三", exact: true }).waitFor({ state: "visible" });
+  await catalog.getByRole("button", { name: /^Alex/u }).waitFor({ state: "hidden" });
+  const opener = details.getByRole("button", { name: "Merge into this contact", exact: true });
+  const picker = page.getByRole("dialog", { name: "Choose a contact to merge", exact: true });
+  const search = picker.getByRole("searchbox", { name: "Search contacts to merge", exact: true });
+  const confirmation = page.getByRole("alertdialog", { name: "Merge contacts?", exact: true });
+  const merge = confirmation.getByRole("button", { name: "Merge contacts", exact: true });
+  const selectSource = async (): Promise<void> => {
+    await opener.click();
+    await search.waitFor({ state: "visible" });
+    expect(await search.evaluate(element => element === document.activeElement)).toBe(true);
+    await search.fill("Alex");
+    await search.press("Enter");
+    await picker.getByRole("button", { name: /^Alex/u }).click();
+    await confirmation.getByText("Keep 张三 and merge Alex into it? The merged record will be removed.", { exact: true })
+      .waitFor({ state: "visible" });
+  };
+
+  const beforeCancel = await directory();
+  await selectSource();
+  await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+  await confirmation.waitFor({ state: "hidden" });
+  expect(await picker.getByRole("button", { name: /^Alex/u }).evaluate(element => element === document.activeElement)).toBe(true);
+  await page.keyboard.press("Escape");
+  await picker.waitFor({ state: "hidden" });
+  expect(await opener.evaluate(element => element === document.activeElement)).toBe(true);
+  expect(await directory()).toEqual(beforeCancel);
+
+  for (const [contactId, summary, label] of [
+    [targetId, "Updated keeper", "Target contact"],
+    [sourceId, "Updated source", "Merged contact"]
+  ] as const) {
+    await selectSource();
+    await contact.updateContact({ contactId, expectedRevision: (await read(contactId)).summary!.revision, patch: { summary } });
+    const beforeConflict = await directory();
+    await merge.click();
+    await confirmation.getByRole("alert").getByText(`${label} ${contactId} changed concurrently.`, { exact: false }).waitFor({ state: "visible" });
+    expect(await merge.isDisabled()).toBe(true);
+    expect(await directory()).toEqual(beforeConflict);
+    expect((await read(sourceId)).events.map(event => event.text)).toContain("Mentor meeting");
+    await confirmation.getByRole("button", { name: "Review current contacts", exact: true }).click();
+    await picker.waitFor({ state: "hidden" });
+    if (contactId === targetId) await details.getByText(summary, { exact: true }).waitFor({ state: "visible" });
+  }
+
+  await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation" });
+  if (await closeNavigation.isVisible()) await closeNavigation.click();
+  await selectSource();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+  await merge.press("Enter");
+  await confirmation.waitFor({ state: "hidden" });
+  await details.getByText("Mentor meeting", { exact: true }).waitFor({ state: "visible" });
+  const kept = await read(targetId);
+  expect(kept).toMatchObject({
+    summary: { contactId: targetId, displayName: "张三", summary: "Updated keeper", aliases: ["Alex"] },
+    identities: expect.arrayContaining([
+      expect.objectContaining({ contactId: targetId, value: "target@example.test" }),
+      expect.objectContaining({ contactId: targetId, value: "source@example.test" })
+    ]),
+    events: [expect.objectContaining({ contactId: targetId, text: "Mentor meeting" })],
+    groups: [expect.objectContaining({ contactGroupId: group.contactGroupId, memberCount: 1 })],
+    relations: [expect.objectContaining({ fromContactId: targetId, toContactId: orgId, note: "Product team" })]
+  });
+  expect((await contact.listContacts({})).contacts.map(entry => entry.contactId).sort()).toEqual([targetId, orgId].sort());
+  await browser.close();
+  browser = undefined;
+  await fixture.close({ removeRoot: false });
+  fixture = await OrchestratorE2eFixture.start({ rootDirectory: dataRoot });
+  const reopened = (await fixture.pair("Reopened merge observer")).clients.contact;
+  expect((await reopened.getContact({ contactId: targetId })).contact).toEqual(kept);
+  expect((await reopened.listContacts({})).contacts.map(entry => entry.contactId)).not.toContain(sourceId);
+});

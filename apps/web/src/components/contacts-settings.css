@@ -147,6 +147,12 @@
 .contact-candidate-summary > span:last-child { min-width: 0; display: flex; flex-direction: column; }
 .contact-candidate-summary strong, .contact-candidate-summary small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .contact-candidate-summary small { color: var(--text-soft); }
+.contact-merge-picker { display: grid; gap: 10px; }
+.contact-merge-picker .contacts-search { margin: 0; }
+.contact-merge-picker .contact-target-results { max-height: min(44vh, 400px); }
+.contact-merge-picker .contact-target-results button { min-width: 0; text-align: start; }
+.contact-merge-picker .contact-candidate-summary strong,
+.contact-merge-picker .contact-candidate-summary small { overflow-wrap: anywhere; white-space: normal; }
 .contact-duplicate-list__divider { color: var(--text-faint); }
 .contact-duplicate-list > div > div:last-child { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 7px; }
 
