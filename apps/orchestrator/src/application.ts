@@ -1939,6 +1939,14 @@ export async function createOrchestratorApplication(
   const partnerRuntimePrompt = new PartnerRuntimePromptResolver(partnerStore, store, partnerMemoryPreferences,
     (partnerId, assertCurrent) => partnerImportStorage.environment.read(partnerId, assertCurrent), makerMemory,
     (session, partnerId) => partnerGroupRuntime?.validTarget(session, partnerId) === true || partnerNetworkLanes?.validTarget(session, partnerId) === true);
+  const ordinaryMemoryPrompt = (target: Pick<TargetDescriptor, "id" | "backendId" | "remoteWorkspace">,
+    base: string | undefined): string | undefined => {
+    const registered = store.getTarget(target.id).descriptor;
+    if (!makerMemory.available || !registered.trusted || target.remoteWorkspace !== undefined || registered.remoteWorkspace !== undefined
+      || target.backendId !== codexBackendId && target.backendId !== claudeCodeBackendId) return base;
+    const memoryPrompt = makerMemory.runtimePrompt(target.id);
+    return memoryPrompt === undefined ? base : [base, memoryPrompt].filter(value => value !== undefined).join("\n\n");
+  };
   let partnerSessionTasks: PartnerSessionTaskManager | undefined;
   let partnerTodos: PartnerTodoManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
@@ -2020,10 +2028,22 @@ export async function createOrchestratorApplication(
     },
     sideChatSourceAllowed: sessionId => partnerStore.getSessionLink(sessionId) === undefined,
     decorateRuntimePrompt: answerDeliveryPrompt,
+    resolveServiceCreationPrompt: input => {
+      const existing = store.findSession(input.sessionId)?.descriptor;
+      if (partnerStore.getSessionLink(input.sessionId) !== undefined || existing !== undefined
+        && (store.sessionCreationServiceKind(existing.id) !== undefined || store.findSessionRuntimePolicy(existing.id) !== undefined)) {
+        return input.appendSystemPrompt;
+      }
+      return ordinaryMemoryPrompt(input.target, existing === undefined ? input.appendSystemPrompt : existing.appendSystemPrompt);
+    },
     resolveServiceRuntimePrompt: async (session, assertCurrent) => {
       const resolved = await partnerRuntimePrompt.resolve(session, assertCurrent);
       assertCurrent();
-      return resolved ?? session.appendSystemPrompt;
+      if (resolved !== undefined || partnerStore.getSessionLink(session.id) !== undefined
+        || store.sessionCreationServiceKind(session.id) !== undefined || store.findSessionRuntimePolicy(session.id) !== undefined) {
+        return resolved ?? session.appendSystemPrompt;
+      }
+      return ordinaryMemoryPrompt({ id: session.targetId, backendId: session.backendId, remoteWorkspace: session.remoteWorkspace }, session.appendSystemPrompt);
     },
     resolvePartnerReplyQuote: (sessionId, quote) => {
       const session = store.getSession(sessionId).descriptor, link = partnerStore.getSessionLink(sessionId);

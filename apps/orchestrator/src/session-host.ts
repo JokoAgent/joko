@@ -625,6 +625,12 @@ export interface CreateServiceSessionInput {
 
 type SessionCreationInput = CreateSessionInput | CreateScheduledSessionInput | CreateServiceSessionInput;
 
+interface ServiceCreationRuntimePromptInput {
+  readonly sessionId: string;
+  readonly target: TargetDescriptor;
+  readonly appendSystemPrompt?: string;
+}
+
 interface QueuedInput {
   readonly providerGroupRebalance?: import("./provider-group-service.js").ProviderGroupRebalanceChoice;
   readonly operationId: string;
@@ -1057,10 +1063,15 @@ export class SessionHost {
   readonly #partnerPauseFlights = new Map<string, Promise<void>>();
   readonly #partnerTargetRetired: (targetId: string) => boolean;
   readonly #resolveServiceRuntimePrompt: ((session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>) | undefined;
+  readonly #resolveServiceCreationPrompt: ((input: ServiceCreationRuntimePromptInput) => string | undefined) | undefined;
   readonly #resolvePartnerReplyQuote: ((sessionId: string, quote: NonNullable<PromptInput['replyQuote']>) => string) | undefined;
   readonly #resolvePartnerTodoQuote: ((sessionId: string, quote: NonNullable<PromptInput['todoQuote']>) => string) | undefined;
   readonly #decorateRuntimePrompt: ((base: string | undefined) => string | undefined) | undefined;
   readonly #serviceRuntimePrompts = new Map<string, { readonly baseDigest: string; readonly text: string }>();
+  /** Prepared native snapshots become current only after their exact durable handoff is adopted. */
+  readonly #preparedRuntimeHandoffPrompts = new Map<string, {
+    readonly identity: string; readonly backendInstanceGeneration: number; readonly baseDigest: string; readonly text: string | undefined;
+  }>();
   readonly #resolveServiceRuntimeConfiguration: ((session: SessionDescriptor) => string | undefined) | undefined;
   readonly #prepareManagedProviderRuntime: ((context: AdapterContext) => Promise<void>) | undefined;
   readonly #resolveModelWorkingContext: ((target: { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly sessionId?: string }) => number | undefined) | undefined;
@@ -1210,6 +1221,8 @@ export class SessionHost {
       readonly partnerTargetRetired?: (targetId: string) => boolean;
       /** Private service identity resolved at native activation, never supplied through RPC or persisted in Session data. */
       readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
+      /** Synchronous private snapshot for a new, connection-owned native task before its first effect. */
+      readonly resolveServiceCreationPrompt?: (input: ServiceCreationRuntimePromptInput) => string | undefined;
       readonly resolvePartnerReplyQuote?: (sessionId: string, quote: NonNullable<PromptInput['replyQuote']>) => string;
       readonly resolvePartnerTodoQuote?: (sessionId: string, quote: NonNullable<PromptInput['todoQuote']>) => string;
       /** Private instructions applied equally to initial creation and later native contexts. */
@@ -1299,6 +1312,7 @@ export class SessionHost {
     this.#sideChatSourceAllowed = options.sideChatSourceAllowed ?? (() => true);
     this.#partnerTargetRetired = options.partnerTargetRetired ?? (() => false);
     this.#resolveServiceRuntimePrompt = options.resolveServiceRuntimePrompt;
+    this.#resolveServiceCreationPrompt = options.resolveServiceCreationPrompt;
     this.#resolvePartnerReplyQuote = options.resolvePartnerReplyQuote;
     this.#resolvePartnerTodoQuote = options.resolvePartnerTodoQuote;
     this.#decorateRuntimePrompt = options.decorateRuntimePrompt;
@@ -2351,14 +2365,18 @@ export class SessionHost {
       let handoff = this.#runtimeHandoffs.read(input.sessionId)?.pending;
       if (handoff?.phase === "pending" && input.patch.backendId === stored.descriptor.backendId) {
         this.#resolveRuntimeHandoffProfile(stored, input.patch, snapshot.effective ?? baseline);
-        this.#runtimeHandoffs.cancel(input.sessionId, snapshot.generation + 1); this.#sessionRuntimeControl.cancelPending(input.sessionId); handoff = undefined;
+        this.#runtimeHandoffs.cancel(input.sessionId, snapshot.generation + 1); this.#preparedRuntimeHandoffPrompts.delete(input.sessionId);
+        this.#sessionRuntimeControl.cancelPending(input.sessionId); handoff = undefined;
       }
       if (input.patch.backendId !== undefined && (input.patch.backendId !== stored.descriptor.backendId || handoff !== undefined)
         || handoff !== undefined) {
         input.assertAuthority?.();
         return this.#stageSessionRuntimeHandoff(input, stored, snapshot);
       }
-      if (handoff !== undefined) this.#runtimeHandoffs.cancel(input.sessionId, snapshot.generation + 1);
+      if (handoff !== undefined) {
+        this.#runtimeHandoffs.cancel(input.sessionId, snapshot.generation + 1);
+        this.#preparedRuntimeHandoffPrompts.delete(input.sessionId);
+      }
       const routeExplicit = input.patch.providerId !== undefined || input.patch.modelId !== undefined;
       const current = routeExplicit && input.patch.backendId !== stored.descriptor.backendId
         ? snapshot.pending?.profile ?? snapshot.effective ?? baseline
@@ -2466,6 +2484,7 @@ export class SessionHost {
     const stored = this.#store.getSession(sessionId);
     this.getSessionRuntimeControl(sessionId);
     this.#runtimeHandoffs.cancel(sessionId, this.#sessionRuntimeControl.snapshot(sessionId, undefined).generation + 1);
+    this.#preparedRuntimeHandoffPrompts.delete(sessionId);
     const generation = this.#sessionRuntimeControl.recordUserSelection(sessionId);
     this.#clearSessionRuntimeRecovery(sessionId);
     this.#publishSessionRuntimeControlChanged(stored);
@@ -5923,6 +5942,7 @@ export class SessionHost {
     const profile = this.#resolveRuntimeHandoffProfile(stored, input.patch, current);
     const source = input.source ?? "agent";
     this.#runtimeHandoffs.stage(input.sessionId, snapshot.generation + 1, profile, source, input.fresh);
+    this.#preparedRuntimeHandoffPrompts.delete(input.sessionId);
     const accepted = this.#sessionRuntimeControl.acceptDeferred(input.sessionId, source, profile, snapshot.effective);
     this.#publishSessionRuntimeControlChanged(stored);
     return { status: "deferred", effectiveBoundary: "next_send", generation: accepted.generation,
@@ -5932,8 +5952,9 @@ export class SessionHost {
   async #performSessionRuntimeHandoff(sessionId: string, assertAuthority?: () => void): Promise<boolean> {
     assertAuthority?.();
     let record = this.#runtimeHandoffs.read(sessionId), pending = record?.pending;
-    if (!pending) return true;
+    if (!pending) { this.#preparedRuntimeHandoffPrompts.delete(sessionId); return true; }
     if (pending.phase === "unknown" || pending.phase === "effect") {
+      this.#preparedRuntimeHandoffPrompts.delete(sessionId);
       if (pending.phase === "effect") this.#runtimeHandoffs.transition(sessionId, pending.generation, { ...pending, phase: "unknown" });
       return false;
     }
@@ -5943,6 +5964,7 @@ export class SessionHost {
     this.#sessionRuntimeControlEffects.add(sessionId);
     let releaseTargetAdmission: (() => void) | undefined;
     try {
+      if (!this.#serviceRuntimePrompts.has(sessionId)) await this.refreshServiceRuntimePrompt(sessionId);
       let stored = this.#store.getSession(sessionId); this.#assertRuntimeHandoffSession(stored);
       const profile = this.#resolveRuntimeHandoffProfile(stored, { ...pending.profile }, pending.profile);
       const adapter = this.requireAdapter(profile.backendId), targetBackendGeneration = this.requireAdapterGeneration(profile.backendId, adapter);
@@ -5963,6 +5985,7 @@ export class SessionHost {
         this.#store.assertSessionRuntimeHandoffSource(sessionId, origin);
         const active = this.#active.get(sessionId);
         if (active !== undefined) {
+          const sourcePrompt = this.#serviceRuntimePrompts.get(sessionId), sourceConfiguration = this.#serviceRuntimeConfigurations.get(sessionId);
           const lease = this.beginActiveBackendSideEffect(sessionId, active);
           update({ ...pending, origin, phase: "effect", effect: "close" });
           try {
@@ -5971,7 +5994,13 @@ export class SessionHost {
           } catch (error) {
             if (!(error instanceof JokoError) || error.publicError.stateMayHaveChanged !== false) this.deleteActiveSession(sessionId, active);
             throw error;
-          } finally { lease.release(); }
+          } finally {
+            // Closing the old native runtime must not change the source
+            // identity that the pending handoff still needs to prove.
+            if (sourcePrompt !== undefined) this.#serviceRuntimePrompts.set(sessionId, sourcePrompt);
+            if (sourceConfiguration !== undefined) this.#serviceRuntimeConfigurations.set(sessionId, sourceConfiguration);
+            lease.release();
+          }
         }
         this.#releaseSessionTools(sessionId);
         update({ generation: pending.generation, source: pending.source, profile, phase: "closed", origin, ...(pending.fresh ? { fresh: true } : {}) });
@@ -6000,8 +6029,13 @@ export class SessionHost {
             mode: resumed ? "delta" : "full", workStateMessages: all, includeToolResults: true });
         const generation = origin.binding.generation + 1;
         const target = { ...this.targetForSession(stored), backendId: profile.backendId };
+        const cachedPrompt = this.#serviceRuntimePrompts.get(sessionId);
+        const baseDigest = privatePromptDigest(stored.descriptor.appendSystemPrompt);
+        const sourcePrompt = cachedPrompt?.baseDigest === baseDigest ? cachedPrompt.text : stored.descriptor.appendSystemPrompt;
+        const targetPrompt = this.#resolveServiceCreationPrompt === undefined ? sourcePrompt
+          : this.#resolveServiceCreationPrompt({ sessionId, target, appendSystemPrompt: sourcePrompt });
         const provisional = this.provisionalContext(sessionId, target, generation, undefined,
-          this.serviceRuntimePrompt(stored.descriptor), targetBackendGeneration, stored.descriptor.worktree);
+          this.decorateRuntimePrompt(targetPrompt), targetBackendGeneration, stored.descriptor.worktree);
         const context = { ...provisional, emit: async () => undefined };
         const create = async (): Promise<NativeSessionBinding> => {
           update({ ...pending!, phase: "effect", effect: "create", backendInstanceGeneration: targetBackendGeneration });
@@ -6044,9 +6078,18 @@ export class SessionHost {
           || state.fastMode !== profile.fastMode || state.permissionMode !== stored.descriptor.permissionMode
           || stored.descriptor.planMode && state.planMode !== true) throw new StoreError("The prepared runtime did not report the selected route and modes.");
         update({ ...pending, phase: "ready" });
+        if (this.#resolveServiceCreationPrompt !== undefined) this.#preparedRuntimeHandoffPrompts.set(sessionId, {
+          identity: JSON.stringify(pending), backendInstanceGeneration: targetBackendGeneration, baseDigest, text: targetPrompt
+        });
       }
       await assertCurrent();
       stored = this.#store.adoptSessionRuntimeHandoff(sessionId, pending.generation);
+      const preparedPrompt = this.#preparedRuntimeHandoffPrompts.get(sessionId);
+      if (preparedPrompt?.identity === JSON.stringify(pending) && preparedPrompt.backendInstanceGeneration === targetBackendGeneration) {
+        if (preparedPrompt.text === undefined) this.#serviceRuntimePrompts.delete(sessionId);
+        else this.#serviceRuntimePrompts.set(sessionId, { baseDigest: preparedPrompt.baseDigest, text: preparedPrompt.text });
+      }
+      this.#preparedRuntimeHandoffPrompts.delete(sessionId);
       this.#sessionRuntimeControl.settlePending(sessionId, pending.generation);
       this.#publishSessionRuntimeControlChanged(stored);
       return true;
@@ -11057,6 +11100,7 @@ export class SessionHost {
     this.#active.clear();
     this.#activeResourceCatalogs.clear();
     this.#serviceRuntimePrompts.clear();
+    this.#preparedRuntimeHandoffPrompts.clear();
     this.#backendResourceCatalogEpochs.clear();
     this.#backendResourceCatalogFences.clear();
     this.#activating.clear();
@@ -11827,7 +11871,9 @@ export class SessionHost {
       const presentationCreatedAt = input.catalogImport?.createdAt ?? now;
       const presentationAt = input.catalogImport?.modifiedAt ?? now;
       const appendSystemPrompt = nativeStart.kind === "attach" ? undefined : input.appendSystemPrompt;
-      const nativeAppendSystemPrompt = this.decorateRuntimePrompt(appendSystemPrompt);
+      let creationRuntimePrompt = appendSystemPrompt;
+      let resolvedCreationPrompt = false;
+      let nativeAppendSystemPrompt = this.decorateRuntimePrompt(appendSystemPrompt);
       if (input.worktree !== undefined
         && (nativeStart.kind !== "new" || nativeStart.parentNativeReference !== undefined)) {
         throw new JokoError({
@@ -12024,6 +12070,26 @@ export class SessionHost {
             if (operationKind === "create_scheduled_session" && input.permissionMode === "acceptEdits"
               && !supportsPermissionMode(this.#store.getBackend(runtimeTarget.backendId).descriptor, input.permissionMode)) {
               throw turnOverrideError("SESSION_PERMISSION_MODE_UNSUPPORTED", "The selected Backend does not support the scheduled task permission mode.");
+            }
+            if (authorized && nativeStart.kind === "new" && this.#resolveServiceCreationPrompt !== undefined) {
+              this.#assertOpen();
+              this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+              const operation = this.#store.getOperation(claim.operation.id);
+              if (operation.status !== "started" || operation.bodyHash !== claim.operation.bodyHash) {
+                throw new StoreError("Task creation Operation is no longer current.");
+              }
+              const currentTarget = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
+              if (currentTarget.revision !== registeredTarget.revision) {
+                throw new RevisionConflictError("Target", input.targetId, registeredTarget.revision, currentTarget.revision);
+              }
+              this.assertCurrentAdapterGeneration(target.descriptor.backendId, adapter, backendInstanceGeneration);
+              groupAssignment?.assertCurrent();
+              // Recompute before recording any native effect for this route.
+              // Cache the private snapshot only after successful adoption.
+              creationRuntimePrompt = this.#resolveServiceCreationPrompt({ sessionId, target: runtimeTarget, appendSystemPrompt });
+              resolvedCreationPrompt = true;
+              nativeAppendSystemPrompt = this.decorateRuntimePrompt(creationRuntimePrompt);
+              context = { ...context, appendSystemPrompt: nativeAppendSystemPrompt };
             }
             try {
               if (groupAssignment) {
@@ -12258,6 +12324,10 @@ export class SessionHost {
             complete
           );
         if (catalogBinding === undefined) {
+          if (resolvedCreationPrompt) {
+            if (creationRuntimePrompt === undefined) this.#serviceRuntimePrompts.delete(sessionId);
+            else this.#serviceRuntimePrompts.set(sessionId, { baseDigest: privatePromptDigest(appendSystemPrompt), text: creationRuntimePrompt });
+          }
           this.setActiveSession(
             sessionId,
             this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch)
@@ -17189,6 +17259,7 @@ export class SessionHost {
     this.#active.delete(sessionId);
     this.#activeResourceCatalogs.delete(sessionId);
     this.#serviceRuntimePrompts.delete(sessionId);
+    this.#preparedRuntimeHandoffPrompts.delete(sessionId);
     this.#serviceRuntimeConfigurations.delete(sessionId);
   }
 
