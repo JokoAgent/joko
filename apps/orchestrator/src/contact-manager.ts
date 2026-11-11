@@ -170,6 +170,37 @@ export class ContactManager {
   create(input: ContactDraft & { readonly expectedDirectoryRevision: bigint; readonly confirmedNameCandidateIds?: readonly string[] }) {
     return this.store.createContact(input);
   }
+  registerTelegramGroupSpeaker(input: {
+    readonly providerUserId: string;
+    readonly displayName: string;
+    readonly username: string | null;
+  }): boolean {
+    return this.store.runInTransaction(() => {
+      const directory = this.directory();
+      if (!directory.enabled) return false;
+      if (this.resolveIdentity("telegram", input.providerUserId) !== undefined) return true;
+
+      const draft: ContactDraft = {
+        kind: "person",
+        displayName: input.displayName.trim() || input.providerUserId,
+        source: "agent",
+        summary: "Telegram group member",
+        identities: [
+          { platform: "telegram", value: input.providerUserId },
+          ...(input.username === null ? [] : [{ platform: "telegram", value: `@${input.username}` }])
+        ]
+      };
+      const candidates = this.findSimilar(draft);
+      // A reused username does not grant authority over the existing contact.
+      if (candidates.some(candidate => candidate.matchType === "identity")) return false;
+      return this.create({
+        ...draft,
+        expectedDirectoryRevision: directory.revision,
+        confirmedNameCandidateIds: candidates.map(candidate => candidate.contactId)
+      }).contact !== undefined;
+    });
+  }
+
   createOrEnrichFromAgent(input: Omit<ContactDraft, "source"> & {
     readonly expectedDirectoryRevision: bigint;
     readonly allowDuplicate?: boolean;

@@ -42,12 +42,13 @@ import {
   type WeChatTransportOptions
 } from "@joko/messaging";
 import type { AdapterContext, BlobRef, DurableNativeDispatchPreparation, EventPayload, InteractionDecision, MessageBlock, NativeHistoryProjection, PromptInput } from "@joko/core";
-import { OperationalStore, PartnerStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { ContactManager } from "./contact-manager.js";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import {
@@ -412,6 +413,95 @@ describe("MessagingManager", () => {
     await vi.waitFor(() => expect(transport.sentText).toMatchObject([{ text: "I read the earlier context." }]));
     expect(fixture.store.getMessagingInboundRequest(requests[0]!.id).status).toBe("completed");
   });
+
+  it("registers only admitted Telegram group speakers with the current Contacts and owner settings", async () => {
+    const contactStore = new ContactStore(":memory:");
+    const contacts = new ContactManager(contactStore);
+    cleanups.push(() => { contacts.close(); contactStore.close(); });
+    const pending: TelegramUpdate[] = [];
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    vi.spyOn(transport, "poll").mockImplementation(async ({ signal }) => {
+      while (pending.length === 0) {
+        signal?.throwIfAborted();
+        await new Promise<void>(resolve => setTimeout(resolve, 5));
+      }
+      signal?.throwIfAborted();
+      const updates = pending.splice(0);
+      return { updates, nextCursor: String(updates.at(-1)!.update_id + 1) };
+    });
+    let ownerUserId = "42";
+    const bot = { id: 9001, username: "joko_test_bot", displayName: "Joko" };
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates,
+      { connectionId: transport.connectionId, ownerUserId, bot }));
+    const fixture = await createFixture(options => { ownerUserId = options.ownerUserId; return transport; },
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, contacts);
+    const connection = await enableTelegramReply(fixture, "telegram-contact-registration");
+    const mention = "@joko_test_bot";
+    const message = (id: number, senderId: number, username: string,
+      overrides: Partial<NonNullable<TelegramUpdate["message"]>> = {}): TelegramUpdate => ({
+      update_id: id,
+      message: {
+        message_id: id, from: { id: senderId, first_name: "Avery", username, is_bot: false },
+        chat: { id: -100555, type: "supergroup" }, date: Math.floor(Date.now() / 1_000),
+        text: `${mention} Hello`, entities: [{ type: "mention", offset: 0, length: mention.length }],
+        ...overrides
+      }
+    });
+    const accept = async (...updates: TelegramUpdate[]) => {
+      pending.push(...updates);
+      await vi.waitFor(() => expect(fixture.store.getMessagingConnection(connection.id).cursor)
+        .toBe(String(updates.at(-1)!.update_id + 1)), { timeout: 5_000 });
+    };
+    const resolve = (id: string) => contacts.resolveIdentity("telegram", id);
+
+    await accept(message(10, 100, "avery_first"));
+    expect(contacts.directory()).toMatchObject({ enabled: false, people: 0 });
+    contacts.setEnabled(contacts.directory().revision, true);
+    await accept(
+      message(11, 100, "avery_first", { text: "ordinary group conversation", entities: [] }),
+      message(12, 42, "owner"),
+      message(13, 101, "private_member", { has_protected_content: true })
+    );
+    expect(contacts.directory().people).toBe(0);
+    expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id }).map(row => row.providerMessageId))
+      .toEqual(expect.arrayContaining(["10", "12", "13"]));
+
+    vi.spyOn(contactStore, "createContact").mockImplementationOnce(() => { throw new Error("Contact store temporarily unavailable."); });
+    await accept(message(14, 100, "avery_first"));
+    expect(resolve("100")).toBeUndefined();
+    await vi.waitFor(() => expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })
+      .find(row => row.providerMessageId === "14")?.status).toBe("completed"));
+    await accept(message(15, 100, "avery_first"));
+    const first = resolve("100")!;
+    expect(first).toMatchObject({ displayName: "Avery", source: "agent", identities: expect.arrayContaining([
+      expect.objectContaining({ platform: "telegram", value: "100" }),
+      expect.objectContaining({ platform: "telegram", value: "@avery_first" })
+    ]) });
+    const edited = contacts.update(first.id, first.revision, { summary: "Owner's contact notes." });
+    await accept(message(16, 100, "avery_renamed"), message(17, 102, "avery_second"), message(18, 103, "avery_first"));
+    expect(resolve("100")).toEqual(edited);
+    expect(resolve("@avery_renamed")).toBeUndefined();
+    expect(resolve("102")).toMatchObject({ displayName: "Avery", identities: expect.arrayContaining([
+      expect.objectContaining({ value: "@avery_second" })
+    ]) });
+    expect(resolve("102")?.id).not.toBe(first.id);
+    expect(resolve("103")).toBeUndefined();
+    expect(contacts.directory().people).toBe(2);
+
+    contacts.delete(first.id, edited.revision);
+    await accept(message(19, 100, "avery_first"));
+    expect(resolve("100")).toBeUndefined();
+    const current = fixture.store.getMessagingConnection(connection.id);
+    await fixture.manager.replaceTelegramConfiguration({
+      connectionId: current.id, expectedRevision: current.revision, expectedGeneration: current.generation,
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" }, ownerProviderUserId: "104"
+    });
+    await accept(message(20, 104, "new_owner"), message(21, 42, "former_owner"), message(22, 100, "avery_first"));
+    expect(resolve("104")).toBeUndefined();
+    expect(resolve("42")?.identities).toContainEqual(expect.objectContaining({ value: "@former_owner" }));
+    expect(resolve("100")?.id).toBeDefined();
+    expect(resolve("100")?.id).not.toBe(first.id);
+  }, 20_000);
 
   it("retires a pending stream when its original connection generation is disabled", async () => {
     const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
@@ -4128,7 +4218,8 @@ async function createFixture(
   weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"],
   slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport,
   replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"],
-  sessionRuntimeRecoveryDelayMs?: (attempt: number) => number
+  sessionRuntimeRecoveryDelayMs?: (attempt: number) => number,
+  contacts?: ContactManager
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -4167,6 +4258,7 @@ async function createFixture(
     contextVault: vault,
     sessionHost: host,
     artifacts,
+    ...(contacts === undefined ? {} : { contacts }),
     retryDelayMs: 5,
     ...(weChatPresenceTiming === undefined ? {} : { weChatPresenceTiming }),
     ...(replyStreamTiming === undefined ? {} : { replyStreamTiming }),
