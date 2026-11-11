@@ -34,6 +34,7 @@ import { TaskTagDialog } from "./components/TaskTags.js";
 import { NewSessionPage } from "./components/NewSessionPage.js";
 import { DesktopWindowControls } from "./components/DesktopWindowControls.js";
 import { DesktopPageSearchBar } from "./components/DesktopPageSearchBar.js";
+import { DesktopPageSearchTextAccess } from "./components/desktop-page-search.js";
 import { StartupUpdateOverlay } from "./components/StartupUpdateOverlay.js";
 import { NativeTaskStatusBridge } from "./components/NativeTaskStatusBridge.js";
 import { useDesktopMenuBar } from "./desktop-menu-bar.js";
@@ -311,6 +312,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [retryableMessageDeepLinkKey, setRetryableMessageDeepLinkKey] = useState<string>();
   const [applicationMenuNotice, setApplicationMenuNotice] = useState<(DesktopUpdateCheckNotice & { readonly id: number })>();
   const [busyAction, setBusyAction] = useState<string>();
+  const [desktopPageSearchOpen, setDesktopPageSearchOpen] = useState(false);
   const actionFlightRef = useRef(0);
   const [layoutNotice, setLayoutNotice] = useState<string>();
   const [sessionProjectOverrides, setSessionProjectOverrides] = useState<ReadonlyMap<string, SessionProjectNavigationPlacement>>(() => new Map());
@@ -2296,6 +2298,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
 
   return (
+    <DesktopPageSearchTextAccess.Provider value={desktopPageSearchOpen}>
     <PartnerConversationScope controller={controller} session={activeSession} active={state.route.kind === "session"} t={t}
       onOpenTopic={(topicSessionId) => addSessionToSplit(topicSessionId, activeSession?.id ?? topicSessionId, "right")}>
     <PartnerAvatarProvider controller={controller} ownerKey={state.connectionState === "connected" && state.activeProfile
@@ -2319,7 +2322,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       />
       <DesktopRemoteDesktopStatus t={t} />
       <a className="skip-link" href="#main-content">{t("app.skipToContent")}</a>
-      <DesktopPageSearchBar overrides={shortcutOverrides} t={t} />
+      <DesktopPageSearchBar overrides={shortcutOverrides} t={t} onOpenChange={setDesktopPageSearchOpen} />
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
         appShortcutOverrides={shortcutOverrides}
@@ -2736,6 +2739,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     </div>
     </PartnerAvatarProvider>
     </PartnerConversationScope>
+    </DesktopPageSearchTextAccess.Provider>
   );
 }
 
