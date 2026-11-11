@@ -102,6 +102,84 @@ describe("session gamepad actions", () => {
     await act(async () => document.querySelector<HTMLButtonElement>("[data-message-fork-confirm='true']")!.click());
     await view.flush(); expect(view.api.forkSession).toHaveBeenCalledOnce();
     expect(view.api.forkSession.mock.calls[0]?.slice(0, 2)).toEqual(["task", "native-entry"]);
+    expect(view.api.loadSessionTimelineAround).not.toHaveBeenCalled();
+  });
+
+  it("forks an already loaded cold user message from its durable event and native parent", async () => {
+    const view = await mount();
+    const coldMessage: TimelineItemView = {
+      ...message, kind: "user", id: "user-entry", messageId: "user-entry", nativeEntryId: "user-entry",
+      text: "Cold prompt", nativeParentEntryId: "native-parent"
+    };
+    await view.render(session, backend, false, {}, [coldMessage], []);
+    view.api.loadSessionTimelineAround.mockResolvedValueOnce([coldMessage]);
+
+    await view.derive("fork");
+    await view.flush();
+
+    expect(view.api.loadSessionTimelineAround).toHaveBeenCalledExactlyOnceWith("task", "event");
+    expect(view.api.forkSession).toHaveBeenCalledExactlyOnceWith("task", "native-parent", "session.branchSuffix", {
+      messageId: "user-entry", eventId: "event"
+    });
+    expect(view.api.saveDraft).toHaveBeenCalledExactlyOnceWith("forked", expect.objectContaining({ text: "Cold prompt", attachments: [] }));
+    expect(view.api.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "forked" });
+  });
+
+  it.each(["event", "message", "boundary", "missing"] as const)("rejects a cold fork when the history read changes its %s", async (change) => {
+    const view = await mount();
+    const coldMessage = { ...message, messageId: "original-message" };
+    const history = change === "missing" ? [] : [{
+      ...coldMessage,
+      ...(change === "event" ? { sourceEventId: "other-event" } : {}),
+      ...(change === "message" ? { messageId: "other-message" } : {}),
+      ...(change === "boundary" ? { nativeEntryId: "other-boundary" } : {})
+    }];
+    await view.render(session, backend, false, {}, [coldMessage], []);
+    view.api.loadSessionTimelineAround.mockResolvedValueOnce(history);
+
+    await view.derive("fork");
+    await expect(view.flush()).rejects.toThrow("timeline.forkUnavailable");
+    expect(view.api.forkSession).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("rechecks the stable assistant boundary during a running task with a later user row: %s", async (hasLaterUser) => {
+    const view = await mount();
+    const laterUser: TimelineItemView = { id: "later-user", sourceEventId: "later-event", kind: "user", sequence: 2n, createdAt: 2 };
+    const running = { ...session, state: "running" as const, activeRunId: "later-run" };
+    await view.render(running, backend, false, {}, [message, laterUser], []);
+    view.api.loadSessionTimelineAround.mockResolvedValueOnce(hasLaterUser ? [message, laterUser] : [message]);
+
+    await view.derive("fork");
+    if (hasLaterUser) {
+      await view.flush();
+      expect(view.api.forkSession).toHaveBeenCalledExactlyOnceWith("task", "native-entry", "session.branchSuffix", {
+        messageId: "message", eventId: "event"
+      });
+    } else {
+      await expect(view.flush()).rejects.toThrow("timeline.forkBusy");
+      expect(view.api.forkSession).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(["confirmation", "history read"] as const)("retires a cold message fork when its connection changes during %s", async (boundary) => {
+    const view = await mount();
+    await view.render(session, backend, false, {}, [message], []);
+    await act(async () => view.host.querySelector<HTMLButtonElement>('[data-testid="message-fork"]')!.click());
+    const confirm = document.querySelector<HTMLButtonElement>("[data-message-fork-confirm='true']")!;
+    let finishHistory!: (items: readonly TimelineItemView[]) => void;
+    view.api.loadSessionTimelineAround.mockImplementationOnce(() => new Promise((resolve) => { finishHistory = resolve; }));
+    if (boundary === "history read") {
+      await act(async () => confirm.click());
+      expect(view.api.loadSessionTimelineAround).toHaveBeenCalledOnce();
+    }
+    await view.render(session, backend, false, { connectionGeneration: 2 }, [message], []);
+    if (boundary === "confirmation") {
+      await act(async () => confirm.click());
+      expect(view.api.loadSessionTimelineAround).not.toHaveBeenCalled();
+    } else await act(async () => finishHistory([message]));
+    await view.flush();
+    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.navigate).not.toHaveBeenCalled();
   });
 
   it("copies the complete current task through the configured gamepad action and reports the result", async () => {
@@ -337,14 +415,17 @@ async function mount(overrides: AppShortcutOverrides = {}) {
     listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } })),
     pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkSession: vi.fn<AppController["forkSession"]>(async () => "forked"),
     loadSessionTimelinePage: vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] })),
+    loadSessionTimelineAround: vi.fn<AppController["loadSessionTimelineAround"]>(async () => []),
     saveDraft: vi.fn<AppController["saveDraft"]>(async () => undefined),
     startSkillLearning: vi.fn<AppController["startSkillLearning"]>(async () => learningRun),
     cloneSession: vi.fn<AppController["cloneSession"]>(async () => "cloned"), navigate: vi.fn(), exportSession: vi.fn(), getArtifactUrl: vi.fn(), releaseArtifactUrl: vi.fn() };
   const archive = vi.fn(); const copy = vi.fn(); const pending: Promise<unknown>[] = [];
   const host = document.body.appendChild(document.createElement("div")); const root = createRoot(host); roots.push(root);
   const controller = { ...api } as unknown as AppController;
-  const render = async (current = session, currentBackend = backend, readOnly = false, stateOverrides: Partial<AppController["state"]> = {}, items = [message]) => {
-    const snapshot = { ...emptySnapshot(), revision: 1n, sessions: [current], backends: [currentBackend], models: [model], timelineBySession: new Map([[current.id, items]]) };
+  const render = async (current = session, currentBackend = backend, readOnly = false, stateOverrides: Partial<AppController["state"]> = {},
+    items: readonly TimelineItemView[] = [message], liveItems = items) => {
+    const snapshot = { ...emptySnapshot(), revision: 1n, sessions: [current], backends: [currentBackend], models: [model],
+      timelineBySession: liveItems.length === 0 ? new Map() : new Map([[current.id, liveItems]]) };
     Object.assign(controller, { ...api, state: { ready: true, connectionState: "connected", connectionGeneration: 1, navigationRevision: 1,
       activeProfile: { id: "profile", serverId: "server", deviceId: "device", name: "Node", origin: "https://node.example" },
       preferences: { ...DEFAULT_UI_PREFERENCES, appShortcutOverrides: overrides }, snapshot, route: { kind: "session", sessionId: current.id }, ...stateOverrides } });

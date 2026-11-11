@@ -58,7 +58,8 @@ import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, resolveErr
 import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { timelineHistoryOwnerKey } from "../timeline-history-cache.js";
-import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
+import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget } from "./message-actions.js";
+import { mergeTimelineWindows } from "./timeline-behavior.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
 import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
@@ -152,8 +153,11 @@ interface ActiveMessageDelete {
 
 interface ActiveMessageFork {
   readonly sessionId: string;
+  readonly itemId: string;
   readonly messageId: string;
-  readonly target: MessageForkTarget;
+  readonly eventId: string;
+  readonly nativeEntryId: string;
+  readonly isCurrent: () => boolean;
 }
 
 export type SessionPanePresentation = "standard" | "filesRail";
@@ -427,9 +431,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current = undefined;
     rewindDocumentRef.current?.remove();
   }, []);
-  const beginDerivedTaskAction = () => {
-    const occurrence = {};
-    derivedTaskActionRef.current = occurrence;
+  const captureDerivedTaskSource = (): (() => boolean) => {
     const sourceState = controllerRef.current.state;
     const sourceProfileId = sourceState.activeProfile?.id;
     const sourceServerId = sourceState.activeProfile?.serverId;
@@ -441,25 +443,27 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const sourceSessionGeneration = session.generation;
     const sourceEpoch = rewindEpochRef.current;
     const sourceResourceOwner = timelineResourceOwnerRef.current;
-    return {
-      isCurrent: () => {
-        const current = controllerRef.current.state;
-        return derivedTaskActionRef.current === occurrence
-          && rewindEpochRef.current === sourceEpoch
-          && sourceResourceOwner !== undefined
-          && timelineResourceOwnerRef.current === sourceResourceOwner
-          && current.connectionState === "connected"
-          && current.connectionGeneration === sourceConnectionGeneration
-          && current.activeProfile?.id === sourceProfileId
-          && current.activeProfile?.serverId === sourceServerId
-          && current.activeProfile?.origin === sourceOrigin
-          && current.snapshot.generation === sourceSnapshotGeneration
-          && current.navigationRevision === sourceNavigationRevision
-          && activeSessionIdRef.current === sourceSessionId
-          && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration
-          && sessionRouteIsCurrent(current.route, sourceSessionId);
-      }
+    return () => {
+      const current = controllerRef.current.state;
+      return rewindEpochRef.current === sourceEpoch
+        && sourceResourceOwner !== undefined
+        && timelineResourceOwnerRef.current === sourceResourceOwner
+        && current.connectionState === "connected"
+        && current.connectionGeneration === sourceConnectionGeneration
+        && current.activeProfile?.id === sourceProfileId
+        && current.activeProfile?.serverId === sourceServerId
+        && current.activeProfile?.origin === sourceOrigin
+        && current.snapshot.generation === sourceSnapshotGeneration
+        && current.navigationRevision === sourceNavigationRevision
+        && activeSessionIdRef.current === sourceSessionId
+        && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration
+        && sessionRouteIsCurrent(current.route, sourceSessionId);
     };
+  };
+  const beginDerivedTaskAction = (isSourceCurrent = captureDerivedTaskSource()) => {
+    const occurrence = {};
+    derivedTaskActionRef.current = occurrence;
+    return { isCurrent: () => derivedTaskActionRef.current === occurrence && isSourceCurrent() };
   };
   const bottomOverlayRef = useRef<HTMLDivElement>(null);
   const composerMessageMentionInsertionIdRef = useRef(0);
@@ -692,6 +696,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     () => recoveryPresentationTimeline.filter((item) => !hidesFromTimelineHistory(item) && !(errorTailProjection?.hideFromTimeline === true && item.id === errorTailProjection.item.id)),
     [errorTailProjection, recoveryPresentationTimeline]
   );
+  const messageForkViewRef = useRef({ canFork: canForkMessage, timeline: visibleTimeline });
+  messageForkViewRef.current = { canFork: canForkMessage, timeline: visibleTimeline };
   const derivationOrigin = session.derivationOrigin;
   const personalReportsEnabled = !guest && !reviewReadOnly && session.remoteWorkspace === undefined && controller.state.activeProfile?.managedLocal === true
     && window.jokoDesktop?.capabilities.includes("development.personal") === true;
@@ -1525,67 +1531,94 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       reportMessageForkFailure(item.id, t("timeline.forkBusy"));
       return;
     }
-    setMessageFork({ sessionId: session.id, messageId: item.id, target });
+    if (item.sourceEventId === undefined) {
+      reportMessageForkFailure(item.id, t("timeline.forkUnavailable"));
+      return;
+    }
+    setMessageFork({
+      sessionId: session.id,
+      itemId: item.id,
+      messageId: item.messageId ?? item.id,
+      eventId: item.sourceEventId,
+      nativeEntryId: target.entryId,
+      isCurrent: captureDerivedTaskSource()
+    });
   };
 
   const confirmMessageFork = (): void => {
     const pending = messageFork;
     if (pending === undefined || pending.sessionId !== session.id || forkingMessageId !== undefined) return;
     setMessageFork(undefined);
-    const latestState = controllerRef.current.state;
-    const latestSnapshot = latestState.snapshot;
-    const latestSession = latestSnapshot.sessions.find((candidate) => candidate.id === pending.sessionId);
-    const latestBackend = latestSession === undefined
-      ? undefined
-      : latestSnapshot.backends.find((candidate) => candidate.id === latestSession.backendId);
-    const latestTimeline = latestSnapshot.timelineBySession.get(pending.sessionId) ?? [];
-    const latestItem = latestTimeline.find((candidate) => candidate.id === pending.messageId);
-    const latestTarget = latestItem === undefined ? undefined : resolveMessageForkTarget(latestItem);
-    const latestRunning = latestSession?.state === "running" || latestSession?.state === "waiting" || latestSession?.state === "retrying";
-    const routeCurrent = sessionRouteIsCurrent(latestState.route, pending.sessionId)
-      && activeSessionIdRef.current === pending.sessionId;
-    if (!routeCurrent) return;
-    if (
-      latestBackend?.capabilities.get("session.fork")?.supported !== true
-      || (latestSession?.worktree !== undefined
-        && latestBackend.capabilities.get("workspace.derive")?.supported !== true)
-      || latestItem === undefined
-      || latestItem.sourceEventId === undefined
-      || latestTarget?.entryId !== pending.target.entryId
-    ) {
-      reportMessageForkFailure(pending.messageId, t("timeline.forkUnavailable"));
+    if (!pending.isCurrent()) return;
+    const currentSource = () => {
+      const snapshot = controllerRef.current.state.snapshot;
+      const sourceSession = snapshot.sessions.find((candidate) => candidate.id === pending.sessionId);
+      if (!messageForkViewRef.current.canFork || sourceSession === undefined) return undefined;
+      const sourceBackend = snapshot.backends.find((candidate) => candidate.id === sourceSession.backendId);
+      if (sourceBackend?.capabilities.get("session.fork")?.supported !== true
+        || (sourceSession.worktree !== undefined && sourceBackend.capabilities.get("workspace.derive")?.supported !== true)) return undefined;
+      const timeline = snapshot.timelineBySession.get(pending.sessionId) ?? [];
+      const running = sourceSession.state === "running" || sourceSession.state === "waiting" || sourceSession.state === "retrying";
+      return { session: sourceSession, timeline, running };
+    };
+    const selectedMessage = (item: TimelineItemView | undefined) => {
+      if (item === undefined || item.sourceEventId !== pending.eventId || (item.messageId ?? item.id) !== pending.messageId) return undefined;
+      const target = resolveMessageForkTarget(item);
+      return target !== undefined && target.entryId === pending.nativeEntryId ? { item, target } : undefined;
+    };
+    const findMessage = (items: readonly TimelineItemView[]) => items.find((item) => item.id === pending.itemId);
+    const source = currentSource();
+    const liveItem = source === undefined ? undefined : findMessage(source.timeline);
+    const selected = selectedMessage(liveItem ?? findMessage(messageForkViewRef.current.timeline));
+    if (source === undefined || selected === undefined) {
+      reportMessageForkFailure(pending.itemId, t("timeline.forkUnavailable"));
       return;
     }
-    if (messageForkBlocked(latestTimeline, latestItem, latestRunning)) {
-      reportMessageForkFailure(pending.messageId, t("timeline.forkBusy"));
+    if (liveItem !== undefined && messageForkBlocked(source.timeline, liveItem, source.running)) {
+      reportMessageForkFailure(pending.itemId, t("timeline.forkBusy"));
       return;
     }
-    const sourceSessionId = pending.sessionId;
-    const sourceSessionName = latestSession?.name ?? session.name;
-    const sourceEventId = latestItem.sourceEventId;
-    const actionOwner = beginDerivedTaskAction();
-    const forkSession = controllerRef.current.forkSession;
-    const saveDraft = controllerRef.current.saveDraft;
-    const navigate = controllerRef.current.navigate;
+    const actionOwner = beginDerivedTaskAction(pending.isCurrent);
+    const { forkSession, saveDraft, navigate, loadSessionTimelineAround } = controllerRef.current;
     const forkOccurrence = {};
     messageForkActionRef.current = forkOccurrence;
-    setForkingMessageId(pending.messageId);
-    runAction(`fork-message:${pending.messageId}`, async () => {
+    setForkingMessageId(pending.itemId);
+    runAction(`fork-message:${pending.itemId}`, async () => {
       try {
+        let { item, target } = selected;
+        let sourceSessionName = source.session.name;
+        if (liveItem === undefined) {
+          // A cold row belongs to the persisted active history, even when this
+          // connection never observed it on the event stream.
+          const history = await loadSessionTimelineAround(pending.sessionId, pending.eventId).catch((cause: unknown) => {
+            if (!actionOwner.isCurrent()) return undefined;
+            throw new Error(t("timeline.forkUnavailable"), { cause });
+          });
+          if (!actionOwner.isCurrent() || history === undefined) return;
+          const latest = currentSource();
+          const persisted = selectedMessage(findMessage(history));
+          if (latest === undefined || persisted === undefined) throw new Error(t("timeline.forkUnavailable"));
+          const latestLiveItem = findMessage(latest.timeline);
+          if (latestLiveItem !== undefined && selectedMessage(latestLiveItem) === undefined) throw new Error(t("timeline.forkUnavailable"));
+          const timeline = mergeTimelineWindows(latest.timeline, history);
+          if (messageForkBlocked(timeline, persisted.item, latest.running)) throw new Error(t("timeline.forkBusy"));
+          ({ item, target } = persisted);
+          sourceSessionName = latest.session.name;
+        }
         const forkedSessionId = await forkSession(
-          sourceSessionId,
-          latestTarget.entryId,
+          pending.sessionId,
+          target.entryId,
           t("session.branchSuffix", { name: sourceSessionName }),
-          { messageId: latestItem.messageId ?? latestItem.id, eventId: sourceEventId }
+          { messageId: pending.messageId, eventId: pending.eventId }
         );
         if (!actionOwner.isCurrent()) return;
-        if (latestTarget.composerText !== undefined) {
-          const editorDocument = composerDocumentFromMessage(latestTarget.composerText, latestItem.quotesEncoded === true, {
-               sessionId: sourceSessionId,
-               messageId: latestItem.id,
-               role: "user",
-               ...(latestItem.sourceEventId === undefined ? {} : { sourceEventId: latestItem.sourceEventId })
-            }, "edit", latestItem.pastedTextRanges);
+        if (target.composerText !== undefined) {
+          const editorDocument = composerDocumentFromMessage(target.composerText, item.quotesEncoded === true, {
+            sessionId: pending.sessionId,
+            messageId: item.id,
+            role: "user",
+            sourceEventId: pending.eventId
+          }, "edit", item.pastedTextRanges);
           await saveDraft(forkedSessionId, {
             text: composerDocumentPlainText(editorDocument),
             editorDocument,
@@ -1600,7 +1633,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       } finally {
         if (messageForkActionRef.current === forkOccurrence) {
           messageForkActionRef.current = undefined;
-          setForkingMessageId((current) => current === pending.messageId ? undefined : current);
+          setForkingMessageId((current) => current === pending.itemId ? undefined : current);
         }
       }
     });
@@ -2452,7 +2485,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         </div>
       </Modal>
       <MessageForkDialog
-        key={currentMessageFork === undefined ? "message-fork:none" : `${currentMessageFork.sessionId}:${currentMessageFork.messageId}`}
+        key={currentMessageFork === undefined ? "message-fork:none" : `${currentMessageFork.sessionId}:${currentMessageFork.itemId}`}
         open={currentMessageFork !== undefined}
         t={t}
         onClose={() => setMessageFork(undefined)}
