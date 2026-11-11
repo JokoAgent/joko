@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import type { BlobRef } from "@joko/core";
+import type { BlobRef, PromptInput } from "@joko/core";
 import type { PersistedEvent } from "@joko/store";
 import { decodePortableSessionPackage, isEncryptedPortableSessionPackage } from "./portable-session-package.js";
 import { decodePortableSessionProjection } from "./portable-session-projection.js";
@@ -40,6 +40,25 @@ function events(): PersistedEvent[] {
 }
 
 describe("portable Session export composition", () => {
+  it.each([
+    ["Partner reply", { replyQuote: { generation: 1, eventId: "source-event", messageId: "source-message",
+      role: "assistant", excerpt: "Original private reply" } }],
+    ["Partner Todo", { todoQuote: { partnerId: "source-partner", todoId: "source-todo", revision: 2, title: "Original private Todo" } }],
+    ["owner IM", { messagingOrigin: { connectionId: "source-connection", channelGeneration: 1, credentialGeneration: "source-credential-generation",
+      bindingRevision: 2, partnerId: "source-partner", conversationId: "source-conversation", requestId: "source-request",
+      channel: "wechat", providerUserId: "source-user", isOwner: true, userText: "Original message" } }]
+  ] satisfies [string, Partial<PromptInput>][])("round-trips accepted %s input through the portable package", async (_label, sourceMetadata) => {
+    const input: PromptInput = { text: "Original message", images: [], files: [], mentions: [], disposition: "prompt" };
+    const blocks = [{ kind: "text", text: input.text }] as const;
+    const built = await buildPortableSessionExport({
+      applicationVersion: "0.1.0", title: "Task", workspaceKind: "dialogue", backendCapability: "native-portable-session-v1",
+      events: [{ emittedAt: 10, payload: { type: "message_complete", role: "user", blocks, acceptedInput: { ...input, ...sourceMetadata } } }],
+      readBlob: async () => { throw new Error("No media to read."); }
+    });
+    const restored = await materializePortableSessionImport(preparePortableSessionImport(built.bytes), vi.fn());
+    expect(restored.events).toEqual([{ emittedAt: 10, payload: { type: "message_complete", role: "user", blocks, acceptedInput: input } }]);
+  });
+
   it("retains audio without a missing cover and replaces a missing track without orphan artwork", async () => {
     const fixture = audioMedia();
     for (const missing of ["cover", "audio"] as const) {

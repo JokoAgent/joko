@@ -542,14 +542,16 @@ function projectAcceptedInputMentions(
     const mentionIndex = replacementIndexes.get(range.mentionIndex);
     return mentionIndex === undefined ? [] : [{ ...range, mentionIndex }];
   });
-  const {
-    sessionReferenceSnapshots: _sessionReferenceSnapshots,
-    artifactReferenceSnapshots: _artifactReferenceSnapshots,
-    ...portableInput
-  } = input;
+  // Queue metadata can identify the source node's conversations, tasks and
+  // permissions. Only project accepted input fields defined by portable v1.
   return {
-    ...portableInput,
+    text: input.text,
+    images: input.images,
+    files: input.files,
     mentions,
+    disposition: input.disposition,
+    ...(input.quotesEncoded === undefined ? {} : { quotesEncoded: input.quotesEncoded }),
+    ...(input.pastedTextRanges === undefined ? {} : { pastedTextRanges: input.pastedTextRanges }),
     ...(mentionRanges === undefined ? {} : { mentionRanges })
   };
 }
