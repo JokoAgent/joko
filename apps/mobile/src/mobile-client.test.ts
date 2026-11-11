@@ -11908,6 +11908,17 @@ describe("native message rewinds", () => {
     return (await app.loadTaskMessageRewindPreview(controls.authorityKey, "rewind-complete", new AbortController().signal))!;
   }
 
+  async function openOldRewindWindow(app: MobileClient, network: MobileNetwork, events: readonly Event[]) {
+    const source = events.map(item => create(EventSchema, { ...item, cursor: { ...item.cursor!, opaqueToken: `cursor-${item.cursor!.sequence}` } }));
+    vi.mocked(network.readAround).mockResolvedValueOnce(source);
+    await app.around("rewind-complete");
+    const earlier = event("earlier-neighbor", 19n);
+    vi.mocked(network.readHistory).mockResolvedValueOnce({ events: [earlier], before: earlier.cursor });
+    await app.older();
+    expect(app.state.window).toEqual([earlier, ...source]);
+    return { window: app.state.window, before: earlier.cursor };
+  }
+
   it("persists approved input and body-free receipt before native dialogue rewind, then merges the draft before receipt clearance and refreshes new history", async () => {
     const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
     const identity = { profileId: credential.profileId, sessionId: "session" };
@@ -11948,7 +11959,10 @@ describe("native message rewinds", () => {
       return f.operation(operationId, "files");
     });
     f.files.workspaceId = "owned-workspace";
+    const oldEvents = f.state.events;
+    f.state.events = [event("latest-window", 24n)];
     const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+    const history = await openOldRewindWindow(app, f.network, oldEvents);
     expect(app.taskMessageRewindControls("rewind-complete")).toMatchObject({ canDialogue: false, canFiles: true });
     const value = await preview(app);
     await expect(app.commitTaskMessageRewind(value, "dialogue", new AbortController().signal)).rejects.toThrow(/preview changed/u);
@@ -11956,6 +11970,24 @@ describe("native message rewinds", () => {
     expect(f.network.listWorkspaceChangeSets).toHaveBeenCalledWith(credential, "owned-workspace", "session", expect.any(AbortSignal));
     expect(f.network.previewWorkspaceRewind).toHaveBeenCalledWith(credential, "owned-workspace", "checkpoint", expect.any(AbortSignal));
     expect(drafts.composer.readSync(identity)?.text).toBe("Keep draft"); expect(saved.pending()).toEqual([]);
+    expect(app.state).toMatchObject({ ...history, historyEnd: false });
+    expect(app.state.detail?.timeline.map(item => item.eventId)).toEqual(["latest-window"]);
+  });
+
+  it("keeps the currently loaded old window when the original files-only rewind receipt is reconciled", async () => {
+    const f = fixture(false); const saved = memoryStorage(credential);
+    const oldEvents = f.state.events;
+    f.state.events = [event("latest-window", 24n)];
+    const app = client(f.network, saved.storage); await app.start();
+    const history = await openOldRewindWindow(app, f.network, oldEvents);
+    vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
+    await expect(app.commitTaskMessageRewind(await preview(app), "files", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+    expect(saved.pending()).toMatchObject([{ kind: "workspace-rewind", operationId: "operation-1" }]);
+    vi.mocked(f.network.getOperation).mockResolvedValueOnce(f.operation("operation-1", "files"));
+    await app.reconcile();
+    expect(saved.pending()).toEqual([]);
+    expect(app.state).toMatchObject({ ...history, historyEnd: false });
+    expect(f.network.submit).toHaveBeenCalledOnce();
   });
 
   it("reconciles a lost response after restart from private retained input when the original Event is gone, without resending", async () => {
