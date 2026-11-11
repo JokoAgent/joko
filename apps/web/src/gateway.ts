@@ -9851,10 +9851,23 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ContactService, scope.transport).previewContactVCardImport({ vcardText }, { signal: scope.signal });
     scope.signal.throwIfAborted();
+    const rejectedEntries = response.rejectedEntries.map((entry) => {
+      if (entry.displayName.trim() === "" || entry.displayName.length > 100 || entry.reason.trim() === "" || entry.reason.length > 120
+        || /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(entry.displayName + entry.reason)) {
+        throw new GatewayError("Orchestrator returned an invalid rejected Contact vCard entry.");
+      }
+      return { entryId: entry.entryId, displayName: entry.displayName, reason: entry.reason };
+    });
+    const entryIds = [...response.entries, ...rejectedEntries].map((entry) => entry.entryId);
+    if (entryIds.length > 2_000 || entryIds.some((id) => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(id))
+      || new Set(entryIds).size !== entryIds.length) {
+      throw new GatewayError("Orchestrator returned invalid Contact vCard preview entries.");
+    }
     return {
       previewId: response.previewId,
       directoryRevision: requiredContactRevision(response.directoryRevision, "vCard preview directory"),
       entries: response.entries.map(mapContactVCardImportPreviewEntry),
+      ...(rejectedEntries.length === 0 ? {} : { rejectedEntries }),
       expiresAt: requiredContactTimestamp(response.expiresAt, "vCard preview expiry")
     };
   }
@@ -9873,14 +9886,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           : entry.outcome === ContactVCardImportOutcome.SKIPPED ? "skipped" as const
             : undefined;
       if (entry.entryId.trim() === "" || entry.displayName.trim() === "" || outcome === undefined
-        || (outcome === "skipped") !== (entry.contactId === undefined)) {
+        || (outcome === "skipped") !== (entry.contactId === undefined)
+        || entry.reason !== undefined && (outcome !== "skipped" || entry.reason.trim() === "" || entry.reason.length > 120)) {
         throw new GatewayError("Orchestrator returned an invalid Contact vCard entry result.");
       }
       return {
         entryId: entry.entryId,
         displayName: entry.displayName,
         outcome,
-        ...(entry.contactId === undefined ? {} : { contactId: entry.contactId })
+        ...(entry.contactId === undefined ? {} : { contactId: entry.contactId }),
+        ...(entry.reason === undefined ? {} : { reason: entry.reason })
       };
     });
     if (response.created !== entries.filter((entry) => entry.outcome === "created").length

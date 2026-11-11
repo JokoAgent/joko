@@ -560,6 +560,13 @@ message PreviewContactVCardImportResponse {
   Revision directory_revision = 2;
   repeated ContactVCardImportPreviewEntry entries = 3;
   google.protobuf.Timestamp expires_at = 4;
+  repeated ContactVCardImportRejectedEntry rejected_entries = 5;
+}
+
+message ContactVCardImportRejectedEntry {
+  string entry_id = 1;
+  string display_name = 2;
+  string reason = 3;
 }
 
 message ContactVCardImportDecision {
@@ -594,6 +601,7 @@ message ContactVCardImportEntryResult {
   string display_name = 2;
   ContactVCardImportOutcome outcome = 3;
   optional string contact_id = 4;
+  optional string reason = 5;
 }
 
 message CommitContactVCardImportResponse {

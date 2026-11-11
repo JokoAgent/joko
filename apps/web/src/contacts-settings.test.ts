@@ -9,6 +9,7 @@ describe("Contact vCard review", () => {
       previewId: "preview",
       directoryRevision: 7n,
       expiresAt: Date.now() + 60_000,
+      rejectedEntries: [{ entryId: "invalid-entry", displayName: "Invalid name", reason: "Contact display name is invalid." }],
       entries: [
         {
           entryId: "entry-one",

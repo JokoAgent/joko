@@ -289,6 +289,7 @@ export function createContactConnectService(
           previewId: preview.previewId,
           directoryRevision: toProtoRevision(preview.directoryRevision),
           entries: preview.entries.map(toProtoImportEntry),
+          rejectedEntries: (preview.rejectedEntries ?? []).map((entry) => create(contract.ContactVCardImportRejectedEntrySchema, entry)),
           expiresAt: toProtoTimestamp(preview.expiresAt)
         });
       });
@@ -313,7 +314,8 @@ export function createContactConnectService(
             outcome: entry.outcome === "created" ? contract.ContactVCardImportOutcome.CREATED
               : entry.outcome === "enriched" ? contract.ContactVCardImportOutcome.ENRICHED
                 : contract.ContactVCardImportOutcome.SKIPPED,
-            ...(entry.contactId === undefined ? {} : { contactId: entry.contactId })
+            ...(entry.contactId === undefined ? {} : { contactId: entry.contactId }),
+            ...(entry.reason === undefined ? {} : { reason: entry.reason })
           }))
         });
       });

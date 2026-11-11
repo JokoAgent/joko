@@ -19,6 +19,58 @@ afterEach(async () => {
   rootDirectory = undefined;
 });
 
+mountedIt("imports valid cards beside rejected cards and shows an all-invalid result without effects", { timeout: 90_000 }, async () => {
+  fixture = await OrchestratorE2eFixture.start({ webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!) });
+  rootDirectory = fixture.rootDirectory;
+  const { clients: { contact } } = await fixture.pair("Contact import observer");
+  const initial = (await contact.getContactDirectory({})).directory!;
+  await contact.setContactDirectoryEnabled({ expectedDirectoryRevision: initial.revision, enabled: true });
+  browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+  const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Contacts importer" })).challenge!;
+  await page.goto(`${fixture.baseUrl}/#/settings/contacts`, { waitUntil: "domcontentloaded" });
+  await page.locator(".connection-tabs > button").nth(2).click();
+  await page.locator("details.device-authorization__manual > summary").click();
+  await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+  await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+  await page.getByLabel("Device name").fill("Contacts importer");
+  await page.locator("form.pair-form button[type=submit]").click();
+  const upload = page.locator(".contacts-settings__file");
+  await upload.waitFor({ state: "attached", timeout: 20_000 });
+  const card = (...fields: string[]) => ["BEGIN:VCARD", "VERSION:3.0", ...fields, "END:VCARD", ""].join("\r\n");
+  await upload.setInputFiles({ name: "mixed.vcf", mimeType: "text/vcard",
+    buffer: Buffer.from(card(`FN:${"x".repeat(101)}`) + card("FN:Bob", "EMAIL:bob@example.test")) });
+  const preview = page.getByRole("dialog", { name: "Review vCard import", exact: true });
+  await preview.getByText("Contact display name is invalid.", { exact: true }).waitFor({ state: "visible" });
+  expect(await preview.locator(".contact-import-list article").count()).toBe(2);
+  const rejected = preview.locator("article").filter({ hasText: "Invalid contact — will be skipped" });
+  expect(await rejected.locator("input, select, button").count()).toBe(0);
+  expect(await preview.locator(".contact-import-list__decision").count()).toBe(1);
+  await preview.getByRole("button", { name: "Import contacts", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  const result = page.getByRole("dialog", { name: "vCard import complete", exact: true });
+  await result.getByText("Created 1, enriched 0, skipped 1.", { exact: true }).waitFor({ state: "visible" });
+  await result.getByText("Contact display name is invalid.", { exact: true }).waitFor({ state: "visible" });
+  expect((await contact.listContacts({})).contacts.map(entry => entry.displayName)).toEqual(["Bob"]);
+  await result.getByRole("button", { name: "Close", exact: true }).last().click();
+
+  const beforeRejectedOnly = (await contact.getContactDirectory({})).directory!;
+  await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 390, height: 844 });
+  const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation" });
+  if (await closeNavigation.isVisible()) await closeNavigation.click();
+  await upload.setInputFiles({ name: "invalid.vcf", mimeType: "text/vcard", buffer: Buffer.from(
+    card(`FN:${"y".repeat(101)}`) + card("FN:Bad title", "ORG:Example", `TITLE:${"x".repeat(1_001)}`)) });
+  await preview.getByText("Contact relation note is invalid.", { exact: true }).waitFor({ state: "visible" });
+  expect(await preview.locator(".contact-import-list__decision").count()).toBe(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+  await preview.getByRole("button", { name: "Import contacts", exact: true }).click();
+  await result.getByText("Created 0, enriched 0, skipped 2.", { exact: true }).waitFor({ state: "visible" });
+  expect(await result.locator(".contact-import-reason").count()).toBe(2);
+  expect((await contact.getContactDirectory({})).directory).toEqual(beforeRejectedOnly);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+});
+
 it("serves and restarts the complete authenticated local Contact chain", async () => {
   fixture = await OrchestratorE2eFixture.start({ keepRoot: true });
   rootDirectory = fixture.rootDirectory;

@@ -76,16 +76,20 @@ describe("Contact gateway", () => {
       previewId: "preview-one",
       directoryRevision: 7n,
       expiresAt: 60_000,
+      rejectedEntries: [{ entryId: "rejected-one", displayName: "Bad card", reason: "Contact display name is invalid." }],
       entries: [{
         entryId: "entry-one",
         disposition: "needsReview",
         contact: { status: "confirmed", source: "import" }
       }]
     });
-    await gateway.commitContactVCardImport("preview-one", 7n, [{
+    await expect(gateway.commitContactVCardImport("preview-one", 7n, [{
       entryId: "entry-one", decision: "merge", targetContactId: "contact-one", expectedTargetRevision: 5n,
       organizationDecision: "merge", organizationTargetContactId: "organization-one", expectedOrganizationTargetRevision: 4n
-    }], signal);
+    }], signal)).resolves.toMatchObject({ skipped: 1, entries: [
+      { entryId: "entry-one", outcome: "enriched" },
+      { entryId: "rejected-one", outcome: "skipped", reason: "Contact display name is invalid." }
+    ] });
     await expect(gateway.exportContactsVCard(["contact-one"], signal)).resolves.toEqual({
       text: "BEGIN:VCARD\r\nEND:VCARD\r\n", contactCount: 1, suggestedFileName: "contacts.vcf"
     });
@@ -153,6 +157,35 @@ describe("Contact gateway", () => {
     expect(requests.find((entry) => entry.method === "syncContactsNow")?.input).toEqual({ peerId: "node-peer" });
     expect(requests.filter((entry) => expectedMethods.includes(entry.method)).every((entry) => entry.signal instanceof AbortSignal && !entry.signal.aborted)).toBe(true);
     gateway.disconnect();
+  });
+
+  it("rejects malformed rejection entries and reasons attached to successful imports", async () => {
+    let override: object = {};
+    const transport = {
+      unary: vi.fn(async (method: any) => response(method, create(method.output,
+        method.localName === "previewContactVCardImport" || method.localName === "commitContactVCardImport"
+          ? { ...contactResponse(method.localName), ...override } : contactResponse(method.localName)))),
+      stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway(
+      { id: "profile", deviceId: "device", name: "Node", origin: "https://service.example", serverId: "node" }, "fixture-auth", {}, () => transport
+    );
+    await gateway.connect();
+    try {
+      for (const entry of [
+        { entryId: "bad", displayName: "Bad card", reason: "" },
+        { entryId: "bad", displayName: "x".repeat(101), reason: "Invalid" },
+        { entryId: "bad", displayName: "Bad\u202e", reason: "Invalid" },
+        { entryId: "entry-one", displayName: "Bad card", reason: "Invalid" },
+        { entryId: "bad", displayName: "Bad card", reason: "x".repeat(121) }
+      ]) {
+        override = { rejectedEntries: [entry] };
+        await expect(gateway.previewContactVCardImport("card")).rejects.toThrow(/vCard/iu);
+      }
+      override = { entries: [{ entryId: "entry-one", displayName: "Ada", outcome: ContactVCardImportOutcome.ENRICHED,
+        contactId: "contact-one", reason: "Must not describe success as rejected" }], skipped: 0 };
+      await expect(gateway.commitContactVCardImport("preview-one", 7n, [])).rejects.toThrow(/entry result/iu);
+    } finally { gateway.disconnect(); }
   });
 
   it("fails closed when sync completion or online counts are inconsistent", async () => {
@@ -255,13 +288,15 @@ function contactResponse(method: string): object {
   if (method === "mergeContacts") return { target: profile(), mergedContactId: "organization-one", movedIdentities: 1, movedEvents: 2, movedRelations: 3, directory: directory() };
   if (method === "previewContactVCardImport") return { previewId: "preview-one", directoryRevision: revision(7n), entries: [{ entryId: "entry-one", contact: {
     kind: ContactKind.PERSON, displayName: "Ada Lovelace", aliases: [], status: ContactStatus.CONFIRMED, source: ContactSource.IMPORT
-  }, disposition: ContactVCardImportDisposition.NEEDS_REVIEW, candidates: [candidate()] }], expiresAt: timestamp(60n) };
+  }, disposition: ContactVCardImportDisposition.NEEDS_REVIEW, candidates: [candidate()] }], expiresAt: timestamp(60n),
+  rejectedEntries: [{ entryId: "rejected-one", displayName: "Bad card", reason: "Contact display name is invalid." }] };
   if (method === "commitContactVCardImport") return {
     created: 0,
     enriched: 1,
-    skipped: 0,
+    skipped: 1,
     contactIds: ["contact-one"],
-    entries: [{ entryId: "entry-one", displayName: "Ada Lovelace", outcome: ContactVCardImportOutcome.ENRICHED, contactId: "contact-one" }],
+    entries: [{ entryId: "entry-one", displayName: "Ada Lovelace", outcome: ContactVCardImportOutcome.ENRICHED, contactId: "contact-one" },
+      { entryId: "rejected-one", displayName: "Bad card", outcome: ContactVCardImportOutcome.SKIPPED, reason: "Contact display name is invalid." }],
     directory: directory()
   };
   if (method === "exportContactsVCard") return { vcardText: "BEGIN:VCARD\r\nEND:VCARD\r\n", contactCount: 1, suggestedFileName: "contacts.vcf" };

@@ -309,6 +309,38 @@ describe("ContactToolBridgeProvider", () => {
     }))).toMatchObject({ contact: { events: [expect.objectContaining({ date: "2026-09", text: "Agent observation", source: "agent" })] } });
   });
 
+  it("pages rejected and valid vCards together and reports rejection reasons through the approved commit", async () => {
+    const fixture = createFixture();
+    enable(fixture.manager);
+    const card = (name: string) => `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${name}\r\nEND:VCARD\r\n`;
+    const first = resultData(await callOrdinary(fixture.provider, "contacts_preview_vcard_import", {
+      vcard_text: card("x".repeat(101)) + card("Bob") + card("y".repeat(101)), limit: 1
+    })) as { preview_id: string; directory_revision: string; next_offset: number };
+    expect(first).toMatchObject({ entry_total: 3, entries: [], rejected_entry_count: 2, next_offset: 1,
+      rejected_entries: [{ entry_id: "vcard-entry-1", reason: "Contact display name is invalid." }] });
+    const second = resultData(await callOrdinary(fixture.provider, "contacts_get_vcard_import_preview", {
+      preview_id: first.preview_id, offset: first.next_offset, limit: 1
+    }));
+    expect(second).toMatchObject({ entries: [{ entry_id: "vcard-entry-2", disposition: "create" }], rejected_entries: [], next_offset: 2 });
+    const last = resultData(await callOrdinary(fixture.provider, "contacts_get_vcard_import_preview", {
+      preview_id: first.preview_id, offset: 2, limit: 1
+    }));
+    expect(last).toMatchObject({ entries: [], rejected_entries: [{ entry_id: "vcard-entry-3", reason: "Contact display name is invalid." }] });
+    expect(last).not.toHaveProperty("next_offset");
+    expect(errorData(await callOrdinary(fixture.provider, "contacts_get_vcard_import_preview", {
+      preview_id: first.preview_id, offset: 4, limit: 1
+    }))).toMatchObject({ errorCode: "INVALID_ARGS" });
+    const commit = { preview_id: first.preview_id, expected_directory_revision: first.directory_revision, decisions: [] };
+    expect(errorData(await callOrdinary(fixture.provider, "contacts_commit_vcard_import", commit))).toMatchObject({ errorCode: "CONFIRMATION_REQUIRED" });
+    expect(resultData(await callSensitive(fixture.provider, "contacts_commit_vcard_import", commit))).toMatchObject({
+      created: 1, enriched: 0, skipped: 2, entries: [
+        { entry_id: "vcard-entry-1", outcome: "skipped", reason: "Contact display name is invalid." },
+        { entry_id: "vcard-entry-2", outcome: "created" },
+        { entry_id: "vcard-entry-3", outcome: "skipped", reason: "Contact display name is invalid." }
+      ]
+    });
+  });
+
   it("previews paged vCards, atomically commits through the sensitive entry, and exports portable text", async () => {
     const fixture = createFixture();
     enable(fixture.manager);

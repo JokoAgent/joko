@@ -150,11 +150,13 @@
 .contact-duplicate-list__divider { color: var(--text-faint); }
 .contact-duplicate-list > div > div:last-child { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 7px; }
 
-.contact-import-list { max-height: min(60vh, 580px); display: grid; gap: 10px; overflow: auto; padding-right: 3px; }
+.contact-import-list { max-height: min(60vh, 580px); display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; overflow: auto; padding-right: 3px; }
 .contact-import-list article { border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--surface); }
 .contact-import-list article > header { display: flex; align-items: center; gap: 9px; }
 .contact-import-list article > header > span:last-child { min-width: 0; display: flex; flex-direction: column; }
 .contact-import-list article > header small { color: var(--text-soft); }
+.contact-import-list article > header strong { overflow-wrap: anywhere; }
+.contact-import-list .contact-import-reason, .contact-import-result .contact-import-reason { overflow-wrap: anywhere; white-space: normal; color: var(--text-soft); }
 .contact-import-list__decision { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
 .contact-import-list footer { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .contact-import-result { max-height: min(48vh, 440px); display: grid; gap: 8px; overflow: auto; margin: 0; padding: 0; list-style: none; }

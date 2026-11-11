@@ -193,6 +193,28 @@ describe("ContactService", () => {
     expect(authenticate).toHaveBeenCalled();
   });
 
+  it("reports all-invalid cards without effects and rechecks authentication before committing them", async () => {
+    const { manager, store } = createFixture();
+    let authorized = true;
+    const service = createContactConnectService(manager, () => {
+      if (!authorized) throw new ConnectError("Revoked", Code.Unauthenticated);
+      return { connectionId: "connection-1" };
+    });
+    const before = store.directoryState();
+    const preview = await service.previewContactVCardImport(create(contract.PreviewContactVCardImportRequestSchema, {
+      vcardText: `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${"x".repeat(101)}\r\nEND:VCARD\r\n`
+    }), context());
+    expect(preview).toMatchObject({ entries: [], rejectedEntries: [{ entryId: "vcard-entry-1", reason: "Contact display name is invalid." }] });
+    const commit = create(contract.CommitContactVCardImportRequestSchema, { previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision });
+    authorized = false;
+    expectConnectError(() => service.commitContactVCardImport(commit, context()), Code.Unauthenticated);
+    expect(store.directoryState()).toEqual(before);
+    authorized = true;
+    expect(await service.commitContactVCardImport(commit, context())).toMatchObject({ created: 0, enriched: 0, skipped: 1,
+      entries: [{ entryId: "vcard-entry-1", outcome: contract.ContactVCardImportOutcome.SKIPPED, reason: "Contact display name is invalid." }] });
+    expect(store.directoryState()).toEqual(before);
+  });
+
   it("maps vCard preview/commit and unavailable ownership without exposing file paths", async () => {
     const fixture = createFixture();
     const service = createContactConnectService(fixture.manager, () => ({ connectionId: "connection-1" }));

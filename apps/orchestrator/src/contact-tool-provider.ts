@@ -245,18 +245,18 @@ const CONTACT_NESTED_TOOLS: readonly ContactNestedToolDescriptor[] = Object.free
       add: { type: "array", items: CONTACT_MEMBER_SCHEMA, maxItems: 200 },
       remove: { type: "array", items: CONTACT_MEMBER_SCHEMA, maxItems: 200 }
     }, ["group_id", "expected_group_revision"]), "conditional", [COLLECTION_RULE, SENSITIVE_RULE]),
-  nestedTool("contacts_preview_vcard_import", "manage", "Parse portable vCard text into a revision-fenced, paged import preview.",
+  nestedTool("contacts_preview_vcard_import", "manage", "Preview vCards with valid entries and rejected_entries with reasons. next_offset pages both lists together.",
     objectSchema({
       vcard_text: { type: "string", minLength: 1, maxLength: 2 * 1024 * 1024 },
       limit: { type: "integer", minimum: 1, maximum: MAXIMUM_PREVIEW_PAGE_SIZE, default: DEFAULT_PREVIEW_PAGE_SIZE }
     }, ["vcard_text"]), "never", [VCARD_RULE]),
-  nestedTool("contacts_get_vcard_import_preview", "manage", "Read another bounded page from an unexpired vCard import preview.",
+  nestedTool("contacts_get_vcard_import_preview", "manage", "Read the next bounded page of valid and rejected entries from an unexpired vCard import preview.",
     objectSchema({
       preview_id: ID_SCHEMA,
       offset: { type: "integer", minimum: 0, maximum: 2_000, default: 0 },
       limit: { type: "integer", minimum: 1, maximum: MAXIMUM_PREVIEW_PAGE_SIZE, default: DEFAULT_PREVIEW_PAGE_SIZE }
     }, ["preview_id"]), "never", [VCARD_RULE]),
-  nestedTool("contacts_commit_vcard_import", "manage", "Atomically commit exact create/merge/skip decisions for an unexpired vCard preview.",
+  nestedTool("contacts_commit_vcard_import", "manage", "Atomically commit decisions for valid preview entries. Rejected entries are skipped with reasons and need no decisions.",
     objectSchema({
       preview_id: ID_SCHEMA,
       expected_directory_revision: REVISION_SCHEMA,
@@ -832,7 +832,8 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
         entry_id: entry.entryId,
         display_name: entry.displayName,
         outcome: entry.outcome,
-        ...(entry.contactId === undefined ? {} : { contact_id: entry.contactId })
+        ...(entry.contactId === undefined ? {} : { contact_id: entry.contactId }),
+        ...(entry.reason === undefined ? {} : { reason: entry.reason })
       })),
       entry_count: result.entries.length,
       results_truncated: result.entries.length > COMMIT_RESULT_LIMIT || result.contactIds.length > COMMIT_RESULT_LIMIT,
@@ -1127,16 +1128,25 @@ function publicCandidate(value: ContactDuplicateCandidate): Readonly<Record<stri
 }
 
 function publicPreviewPage(preview: ContactVCardImportPreview, offset: number, limit: number): Readonly<Record<string, unknown>> {
-  if (offset > preview.entries.length) throw new ContactToolError("INVALID_ARGS", "Preview offset exceeds the entry count.");
-  const entries = preview.entries.slice(offset, offset + limit);
+  const rejected = preview.rejectedEntries ?? [];
+  const ordered = [...preview.entries.map((entry) => ({ kind: "entry" as const, entryId: entry.entryId, entry })),
+    ...rejected.map((rejection) => ({ kind: "rejected" as const, entryId: rejection.entryId, rejection }))]
+    .sort((left, right) => Number(left.entryId.slice("vcard-entry-".length)) - Number(right.entryId.slice("vcard-entry-".length)));
+  if (offset > ordered.length) throw new ContactToolError("INVALID_ARGS", "Preview offset exceeds the entry count.");
+  const page = ordered.slice(offset, offset + limit);
   return {
     preview_id: preview.previewId,
     directory_revision: preview.directoryRevision.toString(),
     expires_at: iso(preview.expiresAt),
-    entry_total: preview.entries.length,
+    entry_total: ordered.length,
     offset,
-    entries: entries.map(publicPreviewEntry),
-    ...(offset + entries.length < preview.entries.length ? { next_offset: offset + entries.length } : {})
+    entries: page.flatMap((item) => item.kind === "entry" ? [publicPreviewEntry(item.entry)] : []),
+    ...(rejected.length === 0 ? {} : {
+      rejected_entry_count: rejected.length,
+      rejected_entries: page.flatMap((item) => item.kind === "rejected" ? [{ entry_id: item.rejection.entryId,
+        display_name: item.rejection.displayName, reason: item.rejection.reason }] : [])
+    }),
+    ...(offset + page.length < ordered.length ? { next_offset: offset + page.length } : {})
   };
 }
 
