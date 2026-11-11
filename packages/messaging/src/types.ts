@@ -70,6 +70,12 @@ export interface MessagingInboundMessage {
   readonly attachments: readonly MessagingInboundAttachment[];
   readonly unsupported: readonly MessagingUnsupportedPart[];
   readonly replyContext: MessagingReplyContext | null;
+  /** Telegram's same-lane explicit reply media, separate from the sender's own attachments. */
+  readonly telegramReplyParts?: {
+    readonly attachments: readonly MessagingInboundAttachment[];
+    readonly unsupported: readonly MessagingUnsupportedPart[];
+  };
+  readonly telegramMediaGroupId?: string;
 }
 
 export interface MessagingInboundInteraction {

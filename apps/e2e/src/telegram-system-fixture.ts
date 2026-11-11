@@ -80,9 +80,14 @@ export class TelegramSystemFixture {
     readonly fileName?: string;
     readonly mimeType?: string;
     readonly attachmentKind?: "document" | "audio";
+    readonly replyToMessageId?: number;
   }): void {
     const file = input.fileId === undefined ? undefined : this.#files.get(input.fileId);
     if (input.fileId !== undefined && file === undefined) throw new Error("Telegram fixture file is not registered.");
+    const replied = input.replyToMessageId === undefined ? undefined
+      : this.#updates.find(({ message }) => message["message_id"] === input.replyToMessageId)?.message;
+    if (input.replyToMessageId !== undefined && replied === undefined) throw new Error("Telegram fixture reply is not registered.");
+    const { reply_to_message: _nestedReply, ...quoted } = replied ?? {};
     this.#updates.push({
       update_id: input.updateId,
       message: {
@@ -95,6 +100,7 @@ export class TelegramSystemFixture {
         },
         chat: { id: TELEGRAM_SYSTEM_OWNER_ID, type: "private", first_name: "Owner" },
         date: Math.floor(Date.now() / 1_000),
+        ...(replied === undefined ? {} : { reply_to_message: quoted }),
         ...(file === undefined ? { text: input.text } : {
           caption: input.text,
           [input.attachmentKind ?? "document"]: {
@@ -104,6 +110,35 @@ export class TelegramSystemFixture {
             mime_type: input.mimeType ?? file.mimeType,
             file_size: file.bytes.byteLength
           }
+        })
+      }
+    });
+    this.#updates.sort((left, right) => left.update_id - right.update_id);
+  }
+
+  enqueueGroupMessage(input: {
+    readonly chatId: number;
+    readonly updateId: number;
+    readonly messageId: number;
+    readonly text: string;
+    readonly photoFileId?: string;
+  }): void {
+    const photo = input.photoFileId === undefined ? undefined : this.#files.get(input.photoFileId);
+    if (input.photoFileId !== undefined && photo === undefined) throw new Error("Telegram fixture photo is not registered.");
+    const mention = "@joko_system_bot";
+    this.#updates.push({
+      update_id: input.updateId,
+      message: {
+        message_id: input.messageId,
+        from: { id: TELEGRAM_SYSTEM_OWNER_ID, is_bot: false, first_name: "Owner", username: "owner" },
+        chat: { id: input.chatId, type: "supergroup", title: "Product chain group" },
+        date: Math.floor(Date.now() / 1_000),
+        ...(photo === undefined ? {
+          text: input.text,
+          ...(input.text.startsWith(`${mention} `) ? { entities: [{ type: "mention", offset: 0, length: mention.length }] } : {})
+        } : {
+          caption: input.text,
+          photo: [{ file_id: photo.fileId, file_unique_id: `${photo.fileId}-unique`, file_size: photo.bytes.byteLength, width: 1, height: 1 }]
         })
       }
     });
@@ -198,7 +233,7 @@ export class TelegramSystemFixture {
           result: {
             message_id: this.#nextMessageId,
             from: { id: 700, is_bot: true, first_name: "Joko", username: "joko_system_bot" },
-            chat: { id: chatId, type: "private" },
+            chat: { id: chatId, type: chatId < 0 ? "supergroup" : "private" },
             date: Math.floor(Date.now() / 1_000),
             text
           }
