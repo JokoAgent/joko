@@ -298,12 +298,23 @@ export class ContactStore {
       clauses.push("EXISTS (SELECT 1 FROM contact_group_members member WHERE member.contact_id = contact.id AND member.group_id = ?)");
       params.push(groupId);
     }
-    if (fts !== undefined) { clauses.push("contact_search_fts MATCH ?"); params.push(fts); }
+    const search = fts === undefined ? "" : `WITH fts_matches AS MATERIALIZED (
+      SELECT contact_id, bm25(contact_search_fts) AS score FROM contact_search_fts WHERE contact_search_fts MATCH ?
+    ), search_matches AS (
+      SELECT contact_id, 0 AS match_kind, score FROM fts_matches
+      UNION ALL
+      SELECT contact_id, 1 AS match_kind, 0 AS score FROM contact_search_fts
+      WHERE content LIKE ? ESCAPE '\\'
+        AND contact_id NOT IN (SELECT contact_id FROM fts_matches)
+    )`;
+    if (fts !== undefined) params.unshift(fts, `%${query!.replace(/[\\%_]/gu, character => `\\${character}`)}%`);
     const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
-    const join = fts === undefined ? "" : "JOIN contact_search_fts ON contact_search_fts.contact_id = contact.id";
-    const totalRow = this.#database.prepare(`SELECT COUNT(*) AS count FROM contacts contact ${join} ${where}`).get(...params) as Row;
-    const order = fts === undefined ? "contact.updated_at DESC, contact.id" : "bm25(contact_search_fts), contact.updated_at DESC, contact.id";
+    const join = fts === undefined ? "" : "JOIN search_matches ON search_matches.contact_id = contact.id";
+    const totalRow = this.#database.prepare(`${search} SELECT COUNT(*) AS count FROM contacts contact ${join} ${where}`).get(...params) as Row;
+    const order = fts === undefined ? "contact.updated_at DESC, contact.id"
+      : "search_matches.match_kind, search_matches.score, contact.updated_at DESC, contact.id";
     const rows = this.#database.prepare(`
+      ${search}
       SELECT contact.*, (SELECT COUNT(*) FROM contact_identities identity WHERE identity.contact_id = contact.id) AS identity_count
       FROM contacts contact ${join} ${where}
       ORDER BY ${order} LIMIT ? OFFSET ?
@@ -456,6 +467,13 @@ export class ContactStore {
       `).run(revision, next.kind, next.displayName, JSON.stringify(next.aliases), next.summary,
         next.narrative, next.agentNotes, next.status, at, id);
       this.#rebuildSearch(id);
+      if (next.displayName !== current["display_name"]) {
+        const related = this.#database.prepare(`
+          SELECT to_contact_id AS id FROM contact_relations WHERE from_contact_id = ?
+          UNION SELECT from_contact_id AS id FROM contact_relations WHERE to_contact_id = ?
+        `).all(id, id);
+        for (const row of related) this.#rebuildSearch(string(row["id"]));
+      }
       return this.getContact(id);
     });
   }
@@ -491,7 +509,6 @@ export class ContactStore {
       const at = this.#now();
       this.#insertIdentity(id, revision, identityDraft(input), at);
       this.#touchContacts([id], revision, at);
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -507,7 +524,6 @@ export class ContactStore {
       const revision = this.#advanceDirectoryRevision();
       this.#database.prepare("DELETE FROM contact_identities WHERE id = ? AND contact_id = ?").run(identity, id);
       this.#touchContacts([id], revision, this.#now());
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -526,7 +542,6 @@ export class ContactStore {
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).run(this.#newId("contact_event"), id, revision, draft.date, draft.text, draft.source, at);
       this.#touchContacts([id], revision, at);
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -543,7 +558,6 @@ export class ContactStore {
       const revision = this.#advanceDirectoryRevision();
       this.#database.prepare("DELETE FROM contact_events WHERE id = ? AND contact_id = ?").run(event, id);
       this.#touchContacts([id], revision, this.#now());
-      this.#rebuildSearch(id);
       return this.getContact(id);
     });
   }
@@ -1224,6 +1238,13 @@ export class ContactStore {
     if (integrity.length !== 1 || string(integrity[0]?.["quick_check"]) !== "ok") {
       throw new ContactStoreError("CONTACT_STORE_UNAVAILABLE", "The Contacts database failed its integrity check.");
     }
+    // Relations are part of the existing derived document, not a new schema.
+    // Repair older documents without changing the durable directory revision.
+    this.#write(() => {
+      const related = this.#database.prepare(`SELECT from_contact_id AS id FROM contact_relations
+        UNION SELECT to_contact_id AS id FROM contact_relations`).iterate();
+      for (const row of related) this.#rebuildSearch(string(row["id"]));
+    });
   }
 
   #write<T>(callback: () => T): T {
@@ -1289,6 +1310,7 @@ export class ContactStore {
   #touchContacts(ids: readonly string[], revision: number, at: number): void {
     for (const id of new Set(ids)) {
       this.#database.prepare("UPDATE contacts SET revision = ?, updated_at = ? WHERE id = ?").run(revision, at, id);
+      this.#rebuildSearch(id);
     }
   }
 
@@ -1306,6 +1328,14 @@ export class ContactStore {
     const eventRows = this.#database.prepare(`
       SELECT event_date, text, source FROM contact_events WHERE contact_id = ? ORDER BY id
     `).all(contactId) as Row[];
+    const relationRows = this.#database.prepare(`
+      SELECT relation_value.relation, relation_value.note, related.display_name
+      FROM contact_relations relation_value
+      JOIN contacts related ON related.id = CASE WHEN relation_value.from_contact_id = ?
+        THEN relation_value.to_contact_id ELSE relation_value.from_contact_id END
+      WHERE relation_value.from_contact_id = ? OR relation_value.to_contact_id = ?
+      ORDER BY relation_value.id
+    `).all(contactId, contactId, contactId) as Row[];
     const content = [
       string(contact["display_name"]),
       ...aliases(contact["aliases_json"]),
@@ -1313,8 +1343,11 @@ export class ContactStore {
       string(contact["narrative"]),
       string(contact["agent_notes"]),
       ...identityRows.flatMap((row) => [string(row["platform"]), string(row["value"]), string(row["label"]), string(row["note"])]),
-      ...eventRows.flatMap((row) => [string(row["event_date"]), string(row["text"]), string(row["source"])])
+      ...eventRows.flatMap((row) => [string(row["event_date"]), string(row["text"]), string(row["source"])]),
+      ...relationRows.flatMap((row) => [string(row["relation"]), string(row["display_name"]), string(row["note"])])
     ].filter(Boolean).join("\n");
+    const indexed = this.#database.prepare("SELECT content FROM contact_search_fts WHERE contact_id = ?").get(contactId);
+    if (indexed?.["content"] === content) return;
     this.#database.prepare("DELETE FROM contact_search_fts WHERE contact_id = ?").run(contactId);
     this.#database.prepare("INSERT INTO contact_search_fts(contact_id, content) VALUES (?, ?)").run(contactId, content);
   }
