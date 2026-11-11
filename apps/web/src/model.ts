@@ -1879,6 +1879,22 @@ export interface FederatedSessionMessageSearchMatchView {
   readonly match: SessionMessageSearchMatchView;
 }
 
+interface FederatedSessionMessageSearchSource {
+  readonly profileId: string;
+  readonly serverId: string;
+  /** The authenticated remote stream that owns this result. */
+  readonly epoch: number;
+  readonly isCurrent: () => boolean;
+}
+
+export interface FederatedSessionMessageSearchPage extends FederatedSessionMessageSearchSource {
+  readonly status: "succeeded";
+  readonly matches: readonly SessionMessageSearchMatchView[];
+}
+
+export type FederatedSessionMessageSearchOutcome = FederatedSessionMessageSearchPage
+  | (FederatedSessionMessageSearchSource & { readonly status: "failed" });
+
 export interface SessionMessageSearchResultView {
   readonly matches: readonly SessionMessageSearchMatchView[];
   readonly totalSize: number;
