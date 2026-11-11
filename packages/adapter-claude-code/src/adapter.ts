@@ -4311,8 +4311,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (turn !== undefined && !turn.nativeIdentityConfirmed) throw continuityGap();
       if (turn !== undefined) turn.childOutputObserved = true;
       if (type === "assistant" && turn !== undefined && this.#isTurnCurrent(runtime, turn)) runtime.nativeUsage.observeAssistant(envelope);
-      if (type === "stream_event" && turn !== undefined && this.#isTurnCurrent(runtime, turn)) runtime.nativeUsage.observeStream(envelope,
-        { fastMode: nativeRequestFastMode(runtime), requestedAt: this.#now() });
+      if (type === "stream_event" && turn !== undefined && this.#isTurnCurrent(runtime, turn)) {
+        runtime.nativeUsage.observeStream(envelope, {
+          fastMode: nativeRequestFastMode(runtime), requestedAt: () => this.#now()
+        });
+      }
       if (!runtime.nativeTaskProjectionEnabled) return;
       const emissions = type === "assistant"
         ? runtime.nativeTasks.observeChildAssistant(envelope)
@@ -4366,7 +4369,6 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (turn.frameCount > MAX_TURN_FRAMES) throw nativeEventLimit();
     }
     if (type === "stream_event") {
-      runtime.nativeUsage.observeStream(envelope, { fastMode: nativeRequestFastMode(runtime), requestedAt: this.#now() });
       await this.#handlePartial(runtime, turn, message);
     } else if (type === "assistant") {
       await this.#handleAssistant(runtime, turn, message);
@@ -4505,6 +4507,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       await this.#settleNativeRetry(runtime, turn, "succeeded");
     }
     this.#observeParentStream(turn, envelope);
+    runtime.nativeUsage.observeStream(envelope, {
+      fastMode: nativeRequestFastMode(runtime), requestedAt: () => turn.parentStreamSegment!.startedAt
+    });
     const delta = turn.stream.accept(message, this.#projection);
     if (delta === undefined) return;
     await this.#emit(runtime, turn, delta.kind === "text"
@@ -5632,7 +5637,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         assistantError = undefined;
       }
       if (type === "stream_event") {
-        child.nativeUsage.observeStream(envelope, { fastMode: false, requestedAt: this.#now() });
+        child.nativeUsage.observeStream(envelope, { fastMode: false, requestedAt: () => this.#now() });
         continue;
       }
       if (type === "assistant") {

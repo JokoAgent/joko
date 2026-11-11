@@ -76,20 +76,21 @@ export class NativeQueryUsage {
     this.#requests.set(requestId, { model, tokens });
   }
 
-  observeStream(envelope: unknown, context: { readonly fastMode?: boolean; readonly requestedAt: number }): void {
+  observeStream(envelope: unknown, context: { readonly fastMode?: boolean; readonly requestedAt: () => number }): void {
     const value = record(envelope), event = record(value?.["event"]);
     const parent = value?.["parent_tool_use_id"];
     if (!event || parent !== undefined && parent !== null && !identity(parent)) return;
     const scope = typeof parent === "string" ? `child:${parent}` : "root";
     if (event["type"] === "message_start") {
       const message = record(event["message"]), requestId = message?.["id"], modelId = message?.["model"], usage = record(message?.["usage"]);
-      if (!identity(requestId) || !identity(modelId) || !usage || counter(context.requestedAt) === undefined
-        || context.requestedAt > 8_640_000_000_000_000 || this.#referenceRequests.has(requestId) || this.#closed.has(requestId)
+      if (!identity(requestId) || !identity(modelId) || !usage || this.#referenceRequests.has(requestId) || this.#closed.has(requestId)
         || !this.#streams.has(scope) && this.#streams.size >= 256) return;
       const existing = this.#streams.get(scope);
       if (existing?.requestId === requestId) return;
+      const requestedAt = context.requestedAt();
+      if (counter(requestedAt) === undefined || requestedAt > 8_640_000_000_000_000) return;
       this.#streams.set(scope, { requestId, modelId, usage: { ...usage }, epoch: this.#epoch,
-        fastMode: context.fastMode, requestedAt: context.requestedAt, invalid: false });
+        fastMode: context.fastMode, requestedAt, invalid: false });
       return;
     }
     const request = this.#streams.get(scope);
