@@ -4806,7 +4806,16 @@ function SessionActionsMenu({ session, t, onStartRename, taskTags, onToggleTaskT
       setPosition(undefined);
       setProjectMenuPosition(undefined);
     };
-    const closeForViewportChange = (): void => {
+    const closeForViewportChange = (event: Event): void => {
+      const target = event.target;
+      if (event.type === "scroll" && target instanceof Node) {
+        if (projectMenuRef.current?.contains(target)) return;
+        if (menuRef.current?.contains(target)) {
+          // Scrolling the parent moves the project submenu's trigger.
+          setProjectMenuPosition(undefined);
+          return;
+        }
+      }
       setPosition(undefined);
       setProjectMenuPosition(undefined);
     };
