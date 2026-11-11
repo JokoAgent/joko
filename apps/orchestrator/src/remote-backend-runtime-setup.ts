@@ -203,18 +203,23 @@ export class RemoteBackendRuntimeSetupManager {
 
   async probe(
     input: Omit<RemoteBackendRuntimeMutationInput, "requestId">,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    assertRequestCurrent?: () => void
   ): Promise<RemoteBackendRuntimeSnapshot> {
     this.#assertOpen();
+    if (signal?.aborted) throw new RemoteBackendRuntimeSetupError("aborted", "The remote Backend runtime probe was cancelled.");
+    assertSetupRequestCurrent(assertRequestCurrent);
     const admission = this.#admit(input);
     const active = this.#activeInstalls.get(admission.resourceKey);
     if (active !== undefined && sameScope(active.input, input)) {
       return active.events.at(-1)?.runtime ?? this.#snapshot(admission, "probing");
     }
-    if (this.#activeUninstalls.has(admission.resourceKey)) {
+    const uninstall = this.#activeUninstalls.get(admission.resourceKey);
+    if (uninstall !== undefined) {
+      if (uninstall.fingerprint === mutationFingerprint(input)) return this.#snapshot(admission, "probing");
       throw new RemoteBackendRuntimeSetupError("busy", "A remote Backend runtime mutation is already active.");
     }
-    const captured = await this.#capture(admission, signal);
+    const captured = await this.#capture(admission, signal, assertRequestCurrent);
     try {
       const probe = await captured.provider.probe(captured.context, signal);
       captured.context.assertCurrent();
@@ -588,7 +593,7 @@ function installFingerprint(input: RemoteBackendRuntimeInstallInput): string {
   return `${mutationFingerprint(input)}\u0000${input.reinstall ? "1" : "0"}`;
 }
 
-function mutationFingerprint(input: RemoteBackendRuntimeMutationInput): string {
+function mutationFingerprint(input: Omit<RemoteBackendRuntimeMutationInput, "requestId">): string {
   return `${input.targetId}\u0000${input.hostId}\u0000${input.expectedTargetRevision}\u0000${input.expectedHostRevision}`;
 }
 

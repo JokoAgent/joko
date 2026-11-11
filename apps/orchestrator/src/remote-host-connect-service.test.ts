@@ -743,7 +743,7 @@ describe("RemoteHostService", () => {
       hostId: "build-box",
       expectedTargetRevision: targetRevision,
       expectedHostRevision: hostRecord.revision
-    }, probeSignal);
+    }, probeSignal, expect.any(Function));
     expect(probed.runtime).toMatchObject({
       targetId: "target-a",
       hostId: "build-box",
@@ -794,6 +794,36 @@ describe("RemoteHostService", () => {
     }, expect.any(Function));
     expect(uninstalled.runtime?.state).toBe(contract.RemoteBackendRuntimeState.NOT_INSTALLED);
     expect(safeJson({ probed, streamed, uninstalled })).not.toContain("backendId");
+  });
+
+  it("retires an in-flight runtime probe when its original paired Owner is revoked", async () => {
+    const fixture = createFixture();
+    const hostRecord = fixture.registry.create({ targetId: "target-a", id: "build-box", hostname: "build.example.test", user: "maker", source: "manual" });
+    const targetRevision = fixture.store.getTarget("target-a").revision;
+    const ready = runtimeSnapshot(targetRevision, hostRecord.revision, "ready");
+    let release!: () => void;
+    const reading = new Promise<void>((resolve) => { release = resolve; });
+    const probe = vi.fn<RemoteBackendRuntimeSetupManager["probe"]>(async (_input, signal) => {
+      await reading;
+      if (signal?.aborted) throw new Error("The remote read was cancelled.");
+      return ready;
+    });
+    const owners = pairedOwners(fixture, { probe } as unknown as RemoteBackendRuntimeSetupManager);
+    const request = create(contract.ProbeRemoteBackendRuntimeRequestSchema, {
+      targetId: "target-a", hostId: "build-box",
+      expectedTargetRevision: toProtoRevision(targetRevision), expectedHostRevision: toProtoRevision(hostRecord.revision)
+    });
+    const pending = owners.service.probeRemoteBackendRuntime(request, owners.original);
+    const denied = expect(pending).rejects.toSatisfy(connectCode(Code.Unauthenticated));
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledOnce());
+    owners.manager.revokeDevice(owners.originalDeviceId);
+    expect(probe.mock.calls[0]![1]?.aborted).toBe(true);
+    expect(owners.original.signal.aborted).toBe(false);
+    release();
+    await denied;
+    await expect(owners.service.probeRemoteBackendRuntime(request, owners.observer)).resolves.toMatchObject({
+      runtime: { hostId: "build-box", state: contract.RemoteBackendRuntimeState.READY }
+    });
   });
 
   it("advertises connector absence independently and fails closed when the service is unavailable", async () => {
