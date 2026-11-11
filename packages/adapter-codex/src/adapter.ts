@@ -626,6 +626,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly host: AppServerHost;
     readonly hostGeneration: number;
     readonly enabled: boolean;
+    readonly threadsPrepared: boolean;
   } | undefined;
   readonly #sessions = new Map<string, SessionRuntime>();
   readonly #freshNativeHistory = new WeakMap<SessionRuntime, { readonly thread: NativeThread; readonly revision: bigint }>();
@@ -1014,6 +1015,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
   }
 
+  nativeMemoryHasPreparedThreads(): boolean {
+    const applied = this.#nativeMemoryOverride;
+    return applied?.host === this.#host && applied.threadsPrepared
+      && this.#host.isActiveGeneration(applied.hostGeneration);
+  }
+
   async readNativeMemoryStatus(signal?: AbortSignal): Promise<NativeMemoryStatus> {
     if (this.#resolveNativeMemoryEnabled === undefined) return this.unsupported("memory.native");
     return this.#withNativeMemoryReconcile(async () => {
@@ -1043,10 +1050,6 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       };
       assertCurrent();
       if (!supportsNativeMemoryRuntime(this.#host)) return this.unsupported("memory.native");
-      const desiredEnabled = await this.#readNativeMemoryPreference();
-      assertCurrent();
-      await this.#applyNativeMemoryPreference(this.#host, desiredEnabled, true, assertCurrent, signal);
-      assertCurrent();
       let response;
       try {
         response = await this.#host.request("config/read", { includeLayers: false }, {
@@ -1076,10 +1079,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           recovery: "Keep the runtime status unavailable until Codex returns the fixed effective configuration shape."
         });
       }
-      if (enabled !== desiredEnabled
-        && this.#nativeMemoryOverride?.host === this.#host
-        && this.#nativeMemoryOverride.hostGeneration === hostGeneration) {
-        this.#nativeMemoryOverride = undefined;
+      // config/read describes the process defaults, not the configuration of
+      // already loaded threads. A drifted default cannot confirm their state.
+      if (this.#nativeMemoryOverride?.host === this.#host
+        && this.#nativeMemoryOverride.hostGeneration === hostGeneration
+        && this.#nativeMemoryOverride.enabled !== enabled) return {};
+      if (this.#nativeMemoryOverride?.host !== this.#host
+        || this.#nativeMemoryOverride.hostGeneration !== hostGeneration) {
+        const desiredEnabled = await this.#readNativeMemoryPreference();
+        assertCurrent();
+        if (desiredEnabled !== enabled) return {};
       }
       return { enabled };
     });
@@ -6569,6 +6578,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const enabled = await this.#readNativeMemoryPreference();
       scope.assertCurrent();
       await this.#applyNativeMemoryPreference(scope.host, enabled, true, scope.assertCurrent, signal);
+      // Claim the configuration before thread/start or thread/resume can load
+      // it. A concurrent settings change must not mutate this generation while
+      // native thread creation is in flight, even before runtime publication.
+      const applied = this.#nativeMemoryOverride;
+      if (applied?.host === scope.host && scope.host.isActiveGeneration(applied.hostGeneration)) {
+        this.#nativeMemoryOverride = { ...applied, threadsPrepared: true };
+      }
     });
   }
 
@@ -6615,8 +6631,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (!running && !startIfNeeded) return "next_session";
     if (running
       && this.#nativeMemoryOverride?.host === host
-      && this.#nativeMemoryOverride.hostGeneration === observedGeneration
-      && this.#nativeMemoryOverride.enabled === enabled) return "immediate";
+      && this.#nativeMemoryOverride.hostGeneration === observedGeneration) {
+      // Native feature updates do not replace loaded threads' execution
+      // configuration. Keep one preference for this process generation until
+      // the owning Host can retire it without interrupting accepted work.
+      if (this.#nativeMemoryOverride.enabled === enabled) return "immediate";
+      if (this.#nativeMemoryOverride.threadsPrepared) return "next_session";
+    }
+    // A failed or unconfirmed write can still change an empty process. Its
+    // previous confirmed value must not authorize a later reverted setting.
+    this.#nativeMemoryOverride = undefined;
     let response;
     try {
       response = await host.request("experimentalFeature/enablement/set", {
@@ -6653,10 +6677,32 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh the Backend and inspect native memory state before explicitly retrying."
       });
     }
+    // The feature ACK echoes the accepted runtime override. Protected native
+    // configuration can still prevent that override from taking effect. Do
+    // not cache it or admit the first thread until the effective config agrees.
+    const assertAppliedGeneration = () => {
+      assertCurrent();
+      if (!host.isActiveGeneration(response.hostGeneration)) {
+        throw new TransportFault("process_exited", "The native-memory configuration owner changed.");
+      }
+    };
+    try {
+      assertAppliedGeneration();
+      const effective = await host.request("config/read", { includeLayers: false }, {
+        signal, beforeDispatch: assertAppliedGeneration
+      });
+      assertAppliedGeneration();
+      const config = objectValue(objectValue(effective.value, "native memory response")["config"], "native memory config");
+      const features = objectValue(config["features"], "native memory features");
+      if (features["memories"] !== enabled) throw new ProtocolShapeError("Native memory configuration did not adopt the preference");
+    } catch (error) {
+      throw this.#requestFailure(error, startIfNeeded ? "provision" : "dispatch", "CODEX_NATIVE_MEMORY_RECONCILE_FAILED", true);
+    }
     this.#nativeMemoryOverride = {
       host,
       hostGeneration: response.hostGeneration,
-      enabled
+      enabled,
+      threadsPrepared: false
     };
     return "immediate";
   }

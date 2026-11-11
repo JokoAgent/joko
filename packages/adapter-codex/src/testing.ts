@@ -119,6 +119,7 @@ interface FakeThread {
   readonly createdAt: number;
   updatedAt: number;
   config: JsonObject;
+  memoryEnabled: boolean;
 }
 
 export class FakeCodexAppServer {
@@ -185,8 +186,10 @@ export class FakeCodexAppServer {
   threadStartResponseOverrides: JsonObject | undefined;
   #nextThread = 1;
   #nextTurn = 1;
+  readonly #loadedThreadIds = new Set<string>();
 
   createTransport(): ScriptedRpcTransport {
+    this.#loadedThreadIds.clear();
     let transport: ScriptedRpcTransport;
     transport = new ScriptedRpcTransport((method, params, options) => this.#handle(transport, method, params, options));
     this.transport = transport;
@@ -197,12 +200,12 @@ export class FakeCodexAppServer {
     const thread = this.#newThread(cwd);
     thread.historyMode = "paginated";
     thread.turns.push(...turns.map((turn) => structuredClone(turn)));
+    this.#loadedThreadIds.delete(thread.id);
     return thread.id;
   }
 
   memoryEnabledForThread(threadId: string): boolean {
-    const value = this.#thread(threadId).config["features.memories"];
-    return typeof value === "boolean" ? value : this.nativeMemoryEnabled;
+    return this.#thread(threadId).memoryEnabled;
   }
 
   async completeTurn(threadId: string, text = "completed response"): Promise<void> {
@@ -419,6 +422,11 @@ export class FakeCodexAppServer {
         }
         const thread = this.#thread(String(record["threadId"]));
         if (isObject(record["config"])) thread.config = { ...thread.config, ...record["config"] };
+        if (!this.#loadedThreadIds.has(thread.id)) {
+          const configured = thread.config["features.memories"];
+          thread.memoryEnabled = typeof configured === "boolean" ? configured : this.nativeMemoryEnabled;
+          this.#loadedThreadIds.add(thread.id);
+        }
         return sessionResponse(thread, record);
       }
       case "thread/read": {
@@ -583,9 +591,11 @@ export class FakeCodexAppServer {
       status: { type: "idle" },
       createdAt: now,
       updatedAt: now,
-      config: structuredClone(config)
+      config: structuredClone(config),
+      memoryEnabled: typeof config["features.memories"] === "boolean" ? config["features.memories"] : this.nativeMemoryEnabled
     };
     this.threads.set(thread.id, thread);
+    this.#loadedThreadIds.add(thread.id);
     return thread;
   }
 

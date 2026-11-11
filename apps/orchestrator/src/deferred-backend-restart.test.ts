@@ -130,6 +130,45 @@ describe("DeferredBackendRestartCoordinator", () => {
     expect(owner.blocksDispatch("codex")).toBe(true);
     expect(restart).not.toHaveBeenCalled();
   });
+
+  it("keeps a saved memory change held when an unchanged smart-routing setting cancels its own request", async () => {
+    let idle = false;
+    const restart = vi.fn(async () => undefined);
+    const wakeQueues = vi.fn();
+    const owner = new DeferredBackendRestartCoordinator({ restart, canRestart: () => idle, wakeQueues, retryDelayMs: 60_000 });
+    try {
+      owner.request("codex", "native_memory");
+      owner.request("codex", "smart_routing");
+      expect(owner.cancelIfWaiting("codex", "smart_routing")).toBe(true);
+      expect(owner.state("codex", "smart_routing").pending).toBe(false);
+      expect(owner.state("codex", "native_memory").pending).toBe(true);
+      expect(owner.blocksDispatch("codex")).toBe(true);
+      expect(wakeQueues).not.toHaveBeenCalled();
+      idle = true;
+      await owner.apply("codex");
+      expect(restart).toHaveBeenCalledOnce();
+      expect(owner.blocksDispatch("codex")).toBe(false);
+      expect(wakeQueues).toHaveBeenCalledOnce();
+    } finally { owner.dispose(); }
+  });
+
+  it("retains both settings when memory changes during a smart-routing replacement", async () => {
+    const first = deferred();
+    const restart = vi.fn().mockImplementationOnce(async () => await first.value).mockResolvedValue(undefined);
+    const wakeQueues = vi.fn();
+    const owner = new DeferredBackendRestartCoordinator({ restart, canRestart: () => true, wakeQueues, retryDelayMs: 60_000 });
+    try {
+      const replacing = owner.schedule("codex", "smart_routing");
+      await vi.waitFor(() => expect(restart).toHaveBeenCalledOnce());
+      owner.request("codex", "native_memory");
+      expect(owner.cancelIfWaiting("codex", "smart_routing")).toBe(false);
+      first.resolve();
+      await replacing;
+      await vi.waitFor(() => expect(owner.state("codex").pending).toBe(false));
+      expect(restart).toHaveBeenCalledTimes(2);
+      expect(wakeQueues).toHaveBeenCalledOnce();
+    } finally { owner.dispose(); }
+  });
 });
 
 function deferred(): { readonly value: Promise<void>; resolve(): void } {

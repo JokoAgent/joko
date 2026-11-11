@@ -4400,7 +4400,7 @@ describe("CodexBackendAdapter", () => {
     })).toThrow("Codex Host-composed capability is invalid");
   });
 
-  it("owns Codex native memory through durable local reconcile while keeping Review and remote policy isolated", async () => {
+  it("keeps Codex native memory fixed until a new local process adopts the saved preference", async () => {
     let enabled = false;
     const resolveNativeMemoryEnabled = vi.fn(async () => enabled);
     const setup = await createSetup(7, { resolveNativeMemoryEnabled });
@@ -4441,8 +4441,8 @@ describe("CodexBackendAdapter", () => {
     await setup.fake.completeTurn(binding.nativeSessionId!, "memory sandbox ready");
 
     enabled = true;
-    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("immediate");
-    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(true);
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("next_session");
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(false);
 
     const reviewContext: AdapterContext = {
       ...context(setup.target, [], { backendInstanceGeneration: 7 }),
@@ -4462,36 +4462,17 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(false);
     expect(setup.fake.memoryEnabledForThread(reviewBinding.nativeSessionId!)).toBe(false);
 
-    let releaseFirst!: () => void;
-    let markFirstStarted!: () => void;
-    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
-    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
-    const request = transport.request.bind(transport);
-    let blockNext = true;
-    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
-      if (method === "experimentalFeature/enablement/set" && blockNext) {
-        blockNext = false;
-        markFirstStarted();
-        await release;
-      }
-      return request(method, params, options);
-    });
+    await setup.adapter.send(prompt("finish accepted work"), context(setup.target, [], {
+      binding, backendInstanceGeneration: 7, operationId: "memory-active-turn"
+    }));
     enabled = true;
-    const older = setup.adapter.reconcileNativeMemory();
-    await firstStarted;
-    enabled = false;
-    const newer = setup.adapter.reconcileNativeMemory();
-    releaseFirst();
-    await Promise.all([older, newer]);
-    const reconciles = transport.requests
-      .filter((request) => request.method === "experimentalFeature/enablement/set")
-      .slice(-2)
-      .map((request) => request.params);
-    expect(reconciles).toEqual([
-      { enablement: { memories: true } },
-      { enablement: { memories: false } }
-    ]);
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("next_session");
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: false });
+    expect(transport.requests.filter(request => request.method === "experimentalFeature/enablement/set")).toHaveLength(1);
     expect(setup.fake.nativeMemoryEnabled).toBe(false);
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(false);
+    await setup.fake.completeTurn(binding.nativeSessionId!, "accepted work completed");
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("next_session");
 
     await setup.fake.transport!.exit(false);
     enabled = true;
@@ -4500,7 +4481,7 @@ describe("CodexBackendAdapter", () => {
       ...context(setup.target, [], { backendInstanceGeneration: 7 }),
       sessionId: "session-codex-after-memory-restart"
     };
-    await setup.adapter.createSession(sessionInput(setup.target), restartedContext);
+    const restartedBinding = await setup.adapter.createSession(sessionInput(setup.target), restartedContext);
     const restartedRequests = setup.fake.transport!.requests;
     const restartedOverride = restartedRequests.findIndex((request) =>
       request.method === "experimentalFeature/enablement/set");
@@ -4508,6 +4489,9 @@ describe("CodexBackendAdapter", () => {
     expect(restartedOverride).toBeGreaterThan(-1);
     expect(restartedOverride).toBeLessThan(restartedStart);
     expect(restartedRequests[restartedOverride]?.params).toEqual({ enablement: { memories: true } });
+    expect(setup.fake.memoryEnabledForThread(restartedBinding.nativeSessionId!)).toBe(true);
+    await setup.adapter.resumeSession(binding, context(setup.target, [], { binding, backendInstanceGeneration: 7 }));
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(true);
   });
 
   it("resets only the fixed local Codex native-memory owner and preserves unknown counts", async () => {
@@ -4564,27 +4548,34 @@ describe("CodexBackendAdapter", () => {
     await expect(reset).resolves.toEqual({});
   });
 
-  it("reads effective Codex native-memory status from the exact local runtime and re-pushes after restart", async () => {
+  it("reads Codex native-memory status without applying saved settings or touching a remote host", async () => {
     let enabled = true;
     const setup = await createRemoteSetup({ resolveNativeMemoryEnabled: () => enabled });
 
-    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({});
     let requests = setup.localFake.transport!.requests;
-    expect(requests.findIndex((request) => request.method === "experimentalFeature/enablement/set"))
-      .toBeLessThan(requests.findIndex((request) => request.method === "config/read"));
+    expect(requests.some(request => request.method === "experimentalFeature/enablement/set")).toBe(false);
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("immediate");
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
     expect(setup.resolveRemote).not.toHaveBeenCalled();
     expect(setup.remoteFake.transport).toBeUndefined();
 
     enabled = false;
-    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: false });
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
+    expect(setup.adapter.nativeMemoryHasPreparedThreads()).toBe(false);
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("immediate");
     expect(setup.localFake.nativeMemoryEnabled).toBe(false);
 
     await setup.localFake.transport!.exit(false);
+    setup.localFake.nativeMemoryEnabled = false;
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: false });
+    requests = setup.localFake.transport!.requests;
+    expect(requests.some(request => request.method === "experimentalFeature/enablement/set")).toBe(false);
     enabled = true;
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("immediate");
     await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
     requests = setup.localFake.transport!.requests;
-    expect(requests.findIndex((request) => request.method === "experimentalFeature/enablement/set"))
-      .toBeLessThan(requests.findIndex((request) => request.method === "config/read"));
+    expect(requests.filter(request => request.method === "experimentalFeature/enablement/set")).toHaveLength(1);
     expect(setup.resolveRemote).not.toHaveBeenCalled();
     expect(setup.remoteFake.transport).toBeUndefined();
   });
@@ -4592,12 +4583,14 @@ describe("CodexBackendAdapter", () => {
   it("fails closed for unconfirmed, malformed, failed, or cancelled Codex native-memory status", async () => {
     const setup = await createSetup(7, { resolveNativeMemoryEnabled: () => true });
 
+    await setup.adapter.describe();
     setup.fake.malformedNextNativeMemoryEnablement = true;
-    await expect(setup.adapter.readNativeMemoryStatus()).rejects.toMatchObject({
+    await expect(setup.adapter.reconcileNativeMemory()).rejects.toMatchObject({
       publicError: { code: "CODEX_NATIVE_MEMORY_ACK_INVALID", stateMayHaveChanged: true }
     });
     expect(setup.fake.transport?.requests.some((request) => request.method === "config/read")).toBe(false);
 
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("immediate");
     setup.fake.nextNativeMemoryStatusResponse = { config: { features: {} } };
     await expect(setup.adapter.readNativeMemoryStatus()).rejects.toMatchObject({
       publicError: { code: "CODEX_NATIVE_MEMORY_STATUS_INVALID", stateMayHaveChanged: false }
@@ -4609,12 +4602,12 @@ describe("CodexBackendAdapter", () => {
     });
 
     setup.fake.nextNativeMemoryStatusResponse = { config: { features: { memories: false } } };
-    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: false });
+    await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({});
     const reconcileCount = setup.fake.transport!.requests.filter((request) =>
       request.method === "experimentalFeature/enablement/set").length;
     await expect(setup.adapter.readNativeMemoryStatus()).resolves.toEqual({ enabled: true });
     expect(setup.fake.transport!.requests.filter((request) =>
-      request.method === "experimentalFeature/enablement/set")).toHaveLength(reconcileCount + 1);
+      request.method === "experimentalFeature/enablement/set")).toHaveLength(reconcileCount);
 
     const cancelled = new AbortController();
     cancelled.abort();
@@ -4678,6 +4671,40 @@ describe("CodexBackendAdapter", () => {
       }
     });
     expect(malformed.fake.transport?.requests.some((request) => request.method === "thread/start")).toBe(false);
+  });
+
+  it("does not admit a native thread when the feature ACK disagrees with effective memory configuration", async () => {
+    const setup = await createSetup(7, { resolveNativeMemoryEnabled: () => false });
+    setup.fake.nextNativeMemoryStatusResponse = { config: { features: { memories: true } } };
+    await expect(setup.adapter.createSession(
+      sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })
+    )).rejects.toMatchObject({ publicError: { code: "CODEX_NATIVE_MEMORY_RECONCILE_FAILED", stateMayHaveChanged: true } });
+    expect(setup.adapter.nativeMemoryHasPreparedThreads()).toBe(false);
+    expect(setup.fake.transport!.requests.some(request => request.method === "thread/start")).toBe(false);
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    expect(setup.fake.transport!.requests.filter(request => request.method === "experimentalFeature/enablement/set")).toHaveLength(2);
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(false);
+  });
+
+  it("reconfirms a reverted cold preference after a write changed defaults but lost effective-config confirmation", async () => {
+    let enabled = false;
+    const setup = await createSetup(7, { resolveNativeMemoryEnabled: () => enabled });
+    await setup.adapter.describe();
+    await expect(setup.adapter.reconcileNativeMemory()).resolves.toBe("immediate");
+    enabled = true;
+    setup.fake.failNextNativeMemoryStatus = true;
+    await expect(setup.adapter.reconcileNativeMemory()).rejects.toMatchObject({
+      publicError: { code: "CODEX_NATIVE_MEMORY_RECONCILE_FAILED", stateMayHaveChanged: true }
+    });
+    expect(setup.fake.nativeMemoryEnabled).toBe(true);
+    enabled = false;
+    const binding = await setup.adapter.createSession(
+      sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 })
+    );
+    expect(setup.fake.transport!.requests.filter(request => request.method === "experimentalFeature/enablement/set")).toHaveLength(3);
+    expect(setup.fake.memoryEnabledForThread(binding.nativeSessionId!)).toBe(false);
   });
 
   it.each([

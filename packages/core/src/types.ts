@@ -29,7 +29,7 @@ export interface Capability {
   readonly options?: readonly string[];
 }
 
-/** `memory.native` can refresh already-loaded local runtimes without mutating remote-host policy. */
+/** `memory.native` can refresh local runtimes after accepted work finishes, without mutating remote-host policy. */
 export const MEMORY_NATIVE_LIVE_LOCAL_OPTION = "live_local" as const;
 /** `memory.native` remains disabled until the user saves an explicit Backend preference. */
 export const MEMORY_NATIVE_DEFAULT_DISABLED_OPTION = "default_disabled" as const;
