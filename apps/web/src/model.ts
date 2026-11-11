@@ -5340,6 +5340,11 @@ export interface AppSnapshot {
    * explicitly invalidate the affected session's separately loaded history.
    */
   readonly timelineHistoryRevisionBySession: ReadonlyMap<string, bigint>;
+  readonly timelineMessageDeletionBySession?: ReadonlyMap<string, {
+    readonly previousRevision: bigint;
+    readonly revision: bigint;
+    readonly eventIds: readonly string[];
+  }>;
   readonly extensionWidgetsBySession: ReadonlyMap<string, readonly ExtensionWidgetView[]>;
   readonly extensionStatusesBySession: ReadonlyMap<string, readonly ExtensionStatusView[]>;
   readonly queue: readonly QueueItemView[];

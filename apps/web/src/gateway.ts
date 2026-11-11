@@ -2217,7 +2217,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       // authoritative history response. It never supplies cached body text.
       timelineHistoryRevisionBySession: sameGeneration
         ? this.#snapshot?.timelineHistoryRevisionBySession ?? new Map<string, bigint>()
-        : new Map<string, bigint>()
+        : new Map<string, bigint>(),
+      timelineMessageDeletionBySession: sameGeneration ? this.#snapshot?.timelineMessageDeletionBySession : undefined
     };
     this.#rawSnapshot = raw;
     this.#snapshot = mapped;
@@ -12233,7 +12234,16 @@ export function projectSnapshotEvent(
       // authoritative projection.
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
       if (!options?.deletionApplied) {
+        const previousRevision = projected.timelineHistoryRevisionBySession.get(sessionId) ?? 0n;
         ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
+        const revision = projected.timelineHistoryRevisionBySession.get(sessionId);
+        if (sessionId !== "" && revision !== undefined && kind.value.productSessionId === sessionId && event.identity?.sessionId === sessionId
+          && cursor?.generation === projected.generation && kind.value.requestedEventId !== ""
+          && kind.value.deletedEventIds.includes(kind.value.requestedEventId)) {
+          const timelineMessageDeletionBySession = new Map(projected.timelineMessageDeletionBySession);
+          timelineMessageDeletionBySession.set(sessionId, { previousRevision, revision, eventIds: kind.value.deletedEventIds });
+          projected = { ...projected, timelineMessageDeletionBySession };
+        }
       }
       refresh = "authoritative";
       break;
