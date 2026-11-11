@@ -22,6 +22,7 @@ import type { OrchestratorApplication } from "./application.js";
 const targets = ["route-a", "route-b", "route-c"].map((backendId, index) => ({
   backendId, providerId: "native-provider", modelId: `model-${index}`
 }));
+const secondPiModel = { ...targets[0]!, modelId: "compaction-other-model" };
 const capacities = [32_000, 64_000, 128_000];
 
 async function openNode(root: string, generation: number) {
@@ -33,7 +34,9 @@ async function openNode(root: string, generation: number) {
   const adapters = targets.map((target, index) => new FakeBackendAdapter({
     ...PI_LIKE_PROFILE, id: target.backendId,
     capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "model.working_context", supported: true }],
-    models: [{ ...PI_LIKE_PROFILE.models[0]!, providerId: target.providerId, modelId: target.modelId, contextWindow: capacities[index]! }]
+    models: [target, ...(index === 0 ? [secondPiModel] : [])].map(model => ({
+      ...PI_LIKE_PROFILE.models[0]!, providerId: model.providerId, modelId: model.modelId, contextWindow: capacities[index]!
+    }))
   }));
   for (const adapter of adapters) {
     if (!store.listBackends().some(item => item.descriptor.id === adapter.id)) store.upsertBackend(await adapter.describe());
@@ -44,7 +47,8 @@ async function openNode(root: string, generation: number) {
   const host = new SessionHost(store, artifacts, adapters, { resolveModelWorkingContext: target => target.sessionId && budgets ? budgets.resolve(target.sessionId, target) : contexts?.resolve(target) }); await host.initialize();
   let active = true;
   contexts = composeModelWorkingContext({ store, providers, sessionHost: host,
-    currentOwner: () => active ? { ownerId: "node-context-owner", generation } : undefined });
+    currentOwner: () => active ? { ownerId: "node-context-owner", generation } : undefined,
+    defaultAutoCompactionThreshold: backendId => backendId === targets[0]!.backendId ? 90 : undefined });
   budgets = new SessionContextBudgetCoordinator(store, contexts, (sessionId, target, check) => host.refreshModelWorkingContexts([target], check, undefined, sessionId), () => false);
   const connections = new ConnectionManager(store), challenge = connections.issuePairing("Model settings observer");
   const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Model settings observer" });
@@ -63,6 +67,42 @@ async function openNode(root: string, generation: number) {
 }
 
 describe("node model working-context composition", () => {
+  it("persists separate Pi model compaction thresholds and restores one without changing either working window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-model-compaction-node-"));
+    let node = await openNode(root, 1);
+    const first = targets[0]!;
+    const read = async (target: typeof first) => (await node.client.getModelWorkingContext({ target })).context!;
+    const set = async (target: typeof first, percent: number | null) => {
+      const current = await read(target);
+      return (await node.client.setModelWorkingContext({ operationId: `threshold-${target.modelId}-${percent}`, target,
+        expectedRevision: current.revision, expectedSourceRevision: current.sourceRevision,
+        autoCompactionThresholdChange: percent === null ? { case: "restoreAutoCompactionThreshold", value: true }
+          : { case: "autoCompactionThresholdPercent", value: percent }
+      })).context!;
+    };
+    try {
+      for (const target of [first, secondPiModel]) {
+        const current = await read(target);
+        expect(current.defaultAutoCompactionThresholdPercent).toBe(90);
+        await node.client.setModelWorkingContext({ operationId: `working-window-${target.modelId}`, target,
+          contextWindowTokens: 100_000n, expectedRevision: current.revision, expectedSourceRevision: current.sourceRevision });
+      }
+      expect(await set(first, 50)).toMatchObject({ autoCompactionThresholdPercent: 50, limitTokens: 100_000n });
+      expect(await set(secondPiModel, 80)).toMatchObject({ autoCompactionThresholdPercent: 80, limitTokens: 100_000n });
+    } finally { await node.close(); }
+    node = await openNode(root, 2);
+    try {
+      expect((await read(first)).autoCompactionThresholdPercent).toBe(50);
+      expect((await read(secondPiModel)).autoCompactionThresholdPercent).toBe(80);
+      expect(await set(first, null)).toMatchObject({ defaultAutoCompactionThresholdPercent: 90, limitTokens: 100_000n });
+      expect(node.contexts.configuredAutoCompactionThreshold(first)).toBeUndefined();
+      expect(node.contexts.configuredAutoCompactionThreshold(secondPiModel)).toBe(80);
+      expect(await read(secondPiModel)).toMatchObject({ autoCompactionThresholdPercent: 80, limitTokens: 100_000n });
+      expect(node.store.getBackend(first.backendId).descriptor.models.map(model => model.contextWindow)).toEqual([32_000, 32_000]);
+      await expect(set(targets[1]!, 50)).rejects.toMatchObject({ code: Code.Unimplemented });
+    } finally { await node.close(); }
+  });
+
   it("saves and replays a task budget through its Operation, dispatches that budget and restores it from SQLite", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-task-context-node-")); let node = await openNode(root, 1);
     let sessionId = "", generation = 0;

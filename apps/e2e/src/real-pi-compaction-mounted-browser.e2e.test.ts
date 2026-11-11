@@ -94,11 +94,12 @@ describe("mounted Pi compaction product chain", () => {
       })
     ));
     const compactSessionId = await createSession("Mounted compact outcomes");
+    let observedSessionId = compactSessionId;
     failureState = async () => {
-      const { session } = await manager.clients.session.getSession({ sessionId: compactSessionId });
-      return { state: session?.state, compacting: session?.contextState?.compacting,
+      const { session } = await manager.clients.session.getSession({ sessionId: observedSessionId });
+      return { sessionId: observedSessionId, state: session?.state, compacting: session?.contextState?.compacting,
         usedTokens: session?.context?.usedTokens.toString(),
-        compactions: fixture!.application.store.listEvents({ sessionId: compactSessionId })
+        compactions: fixture!.application.store.listEvents({ sessionId: observedSessionId })
           .flatMap((event) => event.payload.type === "compaction"
             ? [{ state: event.payload.state, reason: event.payload.reason }] : []).slice(-8) };
     };
@@ -163,7 +164,9 @@ describe("mounted Pi compaction product chain", () => {
     await page.getByLabel("Device name").fill("Mounted Pi compact Web");
     await page.locator("form.pair-form button[type=submit]").click();
 
-    const trigger = page.getByRole("button", { name: "Click to compact context" });
+    const compactTrigger = (sessionId: string) => page.locator(`.session-pane[data-input-session-id='${sessionId}']`)
+      .getByRole("button", { name: "Click to compact context" });
+    const trigger = compactTrigger(compactSessionId);
     try {
       await trigger.waitFor({ state: "visible", timeout: 30_000 });
     } catch (error) {
@@ -222,14 +225,30 @@ describe("mounted Pi compaction product chain", () => {
     await navigateMountedTask(page, compactSessionId, "Mounted compact outcomes");
     await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
 
+    observedSessionId = failingSessionId;
     await send(failingSessionId, "First turn for a genuine Provider failure.");
     await send(failingSessionId, "Second turn for a genuine Provider failure.");
     await navigateMountedTask(page, failingSessionId, "Mounted compact failure");
-    const failingTrigger = page.getByRole("button", { name: "Click to compact context" });
+    const failingTrigger = compactTrigger(failingSessionId);
     await failingTrigger.waitFor({ state: "visible" });
+    await page.evaluate(() => {
+      document.addEventListener("click", (event) => {
+        const target = event.target instanceof Element ? event.target : undefined;
+        const owner = target?.closest<HTMLElement>(".session-pane");
+        document.documentElement.dataset.compactionClickTarget = JSON.stringify({
+          element: target?.tagName, button: target?.closest("button")?.getAttribute("aria-label"),
+          sessionId: owner?.dataset.inputSessionId, generation: owner?.dataset.inputSessionGeneration
+        });
+      }, { capture: true, once: true });
+    });
     failSummary = true;
     await failingTrigger.click();
-    await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
+    await confirmation.getByRole("button", { name: "Compact", exact: true }).click().catch(async (cause: unknown) => {
+      throw new Error(`Could not confirm manual compaction: ${JSON.stringify({
+        clickTarget: await page.locator("html").getAttribute("data-compaction-click-target"),
+        browserErrors: errors
+      })}`, { cause });
+    });
     const failure = page.locator(".compact-action-feedback--failure");
     await failure.waitFor({ state: "visible", timeout: 30_000 }).catch(async (error: unknown) => {
       throw new Error(`Mounted Pi failure feedback was absent: ${JSON.stringify({
@@ -252,6 +271,7 @@ describe("mounted Pi compaction product chain", () => {
     await settleBrowserErrors();
     errors.splice(0);
 
+    observedSessionId = compactSessionId;
     const authKey = manager.authKey;
     usagePhase = "service-stop";
     await fixture.close({ removeRoot: false });

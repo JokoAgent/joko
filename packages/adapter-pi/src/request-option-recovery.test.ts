@@ -35,7 +35,9 @@ it("loads the provisioned native hook and removes only the two cache fields on o
   const root = await mkdtemp(join(tmpdir(), "joko-cache-hook-"));
   const path = await provisionManagedRequestOptionRecovery(root);
   const bodies: unknown[] = [], actions: unknown[] = [];
+  const controller = new AbortController();
   globalThis.fetch = async (input, init) => {
+    expect(init?.signal).toBe(controller.signal);
     const request = new Request(input, init);
     expect(request.headers.has("x-joko-cache-compatibility-request")).toBe(false);
     bodies.push(await request.json());
@@ -63,6 +65,7 @@ it("loads the provisioned native hook and removes only the two cache fields on o
   const event = { headers: {} };
   handlers.get("before_provider_headers")!(event, context);
   const response = await fetch("https://local.test/v1/chat/completions", { method: "POST",
+    signal: controller.signal,
     headers: { ...event.headers, "content-type": "application/json" },
     body: JSON.stringify({ model: "model", messages: [{ role: "user", content: "same input" }], prompt_cache_key: "key", prompt_cache_retention: "24h" }) });
   expect(response.status).toBe(200);

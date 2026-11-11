@@ -1278,6 +1278,10 @@ message SetModelWorkingContextRequest {
   optional uint64 context_window_tokens = 4;
   Revision expected_revision = 5;
   string expected_source_revision = 6;
+  oneof auto_compaction_threshold_change {
+    uint32 auto_compaction_threshold_percent = 7;
+    bool restore_auto_compaction_threshold = 8;
+  }
 }
 message SetModelWorkingContextResponse { ModelWorkingContextView context = 1; }
 message ResetModelWorkingContextRequest {

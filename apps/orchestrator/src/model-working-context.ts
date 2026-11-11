@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM, PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM } from "@joko/adapter-pi";
 import type { ProviderModel } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
@@ -12,6 +13,7 @@ export interface ModelWorkingContextRoute {
   readonly providerRevision?: bigint;
   readonly supported: boolean;
   readonly available: boolean;
+  readonly defaultAutoCompactionThresholdPercent?: number;
 }
 export interface ModelNativeContextInfo {
   readonly contextWindowTokens?: number;
@@ -26,6 +28,8 @@ export interface ModelWorkingContextQuery {
 }
 export interface ModelWorkingContextEdit extends ModelWorkingContextQuery {
   readonly limit?: number;
+  /** Null restores the Backend threshold. Omit this field when editing the window. */
+  readonly autoCompactionThresholdPercent?: number | null;
   readonly expectedRevision: bigint;
   readonly expectedSourceRevision: string;
   readonly operationId: string;
@@ -42,6 +46,8 @@ export interface ModelWorkingContextView {
   readonly canConfigure: boolean;
   readonly blockedReason?: "model_unavailable" | "unsupported";
   readonly nativeContext?: ModelNativeContextInfo;
+  readonly autoCompactionThresholdPercent?: number;
+  readonly defaultAutoCompactionThresholdPercent?: number;
 }
 export interface ModelWorkingContextOptions {
   readonly store: OperationalStore;
@@ -50,7 +56,12 @@ export interface ModelWorkingContextOptions {
   readonly refresh: (targets: readonly ModelRouteTarget[], assertCurrent: () => void, signal?: AbortSignal) => Promise<void>;
   readonly readNativeContext?: (target: ModelRouteTarget, sessionId: string | undefined, signal?: AbortSignal) => Promise<ModelNativeContextInfo | undefined>;
 }
-interface Entry { readonly target: ModelRouteTarget; readonly overrideTokens?: number; readonly lastEditId: string }
+interface Entry {
+  readonly target: ModelRouteTarget;
+  readonly overrideTokens?: number;
+  readonly autoCompactionThresholdPercent?: number;
+  readonly lastEditId: string;
+}
 interface State { readonly format: 1; readonly entries: readonly Entry[] }
 export class ModelWorkingContextError extends Error {
   constructor(readonly reason: "invalid" | "conflict" | "owner_changed" | "unsupported" | "refresh_failed" | "cancelled") {
@@ -69,6 +80,11 @@ export class ModelWorkingContextCoordinator {
   configuredLimit(target: ModelRouteTarget): number | undefined {
     const owner = this.options.currentOwner();
     return owner ? this.state(owner.ownerId).entries.find(entry => key(entry.target) === key(target))?.overrideTokens : undefined;
+  }
+  configuredAutoCompactionThreshold(target: ModelRouteTarget): number | undefined {
+    const owner = this.options.currentOwner();
+    if (!owner || this.options.resolveRoute(target)?.defaultAutoCompactionThresholdPercent === undefined) return undefined;
+    return this.state(owner.ownerId).entries.find(entry => key(entry.target) === key(target))?.autoCompactionThresholdPercent;
   }
   resolve(target: ModelRouteTarget): number | undefined {
     const owner = this.options.currentOwner();
@@ -91,17 +107,31 @@ export class ModelWorkingContextCoordinator {
     const targets = validateTargets(edit); const owner = this.owner(signal);
     if (!text(edit.operationId) || typeof edit.expectedSourceRevision !== "string" || typeof edit.expectedRevision !== "bigint") throw new ModelWorkingContextError("invalid");
     if (edit.limit !== undefined && !validLimit(edit.limit)) throw new ModelWorkingContextError("invalid");
+    const thresholdEdit = edit.autoCompactionThresholdPercent !== undefined;
+    const threshold = edit.autoCompactionThresholdPercent ?? undefined;
+    if (thresholdEdit && (targets.length !== 1 || edit.limit !== undefined || threshold !== undefined && !validThreshold(threshold))) {
+      throw new ModelWorkingContextError("invalid");
+    }
     const source = this.source(targets);
     const setting = this.options.store.findSetting<unknown>("service", owner.ownerId, SETTING_KEY);
     if ((setting?.revision ?? 0n) !== edit.expectedRevision || source.revision !== edit.expectedSourceRevision) throw new ModelWorkingContextError("conflict");
-    if (edit.limit !== undefined && source.routes.some(route => route === undefined || !route.supported || !route.available)) throw new ModelWorkingContextError("unsupported");
+    if (thresholdEdit && source.routes[0]?.defaultAutoCompactionThresholdPercent === undefined) throw new ModelWorkingContextError("unsupported");
+    const restoring = thresholdEdit ? threshold === undefined : edit.limit === undefined;
+    if (!restoring && source.routes.some(route => route === undefined || !route.supported || !route.available)) throw new ModelWorkingContextError("unsupported");
     const before = this.state(owner.ownerId).entries;
     const writtenId = randomUUID();
     const changed = new Set(targets.map(key));
     const entries = before.filter(entry => !changed.has(key(entry.target)));
-    const receiptTargets = edit.limit === undefined ? targets.filter(target => before.some(entry => key(entry.target) === key(target))) : targets;
+    const receiptTargets = restoring ? targets.filter(target => before.some(entry => key(entry.target) === key(target))) : targets;
     const receipts = new Set(receiptTargets.map(key));
-    entries.push(...receiptTargets.map(target => ({ target, lastEditId: writtenId, ...(edit.limit === undefined ? {} : { overrideTokens: edit.limit }) })));
+    for (const target of receiptTargets) {
+      const previous = before.find(entry => key(entry.target) === key(target));
+      const overrideTokens = thresholdEdit ? previous?.overrideTokens : edit.limit;
+      const autoCompactionThresholdPercent = thresholdEdit ? threshold : previous?.autoCompactionThresholdPercent;
+      entries.push({ target, lastEditId: writtenId,
+        ...(overrideTokens === undefined ? {} : { overrideTokens }),
+        ...(autoCompactionThresholdPercent === undefined ? {} : { autoCompactionThresholdPercent }) });
+    }
     if (entries.length > MAXIMUM_ENTRIES) throw new ModelWorkingContextError("invalid");
     this.assertOwner(owner, signal);
     this.write(owner.ownerId, entries);
@@ -113,8 +143,9 @@ export class ModelWorkingContextCoordinator {
     };
     try {
       assertCurrent(); await this.options.refresh(targets, assertCurrent, signal); assertCurrent();
-      // A successful reset leaves no override or rollback receipt on disk.
-      if (edit.limit === undefined) this.write(owner.ownerId, this.state(owner.ownerId).entries.filter(entry => entry.lastEditId !== writtenId));
+      // A successful reset removes records that no longer contain an override.
+      if (restoring) this.write(owner.ownerId, this.state(owner.ownerId).entries.filter(entry =>
+        entry.lastEditId !== writtenId || entry.overrideTokens !== undefined || entry.autoCompactionThresholdPercent !== undefined));
       return this.view(owner.ownerId, targets, this.source(targets));
     } catch (error) {
       // This exact edit owns only its target keys; unrelated and newer writes survive, including ABA.
@@ -146,7 +177,8 @@ export class ModelWorkingContextCoordinator {
     const routes = targets.map(target => this.options.resolveRoute(target));
     const revision = createHash("sha256").update(JSON.stringify(targets.map((target, index) => {
       const route = routes[index]; return [target, route === undefined ? null : [route.catalogRevision.toString(), route.instanceGeneration,
-        route.providerRevision?.toString() ?? null, route.supported, route.available, route.model.contextWindow]];
+        route.providerRevision?.toString() ?? null, route.supported, route.available, route.model.contextWindow,
+        route.defaultAutoCompactionThresholdPercent ?? null]];
     }))).digest("hex");
     return { routes, revision };
   }
@@ -155,11 +187,16 @@ export class ModelWorkingContextCoordinator {
     const entries = this.state(ownerId).entries;
     const values = targets.map(target => entries.find(entry => key(entry.target) === key(target))?.overrideTokens);
     const limitTokens = values.find(value => value !== undefined); const primary = source.routes[0];
+    const defaultAutoCompactionThresholdPercent = primary?.defaultAutoCompactionThresholdPercent;
+    const autoCompactionThresholdPercent = defaultAutoCompactionThresholdPercent === undefined ? undefined
+      : entries.find(entry => key(entry.target) === key(targets[0]!))?.autoCompactionThresholdPercent;
     const defaultContextWindowTokens = primary === undefined ? undefined : validDefault(primary.model.contextWindow);
     const canConfigure = source.routes.every(route => route !== undefined && route.supported && route.available);
     return { target: targets[0]!, ...(limitTokens === undefined ? {} : { limitTokens }),
       ...(defaultContextWindowTokens === undefined ? {} : { defaultContextWindowTokens }),
       ...((values[0] ?? defaultContextWindowTokens) === undefined ? {} : { effectiveContextWindowTokens: values[0] ?? defaultContextWindowTokens }),
+      ...(defaultAutoCompactionThresholdPercent === undefined ? {} : { defaultAutoCompactionThresholdPercent }),
+      ...(autoCompactionThresholdPercent === undefined ? {} : { autoCompactionThresholdPercent }),
       customized: values.some(value => value !== undefined), mixed: values.some(value => value !== values[0]),
       revision: record?.revision ?? 0n, sourceRevision: source.revision, canConfigure,
       ...(canConfigure ? {} : { blockedReason: source.routes.some(route => route === undefined) ? "model_unavailable" as const : "unsupported" as const }) };
@@ -172,8 +209,9 @@ export class ModelWorkingContextCoordinator {
     if (state.format !== 1 || !Array.isArray(state.entries) || state.entries.length > MAXIMUM_ENTRIES) throw new ModelWorkingContextError("invalid");
     const seen = new Set<string>();
     for (const entry of state.entries) {
-      if (!entry || typeof entry !== "object" || Object.keys(entry).some(field => !["target", "overrideTokens", "lastEditId"].includes(field)) || !text(entry.lastEditId)
-        || (entry.overrideTokens !== undefined && !validLimit(entry.overrideTokens))) throw new ModelWorkingContextError("invalid");
+      if (!entry || typeof entry !== "object" || Object.keys(entry).some(field => !["target", "overrideTokens", "autoCompactionThresholdPercent", "lastEditId"].includes(field)) || !text(entry.lastEditId)
+        || (entry.overrideTokens !== undefined && !validLimit(entry.overrideTokens))
+        || (entry.autoCompactionThresholdPercent !== undefined && !validThreshold(entry.autoCompactionThresholdPercent))) throw new ModelWorkingContextError("invalid");
       validateTarget(entry.target); if (seen.has(key(entry.target))) throw new ModelWorkingContextError("invalid"); seen.add(key(entry.target));
     }
     return state;
@@ -185,6 +223,9 @@ export class ModelWorkingContextCoordinator {
 function key(target: ModelRouteTarget): string { return JSON.stringify([target.backendId, target.providerId, target.modelId]); }
 function text(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value && !value.includes("\0"); }
 function validLimit(value: number): boolean { return Number.isSafeInteger(value) && value >= 1000 && value <= 100_000_000; }
+function validThreshold(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM && value <= PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM;
+}
 function validDefault(value: number): number | undefined { return Number.isSafeInteger(value) && value > 0 ? value : undefined; }
 function validateTarget(target: ModelRouteTarget): void {
   if (!target || typeof target !== "object" || Object.keys(target).some(field => !["backendId", "providerId", "modelId", "$typeName"].includes(field))

@@ -114,6 +114,33 @@ describe("ProviderSettings model advanced journey", () => {
     expect(document.body.textContent).toContain("Routes have different overrides");
   });
 
+  it("saves and restores the ratio on the exact Pi route of a mounted model drawer", async () => {
+    let current = context({ defaultAutoCompactionThresholdPercent: 90, limitTokens: 100_000 });
+    const setThreshold = vi.fn(async (_route: unknown, _observed: unknown, percent: number | null) => {
+      current = { ...current, autoCompactionThresholdPercent: percent ?? undefined, revision: current.revision + 1n };
+      return current;
+    });
+    const setWindow = vi.fn(async (_route: unknown, _observed: unknown, tokens: number) => {
+      current = { ...current, limitTokens: tokens, effectiveContextWindowTokens: tokens, revision: current.revision + 1n };
+      return current;
+    });
+    await mount({ getModelWorkingContext: vi.fn(async () => current),
+      setModelAutoCompactionThreshold: setThreshold, setModelWorkingContext: setWindow }, undefined, {}, true);
+    await open();
+    const picker = required(document.querySelector<HTMLButtonElement>('[aria-label="Pi auto-compaction threshold"]'));
+    await selectProtocol(picker, "50%");
+    expect(setThreshold).toHaveBeenCalledWith({ backendId: "a", providerId: "provider", modelId: "model-primary" },
+      expect.objectContaining({ revision: 7n, limitTokens: 100_000 }), 50, expect.any(AbortSignal));
+    expect(picker.textContent).toContain("50%");
+    await edit(contextInput(), "120");
+    await clickText("Save", ".model-working-context");
+    expect(setWindow).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ revision: 8n }), 120_000, expect.any(AbortSignal));
+    await selectProtocol(picker, "Use Backend setting (90%)");
+    expect(setThreshold).toHaveBeenLastCalledWith({ backendId: "a", providerId: "provider", modelId: "model-primary" },
+      expect.objectContaining({ revision: 9n, autoCompactionThresholdPercent: 50, limitTokens: 120_000 }), null, expect.any(AbortSignal));
+    expect(picker.textContent).toContain("Use Backend setting (90%)");
+  });
+
   it("edits only an advertised manual protocol through full Provider CAS and shows failures", async () => {
     const saveProvider = vi.fn().mockRejectedValueOnce(new Error("CAS conflict")).mockResolvedValue(undefined);
     const mounted = await mount({ saveProvider }); await open();
@@ -203,12 +230,14 @@ describe("ProviderSettings model advanced journey", () => {
   });
 });
 
-async function mount(overrides: Record<string, unknown> = {}, managed?: ManagedModelRuntimeView, modelOverrides: Partial<ModelView> = {}) {
+async function mount(overrides: Record<string, unknown> = {}, managed?: ManagedModelRuntimeView, modelOverrides: Partial<ModelView> = {}, includePi = false) {
   const config = configuration();
   const snapshot: AppSnapshot = { ...emptySnapshot(), models: [model("a", "model-primary", modelOverrides), model("b", "model-secondary", { efforts: ["low", "medium"], metadata: { defaultEffort: "medium", outboundProtocol: "anthropic-messages", protocolMode: "compatibility" } })],
     backends: ["a", "b"].map(id => ({ id, name: `Runtime ${id}`, version: "1", health: "healthy", capabilities: new Map(), providerRuntimeSupport: { protocols: ["openaiChat", "anthropic"], fields: ["modelCompatibility"] } })),
     providers: ["a", "b"].map(backendId => ({ backendId, id: "provider", name: "Provider", kind: "customEndpoint", compatibility: "openaiChat", authenticationState: "notRequired", endpoint: "https://provider.invalid/v1", ownerManaged: true, supportsLogin: false, supportsLogout: false, supportsRefresh: false, supportsModelRefresh: false, capabilities: new Set(), credentialSurfaces: [], loginMethods: [], routingEnabled: true })),
-    ...(managed === undefined ? {} : { managedModelRuntimes: [managed] }), settings: { ...emptySnapshot().settings, providers: [config] }
+    ...(managed === undefined ? {} : { managedModelRuntimes: [managed] }), settings: { ...emptySnapshot().settings, providers: [config],
+      pi: includePi ? [{ backendId: "a", autoCompaction: true, autoCompactionThresholdPercent: 90, autoCompactionThresholdCustomized: true,
+        autoRetry: true, steeringMode: "all", followUpMode: "all" }] : [] }
   };
   const api = { state: { activeProfile: { id: "profile", serverId: "node", name: "Node", origin: "https://node.invalid" }, connectionState: "connected", connectionGeneration: 1, effectiveLocale: "en", preferences: { locale: "en" }, snapshot },
     refreshProviderModels: vi.fn(async () => undefined), refreshManagedModelRuntimes: vi.fn(async () => undefined), saveProvider: vi.fn(async () => undefined), updateBackendSettings: vi.fn(async () => undefined),

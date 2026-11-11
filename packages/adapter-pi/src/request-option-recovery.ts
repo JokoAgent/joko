@@ -125,36 +125,41 @@ export default function install(pi: { on(event: string, handler: (...args: any[]
     if (!token) return originalFetch(input, init);
     let request: Request;
     try { request = new Request(input, init); } catch { return originalFetch(input, init); }
+    const suppliedSignal = init?.signal === undefined && input instanceof Request ? input.signal : init?.signal;
+    const signal = suppliedSignal ?? request.signal;
+    // Undici's intermediate Request controllers can be collected during a
+    // pending response. Keep the wire request tied directly to the caller.
+    const fetchRequest = (next: Request) => originalFetch(next, { signal });
     const state = requests.get(token);
     const headers = new Headers(request.headers);
     headers.delete(MARKER);
     request = new Request(request, { headers });
-    if (!state || state.epoch !== installed.epoch || !exactRequest(request, state.model)) return originalFetch(request);
-    request.signal.throwIfAborted();
+    if (!state || state.epoch !== installed.epoch || !exactRequest(request, state.model)) return fetchRequest(request);
+    signal.throwIfAborted();
     let payload: unknown;
-    try { payload = await request.clone().json(); } catch { return originalFetch(request); }
-    if (!isRecord(payload) || payload.model !== state.model.id) return originalFetch(request);
+    try { payload = await request.clone().json(); } catch { return fetchRequest(request); }
+    if (!isRecord(payload) || payload.model !== state.model.id) return fetchRequest(request);
     const receipt = route(state.model);
-    if (!receipt) return originalFetch(request);
+    if (!receipt) return fetchRequest(request);
     const hasCacheOptions = Object.hasOwn(payload, "prompt_cache_key") || Object.hasOwn(payload, "prompt_cache_retention");
     const prepared = await privateRequest(state.context, { action: "prepare", route: receipt, hasCacheOptions });
-    request.signal.throwIfAborted();
+    signal.throwIfAborted();
     if (state.epoch !== installed.epoch || prepared.current !== true) throw new DOMException("Provider request ownership changed", "AbortError");
-    const first = await originalFetch(prepared.applied === true ? withPayload(request, payload) : request);
+    const first = await fetchRequest(prepared.applied === true ? withPayload(request, payload) : request);
     // A rule already applied to this wire request never authorizes another replay.
     if (first.status !== 400 || prepared.applied === true || !hasCacheOptions || typeof prepared.lease !== "string") return first;
-    request.signal.throwIfAborted();
+    signal.throwIfAborted();
     let text: string | undefined;
-    try { text = await errorText(first, request.signal); } catch {
-      request.signal.throwIfAborted(); return first;
+    try { text = await errorText(first, signal); } catch {
+      signal.throwIfAborted(); return first;
     }
     if (text === undefined || !isUnsupportedCacheOptionError(text)) return first;
     const learned = await privateRequest(state.context, { action: "learn", lease: prepared.lease });
-    request.signal.throwIfAborted();
+    signal.throwIfAborted();
     if (state.epoch !== installed.epoch || learned.replay !== true || learned.applied !== true) return first;
     void first.body?.cancel().catch(() => undefined);
     // Reuse the exact accepted HTTP body and signal. No second native user turn.
-    return originalFetch(withPayload(request, payload));
+    return fetchRequest(withPayload(request, payload));
   };
 }
 `;

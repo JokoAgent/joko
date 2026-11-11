@@ -40,7 +40,7 @@ import type {
   ResolvedAgentAuthConnectorPort,
   ResolvedAgentAuthConnectorRequest
 } from "./types.js";
-import { AgentAuthConnectorFailure } from "./types.js";
+import { AgentAuthConnectorFailure, MAXIMUM_MANAGED_PI_EXECUTABLE_BYTES } from "./types.js";
 
 const { Client, utils, BaseAgent, createAgent } = ssh2;
 
@@ -803,7 +803,7 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
       request.maximumBytes,
       "maximum file bytes",
       1,
-      MAXIMUM_FILE_TRANSFER_BYTES
+      fileTransferLimit(path, request.managedPiExecutable)
     );
     return this.withSftp(request.signal, async (sftp) => {
       const info = await callbackOperation<Stats>(
@@ -857,7 +857,9 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
 
   async write(request: RemoteFileWriteRequest): Promise<void> {
     const path = absoluteRemotePath(request.path);
-    if (!(request.content instanceof Uint8Array) || request.content.byteLength > MAXIMUM_FILE_TRANSFER_BYTES) {
+    const maximumBytes = fileTransferLimit(path, request.managedPiExecutable);
+    if (!(request.content instanceof Uint8Array) || request.content.byteLength > maximumBytes
+      || request.managedPiExecutable === true && (request.atomic !== true || request.createOnly === true)) {
       throw new RemoteSshError("INVALID_ARGUMENT", "Remote file content is invalid.", false);
     }
     const mode = request.mode === undefined ? 0o600 : boundedInteger(request.mode, "file mode", 0, 0o777);
@@ -982,6 +984,14 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
       throw fileFailure();
     }
   }
+}
+
+function fileTransferLimit(path: string, managedPiExecutable: true | undefined): number {
+  if (managedPiExecutable !== true) return MAXIMUM_FILE_TRANSFER_BYTES;
+  if (!/\/\.joko\/runtime\/[a-f0-9]{32}\/bin\/[a-f0-9]{64}\/pi$/u.test(path)) {
+    throw new RemoteSshError("INVALID_ARGUMENT", "Managed Pi executable destination is invalid.", false);
+  }
+  return MAXIMUM_MANAGED_PI_EXECUTABLE_BYTES;
 }
 
 async function removeEntry(

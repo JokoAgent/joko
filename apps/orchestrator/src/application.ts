@@ -1293,6 +1293,7 @@ export async function createOrchestratorApplication(
   // origin. This endpoint follows the actual bind and is not discoverable.
   const bridgeEndpoint = internalBridgeEndpoint(config);
   let sessionHostForPi: SessionHost | undefined;
+  let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
   const piHostCapabilities = [
     "review.isolated",
     ...HOST_COMPOSED_CAPABILITIES,
@@ -1380,6 +1381,12 @@ export async function createOrchestratorApplication(
       await remotePiProcesses.validate(binding, signal);
     },
     providers: providerSnapshot.providers,
+    canRefreshIdleModelEndpoint: sessionId => {
+      const session = store.findSession(sessionId)?.descriptor;
+      return session !== undefined && !session.archived && session.deletedAt === undefined
+        && store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length === 0
+        && store.listRuns({ sessionId, states: ["queued", "running", "waiting", "retrying", "dispatch_unknown"], limit: 1 }).length === 0;
+    },
     nativeModels: providerAuth.listNativeModels().filter((model) =>
       availableNativeProviderIds.has(model.providerId)
       && modelRoutingEnabled(store, piBackendId, model.providerId, model.modelId)),
@@ -1402,6 +1409,9 @@ export async function createOrchestratorApplication(
     resolveMakerMemoryPrompt: (context, bridge) => bridge?.tools.some(tool => tool.serverId === MAKER_MEMORY_PROVIDER_ID)
       ? makerMemory.runtimePrompt(context.target.id)
       : undefined,
+    resolveModelAutoCompactionThreshold: (context, selection) => modelWorkingContext?.configuredAutoCompactionThreshold({
+      backendId: context.target.backendId, ...selection
+    }),
     isCompactionMemoryEnabled: (context) => makerMemory.enabledForBackend(context.target.backendId),
     onCompactionDigest: (input) => { makerMemory.writeCompactionDigest(input); },
     mcpBridge: bridgeGeneration.baseSnapshot,
@@ -1908,7 +1918,6 @@ export async function createOrchestratorApplication(
   let partnerSessionTasks: PartnerSessionTaskManager | undefined;
   let partnerTodos: PartnerTodoManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
-  let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
   let sessionContextBudget: SessionContextBudgetCoordinator | undefined;
   const sessionHost: SessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
     partnerLearning: {
@@ -2170,7 +2179,10 @@ export async function createOrchestratorApplication(
     store,
     providers,
     sessionHost,
-    currentOwner: () => closed ? undefined : workingContextOwner
+    currentOwner: () => closed ? undefined : workingContextOwner,
+    defaultAutoCompactionThreshold: backendId => backendId === piBackendId ? projectPiSettingsDefaults(effectivePiSettings(
+      baseSettings, store.findSetting<unknown>("service", "orchestrator", `settings.pi.${backendId}`)?.value
+    )).autoCompactionThresholdPercent : undefined
   });
   sessionContextBudget = new SessionContextBudgetCoordinator(store, modelWorkingContext,
     (sessionId, target, check) => sessionHost.refreshModelWorkingContexts([target], check, undefined, sessionId),

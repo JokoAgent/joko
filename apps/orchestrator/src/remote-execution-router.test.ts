@@ -48,6 +48,19 @@ describe("RemoteExecutionRouter", () => {
     expect(() => authority.assertCurrent()).toThrow(/process lease retired/u);
     expect(() => authority.assertFilesCurrent()).toThrow(/process lease retired/u);
     expect(hosts.captureProcessAuthority).toHaveBeenCalledOnce(); expect(hosts.captureTransportAuthority).not.toHaveBeenCalled();
+
+    processCurrent = true;
+    hosts.captureProcessAuthority.mockResolvedValueOnce({ ...captured,
+      host: { ...captured.host, id: "alias", hostname: "other-address.example.test", port: 2222 } });
+    const alias = await router.workspace({ ...binding, hostId: "alias" });
+    expect(alias.executionIdentity).not.toBe(authority.executionIdentity);
+    expect(alias.mutationIdentity).toBe(authority.mutationIdentity);
+    expect(alias.mutationIdentity).toBeDefined();
+
+    hosts.captureProcessAuthority.mockResolvedValueOnce({ ...captured,
+      host: { ...captured.host, trust: { ...captured.host.trust!, fingerprint: "SHA256:independent" } } });
+    const independent = await router.workspace(binding);
+    expect(independent.mutationIdentity).not.toBe(alias.mutationIdentity);
   });
 
   it("resolves a durable peer binding through its frozen controller relation and current route", async () => {

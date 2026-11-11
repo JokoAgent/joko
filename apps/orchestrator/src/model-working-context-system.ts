@@ -9,6 +9,7 @@ export interface ModelWorkingContextSystemOptions {
   readonly providers: Pick<ProviderCatalogManager, "listConfigurations">;
   readonly currentOwner: () => { readonly ownerId: string; readonly generation: number } | undefined;
   readonly sessionHost: Pick<SessionHost, "refreshModelWorkingContexts">;
+  readonly defaultAutoCompactionThreshold?: (backendId: string) => number | undefined;
 }
 
 /** Bind working budgets to the current node catalog without changing its capacities. */
@@ -23,12 +24,16 @@ export function composeModelWorkingContext(options: ModelWorkingContextSystemOpt
       if (!backend) return undefined;
       const model = backend.descriptor.models.find(item => item.providerId === target.providerId && item.modelId === target.modelId);
       if (!model) return undefined;
+      const supported = backend.descriptor.capabilities.get("model.working_context")?.supported === true;
+      const textModel = model.declaredOutputModalities?.includes("text") ?? true;
+      const defaultAutoCompactionThresholdPercent = supported && textModel ? options.defaultAutoCompactionThreshold?.(target.backendId) : undefined;
       const route: ModelWorkingContextRoute = {
         model,
         catalogRevision: backend.revision,
         instanceGeneration: backend.descriptor.instanceGeneration,
         ...(configuration === undefined ? {} : { providerRevision: configuration.version }),
-        supported: backend.descriptor.capabilities.get("model.working_context")?.supported === true,
+        supported,
+        ...(defaultAutoCompactionThresholdPercent === undefined ? {} : { defaultAutoCompactionThresholdPercent }),
         available: true
       };
       return route;
