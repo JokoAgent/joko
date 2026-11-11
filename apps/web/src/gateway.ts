@@ -3624,11 +3624,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async navigateSessionBranch(
     sessionId: string,
     target: import("./model.js").NativeNavigationTargetView,
-    options: { readonly expectedGeneration: bigint; readonly summarize?: boolean; readonly customInstructions?: string }
+    options: Parameters<OrchestratorGateway["navigateSessionBranch"]>[2]
   ): Promise<void> {
     if (options.expectedGeneration < 1n) throw new GatewayError("A source task generation is required for navigation.");
     const customInstructions = options.customInstructions?.trim().slice(0, 4_000) ?? "";
-    await this.submit({
+    const confirmSameGeneration = options.onSameGenerationConfirmed;
+    const scope = confirmSameGeneration === undefined ? undefined : this.captureActionScope();
+    const operation = await this.submit({
       case: "navigateSessionBranch",
       value: {
         sessionId,
@@ -3637,6 +3639,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         customInstructions: options.summarize === true ? customInstructions : ""
       }
     }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
+    if (confirmSameGeneration === undefined || scope === undefined) return;
+    const result = operation.result?.payload;
+    if (operation.state !== OperationState.SUCCEEDED || result?.case !== "acknowledgement" || result.value.accepted !== true) {
+      throw new GatewayError("The task navigation result could not be confirmed.", { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" });
+    }
+    // An accepted operation can replace the binding before the renderer sees its new generation.
+    const response = await createClient(SessionService, scope.transport).getSession({ sessionId }, { signal: scope.signal, timeoutMs: 5_000 })
+      .catch(() => undefined);
+    if (!scope.signal.aborted && this.#transport === scope.transport && response?.session?.sessionId === sessionId
+      && response.session.nativeBinding?.runtimeGeneration === options.expectedGeneration) confirmSameGeneration();
   }
 
   async openSideChat(sessionId: string, expectedGeneration: bigint, options?: {
@@ -12471,6 +12483,8 @@ function projectTimelineEvent(
         id: kind.value.messageId,
         messageId: kind.value.messageId,
         sourceEventId: event.eventId,
+        // The v1 user input event carries the durable completed user row.
+        ...(kind.value.role === 1 && event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
         ...timelineNativeMessageIdentity(event, existing),
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
         sequence: existing?.sequence ?? sequence,

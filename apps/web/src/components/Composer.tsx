@@ -1,6 +1,6 @@
-import type { DragEvent, JSX, ReactNode } from "react";
+import type { DragEvent, JSX, ReactNode, RefObject } from "react";
 import { builtinSkillIntentForText } from "../builtin-skill-intent.js";
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useId, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { JSONContent } from "@tiptap/core";
 import {
   AlertTriangle,
@@ -80,6 +80,8 @@ export interface ComposerHistoryEntry {
   readonly editorDocument: JSONContent;
 }
 
+export type PrepareRewindDraft = (isRewindCurrent: () => boolean) => Promise<((text: string) => Promise<void>) | undefined>;
+
 interface ComposerWorkspaceMentionIndex {
   readonly workspaceId: string;
   readonly status: "loading" | "ready" | "error";
@@ -102,7 +104,7 @@ interface PendingComposerDraftSave {
   queued: boolean;
 }
 
-export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, rewindDraftRef, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -127,6 +129,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft };
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
   readonly draftReplacement?: { readonly id: number; readonly sessionId: string; readonly text: string; readonly editorDocument?: JSONContent; readonly attachments?: readonly AttachmentDraft[] };
+  readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null>;
   readonly objectiveDialogHandoff?: ObjectiveDialogHandoffRequest;
   readonly t: Translator;
   readonly runAction: RunAction;
@@ -210,6 +213,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   const composerMountedRef = useRef(false);
   const pendingDraftSaveRef = useRef<PendingComposerDraftSave | undefined>(undefined);
+  const persistedRewindDraftRef = useRef<{ readonly ownerKey: string; readonly guard: ComposerOperationGuard; readonly token: ComposerOwnershipToken; readonly draft: ComposerDraft } | undefined>(undefined);
   const draftSaveSurfaceRef = useRef<object | undefined>(undefined);
   const savedDraftTimerRef = useRef<number | undefined>(undefined);
   const hydratedDraftOwnerRef = useRef<string | undefined>(undefined);
@@ -880,6 +884,76 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     requestComposerFrame(() => richEditorRef.current?.focus());
   }, [draftReplacement, readOnly, session.id]);
 
+  useImperativeHandle(rewindDraftRef, (): PrepareRewindDraft => async (isRewindCurrent) => {
+    const sourceController = controllerRef.current;
+    const { readDraftSnapshot, saveDraftIfRevision } = sourceController;
+    const profile = sourceController.state.activeProfile;
+    const guard = operationGuardRef.current;
+    const token = guard.capture(session.id);
+    const epoch = sendEpochRef.current;
+    const surface = draftSaveSurfaceRef.current;
+    const ownerDocument = composerStackRef.current?.ownerDocument;
+    const liveDraft: ComposerDraft = {
+      text: textRef.current, editorDocument: editorDocumentRef.current, deliveryMode, extraDirectoryIds,
+      attachments: attachmentsRef.current, mentions: mentionsRef.current, inlineMentionRanges: inlineMentionRangesRef.current,
+      browserComments: browserCommentsRef.current
+    };
+    const current = () => isRewindCurrent() && composerMountedRef.current && ownerDocument !== undefined
+      && composerStackRef.current?.isConnected === true && composerStackRef.current.ownerDocument === ownerDocument
+      && epoch !== undefined && sendEpochRef.current === epoch && surface !== undefined && draftSaveSurfaceRef.current === surface
+      && controllerRef.current.readDraftSnapshot === readDraftSnapshot && controllerRef.current.saveDraftIfRevision === saveDraftIfRevision
+      && hydratedDraftOwnerRef.current === voiceDictionaryOwnerKey && resourceCommandStateRef.current.owner === sendOwner
+      && sendStateRef.current.connected && !resourceCommandStateRef.current.locked
+      && !resourceCommandStateRef.current.bashMode && !composerIsComposingRef.current
+      && operationGuardRef.current === guard && guard.ownsActivation(token) && guard.draftUnchanged(token)
+      && textRef.current === liveDraft.text && editorDocumentRef.current === liveDraft.editorDocument
+      && guard.activeSubmission(session.id) === undefined;
+    if (!current() || !composerDraftIsEmpty(liveDraft)) return undefined;
+    const waitForSaves = () => Promise.all([draftSaveChainRef.current, pendingComposerDraftSave(profile?.serverId, profile?.id, session.id)]);
+    const discardPendingEmptySave = (hydrationOnly: boolean): boolean => {
+      const pending = pendingDraftSaveRef.current;
+      if (pending?.ownerKey !== voiceDictionaryOwnerKey || pending.queued) return true;
+      if (pending.guard !== guard || pending.surface !== surface || !guard.ownsActivation(pending.token)
+        || !guard.draftUnchanged(pending.token) || !sameObjectiveInvocationDraft(pending.draft, liveDraft)) return false;
+      if (!hydrationOnly || pending.token.draftRevision === 0) pendingDraftSaveRef.current = undefined;
+      return true;
+    };
+    // An empty hydration autosave could overwrite a newer draft before the CAS.
+    if (!discardPendingEmptySave(true)) return undefined;
+    await waitForSaves();
+    if (!current()) return undefined;
+    if (ownerDocument !== undefined && failedComposerDraftSave(profile?.serverId, profile?.id, session.id, voiceDictionaryOwnerKey, ownerDocument) !== undefined) return undefined;
+    const stored = await readDraftSnapshot(session.id);
+    if (!current() || (stored.draft !== undefined
+      && (!sameObjectiveInvocationDraft(stored.draft, liveDraft) || !discardPendingEmptySave(false)))) return undefined;
+
+    return async (text) => {
+      if (!current()) return;
+      await waitForSaves();
+      if (!current() || !discardPendingEmptySave(false)) return;
+      const editorDocument = plainTextToComposerDocument(text);
+      const replacement: ComposerDraft = { ...liveDraft, text: composerDocumentPlainText(editorDocument), editorDocument };
+      const revision = await saveDraftIfRevision(session.id, replacement, stored.revision);
+      if (revision === undefined || !current()) return;
+      const confirmed = await readDraftSnapshot(session.id);
+      if (!current() || confirmed.revision !== revision || confirmed.draft === undefined
+        || !sameObjectiveInvocationDraft(confirmed.draft, replacement) || !guard.consumeUnchangedDraft(token)) return;
+      pendingDraftSaveRef.current = undefined;
+      persistedRewindDraftRef.current = { ownerKey: voiceDictionaryOwnerKey, guard, token: guard.capture(session.id), draft: replacement };
+      hydratedDraftRevisionRef.current = revision;
+      onDraftMutation?.();
+      editorRevisionRef.current += 1;
+      resetHistoryNavigation();
+      closePalette();
+      builtinSkillIntentRef.current = undefined;
+      editorDocumentRef.current = editorDocument;
+      textRef.current = replacement.text;
+      setEditorDocument(editorDocument);
+      setText(replacement.text);
+      requestComposerFrame(() => richEditorRef.current?.focus());
+    };
+  });
+
   useEffect(() => {
     if (!supportedModes.includes(deliveryMode)) setDeliveryMode(supportedModes[0] ?? "prompt");
   }, [deliveryMode, supportedModes]);
@@ -924,6 +998,11 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       browserComments,
       ...(extraDirectoriesSupported && extraDirectoryIds !== undefined ? { extraDirectoryIds } : {})
     } satisfies ComposerDraft;
+    const persistedRewind = persistedRewindDraftRef.current;
+    if (persistedRewind?.ownerKey === voiceDictionaryOwnerKey && persistedRewind.guard === guard
+      && guard.ownsActivation(persistedRewind.token) && guard.draftUnchanged(persistedRewind.token)
+      && sameObjectiveInvocationDraft(persistedRewind.draft, draft)) return;
+    persistedRewindDraftRef.current = undefined;
     const pending: PendingComposerDraftSave = {
       ownerKey: voiceDictionaryOwnerKey,
       serverId: controller.state.activeProfile?.serverId,
@@ -975,7 +1054,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         restoredObjectiveDialogHandoffRecoveryRef.current = undefined;
         return;
       }
-      if (owner.draftRevision === 0 && objectiveInvocationDraftIsEmpty(sourceDraft)) {
+      if (owner.draftRevision === 0 && composerDraftIsEmpty(sourceDraft)) {
         if (restoringObjectiveDialogHandoffRef.current !== handoff.id) {
           restoringObjectiveDialogHandoffRef.current = handoff.id;
           sourceGuard.markDraftEdited(session.id);
@@ -3390,7 +3469,7 @@ export function sameObjectiveInvocationDraft(left: ComposerDraft, right: Compose
   return JSON.stringify(comparable(left)) === JSON.stringify(comparable(right));
 }
 
-function objectiveInvocationDraftIsEmpty(draft: ComposerDraft): boolean {
+function composerDraftIsEmpty(draft: ComposerDraft): boolean {
   return composerDocumentIsEmpty(normalizeComposerDocument(draft.editorDocument, draft.text))
     && draft.attachments.length === 0
     && (draft.browserComments?.length ?? 0) === 0

@@ -1,20 +1,27 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, type RefObject } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController, ControllerState } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type BackendView, type SessionView, type TargetView, type TimelineItemView } from "../model.js";
+import { emptySnapshot, type BackendView, type SessionView, type TargetView, type TimelineItemView, type WorkspaceView } from "../model.js";
+import type { PrepareRewindDraft } from "./Composer.js";
 import { SessionPane } from "./SessionPane.js";
-import type { Translator } from "./types.js";
+import type { RunAction, Translator } from "./types.js";
+
+const prepareRewindDraft = vi.hoisted(() => vi.fn<PrepareRewindDraft>());
 
 vi.mock("./Composer.js", async () => {
   const React = await import("react");
-  return { Composer: (props: { readonly draftReplacement?: { readonly text: string }; readonly onDraftMutation?: () => void }) => React.createElement(React.Fragment, null,
-    React.createElement("button", { type: "button", onClick: props.onDraftMutation }, "Unsaved composer input"),
-    props.draftReplacement === undefined ? null : React.createElement("output", { "data-testid": "edit-replacement" }, props.draftReplacement.text)) };
+  return { Composer: (props: { readonly draftReplacement?: { readonly text: string }; readonly onDraftMutation?: () => void;
+    readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null> }) => {
+    React.useImperativeHandle(props.rewindDraftRef, () => prepareRewindDraft);
+    return React.createElement(React.Fragment, null,
+      React.createElement("button", { type: "button", onClick: props.onDraftMutation }, "Unsaved composer input"),
+      props.draftReplacement === undefined ? null : React.createElement("output", { "data-testid": "edit-replacement" }, props.draftReplacement.text));
+  } };
 });
 vi.mock("./Timeline.js", async () => {
   const React = await import("react");
@@ -54,6 +61,127 @@ beforeAll(() => {
 afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
   document.body.replaceChildren();
+  prepareRewindDraft.mockReset();
+});
+
+describe("SessionPane dialogue rewind draft recovery", () => {
+  it("restores the source text after the current dialogue rewind completes", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
+    let finish!: () => void;
+    const navigateSessionBranch = vi.fn<AppController["navigateSessionBranch"]>(async (_sessionId, _target, options) => {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      options.onSameGenerationConfirmed?.();
+    });
+    const restore = vi.fn(async () => undefined);
+    prepareRewindDraft.mockResolvedValueOnce(restore);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await clickButton(container, "Preview rewind");
+    await clickButton(document, "timeline.rewindDialogueOnly");
+    expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "native_entry", entryId: "entry-parent" },
+      { expectedGeneration: sourceSession.generation, onSameGenerationConfirmed: expect.any(Function) });
+    expect(restore).not.toHaveBeenCalled();
+    await act(async () => finish());
+    expect(restore).toHaveBeenCalledExactlyOnceWith(sourceMessage.text);
+    expect(document.querySelector('[data-message-rewind-preview="true"]')).toBeNull();
+  });
+
+  it.each(["Rewind rejected", "Native result unknown"])("keeps the composer untouched when the original operation reports %s", async (reason) => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
+    const navigateSessionBranch = vi.fn(async () => { throw new Error(reason); });
+    const restore = vi.fn(async () => undefined);
+    prepareRewindDraft.mockResolvedValueOnce(restore);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await clickButton(container, "Preview rewind");
+    await clickButton(document, "timeline.rewindDialogueOnly");
+    expect(document.querySelector(".message-rewind-preview [role=alert]")?.textContent).toBe(reason);
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it("does not apply an old rewind result after leaving and returning to the task", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
+    let finish!: () => void;
+    const navigateSessionBranch = vi.fn<AppController["navigateSessionBranch"]>(async (_sessionId, _target, options) => {
+      await new Promise<void>((resolve) => { finish = resolve; });
+      options.onSameGenerationConfirmed?.();
+    });
+    const restore = vi.fn(async () => undefined);
+    prepareRewindDraft.mockResolvedValueOnce(restore);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await clickButton(container, "Preview rewind");
+    await clickButton(document, "timeline.rewindDialogueOnly");
+    expect(navigateSessionBranch).toHaveBeenCalledOnce();
+    Reflect.set(controller.state, "navigationRevision", 3);
+    await act(async () => finish());
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it("closes a successful dialogue rewind whose current binding cannot be confirmed", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
+    const navigateSessionBranch = vi.fn(async () => undefined);
+    const restore = vi.fn(async () => undefined);
+    prepareRewindDraft.mockResolvedValueOnce(restore);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await clickButton(container, "Preview rewind");
+    await clickButton(document, "timeline.rewindDialogueOnly");
+    expect(navigateSessionBranch).toHaveBeenCalledOnce();
+    expect(restore).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-message-rewind-preview="true"]')).toBeNull();
+  });
+
+  it("still navigates when the message ID has a different durable event from the selected row", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
+    const navigateSessionBranch = vi.fn(async () => undefined);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await clickButton(container, "Preview rewind");
+    Reflect.set(controller.state.snapshot, "timelineBySession", new Map([[sourceSession.id,
+      [{ ...sourceMessage, sourceEventId: "replaced", completionCursor: 3n, text: "Different input" }]]]));
+    await clickButton(document, "timeline.rewindDialogueOnly");
+    expect(navigateSessionBranch).toHaveBeenCalledOnce();
+    expect(prepareRewindDraft).not.toHaveBeenCalled();
+  });
+
+  it("finishes the dialogue rewind when the draft cannot be prepared and reports that separately", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
+    const navigateSessionBranch = vi.fn(async () => undefined);
+    prepareRewindDraft.mockRejectedValueOnce(new Error("Draft storage unavailable"));
+    const errors: unknown[] = [];
+    const runAction: RunAction = (_key, action) => { void action().catch((error: unknown) => { errors.push(error); }); };
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage, { runAction });
+    await clickButton(container, "Preview rewind");
+    await clickButton(document, "timeline.rewindDialogueOnly");
+    expect(navigateSessionBranch).toHaveBeenCalledOnce();
+    expect(errors).toEqual([expect.objectContaining({ message: "timeline.rewindDraftRestoreFailed" })]);
+    expect(document.querySelector('[data-message-rewind-preview="true"]')).toBeNull();
+  });
+
+  it("keeps file-only restore independent of dialogue and the composer", async () => {
+    const sourceSession = session(), sourceMessage = completedMessage();
+    const originalBackend = backend();
+    const sourceBackend = { ...originalBackend, capabilities: new Map([...originalBackend.capabilities,
+      ["workspace.rewind", { name: "workspace.rewind", supported: true, options: [] }]]) };
+    const workspace: WorkspaceView = { id: "workspace-one", targetId: sourceSession.targetId, name: "Project", kind: "userProject",
+      serverPath: "/workspace", trusted: true, dirty: true, entries: [] };
+    const navigateSessionBranch = vi.fn(async () => undefined);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    controller.listWorkspaceChangeSets = vi.fn<AppController["listWorkspaceChangeSets"]>(async () => [{ id: "change", runId: sourceMessage.runId!, turnId: "turn", changeCount: 1,
+      completeBaseline: true, gaps: [], capturedAt: 1 }]);
+    controller.previewWorkspaceRewind = vi.fn<AppController["previewWorkspaceRewind"]>(async () => ({ id: "preview", changeSetId: "change", safety: "safe",
+      inversePaths: ["notes.md"], gaps: [], conflicts: [], dialogueOnlyAvailable: true }));
+    const execute = vi.fn<AppController["executeWorkspaceRewind"]>(async () => undefined);
+    controller.executeWorkspaceRewind = execute;
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage, { workspace });
+    await clickButton(container, "Preview rewind");
+    await clickButton(document, "timeline.rewindFilesOnly");
+    expect(execute).toHaveBeenCalledExactlyOnceWith(workspace.id, "preview", "change", false);
+    expect(navigateSessionBranch).not.toHaveBeenCalled();
+    expect(prepareRewindDraft).not.toHaveBeenCalled();
+  });
 });
 
 describe("SessionPane edited-message draft transaction", () => {
@@ -314,7 +442,8 @@ function mountPane(
   controller: AppController,
   sourceSession: SessionView,
   sourceBackend: BackendView,
-  sourceMessage: TimelineItemView
+  sourceMessage: TimelineItemView,
+  options: { readonly workspace?: WorkspaceView; readonly runAction?: RunAction } = {}
 ): HTMLDivElement {
   const container = document.body.appendChild(document.createElement("div"));
   const root = createRoot(container);
@@ -323,6 +452,7 @@ function mountPane(
     controller={controller}
     session={sourceSession}
     backend={sourceBackend}
+    workspace={options.workspace}
     models={[]}
     timeline={[sourceMessage]}
     timelineHasEarlier={false}
@@ -338,7 +468,7 @@ function mountPane(
     navigationOpen
     inspectorOpen
     t={t}
-    runAction={(_key, action) => { void action(); }}
+    runAction={options.runAction ?? ((_key, action) => { void action(); })}
     onOpenNavigation={() => undefined}
     onOpenInspector={() => undefined}
     onRename={() => undefined}
@@ -382,6 +512,7 @@ function controllerFor(
   let revision = 1;
   return {
     state, ...methods,
+    listPartners: async () => ({ partners: [] }),
     getPortableReplacementCleanup: async () => undefined,
     readDraftSnapshot: async (sessionId: string) => ({ revision, draft: await methods.readDraft(sessionId) }),
     saveDraftIfRevision: async (sessionId: string, draft: Parameters<AppController["saveDraft"]>[1], expectedRevision: number) => {
@@ -446,6 +577,16 @@ function message(): TimelineItemView {
     nativeRewindBefore: { kind: "native_entry", entryId: "entry-parent" },
     createdAt: 1_000
   };
+}
+
+function completedMessage(): TimelineItemView {
+  return { ...message(), sourceEventId: "complete", completionCursor: 2n, runId: "run" };
+}
+
+async function clickButton(container: ParentNode, label: string): Promise<void> {
+  const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent === label);
+  if (button === undefined) throw new Error(`Missing button: ${label}`);
+  await act(async () => button.click());
 }
 
 function required<T>(value: T | null): T {

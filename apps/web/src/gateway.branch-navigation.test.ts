@@ -3,6 +3,7 @@ import type { Transport } from "@connectrpc/connect";
 import {
   BackendHealth,
   CapabilitySupport,
+  GetSessionResponseSchema,
   GetSnapshotResponseSchema,
   OperationState,
   SnapshotSchema,
@@ -44,6 +45,9 @@ describe("Pi branch navigation gateway", () => {
     vi.stubGlobal("window", { location: { href: "https://joko.test/#/tasks/current" } });
     const payloads: any[] = [];
     const preconditions: any[] = [];
+    let acknowledged = true;
+    let confirmedGeneration: bigint | undefined = 7n;
+    let sessionReads = 0;
     const transport = {
       unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
         if (method.localName === "getSnapshot") {
@@ -55,7 +59,15 @@ describe("Pi branch navigation gateway", () => {
           payloads.push(input.mutation?.payload);
           preconditions.push(input.mutation?.preconditions);
           return response(method, create(SubmitOperationResponseSchema, {
-            operation: { operationId: input.operationId, connectionId: input.connectionId, state: OperationState.SUCCEEDED }
+            operation: { operationId: input.operationId, connectionId: input.connectionId, state: OperationState.SUCCEEDED,
+              result: { payload: { case: "acknowledgement", value: { accepted: acknowledged } } } }
+          }));
+        }
+        if (method.localName === "getSession") {
+          sessionReads += 1;
+          if (confirmedGeneration === undefined) throw new Error("Task readback unavailable");
+          return response(method, create(GetSessionResponseSchema, {
+            session: { sessionId: input.sessionId, nativeBinding: { runtimeGeneration: confirmedGeneration } }
           }));
         }
         throw new Error(`Unexpected method: ${method.localName}`);
@@ -104,6 +116,26 @@ describe("Pi branch navigation gateway", () => {
     expect(preconditions[2]).toMatchObject([{ entity: { id: "session-one" }, expectedGeneration: 7n }]);
     await expect(gateway.navigateSessionBranch("session-one", { kind: "session_start" }, { expectedGeneration: 0n })).rejects.toThrow(/generation/u);
     expect(payloads).toHaveLength(3);
+    expect(sessionReads).toBe(0);
+
+    const target = { kind: "native_entry", entryId: "entry-two" } as const;
+    const onSameGenerationConfirmed = vi.fn();
+    const options = { expectedGeneration: 7n, onSameGenerationConfirmed };
+    await gateway.navigateSessionBranch("session-one", target, options);
+    expect(onSameGenerationConfirmed).toHaveBeenCalledOnce();
+    expect(sessionReads).toBe(1);
+    confirmedGeneration = 8n;
+    await expect(gateway.navigateSessionBranch("session-one", target, options)).resolves.toBeUndefined();
+    confirmedGeneration = undefined;
+    await expect(gateway.navigateSessionBranch("session-one", target, options)).resolves.toBeUndefined();
+    expect(onSameGenerationConfirmed).toHaveBeenCalledOnce();
+    expect(sessionReads).toBe(3);
+
+    acknowledged = false;
+    await expect(gateway.navigateSessionBranch("session-one", target, options))
+      .rejects.toMatchObject({ code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" });
+    await expect(gateway.navigateSessionBranch("session-one", target, { expectedGeneration: 7n })).resolves.toBeUndefined();
+    expect(sessionReads).toBe(3);
     gateway.disconnect();
   });
 });
