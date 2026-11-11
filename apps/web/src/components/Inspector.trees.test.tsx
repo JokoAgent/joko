@@ -20,6 +20,7 @@ import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
 const t: Translator = (key) => key;
+const branchConnection = { connectionState: "connected", connectionGeneration: 1, snapshot: { generation: 1n } } as const;
 
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -120,6 +121,7 @@ describe("Inspector production trees", () => {
       }]
     };
     const controller = {
+      state: branchConnection,
       getSessionTree: vi.fn(async () => treeView),
       navigateSessionBranch,
       forkSession: vi.fn(async () => "forked"),
@@ -151,12 +153,37 @@ describe("Inspector production trees", () => {
     expect(navigateSessionBranch).toHaveBeenCalledWith("session-one", { kind: "native_entry", entryId: "child" }, { expectedGeneration: 1n, summarize: false });
   });
 
+  it.each(["older success", "older failure"])("keeps the new active branch after %s", async (completion) => {
+    let resolveOld!: (value: NativeSessionTreeView) => void;
+    let rejectOld!: (error: Error) => void;
+    const previous = new Promise<NativeSessionTreeView>((resolve, reject) => { resolveOld = resolve; rejectOld = reject; });
+    const nodes = ["old-leaf", "new-leaf"].map<NativeSessionTreeView["roots"][number]>(id =>
+      ({ id, kind: "message", role: "assistant", text: id, active: false, children: [] }));
+    const getSessionTree = vi.fn<AppController["getSessionTree"]>().mockReturnValueOnce(previous)
+      .mockResolvedValueOnce({ nativeSessionId: "native-one", activeLeafId: "new-leaf", roots: nodes });
+    const controller = { state: branchConnection, getSessionTree } as unknown as AppController;
+    const host = await render(<BranchesPanel controller={controller} backend={backend()} session={session()} t={t} runAction={vi.fn()} />);
+    const refresh = required(Array.from(host.querySelectorAll("button")).find(button => button.textContent === "common.refresh") ?? null);
+    await act(async () => refresh.click());
+    expect(getSessionTree.mock.calls).toEqual([["session-one"], ["session-one"]]);
+    const active = () => host.querySelector<HTMLElement>('[role="treeitem"][aria-current="true"]');
+    expect(active()?.dataset.inspectorTreeKey).toBe("new-leaf");
+    await act(async () => {
+      if (completion === "older failure") rejectOld(new Error("Old branch read failed"));
+      else resolveOld({ nativeSessionId: "native-one", activeLeafId: "old-leaf", roots: nodes });
+    });
+    expect(active()?.dataset.inspectorTreeKey).toBe("new-leaf");
+    expect(active()?.querySelector<HTMLButtonElement>("[data-inspector-tree-primary]")?.disabled).toBe(true);
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+  });
+
   it("shows isolated-workspace branch forks only when the backend can derive the workspace", async () => {
     const treeView: NativeSessionTreeView = {
       nativeSessionId: "native-one",
       roots: [{ id: "root", kind: "message", role: "user", text: "Root question", active: false, children: [] }]
     };
     const controller = {
+      state: branchConnection,
       getSessionTree: vi.fn(async () => treeView),
       navigateSessionBranch: vi.fn(async () => undefined),
       forkSession: vi.fn(async () => "forked"),
