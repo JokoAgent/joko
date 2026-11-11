@@ -2742,6 +2742,7 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   await waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner);
   assertPackagedSmokeTaskWindowOwner(taskWindow, taskOwner);
   recordPackagedSmokeProgress("task_window_reloaded_exact_owner");
+  recordPackagedFullSmokeStage("task_window_original_reload_verified");
   if (process.platform === "win32") {
     await runPackagedSmokeTimelineTurn(taskOptions, task);
     recordPackagedSmokeProgress("timeline_generation_completed");
@@ -2759,6 +2760,7 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   let sharingHost: ManagedOrchestratorRuntime | undefined;
   let sharingHostAuth: string | undefined;
   try {
+    recordPackagedFullSmokeStage("task_sharing_started");
     await verifyPackagedSmokeTaskSharing({ window: owner, task: concurrentTask, serverId: connection.serverId,
       prepareOwner: () => preparePackagedSmokeTaskOwner(owner, concurrentTask),
       readClipboard: () => clipboard.readText("clipboard"),
@@ -2767,8 +2769,14 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
         writeFileSync(`${packagedSmokeResultPath}.task-sharing-${surface}.png`,
           (await owner.webContents.capturePage()).toPNG(), { mode: 0o600 });
       },
-      copiedInvitation: value => { sharingInvitation = value; }, offerInvitation: handleDesktopDeepLinkUrl,
+      copiedInvitation: value => {
+        sharingInvitation = value;
+        recordPackagedFullSmokeStage("task_sharing_owner_invitation_copied");
+      },
+      guestLeft: () => recordPackagedFullSmokeStage("task_sharing_guest_left"),
+      offerInvitation: handleDesktopDeepLinkUrl,
       createForeignInvitation: async () => {
+        recordPackagedFullSmokeStage("task_sharing_foreign_bootstrap_started");
         const ports = await selectManagedOrchestratorPorts();
         const directory = join(app.getPath("userData"), "shared-task-host");
         sharingHost = await startManagedOrchestrator({
@@ -2784,6 +2792,7 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
           platform: process.platform, ...ports, environment: process.env, ephemeral: true
         });
         sharingHostAuth = sharingHost.takeAuthKey(); await sharingHost.commit();
+        recordPackagedFullSmokeStage("task_sharing_foreign_bootstrap_committed");
         const host = sharingHost;
         const foreignOptions: PackagedSmokeTaskOptions = {
           connection: host.connection, displayName: "Packaged shared task", providerOrigin: taskOptions.providerOrigin,
@@ -2791,13 +2800,18 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
           isAuthorityCurrent: current => sharingHost === host && sameManagedOrchestratorConnection(current, host.connection)
         };
         const foreignTask = await createPackagedSmokeTask(foreignOptions);
-        return { invitation: await createPackagedSmokeTaskInvitation(foreignOptions, foreignTask),
-          sessionId: foreignTask.sessionId, hostServerId: host.connection.serverId };
+        const invitation = await createPackagedSmokeTaskInvitation(foreignOptions, foreignTask);
+        recordPackagedFullSmokeStage("task_sharing_foreign_invitation_ready");
+        return { invitation, sessionId: foreignTask.sessionId, hostServerId: host.connection.serverId };
       } });
     recordPackagedSmokeProgress("task_sharing_management_guest_input_and_exit_passed");
+    recordPackagedFullSmokeStage("task_sharing_owner_share_ended");
   } finally {
     sharingHostAuth = undefined;
-    if (sharingHost !== undefined) await sharingHost.stop();
+    if (sharingHost !== undefined) {
+      await sharingHost.stop();
+      recordPackagedFullSmokeStage("task_sharing_foreign_host_stopped");
+    }
     sharingHost = undefined;
     await restorePackagedSmokeClipboard(sharingClipboard,
       () => sharingInvitation !== undefined && clipboard.readText("clipboard") === sharingInvitation);
@@ -2835,19 +2849,24 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   const exactWindows = new Set([taskWindow, peerWindow, concurrentWindow]);
   await assertPackagedSmokeTaskWindowProfileFence(peerWindow, taskOwner);
   assertPackagedSmokeTaskWindowSet(exactWindows);
+  recordPackagedFullSmokeStage("task_window_peer_profile_fenced");
 
   const crashDraftText = "Joko task draft survives renderer recovery";
   const peerDraftText = "Joko same-session peer keeps its independent draft";
   await writePackagedSmokeTaskDraft(peerWindow, connection, task.sessionId, peerDraftText);
+  recordPackagedFullSmokeStage("task_window_peer_draft_durable");
   await writePackagedSmokeTaskDraft(taskWindow, connection, task.sessionId, crashDraftText);
+  recordPackagedFullSmokeStage("task_window_original_draft_durable");
   // Each write above already waited for its own saved badge and verified
   // IndexedDB. The earlier window's badge can expire during the second write.
   await waitForPackagedSmokeTaskDraft(peerWindow, peerDraftText, false);
   const firstDocument = await readPackagedSmokeTaskDocumentIdentity(taskWindow);
   const concurrentDocument = await readPackagedSmokeTaskDocumentIdentity(concurrentWindow);
   const peerReloaded = new Promise<void>((resolveLoad) => peerWindow.webContents.once("did-finish-load", () => resolveLoad()));
+  recordPackagedFullSmokeStage("task_window_peer_reload_started");
   peerWindow.webContents.reload();
   await waitForPackagedSmokeDeadline(peerReloaded, 20_000, "Same-Session peer reload");
+  recordPackagedFullSmokeStage("task_window_peer_reload_loaded");
   await Promise.all([
     waitForPackagedSmokeTaskPresentation(peerWindow, task, taskOwner),
     waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner),
@@ -2862,12 +2881,16 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   const peerDocument = await readPackagedSmokeTaskDocumentIdentity(peerWindow);
   assertPackagedSmokeTaskWindowSet(exactWindows);
   recordPackagedSmokeProgress("task_windows_same_session_independent_documents");
+  recordPackagedFullSmokeStage("task_window_peer_reload_verified");
 
   const rendererLost = new Promise<void>((resolveLoss) => taskContents.once("render-process-gone", () => resolveLoss()));
   const rendererReloaded = new Promise<void>((resolveLoad) => taskContents.once("did-finish-load", () => resolveLoad()));
+  recordPackagedFullSmokeStage("task_window_crash_requested");
   taskContents.forcefullyCrashRenderer();
   await waitForPackagedSmokeDeadline(rendererLost, 10_000, "Task renderer crash");
+  recordPackagedFullSmokeStage("task_window_crash_observed");
   await waitForPackagedSmokeDeadline(rendererReloaded, 20_000, "Task renderer recovery load");
+  recordPackagedFullSmokeStage("task_window_crash_reload_loaded");
   await Promise.all([
     waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner),
     waitForPackagedSmokeTaskPresentation(peerWindow, task, taskOwner),
@@ -2885,6 +2908,7 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   }
   recordPackagedSmokeProgress("task_window_crash_recovered_exact_owner");
   recordPackagedSmokeProgress("task_draft_recovered_after_renderer_crash");
+  recordPackagedFullSmokeStage("task_window_crash_recovery_verified");
 
   await closePackagedSmokeTaskWindow(taskWindow, taskOwner);
   recordPackagedSmokeProgress("task_window_close_retirement_verified");
@@ -4274,6 +4298,7 @@ async function verifyPackagedSmokeNewTaskDraftCrash(window: BrowserWindow): Prom
     await waitForPackagedSmokePoll();
   }
   if (!editorReady) throw new Error("Packaged smoke new-task composer did not become editable.");
+  recordPackagedFullSmokeStage("new_task_draft_editor_ready");
   const inserted = await window.webContents.executeJavaScript([
     "(() => {",
     "  const editor = document.querySelector('.new-task-page .composer-rich-editor__content[contenteditable=\"true\"]');",
@@ -4287,11 +4312,14 @@ async function verifyPackagedSmokeNewTaskDraftCrash(window: BrowserWindow): Prom
   ].join("\n"), true) as unknown;
   if (inserted !== true) throw new Error("Packaged smoke could not edit the new-task composer.");
   await waitForPackagedSmokeIndexedDraft(window, draftKey, draftText, "new-task");
+  recordPackagedFullSmokeStage("new_task_draft_durable");
   const contents = window.webContents;
   const lost = new Promise<void>((resolveLoss) => contents.once("render-process-gone", () => resolveLoss()));
   contents.forcefullyCrashRenderer();
   await waitForPackagedSmokeDeadline(lost, 10_000, "new-task renderer crash");
+  recordPackagedFullSmokeStage("new_task_main_reload_started");
   await waitForPackagedSmokeOwnerDocument(window, "new-task crash reload", () => window.reload());
+  recordPackagedFullSmokeStage("new_task_main_reload_dom_ready");
   const restoreDeadline = Date.now() + 20_000;
   let reconnectRequested = false;
   let lastObservation: Readonly<Record<string, boolean>> = { observed: false };
@@ -4342,6 +4370,7 @@ async function verifyPackagedSmokeNewTaskDraftCrash(window: BrowserWindow): Prom
       recordPackagedSmokeProgress("new_task_draft_reconnected_after_renderer_crash");
     }
     if (result["restored"] === true) {
+      recordPackagedFullSmokeStage("new_task_draft_restored_in_main");
       await captureRecovery();
       recordPackagedSmokeProgress("new_task_draft_recovered_after_renderer_crash");
       return;
@@ -4521,6 +4550,12 @@ function recordPackagedSmokeProgress(step: string): void {
     appendFileSync(`${packagedSmokeResultPath}.progress`, `${step}\n`, { encoding: "utf8", mode: 0o600 });
   } catch {
     // The terminal result remains authoritative.
+  }
+}
+
+function recordPackagedFullSmokeStage(stage: string): void {
+  if (app.isPackaged && packagedSmoke && packagedSmokeScope === "full") {
+    recordPackagedSmokeProgress(`${stage}:${Date.now()}`);
   }
 }
 
