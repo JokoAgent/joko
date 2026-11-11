@@ -727,6 +727,8 @@ class WorkspaceMarkdownTableWidget extends WidgetType {
     root.className = "cm-md-table-widget";
     root.contentEditable = "false";
     const table = document.createElement("table");
+    // The table owns its DOM selection independently of the source editor.
+    table.dataset.workspaceFileQuoteRendered = "";
     const colgroup = document.createElement("colgroup");
     const columnCount = workspaceMarkdownTableColumnCount(this.block.model);
     const sourceWidths = normalizeWorkspaceMarkdownColumnWidths(this.block.model.sourceWidths ?? [], columnCount);

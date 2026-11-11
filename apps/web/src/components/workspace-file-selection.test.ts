@@ -1,12 +1,74 @@
+// @vitest-environment jsdom
+
+import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import { readSelectionInStream } from "./SelectionQuoteButton.js";
 import {
   normalizeWorkspaceFileSource,
   WORKSPACE_FILE_QUOTE_MAXIMUM_CHARACTERS,
   workspaceFileQuoteFromOffsets
 } from "./workspace-file-selection.js";
+import { DEFAULT_WORKSPACE_MARKDOWN_TABLE_LABELS, workspaceMarkdownLivePreviewExtensions } from "./workspace-markdown-live-preview.js";
 
 describe("workspace file selection quotes", () => {
+  it.each([false, true])("quotes a live table selection independently of the source selection (readOnly=%s)", (readOnly) => {
+    const source = "  OLD\n\n| Name | Value |\n| --- | --- |\n| Actual CELL | one |";
+    const container = document.body.appendChild(document.createElement("div"));
+    const view = new EditorView({ parent: container, state: EditorState.create({
+      doc: source,
+      extensions: [
+        ...workspaceMarkdownLivePreviewExtensions(DEFAULT_WORKSPACE_MARKDOWN_TABLE_LABELS),
+        EditorState.readOnly.of(readOnly),
+        EditorView.editable.of(!readOnly)
+      ]
+    }) });
+    const selection = window.getSelection()!;
+    const selectText = (node: Node, anchor: number, head: number): void => {
+      selection.setBaseAndExtent(node, anchor, node, head);
+      Object.defineProperty(selection.getRangeAt(0), "getClientRects", { value: () => [new DOMRect(160, 120, 38, 16)] });
+    };
+    const sourceSelection = () => {
+      const { anchor, head } = view.state.selection.main;
+      return workspaceFileQuoteFromOffsets(view.state.doc.toString(), anchor, head);
+    };
+    const options = {
+      sourcePath: "docs/table.md",
+      getQuoteText: () => sourceSelection()?.text ?? null,
+      getQuoteMetadata: () => {
+        const quote = sourceSelection();
+        return quote === undefined ? null : { startLine: quote.startLine, endLine: quote.endLine };
+      }
+    };
+    try {
+      const cellText = container.querySelector("tbody td")!.firstChild!;
+      expect(cellText.textContent).toBe("Actual CELL");
+      const expected = { kind: "file", sessionId: "task", sourcePath: "docs/table.md", text: "CELL" };
+      expect(sourceSelection()).toBeUndefined();
+      selectText(cellText, 7, 11);
+      expect(readSelectionInStream("task", container, false, options)?.quote).toMatchObject(expected);
+
+      view.dispatch({ selection: { anchor: 0, head: 5 } });
+      expect(sourceSelection()?.text).toBe("  OLD");
+      selectText(cellText, 11, 7);
+      const quote = readSelectionInStream("task", container, true, options)?.quote;
+      expect(quote).toMatchObject(expected);
+      expect(quote).not.toHaveProperty("startLine");
+      expect(quote).not.toHaveProperty("endLine");
+      expect(readSelectionInStream("task", document.createElement("div"), false, options)).toBeUndefined();
+
+      const sourceText = container.querySelector(".cm-line")!.firstChild!;
+      selectText(sourceText, 2, 5);
+      expect(readSelectionInStream("task", container, false, options)?.quote)
+        .toMatchObject({ ...expected, text: "  OLD", startLine: 1, endLine: 1 });
+    } finally {
+      selection.removeAllRanges();
+      view.destroy();
+      container.remove();
+    }
+  });
+
   it("preserves indentation and internal blank lines with a closed line range", () => {
     const source = "before\n    first\n\n      third\nafter";
     const start = source.indexOf("    first");
