@@ -262,6 +262,99 @@ describe("Timeline viewport journeys", () => {
     expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
   });
 
+  it("holds the clicked completed work heading through layout and then follows tail growth again", async () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    const header = await renderCompletedWork();
+    const viewport = timeline();
+    const originalTop = viewport.scrollTop;
+    const headerTop = header.getBoundingClientRect().top;
+
+    await act(async () => header.querySelector<HTMLElement>("strong")!.click());
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    expect(header.parentElement?.querySelectorAll("[data-work-child-id]")).toHaveLength(8);
+    extent += 480;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(originalTop);
+    expect(header.getBoundingClientRect().top).toBe(headerTop);
+    expect(jumpLatest()).toBeNull();
+
+    now.mockReturnValue(1_150);
+    extent += 70;
+    // A later layout pass may already have applied browser scroll anchoring.
+    viewport.scrollTop += 60;
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    await notifyResize(header.closest(".timeline__row")!);
+    expect(viewport.scrollTop).toBe(originalTop);
+    expect(header.getBoundingClientRect().top).toBe(headerTop);
+
+    now.mockReturnValue(1_301);
+    extent += 90;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+    expect(jumpLatest()).toBeNull();
+  });
+
+  it("gives new content in the same streaming tail priority over work group layout", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(1_000);
+    const header = await renderCompletedWork(true);
+    const viewport = timeline();
+    const originalTop = viewport.scrollTop;
+    await act(async () => header.click());
+    extent += 480;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(originalTop);
+
+    const tail = props.items.at(-1)!;
+    extent += 90;
+    await render({ items: [...props.items.slice(0, -1), { ...tail, text: `${tail.text} More streamed content.` }] });
+    await contentResize();
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+    expect(jumpLatest()).toBeNull();
+  });
+
+  it.each(["wheel", "PageDown", "task change", "pagehide"] as const)("retires a pending work group correction after %s", async (input) => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    const header = await renderCompletedWork();
+    const viewport = timeline();
+    now.mockReturnValue(1_100);
+    await act(async () => header.click());
+    const originalTop = viewport.scrollTop;
+    extent += 480;
+    viewport.scrollTop += 60;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(originalTop);
+
+    extent += 80;
+    await queueResize(host.querySelector(".timeline__virtual")!);
+    const pending = [...frames.values()];
+    expect(pending.length).toBeGreaterThan(0);
+
+    if (input === "wheel") {
+      await wheel(viewport, -40);
+      viewport.scrollTop -= 40;
+      await act(async () => viewport.dispatchEvent(new Event("scroll")));
+      expectUnread(0);
+    } else if (input === "PageDown") {
+      await act(async () => header.dispatchEvent(new KeyboardEvent("keydown", { key: input, bubbles: true, cancelable: true })));
+      viewport.scrollTop += 160;
+      await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    } else if (input === "task change") {
+      await render({ sessionId: "next-task", viewportOwnerKey: `${props.viewportOwnerKey}:next-task` });
+    } else {
+      await act(async () => window.dispatchEvent(new Event("pagehide")));
+    }
+
+    const nextTop = viewport.scrollTop;
+    scrollWrites.length = 0;
+    await replayFrames(pending);
+    expect(scrollWrites).toHaveLength(0);
+    expect(viewport.scrollTop).toBe(nextTop);
+    if (input === "wheel") {
+      await contentResize();
+      expect(viewport.scrollTop).toBe(nextTop);
+    }
+  });
+
   it("keeps a following tail at the edge when only the viewport shrinks", async () => {
     await render();
     await flushFrames();
@@ -437,6 +530,24 @@ async function render(update: Partial<TimelineProps> = {}): Promise<void> {
   await act(async () => root.render(<Timeline {...props} />));
 }
 
+async function renderCompletedWork(streaming = false): Promise<HTMLButtonElement> {
+  viewportHeight = 240;
+  const work = Array.from({ length: 8 }, (_, index) => item(`${props.ownerKey}-work-${index}`, index + 7, "thinking"));
+  await render({ sessionActive: streaming, messageNavRailEnabled: false, items: [
+    ...props.items.slice(0, 6), ...work, { ...item("short-answer", 15, "assistant"), streaming }
+  ] });
+  await flushFrames();
+  const viewport = timeline();
+  const header = viewport.querySelector<HTMLButtonElement>(".work-group__header")!;
+  extent = viewport.scrollTop + header.getBoundingClientRect().top + 160;
+  await contentResize();
+  expect(header.getAttribute("aria-expanded")).toBe("false");
+  expect(header.getBoundingClientRect().top).toBeGreaterThan(0);
+  expect(header.getBoundingClientRect().bottom).toBeLessThan(viewport.clientHeight);
+  expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+  return header;
+}
+
 async function append(items: readonly TimelineItemView[]): Promise<void> { await render({ items: [...props.items, ...items] }); }
 function timeline(): HTMLDivElement { return host.querySelector<HTMLDivElement>(".timeline")!; }
 function jumpLatest(): HTMLButtonElement | null { return host.querySelector<HTMLButtonElement>(".jump-latest"); }
@@ -460,10 +571,14 @@ async function contentResize(): Promise<void> {
 }
 
 async function notifyResize(target: Element): Promise<void> {
+  await queueResize(target);
+  await flushFrames();
+}
+
+async function queueResize(target: Element): Promise<void> {
   await act(async () => {
     for (const observer of [...observers]) if (observer.targets.has(target)) observer.callback([], observer);
   });
-  await flushFrames();
 }
 
 async function flushFrames(): Promise<void> {
