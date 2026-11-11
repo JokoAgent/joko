@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { translate } from "../i18n.js";
 import { DesktopPageSearchBar } from "./DesktopPageSearchBar.js";
+import { TimelineCodeBlock } from "./TimelineCodeBlock.js";
 import { findDesktopPageMatches, PAGE_SEARCH_ACTIVE_HIGHLIGHT, PAGE_SEARCH_HIGHLIGHT } from "./desktop-page-search.js";
 
 const roots: Root[] = [];
@@ -87,6 +88,44 @@ describe("DesktopPageSearchBar", () => {
     expect(document.querySelector('[role="search"]')).toBeNull();
     expect(document.activeElement).toBe(returnFocus);
     expect(highlights).toEqual(new Map([["other-feature", other]]));
+  });
+
+  it.each(["Next match", "Previous match", "Close page search"])("closes Find with Escape when %s has focus", async (label) => {
+    document.body.innerHTML = '<button id="return">Return</button><p>needle</p>';
+    const returnFocus = document.querySelector<HTMLButtonElement>("#return")!;
+    returnFocus.focus();
+    await render();
+    await pressFindShortcut();
+    await typeQuery("needle");
+    const control = document.querySelector<HTMLButtonElement>(`[role="search"] button[aria-label="${label}"]`)!;
+    expect(control.disabled).toBe(false);
+    control.focus();
+    expect(document.activeElement).toBe(control);
+    const escape = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    await act(async () => control.dispatchEvent(escape));
+    expect(escape.defaultPrevented).toBe(true);
+    expect(document.querySelector('[role="search"]')).toBeNull();
+    expect(document.activeElement).toBe(returnFocus);
+    expect(highlights.has(PAGE_SEARCH_HIGHLIGHT)).toBe(false);
+  });
+
+  it("matches exact spaces in the actual untyped Timeline code block", async () => {
+    const codeText = "leftunique    rightunique";
+    const message = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(message);
+    roots.push(root);
+    await act(async () => root.render(<TimelineCodeBlock ownerKey="task" source={codeText} t={(key) => key} />));
+    const code = message.querySelector<HTMLElement>("code")!;
+    code.style.whiteSpace = "pre-wrap";
+    await render();
+    await pressFindShortcut();
+    await typeQuery("leftunique rightunique");
+    expect(count()).toBe("0/0");
+    await typeQuery(codeText);
+    expect(count()).toBe("1/1");
+    const range = [...highlights.get(PAGE_SEARCH_ACTIVE_HIGHLIGHT)!][0]!;
+    expect(range.startContainer.parentElement).toBe(code);
+    expect(range.toString()).toBe(codeText);
   });
 
   it("refreshes streamed text and visibility without losing the current occurrence or input selection", async () => {
