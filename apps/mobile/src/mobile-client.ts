@@ -6148,6 +6148,15 @@ export class MobileClient {
     this.#homeSearchAbort = controller;
     this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "searching",
       homeSearchMatches: [], homeSearchError: undefined });
+    const currentSearch = (): boolean => {
+      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || !this.#current(epoch)
+        || credential !== this.#credential || profileId !== this.#activeProfileId || this.#state.status !== "connected"
+        || this.#state.homeSearchQuery !== normalized || this.#state.homeSearchFilter !== statusFilter) return false;
+      const current = this.#state.owner;
+      return current === owner || (current !== undefined && current.generation === owner.generation
+        && owner.revision !== undefined && current.revision?.value === owner.revision.value
+        && current.resumeCursor?.generation === owner.resumeCursor?.generation && current.resumeCursor?.sequence === owner.resumeCursor?.sequence);
+    };
     try {
       const matches = await this.network.searchSessionMessages(
         credential,
@@ -6157,9 +6166,7 @@ export class MobileClient {
             : SessionMessageSearchSessionStatus.UNSPECIFIED,
         controller.signal
       );
-      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
-        || profileId !== this.#activeProfileId || this.#state.homeSearchQuery !== normalized
-        || this.#state.homeSearchFilter !== statusFilter) return;
+      if (!currentSearch()) return;
       const visible = new Set(this.#state.owner?.sessions.map((session) => session.sessionId) ?? []);
       const firstBySession = new Map<string, MobileHomeSearchMatch>();
       for (const { sessionId, eventId } of matches) {
@@ -6168,8 +6175,7 @@ export class MobileClient {
       this.#set({ homeSearchStatus: "ready", homeSearchMatches: [...firstBySession.values()], homeSearchError: undefined });
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
-      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
-        || profileId !== this.#activeProfileId) return;
+      if (!currentSearch()) return;
       this.#set({ homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: message(error) });
     } finally {
       if (this.#homeSearchAbort === controller) this.#homeSearchAbort = undefined;

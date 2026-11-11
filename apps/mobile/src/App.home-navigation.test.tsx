@@ -572,6 +572,27 @@ describe("actual Home navigation hosts", () => {
     expect(onSelect).toHaveBeenLastCalledWith(undefined);
   });
 
+  it("shows a pending first search and retains a ready body result across an equivalent owner snapshot", async () => {
+    await render();
+    searchHome.mockClear();
+    await type(message("home.search"), "needle");
+    expect(host.querySelector(`div[aria-label="${message("home.search")}"]`)).not.toBeNull();
+    expect(host.textContent).not.toContain(message("home.empty.search"));
+    expect(searchHome).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(180));
+    expect(searchHome).toHaveBeenCalledExactlyOnceWith("needle", "active");
+
+    await render({ state: { ...state, homeSearchQuery: "needle", homeSearchStatus: "ready",
+      homeSearchMatches: [{ sessionId: "other", eventId: "matching-message" }] } });
+    expect(button("Open task Beta")).toBeDefined();
+    searchHome.mockClear();
+    const owner = create(SnapshotSchema, { ...state.owner!, snapshotId: "fresh-snapshot-same-revision" });
+    await render({ state: { ...state, owner } });
+    await act(async () => vi.advanceTimersByTimeAsync(180));
+    expect(button("Open task Beta")).toBeDefined();
+    expect(searchHome).not.toHaveBeenCalled();
+  });
+
   it("reopens Home with the saved archive filter and the current node's task list", async () => {
     const values = new Map<string, string>();
     const storage = {

@@ -8275,6 +8275,30 @@ describe("native mobile connection and operation ownership", () => {
 });
 
 describe("mobile Home search and task mutations", () => {
+  it.each([true, false])("adopts an in-flight Home search only while a polled projection has the same revision (%s)", async (sameRevision) => {
+    vi.useFakeTimers();
+    const owner = create(SnapshotSchema, { ...snapshot, snapshotId: "first", revision: { value: 11n } });
+    const network = projectedNetwork(owner);
+    network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.liveStatus).toBe("polling");
+
+    let resolveSearch!: (matches: readonly SessionMessageSearchMatch[]) => void;
+    vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise(resolve => { resolveSearch = resolve; }));
+    const search = app.searchHome("needle", "active");
+    expect(app.state.homeSearchStatus).toBe("searching");
+    const polled = create(SnapshotSchema, { ...owner, snapshotId: "polled", revision: { value: sameRevision ? 11n : 12n } });
+    vi.mocked(network.readOwner).mockResolvedValueOnce({ connection, device, snapshot: polled });
+    vi.mocked(network.readSession).mockResolvedValueOnce(polled);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(app.state.owner).toBe(polled);
+    resolveSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "matching-message" })]);
+    await search;
+    expect(app.state.homeSearchMatches).toEqual(sameRevision ? [{ sessionId: "session", eventId: "matching-message" }] : []);
+  });
+
   it.each(["search", "page", "anchor"] as const)("retires the original profile and its offline history when %s observes revocation", async (read) => {
     const owner = create(SnapshotSchema, { ...runtimeControlProjection(),
       connections: [connection, otherConnection], devices: [device, otherDevice] });
