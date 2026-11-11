@@ -1435,29 +1435,39 @@ function ContextPanel({ controller, backend, session, queue, tasks, t, runAction
 }
 
 export function BranchesPanel({ controller, backend, session, t, runAction }: { readonly controller: AppController; readonly backend?: BackendView; readonly session: SessionView; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {
-  const [tree, setTree] = useState<NativeSessionTreeView>();
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string>();
   const [summarize, setSummarize] = useState(false);
   const [summaryFocus, setSummaryFocus] = useState("");
   const treeNavigation = useInspectorTreeNavigation();
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
+  const { activeProfile, connectionGeneration, connectionState, snapshot } = controller.state;
+  const owner = useMemo(() => ({ sessionId: session.id }), [activeProfile?.id, activeProfile?.origin, activeProfile?.serverId,
+    connectionGeneration, connectionState, snapshot.generation, session.id, session.generation, session.backendId, session.targetId]);
+  const mountedOwner = useRef<typeof owner | undefined>(undefined);
+  const readSequence = useRef(0);
+  const [read, setRead] = useState<{ readonly owner: typeof owner; readonly tree?: NativeSessionTreeView; readonly loading: boolean; readonly error?: string }>();
+  const currentRead = read?.owner === owner ? read : undefined;
+  const tree = currentRead?.tree, loading = currentRead?.loading ?? true, error = currentRead?.error;
   const busy = session.state === "running" || session.state === "waiting" || session.state === "retrying";
   const canFork = backend?.capabilities.get("session.fork")?.supported === true
     && (session.worktree === undefined || backend.capabilities.get("workspace.derive")?.supported === true);
   const load = useCallback(async (): Promise<void> => {
-    setLoading(true);
-    setError(undefined);
+    if (mountedOwner.current !== owner) return;
+    const request = ++readSequence.current;
+    const current = (): boolean => mountedOwner.current === owner && readSequence.current === request;
+    setRead(previous => ({ owner, loading: true, tree: previous?.owner === owner ? previous.tree : undefined }));
     try {
-      setTree(await controllerRef.current.getSessionTree(session.id));
+      const next = await controllerRef.current.getSessionTree(owner.sessionId);
+      if (current()) setRead({ owner, tree: next, loading: false });
     } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setLoading(false);
+      if (current()) setRead(previous => ({ owner, loading: false, tree: previous?.tree, error: messageOf(cause) }));
     }
-  }, [session.id]);
-  useEffect(() => { void load(); }, [load]);
+  }, [owner]);
+  useLayoutEffect(() => {
+    mountedOwner.current = owner;
+    void load();
+    return () => { mountedOwner.current = undefined; };
+  }, [load, owner]);
   return (
     <div className="inspector-panel">
       <section className="inspector-section">
