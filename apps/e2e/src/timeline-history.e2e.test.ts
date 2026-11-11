@@ -287,13 +287,23 @@ describe("mounted Timeline history windows", () => {
     await page.locator(".timeline-history--error").getByRole("button", { name: "Retry", exact: true }).click();
     await waitFor(async () => olderRequests, (value) => value === 2, "the explicit history retry");
     expect(await navIds(page)).toEqual(initialIds);
+    const waitingAnchor = await settledAnchor(page);
+    expect(waitingAnchor.id).toBe(beforeRetry.id);
+    expect(Math.abs(waitingAnchor.offset - beforeRetry.offset)).toBeLessThanOrEqual(3);
+    await page.locator(".timeline").hover();
+    await page.mouse.wheel(0, 40);
+    await waitFor(() => anchor(page), (value) => value.id !== waitingAnchor.id || Math.abs(value.offset - waitingAnchor.offset) > 10,
+      "manual scrolling within the original history window");
+    const latestReadingAnchor = await settledAnchor(page);
+    expect(latestReadingAnchor.id !== waitingAnchor.id || Math.abs(latestReadingAnchor.offset - waitingAnchor.offset) > 10).toBe(true);
+    expect(olderRequests).toBe(2);
     releasePage!();
     releasePage = undefined;
     await waitFor(() => navIds(page), (value) => value.length > initialIds.length, "older history to merge");
     const afterRetry = await settledAnchor(page);
-    const retainedOffset = await rowOffset(page, beforeRetry.id!);
-    expect(afterRetry.id, JSON.stringify({ beforeRetry, afterRetry, retainedOffset })).toBe(beforeRetry.id);
-    expect(Math.abs(afterRetry.offset - beforeRetry.offset)).toBeLessThanOrEqual(3);
+    const retainedOffset = await rowOffset(page, latestReadingAnchor.id!);
+    expect(afterRetry.id, JSON.stringify({ beforeRetry, latestReadingAnchor, afterRetry, retainedOffset })).toBe(latestReadingAnchor.id);
+    expect(Math.abs(afterRetry.offset - latestReadingAnchor.offset)).toBeLessThanOrEqual(3);
     await loadAllEarlier(page, 56);
     const allInitialIds = await navIds(page);
     expect(new Set(allInitialIds).size).toBe(56);

@@ -1,3 +1,5 @@
+import { createContext } from "react";
+
 export interface DesktopPageMatch {
   readonly range: Range;
   readonly document: Document;
@@ -17,6 +19,14 @@ interface FoldedText {
 
 export const PAGE_SEARCH_HIGHLIGHT = "joko-page-search";
 export const PAGE_SEARCH_ACTIVE_HIGHLIGHT = "joko-page-search-active";
+export const PAGE_SEARCH_SCROLL_EVENT = "joko:page-search-scroll";
+export const DesktopPageSearchTextAccess = createContext(false);
+const searchTextRows = new WeakSet<Element>();
+
+export function registerDesktopPageSearchTextRow(element: Element, active: boolean): void {
+  if (active) searchTextRows.add(element);
+  else searchTextRows.delete(element);
+}
 const SKIP_ELEMENTS = "script, style, noscript, template, input, textarea, select, [data-page-search-ignore]";
 const INLINE_DISPLAYS = new Set(["inline", "inline-block", "inline-flex", "inline-grid", "contents", "ruby", "ruby-base", "ruby-text", ""]);
 
@@ -119,7 +129,7 @@ export function desktopPageElementVisible(
   const ownStyle = style(element);
   if (ownStyle.visibility === "hidden" || ownStyle.visibility === "collapse") return false;
   for (let current: Element | null = element; current !== null; current = current.parentElement) {
-    if (current.hasAttribute("hidden") || current.hasAttribute("inert")) return false;
+    if (current.hasAttribute("hidden") || (current.hasAttribute("inert") && !searchTextRows.has(current))) return false;
     if (current.tagName === "DIALOG" && !current.hasAttribute("open")) return false;
     if (current.tagName === "DETAILS" && !current.hasAttribute("open")) {
       const summary = [...current.children].find((child) => child.tagName === "SUMMARY");
@@ -134,6 +144,13 @@ export function desktopPageElementVisible(
 function rangeIsPainted(range: Range, style: (element: Element) => CSSStyleDeclaration): boolean {
   const rectangles = [...range.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0);
   if (rectangles.length === 0) return false;
+  let top = Infinity, bottom = -Infinity;
+  for (const rect of rectangles) {
+    top = Math.min(top, rect.top);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  let timelineShift: { minimum: number; maximum: number } | undefined;
+  let needsTimelineScroll = false;
   for (let ancestor = range.commonAncestorContainer.nodeType === 1
     ? range.commonAncestorContainer as Element : range.commonAncestorContainer.parentElement;
     ancestor !== null; ancestor = ancestor.parentElement) {
@@ -141,12 +158,35 @@ function rangeIsPainted(range: Range, style: (element: Element) => CSSStyleDecla
     const computed = style(ancestor);
     const clipX = computed.overflowX === "hidden" || computed.overflowX === "clip";
     const clipY = computed.overflowY === "hidden" || computed.overflowY === "clip";
-    if (!clipX && !clipY) continue;
+    const timeline = ancestor.matches(".timeline[data-timeline-session-id]")
+      && (computed.overflowY === "auto" || computed.overflowY === "scroll")
+      && ancestor.scrollHeight > ancestor.clientHeight;
+    if (!clipX && !clipY && !timeline) continue;
     const bounds = ancestor.getBoundingClientRect();
-    if (rectangles.some((rect) => (clipX && (rect.left < bounds.left - 1 || rect.right > bounds.right + 1))
-      || (clipY && (rect.top < bounds.top - 1 || rect.bottom > bounds.bottom + 1)))) return false;
+    if (clipX && rectangles.some((rect) => rect.left < bounds.left - 1 || rect.right > bounds.right + 1)) return false;
+    if (clipY) {
+      const minimum = bounds.top - top - 1;
+      const maximum = bounds.bottom - bottom + 1;
+      if (minimum > 0 || maximum < 0) {
+        if (timelineShift === undefined) return false;
+        needsTimelineScroll = true;
+      }
+      if (timelineShift !== undefined) {
+        timelineShift.minimum = Math.max(timelineShift.minimum, minimum);
+        timelineShift.maximum = Math.min(timelineShift.maximum, maximum);
+      }
+    }
+    if (timeline && timelineShift === undefined) {
+      // Keep a mounted row if the actual scrollport can move its text into
+      // view. Outer fixed clips still constrain where that row can appear.
+      const viewportTop = bounds.top + ancestor.clientTop;
+      timelineShift = {
+        minimum: Math.max(ancestor.scrollTop - (ancestor.scrollHeight - ancestor.clientHeight), viewportTop - top - 1),
+        maximum: Math.min(ancestor.scrollTop, viewportTop + ancestor.clientHeight - bottom + 1)
+      };
+    }
   }
-  return true;
+  return !needsTimelineScroll || (timelineShift !== undefined && timelineShift.minimum <= timelineShift.maximum);
 }
 
 function foldText(value: string, preserveWhitespace = false): FoldedText {
@@ -213,6 +253,9 @@ export function scrollDesktopPageMatch(match: DesktopPageMatch): void {
   const owner = match.document;
   const element = match.range.startContainer.parentElement;
   if (element === null) return;
+  const view = owner.defaultView;
+  if (view === null) return;
+  element.dispatchEvent(new view.CustomEvent(PAGE_SEARCH_SCROLL_EVENT, { bubbles: true, detail: match.range }));
   // Reveal the text's containing scrollers first, then center the actual range
   // rather than a potentially very tall paragraph. Neither operation moves focus.
   element.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });

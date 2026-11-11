@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import type { ProviderAccountResetApi } from "@joko/contracts";
-import { assistantStreamAttempt, isClaudeStreamBlock } from "@joko/contracts";
+import { assistantStreamAttempt, isAssistantStreamBlock } from "@joko/contracts";
 import { createProviderAccountResetApi, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
@@ -1137,6 +1137,16 @@ interface ArtifactUrlLease {
   url?: string;
 }
 
+interface MessageDeletionProjection {
+  readonly sessionId: string;
+  readonly eventId: string;
+  readonly serviceGeneration: bigint;
+  readonly sessionGeneration: bigint;
+  applied?: "receipt" | "event";
+  receiptRevision?: bigint;
+  coveredCursor?: bigint;
+}
+
 interface GatewayActionScope {
   readonly transport: Transport;
   readonly authKey: string;
@@ -1198,6 +1208,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   #refreshPromise: Promise<void> | undefined;
   #eventRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #eventRefreshQueued = false;
+  readonly #messageDeletionProjections = new Map<string, MessageDeletionProjection>();
   readonly #artifactUrls = new Map<string, ArtifactUrlLease>();
   readonly #workspaceTextPreviews = new WorkspaceTextPreviewCache();
   readonly #portableImportDrafts = new Map<string, { readonly expiresAt: number; readonly cancel: () => Promise<void>; readonly release: () => void }>();
@@ -1481,6 +1492,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       this.#eventRefreshTimer = undefined;
     }
     this.#eventRefreshQueued = false;
+    this.#messageDeletionProjections.clear();
     this.#transport = undefined;
     this.#streamTask = undefined;
     for (const lease of this.#artifactUrls.values()) if (lease.url !== undefined) URL.revokeObjectURL(lease.url);
@@ -2185,6 +2197,14 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       && session.nativeBinding?.runtimeGeneration !== undefined
       && previousSessions.get(session.sessionId) === session.nativeBinding.runtimeGeneration)
       .map((session) => [session.sessionId, session.nativeBinding!.runtimeGeneration]));
+    for (const [operationId, deletion] of this.#messageDeletionProjections) {
+      if (raw.generation !== deletion.serviceGeneration || retainedSessions.get(deletion.sessionId) !== deletion.sessionGeneration) {
+        this.#messageDeletionProjections.delete(operationId);
+      } else if (deletion.receiptRevision !== undefined && (raw.revision?.value ?? -1n) >= deletion.receiptRevision
+        && fetchedCursor?.generation === deletion.serviceGeneration) {
+        deletion.coveredCursor ??= fetchedCursor.sequence;
+      }
+    }
     // Owner snapshots omit transcripts. Retain only already durable stream
     // events still owned by the same service and Session generations.
     raw = { ...raw, timeline: [...(previousRaw?.timeline ?? []).filter((event) => {
@@ -2464,18 +2484,58 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async deleteSessionMessage(sessionId: string, eventId: string): Promise<void> {
-    await this.submit({ case: "deleteSessionMessage", value: { sessionId, eventId } }, true);
-    this.invalidateTimelineHistory(sessionId);
-    // The deletion event carries stable identities, not a complete surviving
-    // transcript. Await the authoritative projection before reporting success.
-    await this.refresh();
+    const scope = this.captureActionScope();
+    const operationId = randomUuid();
+    const serviceGeneration = this.#snapshot?.generation;
+    const sessionGeneration = this.#snapshot?.sessions.find((session) => session.id === sessionId)?.generation;
+    const deletion: MessageDeletionProjection | undefined = serviceGeneration === undefined || sessionGeneration === undefined
+      ? undefined : { sessionId, eventId, serviceGeneration, sessionGeneration };
+    if (deletion !== undefined) this.#messageDeletionProjections.set(operationId, deletion);
+    try {
+      // The terminal receipt settles the mutation. submit refreshes the catalog independently.
+      await this.submit({ case: "deleteSessionMessage", value: { sessionId, eventId } }, true, [], scope.signal, (_id, operation) => {
+        if (operation?.state !== OperationState.SUCCEEDED) return;
+        const result = operation.result?.payload, mutation = operation.mutation?.payload;
+        const receiptRevision = operation.version?.revision?.value;
+        if (operation.operationId !== operationId || this.#taskSharing === undefined && operation.connectionId !== this.#profile?.id
+          || mutation?.case !== "deleteSessionMessage" || mutation.value.sessionId !== sessionId || mutation.value.eventId !== eventId
+          || result?.case !== "acknowledgement" || !result.value.accepted || receiptRevision === undefined || receiptRevision < 1n) {
+          throw new GatewayError("The original message deletion result could not be confirmed.", { code: "RESULT_UNKNOWN" });
+        }
+        const raw = this.#rawSnapshot, snapshot = this.#snapshot;
+        if (deletion === undefined || deletion.applied !== undefined || this.#messageDeletionProjections.get(operationId) !== deletion
+          || scope.signal.aborted || this.#transport !== scope.transport || raw === undefined || snapshot === undefined
+          || snapshot.generation !== deletion.serviceGeneration
+          || snapshot.sessions.find((session) => session.id === sessionId)?.generation !== deletion.sessionGeneration) return;
+        deletion.applied = "receipt";
+        deletion.receiptRevision = receiptRevision;
+        const retired = retireTimelineHistory(raw, snapshot, sessionId);
+        this.#rawSnapshot = retired.rawSnapshot;
+        this.#snapshot = retired.snapshot;
+        this.#callbacks.onSnapshot?.(retired.snapshot);
+      }, operationId);
+    } finally {
+      if (deletion?.applied !== "receipt") this.#messageDeletionProjections.delete(operationId);
+    }
   }
 
-  private invalidateTimelineHistory(sessionId: string): void {
-    if (this.#snapshot === undefined || sessionId.length === 0) return;
-    const snapshot = withTimelineHistoryInvalidation(this.#snapshot, sessionId, this.#snapshot.cursor);
-    this.#snapshot = snapshot;
-    this.#callbacks.onSnapshot?.(snapshot);
+  private messageDeletionFromEvent(event: Event): { readonly operationId: string; readonly deletion: MessageDeletionProjection } | undefined {
+    const kind = event.payload?.kind, identity = event.identity;
+    if (kind?.case !== "messageDeleted" || identity === undefined) return undefined;
+    const deletion = this.#messageDeletionProjections.get(identity.operationId);
+    return deletion !== undefined && event.cursor?.generation === deletion.serviceGeneration
+      && identity.sessionId === deletion.sessionId && identity.generation === deletion.sessionGeneration
+      && kind.value.productSessionId === deletion.sessionId && kind.value.requestedEventId === deletion.eventId
+      && kind.value.deletedEventIds.includes(deletion.eventId)
+      ? { operationId: identity.operationId, deletion } : undefined;
+  }
+
+  private isWaitingForMessageDeletionEvent(event: Event): boolean {
+    for (const deletion of this.#messageDeletionProjections.values()) {
+      if (deletion.applied === "receipt" && event.cursor?.generation === deletion.serviceGeneration
+        && event.identity?.sessionId === deletion.sessionId && event.identity.generation === deletion.sessionGeneration) return true;
+    }
+    return false;
   }
 
   async renameSession(sessionId: string, name: string): Promise<void> {
@@ -3626,11 +3686,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async navigateSessionBranch(
     sessionId: string,
     target: import("./model.js").NativeNavigationTargetView,
-    options: { readonly expectedGeneration: bigint; readonly summarize?: boolean; readonly customInstructions?: string }
+    options: Parameters<OrchestratorGateway["navigateSessionBranch"]>[2]
   ): Promise<void> {
     if (options.expectedGeneration < 1n) throw new GatewayError("A source task generation is required for navigation.");
     const customInstructions = options.customInstructions?.trim().slice(0, 4_000) ?? "";
-    await this.submit({
+    const confirmSameGeneration = options.onSameGenerationConfirmed;
+    const scope = confirmSameGeneration === undefined ? undefined : this.captureActionScope();
+    const operation = await this.submit({
       case: "navigateSessionBranch",
       value: {
         sessionId,
@@ -3639,6 +3701,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         customInstructions: options.summarize === true ? customInstructions : ""
       }
     }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
+    if (confirmSameGeneration === undefined || scope === undefined) return;
+    const result = operation.result?.payload;
+    if (operation.state !== OperationState.SUCCEEDED || result?.case !== "acknowledgement" || result.value.accepted !== true) {
+      throw new GatewayError("The task navigation result could not be confirmed.", { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" });
+    }
+    // An accepted operation can replace the binding before the renderer sees its new generation.
+    const response = await createClient(SessionService, scope.transport).getSession({ sessionId }, { signal: scope.signal, timeoutMs: 5_000 })
+      .catch(() => undefined);
+    if (!scope.signal.aborted && this.#transport === scope.transport && response?.session?.sessionId === sessionId
+      && response.session.nativeBinding?.runtimeGeneration === options.expectedGeneration) confirmSameGeneration();
   }
 
   async openSideChat(sessionId: string, expectedGeneration: bigint, options?: {
@@ -11103,6 +11175,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         const transport = this.requireTransport();
         const client = createClient(EventService, transport);
         const cursor = this.#rawSnapshot?.resumeCursor;
+        // A new stream starting from a snapshot that covers the commit cannot replay its old rows.
+        if (cursor !== undefined) {
+          for (const [operationId, deletion] of this.#messageDeletionProjections) {
+            if (deletion.coveredCursor !== undefined && cursor.generation === deletion.serviceGeneration
+              && cursor.sequence >= deletion.coveredCursor) this.#messageDeletionProjections.delete(operationId);
+          }
+        }
         let lastGeneration = this.#snapshot?.generation;
         let lastSequence = this.#snapshot?.cursor;
         let consumedGeneration = lastGeneration;
@@ -11124,9 +11203,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           onAccepted();
           const event = response.event;
           if (event === undefined) continue;
+          const eventCursor = event.cursor;
+          if (eventCursor !== undefined && this.#messageDeletionProjections.size > 0) {
+            for (const [operationId, deletion] of this.#messageDeletionProjections) {
+              if (deletion.coveredCursor !== undefined && eventCursor.generation === deletion.serviceGeneration
+                && eventCursor.sequence > deletion.coveredCursor) this.#messageDeletionProjections.delete(operationId);
+            }
+          }
           const invalidated = payloadCase(event) === "projectionInvalidated";
           const continuity = classifyEventContinuity(lastGeneration, lastSequence, event);
           const duplicate = continuity === "duplicate";
+          const matchedDeletion = this.messageDeletionFromEvent(event);
+          const deletionApplied = matchedDeletion?.deletion.applied === "receipt";
+          if (matchedDeletion !== undefined) {
+            if (deletionApplied) this.#messageDeletionProjections.delete(matchedDeletion.operationId);
+            else if (!duplicate && this.#rawSnapshot !== undefined && this.#snapshot !== undefined) matchedDeletion.deletion.applied = "event";
+          }
           const consumedContinuity = classifyEventContinuity(consumedGeneration, consumedSequence, event);
           if (consumedContinuity === "contiguous") {
             consumedGeneration = event.cursor?.generation;
@@ -11173,7 +11265,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
               lastSequence = this.#snapshot?.cursor;
               continue;
             }
-            const projected = projectSnapshotEvent(rawSnapshot, snapshot, event, this.isLocalUserInput);
+            const deletionProjection = deletionApplied || this.#messageDeletionProjections.size > 0
+              ? { skipTimeline: this.isWaitingForMessageDeletionEvent(event), deletionApplied }
+              : undefined;
+            const projected = projectSnapshotEvent(rawSnapshot, snapshot, event, this.isLocalUserInput, deletionProjection);
             this.#rawSnapshot = projected.rawSnapshot;
             this.#snapshot = projected.snapshot;
             this.#callbacks.onSnapshot?.(projected.snapshot);
@@ -11277,6 +11372,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const raw = this.#rawSnapshot, snapshot = this.#snapshot, identity = event.identity, cursor = event.cursor;
     const kind = event.payload?.kind;
     if (this.#taskSharing !== undefined || raw === undefined || snapshot === undefined || identity === undefined || cursor === undefined
+      || this.isWaitingForMessageDeletionEvent(event)
       || kind?.case !== "compactionChanged" || event.eventId === "" || kind.value.compactionId === ""
       || ![CompactionState.STARTED, CompactionState.COMPLETED, CompactionState.NO_OP, CompactionState.ABORTED, CompactionState.FAILED].includes(kind.value.state)
       || cursor.generation !== source.generation || cursor.generation !== snapshot.generation || cursor.sequence > snapshot.cursor
@@ -11687,7 +11783,8 @@ export function projectSnapshotEvent(
   rawSnapshot: Snapshot,
   snapshot: AppSnapshot,
   event: Event,
-  isLocalUserInput?: LocalUserInputMatcher
+  isLocalUserInput?: LocalUserInputMatcher,
+  options?: { readonly skipTimeline: boolean; readonly deletionApplied: boolean }
 ): EventProjectionResult {
   const cursor = event.cursor;
   let raw: Snapshot = {
@@ -11709,7 +11806,7 @@ export function projectSnapshotEvent(
     return { rawSnapshot: raw, snapshot: projected, refresh: "batched" };
   }
 
-  if (isTimelineEvent(kind.case) && !isVisionBridgeStatusEvent(event)) {
+  if (!options?.skipTimeline && isTimelineEvent(kind.case) && !isVisionBridgeStatusEvent(event)) {
     raw = { ...raw, timeline: [...raw.timeline, event] };
     projected = { ...projected, timelineBySession: projectTimelineEvent(projected.timelineBySession, event, isLocalUserInput) };
     if (kind.case === "runtimeRecoveryChanged") {
@@ -12089,7 +12186,9 @@ export function projectSnapshotEvent(
       // Store owns the user-row/assistant-round semantics and the surviving
       // authoritative projection.
       const sessionId = kind.value.productSessionId || event.identity?.sessionId || "";
-      ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
+      if (!options?.deletionApplied) {
+        ({ rawSnapshot: raw, snapshot: projected } = retireTimelineHistory(raw, projected, sessionId || undefined, cursor?.sequence));
+      }
       refresh = "authoritative";
       break;
     }
@@ -12456,6 +12555,8 @@ function projectTimelineEvent(
         id: kind.value.messageId,
         messageId: kind.value.messageId,
         sourceEventId: event.eventId,
+        // The v1 user input event carries the durable completed user row.
+        ...(kind.value.role === 1 && event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
         ...timelineNativeMessageIdentity(event, existing),
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
         sequence: existing?.sequence ?? sequence,
@@ -12492,7 +12593,7 @@ function projectTimelineEvent(
     }
     case "textDelta": {
       const contentIndex = kind.value.contentIndex;
-      const streamAttempt = isClaudeStreamBlock(kind.value.messageId) ? assistantStreamAttempt(event) : undefined;
+      const streamAttempt = isAssistantStreamBlock(kind.value.messageId) ? assistantStreamAttempt(event) : undefined;
       const existing = items.find((item) =>
         item.kind === "assistant"
         && isProjectedMessageItem(item, kind.value.messageId)

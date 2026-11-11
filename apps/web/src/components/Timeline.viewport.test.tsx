@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 
-import { act, type ComponentProps } from "react";
+import { act, useState, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ArtifactView, TimelineItemView } from "../model.js";
+import { DesktopPageSearchBar } from "./DesktopPageSearchBar.js";
 import { Timeline } from "./Timeline.js";
+import { DesktopPageSearchTextAccess, PAGE_SEARCH_ACTIVE_HIGHLIGHT } from "./desktop-page-search.js";
 import type { Translator } from "./types.js";
 
 type TimelineProps = ComponentProps<typeof Timeline>;
@@ -16,6 +18,7 @@ let host: HTMLDivElement;
 let root: Root;
 let props: TimelineProps;
 let extent: number;
+let viewportHeight: number;
 let frameId: number;
 let ownerId = 0;
 let frames: Map<number, PendingFrame>;
@@ -39,6 +42,7 @@ beforeEach(() => {
   observers = new Set();
   scrollWrites = [];
   extent = 4_000;
+  viewportHeight = 600;
   frameId = 0;
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
     const id = ++frameId;
@@ -55,10 +59,10 @@ beforeEach(() => {
     addEventListener(): void {},
     removeEventListener(): void {}
   }));
-  vi.spyOn(Element.prototype, "clientHeight", "get").mockImplementation(function (this: Element) { return this.classList.contains("timeline") ? 600 : 80; });
+  vi.spyOn(Element.prototype, "clientHeight", "get").mockImplementation(function (this: Element) { return this.classList.contains("timeline") ? viewportHeight : 80; });
   vi.spyOn(Element.prototype, "clientWidth", "get").mockReturnValue(620);
   vi.spyOn(Element.prototype, "scrollHeight", "get").mockImplementation(function (this: Element) { return this.classList.contains("timeline") ? extent : 80; });
-  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) { return this.classList.contains("timeline") ? 600 : 80; });
+  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) { return this.classList.contains("timeline") ? viewportHeight : 80; });
   vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(656);
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
     const viewport = this.classList.contains("timeline") ? this : this.closest<HTMLElement>(".timeline");
@@ -66,14 +70,14 @@ beforeEach(() => {
     const start = Number.parseFloat(row?.style.transform.replace(/^translateY\(/, "") ?? "0") || 0;
     const isRoot = this === viewport;
     const top = isRoot ? 0 : start - (viewport?.scrollTop ?? 0);
-    const height = isRoot ? 600 : this.classList.contains("timeline__virtual") ? extent : 80;
+    const height = isRoot ? viewportHeight : this.classList.contains("timeline__virtual") ? extent : 80;
     const left = isRoot ? 0 : 64;
     return { x: left, y: top, left, top, right: left + 592, bottom: top + height, width: 592, height, toJSON: () => ({}) };
   });
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
     configurable: true,
     value(this: HTMLElement, options: ScrollToOptions): void {
-      const top = Math.max(0, Math.min(extent - 600, options.top ?? this.scrollTop));
+      const top = Math.max(0, Math.min(extent - viewportHeight, options.top ?? this.scrollTop));
       this.scrollTop = top;
       scrollWrites.push({ node: this, top, behavior: options.behavior });
     }
@@ -169,6 +173,197 @@ describe("Timeline viewport journeys", () => {
     expect(viewport.scrollTop).toBe(0);
   });
 
+  it("restores the new reading position after Home and a same-owner reopen", async () => {
+    extent = 1_080;
+    await render({ messageNavRailEnabled: false });
+    const viewport = timeline();
+    await flushFrames();
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+    expect(viewport.querySelectorAll(".timeline__row")).toHaveLength(props.items.length);
+
+    await act(async () => {
+      viewport.focus();
+      viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    await flushFrames();
+    expect(viewport.scrollTop).toBe(0);
+    expect(viewport.querySelectorAll(".timeline__row")).toHaveLength(props.items.length);
+
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    await flushFrames();
+    expect(timeline().scrollTop).toBe(0);
+    expectUnread(0);
+  });
+
+  it.each(["matching history", "a new history revision", "a manual scroll"] as const)("handles a saved old row after reopen and %s", async (arrival) => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    viewportHeight = 240;
+    extent = 640;
+    const fullHistory = props.items;
+    const historyOwnerKey = `${props.viewportOwnerKey}:history:1`;
+    const oldRowSelector = '[data-timeline-item-id="initial-2"]';
+    const offset = -24;
+    await render({ historyOwnerKey, messageNavRailEnabled: false });
+    await flushFrames();
+    const original = timeline();
+    const oldRow = original.querySelector<HTMLElement>(oldRowSelector)!;
+    now.mockReturnValue(1_100);
+    await wheel(original, -120);
+    await act(async () => {
+      original.scrollTop += oldRow.getBoundingClientRect().top - original.getBoundingClientRect().top - offset;
+      original.dispatchEvent(new Event("scroll"));
+    });
+    expect(oldRow.getBoundingClientRect().top - original.getBoundingClientRect().top).toBeCloseTo(offset);
+    expectUnread(0);
+
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    extent = 320;
+    await render({ items: fullHistory.slice(4), historyLoading: true });
+    await flushFrames();
+    const reopened = timeline();
+    expect(reopened.querySelector(oldRowSelector)).toBeNull();
+    expect(reopened.querySelector('[data-timeline-item-id="initial-4"]')).not.toBeNull();
+    expect(reopened.scrollTop).toBe(0);
+
+    const recentRowSelector = '[data-timeline-item-id="initial-4"]';
+    let manualOffset: number | undefined;
+    if (arrival === "a new history revision") {
+      await render({ historyOwnerKey: `${historyOwnerKey}:revised` });
+    } else if (arrival === "a manual scroll") {
+      await act(async () => {
+        reopened.scrollTop = 64;
+        reopened.dispatchEvent(new Event("scroll"));
+      });
+      manualOffset = reopened.querySelector<HTMLElement>(recentRowSelector)!.getBoundingClientRect().top - reopened.getBoundingClientRect().top;
+    }
+    extent = 640;
+    await render({ items: fullHistory, historyLoading: false });
+    await flushFrames();
+    await contentResize();
+    const restoredRow = reopened.querySelector<HTMLElement>(oldRowSelector)!;
+    const restoredOffset = restoredRow.getBoundingClientRect().top - reopened.getBoundingClientRect().top;
+    if (arrival === "matching history") {
+      expect(Math.abs(restoredOffset - offset)).toBeLessThanOrEqual(0.5);
+    } else if (manualOffset !== undefined) {
+      const currentRecentOffset = reopened.querySelector<HTMLElement>(recentRowSelector)!.getBoundingClientRect().top - reopened.getBoundingClientRect().top;
+      expect(Math.abs(currentRecentOffset - manualOffset)).toBeLessThanOrEqual(0.5);
+    } else {
+      expect(Math.abs(restoredOffset - offset)).toBeGreaterThan(3);
+    }
+    expectUnread(0);
+  });
+
+  it("leaves Page Up with the focused long tool output while it can scroll upward", async () => {
+    await render({ items: [...props.items, {
+      ...item("long-tool", 9, "tool"),
+      tool: { id: "long-tool", name: "bash", state: "running", input: "", output: "Tool output line\n".repeat(1_200), isError: false }
+    }] });
+    const output = host.querySelector<HTMLElement>(".windowed-output")!;
+    output.style.overflowY = "auto";
+    Object.defineProperty(output, "scrollHeight", { value: 500 });
+    output.scrollTop = 120;
+    await act(async () => output.focus());
+    expect(document.activeElement).toBe(output);
+
+    const withinOutput = new KeyboardEvent("keydown", { key: "PageUp", bubbles: true, cancelable: true });
+    await act(async () => output.dispatchEvent(withinOutput));
+    expect(withinOutput.defaultPrevented).toBe(false);
+    expect(jumpLatest()).toBeNull();
+
+    output.scrollTop = 0;
+    await act(async () => output.dispatchEvent(new KeyboardEvent("keydown", { key: "PageUp", bubbles: true })));
+    expectUnread(0);
+  });
+
+  it("focuses the original ordinary search row once it is highlighted", async () => {
+    await render();
+    const viewport = timeline();
+    await act(async () => viewport.focus());
+    const row = viewport.querySelector<HTMLElement>('[data-timeline-item-id="initial-3"]')!;
+    expect(row.hasAttribute("tabindex")).toBe(false);
+
+    await render({ focusRequest: { itemId: "initial-3", requestId: 1 } });
+    expect(row.getAttribute("aria-current")).toBe("true");
+    expect(document.activeElement).toBe(row);
+
+    await act(async () => viewport.focus());
+    await append([item("later-answer", 9, "assistant")]);
+    expect(document.activeElement).toBe(viewport);
+  });
+
+  it("finds a loaded message outside the virtual window and retires its text on close", async () => {
+    extent = 6_400;
+    const artifact: ArtifactView = { id: "find-image", blobId: "find-blob", kind: "image", fileName: "image.png",
+      title: "Image attachment", mediaType: "image/png", byteSize: 8, sourceRevealAvailable: false };
+    const loadArtifact = vi.fn(async () => "blob:find-image");
+    const loadEarlier = vi.fn(async () => undefined);
+    props = { ...props, sessionActive: false, messageNavRailEnabled: false, hasEarlier: true, onLoadEarlier: loadEarlier,
+      onArtifactUrl: loadArtifact, items: Array.from({ length: 68 }, (_, index) => index === 0
+        ? { ...item("first-search-row", 1, "assistant"), text: "The **loaded needle** is here.", attachments: [artifact] }
+        : item(`search-row-${index}`, index + 1, "user")) };
+    const highlights = new Map<string, Set<Range>>();
+    vi.stubGlobal("jokoDesktop", { capabilities: ["page.search"] });
+    vi.stubGlobal("CSS", { highlights });
+    vi.stubGlobal("Highlight", class extends Set<Range> {});
+    function rangeBox(this: Range): DOMRect { return this.startContainer.parentElement?.getBoundingClientRect() ?? new DOMRect(); }
+    const restores = [
+      setSearchGeometryMethod(window.Range.prototype, "getClientRects", function (this: Range) { return [rangeBox.call(this)]; }),
+      setSearchGeometryMethod(window.Range.prototype, "getBoundingClientRect", rangeBox),
+      setSearchGeometryMethod(window.Element.prototype, "scrollIntoView", vi.fn())
+    ];
+    function FindableTimeline() {
+      const [findOpen, setFindOpen] = useState(false);
+      return <DesktopPageSearchTextAccess.Provider value={findOpen}>
+        <DesktopPageSearchBar overrides={{}} t={props.t} onOpenChange={setFindOpen} />
+        <Timeline {...props} />
+      </DesktopPageSearchTextAccess.Provider>;
+    }
+    try {
+      await act(async () => root.render(<FindableTimeline />));
+      await flushFrames();
+      const viewport = timeline();
+      const firstSelector = '[data-timeline-item-id="first-search-row"]';
+      const tailSelector = '[data-timeline-item-id="search-row-67"]';
+      expect(viewport.querySelector(firstSelector)).toBeNull();
+      expect(viewport.querySelector(tailSelector)).not.toBeNull();
+      viewport.style.overflowY = "auto";
+      let top = viewport.scrollTop;
+      Object.defineProperty(viewport, "scrollTop", { configurable: true, get: () => top,
+        set: (value: number) => { top = Math.max(0, Math.min(extent - viewportHeight, value)); } });
+
+      await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", code: "KeyF", ctrlKey: true, bubbles: true, cancelable: true })));
+      await flushFrames();
+      const input = host.querySelector<HTMLInputElement>('[role="search"] input')!;
+      expect(document.activeElement).toBe(input);
+      expect(viewport.querySelector(firstSelector)?.hasAttribute("inert")).toBe(true);
+      expect(loadArtifact).not.toHaveBeenCalled();
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "loaded needle");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        viewport.dispatchEvent(new Event("scroll"));
+      });
+      await flushFrames();
+      expect(host.querySelector(".desktop-page-search-bar__count")?.textContent).toBe("1/1");
+      expect([...highlights.get(PAGE_SEARCH_ACTIVE_HIGHLIGHT)!][0]?.toString()).toBe("loaded needle");
+      expect(viewport.scrollTop).toBeLessThanOrEqual(56);
+      expect(viewport.querySelector(firstSelector)?.hasAttribute("inert")).toBe(false);
+      expect(loadEarlier).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(input);
+
+      await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+      await flushFrames();
+      expect(highlights.size).toBe(0);
+      expect(viewport.querySelector(tailSelector)).toBeNull();
+    } finally {
+      for (const restore of restores.reverse()) restore();
+    }
+  });
+
   it("keeps virtual-row corrections from detaching a growing tail after a delayed scroll event", async () => {
     await render({ items: Array.from({ length: 60 }, (_, index) => item(`measured-${index}`, index + 1, "user")) });
     await flushFrames();
@@ -194,6 +389,121 @@ describe("Timeline viewport journeys", () => {
     expect(jumpLatest()).toBeNull();
     await contentResize();
     expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+  });
+
+  it("holds the clicked completed work heading through layout and then follows tail growth again", async () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    const header = await renderCompletedWork();
+    const viewport = timeline();
+    const originalTop = viewport.scrollTop;
+    const headerTop = header.getBoundingClientRect().top;
+
+    await act(async () => header.querySelector<HTMLElement>("strong")!.click());
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    expect(header.parentElement?.querySelectorAll("[data-work-child-id]")).toHaveLength(8);
+    extent += 480;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(originalTop);
+    expect(header.getBoundingClientRect().top).toBe(headerTop);
+    expect(jumpLatest()).toBeNull();
+
+    now.mockReturnValue(1_150);
+    extent += 70;
+    // A later layout pass may already have applied browser scroll anchoring.
+    viewport.scrollTop += 60;
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    await notifyResize(header.closest(".timeline__row")!);
+    expect(viewport.scrollTop).toBe(originalTop);
+    expect(header.getBoundingClientRect().top).toBe(headerTop);
+
+    now.mockReturnValue(1_301);
+    extent += 90;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+    expect(jumpLatest()).toBeNull();
+  });
+
+  it("gives new content in the same streaming tail priority over work group layout", async () => {
+    vi.spyOn(performance, "now").mockReturnValue(1_000);
+    const header = await renderCompletedWork(true);
+    const viewport = timeline();
+    const originalTop = viewport.scrollTop;
+    await act(async () => header.click());
+    extent += 480;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(originalTop);
+
+    const tail = props.items.at(-1)!;
+    extent += 90;
+    await render({ items: [...props.items.slice(0, -1), { ...tail, text: `${tail.text} More streamed content.` }] });
+    await contentResize();
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+    expect(jumpLatest()).toBeNull();
+  });
+
+  it.each(["wheel", "PageDown", "task change", "pagehide"] as const)("retires a pending work group correction after %s", async (input) => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    const header = await renderCompletedWork();
+    const viewport = timeline();
+    now.mockReturnValue(1_100);
+    await act(async () => header.click());
+    const originalTop = viewport.scrollTop;
+    extent += 480;
+    viewport.scrollTop += 60;
+    await contentResize();
+    expect(viewport.scrollTop).toBe(originalTop);
+
+    extent += 80;
+    await queueResize(host.querySelector(".timeline__virtual")!);
+    const pending = [...frames.values()];
+    expect(pending.length).toBeGreaterThan(0);
+
+    if (input === "wheel") {
+      await wheel(viewport, -40);
+      viewport.scrollTop -= 40;
+      await act(async () => viewport.dispatchEvent(new Event("scroll")));
+      expectUnread(0);
+    } else if (input === "PageDown") {
+      await act(async () => header.dispatchEvent(new KeyboardEvent("keydown", { key: input, bubbles: true, cancelable: true })));
+      viewport.scrollTop += 160;
+      await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    } else if (input === "task change") {
+      await render({ sessionId: "next-task", viewportOwnerKey: `${props.viewportOwnerKey}:next-task` });
+    } else {
+      await act(async () => window.dispatchEvent(new Event("pagehide")));
+    }
+
+    const nextTop = viewport.scrollTop;
+    scrollWrites.length = 0;
+    await replayFrames(pending);
+    expect(scrollWrites).toHaveLength(0);
+    expect(viewport.scrollTop).toBe(nextTop);
+    if (input === "wheel") {
+      await contentResize();
+      expect(viewport.scrollTop).toBe(nextTop);
+    }
+  });
+
+  it("keeps a following tail at the edge when only the viewport shrinks", async () => {
+    await render();
+    await flushFrames();
+    const viewport = timeline();
+    const originalExtent = viewport.scrollHeight;
+    expect(viewport.scrollTop).toBe(originalExtent - viewport.clientHeight);
+
+    viewportHeight -= 100;
+    await notifyResize(viewport);
+    expect(viewport.scrollHeight).toBe(originalExtent);
+    expect(viewport.scrollTop).toBe(originalExtent - viewport.clientHeight);
+    expect(jumpLatest()).toBeNull();
+
+    await scrollbarPress(viewport);
+    const heldTop = viewport.scrollTop;
+    viewportHeight -= 100;
+    await notifyResize(viewport);
+    expect(viewport.scrollTop).toBe(heldTop);
+    await act(async () => window.dispatchEvent(new MouseEvent("mouseup", { button: 0 })));
+    expect(viewport.scrollTop).toBe(originalExtent - viewport.clientHeight);
   });
 
   it("shows whole-Run accounting only on its current completion while keeping segment usage private to running status", async () => {
@@ -349,6 +659,24 @@ async function render(update: Partial<TimelineProps> = {}): Promise<void> {
   await act(async () => root.render(<Timeline {...props} />));
 }
 
+async function renderCompletedWork(streaming = false): Promise<HTMLButtonElement> {
+  viewportHeight = 240;
+  const work = Array.from({ length: 8 }, (_, index) => item(`${props.ownerKey}-work-${index}`, index + 7, "thinking"));
+  await render({ sessionActive: streaming, messageNavRailEnabled: false, items: [
+    ...props.items.slice(0, 6), ...work, { ...item("short-answer", 15, "assistant"), streaming }
+  ] });
+  await flushFrames();
+  const viewport = timeline();
+  const header = viewport.querySelector<HTMLButtonElement>(".work-group__header")!;
+  extent = viewport.scrollTop + header.getBoundingClientRect().top + 160;
+  await contentResize();
+  expect(header.getAttribute("aria-expanded")).toBe("false");
+  expect(header.getBoundingClientRect().top).toBeGreaterThan(0);
+  expect(header.getBoundingClientRect().bottom).toBeLessThan(viewport.clientHeight);
+  expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+  return header;
+}
+
 async function append(items: readonly TimelineItemView[]): Promise<void> { await render({ items: [...props.items, ...items] }); }
 function timeline(): HTMLDivElement { return host.querySelector<HTMLDivElement>(".timeline")!; }
 function jumpLatest(): HTMLButtonElement | null { return host.querySelector<HTMLButtonElement>(".jump-latest"); }
@@ -368,11 +696,18 @@ async function scrollbarPress(viewport: HTMLElement): Promise<void> {
 }
 
 async function contentResize(): Promise<void> {
-  await act(async () => {
-    const content = host.querySelector(".timeline__virtual")!;
-    for (const observer of [...observers]) if (observer.targets.has(content)) observer.callback([], observer);
-  });
+  await notifyResize(host.querySelector(".timeline__virtual")!);
+}
+
+async function notifyResize(target: Element): Promise<void> {
+  await queueResize(target);
   await flushFrames();
+}
+
+async function queueResize(target: Element): Promise<void> {
+  await act(async () => {
+    for (const observer of [...observers]) if (observer.targets.has(target)) observer.callback([], observer);
+  });
 }
 
 async function flushFrames(): Promise<void> {
@@ -398,4 +733,13 @@ function interaction(id: string, sequence: number, kind: NonNullable<TimelineIte
 function restorePrototypeMethod(name: "scrollTo" | "scrollBy", descriptor: PropertyDescriptor | undefined): void {
   if (descriptor === undefined) Reflect.deleteProperty(HTMLElement.prototype, name);
   else Object.defineProperty(HTMLElement.prototype, name, descriptor);
+}
+
+function setSearchGeometryMethod(target: object, name: string, method: unknown): () => void {
+  const original = Object.getOwnPropertyDescriptor(target, name);
+  Object.defineProperty(target, name, { configurable: true, value: method });
+  return () => {
+    if (original === undefined) Reflect.deleteProperty(target, name);
+    else Object.defineProperty(target, name, original);
+  };
 }

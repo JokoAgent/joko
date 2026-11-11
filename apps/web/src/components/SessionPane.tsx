@@ -29,7 +29,7 @@ import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigatio
 import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
-import { Composer, type ComposerHistoryEntry } from "./Composer.js";
+import { Composer, type ComposerHistoryEntry, type PrepareRewindDraft } from "./Composer.js";
 import { CompactionStatusIndicator } from "./CompactionStatusIndicator.js";
 import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacityRing.js";
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
@@ -57,7 +57,9 @@ import { hasPendingComposerQueueItems, pauseQueueThenAbort, pauseQueueThenAbortR
 import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, resolveErrorTail } from "./error-tail-behavior.js";
 import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
-import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
+import { timelineHistoryOwnerKey } from "../timeline-history-cache.js";
+import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget } from "./message-actions.js";
+import { mergeTimelineWindows } from "./timeline-behavior.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
 import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
@@ -124,8 +126,11 @@ interface ActiveShareSelection {
 }
 
 interface ActiveMessageRewind extends MessageRewindPreviewState {
+  readonly requestId: number;
   readonly sessionId: string;
   readonly itemId: string;
+  readonly sourceEventId?: string;
+  readonly completionCursor?: bigint;
   readonly target: NativeNavigationTargetView;
   readonly generation: bigint;
   readonly navigate: AppController["navigateSessionBranch"];
@@ -151,8 +156,11 @@ interface ActiveMessageDelete {
 
 interface ActiveMessageFork {
   readonly sessionId: string;
+  readonly itemId: string;
   readonly messageId: string;
-  readonly target: MessageForkTarget;
+  readonly eventId: string;
+  readonly nativeEntryId: string;
+  readonly isCurrent: () => boolean;
 }
 
 export type SessionPanePresentation = "standard" | "filesRail";
@@ -426,9 +434,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current = undefined;
     rewindDocumentRef.current?.remove();
   }, []);
-  const beginDerivedTaskAction = () => {
-    const occurrence = {};
-    derivedTaskActionRef.current = occurrence;
+  const captureDerivedTaskSource = (): (() => boolean) => {
     const sourceState = controllerRef.current.state;
     const sourceProfileId = sourceState.activeProfile?.id;
     const sourceServerId = sourceState.activeProfile?.serverId;
@@ -440,25 +446,27 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const sourceSessionGeneration = session.generation;
     const sourceEpoch = rewindEpochRef.current;
     const sourceResourceOwner = timelineResourceOwnerRef.current;
-    return {
-      isCurrent: () => {
-        const current = controllerRef.current.state;
-        return derivedTaskActionRef.current === occurrence
-          && rewindEpochRef.current === sourceEpoch
-          && sourceResourceOwner !== undefined
-          && timelineResourceOwnerRef.current === sourceResourceOwner
-          && current.connectionState === "connected"
-          && current.connectionGeneration === sourceConnectionGeneration
-          && current.activeProfile?.id === sourceProfileId
-          && current.activeProfile?.serverId === sourceServerId
-          && current.activeProfile?.origin === sourceOrigin
-          && current.snapshot.generation === sourceSnapshotGeneration
-          && current.navigationRevision === sourceNavigationRevision
-          && activeSessionIdRef.current === sourceSessionId
-          && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration
-          && sessionRouteIsCurrent(current.route, sourceSessionId);
-      }
+    return () => {
+      const current = controllerRef.current.state;
+      return rewindEpochRef.current === sourceEpoch
+        && sourceResourceOwner !== undefined
+        && timelineResourceOwnerRef.current === sourceResourceOwner
+        && current.connectionState === "connected"
+        && current.connectionGeneration === sourceConnectionGeneration
+        && current.activeProfile?.id === sourceProfileId
+        && current.activeProfile?.serverId === sourceServerId
+        && current.activeProfile?.origin === sourceOrigin
+        && current.snapshot.generation === sourceSnapshotGeneration
+        && current.navigationRevision === sourceNavigationRevision
+        && activeSessionIdRef.current === sourceSessionId
+        && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration
+        && sessionRouteIsCurrent(current.route, sourceSessionId);
     };
+  };
+  const beginDerivedTaskAction = (isSourceCurrent = captureDerivedTaskSource()) => {
+    const occurrence = {};
+    derivedTaskActionRef.current = occurrence;
+    return { isCurrent: () => derivedTaskActionRef.current === occurrence && isSourceCurrent() };
   };
   const bottomOverlayRef = useRef<HTMLDivElement>(null);
   const composerMessageMentionInsertionIdRef = useRef(0);
@@ -468,6 +476,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const appliedExternalAttachmentInsertionRef = useRef<string | undefined>(undefined);
   const composerDraftReplacementIdRef = useRef(0);
   const composerLocalDraftEpochRef = useRef(0);
+  const rewindDraftRef = useRef<PrepareRewindDraft | null>(null);
   const noteComposerDraftMutation = useCallback(() => { composerLocalDraftEpochRef.current += 1; setComposerDraftReplacement(undefined); }, []);
   const shareSelectionBeforeAllRef = useRef<ReadonlySet<string> | undefined>(undefined);
   const messageRewindRequestIdRef = useRef(0);
@@ -691,6 +700,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     () => recoveryPresentationTimeline.filter((item) => !hidesFromTimelineHistory(item) && !(errorTailProjection?.hideFromTimeline === true && item.id === errorTailProjection.item.id)),
     [errorTailProjection, recoveryPresentationTimeline]
   );
+  const messageForkViewRef = useRef({ canFork: canForkMessage, timeline: visibleTimeline });
+  messageForkViewRef.current = { canFork: canForkMessage, timeline: visibleTimeline };
   const derivationOrigin = session.derivationOrigin;
   const personalReportsEnabled = !guest && !reviewReadOnly && session.remoteWorkspace === undefined && controller.state.activeProfile?.managedLocal === true
     && window.jokoDesktop?.capabilities.includes("development.personal") === true;
@@ -1524,67 +1535,94 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       reportMessageForkFailure(item.id, t("timeline.forkBusy"));
       return;
     }
-    setMessageFork({ sessionId: session.id, messageId: item.id, target });
+    if (item.sourceEventId === undefined) {
+      reportMessageForkFailure(item.id, t("timeline.forkUnavailable"));
+      return;
+    }
+    setMessageFork({
+      sessionId: session.id,
+      itemId: item.id,
+      messageId: item.messageId ?? item.id,
+      eventId: item.sourceEventId,
+      nativeEntryId: target.entryId,
+      isCurrent: captureDerivedTaskSource()
+    });
   };
 
   const confirmMessageFork = (): void => {
     const pending = messageFork;
     if (pending === undefined || pending.sessionId !== session.id || forkingMessageId !== undefined) return;
     setMessageFork(undefined);
-    const latestState = controllerRef.current.state;
-    const latestSnapshot = latestState.snapshot;
-    const latestSession = latestSnapshot.sessions.find((candidate) => candidate.id === pending.sessionId);
-    const latestBackend = latestSession === undefined
-      ? undefined
-      : latestSnapshot.backends.find((candidate) => candidate.id === latestSession.backendId);
-    const latestTimeline = latestSnapshot.timelineBySession.get(pending.sessionId) ?? [];
-    const latestItem = latestTimeline.find((candidate) => candidate.id === pending.messageId);
-    const latestTarget = latestItem === undefined ? undefined : resolveMessageForkTarget(latestItem);
-    const latestRunning = latestSession?.state === "running" || latestSession?.state === "waiting" || latestSession?.state === "retrying";
-    const routeCurrent = sessionRouteIsCurrent(latestState.route, pending.sessionId)
-      && activeSessionIdRef.current === pending.sessionId;
-    if (!routeCurrent) return;
-    if (
-      latestBackend?.capabilities.get("session.fork")?.supported !== true
-      || (latestSession?.worktree !== undefined
-        && latestBackend.capabilities.get("workspace.derive")?.supported !== true)
-      || latestItem === undefined
-      || latestItem.sourceEventId === undefined
-      || latestTarget?.entryId !== pending.target.entryId
-    ) {
-      reportMessageForkFailure(pending.messageId, t("timeline.forkUnavailable"));
+    if (!pending.isCurrent()) return;
+    const currentSource = () => {
+      const snapshot = controllerRef.current.state.snapshot;
+      const sourceSession = snapshot.sessions.find((candidate) => candidate.id === pending.sessionId);
+      if (!messageForkViewRef.current.canFork || sourceSession === undefined) return undefined;
+      const sourceBackend = snapshot.backends.find((candidate) => candidate.id === sourceSession.backendId);
+      if (sourceBackend?.capabilities.get("session.fork")?.supported !== true
+        || (sourceSession.worktree !== undefined && sourceBackend.capabilities.get("workspace.derive")?.supported !== true)) return undefined;
+      const timeline = snapshot.timelineBySession.get(pending.sessionId) ?? [];
+      const running = sourceSession.state === "running" || sourceSession.state === "waiting" || sourceSession.state === "retrying";
+      return { session: sourceSession, timeline, running };
+    };
+    const selectedMessage = (item: TimelineItemView | undefined) => {
+      if (item === undefined || item.sourceEventId !== pending.eventId || (item.messageId ?? item.id) !== pending.messageId) return undefined;
+      const target = resolveMessageForkTarget(item);
+      return target !== undefined && target.entryId === pending.nativeEntryId ? { item, target } : undefined;
+    };
+    const findMessage = (items: readonly TimelineItemView[]) => items.find((item) => item.id === pending.itemId);
+    const source = currentSource();
+    const liveItem = source === undefined ? undefined : findMessage(source.timeline);
+    const selected = selectedMessage(liveItem ?? findMessage(messageForkViewRef.current.timeline));
+    if (source === undefined || selected === undefined) {
+      reportMessageForkFailure(pending.itemId, t("timeline.forkUnavailable"));
       return;
     }
-    if (messageForkBlocked(latestTimeline, latestItem, latestRunning)) {
-      reportMessageForkFailure(pending.messageId, t("timeline.forkBusy"));
+    if (liveItem !== undefined && messageForkBlocked(source.timeline, liveItem, source.running)) {
+      reportMessageForkFailure(pending.itemId, t("timeline.forkBusy"));
       return;
     }
-    const sourceSessionId = pending.sessionId;
-    const sourceSessionName = latestSession?.name ?? session.name;
-    const sourceEventId = latestItem.sourceEventId;
-    const actionOwner = beginDerivedTaskAction();
-    const forkSession = controllerRef.current.forkSession;
-    const saveDraft = controllerRef.current.saveDraft;
-    const navigate = controllerRef.current.navigate;
+    const actionOwner = beginDerivedTaskAction(pending.isCurrent);
+    const { forkSession, saveDraft, navigate, loadSessionTimelineAround } = controllerRef.current;
     const forkOccurrence = {};
     messageForkActionRef.current = forkOccurrence;
-    setForkingMessageId(pending.messageId);
-    runAction(`fork-message:${pending.messageId}`, async () => {
+    setForkingMessageId(pending.itemId);
+    runAction(`fork-message:${pending.itemId}`, async () => {
       try {
+        let { item, target } = selected;
+        let sourceSessionName = source.session.name;
+        if (liveItem === undefined) {
+          // A cold row belongs to the persisted active history, even when this
+          // connection never observed it on the event stream.
+          const history = await loadSessionTimelineAround(pending.sessionId, pending.eventId).catch((cause: unknown) => {
+            if (!actionOwner.isCurrent()) return undefined;
+            throw new Error(t("timeline.forkUnavailable"), { cause });
+          });
+          if (!actionOwner.isCurrent() || history === undefined) return;
+          const latest = currentSource();
+          const persisted = selectedMessage(findMessage(history));
+          if (latest === undefined || persisted === undefined) throw new Error(t("timeline.forkUnavailable"));
+          const latestLiveItem = findMessage(latest.timeline);
+          if (latestLiveItem !== undefined && selectedMessage(latestLiveItem) === undefined) throw new Error(t("timeline.forkUnavailable"));
+          const timeline = mergeTimelineWindows(latest.timeline, history);
+          if (messageForkBlocked(timeline, persisted.item, latest.running)) throw new Error(t("timeline.forkBusy"));
+          ({ item, target } = persisted);
+          sourceSessionName = latest.session.name;
+        }
         const forkedSessionId = await forkSession(
-          sourceSessionId,
-          latestTarget.entryId,
+          pending.sessionId,
+          target.entryId,
           t("session.branchSuffix", { name: sourceSessionName }),
-          { messageId: latestItem.messageId ?? latestItem.id, eventId: sourceEventId }
+          { messageId: pending.messageId, eventId: pending.eventId }
         );
         if (!actionOwner.isCurrent()) return;
-        if (latestTarget.composerText !== undefined) {
-          const editorDocument = composerDocumentFromMessage(latestTarget.composerText, latestItem.quotesEncoded === true, {
-               sessionId: sourceSessionId,
-               messageId: latestItem.id,
-               role: "user",
-               ...(latestItem.sourceEventId === undefined ? {} : { sourceEventId: latestItem.sourceEventId })
-            }, "edit", latestItem.pastedTextRanges);
+        if (target.composerText !== undefined) {
+          const editorDocument = composerDocumentFromMessage(target.composerText, item.quotesEncoded === true, {
+            sessionId: pending.sessionId,
+            messageId: item.id,
+            role: "user",
+            sourceEventId: pending.eventId
+          }, "edit", item.pastedTextRanges);
           await saveDraft(forkedSessionId, {
             text: composerDocumentPlainText(editorDocument),
             editorDocument,
@@ -1599,7 +1637,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       } finally {
         if (messageForkActionRef.current === forkOccurrence) {
           messageForkActionRef.current = undefined;
-          setForkingMessageId((current) => current === pending.messageId ? undefined : current);
+          setForkingMessageId((current) => current === pending.itemId ? undefined : current);
         }
       }
     });
@@ -1800,7 +1838,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && activeSessionIdRef.current === session.id
       && controllerRef.current.navigateSessionBranch === sourceController.navigateSessionBranch
       && controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id)?.generation === generation;
-    setMessageRewind({ sessionId: session.id, itemId: item.id, target: navigationTarget, generation, navigate: sourceController.navigateSessionBranch, executeWorkspaceRewind: sourceController.executeWorkspaceRewind, isCurrent, loadingFiles: filesSupported });
+    setMessageRewind({ requestId, sessionId: session.id, itemId: item.id, sourceEventId: item.sourceEventId, completionCursor: item.completionCursor,
+      target: navigationTarget, generation, navigate: sourceController.navigateSessionBranch, executeWorkspaceRewind: sourceController.executeWorkspaceRewind,
+      isCurrent, loadingFiles: filesSupported });
     if (!filesSupported || workspace === undefined || runId === undefined) return;
     const sourceSessionId = session.id;
     const workspaceId = workspace.id;
@@ -1825,26 +1865,56 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     })();
   };
 
-  const closeMessageRewind = (): void => {
-    messageRewindRequestIdRef.current += 1;
-    setMessageRewind(undefined);
+  const closeMessageRewind = (requestId: number | undefined): void => {
+    if (messageRewindRequestIdRef.current === requestId) messageRewindRequestIdRef.current += 1;
+    setMessageRewind((current) => current?.requestId === requestId ? undefined : current);
   };
 
   const rewindDialogueOnly = async (): Promise<void> => {
     const rewind = messageRewind;
     if (rewind === undefined || !rewind.isCurrent() || rewind.sessionId !== session.id) throw new Error(t("timeline.rewindUnavailable"));
-    const latest = controllerRef.current.state.snapshot;
-    const latestSession = latest.sessions.find((candidate) => candidate.id === rewind.sessionId);
-    const latestBackend = latestSession === undefined ? undefined : latest.backends.find((candidate) => candidate.id === latestSession.backendId);
-    const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
-    const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
-    if (latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
-    const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
-    if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
-      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, sessionCapabilitySupportsTarget(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
-      throw new Error(t("timeline.rewindStale"));
+    const readCurrentMessage = (): TimelineItemView => {
+      const latest = controllerRef.current.state.snapshot;
+      const latestSession = latest.sessions.find((candidate) => candidate.id === rewind.sessionId);
+      const latestBackend = latestSession === undefined ? undefined : latest.backends.find((candidate) => candidate.id === latestSession.backendId);
+      const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
+      const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
+      if (!rewind.isCurrent() || latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
+      const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
+      if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
+        || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, sessionCapabilitySupportsTarget(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
+        throw new Error(t("timeline.rewindStale"));
+      }
+      return currentItem;
+    };
+    const item = readCurrentMessage();
+    const text = rewind.target.kind === "native_entry" && !guest && !reviewReadOnly && session.derivationOrigin?.sideChat !== true
+      && item.sourceEventId === rewind.sourceEventId && item.completionCursor === rewind.completionCursor
+      && controllerRef.current.state.taskSource?.kind !== "joined"
+      && (partnerConversation === undefined || partnerConversation.kind === "task") ? plainMessageRewindDraftText(item) : undefined;
+    const prepare = rewindDraftRef.current;
+    let restore: Awaited<ReturnType<PrepareRewindDraft>> = undefined;
+    let draftFailed = false;
+    if (text !== undefined && prepare !== null) {
+      try { restore = await prepare(rewind.isCurrent); }
+      catch { draftFailed = true; }
+      const current = readCurrentMessage();
+      if (current.sourceEventId !== item.sourceEventId || current.completionCursor !== item.completionCursor || plainMessageRewindDraftText(current) !== text) {
+        restore = undefined;
+        draftFailed = false;
+      }
     }
-    await rewind.navigate(rewind.sessionId, rewind.target, { expectedGeneration: rewind.generation });
+    let sameGenerationConfirmed = false;
+    await rewind.navigate(rewind.sessionId, rewind.target, {
+      expectedGeneration: rewind.generation,
+      ...(restore === undefined ? {} : { onSameGenerationConfirmed: () => { sameGenerationConfirmed = true; } })
+    });
+    if (!rewind.isCurrent() || text === undefined) return;
+    try { if (sameGenerationConfirmed) await restore?.(text); }
+    catch { draftFailed = true; }
+    if (draftFailed && rewind.isCurrent()) {
+      runAction(`rewind-draft:${rewind.itemId}`, async () => { throw new Error(t("timeline.rewindDraftRestoreFailed")); });
+    }
   };
 
   const rewindFilesOnly = async (): Promise<void> => {
@@ -2263,6 +2333,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         hasEarlier={timelineHasEarlier}
         historyLoading={timelineHistoryLoading}
         historyError={timelineHistoryError}
+        historyOwnerKey={timelineHistoryOwnerKey(controller.state.activeProfile, controller.state.snapshot.generation, session.id,
+          session.generation, controller.state.snapshot.timelineHistoryRevisionBySession.get(session.id) ?? 0n)}
         onLoadEarlier={onLoadEarlierTimeline}
         onInlinePlanVisibilityChange={handleInlinePlanVisibilityChange}
         followLatestSignal={followLatestSignal}
@@ -2422,7 +2494,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }}
           t={t}
         />}
-<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
+<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} rewindDraftRef={rewindDraftRef} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
           if (handoff !== undefined) {
             if (!objectiveDialogRequestMatchesOwner(handoff, controller, session)) {
               onObjectiveDialogHandoffHandled?.(handoff.id);
@@ -2449,7 +2521,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         </div>
       </Modal>
       <MessageForkDialog
-        key={currentMessageFork === undefined ? "message-fork:none" : `${currentMessageFork.sessionId}:${currentMessageFork.messageId}`}
+        key={currentMessageFork === undefined ? "message-fork:none" : `${currentMessageFork.sessionId}:${currentMessageFork.itemId}`}
         open={currentMessageFork !== undefined}
         t={t}
         onClose={() => setMessageFork(undefined)}
@@ -2489,11 +2561,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         </div>
       </Modal>
       <MessageRewindDialog
-        key={messageRewind === undefined ? "message-rewind:none" : `${messageRewind.sessionId}:${messageRewind.itemId}`}
+        key={messageRewind?.requestId ?? "message-rewind:none"}
         open={messageRewind !== undefined && messageRewind.sessionId === session.id}
         state={messageRewind ?? { loadingFiles: false }}
         t={t}
-        onClose={closeMessageRewind}
+        onClose={() => closeMessageRewind(messageRewind?.requestId)}
         onDialogueOnly={rewindDialogueOnly}
         onFilesOnly={rewindFilesOnly}
       />
@@ -2502,6 +2574,16 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       </Modal>
     </main>
   );
+}
+
+function plainMessageRewindDraftText(item: TimelineItemView): string | undefined {
+  if (item.kind !== "user" || item.streaming === true || item.completionCursor === undefined || !item.sourceEventId
+    || item.partnerPrivateOrigin !== undefined || item.sharedTaskAuthor !== undefined || item.automationOrigin !== undefined
+    || item.inputDelivery === "scheduler"
+    || item.replyQuote !== undefined || item.todoQuote !== undefined || item.quotesEncoded === true
+    || (item.attachments?.length ?? 0) > 0 || (item.inputMentions?.length ?? 0) > 0
+    || (item.mentionRanges?.length ?? 0) > 0 || (item.pastedTextRanges?.length ?? 0) > 0) return undefined;
+  return item.text?.trim() ? item.text : undefined;
 }
 
 async function restoreEditedMessageDraft(

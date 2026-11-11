@@ -458,16 +458,21 @@ describe("ordered Thinking inside canonical Mobile messages", () => {
     expect(timelineRows([first, second, final])).toMatchObject([{ id: "answer", text: "Final words.", completed: true }]);
   });
 
-  it("keeps an interrupted Claude reply when another attempt completes", () => {
-    const first = scoped(1, "textDelta", { messageId: "claude-block-1-0", contentIndex: 0, delta: "First reply." });
+  it.each(["claude-block", "assistant-b324bbdc-36f8-4014-a181-76bee0e27d4e"])("keeps an interrupted %s reply when another attempt completes", (prefix) => {
+    const first = scoped(1, "textDelta", { messageId: `${prefix}-1-0`, contentIndex: 0, delta: "First reply." });
     const failed = scoped(2, "terminalError", { error: { message: "The stream ended." } });
-    const next = scoped(3, "textDelta", { messageId: "claude-block-2-0", contentIndex: 0, delta: "Next reply" });
+    const next = scoped(3, "textDelta", { messageId: `${prefix}-2-0`, contentIndex: 0, delta: "Next reply" });
     const final = scoped(4, "messageCompleted", { messageId: "final", role: MessageRole.ASSISTANT,
       blocks: [{ content: { case: "text", value: "Next reply finished." } }] });
     for (const event of [next, final]) event.identity!.attemptId = "retry";
-    expect(timelineRows([first, failed, next, final]).filter(row => row.kind === "assistant")).toMatchObject([
-      { id: "claude-block-1-0", text: "First reply.", completed: false, runOutcome: "failed" },
-      { id: "final", text: "Next reply finished.", completed: true }
+    const nextDelta = scoped(5, "textDelta", { messageId: `${prefix}-3-0`, contentIndex: 0, delta: "Another turn." });
+    const nextFinal = scoped(6, "messageCompleted", { messageId: "next-final", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "Another turn." } }] });
+    for (const event of [nextDelta, nextFinal]) event.identity!.runId = "next-run";
+    expect(timelineRows([first, failed, next, final, nextDelta, nextFinal]).filter(row => row.kind === "assistant")).toMatchObject([
+      { id: `${prefix}-1-0`, text: "First reply.", completed: false, runOutcome: "failed" },
+      { id: "final", text: "Next reply finished.", completed: true },
+      { id: "next-final", text: "Another turn.", completed: true }
     ]);
   });
 

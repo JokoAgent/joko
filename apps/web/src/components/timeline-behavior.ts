@@ -6,6 +6,7 @@ const FENCE_LINE = /^\s{0,3}(`{3,}|~{3,})(.*)$/;
 export interface TimelineViewportState {
   readonly anchorItemId?: string;
   readonly anchorOffset: number;
+  readonly historyOwnerKey?: string;
   readonly following: boolean;
   readonly unreadCount: number;
   readonly knownItemIds: ReadonlySet<string>;
@@ -20,7 +21,7 @@ export interface TimelineViewportState {
 export class TimelineViewportStore {
   readonly #states = new Map<string, TimelineViewportState>();
 
-  restore(ownerKey: string, items: readonly TimelineItemView[]): TimelineViewportState {
+  restore(ownerKey: string, items: readonly TimelineItemView[], loadingHistoryOwnerKey?: string): TimelineViewportState {
     const stored = this.#states.get(ownerKey);
     const currentIds = new Set(items.map((item) => item.id));
     const currentUnreadIds = timelineUnreadItemIds(items);
@@ -40,12 +41,14 @@ export class TimelineViewportStore {
 
     const added = countUnreadTimelineItems(stored.knownUnreadItemIds, stored.maximumSequence, items, stored.following);
     const maximumSequence = maximumBigInt(stored.maximumSequence, currentMaximum);
-    const anchorItemId = stored.anchorItemId !== undefined && (items.length === 0 || currentIds.has(stored.anchorItemId))
+    const loadingSameHistory = loadingHistoryOwnerKey !== undefined && loadingHistoryOwnerKey === stored.historyOwnerKey;
+    const anchorItemId = stored.anchorItemId !== undefined && (items.length === 0 || currentIds.has(stored.anchorItemId) || loadingSameHistory)
       ? stored.anchorItemId
       : undefined;
     const restored: TimelineViewportState = {
       ...(anchorItemId === undefined ? {} : { anchorItemId }),
       anchorOffset: anchorItemId === undefined ? 0 : stored.anchorOffset,
+      historyOwnerKey: stored.historyOwnerKey,
       following: stored.following,
       unreadCount: stored.following ? 0 : stored.unreadCount + added,
       knownItemIds: currentIds,
@@ -56,13 +59,14 @@ export class TimelineViewportStore {
     return cloneTimelineViewportState(restored);
   }
 
-  save(ownerKey: string, viewport: Pick<TimelineViewportState, "anchorItemId" | "anchorOffset" | "following" | "unreadCount">, items: readonly TimelineItemView[]): void {
+  save(ownerKey: string, viewport: Pick<TimelineViewportState, "anchorItemId" | "anchorOffset" | "historyOwnerKey" | "following" | "unreadCount">, items: readonly TimelineItemView[]): void {
     const previous = this.#states.get(ownerKey);
     const currentMaximum = maximumTimelineSequence(items);
     const maximumSequence = maximumBigInt(previous?.maximumSequence, currentMaximum);
     this.#states.set(ownerKey, {
       ...(viewport.anchorItemId === undefined ? {} : { anchorItemId: viewport.anchorItemId }),
       anchorOffset: viewport.anchorOffset,
+      historyOwnerKey: viewport.historyOwnerKey,
       following: viewport.following,
       unreadCount: viewport.following ? 0 : viewport.unreadCount,
       knownItemIds: new Set(items.map((item) => item.id)),
