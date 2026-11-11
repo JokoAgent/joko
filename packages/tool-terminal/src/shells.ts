@@ -56,10 +56,18 @@ export async function discoverTerminalShells(source: Readonly<NodeJS.ProcessEnv>
       id: definition.id, label: definition.label, executable, args: definition.args, isDefault: false
     });
   }
-  const selected = process.platform === "win32" ? shells[0] : shells.find((shell) => {
-    const preferred = source.SHELL;
-    return preferred !== undefined && basename(preferred) === shell.id;
-  }) ?? shells[0];
+  let selected = shells[0];
+  if (process.platform !== "win32") {
+    const preferred = source.SHELL?.trim();
+    const executable = preferred ? await firstExecutable([preferred]) : undefined;
+    if (preferred !== undefined && executable !== undefined) {
+      selected = shells.find((shell) => shell.executable === preferred);
+      if (selected === undefined) {
+        selected = { id: "login-shell", label: basename(preferred), executable: preferred, args: [], isDefault: false };
+        shells.push(selected);
+      }
+    }
+  }
   return shells.map((shell) => ({ ...shell, isDefault: shell === selected }));
 }
 
