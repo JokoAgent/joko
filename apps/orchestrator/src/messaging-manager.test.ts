@@ -385,6 +385,34 @@ describe("MessagingManager", () => {
     expect(deliveries().map(({ attempts }) => attempts)).toEqual([2, 1]);
   });
 
+  it("admits a pure Telegram group summon with context and does not run for a bare display name", async () => {
+    const from = { id: 99, first_name: "Guest", is_bot: false };
+    const chat = { id: -100555, type: "supergroup" as const };
+    const date = Math.floor(Date.now() / 1_000), mention = "@joko_test_bot";
+    const batch: TelegramUpdate[] = [
+      { update_id: 9, message: { message_id: 77, from, chat, date, text: "Joko has a schedule today" } },
+      { update_id: 10, message: { message_id: 78, from, chat, date, text: mention,
+        entities: [{ type: "mention", offset: 0, length: mention.length }] } }
+    ];
+    const transport = new FakeTelegramTransport(normalizeTelegramUpdates(batch, { connectionId: "placeholder", ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } }));
+    const adapter = new ControlledReplyAdapter();
+    const fixture = await createFixture(() => transport, () => adapter);
+    const connection = await enableTelegramReply(fixture, "telegram-summon");
+    await vi.waitFor(() => expect(adapter.context?.inputQueueItemId).toBeDefined());
+    const requests = fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    expect(requests).toMatchObject([{ providerMessageId: "78", status: "queued" }]);
+    const queue = fixture.store.getQueueItem(adapter.context!.inputQueueItemId!);
+    expect(queue.body.text).toContain("<group_chat_context>\n[Guest] Joko has a schedule today\n</group_chat_context>");
+    expect(queue.body.text).toContain("The speaker explicitly called the bot without adding a text request.");
+    expect(queue.body.text).not.toContain("<ambient_mode>");
+    expect(queue.executionOverrides?.permissionMode).toBe("ask");
+    await vi.waitFor(() => expect(transport.typing).toHaveLength(1));
+    await adapter.finish("I read the earlier context.");
+    await vi.waitFor(() => expect(transport.sentText).toMatchObject([{ text: "I read the earlier context." }]));
+    expect(fixture.store.getMessagingInboundRequest(requests[0]!.id).status).toBe("completed");
+  });
+
   it("retires a pending stream when its original connection generation is disabled", async () => {
     const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
     const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 20, discordMs: 20 });

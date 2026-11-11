@@ -1880,6 +1880,8 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     event: MessagingInboundMessage
   ): MessagingDeliveryRecord | undefined {
+    if (connection.channel === "telegram" && event.address.conversationKind !== "direct"
+      && event.text.trim() === "" && event.attachments.length === 0 && event.unsupported.length === 0) return undefined;
     const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
     if (event.replyContext !== null) {
       const exact = this.#store.findSentMessagingInteractionDelivery({
@@ -2877,6 +2879,9 @@ export class MessagingManager {
       );
     }
     if (event.text.trim() !== "") sections.push(event.text);
+    else if (event.address.channel === "telegram" && conversation.conversationKind !== "direct" && !event.ambient) {
+      sections.push("The speaker explicitly called the bot without adding a text request.");
+    }
     if (event.unsupported.length > 0) {
       sections.push(event.unsupported.map((part) => `[Unsupported ${part.code}] ${part.label}`).join("\n"));
     }

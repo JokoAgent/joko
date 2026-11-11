@@ -109,6 +109,38 @@ describe("normalizeTelegramUpdates", () => {
     expect(result.groupObservations).toHaveLength(3);
   });
 
+  it("keeps explicit empty summons and checks text and caption mentions against the bot identity", () => {
+    const group = (id: number, text?: string) => message({ id, from: STRANGER, chatId: -10, chatType: "group",
+      ...(text === undefined ? {} : { text }) });
+    const pure = update(70, { ...group(70, "@jokobot"), entities: [{ type: "mention", offset: 0, length: 8 }] });
+    const named = update(71, { ...group(71, "😺 Joko 你好"),
+      entities: [{ type: "text_mention", offset: 3, length: 4, user: BOT }] });
+    const other = update(72, { ...group(72, "Joko 你好"),
+      entities: [{ type: "text_mention", offset: 0, length: 4, user: user(701, "Joko", "other_bot", true) }] });
+    const manual = update(73, group(73, "@Joko"));
+    const bare = update(74, group(74, "Joko 今天请假了"));
+    const photo = update(75, { ...message({ id: 75, from: STRANGER, chatId: -10, chatType: "group", photoId: "caption-photo" }),
+      caption: "😀 Joko 看图", caption_entities: [{ type: "text_mention", offset: 3, length: 4, user: BOT }] });
+    const reply = update(76, { ...group(76), reply_to_message: message({ id: 66, from: BOT, chatId: -10, chatType: "group", text: "Earlier reply" }) });
+    const malformed = update(77, { ...group(77, "Joko"),
+      entities: [{ type: "text_mention", offset: 1, length: 4, user: BOT }] });
+    const result = normalizeTelegramUpdates([pure, named, other, manual, bare, photo, reply, malformed], options());
+    expect(result.events).toEqual([
+      expect.objectContaining({ messageId: "70", text: "", ambient: false }),
+      expect.objectContaining({ messageId: "71", text: "😺 你好", ambient: false }),
+      expect.objectContaining({ messageId: "73", text: "", ambient: false }),
+      expect.objectContaining({ messageId: "75", text: "😀 看图", ambient: false, attachments: [expect.objectContaining({ kind: "image" })] }),
+      expect.objectContaining({ messageId: "76", text: "", ambient: false, replyContext: expect.objectContaining({ text: "Earlier reply" }) })
+    ]);
+    expect(result.ignored.map(({ providerRequestId, reason }) => [providerRequestId, reason])).toEqual(
+      [72, 74, 77].map(id => [`telegram:update:${id}`, "unaddressed"]));
+    expect(normalizeTelegramUpdates([pure], options({ groupActivation: { "-10": "disabled" } })).events).toEqual([]);
+    expect(normalizeTelegramUpdates([pure, bare], options({ groupActivation: { "-10": "always" } })).events).toEqual([
+      expect.objectContaining({ messageId: "70", text: "", ambient: false }),
+      expect.objectContaining({ messageId: "74", text: "Joko 今天请假了", ambient: true })
+    ]);
+  });
+
   it("folds one media group into one event and flags oversize items", () => {
     const first = message({
       id: 30,
