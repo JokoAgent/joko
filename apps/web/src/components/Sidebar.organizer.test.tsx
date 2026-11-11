@@ -881,6 +881,15 @@ describe("Sidebar organizer display controls", () => {
     await act(async () => projectTrigger.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
     let projectMenu = document.body.querySelector<HTMLElement>(".session-project-menu-popover");
     if (projectMenu === null) throw new Error("Project submenu was not rendered.");
+    const projectList = required(projectMenu.querySelector(".session-project-menu__projects"));
+    await act(async () => { projectList.dispatchEvent(new Event("scroll")); });
+    expect(projectMenu.isConnected).toBe(true);
+    const parentMenu = menu;
+    await act(async () => { parentMenu.dispatchEvent(new Event("scroll")); });
+    expect(parentMenu.isConnected).toBe(true);
+    expect(projectMenu.isConnected).toBe(false);
+    await act(async () => projectTrigger.click());
+    projectMenu = required(document.body.querySelector<HTMLElement>(".session-project-menu-popover"));
     expect(buttonWithText(projectMenu, "Project B").disabled).toBe(true);
     const projectAButton = buttonWithText(projectMenu, "Project A");
     await act(async () => projectAButton.click());
@@ -897,6 +906,33 @@ describe("Sidebar organizer display controls", () => {
     const dialogueButton = buttonWithText(projectMenu, "session.moveToDialogue");
     await act(async () => dialogueButton.click());
     expect(onMoveSessionProject).toHaveBeenLastCalledWith(moved, { kind: "dialogue" });
+  });
+
+  it("opens the original task after its menu scrolls and dismisses the menu on outside scroll or resize", async () => {
+    const onOpenSessionWindow = vi.fn();
+    const { container } = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), { onOpenSessionWindow });
+    const row = required(container.querySelector("[data-session-id='session']"));
+    const openMenu = async () => {
+      await act(async () => {
+        row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 82, clientY: 90 }));
+      });
+      return required(document.body.querySelector<HTMLElement>(".session-menu-popover"));
+    };
+
+    const scrolledMenu = await openMenu();
+    await act(async () => { scrolledMenu.dispatchEvent(new Event("scroll")); });
+    expect(scrolledMenu.isConnected).toBe(true);
+    await act(async () => buttonWithText(scrolledMenu, "session.openNewWindow").click());
+    expect(onOpenSessionWindow).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: "session" }));
+    expect(scrolledMenu.isConnected).toBe(false);
+
+    const outsideScrollMenu = await openMenu();
+    await act(async () => { container.dispatchEvent(new Event("scroll")); });
+    expect(outsideScrollMenu.isConnected).toBe(false);
+
+    const resizedMenu = await openMenu();
+    await act(async () => { window.dispatchEvent(new Event("resize")); });
+    expect(resizedMenu.isConnected).toBe(false);
   });
 
   it("opens the task menu at the row context point and supports synchronous selection, inline rename, bulk actions, and quick archive", async () => {
@@ -1536,6 +1572,7 @@ interface SidebarRenderOptions {
   readonly mode?: SidebarProps["mode"];
   readonly sidebarOwnerLayouts?: SidebarProps["sidebarOwnerLayouts"];
   readonly onMoveSessionProject?: SidebarProps["onMoveSessionProject"];
+  readonly onOpenSessionWindow?: SidebarProps["onOpenSessionWindow"];
   readonly onNavigate?: SidebarProps["onNavigate"];
   readonly onNewTask?: SidebarProps["onNewTask"];
   readonly onNewTaskInTarget?: SidebarProps["onNewTaskInTarget"];
@@ -1660,6 +1697,7 @@ async function renderSidebar(
       onPreviewScheduleDeletion={options.onPreviewScheduleDeletion}
       onDeleteSchedule={options.onDeleteSchedule}
       onMoveSessionProject={options.onMoveSessionProject}
+      onOpenSessionWindow={options.onOpenSessionWindow}
       onSearchMessages={async () => []}
       onMessageSearchSortChange={noop}
       onSidebarDisplayPreferencesChange={onPreferencesChange}
