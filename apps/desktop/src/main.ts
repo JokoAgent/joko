@@ -1804,10 +1804,25 @@ function createWindow(): void {
       });
     });
   } else {
-    window.once("ready-to-show", () => {
-      window.show();
+    let initialPresentationHandled = false;
+    let alreadyShown = false;
+    window.once("show", () => { alreadyShown = true; });
+    const presentInitialWindow = (): void => {
+      if (initialPresentationHandled || mainWindow !== window || window.isDestroyed() || !canShowDesktopWindow({
+        quitting,
+        channelQuitHandoffPending: desktopUpdateChannelQuitHandoffPending,
+        nativeInstallQuitHandoffPending: desktopUpdateNativeInstallQuitHandoffPending,
+        completeExitQuitHandoffPending: desktopCompleteExitQuitHandoffPending
+      })) return;
+      initialPresentationHandled = true;
+      if (!alreadyShown && !window.isMinimized()) window.show();
       desktopRemoteDesktopViewerPrewarm.schedule(window);
-    });
+    };
+    window.once("ready-to-show", presentInitialWindow);
+    if (process.platform === "linux") {
+      // A hidden Linux window can finish loading without emitting ready-to-show.
+      windowContents.once("did-finish-load", presentInitialWindow);
+    }
   }
   if (packagedSmoke) {
     void loadUi(window).catch((error: unknown) => {
