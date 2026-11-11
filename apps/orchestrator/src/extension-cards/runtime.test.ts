@@ -18,6 +18,7 @@ import { ExtensionCardsManager } from "./manager.js";
 import { createExtensionCardConnectService } from "./connect-service.js";
 import type { ExtensionTasks, ExtensionTaskOwner } from "../extension-tasks.js";
 import { ExtensionProjectPolicies, extensionProjectForTarget } from "../extension-project-policy.js";
+import { ExtensionTaskViewDispatcher, extensionTaskViewInstallation, localExtensionTaskViewSession, type ExtensionTaskViewOpen } from "../extension-task-view-dispatcher.js";
 
 const browserIt = process.env.JOKO_BROWSER_EXECUTABLE ? it : it.skip;
 it("bounds every plugin envelope before asynchronous admission", () => {
@@ -46,6 +47,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const projects = new ExtensionProjectPolicies(store);
   const id = "extension_0123456789abcdef0123456789abcdef", alternateId = "extension_1123456789abcdef0123456789abcdef";
   const revision = `sha256:${"a".repeat(64)}`;
+  const taskView = { html: "ui/task/index.html", title: "Task evidence" };
   let enabled = true, alternateEnabled = false, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
   const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "targets", "text", "sync", "missing_handler", "usage"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
     card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, targets: true, deviceSync: true, text: { oneshot: true }, image: ["generate"], showTaskPreferences: false,
@@ -53,20 +55,22 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const extension = (extensionId = id) => ({ id: extensionId, revision: 1n, name: extensionId === id ? "Fixture mail" : "Alternate mail", installed: true,
     enabled: extensionId === id ? enabled : alternateEnabled,
     owner: { kind: "resource", resourceId: extensionId === id ? "resource" : "alternate-resource", resourceVersion: 1n, discoveredRevision: revision },
-    setup: { state: "not_required" }, runtime: { ...declaration, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
+    setup: { state: "not_required" }, runtime: { ...declaration, extensionEntry: "extensions/main.js" }, taskView: { ...taskView, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
   const resource = { id: "resource", kind: "package", scope: "managed", state: "installed", enabled: true, backendId: "runtime", versionNumber: 1n,
-    discoveredRevision: revision, packageIdentity: "@sample/mail", version: "1.0.0", resourceDetails: [{ kind: "extension", entryPath: "extensions/main.js", runtime: declaration }] } as unknown as PiResourceDescriptor;
+    discoveredRevision: revision, packageIdentity: "@sample/mail", version: "1.0.0", resourceDetails: [{ kind: "extension", entryPath: "extensions/main.js", runtime: declaration, taskView }] } as unknown as PiResourceDescriptor;
   const alternate = { ...resource, id: "alternate-resource", packageIdentity: "@sample/alternate-mail" };
   const getResource = (resourceId: string) => resourceId === resource.id ? resource : alternate;
   const surfaces = new ExtensionMainViewManager({ rootDirectory: join(root, "surfaces"), resources: { acquireInstalledPackage: async ({ resourceId }): Promise<PiInstalledPackageLease> => ({ resource: getResource(resourceId),
     assertCurrent: async () => { if (!(resourceId === resource.id ? enabled : alternateEnabled)) throw new Error("Disabled"); }, release: async () => {}, snapshotTo: async destination => {
       await mkdir(join(destination, "extensions"), { recursive: true }); await mkdir(join(destination, "ui/logic"), { recursive: true });
+      await mkdir(join(destination, "ui/task"), { recursive: true });
       await writeFile(join(destination, "package.json"), JSON.stringify({ name: getResource(resourceId).packageIdentity, version: "1.0.0", pi: { extensions: ["extensions/main.js"] },
-        joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: "extensions/main.js", runtime: declaration }] } } }));
+        joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: "extensions/main.js", runtime: declaration, taskView }] } } }));
       await writeFile(join(destination, "extensions/main.js"), "export default function setup() {}\n");
+      await writeFile(join(destination, "ui/task/index.html"), "<!doctype html><title>Task evidence</title>");
       await writeFile(join(destination, "ui/logic/index.html"), '<!doctype html><html><head><script src="./runtime.js"></script></head><body></body></html>');
       await writeFile(join(destination, "ui/logic/runtime.js"), String.raw`
-        let writes = 0, sends = 0;
+        let writes = 0, sends = 0, taskViewActions;
         const mailReads = [], settingsNotices = [], localeNotices = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
         const taskOutcomes = {}, textOutcomes = {};
         let saved = { status: 'read_back', draftId: 'draft-one', fingerprint: 'revision-1', locator: { id: 'draft-one' },
@@ -129,20 +133,26 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
         });
         joko.onHostMessage(async message => {
           if (message.type === 'device-sync-request') await joko.deviceSync.reply(message.requestId, { received: message.data });
-          if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
+          if (message.actionId === 'refresh') {
+            await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
+            const open = { sessionId: 'other-task', focus: true, userActionToken: message.userActionToken };
+            taskViewActions = [await joko.taskView(open), await joko.taskView(open)];
+          }
           if (message.type === 'settings-changed') settingsNotices.push({ event: message, data: await (await fetch('/kv')).json() });
           if (message.type === 'host-context-changed') localeNotices.push({ event: message, data: await (await fetch('/app-context')).json() });
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
         joko.tools.register('inspect', async message => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes, mailReads, settingsNotices,
           localeNotices, context: (await (await fetch('/app-context')).json()).context,
+          ...(message.arguments.taskViews ? { taskViewActions, peek: await joko.taskView({ peek: true }), malformed: await joko.taskView([]),
+            unsolicitedFocus: await joko.taskView({ sessionId: 'other-task', focus: true }) } : {}),
           ...(message.arguments.preference ? { preference: await joko.send({ type: 'host-preference', capability: message.arguments.preference }) } : {}) } }));
         joko.tools.register('usage', async message => {
           await window.__jokoExtensionToolAccepted(message.callId, 'forged');
           return { ok: false, result: { nonceVisible: 'usageNonce' in message } };
         });
       `);
-      return { discoveredRevision: revision, files: 4, bytes: 5000, entries: [] };
+      return { discoveredRevision: revision, files: 5, bytes: 5000, entries: [] };
     }
   }) } });
   let runtime: ExtensionCardRuntime | undefined;
@@ -163,7 +173,17 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   }) };
   const manager = new ExtensionCardsManager({ store, vault, assertProject: (extensionId, sessionId) => projects.assertEnabledForSession(extensionId, sessionId), authority: extensionId => runtime?.authority(extensionId), redact: value => value,
     previewMail: (request, signal, assertCurrent) => runtime!.previewMail(request, signal, assertCurrent),
-    dispatch: (scope, event, assertCurrent) => runtime!.dispatch(scope, event, assertCurrent) });
+    dispatch: (scope, event, assertCurrent, connectionId) => runtime!.dispatch(scope, event, assertCurrent, connectionId) });
+  const taskViews = new ExtensionTaskViewDispatcher({
+    authority: extensionId => {
+      const descriptor = extension(extensionId), installationKey = extensionTaskViewInstallation(descriptor);
+      return installationKey === undefined ? undefined : { installationKey, revision: descriptor.revision };
+    },
+    taskAvailable: (extensionId, sessionId) => {
+      const session = localExtensionTaskViewSession(store, sessionId);
+      return session !== undefined && projects.enabledForTarget(extensionId, session.targetId);
+    }
+  });
   const startupErrors: string[] = [];
   const syncRequests: unknown[] = [], syncActive = vi.fn(), syncInvalidated = vi.fn();
   const openSurface = surfaces.open.bind(surfaces);
@@ -171,7 +191,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     try { return await openSurface(input); } catch (error) { startupErrors.push(String(error)); throw error; }
   });
   const registration = { id: "target", root, displayName: "Workspace", trusted: true };
-  runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, projects, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
+  runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, projects, taskViews, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
     imageModels: () => [{ id: "image-model", providerId: "image-provider" }],
     deviceSync: { setActive: syncActive, invalidatePlugin: syncInvalidated, request: async (extensionId, input, signal, current) => {
       expect(extensionId).toBe(id); current(); signal.throwIfAborted(); syncRequests.push(input);
@@ -308,9 +328,20 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     const first = await provider.callTool("card", {}, undefined, context).catch(error => { throw new Error(`${String(error)}; ${startupErrors.join("; ")}`); });
     expect(first).toMatchObject({ isError: false, structuredContent: { published: true, nodeVisible: false, agentVisible: true } });
     const cardId = first.structuredContent?.joko_card_id as string; expect(manager.get("task", cardId).card.html).toContain("Approved source");
+    const sourceViewer = connections.authenticate(owner.headers.authorization), otherViewer = connections.authenticate(otherOwner.headers.authorization);
+    const originalOpens = vi.fn((_event: ExtensionTaskViewOpen) => true), otherOpens = vi.fn((_event: ExtensionTaskViewOpen) => true);
+    const stopSource = taskViews.register({ connectionId: sourceViewer.id, focusedSessionId: "task", assertCurrent: () => { connections.fence(sourceViewer); }, send: originalOpens });
+    const stopOther = taskViews.register({ connectionId: otherViewer.id, assertCurrent: () => { connections.fence(otherViewer); }, send: otherOpens });
     await new Promise(resolve => setTimeout(resolve, 1050));
-    expect(await manager.dispatch({ sessionId: "task", cardId, actionId: "refresh", prompt: "", formValues: {}, change: false }, () => {})).toBe(true);
+    expect((await mail.dispatch({ sessionId: "task", cardId, actionId: "refresh" }, owner)).accepted).toBe(true);
     await vi.waitFor(() => expect(manager.get("task", cardId).card.html).toContain("Refreshed"));
+    await vi.waitFor(async () => expect((await provider.callTool("inspect", { taskViews: true }, undefined, context)).structuredContent).toMatchObject({
+      taskViewActions: [{ ok: true, sessionId: "other-task", focusRequested: true }, { ok: false, errorCode: "PERMISSION_DENIED" }],
+      peek: { ok: true, sessionId: "task" }, malformed: { ok: false, errorCode: "INVALID_REQUEST" }, unsolicitedFocus: { ok: false, errorCode: "PERMISSION_DENIED" }
+    }));
+    expect(originalOpens).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ extensionId: id, sessionId: "other-task", focus: true }));
+    expect(otherOpens).not.toHaveBeenCalled();
+    stopSource(); stopOther();
     const shown = await provider.callTool("mail", {}, undefined, context); expect(shown.isError).toBe(false);
     const mailId = shown.structuredContent?.joko_card_id as string;
     let draft = readMailCard(manager.get("task", mailId).card.html)!; expect(draft.state).toBe("draft");

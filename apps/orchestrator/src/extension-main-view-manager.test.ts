@@ -46,6 +46,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
   let surfaceLibrary: ExtensionMainViewAuthority["library"];
   let surfaceSettings: ExtensionMainViewAuthority["settings"];
   let surfaceRuntime: ExtensionMainViewAuthority["runtime"];
+  let surfaceTaskView: Pick<NonNullable<ExtensionMainViewAuthority["taskView"]>, "html" | "title"> | undefined;
   const acquireInstalledPackage = vi.fn(async (): Promise<PiInstalledPackageLease> => ({
     resource: {} as PiInstalledPackageLease["resource"],
     snapshotTo: async (destination) => {
@@ -61,6 +62,7 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
             extensions: [{
               entry: authority.extensionEntry,
               mainView: surfaceManifest,
+              ...(surfaceTaskView === undefined ? {} : { taskView: surfaceTaskView }),
               ...(surfaceSettings === undefined ? {} : { settings: surfaceSettings }),
               ...(surfaceRuntime === undefined ? {} : { runtime: surfaceRuntime }),
               ...(surfaceLibrary === undefined ? {} : { library: surfaceLibrary })
@@ -94,11 +96,42 @@ async function fixture(options: { readonly now?: () => number; readonly ttlMs?: 
     setSurfaceLibrary(value: typeof surfaceLibrary) { surfaceLibrary = value; },
     setSurfaceSettings(value: typeof surfaceSettings) { surfaceSettings = value; },
     setSurfaceRuntime(value: typeof surfaceRuntime) { surfaceRuntime = value; },
+    setSurfaceTaskView(value: typeof surfaceTaskView) { surfaceTaskView = value; },
     releases: () => releases
   };
 }
 
 describe("ExtensionMainViewManager", () => {
+  it("loads each task page with only its captured task ID and retires it independently of the main page", async () => {
+    const f = await fixture();
+    try {
+      const taskPage = { html: "ui/review/secondary.html", title: "Task evidence" };
+      f.setSurfaceTaskView(taskPage);
+      const open = (sessionId: string, assertAuthorityCurrent = () => {}) => f.manager.open({
+        authority: { ...authority, mainView: taskPage, taskView: { ...taskPage, sessionId, sessionCreatedAt: 1, targetId: "original-target" } },
+        connectionId: "connection-a", assertAuthorityCurrent
+      });
+      const main = await f.manager.open({ authority, connectionId: "connection-a", assertAuthorityCurrent: () => {} });
+      let current = true;
+      const a = await open("task-a", () => { if (!current) throw new Error("Task retired."); });
+      const b = await open("task-b");
+      for (const [page, sessionId] of [[a, "task-a"], [b, "task-b"]] as const) {
+        const [, , , , surfaceId, token, entry] = page.endpoint.split("/");
+        expect(entry).toBe("secondary.html");
+        const html = await f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET", isolatedDocument: true });
+        const programs = [...html.body!.toString().matchAll(/data:text\/javascript;base64,([A-Za-z0-9+/=]+)/gu)]
+          .map(match => Buffer.from(match[1]!, "base64").toString()).join("\n");
+        expect(programs).toContain(JSON.stringify({ sessionId }));
+        expect(programs).not.toContain(sessionId === "task-a" ? "task-b" : "task-a");
+        expect(programs).not.toContain("extension-library-request");
+        await expect(f.manager.getSurface(page.id, "connection-b")).rejects.toMatchObject({ statusCode: 404 });
+      }
+      current = false;
+      await expect(f.manager.getSurface(a.id, "connection-a")).rejects.toMatchObject({ statusCode: 410 });
+      expect(f.manager.isSurfaceCurrent(main.id, "connection-a")).toBe(true);
+      expect(f.manager.isSurfaceCurrent(b.id, "connection-a")).toBe(true);
+    } finally { await f.manager.close(); }
+  });
   it("opens the inspected mobile settings page independently of the main view and its Library authority", async () => {
     const f = await fixture();
     try {

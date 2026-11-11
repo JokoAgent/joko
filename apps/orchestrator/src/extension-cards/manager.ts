@@ -37,7 +37,7 @@ interface Options {
   readonly authority: (extensionId: string) => ExtensionCardAuthority | undefined;
   readonly assertProject?: (extensionId: string, sessionId: string) => void;
   readonly redact: (text: string) => string;
-  readonly dispatch: (scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void) => Promise<void>;
+  readonly dispatch: (scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void, connectionId: string) => Promise<void>;
   readonly previewMail?: (request: ExtensionMailPreviewRequest, signal: AbortSignal, assertCurrent: () => void) => Promise<ExtensionMailPreview>;
   readonly media?: ExtensionCardMedia;
   readonly oauthCards?: () => ExtensionOAuthCards | undefined;
@@ -220,7 +220,7 @@ export class ExtensionCardsManager {
       if (spawnCallId !== scope.callId && !this.cards.reopenForAction(spawnCallId, { ...scope, toolUseId: null })) return false;
       await this.options.dispatch(scope, { type: "event", name: "card-action", callId: scope.callId, actionId: input.actionId,
         spawnCallId,
-        ...(input.prompt.trim() ? { prompt: input.prompt.trim() } : {}), ...(hasValues ? { formValues: values! } : {}), ...(mailAttachment ? { mailAttachment } : {}), change: input.change, ts: Date.now() }, assertCurrent);
+        ...(input.prompt.trim() ? { prompt: input.prompt.trim() } : {}), ...(hasValues ? { formValues: values! } : {}), ...(mailAttachment ? { mailAttachment } : {}), change: input.change, ts: Date.now() }, assertCurrent, connectionId);
       assertCurrent(); return true;
     } finally { this.#actions.delete(actionKey); }
   }

@@ -13,6 +13,7 @@ import {
   type ExtensionRoutineEventsDescriptor,
   type ExtensionRuntimeDescriptor,
   type ExtensionMainViewDescriptor,
+  type ExtensionTaskViewDescriptor,
   type ExtensionSettingsDescriptor,
   type ExtensionRecommendationDescriptor
 } from "./extension-surface-manifest.js";
@@ -83,6 +84,7 @@ export interface PiPackageResourceDetail {
   /** Exact package-relative runtime entry for Extension resources. */
   readonly entryPath?: string;
   readonly mainView?: ExtensionMainViewDescriptor;
+  readonly taskView?: ExtensionTaskViewDescriptor;
   readonly settings?: ExtensionSettingsDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
   readonly routineEvents?: ExtensionRoutineEventsDescriptor;
@@ -133,6 +135,7 @@ export interface PiPackageCatalogInspection {
     readonly relativePath: string;
     readonly resourceName: string;
     readonly mainView?: ExtensionMainViewDescriptor;
+    readonly taskView?: ExtensionTaskViewDescriptor;
     readonly settings?: ExtensionSettingsDescriptor;
     readonly library?: ExtensionLibraryDescriptor;
     readonly routineEvents?: ExtensionRoutineEventsDescriptor;
@@ -454,6 +457,7 @@ export async function inspectPiPackageCatalog(packagePath: string): Promise<PiPa
       relativePath,
       resourceName: boundedDisplay(basename(entry)),
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.taskView === undefined ? {} : { taskView: surface.taskView }),
       ...(surface?.settings === undefined ? {} : { settings: { ...surface.settings } }),
       ...(surface?.library === undefined ? {} : { library: surface.library }),
       ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
@@ -579,6 +583,7 @@ async function extensionDetail(
   entryPath = toPosix(relative(root, entry)),
   surface?: {
     readonly mainView?: ExtensionMainViewDescriptor;
+    readonly taskView?: ExtensionTaskViewDescriptor;
     readonly settings?: ExtensionSettingsDescriptor;
     readonly library?: ExtensionLibraryDescriptor;
     readonly routineEvents?: ExtensionRoutineEventsDescriptor;
@@ -593,6 +598,7 @@ async function extensionDetail(
       name: boundedDisplay(basename(entry)),
       entryPath,
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.taskView === undefined ? {} : { taskView: surface.taskView }),
       ...(surface?.settings === undefined ? {} : { settings: { ...surface.settings } }),
       ...(surface?.library === undefined ? {} : { library: surface.library }),
       ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
@@ -609,6 +615,7 @@ async function extensionDetail(
       ...basicResourceDetail("extension", basename(entry), "unknown", ["analysis-incomplete"]),
       entryPath,
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
+      ...(surface?.taskView === undefined ? {} : { taskView: surface.taskView }),
       ...(surface?.settings === undefined ? {} : { settings: { ...surface.settings } }),
       ...(surface?.library === undefined ? {} : { library: surface.library }),
       ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),

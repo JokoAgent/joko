@@ -494,6 +494,8 @@ service ExtensionService {
   rpc ListExtensionPackageExports(ListExtensionPackageExportsRequest) returns (ListExtensionPackageExportsResponse);
   rpc GetExtensionPackageExport(GetExtensionPackageExportRequest) returns (GetExtensionPackageExportResponse);
   rpc OpenExtensionMainView(OpenExtensionMainViewRequest) returns (OpenExtensionMainViewResponse);
+  rpc OpenExtensionTaskView(OpenExtensionTaskViewRequest) returns (OpenExtensionTaskViewResponse);
+  rpc WatchExtensionTaskViews(WatchExtensionTaskViewsRequest) returns (stream WatchExtensionTaskViewsResponse);
   rpc OpenExtensionSettings(OpenExtensionSettingsRequest) returns (OpenExtensionSettingsResponse);
   // Requires the committed native Desktop host authorization in addition to the connection.
   rpc SetDesktopExtensionHostLocale(SetDesktopExtensionHostLocaleRequest) returns (SetDesktopExtensionHostLocaleResponse);
@@ -2689,6 +2691,23 @@ message OpenExtensionMainViewRequest {
 
 message OpenExtensionMainViewResponse {
   ExtensionMainViewSurface surface = 1;
+}
+
+message OpenExtensionTaskViewRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string session_id = 3;
+}
+message OpenExtensionTaskViewResponse {
+  ExtensionMainViewSurface surface = 1;
+}
+message WatchExtensionTaskViewsRequest {
+  // Captured from this UI instance; an empty value means no foreground Task.
+  string focused_session_id = 1;
+}
+message WatchExtensionTaskViewsResponse {
+  // An empty response acknowledges registration without opening a page.
+  optional ExtensionTaskViewOpen open = 1;
 }
 
 message OpenExtensionSettingsRequest {

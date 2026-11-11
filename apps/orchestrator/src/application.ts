@@ -157,6 +157,7 @@ import { ExtensionCatalogManager } from "./extension-catalog.js";
 import { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
+import { ExtensionTaskViewDispatcher, extensionTaskViewInstallation, localExtensionTaskViewSession } from "./extension-task-view-dispatcher.js";
 import { ExtensionSettingsManager } from "./extension-settings.js";
 import { ExtensionDirectoryPicker } from "./extension-directory-picker.js";
 import { ExtensionPackagePublisher } from "./extension-package-publisher.js";
@@ -567,6 +568,7 @@ export interface OrchestratorApplication {
   readonly extensionProjects?: ExtensionProjectPolicies;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
+  readonly extensionTaskViews?: ExtensionTaskViewDispatcher;
   readonly extensionSettings?: ExtensionSettingsManager;
   readonly extensionImageModels?: () => ReturnType<ImageGenerationBridgeToolProvider["listModels"]>;
   readonly desktopExtensionContext?: Pick<ExtensionCardRuntime, "desktopHostLocale" | "setDesktopHostLocale">;
@@ -2686,21 +2688,36 @@ export async function createOrchestratorApplication(
   piResources.setExtensionTaskPackageChange((transaction, resource) => extensionTasks.reconcilePackageTasks(transaction, [resource]));
   store.transaction(transaction => extensionTasks.reconcilePackageTasks(transaction, piResources.list({ kind: "package" })));
   const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
+  const extensionTaskViews = new ExtensionTaskViewDispatcher({
+    authority: id => {
+      try {
+        const extension = extensionCatalog.get(id), installationKey = extensionTaskViewInstallation(extension);
+        return installationKey === undefined ? undefined : { installationKey, revision: extension.revision };
+      } catch { return undefined; }
+    },
+    taskAvailable: (extensionId, sessionId) => {
+      try {
+        return localExtensionTaskViewSession(store, sessionId) !== undefined
+          && extensionProjects.enabledForTarget(extensionId, store.getSession(sessionId).descriptor.targetId);
+      } catch { return false; }
+    }
+  });
   const extensionCards = new ExtensionCardsManager({ store, vault: credentialVault,
     assertProject: (extensionId, sessionId) => extensionProjects.assertEnabledForSession(extensionId, sessionId),
     media: extensionCardMedia,
     oauthCards: () => extensionOAuthCards,
     authority: id => extensionCardRuntime?.authority(id), redact: value => credentials.redactText(value),
     previewMail: async (...args) => { if (!extensionCardRuntime) throw new Error("Mail runtime unavailable."); return extensionCardRuntime.previewMail(...args); },
-    dispatch: async (scope, event, assertCurrent) => {
+    dispatch: async (scope, event, assertCurrent, connectionId) => {
       if (!extensionCardRuntime) throw new Error("Extension card runtime unavailable.");
-      await extensionCardRuntime.dispatch(scope, event, assertCurrent);
+      await extensionCardRuntime.dispatch(scope, event, assertCurrent, connectionId);
     } });
   startupExtensionCards = extensionCards;
   extensionOAuthCards = new ExtensionOAuthCards({ cards: extensionCards, settings: extensionOAuth, accounts: extensionOAuthAccounts, store, catalog: extensionCatalog,
     authority: id => extensionCardRuntime?.authority(id), locale: () => persistedLocale(store),
     continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard) });
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store, projects: extensionProjects,
+    taskViews: extensionTaskViews,
     deviceSync: extensionDeviceSync,
     vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, targets: extensionTargets, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
@@ -3686,6 +3703,7 @@ export async function createOrchestratorApplication(
     extensionProjects,
     extensionLibraries,
     extensionMainViews,
+    extensionTaskViews,
     extensionSettings,
     extensionImageModels: listExtensionImageModels,
     ...(dependencies.desktopManagedExtensionContext ? { desktopExtensionContext: extensionCardRuntime } : {}),

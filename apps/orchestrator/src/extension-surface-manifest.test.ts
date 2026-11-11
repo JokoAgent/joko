@@ -6,6 +6,18 @@ const entries = ["extensions/review.ts", "extensions/search/index.js"];
 const files = [...entries, "ui/review/index.html", "ui/review/app.js", "ui/search.html"];
 
 describe("Extension surface manifest", () => {
+  it("inspects a task page independently of the global page and permits its resident runtime without tools", () => {
+    const mainView = { html: "ui/review/index.html", title: "Dashboard" };
+    const taskView = { html: "ui/search.html", title: "Task evidence" };
+    const runtime = { html: "ui/review/index.html", tools: [] };
+    const manifest = (task: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1,
+      extensions: [{ entry: entries[0], mainView, taskView: task, runtime }] } } });
+    expect(parseExtensionSurfaceManifest(manifest(taskView), entries, files)).toEqual([{ entry: entries[0], mainView, taskView, runtime }]);
+    for (const invalid of [undefined, { ...taskView, html: "../outside.html" }, { ...taskView, html: "ui/missing.html" },
+      { ...taskView, title: "x".repeat(65) }, { ...taskView, url: "https://example.invalid/" }]) {
+      expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
+    }
+  });
   it("requires an explicit native directory choice declaration without granting Node or Library access", () => {
     const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
     const runtime = { html: "ui/review/index.html", tools: [], pick: true };

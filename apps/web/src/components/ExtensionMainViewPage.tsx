@@ -45,6 +45,7 @@ export function ExtensionMainViewPage({
   ownerDocument = document,
   registerCloseGuard,
   settings = false,
+  taskSessionId,
   onOpenLibrary
 }: {
   readonly controller: AppController;
@@ -57,6 +58,7 @@ export function ExtensionMainViewPage({
   readonly ownerDocument?: Document;
   readonly registerCloseGuard?: (guard: () => Promise<boolean>) => () => void;
   readonly settings?: boolean;
+  readonly taskSessionId?: string;
   readonly onOpenLibrary?: () => void;
 }) {
   const controllerOwner = JSON.stringify([liveController.state.activeProfile?.id, liveController.state.activeProfile?.serverId,
@@ -147,9 +149,11 @@ export function ExtensionMainViewPage({
     setState({ phase: "loading" });
     void controller.getExtension(extensionId, undefined, abort.signal).then(async (catalog) => {
       if (disposed || request !== requestRevision.current || liveOwnerRef.current !== controllerOwner || abort.signal.aborted) return;
-      const extension = catalog.extensions[0];
+      const entry = catalog.extensions[0];
+      const extension = taskSessionId === undefined || entry === undefined ? entry : { ...entry, library: undefined };
       if (extension === undefined || extension.id !== extensionId || (settings
-        ? !extension.installed || !extension.settings || extension.owner.kind !== "resource" : !extensionMainViewReady(extension))) {
+        ? !extension.installed || !extension.settings || extension.owner.kind !== "resource"
+        : taskSessionId === undefined ? !extensionMainViewReady(extension) : !extensionTaskViewReady(extension))) {
         if (!disposed && request === requestRevision.current) setState({ phase: "error", ...(extension === undefined ? {} : { extension }) });
         return;
       }
@@ -158,14 +162,16 @@ export function ExtensionMainViewPage({
       if (settings && !api) throw new Error("Plugin author settings are unavailable.");
       settingsApi.current = api;
       const surface = settings ? await api!.open(extension.id, extension.revision, abort.signal)
-        : await controller.openExtensionMainView(extension.id, extension.revision, abort.signal);
+        : taskSessionId === undefined ? await controller.openExtensionMainView(extension.id, extension.revision, abort.signal)
+          : await controller.openExtensionTaskView(extension.id, extension.revision, taskSessionId, abort.signal);
       if (settings) settingsSurfaceClosers.current.set(surface, id => api!.close(id));
       if (disposed || request !== requestRevision.current || liveOwnerRef.current !== controllerOwner || abort.signal.aborted || surface.extensionId !== extension.id) {
         releaseSurface(surface);
         return;
       }
-      if (settings && (surface.purpose !== "settings" || surface.mobileSettings)) {
-        releaseSurface(surface); throw new Error("The plugin settings purpose changed.");
+      if (surface.purpose !== (settings ? "settings" : taskSessionId === undefined ? undefined : "task")
+        || surface.mobileSettings || surface.taskSessionId !== taskSessionId) {
+        releaseSurface(surface); throw new Error("The plugin page purpose changed.");
       }
       surfaceRef.current = surface;
       setFrameEndpoint(surface.endpoint);
@@ -183,7 +189,7 @@ export function ExtensionMainViewPage({
       sourceWindow?.removeEventListener("pagehide", releaseOnPageHide);
       releaseSurface(surfaceRef.current);
     };
-  }, [controller, controllerOwner, extensionId, releaseSurface, retryRevision, settings, ownerDocument]);
+  }, [controller, controllerOwner, extensionId, releaseSurface, retryRevision, settings, taskSessionId, ownerDocument]);
 
   useEffect(() => {
     if (state.phase !== "ready") return undefined;
@@ -578,9 +584,9 @@ export function ExtensionMainViewPage({
   }, [controller, frameRevision, ownerDocument, settings, state]);
 
   const extension = "extension" in state ? state.extension : undefined;
-  const title = state.phase === "ready"
-    ? state.surface.title ?? state.extension.mainView?.title ?? state.extension.name
-    : extension?.mainView?.title ?? extension?.name ?? t("extensions.mainView.title");
+  const declaredTitle = taskSessionId === undefined ? extension?.mainView?.title : extension?.taskView?.title;
+  const title = (state.phase === "ready" ? state.surface.title : undefined)
+    ?? declaredTitle ?? extension?.name ?? t("extensions.mainView.title");
   const back = (): void => controller.navigate({ kind: "tools", extensionId });
   const retry = (): void => setRetryRevision((value) => value + 1);
   const checkSettingsOperation = (): void => {
@@ -715,12 +721,18 @@ export function extensionMainViewReady(extension: ExtensionCatalogEntryView | un
     && (extension.installState === "installed" || extension.installState === "updateAvailable");
 }
 
+export function extensionTaskViewReady(extension: ExtensionCatalogEntryView | undefined): extension is ExtensionCatalogEntryView & { readonly taskView: NonNullable<ExtensionCatalogEntryView["taskView"]> } {
+  return extension !== undefined && extension.taskView !== undefined && extension.owner.kind === "resource"
+    && extension.installed && extension.enabled && (extension.setup.state === "ready" || extension.setup.state === "notRequired")
+    && (extension.installState === "installed" || extension.installState === "updateAvailable");
+}
+
 export function sameExtensionMainViewSurface(left: ExtensionMainViewSurfaceView, right: ExtensionMainViewSurfaceView): boolean {
   return left.id === right.id && left.extensionId === right.extensionId && left.endpoint === right.endpoint
     && left.owner.resourceId === right.owner.resourceId && left.owner.resourceRevision === right.owner.resourceRevision
     && left.owner.discoveredRevision === right.owner.discoveredRevision && left.backendId === right.backendId
     && left.backendRevision === right.backendRevision && left.backendGeneration === right.backendGeneration
-    && (left.purpose === undefined ? right.expiresAt >= left.expiresAt : left.expiresAt === right.expiresAt)
+    && (left.purpose !== "settings" ? right.expiresAt >= left.expiresAt : left.expiresAt === right.expiresAt)
     && left.title === right.title && left.icon === right.icon
-    && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings;
+    && left.purpose === right.purpose && left.mobileSettings === right.mobileSettings && left.taskSessionId === right.taskSessionId;
 }
