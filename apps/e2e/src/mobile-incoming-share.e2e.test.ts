@@ -59,7 +59,9 @@ interface MobileHarness {
     readonly activeProfileId?: string;
     readonly selectedId?: string;
     readonly owner?: { readonly sessions: readonly { readonly sessionId: string; readonly targetId: string }[] };
-    readonly detail?: { readonly sessions: readonly { readonly sessionId: string }[] };
+    readonly detail?: { readonly sessions: readonly { readonly sessionId: string }[];
+      readonly timeline: readonly { readonly eventId: string }[] };
+    readonly live: readonly { readonly eventId: string }[];
     readonly files: { readonly open: boolean; readonly location: { readonly kind: string; readonly path?: string };
       readonly preview?: { readonly kind: string; readonly text?: string; readonly focusLine?: number; readonly focusColumn?: number } };
   };
@@ -79,6 +81,7 @@ interface MobileHarness {
     readonly references: ReadonlyMap<string, { readonly kind: string; readonly relativePath: string;
       readonly image?: { readonly uri: string; readonly width: number; readonly height: number } }>;
   }>;
+  assertMarkdownResourcesCurrent(leaseId: string): void;
   openMarkdownPath(leaseId: string, key: string, signal: AbortSignal): Promise<unknown>;
   openMarkdownImageGallery(leaseId: string, key: string, signal: AbortSignal): Promise<{ readonly leaseId: string; readonly initialIndex: number }>;
   loadImageGalleryPage(leaseId: string, page: number, signal: AbortSignal): Promise<{ readonly previewUri: string; readonly expectedWidthPixels: number; readonly expectedHeightPixels: number }>;
@@ -237,7 +240,20 @@ describe("mobile incoming share through the authenticated task product chain", (
     mobile.releaseConversationShare(shared.leaseId);
     const deleted = await submit(manager.clients.operation, manager.connectionId, deleteSessionMessageMutation(sessionId, event.eventId, generation));
     expect(deleted.state).toBe(OperationState.SUCCEEDED);
-    await expect(mobile.openMarkdownPath(resources.leaseId, fileKey, new AbortController().signal)).rejects.toThrow(/changed|removed|left|not_found|released/u);
+    expect(deleted.result?.payload).toMatchObject({ case: "acknowledgement", value: { accepted: true } });
+    const previousPreview = mobile.state.files.preview;
+    const staleReadSignal = new AbortController().signal;
+    // The Mobile stream can retire the lease during authenticated revalidation.
+    await expect(mobile.openMarkdownPath(resources.leaseId, fileKey, staleReadSignal)).rejects
+      .toThrow(/changed|removed|left|not_found|released|^The message resource read was cancelled\.$/u);
+    expect(staleReadSignal.aborted).toBe(false);
+    expect(mobile.state.files.preview).toBe(previousPreview);
+    await waitFor(async () => {
+      const { status, selectedId, detail, live } = mobile!.state;
+      return status === "connected" && selectedId === sessionId && detail !== undefined
+        && !detail.timeline.some(item => item.eventId === event.eventId) && !live.some(item => item.eventId === event.eventId);
+    }, retired => retired, "the deleted Markdown source to retire on the same phone");
+    expect(() => mobile!.assertMarkdownResourcesCurrent(resources.leaseId)).toThrow(/changed|left|released/u);
     mobile.releaseMarkdownResources(resources.leaseId);
     expect(fixture.adapter(profile.id).sendCalls).toHaveLength(1);
   }, 60_000);
