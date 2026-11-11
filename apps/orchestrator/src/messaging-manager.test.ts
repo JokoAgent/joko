@@ -247,6 +247,97 @@ describe("MessagingManager", () => {
     expect(final().find((row) => row.partIndex === 0)?.providerMessageId).toBe(carrierId);
   });
 
+  it.each([{ finalStatus: "sent", continuations: 1 }, { finalStatus: "unknown", continuations: 2 }] as const)(
+    "preserves the Discord carrier for a $finalStatus final after $continuations Partner continuations",
+    async ({ finalStatus, continuations }) => {
+      const adapter = new ControlledReplyAdapter({ ...PI_LIKE_PROFILE,
+        capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+          ? { ...capability, options: ["ask"] } : capability) });
+      const transport = new StreamingDiscordTransport();
+      const fixture = await createFixture(undefined, () => adapter, () => transport,
+        undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 }, () => 10);
+      const profiles = new PartnerStore(join(fixture.root, "partners.db"));
+      cleanups.push(async () => { try { await fixture.manager.close(); } finally { profiles.close(); } });
+      const partners = new PartnerManager({ store: profiles, operationalStore: fixture.store, sessionHost: fixture.host,
+        homesRoot: join(fixture.root, "homes"), workspaceService: { register: async input => input, unregister: () => undefined } });
+      const partner = await partners.createPartner({ requestId: "discord-recovery-create", expectedDirectoryRevision: profiles.directoryState().revision,
+        displayName: "Ada", avatar: "orbit", identitySource: "A Partner who replies to the owner.", templateId: "general", usesDirectoryDefaults: false,
+        capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }],
+          permissionMode: "ask", planMode: false } });
+      expect(partner.initializationState).toBe("ready");
+      const attachPartnerRuntime = (messaging: MessagingManager) => {
+        const runtime = new PartnerMessagingRuntime({ store: fixture.store, profiles, partners, host: fixture.host, messaging, pauseGoal: async () => undefined });
+        messaging.setPartnerRuntime(runtime);
+        fixture.host.setMessagingQueueGuard(item => runtime.assertQueueCurrent(item), (item, request) => runtime.reviewTool(item, request));
+        return runtime;
+      };
+      const runtime = attachPartnerRuntime(fixture.manager);
+      const owner = fixture.store.createConnection({ id: "discord-ui-owner", name: "Owner", authKeyDigest: "discord-ui-auth" });
+      const created = fixture.manager.createDiscordConnection({ ownerProviderUserId: "111111111111111111",
+        configuration: { ...DEFAULT_DISCORD_MESSAGING_CONFIGURATION, emojiReactions: "off", lifecycleAnnouncements: false } });
+      const bound = await runtime.setBinding({ operationId: "discord-recovery-bind", owner, connectionId: created.id, partnerId: partner.id,
+        expectedBindingRevision: 0, expectedConnectionRevision: created.revision, expectedConnectionGeneration: created.generation,
+        expectedPartnerRevision: partner.revision });
+      const connection = await replaceCredential(fixture, bound.connection, "discord-recovery", true);
+      await vi.waitFor(() => expect(adapter.context?.sessionId).toBe(partner.canonicalSessionId), { timeout: 5_000 });
+      const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
+      const activeRunId = () => {
+        const queueId = adapter.context?.inputQueueItemId;
+        return queueId === undefined ? undefined : fixture.store.getQueueItem(queueId).runId;
+      };
+      expect(activeRunId()).toBe(request.runId);
+      const generation = adapter.context!.generation;
+      const delivery = (dedupeKey: string) => fixture.store.findMessagingDeliveryByDedupe({ connectionId: connection.id,
+        channelGeneration: connection.generation, dedupeKey });
+      const start = () => delivery(`request:${request.id}:progress:start`);
+      const removal = () => delivery(`request:${request.id}:progress:remove`);
+      await vi.waitFor(() => expect(start()?.status).toBe("sent"));
+      await adapter.emit({ type: "text_delta", blockId: "progress", delta: "Work in progress" });
+      await vi.waitFor(() => expect(transport.stream.edits).toContainEqual(expect.objectContaining({ text: "Work in progress" })));
+
+      let settledRun = request.runId!;
+      for (let index = 0; index < continuations; index++) {
+        const parent = settledRun;
+        await adapter.emit({ type: "error", terminal: true, error: { code: "UPSTREAM_STREAM_INTERRUPTED",
+          message: "The original stream was interrupted.", phase: "retry", retryable: false, stateMayHaveChanged: true, recovery: "Continue." } });
+        await adapter.emit({ type: "done", outcome: "failed" });
+        await vi.waitFor(() => {
+          const child = fixture.store.findRunByParentId(parent)?.descriptor;
+          expect(child?.id).toBeDefined();
+          expect(activeRunId()).toBe(child?.id);
+          expect(adapter.context?.generation).toBe(generation);
+        }, { timeout: 5_000 });
+        settledRun = activeRunId()!;
+        expect(fixture.store.findMessagingInboundRequestByRunId(settledRun)?.id).toBe(request.id);
+        expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("queued");
+      }
+
+      const finalReceipt = deliveryGate();
+      transport.stream.beforeEditReceipt = async ({ text }) => {
+        if (text !== "Recovered final answer") return;
+        await finalReceipt.wait;
+        if (finalStatus === "unknown") throw new MessagingTransportError("network", "Final edit ACK lost.", { effect: "unknown", retryable: true });
+      };
+      await adapter.finish("Recovered final answer");
+      const final = () => delivery(`run:${settledRun}:answer`);
+      await vi.waitFor(() => expect(final()?.status).toBe("dispatching"));
+      expect(removal()).toBeUndefined();
+      finalReceipt.release();
+      await vi.waitFor(() => expect(final()?.status).toBe(finalStatus));
+      expect(fixture.store.getMessagingInboundRequest(request.id)).toMatchObject({ status: "completed", runId: request.runId });
+      expect(delivery(`run:${request.runId}:answer`)).toBeUndefined();
+      expect(final()?.attempts).toBe(1);
+      if (finalStatus === "sent") expect(final()?.providerMessageId).toBe(start()?.providerMessageId);
+      const edits = transport.stream.attempts.length;
+      await fixture.restartManager(attachPartnerRuntime);
+      expect(final()?.status).toBe(finalStatus);
+      expect(final()?.attempts).toBe(1);
+      expect(transport.stream.attempts).toHaveLength(edits);
+      expect(removal()).toBeUndefined();
+      expect(transport.stream.removed).toEqual([]);
+    }, 20_000
+  );
+
   it("retains a Telegram progress carrier when the independent final ACK is unknown, including after restart", async () => {
     const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
     const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
@@ -257,6 +348,69 @@ describe("MessagingManager", () => {
     await vi.waitFor(() => expect(fixture.store.listMessagingDeliveries({ statuses: ["unknown"] }).some(row => row.dedupeKey.endsWith(":answer"))).toBe(true));
     const attempts = transport.textAttempts; expect(transport.stream.removed).toEqual([]);
     await fixture.restartManager(); expect(transport.textAttempts).toBe(attempts); expect(transport.stream.removed).toEqual([]);
+  });
+
+  it("sends a Telegram answer in order after the first part receives a retry_after", async () => {
+    const adapter = new ControlledReplyAdapter();
+    const transport = new StreamingTelegramTransport();
+    const fixture = await createFixture(() => transport, () => adapter);
+    const poll = transport.poll.bind(transport), normalize = transport.normalize.bind(transport);
+    vi.spyOn(transport, "poll").mockImplementation(async input => {
+      if (input.cursor === null) return poll(input);
+      await new Promise<void>(resolve => setTimeout(resolve, 15));
+      input.signal?.throwIfAborted();
+      return { updates: [], nextCursor: input.cursor };
+    });
+    vi.spyOn(transport, "normalize").mockImplementation(updates => updates.length === 0
+      ? { events: [], groupObservations: [], ignored: [] } : normalize(updates));
+    const send = transport.sendTextPart.bind(transport);
+    const attempts: { part: "first" | "tail"; at: number }[] = [];
+    const retryAfterMs = 250;
+    vi.spyOn(transport, "sendTextPart").mockImplementation(async input => {
+      const part = input.text.startsWith("FirstSegment") ? "first" : "tail";
+      attempts.push({ part, at: Date.now() });
+      if (attempts.length === 1 && part === "first") throw new MessagingTransportError("rate_limited", "Telegram asked to retry.",
+        { effect: "none", retryable: true, providerStatus: 429, retryAfterMs });
+      return send(input);
+    });
+    const connection = await enableTelegramReply(fixture, "telegram-ordered");
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.finish(`FirstSegment${"x".repeat(4_200)}`);
+    const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
+    const deliveries = () => fixture.store.listMessagingDeliveries({ connectionId: connection.id })
+      .filter(delivery => delivery.dedupeKey === `run:${request.runId}:answer`).sort((a, b) => a.partIndex - b.partIndex);
+    await vi.waitFor(() => expect(deliveries().map(({ status }) => status)).toEqual(["sent", "sent"]), { timeout: 5_000 });
+    expect(attempts.map(({ part }) => part)).toEqual(["first", "first", "tail"]);
+    expect(attempts[1]!.at - attempts[0]!.at).toBeGreaterThanOrEqual(retryAfterMs);
+    expect(deliveries().map(({ attempts }) => attempts)).toEqual([2, 1]);
+  });
+
+  it("admits a pure Telegram group summon with context and does not run for a bare display name", async () => {
+    const from = { id: 99, first_name: "Guest", is_bot: false };
+    const chat = { id: -100555, type: "supergroup" as const };
+    const date = Math.floor(Date.now() / 1_000), mention = "@joko_test_bot";
+    const batch: TelegramUpdate[] = [
+      { update_id: 9, message: { message_id: 77, from, chat, date, text: "Joko has a schedule today" } },
+      { update_id: 10, message: { message_id: 78, from, chat, date, text: mention,
+        entities: [{ type: "mention", offset: 0, length: mention.length }] } }
+    ];
+    const transport = new FakeTelegramTransport(normalizeTelegramUpdates(batch, { connectionId: "placeholder", ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } }));
+    const adapter = new ControlledReplyAdapter();
+    const fixture = await createFixture(() => transport, () => adapter);
+    const connection = await enableTelegramReply(fixture, "telegram-summon");
+    await vi.waitFor(() => expect(adapter.context?.inputQueueItemId).toBeDefined());
+    const requests = fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    expect(requests).toMatchObject([{ providerMessageId: "78", status: "queued" }]);
+    const queue = fixture.store.getQueueItem(adapter.context!.inputQueueItemId!);
+    expect(queue.body.text).toContain("<group_chat_context>\n[Guest] Joko has a schedule today\n</group_chat_context>");
+    expect(queue.body.text).toContain("The speaker explicitly called the bot without adding a text request.");
+    expect(queue.body.text).not.toContain("<ambient_mode>");
+    expect(queue.executionOverrides?.permissionMode).toBe("ask");
+    await vi.waitFor(() => expect(transport.typing).toHaveLength(1));
+    await adapter.finish("I read the earlier context.");
+    await vi.waitFor(() => expect(transport.sentText).toMatchObject([{ text: "I read the earlier context." }]));
+    expect(fixture.store.getMessagingInboundRequest(requests[0]!.id).status).toBe("completed");
   });
 
   it("retires a pending stream when its original connection generation is disabled", async () => {
@@ -1008,9 +1162,91 @@ describe("MessagingManager", () => {
     }, { timeout: 2_000 });
   });
 
-  it("runs protected Telegram text once without retaining the input in Queue, Operation, or native history projection", async () => {
+  it("keeps verified Telegram album media across a partial attachment retry", async () => {
+    const from = { id: 42, first_name: "Owner", is_bot: false };
+    const chat = { id: 42, type: "private" as const };
+    const date = Math.floor(Date.now() / 1_000);
+    const album = { from, chat, date, media_group_id: "album" };
+    const video = (id: string) => ({ file_id: id, file_unique_id: `unique-${id}`, file_name: `${id}.mp4` });
+    const batch = normalizeTelegramUpdates([
+      { update_id: 9, message: { ...album, message_id: 77, caption: "Compare the clip and the frame.", video: video("spoofed") } },
+      { update_id: 10, message: { ...album, message_id: 78, video: video("missing") } },
+      { update_id: 11, message: { ...album, message_id: 79, video: video("clip") } },
+      { update_id: 12, message: { ...album, message_id: 80, photo: [{ file_id: "frame", file_unique_id: "frame",
+        width: 1, height: 1 }] } }
+    ], { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+    const transport = new FakeTelegramTransport(batch);
+    let frameAttempts = 0;
+    const clip = Buffer.from("00000014667479706d7034320000000069736f6d", "hex");
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      const { providerFileId, fileName } = attachment;
+      if (providerFileId === "missing") throw new MessagingTransportError("provider_rejected", "Missing test clip.",
+        { effect: "none", retryable: false });
+      if (providerFileId === "clip") return { bytes: clip, fileName, mimeType: "application/octet-stream" };
+      if (providerFileId === "frame") {
+        frameAttempts += 1;
+        if (frameAttempts === 1) throw new MessagingTransportError("network", "Interrupted photo download.",
+          { effect: "none", retryable: true });
+        return { bytes: jpeg, fileName, mimeType: "image/jpeg" };
+      }
+      return { bytes: pngBytes(), fileName, mimeType: "video/mp4" };
+    });
+    const fixture = await createFixture(() => transport, () => new AttachmentFakeAdapter(true));
+    const connection = await enableTelegramReply(fixture, "telegram-native-album");
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    await vi.waitFor(() => expect(requests()).toMatchObject([{ status: "completed", providerMessageId: "77" }]), { timeout: 5_000 });
+    const request = requests()[0]!;
+    expect(download.mock.calls.map(([attachment]) => attachment.providerFileId))
+      .toEqual(["spoofed", "missing", "clip", "frame", "spoofed", "missing", "frame"]);
+    expect(fixture.store.listMessagingRequestArtifactOrdinals(request.id)).toEqual([2, 3]);
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue.body.text).toContain("Compare the clip and the frame.");
+    expect(queue.body.text).toContain("[Unsupported video] spoofed.mp4");
+    expect(queue.body.text).toContain("[Unsupported download] missing.mp4");
+    expect(queue.body.images).toHaveLength(1);
+    expect(queue.body.files).toMatchObject([{ blob: { fileName: "clip.mp4", mimeType: "video/mp4", byteLength: clip.length } }]);
+    expect((await fixture.artifacts.readBlob(queue.body.files[0]!.blob)).data).toEqual(clip);
+  });
+
+  it("releases staged Telegram media when the connection is disabled before adoption", async () => {
+    const batch = normalizeTelegramUpdates([{ update_id: 9, message: {
+      message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
+      chat: { id: 42, type: "private" }, date: Math.floor(Date.now() / 1_000),
+      voice: { file_id: "voice-77", file_unique_id: "unique-voice" }
+    } }], { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+    const transport = new FakeTelegramTransport(batch);
+    vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => ({
+      bytes: Buffer.from("OggS"), fileName: attachment.fileName, mimeType: "audio/ogg"
+    }));
+    const adapter = new AttachmentFakeAdapter(true);
+    const send = vi.spyOn(adapter, "send");
+    const fixture = await createFixture(() => transport, () => adapter);
+    const held = deliveryGate();
+    const ingest = fixture.artifacts.ingestBytes.bind(fixture.artifacts);
+    let stagedId: string | undefined;
+    vi.spyOn(fixture.artifacts, "ingestBytes").mockImplementationOnce(async (...args) => {
+      const artifact = await ingest(...args);
+      stagedId = artifact.id;
+      await held.wait;
+      return artifact;
+    });
+    const release = vi.spyOn(fixture.store, "releaseArtifactStaging");
+    const connection = await enableTelegramReply(fixture, "telegram-retired-media");
+    await vi.waitFor(() => expect(stagedId).toBeDefined());
+    const current = fixture.store.getMessagingConnection(connection.id);
+    await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision,
+      expectedGeneration: current.generation, enabled: false });
+    held.release();
+    await vi.waitFor(() => expect(release).toHaveBeenCalledWith([stagedId]));
+    expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toMatchObject([{ artifactIds: [] }]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("runs protected Telegram text once without downloading its voice or retaining the input", async () => {
     const privateText = "protectedtelegrambodya17c";
-    const transport = new ProtectedTelegramTransport(privateText);
+    const transport = new ProtectedTelegramTransport(privateText, true);
+    const download = vi.spyOn(transport, "downloadAttachment");
     const adapter = new ProtectedTelegramAdapter();
     const fixture = await createFixture(() => transport, () => adapter);
     const persistPoll = vi.spyOn(fixture.store, "saveMessagingPollBatch");
@@ -1022,8 +1258,11 @@ describe("MessagingManager", () => {
     const request = fixture.store.listMessagingInboundRequests()[0]!;
     const queue = fixture.store.getQueueItem(request.queueItemId!);
     expect(adapter.received).toHaveLength(1);
+    expect(download).not.toHaveBeenCalled();
+    expect(request.artifactIds).toEqual([]);
     expect(persistPoll).not.toHaveBeenCalled();
     expect(adapter.received[0]).toContain(privateText);
+    expect(adapter.received[0]).toContain("[Unsupported protected_media]");
     expect(adapter.history.events[0]?.payload).toMatchObject({ role: "user", blocks: [{ text: expect.stringContaining(privateText) }] });
     expect(queue.body.text).toBe("[Protected message]");
     expect(fixture.store.getOperation(request.operationId!).body).toMatchObject({ prompt: { text: "[Protected message]" } });
@@ -3644,7 +3883,7 @@ class ProtectedTelegramAdapter extends FakeBackendAdapter {
 
 class ControlledReplyAdapter extends FakeBackendAdapter {
   context?: AdapterContext;
-  constructor() { super(PI_LIKE_PROFILE); }
+  constructor(profile = PI_LIKE_PROFILE) { super(profile); }
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> { this.context = context; }
   async emit(event: EventPayload): Promise<void> { if (!this.context) throw new Error("No admitted reply run."); await this.context.emit(event); }
   async finish(text: string): Promise<void> {
@@ -3888,7 +4127,8 @@ async function createFixture(
   weChatTransportFactory?: (options: WeChatTransportOptions) => FakeWeChatTransport,
   weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"],
   slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport,
-  replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"]
+  replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"],
+  sessionRuntimeRecoveryDelayMs?: (attempt: number) => number
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -3907,6 +4147,7 @@ async function createFixture(
   const adapter = adapterFactory?.() ?? new FakeBackendAdapter(PI_LIKE_PROFILE);
   let manager: MessagingManager | undefined;
   const host = new SessionHost(store, artifacts, [adapter], {
+    ...(sessionRuntimeRecoveryDelayMs === undefined ? {} : { sessionRuntimeRecoveryDelayMs }),
     onServiceRunSettled: (input) => manager?.onRunSettled(input),
     onServiceInteractionOpened: (input) => manager?.onInteractionOpened(input),
     onServiceInteractionSettled: (input) => manager?.onInteractionSettled(input)
@@ -3961,9 +4202,10 @@ async function createFixture(
     rmSync(root, { recursive: true, force: true });
   });
   return { root, store, artifacts, credentials, adapter, host, get manager() { return manager!; },
-    async restartManager() {
+    async restartManager(configure?: (current: MessagingManager) => void) {
       await manager?.close();
       manager = new MessagingManager(options);
+      configure?.(manager);
       await manager.initialize();
     }
   };
@@ -4034,13 +4276,16 @@ function weChatDirectBatch(): WeChatNormalizationResult {
 
 class ProtectedTelegramTransport extends FakeTelegramTransport {
   readonly #update: TelegramUpdate;
-  constructor(text: string) {
+  constructor(text: string, includeVoice = false) {
     const mention = "@joko_test_bot";
+    const entities = [{ type: "mention", offset: 0, length: mention.length }];
     const update: TelegramUpdate = { update_id: 9, message: {
       message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
       chat: { id: -100555, type: "supergroup" }, date: Math.floor(Date.now() / 1000),
-      text: `${mention} ${text}`, has_protected_content: true,
-      entities: [{ type: "mention", offset: 0, length: mention.length }]
+      has_protected_content: true,
+      ...(includeVoice ? { caption: `${mention} ${text}`, caption_entities: entities,
+        voice: { file_id: "protected-voice", file_unique_id: "unique-protected-voice" } }
+        : { text: `${mention} ${text}`, entities })
     } };
     super(normalizeTelegramUpdates([update], { connectionId: "placeholder", ownerUserId: "42",
       bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } }));

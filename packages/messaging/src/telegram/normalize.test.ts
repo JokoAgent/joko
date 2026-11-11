@@ -109,6 +109,38 @@ describe("normalizeTelegramUpdates", () => {
     expect(result.groupObservations).toHaveLength(3);
   });
 
+  it("keeps explicit empty summons and checks text and caption mentions against the bot identity", () => {
+    const group = (id: number, text?: string) => message({ id, from: STRANGER, chatId: -10, chatType: "group",
+      ...(text === undefined ? {} : { text }) });
+    const pure = update(70, { ...group(70, "@jokobot"), entities: [{ type: "mention", offset: 0, length: 8 }] });
+    const named = update(71, { ...group(71, "😺 Joko 你好"),
+      entities: [{ type: "text_mention", offset: 3, length: 4, user: BOT }] });
+    const other = update(72, { ...group(72, "Joko 你好"),
+      entities: [{ type: "text_mention", offset: 0, length: 4, user: user(701, "Joko", "other_bot", true) }] });
+    const manual = update(73, group(73, "@Joko"));
+    const bare = update(74, group(74, "Joko 今天请假了"));
+    const photo = update(75, { ...message({ id: 75, from: STRANGER, chatId: -10, chatType: "group", photoId: "caption-photo" }),
+      caption: "😀 Joko 看图", caption_entities: [{ type: "text_mention", offset: 3, length: 4, user: BOT }] });
+    const reply = update(76, { ...group(76), reply_to_message: message({ id: 66, from: BOT, chatId: -10, chatType: "group", text: "Earlier reply" }) });
+    const malformed = update(77, { ...group(77, "Joko"),
+      entities: [{ type: "text_mention", offset: 1, length: 4, user: BOT }] });
+    const result = normalizeTelegramUpdates([pure, named, other, manual, bare, photo, reply, malformed], options());
+    expect(result.events).toEqual([
+      expect.objectContaining({ messageId: "70", text: "", ambient: false }),
+      expect.objectContaining({ messageId: "71", text: "😺 你好", ambient: false }),
+      expect.objectContaining({ messageId: "73", text: "", ambient: false }),
+      expect.objectContaining({ messageId: "75", text: "😀 看图", ambient: false, attachments: [expect.objectContaining({ kind: "image" })] }),
+      expect.objectContaining({ messageId: "76", text: "", ambient: false, replyContext: expect.objectContaining({ text: "Earlier reply" }) })
+    ]);
+    expect(result.ignored.map(({ providerRequestId, reason }) => [providerRequestId, reason])).toEqual(
+      [72, 74, 77].map(id => [`telegram:update:${id}`, "unaddressed"]));
+    expect(normalizeTelegramUpdates([pure], options({ groupActivation: { "-10": "disabled" } })).events).toEqual([]);
+    expect(normalizeTelegramUpdates([pure, bare], options({ groupActivation: { "-10": "always" } })).events).toEqual([
+      expect.objectContaining({ messageId: "70", text: "", ambient: false }),
+      expect.objectContaining({ messageId: "74", text: "Joko 今天请假了", ambient: true })
+    ]);
+  });
+
   it("folds one media group into one event and flags oversize items", () => {
     const first = message({
       id: 30,
@@ -140,20 +172,56 @@ describe("normalizeTelegramUpdates", () => {
         file_size: (20 * 1024 * 1024) + 1
       }
     });
+    const fourth: TelegramMessage = {
+      ...message({ id: 33, from: OWNER, chatId: 42, chatType: "private", mediaGroupId: "a" }),
+      video: { file_id: "album-video", file_unique_id: "v1", file_name: "clip.MOV", file_size: 1024 }
+    };
+    const fifth: TelegramMessage = {
+      ...message({ id: 34, from: OWNER, chatId: 42, chatType: "private", mediaGroupId: "a" }),
+      video: { file_id: "oversize-video", file_unique_id: "v2", file_name: "large.mp4", file_size: (20 * 1024 * 1024) + 1 }
+    };
 
-    const result = normalizeTelegramUpdates([update(30, first), update(31, second), update(32, third)], options());
+    const result = normalizeTelegramUpdates([
+      update(30, first), update(31, second), update(32, third), update(33, fourth), update(34, fifth)
+    ], options());
 
     expect(result.events).toEqual([
       expect.objectContaining({
-        providerRequestIds: ["telegram:update:30", "telegram:update:31", "telegram:update:32"],
+        providerRequestIds: ["telegram:update:30", "telegram:update:31", "telegram:update:32", "telegram:update:33", "telegram:update:34"],
         text: "album",
         attachments: [
           expect.objectContaining({ providerFileId: "photo-1", kind: "image" }),
-          expect.objectContaining({ providerFileId: "photo-2", kind: "image" })
+          expect.objectContaining({ providerFileId: "photo-2", kind: "image" }),
+          expect.objectContaining({ providerFileId: "album-video", kind: "file", mimeType: "video/quicktime", audioVideo: "video" })
         ],
-        unsupported: [{ code: "oversize", label: "File exceeds Telegram's download limit." }]
+        unsupported: [
+          { code: "oversize", label: "File exceeds Telegram's download limit." },
+          { code: "oversize", label: "large.mp4 exceeds Telegram's download limit." }
+        ]
       })
     ]);
+  });
+
+  it.each([
+    ["voice", "voice-35.ogg", "audio/ogg", "audio"],
+    ["audio", "audio-35.mp3", "audio/mpeg", "audio"],
+    ["video", "video-35.mp4", "video/mp4", "video"],
+    ["video_note", "video-note-35.mp4", "video/mp4", "video"]
+  ] as const)("retains a native %s and its caption with the original Telegram file identity", (field, fileName, mimeType, audioVideo) => {
+    const incoming: TelegramMessage = {
+      ...message({ id: 35, from: OWNER, chatId: 42, chatType: "private" }),
+      caption: "Review this media",
+      [field]: { file_id: "media-35", file_unique_id: "unique-35", file_size: 1024 }
+    };
+    const result = normalizeTelegramUpdates([update(35, incoming)], options());
+    expect(result.events).toMatchObject([{
+      text: "Review this media",
+      attachments: [{
+        kind: "file", providerFileId: "media-35", providerUniqueFileId: "unique-35",
+        fileName, mimeType, byteLength: 1024, audioVideo
+      }],
+      unsupported: []
+    }]);
   });
 
   it("admits only owner interactions and keeps callback values opaque", () => {

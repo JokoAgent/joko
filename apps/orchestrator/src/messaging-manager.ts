@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { fileTypeFromBuffer } from "file-type";
 import {
+  DISCORD_MAXIMUM_INBOUND_FILE_BYTES,
+  TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES,
   DingTalkTransport,
   DiscordTransport,
   FeishuTransport,
@@ -71,6 +73,7 @@ import type { PartnerMessagingRuntime, PartnerMessagingBinding, PartnerMessageDe
 import type { ArtifactStore } from "./artifact-store.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
+import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import type { EnqueueResult, InteractionDecisionSubmission, SessionHost } from "./session-host.js";
 import { listAllInteractions, listAllMessagingInboundRequests } from "./operational-pagination.js";
 
@@ -1880,6 +1883,8 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     event: MessagingInboundMessage
   ): MessagingDeliveryRecord | undefined {
+    if (connection.channel === "telegram" && event.address.conversationKind !== "direct"
+      && event.text.trim() === "" && event.attachments.length === 0 && event.unsupported.length === 0) return undefined;
     const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
     if (event.replyContext !== null) {
       const exact = this.#store.findSentMessagingInteractionDelivery({
@@ -2494,13 +2499,45 @@ export class MessagingManager {
         { code: "protected_media", label: "Protected media was not retained." }
       ] };
     }
-    const existingArtifactCount = request.artifactIds.length;
-    for (let index = existingArtifactCount; index < event.attachments.length; index += 1) {
+    // A rejected media attachment can leave a gap in the original provider order.
+    const stagedOrdinals = request.artifactIds.length === 0
+      ? undefined
+      : new Set(this.#store.listMessagingRequestArtifactOrdinals(request.id));
+    const unsupported = [...event.unsupported];
+    for (const [index, attachment] of event.attachments.entries()) {
+      if (stagedOrdinals?.has(index)) continue;
       signal.throwIfAborted();
       this.#requireWorkerConnection(connection.id, connection.generation);
-      const attachment = event.attachments[index]!;
-      const downloaded = await transport.downloadAttachment(attachment, signal);
-      const mimeType = await verifiedAttachmentMime(transport.channel, attachment.kind, attachment.mimeType, downloaded);
+      let downloaded: MessagingDownloadedAttachment;
+      try {
+        downloaded = await transport.downloadAttachment(attachment, signal);
+      } catch (error) {
+        if (attachment.audioVideo === undefined || isCancelled(error)
+          || (error instanceof MessagingTransportError && (error.code === "invalid_credential" || error.code === "conflict"))) throw error;
+        signal.throwIfAborted();
+        this.#requireWorkerConnection(connection.id, connection.generation);
+        const code = error instanceof MessagingTransportError && error.code === "payload_too_large" ? "oversize" : "download";
+        unsupported.push({ code, label: attachment.fileName });
+        continue;
+      }
+      let mimeType: string | null;
+      if (attachment.audioVideo === undefined) {
+        mimeType = await verifiedAttachmentMime(transport.channel, attachment.kind, attachment.mimeType, downloaded);
+      } else {
+        const maximumBytes = transport.channel === "discord"
+          ? DISCORD_MAXIMUM_INBOUND_FILE_BYTES
+          : TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES;
+        if (downloaded.bytes.byteLength > maximumBytes) {
+          unsupported.push({ code: "oversize", label: attachment.fileName });
+          continue;
+        }
+        mimeType = sniffMediaMime(downloaded.bytes, attachment.mimeType ?? "");
+        if (mimeType === null || (!mimeType.startsWith("audio/") && !mimeType.startsWith("video/"))) {
+          unsupported.push({ code: attachment.audioVideo, label: attachment.fileName });
+          continue;
+        }
+      }
+      signal.throwIfAborted();
       this.#requireWorkerConnection(connection.id, connection.generation);
       const artifact = await this.#artifacts.ingestBytes(downloaded.bytes, {
         fileName: downloaded.fileName,
@@ -2508,6 +2545,8 @@ export class MessagingManager {
         expiresAt: this.#now() + ATTACHMENT_STAGING_TTL_MS
       });
       try {
+        signal.throwIfAborted();
+        this.#requireWorkerConnection(connection.id, connection.generation);
         request = this.#store.attachMessagingRequestArtifact({
           requestId: request.id,
           expectedRevision: request.revision,
@@ -2520,11 +2559,13 @@ export class MessagingManager {
       }
     }
 
+    signal.throwIfAborted();
+    this.#requireWorkerConnection(connection.id, connection.generation);
     activeConversation = this.#store.getMessagingConversation(activeConversation.id);
     if (activeConversation.sessionId === undefined) throw new Error("Messaging conversation has no Session binding.");
     const artifacts = request.artifactIds.map((artifactId) => this.#store.getArtifact(artifactId).blob);
     const origin = this.#partnerRuntime?.origin(activeConversation, event, request.id);
-    const prompt = { ...this.#messagePrompt(activeConversation, event, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
+    const prompt = { ...this.#messagePrompt(activeConversation, { ...event, unsupported }, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
     const configuration = decodeSupportedConnection(connection);
     const overrides: TurnExecutionOverrides | undefined = origin
       ? { permissionMode: 'ask' }
@@ -2877,6 +2918,9 @@ export class MessagingManager {
       );
     }
     if (event.text.trim() !== "") sections.push(event.text);
+    else if (event.address.channel === "telegram" && conversation.conversationKind !== "direct" && !event.ambient) {
+      sections.push("The speaker explicitly called the bot without adding a text request.");
+    }
     if (event.unsupported.length > 0) {
       sections.push(event.unsupported.map((part) => `[Unsupported ${part.code}] ${part.label}`).join("\n"));
     }
@@ -3217,18 +3261,41 @@ export class MessagingManager {
     const { request, connection, conversation } = source;
     const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${requestId}:progress:start` });
     if (start?.status !== "sent" || !start.providerMessageId) return;
-    const answer = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `run:${request.runId}:answer` });
-    if (answer) {
-      if (answer.partCount > 1000) return;
-      for (let index = 0; index < answer.partCount; index++) if (this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id,
-        channelGeneration: connection.generation, dedupeKey: answer.dedupeKey, partIndex: index })?.status !== "sent") return;
-      if (connection.channel === "discord" && answer.kind === "text" && answer.providerMessageId === start.providerMessageId) return;
-    }
+    if (!this.#canRemoveReplyStreamCarrier(source, start.providerMessageId)) return;
     const payload = { format: 1, address: addressFor(connection, conversation), replyStream: { requestId, phase: "remove", messageId: start.providerMessageId } };
     this.#store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
       dedupeKey: `request:${requestId}:progress:remove`, kind: "notice", partIndex: 0, partCount: 1, payloadHash: operationBodyHash(payload), payload,
       availableAt: this.#now(), createdAt: this.#now() });
     this.#scheduleDeliveryDrain(connection.id);
+  }
+
+  #canRemoveReplyStreamCarrier(source: {
+    readonly request: MessagingInboundRequestRecord;
+    readonly connection: MessagingConnectionRecord;
+    readonly conversation: MessagingConversationRecord;
+  }, carrierId: string): boolean {
+    const { request, connection, conversation } = source;
+    const scope = { connectionId: connection.id, channelGeneration: connection.generation };
+    let runId = request.runId;
+    // The request keeps its admitted Run ID. A trusted continuation can own the
+    // final delivery, including when the outbox is reopened after a restart.
+    for (let depth = 0; depth < 16 && runId !== undefined; depth++) {
+      const answer = this.#store.findMessagingDeliveryByDedupe({ ...scope, dedupeKey: `run:${runId}:answer` });
+      if (answer !== undefined) {
+        if (answer.conversationId !== conversation.id || answer.partCount > 1000) return false;
+        for (let partIndex = 0; partIndex < answer.partCount; partIndex++) {
+          const part = this.#store.findMessagingDeliveryByDedupe({ ...scope, dedupeKey: answer.dedupeKey, partIndex });
+          if (part?.status !== "sent" || part.conversationId !== conversation.id) return false;
+        }
+        return connection.channel !== "discord" || answer.kind !== "text" || answer.providerMessageId !== carrierId;
+      }
+      const child = this.#store.findRunByParentId(runId)?.descriptor;
+      if (child === undefined) return true;
+      if (depth === 15) return false;
+      if (this.#store.findMessagingInboundRequestByRunId(child.id)?.id !== request.id) return true;
+      runId = child.id;
+    }
+    return false;
   }
 
   #streamDeliverySource(delivery: MessagingDeliveryRecord) {
@@ -3244,6 +3311,8 @@ export class MessagingManager {
     if (!marker && (source.connection.channel !== "discord" || source.request.status !== "completed")) return;
     const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: source.connection.id, channelGeneration: source.connection.generation, dedupeKey: `request:${requestId}:progress:start` });
     if (marker && marker["phase"] !== "start" && (start?.status !== "sent" || marker["messageId"] !== start.providerMessageId)) return;
+    if (marker?.["phase"] === "remove" && (start?.providerMessageId === undefined
+      || !this.#canRemoveReplyStreamCarrier(source, start.providerMessageId))) return;
     return { ...source, start };
   }
 

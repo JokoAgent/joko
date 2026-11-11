@@ -11,7 +11,8 @@ import {
   StaleGenerationError,
   StoreError,
   messagingConversationContextAad,
-  operationBodyHash
+  operationBodyHash,
+  type MessagingDeliveryRecord
 } from "./index.js";
 
 const cleanups: Array<() => void> = [];
@@ -711,6 +712,52 @@ describe("OperationalStore messaging", () => {
     })).toThrow(/Protected/u);
   });
 
+  it.each([0, 1, 2])("keeps Telegram answer order while part %i waits for a durable retry", (retryIndex) => {
+    const fixture = createActiveFixture();
+    const answer = enqueueTelegramAnswer(fixture, "run:ordered:answer");
+    const claim = (at: number) => claimMessagingPart(fixture, at);
+    for (let index = 0; index < retryIndex; index++) {
+      const part = claim(100 + index * 2)!;
+      expect(part.id).toBe(answer[index]!.id);
+      settleMessagingPart(fixture, part, 101 + index * 2);
+    }
+    const rejected = claim(110)!;
+    expect(rejected.id).toBe(answer[retryIndex]!.id);
+    expect(claim(111)).toBeUndefined();
+    const failed = fixture.store.settleMessagingDelivery({ deliveryId: rejected.id, expectedRevision: rejected.revision,
+      claimToken: rejected.claimToken!, status: "failed", errorCode: "rate_limited", settledAt: 112 });
+    fixture.store.retryMessagingDelivery({ deliveryId: failed.id, expectedRevision: failed.revision,
+      expectedChannelGeneration: fixture.generation, availableAt: 1_000 });
+    const [other] = enqueueTelegramAnswer(fixture, "run:independent:answer", 1);
+    fixture.reopen();
+    const independent = claim(900)!;
+    expect(independent.id).toBe(other!.id);
+    settleMessagingPart(fixture, independent, 901);
+    expect(claim(999)).toBeUndefined();
+    for (let index = retryIndex; index < answer.length; index++) {
+      const part = claim(1_000 + index)!;
+      expect(part).toMatchObject({ id: answer[index]!.id, partIndex: index, attempts: index === retryIndex ? 2 : 1 });
+      settleMessagingPart(fixture, part, 1_000 + index);
+    }
+    expect(claim(1_010)).toBeUndefined();
+    expect(answer.map(({ id }) => fixture.store.getMessagingDelivery(id).status)).toEqual(["sent", "sent", "sent"]);
+  });
+
+  it.each(["failed", "unknown"] as const)("retires unsent Telegram tails when the first effect is %s", (status) => {
+    const fixture = createActiveFixture();
+    const [first, ...tail] = enqueueTelegramAnswer(fixture, "run:incomplete:answer");
+    const claimed = claimMessagingPart(fixture, 100)!;
+    expect(claimed.id).toBe(first!.id);
+    if (status === "failed") fixture.store.settleMessagingDelivery({ deliveryId: claimed.id, expectedRevision: claimed.revision,
+      claimToken: claimed.claimToken!, status: "failed", errorCode: "provider_rejected", settledAt: 101 });
+    fixture.reopen();
+    if (status === "unknown") expect(fixture.store.recoverClaimedMessagingDeliveries(102)).toBe(1);
+    const [other] = enqueueTelegramAnswer(fixture, "run:next:answer", 1);
+    expect(claimMessagingPart(fixture, 103)?.id).toBe(other!.id);
+    expect(fixture.store.getMessagingDelivery(first!.id)).toMatchObject({ status, attempts: 1 });
+    for (const part of tail) expect(fixture.store.getMessagingDelivery(part.id)).toMatchObject({ status: "cancelled", attempts: 0 });
+  });
+
   it("claims outbound and interaction effects once and recovers uncertain effects without replay", () => {
     const fixture = createActiveFixture();
     const payload = { text: "answer" };
@@ -1226,6 +1273,26 @@ function createActiveFixture(options: {
     sessionId: "active-messaging-session",
     generation: connected.generation
   };
+}
+
+function enqueueTelegramAnswer(fixture: ReturnType<typeof createActiveFixture>, dedupeKey: string, partCount = 3) {
+  return Array.from({ length: partCount }, (_, partIndex) => {
+    const kind = partIndex === 2 ? "file" : "text";
+    const payload = { part: partIndex, kind };
+    return fixture.store.enqueueMessagingDelivery({ connectionId: fixture.connectionId, expectedChannelGeneration: fixture.generation,
+      conversationId: fixture.conversationId, dedupeKey, kind, partIndex, partCount, payloadHash: operationBodyHash(payload),
+      payload, createdAt: 50, availableAt: 50 + partIndex });
+  });
+}
+
+function claimMessagingPart(fixture: ReturnType<typeof createActiveFixture>, claimedAt: number) {
+  return fixture.store.claimNextMessagingDelivery({ connectionId: fixture.connectionId, expectedChannelGeneration: fixture.generation,
+    claimToken: `telegram-part-claim-${claimedAt}`, claimedAt });
+}
+
+function settleMessagingPart(fixture: ReturnType<typeof createActiveFixture>, part: MessagingDeliveryRecord, settledAt: number): void {
+  fixture.store.settleMessagingDelivery({ deliveryId: part.id, expectedRevision: part.revision, claimToken: part.claimToken!,
+    status: "sent", providerMessageId: `telegram-sent-${part.id}`, settledAt });
 }
 
 function sealMessagingContext(value: string, aad: string, nonceByte: number) {

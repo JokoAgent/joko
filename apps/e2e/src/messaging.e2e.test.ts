@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 import { create } from "@bufbuild/protobuf";
 import {
   MessagingChannel,
@@ -191,10 +193,34 @@ describe("Telegram Messaging production product chain", () => {
     expect((await restartedClients.session.getSession({ sessionId })).session?.sessionId).toBe(sessionId);
     expect(fixture.providerRequests).toHaveLength(1);
 
+    const audio = await readFile(new URL("../../desktop/resources/native-task-status-sounds/ring-chime.mp3", import.meta.url));
+    telegram.addFile({ fileId: "native-audio-102", path: "music/chime.mp3", bytes: audio, mimeType: "audio/mpeg" });
+    telegram.enqueueDirectMessage({
+      updateId: 12, messageId: 102, text: "Inspect this native audio.",
+      fileId: "native-audio-102", attachmentKind: "audio", mimeType: "application/octet-stream"
+    });
+    await waitFor(
+      async () => telegram?.outboundMessages ?? [],
+      (messages) => messages.some((message) => message.replyToMessageId === 102 && message.text === SECOND_REPLY),
+      "the native Telegram audio turn to finish",
+      30_000
+    );
+    const audioRequest = required(fixture.application.store.listMessagingInboundRequests()
+      .find((request) => request.providerMessageId === "102"), "native Telegram audio request");
+    expect(audioRequest).toMatchObject({ status: "completed", conversationId: restartedConversation.id });
+    expect(audioRequest.artifactIds).toHaveLength(1);
+    const storedAudio = fixture.application.store.getArtifact(audioRequest.artifactIds[0]!);
+    expect(storedAudio.blob).toMatchObject({ fileName: "chime.mp3", mimeType: "audio/mpeg", byteLength: audio.byteLength });
+    expect((await fixture.application.artifacts.readBlob(storedAudio.blob)).data).toEqual(audio);
+    expect(telegram.methodCount("getFile")).toBe(2);
+    expect(fixture.providerRequests).toHaveLength(2);
+    const audioPath = await fixture.application.artifacts.resolveBlobPath(storedAudio.blob);
+    expect(JSON.stringify(fixture.providerRequests[1]?.body)).toContain(JSON.stringify(audioPath).slice(1, -1));
+
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),
       connections: fixture.application.store.listMessagingConnections(),
-      requests,
+      requests: fixture.application.store.listMessagingInboundRequests(),
       deliveries: fixture.application.store.listMessagingDeliveries(),
       diagnostics: fixture.application.store.listDiagnostics({ limit: 200 })
     }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
