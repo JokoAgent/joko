@@ -1200,6 +1200,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
             // Virtual-row corrections can interrupt native animated Home
             // before it reaches the history boundary.
             event.preventDefault();
+            // Let the resulting scroll record the newly chosen reading position.
+            viewportAnchorRef.current = undefined;
             writeScrollTop(0);
           }
           if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();

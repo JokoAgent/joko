@@ -171,6 +171,32 @@ describe("Timeline viewport journeys", () => {
     expect(viewport.scrollTop).toBe(0);
   });
 
+  it("restores the new reading position after Home and a same-owner reopen", async () => {
+    extent = 1_080;
+    await render({ messageNavRailEnabled: false });
+    const viewport = timeline();
+    await flushFrames();
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+    expect(viewport.querySelectorAll(".timeline__row")).toHaveLength(props.items.length);
+
+    await act(async () => {
+      viewport.focus();
+      viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    await flushFrames();
+    expect(viewport.scrollTop).toBe(0);
+    expect(viewport.querySelectorAll(".timeline__row")).toHaveLength(props.items.length);
+
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    await render();
+    await flushFrames();
+    expect(timeline().scrollTop).toBe(0);
+    expectUnread(0);
+  });
+
   it("leaves Page Up with the focused long tool output while it can scroll upward", async () => {
     await render({ items: [...props.items, {
       ...item("long-tool", 9, "tool"),
