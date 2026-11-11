@@ -149,9 +149,16 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
-  it("does not reuse an around-message window after the authoritative history revision changes", async () => {
+  it("keeps an adopted message link consumed after deletion and resolves a new opening separately", async () => {
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
     const task = session("task-a");
     const linkedMessage = timelineItem("shared-message");
+    const neighbor = { ...timelineItem("surviving-answer"), sequence: 2n };
     const loadSessionTimelineAround = vi.fn<AppController["loadSessionTimelineAround"]>()
       .mockResolvedValueOnce([linkedMessage])
       .mockResolvedValueOnce([]);
@@ -168,20 +175,56 @@ describe("Desktop system handoff App boundary", () => {
     const fixture = renderApp(initial, { loadSessionTimelineAround });
 
     await fixture.render();
-    await act(async () => {
-      await vi.waitFor(() => expect(loadSessionTimelineAround).toHaveBeenCalledTimes(1));
-    });
-
-    await fixture.render({
+    expect(loadSessionTimelineAround).toHaveBeenCalledOnce();
+    expect(fixture.container.querySelector('[data-message-client-id="shared-message"]')?.closest(".timeline__row")
+      ?.getAttribute("aria-current")).toBe("true");
+    const afterDeletion = {
       ...initial,
       snapshot: {
         ...initial.snapshot,
-        timelineHistoryRevisionBySession: new Map([[task.id, 1n]])
+        timelineHistoryRevisionBySession: new Map([[task.id, 1n]]),
+        timelineBySession: new Map([[task.id, [neighbor]]])
       }
+    };
+    await fixture.render(afterDeletion);
+    expect(loadSessionTimelineAround).toHaveBeenCalledOnce();
+    expect(fixture.container.textContent).toContain(neighbor.text);
+    expect(fixture.container.textContent).not.toContain(linkedMessage.text);
+    expect(fixture.container.textContent).not.toContain("That message is no longer available in the task timeline.");
+
+    await fixture.render({ ...afterDeletion, navigationRevision: 1 });
+    expect(loadSessionTimelineAround).toHaveBeenCalledTimes(2);
+    expect(loadSessionTimelineAround).toHaveBeenLastCalledWith(task.id, "event-a", 160);
+    expect(fixture.container.textContent).toContain("That message is no longer available in the task timeline.");
+    await fixture.dispose();
+  });
+
+  it("resolves an unconsumed message link against the new history revision", async () => {
+    const task = session("task-a");
+    const linkedMessage = timelineItem("shared-message");
+    const original = deferred<readonly TimelineItemView[]>();
+    const replacement = deferred<readonly TimelineItemView[]>();
+    const loadSessionTimelineAround = vi.fn<AppController["loadSessionTimelineAround"]>()
+      .mockReturnValueOnce(original.promise)
+      .mockReturnValueOnce(replacement.promise);
+    const initial = connectedState({
+      route: { kind: "session", sessionId: task.id, messageId: linkedMessage.id, messageEventId: "event-a" },
+      sessions: [task]
     });
-    await act(async () => {
-      await vi.waitFor(() => expect(loadSessionTimelineAround).toHaveBeenCalledTimes(2));
+    const fixture = renderApp(initial, { loadSessionTimelineAround });
+
+    await fixture.render();
+    expect(loadSessionTimelineAround).toHaveBeenCalledOnce();
+    await fixture.render({
+      ...initial,
+      snapshot: { ...initial.snapshot, timelineHistoryRevisionBySession: new Map([[task.id, 1n]]) }
     });
+    expect(loadSessionTimelineAround).toHaveBeenCalledTimes(2);
+
+    await act(async () => original.resolve([linkedMessage]));
+    expect(fixture.container.textContent).not.toContain(linkedMessage.text);
+    expect(fixture.container.querySelector(".action-progress")).not.toBeNull();
+    await act(async () => replacement.resolve([]));
     expect(fixture.container.textContent).toContain("That message is no longer available in the task timeline.");
     await fixture.dispose();
   });
