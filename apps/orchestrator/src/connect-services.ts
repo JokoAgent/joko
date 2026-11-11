@@ -68,6 +68,7 @@ import {
   AsyncTransactionError,
   AuthorizationError,
   InvalidStateTransitionError,
+  MessageSearchRevisionConflictError,
   NotFoundError,
   OperationConflictError,
   OperationInProgressError,
@@ -3014,6 +3015,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           poolCapped: result.poolCapped
         };
       } catch (error) {
+        if (error instanceof MessageSearchRevisionConflictError) throw new ConnectError(error.message, Code.Aborted);
         if (error instanceof NotFoundError) throw error;
         if (error instanceof StoreClosedError) throw error;
         if (error instanceof ProtoMappingError) throw invalidArgument(error.message);
