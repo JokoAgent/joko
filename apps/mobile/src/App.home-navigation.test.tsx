@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
   SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
-  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, TargetSchema, capabilityNames } from "@joko/contracts";
+  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, TargetSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -519,6 +519,36 @@ describe("actual Home navigation hosts", () => {
     expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.search")}"]`)?.value).toBe("Beta");
     expect(button(message("home.filter.archived")).getAttribute("aria-selected")).toBe("true");
     expect(host.textContent).not.toContain("Alpha");
+  });
+
+  it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {
+    const owner = create(SnapshotSchema, { ...state.owner!,
+      workspaces: [{ workspaceId: "project-workspace", targetId: "project", displayName: "Project", kind: WorkspaceKind.USER_PROJECT }],
+      sessions: [
+        { sessionId: "title", targetId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
+          lastActivityAt: { seconds: 10n } },
+        { sessionId: "body", targetId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
+          lastActivityAt: { seconds: 20n } }
+      ] });
+    const order = () => [...host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]')]
+      .map(row => row.getAttribute("aria-label"));
+    await render({ state: { ...state, owner, detail: owner, homeSearchStatus: "ready",
+      homeSearchQuery: "needle", homeSearchSessionIds: ["body"] } });
+    await type(message("home.search"), "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(180));
+    expect(searchHome).toHaveBeenLastCalledWith("needle", "active");
+    expect(order()).toEqual(["Open task Needle title", "Open task Newer task"]);
+    expect(button(message("home.searchSort.relevance")).getAttribute("aria-selected")).toBe("true");
+    await press(message("home.searchSort.activityDesc"));
+    expect(order()).toEqual(["Open task Newer task", "Open task Needle title"]);
+    await press(message("home.searchSort.activityAsc"));
+    expect(order()).toEqual(["Open task Needle title", "Open task Newer task"]);
+    expect(button(message("home.searchSort.activityAsc")).getAttribute("aria-selected")).toBe("true");
+
+    await type(message("home.search"), "");
+    expect(searchHome).toHaveBeenLastCalledWith("", "active");
+    expect(order()).toEqual(["Open task Newer task", "Open task Needle title"]);
+    expect(host.textContent).not.toContain(message("home.searchSort.activityAsc"));
   });
 
   it("reopens Home with the saved archive filter and the current node's task list", async () => {

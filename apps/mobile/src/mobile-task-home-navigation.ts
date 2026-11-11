@@ -1,6 +1,9 @@
+import type { MobileHomeSearchSort } from "./home-navigation";
+
 export interface MobileHomeViewState {
   readonly search: string;
   readonly statusFilter: "active" | "archived" | "all";
+  readonly searchSort?: MobileHomeSearchSort;
 }
 
 export type MobileHomeViewChange = (next: MobileHomeViewState, chooseStatus?: boolean) => void;

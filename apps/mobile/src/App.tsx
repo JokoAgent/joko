@@ -288,7 +288,7 @@ import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selecti
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
-  type MobileHomeStatusFilter
+  type MobileHomeSearchSort, type MobileHomeStatusFilter
 } from "./home-navigation";
 import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
   type MobileTaskHomeNavigationScope } from "./mobile-task-home-navigation";
@@ -1314,10 +1314,12 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   onPartners?: (entry: MobileHomePartnerEntry) => void;
 }) {
   const [localViewState, setLocalViewState] = useState<MobileHomeViewState>({ search: "", statusFilter: "active" });
-  const { search, statusFilter } = viewState ?? localViewState;
+  const currentView = viewState ?? localViewState;
+  const { search, statusFilter, searchSort = "relevance" } = currentView;
   const setViewState: MobileHomeViewChange = onViewStateChange ?? setLocalViewState;
-  const setSearch = (search: string): void => setViewState({ search, statusFilter });
-  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => setViewState({ search, statusFilter }, true);
+  const setSearch = (search: string): void => setViewState({ ...currentView, search });
+  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => setViewState({ ...currentView, statusFilter }, true);
+  const setSearchSort = (searchSort: MobileHomeSearchSort): void => setViewState({ ...currentView, searchSort });
   const [localError, setLocalError] = useState("");
   const [copyNotice, setCopyNotice] = useState("");
   const [copyBusy, setCopyBusy] = useState(false);
@@ -1344,9 +1346,10 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     snapshot: state.owner,
     statusFilter,
     query: search,
+    searchSort,
     messageSessionIds: currentMessageIds,
     labels: mobileHomeSectionLabels(locale)
-  }), [currentMessageIds, locale, search, state.owner, statusFilter]);
+  }), [currentMessageIds, locale, search, searchSort, state.owner, statusFilter]);
   const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
 
   useEffect(() => {
@@ -1570,6 +1573,14 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.filter.${filter}`)}</Text>
       </Pressable>)}
     </View>
+    {normalizedSearch && <View accessibilityRole="tablist" accessibilityLabel={mobileMessage(locale, "home.searchSort")} style={[styles.filterRow, { flexWrap: "wrap" }]}>
+      {(["relevance", "activityDesc", "activityAsc"] as const).map((sort) => <Pressable key={sort} accessibilityRole="tab"
+        accessibilityState={{ selected: sort === searchSort }} onPress={() => setSearchSort(sort)}
+        style={[styles.filterChip, { borderColor: sort === searchSort ? colors.accent : colors.border,
+          backgroundColor: sort === searchSort ? colors.brandBackground : colors.surface }]}>
+        <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.searchSort.${sort}`)}</Text>
+      </Pressable>)}
+    </View>}
     {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
     {localError && <Banner text={localError} colors={colors} />}
     {copyNotice && <Notice text={copyNotice} colors={colors} locale={locale}
@@ -1581,7 +1592,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       ListHeaderComponent={onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
         active={foreground} visible={statusFilter !== "archived"} query={search} colors={colors} locale={locale}
         canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
-      renderSectionHeader={({ section }) => <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
+      renderSectionHeader={({ section }) => section.kind === "search" ? null
+        : <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
           ? "home.empty.search" : statusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}

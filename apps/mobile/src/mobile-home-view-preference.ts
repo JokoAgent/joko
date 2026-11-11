@@ -9,7 +9,7 @@ export function useMobileHomeViewPreference(sourceKey: string, storage?: Pick<Mo
   readonly view: MobileHomeViewState;
   readonly change: MobileHomeViewChange;
 } {
-  const [local, setLocal] = useState<{ sourceKey: string; search: string; status: StatusFilter | undefined }>();
+  const [local, setLocal] = useState<{ sourceKey: string; search: string; status: StatusFilter | undefined; sort?: MobileHomeViewState["searchSort"] }>();
   const [saved, setSaved] = useState<{ sourceKey: string; status: StatusFilter }>();
   const latest = useRef(sourceKey);
   latest.current = sourceKey;
@@ -27,10 +27,11 @@ export function useMobileHomeViewPreference(sourceKey: string, storage?: Pick<Mo
 
   const current = local?.sourceKey === sourceKey ? local : undefined;
   const savedStatus = storage && saved?.sourceKey === sourceKey ? saved.status : undefined;
-  const view: MobileHomeViewState = { search: current?.search ?? "", statusFilter: current?.status ?? savedStatus ?? "active" };
+  const view: MobileHomeViewState = { search: current?.search ?? "", statusFilter: current?.status ?? savedStatus ?? "active",
+    ...(current?.sort === undefined ? {} : { searchSort: current.sort }) };
   const change: MobileHomeViewChange = (next, chooseStatus = false) => {
     if (latest.current !== sourceKey) return;
-    setLocal(previous => ({ sourceKey, search: next.search,
+    setLocal(previous => ({ sourceKey, search: next.search, sort: next.searchSort,
       status: chooseStatus ? next.statusFilter : previous?.sourceKey === sourceKey ? previous.status : undefined }));
     if (storage && chooseStatus) writes.current = writes.current.then(() => storage.setItem(key, next.statusFilter)).catch(() => undefined);
   };

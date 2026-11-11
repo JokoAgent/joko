@@ -2,6 +2,7 @@ import { WorkspaceKind, type Session, type Snapshot } from "@joko/contracts";
 import { safeWindowRect, windowDivision, type MobileWindowGeometry } from "./mobile-window-geometry";
 
 export type MobileHomeStatusFilter = "active" | "archived" | "all";
+export type MobileHomeSearchSort = "relevance" | "activityDesc" | "activityAsc";
 
 export interface MobileHomeSessionItem {
   readonly session: Session;
@@ -13,7 +14,7 @@ export interface MobileHomeSessionItem {
 
 export interface MobileHomeSection {
   readonly key: string;
-  readonly kind: "pinned" | "dialogue" | "project";
+  readonly kind: "pinned" | "dialogue" | "project" | "search";
   readonly title: string;
   readonly items: readonly MobileHomeSessionItem[];
 }
@@ -22,6 +23,7 @@ export interface BuildMobileHomeSectionsOptions {
   readonly snapshot: Snapshot | undefined;
   readonly statusFilter: MobileHomeStatusFilter;
   readonly query: string;
+  readonly searchSort?: MobileHomeSearchSort;
   readonly messageSessionIds?: ReadonlySet<string>;
   readonly labels: {
     readonly dialogue: string;
@@ -58,6 +60,24 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
       groupTitle: project ? target?.displayName || workspace.displayName || options.labels.project : options.labels.dialogue
     };
   });
+  if (normalizedQuery) {
+    if (items.length === 0) return [];
+    const ranks = new Map([...(options.messageSessionIds ?? [])].map((sessionId, index) => [sessionId, index] as const));
+    const titleMatches = new Set(items.filter(({ session }) => session.displayName.toLocaleLowerCase().includes(normalizedQuery))
+      .map(({ session }) => session.sessionId));
+    const sorted = items.sort((left, right) => {
+      const recent = compareHomeItems(right, left);
+      if (recent !== 0 && options.searchSort === "activityAsc") return -recent;
+      if (recent !== 0 && options.searchSort === "activityDesc") return recent;
+      const leftId = left.session.sessionId;
+      const rightId = right.session.sessionId;
+      return Number(titleMatches.has(rightId)) - Number(titleMatches.has(leftId))
+        || (ranks.get(leftId) ?? Number.MAX_SAFE_INTEGER) - (ranks.get(rightId) ?? Number.MAX_SAFE_INTEGER)
+        || Number(right.session.pinned) - Number(left.session.pinned)
+        || recent || leftId.localeCompare(rightId);
+    });
+    return [{ key: "search", kind: "search", title: "", items: sorted }];
+  }
   const sections: MobileHomeSection[] = [];
   const pinned = sortHomeItems(items.filter((item) => item.session.pinned));
   if (pinned.length > 0) sections.push({ key: "pinned", kind: "pinned", title: options.labels.pinned, items: pinned });
