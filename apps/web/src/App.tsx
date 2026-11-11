@@ -1342,11 +1342,13 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       setRetryableMessageDeepLinkKey(undefined);
       return;
     }
-    const deepLinkKey = `${state.activeProfile?.id ?? ""}\u0000${activeSession.id}\u0000${messageEventId ?? ""}\u0000${messageId}\u0000${state.snapshot.generation}\u0000${activeTimelineHistoryRevision}\u0000${state.navigationRevision ?? 0}`;
+    const linkOccurrenceKey = `${state.activeProfile?.id ?? ""}\u0000${activeSession.id}\u0000${messageEventId ?? ""}\u0000${messageId}\u0000${state.snapshot.generation}\u0000${state.navigationRevision ?? 0}`;
+    // History changes retire pending reads. A completed jump belongs to the original navigation.
+    const deepLinkKey = `${linkOccurrenceKey}\u0000${activeTimelineHistoryRevision}`;
     if (currentMessageDeepLinkRef.current !== deepLinkKey) {
       messageJumpGenerationRef.current += 1;
       currentMessageDeepLinkRef.current = deepLinkKey;
-      handledMessageDeepLinkRef.current = undefined;
+      if (handledMessageDeepLinkRef.current !== linkOccurrenceKey) handledMessageDeepLinkRef.current = undefined;
       loadingMessageDeepLinkRef.current = undefined;
       failedMessageDeepLinkRef.current = undefined;
       setRetryableMessageDeepLinkKey(undefined);
@@ -1356,9 +1358,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         pageRequests: 0
       };
     }
+    if (handledMessageDeepLinkRef.current === linkOccurrenceKey) return;
     if (activeTimeline.some((item) => item.id === messageId)) {
-      if (handledMessageDeepLinkRef.current === deepLinkKey) return;
-      handledMessageDeepLinkRef.current = deepLinkKey;
+      handledMessageDeepLinkRef.current = linkOccurrenceKey;
       if (loadingMessageDeepLinkRef.current === deepLinkKey) {
         const busyKey = `message-link:${messageJumpGenerationRef.current}`;
         loadingMessageDeepLinkRef.current = undefined;
@@ -1385,7 +1387,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     };
     if (state.connectionState !== "connected") return;
     if (messageEventId !== undefined) {
-      if (loadingMessageDeepLinkRef.current === deepLinkKey || handledMessageDeepLinkRef.current === deepLinkKey) return;
+      if (loadingMessageDeepLinkRef.current === deepLinkKey) return;
       loadingMessageDeepLinkRef.current = deepLinkKey;
       const jumpGeneration = ++messageJumpGenerationRef.current;
       const busyKey = `message-link:${jumpGeneration}`;
@@ -1396,7 +1398,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       void controllerRef.current.loadSessionTimelineAround(activeSession.id, messageEventId, 160).then((items) => {
         if (!isPending()) return;
         if (!items.some((item) => item.id === messageId)) throw new Error(t("nav.messageJumpUnavailable"));
-        handledMessageDeepLinkRef.current = deepLinkKey;
+        handledMessageDeepLinkRef.current = linkOccurrenceKey;
         setSearchTimelineWindow({
           profileId: state.activeProfile?.id,
           sessionId: activeSession.id,
