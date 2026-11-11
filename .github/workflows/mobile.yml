@@ -176,11 +176,19 @@ jobs:
       - name: Verify the bounded native build observation parser
         run: pnpm --filter @joko/mobile exec vitest run src/android-build-observer.test.mjs
 
-      - name: Prepare the fixture's Workspace file index
+      - name: Prepare ripgrep for the fixture's Workspace
         run: |
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- install --no-install-recommends --yes ripgrep
-          rg --version
+          ripgrep_version=15.2.0
+          ripgrep_release="ripgrep-$ripgrep_version-x86_64-unknown-linux-musl"
+          ripgrep_root="$RUNNER_TEMP/joko-ci-ripgrep"
+          ripgrep_archive="$ripgrep_root/$ripgrep_release.tar.gz"
+          mkdir -p "$ripgrep_root"
+          curl --fail --silent --show-error --location --retry 2 --max-time 60 --output "$ripgrep_archive" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/$ripgrep_version/$ripgrep_release.tar.gz"
+          printf '%s  %s\n' '33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c' "$ripgrep_archive" | sha256sum --check --strict
+          tar -xzf "$ripgrep_archive" -C "$ripgrep_root"
+          "$ripgrep_root/$ripgrep_release/rg" --version
+          printf '%s\n' "$ripgrep_root/$ripgrep_release" >> "$GITHUB_PATH"
 
       - name: Build shared Mobile and native E2E inputs
         run: pnpm --filter @joko/e2e... --filter @joko/remote-desktop-sync --if-present build
