@@ -11990,6 +11990,36 @@ describe("native message rewinds", () => {
     expect(f.network.submit).toHaveBeenCalledOnce();
   });
 
+  it("retires a files-only receipt when the preview expires during its pending write before dispatch", async () => {
+    const f = fixture(false); const saved = memoryStorage(credential);
+    let now = 2_000;
+    let release!: () => void;
+    const writeGate = new Promise<void>(resolve => { release = resolve; });
+    const savePending = saved.storage.savePending;
+    let paused = false;
+    saved.storage.savePending = vi.fn(async (items) => {
+      if (!paused && items.some(item => item.kind === "workspace-rewind")) { paused = true; await writeGate; }
+      await savePending(items);
+    });
+    const app = client(f.network, saved.storage, undefined, () => now); await app.start();
+    const first = await preview(app);
+    const commit = app.commitTaskMessageRewind(first, "files", new AbortController().signal);
+    const expired = expect(commit).rejects.toThrow(/blocked or expired/u);
+    await vi.waitFor(() => expect(paused).toBe(true));
+    now = 101_000;
+    release();
+    await expired;
+    expect(f.network.submit).not.toHaveBeenCalled();
+    expect(saved.pending()).toEqual([]);
+    expect(app.state).toMatchObject({ pending: [], busy: false });
+    expect(app.taskMessageRewindControls("rewind-complete")?.canFiles).toBe(true);
+
+    f.files.expiresAt!.seconds = 200n;
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => f.operation(operationId, "files"));
+    await expect(app.commitTaskMessageRewind(await preview(app), "files", new AbortController().signal)).resolves.toEqual({ kind: "rewound", mode: "files" });
+    expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
   it("reconciles a lost response after restart from private retained input when the original Event is gone, without resending", async () => {
     const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
     vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));

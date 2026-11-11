@@ -6059,7 +6059,7 @@ export class MobileClient {
     await write;
   }
 
-  async #retireUndispatchedSettingsReceipt(pending: PendingOperation): Promise<void> {
+  async #retireUndispatchedReceipt(pending: PendingOperation): Promise<void> {
     const retained = (item: PendingOperation) => item.operationId !== pending.operationId || item.connectionId !== pending.connectionId
       || item.taskJoinId !== pending.taskJoinId || item.kind !== pending.kind;
     const write = this.#pendingWrite.then(async () => {
@@ -13388,7 +13388,12 @@ export class MobileClient {
         try { await this.composerDrafts!.clearOperationInput(identity, operationId); }
         catch (error) { cleanupError = message(error); }
       }
-      if (!result.accepted) return { kind: "rejected" };
+      if (!result.accepted) {
+        if (mode === "files" && result.operation === undefined && !fileCurrent()) {
+          throw new Error("The Workspace rewind preview is blocked or expired. Open a new preview.");
+        }
+        return { kind: "rejected" };
+      }
       this.#messageRewindPreviews.delete(preview);
       if (mode === "dialogue") this.#clearHistory();
       await this.refresh();
@@ -16767,8 +16772,9 @@ export class MobileClient {
     let operation: Operation;
     if (!persisted || !requestCurrent() || authority?.beforeDispatch?.() === false) {
       if (pending.kind === "extension-settings-routing" || pending.kind === "extension-settings-credential-clear"
-        || pending.kind === "extension-settings-directory") {
-        await this.#retireUndispatchedSettingsReceipt(pending);
+        || pending.kind === "extension-settings-directory" || pending.kind === "workspace-rewind") {
+        await this.#retireUndispatchedReceipt(pending);
+        if (pending.kind === "workspace-rewind" && markBusy && this.#current(epoch)) this.#set({ busy: false });
         return { accepted: false, definitive: true };
       }
       return { accepted: false, definitive: false };
