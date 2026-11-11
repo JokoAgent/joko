@@ -141,6 +141,12 @@ describe("packaged Desktop Pi compaction", () => {
     const pairingTab = page.locator(".connection-tabs > button").nth(2);
     try {
       await pairingTab.click();
+      const nativeWindow = await desktop.browserWindow(page);
+      try {
+        expect(await nativeWindow.evaluate(window => window.isVisible())).toBe(true);
+      } finally {
+        await nativeWindow.dispose();
+      }
     } catch (error) {
       let deadline: NodeJS.Timeout | number | undefined;
       const observation = await Promise.race([
