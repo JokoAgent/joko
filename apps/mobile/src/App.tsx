@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, use
 import {
   AccessibilityInfo, ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
-  useWindowDimensions, View
+  useWindowDimensions, View, type NativeScrollEvent
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileAdaptiveWindowProvider, useMobileAdaptiveWindow } from "./MobileAdaptiveWindow";
@@ -3582,6 +3582,19 @@ interface MobileTaskSendFollow {
   seek?: { readonly index: number; waitingForMeasurement: boolean };
 }
 
+interface MobileTaskTimelineFollow {
+  readonly sourceKey: string;
+  position: "unmeasured" | "latest" | "earlier";
+  motion: "idle" | "dragging" | "released" | "momentum";
+  initialRequested?: boolean;
+  offset?: number;
+  dragStart?: number;
+  viewportHeight?: number;
+  streamingWhenUnpinned?: ReadonlySet<string>;
+  measurement?: { readonly width: number; readonly height: number; readonly older: MobileClient["state"]["older"] };
+  tail?: { readonly row: TimelineRow; readonly older: MobileClient["state"]["older"] };
+}
+
 export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused, onTaskSharing,
   messageFocus, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
@@ -3724,6 +3737,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const initialTimelineTailRef = useRef<{ readonly ownerKey: string; requested: boolean; finished: boolean } | undefined>(undefined);
   const latestSendFollowRef = useRef<MobileTaskSendFollow | undefined>(undefined);
   const [acceptedSendFollowId, setAcceptedSendFollowId] = useState<string>();
+  const latestTimelineFollowRef = useRef<MobileTaskTimelineFollow | undefined>(undefined);
+  const [timelineForegroundEpoch, setTimelineForegroundEpoch] = useState(0);
+  const [newTimelineMessages, setNewTimelineMessages] = useState<MobileTaskTimelineFollow>();
   const timelineViewportRef = useRef<View>(null);
   const queueViewportRef = useRef<View>(null);
   const partnerConversationTransport = client.partnerConversationTransport();
@@ -4254,6 +4270,35 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
   const conversationShare = useMobileConversationShare({ client, rows: partnerRows ?? rows, locale,
     onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
+  const timelineFollowSource = activeMessageFocus === undefined && !conversationShare.active ? sendFollowSource : undefined;
+  const timelineFollow = useMemo<MobileTaskTimelineFollow | undefined>(() => timelineFollowSource === undefined ? undefined
+    : { sourceKey: timelineFollowSource, position: "unmeasured", motion: "idle" }, [timelineFollowSource, timelineListKey, timelineForegroundEpoch]);
+  useLayoutEffect(() => {
+    latestTimelineFollowRef.current = timelineFollow;
+    return () => { if (latestTimelineFollowRef.current === timelineFollow) latestTimelineFollowRef.current = undefined; };
+  }, [timelineFollow]);
+  const currentTimelineFollow = useCallback(() => timelineFollow && latestTimelineFollowRef.current === timelineFollow
+    && taskMountedRef.current && AppState.currentState === "active" && client.state.status === "connected"
+    && client.state.window === undefined && client.taskHeaderSourceKey() === timelineFollow.sourceKey ? timelineFollow : undefined, [timelineFollow]);
+  const visibleTimelineMessages = useMemo(() => displayRows.filter((row): row is TimelineRow => !isWorkGroup(row)
+    && !row.optimistic && !row.workActivity && (row.kind === "user" || row.kind === "assistant")), [displayRows]);
+  const stableTimelineMessages = useMemo(() => visibleTimelineMessages.filter(row => row.completed), [visibleTimelineMessages]);
+  useLayoutEffect(() => {
+    const follow = currentTimelineFollow();
+    if (!follow) return;
+    const previous = follow.tail, tail = stableTimelineMessages.at(-1);
+    follow.tail = tail === undefined ? undefined : { row: tail, older: state.older };
+    if (follow.position !== "earlier" || !previous || previous.older !== state.older || state.historyBusy || client.state.historyBusy || !tail
+      || tail.sequence <= previous.row.sequence) return;
+    const previousIndex = stableTimelineMessages.findIndex(row => row.id === previous.row.id && row.sequence === previous.row.sequence);
+    if (previousIndex < 0) return;
+    // Keep the original accepted-send seek in charge of its own user row.
+    const appended = stableTimelineMessages.slice(previousIndex + 1).some(row => row.sequence > previous.row.sequence && !follow.streamingWhenUnpinned?.has(row.id)
+      && (row.operationId === undefined || row.operationId !== acceptedSendFollowId && row.operationId !== acceptedFollow?.operationId
+        && !ownerOptimisticRows.some(optimistic => optimistic.operationId === row.operationId)));
+    if (appended) setNewTimelineMessages(follow);
+  }, [acceptedFollow?.operationId, acceptedSendFollowId, currentTimelineFollow, ownerOptimisticRows,
+    stableTimelineMessages, state.historyBusy, state.older]);
   const initialTailOwnerKey = JSON.stringify([mobileHomeSourceKey(state), timelineListKey]);
   if (initialTimelineTailRef.current?.ownerKey !== initialTailOwnerKey) {
     initialTimelineTailRef.current = { ownerKey: initialTailOwnerKey, requested: false, finished: false };
@@ -4267,18 +4312,58 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const list = timelineListRef.current;
     if (!initialTailAvailable || initialTimelineTailRef.current !== initialTimelineTail || initialTimelineTail.finished
       || !list || !taskMountedRef.current || AppState.currentState !== "active" || client.taskHeaderSourceKey() !== headerSourceKey
-      || client.state.window !== undefined || client.state.historyBusy) return;
-    if (latestSendFollowRef.current !== undefined) { initialTimelineTail.finished = true; return; }
-    if (initialTimelineTail.requested && !measured) return;
+      || client.state.window !== undefined || client.state.historyBusy) return false;
+    if (latestSendFollowRef.current !== undefined) { initialTimelineTail.finished = true; return false; }
+    if (initialTimelineTail.requested && !measured) return false;
     if (initialTimelineTail.requested) initialTimelineTail.finished = true;
     initialTimelineTail.requested = true;
+    const follow = currentTimelineFollow();
+    if (follow) follow.initialRequested = true;
     list.scrollToEnd({ animated: false });
-  }, [headerSourceKey, initialTailAvailable, initialTimelineTail]);
+    return true;
+  }, [currentTimelineFollow, headerSourceKey, initialTailAvailable, initialTimelineTail]);
   useLayoutEffect(() => {
     if (!initialTailAvailable || initialTimelineTail.finished) return;
     const frame = requestAnimationFrame(() => scrollInitialTimelineTail(false));
     return () => cancelAnimationFrame(frame);
   }, [initialTailAvailable, initialTimelineTail, scrollInitialTimelineTail]);
+  const observeTimelineScroll = (metrics: NativeScrollEvent): void => {
+    const follow = currentTimelineFollow();
+    if (!follow || state.historyBusy || client.state.historyBusy || metrics.layoutMeasurement.height <= 0) return;
+    const offset = metrics.contentOffset.y, previousOffset = follow.offset;
+    const distance = metrics.contentSize.height - offset - metrics.layoutMeasurement.height;
+    follow.offset = offset;
+    follow.viewportHeight = metrics.layoutMeasurement.height;
+    const userScrolling = follow.motion === "dragging" || follow.motion === "momentum";
+    if (userScrolling) {
+      follow.dragStart ??= previousOffset ?? offset;
+      if (follow.position !== "earlier" && distance > 16 && offset < follow.dragStart - 16) {
+        follow.position = "earlier";
+        follow.streamingWhenUnpinned = new Set(visibleTimelineMessages.filter(row => !row.completed).map(row => row.id));
+      }
+      if (distance <= 1 && (follow.position === "unmeasured" || previousOffset !== undefined && offset > previousOffset)) {
+        follow.position = "latest";
+        follow.streamingWhenUnpinned = undefined;
+        setNewTimelineMessages(undefined);
+      }
+    } else if (follow.position === "unmeasured" && follow.motion === "idle" && follow.initialRequested && distance <= 1) {
+      follow.position = "latest";
+    }
+  };
+  const confirmShortTimelineTail = (follow: MobileTaskTimelineFollow): void => {
+    if (follow.position === "unmeasured" && follow.motion === "idle" && follow.initialRequested
+      && follow.measurement && follow.viewportHeight && follow.measurement.height <= follow.viewportHeight) follow.position = "latest";
+  };
+  const jumpToLatestTimeline = (): void => {
+    const follow = currentTimelineFollow(), list = timelineListRef.current;
+    if (!follow || !list || follow.position !== "earlier" || newTimelineMessages !== follow || state.historyBusy || client.state.historyBusy) return;
+    if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
+    follow.position = "latest";
+    follow.motion = "idle";
+    follow.streamingWhenUnpinned = undefined;
+    setNewTimelineMessages(undefined);
+    list.scrollToEnd({ animated: false });
+  };
   const conversationShareColors = useMemo(() => ({ background: colors.background, surfaceElevated: colors.surface,
     textPrimary: colors.ink, textSecondary: colors.muted, textTertiary: colors.muted }), [colors]);
   useEffect(() => mobileComposerDrafts.subscribeErrors((identity, error) => {
@@ -4678,6 +4763,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (status === "active") return;
       if (initialTimelineTailRef.current) initialTimelineTailRef.current.finished = true;
       latestSendFollowRef.current = undefined;
+      latestTimelineFollowRef.current = undefined;
+      setTimelineForegroundEpoch((value) => value + 1);
+      setNewTimelineMessages(undefined);
       taskHomeNavigator.retire();
       if (drawerMountedRef.current) taskHomeNavigator.close();
     });
@@ -6769,7 +6857,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
-    <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
+    <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={(event) => {
+      const follow = currentTimelineFollow();
+      if (follow) {
+        follow.viewportHeight = event.nativeEvent.layout.height;
+        confirmShortTimelineTail(follow);
+      }
+      setImageViewportPulse((value) => value + 1);
+    }}>
     <FlatList key={timelineListKey} ref={timelineListRef} data={displayRows}
       extraData={{ selection: conversationShare.selectedIds, visibleTimelineRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => !isWorkGroup(row) && row.kind === "user" && row.operationId ? `local-send:${row.operationId}` : row.id} style={styles.fill} contentContainerStyle={styles.list}
       viewabilityConfig={timelineViewability} onViewableItemsChanged={onTimelineRowsVisible}
@@ -6778,17 +6873,54 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
           if (layoutMeasurement.height > 0 && contentSize.height - contentOffset.y - layoutMeasurement.height <= 1) initialTimelineTail.finished = true;
         }
+        observeTimelineScroll(event.nativeEvent);
         setImageViewportPulse((value) => value + 1);
       }}
-      onScrollBeginDrag={() => {
+      onScrollBeginDrag={(event) => {
         initialTimelineTail.finished = true;
         if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
+        const follow = currentTimelineFollow();
+        if (follow) {
+          follow.motion = "dragging";
+          follow.dragStart = event?.nativeEvent.contentOffset.y ?? follow.offset;
+        }
       }}
-      onContentSizeChange={() => {
-        scrollInitialTimelineTail(true);
-        if (!acceptedFollow?.seek?.waitingForMeasurement || !sendFollowTarget || sendFollowVisible || !currentSendFollow(acceptedFollow)) return;
-        latestSendFollowRef.current = undefined;
-        acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+      onScrollEndDrag={(event) => {
+        const follow = currentTimelineFollow();
+        if (follow?.motion !== "dragging") return;
+        observeTimelineScroll(event.nativeEvent);
+        follow.motion = "released";
+      }}
+      onMomentumScrollBegin={() => {
+        const follow = currentTimelineFollow();
+        if (follow?.motion === "released") follow.motion = "momentum";
+      }}
+      onMomentumScrollEnd={(event) => {
+        const follow = currentTimelineFollow();
+        if (follow?.motion !== "momentum") return;
+        observeTimelineScroll(event.nativeEvent);
+        follow.motion = "idle";
+      }}
+      onContentSizeChange={(width, height) => {
+        const follow = currentTimelineFollow(), previous = follow?.measurement;
+        if (follow) {
+          follow.measurement = { width, height, older: state.older };
+          if (previous && previous.older !== state.older && follow.position === "latest") {
+            follow.position = "unmeasured";
+            follow.initialRequested = false;
+          }
+        }
+        const initialScroll = scrollInitialTimelineTail(true);
+        if (follow) confirmShortTimelineTail(follow);
+        if (acceptedFollow?.seek?.waitingForMeasurement && sendFollowTarget && !sendFollowVisible && currentSendFollow(acceptedFollow)) {
+          latestSendFollowRef.current = undefined;
+          acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+          return;
+        }
+        if (initialScroll || hasAcceptedFollow || latestSendFollowRef.current !== undefined || state.historyBusy || client.state.historyBusy
+          || follow?.position !== "latest" || follow.motion === "dragging" || follow.motion === "momentum"
+          || !previous || previous.older !== state.older || client.state.older !== state.older || previous.width !== width || previous.height >= height) return;
+        timelineListRef.current?.scrollToEnd({ animated: false });
       }}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
         if (acceptedFollow?.seek?.index === index && sendFollowTarget && currentSendFollow(acceptedFollow)) {
@@ -6858,6 +6990,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           {content}
         </MobilePartnerConversationRow> : content}</View>;
       }} />
+    {newTimelineMessages !== undefined && newTimelineMessages === timelineFollow && !state.historyBusy
+      && <View style={styles.timelineLatestAction} accessibilityLiveRegion="polite">
+      <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} compact onPress={jumpToLatestTimeline} />
+    </View>}
     </View>
     <View testID="task.controls-viewport" pointerEvents="box-none" style={controlsRegion}>
     {state.window !== undefined && localOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
@@ -8640,6 +8776,7 @@ const styles = StyleSheet.create({
   messageActions: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 18 },
   inlineTouchAction: { minHeight: 44, justifyContent: "center" },
   historyActions: { gap: 8 },
+  timelineLatestAction: { position: "absolute", right: 12, bottom: 12 },
   queue: { paddingHorizontal: 18, paddingVertical: 6 }, pending: { paddingHorizontal: 12, flexWrap: "wrap", flexDirection: "row", alignItems: "center" },
   queueRegion: { maxHeight: 272, paddingHorizontal: 12, paddingBottom: 8, gap: 6 },
   queueScroll: { flexGrow: 0 },
