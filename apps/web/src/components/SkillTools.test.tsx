@@ -12,6 +12,7 @@ import type {
   ResourceUsageReportView,
   SkillDescriptorView,
   SkillDraftView,
+  SkillLearningRunView,
   SkillMarketEntryView,
   SkillMarketSourceView,
   SkillPublicationJobView,
@@ -21,6 +22,7 @@ import type {
   TargetView
 } from "../model.js";
 import { diffLineClass, groupSkillCatalog, SkillTools } from "./SkillTools.js";
+import { SkillLearningTools } from "./SkillLearningTools.js";
 import { requestCatalogNavigationLeave } from "../catalog-navigation-leave.js";
 
 const roots: Root[] = [];
@@ -37,6 +39,48 @@ afterEach(async () => {
 });
 
 describe("SkillTools", () => {
+  it.each(["already collecting", "appears before admission"] as const)("does not bind an unrelated run that %s to its pending start", async presence => {
+    let other: SkillLearningRunView = { id: "another-client-run", revision: 1n, state: "collecting", sourceKind: "text",
+      backendId: "pi", targetId: "target-project", summary: "Another client's collection", createdAt: 1, updatedAt: 1, expiresAt: 100_000 };
+    let runs: readonly SkillLearningRunView[] = presence === "already collecting" ? [other] : [];
+    let resolveStart!: (run: SkillLearningRunView) => void;
+    const pending = new Promise<SkillLearningRunView>(resolve => { resolveStart = resolve; });
+    const startSkillLearning = vi.fn(() => pending);
+    const cancelSkillLearning = vi.fn(async (run: SkillLearningRunView) => {
+      expect(run.id).toBe(other.id);
+      other = { ...other, state: "cancelled", revision: 2n };
+      runs = [other];
+      return other;
+    });
+    const controller = { startSkillLearning, cancelSkillLearning,
+      listSkillLearningRuns: vi.fn(async () => runs),
+      getSkillLearningRun: vi.fn(async (id: string) => runs.find(run => run.id === id)!)
+    } as unknown as AppController;
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<SkillLearningTools controller={controller} backends={projectResourceBackends} targets={targets} t={skillTranslator} />));
+    await settle();
+    const instruction = required(container.querySelector("textarea"));
+    await act(async () => setInputValue(instruction, "My pending request."));
+    await act(async () => buttonWithText(container, "Start learning").click());
+    runs = [other];
+    await act(async () => buttonWithText(container, "Refresh").click());
+    await settle();
+    await act(async () => buttonWithText(container, "Cancel").click());
+    await settle();
+    expect(cancelSkillLearning).toHaveBeenCalledTimes(1);
+    expect(instruction.disabled).toBe(true);
+    expect(instruction.value).toBe("My pending request.");
+    expect(startSkillLearning).toHaveBeenCalledTimes(1);
+    const own: SkillLearningRunView = { ...other, id: "this-request-run", state: "distilling",
+      summary: "My pending request.", distillationSessionId: "this-request-session" };
+    runs = [own, other];
+    await act(async () => { resolveStart(own); await pending; });
+    await settle();
+    expect(instruction.disabled).toBe(false);
+    expect(container.querySelector(".skill-learning__detail h3")?.textContent).toBe("My pending request.");
+  });
+
   it("keeps the actual unsaved file on a declined node change and discards only after explicit acceptance", async () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
     const container = await renderSkills(skillController());
