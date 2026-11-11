@@ -121,7 +121,8 @@ describe("ExtensionMainViewManager", () => {
         const html = await f.manager.serve({ surfaceId: surfaceId!, token: token!, assetPath: entry!, method: "GET", isolatedDocument: true });
         const programs = [...html.body!.toString().matchAll(/data:text\/javascript;base64,([A-Za-z0-9+/=]+)/gu)]
           .map(match => Buffer.from(match[1]!, "base64").toString()).join("\n");
-        expect(programs).toContain(JSON.stringify({ sessionId }));
+        const taskContext = programs.match(/const taskContext\s*=\s*Object\.freeze\(\{\s*"?sessionId"?\s*:\s*"([^"]+)"\s*\}\)/u);
+        expect(taskContext?.[1]).toBe(sessionId);
         expect(programs).not.toContain(sessionId === "task-a" ? "task-b" : "task-a");
         expect(programs).not.toContain("extension-library-request");
         await expect(f.manager.getSurface(page.id, "connection-b")).rejects.toMatchObject({ statusCode: 404 });
