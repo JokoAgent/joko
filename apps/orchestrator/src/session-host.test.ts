@@ -12325,6 +12325,57 @@ describe("SessionHost", () => {
     expect(fixture.store.getSession(childId).descriptor.worktree).toBeUndefined();
   });
 
+  it("passes the exact formal Pi source row without changing legacy derivations", async () => {
+    class PiMessageForkAdapter extends FakeBackendAdapter {
+      override async describe() { return { ...await super.describe(), adapterKind: "pi" }; }
+    }
+    const adapter = new PiMessageForkAdapter(PI_LIKE_PROFILE);
+    const fixture = await createFixture(adapter);
+    const sourceSessionId = (await fixture.host.createSession({ operationId: "pi-message-fork-source", connection: fixture.connection,
+      targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    appendSessionEvent(fixture.store, sourceSessionId, "pi-answer-event", 10, {
+      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Final answer" }],
+      nativeHistory: { identity: { entryId: "pi-answer" } }
+    });
+    appendSessionEvent(fixture.store, sourceSessionId, "pi-input-event", 20, {
+      type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Original input" }],
+      nativeHistory: { identity: { entryId: "pi-input", parentEntryId: "pi-answer" } }
+    });
+    const nativeFork = adapter.fork.bind(adapter);
+    const fork = vi.spyOn(adapter, "fork").mockImplementation((entryId, context, derivation) => {
+      derivation.messageFork?.assertCurrent();
+      return nativeFork(entryId, context, derivation);
+    });
+    const base = { connection: fixture.connection, sourceSessionId, title: "Fork", kind: "fork" as const, entryId: "pi-answer" };
+    for (const [role, messageId, eventId] of [["assistant", "pi-answer", "pi-answer-event"], ["user", "pi-input", "pi-input-event"]] as const) {
+      const derived = await fixture.host.deriveSession({ ...base, operationId: `pi-message-fork-${role}`, messageFork: true,
+        sourceMessage: { messageId, eventId } });
+      expect(fork.mock.calls.at(-1)?.[2].messageFork).toMatchObject({ role, nativeEntryId: messageId });
+      expect(fixture.store.getSession(derived.value.sessionId).descriptor.derivationOrigin).toEqual({
+        kind: "fork", sourceSessionId, sourceMessageId: messageId, sourceEventId: eventId
+      });
+    }
+    const inputOrigin = { messageId: "pi-input", eventId: "pi-input-event" };
+    await fixture.host.deriveSession({ ...base, operationId: "legacy-pi-fork", sourceMessage: inputOrigin });
+    expect(fork.mock.calls.at(-1)?.[2].messageFork).toBeUndefined();
+    const calls = fork.mock.calls.length;
+    await expect(fixture.host.deriveSession({ ...base, operationId: "mismatched-pi-fork", messageFork: true,
+      entryId: "unrelated-native-user", sourceMessage: inputOrigin })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(fork).toHaveBeenCalledTimes(calls);
+
+    fork.mockImplementationOnce(async (_entryId, _context, derivation) => {
+      const current = fixture.store.getSession(sourceSessionId);
+      fixture.store.updateSession(sourceSessionId, { binding: { ...current.descriptor.binding,
+        generation: current.descriptor.binding.generation + 1 } }, current.revision);
+      derivation.messageFork!.assertCurrent();
+      throw new Error("A stale source should fail before dispatch.");
+    });
+    const sessions = fixture.store.listSessions().map(item => item.descriptor.id);
+    await expect(fixture.host.deriveSession({ ...base, operationId: "retired-pi-fork", messageFork: true, sourceMessage: inputOrigin }))
+      .rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(fixture.store.listSessions().map(item => item.descriptor.id)).toEqual(sessions);
+  });
+
   it("does not dispatch a generation-bound message fork after the source binding changes in native preflight", async () => {
     const adapter = new AdapterOwnedDerivationFakeAdapter();
     const fixture = await createFixture(adapter);

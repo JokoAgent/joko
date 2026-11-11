@@ -242,6 +242,93 @@ describe("real Pi managed generation smoke", () => {
     }
   });
 
+  it("uses the published user-pivot fork for both ordinary message roles and preserves the native hook", { timeout: 60_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-real-pi-message-fork-"));
+    const workspace = join(root, "workspace"), home = join(root, "home"), sessions = join(home, "sessions");
+    await Promise.all([mkdir(workspace), mkdir(sessions, { recursive: true })]);
+    const extension = join(root, "fork-hook.js"), hookLog = join(root, "fork-hook.jsonl"), veto = join(root, "veto");
+    await writeFile(extension, `import { appendFileSync, existsSync } from "node:fs";
+export default function (pi) {
+  pi.on("session_before_fork", ({ entryId, position }) => {
+    appendFileSync(${JSON.stringify(hookLog)}, JSON.stringify({ entryId, position }) + "\\n");
+    return { cancel: existsSync(${JSON.stringify(veto)}) };
+  });
+}
+`);
+    const manager = SessionManager.create(workspace, sessions);
+    const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+    const reply = (text: string, timestamp: number) => ({ role: "assistant" as const, content: [{ type: "text" as const, text }],
+      api: "openai-completions" as const, provider: "local", model: "fork-model", usage, stopReason: "stop" as const, timestamp });
+    manager.appendModelChange("local", "fork-model");
+    manager.appendThinkingLevelChange("off");
+    const first = manager.appendMessage({ role: "user", content: "First question", timestamp: 1 });
+    manager.appendMessage({ ...reply("", 2), stopReason: "toolUse",
+      content: [{ type: "toolCall", id: "fixture-call", name: "read", arguments: { path: "fixture" } }] });
+    const tool = manager.appendMessage({ role: "toolResult", toolCallId: "fixture-call", toolName: "read",
+      content: [{ type: "text", text: "Retained tool result" }], isError: false, timestamp: 3 });
+    manager.appendLabelChange(first, "Before boundary");
+    const custom = manager.appendCustomEntry("fork-fixture", { retained: true });
+    const assistant = manager.appendMessage(reply("Final answer", 4));
+    const sibling = manager.appendMessage({ role: "user", content: "Sibling question", timestamp: 5 });
+    manager.branch(assistant);
+    const user = manager.appendMessage({ role: "user", content: "Original next question", timestamp: 6 });
+    const latest = manager.appendMessage(reply("Later answer", 7));
+    manager.appendCustomEntry("fork-fixture", { retained: false });
+    manager.appendLabelChange(first, "Current native label");
+    const sourcePath = manager.getSessionFile()!;
+    const expected = manager.getBranch(assistant).filter(entry => entry.type !== "label").map(entry => entry.id);
+    const target: TargetDescriptor = { id: "ordinary-fork-target", backendId: "pi", displayName: "Message fork", workspaceRoot: workspace, managed: true, trusted: false };
+    const base = { ...smokeContext(target, 1, new EventSink()), sessionId: "ordinary-fork-source" };
+    const adapter = createPiAdapter({ agentHome: home, sessionRoot: home, includeManagedSubagentTools: () => false,
+      providers: [{ id: "local", baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "fork-model", contextWindow: 32_768, maxTokens: 1_024 }] }],
+      managedResources: { extensions: [extension], skills: [], prompts: [], packages: [], resources: [{
+        id: "native-fork-hook", kind: "extension", name: "Native fork hook", source: "approved fixture", state: "approved",
+        revision: "sha256:fork-hook", resourceVersion: 1n, runtimePath: extension
+      }] } });
+    try {
+      const binding = await adapter.createSession({ target, providerId: "local", modelId: "fork-model", fastMode: false,
+        permissionMode: "ask", nativeStart: { kind: "attach", nativeReference: sourcePath } }, base);
+      const source = { ...base, binding }, originalBytes = await readFile(sourcePath), originalLeaf = (await adapter.getEntries(undefined, source)).leafId;
+      for (const [role, nativeEntryId] of [["assistant", assistant], ["user", user]] as const) {
+        const recordBinding = vi.fn();
+        const result = await adapter.fork(assistant, source, { sessionId: `ordinary-fork-${role}`, target, recordBinding,
+          messageFork: { role, nativeEntryId, assertCurrent() {} } });
+        expect(recordBinding).toHaveBeenCalledExactlyOnceWith(result.binding);
+        expect(result.editorText).toBeUndefined();
+        const child = SessionManager.open(result.binding.opaqueRef);
+        expect(child.getHeader()?.parentSession).toBe(sourcePath);
+        expect(child.getEntries().filter(entry => entry.type !== "label").map(entry => entry.id)).toEqual(expected);
+        expect(child.getEntry(tool)).toMatchObject({ message: { role: "toolResult", content: [{ type: "text", text: "Retained tool result" }] } });
+        expect(child.getEntry(custom)).toMatchObject({ type: "custom", data: { retained: true } });
+        expect(child.getLabel(first)).toBe("Current native label");
+      }
+      const recordBinding = vi.fn();
+      await expect(adapter.fork(assistant, source, { sessionId: "wrong-user-branch", target, recordBinding,
+        messageFork: { role: "user", nativeEntryId: sibling, assertCurrent() {} } })).rejects.toMatchObject({
+        publicError: { code: "PI_FORK_ENTRY_INELIGIBLE" }
+      });
+      await expect(adapter.fork(latest, source, { sessionId: "missing-direct-user", target, recordBinding,
+        messageFork: { role: "assistant", nativeEntryId: latest, assertCurrent() {} } })).rejects.toMatchObject({
+        publicError: { code: "PI_FORK_ENTRY_INELIGIBLE" }
+      });
+      await writeFile(veto, "cancel");
+      await expect(adapter.fork(assistant, source, { sessionId: "vetoed-message-fork", target, recordBinding,
+        messageFork: { role: "assistant", nativeEntryId: assistant, assertCurrent() {} } })).rejects.toMatchObject({
+        publicError: { code: "PI_SESSION_CHANGE_CANCELLED" }
+      });
+      expect(recordBinding).not.toHaveBeenCalled();
+      expect((await readFile(hookLog, "utf8")).trim().split("\n").map(line => JSON.parse(line))).toEqual(
+        Array.from({ length: 3 }, () => ({ entryId: user, position: "before" })));
+      expect(await readFile(sourcePath)).toEqual(originalBytes);
+      expect((await adapter.getEntries(undefined, source)).leafId).toBe(originalLeaf);
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("exercises the latest native Pi workflow without crossing product bindings", { timeout: 60_000 }, async () => {
     const server = await startOpenAiCompatibleServer();
     const address = server.address() as AddressInfo;
