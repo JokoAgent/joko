@@ -19,9 +19,17 @@ export function MobileConversationSearchSheet({ visible, rows, additional, color
   readonly onClose: () => void; readonly onFocus: (hit: MobileConversationSearchHit) => void;
   readonly onLoadEarlier: () => Promise<void>;
 }) {
-  const [query, setQuery] = useState(""); const [index, setIndex] = useState(0); const [failed, setFailed] = useState(false);
+  const [query, setQuery] = useState("");
+  const [selection, setSelection] = useState<{ readonly hit: MobileConversationSearchHit; readonly index: number }>();
+  const [failed, setFailed] = useState(false);
   const hits = useMemo(() => findMobileConversationSearchHits(rows, query, additional), [rows, query, additional]);
-  const activeIndex = normalizeConversationSearchIndex(hits.length, index), active = hits[activeIndex];
+  const retainedIndex = selection === undefined ? -1 : hits.findIndex(hit =>
+    hit.itemKey === selection.hit.itemKey && hit.sourceKey === selection.hit.sourceKey);
+  const activeIndex = retainedIndex < 0 ? normalizeConversationSearchIndex(hits.length, selection?.index ?? 0) : retainedIndex;
+  const active = hits[activeIndex];
+  if (active !== undefined && (retainedIndex < 0 || selection?.index !== activeIndex)) {
+    setSelection({ hit: active, index: activeIndex });
+  }
   const owner = useRef<object>({}); const busy = useRef(false);
   const callbacks = useRef({ onFocus, onClose }); callbacks.current = { onFocus, onClose };
   const insets = useSafeAreaInsets(), keyboard = useMobileKeyboardState();
@@ -32,7 +40,12 @@ export function MobileConversationSearchSheet({ visible, rows, additional, color
     return () => { owner.current = {}; busy.current = false; subscription.remove(); };
   }, [visible]);
   useEffect(() => { if (visible && active) callbacks.current.onFocus(active); }, [visible, active?.itemKey, active?.sourceKey, query]);
-  const changeQuery = (text: string): void => { setQuery(text); setIndex(0); setFailed(false); };
+  const changeQuery = (text: string): void => { setQuery(text); setSelection(undefined); setFailed(false); };
+  const move = (direction: "previous" | "next"): void => {
+    const index = nextConversationSearchIndex(hits.length, activeIndex, direction);
+    const hit = hits[index];
+    if (hit !== undefined) setSelection({ hit, index });
+  };
   const earlier = async (): Promise<void> => {
     if (!visible || busy.current || loadingEarlier || !canLoadEarlier || !hasEarlier) return;
     const current = owner.current; busy.current = true; setFailed(false);
@@ -51,7 +64,7 @@ export function MobileConversationSearchSheet({ visible, rows, additional, color
     earlier={{ visible: query.trim() !== "" && hasEarlier, disabled: loadingEarlier || !canLoadEarlier,
       label: mobileMessage(locale, loadingEarlier ? "task.loadingHistory" : "conversationSearch.earlier") }}
     failed={failed ? mobileMessage(locale, "conversationSearch.failed") : undefined} colors={colors}
-    onChangeQuery={changeQuery} onClose={onClose} onMove={(direction) => setIndex(nextConversationSearchIndex(hits.length, activeIndex, direction))}
+    onChangeQuery={changeQuery} onClose={onClose} onMove={move}
     onLoadEarlier={() => { void earlier(); }} />;
   return <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
     <MobileKeyboardAvoidingView style={styles.overlay} keyboard={keyboard} consumedBottomInset={insets.bottom}>
@@ -66,8 +79,8 @@ export function MobileConversationSearchSheet({ visible, rows, additional, color
           {query !== "" && action(mobileMessage(locale, "conversationSearch.clear"), () => changeQuery(""))}
         </View>
         <View style={styles.toolbar}><Text accessibilityLiveRegion="polite" style={[styles.counter, { color: colors.muted }]}>{counter}</Text>
-          {action(mobileMessage(locale, "conversationSearch.previous"), () => setIndex(nextConversationSearchIndex(hits.length, activeIndex, "previous")), hits.length === 0)}
-          {action(mobileMessage(locale, "conversationSearch.next"), () => setIndex(nextConversationSearchIndex(hits.length, activeIndex, "next")), hits.length === 0)}</View>
+          {action(mobileMessage(locale, "conversationSearch.previous"), () => move("previous"), hits.length === 0)}
+          {action(mobileMessage(locale, "conversationSearch.next"), () => move("next"), hits.length === 0)}</View>
         {query.trim() !== "" && hasEarlier && <View style={styles.toolbar}>{loadingEarlier && <ActivityIndicator color={colors.muted} />}
           {action(mobileMessage(locale, loadingEarlier ? "task.loadingHistory" : "conversationSearch.earlier"), () => { void earlier(); }, loadingEarlier || !canLoadEarlier)}</View>}
         {failed && <Text accessibilityRole="alert" style={{ color: colors.negative }}>{mobileMessage(locale, "conversationSearch.failed")}</Text>}

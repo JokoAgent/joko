@@ -45,6 +45,32 @@ it("focuses the existing hit, cycles matches, clears the query and never loads h
   await press("Clear search"); expect(host.textContent).toContain("Enter a keyword");
 });
 
+it("retains the exact selected match when an earlier page inserts a hit ahead of it", async () => {
+  const focus = vi.fn();
+  let complete!: () => void;
+  const earlier = vi.fn(() => new Promise<void>(resolve => { complete = resolve; }));
+  const render = (window: readonly TimelineRow[], loadingEarlier = false) => act(() => root.render(createElement(MobileConversationSearchSheet, {
+    visible: true, rows: window, colors, locale: "en", hasEarlier: true, loadingEarlier, canLoadEarlier: true,
+    onClose: vi.fn(), onFocus: focus, onLoadEarlier: earlier
+  })));
+  await render(rows);
+  await input("match");
+  await press("Next match");
+  expect(host.textContent).toContain("2 / 2");
+  expect(focus).toHaveBeenLastCalledWith({ itemKey: "1", sourceKey: "1" });
+  focus.mockClear();
+  await press("Search earlier messages");
+  expect(earlier).toHaveBeenCalledOnce();
+  await render(rows, true);
+  await act(async () => complete());
+  const older = { ...rows[0]!, id: "older", eventId: "older", text: "Older match" };
+  await render([older, ...rows]);
+  expect(host.textContent).toContain("3 / 3");
+  expect(focus).not.toHaveBeenCalled();
+  await press("Previous match");
+  expect(focus).toHaveBeenLastCalledWith({ itemKey: "0", sourceKey: "0" });
+});
+
 it("retires a failed older read on close and closes when the app leaves the foreground", async () => {
   let reject!: (reason: Error) => void; const pending = new Promise<void>((_resolve, fail) => { reject = fail; });
   const close = vi.fn(); const render = async (visible: boolean) => { await act(() => root.render(createElement(MobileConversationSearchSheet, {
