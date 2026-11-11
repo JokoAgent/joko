@@ -3217,18 +3217,41 @@ export class MessagingManager {
     const { request, connection, conversation } = source;
     const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `request:${requestId}:progress:start` });
     if (start?.status !== "sent" || !start.providerMessageId) return;
-    const answer = this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id, channelGeneration: connection.generation, dedupeKey: `run:${request.runId}:answer` });
-    if (answer) {
-      if (answer.partCount > 1000) return;
-      for (let index = 0; index < answer.partCount; index++) if (this.#store.findMessagingDeliveryByDedupe({ connectionId: connection.id,
-        channelGeneration: connection.generation, dedupeKey: answer.dedupeKey, partIndex: index })?.status !== "sent") return;
-      if (connection.channel === "discord" && answer.kind === "text" && answer.providerMessageId === start.providerMessageId) return;
-    }
+    if (!this.#canRemoveReplyStreamCarrier(source, start.providerMessageId)) return;
     const payload = { format: 1, address: addressFor(connection, conversation), replyStream: { requestId, phase: "remove", messageId: start.providerMessageId } };
     this.#store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
       dedupeKey: `request:${requestId}:progress:remove`, kind: "notice", partIndex: 0, partCount: 1, payloadHash: operationBodyHash(payload), payload,
       availableAt: this.#now(), createdAt: this.#now() });
     this.#scheduleDeliveryDrain(connection.id);
+  }
+
+  #canRemoveReplyStreamCarrier(source: {
+    readonly request: MessagingInboundRequestRecord;
+    readonly connection: MessagingConnectionRecord;
+    readonly conversation: MessagingConversationRecord;
+  }, carrierId: string): boolean {
+    const { request, connection, conversation } = source;
+    const scope = { connectionId: connection.id, channelGeneration: connection.generation };
+    let runId = request.runId;
+    // The request keeps its admitted Run ID. A trusted continuation can own the
+    // final delivery, including when the outbox is reopened after a restart.
+    for (let depth = 0; depth < 16 && runId !== undefined; depth++) {
+      const answer = this.#store.findMessagingDeliveryByDedupe({ ...scope, dedupeKey: `run:${runId}:answer` });
+      if (answer !== undefined) {
+        if (answer.conversationId !== conversation.id || answer.partCount > 1000) return false;
+        for (let partIndex = 0; partIndex < answer.partCount; partIndex++) {
+          const part = this.#store.findMessagingDeliveryByDedupe({ ...scope, dedupeKey: answer.dedupeKey, partIndex });
+          if (part?.status !== "sent" || part.conversationId !== conversation.id) return false;
+        }
+        return connection.channel !== "discord" || answer.kind !== "text" || answer.providerMessageId !== carrierId;
+      }
+      const child = this.#store.findRunByParentId(runId)?.descriptor;
+      if (child === undefined) return true;
+      if (depth === 15) return false;
+      if (this.#store.findMessagingInboundRequestByRunId(child.id)?.id !== request.id) return true;
+      runId = child.id;
+    }
+    return false;
   }
 
   #streamDeliverySource(delivery: MessagingDeliveryRecord) {
@@ -3244,6 +3267,8 @@ export class MessagingManager {
     if (!marker && (source.connection.channel !== "discord" || source.request.status !== "completed")) return;
     const start = this.#store.findMessagingDeliveryByDedupe({ connectionId: source.connection.id, channelGeneration: source.connection.generation, dedupeKey: `request:${requestId}:progress:start` });
     if (marker && marker["phase"] !== "start" && (start?.status !== "sent" || marker["messageId"] !== start.providerMessageId)) return;
+    if (marker?.["phase"] === "remove" && (start?.providerMessageId === undefined
+      || !this.#canRemoveReplyStreamCarrier(source, start.providerMessageId))) return;
     return { ...source, start };
   }
 

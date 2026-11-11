@@ -247,6 +247,97 @@ describe("MessagingManager", () => {
     expect(final().find((row) => row.partIndex === 0)?.providerMessageId).toBe(carrierId);
   });
 
+  it.each([{ finalStatus: "sent", continuations: 1 }, { finalStatus: "unknown", continuations: 2 }] as const)(
+    "preserves the Discord carrier for a $finalStatus final after $continuations Partner continuations",
+    async ({ finalStatus, continuations }) => {
+      const adapter = new ControlledReplyAdapter({ ...PI_LIKE_PROFILE,
+        capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+          ? { ...capability, options: ["ask"] } : capability) });
+      const transport = new StreamingDiscordTransport();
+      const fixture = await createFixture(undefined, () => adapter, () => transport,
+        undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 }, () => 10);
+      const profiles = new PartnerStore(join(fixture.root, "partners.db"));
+      cleanups.push(async () => { try { await fixture.manager.close(); } finally { profiles.close(); } });
+      const partners = new PartnerManager({ store: profiles, operationalStore: fixture.store, sessionHost: fixture.host,
+        homesRoot: join(fixture.root, "homes"), workspaceService: { register: async input => input, unregister: () => undefined } });
+      const partner = await partners.createPartner({ requestId: "discord-recovery-create", expectedDirectoryRevision: profiles.directoryState().revision,
+        displayName: "Ada", avatar: "orbit", identitySource: "A Partner who replies to the owner.", templateId: "general", usesDirectoryDefaults: false,
+        capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }],
+          permissionMode: "ask", planMode: false } });
+      expect(partner.initializationState).toBe("ready");
+      const attachPartnerRuntime = (messaging: MessagingManager) => {
+        const runtime = new PartnerMessagingRuntime({ store: fixture.store, profiles, partners, host: fixture.host, messaging, pauseGoal: async () => undefined });
+        messaging.setPartnerRuntime(runtime);
+        fixture.host.setMessagingQueueGuard(item => runtime.assertQueueCurrent(item), (item, request) => runtime.reviewTool(item, request));
+        return runtime;
+      };
+      const runtime = attachPartnerRuntime(fixture.manager);
+      const owner = fixture.store.createConnection({ id: "discord-ui-owner", name: "Owner", authKeyDigest: "discord-ui-auth" });
+      const created = fixture.manager.createDiscordConnection({ ownerProviderUserId: "111111111111111111",
+        configuration: { ...DEFAULT_DISCORD_MESSAGING_CONFIGURATION, emojiReactions: "off", lifecycleAnnouncements: false } });
+      const bound = await runtime.setBinding({ operationId: "discord-recovery-bind", owner, connectionId: created.id, partnerId: partner.id,
+        expectedBindingRevision: 0, expectedConnectionRevision: created.revision, expectedConnectionGeneration: created.generation,
+        expectedPartnerRevision: partner.revision });
+      const connection = await replaceCredential(fixture, bound.connection, "discord-recovery", true);
+      await vi.waitFor(() => expect(adapter.context?.sessionId).toBe(partner.canonicalSessionId), { timeout: 5_000 });
+      const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
+      const activeRunId = () => {
+        const queueId = adapter.context?.inputQueueItemId;
+        return queueId === undefined ? undefined : fixture.store.getQueueItem(queueId).runId;
+      };
+      expect(activeRunId()).toBe(request.runId);
+      const generation = adapter.context!.generation;
+      const delivery = (dedupeKey: string) => fixture.store.findMessagingDeliveryByDedupe({ connectionId: connection.id,
+        channelGeneration: connection.generation, dedupeKey });
+      const start = () => delivery(`request:${request.id}:progress:start`);
+      const removal = () => delivery(`request:${request.id}:progress:remove`);
+      await vi.waitFor(() => expect(start()?.status).toBe("sent"));
+      await adapter.emit({ type: "text_delta", blockId: "progress", delta: "Work in progress" });
+      await vi.waitFor(() => expect(transport.stream.edits).toContainEqual(expect.objectContaining({ text: "Work in progress" })));
+
+      let settledRun = request.runId!;
+      for (let index = 0; index < continuations; index++) {
+        const parent = settledRun;
+        await adapter.emit({ type: "error", terminal: true, error: { code: "UPSTREAM_STREAM_INTERRUPTED",
+          message: "The original stream was interrupted.", phase: "retry", retryable: false, stateMayHaveChanged: true, recovery: "Continue." } });
+        await adapter.emit({ type: "done", outcome: "failed" });
+        await vi.waitFor(() => {
+          const child = fixture.store.findRunByParentId(parent)?.descriptor;
+          expect(child?.id).toBeDefined();
+          expect(activeRunId()).toBe(child?.id);
+          expect(adapter.context?.generation).toBe(generation);
+        }, { timeout: 5_000 });
+        settledRun = activeRunId()!;
+        expect(fixture.store.findMessagingInboundRequestByRunId(settledRun)?.id).toBe(request.id);
+        expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("queued");
+      }
+
+      const finalReceipt = deliveryGate();
+      transport.stream.beforeEditReceipt = async ({ text }) => {
+        if (text !== "Recovered final answer") return;
+        await finalReceipt.wait;
+        if (finalStatus === "unknown") throw new MessagingTransportError("network", "Final edit ACK lost.", { effect: "unknown", retryable: true });
+      };
+      await adapter.finish("Recovered final answer");
+      const final = () => delivery(`run:${settledRun}:answer`);
+      await vi.waitFor(() => expect(final()?.status).toBe("dispatching"));
+      expect(removal()).toBeUndefined();
+      finalReceipt.release();
+      await vi.waitFor(() => expect(final()?.status).toBe(finalStatus));
+      expect(fixture.store.getMessagingInboundRequest(request.id)).toMatchObject({ status: "completed", runId: request.runId });
+      expect(delivery(`run:${request.runId}:answer`)).toBeUndefined();
+      expect(final()?.attempts).toBe(1);
+      if (finalStatus === "sent") expect(final()?.providerMessageId).toBe(start()?.providerMessageId);
+      const edits = transport.stream.attempts.length;
+      await fixture.restartManager(attachPartnerRuntime);
+      expect(final()?.status).toBe(finalStatus);
+      expect(final()?.attempts).toBe(1);
+      expect(transport.stream.attempts).toHaveLength(edits);
+      expect(removal()).toBeUndefined();
+      expect(transport.stream.removed).toEqual([]);
+    }, 20_000
+  );
+
   it("retains a Telegram progress carrier when the independent final ACK is unknown, including after restart", async () => {
     const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
     const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 });
@@ -3644,7 +3735,7 @@ class ProtectedTelegramAdapter extends FakeBackendAdapter {
 
 class ControlledReplyAdapter extends FakeBackendAdapter {
   context?: AdapterContext;
-  constructor() { super(PI_LIKE_PROFILE); }
+  constructor(profile = PI_LIKE_PROFILE) { super(profile); }
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> { this.context = context; }
   async emit(event: EventPayload): Promise<void> { if (!this.context) throw new Error("No admitted reply run."); await this.context.emit(event); }
   async finish(text: string): Promise<void> {
@@ -3888,7 +3979,8 @@ async function createFixture(
   weChatTransportFactory?: (options: WeChatTransportOptions) => FakeWeChatTransport,
   weChatPresenceTiming?: MessagingManagerOptions["weChatPresenceTiming"],
   slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport,
-  replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"]
+  replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"],
+  sessionRuntimeRecoveryDelayMs?: (attempt: number) => number
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -3907,6 +3999,7 @@ async function createFixture(
   const adapter = adapterFactory?.() ?? new FakeBackendAdapter(PI_LIKE_PROFILE);
   let manager: MessagingManager | undefined;
   const host = new SessionHost(store, artifacts, [adapter], {
+    ...(sessionRuntimeRecoveryDelayMs === undefined ? {} : { sessionRuntimeRecoveryDelayMs }),
     onServiceRunSettled: (input) => manager?.onRunSettled(input),
     onServiceInteractionOpened: (input) => manager?.onInteractionOpened(input),
     onServiceInteractionSettled: (input) => manager?.onInteractionSettled(input)
@@ -3961,9 +4054,10 @@ async function createFixture(
     rmSync(root, { recursive: true, force: true });
   });
   return { root, store, artifacts, credentials, adapter, host, get manager() { return manager!; },
-    async restartManager() {
+    async restartManager(configure?: (current: MessagingManager) => void) {
       await manager?.close();
       manager = new MessagingManager(options);
+      configure?.(manager);
       await manager.initialize();
     }
   };
