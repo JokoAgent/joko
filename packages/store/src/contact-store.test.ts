@@ -20,6 +20,54 @@ afterEach(() => {
 });
 
 describe("current-v1 Contacts store", () => {
+  it("keeps exact group names and their members across concurrent sync and restart", () => {
+    const { store: east, filePath } = createFixture("groups-east");
+    const { store: west } = createFixture("groups-west");
+    const alice = createContact(east, { kind: "person", displayName: "Alice" });
+    const bea = createContact(west, { kind: "person", displayName: "Bea" });
+    const attach = (store: ContactStore, contactId: string, name: string) => {
+      const group = store.createGroup(store.directoryState().revision, name);
+      store.setGroupMembership(contactId, store.getContact(contactId).revision, group.id, true);
+      return store.listGroups().find(({ id }) => id === group.id)!;
+    };
+    const upper = attach(east, alice.id, "A");
+    const lowerOnEast = attach(east, alice.id, "a");
+    const wide = east.updateGroup(lowerOnEast.id, lowerOnEast.revision, "Ａ", "Full width");
+    expectContactError(() => east.createGroup(east.directoryState().revision, "A"), "CONTACT_ALREADY_EXISTS");
+    expectContactError(() => east.updateGroup(wide.id, wide.revision, "A", ""), "CONTACT_ALREADY_EXISTS");
+    const lower = attach(west, bea.id, "a");
+    const exact = new Map([
+      [attach(east, alice.id, "Shared").id, alice.id],
+      [attach(west, bea.id, "Shared").id, bea.id]
+    ]);
+
+    const merged = east.mergeContactSyncState("east", west.readContactSyncState("west").state);
+    west.mergeContactSyncState("west", merged.state);
+    const groupIds = (store: ContactStore, contactId: string) => new Set(store.getContact(contactId).groups.map(group => group.id));
+    const verify = (store: ContactStore, expectedSharedId?: string) => {
+      expect(new Set(store.listGroups().map(({ name }) => name))).toEqual(new Set(["A", "a", "Ａ", "Shared"]));
+      expect(store.listGroups()).toHaveLength(4);
+      const shared = store.listGroups().find(({ name }) => name === "Shared")!;
+      if (expectedSharedId !== undefined) expect(shared.id).toBe(expectedSharedId);
+      expect(exact.has(shared.id)).toBe(true);
+      expect(groupIds(store, alice.id)).toEqual(new Set([upper.id, wide.id, ...(exact.get(shared.id) === alice.id ? [shared.id] : [])]));
+      expect(groupIds(store, bea.id)).toEqual(new Set([lower.id, ...(exact.get(shared.id) === bea.id ? [shared.id] : [])]));
+      return shared;
+    };
+    const winner = verify(east);
+    verify(west, winner.id);
+
+    east.close();
+    const reopened = new ContactStore(filePath);
+    cleanups.push(() => reopened.close());
+    const liveWinner = verify(reopened, winner.id);
+    expect(reopened.deleteGroup(liveWinner.id, liveWinner.revision)).toBe(true);
+    west.mergeContactSyncState("west", reopened.readContactSyncState("east").state);
+    const otherId = [...exact.keys()].find(id => id !== winner.id)!;
+    verify(reopened, otherId);
+    verify(west, otherId);
+  });
+
   it("preserves month and day precision with optional event sources through sync and reopen", () => {
     const { store, filePath } = createFixture();
     let person = createContact(store, { kind: "person", displayName: "Event owner" });
@@ -395,13 +443,13 @@ describe("current-v1 Contacts store", () => {
   });
 });
 
-function createFixture(): { readonly store: ContactStore; readonly filePath: string } {
+function createFixture(idPrefix = "fixture"): { readonly store: ContactStore; readonly filePath: string } {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-contact-store-"));
   const filePath = path.join(directory, "contacts.db");
   let seed = 0;
   let now = 1_000;
   const store = new ContactStore(filePath, {
-    idFactory: () => `fixture-${seed += 1}`,
+    idFactory: () => `${idPrefix}-${seed += 1}`,
     now: () => now += 1
   });
   cleanups.push(() => {

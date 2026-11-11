@@ -252,6 +252,23 @@ describe("ContactManager portable address-book boundary", () => {
     });
   });
 
+  it("reuses exact vCard categories and preserves differently spelled groups on export", () => {
+    const { manager } = createFixture();
+    const original = manager.createGroup(manager.directory().revision, "A", "Existing");
+    const preview = manager.previewVCardImport([
+      "BEGIN:VCARD", "VERSION:3.0", "FN:Category owner", "CATEGORIES:A,a,Ａ,A", "END:VCARD"
+    ].join("\r\n"));
+    const result = manager.commitVCardImport({
+      previewId: preview.previewId, expectedDirectoryRevision: preview.directoryRevision, decisions: []
+    });
+    expect(result).toMatchObject({ created: 1, skipped: 0, directory: { groups: 3 } });
+    const owner = manager.get(result.entries[0]!.contactId!);
+    expect(owner.groups.find(({ name }) => name === "A")?.id).toBe(original.id);
+    expect(new Set(owner.groups.map(({ name }) => name))).toEqual(new Set(["A", "a", "Ａ"]));
+    const exported = parseContactVCards(manager.exportVCards([owner.id]).text)[0]!;
+    expect(new Set(exported.groups)).toEqual(new Set(["A", "a", "Ａ"]));
+  });
+
   it("keeps similar names pending until an explicit create or merge decision", () => {
     const fixture = createFixture();
     const existing = fixture.store.createContact({
