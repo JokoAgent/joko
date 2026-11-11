@@ -7,6 +7,7 @@ import {
   type ContactDuplicateCandidate,
   type ContactGroupRecord,
   type ContactIdentityDraft,
+  type ContactIdentityRecord,
   type ContactProfileRecord,
   type ContactSummaryRecord,
   type OperationalStore
@@ -109,7 +110,7 @@ const VCARD_RULE =
 
 const CONTACT_NESTED_TOOLS: readonly ContactNestedToolDescriptor[] = Object.freeze([
   nestedTool("contacts_resolve", "search",
-    "Resolve an exact platform identity, name, alias, or full-text clue to compact Contacts profiles ranked by identity, name, then full-text confidence.",
+    "Return compact Contacts profiles from the first matching tier: exact platform identity, exact display name or alias, then full-text clues.",
     objectSchema({
       value: { type: "string", minLength: 1, maxLength: 320 },
       platform: { type: "string", minLength: 1, maxLength: 32, pattern: "^[a-z0-9_-]+$" },
@@ -504,28 +505,27 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
     }
     if (value.length > 256) throw new ContactToolError("INVALID_ARGS", "value exceeds the full-text lookup limit; specify platform.");
     const exactIdentities = this.#contacts.resolveIdentities(value, limit);
-    const exactByContact = new Map(exactIdentities.map((identity) => [identity.contactId, identity]));
-    const page = this.#contacts.list({ query: value, limit: Math.min(100, Math.max(20, limit * 5)), offset: 0 });
-    const foldedValue = folded(value);
-    const ranked = [
-      ...exactIdentities.map((identity) => ({ contactId: identity.contactId, rank: 0, identity })),
-      ...page.contacts.filter((summary) => !exactByContact.has(summary.id)).map((summary) => ({
-        contactId: summary.id,
-        rank: folded(summary.displayName) === foldedValue || summary.aliases.some((alias) => folded(alias) === foldedValue) ? 1 : 2,
-        identity: undefined
-      }))
-    ].sort((left, right) => left.rank - right.rank);
-    const selected = new Map<string, typeof ranked[number]>();
-    for (const entry of ranked) {
-      if (!selected.has(entry.contactId)) selected.set(entry.contactId, entry);
-      if (selected.size >= limit) break;
+    if (exactIdentities.length > 0) {
+      const byContact = new Map<string, ContactIdentityRecord>();
+      for (const identity of exactIdentities) {
+        if (!byContact.has(identity.contactId)) byContact.set(identity.contactId, identity);
+      }
+      return { matches: [...byContact.values()].map((identity) => ({
+        match_type: "identity",
+        matched_identity: publicIdentity(identity),
+        profile: compactProfile(this.#contacts.get(identity.contactId))
+      })) };
     }
-    const matches = [...selected.values()].map((entry) => ({
-      match_type: entry.rank === 0 ? "identity" : entry.rank === 1 ? "name" : "fts",
-      ...(entry.identity === undefined ? {} : { matched_identity: publicIdentity(entry.identity) }),
-      profile: compactProfile(this.#contacts.get(entry.contactId))
-    }));
-    return { matches };
+    const nameIds = this.#contacts.resolveNameIds(value, limit);
+    if (nameIds.length > 0) return { matches: nameIds.map((id) => ({
+      match_type: "name",
+      profile: compactProfile(this.#contacts.get(id))
+    })) };
+    const page = this.#contacts.list({ query: value, limit });
+    return { matches: page.contacts.map(({ id }) => ({
+      match_type: "fts",
+      profile: compactProfile(this.#contacts.get(id))
+    })) };
   }
 
   #search(input: Readonly<Record<string, unknown>>): unknown {
@@ -1453,10 +1453,6 @@ function assertKeys(value: Readonly<Record<string, unknown>>, allowed: readonly 
 
 function isContactCategory(value: unknown): value is ContactToolCategory {
   return value === "search" || value === "read" || value === "write" || value === "manage";
-}
-
-function folded(value: string): string {
-  return value.normalize("NFKC").toLocaleLowerCase("en-US");
 }
 
 function iso(value: number): string {
