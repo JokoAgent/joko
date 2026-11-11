@@ -14521,6 +14521,7 @@ export class SessionHost {
             const assertCurrent = () => {
               this.assertDispatchAdmissionOwner(item, attemptId, sending, stored.descriptor.binding.generation, partnerPolicy);
               this.assertQueueProviderAuthentication(item, stored);
+              if (item.body.messagingOrigin) this.#messagingQueueGuard?.(item);
             };
             telegramHistory = await this.#prepareTelegramHistory({ item, signal: context.signal, assertCurrent });
             assertCurrent();
