@@ -59,7 +59,7 @@ import {
   X
 } from "lucide-react";
 import type { AppRoute } from "../controller.js";
-import type { AppSnapshot, ConnectionProfile, ExtensionCatalogEntryView, FederatedSessionMessageSearchMatchView, MachineCacheView, MachinePresenceView, MachineSessionCacheView, ScheduleView, SessionMessageSearchFiltersView, SessionMessageSearchMatchView, SessionTitleSuggestionView, SessionView, TargetView } from "../model.js";
+import type { AppSnapshot, ConnectionProfile, ExtensionCatalogEntryView, FederatedSessionMessageSearchMatchView, FederatedSessionMessageSearchOutcome, FederatedSessionMessageSearchPage, MachineCacheView, MachinePresenceView, MachineSessionCacheView, ScheduleView, SessionMessageSearchFiltersView, SessionMessageSearchMatchView, SessionTitleSuggestionView, SessionView, TargetView } from "../model.js";
 import { selectedRemoteMachineCaches, type MachineSelection } from "../machine-federation.js";
 import type { NavigationMode } from "../navigation-layout.js";
 import {
@@ -338,7 +338,7 @@ export interface SidebarProps {
     semanticMode: "keyword" | "hybrid",
     filters: SessionMessageSearchFiltersView,
     signal: AbortSignal
-  ) => Promise<readonly FederatedSessionMessageSearchMatchView[]>;
+  ) => Promise<readonly FederatedSessionMessageSearchOutcome[]>;
   readonly onMessageSearchSortChange: (sort: ConversationSearchSort) => void;
   readonly onSidebarDisplayPreferencesChange: (patch: Partial<SidebarDisplayPreferences>) => void;
   readonly onSidebarOwnerLayoutChange: (patch: Partial<SidebarOwnerLayout>) => void;
@@ -401,7 +401,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   }), [ownerLayout, props.sidebarDisplayPreferences]);
   const showArchived = sidebarLayout.status === "archived";
   const [messageMatches, setMessageMatches] = useState<readonly SessionMessageSearchMatchView[]>([]);
-  const [remoteMessageMatches, setRemoteMessageMatches] = useState<readonly FederatedSessionMessageSearchMatchView[]>([]);
+  const [remoteMessagePages, setRemoteMessagePages] = useState<readonly FederatedSessionMessageSearchPage[]>([]);
   const [messageSearchLoading, setMessageSearchLoading] = useState(false);
   const [remoteMessageSearchLoading, setRemoteMessageSearchLoading] = useState(false);
   const [messageSearchError, setMessageSearchError] = useState<string>();
@@ -418,12 +418,6 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const semanticSearchStartedGenerationRef = useRef(0);
   const keywordSearchSucceededGenerationRef = useRef(0);
   const remoteMessageSearchGenerationRef = useRef(0);
-  const remoteSemanticSearchStartedGenerationRef = useRef(0);
-  const remoteKeywordSearchSucceededGenerationRef = useRef(0);
-  const remoteKeywordMatchesRef = useRef<{
-    readonly generation: number;
-    readonly matches: readonly FederatedSessionMessageSearchMatchView[];
-  } | undefined>(undefined);
   const searchFilterRef = useRef<HTMLDetailsElement>(null);
   const sessionListRef = useRef<HTMLElement>(null);
   const projectRemovalFocusRef = useRef<{
@@ -517,9 +511,10 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       && !remoteContentIdentityFilterActive
       && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff)
   ).length, 0);
-  const remoteMessageSearchScopeKey = selectedRemoteProfiles.map((profile) =>
-    `${profile.id}\u0000${profile.serverId}\u0000${props.machineControl?.presenceByProfile[profile.id] ?? "offline"}`
-  ).join("\u0001");
+  const remoteMessageSearchScopeKey = JSON.stringify([currentSearchProfileId, selectedRemoteProfiles.map((profile) => [
+    profile.id, profile.serverId, profile.origin, profile.endpointPublicKey, profile.transportKind,
+    props.machineControl?.presenceByProfile[profile.id] ?? "offline"
+  ])]);
   const activeSession = activeSessionId === undefined
     ? undefined
     : snapshot.sessions.find((candidate) => candidate.id === activeSessionId);
@@ -639,6 +634,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       projectIds: messageSearchTargetIds
     }
   ), [currentMachineIncluded, messageMatches, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, props.messageSearchSort, query, navigationSessions, visibleTargets]);
+  const currentRemoteMessagePages = remoteMessagePages.every((page) => page.isCurrent())
+    ? remoteMessagePages
+    : remoteMessagePages.filter((page) => page.isCurrent());
   const remoteSearchCandidates = useMemo(() => messageSearchTargetIds !== "all" ? [] : projectRemoteMachineSearchResults(
     remoteMachineCaches,
     props.machineControl?.presenceByProfile ?? {},
@@ -649,10 +647,16 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       backendFilterActive: messageSearchBackendId !== "all",
       projectFilterActive: messageSearchTargetIds !== "all",
       sort: props.messageSearchSort,
-      messageMatches: remoteMessageMatches,
+      messageMatches: currentRemoteMessagePages.flatMap((page) => page.matches.map((match) => ({
+        profileId: page.profileId,
+        serverId: page.serverId,
+        source: "live" as const,
+        reachable: true as const,
+        match
+      }))),
       profiles: selectedRemoteProfiles
     }
-  ), [messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, props.machineControl?.presenceByProfile, props.messageSearchSort, query, remoteMachineCaches, remoteMessageMatches, selectedRemoteProfiles]);
+  ), [currentRemoteMessagePages, messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, props.machineControl?.presenceByProfile, props.messageSearchSort, query, remoteMachineCaches, selectedRemoteProfiles]);
   const federatedSearchGroups = useMemo(() => projectFederatedSidebarSearchGroups(
     currentSearchProfileId,
     messageSearchLoading || messageSearchError !== undefined ? [] : localSearchCandidates,
@@ -977,17 +981,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
   useEffect(() => {
     const generation = ++remoteMessageSearchGenerationRef.current;
-    remoteSemanticSearchStartedGenerationRef.current = 0;
-    remoteKeywordSearchSucceededGenerationRef.current = 0;
-    remoteKeywordMatchesRef.current = undefined;
     setRemoteMessageSearchError(undefined);
     const searchRemoteMessages = searchRemoteMessagesRef.current;
     if (normalizedQuery === "" || searchRemoteMessages === undefined || messageSearchTargetIds !== "all") {
-      setRemoteMessageMatches([]);
+      setRemoteMessagePages([]);
       setRemoteMessageSearchLoading(false);
       return;
     }
-    setRemoteMessageMatches([]);
+    setRemoteMessagePages([]);
     setRemoteMessageSearchLoading(true);
     const abort = new AbortController();
     const searchFilters: SessionMessageSearchFiltersView = {
@@ -1000,51 +1001,41 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               - MESSAGE_SEARCH_ACTIVITY_DAYS[messageSearchLastActivity] * MESSAGE_SEARCH_DAY_MS
           })
     };
-    const keywordTimer = setTimeout(() => {
-      void searchRemoteMessages(query.trim(), "keyword", searchFilters, abort.signal).then((matches) => {
-        if (remoteMessageSearchGenerationRef.current !== generation) return;
-        remoteKeywordSearchSucceededGenerationRef.current = generation;
-        remoteKeywordMatchesRef.current = { generation, matches };
-        if (remoteSemanticSearchStartedGenerationRef.current === generation) {
-          setRemoteMessageSearchLoading(false);
-          setRemoteMessageSearchError(undefined);
-          return;
-        }
-        setRemoteMessageMatches(matches);
-        setRemoteMessageSearchLoading(false);
-        setRemoteMessageSearchError(undefined);
-      }).catch((error: unknown) => {
+    type StageResult = readonly FederatedSessionMessageSearchOutcome[] | "failed";
+    let keywordResult: StageResult | undefined;
+    let hybridResult: StageResult | undefined;
+    const search = async (mode: "keyword" | "hybrid"): Promise<void> => {
+      let result: StageResult;
+      try {
+        result = await searchRemoteMessages(query.trim(), mode, searchFilters, abort.signal);
+      } catch (error) {
         if (messageSearchWasAborted(abort.signal, error)) return;
-        if (remoteMessageSearchGenerationRef.current !== generation) return;
-        if (remoteSemanticSearchStartedGenerationRef.current === generation) return;
-        setRemoteMessageMatches([]);
-        setRemoteMessageSearchLoading(false);
-        setRemoteMessageSearchError(t("nav.remoteMessageSearchFailed"));
-      });
-    }, CONVERSATION_KEYWORD_DEBOUNCE_MS);
-    const hybridTimer = setTimeout(() => {
-      remoteSemanticSearchStartedGenerationRef.current = generation;
-      void searchRemoteMessages(query.trim(), "hybrid", searchFilters, abort.signal).then((matches) => {
-        if (remoteMessageSearchGenerationRef.current !== generation) return;
-        setRemoteMessageMatches(matches);
-        setRemoteMessageSearchLoading(false);
-        setRemoteMessageSearchError(undefined);
-      }).catch((error: unknown) => {
-        if (messageSearchWasAborted(abort.signal, error)) return;
-        if (remoteMessageSearchGenerationRef.current !== generation) return;
-        remoteSemanticSearchStartedGenerationRef.current = 0;
-        const keywordPage = remoteKeywordMatchesRef.current;
-        if (remoteKeywordSearchSucceededGenerationRef.current === generation && keywordPage?.generation === generation) {
-          setRemoteMessageMatches(keywordPage.matches);
-          setRemoteMessageSearchLoading(false);
-          setRemoteMessageSearchError(undefined);
-          return;
-        }
-        setRemoteMessageMatches([]);
-        setRemoteMessageSearchLoading(false);
-        setRemoteMessageSearchError(t("nav.remoteMessageSearchFailed"));
-      });
-    }, CONVERSATION_HYBRID_DEBOUNCE_MS);
+        result = "failed";
+      }
+      if (abort.signal.aborted || remoteMessageSearchGenerationRef.current !== generation) return;
+      if (mode === "keyword") keywordResult = result;
+      else hybridResult = result;
+
+      const keywordOutcomes = keywordResult === "failed" ? [] : keywordResult?.filter((outcome) => outcome.isCurrent()) ?? [];
+      const hybridOutcomes = hybridResult === "failed" ? undefined : hybridResult?.filter((outcome) => outcome.isCurrent());
+      const keywordPages = new Map(keywordOutcomes.filter((outcome) => outcome.status === "succeeded")
+        .map((page) => [page.profileId, page] as const));
+      // A successful hybrid page, even empty, replaces the keyword page for its stream.
+      const pages = hybridOutcomes?.flatMap((outcome) => {
+        if (outcome.status === "succeeded") return [outcome];
+        const fallback = keywordPages.get(outcome.profileId);
+        return fallback?.epoch === outcome.epoch && fallback.serverId === outcome.serverId ? [fallback] : [];
+      }) ?? [...keywordPages.values()];
+      const failed = keywordResult === "failed" || hybridResult === "failed"
+        || keywordOutcomes.some((outcome) => outcome.status === "failed")
+        || hybridOutcomes?.some((outcome) => outcome.status === "failed") === true;
+      const waitingForFallback = keywordResult === undefined || hybridResult === undefined;
+      setRemoteMessagePages(pages);
+      setRemoteMessageSearchLoading(pages.length === 0 && failed && waitingForFallback);
+      setRemoteMessageSearchError(pages.length === 0 && failed && !waitingForFallback ? t("nav.remoteMessageSearchFailed") : undefined);
+    };
+    const keywordTimer = setTimeout(() => { void search("keyword"); }, CONVERSATION_KEYWORD_DEBOUNCE_MS);
+    const hybridTimer = setTimeout(() => { void search("hybrid"); }, CONVERSATION_HYBRID_DEBOUNCE_MS);
     return () => {
       clearTimeout(keywordTimer);
       clearTimeout(hybridTimer);
@@ -1205,10 +1196,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const clearSearch = (): void => {
     messageSearchGenerationRef.current += 1;
     remoteMessageSearchGenerationRef.current += 1;
-    remoteKeywordMatchesRef.current = undefined;
     setQuery("");
     setMessageMatches([]);
-    setRemoteMessageMatches([]);
+    setRemoteMessagePages([]);
     setMessageSearchError(undefined);
     setRemoteMessageSearchError(undefined);
     setMessageSearchLoading(false);

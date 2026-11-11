@@ -67,7 +67,7 @@ import type {
   ComposerDraft,
   ConnectionProfile,
   DiscoveredOrchestratorView,
-  FederatedSessionMessageSearchMatchView,
+  FederatedSessionMessageSearchOutcome,
   InteractionView,
   Locale,
   LocalePreference,
@@ -294,7 +294,7 @@ export interface AppController extends OperationApi {
   refreshPartnerSource?(sourceKey: string): Promise<void>;
   openSourcePartner?(sourceKey: string, partnerId: string, destination: "session" | "settings" | "preparation"): Promise<void>;
   readSourcePartnerAvatar?(sourceKey: string, partnerId: string, revision: bigint, image: import("./partner-avatar.js").PartnerAvatarImageView, signal: AbortSignal): Promise<string>;
-  searchRemoteSessionMessages(query: string, options?: SessionMessageSearchCollectionOptions): Promise<readonly FederatedSessionMessageSearchMatchView[]>;
+  searchRemoteSessionMessages(query: string, options?: SessionMessageSearchCollectionOptions): Promise<readonly FederatedSessionMessageSearchOutcome[]>;
   retryManagedOrchestrator(): Promise<void>;
   /** Consume only the not-yet-started automatic attempt for this app open. */
   cancelAutomaticConnectionAttempt(): void;
@@ -2429,52 +2429,56 @@ export function useAppController(): AppController {
   const searchRemoteSessionMessages = useCallback(async (
     query: string,
     options: SessionMessageSearchCollectionOptions = {}
-  ): Promise<readonly FederatedSessionMessageSearchMatchView[]> => {
+  ): Promise<readonly FederatedSessionMessageSearchOutcome[]> => {
     const normalizedQuery = query.trim();
     if (normalizedQuery === "") return [];
     throwIfRemoteSearchAborted(options.signal);
 
+    const activeProfileId = activeProfileRef.current?.id;
     const connectedProfileIds = new Set([...remoteMachineGatewaysRef.current]
       .filter(([, binding]) => binding.connected && binding.gateway !== undefined)
       .map(([profileId]) => profileId));
     const profileIds = selectedReachableRemoteProfileIds(
       preferencesRef.current.machineSelection,
       profilesRef.current,
-      activeProfileRef.current?.id,
+      activeProfileId,
       machinePresenceByProfileRef.current,
       connectedProfileIds
     );
     const profiles = new Map(profilesRef.current.map((profile) => [profile.id, profile] as const));
-    const searches = profileIds.map(async (profileId): Promise<readonly FederatedSessionMessageSearchMatchView[]> => {
+    const searches = profileIds.map(async (profileId): Promise<FederatedSessionMessageSearchOutcome | undefined> => {
       const profile = profiles.get(profileId);
       const binding = remoteMachineGatewaysRef.current.get(profileId);
-      if (profile === undefined || binding?.gateway === undefined || !binding.connected) return [];
+      if (profile === undefined || binding?.gateway === undefined || binding.liveEpoch === undefined) return undefined;
       const routedOptions = remoteSessionMessageSearchOptionsForProfile(profileId, options);
-      if (routedOptions === undefined || binding.profileKey !== remoteMachineProfileKey(profile)) return [];
-      const { gateway: remoteGateway, epoch, profileKey } = binding;
-      const result = await remoteGateway.searchAllSessionMessages(normalizedQuery, routedOptions);
-      const current = remoteMachineGatewaysRef.current.get(profileId);
-      const currentProfile = profilesRef.current.find((candidate) => candidate.id === profileId);
-      if (current?.epoch !== epoch
-        || current.profileKey !== profileKey
-        || current.gateway !== remoteGateway
-        || !current.connected
-        || currentProfile?.serverId !== profile.serverId
-        || currentProfile === undefined
-        || remoteMachineProfileKey(currentProfile) !== profileKey
-        || machinePresenceByProfileRef.current[profileId] !== "online") return [];
-      return result.matches.map((match) => ({
-        profileId,
-        serverId: profile.serverId,
-        source: "live" as const,
-        reachable: true as const,
-        match
-      }));
+      if (routedOptions === undefined || binding.profileKey !== remoteMachineProfileKey(profile)) return undefined;
+      const { gateway: remoteGateway, liveEpoch: epoch } = binding;
+      const sourceGeneration = binding.snapshot?.generation;
+      const authority = machineCacheAuthorityRef.current.get(profileId);
+      const isCurrent = (): boolean => {
+        const selection = preferencesRef.current.machineSelection;
+        return !options.signal?.aborted
+          && activeProfileRef.current?.id === activeProfileId
+          && remoteMachineGatewaysRef.current.get(profileId) === binding
+          && binding.gateway === remoteGateway && binding.connected
+          && binding.liveEpoch === epoch && binding.snapshot?.generation === sourceGeneration
+          && currentMachineCacheOwner(profile, authority) && !machineCacheRevoked(profile)
+          && (selection === "all" || selection.includes(profileId))
+          && machinePresenceByProfileRef.current[profileId] === "online";
+      };
+      if (!isCurrent()) return undefined;
+      const source = { profileId, serverId: profile.serverId, epoch, isCurrent };
+      try {
+        const { matches } = await remoteGateway.searchAllSessionMessages(normalizedQuery, routedOptions);
+        return { ...source, status: "succeeded", matches };
+      } catch {
+        return { ...source, status: "failed" };
+      }
     });
-    const settled = await Promise.allSettled(searches);
+    const settled = await Promise.all(searches);
     throwIfRemoteSearchAborted(options.signal);
-    return settled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
-  }, []);
+    return settled.flatMap((outcome) => outcome !== undefined && outcome.isCurrent() ? [outcome] : []);
+  }, [currentMachineCacheOwner, machineCacheRevoked]);
 
   useEffect(() => {
     if (!state.ready || state.profiles.length === 0) return;

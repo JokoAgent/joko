@@ -5,14 +5,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type SessionMessageSearchMatchView } from "../model.js";
+import { emptySnapshot, type FederatedSessionMessageSearchOutcome, type FederatedSessionMessageSearchPage, type SessionMessageSearchMatchView } from "../model.js";
 import { Sidebar, type SidebarProps } from "./Sidebar.js";
 import type { Translator } from "./types.js";
 
 interface Deferred<T> {
   readonly promise: Promise<T>;
   readonly resolve: (value: T) => void;
-  readonly reject: (reason?: unknown) => void;
 }
 
 const roots: Root[] = [];
@@ -216,37 +215,10 @@ describe("Sidebar progressive conversation search", () => {
   it("renders a live remote message result and activates its profile-qualified jump", async () => {
     vi.useFakeTimers();
     const openRemoteMessage = vi.fn();
-    const remoteMatch = {
-      profileId: "remote-east",
-      serverId: "server-east",
-      source: "live" as const,
-      reachable: true as const,
-      match: hit("deployment needle", "remote-event")
-    };
+    const remoteMatch = hit("deployment needle", "remote-event");
     const { container } = await renderSidebar(async () => [], {
-      onSearchRemoteMessages: async () => [remoteMatch],
-      machineControl: {
-        profiles: [
-          { id: "local", deviceId: "device-test", serverId: "server-local", name: "Local", origin: "http://127.0.0.1:4318"  },
-          { id: "remote-east", deviceId: "device-test", serverId: "server-east", name: "East", origin: "https://east.example.test"  }
-        ],
-        activeProfile: { id: "local", deviceId: "device-test", serverId: "server-local", name: "Local", origin: "http://127.0.0.1:4318"  },
-        presenceByProfile: { local: "current", "remote-east": "online" },
-        caches: [{
-          profileId: "remote-east",
-          serverId: "server-east",
-          name: "East",
-          origin: "https://east.example.test",
-          updatedAt: 1,
-          sessions: [{ id: "session-a", name: "Remote task", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }]
-        }],
-        selection: "all",
-        onSelectionChange: vi.fn(),
-        onRefresh: vi.fn(),
-        onSwitch: vi.fn(),
-        onOpenCachedSession: vi.fn(),
-        onOpenMessageMatch: openRemoteMessage
-      }
+      onSearchRemoteMessages: async () => [remoteSearchPage("east", [remoteMatch])],
+      machineControl: { ...remoteMachineControl(), onOpenMessageMatch: openRemoteMessage }
     });
     await enterQuery(container, "needle");
     await act(async () => vi.advanceTimersByTimeAsync(250));
@@ -256,51 +228,133 @@ describe("Sidebar progressive conversation search", () => {
     expect(result).toBeDefined();
     expect(result?.textContent).toContain("machine.searchLive");
     await act(async () => result?.click());
-    expect(openRemoteMessage).toHaveBeenCalledWith("remote-east", remoteMatch.match);
+    expect(openRemoteMessage).toHaveBeenCalledWith("remote-east", remoteMatch);
   });
 
-  it("restores a late remote keyword page when hybrid has already started and then fails", async () => {
+  it.each(["keyword", "hybrid"] as const)("keeps keyword hits only for failed peers when %s settles first", async (first) => {
     vi.useFakeTimers();
-    const keyword = deferred<readonly {
-      readonly profileId: string;
-      readonly serverId: string;
-      readonly source: "live";
-      readonly reachable: true;
-      readonly match: SessionMessageSearchMatchView;
-    }[]>();
-    const hybrid = deferred<readonly never[]>();
-    const remoteMatch = {
-      profileId: "remote-east",
-      serverId: "server-east",
-      source: "live" as const,
-      reachable: true as const,
-      match: hit("late keyword needle", "late-keyword")
-    };
+    const keyword = deferred<readonly FederatedSessionMessageSearchOutcome[]>();
+    const hybrid = deferred<readonly FederatedSessionMessageSearchOutcome[]>();
+    const keywordPages = [
+      remoteSearchPage("east", [hit("east keyword needle", "east-keyword")]),
+      remoteSearchPage("west", [hit("west keyword needle", "west-keyword")]),
+      remoteSearchPage("north", [hit("north keyword needle", "north-keyword")])
+    ];
+    const hybridOutcomes = [
+      { ...remoteSearchSource("east"), status: "failed" as const },
+      remoteSearchPage("west", [hit("west hybrid needle", "west-hybrid")]),
+      remoteSearchPage("north", [])
+    ];
     const { container } = await renderSidebar(async () => [], {
       onSearchRemoteMessages: (_query, mode) => mode === "keyword" ? keyword.promise : hybrid.promise,
+      machineControl: remoteMachineControl("west", "north")
+    });
+    await enterQuery(container, "needle");
+    if (first === "keyword") {
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+      await act(async () => keyword.resolve(keywordPages));
+      expect(container.textContent).toContain("east keyword needle");
+      expect(container.textContent).toContain("west keyword needle");
+      expect(container.textContent).toContain("north keyword needle");
+      await act(async () => vi.advanceTimersByTimeAsync(650));
+      await act(async () => hybrid.resolve(hybridOutcomes));
+    } else {
+      await act(async () => vi.advanceTimersByTimeAsync(900));
+      await act(async () => hybrid.resolve(hybridOutcomes));
+      expect(container.textContent).toContain("west hybrid needle");
+      expect(container.textContent).not.toContain("east keyword needle");
+      await act(async () => keyword.resolve(keywordPages));
+    }
+
+    expect(container.textContent).toContain("east keyword needle");
+    expect(container.textContent).toContain("west hybrid needle");
+    expect(container.textContent).not.toContain("west keyword needle");
+    expect(container.textContent).not.toContain("north keyword needle");
+    expect(container.textContent).not.toContain("nav.remoteMessageSearchFailed");
+  });
+
+  it("shows failure when neither stage succeeds for any current peer", async () => {
+    vi.useFakeTimers();
+    const { container } = await renderSidebar(async () => [], {
+      onSearchRemoteMessages: async () => [{ ...remoteSearchSource("east"), status: "failed" }],
+      machineControl: remoteMachineControl()
+    });
+    await enterQuery(container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(container.textContent).toContain("nav.searchingMessages");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(container.textContent).toContain("nav.remoteMessageSearchFailed");
+    expect(container.textContent).not.toContain("nav.noMatchingTasks");
+  });
+
+  it("preserves the late keyword page when the whole hybrid request rejects", async () => {
+    vi.useFakeTimers();
+    const keyword = deferred<readonly FederatedSessionMessageSearchOutcome[]>();
+    const hybrid = deferred<void>();
+    const { container } = await renderSidebar(async () => [], {
+      onSearchRemoteMessages: (_query, mode) => mode === "keyword" ? keyword.promise : hybrid.promise.then(() => {
+        throw new Error("Remote semantic search unavailable");
+      }),
       machineControl: remoteMachineControl()
     });
     await enterQuery(container, "needle");
     await act(async () => vi.advanceTimersByTimeAsync(900));
-    await act(async () => keyword.resolve([remoteMatch]));
-    await act(async () => hybrid.reject(new Error("semantic provider unavailable")));
-
+    await act(async () => keyword.resolve([remoteSearchPage("east", [hit("late keyword needle", "late-keyword")])]));
+    await act(async () => hybrid.resolve(undefined));
     expect(container.textContent).toContain("late keyword needle");
     expect(container.textContent).not.toContain("nav.remoteMessageSearchFailed");
   });
 
+  it("retires keyword content when the same online peer reconnects", async () => {
+    vi.useFakeTimers();
+    const control = remoteMachineControl("west");
+    let originalStreamCurrent = true;
+    const eastKeyword = {
+      ...remoteSearchPage("east", [hit("retired keyword needle", "retired-keyword")]),
+      isCurrent: () => originalStreamCurrent
+    };
+    const rendered = await renderSidebar(async () => [], {
+      onSearchRemoteMessages: async (_query, mode) => mode === "keyword" ? [eastKeyword] : [
+        { ...remoteSearchSource("east"), epoch: 4, status: "failed" },
+        remoteSearchPage("west", [hit("current hybrid needle", "current-hybrid")])
+      ],
+      machineControl: control
+    });
+    await enterQuery(rendered.container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(rendered.container.textContent).toContain("retired keyword needle");
+    originalStreamCurrent = false;
+    await rendered.rerender({ machineControl: { ...control } });
+    expect(rendered.container.textContent).not.toContain("retired keyword needle");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(rendered.container.textContent).toContain("current hybrid needle");
+    expect(rendered.container.textContent).not.toContain("retired keyword needle");
+  });
+
+  it("aborts a superseded remote query and ignores its late hybrid pages", async () => {
+    vi.useFakeTimers();
+    const retiredHybrid = deferred<readonly FederatedSessionMessageSearchOutcome[]>();
+    const onSearchRemoteMessages = vi.fn<NonNullable<SidebarProps["onSearchRemoteMessages"]>>(async (query, mode) =>
+      query === "retired" && mode === "hybrid" ? retiredHybrid.promise : [remoteSearchPage("east", [hit(`${query} keyword result`, query)])]);
+    const { container } = await renderSidebar(async () => [], { onSearchRemoteMessages, machineControl: remoteMachineControl() });
+    await enterQuery(container, "retired");
+    await act(async () => vi.advanceTimersByTimeAsync(900));
+    const retiredSignal = onSearchRemoteMessages.mock.calls[1]?.[3];
+    expect(retiredSignal?.aborted).toBe(false);
+    await enterQuery(container, "current");
+    expect(retiredSignal?.aborted).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    await act(async () => retiredHybrid.resolve([remoteSearchPage("east", [hit("retired hybrid result", "retired-hybrid")])]));
+    expect(container.textContent).toContain("current keyword result");
+    expect(container.textContent).not.toContain("retired hybrid result");
+  });
+
   it("renders a live remote task that is not present in the last machine cache", async () => {
     vi.useFakeTimers();
-    const match = {
-      profileId: "remote-east",
-      serverId: "server-east",
-      source: "live" as const,
-      reachable: true as const,
-      match: { ...hit("needle from uncached task", "uncached-event"), sessionId: "uncached-session" }
-    };
+    const match = { ...hit("needle from uncached task", "uncached-event"), sessionId: "uncached-session" };
     const control = remoteMachineControl();
     const { container } = await renderSidebar(async () => [], {
-      onSearchRemoteMessages: async () => [match],
+      onSearchRemoteMessages: async () => [remoteSearchPage("east", [match])],
       machineControl: { ...control, caches: [] }
     });
     await enterQuery(container, "needle");
@@ -486,22 +540,38 @@ function hit(snippet: string, eventId: string): SessionMessageSearchMatchView {
   };
 }
 
-function remoteMachineControl(): NonNullable<SidebarProps["machineControl"]> {
+const remoteSearchEpochs = { east: 1, west: 2, north: 3 };
+type RemotePeer = keyof typeof remoteSearchEpochs;
+
+function remoteSearchSource(peer: RemotePeer) {
+  return { profileId: `remote-${peer}`, serverId: `server-${peer}`, epoch: remoteSearchEpochs[peer], isCurrent: () => true };
+}
+
+function remoteSearchPage(peer: RemotePeer, matches: readonly SessionMessageSearchMatchView[]): FederatedSessionMessageSearchPage {
+  return { ...remoteSearchSource(peer), status: "succeeded", matches };
+}
+
+function remoteMachineControl(...additionalPeers: readonly RemotePeer[]): NonNullable<SidebarProps["machineControl"]> {
+  const activeProfile = { id: "local", deviceId: "device-test", serverId: "server-local", name: "Local", origin: "http://127.0.0.1:4318" };
+  const peers = (["east", ...additionalPeers] as const).map((peer) => ({
+    id: `remote-${peer}`,
+    deviceId: "device-test",
+    serverId: `server-${peer}`,
+    name: peer,
+    origin: `https://${peer}.example.test`
+  }));
   return {
-    profiles: [
-      { id: "local", deviceId: "device-test", serverId: "server-local", name: "Local", origin: "http://127.0.0.1:4318"  },
-      { id: "remote-east", deviceId: "device-test", serverId: "server-east", name: "East", origin: "https://east.example.test"  }
-    ],
-    activeProfile: { id: "local", deviceId: "device-test", serverId: "server-local", name: "Local", origin: "http://127.0.0.1:4318"  },
-    presenceByProfile: { local: "current", "remote-east": "online" },
-    caches: [{
-      profileId: "remote-east",
-      serverId: "server-east",
-      name: "East",
-      origin: "https://east.example.test",
+    profiles: [activeProfile, ...peers],
+    activeProfile,
+    presenceByProfile: { local: "current", ...Object.fromEntries(peers.map((peer) => [peer.id, "online" as const])) },
+    caches: peers.map((peer) => ({
+      profileId: peer.id,
+      serverId: peer.serverId,
+      name: peer.name,
+      origin: peer.origin,
       updatedAt: 1,
       sessions: [{ id: "session-a", name: "Remote task", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }]
-    }],
+    })),
     selection: "all",
     onSelectionChange: vi.fn(),
     onRefresh: vi.fn(),
@@ -513,10 +583,8 @@ function remoteMachineControl(): NonNullable<SidebarProps["machineControl"]> {
 
 function deferred<T>(): Deferred<T> {
   let resolvePromise!: (value: T) => void;
-  let rejectPromise!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolve, reject) => {
+  const promise = new Promise<T>((resolve) => {
     resolvePromise = resolve;
-    rejectPromise = reject;
   });
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
+  return { promise, resolve: resolvePromise };
 }
