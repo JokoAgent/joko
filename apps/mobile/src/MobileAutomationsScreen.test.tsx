@@ -277,7 +277,7 @@ function mobileState(automationPatch: Partial<MobileAutomationsState> = {}, stat
     homeSearchQuery: "",
     homeSearchFilter: "active",
     homeSearchStatus: "idle",
-    homeSearchSessionIds: [],
+    homeSearchMatches: [],
     files: emptyMobileFilesState(),
     automations: automations(automationPatch),
     partnerPrivate: emptyMobilePartnerPrivateState(),

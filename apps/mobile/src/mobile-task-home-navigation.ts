@@ -1,4 +1,4 @@
-import type { MobileHomeSearchSort } from "./home-navigation";
+import type { MobileHomeSearchMatch, MobileHomeSearchSort } from "./home-navigation";
 
 export interface MobileHomeViewState {
   readonly search: string;
@@ -9,7 +9,7 @@ export interface MobileHomeViewState {
 export type MobileHomeViewChange = (next: MobileHomeViewState, chooseStatus?: boolean) => void;
 
 export type MobileHomeNavigationIntent =
-  | { readonly kind: "session"; readonly sessionId: string }
+  | { readonly kind: "session"; readonly sessionId: string; readonly searchMatch?: MobileHomeSearchMatch }
   | { readonly kind: "new-task" | "incoming-share" | "home" | "menu" | "search" }
   | { readonly kind: "page"; readonly action: () => void };
 
@@ -22,7 +22,7 @@ export interface MobileTaskHomeNavigationScope {
 export interface MobileTaskHomeNavigationPorts {
   readScope(): MobileTaskHomeNavigationScope | undefined;
   close(): void;
-  prepare(isCurrent: () => boolean): Promise<void>;
+  prepare(isCurrent: () => boolean, intent: MobileHomeNavigationIntent): Promise<void>;
   execute(intent: MobileHomeNavigationIntent, sourceCurrent: () => boolean): Promise<void>;
   failed(error: unknown): void;
   changed?(): void;
@@ -55,7 +55,7 @@ export class MobileTaskHomeNavigation {
     if (this.busy) return;
     const scope = this.ports.readScope();
     if (!scope) return;
-    if (intent.kind === "session" && intent.sessionId === scope.sessionId) {
+    if (intent.kind === "session" && intent.sessionId === scope.sessionId && intent.searchMatch === undefined) {
       if (modal) this.close();
       return;
     }
@@ -114,7 +114,7 @@ export class MobileTaskHomeNavigation {
     };
     try {
       if (!current()) return;
-      await this.ports.prepare(current);
+      await this.ports.prepare(current, pending.intent);
       if (!current()) return;
       this.#executing = true;
       await this.ports.execute(pending.intent, sourceCurrent);

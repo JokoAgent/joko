@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, createElement, forwardRef, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { act, createElement, forwardRef, useEffect, useImperativeHandle, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
@@ -10,6 +10,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
 import { mobileMessage } from "./mobile-messages";
+import { projectMobileHomeSearchMessageFocus } from "./mobile-native-intent";
 import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
@@ -27,16 +28,18 @@ type NativeProps = {
   style?: unknown;
   pointerEvents?: string;
   accessibilityElementsHidden?: boolean;
+  accessibilityLiveRegion?: "none" | "polite" | "assertive";
   consumedBottomInset?: number;
 };
-const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, consumedBottomInset }: NativeProps) => createElement("div", {
+const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, accessibilityLiveRegion, consumedBottomInset }: NativeProps) => createElement("div", {
   "aria-label": accessibilityLabel, "data-testid": testID, "data-native-style": JSON.stringify(style),
-  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "data-consumed-bottom-inset": consumedBottomInset
+  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "aria-live": accessibilityLiveRegion, "data-consumed-bottom-inset": consumedBottomInset
 }, children);
 const empty = Object.freeze([]);
 const homeConnectionId = "home-connection";
 const select = vi.fn(async (_sessionId?: string) => {});
 const searchHome = vi.fn(async () => {});
+const scrollToIndex = vi.fn();
 const setSessionPinned = vi.fn(async () => true);
 const setSessionArchived = vi.fn(async (_sessionId: string, _archived: boolean, _archiveConfirmation?: string) => true);
 const archiveConfirmation = "a".repeat(64);
@@ -142,9 +145,12 @@ beforeAll(async () => {
     }) => createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
       : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
         section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index })))))),
-    FlatList: ({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
-      renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }) => createElement("div", {},
-      data?.length && renderItem ? data.map(item => createElement("div", { key: item.id }, renderItem({ item }))) : ListEmptyComponent),
+    FlatList: forwardRef(({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
+      renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }, ref) => {
+      useImperativeHandle(ref, () => ({ scrollToIndex, scrollToEnd() {}, scrollToOffset() {} }), []);
+      return createElement("div", {}, data?.length && renderItem
+        ? data.map(item => createElement("div", { key: item.id }, renderItem({ item }))) : ListEmptyComponent);
+    }),
     TextInput: forwardRef<HTMLInputElement, { value?: string; accessibilityLabel?: string; placeholder?: string;
       onChangeText?: (value: string) => void }>((input, ref) => createElement("input", { ref, value: input.value ?? "",
       "aria-label": input.accessibilityLabel, placeholder: input.placeholder, readOnly: !input.onChangeText,
@@ -272,7 +278,7 @@ beforeEach(async () => {
   await newTaskDrafts.clear({ profileId: "profile" });
   vi.useFakeTimers();
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
-  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
+  for (const spy of [select, searchHome, scrollToIndex, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -290,7 +296,7 @@ beforeEach(async () => {
       { targetId: "project", backendId: "backend", displayName: "Project" }] });
   state = { status: "connected", activeProfileId: "profile", selectedId: "current", owner, detail: owner, saved: [], pending: [],
     older: [], live: [], busy: false, historyBusy: false, historyEnd: true, readReceipts: {},
-    homeSearchQuery: "", homeSearchFilter: "active", homeSearchSessionIds: [], homeSearchStatus: "idle" } as unknown as MobileState;
+    homeSearchQuery: "", homeSearchFilter: "active", homeSearchMatches: [], homeSearchStatus: "idle" } as unknown as MobileState;
   viewState = { search: "", statusFilter: "active" };
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
   props = { colors, state, locale: "en", onNew, onSelect, onMenu, onOpenShare, currentSessionId: "current",
@@ -530,10 +536,10 @@ describe("actual Home navigation hosts", () => {
         { sessionId: "body", targetId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
           lastActivityAt: { seconds: 20n } }
       ] });
-    const order = () => [...host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]')]
+    const order = () => Array.from(host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]'))
       .map(row => row.getAttribute("aria-label"));
     await render({ state: { ...state, owner, detail: owner, homeSearchStatus: "ready",
-      homeSearchQuery: "needle", homeSearchSessionIds: ["body"] } });
+      homeSearchQuery: "needle", homeSearchMatches: [{ sessionId: "body", eventId: "body-message" }] } });
     await type(message("home.search"), "needle");
     await act(async () => vi.advanceTimersByTimeAsync(180));
     expect(searchHome).toHaveBeenLastCalledWith("needle", "active");
@@ -549,6 +555,21 @@ describe("actual Home navigation hosts", () => {
     expect(searchHome).toHaveBeenLastCalledWith("", "active");
     expect(order()).toEqual(["Open task Newer task", "Open task Needle title"]);
     expect(host.textContent).not.toContain(message("home.searchSort.activityAsc"));
+  });
+
+  it("hands a body-only Home result to the selected task and opens title-only results normally", async () => {
+    const match = { sessionId: "other", eventId: "matching-message" };
+    await render({ state: { ...state, homeSearchQuery: "needle", homeSearchStatus: "ready", homeSearchMatches: [match] },
+      runNavigation: undefined, host: "home" });
+    await type(message("home.search"), "needle");
+    await press("Open task Beta");
+    expect(select).toHaveBeenLastCalledWith("other");
+    expect(onSelect).toHaveBeenLastCalledWith(match);
+
+    await type(message("home.search"), "Alpha");
+    await press("Open task Alpha");
+    expect(select).toHaveBeenLastCalledWith("current");
+    expect(onSelect).toHaveBeenLastCalledWith(undefined);
   });
 
   it("reopens Home with the saved archive filter and the current node's task list", async () => {
@@ -660,6 +681,33 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it("locates the selected body event in the already-open wide task without selecting or flushing it again", async () => {
+    dimensions = { ...dimensions, width: 900, height: 700 };
+    const match = { sessionId: "current", eventId: "matching-event" };
+    const events = ["Unrelated reply", "Original needle reply"].map((text, index) => create(EventSchema, {
+      eventId: index === 0 ? "different-event" : match.eventId, identity: { sessionId: "current", runId: `search-run-${index}` },
+      cursor: { generation: 1n, sequence: BigInt(index + 1) }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: `search-message-${index}`, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: text } }]
+      } } }
+    }));
+    viewState = { search: "needle", statusFilter: "active" };
+    state = { ...state, homeSearchQuery: "needle", homeSearchStatus: "ready", homeSearchMatches: [match],
+      detail: create(SnapshotSchema, { ...state.detail!, timeline: events }) };
+    await renderTask();
+    await press("Open task Alpha");
+    expect(onNavigated).toHaveBeenCalledExactlyOnceWith(match);
+    expect(select).not.toHaveBeenCalled();
+    expect(draftFlush).not.toHaveBeenCalled();
+    const focus = projectMobileHomeSearchMessageFocus(state, match, -1);
+    expect(focus).toEqual({ requestId: -1, sessionId: "current", messageId: "search-message-1", messageEventId: match.eventId });
+    await renderTask({ messageFocus: focus });
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(scrollToIndex).toHaveBeenCalledWith({ index: 1, animated: false, viewPosition: 0.5 });
+    const focused = Array.from(host.querySelectorAll('[aria-live="polite"]')).find(row => row.textContent?.includes("Original needle reply"));
+    expect(focused?.getAttribute("data-native-style")).toContain('"borderWidth":2');
+    expect(projectMobileHomeSearchMessageFocus(state, { ...match, eventId: "retired-event" }, -2)).toBeUndefined();
+  });
+
   it("opens the exact collapsed plan when searching its completed step", async () => {
     const completedStep = "Verify the archived checksum";
     const plan = create(EventSchema, { eventId: "plan-search-event", identity: { sessionId: "current", runId: "plan-run", generation: 7n },

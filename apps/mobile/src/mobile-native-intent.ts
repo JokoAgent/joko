@@ -1,4 +1,5 @@
 import type { MobileState } from "./mobile-client";
+import type { MobileHomeSearchMatch } from "./home-navigation";
 import { timelineRows } from "./timeline";
 
 export const mobileNativeIntentMaximumCharacters = 4_096;
@@ -250,6 +251,13 @@ export function projectMobileNativeIntentSnapshot(state: MobileState): MobileNat
       last?.eventId ?? ""
     ].join("\u001f")
   });
+}
+
+export function projectMobileHomeSearchMessageFocus(state: MobileState, match: MobileHomeSearchMatch, requestId: number): MobileNativeIntentMessageFocus | undefined {
+  if (state.status !== "connected" || state.taskSource?.kind === "joined" || state.selectedId !== match.sessionId) return undefined;
+  const message = projectMobileNativeIntentSnapshot(state).messages.find(row => row.eventId === match.eventId);
+  if (message !== undefined) return { requestId, sessionId: match.sessionId, messageId: message.messageId, messageEventId: message.eventId };
+  return undefined;
 }
 
 export async function executeMobileNativeIntent(

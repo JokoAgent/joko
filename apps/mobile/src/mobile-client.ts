@@ -106,7 +106,7 @@ import {
   MobileRemoteDesktopAuthorityError,
   type MobileRemoteDesktopTransport
 } from "./remote-desktop-controller";
-import type { MobileHomeStatusFilter } from "./home-navigation";
+import type { MobileHomeSearchMatch, MobileHomeStatusFilter } from "./home-navigation";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
   MOBILE_FILE_SHARE_MAXIMUM_BYTES,
@@ -549,7 +549,7 @@ export interface MobileState {
   readonly homeSearchQuery: string;
   readonly homeSearchFilter: MobileHomeStatusFilter;
   readonly homeSearchStatus: "idle" | "searching" | "ready" | "error";
-  readonly homeSearchSessionIds: readonly string[];
+  readonly homeSearchMatches: readonly MobileHomeSearchMatch[];
   readonly homeSearchError?: string;
   readonly timelinePreview?: MobileFilePreview;
   readonly files: MobileFilesState;
@@ -972,7 +972,7 @@ export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
     historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
-    homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState(),
+    homeSearchStatus: "idle", homeSearchMatches: [], files: emptyMobileFilesState(),
     automations: emptyMobileAutomationsState(), partnerPrivate: emptyMobilePartnerPrivateState() };
   #credentialValue?: PairedCredential;
   #stopEndpointTrustWatch = () => {};
@@ -3992,7 +3992,7 @@ export class MobileClient {
     this.#state = {
       ...this.#state,
       homeSearchStatus: "idle",
-      homeSearchSessionIds: [],
+      homeSearchMatches: [],
       homeSearchError: undefined,
       timelinePreview: undefined,
       partnerPrivate: emptyMobilePartnerPrivateState(partnerPrivate.open,
@@ -6132,7 +6132,7 @@ export class MobileClient {
     const generation = ++this.#homeSearchEpoch;
     if (!normalized) {
       this.#set({ homeSearchQuery: "", homeSearchFilter: statusFilter, homeSearchStatus: "idle",
-        homeSearchSessionIds: [], homeSearchError: undefined });
+        homeSearchMatches: [], homeSearchError: undefined });
       return;
     }
     const credential = this.#credential;
@@ -6141,13 +6141,13 @@ export class MobileClient {
     const epoch = this.#epoch;
     if (!credential || !owner || !profileId || this.#state.status !== "connected" || !this.#foreground) {
       this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "error",
-        homeSearchSessionIds: [], homeSearchError: "Reconnect to search task messages." });
+        homeSearchMatches: [], homeSearchError: "Reconnect to search task messages." });
       return;
     }
     const controller = new AbortController();
     this.#homeSearchAbort = controller;
     this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "searching",
-      homeSearchSessionIds: [], homeSearchError: undefined });
+      homeSearchMatches: [], homeSearchError: undefined });
     try {
       const matches = await this.network.searchSessionMessages(
         credential,
@@ -6161,13 +6161,16 @@ export class MobileClient {
         || profileId !== this.#activeProfileId || this.#state.homeSearchQuery !== normalized
         || this.#state.homeSearchFilter !== statusFilter) return;
       const visible = new Set(this.#state.owner?.sessions.map((session) => session.sessionId) ?? []);
-      const sessionIds = [...new Set(matches.map((match) => match.sessionId).filter((sessionId) => visible.has(sessionId)))];
-      this.#set({ homeSearchStatus: "ready", homeSearchSessionIds: sessionIds, homeSearchError: undefined });
+      const firstBySession = new Map<string, MobileHomeSearchMatch>();
+      for (const { sessionId, eventId } of matches) {
+        if (visible.has(sessionId) && !firstBySession.has(sessionId)) firstBySession.set(sessionId, { sessionId, eventId });
+      }
+      this.#set({ homeSearchStatus: "ready", homeSearchMatches: [...firstBySession.values()], homeSearchError: undefined });
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
         || profileId !== this.#activeProfileId) return;
-      this.#set({ homeSearchStatus: "error", homeSearchSessionIds: [], homeSearchError: message(error) });
+      this.#set({ homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: message(error) });
     } finally {
       if (this.#homeSearchAbort === controller) this.#homeSearchAbort = undefined;
     }
