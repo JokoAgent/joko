@@ -8086,6 +8086,27 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.window).toBeUndefined();
   });
 
+  it.each([120, 4])("uses the first event cursor for the first older request with %i recent events", async (count) => {
+    const network = fakeNetwork();
+    const timeline = Array.from({ length: count }, (_, index) => event(`recent-${index}`, BigInt(index + 10)));
+    const resumeCursor = { opaqueToken: "cursor-130", sequence: 130n, generation: 1n };
+    const owner = create(SnapshotSchema, { ...snapshot, resumeCursor });
+    const detail = create(SnapshotSchema, { ...owner, scope: { kind: { case: "session", value: { sessionId: "session", recentTimelineItems: 120 } } }, timeline });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: owner });
+    vi.mocked(network.readSession).mockResolvedValue(detail);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    expect(app.state.before).toBeUndefined();
+    const earlier = count === 120 ? [event("just-before-the-window", 9n)] : [];
+    vi.mocked(network.readHistory).mockResolvedValueOnce({ events: earlier });
+
+    await app.older();
+    expect(network.readHistory).toHaveBeenCalledExactlyOnceWith(credential, "session", timeline[0]!.cursor, expect.any(AbortSignal));
+    expect(app.state.older).toEqual(earlier.length ? [...earlier, ...timeline] : []);
+    expect(app.state.detail?.timeline).toEqual(timeline);
+    expect(app.state.historyEnd).toBe(true);
+  });
+
   it("retires an in-flight historic page when returning to the latest window", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);

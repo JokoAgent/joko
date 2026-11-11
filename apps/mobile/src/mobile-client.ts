@@ -9433,7 +9433,18 @@ export class MobileClient {
     this.#historyOwner = owner;
     this.#set({ historyBusy: true });
     try {
-      const before = this.#state.before;
+      const detail = this.#state.detail;
+      const scope = detail?.scope?.kind;
+      const generation = this.#taskGeneration();
+      const first = detail?.timeline[0];
+      // GetSnapshot and ListSessionTimeline issue cursors in the same service generation.
+      const hasLatestSnapshot = detail !== undefined && detail.generation === generation
+        && this.#state.window === undefined && this.#state.older.length === 0 && !this.#joinedTask
+        && scope?.case === "session" && scope.value.sessionId === sessionId && scope.value.recentTimelineItems > 0
+        && detail.sessions.some(session => session.sessionId === sessionId && session.derivationOrigin?.sideChat !== true);
+      const snapshotBefore = hasLatestSnapshot && first?.identity?.sessionId === sessionId && first.cursor?.opaqueToken
+        && first.cursor.generation === generation && first.cursor.sequence > 0n ? first.cursor : undefined;
+      const before = this.#state.before ?? snapshotBefore;
       const page = await this.network.readHistory(credential, sessionId, before, this.#abort?.signal);
       if (!this.#current(epoch) || sessionId !== this.#state.selectedId || this.#historyOwner !== owner) return;
       validateHistory(page.events, sessionId, this.#taskGeneration(), before);
@@ -9442,7 +9453,8 @@ export class MobileClient {
         throw new Error("The task history returned a cyclic or mismatched page cursor.");
       }
       const known = new Set(this.#state.older.map((item) => item.eventId));
-      const older = [...page.events.filter((item) => !known.has(item.eventId)), ...this.#state.older];
+      const retainedLatest = snapshotBefore !== undefined && before === snapshotBefore && page.events.length > 0 ? detail?.timeline ?? [] : [];
+      const older = [...page.events.filter((item) => !known.has(item.eventId)), ...retainedLatest, ...this.#state.older];
       const window = this.#state.window ? [...older, ...this.#state.window] : undefined;
       this.#set({ older: window ? [] : older, window, before: page.before, historyEnd: !page.before });
       if (!this.#joinedTask && window === undefined && this.#state.node && this.#state.owner && this.#state.detail) {
