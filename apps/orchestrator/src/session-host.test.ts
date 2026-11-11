@@ -12333,33 +12333,44 @@ describe("SessionHost", () => {
     const fixture = await createFixture(adapter);
     const sourceSessionId = (await fixture.host.createSession({ operationId: "pi-message-fork-source", connection: fixture.connection,
       targetId: "target-one", title: "Source", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
-    appendSessionEvent(fixture.store, sourceSessionId, "pi-answer-event", 10, {
-      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Final answer" }],
-      nativeHistory: { identity: { entryId: "pi-answer" } }
-    });
-    appendSessionEvent(fixture.store, sourceSessionId, "pi-input-event", 20, {
-      type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Original input" }],
-      nativeHistory: { identity: { entryId: "pi-input", parentEntryId: "pi-answer" } }
-    });
+    const source = fixture.store.getSession(sourceSessionId).descriptor;
+    const rows = [
+      { role: "assistant", entryId: "pi-answer", eventId: "pi-answer-event", emittedAt: 10, text: "Final answer", parentEntryId: undefined },
+      { role: "user", entryId: "pi-input", eventId: "pi-input-event", emittedAt: 20, text: "Original input", parentEntryId: "pi-answer" }
+    ] as const;
+    for (const { role, entryId, eventId, emittedAt, text, parentEntryId } of rows) {
+      fixture.store.appendEvent({
+        id: eventId, backendId: source.backendId, targetId: source.targetId, sessionId: sourceSessionId,
+        generation: source.binding.generation, emittedAt, traceId: `test:${eventId}`,
+        payload: { type: "message_complete", role, blocks: [{ kind: "text", text }],
+          nativeHistory: { identity: { entryId, ...(parentEntryId === undefined ? {} : { parentEntryId }) } } },
+        metadata: { namespace: "joko.native_history", fields: {
+          [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(source.binding.opaqueRef)
+        } }
+      });
+      expect(fixture.store.findVisibleSessionMessageOrigin({ sessionId: sourceSessionId, eventId, includeRetainedContext: false }))
+        .toEqual({ messageId: entryId, eventId });
+    }
     const nativeFork = adapter.fork.bind(adapter);
     const fork = vi.spyOn(adapter, "fork").mockImplementation((entryId, context, derivation) => {
       derivation.messageFork?.assertCurrent();
       return nativeFork(entryId, context, derivation);
     });
     const base = { connection: fixture.connection, sourceSessionId, title: "Fork", kind: "fork" as const, entryId: "pi-answer" };
-    for (const [role, messageId, eventId] of [["assistant", "pi-answer", "pi-answer-event"], ["user", "pi-input", "pi-input-event"]] as const) {
-      const derived = await fixture.host.deriveSession({ ...base, operationId: `pi-message-fork-${role}`, messageFork: true,
-        sourceMessage: { messageId, eventId } });
-      expect(fork.mock.calls.at(-1)?.[2].messageFork).toMatchObject({ role, nativeEntryId: messageId });
+    const formal = { ...base, messageFork: true as const, expectedGeneration: source.binding.generation };
+    for (const { role, entryId, eventId } of rows) {
+      const derived = await fixture.host.deriveSession({ ...formal, operationId: `pi-message-fork-${role}`,
+        sourceMessage: { messageId: entryId, eventId } });
+      expect(fork.mock.calls.at(-1)?.[2].messageFork).toMatchObject({ role, nativeEntryId: entryId });
       expect(fixture.store.getSession(derived.value.sessionId).descriptor.derivationOrigin).toEqual({
-        kind: "fork", sourceSessionId, sourceMessageId: messageId, sourceEventId: eventId
+        kind: "fork", sourceSessionId, sourceMessageId: entryId, sourceEventId: eventId
       });
     }
     const inputOrigin = { messageId: "pi-input", eventId: "pi-input-event" };
     await fixture.host.deriveSession({ ...base, operationId: "legacy-pi-fork", sourceMessage: inputOrigin });
     expect(fork.mock.calls.at(-1)?.[2].messageFork).toBeUndefined();
     const calls = fork.mock.calls.length;
-    await expect(fixture.host.deriveSession({ ...base, operationId: "mismatched-pi-fork", messageFork: true,
+    await expect(fixture.host.deriveSession({ ...formal, operationId: "mismatched-pi-fork",
       entryId: "unrelated-native-user", sourceMessage: inputOrigin })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
     expect(fork).toHaveBeenCalledTimes(calls);
 
@@ -12371,7 +12382,7 @@ describe("SessionHost", () => {
       throw new Error("A stale source should fail before dispatch.");
     });
     const sessions = fixture.store.listSessions().map(item => item.descriptor.id);
-    await expect(fixture.host.deriveSession({ ...base, operationId: "retired-pi-fork", messageFork: true, sourceMessage: inputOrigin }))
+    await expect(fixture.host.deriveSession({ ...formal, operationId: "retired-pi-fork", sourceMessage: inputOrigin }))
       .rejects.toBeInstanceOf(OperationPreviouslyFailedError);
     expect(fixture.store.listSessions().map(item => item.descriptor.id)).toEqual(sessions);
   });
