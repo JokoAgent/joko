@@ -278,7 +278,6 @@ beforeEach(async () => {
   createNewTask.mockClear();
   await newTaskDrafts.clear({ profileId: "profile" });
   vi.useFakeTimers();
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
   for (const spy of [select, searchHome, scrollToIndex, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
@@ -326,7 +325,11 @@ async function type(label: string, value: string): Promise<void> {
 }
 async function option(label: string): Promise<void> {
   await press(mobileMessage("en", "home.optionsFor", { name: "Alpha" }));
-  await press(label); await act(async () => vi.advanceTimersByTimeAsync(2));
+  await press(label);
+  await act(async () => {
+    vi.advanceTimersToNextFrame();
+    vi.advanceTimersToNextFrame();
+  });
 }
 
 it("restores the Worktree branch in the actual new-task form, submits it and clears it when another project is selected", async () => {
@@ -723,7 +726,7 @@ describe("actual Task Home navigation composition", () => {
     const focus = projectMobileHomeSearchMessageFocus(state, match, -1);
     expect(focus).toEqual({ requestId: -1, sessionId: "current", messageId: "search-message-1", messageEventId: match.eventId });
     await renderTask({ messageFocus: focus });
-    await act(async () => vi.advanceTimersByTimeAsync(1));
+    await act(async () => { vi.advanceTimersToNextFrame(); });
     expect(scrollToIndex).toHaveBeenCalledWith({ index: 1, animated: false, viewPosition: 0.5 });
     const focused = Array.from(host.querySelectorAll('[aria-live="polite"]')).find(row => row.textContent?.includes("Original needle reply"));
     expect(focused?.getAttribute("data-native-style")).toContain('"borderWidth":2');
