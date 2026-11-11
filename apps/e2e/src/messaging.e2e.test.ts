@@ -196,26 +196,41 @@ describe("Telegram Messaging production product chain", () => {
     const audio = await readFile(new URL("../../desktop/resources/native-task-status-sounds/ring-chime.mp3", import.meta.url));
     telegram.addFile({ fileId: "native-audio-102", path: "music/chime.mp3", bytes: audio, mimeType: "audio/mpeg" });
     telegram.enqueueDirectMessage({
-      updateId: 12, messageId: 102, text: "Inspect this native audio.",
-      fileId: "native-audio-102", attachmentKind: "audio", mimeType: "application/octet-stream"
+      updateId: 12, messageId: 102, text: "Compare this native audio and the quoted note.",
+      fileId: "native-audio-102", attachmentKind: "audio", mimeType: "application/octet-stream", replyToMessageId: 100
     });
     await waitFor(
       async () => telegram?.outboundMessages ?? [],
       (messages) => messages.some((message) => message.replyToMessageId === 102 && message.text === SECOND_REPLY),
-      "the native Telegram audio turn to finish",
+      "the native Telegram audio and quoted attachment turn to finish",
       30_000
     );
     const audioRequest = required(fixture.application.store.listMessagingInboundRequests()
       .find((request) => request.providerMessageId === "102"), "native Telegram audio request");
     expect(audioRequest).toMatchObject({ status: "completed", conversationId: restartedConversation.id });
-    expect(audioRequest.artifactIds).toHaveLength(1);
+    expect(audioRequest.artifactIds).toHaveLength(2);
     const storedAudio = fixture.application.store.getArtifact(audioRequest.artifactIds[0]!);
     expect(storedAudio.blob).toMatchObject({ fileName: "chime.mp3", mimeType: "audio/mpeg", byteLength: audio.byteLength });
     expect((await fixture.application.artifacts.readBlob(storedAudio.blob)).data).toEqual(audio);
-    expect(telegram.methodCount("getFile")).toBe(2);
+    const quoted = fixture.application.store.getArtifact(audioRequest.artifactIds[1]!);
+    expect(quoted).toMatchObject({
+      blob: { fileName: "product-chain-note.txt", mimeType: "text/plain" },
+      sessionId, runId: audioRequest.runId
+    });
+    expect(quoted.blob.id).not.toBe(staged.blob.id);
+    expect((await fixture.application.artifacts.readBlob(quoted.blob)).data).toEqual(Buffer.from(attachmentBytes));
+    expect(telegram.methodCount("getFile")).toBe(3);
     expect(fixture.providerRequests).toHaveLength(2);
     const audioPath = await fixture.application.artifacts.resolveBlobPath(storedAudio.blob);
-    expect(JSON.stringify(fixture.providerRequests[1]?.body)).toContain(JSON.stringify(audioPath).slice(1, -1));
+    const quotedPath = await fixture.application.artifacts.resolveBlobPath(quoted.blob);
+    const messages = fixture.providerRequests[1]?.body["messages"];
+    expect(Array.isArray(messages)).toBe(true);
+    const lastUser = Array.isArray(messages) ? messages.findLast((message: unknown) =>
+      typeof message === "object" && message !== null && "role" in message && message.role === "user") : undefined;
+    const userInput = JSON.stringify(lastUser);
+    expect(userInput).toContain("Compare this native audio and the quoted note.");
+    expect(userInput).toContain(JSON.stringify(audioPath).slice(1, -1));
+    expect(userInput).toContain(JSON.stringify(quotedPath).slice(1, -1));
 
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),

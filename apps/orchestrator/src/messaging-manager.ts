@@ -29,10 +29,12 @@ import {
   type MessagingConnectionProbe,
   type MessagingDownloadedAttachment,
   type MessagingGroupObservation,
+  type MessagingInboundAttachment,
   type MessagingInboundEvent,
   type MessagingInboundInteraction,
   type MessagingInboundMessage,
   type MessagingSendReceipt,
+  type MessagingUnsupportedPart,
   type SlackNormalizationResult,
   type SlackPollResult,
   type SlackSocketUpdate,
@@ -75,7 +77,7 @@ import type { ContactManager } from "./contact-manager.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
 import { sniffMediaMime } from "./extension-cards/media-sniff.js";
-import type { EnqueueResult, InteractionDecisionSubmission, SessionHost } from "./session-host.js";
+import type { EnqueueResult, EnqueueServiceInput, InteractionDecisionSubmission, SessionHost } from "./session-host.js";
 import { listAllInteractions, listAllMessagingInboundRequests } from "./operational-pagination.js";
 
 const CREDENTIAL_JOURNAL_SCOPE_TYPE = "service";
@@ -1750,8 +1752,9 @@ export class MessagingManager {
       : { nextCursor: retained.nextCursor, updates: retained.updates as TelegramPollResult["updates"] };
     let updates = [...result.updates];
     // A supplemental getUpdates would acknowledge the preceding page at
-    // Telegram. Process a protected page from memory before acknowledging it.
-    if (updates.some(update => update.message?.has_protected_content === true)) return result;
+    // Telegram. Process pages containing protected messages or quotes from
+    // memory before acknowledging them.
+    if (telegramBatchContainsProtectedContent(updates)) return result;
     const persist = (): void => this.#store.saveMessagingPollBatch({
       connectionId: transport.connectionId,
       channelGeneration: transport.generation,
@@ -1772,7 +1775,7 @@ export class MessagingManager {
       // This response is still unacknowledged. If it would exceed the durable
       // budget, admit the retained pages first and fetch this response again.
       if (combined.length > 1_100 || Buffer.byteLength(JSON.stringify(combined)) > 16 * 1024 * 1024) break;
-      if (supplemental.updates.some(update => update.message?.has_protected_content === true)) {
+      if (telegramBatchContainsProtectedContent(supplemental.updates)) {
         return { updates: combined, nextCursor: supplemental.nextCursor };
       }
       result = supplemental;
@@ -2513,40 +2516,16 @@ export class MessagingManager {
       if (stagedOrdinals?.has(index)) continue;
       signal.throwIfAborted();
       this.#requireWorkerConnection(connection.id, connection.generation);
-      let downloaded: MessagingDownloadedAttachment;
-      try {
-        downloaded = await transport.downloadAttachment(attachment, signal);
-      } catch (error) {
-        if (attachment.audioVideo === undefined || isCancelled(error)
-          || (error instanceof MessagingTransportError && (error.code === "invalid_credential" || error.code === "conflict"))) throw error;
-        signal.throwIfAborted();
-        this.#requireWorkerConnection(connection.id, connection.generation);
-        const code = error instanceof MessagingTransportError && error.code === "payload_too_large" ? "oversize" : "download";
-        unsupported.push({ code, label: attachment.fileName });
-        continue;
-      }
-      let mimeType: string | null;
-      if (attachment.audioVideo === undefined) {
-        mimeType = await verifiedAttachmentMime(transport.channel, attachment.kind, attachment.mimeType, downloaded);
-      } else {
-        const maximumBytes = transport.channel === "discord"
-          ? DISCORD_MAXIMUM_INBOUND_FILE_BYTES
-          : TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES;
-        if (downloaded.bytes.byteLength > maximumBytes) {
-          unsupported.push({ code: "oversize", label: attachment.fileName });
-          continue;
-        }
-        mimeType = sniffMediaMime(downloaded.bytes, attachment.mimeType ?? "");
-        if (mimeType === null || (!mimeType.startsWith("audio/") && !mimeType.startsWith("video/"))) {
-          unsupported.push({ code: attachment.audioVideo, label: attachment.fileName });
-          continue;
-        }
-      }
+      const media = await downloadInboundAttachment(transport, attachment, signal);
       signal.throwIfAborted();
       this.#requireWorkerConnection(connection.id, connection.generation);
-      const artifact = await this.#artifacts.ingestBytes(downloaded.bytes, {
-        fileName: downloaded.fileName,
-        mimeType,
+      if ("unsupported" in media) {
+        unsupported.push(media.unsupported);
+        continue;
+      }
+      const artifact = await this.#artifacts.ingestBytes(media.downloaded.bytes, {
+        fileName: media.downloaded.fileName,
+        mimeType: media.mimeType,
         expiresAt: this.#now() + ATTACHMENT_STAGING_TTL_MS
       });
       try {
@@ -2570,7 +2549,6 @@ export class MessagingManager {
     if (activeConversation.sessionId === undefined) throw new Error("Messaging conversation has no Session binding.");
     const artifacts = request.artifactIds.map((artifactId) => this.#store.getArtifact(artifactId).blob);
     const origin = this.#partnerRuntime?.origin(activeConversation, event, request.id);
-    const prompt = { ...this.#messagePrompt(activeConversation, { ...event, unsupported }, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
     const configuration = decodeSupportedConnection(connection);
     const overrides: TurnExecutionOverrides | undefined = origin
       ? { permissionMode: 'ask' }
@@ -2579,73 +2557,93 @@ export class MessagingManager {
       : !event.speaker.isOwner
         ? { permissionMode: "ask" }
         : undefined;
-    const execution = this.#sessionHost.enqueueServiceInput({
-      operationId: `messaging-input-${request.id}`,
-      sessionId: activeConversation.sessionId,
-      prompt,
-      source: "system",
-      ...(event.protectedContent ? { protectedMessagingRequestId: request.id } : {}),
-      ...(overrides === undefined ? {} : { overrides }),
-      onAdmitted: (store, admitted) => {
-        let admittedRequest = store.getMessagingInboundRequest(request.id);
-        for (const blob of artifacts) store.adoptSessionArtifact({ blob, sessionId: admitted.sessionId, runId: admitted.runId });
-        admittedRequest = store.bindMessagingInboundAdmission({
-          requestId: admittedRequest.id,
-          expectedRevision: admittedRequest.revision,
-          conversationId: activeConversation.id,
-          operationId: `messaging-input-${request.id}`,
-          runId: admitted.runId,
-          attemptId: admitted.attemptId,
-          queueItemId: admitted.queueItemId,
-          updatedAt: this.#now()
+    const quote = transport.channel === "telegram" && !event.protectedContent && event.telegramReplyParts !== undefined
+      ? await this.#stageTelegramReplyAttachments(connection, transport, activeConversation, event.telegramReplyParts, unsupported, signal)
+      : undefined;
+    const operationId = `messaging-input-${request.id}`;
+    const onAdmitted: NonNullable<EnqueueServiceInput["onAdmitted"]> = (store, admitted) => {
+      let admittedRequest = store.getMessagingInboundRequest(request.id);
+      for (const { index, artifactId } of quote?.staged ?? []) {
+        admittedRequest = store.attachMessagingRequestArtifact({
+          requestId: request.id, expectedRevision: admittedRequest.revision,
+          ordinal: event.attachments.length + index, artifactId
         });
-        if ((connection.channel === 'feishu' || connection.channel === 'lark') && transport.openReplyProgress) {
-          const payload = { format: 1, address: addressFor(connection, activeConversation), text: 'Working on this task…',
-            feishuProgress: 'open', requestId: admittedRequest.id, sourceMessageId: event.messageId };
-          store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
-            conversationId: activeConversation.id, dedupeKey: `request:${request.id}:progress:start`, kind: 'notice', partIndex: 0, partCount: 1,
-            payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
-        }
-        if (connection.channel === "discord" && transport.editTextPart && transport.removeTextPart) {
-          const payload = { format: 1, address: addressFor(connection, activeConversation), text: "…",
-            replyStream: { requestId: admittedRequest.id, phase: "start" },
-            ...(shouldQuote(configuration, activeConversation, 0) ? { replyToMessageId: event.messageId } : {}) };
-          store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: activeConversation.id,
-            dedupeKey: `request:${admittedRequest.id}:progress:start`, kind: "notice", partIndex: 0, partCount: 1,
-            payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
-        }
-        if (connection.channel === "slack") {
-          const progressPayload = {
-            format: 1,
-            address: addressFor(connection, activeConversation),
-            text: "Working on this task…"
-          };
-          const now = this.#now();
-          store.enqueueMessagingDelivery({
-            connectionId: connection.id,
-            expectedChannelGeneration: connection.generation,
-            conversationId: activeConversation.id,
-            dedupeKey: `request:${request.id}:progress:start`,
-            kind: "notice",
-            partIndex: 0,
-            partCount: 1,
-            payloadHash: operationBodyHash(progressPayload),
-            payload: progressPayload,
-            availableAt: now,
-            createdAt: now
-          });
-        }
-        if (connection.channel === "slack" && reactionMode(configuration) !== "off") {
-          enqueueReaction(store, connection, activeConversation, {
-            dedupeKey: `request:${request.id}:ack`,
-            messageId: event.messageId,
-            emoji: "👀",
-            availableAt: this.#now()
-          });
-        }
-        void admittedRequest;
       }
-    });
+      for (const blob of artifacts) store.adoptSessionArtifact({ blob, sessionId: admitted.sessionId, runId: admitted.runId });
+      admittedRequest = store.bindMessagingInboundAdmission({
+        requestId: admittedRequest.id,
+        expectedRevision: admittedRequest.revision,
+        conversationId: activeConversation.id,
+        operationId,
+        runId: admitted.runId,
+        attemptId: admitted.attemptId,
+        queueItemId: admitted.queueItemId,
+        updatedAt: this.#now()
+      });
+      if ((connection.channel === 'feishu' || connection.channel === 'lark') && transport.openReplyProgress) {
+        const payload = { format: 1, address: addressFor(connection, activeConversation), text: 'Working on this task…',
+          feishuProgress: 'open', requestId: admittedRequest.id, sourceMessageId: event.messageId };
+        store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+          conversationId: activeConversation.id, dedupeKey: `request:${request.id}:progress:start`, kind: 'notice', partIndex: 0, partCount: 1,
+          payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
+      }
+      if (connection.channel === "discord" && transport.editTextPart && transport.removeTextPart) {
+        const payload = { format: 1, address: addressFor(connection, activeConversation), text: "…",
+          replyStream: { requestId: admittedRequest.id, phase: "start" },
+          ...(shouldQuote(configuration, activeConversation, 0) ? { replyToMessageId: event.messageId } : {}) };
+        store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: activeConversation.id,
+          dedupeKey: `request:${admittedRequest.id}:progress:start`, kind: "notice", partIndex: 0, partCount: 1,
+          payloadHash: operationBodyHash(payload), payload, availableAt: this.#now(), createdAt: this.#now() });
+      }
+      if (connection.channel === "slack") {
+        const progressPayload = {
+          format: 1,
+          address: addressFor(connection, activeConversation),
+          text: "Working on this task…"
+        };
+        const now = this.#now();
+        store.enqueueMessagingDelivery({
+          connectionId: connection.id,
+          expectedChannelGeneration: connection.generation,
+          conversationId: activeConversation.id,
+          dedupeKey: `request:${request.id}:progress:start`,
+          kind: "notice",
+          partIndex: 0,
+          partCount: 1,
+          payloadHash: operationBodyHash(progressPayload),
+          payload: progressPayload,
+          availableAt: now,
+          createdAt: now
+        });
+      }
+      if (connection.channel === "slack" && reactionMode(configuration) !== "off") {
+        enqueueReaction(store, connection, activeConversation, {
+          dedupeKey: `request:${request.id}:ack`,
+          messageId: event.messageId,
+          emoji: "👀",
+          availableAt: this.#now()
+        });
+      }
+    };
+    let execution: ReturnType<MessagingManagerOptions["sessionHost"]["enqueueServiceInput"]>;
+    try {
+      quote?.assertCurrent();
+      artifacts.push(...(quote?.staged.map(({ artifactId }) => this.#store.getArtifact(artifactId).blob) ?? []));
+      const prompt = { ...this.#messagePrompt(activeConversation, { ...event, unsupported }, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
+      execution = this.#sessionHost.enqueueServiceInput({
+        operationId,
+        sessionId: activeConversation.sessionId,
+        prompt,
+        source: "system",
+        ...(event.protectedContent ? { protectedMessagingRequestId: request.id } : {}),
+        ...(overrides === undefined ? {} : { overrides }),
+        onAdmitted
+      });
+    } catch (error) {
+      quote?.release();
+      throw error;
+    }
+    if (execution.replayed) quote?.release();
     if (execution.value.queueItemId === "") throw new Error("Messaging Queue admission failed.");
     this.#registerTelegramGroupSpeaker(connection, event);
     if (connection.channel === "slack") {
@@ -2800,6 +2798,70 @@ export class MessagingManager {
       conversationKind: address.conversationKind,
       observedAt
     });
+  }
+
+  async #stageTelegramReplyAttachments(
+    connection: MessagingConnectionRecord,
+    transport: MessagingTransportEffectsPort,
+    conversation: MessagingConversationRecord,
+    reply: NonNullable<MessagingInboundMessage["telegramReplyParts"]>,
+    unsupported: MessagingUnsupportedPart[],
+    signal: AbortSignal
+  ) {
+    if (conversation.sessionId === undefined) throw new Error("Telegram conversation has no Session binding.");
+    const session = this.#store.getSession(conversation.sessionId).descriptor;
+    const backend = this.#store.getBackend(session.backendId).descriptor;
+    const staged: Array<{ readonly index: number; readonly artifactId: string }> = [];
+    const release = () => {
+      if (staged.length > 0) this.#store.releaseArtifactStaging(staged.map(({ artifactId }) => artifactId));
+    };
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      this.#requireWorkerConnection(connection.id, connection.generation);
+      const current = this.#store.getMessagingConversation(conversation.id);
+      const task = this.#store.getSession(session.id).descriptor;
+      if (current.status !== "active" || current.channelGeneration !== connection.generation
+        || current.sessionId !== session.id || task.archived || task.deletedAt !== undefined
+        || task.binding.generation !== session.binding.generation || task.backendId !== session.backendId
+        || this.#store.getBackend(session.backendId).descriptor.instanceGeneration !== backend.instanceGeneration) {
+        throw new Error("The Telegram task changed while preparing its quoted attachments.");
+      }
+    };
+    const note = (part: MessagingUnsupportedPart) => {
+      unsupported.push({ ...part, label: `Quoted attachment: ${part.label}` });
+    };
+    try {
+      assertCurrent();
+      reply.unsupported.forEach(note);
+      for (const [index, attachment] of reply.attachments.entries()) {
+        assertCurrent();
+        if (backend.capabilities.get(`input.${attachment.kind}`)?.supported !== true) {
+          note({ code: "capability", label: attachment.fileName });
+          continue;
+        }
+        const media = await downloadInboundAttachment(transport, attachment, signal, true);
+        assertCurrent();
+        if ("unsupported" in media) {
+          note(media.unsupported);
+          continue;
+        }
+        const kind = media.mimeType.startsWith("image/") ? "image" : "file";
+        if (backend.capabilities.get(`input.${kind}`)?.supported !== true) {
+          note({ code: "capability", label: attachment.fileName });
+          continue;
+        }
+        const artifact = await this.#artifacts.ingestBytes(media.downloaded.bytes, {
+          fileName: media.downloaded.fileName, mimeType: media.mimeType,
+          expiresAt: this.#now() + ATTACHMENT_STAGING_TTL_MS
+        });
+        staged.push({ index, artifactId: artifact.id });
+        assertCurrent();
+      }
+      return { staged, assertCurrent, release };
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   #registerTelegramGroupSpeaker(connection: MessagingConnectionRecord, event: MessagingInboundMessage): void {
@@ -5043,6 +5105,50 @@ export function decodeWeChatMessagingConfiguration(value: unknown): WeChatMessag
   return decodeWeChatConfiguration(value);
 }
 
+async function downloadInboundAttachment(
+  transport: MessagingTransportEffectsPort,
+  attachment: MessagingInboundAttachment,
+  signal: AbortSignal,
+  contextual = false
+): Promise<{ readonly downloaded: MessagingDownloadedAttachment; readonly mimeType: string } | {
+  readonly unsupported: MessagingUnsupportedPart;
+}> {
+  let downloaded: MessagingDownloadedAttachment;
+  try {
+    downloaded = await transport.downloadAttachment(attachment, signal);
+  } catch (error) {
+    if ((!contextual && attachment.audioVideo === undefined) || isCancelled(error)
+      || (error instanceof MessagingTransportError && (error.code === "invalid_credential" || error.code === "conflict"))) throw error;
+    signal.throwIfAborted();
+    const code = error instanceof MessagingTransportError && error.code === "payload_too_large" ? "oversize" : "download";
+    return { unsupported: { code, label: attachment.fileName } };
+  }
+  if (attachment.audioVideo !== undefined || (contextual && attachment.kind === "image")) {
+    const maximumBytes = transport.channel === "discord"
+      ? DISCORD_MAXIMUM_INBOUND_FILE_BYTES
+      : TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES;
+    if (downloaded.bytes.byteLength > maximumBytes) {
+      return { unsupported: { code: "oversize", label: attachment.fileName } };
+    }
+    const mimeType = sniffMediaMime(downloaded.bytes, attachment.mimeType ?? "");
+    const matches = attachment.audioVideo === undefined ? mimeType?.startsWith("image/") === true
+      : mimeType?.startsWith("audio/") === true || mimeType?.startsWith("video/") === true;
+    if (mimeType === null || !matches) {
+      return { unsupported: { code: attachment.audioVideo ?? "image", label: attachment.fileName } };
+    }
+    return { downloaded, mimeType };
+  }
+  try {
+    return {
+      downloaded,
+      mimeType: await verifiedAttachmentMime(transport.channel, attachment.kind, attachment.mimeType, downloaded)
+    };
+  } catch (error) {
+    if (!contextual || !(error instanceof MessagingTransportError)) throw error;
+    return { unsupported: { code: error.code === "payload_too_large" ? "oversize" : "file", label: attachment.fileName } };
+  }
+}
+
 async function verifiedAttachmentMime(
   channel: SupportedMessagingChannel,
   kind: "image" | "file",
@@ -5246,6 +5352,13 @@ function validBlobRef(value: unknown): value is BlobRef {
     && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(value["mimeType"])
     && (value["fileName"] === undefined || (typeof value["fileName"] === "string"
       && value["fileName"].length <= 1_024 && !/[\u0000-\u001f\u007f]/u.test(value["fileName"])));
+}
+
+function telegramBatchContainsProtectedContent(updates: readonly TelegramUpdate[]): boolean {
+  return updates.some(update => {
+    const message = update.message ?? update.callback_query?.message;
+    return message?.has_protected_content === true || message?.reply_to_message?.has_protected_content === true;
+  });
 }
 
 function telegramAlbumsNeedSettle(updates: readonly TelegramUpdate[]): boolean {

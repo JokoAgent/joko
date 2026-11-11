@@ -1,3 +1,5 @@
+import { extname } from "node:path";
+
 import { inboundAudioVideoMime } from "../inbound-audio-video.js";
 import type {
   MessagingAddress,
@@ -22,6 +24,12 @@ import type {
 
 export const TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES = 20 * 1024 * 1024;
 export const TELEGRAM_DEFAULT_MAXIMUM_MESSAGE_AGE_MS = 60 * 60 * 1_000;
+const TELEGRAM_MAXIMUM_QUOTED_ATTACHMENTS = 3;
+const CONTEXT_IMAGE_MIME: Readonly<Record<string, string>> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml", ".heic": "image/heic",
+  ".tif": "image/tiff", ".tiff": "image/tiff"
+};
 
 export interface TelegramBotIdentity {
   readonly id: number;
@@ -158,6 +166,11 @@ function normalizeMessage(
   }
   const address = addressOf(options.connectionId, message);
   const speaker = speakerOf(message.from, options.ownerUserId);
+  const protectedContent = messages.some((entry) => entry.has_protected_content === true);
+  const replied = message.reply_to_message;
+  const replyContext = protectedContent ? null : replyContextOf(message);
+  const replyParts = replied === undefined || replyContext === null ? undefined
+    : collectReplyParts(replied, address, messages, collected.attachments);
   return {
     event: {
       kind: "message",
@@ -168,10 +181,11 @@ function normalizeMessage(
       occurredAt: message.date * 1_000,
       text,
       ambient,
-      protectedContent: messages.some((entry) => entry.has_protected_content === true),
+      protectedContent,
       attachments: collected.attachments,
       unsupported: collected.unsupported,
-      replyContext: replyContextOf(message)
+      replyContext,
+      ...(replyParts === undefined ? {} : { telegramReplyParts: replyParts })
     },
     ignored: null
   };
@@ -240,7 +254,7 @@ function groupUpdates(updates: readonly TelegramUpdate[]): readonly UpdateGroup[
   return singles.sort((left, right) => left.primary.update_id - right.primary.update_id);
 }
 
-function collectParts(messages: readonly TelegramMessage[]): {
+function collectParts(messages: readonly TelegramMessage[], contextual = false): {
   readonly attachments: readonly MessagingInboundAttachment[];
   readonly unsupported: readonly MessagingUnsupportedPart[];
 } {
@@ -268,14 +282,22 @@ function collectParts(messages: readonly TelegramMessage[]): {
       if ((document.file_size ?? 0) > TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES) {
         unsupported.push({ code: "oversize", label: "File exceeds Telegram's download limit." });
       } else {
-        const mime = normalizeMime(document.mime_type);
+        const declared = normalizeMime(document.mime_type);
+        const fileName = sanitizeFileName(document.file_name ?? `document-${safeFileToken(document.file_unique_id)}`);
+        const media = contextual && declared?.startsWith("image/") !== true
+          ? inboundAudioVideoMime(declared, fileName) : null;
+        const mime = contextual && declared?.startsWith("image/") !== true
+          ? media ?? CONTEXT_IMAGE_MIME[extname(fileName).toLowerCase()] ?? declared
+          : declared;
+        const audioVideo = media === null ? undefined : media.startsWith("audio/") ? "audio" : "video";
         attachments.push({
           providerFileId: document.file_id,
           providerUniqueFileId: document.file_unique_id,
           kind: mime?.startsWith("image/") === true ? "image" : "file",
-          fileName: sanitizeFileName(document.file_name ?? `document-${safeFileToken(document.file_unique_id)}`),
+          fileName,
           mimeType: mime,
-          byteLength: document.file_size ?? null
+          byteLength: document.file_size ?? null,
+          ...(audioVideo === undefined ? {} : { audioVideo })
         });
       }
     }
@@ -312,6 +334,36 @@ function collectParts(messages: readonly TelegramMessage[]): {
       });
     }
   }
+  return { attachments, unsupported };
+}
+
+function collectReplyParts(
+  replied: TelegramMessage,
+  address: MessagingAddress,
+  current: readonly TelegramMessage[],
+  currentAttachments: readonly MessagingInboundAttachment[]
+): MessagingInboundMessage["telegramReplyParts"] {
+  const replyAddress = addressOf(address.connectionId, replied);
+  if (replyAddress.providerConversationId !== address.providerConversationId
+    || replyAddress.conversationKind !== address.conversationKind
+    || replyAddress.providerThreadId !== address.providerThreadId
+    || current.some((message) => message.message_id === replied.message_id
+      || (message.media_group_id !== undefined && message.media_group_id === replied.media_group_id))) return undefined;
+  const parts = collectParts([replied], true);
+  const seen = new Set(currentAttachments.map(attachment => attachment.providerUniqueFileId ?? attachment.providerFileId));
+  const attachments: MessagingInboundAttachment[] = [];
+  const unsupported = [...parts.unsupported];
+  for (const attachment of parts.attachments) {
+    const identity = attachment.providerUniqueFileId ?? attachment.providerFileId;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    if (attachments.length === TELEGRAM_MAXIMUM_QUOTED_ATTACHMENTS) {
+      unsupported.push({ code: "attachment_limit", label: attachment.fileName });
+      continue;
+    }
+    attachments.push(attachment);
+  }
+  if (attachments.length === 0 && unsupported.length === 0) return undefined;
   return { attachments, unsupported };
 }
 
@@ -378,13 +430,16 @@ function replyContextOf(message: TelegramMessage): MessagingReplyContext | null 
   if (replied === undefined || replied.has_protected_content === true || message.has_protected_content === true) {
     return null;
   }
-  const attachmentCount = (replied.photo?.length ? 1 : 0) + (replied.document === undefined ? 0 : 1);
+  const attachmentCount = [replied.photo?.[0], replied.document, replied.voice, replied.audio, replied.video, replied.video_note]
+    .filter(part => part !== undefined).length;
   let text = replied.text ?? replied.caption ?? "";
   if (text === "") {
     if (replied.photo?.length) text = "[Image]";
     else if (replied.document !== undefined) text = `[File: ${replied.document.file_name ?? "document"}]`;
     else if (replied.voice !== undefined) text = "[Voice message]";
+    else if (replied.audio !== undefined) text = "[Audio]";
     else if (replied.video !== undefined) text = "[Video]";
+    else if (replied.video_note !== undefined) text = "[Video note]";
     else if (replied.sticker !== undefined) text = "[Sticker]";
     else return null;
   }

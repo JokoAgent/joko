@@ -1299,12 +1299,15 @@ describe("MessagingManager", () => {
     expect((await fixture.artifacts.readBlob(queue.body.files[0]!.blob)).data).toEqual(clip);
   });
 
-  it("releases staged Telegram media when the connection is disabled before adoption", async () => {
-    const batch = normalizeTelegramUpdates([{ update_id: 9, message: {
-      message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
-      chat: { id: 42, type: "private" }, date: Math.floor(Date.now() / 1_000),
-      voice: { file_id: "voice-77", file_unique_id: "unique-voice" }
-    } }], { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+  it.each(["current", "quoted"] as const)("releases staged %s Telegram media when the connection is disabled before adoption", async source => {
+    const sender = { from: { id: 42, first_name: "Owner", is_bot: false },
+      chat: { id: 42, type: "private" as const }, date: Math.floor(Date.now() / 1_000) };
+    const voice = { file_id: "voice-77", file_unique_id: "unique-voice" };
+    const message: NonNullable<TelegramUpdate["message"]> = source === "current"
+      ? { ...sender, message_id: 77, voice }
+      : { ...sender, message_id: 77, text: "Review this", reply_to_message: { ...sender, message_id: 76, voice } };
+    const batch = normalizeTelegramUpdates([{ update_id: 9, message }],
+      { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
     const transport = new FakeTelegramTransport(batch);
     vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => ({
       bytes: Buffer.from("OggS"), fileName: attachment.fileName, mimeType: "audio/ogg"
@@ -1331,6 +1334,53 @@ describe("MessagingManager", () => {
     await vi.waitFor(() => expect(release).toHaveBeenCalledWith([stagedId]));
     expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toMatchObject([{ artifactIds: [] }]);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each(["available", "missing", "protected"] as const)("preserves a Telegram reply turn with %s quoted media", async condition => {
+    const chat = { id: 42, type: "private" as const }, date = Math.floor(Date.now() / 1_000);
+    const quoted = { message_id: 76, chat, date, caption: "The original image", has_protected_content: condition === "protected",
+      photo: [{ file_id: "quote-photo", file_unique_id: "unique-quote", width: 1, height: 1 }] };
+    const update: TelegramUpdate = { update_id: 9, message: { message_id: 77, chat, date,
+      from: { id: 42, first_name: "Owner", is_bot: false },
+      text: "Describe that image.", reply_to_message: quoted } };
+    const batch = normalizeTelegramUpdates([update], { connectionId: "placeholder", ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+    const transport = new FakeTelegramTransport(batch);
+    vi.spyOn(transport, "poll").mockImplementationOnce(async () => ({ updates: [update], nextCursor: "10" }));
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      if (condition === "missing") throw new MessagingTransportError("provider_rejected", "Quoted media was removed.",
+        { effect: "none", retryable: false });
+      return { bytes: jpeg, fileName: attachment.fileName, mimeType: "image/jpeg" };
+    });
+    const fixture = await createFixture(() => transport, () => new AttachmentFakeAdapter(true));
+    const persistPoll = vi.spyOn(fixture.store, "saveMessagingPollBatch");
+    const connection = await enableTelegramReply(fixture, "telegram-quoted-photo");
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    await vi.waitFor(() => expect(requests()).toMatchObject([{ status: "completed", providerMessageId: "77" }]));
+    const request = requests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue.body.text).toContain("Describe that image.");
+    if (condition === "available") {
+      expect(download).toHaveBeenCalledTimes(1);
+      expect(download).toHaveBeenCalledWith(expect.objectContaining({ providerFileId: "quote-photo" }), expect.any(AbortSignal));
+      expect(queue.body.images).toHaveLength(1);
+      const blob = queue.body.images[0]!.blob;
+      expect(request.artifactIds).toEqual([blob.id]);
+      expect(fixture.store.getArtifact(blob.id)).toMatchObject({ sessionId: queue.sessionId, runId: queue.runId });
+      expect((await fixture.artifacts.readBlob(blob)).data).toEqual(jpeg);
+    } else {
+      expect(request.artifactIds).toEqual([]);
+      expect(queue.body.images).toEqual([]);
+      if (condition === "missing") {
+        expect(download).toHaveBeenCalledTimes(1);
+        expect(queue.body.text).toContain("[Unsupported download] Quoted attachment:");
+      } else {
+        expect(download).not.toHaveBeenCalled();
+        expect(persistPoll).not.toHaveBeenCalled();
+        expect(queue.body.text).not.toContain("The original image");
+      }
+    }
   });
 
   it("runs protected Telegram text once without downloading its voice or retaining the input", async () => {

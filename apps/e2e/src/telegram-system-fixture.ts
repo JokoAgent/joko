@@ -80,9 +80,14 @@ export class TelegramSystemFixture {
     readonly fileName?: string;
     readonly mimeType?: string;
     readonly attachmentKind?: "document" | "audio";
+    readonly replyToMessageId?: number;
   }): void {
     const file = input.fileId === undefined ? undefined : this.#files.get(input.fileId);
     if (input.fileId !== undefined && file === undefined) throw new Error("Telegram fixture file is not registered.");
+    const replied = input.replyToMessageId === undefined ? undefined
+      : this.#updates.find(({ message }) => message["message_id"] === input.replyToMessageId)?.message;
+    if (input.replyToMessageId !== undefined && replied === undefined) throw new Error("Telegram fixture reply is not registered.");
+    const { reply_to_message: _nestedReply, ...quoted } = replied ?? {};
     this.#updates.push({
       update_id: input.updateId,
       message: {
@@ -95,6 +100,7 @@ export class TelegramSystemFixture {
         },
         chat: { id: TELEGRAM_SYSTEM_OWNER_ID, type: "private", first_name: "Owner" },
         date: Math.floor(Date.now() / 1_000),
+        ...(replied === undefined ? {} : { reply_to_message: quoted }),
         ...(file === undefined ? { text: input.text } : {
           caption: input.text,
           [input.attachmentKind ?? "document"]: {
