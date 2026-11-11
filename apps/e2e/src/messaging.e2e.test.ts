@@ -232,6 +232,38 @@ describe("Telegram Messaging production product chain", () => {
     expect(userInput).toContain(JSON.stringify(audioPath).slice(1, -1));
     expect(userInput).toContain(JSON.stringify(quotedPath).slice(1, -1));
 
+    const photo = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"
+    );
+    telegram.addFile({ fileId: "group-photo-103", path: "photos/group-photo.png", bytes: photo, mimeType: "image/png" });
+    const chatId = -100123;
+    const groupPrompt = "Describe the earlier group photo.";
+    telegram.enqueueGroupMessage({ chatId, updateId: 13, messageId: 103, text: "Photo from the group", photoFileId: "group-photo-103" });
+    await waitFor(
+      async () => fixture?.application.store.getMessagingConnection(created.connectionId).cursor,
+      (cursor) => cursor === "14", "Telegram to observe the group photo", 15_000
+    );
+    expect(telegram.methodCount("getFile")).toBe(3);
+    expect(fixture.providerRequests).toHaveLength(2);
+    telegram.enqueueGroupMessage({ chatId, updateId: 14, messageId: 104, text: `@joko_system_bot ${groupPrompt}` });
+    await waitFor(
+      async () => telegram?.outboundMessages ?? [],
+      (replies) => replies.some((message) => message.chatId === chatId && message.replyToMessageId === 104 && message.text === SECOND_REPLY),
+      "the Telegram group photo turn to finish", 30_000
+    );
+    const groupRequest = required(fixture.application.store.listMessagingInboundRequests()
+      .find((request) => request.providerMessageId === "104"), "Telegram group request");
+    expect(groupRequest).toMatchObject({ status: "completed", artifactIds: [] });
+    const groupQueue = fixture.application.store.getQueueItem(groupRequest.queueItemId!);
+    expect(groupQueue.body).toMatchObject({ images: [], files: [] });
+    expect(groupQueue.body.text).toContain("Photo from the group");
+    expect(fixture.application.store.listArtifacts({ sessionId: groupQueue.sessionId })).toEqual([]);
+    expect(telegram.methodCount("getFile")).toBe(4);
+    expect(fixture.providerRequests).toHaveLength(3);
+    const providerGroupInput = JSON.stringify(fixture.providerRequests[2]?.body["messages"]);
+    expect(providerGroupInput).toContain(groupPrompt);
+    expect(providerGroupInput).toContain(`data:image/png;base64,${photo.toString("base64")}`);
+
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),
       connections: fixture.application.store.listMessagingConnections(),
@@ -253,6 +285,7 @@ async function startSystem(
     keepRoot: rootDirectory === undefined,
     telegramApiBaseUrl: telegram.baseUrl,
     messagingRetryDelayMs: 250,
+    providerSupportsImages: true,
     providerResponder: ({ requestNumber }) => ({ kind: "text", text: reply({ requestNumber }) })
   });
 }

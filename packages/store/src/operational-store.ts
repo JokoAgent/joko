@@ -7069,6 +7069,26 @@ export class OperationalStore {
     `).all(input.conversationId, limit) as Row[]).map(messagingGroupObservationFromRow);
   }
 
+  latestAcceptedTelegramGroupMessageId(conversationId: string, beforeMessageId: number): number | undefined {
+    this.assertOpen();
+    if (!Number.isSafeInteger(beforeMessageId) || beforeMessageId <= 0) return undefined;
+    const row = this.database.prepare(`
+      SELECT MAX(CAST(request.provider_message_id AS INTEGER)) AS message_id
+      FROM messaging_inbound_requests request
+      JOIN messaging_conversations conversation ON conversation.id = request.conversation_id
+      JOIN messaging_channels channel ON channel.id = request.connection_id
+      JOIN queue_items queue ON queue.id = request.queue_item_id AND queue.run_id = request.run_id
+        AND queue.operation_id = request.operation_id AND queue.session_id = conversation.session_id
+      WHERE conversation.id = ? AND conversation.conversation_kind = 'group'
+        AND channel.channel = 'telegram' AND conversation.connection_id = channel.id
+        AND request.channel_generation = conversation.channel_generation
+        AND request.provider_message_id NOT GLOB '*[^0-9]*'
+        AND CAST(request.provider_message_id AS INTEGER) BETWEEN 1 AND ?
+        AND queue.backend_accepted_at IS NOT NULL
+    `).get(conversationId, beforeMessageId - 1) as Row | undefined;
+    return row?.["message_id"] == null ? undefined : numberValue(row["message_id"]);
+  }
+
   enqueueMessagingDelivery(input: EnqueueMessagingDeliveryInput): MessagingDeliveryRecord {
     return this.transaction(() => {
       const connection = this.getMessagingConnection(input.connectionId);

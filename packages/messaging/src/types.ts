@@ -75,6 +75,7 @@ export interface MessagingInboundMessage {
     readonly attachments: readonly MessagingInboundAttachment[];
     readonly unsupported: readonly MessagingUnsupportedPart[];
   };
+  readonly telegramMediaGroupId?: string;
 }
 
 export interface MessagingInboundInteraction {

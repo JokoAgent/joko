@@ -44,6 +44,7 @@ import {
   type DiscordPollResult,
   type DiscordTransportOptions,
   type TelegramNormalizationResult,
+  type TelegramGroupMedia,
   type TelegramPollResult,
   type TelegramTransportOptions,
   type TelegramUpdate,
@@ -72,12 +73,12 @@ import {
 import type { PersistedEvent } from '@joko/store';
 import type { ConnectionRecord } from '@joko/store';
 import type { PartnerMessagingRuntime, PartnerMessagingBinding, PartnerMessageDeliveryOrigin } from './partner-messaging.js';
-import type { ArtifactStore } from "./artifact-store.js";
+import type { ArtifactStore, DispatchInputArtifacts } from "./artifact-store.js";
 import type { ContactManager } from "./contact-manager.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
 import { sniffMediaMime } from "./extension-cards/media-sniff.js";
-import type { EnqueueResult, EnqueueServiceInput, InteractionDecisionSubmission, SessionHost } from "./session-host.js";
+import type { EnqueueResult, EnqueueServiceInput, InteractionDecisionSubmission, SessionHost, TelegramHistoryDispatchInput, PreparedTelegramHistory } from "./session-host.js";
 import { listAllInteractions, listAllMessagingInboundRequests } from "./operational-pagination.js";
 
 const CREDENTIAL_JOURNAL_SCOPE_TYPE = "service";
@@ -98,6 +99,9 @@ const SLACK_REPEAT_PROGRESS_MS = 120_000;
 const TELEGRAM_ALBUM_SETTLE_POLL_SECONDS = 1;
 const TELEGRAM_ALBUM_MAXIMUM_MEMBERS = 10;
 const TELEGRAM_ALBUM_MAXIMUM_SUPPLEMENTAL_POLLS = 10;
+const TELEGRAM_GROUP_MEDIA_LIMIT = 200;
+const TELEGRAM_GROUP_MEDIA_MAX_AGE_MS = 24 * 60 * 60_000;
+const TELEGRAM_GROUP_MEDIA_QUOTA = { image: 6, file: 4 } as const;
 const LIFECYCLE_DRAIN_TIMEOUT_MS = 1_500;
 const WECOM_EMPTY_REPLY_TEXT = "_(Empty reply)_";
 const WECOM_ATTACHMENT_REPLY_TEXT = "Attachments follow.";
@@ -416,6 +420,19 @@ interface ActiveWorker {
   readonly task: Promise<void>;
   transport?: MessagingTransportPort;
   registeredTelegramSpeakers?: Set<string>;
+  telegramGroupMedia?: Map<string, TelegramGroupMedia>;
+  telegramHistorySelections?: Map<string, TelegramHistorySelection>;
+}
+
+interface TelegramHistorySelection {
+  readonly address: MessagingAddress;
+  readonly triggerId: number;
+  readonly bodyHash: string;
+  readonly messageIds: readonly string[];
+  readonly albumId: string | undefined;
+  readonly replyId: string | undefined;
+  readonly currentFiles: ReadonlySet<string>;
+  readonly expiresAt: number;
 }
 
 interface MessagingOutboundFile {
@@ -456,7 +473,7 @@ export interface MessagingManagerOptions {
   readonly sessionHost: Pick<SessionHost,
     "createServiceSession" | "enqueueServiceInput" | "resolveInteraction" | "dismissInteraction"
     | "abort" | "applySessionSettings">;
-  readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob">;
+  readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob" | "createDispatchInputArtifacts">;
   readonly contacts?: Pick<ContactManager, "registerTelegramGroupSpeaker">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
   readonly createDiscordTransport?: (options: DiscordTransportOptions) => DiscordTransportPort;
@@ -522,6 +539,7 @@ export class MessagingManager {
   readonly #tickets = new Map<string, CredentialTicketBinding>();
   readonly #workers = new Map<string, ActiveWorker>();
   readonly #workerRetirements = new Map<string, Promise<void>>();
+  readonly #telegramHistoryArtifacts = new Map<string, DispatchInputArtifacts>();
   readonly #deliveryFlights = new Map<string, Promise<void>>();
   readonly #weChatPresence = new Map<string, {
     readonly connectionId: string;
@@ -1324,10 +1342,13 @@ export class MessagingManager {
     readonly outcome: "completed" | "aborted" | "failed";
     readonly recovering?: boolean;
   }): Promise<void> {
+    const releaseHistory = this.#releaseTelegramHistory(input.runId);
+    if (releaseHistory !== undefined) await releaseHistory;
     if (!this.#initialized || this.#closed) return;
     const recovery = this.#store.findPendingContextRebuild(input.sessionId);
     if (input.recovering || input.outcome === 'failed' && recovery?.reason === 'context_overflow' && recovery.replaySafe && recovery.sourceRunId === input.runId) return;
     const request = this.#store.findMessagingInboundRequestByRunId(input.runId);
+    if (request?.runId === input.runId) this.#workers.get(request.connectionId)?.telegramHistorySelections?.delete(request.id);
     if (request !== undefined) this.#stopWeChatPresence(request);
     if (request !== undefined) this.#stopSlackPresence(request);
     if (request !== undefined) this.#stopFeishuProgress(request.id);
@@ -1539,6 +1560,7 @@ export class MessagingManager {
     tasks.push(...this.#workerRetirements.values());
     this.#workers.clear();
     await Promise.allSettled(tasks);
+    await Promise.allSettled([...this.#telegramHistoryArtifacts.keys()].map(runId => this.#releaseTelegramHistory(runId)));
     await this.#mutationTail.catch(() => undefined);
     await Promise.allSettled(this.#deliveryFlights.values());
   }
@@ -1840,6 +1862,9 @@ export class MessagingManager {
         })?.sessionId === undefined) continue;
       const conversation = this.#ensureConversation(activeConnection, observation.address, observation.occurredAt);
       this.#appendGroupObservation(conversation, observation);
+    }
+    if (activeConnection.channel === "telegram" && "groupMedia" in batch && batch.groupMedia !== undefined) {
+      this.#rememberTelegramGroupMedia(activeConnection, batch.groupMedia, interactionReplyMessageIds);
     }
     for (const event of events) {
       signal.throwIfAborted();
@@ -2561,6 +2586,9 @@ export class MessagingManager {
       ? await this.#stageTelegramReplyAttachments(connection, transport, activeConversation, event.telegramReplyParts, unsupported, signal)
       : undefined;
     const operationId = `messaging-input-${request.id}`;
+    const groupHistory: { messageIds: readonly string[]; selections: ActiveWorker["telegramHistorySelections"] } = {
+      messageIds: [], selections: undefined
+    };
     const onAdmitted: NonNullable<EnqueueServiceInput["onAdmitted"]> = (store, admitted) => {
       let admittedRequest = store.getMessagingInboundRequest(request.id);
       for (const { index, artifactId } of quote?.staged ?? []) {
@@ -2580,6 +2608,10 @@ export class MessagingManager {
         queueItemId: admitted.queueItemId,
         updatedAt: this.#now()
       });
+      if (connection.channel === "telegram" && groupHistory.messageIds.length > 0) {
+        groupHistory.selections = this.#rememberTelegramHistorySelection(connection, request.id, event,
+          groupHistory.messageIds, store.getQueueItem(admitted.queueItemId).bodyHash);
+      }
       if ((connection.channel === 'feishu' || connection.channel === 'lark') && transport.openReplyProgress) {
         const payload = { format: 1, address: addressFor(connection, activeConversation), text: 'Working on this task…',
           feishuProgress: 'open', requestId: admittedRequest.id, sourceMessageId: event.messageId };
@@ -2629,7 +2661,9 @@ export class MessagingManager {
     try {
       quote?.assertCurrent();
       artifacts.push(...(quote?.staged.map(({ artifactId }) => this.#store.getArtifact(artifactId).blob) ?? []));
-      const prompt = { ...this.#messagePrompt(activeConversation, { ...event, unsupported }, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
+      const input = this.#messagePrompt(activeConversation, { ...event, unsupported }, artifacts);
+      const prompt = { ...input.prompt, ...(origin ? { messagingOrigin: origin } : {}) };
+      groupHistory.messageIds = input.groupContextMessageIds;
       execution = this.#sessionHost.enqueueServiceInput({
         operationId,
         sessionId: activeConversation.sessionId,
@@ -2640,6 +2674,7 @@ export class MessagingManager {
         onAdmitted
       });
     } catch (error) {
+      groupHistory.selections?.delete(request.id);
       quote?.release();
       throw error;
     }
@@ -2951,12 +2986,193 @@ export class MessagingManager {
     });
   }
 
+  #rememberTelegramGroupMedia(
+    connection: MessagingConnectionRecord,
+    entries: readonly TelegramGroupMedia[],
+    interactionReplies: ReadonlySet<string>
+  ): void {
+    const worker = this.#workers.get(connection.id);
+    if (worker === undefined || worker.generation !== connection.generation || worker.controller.signal.aborted) return;
+    const pool = worker.telegramGroupMedia ??= new Map<string, TelegramGroupMedia>();
+    const cutoff = this.#now() - TELEGRAM_GROUP_MEDIA_MAX_AGE_MS;
+    for (const [key, media] of pool) if (media.occurredAt < cutoff) pool.delete(key);
+    for (const media of entries) {
+      if (media.address.channel !== "telegram" || media.address.connectionId !== connection.id
+        || media.address.conversationKind !== "group" || media.occurredAt < cutoff || interactionReplies.has(media.messageId)) continue;
+      const key = telegramGroupMediaKey(media.address, media.messageId);
+      pool.delete(key);
+      pool.set(key, media);
+      if (pool.size > TELEGRAM_GROUP_MEDIA_LIMIT) pool.delete(pool.keys().next().value!);
+    }
+  }
+
+  #rememberTelegramHistorySelection(
+    connection: MessagingConnectionRecord,
+    requestId: string,
+    event: MessagingInboundMessage,
+    groupContextMessageIds: readonly string[],
+    bodyHash: string
+  ): ActiveWorker["telegramHistorySelections"] {
+    if (connection.channel !== "telegram" || event.address.conversationKind !== "group"
+      || event.ambient || event.protectedContent || groupContextMessageIds.length === 0) return undefined;
+    const worker = this.#workers.get(connection.id);
+    const pool = worker?.telegramGroupMedia;
+    const triggerId = Number(event.messageId);
+    if (worker === undefined || worker.generation !== connection.generation || pool === undefined
+      || !Number.isSafeInteger(triggerId) || triggerId <= 0) return undefined;
+    const now = this.#now();
+    const cutoff = now - TELEGRAM_GROUP_MEDIA_MAX_AGE_MS;
+    const messageIds = groupContextMessageIds.filter(id => {
+      const media = pool.get(telegramGroupMediaKey(event.address, id));
+      return media !== undefined && media.occurredAt >= cutoff && id !== event.replyContext?.providerMessageId
+        && (event.telegramMediaGroupId === undefined || media.mediaGroupId !== event.telegramMediaGroupId);
+    });
+    if (messageIds.length === 0) return undefined;
+    const selections = worker.telegramHistorySelections ??= new Map<string, TelegramHistorySelection>();
+    for (const [id, selection] of selections) if (selection.expiresAt < now) selections.delete(id);
+    selections.set(requestId, {
+      address: event.address,
+      triggerId,
+      bodyHash,
+      messageIds,
+      albumId: event.telegramMediaGroupId,
+      replyId: event.replyContext?.providerMessageId,
+      currentFiles: new Set([...event.attachments, ...(event.telegramReplyParts?.attachments ?? [])]
+        .map(attachment => attachment.providerUniqueFileId ?? attachment.providerFileId)),
+      expiresAt: now + TELEGRAM_GROUP_MEDIA_MAX_AGE_MS
+    });
+    return selections;
+  }
+
+  /** Resolve only the originally selected group rows at the actual Queue dispatch. */
+  async prepareTelegramHistory(input: TelegramHistoryDispatchInput): Promise<PreparedTelegramHistory | undefined> {
+    const { item } = input;
+    const request = this.#store.findMessagingInboundRequestByRunId(item.runId);
+    if (request?.runId !== item.runId || request.queueItemId !== item.id || request.operationId !== item.operationId
+      || request.status !== "queued" || request.protectedContent || request.conversationId === undefined) return undefined;
+    const worker = this.#workers.get(request.connectionId);
+    const selection = worker?.telegramHistorySelections?.get(request.id);
+    const pool = worker?.telegramGroupMedia;
+    const transport = worker?.transport;
+    if (worker === undefined || selection === undefined || pool === undefined) return undefined;
+    worker.telegramHistorySelections?.delete(request.id);
+    const now = this.#now();
+    if (transport?.channel !== "telegram" || worker.generation !== request.channelGeneration || selection.expiresAt < now
+      || request.providerMessageId !== String(selection.triggerId) || item.bodyHash !== selection.bodyHash) return undefined;
+    const conversationId = request.conversationId;
+    const signal = AbortSignal.any([input.signal, worker.controller.signal]);
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      input.assertCurrent();
+      const connection = this.#requireWorkerConnection(request.connectionId, request.channelGeneration);
+      const conversation = this.#store.getMessagingConversation(conversationId);
+      if (this.#workers.get(connection.id) !== worker || conversation.status !== "active"
+        || conversation.sessionId !== item.sessionId || conversation.channelGeneration !== connection.generation
+        || !sameMessagingAddress(selection.address, addressFor(connection, conversation))
+        || this.#store.getMessagingInboundRequest(request.id).status !== "queued") {
+        throw new Error("The original Telegram group input changed.");
+      }
+    };
+    let artifacts: DispatchInputArtifacts | undefined;
+    try {
+      assertCurrent();
+      const previous = this.#store.latestAcceptedTelegramGroupMessageId(conversationId, selection.triggerId) ?? 0;
+      const cutoff = now - TELEGRAM_GROUP_MEDIA_MAX_AGE_MS;
+      const entries = selection.messageIds.flatMap(id => {
+        if (id === selection.replyId || Number(id) <= previous || Number(id) >= selection.triggerId) return [];
+        const entry = pool.get(telegramGroupMediaKey(selection.address, id));
+        return entry !== undefined && entry.occurredAt >= cutoff
+          && (selection.albumId === undefined || entry.mediaGroupId !== selection.albumId) ? [entry] : [];
+      }).sort((left, right) => Number(right.messageId) - Number(left.messageId));
+      if (entries.length === 0) return undefined;
+
+      const session = this.#store.getSession(item.sessionId).descriptor;
+      const backend = this.#store.getBackend(session.backendId).descriptor;
+      const supports = (kind: MessagingInboundAttachment["kind"]) => {
+        // Hosted Source files require a durable Queue owner. Its image callbacks enter through the device connection.
+        if (backend.adapterKind === "hosted" || backend.capabilities.get(`input.${kind}`)?.supported !== true) return false;
+        if (session.remoteWorkspace === undefined) return true;
+        return kind === "image" && (backend.adapterKind === "pi" || backend.adapterKind === "claude-agent-sdk-stdio");
+      };
+      const seen = new Set(selection.currentFiles);
+      const used = { image: 0, file: 0 };
+      const attachments: MessagingInboundAttachment[] = [];
+      const unavailable: string[] = [];
+      let overQuota = 0;
+      const note = (part: MessagingUnsupportedPart) => {
+        unavailable.push(`[Unavailable group attachment ${part.code}] ${safeExternalText(part.label, 160)}`);
+      };
+      for (const entry of entries) {
+        if (entry.attachments.length === 0) {
+          if (used[entry.kind] >= TELEGRAM_GROUP_MEDIA_QUOTA[entry.kind]) overQuota += 1;
+          else { used[entry.kind] += 1; entry.unsupported.forEach(note); }
+          continue;
+        }
+        const previousLength = attachments.length;
+        for (const attachment of entry.attachments) {
+          const identity = attachment.providerUniqueFileId ?? attachment.providerFileId;
+          if (seen.has(identity)) continue;
+          seen.add(identity);
+          if (used[attachment.kind] >= TELEGRAM_GROUP_MEDIA_QUOTA[attachment.kind]) {
+            overQuota += 1;
+            continue;
+          }
+          used[attachment.kind] += 1;
+          attachments.push(attachment);
+        }
+        if (attachments.length > previousLength) entry.unsupported.forEach(note);
+      }
+      if (attachments.length === 0 && unavailable.length === 0 && overQuota === 0) return undefined;
+      if (overQuota > 0) unavailable.push(`Additional group attachments omitted by the media limit: ${overQuota}.`);
+      artifacts = this.#artifacts.createDispatchInputArtifacts(assertCurrent);
+      this.#telegramHistoryArtifacts.set(item.runId, artifacts);
+      const images: PromptInput["images"][number][] = [];
+      const files: PromptInput["files"][number][] = [];
+      for (const attachment of attachments.reverse()) {
+        assertCurrent();
+        if (!supports(attachment.kind)) {
+          note({ code: "capability", label: attachment.fileName });
+          continue;
+        }
+        const media = await downloadInboundAttachment(transport, attachment, signal, true);
+        assertCurrent();
+        if ("unsupported" in media) {
+          note(media.unsupported);
+          continue;
+        }
+        const kind = media.mimeType.startsWith("image/") ? "image" : "file";
+        if (!supports(kind) || kind !== attachment.kind && used[kind] >= TELEGRAM_GROUP_MEDIA_QUOTA[kind]) {
+          note({ code: supports(kind) ? "attachment_limit" : "capability", label: attachment.fileName });
+          continue;
+        }
+        if (kind !== attachment.kind) used[kind] += 1;
+        const blob = await artifacts.stage(media.downloaded.bytes, { fileName: media.downloaded.fileName, mimeType: media.mimeType });
+        (kind === "image" ? images : files).push({ blob });
+      }
+      assertCurrent();
+      const scope = artifacts;
+      return { images, files, unavailable, signal, assertCurrent, run: scope.run, release: () => this.#releaseTelegramHistory(item.runId, scope) };
+    } catch (error) {
+      if (artifacts !== undefined) await this.#releaseTelegramHistory(item.runId, artifacts);
+      if (!signal.aborted) this.#recordFailure("TELEGRAM_GROUP_MEDIA_UNAVAILABLE", request.connectionId, error);
+      return undefined;
+    }
+  }
+
+  #releaseTelegramHistory(runId: string, expected?: DispatchInputArtifacts): Promise<void> | undefined {
+    const artifacts = this.#telegramHistoryArtifacts.get(runId);
+    if (artifacts === undefined || expected !== undefined && artifacts !== expected) return undefined;
+    this.#telegramHistoryArtifacts.delete(runId);
+    return artifacts.release();
+  }
+
   #messagePrompt(
     conversation: MessagingConversationRecord,
     event: MessagingInboundMessage,
     artifacts: readonly BlobRef[]
-  ): PromptInput {
+  ): { readonly prompt: PromptInput; readonly groupContextMessageIds: readonly string[] } {
     const sections: string[] = [];
+    const groupContextMessageIds: string[] = [];
     if (conversation.conversationKind !== "direct") {
       const observations = this.#store.listMessagingGroupObservations({
         conversationId: conversation.id,
@@ -2965,6 +3181,7 @@ export class MessagingManager {
       const context: string[] = [];
       let size = 0;
       for (const entry of observations) {
+        if (event.address.channel === "telegram" && Number(entry.providerMessageId) >= Number(event.messageId)) continue;
         const untrustedFeishuParticipant = (event.address.channel === "feishu" || event.address.channel === "lark")
           && !entry.isBot && entry.providerUserId !== event.speaker.providerUserId;
         const visibleText = untrustedFeishuParticipant && looksLikeGroupPromptInjection(entry.text)
@@ -2973,6 +3190,7 @@ export class MessagingManager {
         const line = `[${safeExternalText(entry.displayName, 128)}] ${safeExternalText(visibleText, 1_000)}`;
         if (size + line.length + 1 > GROUP_CONTEXT_MAXIMUM_CHARACTERS) continue;
         context.push(line);
+        groupContextMessageIds.push(entry.providerMessageId);
         size += line.length + 1;
       }
       if (context.length > 0) {
@@ -3018,11 +3236,8 @@ export class MessagingManager {
       .filter((blob) => !blob.mimeType.startsWith("image/"))
       .map((blob) => ({ blob }));
     return {
-      text: sections.join("\n\n"),
-      images,
-      files,
-      mentions: [],
-      disposition: "prompt"
+      prompt: { text: sections.join("\n\n"), images, files, mentions: [], disposition: "prompt" },
+      groupContextMessageIds
     };
   }
 
@@ -5332,6 +5547,10 @@ function messagingAddressKey(address: MessagingAddress): string {
     address.providerThreadId,
     address.conversationKind
   ]);
+}
+
+function telegramGroupMediaKey(address: MessagingAddress, messageId: string): string {
+  return JSON.stringify([address.providerConversationId, address.providerThreadId, messageId]);
 }
 
 function outboundFileName(value: string | undefined, index: number): string {

@@ -1,4 +1,4 @@
-import { rm, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,42 @@ afterEach(async () => {
 });
 
 describe("ArtifactStore garbage collection", () => {
+  it("resolves dispatch input only during its owning send and releases the file after the run", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-artifact-dispatch-"));
+    cleanupPaths.push(directory);
+    const store = new OperationalStore(join(directory, "orchestrator.db"));
+    const artifacts = new ArtifactStore({
+      rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [directory]
+    });
+    await artifacts.initialize();
+    const owner = new AbortController();
+    const staged = artifacts.createDispatchInputArtifacts(() => owner.signal.throwIfAborted());
+    const bytes = Buffer.from("private dispatch input\n");
+    try {
+      const blob = await staged.stage(bytes, { fileName: "history.txt", mimeType: "text/plain" });
+      expect(store.listArtifacts()).toEqual([]);
+      await expect(artifacts.resolveBlobPath(blob)).rejects.toThrow();
+      await expect(artifacts.readBlob(blob)).rejects.toThrow();
+      const path = await staged.run(async () => {
+        const resolved = await artifacts.resolveBlobPath(blob);
+        expect((await artifacts.readBlob(blob)).data).toEqual(bytes);
+        await expect(artifacts.readBlob({ ...blob, byteLength: 1 })).rejects.toThrow();
+        await expect(artifacts.get(blob.id)).rejects.toThrow();
+        await expect(artifacts.createDownloadTicket(blob.id)).rejects.toThrow();
+        owner.abort(new Error("Dispatch ownership ended."));
+        await expect(artifacts.readBlob(blob)).rejects.toThrow("Dispatch ownership ended.");
+        return resolved;
+      });
+      await expect(artifacts.resolveBlobPath(blob)).rejects.toThrow();
+      expect(await readFile(path)).toEqual(bytes);
+      await staged.release();
+      await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await staged.release();
+      store.close();
+    }
+  });
+
   it("infers supported text filenames at ingestion and preserves an explicitly declared Blob type", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-artifact-text-"));
     cleanupPaths.push(directory);

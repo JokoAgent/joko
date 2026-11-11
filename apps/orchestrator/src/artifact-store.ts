@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { copyFile, type FileHandle, lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
@@ -62,12 +63,29 @@ export interface ArtifactFileHandleIngestOptions {
   readonly beforeFinalize?: (snapshot: ArtifactSnapshotDigest) => Promise<void>;
 }
 
+export interface DispatchInputArtifacts {
+  stage(bytes: Uint8Array, options: { readonly fileName: string; readonly mimeType: string }): Promise<BlobRef>;
+  run<T>(send: () => Promise<T>): Promise<T>;
+  release(): Promise<void>;
+}
+
+interface DispatchInputArtifact extends ArtifactRecord {
+  readonly identity: Awaited<ReturnType<typeof lstat>>;
+}
+
+interface ActiveDispatchInputArtifacts {
+  readonly files: ReadonlyMap<string, DispatchInputArtifact>;
+  readonly assertCurrent: () => void;
+  active: boolean;
+}
+
 export class ArtifactStore {
   readonly #options: ArtifactStoreOptions;
   readonly #maximumBlobBytes: number;
   readonly #ticketTtlMs: number;
   readonly #now: () => number;
   readonly #permanentIngests = new Map<string, Promise<ArtifactRecord>>();
+  readonly #dispatchInputArtifacts = new AsyncLocalStorage<ActiveDispatchInputArtifacts>();
 
   constructor(options: ArtifactStoreOptions) {
     this.#options = options;
@@ -187,6 +205,78 @@ export class ArtifactStore {
     }
   }
 
+  /** The native input may resolve these bytes only within the owning send. */
+  createDispatchInputArtifacts(assertCurrent: () => void): DispatchInputArtifacts {
+    const files = new Map<string, DispatchInputArtifact>();
+    let released = false;
+    let dispatched = false;
+    let cleanup: Promise<void> | undefined;
+    const assertAvailable = () => {
+      if (released) throw new Error("The temporary input attachments have been released.");
+      assertCurrent();
+    };
+    return {
+      stage: async (bytes, options) => {
+        assertAvailable();
+        if (dispatched || bytes.byteLength === 0 || bytes.byteLength > this.#maximumBlobBytes) {
+          throw new Error("The temporary input attachment cannot be staged.");
+        }
+        const root = await realpath(this.#options.rootDirectory);
+        const incoming = join(root, "incoming");
+        const directory = await lstat(incoming);
+        if (!directory.isDirectory() || directory.isSymbolicLink() || await realpath(incoming) !== incoming) {
+          throw new Error("Temporary input storage is unavailable.");
+        }
+        assertAvailable();
+        const id = randomUUID();
+        const storagePath = join(incoming, `dispatch-input-${id}`);
+        const handle = await open(storagePath, "wx", 0o600);
+        try {
+          await handle.writeFile(bytes);
+          const identity = await handle.stat();
+          const blob: BlobRef = {
+            id,
+            sha256: createHash("sha256").update(bytes).digest("hex"),
+            byteLength: bytes.byteLength,
+            mimeType: options.mimeType,
+            fileName: sanitizeFileName(options.fileName)
+          };
+          await handle.close();
+          assertAvailable();
+          if (dispatched) throw new Error("The temporary input attachments already entered dispatch.");
+          files.set(id, { ...blob, storagePath, identity, createdAt: this.#now() });
+          return blob;
+        } catch (error) {
+          await handle.close().catch(() => undefined);
+          await rm(storagePath, { force: true }).catch(() => undefined);
+          throw error;
+        }
+      },
+      run: async send => {
+        assertAvailable();
+        if (dispatched) throw new Error("The temporary input attachments already entered dispatch.");
+        dispatched = true;
+        const scope = { files, assertCurrent: assertAvailable, active: true };
+        try {
+          return await this.#dispatchInputArtifacts.run(scope, send);
+        } finally {
+          scope.active = false;
+        }
+      },
+      release: () => {
+        if (cleanup !== undefined) return cleanup;
+        released = true;
+        cleanup = Promise.allSettled([...files.values()].map(async file => {
+          const current = await lstat(file.storagePath).catch(() => undefined);
+          if (current !== undefined && sameFileIdentity(current, file.identity)) {
+            await rm(file.storagePath, { force: true });
+          }
+        })).then(() => { files.clear(); });
+        return cleanup;
+      }
+    };
+  }
+
   async createUploadTicket(input: {
     expectedSha256?: string;
     expectedSize?: number;
@@ -213,6 +303,11 @@ export class ArtifactStore {
 
   /** Resolve a blob to a verified regular file for a fenced backend process. */
   async resolveBlobPath(blob: BlobRef): Promise<string> {
+    const dispatch = this.dispatchInputArtifact(blob.id);
+    if (dispatch !== undefined) {
+      assertBlobIdentity(blob, dispatch.file);
+      return (await dispatch.verify()).canonical;
+    }
     const artifact = await this.requireArtifact(blob.id);
     assertBlobIdentity(blob, artifact);
     await this.verifyStoragePath(artifact);
@@ -221,9 +316,11 @@ export class ArtifactStore {
 
   /** Read a verified blob for Pi's native image RPC payload. */
   async readBlob(blob: BlobRef): Promise<{ readonly data: Uint8Array; readonly mimeType: string }> {
-    const artifact = await this.requireArtifact(blob.id);
+    const dispatch = this.dispatchInputArtifact(blob.id);
+    const artifact = dispatch?.file ?? await this.requireArtifact(blob.id);
     assertBlobIdentity(blob, artifact);
-    const before = await this.verifyStoragePath(artifact);
+    const verify = dispatch?.verify ?? (() => this.verifyStoragePath(artifact));
+    const before = await verify();
     const handle = await open(before.canonical, "r");
     try {
       const opened = await handle.stat();
@@ -231,7 +328,7 @@ export class ArtifactStore {
       if (opened.size !== artifact.byteLength) throw new Error("Artifact content changed after it was registered.");
       const data = await handle.readFile();
       const afterHandle = await handle.stat();
-      const after = await this.verifyStoragePath(artifact);
+      const after = await verify();
       if (after.canonical !== before.canonical
         || !sameFileIdentity(opened, afterHandle)
         || !sameFileIdentity(opened, after.info)
@@ -394,6 +491,24 @@ export class ArtifactStore {
       throw new Error("Artifact does not exist or has expired.");
     }
     return artifact;
+  }
+
+  private dispatchInputArtifact(id: string) {
+    const scope = this.#dispatchInputArtifacts.getStore();
+    const file = scope?.files.get(id);
+    if (scope === undefined || file === undefined) return undefined;
+    return { file, verify: async () => {
+      if (!scope.active) throw new Error("The temporary input dispatch has ended.");
+      scope.assertCurrent();
+      const canonical = await realpath(file.storagePath);
+      const info = await lstat(file.storagePath);
+      scope.assertCurrent();
+      if (!scope.active || canonical !== file.storagePath || !info.isFile()
+        || info.isSymbolicLink() || info.nlink !== 1 || !sameFileIdentity(info, file.identity)) {
+        throw new Error("The temporary input attachment changed.");
+      }
+      return { canonical, info };
+    } };
   }
 
   private async verifyStoragePath(artifact: ArtifactRecord): Promise<{

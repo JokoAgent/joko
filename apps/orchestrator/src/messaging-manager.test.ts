@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1382,6 +1383,158 @@ describe("MessagingManager", () => {
       }
     }
   });
+
+  it.each(["completed", "failed"] as const)("sends only the selected Telegram topic media when the first dispatch is %s", async firstOutcome => {
+    const chat = { id: -100123, type: "supergroup" as const, title: "Design" };
+    const date = Math.floor(Date.now() / 1_000);
+    const sender = { id: 53, first_name: "Participant", is_bot: false };
+    const topic = { chat, date, is_topic_message: true, message_thread_id: 7, from: sender };
+    const photo = (id: number, overrides: Partial<NonNullable<TelegramUpdate["message"]>> = {}): TelegramUpdate => ({
+      update_id: id, message: { ...topic, message_id: id, caption: `Photo ${id}`,
+        photo: [{ file_id: `photo-${id}`, file_unique_id: `photo-unique-${id}`, width: 1, height: 1 }], ...overrides }
+    });
+    const document = (id: number): TelegramUpdate => ({ update_id: id, message: { ...topic, message_id: id,
+      caption: `Document ${id}`, document: { file_id: `file-${id}`, file_unique_id: `file-unique-${id}`,
+        file_name: `notes-${id}.txt`, mime_type: "text/plain" } } });
+    const summon = (id: number): TelegramUpdate => ({ update_id: id, message: { ...topic, message_id: id,
+      text: `@joko_test_bot Review the attachments for ${id}.`, entities: [{ type: "mention", offset: 0, length: "@joko_test_bot".length }] } });
+    const longMessages: TelegramUpdate[] = [25, 26, 27].map(id => ({ update_id: id, message: {
+      ...topic, message_id: id, text: `Discussion ${id} ${"x".repeat(1_000)}`
+    } }));
+    const first = [photo(1, { date: date - 25 * 3_600 }), photo(2, { has_protected_content: true }),
+      photo(3, { message_thread_id: 8 }), ...[10, 11, 12, 13, 14, 15, 16].map(id => photo(id)),
+      ...[20, 21, 22, 23, 24].map(document), ...longMessages, photo(29, { caption: `Photo outside window ${"x".repeat(1_000)}` }),
+      summon(30), photo(31)];
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const next = deliveryGate();
+    vi.spyOn(transport, "poll").mockResolvedValueOnce({ updates: first, nextCursor: "32" })
+      .mockImplementationOnce(async ({ signal }) => {
+        await next.wait;
+        signal?.throwIfAborted();
+        return { updates: [summon(32)], nextCursor: "33" };
+      });
+    cleanups.push(next.release);
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    const adapter = new AttachmentFakeAdapter(true);
+    const fixture = await createFixture(() => transport, () => adapter);
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const fileBytes = Buffer.from("group document\n");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      const request = fixture.store.listMessagingInboundRequests().find(item => item.status === "queued");
+      expect(fixture.store.getQueueItem(request!.queueItemId!).state).toBe("dispatching");
+      if (attachment.providerFileId === "file-24") throw new MessagingTransportError("provider_rejected", "The file was removed.",
+        { effect: "none", retryable: false });
+      return { bytes: attachment.kind === "image" ? jpeg : fileBytes, fileName: attachment.fileName,
+        mimeType: attachment.kind === "image" ? "image/jpeg" : "text/plain" };
+    });
+    const nativeSend = adapter.send.bind(adapter);
+    const paths: string[] = [];
+    let firstDispatch = true;
+    const send = vi.spyOn(adapter, "send").mockImplementation(async (prompt, context) => {
+      const reject = firstDispatch && firstOutcome === "failed";
+      firstDispatch = false;
+      for (const { blob } of prompt.images) expect((await fixture.artifacts.readBlob(blob)).data).toEqual(jpeg);
+      for (const { blob } of prompt.files) {
+        const path = await fixture.artifacts.resolveBlobPath(blob);
+        expect(await readFile(path)).toEqual(fileBytes);
+        paths.push(path);
+      }
+      if (reject) throw new Error("Backend declined the first group turn.");
+      await context.emit({ type: "message_complete", role: "user", blocks: [
+        { kind: "text", text: prompt.text }, ...prompt.images.map(({ blob }) => ({ kind: "image" as const, blob }))
+      ] });
+      return nativeSend(prompt, context);
+    });
+    const connection = await enableTelegramReply(fixture, "telegram-group-media");
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    await vi.waitFor(() => expect(requests()).toMatchObject([{ status: firstOutcome, providerMessageId: "30" }]), { timeout: 5_000 });
+    const firstPrompt = send.mock.calls[0]![0];
+    expect(firstPrompt).toMatchObject({ images: Array.from({ length: 6 }, () => ({ blob: { mimeType: "image/jpeg" } })),
+      files: [21, 22, 23].map(id => ({ blob: { fileName: `notes-${id}.txt` } })) });
+    expect(firstPrompt.text).toContain("[Unavailable group attachment download] notes-24.txt");
+    expect(firstPrompt.text).toContain("Additional group attachments omitted by the media limit: 2.");
+    expect(firstPrompt.text).toContain("Discussion 27");
+    expect(firstPrompt.text).not.toContain("Photo outside window");
+    expect(firstPrompt.text).not.toContain("Photo 31");
+    expect(download.mock.calls.map(([attachment]) => attachment.providerFileId)).toEqual([
+      "photo-11", "photo-12", "photo-13", "photo-14", "photo-15", "photo-16", "file-21", "file-22", "file-23", "file-24"
+    ]);
+    const request = requests()[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(request.artifactIds).toEqual([]);
+    expect(queue.body).toMatchObject({ images: [], files: [] });
+    expect(fixture.store.getOperation(request.operationId!).body).toMatchObject({ prompt: queue.body });
+    const userMessages = fixture.store.listEvents({ sessionId: queue.sessionId }).map(event => event.payload)
+      .filter(event => event.type === "message_complete" && event.role === "user");
+    if (firstOutcome === "completed") {
+      expect(queue.backendAcceptedAt).toBeDefined();
+      expect(userMessages).toContainEqual(expect.objectContaining({ acceptedInput: queue.body,
+        blocks: [{ kind: "text", text: queue.body.text }] }));
+    } else {
+      expect(queue.backendAcceptedAt).toBeUndefined();
+      expect(userMessages).toEqual([]);
+    }
+    expect(fixture.store.listArtifacts()).toEqual([]);
+    expect(paths).toHaveLength(3);
+    for (const path of paths) await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+
+    next.release();
+    await vi.waitFor(() => expect(requests().find(item => item.providerMessageId === "32")?.status).toBe("completed"), { timeout: 5_000 });
+    expect(send).toHaveBeenCalledTimes(2);
+    const secondPrompt = send.mock.calls[1]![0];
+    const secondDownloads = download.mock.calls.slice(10).map(([attachment]) => attachment.providerFileId);
+    if (firstOutcome === "completed") {
+      expect(secondPrompt).toMatchObject({ images: [{ blob: { mimeType: "image/jpeg" } }], files: [] });
+      expect(secondDownloads).toEqual(["photo-31"]);
+    } else {
+      expect(secondPrompt.images).toHaveLength(6);
+      expect(secondPrompt.files).toHaveLength(3);
+      expect(secondDownloads).toEqual(["photo-12", "photo-13", "photo-14", "photo-15", "photo-16",
+        "file-21", "file-22", "file-23", "file-24", "photo-31"]);
+    }
+  }, 12_000);
+
+  it("releases already fetched Telegram group bytes when the connection generation changes during dispatch", async () => {
+    const sender = { chat: { id: -100124, type: "supergroup" as const }, date: Math.floor(Date.now() / 1_000),
+      from: { id: 53, first_name: "Participant", is_bot: false } };
+    const updates: TelegramUpdate[] = [1, 2].map(id => ({ update_id: id, message: { ...sender, message_id: id,
+      caption: `Background photo ${id}`, photo: [{ file_id: `photo-${id}`, file_unique_id: `unique-${id}`, width: 1, height: 1 }] } }));
+    updates.push({ update_id: 3, message: { ...sender, message_id: 3,
+      text: "@joko_test_bot Review the photos.", entities: [{ type: "mention", offset: 0, length: "@joko_test_bot".length }] } });
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    vi.spyOn(transport, "poll").mockResolvedValueOnce({ updates, nextCursor: "4" });
+    vi.spyOn(transport, "normalize").mockImplementation(messages => normalizeTelegramUpdates(messages, {
+      connectionId: transport.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    const held = deliveryGate();
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      if (attachment.providerFileId === "photo-2") await held.wait;
+      return { bytes: jpeg, fileName: attachment.fileName, mimeType: "image/jpeg" };
+    });
+    const adapter = new AttachmentFakeAdapter(true);
+    const send = vi.spyOn(adapter, "send");
+    const fixture = await createFixture(() => transport, () => adapter);
+    cleanups.push(held.release);
+    const connection = await enableTelegramReply(fixture, "telegram-retired-group-media");
+    await vi.waitFor(() => expect(download).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+    const incoming = join(fixture.root, "artifacts", "incoming");
+    const staged = (await readdir(incoming)).filter(name => name.startsWith("dispatch-input-"));
+    expect(staged).toHaveLength(1);
+    expect(await readFile(join(incoming, staged[0]!))).toEqual(jpeg);
+    expect(send).not.toHaveBeenCalled();
+
+    const current = fixture.store.getMessagingConnection(connection.id);
+    await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision,
+      expectedGeneration: current.generation, enabled: false });
+    held.release();
+    await vi.waitFor(async () => expect((await readdir(incoming)).filter(name => name.startsWith("dispatch-input-"))).toEqual([]));
+    expect(send.mock.calls.every(([prompt]) => prompt.images.length === 0 && prompt.files.length === 0)).toBe(true);
+    expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toMatchObject([{ status: "cancelled", artifactIds: [] }]);
+    expect(fixture.store.listArtifacts()).toEqual([]);
+  }, 12_000);
 
   it("runs protected Telegram text once without downloading its voice or retaining the input", async () => {
     const privateText = "protectedtelegrambodya17c";
@@ -4289,6 +4442,7 @@ async function createFixture(
   let manager: MessagingManager | undefined;
   const host = new SessionHost(store, artifacts, [adapter], {
     ...(sessionRuntimeRecoveryDelayMs === undefined ? {} : { sessionRuntimeRecoveryDelayMs }),
+    prepareTelegramHistory: async input => manager?.prepareTelegramHistory(input),
     onServiceRunSettled: (input) => manager?.onRunSettled(input),
     onServiceInteractionOpened: (input) => manager?.onInteractionOpened(input),
     onServiceInteractionSettled: (input) => manager?.onInteractionSettled(input)

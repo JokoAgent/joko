@@ -51,6 +51,18 @@ export interface TelegramNormalizationResult {
   /** Protected group content is never included in this long-lived history lane. */
   readonly groupObservations: readonly MessagingGroupObservation[];
   readonly ignored: readonly MessagingIgnoredInbound[];
+  /** Short-lived provider file descriptors for messages observed in a group. */
+  readonly groupMedia?: readonly TelegramGroupMedia[];
+}
+
+export interface TelegramGroupMedia {
+  readonly address: MessagingAddress;
+  readonly messageId: string;
+  readonly occurredAt: number;
+  readonly mediaGroupId: string | null;
+  readonly kind: MessagingInboundAttachment["kind"];
+  readonly attachments: readonly MessagingInboundAttachment[];
+  readonly unsupported: readonly MessagingUnsupportedPart[];
 }
 
 interface UpdateGroup {
@@ -82,13 +94,20 @@ export function normalizeTelegramUpdates(
   const groups = groupUpdates(unique);
   const events: MessagingInboundEvent[] = [];
   const observations: MessagingGroupObservation[] = [];
+  const groupMedia: TelegramGroupMedia[] = [];
   for (const group of groups) {
     const primaryMessage = group.primary.message;
     if (primaryMessage !== undefined) {
       const messages = group.updates.flatMap((update) => update.message === undefined ? [] : [update.message]);
+      const protectedGroup = messages.some(message => message.has_protected_content === true);
       for (const message of messages) {
         const observation = groupObservationOf(message, options);
-        if (observation !== null) observations.push(observation);
+        if (observation === null) continue;
+        observations.push(observation);
+        if (!protectedGroup && options.groupActivation?.[observation.address.providerConversationId] !== "disabled") {
+          const media = groupMediaOf(message, observation);
+          if (media !== undefined) groupMedia.push(media);
+        }
       }
       const result = normalizeMessage(group, primaryMessage, options, now, maximumAge);
       if (result.event !== null) events.push(result.event);
@@ -104,7 +123,7 @@ export function normalizeTelegramUpdates(
     }
     ignored.push(ignoredEntry(requestIdOf(group.primary.update_id), "unsupported_update", null, null));
   }
-  return { events, groupObservations: observations, ignored };
+  return { events, groupObservations: observations, ignored, ...(groupMedia.length === 0 ? {} : { groupMedia }) };
 }
 
 function normalizeMessage(
@@ -185,7 +204,8 @@ function normalizeMessage(
       attachments: collected.attachments,
       unsupported: collected.unsupported,
       replyContext,
-      ...(replyParts === undefined ? {} : { telegramReplyParts: replyParts })
+      ...(replyParts === undefined ? {} : { telegramReplyParts: replyParts }),
+      ...(address.conversationKind !== "group" || message.media_group_id === undefined ? {} : { telegramMediaGroupId: message.media_group_id })
     },
     ignored: null
   };
@@ -282,14 +302,10 @@ function collectParts(messages: readonly TelegramMessage[], contextual = false):
       if ((document.file_size ?? 0) > TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES) {
         unsupported.push({ code: "oversize", label: "File exceeds Telegram's download limit." });
       } else {
-        const declared = normalizeMime(document.mime_type);
         const fileName = sanitizeFileName(document.file_name ?? `document-${safeFileToken(document.file_unique_id)}`);
-        const media = contextual && declared?.startsWith("image/") !== true
-          ? inboundAudioVideoMime(declared, fileName) : null;
-        const mime = contextual && declared?.startsWith("image/") !== true
-          ? media ?? CONTEXT_IMAGE_MIME[extname(fileName).toLowerCase()] ?? declared
-          : declared;
-        const audioVideo = media === null ? undefined : media.startsWith("audio/") ? "audio" : "video";
+        const declared = normalizeMime(document.mime_type);
+        const mime = contextual ? contextualDocumentMime(declared, fileName) : declared;
+        const audioVideo = !contextual ? undefined : mime?.startsWith("audio/") ? "audio" : mime?.startsWith("video/") ? "video" : undefined;
         attachments.push({
           providerFileId: document.file_id,
           providerUniqueFileId: document.file_unique_id,
@@ -335,6 +351,28 @@ function collectParts(messages: readonly TelegramMessage[], contextual = false):
     }
   }
   return { attachments, unsupported };
+}
+
+function contextualDocumentMime(declared: string | null, fileName: string): string | null {
+  if (declared?.startsWith("image/")) return declared;
+  return inboundAudioVideoMime(declared, fileName) ?? CONTEXT_IMAGE_MIME[extname(fileName).toLowerCase()] ?? declared;
+}
+
+function groupMediaOf(message: TelegramMessage, observation: MessagingGroupObservation): TelegramGroupMedia | undefined {
+  if (!Number.isSafeInteger(observation.occurredAt) || !Number.isSafeInteger(message.message_id) || message.message_id <= 0
+    || !(message.photo?.length || message.document || message.voice || message.audio || message.video || message.video_note)) {
+    return undefined;
+  }
+  const documentMime = message.document === undefined ? null
+    : contextualDocumentMime(normalizeMime(message.document.mime_type), message.document.file_name ?? "");
+  return {
+    address: observation.address,
+    messageId: observation.messageId,
+    occurredAt: observation.occurredAt,
+    mediaGroupId: message.media_group_id ?? null,
+    kind: message.photo?.length || documentMime?.startsWith("image/") ? "image" : "file",
+    ...collectParts([message], true)
+  };
 }
 
 function collectReplyParts(
