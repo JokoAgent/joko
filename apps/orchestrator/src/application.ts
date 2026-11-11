@@ -2291,6 +2291,7 @@ export async function createOrchestratorApplication(
     contextVault: credentialVault,
     sessionHost,
     artifacts,
+    contacts,
     ...(dependencies.messagingTelegramApiBaseUrl === undefined
       ? {}
       : { telegramApiBaseUrl: dependencies.messagingTelegramApiBaseUrl }),

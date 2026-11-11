@@ -71,6 +71,7 @@ import type { PersistedEvent } from '@joko/store';
 import type { ConnectionRecord } from '@joko/store';
 import type { PartnerMessagingRuntime, PartnerMessagingBinding, PartnerMessageDeliveryOrigin } from './partner-messaging.js';
 import type { ArtifactStore } from "./artifact-store.js";
+import type { ContactManager } from "./contact-manager.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
 import { sniffMediaMime } from "./extension-cards/media-sniff.js";
@@ -412,6 +413,7 @@ interface ActiveWorker {
   readonly controller: AbortController;
   readonly task: Promise<void>;
   transport?: MessagingTransportPort;
+  registeredTelegramSpeakers?: Set<string>;
 }
 
 interface MessagingOutboundFile {
@@ -453,6 +455,7 @@ export interface MessagingManagerOptions {
     "createServiceSession" | "enqueueServiceInput" | "resolveInteraction" | "dismissInteraction"
     | "abort" | "applySessionSettings">;
   readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob">;
+  readonly contacts?: Pick<ContactManager, "registerTelegramGroupSpeaker">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
   readonly createDiscordTransport?: (options: DiscordTransportOptions) => DiscordTransportPort;
   readonly createDingTalkTransport?: (options: DingTalkTransportOptions) => DingTalkTransportPort;
@@ -499,6 +502,7 @@ export class MessagingManager {
   readonly #contextVault: MessagingManagerOptions["contextVault"];
   readonly #sessionHost: MessagingManagerOptions["sessionHost"];
   readonly #artifacts: MessagingManagerOptions["artifacts"];
+  readonly #contacts: MessagingManagerOptions["contacts"];
   readonly #createTelegramTransport: NonNullable<MessagingManagerOptions["createTelegramTransport"]>;
   readonly #createDiscordTransport: NonNullable<MessagingManagerOptions["createDiscordTransport"]>;
   readonly #createDingTalkTransport: NonNullable<MessagingManagerOptions["createDingTalkTransport"]>;
@@ -549,6 +553,7 @@ export class MessagingManager {
     this.#contextVault = options.contextVault;
     this.#sessionHost = options.sessionHost;
     this.#artifacts = options.artifacts;
+    this.#contacts = options.contacts;
     this.#now = options.now ?? Date.now;
     this.#replyStreamTiming = options.replyStreamTiming ?? { telegramMs: 1500, discordMs: 1300 };
     this.#idFactory = options.idFactory ?? randomUUID;
@@ -2642,6 +2647,7 @@ export class MessagingManager {
       }
     });
     if (execution.value.queueItemId === "") throw new Error("Messaging Queue admission failed.");
+    this.#registerTelegramGroupSpeaker(connection, event);
     if (connection.channel === "slack") {
       const queued = this.#store.getMessagingInboundRequest(request.id);
       this.#startSlackPresence(queued);
@@ -2794,6 +2800,25 @@ export class MessagingManager {
       conversationKind: address.conversationKind,
       observedAt
     });
+  }
+
+  #registerTelegramGroupSpeaker(connection: MessagingConnectionRecord, event: MessagingInboundMessage): void {
+    const { speaker } = event;
+    if (this.#contacts === undefined || connection.channel !== "telegram" || event.address.conversationKind !== "group"
+      || event.protectedContent || speaker.isOwner || speaker.isBot || speaker.providerUserId === connection.ownerProviderUserId) return;
+    const worker = this.#workers.get(connection.id);
+    if (worker === undefined || worker.generation !== connection.generation || worker.controller.signal.aborted) return;
+    const registered = worker.registeredTelegramSpeakers ??= new Set<string>();
+    if (registered.has(speaker.providerUserId)) return;
+    try {
+      if (this.#contacts.registerTelegramGroupSpeaker({
+        providerUserId: telegramUserId(speaker.providerUserId), displayName: speaker.displayName, username: speaker.username
+      })) {
+        registered.add(speaker.providerUserId);
+      }
+    } catch (error) {
+      this.#recordFailure("TELEGRAM_CONTACT_REGISTRATION_FAILED", connection.id, error);
+    }
   }
 
   async #activateConversation(
