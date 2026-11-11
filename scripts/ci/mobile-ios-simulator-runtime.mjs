@@ -559,6 +559,7 @@ async function capturePostUiFrame(ocr, identity, expectedPid) {
 }
 async function cleanup() {
   const errors = [];
+  let simulatorCleanup = udid ? "unconfirmed" : "not_created";
   if (metro?.pid) {
     try { process.kill(-metro.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") errors.push("Owned Metro group could not be stopped."); }
     for (let count = 0; count < 20 && !metroClosed; count++) await delay(100);
@@ -573,11 +574,12 @@ async function cleanup() {
         if (bundleId && owned.state === "Booted") await command("xcrun", ["simctl", "terminate", udid, bundleId], { cleanup: true }).catch(() => undefined);
         if (owned.state === "Booted") await command("xcrun", ["simctl", "shutdown", udid], { cleanup: true });
         await command("xcrun", ["simctl", "delete", udid], { cleanup: true });
-      }
+        simulatorCleanup = "deleted";
+      } else simulatorCleanup = "already_absent";
     } catch (error) { errors.push(error.message); }
   }
   if (evidence) save("cleanup.json", { simulatorUdid: udid, simulatorName: deviceName, ownedMetroPid: metro?.pid,
-    deletedOnlyCreatedSimulator: !!udid && errors.length === 0, errors });
+    simulatorCleanup, deletedOnlyCreatedSimulator: simulatorCleanup === "deleted" || simulatorCleanup === "already_absent", errors });
   clearTimeout(deadline); process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop);
   return errors;
 }
