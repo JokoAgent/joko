@@ -117,12 +117,37 @@ describe("mounted Partner collaboration product chain", () => {
     await page.locator("form.pair-form button[type=submit]").click();
     await page.locator(partnerCard(partner.partnerId)).waitFor({ state: "visible", timeout: 30_000 });
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(partner.canonicalSessionId)}`);
-    await sendPartnerPrompt(fixture, manager, partner.canonicalSessionId, command);
+    const parentRunId = await sendPartnerPrompt(fixture, manager, partner.canonicalSessionId, command);
 
     const request = page.locator('.partner-task-receipt[data-partner-task-status="preparing"]').filter({ hasText: title });
     const outcome = page.locator('.partner-task-receipt[data-partner-task-status="completed"]').filter({ hasText: result });
-    await request.waitFor({ state: "visible", timeout: 30_000 });
-    await outcome.waitFor({ state: "visible", timeout: 30_000 });
+    let phase = "preparing card";
+    try {
+      await request.waitFor({ state: "visible", timeout: 30_000 });
+      phase = "completed card";
+      await outcome.waitFor({ state: "visible", timeout: 30_000 });
+    } catch (error) {
+      const { store, partnerSessionTasks } = fixture.application;
+      const sessionId = partner.canonicalSessionId;
+      const history = store.listEvents({ sessionId, order: "desc", limit: 120 });
+      const start = history.find(event => event.runId === parentRunId && event.payload.type === "tool_result"
+        && event.payload.name.endsWith("start_session_task"))?.payload;
+      const tool = start?.type === "tool_result" ? {
+        isError: start.isError,
+        code: /"code"\s*:\s*"([A-Z_]{1,64})"/u.exec(start.output.replace(/\\"/gu, '"'))?.[1],
+        hasTitle: start.output.includes(title)
+      } : undefined;
+      const storedReceipts = (activeNativeTimeline: boolean) => store.listEvents({ sessionId, activeNativeTimeline, order: "desc", limit: 120 })
+        .flatMap(event => event.payload.type === "partner_session_task_receipt" ? [event.payload.receipt.status] : []);
+      const connectReceipts = await manager.clients.session.listSessionTimeline({ sessionId, limit: 120 }, { signal: AbortSignal.timeout(3_000) })
+        .then(value => value.events.flatMap(event => event.payload?.kind.case === "partnerSessionTaskReceipt" ? [event.payload.kind.value.status] : []),
+          () => "unavailable");
+      const tasks = partnerSessionTasks?.list(partner.partnerId).filter(task => task.title === title).slice(0, 4)
+        .map(task => ({ status: task.status, hasSession: task.sessionId !== undefined, hasRun: task.runId !== undefined,
+          deliveredExecution: task.deliveredExecution, hasError: task.error !== undefined }));
+      throw new Error(`Independent task ${phase} was not visible. ${JSON.stringify({ tool, tasks, stored: storedReceipts(false),
+        active: storedReceipts(true), connectReceipts })}`, { cause: error });
+    }
     expect(await outcome.innerText()).toContain("Completed · #1");
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
@@ -949,7 +974,7 @@ async function sendPartnerPrompt(
   manager: Awaited<ReturnType<RealPiSystemFixture["pair"]>>,
   sessionId: string,
   prompt: string
-): Promise<void> {
+): Promise<string> {
   const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
   const submitted = await submit(
     manager.clients.operation,
@@ -973,6 +998,7 @@ async function sendPartnerPrompt(
     );
   }
   expect(settled.run?.state).toBe(RunState.SUCCEEDED);
+  return runId;
 }
 
 async function waitForDelegation(
