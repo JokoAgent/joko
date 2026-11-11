@@ -127,11 +127,20 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
       url: page.url(), body: (await page.locator("body").innerText()).slice(0, 1800)
     })}`);
   });
-  await page.waitForFunction(() => document.querySelectorAll(".workspace-file-body__pdf-pages canvas").length === 2);
+  const pdfPages = page.locator(".workspace-file-body__pdf-pages [data-pdf-page]");
+  const firstPage = page.locator('.workspace-file-body__pdf-pages [data-pdf-page="1"]');
+  const secondPage = page.locator('.workspace-file-body__pdf-pages [data-pdf-page="2"]');
+  const firstCanvas = firstPage.locator("canvas");
+  await firstCanvas.waitFor({ state: "visible" });
   expect(await page.locator('[role="treeitem"][data-relative-path="documents/chart-report.pdf"]').getAttribute("aria-selected")).toBe("true");
-  const canvases = page.locator(".workspace-file-body__pdf-pages canvas");
-  expect(await canvases.count()).toBe(2);
-  expect(await canvases.first().evaluate((element) => {
+  expect(await pdfPages.count()).toBe(2);
+  expect(await firstPage.evaluate(row => {
+    const sheet = row.querySelector(".workspace-file-body__pdf-sheet");
+    if (sheet === null) return false;
+    const rowBounds = row.getBoundingClientRect(), sheetBounds = sheet.getBoundingClientRect();
+    return Math.abs((rowBounds.left + rowBounds.right) - (sheetBounds.left + sheetBounds.right)) <= 1;
+  })).toBe(true);
+  expect(await firstCanvas.evaluate((element) => {
     const canvas = element as HTMLCanvasElement;
     const pixels = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height).data;
     let colored = 0;
@@ -146,18 +155,21 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
     await mkdir(captureDirectory, { recursive: true });
     await page.screenshot({ path: join(captureDirectory, "pdf-wide.png") });
   }
-  expect(await canvases.nth(1).evaluate((element) => {
+  await secondPage.evaluate(element => element.scrollIntoView({ block: "start" }));
+  const secondCanvas = secondPage.locator("canvas");
+  await secondCanvas.waitFor({ state: "visible" });
+  expect(await secondCanvas.evaluate((element) => {
     const canvas = element as HTMLCanvasElement;
     const pixels = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height).data;
     let ink = 0;
     for (let index = 0; index < pixels.length; index += 4) {
       if (pixels[index]! < 150 && pixels[index + 1]! < 150 && pixels[index + 2]! < 200 && pixels[index + 3]! > 0) ink += 1;
     }
-    element.scrollIntoView({ block: "start" });
     return ink;
   })).toBeGreaterThan(100);
   if (captureDirectory) await page.screenshot({ path: join(captureDirectory, "pdf-second-page.png") });
-  await canvases.first().scrollIntoViewIfNeeded();
+  await firstPage.evaluate(element => element.scrollIntoView({ block: "start" }));
+  await firstCanvas.waitFor({ state: "visible" });
 
   const downloadPromise = page.waitForEvent("download");
   await page.locator(".workspace-file-body__download").click();
@@ -171,7 +183,7 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
     return rail?.getAttribute("aria-hidden") === "true" && rail.getBoundingClientRect().width < 1;
   });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
-  expect(await canvases.count()).toBe(2);
+  expect(await pdfPages.count()).toBe(2);
   const closeNavigation = page.locator(".sidebar__mobile-close");
   if (await closeNavigation.isVisible()) await closeNavigation.click();
   if (captureDirectory) await page.screenshot({ path: join(captureDirectory, "pdf-compact.png") });
@@ -185,12 +197,27 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
   if (captureDirectory) await page.screenshot({ path: join(captureDirectory, "pdf-compact-scrolled.png") });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Connect", exact: true }).click();
-  await page.waitForFunction(() => document.querySelectorAll(".workspace-file-body__pdf-pages canvas").length === 2).catch(async (error: unknown) => {
+  await firstCanvas.waitFor({ state: "visible" }).catch(async (error: unknown) => {
     if (captureDirectory) await page.screenshot({ path: join(captureDirectory, "pdf-reload-failure.png") });
     throw new Error(`PDF did not restore after reload: ${error instanceof Error ? error.message : String(error)} ${JSON.stringify({
       url: page.url(), body: (await page.locator("body").innerText()).slice(0, 1800)
     })}`);
   });
+  expect(await pdfPages.count()).toBe(2);
+  const unreadablePdfPath = "documents/unrenderable.pdf";
+  const unreadablePdfBytes = Buffer.from("%PDF-1.4\n%%EOF\n");
+  await writeFile(join(fixture.workspaceDirectory, unreadablePdfPath), unreadablePdfBytes);
+  await page.evaluate(path => { window.location.hash = path; },
+    `#/files/${encodeURIComponent(sessionId)}?file=${encodeURIComponent(unreadablePdfPath)}`);
+  const unrenderable = page.locator(".workspace-file-body--unsupported");
+  await unrenderable.waitFor({ state: "visible" });
+  expect(await unrenderable.locator("strong").innerText()).toBe("unrenderable.pdf");
+  expect(await page.locator(".workspace-file-body__pdf-pages canvas").count()).toBe(0);
+  const fallbackDownload = page.waitForEvent("download");
+  await unrenderable.locator(".workspace-file-body__download").click();
+  expect(await readFile(await (await fallbackDownload).path())).toEqual(unreadablePdfBytes);
+
+  await page.evaluate(path => { window.location.hash = path; }, new URL(fileRoute).hash);
   await rm(outputPath);
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Connect", exact: true }).click();

@@ -317,17 +317,33 @@
   padding: 24px 16px;
 }
 
-.workspace-file-body__pdf-pages > canvas {
-  display: block;
+.workspace-file-body__pdf-page {
+  /* Observe the full row even when a centered sheet is outside the horizontal scroll position. */
+  align-self: stretch;
+  display: flex;
+  justify-content: center;
   flex: 0 0 auto;
+}
+
+.workspace-file-body__pdf-sheet {
+  flex: 0 0 auto;
+  overflow: hidden;
   border-radius: 2px;
   background: #fff;
   box-shadow: var(--shadow-sm);
 }
 
+.workspace-file-body__pdf-sheet > canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .workspace-file-body__pdf-loading {
-  position: absolute;
-  inset: 0;
+  position: sticky;
+  top: 50%;
+  height: 0;
+  z-index: 1;
   display: flex;
   align-items: center;
   justify-content: center;
