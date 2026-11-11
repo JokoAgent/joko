@@ -11,6 +11,7 @@ import {
   OperationSchema,
   OperationState,
   SessionState,
+  StreamEventsRequestSchema,
   StreamEventsResponseSchema,
   SubmitOperationResponseSchema,
   WatchOperationResponseSchema,
@@ -99,16 +100,22 @@ describe("message deletion gateway", () => {
     await view.gateway.connect();
     try {
       await view.answer(sessionId, eventId, "Deleted answer");
+      expect(view.latest().timelineBySession.get(sessionId)?.[0]?.sourceEventId).toBe(eventId);
       const deletion = view.gateway.deleteSessionMessage(sessionId, eventId);
       await vi.waitFor(() => expect(view.submissions).toHaveLength(1));
       const coveredCursor = view.coverDeletionInSnapshot();
       view.complete();
       await deletion;
       await vi.waitFor(() => expect(view.latest().cursor).toBe(coveredCursor));
+      const revision = view.latest().timelineHistoryRevisionBySession.get(sessionId);
+      expect(revision).toBeGreaterThan(0n);
+      expect(view.latest().timelineBySession.has(sessionId)).toBe(false);
       view.closeEventStream();
       await vi.waitFor(() => expect(view.streamCursors).toEqual([0n, coveredCursor]));
       await view.answer(sessionId, "later-event", "New output after reconnect");
       expect(view.latest().timelineBySession.get(sessionId)?.map((item) => item.text)).toEqual(["New output after reconnect"]);
+      expect(view.latest().timelineHistoryRevisionBySession.get(sessionId)).toBe(revision);
+      expect(view.submissions).toHaveLength(1);
     } finally { view.gateway.disconnect(); }
   });
 
@@ -227,10 +234,14 @@ function harness(directReceipt = false) {
       }
       throw new Error(`Unexpected method: ${method.localName}`);
     }),
-    stream: vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown, _headers: unknown, input: any) => {
+    stream: vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown, _headers: unknown,
+      input: AsyncIterable<MessageInitShape<typeof StreamEventsRequestSchema>>) => {
       if (method.localName === "watchOperation") return response(method, watchOperation(), true);
       if (method.localName !== "streamEvents") throw new Error(`Unexpected stream: ${method.localName}`);
-      streamCursors.push(input.afterCursor?.sequence ?? 0n);
+      const request = await input[Symbol.asyncIterator]().next();
+      const sequence = request.done ? undefined : request.value.afterCursor?.sequence;
+      if (sequence === undefined) throw new Error("The owner event stream request is missing its resume cursor.");
+      streamCursors.push(sequence);
       return response(method, streamEvents(signal), true);
     })
   } as unknown as Transport;
