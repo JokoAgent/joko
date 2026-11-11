@@ -217,9 +217,18 @@ jobs:
 
       - name: Install Linux test dependencies
         if: runner.os == 'Linux'
+        timeout-minutes: 15
+        shell: bash
         run: |
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update
-          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep xauth xvfb openbox x11-utils apparmor
+          ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o "Dir::Etc::sourcelist=$ubuntu_sources" -o Dir::Etc::sourceparts=-)
+          if ! sudo apt-get "${apt_sources[@]}" update --error-on=any; then
+            # Keep the runner's suites and Ubuntu archive signing keys when changing mirrors.
+            grep -Fq 'mirror+file:/etc/apt/apt-mirrors.txt' "$ubuntu_sources"
+            printf 'https://mirror.math.princeton.edu/pub/ubuntu/\tpriority:0\n' | sudo tee -a /etc/apt/apt-mirrors.txt
+            sudo apt-get "${apt_sources[@]}" update --error-on=any
+          fi
+          sudo apt-get "${apt_sources[@]}" install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep xauth xvfb openbox x11-utils apparmor
 
       - name: Install Windows test dependencies
         if: runner.os == 'Windows'
