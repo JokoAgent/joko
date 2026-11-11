@@ -6742,9 +6742,9 @@ describe("native mobile connection and operation ownership", () => {
 
   it.each(["exact queue", "other queue", "observer throws"] as const)(
     "exposes the exact send identity before durable submit and preserves its refresh with %s", async (receipt) => {
-    const source = create(SessionSchema, { ...snapshot.sessions[0]!, nativeBinding: {
+    const source = create(SessionSchema, { ...snapshot.sessions[0]!, nativeBinding: create(NativeSessionBindingSchema, {
       backendId: "backend", opaqueReference: "original-binding", runtimeGeneration: 8n
-    } });
+    }) });
     const projection = create(SnapshotSchema, { ...snapshot, sessions: [source] });
     const network = projectedNetwork(projection);
     const saved = memoryStorage(credential);
