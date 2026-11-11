@@ -27,6 +27,7 @@ let timelineList: { data: readonly unknown[]; onViewableItemsChanged: TimelineVi
   onScrollToIndexFailed?: TimelineScrollFailure } | undefined;
 const scrollTimelineToIndex = vi.fn<(options: { index: number; animated: boolean; viewPosition?: number }) => void>();
 const scrollTimelineToOffset = vi.fn();
+const scrollTimelineToEnd = vi.fn();
 let sendFollowSourceKey: string | undefined;
 let receiveAppMessage: ((event: { nativeEvent: { data: string } }) => void) | undefined;
 let appBridgeKey = "";
@@ -116,7 +117,7 @@ beforeAll(async () => {
       renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility;
       onScrollBeginDrag?: () => void; onContentSizeChange?: (width: number, height: number) => void;
       onScrollToIndexFailed?: TimelineScrollFailure }, ref) => {
-      useImperativeHandle(ref, () => ({ scrollToIndex: scrollTimelineToIndex, scrollToOffset: scrollTimelineToOffset }), []);
+      useImperativeHandle(ref, () => ({ scrollToIndex: scrollTimelineToIndex, scrollToOffset: scrollTimelineToOffset, scrollToEnd: scrollTimelineToEnd }), []);
       if (onViewableItemsChanged) timelineList = { data: data ?? [], onViewableItemsChanged, onScrollBeginDrag, onContentSizeChange, onScrollToIndexFailed };
       return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))));
     }), TextInput: forwardRef(() => null),
@@ -197,17 +198,18 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
-  timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); sendFollowSourceKey = undefined;
+  timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear(); sendFollowSourceKey = undefined;
   activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
   activeObjectiveApi = undefined;
   activeCollaborationApi = undefined; activeInputHandoffApi = undefined; taskRole = "ordinary";
   drafts.save(identity, plainTextMobileComposerDraft("/an arguments")); await drafts.flush(identity);
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
-afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); });
-function taskScreen() {
+afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); vi.useRealTimers(); });
+function taskScreen(messageFocus?: ComponentProps<typeof TaskScreen>["messageFocus"]) {
   return createElement(TaskScreen, { colors, state: renderedState, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {},
-    onOpenPartnerThread: openPrivateThread, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false });
+    onOpenPartnerThread: openPrivateThread, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false,
+    messageFocus });
 }
 async function render(assertPalette = true): Promise<void> {
   await act(async () => root.render(taskScreen()));
@@ -261,6 +263,24 @@ describe("actual App slash Skill selection", () => {
     expect(input.draft.text).toBe(retirement === "edit" ? "/an arguments changed" : "/an arguments");
     expect(input.draft.mentions).toEqual([]); expect(send).not.toHaveBeenCalled();
   });
+});
+
+it.each(["ordinary open", "manual drag", "explicit message focus"] as const)("uses the initial task tail only for an %s", async (opening) => {
+  vi.useFakeTimers();
+  sendFollowSourceKey = "task-source";
+  renderedState = { ...state, live: Array.from({ length: 24 }, (_, index) =>
+    taskUserInput(`input-${index}`, `operation-${index}`, BigInt(index + 1), `Existing input ${index}`)) };
+  const focus = opening === "explicit message focus"
+    ? { requestId: 1, sessionId: "session", messageId: "input-3", messageEventId: "input-3" } : undefined;
+  await act(async () => root.render(taskScreen(focus)));
+  expect(timelineList?.data).toHaveLength(24);
+  if (opening === "manual drag") await act(async () => timelineList?.onScrollBeginDrag?.());
+  await act(async () => {
+    timelineList?.onContentSizeChange?.(400, 1_600);
+    timelineList?.onContentSizeChange?.(400, 1_700);
+    timelineList?.onContentSizeChange?.(400, 1_800);
+  });
+  expect(scrollTimelineToEnd.mock.calls).toEqual(opening === "ordinary open" ? [[{ animated: false }], [{ animated: false }]] : []);
 });
 
 it.each(["unmeasured input", "fast answer", "manual drag", "newer input", "unconfirmed send"] as const)(

@@ -3721,6 +3721,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const copyGenerationRef = useRef(0);
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
+  const initialTimelineTailRef = useRef<{ readonly ownerKey: string; requested: boolean; finished: boolean } | undefined>(undefined);
   const latestSendFollowRef = useRef<MobileTaskSendFollow | undefined>(undefined);
   const [acceptedSendFollowId, setAcceptedSendFollowId] = useState<string>();
   const timelineViewportRef = useRef<View>(null);
@@ -4253,6 +4254,31 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
   const conversationShare = useMobileConversationShare({ client, rows: partnerRows ?? rows, locale,
     onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
+  const initialTailOwnerKey = JSON.stringify([mobileHomeSourceKey(state), timelineListKey]);
+  if (initialTimelineTailRef.current?.ownerKey !== initialTailOwnerKey) {
+    initialTimelineTailRef.current = { ownerKey: initialTailOwnerKey, requested: false, finished: false };
+  }
+  const initialTimelineTail = initialTimelineTailRef.current;
+  if (activeMessageFocus !== undefined || searchVisible || state.window !== undefined || conversationShare.active) initialTimelineTail.finished = true;
+  const initialTailAvailable = state.status === "connected" && state.detail !== undefined && state.taskSource?.kind !== "joined"
+    && state.window === undefined && !state.historyBusy && !conversationShare.active && partnerIdentity.ready && !partnerIdentity.partner
+    && headerRole.role === "ordinary" && headerSourceKey !== undefined && displayRows.length > 0;
+  const scrollInitialTimelineTail = useCallback((measured: boolean) => {
+    const list = timelineListRef.current;
+    if (!initialTailAvailable || initialTimelineTailRef.current !== initialTimelineTail || initialTimelineTail.finished
+      || !list || !taskMountedRef.current || AppState.currentState !== "active" || client.taskHeaderSourceKey() !== headerSourceKey
+      || client.state.window !== undefined || client.state.historyBusy) return;
+    if (latestSendFollowRef.current !== undefined) { initialTimelineTail.finished = true; return; }
+    if (initialTimelineTail.requested && !measured) return;
+    if (initialTimelineTail.requested) initialTimelineTail.finished = true;
+    initialTimelineTail.requested = true;
+    list.scrollToEnd({ animated: false });
+  }, [headerSourceKey, initialTailAvailable, initialTimelineTail]);
+  useLayoutEffect(() => {
+    if (!initialTailAvailable || initialTimelineTail.finished) return;
+    const frame = requestAnimationFrame(() => scrollInitialTimelineTail(false));
+    return () => cancelAnimationFrame(frame);
+  }, [initialTailAvailable, initialTimelineTail, scrollInitialTimelineTail]);
   const conversationShareColors = useMemo(() => ({ background: colors.background, surfaceElevated: colors.surface,
     textPrimary: colors.ink, textSecondary: colors.muted, textTertiary: colors.muted }), [colors]);
   useEffect(() => mobileComposerDrafts.subscribeErrors((identity, error) => {
@@ -4650,6 +4676,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const subscription = client.subscribe(() => taskHomeNavigator.observeScope());
     const lifecycle = AppState.addEventListener("change", (status) => {
       if (status === "active") return;
+      if (initialTimelineTailRef.current) initialTimelineTailRef.current.finished = true;
       latestSendFollowRef.current = undefined;
       taskHomeNavigator.retire();
       if (drawerMountedRef.current) taskHomeNavigator.close();
@@ -6140,6 +6167,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const list = timelineListRef.current;
         if (list && sendFollowOwner && rebalanceSource === sendFollowOwner.sourceKey
           && client.state.window === undefined && AppState.currentState === "active") {
+          initialTimelineTail.finished = true;
           sendFollow = { owner: sendFollowOwner, operationId, list };
         }
         latestSendFollowRef.current = sendFollow;
@@ -6745,11 +6773,19 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     <FlatList key={timelineListKey} ref={timelineListRef} data={displayRows}
       extraData={{ selection: conversationShare.selectedIds, visibleTimelineRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => !isWorkGroup(row) && row.kind === "user" && row.operationId ? `local-send:${row.operationId}` : row.id} style={styles.fill} contentContainerStyle={styles.list}
       viewabilityConfig={timelineViewability} onViewableItemsChanged={onTimelineRowsVisible}
-      scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
+      scrollEventThrottle={100} onScroll={(event) => {
+        if (initialTimelineTail.requested && !initialTimelineTail.finished) {
+          const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+          if (layoutMeasurement.height > 0 && contentSize.height - contentOffset.y - layoutMeasurement.height <= 1) initialTimelineTail.finished = true;
+        }
+        setImageViewportPulse((value) => value + 1);
+      }}
       onScrollBeginDrag={() => {
+        initialTimelineTail.finished = true;
         if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
       }}
       onContentSizeChange={() => {
+        scrollInitialTimelineTail(true);
         if (!acceptedFollow?.seek?.waitingForMeasurement || !sendFollowTarget || sendFollowVisible || !currentSendFollow(acceptedFollow)) return;
         latestSendFollowRef.current = undefined;
         acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
@@ -6792,7 +6828,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => client.latest()} />}
         {!state.historyEnd && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadEarlier")} colors={colors}
           disabled={state.historyBusy || state.status !== "connected"}
-          onPress={() => void client.older().catch((error) => setLocalError(errorText(error)))} />}
+          onPress={() => { initialTimelineTail.finished = true; void client.older().catch((error) => setLocalError(errorText(error))); }} />}
         </View>
       </View>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, !partnerIdentity.ready ? "task.loading" : chasingHiddenHistory
