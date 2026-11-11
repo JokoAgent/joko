@@ -1195,6 +1195,8 @@ export interface EnqueueMessagingDeliveryInput {
   readonly connectionId: string;
   readonly expectedChannelGeneration: number;
   readonly conversationId: string;
+  /** An idle task-control notice can be sent before the conversation has a Session. */
+  readonly allowObservedConversation?: true;
   readonly dedupeKey: string;
   readonly kind: MessagingDeliveryKind;
   readonly partIndex: number;

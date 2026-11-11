@@ -8,6 +8,7 @@ import { join } from "node:path";
 import {
   MessagingTransportError,
   TelegramTransport,
+  normalizeDiscordUpdates,
   normalizeTelegramUpdates,
   type DingTalkCallbackUpdate,
   type DingTalkNormalizationResult,
@@ -150,6 +151,108 @@ describe("MessagingManager", () => {
     expect(receipt()?.id).toBe(deliveryId);
     expect(transport.sentText.length + transport.stream.edits.length + card.mock.calls.length).toBe(effects);
   });
+
+  it.each(["telegram", "discord"] as const)("stops the exact %s turn and cancels its queued inputs before the Backend can drain them", async channel => {
+    const telegram = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const discord = new FakeDiscordTransport();
+    const adapter = new ControlledReplyAdapter();
+    const input = [
+      { id: 1, text: "/stop" },
+      { id: 2, text: "Keep this turn active" },
+      { id: 3, text: "!stop", sticker: true },
+      { id: 4, text: "！STOP" },
+      { id: 4, text: "！STOP" }
+    ];
+    const date = Math.floor(Date.now() / 1_000);
+    const messageId = (id: number) => channel === "telegram" ? String(id) : `99999999999999999${id}`;
+    const gates = input.map(() => deliveryGate());
+    const telegramPoll = vi.spyOn(telegram, "poll");
+    const discordPoll = vi.spyOn(discord, "poll");
+    vi.spyOn(telegram, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: telegram.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    vi.spyOn(discord, "normalize").mockImplementation(updates => normalizeDiscordUpdates(updates, {
+      connectionId: discord.connectionId, ownerUserId: "111111111111111111", ownerConversationId: "444444444444444444",
+      bot: { id: "222222222222222222", username: "joko_test_bot", displayName: "Joko" }, groupActivation: {}
+    }));
+    input.forEach((message, index) => {
+      telegramPoll.mockImplementationOnce(async ({ signal }) => {
+        await gates[index]!.wait;
+        signal?.throwIfAborted();
+        return { nextCursor: String(index + 11), updates: [{ update_id: message.id + 10, message: {
+          message_id: message.id, chat: { id: 42, type: "private" }, date,
+          from: { id: 42, first_name: "Owner", is_bot: false }, text: message.text,
+          ...(message.sticker ? { sticker: { emoji: "📎" } } : {})
+        } }] };
+      });
+      discordPoll.mockImplementationOnce(async ({ signal }) => {
+        await gates[index]!.wait;
+        signal?.throwIfAborted();
+        return { nextCursor: `discord-stop-${index}`, updates: [{ sequence: message.id, eventType: "MESSAGE_CREATE",
+          channel: { id: "444444444444444444", type: 1 },
+          message: { id: messageId(message.id), channel_id: "444444444444444444", timestamp: new Date().toISOString(),
+            author: { id: "111111111111111111", username: "owner" }, content: message.text,
+            ...(message.sticker ? { sticker_items: [{ id: "888888888888888888", name: "Sticker" }] } : {})
+          }
+        }] };
+      });
+    });
+    const fixture = await createFixture(() => telegram, () => adapter, () => discord);
+    cleanups.push(() => gates.forEach(gate => gate.release()));
+    const transport = channel === "telegram" ? telegram : discord;
+    const send = vi.spyOn(adapter, "send");
+    const connection = await enableReplyStream(fixture, channel);
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    const repliesTo = (id: number) => transport.sentText.filter(row => row.replyToMessageId === messageId(id));
+    gates[0]!.release();
+    await vi.waitFor(() => expect(repliesTo(1)).toMatchObject([{ text: "No active task needed stopping." }]));
+    expect(fixture.store.listSessions()).toEqual([]);
+
+    gates[1]!.release();
+    await vi.waitFor(() => {
+      const runId = requests().find(request => request.providerMessageId === messageId(2))?.runId;
+      expect(runId).toBeDefined();
+      expect(fixture.store.getRun(runId!).descriptor.state).toBe("running");
+    }, { timeout: 5_000 });
+    const active = requests().find(request => request.providerMessageId === messageId(2))!;
+    const activeQueue = fixture.store.getQueueItem(active.queueItemId!);
+    gates[2]!.release();
+    await vi.waitFor(() => expect(requests().find(request => request.providerMessageId === messageId(3))?.status).toBe("queued"));
+    const pending = requests().find(request => request.providerMessageId === messageId(3))!;
+    expect(fixture.store.getQueueItem(pending.queueItemId!).body.text).toContain("Sticker");
+    const independent = fixture.host.enqueueServiceInput({
+      operationId: "independent-input", sessionId: activeQueue.sessionId, source: "system",
+      prompt: { disposition: "prompt", text: "Independent input", images: [], files: [], mentions: [] }
+    }).value;
+    const nativeAbort = adapter.abort.bind(adapter);
+    const abort = vi.spyOn(adapter, "abort").mockImplementation(async context => {
+      expect(context.runId).toBe(active.runId);
+      expect(fixture.store.getQueueItem(pending.queueItemId!).state).toBe("cancelled");
+      expect(fixture.store.getQueueItem(independent.queueItemId).state).toBe("accepted");
+      return nativeAbort(context);
+    });
+    gates[3]!.release();
+    await vi.waitFor(() => expect(repliesTo(4)).toMatchObject([{ text: "Stopped the current turn. Cancelled 1 queued message." }]), { timeout: 5_000 });
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getRun(active.runId!).descriptor.state).toBe("aborted");
+    expect(requests()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ providerMessageId: messageId(2), status: "cancelled" }),
+      expect.objectContaining({ providerMessageId: messageId(3), status: "cancelled" })
+    ]));
+    await vi.waitFor(() => expect(send.mock.calls.map(([prompt]) => prompt.text)).toEqual(["Keep this turn active", "Independent input"]));
+
+    gates[4]!.release();
+    const cursor = channel === "telegram" ? "15" : "discord-stop-4";
+    await vi.waitFor(() => expect(fixture.store.getMessagingConnection(connection.id).cursor).toBe(cursor));
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(repliesTo(4)).toHaveLength(1);
+    expect(requests()).toHaveLength(2);
+    const receipts = fixture.store.listMessagingInteractions({ connectionId: connection.id });
+    expect(receipts.map(({ status, payload }) => ({ status, payload }))).toEqual([
+      { status: "completed", payload: { format: 1, action: "stop" } },
+      { status: "completed", payload: { format: 1, action: "stop" } }
+    ]);
+  }, 15_000);
 
   it.each(["telegram", "discord"] as const)("serializes %s progress before the final and retains the channel's final-message lifecycle", async channel => {
     const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
@@ -1496,15 +1599,29 @@ describe("MessagingManager", () => {
     }
   }, 12_000);
 
-  it("releases already fetched Telegram group bytes when the connection generation changes during dispatch", async () => {
+  it.each(["connection retirement", "owner stop"] as const)("releases Telegram group bytes before dispatch on %s", async cause => {
     const sender = { chat: { id: -100124, type: "supergroup" as const }, date: Math.floor(Date.now() / 1_000),
-      from: { id: 53, first_name: "Participant", is_bot: false } };
+      is_topic_message: true, message_thread_id: 7, from: { id: 53, first_name: "Participant", is_bot: false } };
     const updates: TelegramUpdate[] = [1, 2].map(id => ({ update_id: id, message: { ...sender, message_id: id,
       caption: `Background photo ${id}`, photo: [{ file_id: `photo-${id}`, file_unique_id: `unique-${id}`, width: 1, height: 1 }] } }));
     updates.push({ update_id: 3, message: { ...sender, message_id: 3,
       text: "@joko_test_bot Review the photos.", entities: [{ type: "mention", offset: 0, length: "@joko_test_bot".length }] } });
     const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
-    vi.spyOn(transport, "poll").mockResolvedValueOnce({ updates, nextCursor: "4" });
+    const poll = vi.spyOn(transport, "poll").mockResolvedValueOnce({ updates, nextCursor: "4" });
+    const otherTopic = deliveryGate(), ownTopic = deliveryGate();
+    const owner = { ...sender, from: { id: 42, first_name: "Owner", is_bot: false } };
+    if (cause === "owner stop") {
+      poll.mockImplementationOnce(async () => {
+        await otherTopic.wait;
+        return { updates: [
+          { update_id: 4, message: { ...sender, message_id: 4, text: "!stop" } },
+          { update_id: 5, message: { ...owner, message_id: 5, message_thread_id: 8, text: "!stop" } }
+        ], nextCursor: "6" };
+      }).mockImplementationOnce(async () => {
+        await ownTopic.wait;
+        return { updates: [{ update_id: 6, message: { ...owner, message_id: 6, text: "!stop" } }], nextCursor: "7" };
+      });
+    }
     vi.spyOn(transport, "normalize").mockImplementation(messages => normalizeTelegramUpdates(messages, {
       connectionId: transport.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
     }));
@@ -1516,8 +1633,9 @@ describe("MessagingManager", () => {
     });
     const adapter = new AttachmentFakeAdapter(true);
     const send = vi.spyOn(adapter, "send");
+    const abort = vi.spyOn(adapter, "abort");
     const fixture = await createFixture(() => transport, () => adapter);
-    cleanups.push(held.release);
+    cleanups.push(held.release, otherTopic.release, ownTopic.release);
     const connection = await enableTelegramReply(fixture, "telegram-retired-group-media");
     await vi.waitFor(() => expect(download).toHaveBeenCalledTimes(2), { timeout: 5_000 });
     const incoming = join(fixture.root, "artifacts", "incoming");
@@ -1526,12 +1644,32 @@ describe("MessagingManager", () => {
     expect(await readFile(join(incoming, staged[0]!))).toEqual(jpeg);
     expect(send).not.toHaveBeenCalled();
 
-    const current = fixture.store.getMessagingConnection(connection.id);
-    await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision,
-      expectedGeneration: current.generation, enabled: false });
+    const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    if (cause === "owner stop") {
+      otherTopic.release();
+      await vi.waitFor(() => expect(transport.sentText.find(row => row.replyToMessageId === "5"))
+        .toMatchObject({ address: { providerThreadId: "8" }, text: "No active task needed stopping." }));
+      expect(transport.sentText.some(row => row.replyToMessageId === "4")).toBe(false);
+      expect(fixture.store.getQueueItem(queue.id).state).toBe("dispatching");
+      ownTopic.release();
+      await vi.waitFor(() => expect(transport.sentText.find(row => row.replyToMessageId === "6"))
+        .toMatchObject({ address: { providerThreadId: "7" }, text: "Cancelled 1 queued message." }));
+      expect(fixture.store.getQueueItem(queue.id).state).toBe("cancelled");
+      await expect(readFile(join(incoming, staged[0]!))).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      const current = fixture.store.getMessagingConnection(connection.id);
+      await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision,
+        expectedGeneration: current.generation, enabled: false });
+    }
     held.release();
     await vi.waitFor(async () => expect((await readdir(incoming)).filter(name => name.startsWith("dispatch-input-"))).toEqual([]));
+    await vi.waitFor(() => expect(fixture.host.observeQueueDispatch(queue)).toBeUndefined());
     expect(send.mock.calls.every(([prompt]) => prompt.images.length === 0 && prompt.files.length === 0)).toBe(true);
+    if (cause === "owner stop") {
+      expect(send).not.toHaveBeenCalled();
+      expect(abort).not.toHaveBeenCalled();
+    }
     expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toMatchObject([{ status: "cancelled", artifactIds: [] }]);
     expect(fixture.store.listArtifacts()).toEqual([]);
   }, 12_000);

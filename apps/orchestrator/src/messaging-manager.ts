@@ -11,6 +11,7 @@ import {
   TelegramTransport,
   WeComTransport,
   WeChatTransport,
+  isMessagingStopCommand,
   splitDingTalkText,
   splitDiscordText,
   splitSlackText,
@@ -57,7 +58,7 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
-import { redactSecrets, type BlobRef, type InteractionQuestionField, type MessageBlock, type PromptInput, type TurnExecutionOverrides } from "@joko/core";
+import { JokoError, redactSecrets, type BlobRef, type InteractionQuestionField, type MessageBlock, type PromptInput, type TurnExecutionOverrides } from "@joko/core";
 import {
   messagingConversationContextAad,
   operationBodyHash,
@@ -68,7 +69,8 @@ import {
   type InteractionRecord,
   type MessagingRouteRecord,
   type OperationalStore,
-  type PutMessagingRouteInput
+  type PutMessagingRouteInput,
+  type QueueItemRecord
 } from "@joko/store";
 import type { PersistedEvent } from '@joko/store';
 import type { ConnectionRecord } from '@joko/store';
@@ -79,7 +81,7 @@ import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
 import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import type { EnqueueResult, EnqueueServiceInput, InteractionDecisionSubmission, SessionHost, TelegramHistoryDispatchInput, PreparedTelegramHistory } from "./session-host.js";
-import { listAllInteractions, listAllMessagingInboundRequests } from "./operational-pagination.js";
+import { listAllInteractions, listAllMessagingInboundRequests, listAllQueueItems } from "./operational-pagination.js";
 
 const CREDENTIAL_JOURNAL_SCOPE_TYPE = "service";
 const CREDENTIAL_JOURNAL_SCOPE_ID = "orchestrator";
@@ -435,6 +437,11 @@ interface TelegramHistorySelection {
   readonly expiresAt: number;
 }
 
+interface MessagingStopResult {
+  readonly notice: string;
+  readonly failure?: "stop_unavailable" | "stop_effect_unknown";
+}
+
 interface MessagingOutboundFile {
   readonly kind: "image" | "file";
   readonly blob: BlobRef;
@@ -472,7 +479,7 @@ export interface MessagingManagerOptions {
   readonly contextVault?: Pick<CredentialVault, "seal" | "open">;
   readonly sessionHost: Pick<SessionHost,
     "createServiceSession" | "enqueueServiceInput" | "resolveInteraction" | "dismissInteraction"
-    | "abort" | "applySessionSettings">;
+    | "abort" | "applySessionSettings" | "observeQueueDispatch">;
   readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob" | "createDispatchInputArtifacts">;
   readonly contacts?: Pick<ContactManager, "registerTelegramGroupSpeaker">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
@@ -1838,8 +1845,12 @@ export class MessagingManager {
       ? batch.interactionReplyCandidates
       : [];
     const interactionReplyMessageIds = new Set<string>();
+    const stopMessages = new Set<string>();
     for (const event of events) {
-      if (event.kind === "message" && this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
+      if (event.kind !== "message") continue;
+      if (isMessagingStopInput(event)) {
+        stopMessages.add(messagingMessageKey(event.address, event.messageId));
+      } else if (this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
         interactionReplyMessageIds.add(event.messageId);
       }
     }
@@ -1850,7 +1861,8 @@ export class MessagingManager {
     }
     for (const observation of batch.groupObservations) {
       signal.throwIfAborted();
-      if (interactionReplyMessageIds.has(observation.messageId)) continue;
+      if (interactionReplyMessageIds.has(observation.messageId)
+        || stopMessages.has(messagingMessageKey(observation.address, observation.messageId))) continue;
       if (activeConnection.channel === "slack"
         && !admittedAddresses.has(messagingAddressKey(observation.address))
         && this.#store.findMessagingConversationByAddress({
@@ -1869,6 +1881,10 @@ export class MessagingManager {
     for (const event of events) {
       signal.throwIfAborted();
       if (event.kind === "message") {
+        if (stopMessages.has(messagingMessageKey(event.address, event.messageId))) {
+          await this.#processTaskStop(activeConnection, event, signal);
+          continue;
+        }
         const contextToken = activeConnection.channel === "wechat"
           ? weChatPrivateContextForEvent(batch, event)
           : undefined;
@@ -2388,6 +2404,147 @@ export class MessagingManager {
       stopped += 1;
     }
     return stopped;
+  }
+
+  async #processTaskStop(connection: MessagingConnectionRecord, event: MessagingInboundMessage, signal: AbortSignal): Promise<void> {
+    if (event.ambient || event.speaker.isBot || !event.speaker.isOwner
+      || event.speaker.providerUserId !== connection.ownerProviderUserId) return;
+    const assertOwner = () => {
+      signal.throwIfAborted();
+      const live = this.#requireWorkerConnection(connection.id, connection.generation);
+      if (live.credentialGeneration !== connection.credentialGeneration || live.ownerProviderUserId !== event.speaker.providerUserId) {
+        throw invalid("The original message owner changed.");
+      }
+    };
+    const now = this.#now();
+    const claimToken = this.#idFactory();
+    const { conversation, claimed } = this.#store.transaction(store => {
+      assertOwner();
+      const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
+      const payload = { format: 1, action: "stop" };
+      const interaction = store.createMessagingInteraction({
+        connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
+        allowObservedConversation: true, providerRequestId: event.providerRequestIds[0]!,
+        providerInteractionId: `stop:${conversation.id}:${event.messageId}`, providerMessageId: event.messageId,
+        actionHash: operationBodyHash(payload), payload, expiresAt: now + 30 * 60_000, createdAt: now
+      });
+      const claimed = interaction.status === "pending" ? store.claimMessagingInteraction({
+        interactionId: interaction.id, expectedRevision: interaction.revision, claimToken, claimedAt: now
+      }) : undefined;
+      return { conversation, claimed };
+    });
+    if (claimed === undefined) return;
+
+    let result: MessagingStopResult;
+    try {
+      result = await this.#stopOwnedMessagingTurn(conversation, claimed.id, signal, assertOwner);
+    } catch {
+      result = { notice: "The stop result could not be confirmed. Check the original task.", failure: "stop_effect_unknown" };
+    }
+    assertOwner();
+    const settledAt = this.#now();
+    this.#store.transaction(store => {
+      const payload = { format: 1, address: event.address, text: result.notice, replyToMessageId: event.messageId };
+      store.enqueueMessagingDelivery({
+        connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
+        allowObservedConversation: true, dedupeKey: `command:${claimed.id}:notice`, kind: "notice", partIndex: 0, partCount: 1,
+        payloadHash: operationBodyHash(payload), payload, availableAt: settledAt, createdAt: settledAt
+      });
+      store.settleMessagingInteraction({
+        interactionId: claimed.id, expectedRevision: claimed.revision, claimToken, settledAt,
+        status: result.failure === undefined ? "completed" : result.failure === "stop_unavailable" ? "failed" : "unknown",
+        ...(result.failure === undefined ? {} : { outcomeCode: result.failure })
+      });
+    });
+    this.#scheduleDeliveryDrain(connection.id);
+  }
+
+  async #stopOwnedMessagingTurn(
+    conversation: MessagingConversationRecord,
+    interactionId: string,
+    signal: AbortSignal,
+    assertOwner: () => void
+  ): Promise<MessagingStopResult> {
+    const sessionId = conversation.sessionId;
+    if (sessionId === undefined) return { notice: "No active task needed stopping." };
+    const assertCurrent = () => {
+      assertOwner();
+      const live = this.#store.getMessagingConversation(conversation.id);
+      const binding = this.#partnerRuntime?.binding(conversation.connectionId);
+      const task = this.#store.getSession(sessionId).descriptor;
+      if (live.status !== "active" || live.sessionId !== sessionId || live.channelGeneration !== conversation.channelGeneration
+        || live.partnerId !== conversation.partnerId || live.partnerBindingRevision !== conversation.partnerBindingRevision
+        || live.partnerId !== binding?.partnerId || (live.partnerId !== undefined && live.partnerBindingRevision !== binding?.revision)
+        || task.archived || task.deletedAt !== undefined) throw invalid("The original message task changed.");
+    };
+    const owns = (runId: string) => {
+      const source = this.#store.findMessagingInboundRequestByRunId(runId);
+      return source?.conversationId === conversation.id && source.connectionId === conversation.connectionId
+        && source.channelGeneration === conversation.channelGeneration;
+    };
+    const assertInputOwner = (item: QueueItemRecord) => {
+      if (item.body.messagingOrigin === undefined && conversation.partnerId === undefined) return;
+      if (item.body.messagingOrigin === undefined || this.#partnerRuntime === undefined) {
+        throw invalid("The original Partner message input is unavailable.");
+      }
+      this.#partnerRuntime.assertQueueCurrent(item);
+    };
+    const cancelled = this.#store.transaction(store => {
+      assertCurrent();
+      const pending = listAllQueueItems(store, { sessionId, states: ["accepted", "dispatching"] }).filter(item =>
+        owns(item.runId) && (item.state === "accepted" || this.#sessionHost.observeQueueDispatch(item)?.phase === "pre-send")
+      );
+      for (const item of pending) {
+        assertInputOwner(item);
+        store.cancelQueueItem({ queueItemId: item.id, expectedRevision: item.revision, traceId: `messaging-stop:${interactionId}:${item.id}` });
+        if (item.attemptId !== undefined && store.getAttempt(item.attemptId).descriptor.endedAt === undefined) store.finishAttempt(item.attemptId);
+      }
+      return pending;
+    });
+    for (const item of cancelled) await this.onRunSettled({ sessionId, runId: item.runId, outcome: "aborted" });
+    const queueNotice = cancelled.length === 0 ? "" : `Cancelled ${cancelled.length} queued message${cancelled.length === 1 ? "" : "s"}.`;
+    const withQueueNotice = (text: string) => queueNotice === "" ? text : `${text} ${queueNotice}`;
+    const liveInputs = () => listAllQueueItems(this.#store, { sessionId, states: ["dispatching", "backend_accepted", "dispatch_unknown"] });
+    const sending = liveInputs().find(item => item.state === "dispatching" && owns(item.runId));
+    const preparation = sending === undefined ? undefined : this.#sessionHost.observeQueueDispatch(sending);
+    if (preparation?.phase === "sending") {
+      let stopWaiting!: () => void;
+      const retired = new Promise<void>(resolve => { stopWaiting = resolve; });
+      signal.addEventListener("abort", stopWaiting, { once: true });
+      try {
+        signal.throwIfAborted();
+        await Promise.race([preparation.settled, retired]);
+      } finally {
+        signal.removeEventListener("abort", stopWaiting);
+      }
+    }
+    assertCurrent();
+    const inputs = liveInputs();
+    const owned = inputs.filter(item => owns(item.runId));
+    if (owned.some(item => item.state !== "backend_accepted")) {
+      return { notice: withQueueNotice("The original message is still awaiting a dispatch receipt. Check the task."), failure: "stop_effect_unknown" };
+    }
+    const target = owned[0];
+    if (target === undefined) return { notice: queueNotice || "No active task needed stopping." };
+    const unavailable = { notice: withQueueNotice("This message conversation cannot stop the current Backend turn."), failure: "stop_unavailable" as const };
+    const task = this.#store.getSession(sessionId).descriptor;
+    if (owned.length !== inputs.length || this.#store.getBackend(task.backendId).descriptor.capabilities.get("turn.abort")?.supported !== true) {
+      return unavailable;
+    }
+    const assertStopCurrent = () => {
+      assertCurrent();
+      if (liveInputs().some(item => !owns(item.runId))) throw invalid("Another message source owns part of the current Backend turn.");
+      assertInputOwner(this.#store.getQueueItem(target.id));
+    };
+    try {
+      await this.#sessionHost.abort(sessionId, target.runId, assertStopCurrent);
+      assertCurrent();
+    } catch (error) {
+      if (error instanceof JokoError && !error.publicError.stateMayHaveChanged) return unavailable;
+      return { notice: withQueueNotice("The stop result could not be confirmed. Check the original task."), failure: "stop_effect_unknown" };
+    }
+    const stopped = this.#store.getRun(target.runId).descriptor.state === "aborted";
+    return { notice: withQueueNotice(stopped ? "Stopped the current turn." : "Stop requested for the current turn.") };
   }
 
   async #startNewWeChatSession(
@@ -2999,7 +3156,7 @@ export class MessagingManager {
     for (const media of entries) {
       if (media.address.channel !== "telegram" || media.address.connectionId !== connection.id
         || media.address.conversationKind !== "group" || media.occurredAt < cutoff || interactionReplies.has(media.messageId)) continue;
-      const key = telegramGroupMediaKey(media.address, media.messageId);
+      const key = messagingMessageKey(media.address, media.messageId);
       pool.delete(key);
       pool.set(key, media);
       if (pool.size > TELEGRAM_GROUP_MEDIA_LIMIT) pool.delete(pool.keys().next().value!);
@@ -3023,7 +3180,7 @@ export class MessagingManager {
     const now = this.#now();
     const cutoff = now - TELEGRAM_GROUP_MEDIA_MAX_AGE_MS;
     const messageIds = groupContextMessageIds.filter(id => {
-      const media = pool.get(telegramGroupMediaKey(event.address, id));
+      const media = pool.get(messagingMessageKey(event.address, id));
       return media !== undefined && media.occurredAt >= cutoff && id !== event.replyContext?.providerMessageId
         && (event.telegramMediaGroupId === undefined || media.mediaGroupId !== event.telegramMediaGroupId);
     });
@@ -3080,7 +3237,7 @@ export class MessagingManager {
       const cutoff = now - TELEGRAM_GROUP_MEDIA_MAX_AGE_MS;
       const entries = selection.messageIds.flatMap(id => {
         if (id === selection.replyId || Number(id) <= previous || Number(id) >= selection.triggerId) return [];
-        const entry = pool.get(telegramGroupMediaKey(selection.address, id));
+        const entry = pool.get(messagingMessageKey(selection.address, id));
         return entry !== undefined && entry.occurredAt >= cutoff
           && (selection.albumId === undefined || entry.mediaGroupId !== selection.albumId) ? [entry] : [];
       }).sort((left, right) => Number(right.messageId) - Number(left.messageId));
@@ -5549,7 +5706,14 @@ function messagingAddressKey(address: MessagingAddress): string {
   ]);
 }
 
-function telegramGroupMediaKey(address: MessagingAddress, messageId: string): string {
+function isMessagingStopInput(event: MessagingInboundMessage): boolean {
+  return (event.address.channel === "telegram" || event.address.channel === "discord")
+    && event.attachments.length === 0 && event.unsupported.length === 0
+    && (event.telegramReplyParts === undefined || event.telegramReplyParts.attachments.length === 0 && event.telegramReplyParts.unsupported.length === 0)
+    && isMessagingStopCommand(event.text);
+}
+
+function messagingMessageKey(address: MessagingAddress, messageId: string): string {
   return JSON.stringify([address.providerConversationId, address.providerThreadId, messageId]);
 }
 
