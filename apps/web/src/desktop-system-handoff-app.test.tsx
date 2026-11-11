@@ -310,6 +310,76 @@ describe("Desktop system handoff App boundary", () => {
     }
   });
 
+  it.each(["matching", "different"] as const)("only replaces the source split slot when the child has %s lineage", async (lineage) => {
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockReturnValue(1_000);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
+    const taskA = session("task-a");
+    const taskB = { ...session("task-b"), generation: 8n };
+    const prompt = { ...timelineItem("prompt-b"), kind: "user" as const, sourceEventId: "event-b", nativeParentEntryId: "previous-native-entry" };
+    const child: SessionView = {
+      ...session("task-fork"),
+      derivationOrigin: { kind: "fork", sourceSessionId: taskB.id, sourceMessageId: prompt.id,
+        sourceEventId: lineage === "matching" ? "event-b" : "different-event", sourceSessionAvailable: true, sourceMessageAvailable: true }
+    };
+    const initial = connectedState({ route: { kind: "session", sessionId: taskA.id }, sessions: [taskA, taskB] });
+    const profile = { ...initial.activeProfile!, serverId: "message-fork-split-test" };
+    const branch = deferred<string>();
+    const forkSession = vi.fn<AppController["forkSession"]>(() => branch.promise);
+    const readDraftSnapshot = vi.fn<AppController["readDraftSnapshot"]>(async () => ({ revision: 0 }));
+    const saveDraftIfRevision = vi.fn<AppController["saveDraftIfRevision"]>(async () => 1);
+    const navigate = vi.fn();
+    const state: ControllerState = {
+      ...initial, profiles: [profile], activeProfile: profile,
+      snapshot: {
+        ...initial.snapshot,
+        timelineBySession: new Map([[taskB.id, [prompt]]]),
+        backends: [{ id: taskB.backendId, name: "Codex", version: "1", health: "healthy",
+          capabilities: new Map([["session.fork", { name: "session.fork", supported: true, options: [] }]]) }]
+      }
+    };
+    window.location.hash = "#/tasks/task-a";
+    writeSessionSplitLayout(profile.serverId, addSessionSplit({}, taskB.id, taskA.id, "right"));
+    const fixture = renderApp(state, { forkSession, readDraftSnapshot, saveDraftIfRevision, navigate });
+    try {
+      await fixture.render();
+      const pane = (id: string) => fixture.container.querySelector(`[data-session-split-pane="${id}"]`);
+      const fork = pane(taskB.id)?.querySelector<HTMLButtonElement>('button[aria-label="Fork from here"]');
+      expect(fork).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => { fork?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })); fork?.click(); });
+      const confirm = fixture.container.querySelector<HTMLButtonElement>('[data-message-fork-confirm="true"]');
+      expect(confirm).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => { confirm?.click(); confirm?.click(); });
+      expect(forkSession).toHaveBeenCalledExactlyOnceWith(taskB.id, "previous-native-entry", expect.any(String), {
+        messageId: prompt.id, eventId: "event-b", expectedGeneration: 8n
+      });
+      await act(async () => { pane(taskA.id)?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })); });
+      await act(async () => branch.resolve(child.id));
+      expect(saveDraftIfRevision).toHaveBeenCalledExactlyOnceWith(child.id, expect.objectContaining({ text: "prompt-b" }), 0);
+      expect(pane(taskB.id)).not.toBeNull();
+      expect(navigate).not.toHaveBeenCalled();
+
+      await fixture.render({ ...state, snapshot: { ...state.snapshot, sessions: [taskA, taskB, child] } });
+      expect(pane(taskA.id)).not.toBeNull();
+      if (lineage === "matching") {
+        expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: child.id });
+        expect(pane(taskB.id)).toBeNull();
+        expect(pane(child.id)).not.toBeNull();
+      } else {
+        expect(navigate).not.toHaveBeenCalled();
+        expect(pane(taskB.id)).not.toBeNull();
+        expect(pane(child.id)).toBeNull();
+      }
+    } finally {
+      await fixture.dispose();
+      writeSessionSplitLayout(profile.serverId, {});
+    }
+  });
+
   it.each(["succeeds", "fails"])("keeps the first message location when the later around read %s", async (outcome) => {
     vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
       return this.classList.contains("timeline") ? 600 : 0;

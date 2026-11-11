@@ -6382,7 +6382,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     sessionId: string,
     entryId: string,
     name: string,
-    sourceMessage?: { readonly messageId: string; readonly eventId: string }
+    sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly expectedGeneration?: bigint }
   ): Promise<string>;
   cloneSession(
     sessionId: string,

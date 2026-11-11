@@ -165,6 +165,13 @@ interface ActiveMessageFork {
   readonly isCurrent: () => boolean;
 }
 
+export interface MessageForkCompletion {
+  readonly sessionId: string;
+  readonly sourceMessageId: string;
+  readonly sourceEventId: string;
+  readonly isCurrent: () => boolean;
+}
+
 export type SessionPanePresentation = "standard" | "filesRail";
 
 export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JSX.Element {
@@ -177,7 +184,7 @@ export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JS
   </PartnerConversationProvider>;
 }
 
-function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, allowSplitMessageDelete = false, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
+function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, allowSplitMessageDelete = false, onSplitMessageForkOpened, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -186,6 +193,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly presentation?: SessionPanePresentation;
   readonly composerAutoFocus?: boolean;
   readonly allowSplitMessageDelete?: boolean;
+  readonly onSplitMessageForkOpened?: (completion: MessageForkCompletion) => void;
   readonly models: readonly ModelView[];
   readonly timeline: readonly TimelineItemView[];
   readonly timelineHasEarlier: boolean;
@@ -471,6 +479,19 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const occurrence = {};
     derivedTaskActionRef.current = occurrence;
     return { isCurrent: () => derivedTaskActionRef.current === occurrence && isSourceCurrent() };
+  };
+  const capturePaneMessageAction = (allowSplitPane: boolean): (() => boolean) => {
+    const pane = paneRef.current;
+    const view = pane?.ownerDocument.defaultView;
+    const locationHash = view?.location.hash;
+    const routeHash = appRouteHash(controllerRef.current.state.route);
+    const isSourceCurrent = captureTaskActionSource((route) => appRouteHash(route) === routeHash
+      && (sessionRouteIsCurrent(route, session.id) || allowSplitPane && route.kind === "session"));
+    return () => {
+      const current = controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id);
+      return pane?.isConnected === true && paneRef.current === pane && view?.location.hash === locationHash && isSourceCurrent()
+        && current?.backendId === session.backendId && current.targetId === session.targetId;
+    };
   };
   const bottomOverlayRef = useRef<HTMLDivElement>(null);
   const composerMessageMentionInsertionIdRef = useRef(0);
@@ -1359,18 +1380,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const target = resolveMessageDeleteTarget(item);
     if (!messageDeleteSupported || messageDeleteBlockedReason !== undefined || target === undefined) return;
     if (messageDeleteRef.current?.busy && messageDeleteRef.current.isCurrent()) return;
-    const pane = paneRef.current;
-    if (pane === null) return;
-    const view = pane.ownerDocument.defaultView;
-    const locationHash = view?.location.hash;
-    const routeHash = appRouteHash(controllerRef.current.state.route);
-    const isSourceCurrent = captureTaskActionSource((route) => appRouteHash(route) === routeHash
-      && (sessionRouteIsCurrent(route, session.id) || allowSplitMessageDelete && route.kind === "session"));
-    const isCurrent = () => {
-      const current = controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id);
-      return pane.isConnected && paneRef.current === pane && view?.location.hash === locationHash && isSourceCurrent()
-        && current?.backendId === session.backendId && current.targetId === session.targetId;
-    };
+    const isCurrent = capturePaneMessageAction(allowSplitMessageDelete);
     if (!isCurrent()) return;
     const deleteMessage = controller.deleteSessionMessage;
     const next: ActiveMessageDelete = {
@@ -1555,13 +1565,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       messageId: item.messageId ?? item.id,
       eventId: item.sourceEventId,
       nativeEntryId: target.entryId,
-      isCurrent: captureTaskActionSource()
+      isCurrent: onSplitMessageForkOpened === undefined ? captureTaskActionSource() : capturePaneMessageAction(true)
     });
   };
 
   const confirmMessageFork = (): void => {
     const pending = messageFork;
-    if (pending === undefined || pending.sessionId !== session.id || forkingMessageId !== undefined) return;
+    if (pending === undefined || pending.sessionId !== session.id || messageForkActionRef.current !== undefined) return;
     setMessageFork(undefined);
     if (!pending.isCurrent()) return;
     const currentSource = () => {
@@ -1593,7 +1603,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       return;
     }
     const actionOwner = beginDerivedTaskAction(pending.isCurrent);
-    const { forkSession, saveDraft, navigate, loadSessionTimelineAround } = controllerRef.current;
+    const { forkSession, saveDraft, readDraftSnapshot, saveDraftIfRevision, navigate, loadSessionTimelineAround } = controllerRef.current;
     const forkOccurrence = {};
     messageForkActionRef.current = forkOccurrence;
     setForkingMessageId(pending.itemId);
@@ -1623,7 +1633,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           pending.sessionId,
           target.entryId,
           t("session.branchSuffix", { name: sourceSessionName }),
-          { messageId: pending.messageId, eventId: pending.eventId }
+          { messageId: pending.messageId, eventId: pending.eventId,
+            ...(onSplitMessageForkOpened === undefined ? {} : { expectedGeneration: source.session.generation }) }
         );
         if (!actionOwner.isCurrent()) return;
         if (target.composerText !== undefined) {
@@ -1633,15 +1644,24 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             role: "user",
             sourceEventId: pending.eventId
           }, "edit", item.pastedTextRanges);
-          await saveDraft(forkedSessionId, {
+          const draft = {
             text: composerDocumentPlainText(editorDocument),
             editorDocument,
             attachments: [],
             mentions: [],
-            deliveryMode: "prompt"
-          });
+            deliveryMode: "prompt" as const
+          };
+          if (onSplitMessageForkOpened === undefined) await saveDraft(forkedSessionId, draft);
+          else {
+            const original = await readDraftSnapshot(forkedSessionId);
+            if (!actionOwner.isCurrent()) return;
+            if (original.draft === undefined) await saveDraftIfRevision(forkedSessionId, draft, original.revision);
+          }
         }
-        if (actionOwner.isCurrent()) navigate({ kind: "session", sessionId: forkedSessionId });
+        if (!actionOwner.isCurrent()) return;
+        if (onSplitMessageForkOpened === undefined) navigate({ kind: "session", sessionId: forkedSessionId });
+        else onSplitMessageForkOpened({ sessionId: forkedSessionId, sourceMessageId: pending.messageId,
+          sourceEventId: pending.eventId, isCurrent: actionOwner.isCurrent });
       } catch (error) {
         if (actionOwner.isCurrent()) throw error;
       } finally {

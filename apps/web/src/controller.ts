@@ -2861,12 +2861,12 @@ export function useAppController(): AppController {
     }
     return artifactGateway;
   }, [artifactGateway, linkGatewayGeneration]);
-  const deleteSessionMessage = useCallback<OperationApi["deleteSessionMessage"]>(async (sessionId, eventId, expectedGeneration) => {
+  const taskMessageGateway = useCallback((): OrchestratorGateway => {
     if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
       || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
       throw new Error("The original task connection is no longer current.");
     }
-    await artifactGateway.deleteSessionMessage(sessionId, eventId, expectedGeneration);
+    return artifactGateway;
   }, [artifactGateway, linkGatewayGeneration]);
   const modelPriceApi = useMemo<Pick<AppController, "getModelPriceOverride" | "setModelPriceOverride" | "resetModelPriceOverride">>(() => ({
     getModelPriceOverride: async (...args) => {
@@ -3821,7 +3821,7 @@ export function useAppController(): AppController {
     abortRetry: (runId) => gateway().abortRetry(runId),
     retry: (runId) => gateway().retry(runId),
     resetSession: (sessionId) => gateway().resetSession(sessionId),
-    deleteSessionMessage,
+    deleteSessionMessage: async (...args) => taskMessageGateway().deleteSessionMessage(...args),
     renameSession: (sessionId, name) => gateway().renameSession(sessionId, name),
     createTaskTag: (originSessionId, name, color, expectedCatalogRevision, presetId) =>
       gateway().createTaskTag(originSessionId, name, color, expectedCatalogRevision, presetId),
@@ -3888,7 +3888,8 @@ export function useAppController(): AppController {
     getSessionStatistics: (sessionId, signal) => gateway().getSessionStatistics(sessionId, signal),
     getSessionTree: (sessionId): Promise<NativeSessionTreeView> => gateway().getSessionTree(sessionId),
     navigateSessionBranch,
-    forkSession: (sessionId, entryId, name, sourceMessage) => gateway().forkSession(sessionId, entryId, name, sourceMessage),
+    forkSession: async (sessionId, entryId, name, sourceMessage) =>
+      (sourceMessage?.expectedGeneration === undefined ? gateway() : taskMessageGateway()).forkSession(sessionId, entryId, name, sourceMessage),
     cloneSession: (sessionId, name, sourceMessage) => gateway().cloneSession(sessionId, name, sourceMessage),
     resolveInteraction: (interaction, value) => gateway().resolveInteraction(interaction, value),
     dismissInteraction: (interaction) => gateway().dismissInteraction(interaction),
@@ -4090,7 +4091,7 @@ export function useAppController(): AppController {
     searchAllSessionMessages: (query, options) => gateway().searchAllSessionMessages(query, options),
     searchRemoteSessionMessages,
     loadSessionTimelinePage: (sessionId, beforeCursor, limit) => gateway().loadSessionTimelinePage(sessionId, beforeCursor, limit),
-    loadSessionTimelineAround: (sessionId, eventId, limit) => gateway().loadSessionTimelineAround(sessionId, eventId, limit),
+    loadSessionTimelineAround: async (sessionId, eventId, limit) => taskMessageGateway().loadSessionTimelineAround(sessionId, eventId, limit),
     listWorkspaceEntries: (workspaceId, parentPath, options) => gateway().listWorkspaceEntries(workspaceId, parentPath, options),
     listWorkspaceEntryPage: (workspaceId, parentPath, pageToken, pageSize, options) => gateway().listWorkspaceEntryPage(workspaceId, parentPath, pageToken, pageSize, options),
     listWorkspaceFiles: (workspaceId, signal) => gateway().listWorkspaceFiles(workspaceId, signal),
@@ -4494,7 +4495,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, taskMessageGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

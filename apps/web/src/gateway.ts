@@ -3761,8 +3761,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     sessionId: string,
     entryId: string,
     name: string,
-    sourceMessage?: { readonly messageId: string; readonly eventId: string }
+    sourceMessage?: Parameters<OrchestratorGateway["forkSession"]>[3]
   ): Promise<string> {
+    const expectedGeneration = sourceMessage?.expectedGeneration;
+    const scope = expectedGeneration === undefined ? undefined : this.captureActionScope();
+    const operationId = scope === undefined ? undefined : randomUuid();
+    const connectionId = this.#profile?.id;
+    const source = scope === undefined ? undefined : this.#snapshot?.sessions.find((session) => session.id === sessionId);
+    if (expectedGeneration !== undefined && (expectedGeneration < 1n || source?.generation !== expectedGeneration)) {
+      throw new GatewayError("The original task generation is no longer current.");
+    }
     const operation = await this.submit({
       case: "forkSession",
       value: {
@@ -3774,7 +3782,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           sourceEventId: sourceMessage.eventId
         })
       }
-    }, true);
+    }, true, expectedGeneration === undefined ? [] : [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }],
+    scope?.signal, undefined, operationId);
+    if (scope !== undefined) {
+      const mutation = operation.mutation?.payload;
+      const result = operation.result?.payload;
+      const child = result?.case === "session" ? result.value : undefined;
+      const origin = child?.derivationOrigin;
+      if (scope.signal.aborted || this.#transport !== scope.transport || operation.state !== OperationState.SUCCEEDED
+        || operation.operationId !== operationId || operation.connectionId !== connectionId || mutation?.case !== "forkSession"
+        || mutation.value.sourceSessionId !== sessionId || mutation.value.nativeEntryId !== entryId
+        || mutation.value.sourceMessageId !== sourceMessage?.messageId || mutation.value.sourceEventId !== sourceMessage?.eventId
+        || (operation.version?.revision?.value ?? 0n) < 1n || !child?.sessionId || child.sessionId === sessionId
+        || child.backendId !== source?.backendId || child.targetId !== source?.targetId || !child.nativeBinding?.opaqueReference
+        || child.nativeBinding.runtimeGeneration < 1n || origin?.kind !== SessionDerivationKind.FORK || origin.sideChat
+        || origin.sourceSessionId !== sessionId || origin.sourceMessageId !== sourceMessage?.messageId
+        || origin.sourceEventId !== sourceMessage?.eventId) {
+        throw new GatewayError("The original message fork result could not be confirmed.", { code: "RESULT_UNKNOWN" });
+      }
+    }
     return operationSessionId(operation);
   }
 

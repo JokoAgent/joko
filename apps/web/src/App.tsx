@@ -131,6 +131,7 @@ import { ExtensionMainViewPage } from "./components/ExtensionMainViewPage.js";
 import { createProviderModelRefreshLifecycle } from "./provider-model-refresh-lifecycle.js";
 import type { NewSessionProjectPickerRequest } from "./components/NewSessionPage.js";
 import type { ObjectiveDialogHandoffRequest } from "./components/ObjectiveIndicator.js";
+import type { MessageForkCompletion } from "./components/SessionPane.js";
 import type { DedicatedHardwareCommand, DedicatedHardwareTaskCatalog } from "./dedicated-hardware.js";
 import {
   createDedicatedHardwareTaskCatalog,
@@ -189,6 +190,11 @@ interface ActiveTimelineHistory {
   readonly initialized: boolean;
   readonly loading: boolean;
   readonly error?: string;
+}
+
+interface SplitMessageFork extends MessageForkCompletion {
+  readonly paneKey: string;
+  readonly sourceSessionId: string;
 }
 
 interface MessageDeepLinkHistorySearch {
@@ -321,6 +327,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   movingSessionProjectIdsRef.current = movingSessionProjectIds;
   const [sessionSplitLayout, setSessionSplitLayout] = useState<SessionSplitLayout>({});
   const [focusedSplitSessionId, setFocusedSplitSessionId] = useState<string>();
+  const [splitMessageForks, setSplitMessageForks] = useState<readonly SplitMessageFork[]>([]);
   const [portableExportSession, setPortableExportSession] = useState<SessionView>();
   const [portableImportRequest, setPortableImportRequest] = useState<PortableSessionImportRequest>();
   const portableImportConnectionKey = portableSessionImportOwnerKey(state);
@@ -1017,6 +1024,32 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     setSessionSplitLayout(layout);
     if (splitOwnerId !== undefined) writeSessionSplitLayout(splitOwnerId, layout, !auxiliaryApplicationWindow);
   }, [auxiliaryApplicationWindow, splitOwnerId]);
+  useEffect(() => {
+    if (splitMessageForks.length === 0) return;
+    const panes = sessionSplitPanes(sessionSplitLayout.root);
+    const settled = new Set<SplitMessageFork>();
+    for (const fork of splitMessageForks) {
+      if (!fork.isCurrent() || !panes.some((pane) => pane.key === fork.paneKey && pane.sessionId === fork.sourceSessionId)) {
+        settled.add(fork);
+        continue;
+      }
+      // The durable Operation can finish before the connected catalog shows its child.
+      const child = state.snapshot.sessions.find((session) => session.id === fork.sessionId);
+      if (child === undefined) continue;
+      settled.add(fork);
+      const origin = child.derivationOrigin;
+      if (child.archived || child.state === "closed" || origin?.kind !== "fork" || origin.sideChat === true
+        || origin.sourceSessionId !== fork.sourceSessionId || origin.sourceMessageId !== fork.sourceMessageId
+        || origin.sourceEventId !== fork.sourceEventId) continue;
+      const next = replaceSessionSplit(sessionSplitLayout, fork.sourceSessionId, child.id);
+      if (next === sessionSplitLayout) continue;
+      commitSessionSplitLayout(next);
+      setFocusedSplitSessionId(child.id);
+      controller.navigate({ kind: "session", sessionId: child.id });
+      break;
+    }
+    if (settled.size > 0) setSplitMessageForks((current) => current.filter((fork) => !settled.has(fork)));
+  }, [commitSessionSplitLayout, controller, sessionSplitLayout, splitMessageForks, state.snapshot.sessions]);
   useEffect(() => {
     if (splitOwnerId === undefined || state.connectionState !== "connected" || state.snapshot.revision === 0n) return;
     const activeIds = new Set(state.snapshot.sessions.filter((session) => !session.archived).map((session) => session.id));
@@ -2266,10 +2299,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
   const renderSessionSplitPane = (sessionId: string): JSX.Element | null => {
     if (activeSession?.id === sessionId) return renderActiveSessionPane(false);
+    const paneKey = splitOwnerId !== undefined && splitOwnerRef.current === splitOwnerId
+      ? sessionSplitPanes(sessionSplitLayout.root).find((pane) => pane.sessionId === sessionId)?.key
+      : undefined;
     return <SplitSessionPaneHost
       key={sessionId}
       controller={controller}
       sessionId={sessionId}
+      allowSplitMessageDelete={paneKey !== undefined}
+      onSplitMessageForkOpened={paneKey === undefined ? undefined : (completion) => {
+        setSplitMessageForks((current) => [...current, { ...completion, paneKey, sourceSessionId: sessionId }]);
+      }}
       navigationOpen={navigationOpen}
       t={t}
       runAction={runAction}
@@ -2754,9 +2794,11 @@ function sessionForTaskRoute(state: ControllerState, sessionId: string): Session
   return scoped.session;
 }
 
-function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAction, onOpenNavigation, onRename, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, onOpenTurnReview }: {
+function SplitSessionPaneHost({ controller, sessionId, allowSplitMessageDelete, onSplitMessageForkOpened, navigationOpen, t, runAction, onOpenNavigation, onRename, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, onOpenTurnReview }: {
   readonly controller: AppController;
   readonly sessionId: string;
+  readonly allowSplitMessageDelete: boolean;
+  readonly onSplitMessageForkOpened?: (completion: MessageForkCompletion) => void;
   readonly navigationOpen: boolean;
   readonly t: (key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => string;
   readonly runAction: RunAction;
@@ -2843,7 +2885,8 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
     backend={backend}
     reviewReadOnly={reviewer !== undefined}
     composerAutoFocus={false}
-    allowSplitMessageDelete
+    allowSplitMessageDelete={allowSplitMessageDelete}
+    onSplitMessageForkOpened={onSplitMessageForkOpened}
     models={snapshot.models}
     timeline={timeline}
     timelineHasEarlier={currentHistory === undefined || !currentHistory.initialized || currentHistory.nextBeforeCursor !== undefined}
