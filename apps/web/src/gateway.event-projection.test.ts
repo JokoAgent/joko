@@ -461,6 +461,14 @@ describe("incremental event projection", () => {
       payload: { kind: { case: "messageCompleted", value: { messageId: "message", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Final" } }] } } } });
     expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).snapshot.timelineBySession.get("session")?.[0]?.completionCursor).toBeUndefined();
   });
+  it("keeps the completed user row cursor from the v1 user input event", () => {
+    const raw = create(SnapshotSchema, { generation: 1n });
+    const identity = { sessionId: "session", sequence: 1n, runId: "run" };
+    const event = create(EventSchema, { eventId: "complete", identity, cursor: { generation: 1n, sequence: 5n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "user", role: MessageRole.USER, userInputAccepted: true } } } });
+    expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).snapshot.timelineBySession.get("session")?.[0])
+      .toMatchObject({ sourceEventId: "complete", completionCursor: 5n, streaming: false });
+  });
   it("reconciles loaded Session labels from one bounded owner catalog event", () => {
     const work = {
       taskTagId: "preset:work",

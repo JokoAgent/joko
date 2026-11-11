@@ -29,7 +29,7 @@ import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigatio
 import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
-import { Composer, type ComposerHistoryEntry } from "./Composer.js";
+import { Composer, type ComposerHistoryEntry, type PrepareRewindDraft } from "./Composer.js";
 import { CompactionStatusIndicator } from "./CompactionStatusIndicator.js";
 import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacityRing.js";
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
@@ -126,8 +126,11 @@ interface ActiveShareSelection {
 }
 
 interface ActiveMessageRewind extends MessageRewindPreviewState {
+  readonly requestId: number;
   readonly sessionId: string;
   readonly itemId: string;
+  readonly sourceEventId?: string;
+  readonly completionCursor?: bigint;
   readonly target: NativeNavigationTargetView;
   readonly generation: bigint;
   readonly navigate: AppController["navigateSessionBranch"];
@@ -473,6 +476,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const appliedExternalAttachmentInsertionRef = useRef<string | undefined>(undefined);
   const composerDraftReplacementIdRef = useRef(0);
   const composerLocalDraftEpochRef = useRef(0);
+  const rewindDraftRef = useRef<PrepareRewindDraft | null>(null);
   const noteComposerDraftMutation = useCallback(() => { composerLocalDraftEpochRef.current += 1; setComposerDraftReplacement(undefined); }, []);
   const shareSelectionBeforeAllRef = useRef<ReadonlySet<string> | undefined>(undefined);
   const messageRewindRequestIdRef = useRef(0);
@@ -1834,7 +1838,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && activeSessionIdRef.current === session.id
       && controllerRef.current.navigateSessionBranch === sourceController.navigateSessionBranch
       && controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id)?.generation === generation;
-    setMessageRewind({ sessionId: session.id, itemId: item.id, target: navigationTarget, generation, navigate: sourceController.navigateSessionBranch, executeWorkspaceRewind: sourceController.executeWorkspaceRewind, isCurrent, loadingFiles: filesSupported });
+    setMessageRewind({ requestId, sessionId: session.id, itemId: item.id, sourceEventId: item.sourceEventId, completionCursor: item.completionCursor,
+      target: navigationTarget, generation, navigate: sourceController.navigateSessionBranch, executeWorkspaceRewind: sourceController.executeWorkspaceRewind,
+      isCurrent, loadingFiles: filesSupported });
     if (!filesSupported || workspace === undefined || runId === undefined) return;
     const sourceSessionId = session.id;
     const workspaceId = workspace.id;
@@ -1859,26 +1865,56 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     })();
   };
 
-  const closeMessageRewind = (): void => {
-    messageRewindRequestIdRef.current += 1;
-    setMessageRewind(undefined);
+  const closeMessageRewind = (requestId: number | undefined): void => {
+    if (messageRewindRequestIdRef.current === requestId) messageRewindRequestIdRef.current += 1;
+    setMessageRewind((current) => current?.requestId === requestId ? undefined : current);
   };
 
   const rewindDialogueOnly = async (): Promise<void> => {
     const rewind = messageRewind;
     if (rewind === undefined || !rewind.isCurrent() || rewind.sessionId !== session.id) throw new Error(t("timeline.rewindUnavailable"));
-    const latest = controllerRef.current.state.snapshot;
-    const latestSession = latest.sessions.find((candidate) => candidate.id === rewind.sessionId);
-    const latestBackend = latestSession === undefined ? undefined : latest.backends.find((candidate) => candidate.id === latestSession.backendId);
-    const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
-    const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
-    if (latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
-    const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
-    if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
-      || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, sessionCapabilitySupportsTarget(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
-      throw new Error(t("timeline.rewindStale"));
+    const readCurrentMessage = (): TimelineItemView => {
+      const latest = controllerRef.current.state.snapshot;
+      const latestSession = latest.sessions.find((candidate) => candidate.id === rewind.sessionId);
+      const latestBackend = latestSession === undefined ? undefined : latest.backends.find((candidate) => candidate.id === latestSession.backendId);
+      const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
+      const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
+      if (!rewind.isCurrent() || latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
+      const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
+      if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
+        || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, sessionCapabilitySupportsTarget(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
+        throw new Error(t("timeline.rewindStale"));
+      }
+      return currentItem;
+    };
+    const item = readCurrentMessage();
+    const text = rewind.target.kind === "native_entry" && !guest && !reviewReadOnly && session.derivationOrigin?.sideChat !== true
+      && item.sourceEventId === rewind.sourceEventId && item.completionCursor === rewind.completionCursor
+      && controllerRef.current.state.taskSource?.kind !== "joined"
+      && (partnerConversation === undefined || partnerConversation.kind === "task") ? plainMessageRewindDraftText(item) : undefined;
+    const prepare = rewindDraftRef.current;
+    let restore: Awaited<ReturnType<PrepareRewindDraft>> = undefined;
+    let draftFailed = false;
+    if (text !== undefined && prepare !== null) {
+      try { restore = await prepare(rewind.isCurrent); }
+      catch { draftFailed = true; }
+      const current = readCurrentMessage();
+      if (current.sourceEventId !== item.sourceEventId || current.completionCursor !== item.completionCursor || plainMessageRewindDraftText(current) !== text) {
+        restore = undefined;
+        draftFailed = false;
+      }
     }
-    await rewind.navigate(rewind.sessionId, rewind.target, { expectedGeneration: rewind.generation });
+    let sameGenerationConfirmed = false;
+    await rewind.navigate(rewind.sessionId, rewind.target, {
+      expectedGeneration: rewind.generation,
+      ...(restore === undefined ? {} : { onSameGenerationConfirmed: () => { sameGenerationConfirmed = true; } })
+    });
+    if (!rewind.isCurrent() || text === undefined) return;
+    try { if (sameGenerationConfirmed) await restore?.(text); }
+    catch { draftFailed = true; }
+    if (draftFailed && rewind.isCurrent()) {
+      runAction(`rewind-draft:${rewind.itemId}`, async () => { throw new Error(t("timeline.rewindDraftRestoreFailed")); });
+    }
   };
 
   const rewindFilesOnly = async (): Promise<void> => {
@@ -2458,7 +2494,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }}
           t={t}
         />}
-<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
+<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} rewindDraftRef={rewindDraftRef} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
           if (handoff !== undefined) {
             if (!objectiveDialogRequestMatchesOwner(handoff, controller, session)) {
               onObjectiveDialogHandoffHandled?.(handoff.id);
@@ -2525,11 +2561,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         </div>
       </Modal>
       <MessageRewindDialog
-        key={messageRewind === undefined ? "message-rewind:none" : `${messageRewind.sessionId}:${messageRewind.itemId}`}
+        key={messageRewind?.requestId ?? "message-rewind:none"}
         open={messageRewind !== undefined && messageRewind.sessionId === session.id}
         state={messageRewind ?? { loadingFiles: false }}
         t={t}
-        onClose={closeMessageRewind}
+        onClose={() => closeMessageRewind(messageRewind?.requestId)}
         onDialogueOnly={rewindDialogueOnly}
         onFilesOnly={rewindFilesOnly}
       />
@@ -2538,6 +2574,16 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       </Modal>
     </main>
   );
+}
+
+function plainMessageRewindDraftText(item: TimelineItemView): string | undefined {
+  if (item.kind !== "user" || item.streaming === true || item.completionCursor === undefined || !item.sourceEventId
+    || item.partnerPrivateOrigin !== undefined || item.sharedTaskAuthor !== undefined || item.automationOrigin !== undefined
+    || item.inputDelivery === "scheduler"
+    || item.replyQuote !== undefined || item.todoQuote !== undefined || item.quotesEncoded === true
+    || (item.attachments?.length ?? 0) > 0 || (item.inputMentions?.length ?? 0) > 0
+    || (item.mentionRanges?.length ?? 0) > 0 || (item.pastedTextRanges?.length ?? 0) > 0) return undefined;
+  return item.text?.trim() ? item.text : undefined;
 }
 
 async function restoreEditedMessageDraft(

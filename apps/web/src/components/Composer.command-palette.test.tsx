@@ -2,7 +2,7 @@
 import type { JSONContent } from "@tiptap/core";
 import { create } from "@bufbuild/protobuf";
 import { PersonalDevelopmentDoctorRunSchema, PersonalDevelopmentStateSchema } from "@joko/contracts";
-import { act, forwardRef, useImperativeHandle, useRef } from "react";
+import { act, createRef, forwardRef, useImperativeHandle, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
@@ -12,7 +12,7 @@ import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type ModelView, type ObjectiveView, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
-import { Composer } from "./Composer.js";
+import { Composer, type PrepareRewindDraft } from "./Composer.js";
 import type { ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
 import { WORKSPACE_ENTRY_DRAG_MIME, encodeWorkspaceEntryDragPayload } from "./workspace-tree-state.js";
 
@@ -162,6 +162,75 @@ afterEach(async () => {
   rafCallbacks.splice(0);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
+});
+
+it("restores an empty composer with one conditional save and no delayed autosave or Send", async () => {
+  vi.useFakeTimers();
+  const view = await mountRewindDraft(draft(""));
+  const restore = await act(async () => view.rewindDraftRef.current!(() => true));
+  expect(restore).toBeDefined();
+  expect(view.api.saveDraft).not.toHaveBeenCalled();
+  expect(view.compareAndSave).not.toHaveBeenCalled();
+
+  await act(async () => restore!("Earlier user input\nSecond line"));
+  expect(view.editor().value).toBe("Earlier user input\nSecond line");
+  expect(view.compareAndSave).toHaveBeenCalledExactlyOnceWith(baseSession.id, expect.objectContaining({ text: "Earlier user input\nSecond line" }), 1);
+  await act(async () => vi.advanceTimersByTimeAsync(500));
+  expect(view.api.saveDraft).not.toHaveBeenCalled();
+  expect(view.api.send).not.toHaveBeenCalled();
+});
+
+it.each(["editor", "durable draft"] as const)("keeps later input in the %s after preparing rewind recovery", async (destination) => {
+  vi.useFakeTimers();
+  const view = await mountRewindDraft(draft(""));
+  const restore = await act(async () => view.rewindDraftRef.current!(() => true));
+  expect(restore).toBeDefined();
+  if (destination === "editor") await input(view.editor(), "Later user input", 16);
+  else view.writeElsewhere("Later user input");
+
+  await act(async () => restore!("Earlier user input"));
+  if (destination === "editor") {
+    expect(view.editor().value).toBe("Later user input");
+    expect(view.compareAndSave).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+  } else {
+    expect(view.editor().value).toBe("");
+    expect(view.compareAndSave).toHaveBeenCalledOnce();
+  }
+  expect(view.drafts.get(baseSession.id)?.text).toBe("Later user input");
+});
+
+it("keeps an occupied composer outside the rewind draft recovery", async () => {
+  const view = await mountRewindDraft(draft("Keep the current draft"));
+  await expect(view.rewindDraftRef.current!(() => true)).resolves.toBeUndefined();
+  expect(view.compareAndSave).not.toHaveBeenCalled();
+  expect(view.editor().value).toBe("Keep the current draft");
+});
+
+it("preserves another window's saved input when an empty composer has a pending hydration autosave", async () => {
+  vi.useFakeTimers();
+  const view = await mountRewindDraft(draft(""));
+  view.writeElsewhere("Draft saved in another window");
+
+  await expect(view.rewindDraftRef.current!(() => true)).resolves.toBeUndefined();
+  await act(async () => vi.advanceTimersByTimeAsync(500));
+  expect(view.api.saveDraft).not.toHaveBeenCalled();
+  expect(view.compareAndSave).not.toHaveBeenCalled();
+  expect(view.drafts.get(baseSession.id)?.text).toBe("Draft saved in another window");
+});
+
+it("retires the prepared rewind draft when the composer changes tasks", async () => {
+  vi.useFakeTimers();
+  const view = await mountRewindDraft(draft(""));
+  const restore = await act(async () => view.rewindDraftRef.current!(() => true));
+  expect(restore).toBeDefined();
+
+  await view.render({ ...baseSession, id: "task-two" });
+  await act(async () => restore!("Earlier user input"));
+  expect(view.compareAndSave).not.toHaveBeenCalled();
+  expect(view.editor().value).toBe("second task");
+  expect(view.drafts.get(baseSession.id)?.text).toBe("");
 });
 
 it("inserts a bound skill only from the current task runtime catalog without sending", async () => {
@@ -1054,6 +1123,7 @@ async function mount(
   roots.push(root);
   const actions: Promise<unknown>[] = [];
   const actionErrors: unknown[] = [];
+  const rewindDraftRef = createRef<PrepareRewindDraft>();
   let completeObjectiveDialog = (): void => undefined;
   const openObjective = vi.fn((onSaved: () => void) => { completeObjectiveDialog = onSaved; });
   const rejectObjectiveDialogHandoff = vi.fn();
@@ -1086,6 +1156,7 @@ async function mount(
       }]}
       commands={commands}
       objectiveDialogHandoff={activeObjectiveDialogHandoff}
+      rewindDraftRef={rewindDraftRef}
       messageHistory={[]}
       t={(key) => key}
       runAction={(_key, action) => { actions.push(action().catch((error: unknown) => { actionErrors.push(error); })); }}
@@ -1101,6 +1172,7 @@ async function mount(
     drafts,
     actions,
     actionErrors,
+    rewindDraftRef,
     openObjective,
     rejectObjectiveDialogHandoff,
     completeObjectiveDialog: () => completeObjectiveDialog(),
@@ -1111,6 +1183,27 @@ async function mount(
     add: () => host.querySelector<HTMLButtonElement>('button[aria-label="common.add"]')!,
     shell: () => host.querySelector<HTMLButtonElement>('button[aria-label="composer.shellEnter"]')!
   };
+}
+
+async function mountRewindDraft(initialDraft: ComposerDraft) {
+  const view = await mount(initialDraft);
+  let revision = 1;
+  vi.mocked(view.api.readDraftSnapshot).mockImplementation(async (sessionId) => ({ revision, draft: view.drafts.get(sessionId) }));
+  vi.mocked(view.api.saveDraft).mockImplementation(async (sessionId, value) => {
+    view.drafts.set(sessionId, value);
+    revision += 1;
+  });
+  const compareAndSave = vi.fn<AppController["saveDraftIfRevision"]>(async (sessionId, value, expected) => {
+    if (expected !== revision) return undefined;
+    view.drafts.set(sessionId, value);
+    return ++revision;
+  });
+  view.api.saveDraftIfRevision = compareAndSave;
+  const writeElsewhere = (text: string): void => {
+    view.drafts.set(baseSession.id, draft(text));
+    revision += 1;
+  };
+  return { ...view, compareAndSave, writeElsewhere };
 }
 
 async function mountPersonalDevelopment(initialDraft: ComposerDraft) {
