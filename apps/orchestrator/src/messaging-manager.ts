@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { fileTypeFromBuffer } from "file-type";
 import {
+  DISCORD_MAXIMUM_INBOUND_FILE_BYTES,
+  TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES,
   DingTalkTransport,
   DiscordTransport,
   FeishuTransport,
@@ -71,6 +73,7 @@ import type { PartnerMessagingRuntime, PartnerMessagingBinding, PartnerMessageDe
 import type { ArtifactStore } from "./artifact-store.js";
 import type { CredentialManager } from "./credential-manager.js";
 import type { CredentialVault } from "./credential-vault.js";
+import { sniffMediaMime } from "./extension-cards/media-sniff.js";
 import type { EnqueueResult, InteractionDecisionSubmission, SessionHost } from "./session-host.js";
 import { listAllInteractions, listAllMessagingInboundRequests } from "./operational-pagination.js";
 
@@ -2496,13 +2499,45 @@ export class MessagingManager {
         { code: "protected_media", label: "Protected media was not retained." }
       ] };
     }
-    const existingArtifactCount = request.artifactIds.length;
-    for (let index = existingArtifactCount; index < event.attachments.length; index += 1) {
+    // A rejected media attachment can leave a gap in the original provider order.
+    const stagedOrdinals = request.artifactIds.length === 0
+      ? undefined
+      : new Set(this.#store.listMessagingRequestArtifactOrdinals(request.id));
+    const unsupported = [...event.unsupported];
+    for (const [index, attachment] of event.attachments.entries()) {
+      if (stagedOrdinals?.has(index)) continue;
       signal.throwIfAborted();
       this.#requireWorkerConnection(connection.id, connection.generation);
-      const attachment = event.attachments[index]!;
-      const downloaded = await transport.downloadAttachment(attachment, signal);
-      const mimeType = await verifiedAttachmentMime(transport.channel, attachment.kind, attachment.mimeType, downloaded);
+      let downloaded: MessagingDownloadedAttachment;
+      try {
+        downloaded = await transport.downloadAttachment(attachment, signal);
+      } catch (error) {
+        if (attachment.audioVideo === undefined || isCancelled(error)
+          || (error instanceof MessagingTransportError && (error.code === "invalid_credential" || error.code === "conflict"))) throw error;
+        signal.throwIfAborted();
+        this.#requireWorkerConnection(connection.id, connection.generation);
+        const code = error instanceof MessagingTransportError && error.code === "payload_too_large" ? "oversize" : "download";
+        unsupported.push({ code, label: attachment.fileName });
+        continue;
+      }
+      let mimeType: string | null;
+      if (attachment.audioVideo === undefined) {
+        mimeType = await verifiedAttachmentMime(transport.channel, attachment.kind, attachment.mimeType, downloaded);
+      } else {
+        const maximumBytes = transport.channel === "discord"
+          ? DISCORD_MAXIMUM_INBOUND_FILE_BYTES
+          : TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES;
+        if (downloaded.bytes.byteLength > maximumBytes) {
+          unsupported.push({ code: "oversize", label: attachment.fileName });
+          continue;
+        }
+        mimeType = sniffMediaMime(downloaded.bytes, attachment.mimeType ?? "");
+        if (mimeType === null || (!mimeType.startsWith("audio/") && !mimeType.startsWith("video/"))) {
+          unsupported.push({ code: attachment.audioVideo, label: attachment.fileName });
+          continue;
+        }
+      }
+      signal.throwIfAborted();
       this.#requireWorkerConnection(connection.id, connection.generation);
       const artifact = await this.#artifacts.ingestBytes(downloaded.bytes, {
         fileName: downloaded.fileName,
@@ -2510,6 +2545,8 @@ export class MessagingManager {
         expiresAt: this.#now() + ATTACHMENT_STAGING_TTL_MS
       });
       try {
+        signal.throwIfAborted();
+        this.#requireWorkerConnection(connection.id, connection.generation);
         request = this.#store.attachMessagingRequestArtifact({
           requestId: request.id,
           expectedRevision: request.revision,
@@ -2522,11 +2559,13 @@ export class MessagingManager {
       }
     }
 
+    signal.throwIfAborted();
+    this.#requireWorkerConnection(connection.id, connection.generation);
     activeConversation = this.#store.getMessagingConversation(activeConversation.id);
     if (activeConversation.sessionId === undefined) throw new Error("Messaging conversation has no Session binding.");
     const artifacts = request.artifactIds.map((artifactId) => this.#store.getArtifact(artifactId).blob);
     const origin = this.#partnerRuntime?.origin(activeConversation, event, request.id);
-    const prompt = { ...this.#messagePrompt(activeConversation, event, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
+    const prompt = { ...this.#messagePrompt(activeConversation, { ...event, unsupported }, artifacts), ...(origin ? { messagingOrigin: origin } : {}) };
     const configuration = decodeSupportedConnection(connection);
     const overrides: TurnExecutionOverrides | undefined = origin
       ? { permissionMode: 'ask' }

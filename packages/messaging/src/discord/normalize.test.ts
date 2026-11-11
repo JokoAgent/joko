@@ -67,6 +67,36 @@ describe("normalizeDiscordUpdates", () => {
     }));
   });
 
+  it("classifies declared and extension-inferred media in the owner DM and keeps guild attachment rules", () => {
+    const audio = {
+      id: "888888888888888888", filename: "voice-message.ogg", content_type: "audio/ogg",
+      size: 1024, url: "https://cdn.discordapp.com/attachments/audio"
+    };
+    const video = {
+      id: "888888888888888889", filename: "clip.mp4", content_type: "application/octet-stream",
+      size: 2048, url: "https://cdn.discordapp.com/attachments/video"
+    };
+    const direct = message({ id: snowflake(NOW, 2), channelId: DM_ID, author: owner, content: "", attachments: [audio, video] });
+    const thread = message({
+      id: snowflake(NOW, 3), channelId: THREAD_ID, guildId: GUILD_ID, author: other,
+      content: `<@${BOT_ID}> listen`, mentions: [bot], attachments: [audio, video]
+    });
+    const result = normalizeDiscordUpdates([
+      update(2, direct, { id: DM_ID, type: 1 }),
+      update(3, thread, { id: THREAD_ID, type: 11, guild_id: GUILD_ID, parent_id: ROOT_CHANNEL_ID })
+    ], options({ [`${GUILD_ID}/${ROOT_CHANNEL_ID}`]: "mention" }));
+
+    expect(result.events).toMatchObject([
+      { attachments: [
+        { providerFileId: `${DM_ID}/${direct.id}/${audio.id}`, kind: "file", audioVideo: "audio", mimeType: "audio/ogg" },
+        { providerFileId: `${DM_ID}/${direct.id}/${video.id}`, kind: "file", audioVideo: "video", mimeType: "video/mp4" }
+      ], unsupported: [] },
+      { attachments: [{ fileName: "clip.mp4", kind: "file", mimeType: "application/octet-stream" }],
+        unsupported: [{ code: "audio", label: "voice-message.ogg" }] }
+    ]);
+    expect(result.events[1]).not.toHaveProperty("attachments.0.audioVideo");
+  });
+
   it("requires explicit guild approval and maps a parent-approved thread to its own lane", () => {
     const unaddressed = message({
       id: snowflake(NOW, 4),

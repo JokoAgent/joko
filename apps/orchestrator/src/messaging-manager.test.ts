@@ -1162,9 +1162,91 @@ describe("MessagingManager", () => {
     }, { timeout: 2_000 });
   });
 
-  it("runs protected Telegram text once without retaining the input in Queue, Operation, or native history projection", async () => {
+  it("keeps verified Telegram album media across a partial attachment retry", async () => {
+    const from = { id: 42, first_name: "Owner", is_bot: false };
+    const chat = { id: 42, type: "private" as const };
+    const date = Math.floor(Date.now() / 1_000);
+    const album = { from, chat, date, media_group_id: "album" };
+    const video = (id: string) => ({ file_id: id, file_unique_id: `unique-${id}`, file_name: `${id}.mp4` });
+    const batch = normalizeTelegramUpdates([
+      { update_id: 9, message: { ...album, message_id: 77, caption: "Compare the clip and the frame.", video: video("spoofed") } },
+      { update_id: 10, message: { ...album, message_id: 78, video: video("missing") } },
+      { update_id: 11, message: { ...album, message_id: 79, video: video("clip") } },
+      { update_id: 12, message: { ...album, message_id: 80, photo: [{ file_id: "frame", file_unique_id: "frame",
+        width: 1, height: 1 }] } }
+    ], { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+    const transport = new FakeTelegramTransport(batch);
+    let frameAttempts = 0;
+    const clip = Buffer.from("00000014667479706d7034320000000069736f6d", "hex");
+    const jpeg = Buffer.from("ffd8ffe000104a46494600010100000100010000ffd9", "hex");
+    const download = vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => {
+      const { providerFileId, fileName } = attachment;
+      if (providerFileId === "missing") throw new MessagingTransportError("provider_rejected", "Missing test clip.",
+        { effect: "none", retryable: false });
+      if (providerFileId === "clip") return { bytes: clip, fileName, mimeType: "application/octet-stream" };
+      if (providerFileId === "frame") {
+        frameAttempts += 1;
+        if (frameAttempts === 1) throw new MessagingTransportError("network", "Interrupted photo download.",
+          { effect: "none", retryable: true });
+        return { bytes: jpeg, fileName, mimeType: "image/jpeg" };
+      }
+      return { bytes: pngBytes(), fileName, mimeType: "video/mp4" };
+    });
+    const fixture = await createFixture(() => transport, () => new AttachmentFakeAdapter(true));
+    const connection = await enableTelegramReply(fixture, "telegram-native-album");
+    const requests = () => fixture.store.listMessagingInboundRequests({ connectionId: connection.id });
+    await vi.waitFor(() => expect(requests()).toMatchObject([{ status: "completed", providerMessageId: "77" }]), { timeout: 5_000 });
+    const request = requests()[0]!;
+    expect(download.mock.calls.map(([attachment]) => attachment.providerFileId))
+      .toEqual(["spoofed", "missing", "clip", "frame", "spoofed", "missing", "frame"]);
+    expect(fixture.store.listMessagingRequestArtifactOrdinals(request.id)).toEqual([2, 3]);
+    const queue = fixture.store.getQueueItem(request.queueItemId!);
+    expect(queue.body.text).toContain("Compare the clip and the frame.");
+    expect(queue.body.text).toContain("[Unsupported video] spoofed.mp4");
+    expect(queue.body.text).toContain("[Unsupported download] missing.mp4");
+    expect(queue.body.images).toHaveLength(1);
+    expect(queue.body.files).toMatchObject([{ blob: { fileName: "clip.mp4", mimeType: "video/mp4", byteLength: clip.length } }]);
+    expect((await fixture.artifacts.readBlob(queue.body.files[0]!.blob)).data).toEqual(clip);
+  });
+
+  it("releases staged Telegram media when the connection is disabled before adoption", async () => {
+    const batch = normalizeTelegramUpdates([{ update_id: 9, message: {
+      message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
+      chat: { id: 42, type: "private" }, date: Math.floor(Date.now() / 1_000),
+      voice: { file_id: "voice-77", file_unique_id: "unique-voice" }
+    } }], { connectionId: "placeholder", ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } });
+    const transport = new FakeTelegramTransport(batch);
+    vi.spyOn(transport, "downloadAttachment").mockImplementation(async attachment => ({
+      bytes: Buffer.from("OggS"), fileName: attachment.fileName, mimeType: "audio/ogg"
+    }));
+    const adapter = new AttachmentFakeAdapter(true);
+    const send = vi.spyOn(adapter, "send");
+    const fixture = await createFixture(() => transport, () => adapter);
+    const held = deliveryGate();
+    const ingest = fixture.artifacts.ingestBytes.bind(fixture.artifacts);
+    let stagedId: string | undefined;
+    vi.spyOn(fixture.artifacts, "ingestBytes").mockImplementationOnce(async (...args) => {
+      const artifact = await ingest(...args);
+      stagedId = artifact.id;
+      await held.wait;
+      return artifact;
+    });
+    const release = vi.spyOn(fixture.store, "releaseArtifactStaging");
+    const connection = await enableTelegramReply(fixture, "telegram-retired-media");
+    await vi.waitFor(() => expect(stagedId).toBeDefined());
+    const current = fixture.store.getMessagingConnection(connection.id);
+    await fixture.manager.setEnabled({ connectionId: current.id, expectedRevision: current.revision,
+      expectedGeneration: current.generation, enabled: false });
+    held.release();
+    await vi.waitFor(() => expect(release).toHaveBeenCalledWith([stagedId]));
+    expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toMatchObject([{ artifactIds: [] }]);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("runs protected Telegram text once without downloading its voice or retaining the input", async () => {
     const privateText = "protectedtelegrambodya17c";
-    const transport = new ProtectedTelegramTransport(privateText);
+    const transport = new ProtectedTelegramTransport(privateText, true);
+    const download = vi.spyOn(transport, "downloadAttachment");
     const adapter = new ProtectedTelegramAdapter();
     const fixture = await createFixture(() => transport, () => adapter);
     const persistPoll = vi.spyOn(fixture.store, "saveMessagingPollBatch");
@@ -1176,8 +1258,11 @@ describe("MessagingManager", () => {
     const request = fixture.store.listMessagingInboundRequests()[0]!;
     const queue = fixture.store.getQueueItem(request.queueItemId!);
     expect(adapter.received).toHaveLength(1);
+    expect(download).not.toHaveBeenCalled();
+    expect(request.artifactIds).toEqual([]);
     expect(persistPoll).not.toHaveBeenCalled();
     expect(adapter.received[0]).toContain(privateText);
+    expect(adapter.received[0]).toContain("[Unsupported protected_media]");
     expect(adapter.history.events[0]?.payload).toMatchObject({ role: "user", blocks: [{ text: expect.stringContaining(privateText) }] });
     expect(queue.body.text).toBe("[Protected message]");
     expect(fixture.store.getOperation(request.operationId!).body).toMatchObject({ prompt: { text: "[Protected message]" } });
@@ -4191,13 +4276,16 @@ function weChatDirectBatch(): WeChatNormalizationResult {
 
 class ProtectedTelegramTransport extends FakeTelegramTransport {
   readonly #update: TelegramUpdate;
-  constructor(text: string) {
+  constructor(text: string, includeVoice = false) {
     const mention = "@joko_test_bot";
+    const entities = [{ type: "mention", offset: 0, length: mention.length }];
     const update: TelegramUpdate = { update_id: 9, message: {
       message_id: 77, from: { id: 42, first_name: "Owner", is_bot: false },
       chat: { id: -100555, type: "supergroup" }, date: Math.floor(Date.now() / 1000),
-      text: `${mention} ${text}`, has_protected_content: true,
-      entities: [{ type: "mention", offset: 0, length: mention.length }]
+      has_protected_content: true,
+      ...(includeVoice ? { caption: `${mention} ${text}`, caption_entities: entities,
+        voice: { file_id: "protected-voice", file_unique_id: "unique-protected-voice" } }
+        : { text: `${mention} ${text}`, entities })
     } };
     super(normalizeTelegramUpdates([update], { connectionId: "placeholder", ownerUserId: "42",
       bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" } }));

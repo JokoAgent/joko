@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+
 import { create } from "@bufbuild/protobuf";
 import {
   DiscordEmojiReactions,
@@ -12,6 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   DISCORD_SYSTEM_BOT_ID,
+  DISCORD_SYSTEM_DM_ID,
   DISCORD_SYSTEM_GUILD_ID,
   DISCORD_SYSTEM_OWNER_ID,
   DISCORD_SYSTEM_ROOT_CHANNEL_ID,
@@ -112,8 +115,9 @@ describe("Discord Messaging production product chain", () => {
       15_000
     );
 
-    discord.enqueueThreadMessage({
+    discord.enqueueMessage({
       messageId: FIRST_MESSAGE_ID,
+      channelId: DISCORD_SYSTEM_THREAD_ID,
       text: "Inspect the attached note in this approved thread.",
       attachmentId: ATTACHMENT_ID
     });
@@ -194,8 +198,9 @@ describe("Discord Messaging production product chain", () => {
       15_000
     );
 
-    discord.enqueueThreadMessage({
+    discord.enqueueMessage({
       messageId: SECOND_MESSAGE_ID,
+      channelId: DISCORD_SYSTEM_THREAD_ID,
       text: "Continue in the same visible thread task after restart."
     });
     await waitFor(
@@ -244,10 +249,39 @@ describe("Discord Messaging production product chain", () => {
       replyToMessageId: SECOND_MESSAGE_ID
     })]);
 
+    const audioMessageId = "900000000000000003";
+    const audioAttachmentId = "888888888888888889";
+    const audio = await readFile(new URL("../../desktop/resources/native-task-status-sounds/ring-chime.mp3", import.meta.url));
+    discord.addAttachment({ id: audioAttachmentId, fileName: "discord-chime.mp3", bytes: audio, mimeType: "audio/mpeg" });
+    discord.enqueueMessage({
+      messageId: audioMessageId, channelId: DISCORD_SYSTEM_DM_ID,
+      text: "Inspect this direct audio attachment.", attachmentId: audioAttachmentId
+    });
+    await waitFor(
+      async () => discord?.outboundMessages ?? [],
+      (messages) => messages.some((message) => message.channelId === DISCORD_SYSTEM_DM_ID
+        && message.replyToMessageId === audioMessageId && message.text === SECOND_REPLY),
+      "the Discord owner DM audio turn to finish",
+      30_000
+    );
+    const audioRequest = required(fixture.application.store.listMessagingInboundRequests()
+      .find((request) => request.providerMessageId === audioMessageId), "Discord audio request");
+    expect(audioRequest.status).toBe("completed");
+    expect(audioRequest.artifactIds).toHaveLength(1);
+    expect(fixture.application.store.getMessagingConversation(audioRequest.conversationId!)).toMatchObject({
+      conversationKind: "direct", providerConversationId: DISCORD_SYSTEM_DM_ID
+    });
+    const storedAudio = fixture.application.store.getArtifact(audioRequest.artifactIds[0]!);
+    expect(storedAudio.blob).toMatchObject({ fileName: "discord-chime.mp3", mimeType: "audio/mpeg", byteLength: audio.byteLength });
+    expect((await fixture.application.artifacts.readBlob(storedAudio.blob)).data).toEqual(audio);
+    expect(fixture.providerRequests).toHaveLength(2);
+    const audioPath = await fixture.application.artifacts.resolveBlobPath(storedAudio.blob);
+    expect(JSON.stringify(fixture.providerRequests[1]?.body)).toContain(JSON.stringify(audioPath).slice(1, -1));
+
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),
       connections: fixture.application.store.listMessagingConnections(),
-      requests,
+      requests: fixture.application.store.listMessagingInboundRequests(),
       deliveries: fixture.application.store.listMessagingDeliveries(),
       diagnostics: fixture.application.store.listDiagnostics({ limit: 200 })
     }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);

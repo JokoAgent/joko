@@ -1,3 +1,4 @@
+import { inboundAudioVideoMime } from "../inbound-audio-video.js";
 import type {
   MessagingGroupObservation,
   MessagingIgnoredInbound,
@@ -129,7 +130,7 @@ function normalizeMessage(
     return { event: null, ignored: ignoredEntry(requestId, "unauthorized", channel.id, message.author.id) };
   }
 
-  const parts = collectParts(message);
+  const parts = collectParts(message, address.conversationKind === "direct");
   let text = message.content ?? "";
   let ambient = false;
   if (address.conversationKind !== "direct") {
@@ -259,14 +260,14 @@ function groupObservation(
   };
 }
 
-function collectParts(message: DiscordMessage): {
+function collectParts(message: DiscordMessage, allowAudioVideo = false): {
   readonly attachments: readonly MessagingInboundAttachment[];
   readonly unsupported: readonly MessagingUnsupportedPart[];
 } {
   const attachments: MessagingInboundAttachment[] = [];
   const unsupported: MessagingUnsupportedPart[] = [];
   for (const attachment of message.attachments ?? []) {
-    const parsed = normalizeAttachment(message, attachment);
+    const parsed = normalizeAttachment(message, attachment, allowAudioVideo);
     if ("unsupported" in parsed) unsupported.push(parsed.unsupported);
     else attachments.push(parsed.attachment);
   }
@@ -278,7 +279,8 @@ function collectParts(message: DiscordMessage): {
 
 function normalizeAttachment(
   message: DiscordMessage,
-  attachment: DiscordAttachment
+  attachment: DiscordAttachment,
+  allowAudioVideo: boolean
 ): { readonly attachment: MessagingInboundAttachment } | { readonly unsupported: MessagingUnsupportedPart } {
   discordSnowflake(attachment.id, "attachment identifier");
   if (!Number.isSafeInteger(attachment.size) || attachment.size < 0) {
@@ -289,11 +291,12 @@ function normalizeAttachment(
     return { unsupported: { code: "oversize", label: `${fileName} exceeds Discord's download limit.` } };
   }
   const mimeType = normalizeMime(attachment.content_type);
-  if (mimeType?.startsWith("audio/") === true) {
-    return { unsupported: { code: "audio", label: fileName } };
-  }
-  if (mimeType?.startsWith("video/") === true) {
-    return { unsupported: { code: "video", label: fileName } };
+  const image = mimeType?.startsWith("image/") === true;
+  const mediaMime = allowAudioVideo && !image ? inboundAudioVideoMime(mimeType, fileName) : null;
+  const audioVideo = mediaMime === null ? undefined : mediaMime.startsWith("audio/") ? "audio" : "video";
+  if (!allowAudioVideo) {
+    if (mimeType?.startsWith("audio/")) return { unsupported: { code: "audio", label: fileName } };
+    if (mimeType?.startsWith("video/")) return { unsupported: { code: "video", label: fileName } };
   }
   return {
     attachment: {
@@ -303,10 +306,11 @@ function normalizeAttachment(
         attachmentId: attachment.id
       }),
       providerUniqueFileId: attachment.id,
-      kind: mimeType?.startsWith("image/") === true ? "image" : "file",
+      kind: image ? "image" : "file",
       fileName,
-      mimeType,
-      byteLength: attachment.size
+      mimeType: mediaMime ?? mimeType,
+      byteLength: attachment.size,
+      ...(audioVideo === undefined ? {} : { audioVideo })
     }
   };
 }

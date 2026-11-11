@@ -38,6 +38,8 @@ export interface MessagingInboundAttachment {
   readonly fileName: string;
   readonly mimeType: string | null;
   readonly byteLength: number | null;
+  /** Native audio/video candidates require a recognized media type before adoption. */
+  readonly audioVideo?: "audio" | "video";
 }
 
 export interface MessagingUnsupportedPart {

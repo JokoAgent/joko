@@ -6727,6 +6727,14 @@ export class OperationalStore {
     return request;
   }
 
+  listMessagingRequestArtifactOrdinals(requestId: string): number[] {
+    this.assertOpen();
+    const rows = this.database.prepare(`
+      SELECT ordinal FROM messaging_request_artifacts WHERE request_id = ? ORDER BY ordinal
+    `).all(requestId) as Row[];
+    return rows.map((row) => numberValue(row["ordinal"]));
+  }
+
   findMessagingInboundRequestByProviderId(input: {
     readonly connectionId: string;
     readonly channelGeneration: number;
