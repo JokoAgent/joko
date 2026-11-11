@@ -4,7 +4,7 @@ import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { extensionSettingsSdkSource } from "@joko/contracts";
 
-import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor, ExtensionSettingsDescriptor, ExtensionRoutineEventsDescriptor, ExtensionRuntimeDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor, ExtensionTaskViewDescriptor, ExtensionSettingsDescriptor, ExtensionRoutineEventsDescriptor, ExtensionRuntimeDescriptor } from "./extension-surface-manifest.js";
 import { EXTENSION_VIEW_LIFECYCLE_ASSET, EXTENSION_VIEW_LIFECYCLE_SCRIPT } from "./extension-view-lifecycle.js";
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import { isolatedExtensionDocument } from "./extension-main-view-document.js";
@@ -39,6 +39,7 @@ export interface ExtensionMainViewAuthority {
   readonly packageVersion?: string;
   readonly extensionEntry: string;
   readonly mainView: ExtensionMainViewDescriptor;
+  readonly taskView?: ExtensionTaskViewDescriptor & { readonly sessionId: string; readonly sessionCreatedAt: number; readonly targetId: string };
   readonly settings?: ExtensionSettingsDescriptor;
   readonly mobileSettings?: true;
   readonly library?: ExtensionLibraryDescriptor;
@@ -93,6 +94,7 @@ interface ActiveSurface {
   readonly authority: ExtensionMainViewAuthority;
   readonly connectionId: string;
   readonly settingsBridgeScript?: Buffer;
+  readonly taskContextScript?: Buffer;
   readonly root: string;
   readonly viewRoot: string;
   readonly lease: PiInstalledPackageLease;
@@ -109,6 +111,7 @@ const DEFAULT_TTL_MS = 10 * 60_000;
 const DEFAULT_MAXIMUM_SURFACES = 32;
 const DEFAULT_MAXIMUM_ASSET_BYTES = 256 * 1024 * 1024;
 const LIBRARY_BRIDGE_ASSET = "__joko_extension_library_bridge__.js";
+const TASK_CONTEXT_ASSET = "__joko_extension_task_context__.js";
 const SETTINGS_BRIDGE_ASSET = "__joko_extension_settings_bridge__.js";
 const LIBRARY_BRIDGE_SCRIPT = Buffer.from(String.raw`(() => {
   "use strict";
@@ -234,11 +237,11 @@ export class ExtensionMainViewManager {
     if (!SAFE_CONNECTION_ID.test(input.connectionId)) throw new Error("Extension main-view connection ID is invalid.");
     return this.#mutate(async () => {
       await this.#destroyExpired(this.#now());
-      const isMainView = input.authority.runtime === undefined && input.authority.routineEvents === undefined;
+      const isMainView = input.authority.runtime === undefined && input.authority.routineEvents === undefined && input.authority.taskView === undefined;
       const previousViews = isMainView && input.authority.mainView.multiple !== true ? [...this.#surfaces.values()].filter(surface =>
         surface.connectionId === input.connectionId && surface.authority.extensionId === input.authority.extensionId
         && (surface.authority.settings !== undefined) === (input.authority.settings !== undefined)
-        && surface.authority.runtime === undefined && surface.authority.routineEvents === undefined) : [];
+        && surface.authority.runtime === undefined && surface.authority.routineEvents === undefined && surface.authority.taskView === undefined) : [];
       if (this.#surfaces.size - previousViews.length >= this.#maximumSurfaces) {
         throw new ExtensionMainViewError(429, "Extension main-view surface limit reached.");
       }
@@ -268,6 +271,8 @@ export class ExtensionMainViewManager {
         const runtime = input.authority.runtime;
         const declarationMatches = input.authority.settings !== undefined
           ? sameSettings(extension?.settings, input.authority.settings)
+          : input.authority.taskView !== undefined
+          ? extension?.taskView?.html === input.authority.taskView.html && extension.taskView.title === input.authority.taskView.title
           : runtime !== undefined ? extension?.runtime?.html === input.authority.mainView.html && JSON.stringify(extension.runtime) === JSON.stringify(runtime) : publisher === undefined
           ? sameMainView(extension?.mainView, input.authority.mainView) && sameLibrary(extension?.library, input.authority.library)
           : extension?.routineEvents?.html === input.authority.mainView.html && JSON.stringify(extension.routineEvents) === JSON.stringify(publisher);
@@ -293,6 +298,10 @@ export class ExtensionMainViewManager {
           authority: copyAuthority(input.authority),
           connectionId: input.connectionId,
           ...(settingsBridgeScript === undefined ? {} : { settingsBridgeScript }),
+          ...(input.authority.taskView === undefined ? {} : { taskContextScript: Buffer.from(`(() => {
+            const taskContext = Object.freeze(${JSON.stringify({ sessionId: input.authority.taskView.sessionId })});
+            Object.defineProperty(window, "joko", { value: Object.freeze({ taskContext }), writable: false, configurable: false });
+          })();`, "utf8") }),
           root,
           viewRoot,
           lease,
@@ -416,6 +425,10 @@ export class ExtensionMainViewManager {
           lifetime: surface.lifetime.signal
         };
       }
+      if (input.assetPath === TASK_CONTEXT_ASSET && surface.taskContextScript !== undefined) {
+        return { status: 200, mimeType: MIME_TYPES[".js"]!, contentLength: surface.taskContextScript.byteLength,
+          ...(input.method === "HEAD" ? {} : { body: surface.taskContextScript }), headers: surfaceHeaders(), lifetime: surface.lifetime.signal };
+      }
       if (input.assetPath === SETTINGS_BRIDGE_ASSET && surface.settingsBridgeScript !== undefined) {
         if (input.method !== "GET" && input.method !== "HEAD" || input.isolatedDocument === true || input.materializeAsset === "style") throw new ExtensionMainViewError(404, "Settings asset transform is invalid.");
         return { status: 200, mimeType: MIME_TYPES[".js"]!, contentLength: surface.settingsBridgeScript.byteLength,
@@ -431,10 +444,11 @@ export class ExtensionMainViewManager {
       const injectLibrary = samePath(candidate, entrypoint) && mimeType.startsWith("text/html")
         && surface.authority.library !== undefined;
       const injectSettings = mimeType.startsWith("text/html") && surface.authority.settings !== undefined;
+      const injectTaskContext = samePath(candidate, entrypoint) && mimeType.startsWith("text/html") && surface.taskContextScript !== undefined;
       const injectLifecycle = samePath(candidate, entrypoint) && mimeType.startsWith("text/html")
         && surface.authority.runtime === undefined && surface.authority.routineEvents === undefined;
       const materialize = input.isolatedDocument === true || input.materializeAsset !== undefined;
-      const file = await readStableAsset(surface.viewRoot, candidate, this.#maximumAssetBytes, inlineStyle || input.method === "HEAD" && !injectLibrary && !injectSettings && !injectLifecycle && !materialize);
+      const file = await readStableAsset(surface.viewRoot, candidate, this.#maximumAssetBytes, inlineStyle || input.method === "HEAD" && !injectLibrary && !injectSettings && !injectTaskContext && !injectLifecycle && !materialize);
       input.signal?.throwIfAborted();
       try {
         await surface.lease.assertCurrent(); await surface.assertAuthorityCurrent();
@@ -447,6 +461,7 @@ export class ExtensionMainViewManager {
       let transformed = inlineStyle ? Buffer.from(input.inlineStyle!) : injectLibrary && file.body !== undefined ? injectLibraryBridge(file.body) : file.body;
       if (injectSettings && transformed !== undefined && !inlineStyle) transformed = injectLibraryBridge(transformed, SETTINGS_BRIDGE_ASSET);
       if (injectLifecycle && transformed !== undefined && !inlineStyle) transformed = injectLibraryBridge(transformed, EXTENSION_VIEW_LIFECYCLE_ASSET);
+      if (injectTaskContext && transformed !== undefined && !inlineStyle) transformed = injectLibraryBridge(transformed, TASK_CONTEXT_ASSET);
       if (materialize) {
         if (input.isolatedDocument === true && !mimeType.startsWith("text/html") || transformed === undefined) {
           throw new ExtensionMainViewError(404, "Only an allowed HTML asset can be materialized.");
@@ -465,6 +480,7 @@ export class ExtensionMainViewManager {
           assertCurrent, ...(input.signal === undefined ? {} : { signal: input.signal }), read: async path => {
             if (path === LIBRARY_BRIDGE_ASSET && surface.authority.library !== undefined) return { body: LIBRARY_BRIDGE_SCRIPT, mimeType: MIME_TYPES[".js"]! };
             if (path === SETTINGS_BRIDGE_ASSET && surface.settingsBridgeScript !== undefined) return { body: surface.settingsBridgeScript, mimeType: MIME_TYPES[".js"]! };
+            if (path === TASK_CONTEXT_ASSET && surface.taskContextScript !== undefined) return { body: surface.taskContextScript, mimeType: MIME_TYPES[".js"]! };
             if (path === EXTENSION_VIEW_LIFECYCLE_ASSET && injectLifecycle) return { body: EXTENSION_VIEW_LIFECYCLE_SCRIPT, mimeType: MIME_TYPES[".js"]! };
             let pending = read.get(path);
             if (pending === undefined) {
@@ -586,6 +602,10 @@ function validateAuthority(authority: ExtensionMainViewAuthority): void {
   if (authority.library !== undefined && authority.library.schemaVersion !== 1) {
     throw new Error("Extension main-view Library authority is invalid.");
   }
+  if (authority.taskView !== undefined && (authority.library !== undefined || authority.settings !== undefined || authority.runtime !== undefined || authority.routineEvents !== undefined
+    || authority.mainView.html !== authority.taskView.html || authority.mainView.title !== authority.taskView.title
+    || !/^[A-Za-z0-9._:-]{1,512}$/u.test(authority.taskView.sessionId) || !/^[A-Za-z0-9._:-]{1,512}$/u.test(authority.taskView.targetId)
+    || !Number.isSafeInteger(authority.taskView.sessionCreatedAt) || authority.taskView.sessionCreatedAt < 0)) throw new Error("Extension task-view authority is invalid.");
   if (authority.settings !== undefined && (authority.library !== undefined || authority.runtime !== undefined || authority.routineEvents !== undefined
     || authority.mainView.html !== (authority.mobileSettings ? authority.settings.mobileHtml ?? authority.settings.html : authority.settings.html)
     || authority.mainView.title !== authority.settings.title)
@@ -594,6 +614,7 @@ function validateAuthority(authority: ExtensionMainViewAuthority): void {
 
 function copyAuthority(authority: ExtensionMainViewAuthority): ExtensionMainViewAuthority {
   return { ...authority, mainView: { ...authority.mainView }, ...(authority.library === undefined ? {} : { library: { ...authority.library } }),
+    ...(authority.taskView === undefined ? {} : { taskView: { ...authority.taskView } }),
     ...(authority.settings === undefined ? {} : { settings: { ...authority.settings } }),
     ...(authority.routineEvents === undefined ? {} : { routineEvents: structuredClone(authority.routineEvents) }),
     ...(authority.runtime === undefined ? {} : { runtime: structuredClone(authority.runtime) }) };

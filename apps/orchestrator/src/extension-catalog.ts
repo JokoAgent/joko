@@ -4,7 +4,7 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
-import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionSettingsDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionTaskViewDescriptor, ExtensionSettingsDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -85,6 +85,7 @@ export interface ExtensionCatalogDescriptor {
   /** Private installed entry identity, never executable bytes in public contracts. */
   readonly runtimeEntryPath?: string;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
+  readonly taskView?: ExtensionTaskViewDescriptor & { readonly extensionEntry: string };
   readonly settings?: ExtensionSettingsDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
@@ -163,6 +164,7 @@ interface ExtensionDefinition {
   readonly description: string;
   readonly enabled: boolean;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
+  readonly taskView?: ExtensionTaskViewDescriptor & { readonly extensionEntry: string };
   readonly settings?: ExtensionSettingsDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
@@ -707,6 +709,7 @@ export class ExtensionCatalogManager {
       enabled: definition.enabled,
       ...(definition.runtimeEntryPath === undefined ? {} : { runtimeEntryPath: definition.runtimeEntryPath }),
       ...(definition.mainView === undefined ? {} : { mainView: { ...definition.mainView } }),
+      ...(definition.taskView === undefined ? {} : { taskView: { ...definition.taskView } }),
       ...(definition.settings === undefined ? {} : { settings: { ...definition.settings } }),
       ...(definition.library === undefined ? {} : { library: { ...definition.library } }),
       ...(definition.routineEvents === undefined ? {} : { routineEvents: structuredClone(definition.routineEvents) }),
@@ -865,6 +868,7 @@ function projectDefinitions(
         ...(entry.mainView === undefined ? {} : {
           mainView: { ...entry.mainView, extensionEntry: entry.extensionRelativePath }
         }),
+        ...(entry.taskView === undefined ? {} : { taskView: { ...entry.taskView, extensionEntry: entry.extensionRelativePath } }),
         ...(entry.settings === undefined ? {} : { settings: { ...entry.settings, extensionEntry: entry.extensionRelativePath } }),
         ...(entry.library === undefined ? {} : {
           library: { ...entry.library, extensionEntry: entry.extensionRelativePath }
@@ -976,6 +980,7 @@ function projectDefinitions(
         ...(detail.mainView === undefined || detail.entryPath === undefined ? {} : {
           mainView: { ...detail.mainView, extensionEntry: detail.entryPath }
         }),
+        ...(detail.taskView === undefined || detail.entryPath === undefined ? {} : { taskView: { ...detail.taskView, extensionEntry: detail.entryPath } }),
         ...(detail.settings === undefined || detail.entryPath === undefined ? {} : { settings: { ...detail.settings, extensionEntry: detail.entryPath } }),
         ...(detail.library === undefined || detail.entryPath === undefined ? {} : {
           library: { ...detail.library, extensionEntry: detail.entryPath }

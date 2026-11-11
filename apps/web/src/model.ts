@@ -4332,6 +4332,7 @@ export interface ExtensionCatalogEntryView {
     readonly multiple?: true;
   };
   readonly library?: { readonly schemaVersion: 1 };
+  readonly taskView?: { readonly title?: string };
   readonly settings?: { readonly title?: string; readonly height: number; readonly mobileCustom: boolean };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
@@ -4393,7 +4394,8 @@ export interface ExtensionMainViewSurfaceView {
   readonly title?: string;
   readonly icon?: ExtensionMainViewIconView;
   readonly expiresAt: number;
-  readonly purpose?: "settings";
+  readonly purpose?: "settings" | "task";
+  readonly taskSessionId?: string;
   readonly mobileSettings?: true;
 }
 
@@ -4406,6 +4408,14 @@ export interface ExtensionSettingsApi {
   readOperation?(record: import("./extension-settings-operation.js").PendingExtensionSettingsOperation, signal: AbortSignal): Promise<import("./extension-settings-operation.js").ExtensionSettingsOperationReceipt>;
   pending?(extensionId: string, signal: AbortSignal): Promise<import("./extension-settings-operation.js").PendingExtensionSettingsOperation | undefined>;
   checkOriginal?(record: import("./extension-settings-operation.js").PendingExtensionSettingsOperation, signal: AbortSignal): Promise<import("./extension-settings-operation.js").ExtensionSettingsOperationReceipt>;
+}
+
+export interface ExtensionTaskViewOpenView {
+  readonly requestId: string;
+  readonly extensionId: string;
+  readonly extensionRevision: bigint;
+  readonly sessionId: string;
+  readonly focus: boolean;
 }
 
 export type ExtensionLibraryStateView = "ready" | "readOnly" | "unavailable";
@@ -6533,6 +6543,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   }): Promise<ExtensionCatalogView>;
   getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal, includeProjectDisabled?: boolean): Promise<ExtensionCatalogView>;
   openExtensionMainView(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  openExtensionTaskView(extensionId: string, expectedRevision: bigint, sessionId: string, signal: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
+  watchExtensionTaskViews(focusedSessionId: string | undefined, signal: AbortSignal,
+    onOpen: (event: ExtensionTaskViewOpenView) => void): Promise<void>;
   getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal, keepAlive?: true): Promise<ExtensionMainViewSurfaceView>;
   closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean>;
   getExtensionLibraryOverview(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionLibraryOverviewView>;

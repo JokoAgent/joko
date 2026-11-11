@@ -2,7 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Code } from "@connectrpc/connect";
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import type { ProviderModel } from "@joko/core";
 import { OperationalStore, operationBodyHash, type OperationRecord } from "@joko/store";
@@ -14,6 +14,7 @@ import { createConnectServices } from "./connect-services.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import { parseExtensionRuntime } from "./extension-surface-manifest.js";
+import { ExtensionTaskViewDispatcher, extensionTaskViewInstallation } from "./extension-task-view-dispatcher.js";
 import { SessionHost } from "./session-host.js";
 
 const connection = {
@@ -1090,7 +1091,7 @@ describe("Connect Extension catalog boundary", () => {
     expect(abort).toHaveBeenCalledWith(pendingJob.id);
   });
 
-  it("opens, probes, closes, and connection-revokes one exact Resource main-view surface", async () => {
+  it("fences Resource main and task views through their own Connect operations", async () => {
     const discoveredRevision = `sha256:${"a".repeat(64)}`;
     const mainView = {
       html: "ui/review/index.html",
@@ -1098,9 +1099,11 @@ describe("Connect Extension catalog boundary", () => {
       icon: "layout" as const,
       extensionEntry: "extensions/review.ts"
     };
+    const taskView = { html: "ui/task/index.html", title: "Task evidence" };
     const entry = extensionEntry({
       owner: { kind: "resource", resourceId: "resource-package", discoveredRevision, resourceVersion: 5n },
       mainView,
+      taskView: { ...taskView, extensionEntry: mainView.extensionEntry },
       library: { schemaVersion: 1, extensionEntry: "extensions/review.ts" },
       sidebarSupported: true
     });
@@ -1124,6 +1127,7 @@ describe("Connect Extension catalog boundary", () => {
         name: "review.ts",
         entryPath: "extensions/review.ts",
         mainView: { html: mainView.html, title: mainView.title, icon: mainView.icon },
+        taskView,
         library: { schemaVersion: 1 },
         compatibility: "supported" as const,
         compatibilityIssues: [] as const,
@@ -1168,7 +1172,13 @@ describe("Connect Extension catalog boundary", () => {
       expiresAt: 1_800_000_060_000
     };
     let finalAuthorityFence: (() => void | Promise<void>) | undefined;
-    const open = vi.fn(async (input: { readonly assertAuthorityCurrent: () => void | Promise<void> }) => {
+    let taskAuthorityFence: (() => void | Promise<void>) | undefined;
+    const open = vi.fn(async (input: { readonly authority: { readonly taskView?: unknown }; readonly assertAuthorityCurrent: () => void | Promise<void> }) => {
+      if (input.authority.taskView !== undefined) {
+        taskAuthorityFence = input.assertAuthorityCurrent;
+        const id = `extension_surface_${"e".repeat(32)}`;
+        return { ...nativeSurface, id, endpoint: `/v1/extensions/main-views/${id}/${"f".repeat(64)}/index.html`, authority: input.authority, title: taskView.title };
+      }
       finalAuthorityFence = input.assertAuthorityCurrent;
       return nativeSurface;
     });
@@ -1178,8 +1188,14 @@ describe("Connect Extension catalog boundary", () => {
     let revoked: (() => void) | undefined;
     const stopRevocation = vi.fn();
     const fence = vi.fn();
+    let remote = false;
+    const task = { id: "task-one", createdAt: 10, backendId: "pi", targetId: "target-one" };
+    const installationKey = extensionTaskViewInstallation(entry)!;
+    const extensionTaskViews = new ExtensionTaskViewDispatcher({ authority: () => ({ installationKey, revision: entry.revision }),
+      taskAvailable: (_id, sessionId) => sessionId === task.id && !remote });
     const services = createConnectServices(stubApplication({
-      store: { getBackend: backend },
+      store: { getBackend: backend, getTarget: () => ({ descriptor: {} }), findSessionRuntimePolicy: () => undefined,
+        findSession: (id: string) => id === task.id ? { descriptor: { ...task, remoteWorkspace: remote ? {} : undefined } } : undefined },
       connections: {
         authenticate: () => connection,
         fence,
@@ -1187,9 +1203,31 @@ describe("Connect Extension catalog boundary", () => {
       },
       piResources: { list: () => [resource], get: () => resource },
       extensionCatalog: { reconcile: () => catalog(entry), get: () => entry },
+      extensionProjects: { enabledForTarget: () => true },
       extensionMainViews: { open, getSurface, closeSurface, closeConnection },
+      extensionTaskViews,
       sessionHost: {}
     }));
+
+    const client = createClient(contract.ExtensionService, createRouterTransport(router => router.service(contract.ExtensionService, services.extension)));
+    const events = client.watchExtensionTaskViews({ focusedSessionId: task.id })[Symbol.asyncIterator]();
+    try {
+      const ready = await events.next();
+      expect(ready.done).toBe(false);
+      expect(ready.value?.open).toBeUndefined();
+      expect(extensionTaskViews.request(entry.id, installationKey, {})).toMatchObject({ ok: true, sessionId: task.id });
+      expect(await events.next()).toMatchObject({ value: { open: { extensionId: entry.id, extensionRevision: { value: entry.revision }, sessionId: task.id, focus: false } } });
+    } finally { await events.return?.(); }
+    const request = { extensionId: entry.id, expectedRevision: { value: entry.revision }, sessionId: task.id };
+    const openedTask = await client.openExtensionTaskView(request);
+    expect(openedTask.surface).toMatchObject({ surfaceId: `extension_surface_${"e".repeat(32)}`, title: taskView.title, taskSessionId: task.id, settings: false });
+    expect(open.mock.lastCall?.[0].authority).toMatchObject({ taskView: { ...taskView, sessionId: task.id, sessionCreatedAt: task.createdAt, targetId: task.targetId } });
+    expect(open.mock.lastCall?.[0].authority).not.toHaveProperty("library");
+    remote = true;
+    await expect(client.openExtensionTaskView(request)).rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(taskAuthorityFence).toBeDefined();
+    await expect(Promise.resolve().then(() => taskAuthorityFence?.())).rejects.toMatchObject({ code: Code.PermissionDenied });
+    remote = false;
 
     const opened = await invoke<contract.OpenExtensionMainViewResponse>(services.extension.openExtensionMainView, {
       extensionId: entry.id,
