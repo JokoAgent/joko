@@ -2,7 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { chromium, type Browser, type Page } from "playwright-core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { waitFor } from "./fixture.js";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
@@ -16,10 +16,77 @@ describe("mounted Skill learning review", () => {
   let browser: Browser | undefined;
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await browser?.close();
     browser = undefined;
     await fixture?.close({ removeRoot: true });
     fixture = undefined;
+  });
+
+  mountedIt("cancels visible collection while start is pending and keeps a newer review selected", { timeout: 120_000 }, async () => {
+    fixture = await RealPiSystemFixture.start({ webDirectory: resolve(webBuild!), enableInternalServer: true,
+      providerResponder: () => ({ kind: "text", text: JSON.stringify({ name: "mounted-learning",
+        description: "Review a repeatable workflow", explanation: "The new procedure is ready.",
+        files: [{ path: "SKILL.md", content: "---\nname: mounted-learning\ndescription: Review a repeatable workflow\n---\n# New procedure\n" }]
+      }) }) });
+    const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted collection reviewer" });
+    const code = fixture.pairingCode(challenge.challenge!.challengeId);
+    browser = await chromium.launch({ executablePath: executable!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(code);
+    await page.getByLabel("Device name").fill("Mounted collection reviewer");
+    await page.locator("form.pair-form button[type=submit]").click();
+    await page.getByRole("tab", { name: /Skills/u }).click();
+    await page.locator(".skill-hub__tabs").getByRole("tab", { name: "Learning", exact: true }).click();
+    await page.setViewportSize({ width: 390, height: 844 });
+    const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation" });
+    if (await closeNavigation.isVisible()) await closeNavigation.click();
+    const host = fixture.application.sessionHost;
+    const createSession = host.createServiceSession.bind(host);
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    let oldCallbackFinished = false;
+    vi.spyOn(host, "createServiceSession").mockImplementationOnce(async input => {
+      await blocked;
+      try { return await createSession(input); }
+      finally { oldCallbackFinished = true; }
+    });
+    try {
+      const learning = page.locator(".skill-learning");
+      const instruction = learning.getByLabel("What should the Skill learn?");
+      await instruction.fill("Cancel the old collection.");
+      const firstRequestPromise = page.waitForRequest(request => request.url().endsWith("/StartSkillLearning"));
+      await learning.getByRole("button", { name: "Start learning", exact: true }).click();
+      const firstRequest = await firstRequestPromise;
+      const lateResponse = page.waitForResponse(response => response.request() === firstRequest, { timeout: 75_000 });
+      const review = learning.getByRole("region", { name: "Review learned Skill" });
+      await review.locator(".skill-learning__progress", { hasText: "Collecting evidence" }).waitFor({ state: "visible", timeout: 15_000 });
+      await review.getByRole("button", { name: "Cancel", exact: true }).click();
+      await review.getByText("Cancelled", { exact: true }).waitFor({ state: "visible" });
+      await waitFor(() => instruction.isEnabled(), value => value, "starting again after collection cancellation");
+      await instruction.fill("A newer independent procedure.");
+      await learning.getByRole("button", { name: "Start learning", exact: true }).click();
+      await review.getByText("The new procedure is ready.").waitFor({ state: "visible", timeout: 45_000 });
+      expect(await review.locator("h3").textContent()).toBe("A newer independent procedure.");
+      release();
+      await (await lateResponse).finished();
+      await waitFor(async () => oldCallbackFinished, value => value, "the cancelled collection callback");
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      expect(await review.locator("h3").textContent()).toBe("A newer independent procedure.");
+      expect(await review.getByText("The new procedure is ready.").isVisible()).toBe(true);
+      const oldRun = (await fixture.application.skillLearning!.list()).find(run => run.summary === "Cancel the old collection.")!;
+      expect(oldRun.state).toBe("cancelled");
+      expect(fixture.application.store.findOperation(`${oldRun.id}_session`)).toBeUndefined();
+      expect(fixture.application.store.findOperation(`${oldRun.id}_input`)).toBeUndefined();
+      expect(fixture.providerRequests).toHaveLength(1);
+      expect(await overflow(page)).toBeLessThanOrEqual(1);
+    } finally {
+      release();
+    }
   });
 
   mountedIt("reviews and accepts a durable learned Skill in wide and narrow Chromium", { timeout: 120_000 }, async () => {
