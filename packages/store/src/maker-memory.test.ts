@@ -83,6 +83,47 @@ describe("OperationalStore Maker Memory", () => {
     expect(store.countMakerMemoryEntries("digest", "another-memory")).toBe(1);
   });
 
+  it("recalls one/two-character memory terms across fields while preserving Target and kind scope", () => {
+    const store = createStore();
+    const entry = store.putMakerMemoryEntry({ targetId: "target-1", kind: "project", slug: "boundary",
+      title: "Go preferences", description: "界面配置", body: "边界索引配置说明" });
+    store.putMakerMemoryEntry({ targetId: "target-2", kind: "project", slug: "other-workspace",
+      title: "Go preferences", description: "界面配置", body: "边界索引配置说明" });
+    store.putMakerMemoryEntry({ targetId: "target-1", kind: "digest", backendId: "memory-capable", slug: "digest-boundary",
+      title: "Digest", description: "Private summary", body: "边界索引配置说明" });
+    for (const query of ["边", "边界", "边界索", "GO", "界面", "unmatched 边界"]) {
+      expect(store.searchMakerMemory("target-1", query, { kind: "project" }).map(hit => hit.id)).toEqual([entry.id]);
+    }
+    expect(store.searchMakerMemory("target-1", "边界").map(hit => hit.kind).sort()).toEqual(["digest", "project"]);
+    expect(store.searchMakerMemory("target-1", "GO", { kind: "project" })[0]?.snippet).toBe("Go preferences");
+  });
+
+  it("treats LIKE wildcard and escape characters as literal memory search input", () => {
+    const store = createStore();
+    const literal = store.putMakerMemoryEntry({ targetId: "target-1", kind: "reference", slug: "literal",
+      title: "Literal syntax", description: "Symbols to preserve", body: "The exact marker is %_! and a quote \"." });
+    store.putMakerMemoryEntry({ targetId: "target-1", kind: "reference", slug: "ordinary",
+      title: "Ordinary syntax", description: "No special symbols", body: "Do not match every record." });
+    for (const query of ["%", "_", "!", "%_!", '"']) {
+      expect(store.searchMakerMemory("target-1", query).map(hit => hit.id)).toEqual([literal.id]);
+    }
+  });
+
+  it("reserves a full keyword page for a short-term-only hit without duplicating lower-ranked MATCH rows", () => {
+    const store = createStore();
+    const ranked = Array.from({ length: 4 }, (_, index) => store.putMakerMemoryEntry({ targetId: "target-1",
+      kind: "project", slug: `ranked-${index}`, title: `Needle ${index}`, description: "Ranked result", body: "needle" }));
+    const short = store.putMakerMemoryEntry({ targetId: "target-1", kind: "project", slug: "short-term",
+      title: "Substring result", description: "Short query", body: "边界索引配置说明" });
+    const mixed = store.searchMakerMemory("target-1", "needle 边界", { limit: 3 });
+    expect(mixed).toHaveLength(3);
+    expect(mixed.slice(0, 2).every(hit => ranked.some(entry => entry.id === hit.id))).toBe(true);
+    expect(mixed[2]?.id).toBe(short.id);
+    expect(new Set(mixed.map(hit => hit.id)).size).toBe(3);
+    expect(store.searchMakerMemory("target-1", "needle 边界", { limit: 1 })[0]?.id).not.toBe(short.id);
+    expect(store.searchMakerMemory("target-1", "needle", { limit: 3 })).toHaveLength(3);
+  });
+
   it("rejects credential-shaped bytes before durable storage", () => {
     const store = createStore();
     expect(() => store.putMakerMemoryEntry({

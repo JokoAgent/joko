@@ -22,6 +22,14 @@ export const MAKER_MEMORY_SETTING_KEY = "settings.memory";
 
 const CURATED_KINDS = ["user", "feedback", "project", "reference"] as const;
 const MEMORY_SCAN_PAGE_SIZE = 1_000;
+const MEMORY_BODY_SOFT_BYTES = 2_048;
+const MEMORY_INDEX_SOFT_BYTES = 4_096;
+interface MemoryWriteWarning {
+  readonly kind: "shard-size-exceeded" | "index-size-exceeded";
+  readonly sizeBytes: number;
+  readonly softLimitBytes: number;
+  readonly hardLimitBytes?: number;
+}
 const MEMORY_RULES = `# Maker Memory
 
 You have workspace-scoped persistent memory shared by future agent sessions. Use only the managed \`joko_memory\` tools for this memory.
@@ -34,7 +42,9 @@ Save only durable information worth recalling later:
 
 Do not save code structure, Git history, instructions already present in repository guidance, transient task progress, raw tool output, or credentials. Search before creating a related entry and update the existing entry instead of making a duplicate. A message beginning with ${MEMORY_SAVE_REQUEST_PREFIXES.map((prefix) => `"${prefix}"`).join(" or ")} is an explicit request to evaluate and save the remainder.
 
-Compression digests are private search-only history. They never appear in this automatic index and cannot be written through memory_write.`;
+Compression digests are private search-only history. They never appear in this automatic index and cannot be written through memory_write.
+
+memory_write may return a shard-size-exceeded or index-size-exceeded warning with warningDetail byte counts. The write succeeded; these are maintenance thresholds, not truncation limits. Small excesses can remain. For large excesses, read related entries and use memory_write to shorten or combine their durable information before deleting obsolete duplicates. Bodies over 8192 UTF-8 bytes are rejected.`;
 
 export interface StoredMemorySettings {
   readonly format: 1;
@@ -208,12 +218,17 @@ export class MakerMemoryController {
   /** Curated startup snapshot. Digest is deliberately omitted. */
   runtimePrompt(targetId: string): string | undefined {
     if (!this.enabledForTarget(targetId)) return undefined;
-    const entries = this.list(targetId)
-      .filter((entry) => entry.kind !== "digest");
-    const index = entries.length === 0
-      ? "(No curated memory has been saved for this workspace.)"
-      : entries.map((entry) => `- [${entry.kind}] ${entry.title} — ${entry.description} (id: ${entry.id})`).join("\n");
-    return `${MEMORY_RULES}\n\n## Current index\n\n${truncateUtf8(index, 4_096)}`;
+    return `${MEMORY_RULES}\n\n${curatedMemoryIndex(this.list(targetId))}`;
+  }
+
+  writeWarning(entry: MakerMemoryEntry): MemoryWriteWarning | undefined {
+    const bodyBytes = Buffer.byteLength(entry.body, "utf8");
+    if (bodyBytes > MEMORY_BODY_SOFT_BYTES) return { kind: "shard-size-exceeded", sizeBytes: bodyBytes,
+      softLimitBytes: MEMORY_BODY_SOFT_BYTES, hardLimitBytes: 8_192 };
+    const indexBytes = Buffer.byteLength(curatedMemoryIndex(this.list(entry.targetId)), "utf8");
+    if (indexBytes > MEMORY_INDEX_SOFT_BYTES) return { kind: "index-size-exceeded", sizeBytes: indexBytes,
+      softLimitBytes: MEMORY_INDEX_SOFT_BYTES };
+    return undefined;
   }
 
   /** Best-effort sink for a runtime that accepted digests at startup. The current
@@ -366,7 +381,10 @@ export class MakerMemoryBridgeProvider implements BridgeToolProvider {
           ...(input["mode"] === undefined ? {} : { mode: writeMode(input["mode"]) })
         }, learningSave === undefined ? undefined : (store, saved, created) => learningSave.recordSaved(store,
           { kind: "memory", entryId: saved.id, title: saved.title, action: created ? "created" : "updated" }));
-        return privateResult({ entry: publicEntry(entry) });
+        const warningDetail = this.#memory.writeWarning(entry);
+        return privateResult({ entry: publicEntry(entry), ...(warningDetail === undefined ? {} : {
+          warning: warningDetail.kind, warningDetail
+        }) });
       }
       case "memory_delete":
         return privateResult({ deleted: this.#memory.delete(targetId, requiredString(input, "entry_id", 512)) });
@@ -402,6 +420,13 @@ function publicEntry(entry: MakerMemoryEntry, includeBody = false): Readonly<Rec
     updated_at: new Date(entry.updatedAt).toISOString(),
     ...(includeBody ? { body: entry.body } : {})
   };
+}
+
+function curatedMemoryIndex(entries: readonly MakerMemoryEntry[]): string {
+  const curated = entries.filter(entry => entry.kind !== "digest");
+  const index = curated.length === 0 ? "(No curated memory has been saved for this workspace.)"
+    : curated.map(entry => `- [${entry.kind}] ${entry.title} — ${entry.description} (id: ${entry.id})`).join("\n");
+  return `## Current index\n\n${index}`;
 }
 
 function privateResult(value: Readonly<Record<string, unknown>>): McpCallResult {

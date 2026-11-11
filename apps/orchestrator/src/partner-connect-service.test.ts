@@ -725,13 +725,15 @@ describe("PartnerService", () => {
     const authenticate = vi.fn(); const service = createPartnerConnectService(f.manager, authenticate, undefined, undefined,
       new PartnerMemoryManager(f.manager, f.operationalStore, memory));
     const write = (targetId: string, kind: "user" | "project" | "digest", slug: string) => f.operationalStore.putMakerMemoryEntry({ targetId, kind, slug,
-      ...(kind === "digest" ? { backendId: PROFILE.id } : {}), title: slug, description: "Original description", body: "Original release policy." });
+      ...(kind === "digest" ? { backendId: PROFILE.id } : {}), title: slug, description: "Original description", body: "Original release policy. 边界索引配置说明" });
     const entry = write(partner.homeTargetId, "project", "release"); const digest = write(partner.homeTargetId, "digest", "digest-release");
     const foreign = write(other.homeTargetId, "user", "foreign");
     authenticate.mockImplementationOnce(() => { throw new ConnectError("Unauthorized", Code.Unauthenticated); });
     expect(() => service.listPartnerMemories(create(contract.ListPartnerMemoriesRequestSchema, { partnerId: partner.id }), context())).toThrow(ConnectError);
     const list = create(contract.ListPartnerMemoriesResponseSchema, await service.listPartnerMemories(create(contract.ListPartnerMemoriesRequestSchema, { partnerId: partner.id, query: "release" }), context()));
     expect(list.groups.flatMap(group => group.entries).map(item => item.entryId)).toEqual([entry.id]);
+    const short = await service.listPartnerMemories(create(contract.ListPartnerMemoriesRequestSchema, { partnerId: partner.id, query: "边界" }), context());
+    expect(short.groups?.flatMap(group => group.entries ?? []).map(item => item.entryId)).toEqual([entry.id]);
     for (const entryId of [digest.id, foreign.id]) expect(() => service.readPartnerMemory(create(contract.ReadPartnerMemoryRequestSchema,
       { partnerId: partner.id, entryId }), context())).toThrow(ConnectError);
     const request = create(contract.UpdatePartnerMemoryRequestSchema, { partnerId: partner.id, entryId: entry.id,
@@ -752,6 +754,25 @@ describe("PartnerService", () => {
     expect((await service.readPartnerMemory(create(contract.ReadPartnerMemoryRequestSchema, { partnerId: partner.id, entryId: entry.id }), context())).entry).toBeUndefined();
     expect(f.operationalStore.searchMakerMemory(partner.homeTargetId, "deploy")).toEqual([]);
     expect(f.operationalStore.getMakerMemoryEntry(digest.id)).toBeTruthy(); expect(f.operationalStore.getMakerMemoryEntry(foreign.id)).toBeTruthy();
+  });
+
+  it("retains a short-term-only Partner memory hit when ranked results span multiple curated kinds", async () => {
+    const f = await createFixture(); const partner = await f.manager.createPartner(partnerInput(f.partnerStore, "Search partner"));
+    const memory = new MakerMemoryController({ store: f.operationalStore }); cleanups.push(() => memory.dispose());
+    const service = createPartnerConnectService(f.manager, () => undefined, undefined, undefined,
+      new PartnerMemoryManager(f.manager, f.operationalStore, memory));
+    for (let index = 0; index < 50; index++) memory.write(partner.homeTargetId, {
+      kind: index % 2 === 0 ? "project" : "reference", name: `ranked-${index}`, title: `Needle ${index}`,
+      description: "Ranked match", body: "needle"
+    });
+    const short = memory.write(partner.homeTargetId, { kind: "user", name: "short-only", title: "Preference",
+      description: "Short search", body: "边界索引配置说明" });
+    const result = await service.listPartnerMemories(create(contract.ListPartnerMemoriesRequestSchema,
+      { partnerId: partner.id, query: "needle 边界" }), context());
+    const entries = result.groups?.flatMap(group => group.entries ?? []) ?? [];
+    expect(entries).toHaveLength(50);
+    expect(entries.some(entry => entry.entryId === short.id)).toBe(true);
+    expect(new Set(entries.map(entry => entry.entryId)).size).toBe(50);
   });
 
   it("keeps stopped memory readable, fences profile revisions and coalesces refresh failures without undoing saves", async () => {

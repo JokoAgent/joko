@@ -81,6 +81,9 @@ describe("Orchestrator application composition", () => {
     const memory = application.makerMemory!;
     const entry = memory.write(targetId, { kind: "project", name: "report-style", title: "Report style",
       description: "Curated startup index marker", body: "Keep reports concise." });
+    const indexEntries = Array.from({ length: 12 }, (_, index) => memory.write(targetId, {
+      kind: "project", name: `full-index-${index}`, title: `Index ${index}`, description: "目录描述".repeat(25), body: "Durable fact."
+    }));
     const router = application.mcpRouter!;
     const snapshots = vi.spyOn(router, "createPiBridgeSnapshot");
     cleanups.push(async () => { snapshots.mockRestore(); });
@@ -108,7 +111,9 @@ describe("Orchestrator application composition", () => {
       return router.executeBridgeCall({ authorization: `Bearer ${result.value.mcpBridge.token}`, requestId: randomUUID(),
         sessionId, targetId, generation, serverId: MAKER_MEMORY_PROVIDER_ID, toolName: "memory_read", arguments: { entry_id: entry.id } });
     };
-    expect(await startupPrompt(original.generation)).toContain(entry.description);
+    const initialPrompt = await startupPrompt(original.generation);
+    expect(initialPrompt).toContain(entry.description);
+    for (const item of [entry, ...indexEntries]) expect(initialPrompt).toContain(`(id: ${item.id})`);
     const updated = await operations.submitOperation({
       operationId: "disable-pi-memory", connectionId: paired.connection.id,
       mutation: { payload: { case: "updateMemorySettings", value: { patch: { backendId: "pi", backendEnabled: false } } } }
