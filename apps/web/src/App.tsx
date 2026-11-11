@@ -1357,6 +1357,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (activeTimeline.some((item) => item.id === messageId)) {
       if (handledMessageDeepLinkRef.current === deepLinkKey) return;
       handledMessageDeepLinkRef.current = deepLinkKey;
+      if (loadingMessageDeepLinkRef.current === deepLinkKey) {
+        const busyKey = `message-link:${messageJumpGenerationRef.current}`;
+        loadingMessageDeepLinkRef.current = undefined;
+        setBusyAction((current) => current === busyKey ? undefined : current);
+      }
       messageDeepLinkHistorySearchRef.current = undefined;
       setRetryableMessageDeepLinkKey(undefined);
       setActionError(undefined);
@@ -1381,10 +1386,13 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       if (loadingMessageDeepLinkRef.current === deepLinkKey || handledMessageDeepLinkRef.current === deepLinkKey) return;
       loadingMessageDeepLinkRef.current = deepLinkKey;
       const jumpGeneration = ++messageJumpGenerationRef.current;
+      const busyKey = `message-link:${jumpGeneration}`;
+      const isPending = (): boolean => messageJumpGenerationRef.current === jumpGeneration
+        && currentMessageDeepLinkRef.current === deepLinkKey && loadingMessageDeepLinkRef.current === deepLinkKey;
       setActionError(undefined);
-      setBusyAction(`message-link:${messageEventId}`);
+      setBusyAction(busyKey);
       void controllerRef.current.loadSessionTimelineAround(activeSession.id, messageEventId, 160).then((items) => {
-        if (messageJumpGenerationRef.current !== jumpGeneration || currentMessageDeepLinkRef.current !== deepLinkKey) return;
+        if (!isPending()) return;
         if (!items.some((item) => item.id === messageId)) throw new Error(t("nav.messageJumpUnavailable"));
         handledMessageDeepLinkRef.current = deepLinkKey;
         setSearchTimelineWindow({
@@ -1403,13 +1411,13 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           requestId: ++timelineFocusRequestIdRef.current
         });
       }).catch((error: unknown) => {
-        if (messageJumpGenerationRef.current === jumpGeneration && currentMessageDeepLinkRef.current === deepLinkKey) {
+        if (isPending()) {
           failedMessageDeepLinkRef.current = deepLinkKey;
           setActionError(messageOf(error, t("nav.messageJumpUnavailable")));
         }
       }).finally(() => {
-        if (loadingMessageDeepLinkRef.current === deepLinkKey) loadingMessageDeepLinkRef.current = undefined;
-        setBusyAction((current) => current === `message-link:${messageEventId}` ? undefined : current);
+        if (isPending()) loadingMessageDeepLinkRef.current = undefined;
+        setBusyAction((current) => current === busyKey ? undefined : current);
       });
       return;
     }

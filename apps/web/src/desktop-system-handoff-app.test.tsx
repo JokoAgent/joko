@@ -186,6 +186,49 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
+  it.each(["succeeds", "fails"])("keeps the first message location when the later around read %s", async (outcome) => {
+    const task = session("task-a");
+    const linkedMessage = timelineItem("linked-answer");
+    const firstPage = deferred<Awaited<ReturnType<AppController["loadSessionTimelinePage"]>>>();
+    const around = deferred<readonly TimelineItemView[] | Error>();
+    const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>(() => firstPage.promise);
+    const loadSessionTimelineAround = vi.fn<AppController["loadSessionTimelineAround"]>(async () => {
+      const result = await around.promise;
+      if (result instanceof Error) throw result;
+      return result;
+    });
+    const fixture = renderApp(connectedState({
+      route: { kind: "session", sessionId: task.id, messageId: linkedMessage.id, messageEventId: "event-a" },
+      sessions: [task]
+    }), { loadSessionTimelinePage, loadSessionTimelineAround });
+
+    await fixture.render();
+    expect(loadSessionTimelinePage).toHaveBeenCalledWith(task.id, undefined, 240);
+    expect(loadSessionTimelineAround).toHaveBeenCalledWith(task.id, "event-a", 160);
+    expect(fixture.container.querySelector(".action-progress")).not.toBeNull();
+
+    await act(async () => firstPage.resolve({ items: [linkedMessage] }));
+    const viewport = fixture.container.querySelector<HTMLDivElement>(".timeline")!;
+    const row = viewport.querySelector<HTMLElement>('[data-timeline-item-id="linked-answer"]')!;
+    expect(row.getAttribute("aria-current")).toBe("true");
+    expect(document.activeElement).toBe(row);
+    expect(fixture.container.querySelector(".action-progress")).toBeNull();
+    await act(async () => {
+      viewport.focus();
+      viewport.scrollTop = 200;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    const scrollTo = vi.mocked(viewport.scrollTo);
+    scrollTo.mockClear();
+
+    await act(async () => around.resolve(outcome === "succeeds" ? [linkedMessage] : new Error("Controlled late around failure")));
+    expect(viewport.scrollTop).toBe(200);
+    expect(scrollTo).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(viewport);
+    expect(fixture.container.textContent).not.toContain("Controlled late around failure");
+    await fixture.dispose();
+  });
+
   it("reuses history during navigation but reads the latest page after reconnecting with an unchanged Session descriptor", async () => {
     const task = session("task-a");
     const initial = connectedState({ route: { kind: "session", sessionId: task.id }, sessions: [task] });
