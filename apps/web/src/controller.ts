@@ -2861,6 +2861,13 @@ export function useAppController(): AppController {
     }
     return artifactGateway;
   }, [artifactGateway, linkGatewayGeneration]);
+  const deleteSessionMessage = useCallback<OperationApi["deleteSessionMessage"]>(async (sessionId, eventId, expectedGeneration) => {
+    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+      || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+      throw new Error("The original task connection is no longer current.");
+    }
+    await artifactGateway.deleteSessionMessage(sessionId, eventId, expectedGeneration);
+  }, [artifactGateway, linkGatewayGeneration]);
   const modelPriceApi = useMemo<Pick<AppController, "getModelPriceOverride" | "setModelPriceOverride" | "resetModelPriceOverride">>(() => ({
     getModelPriceOverride: async (...args) => {
       const value = await catalogGateway().getModelPriceOverride(...args);
@@ -3814,7 +3821,7 @@ export function useAppController(): AppController {
     abortRetry: (runId) => gateway().abortRetry(runId),
     retry: (runId) => gateway().retry(runId),
     resetSession: (sessionId) => gateway().resetSession(sessionId),
-    deleteSessionMessage: (sessionId, eventId) => gateway().deleteSessionMessage(sessionId, eventId),
+    deleteSessionMessage,
     renameSession: (sessionId, name) => gateway().renameSession(sessionId, name),
     createTaskTag: (originSessionId, name, color, expectedCatalogRevision, presetId) =>
       gateway().createTaskTag(originSessionId, name, color, expectedCatalogRevision, presetId),

@@ -22,7 +22,7 @@ import {
   Sparkles,
   UsersRound
 } from "lucide-react";
-import type { AppController, AppRoute } from "../controller.js";
+import { appRouteHash, type AppController, type AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
@@ -150,6 +150,8 @@ interface ActiveMessageDelete {
   readonly messageId: string;
   readonly eventId: string;
   readonly item: TimelineItemView;
+  readonly isCurrent: () => boolean;
+  readonly dispatch: () => Promise<void>;
   readonly busy: boolean;
   readonly error?: string;
 }
@@ -175,7 +177,7 @@ export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JS
   </PartnerConversationProvider>;
 }
 
-function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
+function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, allowSplitMessageDelete = false, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -183,6 +185,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly reviewReadOnly?: boolean;
   readonly presentation?: SessionPanePresentation;
   readonly composerAutoFocus?: boolean;
+  readonly allowSplitMessageDelete?: boolean;
   readonly models: readonly ModelView[];
   readonly timeline: readonly TimelineItemView[];
   readonly timelineHasEarlier: boolean;
@@ -367,7 +370,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const recoveryFlightsRef = useRef(new RecoveryActionSingleFlight());
   const recoveryWaitAbortsRef = useRef(new Map<string, AbortController>());
   const compactGuardRef = useRef(new SessionScopedRequestGuard());
-  const messageDeleteGuardRef = useRef(new SessionScopedRequestGuard());
   const paneRef = useRef<HTMLElement>(null);
   const timelineRootRef = useRef<HTMLDivElement | null>(null);
   const bindTimelineRoot = useCallback((root: HTMLDivElement | null): void => {
@@ -434,7 +436,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current = undefined;
     rewindDocumentRef.current?.remove();
   }, []);
-  const captureDerivedTaskSource = (): (() => boolean) => {
+  const captureTaskActionSource = (
+    matchesRoute: (route: AppRoute) => boolean = (route) => sessionRouteIsCurrent(route, session.id)
+  ): (() => boolean) => {
     const sourceState = controllerRef.current.state;
     const sourceProfileId = sourceState.activeProfile?.id;
     const sourceServerId = sourceState.activeProfile?.serverId;
@@ -460,10 +464,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         && current.navigationRevision === sourceNavigationRevision
         && activeSessionIdRef.current === sourceSessionId
         && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration
-        && sessionRouteIsCurrent(current.route, sourceSessionId);
+        && matchesRoute(current.route);
     };
   };
-  const beginDerivedTaskAction = (isSourceCurrent = captureDerivedTaskSource()) => {
+  const beginDerivedTaskAction = (isSourceCurrent = captureTaskActionSource()) => {
     const occurrence = {};
     derivedTaskActionRef.current = occurrence;
     return { isCurrent: () => derivedTaskActionRef.current === occurrence && isSourceCurrent() };
@@ -834,7 +838,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     ? undefined
     : t("timeline.deleteMessageBusy");
   const currentMessageFork = messageFork?.sessionId === session.id ? messageFork : undefined;
-  const currentMessageDelete = messageDelete?.sessionId === session.id ? messageDelete : undefined;
+  const currentMessageDelete = messageDelete?.isCurrent() === true ? messageDelete : undefined;
   const latestVisibleUserMessage = lastVisibleUserMessage(visibleTimeline);
   const rewindToStartSupported = sessionCapabilitySupportsTarget(
     backend?.capabilities.get("session.rewind_to_start"),
@@ -1004,6 +1008,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setForkingMessageId(undefined);
     setShareSelection(undefined);
     setMessageRewind(undefined);
+    messageDeleteRef.current = undefined;
     setMessageDeleteState(undefined);
     shareSelectionBeforeAllRef.current = undefined;
     messageRewindRequestIdRef.current += 1;
@@ -1097,7 +1102,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
 
   useLayoutEffect(() => {
     compactGuardRef.current.setCurrentSession(session.id);
-    messageDeleteGuardRef.current.setCurrentSession(session.id);
     setCompactFeedback((current) => current !== undefined && !compactGuardRef.current.isCurrent(current.sessionId, current.epoch)
       ? undefined
       : current);
@@ -1110,7 +1114,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     }
     return () => {
       if (compactGuardRef.current.isCurrent(session.id)) compactGuardRef.current.setCurrentSession(null);
-      if (messageDeleteGuardRef.current.isCurrent(session.id)) messageDeleteGuardRef.current.setCurrentSession(null);
     };
   }, [session.id]);
 
@@ -1355,11 +1358,28 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const openMessageDelete = (item: TimelineItemView): void => {
     const target = resolveMessageDeleteTarget(item);
     if (!messageDeleteSupported || messageDeleteBlockedReason !== undefined || target === undefined) return;
+    if (messageDeleteRef.current?.busy && messageDeleteRef.current.isCurrent()) return;
+    const pane = paneRef.current;
+    if (pane === null) return;
+    const view = pane.ownerDocument.defaultView;
+    const locationHash = view?.location.hash;
+    const routeHash = appRouteHash(controllerRef.current.state.route);
+    const isSourceCurrent = captureTaskActionSource((route) => appRouteHash(route) === routeHash
+      && (sessionRouteIsCurrent(route, session.id) || allowSplitMessageDelete && route.kind === "session"));
+    const isCurrent = () => {
+      const current = controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id);
+      return pane.isConnected && paneRef.current === pane && view?.location.hash === locationHash && isSourceCurrent()
+        && current?.backendId === session.backendId && current.targetId === session.targetId;
+    };
+    if (!isCurrent()) return;
+    const deleteMessage = controller.deleteSessionMessage;
     const next: ActiveMessageDelete = {
       sessionId: session.id,
       messageId: target.messageId,
       eventId: target.eventId,
       item,
+      isCurrent,
+      dispatch: () => deleteMessage(session.id, target.eventId, session.generation),
       busy: false
     };
     messageDeleteRef.current = next;
@@ -1374,9 +1394,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
 
   const confirmMessageDelete = (): void => {
     const pending = messageDeleteRef.current;
-    if (pending === undefined || pending.busy) return;
-    const request = messageDeleteGuardRef.current.tryBegin(pending.sessionId);
-    if (request === undefined) return;
+    if (pending === undefined || pending.busy || !pending.isCurrent()) return;
     void (async () => {
       try {
         const latestState = controllerRef.current.state;
@@ -1392,9 +1410,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           candidate.id === pending.messageId && candidate.sourceEventId === pending.eventId
         );
         const latestTarget = latestItem === undefined ? undefined : resolveMessageDeleteTarget(latestItem);
-        const routeCurrent = sessionRouteIsCurrent(latestState.route, pending.sessionId)
-          && activeSessionIdRef.current === pending.sessionId;
-        if (!routeCurrent || !messageDeleteGuardRef.current.isCurrent(pending.sessionId, request.epoch)) return;
         if (
           latestSession?.state !== "idle"
           || latestSession.compacting === true
@@ -1420,27 +1435,22 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         const inFlight = { ...pending, busy: true, error: undefined };
         messageDeleteRef.current = inFlight;
         setMessageDeleteState(inFlight);
-        await controllerRef.current.deleteSessionMessage(pending.sessionId, pending.eventId);
-        if (!messageDeleteGuardRef.current.isCurrent(pending.sessionId, request.epoch)) return;
-        const current = messageDeleteRef.current;
-        if (current?.sessionId !== pending.sessionId || current.eventId !== pending.eventId) return;
+        await pending.dispatch();
+        if (!pending.isCurrent() || messageDeleteRef.current !== inFlight) return;
         setShareSelection(undefined);
         shareSelectionBeforeAllRef.current = undefined;
         messageRewindRequestIdRef.current += 1;
         setMessageRewind(undefined);
         setMessageActionResetSignal((value) => value + 1);
-        window.getSelection()?.removeAllRanges();
+        paneRef.current?.ownerDocument.getSelection()?.removeAllRanges();
         messageDeleteRef.current = undefined;
         setMessageDeleteState(undefined);
       } catch {
-        if (!messageDeleteGuardRef.current.isCurrent(pending.sessionId, request.epoch)) return;
         const current = messageDeleteRef.current;
-        if (current?.sessionId !== pending.sessionId || current.eventId !== pending.eventId) return;
+        if (!pending.isCurrent() || current?.dispatch !== pending.dispatch) return;
         const failed = { ...current, busy: false, error: t("timeline.deleteMessageFailed") };
         messageDeleteRef.current = failed;
         setMessageDeleteState(failed);
-      } finally {
-        request.release();
       }
     })();
   };
@@ -1545,7 +1555,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       messageId: item.messageId ?? item.id,
       eventId: item.sourceEventId,
       nativeEntryId: target.entryId,
-      isCurrent: captureDerivedTaskSource()
+      isCurrent: captureTaskActionSource()
     });
   };
 

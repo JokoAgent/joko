@@ -2843,6 +2843,7 @@ function SplitSessionPaneHost({ controller, sessionId, navigationOpen, t, runAct
     backend={backend}
     reviewReadOnly={reviewer !== undefined}
     composerAutoFocus={false}
+    allowSplitMessageDelete
     models={snapshot.models}
     timeline={timeline}
     timelineHasEarlier={currentHistory === undefined || !currentHistory.initialized || currentHistory.nextBeforeCursor !== undefined}

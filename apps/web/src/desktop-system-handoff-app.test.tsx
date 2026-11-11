@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppWithController, reserveMessageDeepLinkHistoryPage } from "./App.js";
 import { useAppController, type AppController, type ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
+import { addSessionSplit, writeSessionSplitLayout } from "./session-split-layout.js";
 import {
   emptySnapshot,
   type ScheduleRunHistoryView,
@@ -227,6 +228,86 @@ describe("Desktop system handoff App boundary", () => {
     await act(async () => replacement.resolve([]));
     expect(fixture.container.textContent).toContain("That message is no longer available in the task timeline.");
     await fixture.dispose();
+  });
+
+  it.each(["original", "rebound"] as const)("scopes message deletion in a non-route split pane to the %s view", async (scope) => {
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockReturnValue(1_000);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
+    const taskA = session("task-a");
+    const taskB = { ...session("task-b"), generation: 8n };
+    const messageA = { ...timelineItem("answer-a"), sourceEventId: "event-a" };
+    const messageB = { ...timelineItem("answer-b"), sourceEventId: "event-b" };
+    const initial = connectedState({ route: { kind: "session", sessionId: taskA.id }, sessions: [taskA, taskB] });
+    const profile = { ...initial.activeProfile!, serverId: "message-delete-split-test" };
+    const original = deferred<void>();
+    const deleteSessionMessage = vi.fn<AppController["deleteSessionMessage"]>()
+      .mockReturnValueOnce(original.promise)
+      .mockResolvedValueOnce(undefined);
+    const navigate = vi.fn();
+    const state: ControllerState = {
+      ...initial,
+      profiles: [profile],
+      activeProfile: profile,
+      snapshot: {
+        ...initial.snapshot,
+        timelineBySession: new Map([[taskA.id, [messageA]], [taskB.id, [messageB]]]),
+        backends: [{ id: taskB.backendId, name: "Pi", version: "1", health: "healthy",
+          capabilities: new Map([["session.message_delete", { name: "session.message_delete", supported: true, options: [] }]]) }]
+      }
+    };
+    window.location.hash = "#/tasks/task-a";
+    writeSessionSplitLayout(profile.serverId, addSessionSplit({}, taskB.id, taskA.id, "right"));
+    const fixture = renderApp(state, { deleteSessionMessage, navigate });
+    const dialog = () => document.querySelector(".message-delete-dialog");
+    const confirm = () => dialog()?.querySelector<HTMLButtonElement>("button.button--danger");
+    const openB = async (): Promise<void> => {
+      const pane = fixture.container.querySelector('[data-session-split-pane="task-b"]')!;
+      const row = pane.querySelector('[data-message-client-id="answer-b"]')?.closest(".timeline__row");
+      const more = row?.querySelector<HTMLElement>("summary");
+      expect(more).toBeInstanceOf(HTMLElement);
+      await act(async () => {
+        more?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+        more?.click();
+        row?.querySelector<HTMLButtonElement>('button[aria-label="Delete message"]')?.click();
+      });
+      expect(dialog()).not.toBeNull();
+    };
+    const clickConfirm = async (): Promise<void> => {
+      const button = confirm();
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => { button?.click(); button?.click(); });
+    };
+    try {
+      await fixture.render();
+      expect(fixture.container.querySelector('[data-session-split-pane="task-a"]')).not.toBeNull();
+      await openB();
+      await clickConfirm();
+      expect(deleteSessionMessage).toHaveBeenCalledExactlyOnceWith(taskB.id, "event-b", 8n);
+      expect(dialog()?.getAttribute("aria-busy")).toBe("true");
+      expect(navigate).not.toHaveBeenCalled();
+      expect(window.location.hash).toBe("#/tasks/task-a");
+      if (scope === "original") {
+        await act(async () => original.resolve());
+      } else {
+        await fixture.render({ ...state, connectionGeneration: 2 });
+        expect(dialog()).toBeNull();
+        await openB();
+        await act(async () => original.reject(new Error("Previous connection failed")));
+        expect(dialog()?.querySelector("[role='alert']")).toBeNull();
+        expect(dialog()?.getAttribute("aria-busy")).toBe("false");
+        await clickConfirm();
+        expect(deleteSessionMessage.mock.calls).toEqual([[taskB.id, "event-b", 8n], [taskB.id, "event-b", 8n]]);
+      }
+      expect(dialog()).toBeNull();
+    } finally {
+      await fixture.dispose();
+      writeSessionSplitLayout(profile.serverId, {});
+    }
   });
 
   it.each(["succeeds", "fails"])("keeps the first message location when the later around read %s", async (outcome) => {

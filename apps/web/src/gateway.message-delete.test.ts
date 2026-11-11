@@ -1,6 +1,7 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
+  EntityKind,
   EventPayloadSchema,
   EventSchema,
   GetSnapshotResponseSchema,
@@ -32,8 +33,10 @@ describe("message deletion gateway", () => {
     try {
       await view.answer(sessionId, eventId, "Deleted answer");
       await view.answer("other-session", "other-event", "Another task's answer");
+      await expect(view.gateway.deleteSessionMessage(sessionId, eventId, 2n)).rejects.toThrow("generation is no longer current");
+      expect(view.submissions).toHaveLength(0);
       view.beforeNextSnapshot(() => refresh.promise);
-      const deletion = view.gateway.deleteSessionMessage(sessionId, eventId);
+      const deletion = view.gateway.deleteSessionMessage(sessionId, eventId, 3n);
       const settled = vi.fn();
       void deletion.then(() => settled("succeeded"), settled);
       await vi.waitFor(() => expect(view.submissions).toHaveLength(1));
@@ -42,6 +45,9 @@ describe("message deletion gateway", () => {
       expect(view.submissions[0]?.mutation?.payload).toMatchObject({
         case: "deleteSessionMessage", value: { sessionId, eventId }
       });
+      expect(view.submissions[0]?.mutation?.preconditions).toMatchObject([
+        { entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: 3n }
+      ]);
 
       view.complete();
       await vi.waitFor(() => expect(settled).toHaveBeenCalledExactlyOnceWith("succeeded"));

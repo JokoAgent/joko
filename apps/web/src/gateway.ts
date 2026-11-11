@@ -2481,17 +2481,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "resetSession", value: { sessionId } }, true);
   }
 
-  async deleteSessionMessage(sessionId: string, eventId: string): Promise<void> {
+  async deleteSessionMessage(sessionId: string, eventId: string, expectedGeneration?: bigint): Promise<void> {
     const scope = this.captureActionScope();
     const operationId = randomUuid();
     const serviceGeneration = this.#snapshot?.generation;
     const sessionGeneration = this.#snapshot?.sessions.find((session) => session.id === sessionId)?.generation;
+    if (expectedGeneration !== undefined && expectedGeneration !== sessionGeneration) {
+      throw new GatewayError("The original task generation is no longer current.");
+    }
+    const preconditions = expectedGeneration === undefined ? []
+      : [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }];
     const deletion: MessageDeletionProjection | undefined = serviceGeneration === undefined || sessionGeneration === undefined
       ? undefined : { sessionId, eventId, serviceGeneration, sessionGeneration };
     if (deletion !== undefined) this.#messageDeletionProjections.set(operationId, deletion);
     try {
       // The terminal receipt settles the mutation. submit refreshes the catalog independently.
-      await this.submit({ case: "deleteSessionMessage", value: { sessionId, eventId } }, true, [], scope.signal, (_id, operation) => {
+      await this.submit({ case: "deleteSessionMessage", value: { sessionId, eventId } }, true, preconditions, scope.signal, (_id, operation) => {
         if (operation?.state !== OperationState.SUCCEEDED) return;
         const result = operation.result?.payload, mutation = operation.mutation?.payload;
         const receiptRevision = operation.version?.revision?.value;
