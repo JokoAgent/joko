@@ -67,6 +67,7 @@ import {
   AsyncTransactionError,
   AuthorizationError,
   InvalidStateTransitionError,
+  MessageSearchRevisionConflictError,
   NotFoundError,
   OperationConflictError,
   OperationInProgressError,
@@ -12918,7 +12919,7 @@ export class OperationalStore {
       throw new StoreError("Message search page token is ahead of the durable event cursor.");
     }
     if (cursor !== undefined && BigInt(cursor.revision) !== currentRevision) {
-      throw new StoreError("Message search page token is stale because durable state changed.");
+      throw new MessageSearchRevisionConflictError();
     }
     return {
       query,
@@ -12974,7 +12975,7 @@ export class OperationalStore {
       throw new StoreError("Message search page token is ahead of the durable event cursor.");
     }
     if (revision !== currentRevision) {
-      throw new StoreError("Message search page token is stale because durable state changed.");
+      throw new MessageSearchRevisionConflictError();
     }
     const offset = cursor?.offset ?? 0;
     const tokens = messageSearchTokens(query);

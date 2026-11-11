@@ -15,7 +15,7 @@ import {
 import { afterEach, describe, expect, it } from "vitest";
 import { MESSAGE_SEARCH_CORPUS } from "./i18n/message-search.test-fixture.js";
 
-import { OperationalStore } from "./index.js";
+import { MessageSearchRevisionConflictError, OperationalStore } from "./index.js";
 
 const cleanups: Array<() => void> = [];
 const EMBEDDING_GENERATION_ID = "embedding-generation-1";
@@ -468,12 +468,15 @@ describe("OperationalStore visible message search", () => {
     })).not.toThrow();
     const sessionB = fixture.store.getSession("session-b");
     fixture.store.updateSession("session-b", { deletedAt: 100 }, sessionB.revision, 100);
+    expect(() => fixture.store.validateSessionMessageSearch({
+      scope: { owner: true }, query: "stable needle", limit: 1, pageToken: first.nextPageToken
+    })).toThrow(MessageSearchRevisionConflictError);
     expect(() => fixture.store.searchSessionMessages({
       scope: { owner: true },
       query: "stable needle",
       limit: 1,
       pageToken: first.nextPageToken
-    })).toThrow(/stale/u);
+    })).toThrow(MessageSearchRevisionConflictError);
 
     const afterDelete = fixture.store.searchSessionMessages({ scope: { owner: true }, query: "stable needle" });
     expect(afterDelete.matches.map((match) => match.sessionId)).not.toContain("session-b");
