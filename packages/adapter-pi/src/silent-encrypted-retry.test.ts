@@ -111,8 +111,11 @@ describe("silent encrypted-content recovery", () => {
       process.env.JOKO_PI_GENERATION = "7";
 
       const bodies: string[] = [];
+      const signals: Array<AbortSignal | null | undefined> = [];
+      const controller = new AbortController();
       let firstFailure = true;
       globalThis.fetch = async (input, init) => {
+        signals.push(init?.signal);
         const request = new Request(input, init);
         expect([...request.headers.keys()]).not.toContain("x-joko-silent-encrypted-retry-provider");
         bodies.push(await request.clone().text());
@@ -136,7 +139,7 @@ describe("silent encrypted-content recovery", () => {
           { type: "reasoning", encrypted_content: "SECRET" }
         ]
       });
-      const send = (model = "grok-4.5", signal?: AbortSignal) => globalThis.fetch("https://provider.test/v1/responses", {
+      const send = (model = "grok-4.5", signal = controller.signal) => globalThis.fetch("https://provider.test/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json", ...hooks.headers() },
         body: requestBody.replace("grok-4.5", model),
@@ -145,12 +148,15 @@ describe("silent encrypted-content recovery", () => {
 
       await expect(send()).resolves.toMatchObject({ status: 200 });
       expect(bodies).toHaveLength(2);
+      expect(signals[0]).toBe(controller.signal);
+      expect(signals[1]).toBe(controller.signal);
       expect(bodies[0]).toContain("SECRET");
       expect(bodies[1]).not.toContain("SECRET");
       expect(bodies[1]).toContain("COMP");
 
       await expect(send()).resolves.toMatchObject({ status: 200 });
       expect(bodies).toHaveLength(3);
+      expect(signals[2]).toBe(controller.signal);
       expect(bodies[2]).not.toContain("SECRET");
       expect(bodies[2]).toContain("COMP");
 
