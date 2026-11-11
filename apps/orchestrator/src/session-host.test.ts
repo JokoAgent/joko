@@ -12374,17 +12374,21 @@ describe("SessionHost", () => {
       entryId: "unrelated-native-user", sourceMessage: inputOrigin })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
     expect(fork).toHaveBeenCalledTimes(calls);
 
-    fork.mockImplementationOnce(async (_entryId, _context, derivation) => {
+    const retiredForkDispatch = vi.fn(nativeFork);
+    fork.mockImplementationOnce(async (entryId, context, derivation) => {
       const current = fixture.store.getSession(sourceSessionId);
       fixture.store.updateSession(sourceSessionId, { binding: { ...current.descriptor.binding,
         generation: current.descriptor.binding.generation + 1 } }, current.revision);
       derivation.messageFork!.assertCurrent();
-      throw new Error("A stale source should fail before dispatch.");
+      return retiredForkDispatch(entryId, context, derivation);
     });
-    const sessions = fixture.store.listSessions().map(item => item.descriptor.id);
+    const sessionIds = () => fixture.store.listSessions().map(item => item.descriptor.id).sort();
+    const sessions = sessionIds();
     await expect(fixture.host.deriveSession({ ...formal, operationId: "retired-pi-fork", sourceMessage: inputOrigin }))
       .rejects.toBeInstanceOf(OperationPreviouslyFailedError);
-    expect(fixture.store.listSessions().map(item => item.descriptor.id)).toEqual(sessions);
+    expect(fork).toHaveBeenCalledTimes(calls + 1);
+    expect(retiredForkDispatch).not.toHaveBeenCalled();
+    expect(sessionIds()).toEqual(sessions);
   });
 
   it("does not dispatch a generation-bound message fork after the source binding changes in native preflight", async () => {
