@@ -7,6 +7,7 @@ import { richAnswerText, splitRichAnswer } from "@joko/contracts";
 import { RichAnswer } from "./RichAnswer.js";
 import { RichAnswerMedia } from "./RichAnswerMedia.js";
 import { useExtensionMailLinkHandler } from "./ExtensionMailReader.js";
+import { DesktopPageSearchTextAccess, PAGE_SEARCH_SCROLL_EVENT, registerDesktopPageSearchTextRow } from "./desktop-page-search.js";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
 import { defaultRangeExtractor, elementScroll, useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -148,6 +149,8 @@ import "./Timeline.stream-fade.css";
 
 const timelineViewports = new TimelineViewportStore();
 const workGroupExpansion = new Map<string, boolean>();
+const TimelineSearchOnly = createContext(false);
+const MEASURED_TIMELINE_ROW = "[data-timeline-item-id]:not([data-timeline-search-only])";
 const WORK_GROUP_ANCHOR_MS = 300;
 const TIMELINE_FORWARD_SCROLL_KEYS: ReadonlySet<string> = new Set(["ArrowDown", "PageDown", "End", " "]);
 const TIMELINE_REHYPE_PLUGINS: NonNullable<ComponentProps<typeof ReactMarkdown>["rehypePlugins"]> = [
@@ -439,10 +442,27 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     if (shareSelection === undefined) return [];
     return shareSelectionPinnedRenderIndexes(shareSelection.selectedIds, renderIndexByChildId, MAXIMUM_RENDERED_SHARE_MESSAGES);
   }, [renderIndexByChildId, shareSelection]);
+  const pageSearchOpen = useContext(DesktopPageSearchTextAccess);
+  const timelineEmpty = items.length === 0;
+  const pageSearchRows = useMemo(() => {
+    const indexes = new Set<number>();
+    if (!pageSearchOpen || partnerPresentation) return indexes;
+    renderItems.forEach((row, index) => {
+      if (row.type === "item" && (row.item.kind === "user" || row.item.kind === "assistant")
+        && row.item.streaming !== true && row.item.partnerPrivateOrigin === undefined && row.item.partnerPrivateSent === undefined) {
+        indexes.add(index);
+      }
+    });
+    return indexes;
+  }, [pageSearchOpen, partnerPresentation, renderItems]);
+  const ordinaryWindowRowsRef = useRef<ReadonlySet<number>>(new Set());
   const extractTimelineRange = useCallback((range: Parameters<typeof defaultRangeExtractor>[0]): number[] => {
-    if (pinnedShareRows.length === 0) return defaultRangeExtractor(range);
-    return [...new Set([...defaultRangeExtractor(range), ...pinnedShareRows])].sort((left, right) => left - right);
-  }, [pinnedShareRows]);
+    const visible = defaultRangeExtractor(range);
+    if (pinnedShareRows.length === 0 && pageSearchRows.size === 0) return visible;
+    const ordinaryWindowRows = new Set([...visible, ...pinnedShareRows]);
+    ordinaryWindowRowsRef.current = ordinaryWindowRows;
+    return [...new Set([...ordinaryWindowRows, ...pageSearchRows])].sort((left, right) => left - right);
+  }, [pageSearchRows, pinnedShareRows]);
   const virtualizer = useVirtualizer({
     count: renderItems.length,
     getScrollElement: () => scrollRef.current,
@@ -457,6 +477,13 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     getItemKey: (index) => renderItems[index]?.key ?? index,
     rangeExtractor: extractTimelineRange
   });
+  const measureTimelineRow = useCallback((node: HTMLDivElement | null): void => {
+    if (node !== null) registerDesktopPageSearchTextRow(node, false);
+    virtualizer.measureElement(node);
+  }, [virtualizer]);
+  const bindPageSearchTextRow = useCallback((node: HTMLDivElement | null): void => {
+    if (node !== null) registerDesktopPageSearchTextRow(node, true);
+  }, []);
   const positionVirtualRow = useCallback((index: number, align: "start" | "center"): void => {
     if (!navigationDocumentActiveRef.current) return;
     const offset = virtualizer.getOffsetForIndex(index, align)?.[0];
@@ -467,6 +494,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const lastItem = items.at(-1);
   const virtualRows = virtualizer.getVirtualItems();
   const renderedRowsKey = virtualRows.map((row) => row.key).join("\u0000");
+  const isSearchOnlyRow = (index: number): boolean => pageSearchRows.has(index) && !ordinaryWindowRowsRef.current.has(index);
+  const measuredRowsKey = pageSearchRows.size === 0 ? renderedRowsKey
+    : virtualRows.filter((row) => !isSearchOnlyRow(row.index)).map((row) => row.key).join("\u0000");
   const estimateMessageNavEntryTop = useCallback((itemId: string, contentTop: number): number | null => {
     const renderIndex = renderIndexByChildId.get(itemId);
     if (renderIndex === undefined) return null;
@@ -579,7 +609,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     const node = scrollRef.current;
     if (node === null) return;
     const viewportTop = node.getBoundingClientRect().top;
-    const rows = node.querySelectorAll<HTMLElement>("[data-timeline-item-id]");
+    const rows = node.querySelectorAll<HTMLElement>(MEASURED_TIMELINE_ROW);
     for (const row of rows) {
       const rect = row.getBoundingClientRect();
       if (rect.bottom <= viewportTop + 0.5) continue;
@@ -762,6 +792,31 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     }
     saveViewport(next, next ? 0 : unreadCountRef.current);
   }, [saveViewport, setFollowing, setUnreadCount]);
+
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    const view = node?.ownerDocument.defaultView;
+    if (node === null || view === undefined || view === null || !pageSearchOpen || timelineEmpty) return;
+    const onFindScroll = (event: Event): void => {
+      if (!navigationDocumentActiveRef.current || !(event instanceof view.CustomEvent) || !(event.detail instanceof view.Range)) return;
+      const range = event.detail;
+      const row = range.startContainer.parentElement?.closest("[data-message-client-id]");
+      if (row === undefined || row === null || !node.contains(row) || !row.contains(range.endContainer)) return;
+      const text = range.getBoundingClientRect();
+      const viewport = node.getBoundingClientRect();
+      if (text.top >= viewport.top && text.bottom <= viewport.bottom) return;
+      cancelTimelineNavigation();
+      setFocusedItemId(undefined);
+      restoreAnchorRef.current = undefined;
+      viewportAnchorRef.current = undefined;
+      setTimelineFollowing(false);
+      // The Find surface performs the actual range scroll immediately after
+      // this event. Its scroll event must not request an earlier history page.
+      writeScrollTop(node.scrollTop);
+    };
+    node.addEventListener(PAGE_SEARCH_SCROLL_EVENT, onFindScroll);
+    return () => node.removeEventListener(PAGE_SEARCH_SCROLL_EVENT, onFindScroll);
+  }, [cancelTimelineNavigation, ownerKey, pageSearchOpen, sessionId, setTimelineFollowing, timelineEmpty, writeScrollTop]);
 
   const jumpToMessageNavEntry = useCallback((itemId: string): void => {
     const node = scrollRef.current;
@@ -1079,7 +1134,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
         let anchorOffsetDelta = 0;
         if (!followingRef.current && anchor !== undefined) {
           const viewportTop = node.getBoundingClientRect().top;
-          for (const row of node.querySelectorAll<HTMLElement>("[data-timeline-item-id]")) {
+          for (const row of node.querySelectorAll<HTMLElement>(MEASURED_TIMELINE_ROW)) {
             if (row.dataset.timelineItemId !== anchor.itemId) continue;
             anchorOffsetDelta = row.getBoundingClientRect().top - viewportTop - anchor.offset;
             break;
@@ -1101,13 +1156,13 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     });
     observer.observe(node);
     observer.observe(content);
-    for (const row of content.querySelectorAll<HTMLElement>("[data-timeline-item-id]")) observer.observe(row);
+    for (const row of content.querySelectorAll<HTMLElement>(MEASURED_TIMELINE_ROW)) observer.observe(row);
     return () => {
       active = false;
       if (frame !== undefined) cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [captureViewportAnchor, getWorkGroupAnchor, ownerKey, renderedRowsKey, saveViewport, sessionId, writeScrollTop]);
+  }, [captureViewportAnchor, getWorkGroupAnchor, measuredRowsKey, ownerKey, saveViewport, sessionId, writeScrollTop]);
 
   useEffect(() => () => {
     if (viewportOwnerRef.current !== viewportOwnerKey) return;
@@ -1228,7 +1283,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     return () => node.removeEventListener(GAMEPAD_SCROLL_EVENT, scroll);
   });
 
-  if (items.length === 0) {
+  if (timelineEmpty) {
     return (
       <div className="timeline-shell" style={{ "--timeline-bottom-inset": `${Math.max(0, bottomInset)}px` } as CSSProperties}>
         <div ref={bindScrollRoot} className="timeline timeline--empty" data-timeline-session-id={sessionId} data-selection-quote-context="" aria-busy={historyLoading || undefined} aria-label={t("timeline.label")} tabIndex={0}>
@@ -1334,26 +1389,30 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
             const renderItem = renderItems[virtualRow.index];
             if (renderItem === undefined) return null;
             const focused = focusedItemId !== undefined && renderItem.childIds.includes(focusedItemId);
+            const searchOnly = isSearchOnlyRow(virtualRow.index);
             return (
               <div
                 key={renderItem.key}
-                ref={virtualizer.measureElement}
+                ref={searchOnly ? bindPageSearchTextRow : measureTimelineRow}
                 data-index={virtualRow.index}
                 data-timeline-item-id={renderItem.key}
                 data-timeline-item-ids={renderItem.childIds.join(" ")}
+                data-timeline-search-only={searchOnly ? "" : undefined}
                 className={cx("timeline__row", focused && "is-search-focus")}
                 tabIndex={focused ? -1 : undefined}
                 aria-current={focused ? "true" : undefined}
-                style={{ transform: `translateY(${virtualRow.start}px)` }}
+                aria-hidden={searchOnly || undefined}
+                inert={searchOnly || undefined}
+                style={{ transform: `translateY(${virtualRow.start}px)`, clipPath: searchOnly ? "inset(100%)" : undefined }}
               >
-                {renderItem.historyGapBefore !== undefined && <div className="timeline-history-gap" role="separator"><span>{t("timeline.historyGap")}</span></div>}
+                {!searchOnly && renderItem.historyGapBefore !== undefined && <div className="timeline-history-gap" role="separator"><span>{t("timeline.historyGap")}</span></div>}
                 {partnerTimeGroups.has(renderItem.key) && <div className="partner-time-group"><time dateTime={new Date(partnerTimeGroups.get(renderItem.key)!).toISOString()}>{formatPartnerTimeGroup(partnerTimeGroups.get(renderItem.key)!, locale)}</time></div>}
                 {firstPartnerUnread === renderItem.key && <div className="partner-unread-divider" role="separator"><span>{t("partners.unreadDivider")}</span></div>}
-                {renderItem.type === "item"
+                <TimelineSearchOnly.Provider value={searchOnly}>{renderItem.type === "item"
                   ? <TimelineBlock sessionId={sessionId} sessionName={sessionName} item={renderItem.item} planAnimated={sessionActive} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} onOpenGeneratedFile={onOpenGeneratedFile} onOpenTurnReview={onOpenTurnReview} onReobserveReview={onReobserveReview} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forkingMessageId={forkingMessageId} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editingMessageId={editingMessageId} editableMessageId={editableMessageId} onEditMessage={(item) => setEditingMessageId(item.id)} onCancelEditMessage={() => setEditingMessageId(undefined)} onMoveEditedMessageToComposer={onMoveEditedMessageToComposer === undefined ? undefined : async (item, text) => { await onMoveEditedMessageToComposer(item, text); setEditingMessageId(undefined); }} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showMessageActions={renderItem.item.kind !== "assistant" || (assistantMessageActions.has(renderItem.item.id) && !blockedAssistantForks.has(renderItem.item.id))} />
                   : renderItem.type === "work"
                     ? <WorkGroupBlock sessionId={sessionId} sessionName={sessionName} work={renderItem} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onHeaderToggle={onWorkGroupHeaderToggle} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} />
-                    : <SessionDerivationMarker origin={renderItem.origin} onOpen={onOpenDerivationOrigin} t={t} />}
+                    : <SessionDerivationMarker origin={renderItem.origin} onOpen={onOpenDerivationOrigin} t={t} />}</TimelineSearchOnly.Provider>
               </div>
             );
           })}
@@ -1595,6 +1654,7 @@ export function AutomationOriginBadge({ automationOrigin, t }: {
 
 function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotion, t, onArtifactUrl, onArtifactDownload, onAddMessageToComposer, onForkMessage, forking, shareSelection, onStartShareSelection, onToggleShareMessage, editing, editable, onEdit, onCancelEdit, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showActions }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly role: "user" | "assistant"; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forking: boolean; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editing: boolean; readonly editable: boolean; readonly onEdit?: (item: TimelineItemView) => void; readonly onCancelEdit?: () => void; readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showActions: boolean }): JSX.Element {
   const personalization = useContext(TimelinePersonalizationContext);
+  const searchOnly = useContext(TimelineSearchOnly);
   const referenceActions = useMemo<TimelineReferenceActions>(() => ({
     ownerKey: personalization.ownerKey,
     sessionId,
@@ -1642,7 +1702,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
   const selectionControl = selectionActive && shareable && onToggleShareMessage !== undefined
     ? <MessageSelectionControl item={item} selected={shareSelection.selectedIds.has(item.id)} roleLabel={roleLabel} t={t} onToggle={onToggleShareMessage} />
     : null;
-  const attachments = (item.attachments?.length ?? 0) > 0
+  const attachments = !searchOnly && (item.attachments?.length ?? 0) > 0
     ? <div className="message-attachments" aria-label={t("timeline.attachments")}>{item.attachments?.map((attachment, index) => <MessageAttachment artifact={attachment} galleryId={timelineMessageAttachmentGalleryId(item.id, attachment.id, index)} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} key={`${attachment.id}:${index}`} />)}</div>
     : null;
   let pastedTextSegmentIndex = 0;
@@ -1674,7 +1734,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     </button>
   </div>;
   if (role === "user") {
-    if (!selectionActive && editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
+    if (!searchOnly && !selectionActive && editing && onCancelEdit !== undefined && onMoveEditedMessageToComposer !== undefined) {
       return <article className="message-user message-user--editing" data-user-msg-id={item.id} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} aria-label={roleLabel}><div className="message-user__stack">{item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}<UserMessageEditBox initialText={quotedUserMessage.body} t={t} onCancel={onCancelEdit} onMoveToComposer={(value) => onMoveEditedMessageToComposer(item, value)} /></div></article>;
     }
     return (
@@ -1696,7 +1756,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
             </div>
           )}
           <SentMessageReferenceChips mentions={inputRanges === undefined ? [] : inputMentions.filter((_mention, index) => !renderedMentions.has(index))} actions={referenceActions} />
-          {!selectionActive && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={actionText} align="right" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={editable} onEdit={onEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
+          {!searchOnly && !selectionActive && showActions && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={actionText} align="right" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={editable} onEdit={onEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
         </div>
       </article>
       </RenderedShareSelectionContext.Provider>
@@ -1712,7 +1772,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
       && item.partnerPrivateOrigin === undefined && <PartnerLearningFooter feedback={item.learning} locale={locale}
         disabled={!partnerConversation.editable || selectionActive}
         onOpen={destination => partnerConversation.openLearningSettings(destination)} />}
-    {!selectionActive && !item.streaming && (showActions || partner !== undefined) && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={richAnswerText(displayText)} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer === undefined ? undefined : () => onAddMessageToComposer({ ...item, text: richAnswerText(displayText) })} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
+    {!searchOnly && !selectionActive && !item.streaming && (showActions || partner !== undefined) && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={richAnswerText(displayText)} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer === undefined ? undefined : () => onAddMessageToComposer({ ...item, text: richAnswerText(displayText) })} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (
     <RenderedShareSelectionContext.Provider value={shareSelected}>
@@ -2053,6 +2113,7 @@ function ThinkingBlock({ item, locale, t }: { readonly item: TimelineItemView; r
 
 export function StreamingMarkdown({ text, streaming, streamFadeKey, t }: { readonly text: string; readonly streaming: boolean; readonly streamFadeKey?: string; readonly t: Translator }): JSX.Element {
   const personalization = useContext(TimelinePersonalizationContext);
+  const searchOnly = useContext(TimelineSearchOnly);
   const throttled = useStreamingMarkdownText(text, streaming);
   const source = streaming ? throttled : text;
   const fade = timelineStreamFadeActive(streaming, personalization.streamFadeEnabled, personalization.reducedMotion);
@@ -2073,8 +2134,8 @@ export function StreamingMarkdown({ text, streaming, streamFadeKey, t }: { reado
     ? <RichAnswer key={part.key} source={part.source} complete={part.complete || !streaming}
       stateKey={JSON.stringify([personalization.answerStateOwnerKey ?? personalization.ownerKey, streamFadeKey, part.key])}
       locale={personalization.locale ?? "en"}
-      onSend={personalization.onSendRichAnswer}
-      renderMedia={node => <RichAnswerMedia node={node} actions={{ ownerKey: personalization.ownerKey, sessionId: personalization.sessionId, t,
+      onSend={searchOnly ? undefined : personalization.onSendRichAnswer}
+      renderMedia={node => searchOnly ? null : <RichAnswerMedia node={node} actions={{ ownerKey: personalization.ownerKey, sessionId: personalization.sessionId, t,
         onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset, onOpenHttpLink: personalization.onOpenHttpLink }} />}
       renderMarkdown={(value, id) => <ParsedMarkdown key={id} text={value} t={t} onWordFadeSettled={settleWord} />} />
     : <ParsedMarkdown key={part.key} text={fade ? repairStreamingMarkdown(part.source) : part.source} t={t}
@@ -2788,7 +2849,8 @@ const SAFE_MARKDOWN_COMPONENTS: Components = {
     },
     img: ({ src, alt }) => {
       const { referenceActions } = useTimelineMarkdownRenderActions();
-      return <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={referenceActions.t} />;
+      const searchOnly = useContext(TimelineSearchOnly);
+      return searchOnly ? null : <TimelineMarkdownImage src={src} alt={alt} actions={referenceActions} t={referenceActions.t} />;
     }
 };
 

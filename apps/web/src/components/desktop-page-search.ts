@@ -1,3 +1,5 @@
+import { createContext } from "react";
+
 export interface DesktopPageMatch {
   readonly range: Range;
   readonly document: Document;
@@ -17,6 +19,14 @@ interface FoldedText {
 
 export const PAGE_SEARCH_HIGHLIGHT = "joko-page-search";
 export const PAGE_SEARCH_ACTIVE_HIGHLIGHT = "joko-page-search-active";
+export const PAGE_SEARCH_SCROLL_EVENT = "joko:page-search-scroll";
+export const DesktopPageSearchTextAccess = createContext(false);
+const searchTextRows = new WeakSet<Element>();
+
+export function registerDesktopPageSearchTextRow(element: Element, active: boolean): void {
+  if (active) searchTextRows.add(element);
+  else searchTextRows.delete(element);
+}
 const SKIP_ELEMENTS = "script, style, noscript, template, input, textarea, select, [data-page-search-ignore]";
 const INLINE_DISPLAYS = new Set(["inline", "inline-block", "inline-flex", "inline-grid", "contents", "ruby", "ruby-base", "ruby-text", ""]);
 
@@ -117,7 +127,7 @@ export function desktopPageElementVisible(
   const ownStyle = style(element);
   if (ownStyle.visibility === "hidden" || ownStyle.visibility === "collapse") return false;
   for (let current: Element | null = element; current !== null; current = current.parentElement) {
-    if (current.hasAttribute("hidden") || current.hasAttribute("inert")) return false;
+    if (current.hasAttribute("hidden") || (current.hasAttribute("inert") && !searchTextRows.has(current))) return false;
     if (current.tagName === "DIALOG" && !current.hasAttribute("open")) return false;
     if (current.tagName === "DETAILS" && !current.hasAttribute("open")) {
       const summary = [...current.children].find((child) => child.tagName === "SUMMARY");
@@ -241,6 +251,9 @@ export function scrollDesktopPageMatch(match: DesktopPageMatch): void {
   const owner = match.document;
   const element = match.range.startContainer.parentElement;
   if (element === null) return;
+  const view = owner.defaultView;
+  if (view === null) return;
+  element.dispatchEvent(new view.CustomEvent(PAGE_SEARCH_SCROLL_EVENT, { bubbles: true, detail: match.range }));
   // Reveal the text's containing scrollers first, then center the actual range
   // rather than a potentially very tall paragraph. Neither operation moves focus.
   element.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });

@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type JSX, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type JSX, type KeyboardEvent } from "react";
 
 import type { AppShortcutOverrides } from "../app-shortcuts.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
@@ -15,12 +15,13 @@ import "./desktop-page-search-bar.css";
 interface DesktopPageSearchBarProps {
   readonly overrides: AppShortcutOverrides;
   readonly t: Translator;
+  readonly onOpenChange?: (open: boolean) => void;
 }
 
 const DOM_REFRESH_DELAY_MS = 100;
 
 /** Desktop renderer search owns highlights; ordinary browsers keep built-in Find. */
-export function DesktopPageSearchBar({ overrides, t }: DesktopPageSearchBarProps): JSX.Element | null {
+export function DesktopPageSearchBar({ overrides, t, onOpenChange }: DesktopPageSearchBarProps): JSX.Element | null {
   const available = typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("page.search") === true;
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -36,6 +37,12 @@ export function DesktopPageSearchBar({ overrides, t }: DesktopPageSearchBarProps
   const documentsRef = useRef(new Set<Document>());
   const inputRef = useRef<HTMLInputElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
+
+  useLayoutEffect(() => {
+    if (!available || !open || onOpenChange === undefined) return;
+    onOpenChange(true);
+    return () => onOpenChange(false);
+  }, [available, onOpenChange, open]);
 
   const stop = useCallback((): void => {
     searchedTextRef.current = undefined;

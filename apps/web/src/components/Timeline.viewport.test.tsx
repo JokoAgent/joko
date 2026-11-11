@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 
-import { act, type ComponentProps } from "react";
+import { act, useState, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ArtifactView, TimelineItemView } from "../model.js";
+import { DesktopPageSearchBar } from "./DesktopPageSearchBar.js";
 import { Timeline } from "./Timeline.js";
+import { DesktopPageSearchTextAccess, PAGE_SEARCH_ACTIVE_HIGHLIGHT } from "./desktop-page-search.js";
 import type { Translator } from "./types.js";
 
 type TimelineProps = ComponentProps<typeof Timeline>;
@@ -292,6 +294,74 @@ describe("Timeline viewport journeys", () => {
     await act(async () => viewport.focus());
     await append([item("later-answer", 9, "assistant")]);
     expect(document.activeElement).toBe(viewport);
+  });
+
+  it("finds a loaded message outside the virtual window and retires its text on close", async () => {
+    extent = 6_400;
+    const artifact: ArtifactView = { id: "find-image", blobId: "find-blob", kind: "image", fileName: "image.png",
+      title: "Image attachment", mediaType: "image/png", byteSize: 8, sourceRevealAvailable: false };
+    const loadArtifact = vi.fn(async () => "blob:find-image");
+    const loadEarlier = vi.fn(async () => undefined);
+    props = { ...props, sessionActive: false, messageNavRailEnabled: false, hasEarlier: true, onLoadEarlier: loadEarlier,
+      onArtifactUrl: loadArtifact, items: Array.from({ length: 68 }, (_, index) => index === 0
+        ? { ...item("first-search-row", 1, "assistant"), text: "The **loaded needle** is here.", attachments: [artifact] }
+        : item(`search-row-${index}`, index + 1, "user")) };
+    const highlights = new Map<string, Set<Range>>();
+    vi.stubGlobal("jokoDesktop", { capabilities: ["page.search"] });
+    vi.stubGlobal("CSS", { highlights });
+    vi.stubGlobal("Highlight", class extends Set<Range> {});
+    function rangeBox(this: Range): DOMRect { return this.startContainer.parentElement?.getBoundingClientRect() ?? new DOMRect(); }
+    const restores = [
+      setSearchGeometryMethod(window.Range.prototype, "getClientRects", function (this: Range) { return [rangeBox.call(this)]; }),
+      setSearchGeometryMethod(window.Range.prototype, "getBoundingClientRect", rangeBox),
+      setSearchGeometryMethod(window.Element.prototype, "scrollIntoView", vi.fn())
+    ];
+    function FindableTimeline() {
+      const [findOpen, setFindOpen] = useState(false);
+      return <DesktopPageSearchTextAccess.Provider value={findOpen}>
+        <DesktopPageSearchBar overrides={{}} t={props.t} onOpenChange={setFindOpen} />
+        <Timeline {...props} />
+      </DesktopPageSearchTextAccess.Provider>;
+    }
+    try {
+      await act(async () => root.render(<FindableTimeline />));
+      await flushFrames();
+      const viewport = timeline();
+      const firstSelector = '[data-timeline-item-id="first-search-row"]';
+      const tailSelector = '[data-timeline-item-id="search-row-67"]';
+      expect(viewport.querySelector(firstSelector)).toBeNull();
+      expect(viewport.querySelector(tailSelector)).not.toBeNull();
+      viewport.style.overflowY = "auto";
+      let top = viewport.scrollTop;
+      Object.defineProperty(viewport, "scrollTop", { configurable: true, get: () => top,
+        set: (value: number) => { top = Math.max(0, Math.min(extent - viewportHeight, value)); } });
+
+      await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", code: "KeyF", ctrlKey: true, bubbles: true, cancelable: true })));
+      await flushFrames();
+      const input = host.querySelector<HTMLInputElement>('[role="search"] input')!;
+      expect(document.activeElement).toBe(input);
+      expect(viewport.querySelector(firstSelector)?.hasAttribute("inert")).toBe(true);
+      expect(loadArtifact).not.toHaveBeenCalled();
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "loaded needle");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        viewport.dispatchEvent(new Event("scroll"));
+      });
+      await flushFrames();
+      expect(host.querySelector(".desktop-page-search-bar__count")?.textContent).toBe("1/1");
+      expect([...highlights.get(PAGE_SEARCH_ACTIVE_HIGHLIGHT)!][0]?.toString()).toBe("loaded needle");
+      expect(viewport.scrollTop).toBeLessThanOrEqual(56);
+      expect(viewport.querySelector(firstSelector)?.hasAttribute("inert")).toBe(false);
+      expect(loadEarlier).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(input);
+
+      await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+      await flushFrames();
+      expect(highlights.size).toBe(0);
+      expect(viewport.querySelector(tailSelector)).toBeNull();
+    } finally {
+      for (const restore of restores.reverse()) restore();
+    }
   });
 
   it("keeps virtual-row corrections from detaching a growing tail after a delayed scroll event", async () => {
@@ -663,4 +733,13 @@ function interaction(id: string, sequence: number, kind: NonNullable<TimelineIte
 function restorePrototypeMethod(name: "scrollTo" | "scrollBy", descriptor: PropertyDescriptor | undefined): void {
   if (descriptor === undefined) Reflect.deleteProperty(HTMLElement.prototype, name);
   else Object.defineProperty(HTMLElement.prototype, name, descriptor);
+}
+
+function setSearchGeometryMethod(target: object, name: string, method: unknown): () => void {
+  const original = Object.getOwnPropertyDescriptor(target, name);
+  Object.defineProperty(target, name, { configurable: true, value: method });
+  return () => {
+    if (original === undefined) Reflect.deleteProperty(target, name);
+    else Object.defineProperty(target, name, original);
+  };
 }
