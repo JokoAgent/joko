@@ -891,7 +891,7 @@ export function skillCatalogEntryFromResource(resource: PiResourceDescriptor): S
     ? resource.state === "approved" || resource.state === "disabled" || resource.state === "loaded"
       || resource.sourceKind === "remote_project" && resource.state === "awaiting_approval"
     : resource.state === "installed" || resource.state === "disabled" || resource.state === "loaded";
-  const standalone = resource.sourceKind === "local" || resource.sourceKind === "skill_market";
+  const standalone = resource.sourceKind === "local" || resource.sourceKind === "skill_market" || resource.sourceKind === "learned";
   return {
     id: resource.id,
     backendId: resource.backendId,

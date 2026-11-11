@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { waitFor } from "./fixture.js";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
 
 const executable = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
@@ -72,6 +73,46 @@ describe("mounted Skill learning review", () => {
     await review.getByText("Installed", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     expect(fixture.application.piResources?.list({ kind: "skill" }).some((item) =>
       item.name === "mounted-learning" && item.sourceKind === "learned" && item.state === "installed")).toBe(true);
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+
+    await page.locator(".skill-hub__tabs").getByRole("tab", { name: "Installed", exact: true }).click();
+    await page.locator("button.skill-card", { hasText: "mounted-learning" }).click();
+    const detail = page.locator(".skill-detail");
+    await detail.getByRole("button", { name: "Edit", exact: true }).click();
+    const editor = detail.getByLabel("Skill file editor");
+    await editor.fill((await editor.inputValue()).replace("# Review each change", "# Reviewed learned workflow"));
+    await detail.getByRole("button", { name: "Review changes", exact: true }).click();
+    const editReview = page.getByRole("dialog", { name: "Review Skill changes" });
+    await waitFor(() => editReview.textContent(), value => value?.includes("+# Reviewed learned workflow") === true,
+      "the learned Skill edit diff");
+    await editReview.getByRole("button", { name: "Apply changes", exact: true }).click();
+    await editReview.waitFor({ state: "hidden" });
+    await waitFor(() => detail.locator(".skill-file-preview__body pre").textContent(),
+      value => value?.includes("# Reviewed learned workflow") === true, "the edited learned Skill file");
+
+    await page.setViewportSize({ width: 1440, height: 960 });
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("tab", { name: /Skills/u }).click();
+    await page.locator("button.skill-card", { hasText: "mounted-learning" }).click();
+    await waitFor(() => detail.locator(".skill-file-preview__body pre").textContent(),
+      value => value?.includes("# Reviewed learned workflow") === true, "the learned Skill file after reload");
+    await detail.getByLabel("Delete mounted-learning?").click();
+    const deleteDialog = page.getByRole("dialog", { name: "Delete mounted-learning?" });
+    await deleteDialog.getByRole("button", { name: "Cancel", exact: true }).click();
+    await deleteDialog.waitFor({ state: "hidden" });
+    expect(fixture.application.piResources?.list({ kind: "skill" }).some((item) =>
+      item.name === "mounted-learning" && item.sourceKind === "learned" && item.state === "installed")).toBe(true);
+    await detail.getByLabel("Delete mounted-learning?").click();
+    const deleteButton = deleteDialog.getByRole("button", { name: "Delete", exact: true });
+    expect(await deleteButton.isDisabled()).toBe(true);
+    await deleteDialog.locator("input").fill("mounted-learning");
+    await deleteButton.click();
+    const removed = page.getByRole("dialog", { name: "Skill removed" });
+    await removed.waitFor({ state: "visible", timeout: 20_000 });
+    await removed.getByRole("button", { name: "Close", exact: true }).click();
+    await page.getByText("No local Skills", { exact: true }).waitFor({ state: "visible" });
+    expect(fixture.application.piResources?.list({ kind: "skill", state: "removed" }).some((item) =>
+      item.name === "mounted-learning" && item.state === "removed")).toBe(true);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     if (errors.length > 0 && process.env.RUNNER_TEMP !== undefined) {
       try {
