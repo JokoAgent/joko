@@ -187,6 +187,12 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it.each(["succeeds", "fails"])("keeps the first message location when the later around read %s", async (outcome) => {
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
     const task = session("task-a");
     const linkedMessage = timelineItem("linked-answer");
     const firstPage = deferred<Awaited<ReturnType<AppController["loadSessionTimelinePage"]>>>();
@@ -209,8 +215,8 @@ describe("Desktop system handoff App boundary", () => {
 
     await act(async () => firstPage.resolve({ items: [linkedMessage] }));
     const viewport = fixture.container.querySelector<HTMLDivElement>(".timeline")!;
-    const row = viewport.querySelector<HTMLElement>('[data-timeline-item-id="linked-answer"]')!;
-    expect(row.getAttribute("aria-current")).toBe("true");
+    const row = viewport.querySelector('[data-message-client-id="linked-answer"]')?.closest<HTMLElement>(".timeline__row");
+    expect(row?.getAttribute("aria-current")).toBe("true");
     expect(document.activeElement).toBe(row);
     expect(fixture.container.querySelector(".action-progress")).toBeNull();
     await act(async () => {
