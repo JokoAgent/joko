@@ -453,7 +453,7 @@ describe("production Skill learning", () => {
     expect(evidence).not.toContain("Completed evidence 129.");
   });
 
-  it("preserves portable references through evidence, review and adoption while removing host paths and secrets", { timeout: 90_000 }, async () => {
+  it("preserves portable references through evidence, review and adoption while removing host paths and secrets", { timeout: 120_000 }, async () => {
     const portable = [
       "Run python 'scripts/tools/report.py'.",
       "[Report script](scripts/tools/report.py)",
@@ -465,13 +465,52 @@ describe("production Skill learning", () => {
     const privatePaths = ["/Users/learner/private/report.md", "/home/learner/private/report.md",
       "C:\\Users\\learner\\private\\report.md", "C:/Users/learner/private/report.md",
       "\\\\private-server\\share\\report.md", "//private-server/share/report.md", "~/private/report.md", "file:///Users/learner/private/report.md"];
-    const body = [portable, ...privatePaths, "password=training-secret", "https://example.test/docs?ticket=private-ticket"].join("\n");
+    const regularExpressions = [
+      "const extension = /[.]py/;",
+      "const word = /report/gi;",
+      "const slash = /[/]/u;",
+      "const nested = /scripts\\/tools\\/report\\.py/u;"
+    ];
+    const credential = `sk-${"a".repeat(24)}`;
+    const javascript = [
+      `${regularExpressions[0]} const nearby = ${JSON.stringify(privatePaths[0])};`,
+      ...regularExpressions.slice(1),
+      'const relative = "scripts/tools/report.py";',
+      "const divided = 12 / 3 / 2;",
+      'const ambiguousString = "/[.]py/";',
+      ...privatePaths.map((path, index) => `const host${index} = ${JSON.stringify(path)};`),
+      `// Host reference: ${privatePaths[0]}`,
+      'const password = "training-secret";',
+      `const fingerprint = /${credential}/;`,
+      'const publicUrl = "https://example.test/docs?ticket=private-ticket";',
+      ""
+    ].join("\n");
+    const expectedJavascript = [
+      `${regularExpressions[0]} const nearby = "<path>";`,
+      ...regularExpressions.slice(1),
+      'const relative = "scripts/tools/report.py";',
+      "const divided = 12 / 3 / 2;",
+      'const ambiguousString = "<path>";',
+      ...privatePaths.map((_path, index) => `const host${index} = "<path>";`),
+      "// Host reference: <path>",
+      'const password = "[REDACTED]";',
+      "const fingerprint = /[REDACTED]/;",
+      'const publicUrl = "https://example.test/docs";',
+      ""
+    ].join("\n");
+    const body = [portable, "```javascript", javascript, "```", ...privatePaths,
+      "password=training-secret", "https://example.test/docs?ticket=private-ticket"].join("\n");
+    const ambiguousText = `${regularExpressions[0]}\n${privatePaths[0]}\npassword=training-secret\n`;
+    const brokenJavascript = `const incomplete = ;\n${ambiguousText}`;
     const script = 'from pathlib import Path\nprint(Path("scripts/tools/report.py"))\n';
     fixture = await RealPiSystemFixture.start({ providerResponder: () => ({ kind: "text", text: JSON.stringify({
       name: "learned-review", description: "Review a portable workflow", explanation: "Keep the reviewed portable references.",
-      files: [{ path: "SKILL.md", content: skillDocument(body) }, { path: "scripts/tools/report.py", content: script }]
+      files: [{ path: "SKILL.md", content: skillDocument(body) }, { path: "scripts/tools/report.py", content: script },
+        { path: "scripts/tools/report.js", content: javascript },
+        { path: "references/unknown.txt", content: ambiguousText },
+        { path: "scripts/tools/incomplete.js", content: brokenJavascript }]
     }) }) });
-    const { clients } = await fixture.pair("Portable learning reviewer");
+    const { clients, connectionId } = await fixture.pair("Portable learning reviewer");
     const started = (await clients.skill.startSkillLearning({
       requestId: randomUUID(), targetId: "workspace-real-pi", instruction: body
     })).run!;
@@ -483,12 +522,26 @@ describe("production Skill learning", () => {
     const diff = proposed.changes.map(change => change.unifiedDiff ?? "").join("\n");
     for (const value of [prompt, content, diff]) {
       for (const line of portable.split("\n")) expect(value).toContain(line);
+      for (const expression of regularExpressions) expect(value).toContain(expression);
       for (const path of privatePaths) expect(value).not.toContain(path);
       expect(value).not.toContain("training-secret");
       expect(value).not.toContain("private-ticket");
+      expect(value).not.toContain(credential);
       expect(value).toContain("<path>");
     }
     expect(proposed.files.find(file => file.key === "scripts/tools/report.py")?.content).toBe(script);
+    expect(proposed.files.find(file => file.key === "scripts/tools/report.js")?.content).toBe(expectedJavascript);
+    expect(content).toContain(expectedJavascript);
+    expect(prompt).toContain(expectedJavascript);
+    const scriptDiff = proposed.changes.find(change => change.key === "scripts/tools/report.js")!.unifiedDiff!;
+    expect(scriptDiff.split("\n").slice(3, -1).map(line => line.slice(1)).join("\n") + "\n").toBe(expectedJavascript);
+    for (const key of ["references/unknown.txt", "scripts/tools/incomplete.js"]) {
+      const fallback = proposed.files.find(file => file.key === key)!.content;
+      expect(fallback).not.toContain(regularExpressions[0]);
+      expect(fallback).not.toContain(privatePaths[0]);
+      expect(fallback).not.toContain("training-secret");
+      expect(fallback).toContain("<path>");
+    }
     expect((await clients.skill.applySkillLearning({ operationId: randomUUID(), runId: reviewed.runId,
       expectedRunRevision: reviewed.revision, expectedProposalRevision: proposed.revision,
       expectedResourceId: proposed.resourceId, confirmReplace: false })).run?.state).toBe(SkillLearningState.APPLIED);
@@ -496,8 +549,42 @@ describe("production Skill learning", () => {
       .skills.find(skill => skill.skillId === proposed.resourceId)!;
     const opened = (await clients.skill.openSkill({ skillId: installed.skillId,
       expectedResourceRevision: installed.entityVersion?.revision })).skill!;
-    expect((await clients.skill.readSkillFile({ sessionId: opened.sessionId, key: "SKILL.md" })).file?.content).toBe(content);
-    expect((await clients.skill.readSkillFile({ sessionId: opened.sessionId, key: "scripts/tools/report.py" })).file?.content).toBe(script);
+    for (const file of proposed.files) {
+      expect((await clients.skill.readSkillFile({ sessionId: opened.sessionId, key: file.key })).file?.content).toBe(file.content);
+    }
+
+    // A normal Skill edit can introduce private host details. A replacement
+    // preview must sanitize that complete old source without damaging regexes.
+    const before = (await clients.skill.readSkillFile({ sessionId: opened.sessionId, key: "scripts/tools/report.js" })).file!;
+    const draft = (await clients.skill.prepareSkillFileEdit({ sessionId: opened.sessionId, key: before.key,
+      expectedFileRevision: before.revision, content: javascript })).draft!;
+    expect((await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "applySkillDraft", value: create(ApplySkillDraftMutationSchema, { draftId: draft.draftId }) }
+    }))).state).toBe(OperationState.SUCCEEDED);
+    const replacement = (await clients.skill.startSkillLearning({
+      requestId: randomUUID(), targetId: "workspace-real-pi", instruction: "Replace the portable workflow."
+    })).run!;
+    const replacementReview = (await waitFor(() => clients.skill.getSkillLearningRun({ runId: replacement.runId }),
+      response => response.run?.state === SkillLearningState.AWAITING_REVIEW, "portable replacement proposal", 45_000)).run!;
+    const replacementProposal = replacementReview.proposal!;
+    const replacementDiff = replacementProposal.changes.find(change => change.key === before.key)!.unifiedDiff!;
+    for (const prefix of ["-", "+"]) {
+      const side = replacementDiff.split("\n").slice(3, -1).filter(line => line.startsWith(prefix)).map(line => line.slice(1));
+      expect(side.join("\n") + "\n").toBe(expectedJavascript);
+    }
+    expect((await clients.skill.applySkillLearning({ operationId: randomUUID(), runId: replacementReview.runId,
+      expectedRunRevision: replacementReview.revision, expectedProposalRevision: replacementProposal.revision,
+      expectedResourceId: replacementProposal.resourceId, expectedCurrentResourceId: replacementProposal.currentResourceId,
+      expectedCurrentResourceRevision: replacementProposal.currentResourceRevision,
+      expectedCurrentObservedRevision: replacementProposal.currentObservedRevision, confirmReplace: true })).run?.state)
+      .toBe(SkillLearningState.APPLIED);
+    const replaced = (await clients.skill.listSkills({ query: "learned-review", page: { pageSize: 100 } }))
+      .skills.find(skill => skill.skillId === replacementProposal.resourceId)!;
+    const replacementSession = (await clients.skill.openSkill({ skillId: replaced.skillId,
+      expectedResourceRevision: replaced.entityVersion?.revision })).skill!;
+    for (const file of replacementProposal.files) {
+      expect((await clients.skill.readSkillFile({ sessionId: replacementSession.sessionId, key: file.key })).file?.content).toBe(file.content);
+    }
   });
 
   it("uses the source task's exact Provider for distillation while that route is enabled", { timeout: 90_000 }, async () => {
