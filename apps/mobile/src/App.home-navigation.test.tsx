@@ -206,7 +206,7 @@ beforeAll(async () => {
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} })
   }));
   for (const name of ["network", "native-lan-discovery", "native-notifications", "mobile-media-preview", "mobile-pdf-preview",
-    "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache", "mobile-incoming-share"])
+    "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache"])
     vi.doMock(`./${name}`, () => new Proxy({}, { get: () => ({}), has: () => true,
       getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
   const incomingShare = { snapshot: { supported: false, busy: false }, subscribe: () => () => {} };
