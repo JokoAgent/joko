@@ -158,7 +158,11 @@ describe("Telegram Messaging production product chain", () => {
     await fixture.close({ removeRoot: false });
     fixture = undefined;
 
-    fixture = await startSystem(telegram, () => SECOND_REPLY, rootDirectory);
+    let heldProviderReply: Promise<void> | undefined;
+    fixture = await startSystem(telegram, async () => {
+      await heldProviderReply;
+      return SECOND_REPLY;
+    }, rootDirectory);
     const restartedClients = fixture.clients(authKey);
     await waitFor(
       async () => fixture!.application.store.getMessagingConnection(created.connectionId),
@@ -264,6 +268,38 @@ describe("Telegram Messaging production product chain", () => {
     expect(providerGroupInput).toContain(groupPrompt);
     expect(providerGroupInput).toContain(`data:image/png;base64,${photo.toString("base64")}`);
 
+    let releaseProvider!: () => void;
+    heldProviderReply = new Promise<void>(resolve => { releaseProvider = resolve; });
+    try {
+      const store = fixture.application.store;
+      const requestFor = (id: string) => store.listMessagingInboundRequests().find(request => request.providerMessageId === id);
+      telegram.enqueueDirectMessage({ updateId: 15, messageId: 105, text: "Keep this original turn running." });
+      await waitFor(async () => fixture?.providerRequests.length ?? 0, count => count === 4, "the held Pi request", 15_000);
+      const active = required(requestFor("105"), "active Telegram request");
+      await waitFor(async () => store.getQueueItem(active.queueItemId!).state, state => state === "backend_accepted",
+        "Pi to accept the original Telegram input", 15_000);
+      telegram.enqueueDirectMessage({ updateId: 16, messageId: 106, text: "This queued input must be cancelled." });
+      const queued = required(await waitFor(async () => requestFor("106"), request => request?.status === "queued",
+        "the next Telegram message to queue", 15_000), "queued Telegram request");
+      expect(store.getQueueItem(queued.queueItemId!).state).toBe("accepted");
+
+      telegram.enqueueDirectMessage({ updateId: 17, messageId: 107, text: "!stop" });
+      const replies = await waitFor(async () => telegram?.outboundMessages ?? [],
+        messages => messages.some(message => message.replyToMessageId === 107),
+        "the stop receipt on the original Telegram message", 20_000);
+      expect(replies.find(message => message.replyToMessageId === 107)?.text)
+        .toMatch(/^(?:Stopped the current turn|Stop requested for the current turn)\. Cancelled 1 queued message\.$/u);
+      await waitFor(async () => requestFor("105")?.status, status => status === "cancelled", "Pi to settle the aborted turn", 15_000);
+      expect(store.getRun(active.runId!).descriptor.state).toBe("aborted");
+      expect(store.getQueueItem(queued.queueItemId!).state).toBe("cancelled");
+      expect(requestFor("106")?.status).toBe("cancelled");
+      expect(requestFor("107")).toBeUndefined();
+      expect(store.getMessagingConversation(restartedConversation.id).sessionId).toBe(sessionId);
+      expect(fixture.providerRequests).toHaveLength(4);
+    } finally {
+      releaseProvider();
+    }
+
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),
       connections: fixture.application.store.listMessagingConnections(),
@@ -277,7 +313,7 @@ describe("Telegram Messaging production product chain", () => {
 
 async function startSystem(
   telegram: TelegramSystemFixture,
-  reply: (input: { readonly requestNumber: number }) => string,
+  reply: (input: { readonly requestNumber: number }) => string | Promise<string>,
   rootDirectory?: string
 ): Promise<RealPiSystemFixture> {
   return RealPiSystemFixture.start({
@@ -286,7 +322,7 @@ async function startSystem(
     telegramApiBaseUrl: telegram.baseUrl,
     messagingRetryDelayMs: 250,
     providerSupportsImages: true,
-    providerResponder: ({ requestNumber }) => ({ kind: "text", text: reply({ requestNumber }) })
+    providerResponder: async ({ requestNumber }) => ({ kind: "text", text: await reply({ requestNumber }) })
   });
 }
 

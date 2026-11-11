@@ -1,6 +1,7 @@
 import { extname } from "node:path";
 
 import { inboundAudioVideoMime } from "../inbound-audio-video.js";
+import { isMessagingStopCommand } from "../task-commands.js";
 import type {
   MessagingAddress,
   MessagingGroupObservation,
@@ -165,7 +166,8 @@ function normalizeMessage(
     const owner = userId === options.ownerUserId;
     let trigger = detectTelegramGroupTrigger(message, options.bot);
     explicitlyAddressed = trigger !== null;
-    if (trigger === null && owner && isBareCommand(sourceText)) trigger = sourceText.trim();
+    if (trigger === null && owner && (isBareCommand(sourceText) || isMessagingStopCommand(sourceText)
+      && collected.attachments.length === 0 && collected.unsupported.length === 0)) trigger = sourceText.trim();
     if (trigger === null && activation === "always" && sourceText.trim() !== "") {
       trigger = sourceText.trim();
       ambient = true;
@@ -173,7 +175,7 @@ function normalizeMessage(
     if (trigger === null) {
       return { event: null, ignored: ignoredEntry(requestId, "unaddressed", chatId, userId) };
     }
-    const command = /^[!/]/u.test(trigger.trimStart());
+    const command = /^[!/]/u.test(trigger.trimStart()) || isMessagingStopCommand(trigger);
     if (command && (!owner || ambient)) {
       return { event: null, ignored: ignoredEntry(requestId, "unauthorized", chatId, userId) };
     }

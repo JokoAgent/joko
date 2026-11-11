@@ -7097,10 +7097,12 @@ export class OperationalStore {
         throw new StoreError("Messaging delivery requires a managed connection credential.");
       }
       const conversation = this.getMessagingConversation(input.conversationId);
+      const observedNotice = input.allowObservedConversation === true && input.kind === "notice"
+        && conversation.status === "observed" && (connection.channel === "telegram" || connection.channel === "discord");
       if (
         conversation.connectionId !== connection.id ||
         conversation.channelGeneration !== connection.generation ||
-        conversation.status !== "active"
+        (conversation.status !== "active" && !observedNotice)
       ) {
         throw new StoreError("Messaging delivery conversation authority is stale.");
       }
@@ -7457,6 +7459,7 @@ export class OperationalStore {
     readonly connectionId: string;
     readonly expectedChannelGeneration: number;
     readonly conversationId: string;
+    readonly allowObservedConversation?: true;
     readonly providerRequestId: string;
     readonly providerInteractionId: string;
     readonly providerMessageId: string;
@@ -7469,10 +7472,12 @@ export class OperationalStore {
       const connection = this.getMessagingConnection(input.connectionId);
       assertMessagingGeneration(connection, input.expectedChannelGeneration);
       const conversation = this.getMessagingConversation(input.conversationId);
+      const observedCommand = input.allowObservedConversation === true && conversation.status === "observed"
+        && (connection.channel === "telegram" || connection.channel === "discord");
       if (
         conversation.connectionId !== connection.id ||
         conversation.channelGeneration !== connection.generation ||
-        conversation.status !== "active"
+        (conversation.status !== "active" && !observedCommand)
       ) throw new StoreError("Messaging interaction conversation authority is stale.");
       const providerRequestId = messagingIdentity(input.providerRequestId, "provider request ID", 512);
       const providerInteractionId = messagingIdentity(input.providerInteractionId, "provider interaction ID", 512);

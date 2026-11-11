@@ -391,6 +391,7 @@ interface ExtensionTargetSteerFallback {
 }
 
 interface DispatchPreparation {
+  readonly queueItemId: string;
   readonly settled: Promise<void>;
   readonly resolve: () => void;
   phase: "pre-send" | "sending";
@@ -13720,7 +13721,14 @@ export class SessionHost {
     return { kind: "blocked" };
   }
 
-  private beginDispatchPreparation(sessionId: string): DispatchPreparation {
+  /** The dispatch owner can distinguish an unsent claim from one entering the Adapter. */
+  observeQueueDispatch(item: Pick<QueueItemRecord, "id" | "sessionId">): Pick<DispatchPreparation, "phase" | "settled"> | undefined {
+    const preparation = this.#dispatchPreparations.get(item.sessionId);
+    if (preparation?.queueItemId !== item.id) return undefined;
+    return { phase: preparation.phase, settled: preparation.settled };
+  }
+
+  private beginDispatchPreparation(sessionId: string, queueItemId: string): DispatchPreparation {
     if (this.#dispatchPreparations.has(sessionId)) {
       throw new Error("A task already has a queue item preparing for Backend dispatch.");
     }
@@ -13728,7 +13736,7 @@ export class SessionHost {
     const settled = new Promise<void>((resolvePromise) => {
       resolve = resolvePromise;
     });
-    const preparation: DispatchPreparation = { settled, resolve, phase: "pre-send" };
+    const preparation: DispatchPreparation = { queueItemId, settled, resolve, phase: "pre-send" };
     this.#dispatchPreparations.set(sessionId, preparation);
     return preparation;
   }
@@ -14296,7 +14304,7 @@ export class SessionHost {
         // A concurrent pause may land between the control read and durable
         // claim. The resume path owns the next wake-up, so never busy-poll.
         if (claimedItem === undefined) { scheduleGate?.release(pending.runId); return; }
-        const dispatchPreparation = this.beginDispatchPreparation(sessionId);
+        const dispatchPreparation = this.beginDispatchPreparation(sessionId, claimedItem.id);
         let item = claimedItem;
         const run = this.#store.getRun(item.runId);
         const messagingRequest = this.#store.findMessagingInboundRequestByRunId(item.runId);

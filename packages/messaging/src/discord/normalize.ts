@@ -1,4 +1,5 @@
 import { inboundAudioVideoMime } from "../inbound-audio-video.js";
+import { isMessagingStopCommand } from "../task-commands.js";
 import type {
   MessagingGroupObservation,
   MessagingIgnoredInbound,
@@ -139,7 +140,8 @@ function normalizeMessage(
     }
     const owner = message.author.id === options.ownerUserId;
     let trigger = discordGroupTrigger(message, options.bot);
-    if (trigger === null && owner && isBareCommand(text)) trigger = text.trim();
+    if (trigger === null && owner && (isBareCommand(text) || isMessagingStopCommand(text)
+      && parts.attachments.length === 0 && parts.unsupported.length === 0)) trigger = text.trim();
     if (trigger === null && activation === "always" && (text.trim() !== "" || parts.attachments.length > 0)) {
       trigger = text.trim();
       ambient = true;
@@ -147,7 +149,7 @@ function normalizeMessage(
     if (trigger === null) {
       return { event: null, ignored: ignoredEntry(requestId, "unaddressed", channel.id, message.author.id) };
     }
-    if (/^\s*[/!]/u.test(trigger) && (!owner || ambient)) {
+    if ((/^\s*[/!]/u.test(trigger) || isMessagingStopCommand(trigger)) && (!owner || ambient)) {
       return { event: null, ignored: ignoredEntry(requestId, "unauthorized", channel.id, message.author.id) };
     }
     text = trigger;
