@@ -48,28 +48,32 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const id = "extension_0123456789abcdef0123456789abcdef", alternateId = "extension_1123456789abcdef0123456789abcdef";
   const revision = `sha256:${"a".repeat(64)}`;
   const taskView = { html: "ui/task/index.html", title: "Task evidence" };
-  let enabled = true, alternateEnabled = false, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
+  let enabled = true, alternateEnabled = false, residentTaskViewOnly = false, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
   const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "targets", "text", "sync", "missing_handler", "usage"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
     card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, targets: true, deviceSync: true, text: { oneshot: true }, image: ["generate"], showTaskPreferences: false,
     network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
+  const residentDeclaration = parseExtensionRuntime({ html: declaration.html, tools: [] }, true);
   const extension = (extensionId = id) => ({ id: extensionId, revision: 1n, name: extensionId === id ? "Fixture mail" : "Alternate mail", installed: true,
     enabled: extensionId === id ? enabled : alternateEnabled,
     owner: { kind: "resource", resourceId: extensionId === id ? "resource" : "alternate-resource", resourceVersion: 1n, discoveredRevision: revision },
-    setup: { state: "not_required" }, runtime: { ...declaration, extensionEntry: "extensions/main.js" }, taskView: { ...taskView, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
+    setup: { state: "not_required" }, runtime: { ...(extensionId === alternateId && residentTaskViewOnly ? residentDeclaration : declaration), extensionEntry: "extensions/main.js" },
+    taskView: { ...taskView, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
   const resource = { id: "resource", kind: "package", scope: "managed", state: "installed", enabled: true, backendId: "runtime", versionNumber: 1n,
     discoveredRevision: revision, packageIdentity: "@sample/mail", version: "1.0.0", resourceDetails: [{ kind: "extension", entryPath: "extensions/main.js", runtime: declaration, taskView }] } as unknown as PiResourceDescriptor;
   const alternate = { ...resource, id: "alternate-resource", packageIdentity: "@sample/alternate-mail" };
-  const getResource = (resourceId: string) => resourceId === resource.id ? resource : alternate;
+  const resident = { ...alternate, resourceDetails: [{ ...alternate.resourceDetails[0]!, runtime: residentDeclaration }] };
+  const getResource = (resourceId: string) => resourceId === resource.id ? resource : residentTaskViewOnly ? resident : alternate;
   const surfaces = new ExtensionMainViewManager({ rootDirectory: join(root, "surfaces"), resources: { acquireInstalledPackage: async ({ resourceId }): Promise<PiInstalledPackageLease> => ({ resource: getResource(resourceId),
     assertCurrent: async () => { if (!(resourceId === resource.id ? enabled : alternateEnabled)) throw new Error("Disabled"); }, release: async () => {}, snapshotTo: async destination => {
       await mkdir(join(destination, "extensions"), { recursive: true }); await mkdir(join(destination, "ui/logic"), { recursive: true });
       await mkdir(join(destination, "ui/task"), { recursive: true });
-      await writeFile(join(destination, "package.json"), JSON.stringify({ name: getResource(resourceId).packageIdentity, version: "1.0.0", pi: { extensions: ["extensions/main.js"] },
-        joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: "extensions/main.js", runtime: declaration, taskView }] } } }));
+      const installedResource = getResource(resourceId);
+      await writeFile(join(destination, "package.json"), JSON.stringify({ name: installedResource.packageIdentity, version: "1.0.0", pi: { extensions: ["extensions/main.js"] },
+        joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: "extensions/main.js", runtime: installedResource.resourceDetails[0]!.runtime, taskView }] } } }));
       await writeFile(join(destination, "extensions/main.js"), "export default function setup() {}\n");
       await writeFile(join(destination, "ui/task/index.html"), "<!doctype html><title>Task evidence</title>");
       await writeFile(join(destination, "ui/logic/index.html"), '<!doctype html><html><head><script src="./runtime.js"></script></head><body></body></html>');
-      await writeFile(join(destination, "ui/logic/runtime.js"), String.raw`
+      await writeFile(join(destination, "ui/logic/runtime.js"), installedResource === resident ? "void joko.taskView({sessionId: 'other-task'});" : String.raw`
         let writes = 0, sends = 0, taskViewActions;
         const mailReads = [], settingsNotices = [], localeNotices = [], mailSource = ${JSON.stringify(getResource(resourceId).packageIdentity)};
         const taskOutcomes = {}, textOutcomes = {};
@@ -439,5 +443,13 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect(syncInvalidated).toHaveBeenCalledWith(id);
     expect(manager.get("task", mailId).interactive).toBe(false);
     await expect(provider.callTool("card", {}, undefined, context)).rejects.toThrow(); expect(publicCards()).toHaveLength(before);
+
+    const residentOpens = vi.fn((_event: ExtensionTaskViewOpen) => true);
+    const stopResident = taskViews.register({ connectionId: sourceViewer.id, focusedSessionId: "task", assertCurrent: () => { connections.fence(sourceViewer); }, send: residentOpens });
+    try {
+      residentTaskViewOnly = true; alternateEnabled = true; changed?.([alternateId]);
+      await vi.waitFor(() => expect(residentOpens).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ extensionId: alternateId, sessionId: "other-task", focus: false })), { timeout: 6_000 });
+      expect(providers.has(`${alternateId}-runtime`)).toBe(false);
+    } finally { stopResident(); }
   } finally { for (const task of [...delayedTasks.values(), ...delayedText.values()]) task.release(); await runtime.stop(); await manager.dispose(); await surfaces.close(); store.close(); await rm(root, { recursive: true, force: true }); }
 }, 30_000);
