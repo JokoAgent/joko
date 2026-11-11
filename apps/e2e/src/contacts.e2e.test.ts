@@ -83,10 +83,18 @@ it("serves and restarts the complete authenticated local Contact chain", async (
     expectedFromRevision: grouped.contact!.summary!.revision,
     toContactId: organization.contact!.summary!.contactId,
     relation: "works at",
-    note: "Research"
+    note: "Relationshipkeyword 通讯录设计方案"
   });
-  expect((await contact.listContacts({ query: "Analytical", pageSize: 100 })).contacts.map((entry) => entry.contactId))
-    .toEqual(expect.arrayContaining([personId, organization.contact!.summary!.contactId]));
+  for (const query of ["Engines", "Relationshipkeyword", "设计方案"]) {
+    const found = await contact.listContacts({ query, pageSize: 100 });
+    expect(found.total).toBe(2);
+    expect(new Set(found.contacts.map((entry) => entry.contactId)))
+      .toEqual(new Set([personId, organization.contact!.summary!.contactId]));
+  }
+  const filtered = await contact.listContacts({ query: "设计方案", kind: ContactKind.PERSON,
+    status: ContactStatus.CONFIRMED, contactGroupId: group.group!.contactGroupId, pageSize: 1 });
+  expect(filtered).toMatchObject({ total: 1, contacts: [{ contactId: personId }] });
+  expect(filtered.nextPageOffset).toBeUndefined();
 
   const preview = await contact.previewContactVCardImport({
     vcardText: "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ada L.\r\nEMAIL:ada@example.test\r\nEND:VCARD\r\n"
@@ -127,6 +135,8 @@ it("serves and restarts the complete authenticated local Contact chain", async (
     relations: [expect.objectContaining({ relatedDisplayName: "Analytical Engines", relation: "works at" })]
   });
   expect(related.directory!.revision!.value).toBeLessThan(restartedDirectory.revision!.value);
+  expect((await contact.listContacts({ query: "设计方案", kind: ContactKind.PERSON })).contacts)
+    .toEqual([expect.objectContaining({ contactId: personId })]);
 });
 
 mountedIt("refreshes the mounted Contacts list and selected profile after another client writes", { timeout: 90_000 }, async () => {
