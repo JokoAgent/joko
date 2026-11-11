@@ -2,9 +2,10 @@
 import { act, createElement, forwardRef, useEffect, useImperativeHandle, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
   SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
-  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, TargetSchema, ToolCallState, WorkspaceKind, capabilityNames } from "@joko/contracts";
+  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, NativeSessionBindingSchema, TargetSchema, ToolCallState, WorkspaceDescriptorSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -529,12 +530,12 @@ describe("actual Home navigation hosts", () => {
 
   it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {
     const owner = create(SnapshotSchema, { ...state.owner!,
-      workspaces: [{ workspaceId: "project-workspace", targetId: "project", displayName: "Project", kind: WorkspaceKind.USER_PROJECT }],
+      workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "project-workspace", targetId: "project", displayName: "Project", kind: WorkspaceKind.USER_PROJECT })],
       sessions: [
-        { sessionId: "title", targetId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
-          lastActivityAt: { seconds: 10n } },
-        { sessionId: "body", targetId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
-          lastActivityAt: { seconds: 20n } }
+        create(SessionSchema, { sessionId: "title", targetId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
+          lastActivityAt: create(TimestampSchema, { seconds: 10n }) }),
+        create(SessionSchema, { sessionId: "body", targetId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
+          lastActivityAt: create(TimestampSchema, { seconds: 20n }) })
       ] });
     const order = () => Array.from(host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]'))
       .map(row => row.getAttribute("aria-label"));
@@ -740,7 +741,7 @@ describe("actual Task Home navigation composition", () => {
       } } } } });
     state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, timeline: [plan],
       sessions: state.detail!.sessions.map(session => session.sessionId === "current"
-        ? create(SessionSchema, { ...session, nativeBinding: { runtimeGeneration: 7n } }) : session) }) };
+        ? create(SessionSchema, { ...session, nativeBinding: create(NativeSessionBindingSchema, { ...session.nativeBinding, runtimeGeneration: 7n }) }) : session) }) };
     await renderTask();
     expect(host.textContent).toContain(completedStep);
     await press("Collapse plan");

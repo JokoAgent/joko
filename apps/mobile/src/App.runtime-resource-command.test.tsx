@@ -22,12 +22,29 @@ import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
 type TimelineScrollFailure = (event: { index: number; averageItemLength: number }) => void;
-let timelineList: { data: readonly unknown[]; onViewableItemsChanged: TimelineVisibility;
-  onScrollBeginDrag?: () => void; onContentSizeChange?: (width: number, height: number) => void;
-  onScrollToIndexFailed?: TimelineScrollFailure } | undefined;
+type TimelineScrollSample = { nativeEvent: { contentOffset: { y: number }; contentSize: { height: number }; layoutMeasurement: { height: number } } };
+type TimelineScrollHandlers = {
+  onScroll?: (event: TimelineScrollSample) => void;
+  onScrollBeginDrag?: (event?: TimelineScrollSample) => void;
+  onScrollEndDrag?: (event: TimelineScrollSample) => void;
+  onMomentumScrollBegin?: () => void;
+  onMomentumScrollEnd?: (event: TimelineScrollSample) => void;
+  onContentSizeChange?: (width: number, height: number) => void;
+  onScrollToIndexFailed?: TimelineScrollFailure;
+};
+let timelineList: ({ data: readonly unknown[]; onViewableItemsChanged: TimelineVisibility } & TimelineScrollHandlers) | undefined;
 const scrollTimelineToIndex = vi.fn<(options: { index: number; animated: boolean; viewPosition?: number }) => void>();
 const scrollTimelineToOffset = vi.fn();
 const scrollTimelineToEnd = vi.fn();
+type NativeAppStatus = "active" | "inactive" | "background";
+const appStateListeners = new Set<(status: NativeAppStatus) => void>();
+const nativeAppState = {
+  currentState: "active" as NativeAppStatus,
+  addEventListener: (_type: string, listener: (status: NativeAppStatus) => void) => {
+    appStateListeners.add(listener);
+    return { remove: () => { appStateListeners.delete(listener); } };
+  }
+};
 let sendFollowSourceKey: string | undefined;
 let receiveAppMessage: ((event: { nativeEvent: { data: string } }) => void) | undefined;
 let appBridgeKey = "";
@@ -113,18 +130,16 @@ beforeAll(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
     View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
-    FlatList: forwardRef(({ data, renderItem, onViewableItemsChanged, onScrollBeginDrag, onContentSizeChange, onScrollToIndexFailed }: { data?: readonly unknown[];
-      renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility;
-      onScrollBeginDrag?: () => void; onContentSizeChange?: (width: number, height: number) => void;
-      onScrollToIndexFailed?: TimelineScrollFailure }, ref) => {
+    FlatList: forwardRef(({ data, renderItem, onViewableItemsChanged, ...scrollHandlers }: { data?: readonly unknown[];
+      renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility } & TimelineScrollHandlers, ref) => {
       useImperativeHandle(ref, () => ({ scrollToIndex: scrollTimelineToIndex, scrollToOffset: scrollTimelineToOffset, scrollToEnd: scrollTimelineToEnd }), []);
-      if (onViewableItemsChanged) timelineList = { data: data ?? [], onViewableItemsChanged, onScrollBeginDrag, onContentSizeChange, onScrollToIndexFailed };
+      if (onViewableItemsChanged) timelineList = { data: data ?? [], onViewableItemsChanged, ...scrollHandlers };
       return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))));
     }), TextInput: forwardRef(() => null),
     Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
     Pressable: ({ children, onPress, disabled, accessibilityLabel }: { children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean; accessibilityLabel?: string }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, typeof children === "function" ? children({ pressed: false }) : children),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 }, Platform: { OS: "android", select: (value: Record<string, unknown>) => value.android ?? value.default },
-    AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) }, BackHandler: { addEventListener: () => ({ remove() {} }) },
+    AppState: nativeAppState, BackHandler: { addEventListener: () => ({ remove() {} }) },
     Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) }, PanResponder: { create: () => ({ panHandlers: {} }) },
     AccessibilityInfo: { announceForAccessibility() {}, setAccessibilityFocus() {}, addEventListener: () => ({ remove() {} }) },
     Linking: { openURL: openSystemLink }, Alert: { alert() {} }, findNodeHandle: () => null, useColorScheme: () => "light", useWindowDimensions: () => ({ width: 390, height: 844, scale: 1, fontScale: 1 })
@@ -198,6 +213,7 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
+  nativeAppState.currentState = "active";
   timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear(); sendFollowSourceKey = undefined;
   activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
   activeObjectiveApi = undefined;
@@ -283,8 +299,120 @@ it.each(["ordinary open", "manual drag", "explicit message focus"] as const)("us
   expect(scrollTimelineToEnd.mock.calls).toEqual(opening === "ordinary open" ? [[{ animated: false }], [{ animated: false }]] : []);
 });
 
+it("follows the measured ordinary tail through streaming growth until the reader scrolls up", async () => {
+  vi.useFakeTimers();
+  sendFollowSourceKey = "task-source";
+  const streaming = create(SnapshotSchema, { sessions: [create(SessionSchema, { ...session, state: SessionState.RUNNING })] });
+  const prompt = taskUserInput("prompt", "prompt-operation", 1n, "A task question");
+  const first = taskAssistantDelta("first-delta", 2n, "Streaming");
+  renderedState = { ...state, owner: streaming, detail: streaming, live: [prompt, first] };
+  await mountMeasuredTimelineTail();
+
+  const second = taskAssistantDelta("second-delta", 3n, " reply");
+  renderedState = { ...renderedState, live: [prompt, first, second] };
+  await act(async () => root.render(taskScreen()));
+  expect(timelineList!.data).toContainEqual(expect.objectContaining({ id: "streaming-reply", text: "Streaming reply" }));
+  await act(async () => {
+    // Native layout can report the old offset with the new height first.
+    timelineList!.onScroll!(timelineScrollSample(1_200, 1_800));
+    timelineList!.onContentSizeChange!(400, 1_800);
+    timelineList!.onContentSizeChange!(400, 1_800);
+  });
+  expect(scrollTimelineToEnd).toHaveBeenCalledExactlyOnceWith({ animated: false });
+  expect(timelineLatestButton()).toBeUndefined();
+
+  await act(async () => {
+    const bottom = timelineScrollSample(1_400, 1_800), earlier = timelineScrollSample(600, 1_800);
+    timelineList!.onScroll!(bottom);
+    timelineList!.onScrollBeginDrag!(bottom);
+    timelineList!.onScrollEndDrag!(bottom);
+    timelineList!.onMomentumScrollBegin!();
+    timelineList!.onScroll!(earlier);
+    timelineList!.onMomentumScrollEnd!(earlier);
+  });
+  renderedState = { ...renderedState, live: [prompt, first, second, taskAssistantDelta("third-delta", 4n, " keeps growing")] };
+  await act(async () => root.render(taskScreen()));
+  await act(async () => timelineList!.onContentSizeChange!(400, 2_000));
+  expect(scrollTimelineToEnd).toHaveBeenCalledTimes(1);
+  expect(timelineLatestButton()).toBeUndefined();
+
+  renderedState = { ...renderedState, live: [...renderedState.live, taskAssistantAnswer("stream-completed", 5n, "streaming-reply")] };
+  await act(async () => root.render(taskScreen()));
+  expect(timelineLatestButton()).toBeUndefined();
+});
+
+it.each(["jump button", "manual return"] as const)("preserves older reading until a stable new tail and clears its notice by %s", async (returnMode) => {
+  vi.useFakeTimers();
+  sendFollowSourceKey = "task-source";
+  const prompt = taskUserInput("loaded-prompt", "prompt-operation", 2n, "Loaded question");
+  const answer = taskAssistantAnswer("loaded-answer", 3n);
+  renderedState = { ...state, live: [prompt, answer] };
+  await mountMeasuredTimelineTail();
+  await act(async () => {
+    const bottom = timelineScrollSample(1_200, 1_600), earlier = timelineScrollSample(500, 1_600);
+    timelineList!.onScrollBeginDrag!(bottom);
+    timelineList!.onScroll!(earlier);
+    timelineList!.onScrollEndDrag!(earlier);
+  });
+
+  const earlierPage = taskUserInput("earlier-prompt", "earlier-operation", 1n, "Loaded from earlier history");
+  renderedState = { ...renderedState, older: [earlierPage] };
+  await act(async () => root.render(taskScreen()));
+  await act(async () => timelineList!.onContentSizeChange!(400, 1_800));
+  expect(timelineLatestButton()).toBeUndefined();
+  expect(scrollTimelineToEnd).not.toHaveBeenCalled();
+
+  const newPrompt = taskUserInput("another-prompt", "other-device-operation", 4n, "A new question");
+  renderedState = { ...renderedState, live: [prompt, answer, newPrompt] };
+  await act(async () => root.render(taskScreen()));
+  expect(timelineList!.data).toContainEqual(expect.objectContaining({ id: "another-prompt" }));
+  await act(async () => timelineList!.onContentSizeChange!(400, 2_000));
+  expect(scrollTimelineToEnd).not.toHaveBeenCalled();
+  expect(timelineLatestButton()).toBeDefined();
+
+  if (returnMode === "jump button") {
+    await act(async () => timelineLatestButton()!.click());
+    expect(scrollTimelineToEnd).toHaveBeenCalledExactlyOnceWith({ animated: false });
+  } else {
+    await act(async () => {
+      const earlier = timelineScrollSample(500, 2_000), bottom = timelineScrollSample(1_600, 2_000);
+      timelineList!.onScrollBeginDrag!(earlier);
+      timelineList!.onScroll!(bottom);
+      timelineList!.onScrollEndDrag!(bottom);
+    });
+    expect(scrollTimelineToEnd).not.toHaveBeenCalled();
+  }
+  expect(timelineLatestButton()).toBeUndefined();
+  scrollTimelineToEnd.mockClear();
+  renderedState = { ...renderedState, live: [prompt, answer, newPrompt, taskAssistantAnswer("new-answer", 5n)] };
+  await act(async () => root.render(taskScreen()));
+  await act(async () => timelineList!.onContentSizeChange!(400, 2_200));
+  expect(scrollTimelineToEnd).toHaveBeenCalledExactlyOnceWith({ animated: false });
+  expect(timelineLatestButton()).toBeUndefined();
+});
+
+it.each(["connection", "around window", "foreground cycle"] as const)("retires the measured tail on a %s change", async (retirement) => {
+  vi.useFakeTimers();
+  sendFollowSourceKey = "task-source";
+  const prompt = taskUserInput("prompt", "prompt-operation", 1n, "Initial question");
+  renderedState = { ...state, live: [prompt] };
+  await mountMeasuredTimelineTail();
+  const oldList = timelineList!;
+  if (retirement === "connection") sendFollowSourceKey = "replacement-connection";
+  if (retirement === "around window") renderedState = { ...renderedState, window: [prompt] };
+  if (retirement === "foreground cycle") {
+    await act(async () => changeNativeAppStatus("background"));
+    await act(async () => changeNativeAppStatus("active"));
+  }
+  await act(async () => root.render(taskScreen()));
+  await act(async () => oldList.onContentSizeChange!(400, 1_800));
+  expect(scrollTimelineToEnd).not.toHaveBeenCalled();
+  expect(timelineLatestButton()).toBeUndefined();
+});
+
 it.each(["unmeasured input", "fast answer", "manual drag", "newer input", "unconfirmed send"] as const)(
   "hands an accepted ordinary send to the actual task list once with %s", async (arrival) => {
+    vi.useFakeTimers();
     sendFollowSourceKey = "task-source";
     const draft = plainTextMobileComposerDraft("Show the latest accepted input");
     const oldPrompt = taskUserInput("old-prompt", "previous-operation", 10n, "Older prompt");
@@ -296,8 +424,17 @@ it.each(["unmeasured input", "fast answer", "manual drag", "newer input", "uncon
       return receipt;
     });
     await render(false);
-    await act(async () => input.onEdit(draft, input.draft));
-    const sendButton = [...host.querySelectorAll("button")].find(button => button.textContent === mobileMessage("en", "composer.send"));
+    await act(async () => {
+      const bottom = timelineScrollSample(1_200, 1_600), earlier = timelineScrollSample(500, 1_600);
+      timelineList!.onContentSizeChange!(400, 1_600);
+      timelineList!.onScroll!(bottom);
+      timelineList!.onScrollBeginDrag!(bottom);
+      timelineList!.onScroll!(earlier);
+      timelineList!.onScrollEndDrag!(earlier);
+    });
+    scrollTimelineToEnd.mockClear();
+    await act(async () => input.onEdit(replaceMobileComposerRange(input.draft, { start: 0, end: input.draft.text.length }, draft.text), input.draft));
+    const sendButton = Array.from(host.querySelectorAll("button")).find(button => button.textContent === mobileMessage("en", "composer.send"));
     expect(sendButton).toBeDefined();
     await act(async () => sendButton!.click());
     const operationId = send.mock.calls[0]?.[1]?.operationId;
@@ -344,7 +481,42 @@ it.each(["unmeasured input", "fast answer", "manual drag", "newer input", "uncon
       timelineList?.onContentSizeChange?.(400, 900);
     });
     expect(scrollTimelineToIndex).toHaveBeenCalledTimes(arrival === "unmeasured input" ? 2 : arrival === "fast answer" ? 1 : 0);
+    expect(scrollTimelineToEnd).not.toHaveBeenCalled();
   });
+
+function timelineScrollSample(y: number, height: number): TimelineScrollSample {
+  return { nativeEvent: { contentOffset: { y }, contentSize: { height }, layoutMeasurement: { height: 400 } } };
+}
+
+async function mountMeasuredTimelineTail(): Promise<void> {
+  await act(async () => root.render(taskScreen()));
+  await act(async () => {
+    timelineList!.onContentSizeChange!(400, 1_600);
+    timelineList!.onScroll!(timelineScrollSample(1_200, 1_600));
+  });
+  expect(scrollTimelineToEnd).toHaveBeenCalledWith({ animated: false });
+  scrollTimelineToEnd.mockClear();
+}
+
+function timelineLatestButton(): HTMLButtonElement | undefined {
+  return Array.from(host.querySelectorAll("button")).find(button => button.getAttribute("aria-label") === mobileMessage("en", "task.returnLatest"));
+}
+
+function changeNativeAppStatus(status: NativeAppStatus): void {
+  nativeAppState.currentState = status;
+  for (const listener of appStateListeners) listener(status);
+}
+
+function taskAssistantDelta(eventId: string, sequence: bigint, delta: string) {
+  return create(EventSchema, { eventId, identity: { sessionId: "session" }, cursor: { generation: 1n, sequence },
+    payload: { kind: { case: "textDelta", value: { messageId: "streaming-reply", delta } } } });
+}
+
+function taskAssistantAnswer(eventId: string, sequence: bigint, messageId = eventId) {
+  return create(EventSchema, { eventId, identity: { sessionId: "session" }, cursor: { generation: 1n, sequence },
+    payload: { kind: { case: "messageCompleted", value: { messageId, role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "A complete answer" } }] } } } });
+}
 
 function taskUserInput(eventId: string, operationId: string, sequence: bigint, text: string) {
   return create(EventSchema, { eventId, identity: { sessionId: "session", operationId }, cursor: { generation: 1n, sequence },
