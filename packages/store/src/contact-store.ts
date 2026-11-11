@@ -136,7 +136,7 @@ CREATE TABLE contact_events (
 CREATE TABLE contact_groups (
   id TEXT PRIMARY KEY,
   revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
-  name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  name TEXT NOT NULL UNIQUE,
   description TEXT NOT NULL,
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
@@ -579,7 +579,7 @@ export class ContactStore {
       if (this.#count("contact_groups") >= MAX_GROUPS) throw invalid("The contact group limit was reached.");
       const name = text(nameValue, 1, MAX_GROUP_NAME, "Contact group name");
       const description = text(descriptionValue, 0, MAX_SUMMARY, "Contact group description");
-      if (this.#database.prepare("SELECT id FROM contact_groups WHERE name = ? COLLATE NOCASE").get(name) !== undefined) {
+      if (this.#database.prepare("SELECT id FROM contact_groups WHERE name = ?").get(name) !== undefined) {
         throw new ContactStoreError("CONTACT_ALREADY_EXISTS", "A contact group with this name already exists.");
       }
       const revision = this.#advanceDirectoryRevision();
@@ -599,7 +599,7 @@ export class ContactStore {
       this.#assertEntityRevision("Contact group", id, current, expectedRevision);
       const name = text(nameValue, 1, MAX_GROUP_NAME, "Contact group name");
       const description = text(descriptionValue, 0, MAX_SUMMARY, "Contact group description");
-      const duplicate = this.#database.prepare("SELECT id FROM contact_groups WHERE name = ? COLLATE NOCASE AND id <> ?").get(name, id);
+      const duplicate = this.#database.prepare("SELECT id FROM contact_groups WHERE name = ? AND id <> ?").get(name, id);
       if (duplicate !== undefined) throw new ContactStoreError("CONTACT_ALREADY_EXISTS", "A contact group with this name already exists.");
       const revision = this.#advanceDirectoryRevision();
       this.#database.prepare("UPDATE contact_groups SET revision = ?, name = ?, description = ?, updated_at = ? WHERE id = ?")

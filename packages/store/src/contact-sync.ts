@@ -604,7 +604,7 @@ export function materializeContactSyncState(state: ContactSyncState): ContactDat
     acknowledgements.set(contact.id, new Map(contact.status.acknowledgedConflicts.map((value) =>
       [`${value.platform}\u0000${value.normalizedValue}`, value])));
   }
-  const groups = uniqueBy(liveEntities(state.groups), (value) => folded(value.name))
+  const groups = uniqueBy(liveEntities(state.groups), (value) => value.name)
     .map<ContactSnapshotGroup>((record) => ({ id: record.id, ...record.value.value })).sort(byId);
   const groupIds = new Set(groups.map((group) => group.id));
   const identities = uniqueBy(
@@ -849,9 +849,8 @@ export function isValidContactDataSnapshot(value: unknown): value is ContactData
   const groupIds = new Set(snapshot.groups.map((group) => group.id));
   const groupNames = new Set<string>();
   for (const group of snapshot.groups) {
-    const key = folded(group.name);
-    if (groupNames.has(key)) return false;
-    groupNames.add(key);
+    if (groupNames.has(group.name)) return false;
+    groupNames.add(group.name);
   }
   const identities = new Set<string>();
   for (const identity of snapshot.identities) {

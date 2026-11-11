@@ -617,7 +617,7 @@ export class ContactManager {
     let current = contact;
     for (const name of names) {
       try {
-        let group = this.store.listGroups().find((candidate) => folded(candidate.name) === folded(name));
+        let group = this.store.listGroups().find((candidate) => candidate.name === name);
         group ??= this.store.createGroup(this.store.directoryState().revision, name);
         if (!current.groups.some((candidate) => candidate.id === group.id)) {
           current = this.store.setGroupMembership(current.id, current.revision, group.id, true);
