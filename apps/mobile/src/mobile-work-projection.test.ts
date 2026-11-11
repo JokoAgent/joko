@@ -67,4 +67,14 @@ describe("mobile work grouping", () => {
     expect(plan.eventId).toBe("plan");
     expect(items[2]).toBe(answer);
   });
+
+  it("keeps local inputs at their reserved positions without changing their placeholder cursors", () => {
+    const prior = row("prior", "user", 10);
+    const first = row("z-first", "user", 0, { optimistic: true, completed: false });
+    const second = row("a-second", "user", 0, { optimistic: true, completed: false });
+    const newer = row("newer", "user", 20);
+    const plan = row("plan", "status", 2, { planSequence: 9n });
+    expect(mobileWorkItems([prior, first, second, newer, plan], false)).toEqual([plan, prior, first, second, newer]);
+    expect([first.sequence, second.sequence]).toEqual([0n, 0n]);
+  });
 });

@@ -205,7 +205,7 @@ function mobileState(patch: Partial<MobileState> = {}): MobileState {
     homeSearchQuery: "",
     homeSearchFilter: "active",
     homeSearchStatus: "idle",
-    homeSearchSessionIds: [],
+    homeSearchMatches: [],
     files: emptyMobileFilesState(),
     automations: emptyMobileAutomationsState(),
     partnerPrivate: emptyMobilePartnerPrivateState(),

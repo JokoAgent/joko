@@ -1,15 +1,17 @@
 // @vitest-environment jsdom
-import { act, createElement, forwardRef, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { act, createElement, forwardRef, useEffect, useImperativeHandle, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
   SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
-  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, TargetSchema, capabilityNames } from "@joko/contracts";
+  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, NativeSessionBindingSchema, TargetSchema, ToolCallState, WorkspaceDescriptorSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
 import { mobileMessage } from "./mobile-messages";
+import { projectMobileHomeSearchMessageFocus } from "./mobile-native-intent";
 import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
@@ -27,16 +29,18 @@ type NativeProps = {
   style?: unknown;
   pointerEvents?: string;
   accessibilityElementsHidden?: boolean;
+  accessibilityLiveRegion?: "none" | "polite" | "assertive";
   consumedBottomInset?: number;
 };
-const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, consumedBottomInset }: NativeProps) => createElement("div", {
+const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, accessibilityLiveRegion, consumedBottomInset }: NativeProps) => createElement("div", {
   "aria-label": accessibilityLabel, "data-testid": testID, "data-native-style": JSON.stringify(style),
-  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "data-consumed-bottom-inset": consumedBottomInset
+  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "aria-live": accessibilityLiveRegion, "data-consumed-bottom-inset": consumedBottomInset
 }, children);
 const empty = Object.freeze([]);
 const homeConnectionId = "home-connection";
 const select = vi.fn(async (_sessionId?: string) => {});
 const searchHome = vi.fn(async () => {});
+const scrollToIndex = vi.fn();
 const setSessionPinned = vi.fn(async () => true);
 const setSessionArchived = vi.fn(async (_sessionId: string, _archived: boolean, _archiveConfirmation?: string) => true);
 const archiveConfirmation = "a".repeat(64);
@@ -142,9 +146,12 @@ beforeAll(async () => {
     }) => createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
       : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
         section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index })))))),
-    FlatList: ({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
-      renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }) => createElement("div", {},
-      data?.length && renderItem ? data.map(item => createElement("div", { key: item.id }, renderItem({ item }))) : ListEmptyComponent),
+    FlatList: forwardRef(({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
+      renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }, ref) => {
+      useImperativeHandle(ref, () => ({ scrollToIndex, scrollToEnd() {}, scrollToOffset() {} }), []);
+      return createElement("div", {}, data?.length && renderItem
+        ? data.map(item => createElement("div", { key: item.id }, renderItem({ item }))) : ListEmptyComponent);
+    }),
     TextInput: forwardRef<HTMLInputElement, { value?: string; accessibilityLabel?: string; placeholder?: string;
       onChangeText?: (value: string) => void }>((input, ref) => createElement("input", { ref, value: input.value ?? "",
       "aria-label": input.accessibilityLabel, placeholder: input.placeholder, readOnly: !input.onChangeText,
@@ -209,7 +216,7 @@ beforeAll(async () => {
   vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {} }));
   vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
   for (const name of ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage",
-    "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard",
+    "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard",
     "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard",
     "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker",
     "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet",
@@ -217,7 +224,7 @@ beforeAll(async () => {
     "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar",
     "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer",
     "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen",
-    "MobilePartnerWorkingStatus", "MobileConversationSearchSheet", "MobilePartnerResourcesScreen",
+    "MobilePartnerWorkingStatus", "MobilePartnerResourcesScreen",
     "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen",
     "MobileUpdateSurface", "MobileRuntimeCommandPalette"])
     vi.doMock(`./${name}`, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => null,
@@ -271,8 +278,7 @@ beforeEach(async () => {
   createNewTask.mockClear();
   await newTaskDrafts.clear({ profileId: "profile" });
   vi.useFakeTimers();
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
-  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
+  for (const spy of [select, searchHome, scrollToIndex, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -290,7 +296,7 @@ beforeEach(async () => {
       { targetId: "project", backendId: "backend", displayName: "Project" }] });
   state = { status: "connected", activeProfileId: "profile", selectedId: "current", owner, detail: owner, saved: [], pending: [],
     older: [], live: [], busy: false, historyBusy: false, historyEnd: true, readReceipts: {},
-    homeSearchQuery: "", homeSearchFilter: "active", homeSearchSessionIds: [], homeSearchStatus: "idle" } as unknown as MobileState;
+    homeSearchQuery: "", homeSearchFilter: "active", homeSearchMatches: [], homeSearchStatus: "idle" } as unknown as MobileState;
   viewState = { search: "", statusFilter: "active" };
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
   props = { colors, state, locale: "en", onNew, onSelect, onMenu, onOpenShare, currentSessionId: "current",
@@ -319,7 +325,11 @@ async function type(label: string, value: string): Promise<void> {
 }
 async function option(label: string): Promise<void> {
   await press(mobileMessage("en", "home.optionsFor", { name: "Alpha" }));
-  await press(label); await act(async () => vi.advanceTimersByTimeAsync(2));
+  await press(label);
+  await act(async () => {
+    vi.advanceTimersToNextFrame();
+    vi.advanceTimersToNextFrame();
+  });
 }
 
 it("restores the Worktree branch in the actual new-task form, submits it and clears it when another project is selected", async () => {
@@ -521,6 +531,72 @@ describe("actual Home navigation hosts", () => {
     expect(host.textContent).not.toContain("Alpha");
   });
 
+  it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {
+    const owner = create(SnapshotSchema, { ...state.owner!,
+      workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "project-workspace", targetId: "project", displayName: "Project", kind: WorkspaceKind.USER_PROJECT })],
+      sessions: [
+        create(SessionSchema, { sessionId: "title", targetId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
+          lastActivityAt: create(TimestampSchema, { seconds: 10n }) }),
+        create(SessionSchema, { sessionId: "body", targetId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
+          lastActivityAt: create(TimestampSchema, { seconds: 20n }) })
+      ] });
+    const order = () => Array.from(host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]'))
+      .map(row => row.getAttribute("aria-label"));
+    await render({ state: { ...state, owner, detail: owner, homeSearchStatus: "ready",
+      homeSearchQuery: "needle", homeSearchMatches: [{ sessionId: "body", eventId: "body-message" }] } });
+    await type(message("home.search"), "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(180));
+    expect(searchHome).toHaveBeenLastCalledWith("needle", "active");
+    expect(order()).toEqual(["Open task Needle title", "Open task Newer task"]);
+    expect(button(message("home.searchSort.relevance")).getAttribute("aria-selected")).toBe("true");
+    await press(message("home.searchSort.activityDesc"));
+    expect(order()).toEqual(["Open task Newer task", "Open task Needle title"]);
+    await press(message("home.searchSort.activityAsc"));
+    expect(order()).toEqual(["Open task Needle title", "Open task Newer task"]);
+    expect(button(message("home.searchSort.activityAsc")).getAttribute("aria-selected")).toBe("true");
+
+    await type(message("home.search"), "");
+    expect(searchHome).toHaveBeenLastCalledWith("", "active");
+    expect(order()).toEqual(["Open task Newer task", "Open task Needle title"]);
+    expect(host.textContent).not.toContain(message("home.searchSort.activityAsc"));
+  });
+
+  it("hands a body-only Home result to the selected task and opens title-only results normally", async () => {
+    const match = { sessionId: "other", eventId: "matching-message" };
+    await render({ state: { ...state, homeSearchQuery: "needle", homeSearchStatus: "ready", homeSearchMatches: [match] },
+      runNavigation: undefined, host: "home" });
+    await type(message("home.search"), "needle");
+    await press("Open task Beta");
+    expect(select).toHaveBeenLastCalledWith("other");
+    expect(onSelect).toHaveBeenLastCalledWith(match);
+
+    await type(message("home.search"), "Alpha");
+    await press("Open task Alpha");
+    expect(select).toHaveBeenLastCalledWith("current");
+    expect(onSelect).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it("shows a pending first search and retains a ready body result across an equivalent owner snapshot", async () => {
+    await render();
+    searchHome.mockClear();
+    await type(message("home.search"), "needle");
+    expect(host.querySelector(`div[aria-label="${message("home.search")}"]`)).not.toBeNull();
+    expect(host.textContent).not.toContain(message("home.empty.search"));
+    expect(searchHome).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(180));
+    expect(searchHome).toHaveBeenCalledExactlyOnceWith("needle", "active");
+
+    await render({ state: { ...state, homeSearchQuery: "needle", homeSearchStatus: "ready",
+      homeSearchMatches: [{ sessionId: "other", eventId: "matching-message" }] } });
+    expect(button("Open task Beta")).toBeDefined();
+    searchHome.mockClear();
+    const owner = create(SnapshotSchema, { ...state.owner!, snapshotId: "fresh-snapshot-same-revision" });
+    await render({ state: { ...state, owner } });
+    await act(async () => vi.advanceTimersByTimeAsync(180));
+    expect(button("Open task Beta")).toBeDefined();
+    expect(searchHome).not.toHaveBeenCalled();
+  });
+
   it("reopens Home with the saved archive filter and the current node's task list", async () => {
     const values = new Map<string, string>();
     const storage = {
@@ -630,6 +706,58 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it("locates the selected body event in the already-open wide task without selecting or flushing it again", async () => {
+    dimensions = { ...dimensions, width: 900, height: 700 };
+    const match = { sessionId: "current", eventId: "matching-event" };
+    const events = ["Unrelated reply", "Original needle reply"].map((text, index) => create(EventSchema, {
+      eventId: index === 0 ? "different-event" : match.eventId, identity: { sessionId: "current", runId: `search-run-${index}` },
+      cursor: { generation: 1n, sequence: BigInt(index + 1) }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: `search-message-${index}`, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: text } }]
+      } } }
+    }));
+    viewState = { search: "needle", statusFilter: "active" };
+    state = { ...state, homeSearchQuery: "needle", homeSearchStatus: "ready", homeSearchMatches: [match],
+      detail: create(SnapshotSchema, { ...state.detail!, timeline: events }) };
+    await renderTask();
+    await press("Open task Alpha");
+    expect(onNavigated).toHaveBeenCalledExactlyOnceWith(match);
+    expect(select).not.toHaveBeenCalled();
+    expect(draftFlush).not.toHaveBeenCalled();
+    const focus = projectMobileHomeSearchMessageFocus(state, match, -1);
+    expect(focus).toEqual({ requestId: -1, sessionId: "current", messageId: "search-message-1", messageEventId: match.eventId });
+    await renderTask({ messageFocus: focus });
+    await act(async () => { vi.advanceTimersToNextFrame(); });
+    expect(scrollToIndex).toHaveBeenCalledWith({ index: 1, animated: false, viewPosition: 0.5 });
+    const focused = Array.from(host.querySelectorAll('[aria-live="polite"]')).find(row => row.textContent?.includes("Original needle reply"));
+    expect(focused?.getAttribute("data-native-style")).toContain('"borderWidth":2');
+    expect(projectMobileHomeSearchMessageFocus(state, { ...match, eventId: "retired-event" }, -2)).toBeUndefined();
+  });
+
+  it("opens the exact collapsed plan when searching its completed step", async () => {
+    const completedStep = "Verify the archived checksum";
+    const plan = create(EventSchema, { eventId: "plan-search-event", identity: { sessionId: "current", runId: "plan-run", generation: 7n },
+      cursor: { generation: 1n, sequence: 5n }, payload: { kind: { case: "toolCallStarted", value: { toolCall: {
+        toolCallId: "plan-search-tool", toolId: "update_plan", sessionId: "current", runId: "plan-run", state: ToolCallState.RUNNING,
+        arguments: [{ fieldPath: "$", value: { case: "text", value: JSON.stringify({ plan: [
+          { step: completedStep, status: "completed" }, { step: "Review current output", status: "in_progress" }
+        ] }).replace("archived checksum", "archived\\u0020checksum") } }]
+      } } } } });
+    state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, timeline: [plan],
+      sessions: state.detail!.sessions.map(session => session.sessionId === "current"
+        ? create(SessionSchema, { ...session, nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 7n }) }) : session) }) };
+    await renderTask();
+    expect(host.textContent).toContain(completedStep);
+    await press("Collapse plan");
+    expect(host.textContent).not.toContain(completedStep);
+    expect(host.textContent).toContain("Review current output");
+
+    await act(async () => headerProps.actions.find(action => action.id === "search")!.onPress());
+    await type(message("conversationSearch.placeholder"), "archived checksum");
+    expect(host.textContent).toContain("1 / 1");
+    expect(host.textContent).toContain(completedStep);
+    expect(button("Collapse plan")).toBeDefined();
+  });
+
   it.each(["connected", "offline"] as const)("adds the exact visible message to its original local draft while %s", async status => {
     const completion = create(EventSchema, { eventId: "reference-completion", identity: { sessionId: "current", runId: "run", backendId: "backend" },
       cursor: { generation: 1n, sequence: 5n }, payload: { kind: { case: "messageCompleted", value: {

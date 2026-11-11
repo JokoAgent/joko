@@ -106,7 +106,7 @@ import {
   MobileRemoteDesktopAuthorityError,
   type MobileRemoteDesktopTransport
 } from "./remote-desktop-controller";
-import type { MobileHomeStatusFilter } from "./home-navigation";
+import type { MobileHomeSearchMatch, MobileHomeStatusFilter } from "./home-navigation";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
   MOBILE_FILE_SHARE_MAXIMUM_BYTES,
@@ -549,7 +549,7 @@ export interface MobileState {
   readonly homeSearchQuery: string;
   readonly homeSearchFilter: MobileHomeStatusFilter;
   readonly homeSearchStatus: "idle" | "searching" | "ready" | "error";
-  readonly homeSearchSessionIds: readonly string[];
+  readonly homeSearchMatches: readonly MobileHomeSearchMatch[];
   readonly homeSearchError?: string;
   readonly timelinePreview?: MobileFilePreview;
   readonly files: MobileFilesState;
@@ -744,6 +744,13 @@ interface MobileConversationShareLease {
 type TrackedMutationResult =
   | { readonly accepted: true; readonly definitive: boolean; readonly operation?: Operation }
   | { readonly accepted: false; readonly definitive: boolean; readonly operation?: Operation };
+
+interface MobileDialogueRewindDispatch {
+  readonly session: Session;
+  readonly serviceGeneration: bigint;
+  readonly mutation: OperationMutation;
+  readonly isCurrent: () => boolean;
+}
 
 export interface MobileNewTaskResult {
   readonly sessionId?: string;
@@ -972,7 +979,7 @@ export class MobileClient {
   #state: MobileState = { status: "starting", busy: false, saved: [], connectionMode: "nearby",
     discoveryState: "idle", nearby: [], older: [], live: [], liveStatus: "paused",
     historyBusy: false, historyEnd: false, pending: [], homeSearchQuery: "", homeSearchFilter: "active",
-    homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState(),
+    homeSearchStatus: "idle", homeSearchMatches: [], files: emptyMobileFilesState(),
     automations: emptyMobileAutomationsState(), partnerPrivate: emptyMobilePartnerPrivateState() };
   #credentialValue?: PairedCredential;
   #stopEndpointTrustWatch = () => {};
@@ -999,6 +1006,7 @@ export class MobileClient {
   #projectionTimer?: ReturnType<typeof setTimeout>;
   #streamAbort?: AbortController;
   #historyOwner?: symbol;
+  #timelineRetirement = 0;
   #projectionReading = false;
   #projectionMisses = 0;
   #streamSequence?: bigint;
@@ -1112,7 +1120,7 @@ export class MobileClient {
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
-    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
     filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
     private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform),
@@ -3838,12 +3846,12 @@ export class MobileClient {
     return () => this.#listeners.delete(listener);
   }
 
-  #set(patch: Partial<MobileState>): void {
+  #set(patch: Partial<MobileState>, retainHistory = true): void {
     if (this.#disposed) return;
     const previousAuthority = this.filesAuthorityKey();
     const previousPartnerAuthority = this.#partnerPrivateAuthorityKey(this.#state);
     let next = { ...this.#state, ...patch };
-    if (patch.detail && next.activeProfileId === this.#state.activeProfileId && next.selectedId === this.#state.selectedId
+    if (retainHistory && patch.detail && next.activeProfileId === this.#state.activeProfileId && next.selectedId === this.#state.selectedId
       && next.taskSource?.kind === this.#state.taskSource?.kind) {
       next = { ...next, detail: retainMobileHistoryPrefix(patch.detail, this.#state.detail) };
     }
@@ -3992,7 +4000,7 @@ export class MobileClient {
     this.#state = {
       ...this.#state,
       homeSearchStatus: "idle",
-      homeSearchSessionIds: [],
+      homeSearchMatches: [],
       homeSearchError: undefined,
       timelinePreview: undefined,
       partnerPrivate: emptyMobilePartnerPrivateState(partnerPrivate.open,
@@ -5918,7 +5926,9 @@ export class MobileClient {
         }
         if (cursor.sequence <= (this.#streamSequence ?? 0n)) continue;
         this.#streamSequence = cursor.sequence;
-        if (event.identity?.sessionId === this.#state.selectedId && historyInvalidated(event)) this.#clearHistory();
+        if (event.identity?.sessionId === this.#state.selectedId && historyInvalidated(event)) {
+          if (!this.#retireStreamTimeline(event, cursor)) this.#clearHistory();
+        }
         if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
         this.#proofTimer = undefined;
         this.#set({ liveStatus: "streaming" });
@@ -5961,6 +5971,7 @@ export class MobileClient {
   async #syncProjection(epoch: number, credential: PairedCredential, snapshotPoll = false): Promise<void> {
     this.#projectionReading = true;
     const selectedId = this.#state.selectedId;
+    const timelineRetirement = this.#timelineRetirement;
     const generation = snapshotPoll ? this.#taskGeneration() : this.#streamGeneration;
     const edge = snapshotPoll ? this.#state.owner?.resumeCursor?.sequence ?? 0n : this.#streamSequence ?? 0n;
     try {
@@ -5981,6 +5992,10 @@ export class MobileClient {
       if (owner.snapshot.generation !== generation || detail && detail.generation !== generation
         || selectedId && !owner.snapshot.sessions.some((item) => item.sessionId === selectedId)) {
         void this.refresh();
+        return;
+      }
+      if (timelineRetirement !== this.#timelineRetirement) {
+        this.#scheduleProjection(epoch, credential);
         return;
       }
       const ownerCursor = owner.snapshot.resumeCursor;
@@ -6059,7 +6074,7 @@ export class MobileClient {
     await write;
   }
 
-  async #retireUndispatchedSettingsReceipt(pending: PendingOperation): Promise<void> {
+  async #retireUndispatchedReceipt(pending: PendingOperation): Promise<void> {
     const retained = (item: PendingOperation) => item.operationId !== pending.operationId || item.connectionId !== pending.connectionId
       || item.taskJoinId !== pending.taskJoinId || item.kind !== pending.kind;
     const write = this.#pendingWrite.then(async () => {
@@ -6132,7 +6147,7 @@ export class MobileClient {
     const generation = ++this.#homeSearchEpoch;
     if (!normalized) {
       this.#set({ homeSearchQuery: "", homeSearchFilter: statusFilter, homeSearchStatus: "idle",
-        homeSearchSessionIds: [], homeSearchError: undefined });
+        homeSearchMatches: [], homeSearchError: undefined });
       return;
     }
     const credential = this.#credential;
@@ -6141,13 +6156,22 @@ export class MobileClient {
     const epoch = this.#epoch;
     if (!credential || !owner || !profileId || this.#state.status !== "connected" || !this.#foreground) {
       this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "error",
-        homeSearchSessionIds: [], homeSearchError: "Reconnect to search task messages." });
+        homeSearchMatches: [], homeSearchError: "Reconnect to search task messages." });
       return;
     }
     const controller = new AbortController();
     this.#homeSearchAbort = controller;
     this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "searching",
-      homeSearchSessionIds: [], homeSearchError: undefined });
+      homeSearchMatches: [], homeSearchError: undefined });
+    const currentSearch = (): boolean => {
+      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || !this.#current(epoch)
+        || credential !== this.#credential || profileId !== this.#activeProfileId || this.#state.status !== "connected"
+        || this.#state.homeSearchQuery !== normalized || this.#state.homeSearchFilter !== statusFilter) return false;
+      const current = this.#state.owner;
+      return current === owner || (current !== undefined && current.generation === owner.generation
+        && owner.revision !== undefined && current.revision?.value === owner.revision.value
+        && current.resumeCursor?.generation === owner.resumeCursor?.generation && current.resumeCursor?.sequence === owner.resumeCursor?.sequence);
+    };
     try {
       const matches = await this.network.searchSessionMessages(
         credential,
@@ -6157,17 +6181,17 @@ export class MobileClient {
             : SessionMessageSearchSessionStatus.UNSPECIFIED,
         controller.signal
       );
-      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
-        || profileId !== this.#activeProfileId || this.#state.homeSearchQuery !== normalized
-        || this.#state.homeSearchFilter !== statusFilter) return;
+      if (!currentSearch()) return;
       const visible = new Set(this.#state.owner?.sessions.map((session) => session.sessionId) ?? []);
-      const sessionIds = [...new Set(matches.map((match) => match.sessionId).filter((sessionId) => visible.has(sessionId)))];
-      this.#set({ homeSearchStatus: "ready", homeSearchSessionIds: sessionIds, homeSearchError: undefined });
+      const firstBySession = new Map<string, MobileHomeSearchMatch>();
+      for (const { sessionId, eventId } of matches) {
+        if (visible.has(sessionId) && !firstBySession.has(sessionId)) firstBySession.set(sessionId, { sessionId, eventId });
+      }
+      this.#set({ homeSearchStatus: "ready", homeSearchMatches: [...firstBySession.values()], homeSearchError: undefined });
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
-      if (controller.signal.aborted || generation !== this.#homeSearchEpoch || owner !== this.#state.owner
-        || profileId !== this.#activeProfileId) return;
-      this.#set({ homeSearchStatus: "error", homeSearchSessionIds: [], homeSearchError: message(error) });
+      if (!currentSearch()) return;
+      this.#set({ homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: message(error) });
     } finally {
       if (this.#homeSearchAbort === controller) this.#homeSearchAbort = undefined;
     }
@@ -9424,7 +9448,18 @@ export class MobileClient {
     this.#historyOwner = owner;
     this.#set({ historyBusy: true });
     try {
-      const before = this.#state.before;
+      const detail = this.#state.detail;
+      const scope = detail?.scope?.kind;
+      const generation = this.#taskGeneration();
+      const first = detail?.timeline[0];
+      // GetSnapshot and ListSessionTimeline issue cursors in the same service generation.
+      const hasLatestSnapshot = detail !== undefined && detail.generation === generation
+        && this.#state.window === undefined && this.#state.older.length === 0 && !this.#joinedTask
+        && scope?.case === "session" && scope.value.sessionId === sessionId && scope.value.recentTimelineItems > 0
+        && detail.sessions.some(session => session.sessionId === sessionId && session.derivationOrigin?.sideChat !== true);
+      const snapshotBefore = hasLatestSnapshot && first?.identity?.sessionId === sessionId && first.cursor?.opaqueToken
+        && first.cursor.generation === generation && first.cursor.sequence > 0n ? first.cursor : undefined;
+      const before = this.#state.before ?? snapshotBefore;
       const page = await this.network.readHistory(credential, sessionId, before, this.#abort?.signal);
       if (!this.#current(epoch) || sessionId !== this.#state.selectedId || this.#historyOwner !== owner) return;
       validateHistory(page.events, sessionId, this.#taskGeneration(), before);
@@ -9433,7 +9468,8 @@ export class MobileClient {
         throw new Error("The task history returned a cyclic or mismatched page cursor.");
       }
       const known = new Set(this.#state.older.map((item) => item.eventId));
-      const older = [...page.events.filter((item) => !known.has(item.eventId)), ...this.#state.older];
+      const retainedLatest = snapshotBefore !== undefined && before === snapshotBefore && page.events.length > 0 ? detail?.timeline ?? [] : [];
+      const older = [...page.events.filter((item) => !known.has(item.eventId)), ...retainedLatest, ...this.#state.older];
       const window = this.#state.window ? [...older, ...this.#state.window] : undefined;
       this.#set({ older: window ? [] : older, window, before: page.before, historyEnd: !page.before });
       if (!this.#joinedTask && window === undefined && this.#state.node && this.#state.owner && this.#state.detail) {
@@ -9554,6 +9590,55 @@ export class MobileClient {
   #clearHistory(): void {
     this.#historyOwner = undefined;
     this.#set({ window: undefined, older: [], before: undefined, historyEnd: false, historyBusy: false });
+  }
+
+  #retireStreamTimeline(event: Event, cursor: EventCursor): boolean {
+    const session = this.#selectedSession(), identity = event.identity, payload = event.payload?.kind;
+    const nativeGeneration = session?.nativeBinding?.runtimeGeneration;
+    if (this.#joinedTask || !session || !identity || !nativeGeneration || cursor.generation !== this.#taskGeneration()
+      || identity.sessionId !== session.sessionId || identity.backendId !== session.backendId || identity.targetId !== session.targetId) return false;
+    if (payload?.case === "sessionReset" && payload.value.productSessionId === session.sessionId
+      && identity.generation >= nativeGeneration) {
+      void this.#retireSelectedTimeline(session, events => events.filter(item => item.identity?.sessionId !== session.sessionId
+        || item.cursor?.generation === cursor.generation && item.cursor.sequence > cursor.sequence),
+      (detail, source) => detail.generation === cursor.generation || (source.nativeBinding?.runtimeGeneration ?? 0n) < identity.generation);
+      return true;
+    }
+    if (payload?.case === "messageDeleted" && payload.value.productSessionId === session.sessionId
+      && identity.generation === nativeGeneration && payload.value.requestedEventId
+      && payload.value.deletedEventIds.includes(payload.value.requestedEventId)) {
+      const deleted = new Set(payload.value.deletedEventIds);
+      void this.#retireSelectedTimeline(session, events => events.filter(item => item.identity?.sessionId !== session.sessionId
+        || !deleted.has(item.eventId)));
+      return true;
+    }
+    return false;
+  }
+
+  async #retireSelectedTimeline(session: Session, project: (events: readonly Event[]) => Event[],
+    canProjectDetail?: (detail: Snapshot, source: Session) => boolean): Promise<void> {
+    const credential = this.#credential;
+    if (!credential || this.#joinedTask || session.sessionId !== this.#state.selectedId) return;
+    const projectDetail = (detail: Snapshot): Snapshot => {
+      const source = detail.sessions.find(item => item.sessionId === session.sessionId);
+      if (!source || source.backendId !== session.backendId || source.targetId !== session.targetId
+        || canProjectDetail?.(detail, source) === false) return detail;
+      const timeline = project(detail.timeline);
+      return timeline.length === detail.timeline.length ? detail : create(SnapshotSchema, { ...detail, timeline });
+    };
+    this.#timelineRetirement += 1;
+    this.#historyOwner = undefined;
+    const detail = this.#state.detail;
+    this.#set({ detail: detail && projectDetail(detail), live: project(this.#state.live), window: undefined, older: [],
+      before: undefined, historyEnd: false, historyBusy: false }, false);
+    const profile = this.#profiles.find(candidate => candidate.profileId === credential.profileId) ?? profileFromCredential(credential);
+    try {
+      await this.offlineCache?.retireTaskTimeline(profile, session.sessionId, projectDetail);
+    } catch (error) {
+      if (this.#credential === credential && this.#state.selectedId === session.sessionId) {
+        this.#set({ error: `Joko could not update the saved offline history: ${message(error)}` });
+      }
+    }
   }
 
   async logoutConnection(connectionId: string): Promise<boolean> {
@@ -11292,6 +11377,7 @@ export class MobileClient {
       && item.sessionId === session.sessionId && item.eventId === eventId)) {
       throw new Error("This message deletion is already pending. Check its operation before trying again.");
     }
+    const credential = this.#credential;
     const action = this.#claimMutation();
     try {
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
@@ -11304,7 +11390,7 @@ export class MobileClient {
           eventId
         }) }
       }), { kind: "message-delete", sessionId: session.sessionId, eventId });
-      if (result.accepted && result.definitive) this.#clearHistory();
+      if (result.accepted && result.definitive && this.#credential === credential && this.#state.selectedId === session.sessionId) this.#clearHistory();
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -13324,6 +13410,7 @@ export class MobileClient {
     if (mode === "files" && !fileCurrent()) throw new Error("The Workspace rewind preview is blocked or expired. Open a new preview.");
     const credential = this.#ready(); const epoch = this.#epoch; const profileId = this.#activeProfileId!;
     const session = this.#selectedSession()!; const operationId = this.newId(); const identity = { profileId, sessionId: session.sessionId };
+    const serviceGeneration = this.#state.owner!.generation;
     const current = (): boolean => !signal.aborted && this.#current(epoch) && this.#foreground && this.#credential === credential
       && this.#state.status === "connected" && this.#state.selectedId === session.sessionId
       && this.#selectedSession()?.backendId === session.backendId && this.#selectedSession()?.targetId === session.targetId;
@@ -13357,7 +13444,8 @@ export class MobileClient {
         signal, isCurrent: current, beforeDispatch: dispatchCurrent,
         beforeTerminalReceipt: async (operation) => {
           if (operation.state !== OperationState.SUCCEEDED) return;
-          await this.#recoverMessageRewindReceipt({ ...receipt, operationId, connectionId: credential.connectionId, state: "unknown" }, operation, epoch, current);
+          await this.#recoverMessageRewindReceipt({ ...receipt, operationId, connectionId: credential.connectionId, state: "unknown" },
+            operation, epoch, { session, serviceGeneration, mutation, isCurrent: current });
         }
       });
       if (!current()) return { kind: "retired" };
@@ -13367,7 +13455,12 @@ export class MobileClient {
         try { await this.composerDrafts!.clearOperationInput(identity, operationId); }
         catch (error) { cleanupError = message(error); }
       }
-      if (!result.accepted) return { kind: "rejected" };
+      if (!result.accepted) {
+        if (mode === "files" && result.operation === undefined && !fileCurrent()) {
+          throw new Error("The Workspace rewind preview is blocked or expired. Open a new preview.");
+        }
+        return { kind: "rejected" };
+      }
       this.#messageRewindPreviews.delete(preview);
       if (mode === "dialogue") this.#clearHistory();
       await this.refresh();
@@ -13394,29 +13487,70 @@ export class MobileClient {
     throw new Error("The Joko node completed rewind without the exact typed outcome. Its operation was not resent.");
   }
 
-  async #recoverMessageRewindReceipt(pending: PendingOperation, operation: Operation, epoch: number, isCurrent?: () => boolean): Promise<void> {
+  async #recoverMessageRewindReceipt(pending: PendingOperation, operation: Operation, epoch: number, dispatch?: MobileDialogueRewindDispatch): Promise<void> {
     this.#assertMessageRewindResult(operation, pending);
     if (pending.kind !== "session-rewind") return;
     const credential = this.#ready(); const profileId = this.#activeProfileId!;
+    const originalOwner = this.#state.owner;
     const current = (): boolean => this.#current(epoch) && this.#foreground && this.#credential === credential && this.#activeProfileId === profileId
-      && (isCurrent?.() ?? true);
+      && (dispatch?.isCurrent() ?? true);
     const owner = await this.network.readOwner(credential, this.deviceNameSource(), this.#abort?.signal);
     if (!current()) return;
     this.#assertOwner(credential, owner, this.#state.node!);
     const sessions = owner.snapshot.sessions.filter((value) => value.sessionId === pending.sessionId);
     const session = sessions[0];
+    const binding = session?.nativeBinding;
+    const sourceGeneration = pending.sourceGeneration ? BigInt(pending.sourceGeneration) : 0n;
     if (sessions.length !== 1 || !session || session.backendId !== pending.backendId || session.targetId !== pending.targetId
-      || session.nativeBinding?.backendId !== pending.backendId || !session.nativeBinding.opaqueReference
-      || !mobileSessionOriginSourceAvailable(session) || !pending.sourceGeneration
-      || (session.nativeBinding?.runtimeGeneration ?? 0n) <= BigInt(pending.sourceGeneration) || !this.composerDrafts) {
+      || !binding || binding.backendId !== pending.backendId || !binding.opaqueReference
+      || !mobileSessionOriginSourceAvailable(session) || sourceGeneration < 1n
+      || binding.runtimeGeneration < sourceGeneration || !this.composerDrafts) {
       throw new Error("The saved conversation rewind no longer has its exact task authority. Its operation was not resent.");
+    }
+    let restoreCurrent = current;
+    if (binding.runtimeGeneration === sourceGeneration) {
+      const serviceGeneration = dispatch?.serviceGeneration ?? originalOwner?.generation ?? 0n;
+      const mutation = operation.mutation, payload = mutation?.payload;
+      const target = payload?.case === "navigateSessionBranch" ? payload.value.target?.kind : undefined;
+      const condition = mutation?.preconditions.length === 1 ? mutation.preconditions[0] : undefined;
+      const sourceRevision = condition?.expectedRevision?.value ?? 0n;
+      const receiptRevision = operation.version?.revision?.value ?? 0n;
+      const sameBinding = (candidate: Session | undefined): boolean => candidate !== undefined
+        && candidate.sessionId === session.sessionId && candidate.backendId === session.backendId && candidate.targetId === session.targetId
+        && candidate.nativeBinding?.backendId === session.backendId && candidate.nativeBinding.opaqueReference === binding.opaqueReference
+        && candidate.nativeBinding.runtimeGeneration === sourceGeneration && candidate.version?.generation === sourceGeneration
+        && mobileSessionOriginSourceAvailable(candidate);
+      const sameOwner = (snapshot: Snapshot | undefined): boolean => {
+        const matches = snapshot?.sessions.filter(candidate => candidate.sessionId === session.sessionId);
+        return snapshot?.scope?.kind.case === "owner" && snapshot.generation === serviceGeneration
+          && snapshot.server?.serverId === credential.serverId && !!snapshot.snapshotId && (snapshot.revision?.value ?? 0n) > 0n
+          && matches?.length === 1 && sameBinding(matches[0]);
+      };
+      if (this.#joinedTask || pending.taskJoinId !== undefined || !pending.eventId || operation.state !== OperationState.SUCCEEDED
+        || !this.#operationReceiptMatches(operation, pending) || serviceGeneration < 1n || operation.generation !== serviceGeneration
+        || mutation === undefined || payload?.case !== "navigateSessionBranch" || payload.value.sessionId !== session.sessionId
+        || payload.value.summarize || payload.value.customInstructions !== "" || target?.case !== "nativeEntryId"
+        || !target.value || target.value.length > 1_024 || target.value !== target.value.trim() || /[\u0000-\u001f\u007f]/u.test(target.value)
+        || condition?.entity?.kind !== EntityKind.SESSION || condition.entity.id !== session.sessionId
+        || condition.expectedGeneration !== sourceGeneration || sourceRevision < 1n || receiptRevision <= sourceRevision
+        || (session.version?.revision?.value ?? 0n) < sourceRevision || (owner.snapshot.revision?.value ?? 0n) < receiptRevision
+        || !sameOwner(originalOwner) || !sameOwner(owner.snapshot)
+        || (dispatch && (!sameBinding(dispatch.session) || !equals(OperationMutationSchema, mutation, dispatch.mutation)))) {
+        throw new Error("The saved in-place conversation rewind no longer has its exact task authority. Its operation was not resent.");
+      }
+      // Store only replaces an opaque native binding at a higher generation.
+      // After restart, the original Operation's precondition still proves this binding.
+      restoreCurrent = () => current() && this.#state.status === "connected" && sameOwner(this.#state.owner);
+      if (!restoreCurrent()) throw new Error("The saved in-place conversation rewind lost its task authority.");
     }
     const draft = await this.composerDrafts.readOperationInput({ profileId, sessionId: session.sessionId }, pending.operationId);
     if (!current()) return;
-    if (!draft || !await this.#restoreForkDraft(draft, profileId, session.sessionId, current)) {
+    if (!draft || !await this.#restoreForkDraft(draft, profileId, session.sessionId, restoreCurrent)) {
       throw new Error("The conversation was rewound, but its retained input could not be restored safely. The newer draft was kept.");
     }
-    if (current()) this.#notifyRewindDraftRestored(profileId, session.sessionId);
+    if (!current()) return;
+    if (!restoreCurrent()) throw new Error("The saved in-place conversation rewind lost its task authority.");
+    this.#notifyRewindDraftRestored(profileId, session.sessionId);
   }
 
   #notifyRewindDraftRestored(profileId: string, sessionId: string): void {
@@ -16746,8 +16880,9 @@ export class MobileClient {
     let operation: Operation;
     if (!persisted || !requestCurrent() || authority?.beforeDispatch?.() === false) {
       if (pending.kind === "extension-settings-routing" || pending.kind === "extension-settings-credential-clear"
-        || pending.kind === "extension-settings-directory") {
-        await this.#retireUndispatchedSettingsReceipt(pending);
+        || pending.kind === "extension-settings-directory" || pending.kind === "workspace-rewind") {
+        await this.#retireUndispatchedReceipt(pending);
+        if (pending.kind === "workspace-rewind" && markBusy && this.#current(epoch)) this.#set({ busy: false });
         return { accepted: false, definitive: true };
       }
       return { accepted: false, definitive: false };
@@ -16817,6 +16952,22 @@ export class MobileClient {
     if (operation.state === OperationState.SUCCEEDED && pending.kind === "device-rename") {
       confirmedMobileDeviceName(operation, pending.targetDeviceId!, pending.connectionId);
     }
+    if (operation.state === OperationState.SUCCEEDED && pending.kind === "message-delete") {
+      const session = this.#selectedSession();
+      const generation = mobileMessageDeletionGeneration(operation, pending);
+      if (session && pending.eventId && pending.sessionId === session.sessionId && generation !== undefined
+        && generation === session.nativeBinding?.runtimeGeneration) {
+        const target = this.#completedMessageEvent(pending.eventId)?.payload?.kind;
+        // The accepted user row carries the requested durable event ID. The
+        // affected assistant-turn IDs come from the authoritative stream marker.
+        if ((target?.case === "messageStarted" || target?.case === "messageCompleted") && target.value.role === MessageRole.USER) {
+          const eventId = pending.eventId;
+          await this.#retireSelectedTimeline(session, events => events.filter(item => item.identity?.sessionId !== session.sessionId
+            || item.eventId !== eventId));
+          if (!this.#current(epoch) || this.#credential?.connectionId !== pending.connectionId) return;
+        }
+      }
+    }
     const next = isTerminal(operation.state)
       ? this.#state.pending.filter((item) => item.operationId !== pending.operationId)
       : this.#state.pending.map((item) => item.operationId === pending.operationId ? { ...item, state: "accepted" as const } : item);
@@ -16865,7 +17016,9 @@ export class MobileClient {
       try { assertMobileSharedTaskOperation(this.#joinedTask.source, pending.operationId, operation); return true; }
       catch { return false; }
     }
-    return !this.#joinedTask && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
+    return !this.#joinedTask && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId
+      && (pending.kind !== "message-delete" || operation.state !== OperationState.SUCCEEDED
+        || mobileMessageDeletionGeneration(operation, pending) !== undefined);
   }
 
   async reconcile(epoch = this.#epoch): Promise<void> {
@@ -16947,9 +17100,9 @@ export class MobileClient {
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
               "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
-            && this.#current(epoch)) {
+            && this.#current(epoch) && (pending.kind !== "message-delete" || this.#operationReceiptMatches(operation, pending))) {
             await this.refresh();
-            if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground
+            if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground && this.#credential === credential
               && this.#state.selectedId === pending.sessionId) this.#clearHistory();
             return;
           }
@@ -17704,4 +17857,13 @@ function historyInvalidated(event: Event): boolean {
     case "nativeBranchChanged": return event.payload.kind.value.timelineRebuilt;
     default: return false;
   }
+}
+
+function mobileMessageDeletionGeneration(operation: Operation, pending: PendingOperation): bigint | undefined {
+  const mutation = operation.mutation?.payload, result = operation.result?.payload;
+  if (mutation?.case !== "deleteSessionMessage" || mutation.value.sessionId !== pending.sessionId
+    || mutation.value.eventId !== pending.eventId || result?.case !== "acknowledgement" || !result.value.accepted) return undefined;
+  const generation = operation.mutation?.preconditions.find(condition => condition.entity?.kind === EntityKind.SESSION
+    && condition.entity.id === pending.sessionId)?.expectedGeneration;
+  return generation !== undefined && generation > 0n ? generation : undefined;
 }

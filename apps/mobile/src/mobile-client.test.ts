@@ -70,7 +70,7 @@ import {
   type NodeIdentity,
   type PairedCredential
 } from "./network";
-import type { Event, Operation, Schedule, ScheduleInput, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
+import type { Event, Operation, OperationMutation, Schedule, ScheduleInput, SessionMessageSearchMatch, Snapshot, WorkspaceEntry, WorkspaceFileChange } from "@joko/contracts";
 import { mobileDeviceNameSource, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -101,6 +101,7 @@ import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
 import { timelineRows } from "./timeline";
+import { findMobileConversationSearchHits } from "./mobile-conversation-search";
 import {
   insertMobileArtifactMention,
   insertMobileResourceMention,
@@ -1360,6 +1361,29 @@ function eventFeed(network: MobileNetwork) {
   return (item: Event) => { queued.push(item); wake?.(); wake = undefined; };
 }
 
+function historyRetirementFixture() {
+  const session = messageActionSnapshot.sessions[0]!;
+  const identity = { sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
+    generation: session.nativeBinding!.runtimeGeneration };
+  const input = (id: string, sequence: bigint, text: string) => create(EventSchema, { ...event(id, sequence), identity,
+    payload: { kind: { case: "messageStarted", value: { messageId: id, role: MessageRole.USER, userInputAccepted: true,
+      userInput: { parts: [{ content: { case: "text", value: text } }] } } } } });
+  const deletedText = "former unique prompt";
+  const deleted = input("retired-input", 7n, deletedText);
+  const neighbor = input("neighbor-input", 8n, "surviving neighbor");
+  const owner = create(SnapshotSchema, { ...messageActionSnapshot, snapshotId: "history-owner", timeline: [],
+    scope: { kind: { case: "owner", value: {} } } });
+  const detail = create(SnapshotSchema, { ...owner, snapshotId: "history-detail", timeline: [deleted, neighbor],
+    scope: { kind: { case: "session", value: { sessionId: session.sessionId, recentTimelineItems: 120 } } } });
+  const network = projectedNetwork(owner);
+  vi.mocked(network.readSession).mockResolvedValue(detail);
+  const saved = memoryStorage(credential), offline = memoryOfflineCache();
+  const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+  const rows = () => timelineRows([...(app.state.detail?.timeline ?? []), ...app.state.live]);
+  const hits = () => findMobileConversationSearchHits(rows(), deletedText);
+  return { app, network, saved, offline, owner, detail, deleted, deletedText, neighbor, input, identity, rows, hits };
+}
+
 function memoryDraftStores() {
   const values = new Map<string, string>();
   const driver: MobilePlainStorageDriver = {
@@ -2060,7 +2084,7 @@ function client(
   pdfPreviewFiles?: MobilePdfPreviewFiles,
   modelPreviewFiles?: MobileModelPreviewFiles,
   fileShare?: Pick<MobileFileShare, "perform">,
-  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
   readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> },
   deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android"),
   creationReceipts?: MobilePartnerCreationReceipts,
@@ -2077,7 +2101,7 @@ function client(
 function clientWithOfflineCache(
   network: MobileNetwork,
   storage: MobileStorage,
-  offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear">,
+  offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
   now: () => number = () => 2_000,
   newId?: () => string
 ) {
@@ -5950,7 +5974,7 @@ describe("native mobile connection and operation ownership", () => {
       save: vi.fn()
         .mockResolvedValueOnce(undefined)
         .mockRejectedValueOnce(new Error("offline storage full")),
-      clear: vi.fn(async () => undefined)
+      clear: vi.fn(async () => undefined), retireTaskTimeline: vi.fn(async () => undefined)
     };
     const network = fakeNetwork();
     network.readOwner = vi.fn(async (current) => current.profileId === otherCredential.profileId
@@ -5977,7 +6001,7 @@ describe("native mobile connection and operation ownership", () => {
     const offlineCache = {
       load: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
-      clear: vi.fn(() => new Promise<void>((resolve) => { releaseClear = resolve; }))
+      clear: vi.fn(() => new Promise<void>((resolve) => { releaseClear = resolve; })), retireTaskTimeline: vi.fn(async () => undefined)
     };
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
@@ -6005,7 +6029,8 @@ describe("native mobile connection and operation ownership", () => {
     const cache = {
       load: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
-      clear: vi.fn(async () => undefined)
+      clear: vi.fn(async () => undefined),
+      retireTaskTimeline: vi.fn(async () => undefined)
     };
     const firstNetwork = fakeNetwork();
     const firstSaved = memoryStorage(credential);
@@ -6444,7 +6469,8 @@ describe("native mobile connection and operation ownership", () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
     const offlineCache = {
-      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined)
+      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
+      retireTaskTimeline: vi.fn(async () => undefined)
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -6466,7 +6492,8 @@ describe("native mobile connection and operation ownership", () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
     const offlineCache = {
-      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined)
+      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
+      retireTaskTimeline: vi.fn(async () => undefined)
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -6495,7 +6522,8 @@ describe("native mobile connection and operation ownership", () => {
     vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: extendedSnapshot });
     const saved = memoryStorage([credential, otherCredential], credential.profileId);
     const offlineCache = {
-      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined)
+      load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
+      retireTaskTimeline: vi.fn(async () => undefined)
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -8114,6 +8142,27 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.window).toBeUndefined();
   });
 
+  it.each([120, 4])("uses the first event cursor for the first older request with %i recent events", async (count) => {
+    const network = fakeNetwork();
+    const timeline = Array.from({ length: count }, (_, index) => event(`recent-${index}`, BigInt(index + 10)));
+    const resumeCursor = { opaqueToken: "cursor-130", sequence: 130n, generation: 1n };
+    const owner = create(SnapshotSchema, { ...snapshot, resumeCursor });
+    const detail = create(SnapshotSchema, { ...owner, scope: { kind: { case: "session", value: { sessionId: "session", recentTimelineItems: 120 } } }, timeline });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: owner });
+    vi.mocked(network.readSession).mockResolvedValue(detail);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    expect(app.state.before).toBeUndefined();
+    const earlier = count === 120 ? [event("just-before-the-window", 9n)] : [];
+    vi.mocked(network.readHistory).mockResolvedValueOnce({ events: earlier });
+
+    await app.older();
+    expect(network.readHistory).toHaveBeenCalledExactlyOnceWith(credential, "session", timeline[0]!.cursor, expect.any(AbortSignal));
+    expect(app.state.older).toEqual(earlier.length ? [...earlier, ...timeline] : []);
+    expect(app.state.detail?.timeline).toEqual(timeline);
+    expect(app.state.historyEnd).toBe(true);
+  });
+
   it("retires an in-flight historic page when returning to the latest window", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);
@@ -8238,6 +8287,44 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.older).toHaveLength(0);
   });
 
+  it.each(["reset", "delete"] as const)("retires a confirmed stream %s before a failed read and offline reopen", async (change) => {
+    const { app, network, offline, owner, detail, deleted, deletedText, neighbor, input, identity, rows, hits } = historyRetirementFixture();
+    const emit = eventFeed(network);
+    await app.start();
+    expect(hits()).toHaveLength(1);
+    const live = input("also-retired", 11n, deletedText);
+    let resolveOld!: (snapshot: Snapshot) => void;
+    const oldRead = new Promise<Snapshot>(resolve => { resolveOld = resolve; });
+    const staleCursor = live.cursor!;
+    vi.mocked(network.readOwner).mockResolvedValueOnce({ connection, device,
+      snapshot: create(SnapshotSchema, { ...owner, resumeCursor: staleCursor }) });
+    vi.mocked(network.readSession).mockReturnValueOnce(oldRead).mockRejectedValue(new Error("snapshot transport unavailable"));
+    vi.mocked(network.inspect).mockRejectedValue(new Error("radio unavailable"));
+    emit(live);
+    await vi.waitFor(() => expect(network.readSession).toHaveBeenCalledTimes(2));
+    expect(hits()).toHaveLength(2);
+    emit(create(EventSchema, { ...event("retirement", 12n), identity: { ...identity,
+      generation: change === "reset" ? identity.generation + 1n : identity.generation },
+      payload: { kind: change === "reset" ? { case: "sessionReset", value: { productSessionId: identity.sessionId } }
+        : { case: "messageDeleted", value: { productSessionId: identity.sessionId, requestedEventId: deleted.eventId,
+          deletedEventIds: [deleted.eventId, live.eventId] } } } }));
+    await vi.waitFor(() => expect(app.state.live.some(item => item.eventId === "retirement")).toBe(true));
+    expect(hits()).toEqual([]);
+    const observed: number[] = [];
+    const unsubscribe = app.subscribe(() => { observed.push(hits().length); });
+    resolveOld(create(SnapshotSchema, { ...detail, resumeCursor: staleCursor, timeline: [...detail.timeline, live] }));
+    await vi.waitFor(() => expect(app.state.status).toBe("offline"));
+    unsubscribe();
+    expect(observed.every(count => count === 0)).toBe(true);
+    expect(rows().map(row => row.eventId)).toEqual(change === "reset" ? [] : [neighbor.eventId]);
+    await app.select(undefined);
+    await app.select(identity.sessionId);
+    expect(app.state.status).toBe("offline");
+    expect(hits()).toEqual([]);
+    expect(rows().map(row => row.eventId)).toEqual(change === "reset" ? [] : [neighbor.eventId]);
+    expect([...offline.values.values()].join("\n")).not.toContain(deletedText);
+  });
+
   it.each(["cursor", "snapshot-only"] as const)("preserves a degraded polling connection with %s observations without treating it as live", async (mode) => {
     vi.useFakeTimers();
     const network = fakeNetwork();
@@ -8303,6 +8390,30 @@ describe("native mobile connection and operation ownership", () => {
 });
 
 describe("mobile Home search and task mutations", () => {
+  it.each([true, false])("adopts an in-flight Home search only while a polled projection has the same revision (%s)", async (sameRevision) => {
+    vi.useFakeTimers();
+    const owner = create(SnapshotSchema, { ...snapshot, snapshotId: "first", revision: { value: 11n } });
+    const network = projectedNetwork(owner);
+    network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.liveStatus).toBe("polling");
+
+    let resolveSearch!: (matches: readonly SessionMessageSearchMatch[]) => void;
+    vi.mocked(network.searchSessionMessages).mockImplementationOnce(() => new Promise(resolve => { resolveSearch = resolve; }));
+    const search = app.searchHome("needle", "active");
+    expect(app.state.homeSearchStatus).toBe("searching");
+    const polled = create(SnapshotSchema, { ...owner, snapshotId: "polled", revision: { value: sameRevision ? 11n : 12n } });
+    vi.mocked(network.readOwner).mockResolvedValueOnce({ connection, device, snapshot: polled });
+    vi.mocked(network.readSession).mockResolvedValueOnce(polled);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(app.state.owner).toBe(polled);
+    resolveSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "matching-message" })]);
+    await search;
+    expect(app.state.homeSearchMatches).toEqual(sameRevision ? [{ sessionId: "session", eventId: "matching-message" }] : []);
+  });
+
   it.each(["search", "page", "anchor"] as const)("retires the original profile and its offline history when %s observes revocation", async (read) => {
     const owner = create(SnapshotSchema, { ...runtimeControlProjection(),
       connections: [connection, otherConnection], devices: [device, otherDevice] });
@@ -8377,7 +8488,8 @@ describe("mobile Home search and task mutations", () => {
     let resolveOld!: (value: readonly SessionMessageSearchMatch[]) => void;
     vi.mocked(network.searchSessionMessages)
       .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
-      .mockResolvedValueOnce([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-new" })]);
+      .mockResolvedValueOnce([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-new" }),
+        create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-secondary" })]);
 
     const oldSearch = app.searchHome("old words", "active");
     await vi.waitFor(() => expect(app.state.homeSearchStatus).toBe("searching"));
@@ -8389,7 +8501,7 @@ describe("mobile Home search and task mutations", () => {
       homeSearchQuery: "new words",
       homeSearchFilter: "all",
       homeSearchStatus: "ready",
-      homeSearchSessionIds: ["session"]
+      homeSearchMatches: [{ sessionId: "session", eventId: "event-new" }]
     });
     resolveOld([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "event-old" })]);
     await oldSearch;
@@ -8402,7 +8514,7 @@ describe("mobile Home search and task mutations", () => {
     await app.refresh();
     resolveOwnerSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "late" })]);
     await ownerSearch;
-    expect(app.state.homeSearchSessionIds).toEqual([]);
+    expect(app.state.homeSearchMatches).toEqual([]);
     expect(app.state.homeSearchStatus).toBe("idle");
 
     let resolveClearedSearch!: (value: readonly SessionMessageSearchMatch[]) => void;
@@ -8416,11 +8528,11 @@ describe("mobile Home search and task mutations", () => {
       homeSearchQuery: "",
       homeSearchFilter: "archived",
       homeSearchStatus: "idle",
-      homeSearchSessionIds: []
+      homeSearchMatches: []
     });
     resolveClearedSearch([create(SessionMessageSearchMatchSchema, { sessionId: "session", eventId: "cleared" })]);
     await clearedSearch;
-    expect(app.state.homeSearchSessionIds).toEqual([]);
+    expect(app.state.homeSearchMatches).toEqual([]);
   });
 
   it("submits every task action with the exact current Session revision", async () => {
@@ -10046,7 +10158,8 @@ describe("native current-task message and Queue actions", () => {
     vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
       if (mutation.payload.case === "deleteSessionMessage") deleted = true;
       return create(OperationSchema, {
-        operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED
+        operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED, mutation,
+        result: { payload: { case: "acknowledgement", value: { accepted: true } } }
       });
     });
     const app = client(network, saved.storage, undefined, undefined, ids());
@@ -10071,6 +10184,42 @@ describe("native current-task message and Queue actions", () => {
       } }
     });
     expect(saved.pending()).toEqual([]);
+  });
+
+  it.each(["exact", "wrong-event", "lost"] as const)("uses the %s local deletion receipt before any replacement read", async (receipt) => {
+    const { app, network, offline, saved, deleted, deletedText, neighbor, identity, rows, hits } = historyRetirementFixture();
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      if (receipt === "lost") throw new Error("receipt transport unavailable");
+      const payload = mutation.payload;
+      const returnedMutation = receipt === "wrong-event" && payload.case === "deleteSessionMessage"
+        ? create(OperationMutationSchema, { ...mutation, payload: { case: "deleteSessionMessage",
+          value: { ...payload.value, eventId: neighbor.eventId } } }) : mutation;
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        mutation: returnedMutation, result: { payload: { case: "acknowledgement", value: { accepted: true } } } });
+    });
+    await app.start();
+    expect(hits()).toHaveLength(1);
+    const whenReading: number[] = [];
+    vi.mocked(network.inspect).mockImplementation(async () => {
+      whenReading.push(hits().length);
+      throw new Error("radio unavailable");
+    });
+    expect(await app.deleteMessage(deleted.eventId)).toBe(receipt === "exact");
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(whenReading).toEqual(receipt === "exact" ? [0] : []);
+    if (receipt !== "exact") {
+      expect(saved.pending()).toMatchObject([{ kind: "message-delete", eventId: deleted.eventId, state: "unknown" }]);
+      expect(hits()).toHaveLength(1);
+      return;
+    }
+    expect(saved.pending()).toEqual([]);
+    expect(app.state.status).toBe("offline");
+    expect(rows().map(row => row.eventId)).toEqual([neighbor.eventId]);
+    await app.select(undefined);
+    await app.select(identity.sessionId);
+    expect(hits()).toEqual([]);
+    expect(rows().map(row => row.eventId)).toEqual([neighbor.eventId]);
+    expect([...offline.values.values()].join("\n")).not.toContain(deletedText);
   });
 
   it("cancels the exact accepted Queue item at its projected revision", async () => {
@@ -11855,7 +12004,7 @@ describe("native message rewinds", () => {
       } } } });
     const state = { source: create(SessionSchema, { ...runtimeSession, state: SessionState.IDLE,
       nativeBinding: create(NativeSessionBindingSchema, { backendId: "backend", opaqueReference: "native-task", runtimeGeneration: 8n }) }),
-      events: [started, completed] };
+      events: [started, completed], serviceGeneration: 1n, ownerRevision: 30n };
     const backend = create(BackendDescriptorSchema, { ...runtimeBackend, capabilities: create(CapabilityManifestSchema, {
       ...runtimeBackend.capabilities!, capabilities: [...runtimeBackend.capabilities!.capabilities,
         create(CapabilitySchema, { name: "workspace.rewind", support: CapabilitySupport.SUPPORTED })]
@@ -11863,8 +12012,13 @@ describe("native message rewinds", () => {
     const workspace = create(WorkspaceDescriptorSchema, { workspaceId: "rewind-workspace", targetId: "target", serverPathDisplay: "D:\\project",
       location: { kind: { case: "serviceNode", value: {} } }, version: { revision: { value: 3n }, generation: 1n } });
     const target = create(TargetSchema, { ...snapshot.targets[0]!, workspaceId: workspace.workspaceId });
-    const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.source, detail),
-      backends: [backend], targets: [target], workspaces: [workspace], ...(detail ? { timeline: state.events } : {}) });
+    const projection = (detail: boolean) => {
+      const base = runtimeControlProjection(state.source, detail);
+      return create(SnapshotSchema, { ...base, generation: state.serviceGeneration,
+        resumeCursor: { ...base.resumeCursor!, generation: state.serviceGeneration },
+        revision: detail ? base.revision : { ...base.revision!, value: state.ownerRevision },
+        backends: [backend], targets: [target], workspaces: [workspace], ...(detail ? { timeline: state.events } : {}) });
+    };
     const network = fakeNetwork(); network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
     network.readSession = vi.fn(async () => projection(true));
     network.listWorkspaceChangeSets = vi.fn(async () => [create(WorkspaceChangeSetSchema, { workspaceId: workspace.workspaceId,
@@ -11883,7 +12037,15 @@ describe("native message rewinds", () => {
         nativeBinding: create(NativeSessionBindingSchema, { ...state.source.nativeBinding!, runtimeGeneration: 9n }),
         version: create(EntityVersionSchema, { revision: { value: 10n }, generation: 9n }) }); state.events = [];
     };
-    return { state, backend, workspace, files, network, operation, advance, input };
+    const ancestor = create(EventSchema, { ...event("retained-assistant", 19n), payload: { kind: { case: "messageCompleted", value: {
+      messageId: "public-boundary", role: MessageRole.ASSISTANT, nativeIdentity: { entryId: "public-boundary" },
+      blocks: [{ content: { case: "text", value: "Retained answer" } }]
+    } } } });
+    const inPlaceReceipt = (operationId: string, mutation: OperationMutation) => create(OperationSchema, {
+      ...operation(operationId), mutation, generation: state.serviceGeneration,
+      version: { revision: { value: 25n }, generation: state.serviceGeneration }
+    });
+    return { state, backend, workspace, files, network, operation, advance, input, ancestor, inPlaceReceipt };
   }
   async function preview(app: MobileClient) {
     const controls = app.taskMessageRewindControls("rewind-complete")!;
@@ -11928,6 +12090,88 @@ describe("native message rewinds", () => {
     expect(f.network.readAround).not.toHaveBeenCalled(); expect(f.network.submit).toHaveBeenCalledOnce();
   });
 
+  it.each(["direct", "lost"] as const)("restores the original input after a %s in-place rewind receipt", async (delivery) => {
+    const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Keep current draft")); await drafts.composer.flush(identity);
+    f.state.events.unshift(f.ancestor);
+    let receipt!: Operation;
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+      receipt = f.inPlaceReceipt(operationId, mutation);
+      f.state.events = [f.ancestor];
+      if (delivery === "lost") throw new Error("response lost after native navigation");
+      return receipt;
+    });
+    let activeDrafts = drafts;
+    let app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, activeDrafts); await app.start();
+    const result = await app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal);
+    if (delivery === "lost") {
+      expect(result).toEqual({ kind: "unknown" });
+      expect(saved.pending()).toMatchObject([{ operationId: receipt.operationId, kind: "session-rewind", sourceGeneration: "8" }]);
+      const retained = await drafts.composer.readOperationInput(identity, receipt.operationId);
+      expect(mobileComposerInput(retained!)).toEqual(mobileComposerInput(f.input));
+      app.dispose();
+      const stale = clone(OperationSchema, receipt);
+      stale.mutation!.preconditions[0]!.expectedGeneration = 7n;
+      vi.mocked(f.network.getOperation).mockResolvedValueOnce(stale).mockResolvedValue(receipt);
+      activeDrafts = { ...drafts, composer: new MobileComposerDraftStore(drafts.composer.driver) };
+      app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, activeDrafts); await app.start();
+      expect(saved.pending()).toMatchObject([{ operationId: receipt.operationId, kind: "session-rewind", sourceGeneration: "8" }]);
+      expect(app.state.detail?.timeline.map(item => item.eventId)).toEqual([f.ancestor.eventId]);
+      expect((await activeDrafts.composer.readDurable(identity))?.text).toBe("Keep current draft");
+      await app.reconcile();
+      expect(f.network.getOperation).toHaveBeenCalledWith(credential, receipt.operationId, expect.any(AbortSignal));
+    } else {
+      expect(result).toEqual({ kind: "rewound", mode: "dialogue" });
+    }
+    const restored = await activeDrafts.composer.readDurable(identity);
+    expect(restored).toMatchObject({ mentions: [{ sessionId: "related" }], atoms: [{ kind: "pasted-text" }], attachments: [] });
+    expect(restored?.text).toContain("Keep current draft");
+    expect(app.state.restoredComposerDraft).toMatchObject(identity);
+    expect(app.state.detail?.sessions[0]?.nativeBinding).toMatchObject({ opaqueReference: "native-task", runtimeGeneration: 8n });
+    expect(app.state.detail?.timeline.map(item => item.eventId)).toEqual([f.ancestor.eventId]);
+    expect(saved.pending()).toEqual([]);
+    await expect(activeDrafts.composer.readOperationInput(identity, receipt.operationId)).resolves.toBeNull();
+    expect(f.network.submit).toHaveBeenCalledOnce(); expect(f.network.readAround).not.toHaveBeenCalled();
+  });
+
+  it.each(["wrong-entry", "changed-binding", "old-snapshot", "different-service"] as const)(
+    "retains the in-place rewind input after %s proof and recovers the original Operation", async (mismatch) => {
+      const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
+      const identity = { profileId: credential.profileId, sessionId: "session" };
+      const original = f.state.source;
+      drafts.composer.save(identity, plainTextMobileComposerDraft("Newer draft")); await drafts.composer.flush(identity);
+      let receipt!: Operation;
+      vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => {
+        receipt = f.inPlaceReceipt(operationId, mutation);
+        f.state.events = [f.ancestor];
+        if (mismatch === "changed-binding") {
+          f.state.source = create(SessionSchema, { ...original, nativeBinding: { ...original.nativeBinding!, opaqueReference: "other-binding" } });
+        }
+        if (mismatch === "old-snapshot") f.state.ownerRevision = 24n;
+        if (mismatch === "different-service") f.state.serviceGeneration = 2n;
+        if (mismatch !== "wrong-entry") return receipt;
+        const wrong = clone(OperationMutationSchema, mutation);
+        if (wrong.payload.case !== "navigateSessionBranch") throw new Error("Expected a branch navigation.");
+        wrong.payload.value.target!.kind = { case: "nativeEntryId", value: "other-entry" };
+        return f.inPlaceReceipt(operationId, wrong);
+      });
+      const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, drafts); await app.start();
+      await expect(app.commitTaskMessageRewind(await preview(app), "dialogue", new AbortController().signal)).resolves.toEqual({ kind: "unknown" });
+      expect(saved.pending()).toMatchObject([{ operationId: receipt.operationId, kind: "session-rewind", state: "unknown" }]);
+      expect((await drafts.composer.readDurable(identity))?.text).toBe("Newer draft");
+      const retained = await drafts.composer.readOperationInput(identity, receipt.operationId);
+      expect(mobileComposerInput(retained!)).toEqual(mobileComposerInput(f.input));
+      expect(app.state.restoredComposerDraft).toBeUndefined();
+      f.state.source = original; f.state.ownerRevision = 30n; f.state.serviceGeneration = 1n;
+      vi.mocked(f.network.getOperation).mockResolvedValueOnce(receipt);
+      await app.reconcile();
+      expect(saved.pending()).toEqual([]);
+      expect(app.state.restoredComposerDraft).toMatchObject(identity);
+      expect((await drafts.composer.readDurable(identity))?.text).toContain("Newer draft");
+      expect(f.network.submit).toHaveBeenCalledOnce();
+    });
+
   it("restores files independently at the exact Workspace/Run checkpoint when the backend lacks the message dialogue boundary", async () => {
     const f = fixture(false); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
     f.workspace.workspaceId = "owned-workspace";
@@ -11969,6 +12213,36 @@ describe("native message rewinds", () => {
     await app.reconcile();
     expect(saved.pending()).toEqual([]);
     expect(app.state).toMatchObject({ ...history, historyEnd: false });
+    expect(f.network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("retires a files-only receipt when the preview expires during its pending write before dispatch", async () => {
+    const f = fixture(false); const saved = memoryStorage(credential);
+    let now = 2_000;
+    let release!: () => void;
+    const writeGate = new Promise<void>(resolve => { release = resolve; });
+    const savePending = saved.storage.savePending;
+    let paused = false;
+    saved.storage.savePending = vi.fn<MobileStorage["savePending"]>(async (items) => {
+      if (!paused && items.some(item => item.kind === "workspace-rewind")) { paused = true; await writeGate; }
+      await savePending(items);
+    });
+    const app = client(f.network, saved.storage, undefined, () => now); await app.start();
+    const first = await preview(app);
+    const commit = app.commitTaskMessageRewind(first, "files", new AbortController().signal);
+    const expired = expect(commit).rejects.toThrow(/blocked or expired/u);
+    await vi.waitFor(() => expect(paused).toBe(true));
+    now = 101_000;
+    release();
+    await expired;
+    expect(f.network.submit).not.toHaveBeenCalled();
+    expect(saved.pending()).toEqual([]);
+    expect(app.state).toMatchObject({ pending: [], busy: false });
+    expect(app.taskMessageRewindControls("rewind-complete")?.canFiles).toBe(true);
+
+    f.files.expiresAt!.seconds = 200n;
+    vi.mocked(f.network.submit).mockImplementationOnce(async (_credential, operationId) => f.operation(operationId, "files"));
+    await expect(app.commitTaskMessageRewind(await preview(app), "files", new AbortController().signal)).resolves.toEqual({ kind: "rewound", mode: "files" });
     expect(f.network.submit).toHaveBeenCalledOnce();
   });
 
