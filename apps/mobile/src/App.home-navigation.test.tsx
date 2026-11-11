@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
   SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
-  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, TargetSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
+  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, TargetSchema, ToolCallState, WorkspaceKind, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -209,7 +209,7 @@ beforeAll(async () => {
   vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {} }));
   vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
   for (const name of ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage",
-    "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard",
+    "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard",
     "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard",
     "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker",
     "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet",
@@ -217,7 +217,7 @@ beforeAll(async () => {
     "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar",
     "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer",
     "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen",
-    "MobilePartnerWorkingStatus", "MobileConversationSearchSheet", "MobilePartnerResourcesScreen",
+    "MobilePartnerWorkingStatus", "MobilePartnerResourcesScreen",
     "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen",
     "MobileUpdateSurface", "MobileRuntimeCommandPalette"])
     vi.doMock(`./${name}`, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => null,
@@ -660,6 +660,31 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it("opens the exact collapsed plan when searching its completed step", async () => {
+    const completedStep = "Verify the archived checksum";
+    const plan = create(EventSchema, { eventId: "plan-search-event", identity: { sessionId: "current", runId: "plan-run", generation: 7n },
+      cursor: { generation: 1n, sequence: 5n }, payload: { kind: { case: "toolCallStarted", value: { toolCall: {
+        toolCallId: "plan-search-tool", toolId: "update_plan", sessionId: "current", runId: "plan-run", state: ToolCallState.RUNNING,
+        arguments: [{ fieldPath: "$", value: { case: "text", value: JSON.stringify({ plan: [
+          { step: completedStep, status: "completed" }, { step: "Review current output", status: "in_progress" }
+        ] }).replace("archived checksum", "archived\\u0020checksum") } }]
+      } } } } });
+    state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, timeline: [plan],
+      sessions: state.detail!.sessions.map(session => session.sessionId === "current"
+        ? create(SessionSchema, { ...session, nativeBinding: { runtimeGeneration: 7n } }) : session) }) };
+    await renderTask();
+    expect(host.textContent).toContain(completedStep);
+    await press("Collapse plan");
+    expect(host.textContent).not.toContain(completedStep);
+    expect(host.textContent).toContain("Review current output");
+
+    await act(async () => headerProps.actions.find(action => action.id === "search")!.onPress());
+    await type(message("conversationSearch.placeholder"), "archived checksum");
+    expect(host.textContent).toContain("1 / 1");
+    expect(host.textContent).toContain(completedStep);
+    expect(button("Collapse plan")).toBeDefined();
+  });
+
   it.each(["connected", "offline"] as const)("adds the exact visible message to its original local draft while %s", async status => {
     const completion = create(EventSchema, { eventId: "reference-completion", identity: { sessionId: "current", runId: "run", backendId: "backend" },
       cursor: { generation: 1n, sequence: 5n }, payload: { kind: { case: "messageCompleted", value: {
