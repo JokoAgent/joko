@@ -1,9 +1,14 @@
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 
+import { create } from "@bufbuild/protobuf";
 import { Code, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import {
+  EntityKind,
+  InteractionState,
+  OperationMutationSchema,
+  OperationState,
   RunState,
   SessionMessageSearchSemanticMode,
   SessionMessageSearchSessionStatus
@@ -14,7 +19,7 @@ import {
   MessageSearchEmbeddingCoordinator,
   ProviderCatalogManager
 } from "@joko/orchestrator";
-import type { BackendDescriptor } from "@joko/core";
+import type { AdapterContext, BackendDescriptor, InteractionDecision, PromptInput } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, expect, it } from "vitest";
 
@@ -142,6 +147,56 @@ it("restarts a real stale search cursor without returning retired pages or retry
   } finally {
     gateway.disconnect();
   }
+}, 30_000);
+
+it("finds an explicitly submitted answer through the original question and timeline RPCs", async () => {
+  let accepted: InteractionDecision | undefined;
+  class QuestionAdapter extends InstrumentedFakeAdapter {
+    override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+      accepted = await context.requestInteraction({ id: "searchable-question", kind: "question", title: "Project details",
+        prompt: "Supply the project details", fields: [
+          { id: "codename", kind: "text", label: "Codename", required: true, multiline: false },
+          { id: "lane", kind: "single", label: "Lane", required: true, allowOther: false,
+            choices: [{ id: "opaque-choice", label: "saffronlane" }] }
+        ] });
+      // The assistant receives the decision without repeating it in a message.
+      await super.send(input, context);
+    }
+  }
+  fixture = await OrchestratorE2eFixture.start({ profiles: [PI_LIKE_PROFILE], createAdapter: profile => new QuestionAdapter(profile) });
+  const paired = await fixture.pair();
+  const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+    createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId: fixture.targetId() })));
+  const sent = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId,
+    BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation), "[project details]"));
+  const runId = queueRunIdFrom(sent);
+  const listed = await waitFor(() => paired.clients.interaction.listInteractions({ sessionId, runId }),
+    response => response.interactions.some(interaction => interaction.state === InteractionState.PENDING), "the searchable question");
+  const interaction = listed.interactions.find(candidate => candidate.state === InteractionState.PENDING)!;
+  const search = (query: string) => paired.clients.session.searchSessionMessages({ scope: { case: "sessionId", value: sessionId },
+    query, semanticMode: SessionMessageSearchSemanticMode.KEYWORD });
+  expect((await search("nebularcodename")).matches).toEqual([]);
+  const resolved = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+    preconditions: [{ entity: { kind: EntityKind.INTERACTION, id: interaction.interactionId },
+      expectedRevision: interaction.version!.revision, expectedGeneration: interaction.generation }],
+    payload: { case: "resolveInteraction", value: { interactionId: interaction.interactionId,
+      interactionGeneration: interaction.generation, resolution: { connectionId: paired.connectionId,
+        decision: { case: "question", value: { answers: [
+          { fieldId: "codename", value: { case: "text", value: "nebularcodename" } },
+          { fieldId: "lane", value: { case: "singleChoice", value: { selection: { case: "choiceId", value: "opaque-choice" } } } }
+        ] } } } } }
+  }));
+  expect(resolved.state).toBe(OperationState.SUCCEEDED);
+  await waitFor(() => paired.clients.run.getRun({ runId }), response => response.run?.state === RunState.SUCCEEDED, "the answered question run");
+  expect(accepted).toMatchObject({ kind: "question", answers: { codename: { kind: "text", value: "nebularcodename" } } });
+  for (const query of ["nebularcodename", "saffronlane"]) {
+    const result = await search(query);
+    expect(result.matches).toEqual([expect.objectContaining({ sessionId, timelineItemId: `interaction:${interaction.interactionId}`,
+      snippet: expect.stringContaining(query) })]);
+    const timeline = await paired.clients.session.listSessionTimeline({ sessionId, aroundEventId: result.matches[0]!.eventId, limit: 20 });
+    expect(timeline.events.map(event => event.eventId)).toContain(result.matches[0]!.eventId);
+  }
+  expect((await search("opaque-choice")).matches).toEqual([]);
 }, 30_000);
 
 it("searches durable Session turns through authenticated HTTP, sqlite-vec, and a generation-fenced Provider route", async () => {
