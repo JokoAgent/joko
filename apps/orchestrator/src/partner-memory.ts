@@ -61,9 +61,14 @@ export class PartnerMemoryManager {
     const owner = this.owner(partnerId);
     if (rawQuery.length > 200 || /[\u0000-\u001f\u007f]/u.test(rawQuery)) throw new ConnectError("Invalid memory search.", Code.InvalidArgument);
     const query = rawQuery.trim();
-    const entries = query ? kinds.flatMap(kind => this.store.searchMakerMemory(owner.homeTargetId, query, { kind, limit: 50 }))
-      .sort((a, b) => a.score - b.score || a.id.localeCompare(b.id)).slice(0, 50)
-      .map(hit => this.store.getMakerMemoryEntry(hit.id)) : this.memory.list(owner.homeTargetId)
+    const hits = query ? kinds.flatMap(kind => this.store.searchMakerMemory(owner.homeTargetId, query, { kind, limit: 50 }))
+      .sort((a, b) => a.score - b.score || a.id.localeCompare(b.id)) : [];
+    const visible = hits.slice(0, 50);
+    const substring = hits.find(hit => hit.score === Number.MAX_SAFE_INTEGER);
+    // Combining the curated kinds must retain the Store's substring recall
+    // slot even when ranked hits from other kinds fill the combined page.
+    if (substring !== undefined && !visible.includes(substring)) visible[visible.length - 1] = substring;
+    const entries = query ? visible.map(hit => this.store.getMakerMemoryEntry(hit.id)) : this.memory.list(owner.homeTargetId)
       .filter(entry => entry.kind !== "digest").sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
     let used = 0; let truncated = false;
     const groups = kinds.map(kind => {
