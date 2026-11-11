@@ -107,8 +107,9 @@ export class DiscordSystemFixture {
     this.#attachments.set(input.id, { ...input, bytes: input.bytes.slice() });
   }
 
-  enqueueThreadMessage(input: {
+  enqueueMessage(input: {
     readonly messageId: string;
+    readonly channelId: typeof DISCORD_SYSTEM_DM_ID | typeof DISCORD_SYSTEM_THREAD_ID;
     readonly text: string;
     readonly attachmentId?: string;
   }): void {
@@ -119,8 +120,8 @@ export class DiscordSystemFixture {
     }
     const message: DiscordSystemMessage = {
       id: input.messageId,
-      channel_id: DISCORD_SYSTEM_THREAD_ID,
-      guild_id: DISCORD_SYSTEM_GUILD_ID,
+      channel_id: input.channelId,
+      ...(input.channelId === DISCORD_SYSTEM_THREAD_ID ? { guild_id: DISCORD_SYSTEM_GUILD_ID } : {}),
       author: owner(),
       content: input.text,
       timestamp: new Date().toISOString(),

@@ -1,3 +1,4 @@
+import { inboundAudioVideoMime } from "../inbound-audio-video.js";
 import type {
   MessagingAddress,
   MessagingGroupObservation,
@@ -279,10 +280,37 @@ function collectParts(messages: readonly TelegramMessage[]): {
       }
     }
     if (message.sticker !== undefined) unsupported.push({ code: "sticker", label: "Sticker" });
-    if (message.voice !== undefined) unsupported.push({ code: "voice", label: "Voice message" });
-    if (message.audio !== undefined) unsupported.push({ code: "audio", label: "Audio" });
-    if (message.video !== undefined) unsupported.push({ code: "video", label: "Video" });
-    if (message.video_note !== undefined) unsupported.push({ code: "video_note", label: "Video note" });
+    const nativeMedia = [
+      [message.voice, `voice-${message.message_id}.ogg`, "audio/ogg"],
+      [message.audio, `audio-${message.message_id}.mp3`, "audio/mpeg"],
+      [message.video, `video-${message.message_id}.mp4`, "video/mp4"],
+      [message.video_note, `video-note-${message.message_id}.mp4`, "video/mp4"]
+    ] as const;
+    for (const [file, fallbackName, fallbackMime] of nativeMedia) {
+      if (!file) continue;
+      const fileName = sanitizeFileName(typeof file.file_name === "string" ? file.file_name : fallbackName);
+      const size = file.file_size;
+      if (typeof file.file_id !== "string" || file.file_id.length === 0 || file.file_id.length > 512
+        || (size !== undefined && (!Number.isSafeInteger(size) || size <= 0))) {
+        unsupported.push({ code: "invalid_attachment", label: fileName });
+        continue;
+      }
+      if ((size ?? 0) > TELEGRAM_MAXIMUM_INBOUND_FILE_BYTES) {
+        unsupported.push({ code: "oversize", label: `${fileName} exceeds Telegram's download limit.` });
+        continue;
+      }
+      const declared = typeof file.mime_type === "string" ? normalizeMime(file.mime_type) : null;
+      const mimeType = inboundAudioVideoMime(declared, fileName) ?? fallbackMime;
+      attachments.push({
+        providerFileId: file.file_id,
+        providerUniqueFileId: typeof file.file_unique_id === "string" ? file.file_unique_id : null,
+        kind: "file",
+        fileName,
+        mimeType,
+        byteLength: size ?? null,
+        audioVideo: mimeType.startsWith("audio/") ? "audio" : "video"
+      });
+    }
   }
   return { attachments, unsupported };
 }
@@ -302,7 +330,8 @@ function groupObservationOf(
     speaker: speakerOf(message.from, options.ownerUserId),
     occurredAt: message.date * 1_000,
     text: message.text ?? message.caption ?? "",
-    attachmentNames: parts.attachments.map((attachment) => attachment.fileName)
+    attachmentNames: parts.attachments.filter((attachment) => attachment.audioVideo === undefined)
+      .map((attachment) => attachment.fileName)
   };
 }
 

@@ -79,6 +79,7 @@ export class TelegramSystemFixture {
     readonly fileId?: string;
     readonly fileName?: string;
     readonly mimeType?: string;
+    readonly attachmentKind?: "document" | "audio";
   }): void {
     const file = input.fileId === undefined ? undefined : this.#files.get(input.fileId);
     if (input.fileId !== undefined && file === undefined) throw new Error("Telegram fixture file is not registered.");
@@ -94,9 +95,9 @@ export class TelegramSystemFixture {
         },
         chat: { id: TELEGRAM_SYSTEM_OWNER_ID, type: "private", first_name: "Owner" },
         date: Math.floor(Date.now() / 1_000),
-        text: input.text,
-        ...(file === undefined ? {} : {
-          document: {
+        ...(file === undefined ? { text: input.text } : {
+          caption: input.text,
+          [input.attachmentKind ?? "document"]: {
             file_id: file.fileId,
             file_unique_id: `${file.fileId}-unique`,
             file_name: input.fileName ?? file.path.split("/").at(-1) ?? "attachment.bin",

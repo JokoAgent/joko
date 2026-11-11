@@ -38,6 +38,10 @@ export interface TelegramDocument {
   readonly file_size?: number;
 }
 
+interface TelegramAudioVideo extends TelegramDocument {
+  readonly duration?: number;
+}
+
 export interface TelegramMessage {
   readonly message_id: number;
   readonly from?: TelegramUser;
@@ -55,10 +59,10 @@ export interface TelegramMessage {
   readonly photo?: readonly TelegramPhotoSize[];
   readonly document?: TelegramDocument;
   readonly sticker?: { readonly emoji?: string; readonly set_name?: string };
-  readonly voice?: { readonly duration?: number };
-  readonly audio?: { readonly file_name?: string };
-  readonly video?: { readonly file_name?: string };
-  readonly video_note?: { readonly duration?: number };
+  readonly voice?: TelegramAudioVideo;
+  readonly audio?: TelegramAudioVideo;
+  readonly video?: TelegramAudioVideo;
+  readonly video_note?: TelegramAudioVideo;
   readonly new_chat_members?: readonly TelegramUser[];
   readonly left_chat_member?: TelegramUser;
 }
