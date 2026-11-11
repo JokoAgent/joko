@@ -354,6 +354,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const handledFocusRequestRef = useRef<number | undefined>(undefined);
   const focusTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const activeFocusRequestRef = useRef<typeof focusRequest>(undefined);
+  const pendingSearchFocusRef = useRef<string | undefined>(undefined);
   const navigationGenerationRef = useRef(0);
   const navigationFrameRef = useRef<number | undefined>(undefined);
   const viewportFrameRef = useRef<number | undefined>(undefined);
@@ -632,6 +633,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     const focus = retireCurrentFocus ? focusRequestRef.current : undefined;
     if (focus !== undefined) handledFocusRequestRef.current = focus.requestId;
     activeFocusRequestRef.current = undefined;
+    pendingSearchFocusRef.current = undefined;
     if (navigationFrameRef.current !== undefined) {
       cancelAnimationFrame(navigationFrameRef.current);
       navigationFrameRef.current = undefined;
@@ -933,8 +935,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
       - Math.min(nextScrollTop, Math.max(0, node.scrollHeight - node.clientHeight));
     writeScrollTop(nextScrollTop, timelineJumpBehavior(reducedMotion));
     viewportAnchorRef.current = { itemId: row.dataset.timelineItemId ?? focusRequest.itemId, offset: rowOffset };
+    pendingSearchFocusRef.current = focusRequest.itemId;
     setFocusedItemId(focusRequest.itemId);
-    row.focus({ preventScroll: true });
     if (focusTimerRef.current !== undefined) clearTimeout(focusTimerRef.current);
     const generation = navigationGenerationRef.current;
     const owner = navigationOwnerRef.current;
@@ -944,6 +946,16 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
       setFocusedItemId((current) => current === focusRequest.itemId ? undefined : current);
     }, 2_400);
   }, [cancelTimelineNavigation, focusRequest, items, ownerKey, positionVirtualRow, reducedMotion, renderItems, renderedRowsKey, sessionId, setTimelineFollowing, writeScrollTop]);
+
+  useLayoutEffect(() => {
+    const itemId = pendingSearchFocusRef.current;
+    if (itemId === undefined || focusedItemId !== itemId || !navigationDocumentActiveRef.current) return;
+    // Wait for the commit that makes the highlighted row focusable.
+    const row = scrollRef.current?.querySelector<HTMLElement>(".timeline__row.is-search-focus[tabindex='-1']");
+    if (row?.isConnected !== true || !timelineRowContains(row, itemId)) return;
+    pendingSearchFocusRef.current = undefined;
+    row.focus({ preventScroll: true });
+  }, [focusRequest?.requestId, focusedItemId, renderedRowsKey]);
 
   useEffect(() => {
     const content = contentRef.current;
@@ -1144,6 +1156,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
         }}
         onKeyDown={(event) => {
           if (event.defaultPrevented || !TIMELINE_HISTORY_NAVIGATION_KEYS.has(event.key) || isEditableTimelineKeyboardTarget(event.target)) return;
+          if (event.key === "PageUp" && hasNestedTimelineScrollerThatCanMoveUp(event.currentTarget, event.target)) return;
           cancelTimelineNavigation();
           setFocusedItemId(undefined);
           restoreAnchorRef.current = undefined;

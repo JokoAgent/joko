@@ -282,11 +282,12 @@ packagedIt("searches completed and paged older messages through packaged Desktop
   expect(await page.locator(".inspector-dock-group[data-edge]").count()).toBe(0);
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
-  await betaResult.locator(".conversation-search-result__hit").first().click();
+  await betaResult.locator(".conversation-search-result__hit").first().press("Enter");
   await page.locator(`.timeline[data-timeline-session-id="${betaSessionId}"]`)
     .waitFor({ state: "visible", timeout: 30_000 });
   const focused = page.locator(".timeline__row.is-search-focus");
   await focused.waitFor({ state: "visible", timeout: 30_000 });
+  expect(await focused.evaluate((row) => row.ownerDocument.activeElement === row)).toBe(true);
   expect(await focused.innerText()).toContain("mosaicneedle beta one");
   expect(await page.evaluate(() => window.location.hash)).toContain(encodeURIComponent(betaSessionId));
 

@@ -171,6 +171,44 @@ describe("Timeline viewport journeys", () => {
     expect(viewport.scrollTop).toBe(0);
   });
 
+  it("leaves Page Up with the focused long tool output while it can scroll upward", async () => {
+    await render({ items: [...props.items, {
+      ...item("long-tool", 9, "tool"),
+      tool: { id: "long-tool", name: "bash", state: "running", input: "", output: "Tool output line\n".repeat(1_200), isError: false }
+    }] });
+    const output = host.querySelector<HTMLElement>(".windowed-output")!;
+    output.style.overflowY = "auto";
+    Object.defineProperty(output, "scrollHeight", { value: 500 });
+    output.scrollTop = 120;
+    await act(async () => output.focus());
+    expect(document.activeElement).toBe(output);
+
+    const withinOutput = new KeyboardEvent("keydown", { key: "PageUp", bubbles: true, cancelable: true });
+    await act(async () => output.dispatchEvent(withinOutput));
+    expect(withinOutput.defaultPrevented).toBe(false);
+    expect(jumpLatest()).toBeNull();
+
+    output.scrollTop = 0;
+    await act(async () => output.dispatchEvent(new KeyboardEvent("keydown", { key: "PageUp", bubbles: true })));
+    expectUnread(0);
+  });
+
+  it("focuses the original ordinary search row once it is highlighted", async () => {
+    await render();
+    const viewport = timeline();
+    await act(async () => viewport.focus());
+    const row = viewport.querySelector<HTMLElement>('[data-timeline-item-id="initial-3"]')!;
+    expect(row.hasAttribute("tabindex")).toBe(false);
+
+    await render({ focusRequest: { itemId: "initial-3", requestId: 1 } });
+    expect(row.getAttribute("aria-current")).toBe("true");
+    expect(document.activeElement).toBe(row);
+
+    await act(async () => viewport.focus());
+    await append([item("later-answer", 9, "assistant")]);
+    expect(document.activeElement).toBe(viewport);
+  });
+
   it("keeps virtual-row corrections from detaching a growing tail after a delayed scroll event", async () => {
     await render({ items: Array.from({ length: 60 }, (_, index) => item(`measured-${index}`, index + 1, "user")) });
     await flushFrames();
