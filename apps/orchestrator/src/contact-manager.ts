@@ -5,6 +5,8 @@ import {
   ContactStoreError,
   normalizeContactIdentityValue,
   normalizeContactPlatform,
+  validateContactDraft,
+  validateContactRelationText,
   type ContactDirectoryState,
   type ContactDraft,
   type ContactDuplicateCandidate,
@@ -51,7 +53,14 @@ export interface ContactVCardImportPreview {
   readonly previewId: string;
   readonly directoryRevision: bigint;
   readonly entries: readonly ContactVCardImportPreviewEntry[];
+  readonly rejectedEntries?: readonly ContactVCardImportRejectedEntry[];
   readonly expiresAt: number;
+}
+
+export interface ContactVCardImportRejectedEntry {
+  readonly entryId: string;
+  readonly displayName: string;
+  readonly reason: string;
 }
 
 export interface ContactVCardImportDecision {
@@ -82,6 +91,7 @@ export interface ContactVCardImportEntryResult {
   readonly displayName: string;
   readonly outcome: "created" | "enriched" | "skipped";
   readonly contactId?: string;
+  readonly reason?: string;
 }
 
 export interface ContactVCardExport {
@@ -289,9 +299,23 @@ export class ContactManager {
     }
 
     const entries: ContactVCardImportPreviewEntry[] = [];
+    const rejectedEntries: ContactVCardImportRejectedEntry[] = [];
     const stagedIdentities = new Map<string, string>();
     for (const [index, card] of parsed.entries()) {
       const entryId = `vcard-entry-${index + 1}`;
+      try {
+        validateContactDraft(card.draft);
+        if (card.organizationName !== undefined) {
+          validateContactDraft({ kind: "organization", displayName: card.organizationName, source: "import" });
+          validateContactRelationText("works at", card.title ?? "");
+        }
+      } catch (error) {
+        if (!(error instanceof ContactStoreError && error.code === "CONTACT_INVALID")) throw error;
+        const displayName = card.draft.displayName.replace(/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, " ")
+          .trim().slice(0, 100).replace(/[\uD800-\uDBFF]$/u, "").trim();
+        rejectedEntries.push({ entryId, displayName: displayName || entryId, reason: error.message.slice(0, 120) });
+        continue;
+      }
       const candidates = this.store.findSimilar(card.draft);
       const existingIdentityIds = unique(candidates.filter((candidate) => candidate.matchType === "identity")
         .map((candidate) => candidate.contactId));
@@ -331,6 +355,7 @@ export class ContactManager {
       previewId: `contact-import-${this.#idFactory()}`,
       directoryRevision: this.store.directoryState().revision,
       entries: Object.freeze(entries),
+      ...(rejectedEntries.length === 0 ? {} : { rejectedEntries: Object.freeze(rejectedEntries) }),
       expiresAt: now + PREVIEW_LIFETIME_MS
     });
     this.#previews.set(preview.previewId, preview);
@@ -364,10 +389,10 @@ export class ContactManager {
     const result = this.store.runInTransaction(() => {
       const resolvedEntries = new Map<string, string>();
       const contactIds = new Set<string>();
-      const entryResults: ContactVCardImportEntryResult[] = [];
+      const entryResults: ContactVCardImportEntryResult[] = (preview.rejectedEntries ?? []).map((entry) => ({ ...entry, outcome: "skipped" }));
       let created = 0;
       let enriched = 0;
-      let skipped = 0;
+      let skipped = entryResults.length;
       for (const entry of preview.entries) {
         const decision = decisions.get(entry.entryId);
         let contact: ContactProfileRecord | undefined;
@@ -425,6 +450,7 @@ export class ContactManager {
           contactId: contact.id
         });
       }
+      entryResults.sort((left, right) => Number(left.entryId.slice("vcard-entry-".length)) - Number(right.entryId.slice("vcard-entry-".length)));
       return { created, enriched, skipped, contactIds: [...contactIds], entries: entryResults };
     });
     this.#previews.delete(preview.previewId);

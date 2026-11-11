@@ -1188,7 +1188,14 @@ export interface ContactVCardImportPreviewView {
   readonly previewId: string;
   readonly directoryRevision: bigint;
   readonly entries: readonly ContactVCardImportPreviewEntryView[];
+  readonly rejectedEntries?: readonly ContactVCardImportRejectedEntryView[];
   readonly expiresAt: number;
+}
+
+export interface ContactVCardImportRejectedEntryView {
+  readonly entryId: string;
+  readonly displayName: string;
+  readonly reason: string;
 }
 
 export interface ContactVCardImportDecisionView {
@@ -1219,6 +1226,7 @@ export interface ContactVCardImportEntryResultView {
   readonly displayName: string;
   readonly outcome: "created" | "enriched" | "skipped";
   readonly contactId?: string;
+  readonly reason?: string;
 }
 
 export interface ContactVCardExportView {

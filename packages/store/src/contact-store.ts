@@ -657,8 +657,7 @@ export class ContactStore {
       if (this.#count("contact_relations", "from_contact_id", from) + this.#count("contact_relations", "to_contact_id", from) >= MAX_RELATIONS) {
         throw invalid("The contact relation limit was reached.");
       }
-      const relation = text(input.relation, 1, MAX_RELATION, "Contact relation");
-      const note = text(input.note ?? "", 0, MAX_NOTE, "Contact relation note");
+      const { relation, note } = contactRelationText(input.relation, input.note ?? "");
       if (this.#database.prepare(`
         SELECT id FROM contact_relations WHERE from_contact_id = ? AND to_contact_id = ? AND relation = ?
       `).get(from, to, relation) !== undefined) throw new ContactStoreError("CONTACT_ALREADY_EXISTS", "This contact relation already exists.");
@@ -691,8 +690,7 @@ export class ContactStore {
         throw notFound("Contact relation", relationId);
       }
       this.#assertEntityRevision("Contact relation", relationId, current, input.expectedRelationRevision);
-      const relation = text(input.relation, 1, MAX_RELATION, "Contact relation");
-      const note = text(input.note ?? "", 0, MAX_NOTE, "Contact relation note");
+      const { relation, note } = contactRelationText(input.relation, input.note ?? "");
       const from = string(current["from_contact_id"]);
       const to = string(current["to_contact_id"]);
       const duplicate = this.#database.prepare(`
@@ -1470,6 +1468,19 @@ export function normalizeContactIdentityValue(value: string, platformValue?: str
   }
   if (normalized.length < 1 || normalized.length > MAX_IDENTITY_VALUE * 2) throw invalid("Contact identity value is invalid.");
   return normalized;
+}
+
+/** Validate an import candidate without reading or changing the directory. */
+export function validateContactDraft(input: ContactDraft): void {
+  contactDraft(input);
+}
+
+export function validateContactRelationText(relation: string, note: string): void {
+  contactRelationText(relation, note);
+}
+
+function contactRelationText(relation: string, note: string): { readonly relation: string; readonly note: string } {
+  return { relation: text(relation, 1, MAX_RELATION, "Contact relation"), note: text(note, 0, MAX_NOTE, "Contact relation note") };
 }
 
 function contactDraft(input: ContactDraft): {

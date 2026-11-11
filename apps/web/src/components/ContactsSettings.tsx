@@ -789,7 +789,7 @@ function ImportResultDialog({ result, t, onClose, onOpen }: {
       {result?.entries.map((entry) => {
         const contactId = entry.contactId;
         return <li key={entry.entryId}>
-          <span><strong>{entry.displayName}</strong><small>{importOutcomeLabel(entry.outcome, t)}</small></span>
+          <span><strong>{entry.displayName}</strong><small>{importOutcomeLabel(entry.outcome, t)}</small>{entry.reason !== undefined && <small className="contact-import-reason">{entry.reason}</small>}</span>
           {contactId !== undefined && <Button tone="ghost" onClick={() => onOpen(contactId)}>{t("contacts.openImported")}</Button>}
         </li>;
       })}
@@ -1063,8 +1063,11 @@ function ImportDialog({ preview, busy, t, onClose, onCommit }: {
     setSelections((current) => current.map((selection) => selection.entryId === entryId ? { ...selection, ...patch } : selection));
   };
   const valid = preview !== undefined && preview.entries.every((entry) => importSelectionValid(entry, selections.find((selection) => selection.entryId === entry.entryId)));
-  return <Modal open={preview !== undefined} title={t("contacts.importTitle")} description={t("contacts.importBody", { count: preview?.entries.length ?? 0 })} onClose={onClose} showClose size="large">
-    <div className="contact-import-list">{preview?.entries.map((entry) => {
+  return <Modal open={preview !== undefined} title={t("contacts.importTitle")} description={t("contacts.importBody", { count: (preview?.entries.length ?? 0) + (preview?.rejectedEntries?.length ?? 0) })} onClose={onClose} showClose size="large">
+    <div className="contact-import-list">{preview?.rejectedEntries?.map((entry) => <article key={entry.entryId}>
+      <header><span><strong>{entry.displayName}</strong><small>{t("contacts.importRejected")}</small></span></header>
+      <p className="contact-import-reason">{entry.reason}</p>
+    </article>)}{preview?.entries.map((entry) => {
       const selection = selections.find((candidate) => candidate.entryId === entry.entryId) ?? defaultImportSelection(entry);
       return <article key={entry.entryId}>
         <header><ContactAvatar contact={entry.contact} /><span><strong>{entry.contact.displayName}</strong><small>{importDispositionLabel(entry, t)}</small></span></header>
