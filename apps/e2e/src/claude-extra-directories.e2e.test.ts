@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
-import { ExtraDirectoryAccess, OperationMutationSchema, OperationState } from "@joko/contracts";
+import { ExtraDirectoryAccess, OperationMutationSchema, OperationState, StateImpact } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
@@ -63,7 +63,7 @@ it("defers an added directory to the next input of both active Claude tasks and 
   const grant = host.extraDirectories.listForTarget(setup.targetId).find(directory => directory.path === secondPath)!;
   const revoked = await remove(grant.id);
   expect(revoked).toMatchObject({ state: OperationState.FAILED,
-    error: { code: "EXTRA_DIRECTORY_RUNTIME_REFRESH_FAILED", stateMayHaveChanged: true } });
+    error: { code: "EXTRA_DIRECTORY_RUNTIME_REFRESH_FAILED", workspaceImpact: StateImpact.MAY_HAVE_CHANGED } });
   expect(host.extraDirectories.listForTarget(setup.targetId).map(directory => directory.path)).toEqual([firstPath]);
   for (const [index, sessionId] of sessions.entries()) {
     expect(host.isSessionActive(sessionId)).toBe(false);
@@ -96,7 +96,7 @@ it("reports an unknown native update while refreshing the other materialized Cla
   const failedClose = vi.spyOn(queries[0]!, "close"), healthyClose = vi.spyOn(queries[1]!, "close");
   const operation = await setup.add(secondPath);
   expect(operation).toMatchObject({ state: OperationState.FAILED,
-    error: { code: "NATIVE_CONTROL_UNKNOWN", stateMayHaveChanged: true } });
+    error: { code: "NATIVE_CONTROL_UNKNOWN", nativeSessionImpact: StateImpact.MAY_HAVE_CHANGED } });
   expect(calls).toEqual(ordered);
   expect(failedUpdate).toHaveBeenCalledOnce();
   const approvedPaths = host.extraDirectories.listForTarget(setup.targetId).map(directory => directory.path);
