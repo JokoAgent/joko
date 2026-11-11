@@ -11,6 +11,7 @@ export async function verifyPackagedSmokeTaskSharing(options: {
   readonly prepareOwner: () => Promise<boolean>;
   readonly readClipboard: () => string;
   readonly copiedInvitation: (invitation: string) => void;
+  readonly guestLeft: () => void;
   readonly offerInvitation: (invitation: string) => boolean;
   readonly createForeignInvitation: () => Promise<{ readonly invitation: string; readonly sessionId: string; readonly hostServerId: string }>;
   readonly recordSurface: (surface: "management" | "guest-ready" | "guest") => Promise<void>;
@@ -127,6 +128,7 @@ export async function verifyPackagedSmokeTaskSharing(options: {
     `  await wait(() => !document.querySelector('[data-task-sharing-session]') && document.querySelector('.session-pane')?.getAttribute('data-input-session-id') === ${JSON.stringify(task.sessionId)}, 'original task after leave');`,
     "  return true;"
   ]);
+  options.guestLeft();
   if (!await options.prepareOwner()) throw new Error("The original task did not remain reachable after participant exit.");
   await script([
     ...openManagement,
