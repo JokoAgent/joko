@@ -3958,9 +3958,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const focusSearchHit = (hit: MobileConversationSearchHit): void => {
     if (!searchOwnerRef.current.open || searchOwnerRef.current.scope !== searchScope) return;
     for (const key of mobileWorkExpansionKeys(displayRows, (row) => row.id === hit.sourceKey)) mobileExpandedBlockStore.setExpanded(blockOwnerKey, key, true);
+    const source = rows.find((row) => row.id === hit.sourceKey);
+    if (source?.plan !== undefined) mobileExpandedBlockStore.setExpanded(blockOwnerKey, source.plan.identity, true, true);
     const controls = client.taskDelegatedControls();
     if (controls) {
-      const source = rows.find((row) => row.id === hit.sourceKey);
       const attached = source === undefined ? [] : delegatedAffinity.byEventId.get(source.eventId) ?? [];
       for (const entry of [...attached, ...delegatedAffinity.orphanEntries.filter((item) => item.key === hit.sourceKey)])
         mobileExpandedBlockStore.setExpanded(controls.surfaceOwnerKey, entry.key, true);
