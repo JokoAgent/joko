@@ -13390,7 +13390,8 @@ export class MobileClient {
       }
       if (!result.accepted) return { kind: "rejected" };
       this.#messageRewindPreviews.delete(preview);
-      this.#clearHistory(); await this.refresh();
+      if (mode === "dialogue") this.#clearHistory();
+      await this.refresh();
       if (cleanupError && this.#foreground && this.#activeProfileId === profileId) this.#set({ error: cleanupError });
       return this.#foreground && this.#activeProfileId === profileId && this.#state.selectedId === session.sessionId
         ? { kind: "rewound", mode } : { kind: "retired" };
@@ -16969,7 +16970,7 @@ export class MobileClient {
               "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
             && this.#current(epoch)) {
             await this.refresh();
-            if ((pending.kind === "message-delete" || messageRewind) && this.#foreground
+            if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground
               && this.#state.selectedId === pending.sessionId) this.#clearHistory();
             return;
           }
