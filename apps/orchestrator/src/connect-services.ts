@@ -1970,7 +1970,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const authenticated = authenticate(context);
       const queue = new AsyncEventQueue(context.signal);
       const stopRevocation = dependencies.connections.onRevoked(authenticated.id, () => queue.close());
-      const unsubscribe = dependencies.store.subscribe((item) => queue.push(item));
+      const unsubscribe = dependencies.store.subscribe((item) => { queue.push(item); });
       try {
         const highWater = dependencies.store.health().globalCursor;
         const after = request.afterCursor === undefined
@@ -4821,13 +4821,13 @@ export function createConnectServices(application: OrchestratorApplication, proj
         assertCurrent, send: event => queue.push(event) });
       const revoke = dependencies.connections.onRevoked(connection.id, () => { unregister(); queue.close(); });
       try {
-        yield create(contract.WatchExtensionTaskViewsResponseSchema);
+        yield create(contract.WatchExtensionTaskViewsResponseSchema, {});
         for (let event = await queue.next(); event !== undefined; event = await queue.next()) {
           assertCurrent();
-          yield create(contract.WatchExtensionTaskViewsResponseSchema, { open: {
+          yield create(contract.WatchExtensionTaskViewsResponseSchema, { open: create(contract.ExtensionTaskViewOpenSchema, {
             requestId: event.requestId, extensionId: event.extensionId, extensionRevision: toProtoRevision(event.extensionRevision),
             sessionId: event.sessionId, focus: event.focus
-          } });
+          }) });
         }
       } finally { revoke(); unregister(); queue.close(); }
     },
