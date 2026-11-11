@@ -57,6 +57,7 @@ import { hasPendingComposerQueueItems, pauseQueueThenAbort, pauseQueueThenAbortR
 import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, resolveErrorTail } from "./error-tail-behavior.js";
 import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
+import { timelineHistoryOwnerKey } from "../timeline-history-cache.js";
 import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, type MessageForkTarget } from "./message-actions.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
 import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
@@ -2263,6 +2264,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         hasEarlier={timelineHasEarlier}
         historyLoading={timelineHistoryLoading}
         historyError={timelineHistoryError}
+        historyOwnerKey={timelineHistoryOwnerKey(controller.state.activeProfile, controller.state.snapshot.generation, session.id,
+          session.generation, controller.state.snapshot.timelineHistoryRevisionBySession.get(session.id) ?? 0n)}
         onLoadEarlier={onLoadEarlierTimeline}
         onInlinePlanVisibilityChange={handleInlinePlanVisibilityChange}
         followLatestSignal={followLatestSignal}

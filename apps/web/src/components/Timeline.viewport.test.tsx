@@ -197,6 +197,55 @@ describe("Timeline viewport journeys", () => {
     expectUnread(0);
   });
 
+  it.each(["matching history", "a new history revision", "a manual scroll"] as const)("handles a saved old row after reopen and %s", async (arrival) => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(1_000);
+    extent = 1_080;
+    const fullHistory = props.items;
+    const historyOwnerKey = `${props.viewportOwnerKey}:history:1`;
+    const oldRowSelector = '[data-timeline-item-id="initial-2"]';
+    const offset = -24;
+    await render({ historyOwnerKey, messageNavRailEnabled: false });
+    await flushFrames();
+    const original = timeline();
+    const oldRow = original.querySelector<HTMLElement>(oldRowSelector)!;
+    now.mockReturnValue(1_100);
+    await wheel(original, -120);
+    await act(async () => {
+      original.scrollTop += oldRow.getBoundingClientRect().top - original.getBoundingClientRect().top - offset;
+      original.dispatchEvent(new Event("scroll"));
+    });
+    expect(oldRow.getBoundingClientRect().top - original.getBoundingClientRect().top).toBeCloseTo(offset);
+    expectUnread(0);
+
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    await render({ items: fullHistory.slice(4), historyLoading: true });
+    await flushFrames();
+    const reopened = timeline();
+    expect(reopened.querySelector(oldRowSelector)).toBeNull();
+    expect(reopened.querySelector('[data-timeline-item-id="initial-4"]')).not.toBeNull();
+    expect(reopened.scrollTop).toBe(0);
+
+    if (arrival === "a new history revision") {
+      await render({ historyOwnerKey: `${historyOwnerKey}:revised` });
+    } else if (arrival === "a manual scroll") {
+      await act(async () => {
+        reopened.scrollTop = 64;
+        reopened.dispatchEvent(new Event("scroll"));
+      });
+    }
+    const beforeHistory = reopened.scrollTop;
+    await render({ items: fullHistory, historyLoading: false });
+    await flushFrames();
+    const restoredRow = reopened.querySelector<HTMLElement>(oldRowSelector)!;
+    if (arrival === "matching history") {
+      expect(restoredRow.getBoundingClientRect().top - reopened.getBoundingClientRect().top).toBeCloseTo(offset);
+    } else {
+      expect(reopened.scrollTop).toBe(beforeHistory);
+    }
+    expectUnread(0);
+  });
+
   it("leaves Page Up with the focused long tool output while it can scroll upward", async () => {
     await render({ items: [...props.items, {
       ...item("long-tool", 9, "tool"),
