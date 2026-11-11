@@ -916,7 +916,9 @@ function EventDialog({ open, busy, t, onClose, onSubmit }: {
   useEffect(() => { if (open) { setDate(""); setText(""); setSource(""); } }, [open]);
   return <Modal open={open} title={t("contacts.addEvent")} onClose={onClose} showClose>
     <form className="contact-form" onSubmit={(event) => { event.preventDefault(); void onSubmit({ date, text: text.trim(), source: source.trim() }); }}>
-      <Field label={t("contacts.eventDate")}><input required type="date" value={date} onChange={(event) => setDate(event.currentTarget.value)} /></Field>
+      <Field label={t("contacts.eventDate")}><input required type="text" maxLength={10}
+        pattern="[0-9]{4}-(0[1-9]|1[0-2])(-(0[1-9]|[12][0-9]|3[01]))?"
+        placeholder={t("contacts.eventDateFormat")} value={date} onChange={(event) => setDate(event.currentTarget.value)} /></Field>
       <Field label={t("contacts.eventText")}><input required value={text} onChange={(event) => setText(event.currentTarget.value)} /></Field>
       <Field label={t("common.source")}><input value={source} onChange={(event) => setSource(event.currentTarget.value)} /></Field>
       <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="primary" type="submit" disabled={busy || date === "" || text.trim() === ""}>{t("common.add")}</Button></div>
