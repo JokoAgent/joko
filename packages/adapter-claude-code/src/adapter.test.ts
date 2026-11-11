@@ -6875,6 +6875,89 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.closeSession(binding, context);
   });
 
+  test("adopts added directories on the next input without interrupting accepted work or deferring removals", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-directory-addition-")));
+    const sdk = new FakeSdkRuntime({ autoAdmitTurns: true }), adapter = adapterFor(sdk);
+    try {
+      const directories = await Promise.all(["first", "second", "third"].map(async id => {
+        const path = join(root, id);
+        await mkdir(path);
+        return { id, path, access: "read_write" as const };
+      }));
+      const initial = [directories[0]!];
+      const binding = await adapter.createSession(createInput(), { ...contextFor().context, extraDirectories: initial });
+      const first = contextFor(binding, { operationId: "before-directory-addition" });
+      await adapter.send(textPrompt("Continue the accepted work"), { ...first.context, extraDirectories: initial });
+      const query = sdk.queries[0]!;
+      const control = contextFor(binding).context;
+      await adapter.setExtraDirectories(directories.slice(0, 2), control);
+      await adapter.setExtraDirectories(directories, control);
+      expect(query.settingCalls).toEqual([]);
+      expect(query.interruptCalls).toBe(0);
+      expect(sdk.retiredQueries).toEqual([]);
+      expect(first.events.some(event => event.type === "done")).toBe(false);
+
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Original work finished", totalCostUsd: 0 }));
+      await eventually(() => first.events.some(event => event.type === "done"));
+      const second = contextFor(binding, { operationId: "after-directory-addition" });
+      await adapter.send(textPrompt("Use the newly approved directories"), { ...second.context, extraDirectories: directories });
+      expect(query.settingCalls).toEqual([{ permissions: { additionalDirectories: directories.map(directory => directory.path) } }]);
+      expect(query.interruptCalls).toBe(0);
+      expect(sdk.queries).toHaveLength(1);
+      await expect(adapter.setExtraDirectories(initial, control))
+        .rejects.toMatchObject({ publicError: { code: "SESSION_BUSY", stateMayHaveChanged: false } });
+
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Second work finished", totalCostUsd: 0 }));
+      await eventually(() => second.events.some(event => event.type === "done"));
+      vi.spyOn(query, "applyFlagSettings").mockRejectedValueOnce(new Error("Native acknowledgement lost"));
+      await expect(adapter.setExtraDirectories(initial, control))
+        .rejects.toMatchObject({ publicError: { code: "NATIVE_CONTROL_UNKNOWN", stateMayHaveChanged: true } });
+      await expect(adapter.send(textPrompt("Must not use an unknown scope"), contextFor(binding, { operationId: "unknown-directory-scope" }).context))
+        .rejects.toMatchObject({ publicError: { code: "NATIVE_CONTROL_UNKNOWN" } });
+    } finally {
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("retains a later directory addition while an idle native update is awaiting its acknowledgement", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-directory-update-")));
+    const sdk = new FakeSdkRuntime({ autoAdmitTurns: true }), adapter = adapterFor(sdk);
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    try {
+      const directories = await Promise.all(["first", "second"].map(async id => {
+        const path = join(root, id);
+        await mkdir(path);
+        return { id, path, access: "read_write" as const };
+      }));
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const query = sdk.queries[0]!;
+      const apply = query.applyFlagSettings.bind(query);
+      const updating = vi.spyOn(query, "applyFlagSettings").mockImplementationOnce(async settings => {
+        await held;
+        await apply(settings);
+      });
+      const first = adapter.setExtraDirectories(directories.slice(0, 1), contextFor(binding).context);
+      await eventually(() => updating.mock.calls.length === 1);
+      await adapter.setExtraDirectories(directories, contextFor(binding).context);
+      release();
+      await first;
+      await adapter.send(textPrompt("Use the latest directory list"), {
+        ...contextFor(binding, { operationId: "latest-directories" }).context, extraDirectories: directories
+      });
+      expect(query.settingCalls).toEqual([
+        { permissions: { additionalDirectories: [directories[0]!.path] } },
+        { permissions: { additionalDirectories: directories.map(directory => directory.path) } }
+      ]);
+      expect(query.interruptCalls).toBe(0);
+    } finally {
+      release();
+      await adapter.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects stale Backend instance contexts and drops late output from a retired Query generation", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true, leaveOutputOpenOnClose: true });
     const adapter = adapterFor(runtime, { teardownTimeoutMs: 10 });
