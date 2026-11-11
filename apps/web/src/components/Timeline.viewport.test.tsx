@@ -16,6 +16,7 @@ let host: HTMLDivElement;
 let root: Root;
 let props: TimelineProps;
 let extent: number;
+let viewportHeight: number;
 let frameId: number;
 let ownerId = 0;
 let frames: Map<number, PendingFrame>;
@@ -39,6 +40,7 @@ beforeEach(() => {
   observers = new Set();
   scrollWrites = [];
   extent = 4_000;
+  viewportHeight = 600;
   frameId = 0;
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
     const id = ++frameId;
@@ -55,10 +57,10 @@ beforeEach(() => {
     addEventListener(): void {},
     removeEventListener(): void {}
   }));
-  vi.spyOn(Element.prototype, "clientHeight", "get").mockImplementation(function (this: Element) { return this.classList.contains("timeline") ? 600 : 80; });
+  vi.spyOn(Element.prototype, "clientHeight", "get").mockImplementation(function (this: Element) { return this.classList.contains("timeline") ? viewportHeight : 80; });
   vi.spyOn(Element.prototype, "clientWidth", "get").mockReturnValue(620);
   vi.spyOn(Element.prototype, "scrollHeight", "get").mockImplementation(function (this: Element) { return this.classList.contains("timeline") ? extent : 80; });
-  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) { return this.classList.contains("timeline") ? 600 : 80; });
+  vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) { return this.classList.contains("timeline") ? viewportHeight : 80; });
   vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(656);
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
     const viewport = this.classList.contains("timeline") ? this : this.closest<HTMLElement>(".timeline");
@@ -66,14 +68,14 @@ beforeEach(() => {
     const start = Number.parseFloat(row?.style.transform.replace(/^translateY\(/, "") ?? "0") || 0;
     const isRoot = this === viewport;
     const top = isRoot ? 0 : start - (viewport?.scrollTop ?? 0);
-    const height = isRoot ? 600 : this.classList.contains("timeline__virtual") ? extent : 80;
+    const height = isRoot ? viewportHeight : this.classList.contains("timeline__virtual") ? extent : 80;
     const left = isRoot ? 0 : 64;
     return { x: left, y: top, left, top, right: left + 592, bottom: top + height, width: 592, height, toJSON: () => ({}) };
   });
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
     configurable: true,
     value(this: HTMLElement, options: ScrollToOptions): void {
-      const top = Math.max(0, Math.min(extent - 600, options.top ?? this.scrollTop));
+      const top = Math.max(0, Math.min(extent - viewportHeight, options.top ?? this.scrollTop));
       this.scrollTop = top;
       scrollWrites.push({ node: this, top, behavior: options.behavior });
     }
@@ -169,6 +171,44 @@ describe("Timeline viewport journeys", () => {
     expect(viewport.scrollTop).toBe(0);
   });
 
+  it("leaves Page Up with the focused long tool output while it can scroll upward", async () => {
+    await render({ items: [...props.items, {
+      ...item("long-tool", 9, "tool"),
+      tool: { id: "long-tool", name: "bash", state: "running", input: "", output: "Tool output line\n".repeat(1_200), isError: false }
+    }] });
+    const output = host.querySelector<HTMLElement>(".windowed-output")!;
+    output.style.overflowY = "auto";
+    Object.defineProperty(output, "scrollHeight", { value: 500 });
+    output.scrollTop = 120;
+    await act(async () => output.focus());
+    expect(document.activeElement).toBe(output);
+
+    const withinOutput = new KeyboardEvent("keydown", { key: "PageUp", bubbles: true, cancelable: true });
+    await act(async () => output.dispatchEvent(withinOutput));
+    expect(withinOutput.defaultPrevented).toBe(false);
+    expect(jumpLatest()).toBeNull();
+
+    output.scrollTop = 0;
+    await act(async () => output.dispatchEvent(new KeyboardEvent("keydown", { key: "PageUp", bubbles: true })));
+    expectUnread(0);
+  });
+
+  it("focuses the original ordinary search row once it is highlighted", async () => {
+    await render();
+    const viewport = timeline();
+    await act(async () => viewport.focus());
+    const row = viewport.querySelector<HTMLElement>('[data-timeline-item-id="initial-3"]')!;
+    expect(row.hasAttribute("tabindex")).toBe(false);
+
+    await render({ focusRequest: { itemId: "initial-3", requestId: 1 } });
+    expect(row.getAttribute("aria-current")).toBe("true");
+    expect(document.activeElement).toBe(row);
+
+    await act(async () => viewport.focus());
+    await append([item("later-answer", 9, "assistant")]);
+    expect(document.activeElement).toBe(viewport);
+  });
+
   it("keeps virtual-row corrections from detaching a growing tail after a delayed scroll event", async () => {
     await render({ items: Array.from({ length: 60 }, (_, index) => item(`measured-${index}`, index + 1, "user")) });
     await flushFrames();
@@ -194,6 +234,28 @@ describe("Timeline viewport journeys", () => {
     expect(jumpLatest()).toBeNull();
     await contentResize();
     expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+  });
+
+  it("keeps a following tail at the edge when only the viewport shrinks", async () => {
+    await render();
+    await flushFrames();
+    const viewport = timeline();
+    const originalExtent = viewport.scrollHeight;
+    expect(viewport.scrollTop).toBe(originalExtent - viewport.clientHeight);
+
+    viewportHeight -= 100;
+    await notifyResize(viewport);
+    expect(viewport.scrollHeight).toBe(originalExtent);
+    expect(viewport.scrollTop).toBe(originalExtent - viewport.clientHeight);
+    expect(jumpLatest()).toBeNull();
+
+    await scrollbarPress(viewport);
+    const heldTop = viewport.scrollTop;
+    viewportHeight -= 100;
+    await notifyResize(viewport);
+    expect(viewport.scrollTop).toBe(heldTop);
+    await act(async () => window.dispatchEvent(new MouseEvent("mouseup", { button: 0 })));
+    expect(viewport.scrollTop).toBe(originalExtent - viewport.clientHeight);
   });
 
   it("shows whole-Run accounting only on its current completion while keeping segment usage private to running status", async () => {
@@ -368,9 +430,12 @@ async function scrollbarPress(viewport: HTMLElement): Promise<void> {
 }
 
 async function contentResize(): Promise<void> {
+  await notifyResize(host.querySelector(".timeline__virtual")!);
+}
+
+async function notifyResize(target: Element): Promise<void> {
   await act(async () => {
-    const content = host.querySelector(".timeline__virtual")!;
-    for (const observer of [...observers]) if (observer.targets.has(content)) observer.callback([], observer);
+    for (const observer of [...observers]) if (observer.targets.has(target)) observer.callback([], observer);
   });
   await flushFrames();
 }
