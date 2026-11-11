@@ -1354,10 +1354,13 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const searchRef = useRef<TextInput>(null);
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
   const normalizedSearch = search.trim();
+  const currentSearch = state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter;
+  const searchPending = foreground && state.status === "connected" && normalizedSearch !== ""
+    && (!currentSearch || state.homeSearchStatus === "idle" || state.homeSearchStatus === "searching");
   const currentMessageMatches = useMemo(() => new Map<string, MobileHomeSearchMatch>(
-    state.homeSearchStatus === "ready" && state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter
+    state.homeSearchStatus === "ready" && currentSearch
       ? state.homeSearchMatches.map(match => [match.sessionId, match] as const) : []
-  ), [normalizedSearch, state.homeSearchFilter, state.homeSearchMatches, state.homeSearchQuery, state.homeSearchStatus, statusFilter]);
+  ), [currentSearch, state.homeSearchMatches, state.homeSearchStatus]);
   const sections = useMemo(() => buildMobileHomeSections({
     snapshot: state.owner,
     statusFilter,
@@ -1392,7 +1395,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     }
     const timer = setTimeout(() => { void client.searchHome(normalizedSearch, statusFilter); }, 180);
     return () => clearTimeout(timer);
-  }, [foreground, normalizedSearch, homeScopeKey, state.owner?.snapshotId, state.owner?.revision?.value, statusFilter]);
+  }, [foreground, normalizedSearch, homeScopeKey, state.status, state.owner?.generation, state.owner?.revision?.value,
+    state.owner?.resumeCursor?.sequence, statusFilter]);
 
   const navigate = (intent: MobileHomeNavigationIntent): void => {
     if (!foreground || !mountedRef.current || AppState.currentState !== "active"
@@ -1584,7 +1588,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         placeholder={mobileMessage(locale, "home.search")}
         placeholderTextColor={colors.muted} value={search} onChangeText={setSearch}
         style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
-      {state.homeSearchStatus === "searching" && normalizedSearch && <ActivityIndicator color={colors.accent} />}
+      {searchPending && <ActivityIndicator accessibilityLabel={mobileMessage(locale, "home.search")} color={colors.accent} />}
     </View>
     <View accessibilityRole="tablist" style={styles.filterRow}>
       {(["active", "archived", "all"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
@@ -1602,7 +1606,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.searchSort.${sort}`)}</Text>
       </Pressable>)}
     </View>}
-    {state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
+    {currentSearch && state.homeSearchError && normalizedSearch && <Banner text={state.homeSearchError} colors={colors} />}
     {localError && <Banner text={localError} colors={colors} />}
     {copyNotice && <Notice text={copyNotice} colors={colors} locale={locale}
       dismissAccessibilityLabel={mobileMessage(locale, "actions.dismissCopyNotice")}
@@ -1615,7 +1619,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
       renderSectionHeader={({ section }) => section.kind === "search" ? null
         : <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
-      ListEmptyComponent={<Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
+      ListEmptyComponent={searchPending ? undefined : <Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
           ? "home.empty.search" : statusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
       renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
