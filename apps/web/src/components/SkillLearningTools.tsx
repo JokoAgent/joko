@@ -30,9 +30,11 @@ export function SkillLearningTools({ controller, backends, targets, marketIdenti
   const [selectedFile, setSelectedFile] = useState<string>();
   const [confirmedReplace, setConfirmedReplace] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [actionError, setActionError] = useState<string>();
   const [reload, setReload] = useState(0);
   const sequence = useRef(0);
+  const startSequence = useRef(0);
   const active = detail?.kind === "ready" ? detail.value : undefined;
 
   useEffect(() => {
@@ -73,20 +75,25 @@ export function SkillLearningTools({ controller, backends, targets, marketIdenti
 
   const start = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
-    if (busy || targetId === "" || (marketIdentity === undefined && instruction.trim() === "")) return;
-    setBusy(true);
+    if (busy || starting || targetId === "" || (marketIdentity === undefined && instruction.trim() === "")) return;
+    const generation = ++startSequence.current;
+    setStarting(true);
     setActionError(undefined);
     void controller.startSkillLearning({
       requestId, targetId, instruction,
       ...(marketIdentity === undefined ? {} : { marketIdentity })
     }).then((run) => {
+      if (generation !== startSequence.current) return;
       setRequestId(randomUuid());
       setInstruction("");
       setSelectedId(run.id);
       setDetail({ kind: "ready", value: run });
       refresh();
-    }).catch((cause: unknown) => setActionError(cause instanceof Error ? cause.message : t("skills.learning.error")))
-      .finally(() => setBusy(false));
+    }).catch((cause: unknown) => {
+      if (generation === startSequence.current) setActionError(cause instanceof Error ? cause.message : t("skills.learning.error"));
+    }).finally(() => {
+      if (generation === startSequence.current) setStarting(false);
+    });
   };
 
   const act = (action: (run: SkillLearningRunView) => Promise<SkillLearningRunView>): void => {
@@ -108,17 +115,17 @@ export function SkillLearningTools({ controller, backends, targets, marketIdenti
       <div><p className="eyebrow">{t("skills.sections.learning")}</p><h2>{t("skills.learning.title")}</h2><p>{t("skills.learning.body")}</p></div>
       <form onSubmit={start}>
         <label>{t("skills.learning.target")}
-          <SelectControl value={targetId} disabled={busy} onChange={(event) => { setTargetId(event.target.value); setRequestId(randomUuid()); }}>
+          <SelectControl value={targetId} disabled={busy || starting} onChange={(event) => { setTargetId(event.target.value); setRequestId(randomUuid()); }}>
             {eligible.map((target) => <option key={target.id} value={target.id}>{target.name}</option>)}
           </SelectControl>
         </label>
         {marketIdentity !== undefined && <p className="skill-learning__source">{t("skills.learning.marketSource")}</p>}
         <label>{t("skills.learning.instruction")}
-          <textarea value={instruction} maxLength={4_000} disabled={busy} placeholder={t("skills.learning.placeholder")}
+          <textarea value={instruction} maxLength={4_000} disabled={busy || starting} placeholder={t("skills.learning.placeholder")}
             onChange={(event) => { setInstruction(event.target.value); setRequestId(randomUuid()); }} />
         </label>
-        <Button tone="primary" type="submit" disabled={busy || targetId === "" || marketIdentity === undefined && instruction.trim() === ""}>
-          <Sparkles aria-hidden="true" />{busy ? t("common.working") : t("skills.learning.start")}
+        <Button tone="primary" type="submit" disabled={busy || starting || targetId === "" || marketIdentity === undefined && instruction.trim() === ""}>
+          <Sparkles aria-hidden="true" />{busy || starting ? t("common.working") : t("skills.learning.start")}
         </Button>
       </form>
       {eligible.length === 0 && <p role="status">{t("skills.learning.noTarget")}</p>}
@@ -157,8 +164,8 @@ export function SkillLearningTools({ controller, backends, targets, marketIdenti
         </section>
         {active.state === "awaitingReview" && <div className="skill-learning__actions">
           {proposal.currentResourceId !== undefined && <label><input type="checkbox" checked={confirmedReplace} onChange={(event) => setConfirmedReplace(event.target.checked)} />{t("skills.learning.replaceConfirm")}</label>}
-          <Button tone="primary" disabled={busy || proposal.currentResourceId !== undefined && !confirmedReplace} onClick={() => act((run) => controller.applySkillLearning(run, confirmedReplace))}><Check aria-hidden="true" />{t("skills.learning.apply")}</Button>
-          <Button disabled={busy} onClick={() => act((run) => controller.discardSkillLearning(run))}><X aria-hidden="true" />{t("skills.learning.discard")}</Button>
+          <Button tone="primary" disabled={busy || starting || proposal.currentResourceId !== undefined && !confirmedReplace} onClick={() => act((run) => controller.applySkillLearning(run, confirmedReplace))}><Check aria-hidden="true" />{t("skills.learning.apply")}</Button>
+          <Button disabled={busy || starting} onClick={() => act((run) => controller.discardSkillLearning(run))}><X aria-hidden="true" />{t("skills.learning.discard")}</Button>
         </div>}
       </>}
       {(active.state === "collecting" || active.state === "distilling") && <Button disabled={busy} onClick={() => act((run) => controller.cancelSkillLearning(run))}>{t("common.cancel")}</Button>}

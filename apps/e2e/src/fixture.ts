@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createConnection, createServer as createPortProbe } from "node:net";
 import { createServer as createHttpServer, type IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
+import type { BrowserContext } from "playwright-core";
 import { replaceEndpointTrust, type EndpointTransport } from "@joko/connection-transport/trust";
 
 import type { AdapterContext, BlobRef, PromptInput } from "@joko/core";
@@ -329,11 +330,13 @@ export class OrchestratorE2eFixture {
     });
     await sessionWorktrees.initialize();
     let objectives: ObjectiveManager | undefined;
+    const nativeMemoryPending = new Map<string, number>();
     const sessionHost = new SessionHost(store, artifacts, backendInstances.availableAdapters(), {
       backendDescriptors: backendInstances.descriptors(),
       backendDescriptorsAlreadyPublished: true,
       workspaceCapture: new DurableWorkspaceRunCapture(store, workspaceChanges),
       worktrees: sessionWorktrees,
+      backendDispatchBlocked: backendId => nativeMemoryPending.has(backendId),
       modelRoutingEnabled: (backendId, providerId, modelId) => modelRoutingEnabled(store, backendId, providerId, modelId),
       onUserInputAdmitted: (transactionStore, result) =>
         objectives?.onUserInputAdmitted(transactionStore, result),
@@ -531,6 +534,25 @@ export class OrchestratorE2eFixture {
       projectBackendProviderAuthentication,
       holdSubagentSmartRoutingDispatch: () => undefined,
       refreshSubagentSmartRouting: restartBackend,
+      holdNativeMemoryDispatch: backendId => {
+        nativeMemoryPending.set(backendId, (nativeMemoryPending.get(backendId) ?? 0) + 1);
+      },
+      refreshNativeMemory: async backendId => {
+        const token = nativeMemoryPending.get(backendId);
+        if (token === undefined) return false;
+        // This fixture owns explicit runtime transitions. A next_session
+        // receipt stays held; only the real Application models idle replacement.
+        const immediate = await sessionHost.invokeBackendAdapter(backendId, async adapter => {
+          if (adapter.reconcileNativeMemory === undefined) throw new Error("The fixture native-memory owner is unavailable.");
+          return await adapter.reconcileNativeMemory() === "immediate";
+        });
+        if (immediate && nativeMemoryPending.get(backendId) === token) {
+          nativeMemoryPending.delete(backendId);
+          sessionHost.wakeBackendQueues(backendId);
+        }
+        return nativeMemoryPending.has(backendId);
+      },
+      nativeMemoryRestartPending: backendId => nativeMemoryPending.has(backendId),
       modelFavorites,
       browserActivity: [],
       contacts,
@@ -758,6 +780,15 @@ async function createHttpConnectFixture(application: OrchestratorApplication, ba
 
 export function sha256(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export async function routeFixtureDiscovery(context: BrowserContext, baseUrl: string): Promise<void> {
+  // Keep the browser's optional default-node probes inside the test fixture.
+  await context.route(/^http:\/\/(?:127\.0\.0\.1|localhost):4318\/joko\.v1\.ConnectionService\/(?:GetServerInfo|ListDiscoveredNodes)$/u, async route => {
+    const { pathname } = new URL(route.request().url());
+    const response = await route.fetch({ url: new URL(pathname, baseUrl).href, maxRetries: 0 });
+    await route.fulfill({ response });
+  });
 }
 
 export async function waitFor<T>(

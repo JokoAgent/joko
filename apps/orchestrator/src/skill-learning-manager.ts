@@ -1,11 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
+import { setImmediate } from "node:timers/promises";
 
-import { redactSecrets } from "@joko/core";
+import { parse as parseJavascript } from "@babel/parser";
+import { redactSecrets, type FileInput, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type ConnectionRecord, type OperationalStore } from "@joko/store";
 
 import type { PiLearnedSkillPreview, PiMarketSkillDiffChange, PiResourceManager } from "./resource-manager.js";
+import type { ArtifactStore } from "./artifact-store.js";
 import type { SessionHost } from "./session-host.js";
 import {
   SkillMutationCoordinator,
@@ -99,6 +102,7 @@ export interface SkillLearningManagerOptions {
   readonly store: OperationalStore;
   readonly sessions: SessionHost;
   readonly resources: PiResourceManager;
+  readonly artifacts: Pick<ArtifactStore, "ingestBytes">;
   readonly mutations: SkillMutationCoordinator;
   readonly market?: SkillMarketManager;
   readonly rootDirectory: string;
@@ -111,6 +115,10 @@ const RUN_ID = /^skill_learning_[a-f0-9]{32}$/u;
 const REVISION = /^sha256:[a-f0-9]{64}$/u;
 const MAX_INSTRUCTION = 4_000;
 const MAX_EVIDENCE = 24_000;
+const MAX_SESSION_MESSAGES = 120;
+const MAX_SESSION_MESSAGE_TEXT = 1_500;
+const MAX_MARKET_REFERENCE_BYTES = 512 * 1024;
+const MAX_MARKET_REFERENCES = 40;
 const MAX_OUTPUT = 768 * 1024;
 const MAX_FILES = 64;
 const MAX_FILE_BYTES = 256 * 1024;
@@ -131,11 +139,13 @@ export class SkillLearningManager {
   readonly #store: OperationalStore;
   readonly #sessions: SessionHost;
   readonly #resources: PiResourceManager;
+  readonly #artifacts: Pick<ArtifactStore, "ingestBytes">;
   readonly #mutations: SkillMutationCoordinator;
   readonly #market?: SkillMarketManager;
   readonly #root: string;
   readonly #now: () => number;
   readonly #onResourceCommitted?: SkillLearningManagerOptions["onResourceCommitted"];
+  readonly #pipelines = new Map<string, { readonly result: Promise<SkillLearningRun>; readonly cancel: (run: SkillLearningRun) => void }>();
   #tail: Promise<void> = Promise.resolve();
 
   constructor(options: SkillLearningManagerOptions) {
@@ -145,6 +155,7 @@ export class SkillLearningManager {
     this.#store = options.store;
     this.#sessions = options.sessions;
     this.#resources = options.resources;
+    this.#artifacts = options.artifacts;
     this.#mutations = options.mutations;
     this.#market = options.market;
     this.#root = options.rootDirectory;
@@ -175,7 +186,8 @@ export class SkillLearningManager {
   }
 
   async start(input: StartSkillLearningInput): Promise<SkillLearningRun> {
-    return this.#serialize(async () => {
+    let pipeline: Promise<SkillLearningRun> | undefined;
+    const admitted = await this.#serialize(async () => {
       const requestId = boundedRequestId(input.requestId);
       const target = this.#store.getTarget(input.targetId);
       const sourceKind: SkillLearningSourceKind = input.marketIdentity !== undefined ? "market"
@@ -202,6 +214,7 @@ export class SkillLearningManager {
         if (existing.ownerConnectionId !== input.connection.id || existing.requestDigest !== digest) {
           throw new Error("Learning request ID was already used for a different request.");
         }
+        pipeline = this.#pipelines.get(id)?.result;
         return this.#public(existing);
       }
       if (this.#storedRuns().some((run) => run.state === "collecting" || run.state === "distilling")) {
@@ -232,37 +245,90 @@ export class SkillLearningManager {
         store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
         store.setSetting("service", SETTING_SCOPE, id, created);
       });
-      try {
-        const evidence = await this.#collectEvidence(input, sourceKind, instruction);
-        const createdSession = await this.#sessions.createServiceSession({
-          operationId: `${id}_session`,
-          serviceKind: "learning",
-          targetId: input.targetId,
-          title: `Learn Skill: ${summary.slice(0, 72)}`,
-          fastMode: false,
-          permissionMode: "ask",
-          planMode: false,
-          appendSystemPrompt: DISTILLATION_INSTRUCTION
-        });
-        const withSession = this.#save(created, {
-          state: "distilling",
-          distillationSessionId: createdSession.value.sessionId
-        });
+      const work = this.#startPipeline(input, target, created, instruction);
+      let cancel!: (run: SkillLearningRun) => void;
+      const cancelled = new Promise<SkillLearningRun>(resolve => { cancel = resolve; });
+      pipeline = Promise.race([work, cancelled]);
+      this.#pipelines.set(id, { result: pipeline, cancel });
+      void work.then(() => this.#pipelines.delete(id), () => this.#pipelines.delete(id));
+      return this.#public(created);
+    });
+    return pipeline ?? admitted;
+  }
+
+  async #startPipeline(input: StartSkillLearningInput, target: ReturnType<OperationalStore["getTarget"]>,
+    created: StoredLearningRun, instruction: string): Promise<SkillLearningRun> {
+    const { id, sourceKind, summary } = created;
+    let distillationSessionId: string | undefined;
+    try {
+      const source = input.sourceSessionId === undefined ? undefined : this.#store.getSession(input.sourceSessionId).descriptor;
+      const history = source === undefined ? undefined : this.#store.captureSessionReferenceSnapshot(source.id, 0);
+      const evidenceEvents: string[] = [];
+      const inherited = source === undefined ? undefined : this.#sourceRoute(source.id, target.descriptor.backendId);
+      const routeDigest = inherited === undefined ? undefined : operationBodyHash(inherited);
+      const routeGeneration = inherited === undefined ? undefined : this.#store.getBackend(target.descriptor.backendId).descriptor.instanceGeneration;
+      const assertSource = () => {
+        if (this.#require(id).state !== "collecting") throw new Error("The Skill learning collection is no longer active.");
+        this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+        if (this.#store.getTarget(input.targetId).revision !== target.revision) throw new Error("The Skill learning Target changed.");
+        if (input.marketIdentity !== undefined) this.#market?.getEntry(input.marketIdentity);
+        if (source === undefined) return;
+        const current = this.#store.getSession(source.id).descriptor;
+        const currentHistory = this.#store.captureSessionReferenceSnapshot(source.id, 0);
+        if (current.deletedAt !== undefined || current.targetId !== input.targetId || current.backendId !== source.backendId
+          || current.binding.generation !== source.binding.generation || current.binding.opaqueRef !== source.binding.opaqueRef
+          || currentHistory.historyMarkerCursor !== history?.historyMarkerCursor || currentHistory.historyLeafId !== history?.historyLeafId
+          || evidenceEvents.some(eventId => this.#store.findEvent(eventId) === undefined)
+          || routeDigest !== undefined && (this.#store.getBackend(target.descriptor.backendId).descriptor.instanceGeneration !== routeGeneration
+            || operationBodyHash(this.#sourceRoute(source.id, target.descriptor.backendId) ?? null) !== routeDigest)) {
+          throw new Error("The original Skill learning source or route changed.");
+        }
+      };
+      const canAttach = sourceKind === "market" && target.descriptor.trusted && target.descriptor.remoteWorkspace === undefined &&
+        this.#store.getBackend(target.descriptor.backendId).descriptor.capabilities.get("input.file")?.supported === true;
+      const evidence = await this.#collectEvidence(input, sourceKind, instruction, source, canAttach, assertSource,
+        history === undefined ? undefined : BigInt(history.throughCursor), evidenceEvents);
+      assertSource();
+      const createdSession = await this.#sessions.createServiceSession({
+        operationId: `${id}_session`,
+        serviceKind: "learning",
+        targetId: input.targetId,
+        title: `Learn Skill: ${summary.slice(0, 72)}`,
+        fastMode: false,
+        ...inherited,
+        permissionMode: "ask",
+        planMode: false,
+        appendSystemPrompt: DISTILLATION_INSTRUCTION,
+        assertServiceScope: assertSource
+      });
+      const sessionId = createdSession.value.sessionId;
+      distillationSessionId = sessionId;
+      return await this.#serialize(async () => {
+        assertSource();
+        const withSession = this.#save(this.#require(id), { state: "distilling", distillationSessionId: sessionId });
         const queued = this.#sessions.enqueueServiceInput({
           operationId: `${id}_input`,
-          sessionId: createdSession.value.sessionId,
+          sessionId,
           source: "system",
-          prompt: { text: learningPrompt(instruction, evidence), images: [], files: [], mentions: [], disposition: "prompt" }
+          prompt: { text: learningPrompt(instruction, evidence.text), images: [], files: evidence.files, mentions: [], disposition: "prompt" }
         });
         return this.#public(this.#save(withSession, { modelRunId: queued.value.runId }));
-      } catch {
-        const current = this.#read(id)!;
-        return this.#public(this.#save(current, {
+      });
+    } catch (error) {
+      return this.#serialize(async () => {
+        const current = this.#require(id);
+        const session = distillationSessionId === undefined ? {} : { distillationSessionId };
+        if (current.state !== "collecting" && current.state !== "distilling") {
+          // Keep a completed creation receipt without reviving a cancelled run.
+          return this.#public(distillationSessionId === undefined ? current : this.#save(current, session));
+        }
+        return this.#public(this.#save(current, { ...session,
           state: "failed",
-          error: "Learning could not start. Check the Target and Backend, then start a new run."
+          error: error instanceof SkillLearningEvidenceError ? error.message
+            : "Learning could not start. Check the Target and Backend, then start a new run."
         }));
-      }
-    });
+      });
+    }
   }
 
   async list(): Promise<readonly SkillLearningRun[]> {
@@ -413,6 +479,7 @@ export class SkillLearningManager {
         }
       });
       const current = this.#require(runId);
+      this.#pipelines.get(runId)?.cancel(await this.#public(current));
       if (!execution.replayed && current.distillationSessionId !== undefined && current.modelRunId !== undefined) {
         await this.#sessions.abort(current.distillationSessionId, current.modelRunId).catch(() => undefined);
       }
@@ -420,26 +487,33 @@ export class SkillLearningManager {
     });
   }
 
-  async #collectEvidence(input: StartSkillLearningInput, sourceKind: SkillLearningSourceKind, instruction: string): Promise<string> {
-    if (sourceKind === "text") return instruction;
+  #sourceRoute(sessionId: string, backendId: string) {
+    const route = this.#sessions.getSessionRuntimeControl(sessionId).effective;
+    if (route?.backendId !== backendId) return undefined;
+    const model = this.#sessions.listSelectableTaskModels(backendId).find(candidate =>
+      candidate.providerId === route.providerId && candidate.modelId === route.modelId);
+    if (model === undefined) return undefined;
+    const fastMode = route.fastMode === "ultrafast" && model.supportsUltrafastMode === true ? "ultrafast" as const
+      : route.fastMode === true && model.supportsFastMode === true;
+    return {
+      providerId: route.providerId,
+      modelId: route.modelId,
+      ...(route.effort !== undefined && model.thinkingLevels.includes(route.effort) ? { effort: route.effort } : {}),
+      fastMode
+    };
+  }
+
+  async #collectEvidence(
+    input: StartSkillLearningInput, sourceKind: SkillLearningSourceKind, instruction: string,
+    source: SessionDescriptor | undefined, canAttach: boolean, assertSource: () => void,
+    throughCursor: bigint | undefined, evidenceEvents: string[]
+  ): Promise<{ readonly text: string; readonly files: readonly FileInput[] }> {
+    if (sourceKind === "text") return { text: instruction, files: [] };
     if (sourceKind === "session") {
-      const source = this.#store.getSession(input.sourceSessionId!).descriptor;
-      if (source.deletedAt !== undefined || source.targetId !== input.targetId) {
+      if (source === undefined || source.deletedAt !== undefined || source.targetId !== input.targetId) {
         throw new Error("The source task is unavailable on the selected Target.");
       }
-      const excerpts = this.#store.listEvents({ sessionId: source.id, order: "desc", limit: 200 })
-        .filter((event) => event.payload.type === "message_complete"
-          && (event.payload.role === "assistant" || event.payload.role === "user")
-          && event.payload.automaticContinuation === undefined
-          && event.payload.objectiveContinuation === undefined && event.payload.inputHandoffContinuation === undefined)
-        .slice(0, 20)
-        .reverse()
-        .map((event) => {
-          if (event.payload.type !== "message_complete") return "";
-          const text = event.payload.blocks.filter((block) => block.kind === "text").map((block) => block.text).join("\n");
-          return `${event.payload.role}: ${safeEvidence(text, 2_000)}`;
-        });
-      return safeEvidence(excerpts.join("\n\n"), MAX_EVIDENCE);
+      return { text: await this.#sessionEvidence(source.id, throughCursor!, evidenceEvents, assertSource), files: [] };
     }
     const entry = this.#market?.getEntry(input.marketIdentity!);
     if (entry === undefined) throw new Error("Skill catalog evidence is unavailable.");
@@ -447,34 +521,120 @@ export class SkillLearningManager {
     const lease = await this.#market!.acquireEntry(identity);
     const temporary = join(this.#root, `market-${randomUUID().replaceAll("-", "")}`);
     try {
+      assertSource();
+      const mainEntry = lease.archiveEntries.find(file => file.kind === "file" && file.key === "SKILL.md");
+      if (mainEntry === undefined || mainEntry.size > MAX_MARKET_REFERENCE_BYTES) {
+        throw new SkillLearningEvidenceError("The catalog Skill requires a complete SKILL.md of at most 512 KiB.");
+      }
       const inspection = await lease.extractTo(temporary);
-      const main = await readFile(join(inspection.canonicalPath, "SKILL.md"), "utf8");
-      const references: string[] = [];
+      assertSource();
+      const mainBytes = await readFile(join(inspection.canonicalPath, "SKILL.md"));
+      assertSource();
+      const main = mainBytes.byteLength === mainEntry.size ? marketReferenceText(mainBytes, mainEntry.key) : undefined;
+      if (main === undefined) throw new SkillLearningEvidenceError("The catalog SKILL.md could not be read as complete UTF-8 text.");
+      const files: FileInput[] = [];
+      const attachments: string[] = [];
+      const inline: string[] = [];
+      const omissions: string[] = [];
+      let considered = 0;
+      let omitted = 0;
+      let inlineBytes = 0;
+      const omit = (key: string, reason: string) => {
+        omitted += 1;
+        if (omissions.length < MAX_MARKET_REFERENCES) omissions.push(`${JSON.stringify(key)} (${reason})`);
+      };
       for (const file of lease.archiveEntries) {
-        if (file.kind !== "file" || file.key === "SKILL.md" || file.size > MAX_EVIDENCE) continue;
-        const raw = await readFile(join(inspection.canonicalPath, ...file.key.split("/")));
-        if (raw.byteLength > MAX_EVIDENCE) continue;
-        let content: string;
-        try {
-          content = new TextDecoder("utf-8", { fatal: true }).decode(raw);
-        } catch {
+        if (file.kind !== "file" || file.key === "SKILL.md") continue;
+        const key = redactSecrets(file.key).slice(0, 240);
+        if (++considered > MAX_MARKET_REFERENCES || file.size > MAX_MARKET_REFERENCE_BYTES) {
+          omit(key, "outside the reference file limits");
           continue;
         }
-        if (/[\u0000-\u0008\u000e-\u001f]/u.test(content)) continue;
-        references.push(`<file path="${file.key}">\n${safeEvidence(content, MAX_EVIDENCE)}\n</file>`);
+        const raw = await readFile(join(inspection.canonicalPath, ...file.key.split("/"))).catch(() => undefined);
+        assertSource();
+        const content = raw !== undefined && raw.byteLength === file.size ? marketReferenceText(raw, file.key) : undefined;
+        if (content === undefined) {
+          omit(key, "complete UTF-8 text is unavailable");
+          continue;
+        }
+        if (canAttach) {
+          assertSource();
+          const { id, sha256, byteLength, mimeType, fileName } = await this.#artifacts.ingestBytes(Buffer.from(content, "utf8"), {
+            fileName: `skill-reference-${files.length + 1}.txt`, mimeType: "text/plain", expiresAt: this.#now() + REVIEW_TTL_MS
+          });
+          assertSource();
+          files.push({ blob: { id, sha256, byteLength, mimeType, ...(fileName === undefined ? {} : { fileName }) } });
+          attachments.push(`${files.length}. ${JSON.stringify(key)}`);
+        } else {
+          const block = `<file path=${JSON.stringify(key)}>\n${content}\n</file>`;
+          const bytes = Buffer.byteLength(block, "utf8");
+          if (inlineBytes + bytes <= MAX_EVIDENCE) {
+            inlineBytes += bytes;
+            inline.push(block);
+          } else omit(key, "outside the inline reference budget for this Target");
+        }
       }
       await lease.assertCurrent();
-      return safeEvidence([
+      assertSource();
+      const metadata = safeEvidence([
         `Catalog Skill: ${entry.name} (${entry.slug})`,
         `Description: ${entry.description}`,
-        `Tags: ${entry.tags.join(", ")}`,
-        main,
-        ...references
-      ].join("\n\n"), MAX_EVIDENCE);
+        `Tags: ${entry.tags.join(", ")}`
+      ].join("\n"), MAX_INSTRUCTION);
+      const text = [metadata, `<catalog_skill>\n${main}\n</catalog_skill>`, ...inline,
+        ...(attachments.length === 0 ? [] : [`Catalog reference attachments in input order\n${attachments.join("\n")}`]),
+        ...(omitted === 0 ? [] : [`Omitted catalog reference files\n${omissions.join("\n")}${omitted > omissions.length ? `\n${omitted - omissions.length} more omitted.` : ""}`])
+      ].join("\n\n");
+      return { text, files };
     } finally {
       lease.release();
       await rm(temporary, { recursive: true, force: true });
     }
+  }
+
+  async #sessionEvidence(sessionId: string, throughCursor: bigint, evidenceEvents: string[], assertSource: () => void): Promise<string> {
+    const excerpts: string[] = [];
+    let beforeCursor = throughCursor + 1n;
+    while (excerpts.length < MAX_SESSION_MESSAGES) {
+      assertSource();
+      const page = this.#store.listEvents({ sessionId, order: "desc", limit: 1_000,
+        activeNativeTimeline: true, messageCompleteOnly: true, beforeCursor });
+      for (const event of page) {
+        const payload = event.payload;
+        if (payload.type !== "message_complete" || payload.role !== "assistant" && payload.role !== "user"
+          || payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined
+          || payload.inputHandoffContinuation !== undefined || payload.role === "user" && payload.partnerPrivateOrigin !== undefined) continue;
+        const text = redactPrivateText(payload.blocks.filter(block => block.kind === "text").map(block => block.text).join("\n")).trim();
+        if (text === "" || payload.role === "user" && /^\/(?:skill:)?learn\s*$/iu.test(text)) continue;
+        const clipped = text.length > MAX_SESSION_MESSAGE_TEXT
+          ? `${text.slice(0, MAX_SESSION_MESSAGE_TEXT)}\n[...truncated]` : text;
+        excerpts.push(`${payload.role}: ${clipped}`);
+        evidenceEvents.push(event.id);
+        if (excerpts.length === MAX_SESSION_MESSAGES) break;
+      }
+      if (excerpts.length === MAX_SESSION_MESSAGES || page.length < 1_000) break;
+      const nextCursor = page.at(-1)!.globalCursor;
+      if (nextCursor >= beforeCursor) throw new Error("Learning evidence history did not advance.");
+      beforeCursor = nextCursor;
+      await setImmediate();
+    }
+    assertSource();
+    if (excerpts.length === 0) throw new SkillLearningEvidenceError("The source task has no conversation text to learn from.");
+    const kept: string[] = [];
+    let used = 0;
+    for (const excerpt of excerpts) {
+      const size = excerpt.length + (kept.length === 0 ? 0 : 2);
+      if (used + size > MAX_EVIDENCE) break;
+      kept.push(excerpt);
+      used += size;
+    }
+    let omitted = excerpts.length - kept.length;
+    const note = () => `(${omitted} earlier message(s) omitted due to size budget.)`;
+    while (omitted > 0 && used + note().length + 2 > MAX_EVIDENCE) {
+      used -= kept.pop()!.length + (kept.length === 0 ? 0 : 2);
+      omitted += 1;
+    }
+    return [...(omitted === 0 ? [] : [note()]), ...kept.reverse()].join("\n\n");
   }
 
   async #reconcile(run: StoredLearningRun): Promise<StoredLearningRun> {
@@ -714,7 +874,7 @@ function parseCandidate(output: string): ParsedCandidate {
     if (Buffer.byteLength(record["content"], "utf8") > MAX_FILE_BYTES) {
       throw new Error("Learning file exceeds the byte budget.");
     }
-    const content = redactPrivateText(record["content"]);
+    const content = redactPrivateText(record["content"], key);
     const bytes = Buffer.byteLength(content, "utf8");
     if (bytes > MAX_FILE_BYTES) throw new Error("Learning file exceeds the byte budget.");
     total += bytes;
@@ -754,7 +914,9 @@ function proposalFromPreview(candidate: ParsedCandidate, preview: PiLearnedSkill
     ...(preview.diffReason === undefined ? {} : { diffReason: preview.diffReason }),
     changes: preview.changes.map((change) => ({
       ...change,
-      ...(change.unifiedDiff === undefined ? {} : { unifiedDiff: redactPrivateText(change.unifiedDiff) })
+      ...(change.unifiedDiff === undefined ? {} : {
+        unifiedDiff: redactLearningDiff(change.key, change.unifiedDiff, candidate.files.find(file => file.key === change.key)?.content)
+      })
     })),
     diffTruncated: preview.diffTruncated
   };
@@ -803,22 +965,117 @@ function safeEvidence(value: string, maximum: number): string {
   return redactPrivateText(value).slice(0, maximum).trim();
 }
 
-function redactPrivateText(value: string): string {
+class SkillLearningEvidenceError extends Error {}
+
+function marketReferenceText(bytes: Uint8Array, key: string): string | undefined {
+  if (bytes.byteLength > MAX_MARKET_REFERENCE_BYTES) return undefined;
+  let content: string;
+  try { content = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return undefined; }
+  return /[\u0000-\u0008\u000e-\u001f]/u.test(content) ? undefined : redactPrivateText(content, key);
+}
+
+function redactLearningDiff(key: string, diff: string, candidate: string | undefined): string {
+  // Resource previews currently contain one whole-file hunk. Reuse the exact
+  // sanitized candidate, and parse the complete old side, never isolated lines.
+  const lines = diff.split("\n");
+  const counts = /^@@ -1,(\d+) \+1,(\d+) @@$/u.exec(lines[2] ?? "");
+  if (lines[0] !== `--- a/${key}` || lines[1] !== `+++ b/${key}` || counts === null || lines.at(-1) !== "") {
+    return redactPrivateText(diff);
+  }
+  const beforeCount = Number(counts[1]), afterCount = Number(counts[2]);
+  const before = lines.slice(3, 3 + beforeCount), after = lines.slice(3 + beforeCount, -1);
+  const splitLines = (text: string): string[] => {
+    if (text === "") return [];
+    const result = text.replaceAll("\r\n", "\n").split("\n");
+    if (result.at(-1) === "") result.pop();
+    return result;
+  };
+  const reviewed = splitLines(candidate ?? "");
+  if (before.length !== beforeCount || after.length !== afterCount || after.length !== reviewed.length
+    || before.some(line => !line.startsWith("-")) || after.some((line, index) => line !== `+${reviewed[index]}`)) {
+    return redactPrivateText(diff);
+  }
+  const oldText = before.map(line => line.slice(1)).join("\n") + (before.length === 0 ? "" : "\n");
+  const redacted = splitLines(redactPrivateText(oldText, key));
+  return [redactPrivateText(`--- a/${key}\n+++ b/${key}`), `@@ -1,${redacted.length} +1,${reviewed.length} @@`,
+    ...redacted.map(line => `-${line}`), ...reviewed.map(line => `+${line}`), ""].join("\n");
+}
+
+function redactPrivateText(value: string, key?: string): string {
+  // Secrets are removed before any code exemption. Unknown languages and code
+  // that cannot be parsed retain the ordinary, conservative path treatment.
   const text = redactSecrets(value);
+  const ranges = regularExpressionRanges(text, key).sort((left, right) => left.start - right.start);
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    chunks.push(redactPrivatePaths(text.slice(cursor, range.start)), text.slice(range.start, range.end));
+    cursor = range.end;
+  }
+  chunks.push(redactPrivatePaths(text.slice(cursor)));
+  return chunks.join("");
+}
+
+function regularExpressionRanges(text: string, key: string | undefined): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const language = (name: string) => /^(?:[cm]?[jt]s|[jt]sx|javascript|typescript)$/iu.test(name) ? name.toLowerCase() : undefined;
+  const collect = (source: string, syntax: string, offset: number) => {
+    let root: unknown;
+    try {
+      root = parseJavascript(source, {
+        sourceType: "unambiguous",
+        plugins: [...(/^(?:[cm]?ts|tsx|typescript)$/u.test(syntax) ? ["typescript" as const] : []),
+          ...(/^(?:jsx|tsx)$/u.test(syntax) ? ["jsx" as const] : [])]
+      });
+    } catch { return; }
+    const pending: unknown[] = [root];
+    while (pending.length > 0) {
+      const value = pending.pop();
+      if (Array.isArray(value)) { for (const child of value) pending.push(child); continue; }
+      if (value === null || typeof value !== "object") continue;
+      const node = value as Record<string, unknown>;
+      if (node["type"] === "RegExpLiteral" && typeof node["start"] === "number" && typeof node["end"] === "number") {
+        ranges.push({ start: offset + node["start"], end: offset + node["end"] });
+      } else for (const child of Object.values(node)) if (child !== null && typeof child === "object") pending.push(child);
+    }
+  };
+  const syntax = key === undefined ? undefined : /\.([cm]?[jt]s|[jt]sx)$/iu.exec(key)?.[1]?.toLowerCase();
+  if (syntax !== undefined) {
+    collect(text, syntax, 0);
+    return ranges;
+  }
+  // Explicit Markdown fences also carry language context in task evidence and
+  // SKILL.md. Do not interpret fences nested inside another (unknown) block.
+  let fence: { marker: string; syntax: string | undefined; start: number } | undefined;
+  for (const match of text.matchAll(/^ {0,3}(`{3,}|~{3,})([^\r\n]*)\r?(?:\n|$)/gmu)) {
+    const marker = match[1]!, info = match[2]!.trim();
+    if (fence === undefined) {
+      fence = { marker, syntax: language(info), start: match.index + match[0].length };
+    } else if (marker[0] === fence.marker[0] && marker.length >= fence.marker.length && info === "") {
+      if (fence.syntax !== undefined) collect(text.slice(fence.start, match.index), fence.syntax, fence.start);
+      fence = undefined;
+    }
+  }
+  return ranges;
+}
+
+function redactPrivatePaths(text: string): string {
   const urls: string[] = [];
-  const masked = text.replace(/\b(?:https?|ssh):\/\/[^\s"'<>|]+/giu, (url) => {
+  const masked = text.replace(/\b(?:https?|ssh|file):\/\/[^\s"'<>|`]+/giu, (url) => {
     try {
       const parsed = new URL(url);
-      urls.push(parsed.username || parsed.password ? "<url>" : `${parsed.origin}${parsed.pathname}`);
+      urls.push(parsed.protocol === "file:" ? "<path>" : parsed.username || parsed.password ? "<url>" : `${parsed.origin}${parsed.pathname}`);
     } catch {
       urls.push("<url>");
     }
     return `\0URL${urls.length - 1}\0`;
   });
-  return masked.replace(/[A-Za-z]:\\[^\s"'<>|]*/gu, "<path>")
-    .replace(/\\\\[^\s"'<>|]+/gu, "<path>")
-    .replace(/\/(?:[^\s"'<>|/]+\/)+[^\s"'<>|/]*/gu, "<path>")
-    .replace(/~\/[^\s"'<>|]*/gu, "<path>")
+  return masked.replace(/[A-Za-z]:[\\/][^\s"'<>|`]*/gu, "<path>")
+    .replace(/\\\\[^\s"'<>|`]+/gu, "<path>")
+    // A slash inside a relative reference or an escaped regex is not a host path.
+    .replace(/(^|[\s"'`=:,;(<>\[]|^[+-])\/{1,2}(?:[^\s"'<>|/\\`]+\/)+[^\s"'<>|/\\`]*/gmu, "$1<path>")
+    .replace(/~[\\/][^\s"'<>|`]*/gu, "<path>")
     .replace(/\0URL(\d+)\0/gu, (_match, index: string) => urls[Number(index)] ?? "<url>");
 }
 

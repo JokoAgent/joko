@@ -11952,6 +11952,7 @@ export class OperationalStore {
       params.push(query.emittedBefore);
     }
     if (query.includeTombstoned !== true) clauses.push("tombstone.event_id IS NULL");
+    if (query.messageCompleteOnly === true) clauses.push("json_extract(event.payload_json, '$.payload.type') = 'message_complete'");
     const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
     const limit = normalizeLimit(query.limit, 1000);
     const order = query.order === "desc" ? "DESC" : "ASC";
@@ -17897,13 +17898,12 @@ export class OperationalStore {
       throw new StoreError("Memory search query must contain 1 through 256 safe characters.");
     }
     const tokens = [...new Set(normalizedQuery.match(/[\p{L}\p{N}_-]+/gu) ?? [])];
-    if (tokens.length === 0) return [];
-    const match = tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR ");
+    const match = tokens.length === 0 ? undefined : tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(" OR ");
     const kindClause = options.kind === undefined ? "" : "AND entry.kind = ?";
-    const params: Array<string | number> = [match, normalizedTarget];
-    if (options.kind !== undefined) params.push(makerMemoryKind(options.kind));
-    params.push(normalizeLimit(options.limit, 10));
-    return (this.database.prepare(`
+    const scope: Array<string | number> = [normalizedTarget];
+    if (options.kind !== undefined) scope.push(makerMemoryKind(options.kind));
+    const limit = normalizeLimit(options.limit, 10);
+    const top = match === undefined ? [] : this.database.prepare(`
       SELECT
         entry.id,
         entry.target_id,
@@ -17917,7 +17917,33 @@ export class OperationalStore {
       WHERE maker_memory_fts MATCH ? AND entry.target_id = ? ${kindClause}
       ORDER BY score, entry.updated_at DESC, entry.id
       LIMIT ?
-    `).all(...params) as Row[]).map((row) => ({
+    `).all(match, ...scope, limit) as Row[];
+    const likeTerms = [...new Set([normalizedQuery, ...tokens.filter(token => tokens.length > 1
+      && Array.from(token).length < 3 && /[\p{L}\p{N}]/u.test(token))])];
+    const patterns = likeTerms.map(term => `%${term.replace(/[!%_]/gu, value => `!${value}`)}%`);
+    // Trigram MATCH cannot recall one/two-character terms. The exclusion is
+    // against all MATCH IDs, not just its limited page, so a full page still
+    // reserves a result for a genuinely substring-only hit.
+    const fallback = this.database.prepare(`
+      SELECT entry.id, entry.target_id, entry.kind, entry.title, entry.description, entry.body
+      FROM maker_memory_entries AS entry
+      WHERE entry.target_id = ? ${kindClause}
+        AND (${patterns.map(() => "(entry.title LIKE ? ESCAPE '!' OR entry.description LIKE ? ESCAPE '!' OR entry.body LIKE ? ESCAPE '!')").join(" OR ")})
+        ${match === undefined ? "" : "AND entry.id NOT IN (SELECT entry_id FROM maker_memory_fts WHERE maker_memory_fts MATCH ?)"}
+      ORDER BY entry.updated_at DESC, entry.id LIMIT ?
+    `).all(...scope, ...patterns.flatMap(pattern => [pattern, pattern, pattern]), ...(match === undefined ? [] : [match]), limit) as Row[];
+    const needles = likeTerms.map(term => term.toLowerCase());
+    for (const row of fallback) {
+      const field = [row["title"], row["description"], row["body"]].map(stringValue)
+        .find(value => needles.some(needle => value.toLowerCase().includes(needle))) ?? stringValue(row["title"]);
+      const characters = Array.from(field);
+      row["snippet"] = characters.length > 160 ? `${characters.slice(0, 160).join("")}…` : field;
+      row["score"] = Number.MAX_SAFE_INTEGER;
+    }
+    const rows = limit > 1 && top.length >= limit && fallback.length > 0
+      ? [...top.slice(0, limit - 1), fallback[0]!]
+      : [...top, ...fallback].slice(0, limit);
+    return rows.map((row) => ({
       id: stringValue(row["id"]),
       targetId: stringValue(row["target_id"]),
       kind: makerMemoryKind(row["kind"]),

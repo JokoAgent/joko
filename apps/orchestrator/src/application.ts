@@ -40,6 +40,7 @@ import {
 } from "@joko/code-host";
 import {
   HOST_COMPOSED_CAPABILITIES,
+  MEMORY_NATIVE_LIVE_LOCAL_OPTION,
   type AdapterContext,
   type BackendAdapter,
   type BackendAuthenticationState,
@@ -505,6 +506,10 @@ export interface OrchestratorApplication {
   readonly holdSubagentSmartRoutingDispatch: (backendId: string) => void;
   /** Apply the durable smart-routing preference through an idle process-generation replacement. */
   readonly refreshSubagentSmartRouting: (backendId: string) => Promise<void>;
+  /** Hold new work until the saved local memory configuration is adopted while idle. */
+  readonly holdNativeMemoryDispatch: (backendId: string) => void;
+  readonly refreshNativeMemory: (backendId: string) => Promise<boolean>;
+  readonly nativeMemoryRestartPending: (backendId: string) => boolean;
   /** Optional only so isolated test hosts can deliberately advertise no provisioning channel. */
   readonly credentials?: CredentialManager;
   readonly providers?: ProviderCatalogManager;
@@ -774,7 +779,7 @@ export async function createOrchestratorApplication(
       const adapter = backendInstances?.adapter(backendId);
       if (!(adapter instanceof CodexBackendAdapter)) return undefined;
       const runtime = adapter.subagentSmartRoutingState();
-      const deferred = deferredBackendRestarts?.state(backendId);
+      const deferred = deferredBackendRestarts?.state(backendId, "smart_routing");
       return {
         applied: runtime.applied,
         restartPending: deferred?.pending === true,
@@ -1923,6 +1928,14 @@ export async function createOrchestratorApplication(
   const partnerRuntimePrompt = new PartnerRuntimePromptResolver(partnerStore, store, partnerMemoryPreferences,
     (partnerId, assertCurrent) => partnerImportStorage.environment.read(partnerId, assertCurrent), makerMemory,
     (session, partnerId) => partnerGroupRuntime?.validTarget(session, partnerId) === true || partnerNetworkLanes?.validTarget(session, partnerId) === true);
+  const ordinaryMemoryPrompt = (target: Pick<TargetDescriptor, "id" | "backendId" | "remoteWorkspace">,
+    base: string | undefined): string | undefined => {
+    const registered = store.getTarget(target.id).descriptor;
+    if (!makerMemory.available || !registered.trusted || target.remoteWorkspace !== undefined || registered.remoteWorkspace !== undefined
+      || target.backendId !== codexBackendId && target.backendId !== claudeCodeBackendId) return base;
+    const memoryPrompt = makerMemory.runtimePrompt(target.id);
+    return memoryPrompt === undefined ? base : [base, memoryPrompt].filter(value => value !== undefined).join("\n\n");
+  };
   let partnerSessionTasks: PartnerSessionTaskManager | undefined;
   let partnerTodos: PartnerTodoManager | undefined;
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
@@ -2004,10 +2017,22 @@ export async function createOrchestratorApplication(
     },
     sideChatSourceAllowed: sessionId => partnerStore.getSessionLink(sessionId) === undefined,
     decorateRuntimePrompt: answerDeliveryPrompt,
+    resolveServiceCreationPrompt: input => {
+      const existing = store.findSession(input.sessionId)?.descriptor;
+      if (partnerStore.getSessionLink(input.sessionId) !== undefined || existing !== undefined
+        && (store.sessionCreationServiceKind(existing.id) !== undefined || store.findSessionRuntimePolicy(existing.id) !== undefined)) {
+        return input.appendSystemPrompt;
+      }
+      return ordinaryMemoryPrompt(input.target, existing === undefined ? input.appendSystemPrompt : existing.appendSystemPrompt);
+    },
     resolveServiceRuntimePrompt: async (session, assertCurrent) => {
       const resolved = await partnerRuntimePrompt.resolve(session, assertCurrent);
       assertCurrent();
-      return resolved ?? session.appendSystemPrompt;
+      if (resolved !== undefined || partnerStore.getSessionLink(session.id) !== undefined
+        || store.sessionCreationServiceKind(session.id) !== undefined || store.findSessionRuntimePolicy(session.id) !== undefined) {
+        return resolved ?? session.appendSystemPrompt;
+      }
+      return ordinaryMemoryPrompt({ id: session.targetId, backendId: session.backendId, remoteWorkspace: session.remoteWorkspace }, session.appendSystemPrompt);
     },
     resolvePartnerReplyQuote: (sessionId, quote) => {
       const session = store.getSession(sessionId).descriptor, link = partnerStore.getSessionLink(sessionId);
@@ -2201,6 +2226,7 @@ export async function createOrchestratorApplication(
     store,
     sessions: sessionHost,
     resources: piResources,
+    artifacts,
     mutations: skillMutations,
     market: skillMarket,
     rootDirectory: join(config.dataDirectory, "skill-learning"),
@@ -2498,16 +2524,41 @@ export async function createOrchestratorApplication(
       }
     });
   };
+  const initializeNativeMemory = async (backendId: string): Promise<void> => {
+    const descriptor = store.getBackend(backendId).descriptor;
+    if (descriptor.capabilities.get("memory.native")?.supported !== true
+      || !descriptor.capabilities.get("memory.native")?.options?.includes(MEMORY_NATIVE_LIVE_LOCAL_OPTION)) return;
+    await sessionHost.invokeBackendAdapter(backendId, async adapter => {
+      const applied = await adapter.reconcileNativeMemory?.();
+      // An inactive process has no loaded thread to retire. Its next provision
+      // applies the durable preference before creating or resuming any thread.
+      if (applied === "next_session" && adapter instanceof CodexBackendAdapter && !adapter.nativeMemoryHasPreparedThreads()) return;
+      if (applied !== "immediate") throw new Error("The local Backend memory configuration is awaiting replacement.");
+      const status = await adapter.readNativeMemoryStatus?.();
+      if (status?.enabled !== makerMemory.nativeEnabledForBackend(backendId)) {
+        throw new Error("The local Backend did not confirm the saved memory configuration.");
+      }
+    });
+  };
   deferredBackendRestarts = new DeferredBackendRestartCoordinator({
-    restart: restartBackend,
+    restart: async backendId => {
+      const adapter = backendInstances.adapter(backendId);
+      if (!deferredBackendRestarts!.state(backendId, "smart_routing").pending
+        && adapter instanceof CodexBackendAdapter && !adapter.nativeMemoryHasPreparedThreads()) {
+        await initializeNativeMemory(backendId);
+        if (backendInstances.adapter(backendId) === adapter && !adapter.nativeMemoryHasPreparedThreads()) return;
+      }
+      await restartBackend(backendId);
+      await initializeNativeMemory(backendId);
+    },
     canRestart: (backendId) => sessionHost.canReplaceBackendInstance(backendId),
     wakeQueues: (backendId) => sessionHost.wakeBackendQueues(backendId)
   });
   const ensureSubagentSmartRoutingReplacement = async (backendId: string): Promise<void> => {
-    if (deferredBackendRestarts!.state(backendId).pending) {
+    if (deferredBackendRestarts!.state(backendId, "smart_routing").pending) {
       await deferredBackendRestarts!.apply(backendId);
     } else {
-      await deferredBackendRestarts!.schedule(backendId);
+      await deferredBackendRestarts!.schedule(backendId, "smart_routing");
     }
   };
   const applyDesiredSubagentSmartRouting = async (backendId: string): Promise<boolean> => {
@@ -2530,9 +2581,9 @@ export async function createOrchestratorApplication(
     if (current.desired === desired
       && current.applied === expectedApplied
       && current.runtimeRevision === inspected.revision) {
-      const deferred = deferredBackendRestarts!.state(backendId);
+      const deferred = deferredBackendRestarts!.state(backendId, "smart_routing");
       if (!deferred.pending) return false;
-      if (!deferred.applying) deferredBackendRestarts!.cancelIfWaiting(backendId);
+      if (!deferred.applying) deferredBackendRestarts!.cancelIfWaiting(backendId, "smart_routing");
       return true;
     }
     await ensureSubagentSmartRoutingReplacement(backendId);
@@ -2581,6 +2632,33 @@ export async function createOrchestratorApplication(
       } catch { /* The Store may already be closed. */ }
     }
   };
+  const refreshNativeMemory = async (backendId: string): Promise<boolean> => {
+    // afterCommit installed the reason synchronously. Its scheduled idle
+    // application may already have completed while the other Memory owners
+    // reconciled; do not manufacture a second replacement in that case.
+    await deferredBackendRestarts!.apply(backendId);
+    return deferredBackendRestarts!.state(backendId, "native_memory").pending;
+  };
+  // Provisioning restores the durable preference before any recovered task can
+  // create a native thread. Status queries remain observations only.
+  for (const { descriptor } of store.listBackends()) {
+    if (descriptor.capabilities.get("memory.native")?.supported !== true
+      || !descriptor.capabilities.get("memory.native")?.options?.includes(MEMORY_NATIVE_LIVE_LOCAL_OPTION)) continue;
+    try { await initializeNativeMemory(descriptor.id); }
+    catch {
+      // A cold candidate has not admitted a native thread yet. Its ordinary
+      // provision path retries the preference before starting one, so a failed
+      // startup probe must not fence the whole Backend indefinitely.
+      const adapter = backendInstances.adapter(descriptor.id);
+      if (adapter instanceof CodexBackendAdapter && adapter.nativeMemoryHasPreparedThreads()) {
+        deferredBackendRestarts.request(descriptor.id, "native_memory");
+      }
+      store.appendDiagnostic({ severity: "warning", component: "backend-instance",
+        code: "NATIVE_MEMORY_INITIALIZATION_DEFERRED",
+        message: "The local Backend memory preference will be confirmed when its next task is provisioned.",
+        details: { backendId: descriptor.id } });
+    }
+  }
   const historyMaintenance = startupHistoryMaintenance = new HistoryMaintenance({
     store,
     activeSessions: {
@@ -3579,8 +3657,11 @@ export async function createOrchestratorApplication(
     restartBackend,
     refreshBackendDescriptor,
     projectBackendProviderAuthentication,
-    holdSubagentSmartRoutingDispatch: (backendId) => deferredBackendRestarts!.request(backendId),
+    holdSubagentSmartRoutingDispatch: (backendId) => deferredBackendRestarts!.request(backendId, "smart_routing"),
     refreshSubagentSmartRouting,
+    holdNativeMemoryDispatch: backendId => deferredBackendRestarts!.request(backendId, "native_memory"),
+    refreshNativeMemory,
+    nativeMemoryRestartPending: backendId => deferredBackendRestarts!.state(backendId, "native_memory").pending,
     credentials,
     providers,
     managedModelRuntime: managedModelRuntimeSystem.registry,

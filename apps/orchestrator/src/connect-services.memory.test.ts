@@ -21,6 +21,7 @@ import { createConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { CredentialManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
+import { DeferredBackendRestartCoordinator } from "./deferred-backend-restart.js";
 import { MAKER_MEMORY_PROVIDER_ID, MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
 import { McpRouter } from "./mcp-router.js";
 import { SessionHost } from "./session-host.js";
@@ -798,7 +799,7 @@ describe("Connect Maker Memory owner and reset scopes", () => {
     }
   });
 
-  it("keeps a rejected live native-memory update pending through a failed status refresh and adopts a confirmed retry", async () => {
+  it("keeps a rejected live native-memory update pending through a failed status refresh and adopts an explicit confirmed retry", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-native-memory-application-"));
     const store = new OperationalStore(join(root, "orchestrator.db"));
     const memory = new MakerMemoryController({ store });
@@ -817,7 +818,10 @@ describe("Connect Maker Memory owner and reset scopes", () => {
         effectiveEnabled = memory.nativeEnabledForBackend(backendId);
       };
       const adapter = { id: backendId, reconcileNativeMemory: async () => { apply(); return "immediate" as const; },
-        readNativeMemoryStatus: async () => { apply(); return { enabled: effectiveEnabled }; } } as unknown as BackendAdapter;
+        readNativeMemoryStatus: async () => {
+          if (rejectUpdate) throw new Error("private status failure");
+          return { enabled: effectiveEnabled };
+        } } as unknown as BackendAdapter;
       const services = createConnectServices(stubApplication({ store, makerMemory: memory, adapters: [adapter],
         connections: { authenticate: () => connection }, sessionHost: immediateHost(store, adapter) }));
       const getSettings = services.settings.getSettings as unknown as (
@@ -838,8 +842,74 @@ describe("Connect Maker Memory owner and reset scopes", () => {
       expect(diagnostics).toContainEqual(expect.objectContaining({ code: "NATIVE_MEMORY_RECONCILIATION_FAILED", details: { backendIds: [backendId] } }));
       expect(diagnostics.map(item => item.message).join("\n")).not.toContain("private runtime failure");
       rejectUpdate = false;
+      await adapter.reconcileNativeMemory!();
       expect(await row()).toMatchObject({ enabled: true, reason: "" });
     } finally {
+      memory.dispose(); store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("saves shared memory while native work finishes and keeps pending status through a failed idle replacement", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-memory-idle-application-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const memory = new MakerMemoryController({ store });
+    const backendId = "codex";
+    const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+    store.upsertBackend({ id: backendId, displayName: "Codex", adapterKind: "codex", version: "test", instanceGeneration: 1,
+      health: "healthy", installationState: "installed", authenticationState: "not_required",
+      capabilities: new Map([["memory.native", { key: "memory.native", supported: true, options: [MEMORY_NATIVE_LIVE_LOCAL_OPTION] }]]),
+      models: [], tools: [], diagnostics: [] });
+    await memory.update({ makerEnabled: false, backendId, backendEnabled: true });
+    let effectiveEnabled = true;
+    let idle = false;
+    let failReplacement = true;
+    const readNativeMemoryStatus = vi.fn(async () => ({ enabled: effectiveEnabled }));
+    const reconcileNativeMemory = vi.fn(async () => "immediate" as const);
+    const adapter = { id: backendId, readNativeMemoryStatus, reconcileNativeMemory, dispose: async () => undefined } as unknown as BackendAdapter;
+    const host = new SessionHost(store, {} as never, [adapter]);
+    const restart = vi.fn(async () => {
+      if (failReplacement) throw new Error("replacement unavailable");
+      effectiveEnabled = memory.nativeEnabledForBackend(backendId);
+    });
+    const wakeQueues = vi.fn();
+    const coordinator = new DeferredBackendRestartCoordinator({ restart, canRestart: () => idle, wakeQueues, retryDelayMs: 60_000 });
+    const hold = vi.fn((id: string) => {
+      expect(memory.settings().makerEnabled).toBe(true);
+      expect(store.getOperation("enable-shared-memory-while-busy").status).toBe("completed");
+      coordinator.request(id, "native_memory");
+    });
+    const services = createConnectServices(stubApplication({ store, makerMemory: memory, adapters: [adapter], sessionHost: host,
+      connections: { authenticate: () => connection }, holdNativeMemoryDispatch: hold,
+      refreshNativeMemory: async (id: string) => { await coordinator.apply(id); return coordinator.state(id, "native_memory").pending; },
+      nativeMemoryRestartPending: (id: string) => coordinator.state(id, "native_memory").pending }));
+    const getSettings = services.settings.getSettings as unknown as (request: unknown, context: unknown) => Promise<contract.GetSettingsResponse>;
+    const row = async () => (await getSettings({}, context())).settings?.memory?.backends[0];
+    const input = { operationId: "enable-shared-memory-while-busy", connectionId: connection.id, makerEnabled: true };
+    try {
+      expect(await row()).toMatchObject({ enabled: true, reason: "" });
+      await submitMemoryUpdate(services.operation.submitOperation, input);
+      expect(coordinator.blocksDispatch(backendId)).toBe(true);
+      expect(restart).not.toHaveBeenCalled();
+      expect(reconcileNativeMemory).not.toHaveBeenCalled();
+      expect(await row()).toMatchObject({ enabled: true, reason: "Live native memory confirmation is pending." });
+      expect(readNativeMemoryStatus).toHaveBeenCalledOnce();
+      await submitMemoryUpdate(services.operation.submitOperation, input);
+      expect(hold).toHaveBeenCalledOnce();
+      idle = true;
+      await coordinator.apply(backendId);
+      expect(await row()).toMatchObject({ enabled: true, reason: "Live native memory confirmation is pending." });
+      expect(wakeQueues).not.toHaveBeenCalled();
+      failReplacement = false;
+      coordinator.onBackendMayBeIdle(backendId);
+      await vi.waitFor(() => expect(coordinator.state(backendId).pending).toBe(false));
+      expect(await row()).toMatchObject({ enabled: false, reason: "" });
+      expect(restart).toHaveBeenCalledTimes(2);
+      expect(wakeQueues).toHaveBeenCalledOnce();
+      expect(readNativeMemoryStatus).toHaveBeenCalledTimes(2);
+    } finally {
+      coordinator.dispose();
+      await host.dispose();
       memory.dispose(); store.close();
       await rm(root, { recursive: true, force: true });
     }

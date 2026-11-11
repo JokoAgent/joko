@@ -77,7 +77,8 @@ export function seedSkillResourceUsage(
 export async function writeSkillMarketSource(
   fixture: Pick<SkillMarketSystemFixture, "rootDirectory">,
   version: string,
-  body: string
+  body: string,
+  extraFiles: readonly { readonly key: string; readonly content: Buffer }[] = []
 ): Promise<string> {
   const sourceRoot = join(fixture.rootDirectory, "skill-market-source");
   const manifestRoot = join(sourceRoot, ".agents", "skills");
@@ -93,7 +94,8 @@ export async function writeSkillMarketSource(
   ].join("\n");
   const archive = makeTgz([
     { path: "package/SKILL.md", content: Buffer.from(skillDocument, "utf8") },
-    { path: "package/references/guide.md", content: Buffer.from(`Guide for ${version}\n`, "utf8") }
+    { path: "package/references/guide.md", content: Buffer.from(`Guide for ${version}\n`, "utf8") },
+    ...extraFiles.map(file => ({ path: `package/${file.key}`, content: file.content }))
   ]);
   const archiveName = `${MARKET_SLUG}.tgz`;
   await writeFile(join(sourceRoot, archiveName), archive);

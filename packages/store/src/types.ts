@@ -1467,6 +1467,8 @@ export interface EventQuery {
   readonly includeTombstoned?: boolean;
   /** Apply the current native binding and active-leaf projection before paging. */
   readonly activeNativeTimeline?: boolean;
+  /** Select complete messages before applying the page limit. */
+  readonly messageCompleteOnly?: boolean;
 }
 
 export interface StoredSubagentRunProjection {

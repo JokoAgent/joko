@@ -6,6 +6,7 @@ export interface DeferredBackendRestartState {
 
 interface PendingRestart {
   token: number;
+  readonly reasons: Set<string>;
   applying: boolean;
   lastError: string;
   timer?: ReturnType<typeof setTimeout>;
@@ -40,8 +41,9 @@ export class DeferredBackendRestartCoordinator {
     }
   }
 
-  state(backendId: string): DeferredBackendRestartState {
-    const state = this.#pending.get(backendId);
+  state(backendId: string, reason?: string): DeferredBackendRestartState {
+    const pending = this.#pending.get(backendId);
+    const state = reason === undefined || pending?.reasons.has(reason) ? pending : undefined;
     return {
       pending: state !== undefined,
       applying: state?.applying === true,
@@ -54,16 +56,18 @@ export class DeferredBackendRestartCoordinator {
   }
 
   /** Install the queue hold synchronously after durable desired-state commit. */
-  request(backendId: string): void {
+  request(backendId: string, reason = "default"): void {
     if (this.#disposed) throw new Error("Deferred Backend restart coordinator is closed.");
     if (backendId.trim() === "" || backendId.length > 128) throw new TypeError("Backend ID is invalid.");
+    if (reason.trim() === "" || reason.length > 128) throw new TypeError("Backend restart reason is invalid.");
     const current = this.#pending.get(backendId);
     if (current === undefined) {
-      const state = { token: 1, applying: false, lastError: "" } satisfies PendingRestart;
+      const state = { token: 1, reasons: new Set([reason]), applying: false, lastError: "" } satisfies PendingRestart;
       this.#pending.set(backendId, state);
       this.#scheduleRetry(backendId, state, 0);
     } else {
       current.token += 1;
+      current.reasons.add(reason);
       current.lastError = "";
       if (current.timer !== undefined) {
         clearTimeout(current.timer);
@@ -78,17 +82,18 @@ export class DeferredBackendRestartCoordinator {
   }
 
   /** Cancel only a waiting hold; an in-flight generation must finish its token fence. */
-  cancelIfWaiting(backendId: string): boolean {
+  cancelIfWaiting(backendId: string, reason = "default"): boolean {
     const state = this.#pending.get(backendId);
-    if (state === undefined || state.applying) return false;
+    if (state === undefined || state.applying || !state.reasons.delete(reason)) return false;
+    if (state.reasons.size > 0) return true;
     if (state.timer !== undefined) clearTimeout(state.timer);
     this.#pending.delete(backendId);
     this.#wakeQueues(backendId);
     return true;
   }
 
-  async schedule(backendId: string): Promise<void> {
-    this.request(backendId);
+  async schedule(backendId: string, reason = "default"): Promise<void> {
+    this.request(backendId, reason);
     await this.#tryApply(backendId);
   }
 
