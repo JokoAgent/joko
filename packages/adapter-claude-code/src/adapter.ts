@@ -639,6 +639,7 @@ interface NativeRuntime {
   permissionMode: PermissionMode;
   planMode: boolean;
   additionalDirectories: readonly ApprovedDirectory[];
+  pendingAdditionalDirectories?: readonly ApprovedDirectory[];
   lastUsage?: UsageSnapshot;
 }
 
@@ -1862,6 +1863,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (input.disposition === "steer") return this.#steer(input, context, persistFence);
     if (this.#workingContextRecoveries.has(context.sessionId)) await this.refreshModelWorkingContext(context);
     let runtime = this.#requireIdleRuntime(context);
+    if (runtime.pendingAdditionalDirectories !== undefined) {
+      await this.setExtraDirectories(context.extraDirectories ?? runtime.pendingAdditionalDirectories, context);
+      runtime = this.#requireIdleRuntime(context);
+    }
     assertRemotePromptSupported(input, runtime);
     if (runtime.managedRoute !== undefined && (context.modelSelection?.providerId !== runtime.managedRoute.providerId
       || context.modelSelection.modelId !== runtime.managedRoute.model.modelId)) throw managedRouteUnavailable();
@@ -3423,16 +3428,35 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     directories: readonly ApprovedDirectory[],
     context: AdapterContext
   ): Promise<void> {
-    const runtime = this.#requireIdleRuntime(context);
+    const runtime = this.#requireRuntime(context);
     this.#assertStandardRuntime(runtime, "change additional directories");
     const validated = await this.#validateExtraDirectories(directories, runtime.target);
+    this.#assertCurrent(runtime, context, context.binding);
+    context.signal.throwIfAborted();
+    context.assertExtraDirectoriesCurrent?.(validated);
+    try {
+      this.#requireIdleRuntime(context);
+    } catch (error) {
+      // An addition changes the next input's scope. Keep the accepted turn and
+      // its installed permissions intact; removals still require immediate
+      // retirement when the native control cannot be applied safely.
+      if (!(error instanceof JokoError) || error.publicError.code !== "SESSION_BUSY"
+        || !runtime.additionalDirectories.every(previous => validated.some(next =>
+          next.id === previous.id && next.access === previous.access
+          && canonicalPathKey(next.path) === canonicalPathKey(previous.path)))) throw error;
+      context.assertExtraDirectoriesCurrent?.(runtime.additionalDirectories);
+      runtime.pendingAdditionalDirectories = validated;
+      return;
+    }
     const paths = validated.map((directory) => directory.path);
+    const pending = runtime.pendingAdditionalDirectories;
     await this.#runIdleControl(runtime, context, "extra_directories", async (acknowledge) => {
       context.assertExtraDirectoriesCurrent?.(validated);
       await runtime.query.applyFlagSettings({ permissions: { additionalDirectories: paths } });
       acknowledge();
       runtime.additionalDirectories = validated;
       context.assertExtraDirectoriesCurrent?.(validated);
+      if (runtime.pendingAdditionalDirectories === pending) runtime.pendingAdditionalDirectories = undefined;
     });
   }
 
