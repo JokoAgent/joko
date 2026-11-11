@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/
 import { isAbsolute, join, resolve } from "node:path";
 import { setImmediate } from "node:timers/promises";
 
+import { parse as parseJavascript } from "@babel/parser";
 import { redactSecrets, type FileInput, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type ConnectionRecord, type OperationalStore } from "@joko/store";
 
@@ -529,7 +530,7 @@ export class SkillLearningManager {
       assertSource();
       const mainBytes = await readFile(join(inspection.canonicalPath, "SKILL.md"));
       assertSource();
-      const main = mainBytes.byteLength === mainEntry.size ? marketReferenceText(mainBytes) : undefined;
+      const main = mainBytes.byteLength === mainEntry.size ? marketReferenceText(mainBytes, mainEntry.key) : undefined;
       if (main === undefined) throw new SkillLearningEvidenceError("The catalog SKILL.md could not be read as complete UTF-8 text.");
       const files: FileInput[] = [];
       const attachments: string[] = [];
@@ -551,7 +552,7 @@ export class SkillLearningManager {
         }
         const raw = await readFile(join(inspection.canonicalPath, ...file.key.split("/"))).catch(() => undefined);
         assertSource();
-        const content = raw !== undefined && raw.byteLength === file.size ? marketReferenceText(raw) : undefined;
+        const content = raw !== undefined && raw.byteLength === file.size ? marketReferenceText(raw, file.key) : undefined;
         if (content === undefined) {
           omit(key, "complete UTF-8 text is unavailable");
           continue;
@@ -873,7 +874,7 @@ function parseCandidate(output: string): ParsedCandidate {
     if (Buffer.byteLength(record["content"], "utf8") > MAX_FILE_BYTES) {
       throw new Error("Learning file exceeds the byte budget.");
     }
-    const content = redactPrivateText(record["content"]);
+    const content = redactPrivateText(record["content"], key);
     const bytes = Buffer.byteLength(content, "utf8");
     if (bytes > MAX_FILE_BYTES) throw new Error("Learning file exceeds the byte budget.");
     total += bytes;
@@ -913,7 +914,9 @@ function proposalFromPreview(candidate: ParsedCandidate, preview: PiLearnedSkill
     ...(preview.diffReason === undefined ? {} : { diffReason: preview.diffReason }),
     changes: preview.changes.map((change) => ({
       ...change,
-      ...(change.unifiedDiff === undefined ? {} : { unifiedDiff: redactPrivateText(change.unifiedDiff) })
+      ...(change.unifiedDiff === undefined ? {} : {
+        unifiedDiff: redactLearningDiff(change.key, change.unifiedDiff, candidate.files.find(file => file.key === change.key)?.content)
+      })
     })),
     diffTruncated: preview.diffTruncated
   };
@@ -964,16 +967,100 @@ function safeEvidence(value: string, maximum: number): string {
 
 class SkillLearningEvidenceError extends Error {}
 
-function marketReferenceText(bytes: Uint8Array): string | undefined {
+function marketReferenceText(bytes: Uint8Array, key: string): string | undefined {
   if (bytes.byteLength > MAX_MARKET_REFERENCE_BYTES) return undefined;
   let content: string;
   try { content = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { return undefined; }
-  return /[\u0000-\u0008\u000e-\u001f]/u.test(content) ? undefined : redactPrivateText(content);
+  return /[\u0000-\u0008\u000e-\u001f]/u.test(content) ? undefined : redactPrivateText(content, key);
 }
 
-function redactPrivateText(value: string): string {
+function redactLearningDiff(key: string, diff: string, candidate: string | undefined): string {
+  // Resource previews currently contain one whole-file hunk. Reuse the exact
+  // sanitized candidate, and parse the complete old side, never isolated lines.
+  const lines = diff.split("\n");
+  const counts = /^@@ -1,(\d+) \+1,(\d+) @@$/u.exec(lines[2] ?? "");
+  if (lines[0] !== `--- a/${key}` || lines[1] !== `+++ b/${key}` || counts === null || lines.at(-1) !== "") {
+    return redactPrivateText(diff);
+  }
+  const beforeCount = Number(counts[1]), afterCount = Number(counts[2]);
+  const before = lines.slice(3, 3 + beforeCount), after = lines.slice(3 + beforeCount, -1);
+  const splitLines = (text: string): string[] => {
+    if (text === "") return [];
+    const result = text.replaceAll("\r\n", "\n").split("\n");
+    if (result.at(-1) === "") result.pop();
+    return result;
+  };
+  const reviewed = splitLines(candidate ?? "");
+  if (before.length !== beforeCount || after.length !== afterCount || after.length !== reviewed.length
+    || before.some(line => !line.startsWith("-")) || after.some((line, index) => line !== `+${reviewed[index]}`)) {
+    return redactPrivateText(diff);
+  }
+  const oldText = before.map(line => line.slice(1)).join("\n") + (before.length === 0 ? "" : "\n");
+  const redacted = splitLines(redactPrivateText(oldText, key));
+  return [redactPrivateText(`--- a/${key}\n+++ b/${key}`), `@@ -1,${redacted.length} +1,${reviewed.length} @@`,
+    ...redacted.map(line => `-${line}`), ...reviewed.map(line => `+${line}`), ""].join("\n");
+}
+
+function redactPrivateText(value: string, key?: string): string {
+  // Secrets are removed before any code exemption. Unknown languages and code
+  // that cannot be parsed retain the ordinary, conservative path treatment.
   const text = redactSecrets(value);
+  const ranges = regularExpressionRanges(text, key).sort((left, right) => left.start - right.start);
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (const range of ranges) {
+    chunks.push(redactPrivatePaths(text.slice(cursor, range.start)), text.slice(range.start, range.end));
+    cursor = range.end;
+  }
+  chunks.push(redactPrivatePaths(text.slice(cursor)));
+  return chunks.join("");
+}
+
+function regularExpressionRanges(text: string, key: string | undefined): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const language = (name: string) => /^(?:[cm]?[jt]s|[jt]sx|javascript|typescript)$/iu.test(name) ? name.toLowerCase() : undefined;
+  const collect = (source: string, syntax: string, offset: number) => {
+    let root: unknown;
+    try {
+      root = parseJavascript(source, {
+        sourceType: "unambiguous",
+        plugins: [...(/^(?:[cm]?ts|tsx|typescript)$/u.test(syntax) ? ["typescript" as const] : []),
+          ...(/^(?:jsx|tsx)$/u.test(syntax) ? ["jsx" as const] : [])]
+      });
+    } catch { return; }
+    const pending: unknown[] = [root];
+    while (pending.length > 0) {
+      const value = pending.pop();
+      if (Array.isArray(value)) { for (const child of value) pending.push(child); continue; }
+      if (value === null || typeof value !== "object") continue;
+      const node = value as Record<string, unknown>;
+      if (node["type"] === "RegExpLiteral" && typeof node["start"] === "number" && typeof node["end"] === "number") {
+        ranges.push({ start: offset + node["start"], end: offset + node["end"] });
+      } else for (const child of Object.values(node)) if (child !== null && typeof child === "object") pending.push(child);
+    }
+  };
+  const syntax = key === undefined ? undefined : /\.([cm]?[jt]s|[jt]sx)$/iu.exec(key)?.[1]?.toLowerCase();
+  if (syntax !== undefined) {
+    collect(text, syntax, 0);
+    return ranges;
+  }
+  // Explicit Markdown fences also carry language context in task evidence and
+  // SKILL.md. Do not interpret fences nested inside another (unknown) block.
+  let fence: { marker: string; syntax: string | undefined; start: number } | undefined;
+  for (const match of text.matchAll(/^ {0,3}(`{3,}|~{3,})([^\r\n]*)\r?(?:\n|$)/gmu)) {
+    const marker = match[1]!, info = match[2]!.trim();
+    if (fence === undefined) {
+      fence = { marker, syntax: language(info), start: match.index + match[0].length };
+    } else if (marker[0] === fence.marker[0] && marker.length >= fence.marker.length && info === "") {
+      if (fence.syntax !== undefined) collect(text.slice(fence.start, match.index), fence.syntax, fence.start);
+      fence = undefined;
+    }
+  }
+  return ranges;
+}
+
+function redactPrivatePaths(text: string): string {
   const urls: string[] = [];
   const masked = text.replace(/\b(?:https?|ssh|file):\/\/[^\s"'<>|`]+/giu, (url) => {
     try {
