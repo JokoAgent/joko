@@ -5,9 +5,12 @@ import { type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import {
   CompactionState,
+  GetSessionStatisticsRequestSchema,
+  ListRuntimeCommandsRequestSchema,
+  ListSessionResourcesRequestSchema,
   MessageRole,
   OperationState,
   RunState,
@@ -15,7 +18,7 @@ import {
   SessionSnapshotScopeSchema,
   SnapshotScopeSchema
 } from "@joko/contracts";
-import { _electron, type ElectronApplication, type Page } from "playwright-core";
+import { _electron, type ElectronApplication, type Page, type Request } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
@@ -305,6 +308,13 @@ describe("packaged Desktop Pi compaction", () => {
 
     const page = await launchConnectedDesktop(fixture, "Packaged Pi Desktop");
     const errors = observePageErrors(page);
+    const conflicts: string[] = [];
+    page.on("response", (response) => {
+      if (response.status() !== 409 || conflicts.length >= 16) return;
+      const { pathname } = new URL(response.url());
+      const endpoint = /^\/joko\.v1\.[A-Za-z0-9]+Service\/[A-Za-z0-9]+$/u.test(pathname) ? pathname : "other";
+      conflicts.push(`${response.request().method()} ${endpoint}`);
+    });
     const route = async (sessionId: string) => {
       await page.evaluate((id) => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, sessionId);
       await page.locator(`.session-pane [data-timeline-session-id='${sessionId}']`)
@@ -325,16 +335,24 @@ describe("packaged Desktop Pi compaction", () => {
 
     const confirmCompact = async (sessionId = compactSessionId) => {
       const pane = page.locator(`.session-pane[data-input-session-id='${sessionId}']`);
-      const witness = await page.evaluateHandle(() => {
-        const events: Array<{ type: string; sessionId?: string; generation?: string; target?: string; className?: string | null; button?: string | null; pressTargetStillMounted?: boolean }> = [];
+      const control = pane.getByRole("button", { name: "Click to compact context" });
+      const witness = await control.evaluateHandle((button) => {
+        const bounds = (element: Element | null): number[] | undefined => {
+          if (!element?.isConnected) return undefined;
+          const { x, y, width, height } = element.getBoundingClientRect();
+          return [x, y, width, height];
+        };
+        const events: unknown[] = [];
         let pressTarget: Element | undefined;
         const capture = (event: Event) => {
-          if (events.length >= 12) return;
+          if (events.length >= 12 || !(event instanceof MouseEvent)) return;
           const target = event.target instanceof Element ? event.target : undefined;
           if (event.type === "pointerdown") pressTarget = target;
           const owner = target?.closest<HTMLElement>(".session-pane");
           events.push({ type: event.type, target: target?.tagName, className: target?.getAttribute("class"),
-            button: target?.closest("button")?.getAttribute("aria-label"), pressTargetStillMounted: pressTarget?.isConnected,
+            button: target?.closest("button")?.getAttribute("aria-label"), hitOriginalButton: event.composedPath().includes(button),
+            point: [event.clientX, event.clientY], buttonBounds: bounds(button), statusbarBounds: bounds(button.closest(".composer-statusbar")),
+            pressTargetStillMounted: pressTarget?.isConnected,
             sessionId: owner?.dataset.inputSessionId, generation: owner?.dataset.inputSessionGeneration });
         };
         const types = ["pointerdown", "pointerup", "click"];
@@ -342,7 +360,7 @@ describe("packaged Desktop Pi compaction", () => {
         return { events, stop: () => { for (const type of types) document.removeEventListener(type, capture, true); } };
       });
       try {
-        await pane.getByRole("button", { name: "Click to compact context" }).click();
+        await control.click();
         await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
       } catch (error) {
         const [pointer, view, owner] = await Promise.all([
@@ -354,7 +372,7 @@ describe("packaged Desktop Pi compaction", () => {
           manager.clients.session.getSession({ sessionId }).then(result => ({ state: result.session?.state,
             generation: result.session?.nativeBinding?.runtimeGeneration.toString() })).catch(() => undefined)
         ]);
-        throw new Error(`Packaged compact confirmation did not open or accept: ${JSON.stringify({ sessionId, owner, view, pointer, errors: errors.slice(-6) })}`, { cause: error });
+        throw new Error(`Packaged compact confirmation did not open or accept: ${JSON.stringify({ sessionId, owner, view, pointer, conflicts, errors: errors.slice(-6) })}`, { cause: error });
       } finally {
         await witness.evaluate(value => value.stop()).catch(() => undefined);
         await witness.dispose().catch(() => undefined);
@@ -683,9 +701,13 @@ describe("packaged Desktop Pi compaction", () => {
     await page.evaluate((id) => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, sessionId);
     await page.getByText("Context compacted", { exact: true }).first()
       .waitFor({ state: "visible", timeout: 30_000 });
-    await waitFor(() => managedClients.session.getSession({ sessionId }),
+    const beforeExit = await waitFor(() => managedClients.session.getSession({ sessionId }),
       (response) => response.session?.state === SessionState.IDLE,
       "managed Desktop Pi task idle before complete exit", 30_000);
+    const originalBinding = beforeExit.session?.nativeBinding;
+    if (!originalBinding?.opaqueReference || originalBinding.runtimeGeneration === 0n) {
+      throw new Error("Managed Desktop Pi did not expose its original native task binding.");
+    }
 
     if (managedDesktopIdentity === undefined) throw new Error("Managed Desktop lost its process identity before restart.");
     if (profileDirectory === undefined) throw new Error("Managed Desktop lost its isolated profile before restart.");
@@ -742,13 +764,43 @@ describe("packaged Desktop Pi compaction", () => {
     const resumedSnapshot = await resumedClients.event.getSnapshot({ scope: sessionScope });
     expect(resumedSnapshot.snapshot?.timeline.some((item) => item.payload?.kind.case === "compactionChanged"
       && item.payload.kind.value.state === CompactionState.COMPLETED)).toBe(true);
+    const bindingBeforeRoute = resumedSnapshot.snapshot?.sessions.find(session => session.sessionId === sessionId)?.nativeBinding;
+    const requestsBeforeRoute = requests.length;
+    const resumedOrigin = new URL(resumedConnection.origin).origin;
+    const readSessionId = new Map<string, (body: Uint8Array) => string>([
+      ["GetSessionStatistics", body => fromBinary(GetSessionStatisticsRequestSchema, body).sessionId],
+      ["ListRuntimeCommands", body => fromBinary(ListRuntimeCommandsRequestSchema, body).sessionId],
+      ["ListSessionResources", body => fromBinary(ListSessionResourcesRequestSchema, body).sessionId]
+    ]);
+    const sessionReadReceipts = new Map<Request, { method: string; startedAt: number; status?: number; finishedAt?: number; failed?: string }>();
+    const observeRead = (request: Request): void => {
+      if (request.method() !== "POST" || sessionReadReceipts.size >= 24) return;
+      const url = new URL(request.url());
+      const method = url.pathname.split("/").at(-1) ?? "";
+      const read = readSessionId.get(method);
+      if (url.origin !== resumedOrigin || url.pathname !== `/joko.v1.SessionService/${method}` || read === undefined) return;
+      const body = request.postDataBuffer();
+      if (body === null) return;
+      try {
+        if (read(body) === sessionId) sessionReadReceipts.set(request, { method, startedAt: Date.now() });
+      } catch { /* Unrelated or unreadable requests do not identify the original task. */ }
+    };
+    resumedPage.on("request", observeRead);
+    resumedPage.on("response", (response) => {
+      const receipt = sessionReadReceipts.get(response.request());
+      if (receipt) { receipt.status = response.status(); receipt.finishedAt = Date.now(); }
+    });
+    resumedPage.on("requestfailed", (request) => {
+      const receipt = sessionReadReceipts.get(request);
+      if (receipt) { receipt.failed = request.failure()?.errorText ?? "unknown"; receipt.finishedAt = Date.now(); }
+    });
     await resumedPage.evaluate((id) => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, sessionId);
     await resumedPage.locator(`.session-pane [data-timeline-session-id='${sessionId}']`)
       .waitFor({ state: "visible", timeout: 30_000 });
     await resumedPage.getByText("Context compacted", { exact: true }).first()
       .waitFor({ state: "visible", timeout: 30_000 });
-    const generationBeforeResume = (await resumedClients.session.getSession({ sessionId }))
-      .session?.nativeBinding?.runtimeGeneration;
+    const bindingBeforeDraft = (await resumedClients.session.getSession({ sessionId })).session?.nativeBinding;
+    const generationBeforeResume = bindingBeforeDraft?.runtimeGeneration;
     const uiGeneration = async () => resumedPage.locator(`.session-pane[data-input-session-id='${sessionId}']`)
       .getAttribute("data-input-session-generation");
     if (generationBeforeResume !== undefined) {
@@ -760,10 +812,40 @@ describe("packaged Desktop Pi compaction", () => {
       .operations.map(operation => operation.operationId));
     await resumedPage.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
       .fill("The managed Desktop Pi task continues after process restart.");
-    await waitFor(async () => (await resumedClients.operation.listOperations({ sessionId })).operations
-      .find(operation => operation.mutation?.payload.case === "prewarmSession" && !existingOperations.has(operation.operationId)),
-    operation => operation?.state === OperationState.SUCCEEDED, "the resumed task's draft prewarm acknowledgement", 30_000);
-    expect((await resumedClients.session.getSession({ sessionId })).session?.nativeBinding?.runtimeGeneration).toBe(generationBeforeResume);
+    const readPrewarm = async (timeoutMs?: number) => (await resumedClients.operation.listOperations({ sessionId }, { timeoutMs })).operations
+      .find(operation => operation.mutation?.payload.case === "prewarmSession" && !existingOperations.has(operation.operationId));
+    const bindingObservation = (binding: typeof bindingBeforeDraft) => binding === undefined ? undefined : {
+      generation: binding.runtimeGeneration.toString(), originalNativeReference: binding.opaqueReference === originalBinding.opaqueReference
+    };
+    try {
+      const prewarm = await waitFor(() => readPrewarm(), operation => operation?.state === OperationState.SUCCEEDED,
+        "the resumed task's draft prewarm acknowledgement", 30_000);
+      expect(prewarm?.mutation?.preconditions.find(value => value.entity?.id === sessionId)?.expectedGeneration).toBe(generationBeforeResume);
+      const bindingAfterPrewarm = (await resumedClients.session.getSession({ sessionId })).session?.nativeBinding;
+      expect(bindingAfterPrewarm?.runtimeGeneration).toBe(generationBeforeResume);
+      expect(bindingAfterPrewarm?.opaqueReference === originalBinding.opaqueReference).toBe(true);
+    } catch (cause) {
+      const [binding, operation, changes] = await Promise.all([
+        resumedClients.session.getSession({ sessionId }, { timeoutMs: 2_000 }).then(response => response.session?.nativeBinding).catch(() => undefined),
+        readPrewarm(2_000).catch(() => undefined),
+        resumedClients.session.listSessionTimeline({ sessionId, limit: 40 }, { timeoutMs: 2_000 })
+          .then(response => response.events.filter(event => event.payload?.kind.case === "sessionChanged").slice(-8)
+            .map(event => ({ generation: event.identity?.generation?.toString(),
+              occurredAt: event.occurredAt && Number(event.occurredAt.seconds) * 1_000 + event.occurredAt.nanos / 1_000_000 })))
+          .catch(() => [])
+      ]);
+      console.error("Managed packaged Pi: cold reopen and draft prewarm.", JSON.stringify({
+        beforeExit: bindingObservation(originalBinding), beforeRoute: bindingObservation(bindingBeforeRoute),
+        beforeDraft: bindingObservation(bindingBeforeDraft), afterPrewarm: bindingObservation(binding),
+        sessionReads: [...sessionReadReceipts.values()], sessionChanges: changes,
+        operation: operation && { state: operation.state, errorCode: operation.error?.code,
+          expectedGeneration: operation.mutation?.preconditions.find(value => value.entity?.id === sessionId)?.expectedGeneration.toString(),
+          acceptedAt: operation.acceptedAt && Number(operation.acceptedAt.seconds) * 1_000 + operation.acceptedAt.nanos / 1_000_000 },
+        providerRequestsBeforeDraft: requestsBeforeResume - requestsBeforeRoute,
+        providerRequestsSinceDraft: requests.length - requestsBeforeResume
+      }));
+      throw cause;
+    }
     await resumedPage.locator(".session-pane").getByRole("button", { name: "Send", exact: true }).click();
     try {
       await waitFor(() => Promise.resolve(requests.length), (count) => count > requestsBeforeResume,

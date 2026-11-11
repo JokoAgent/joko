@@ -2907,16 +2907,22 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   }
   recordPackagedSmokeProgress("task_window_closed_without_peer_loss");
 
+  recordPackagedSmokeProgress(`task_window_durable_recheck_started:${Date.now()}`);
   await Promise.all([
     verifyPackagedSmokeTask(taskOptions, task),
     verifyPackagedSmokeTask(concurrentTaskOptions, concurrentTask)
   ]);
-  if (!await preparePackagedSmokeTaskOwner(owner, task)
-    || !await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
+  recordPackagedSmokeProgress(`task_window_durable_recheck_completed:${Date.now()}`);
+  const originalTaskVisible = await preparePackagedSmokeTaskOwner(owner, task);
+  if (originalTaskVisible) recordPackagedSmokeProgress(`task_window_original_task_visible_in_main:${Date.now()}`);
+  if (!originalTaskVisible || !await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
     throw new Error("Closing a packaged Task window removed accepted durable Tasks from the owner product UI.");
   }
+  recordPackagedSmokeProgress(`task_window_concurrent_task_visible_in_main:${Date.now()}`);
   await closePackagedSmokeTaskWindow(peerWindow, taskOwner);
+  recordPackagedSmokeProgress(`task_window_same_session_peer_closed:${Date.now()}`);
   await waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner);
+  recordPackagedSmokeProgress(`task_window_concurrent_task_still_visible:${Date.now()}`);
   await closePackagedSmokeTaskWindow(concurrentWindow, concurrentOwner);
   if ([...sessionWindows.values()].some((candidate) => !candidate.isDestroyed())) {
     throw new Error("Packaged smoke retained a Task window after isolated cleanup.");
