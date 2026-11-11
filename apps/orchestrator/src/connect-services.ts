@@ -215,6 +215,7 @@ import {
   type ExtensionMainViewManager,
   type ExtensionMainViewSurface as NativeExtensionMainViewSurface
 } from "./extension-main-view-manager.js";
+import { localExtensionTaskViewSession, type ExtensionTaskViewDispatcher, type ExtensionTaskViewOpen } from "./extension-task-view-dispatcher.js";
 import type {
   ExtensionPackageExportAuthority as NativeExtensionPackageExportAuthority,
   ExtensionPackageExportJob as NativeExtensionPackageExportJob,
@@ -588,6 +589,7 @@ export interface ConnectServiceDependencies {
   readonly extensionProjects?: ExtensionProjectPolicies;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
+  readonly extensionTaskViews?: ExtensionTaskViewDispatcher;
   readonly extensionSettings?: ExtensionSettingsManager;
   readonly extensionDirectoryPicker?: ExtensionDirectoryPicker;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
@@ -1388,6 +1390,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.extensionProjects === undefined ? {} : { extensionProjects: application.extensionProjects }),
     ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
+    ...(application.extensionTaskViews === undefined ? {} : { extensionTaskViews: application.extensionTaskViews }),
     ...(application.extensionSettings === undefined ? {} : { extensionSettings: application.extensionSettings }),
     ...(application.extensionDirectoryPicker === undefined ? {} : { extensionDirectoryPicker: application.extensionDirectoryPicker }),
     ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
@@ -4786,6 +4789,48 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }));
       return { surface: mapExtensionMainViewSurface(surface) };
     },
+    openExtensionTaskView: async (request, context) => {
+      const connection = authenticate(context);
+      if (!dependencies.extensionMainViews || !dependencies.extensionTaskViews) {
+        throw new ConnectError("Plugin task views are unavailable.", Code.Unimplemented);
+      }
+      const sessionId = nonBlankRequest(request.sessionId, "session_id");
+      const authority = requireExtensionMainViewAuthority(dependencies, nonBlankRequest(request.extensionId, "extension_id"),
+        fromProtoRevision(request.expectedRevision, "open_extension_task_view.expected_revision"), false, undefined, sessionId);
+      ensureExtensionSurfaceRevocation(connection.id);
+      const surface = await extensionMainViewEffect(() => dependencies.extensionMainViews!.open({ authority, connectionId: connection.id,
+        assertAuthorityCurrent: () => { dependencies.connections.fence(connection); assertCurrentExtensionMainViewAuthority(dependencies, authority); }
+      }));
+      try {
+        context.signal.throwIfAborted();
+        dependencies.connections.fence(connection);
+        assertCurrentExtensionMainViewAuthority(dependencies, authority);
+        return { surface: mapExtensionMainViewSurface(surface) };
+      } catch (error) {
+        await dependencies.extensionMainViews.closeSurface(surface.id, connection.id).catch(() => undefined);
+        throw error;
+      }
+    },
+    watchExtensionTaskViews: async function* (request, context) {
+      const connection = authenticate(context), dispatcher = dependencies.extensionTaskViews;
+      if (!dispatcher) throw new ConnectError("Plugin task views are unavailable.", Code.Unimplemented);
+      if (request.focusedSessionId && !/^[A-Za-z0-9._:-]{1,512}$/u.test(request.focusedSessionId)) throw invalidArgument("focused_session_id is invalid");
+      const queue = new AsyncEventQueue<ExtensionTaskViewOpen>(context.signal, 32);
+      const assertCurrent = () => { context.signal.throwIfAborted(); dependencies.connections.fence(connection); };
+      const unregister = dispatcher.register({ connectionId: connection.id, focusedSessionId: request.focusedSessionId || undefined,
+        assertCurrent, send: event => queue.push(event) });
+      const revoke = dependencies.connections.onRevoked(connection.id, () => { unregister(); queue.close(); });
+      try {
+        yield create(contract.WatchExtensionTaskViewsResponseSchema);
+        for (let event = await queue.next(); event !== undefined; event = await queue.next()) {
+          assertCurrent();
+          yield create(contract.WatchExtensionTaskViewsResponseSchema, { open: {
+            requestId: event.requestId, extensionId: event.extensionId, extensionRevision: toProtoRevision(event.extensionRevision),
+            sessionId: event.sessionId, focus: event.focus
+          } });
+        }
+      } finally { revoke(); unregister(); queue.close(); }
+    },
     openExtensionSettings: async (request, context) => {
       const connection = authenticate(context);
       if (!dependencies.extensionMainViews || !dependencies.extensionSettings || !request.expectedRevision) {
@@ -7851,16 +7896,17 @@ class AsyncEventQueue<T = PersistedEvent> {
   readonly #waiters: Array<(value: T | undefined) => void> = [];
   #closed = false;
 
-  constructor(signal: AbortSignal) {
+  constructor(signal: AbortSignal, private readonly capacity = Number.POSITIVE_INFINITY) {
     this.#signal = signal;
     signal.addEventListener("abort", () => this.close(), { once: true });
   }
 
-  push(value: T): void {
-    if (this.#closed) return;
+  push(value: T): boolean {
+    if (this.#closed || this.#signal.aborted || this.#values.length >= this.capacity) return false;
     const waiter = this.#waiters.shift();
     if (waiter === undefined) this.#values.push(value);
     else waiter(value);
+    return true;
   }
 
   next(): Promise<T | undefined> {
@@ -11471,6 +11517,9 @@ function mapExtensionCatalogEntry(item: NativeExtensionCatalogDescriptor): contr
       ...(item.settings.title === undefined ? {} : { title: item.settings.title }), height: item.settings.height ?? 360,
       mobileCustom: item.settings.mobileHtml !== undefined
     }) }),
+    ...(item.taskView === undefined ? {} : { taskView: create(contract.ExtensionTaskViewDescriptorSchema, {
+      ...(item.taskView.title === undefined ? {} : { title: item.taskView.title })
+    }) }),
     ...(item.mainView === undefined
       ? {}
       : {
@@ -11562,7 +11611,8 @@ function requireExtensionMainViewAuthority(
   extensionId: string,
   expectedExtensionRevision: bigint,
   currentOnly = false,
-  settings?: { readonly mobile: boolean }
+  settings?: { readonly mobile: boolean },
+  taskSessionId?: string
 ): NativeExtensionMainViewAuthority {
   if (dependencies.piResources === undefined || dependencies.extensionCatalog === undefined) {
     throw new ConnectError("Extension main views are unavailable.", Code.Unimplemented);
@@ -11570,10 +11620,15 @@ function requireExtensionMainViewAuthority(
   const extension = currentOnly
     ? requireCurrentExtensionMutation(dependencies, extensionId, expectedExtensionRevision)
     : requireExtensionMutation(dependencies, extensionId, expectedExtensionRevision);
-  const declaration = settings ? extension.settings : extension.mainView;
+  const taskView = taskSessionId === undefined ? undefined : extension.taskView;
+  const declaration = taskSessionId !== undefined ? taskView : settings ? extension.settings : extension.mainView;
   if (extension.owner.kind !== "resource" || !extension.installed || declaration === undefined
-    || !settings && (!extension.enabled || !extension.sidebarSupported || extension.setup.state !== "ready" && extension.setup.state !== "not_required")) {
+    || !settings && (!extension.enabled || taskSessionId === undefined && !extension.sidebarSupported || extension.setup.state !== "ready" && extension.setup.state !== "not_required")) {
     throw new ConnectError("Extension main view is not ready.", Code.FailedPrecondition);
+  }
+  const task = taskSessionId === undefined ? undefined : localExtensionTaskViewSession(dependencies.store, taskSessionId);
+  if (taskSessionId !== undefined && (!task || !dependencies.extensionProjects?.enabledForTarget(extensionId, task.targetId))) {
+    throw new ConnectError("The original task cannot host this plugin page.", Code.PermissionDenied);
   }
   let resource: NativePiResourceDescriptor;
   try {
@@ -11589,7 +11644,8 @@ function requireExtensionMainViewAuthority(
   } : undefined;
   const matchingDetails = resource.resourceDetails.filter((detail) => detail.kind === "extension"
     && detail.entryPath === declaration.extensionEntry
-    && (settingsDescriptor ? detail.settings?.html === settingsDescriptor.html
+    && (taskView ? detail.taskView?.html === taskView.html && detail.taskView?.title === taskView.title
+      : settingsDescriptor ? detail.settings?.html === settingsDescriptor.html
       && detail.settings?.mobileHtml === settingsDescriptor.mobileHtml && detail.settings?.title === settingsDescriptor.title
       && detail.settings?.height === settingsDescriptor.height : detail.mainView?.html === extension.mainView?.html
     && detail.mainView?.title === extension.mainView?.title
@@ -11615,7 +11671,8 @@ function requireExtensionMainViewAuthority(
     packageName: resource.packageIdentity,
     ...(resource.version === undefined ? {} : { packageVersion: resource.version }),
     extensionEntry: declaration.extensionEntry,
-    mainView: settingsDescriptor ? { html: settings?.mobile ? settingsDescriptor.mobileHtml ?? settingsDescriptor.html : settingsDescriptor.html,
+    mainView: taskView ? { html: taskView.html, title: taskView.title }
+      : settingsDescriptor ? { html: settings?.mobile ? settingsDescriptor.mobileHtml ?? settingsDescriptor.html : settingsDescriptor.html,
       ...(settingsDescriptor.title === undefined ? {} : { title: settingsDescriptor.title }) } : {
       html: extension.mainView!.html,
       ...(extension.mainView!.open === undefined ? {} : { open: extension.mainView!.open }),
@@ -11625,7 +11682,9 @@ function requireExtensionMainViewAuthority(
       ...(extension.mainView!.icon === undefined ? {} : { icon: extension.mainView!.icon })
     },
     ...(settingsDescriptor === undefined ? {} : { settings: settingsDescriptor, ...(settings?.mobile ? { mobileSettings: true as const } : {}) }),
-    ...(settings || extension.library === undefined ? {} : { library: { schemaVersion: extension.library.schemaVersion } })
+    ...(taskView === undefined || task === undefined ? {} : { taskView: { html: taskView.html, title: taskView.title,
+      sessionId: task.id, sessionCreatedAt: task.createdAt, targetId: task.targetId } }),
+    ...(settings || taskView || extension.library === undefined ? {} : { library: { schemaVersion: extension.library.schemaVersion } })
   };
 }
 
@@ -11638,7 +11697,8 @@ function assertCurrentExtensionMainViewAuthority(
     expected.extensionId,
     dependencies.extensionCatalog!.get(expected.extensionId).revision,
     true,
-    expected.settings === undefined ? undefined : { mobile: expected.mobileSettings === true }
+    expected.settings === undefined ? undefined : { mobile: expected.mobileSettings === true },
+    expected.taskView?.sessionId
   );
   if (current.extensionId !== expected.extensionId || current.resourceId !== expected.resourceId
     || current.backendId !== expected.backendId || current.backendRevision !== expected.backendRevision
@@ -11649,6 +11709,7 @@ function assertCurrentExtensionMainViewAuthority(
     || current.mainView.icon !== expected.mainView.icon
     || current.mainView.open !== expected.mainView.open || current.mainView.side !== expected.mainView.side
     || current.mainView.multiple !== expected.mainView.multiple
+    || JSON.stringify(current.taskView) !== JSON.stringify(expected.taskView)
     || JSON.stringify(current.settings) !== JSON.stringify(expected.settings) || current.mobileSettings !== expected.mobileSettings
     || current.library?.schemaVersion !== expected.library?.schemaVersion
     || (current.library === undefined) !== (expected.library === undefined)) throw new Error("Extension main-view authority changed.");
@@ -13099,7 +13160,8 @@ function mapExtensionMainViewSurface(surface: NativeExtensionMainViewSurface): c
     backendId: surface.authority.backendId,
     backendRevision: toProtoRevision(surface.authority.backendRevision),
     backendGeneration: BigInt(surface.authority.backendGeneration),
-    settings: surface.authority.settings !== undefined, mobileSettings: surface.authority.mobileSettings === true
+    settings: surface.authority.settings !== undefined, mobileSettings: surface.authority.mobileSettings === true,
+    ...(surface.authority.taskView === undefined ? {} : { taskSessionId: surface.authority.taskView.sessionId })
   });
 }
 

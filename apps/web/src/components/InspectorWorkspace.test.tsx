@@ -5,7 +5,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { translate } from "../i18n.js";
-import { emptySnapshot, type AppSnapshot, type SessionView, type TerminalView, type TerminalPaletteView } from "../model.js";
+import { emptySnapshot, type AppSnapshot, type ExtensionCatalogEntryView, type ExtensionTaskViewOpenView, type SessionView, type TerminalView, type TerminalPaletteView } from "../model.js";
 import { InspectorWorkspace } from "./InspectorWorkspace.js";
 import type { Translator } from "./types.js";
 
@@ -20,6 +20,45 @@ afterEach(async () => {
 });
 
 describe("Inspector workspace production integration", () => {
+  it("opens a plugin page in each task and ignores opens from a retired viewer", async () => {
+    const extension: ExtensionCatalogEntryView = {
+      id: `extension_${"a".repeat(32)}`, revision: 1n, owner: { kind: "resource", resourceId: "resource", discoveredRevision: `sha256:${"a".repeat(64)}`, resourceRevision: 1n },
+      source: "local", installed: true, installState: "installed", name: "Sample", description: "", enabled: true, taskView: { title: "Task evidence" },
+      sidebarSupported: false, sidebarVisible: false, tools: [], permissions: [], commands: [], setup: { state: "notRequired", revision: 1n, fields: [] }, useSupported: true
+    };
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const h = await fixture([], undefined, [extension]);
+    const event = { requestId: "open-one", extensionId: extension.id, extensionRevision: 1n, sessionId: "one", focus: false };
+    const first = h.taskViewWatchers.at(-1)!;
+    expect(first.focusedSessionId).toBe("one");
+    await act(async () => first.onOpen(event));
+    await settle();
+    expect(h.openExtensionTaskView).toHaveBeenLastCalledWith(extension.id, 1n, "one", expect.any(AbortSignal));
+    expect(h.host.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Task evidence");
+
+    await act(async () => first.onOpen({ ...event, requestId: "open-two", sessionId: "two" }));
+    expect(h.navigate).not.toHaveBeenCalled();
+    expect(h.openExtensionTaskView).toHaveBeenCalledTimes(1);
+    await h.render("two");
+    expect(first.signal.aborted).toBe(true);
+    expect(h.openExtensionTaskView).toHaveBeenLastCalledWith(extension.id, 1n, "two", expect.any(AbortSignal));
+    const second = h.taskViewWatchers.at(-1)!;
+    expect(second.focusedSessionId).toBe("two");
+    await act(async () => first.onOpen({ ...event, focus: true }));
+    expect(h.navigate).not.toHaveBeenCalled();
+    await act(async () => second.onOpen({ ...event, focus: true }));
+    expect(h.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "one" });
+    await h.render("one");
+    expect(h.openExtensionTaskView).toHaveBeenLastCalledWith(extension.id, 1n, "one", expect.any(AbortSignal));
+    const originalPageSignal = h.openExtensionTaskView.mock.lastCall![3];
+
+    h.snapshot.extensions[0] = { ...extension, enabled: false };
+    await h.render("one");
+    expect(originalPageSignal.aborted).toBe(true);
+    expect(h.host.textContent).not.toContain("Task evidence");
+    expect(h.taskViewWatchers.at(-1)!.signal.aborted).toBe(true);
+  });
+
   it("keeps native window subscriptions behind the advertised Inspector capabilities", async () => {
     const h = await fixture([], ["navigation.deepLinks"]);
     expect(h.onClosed).not.toHaveBeenCalled();
@@ -79,7 +118,7 @@ describe("Inspector workspace production integration", () => {
   });
 });
 
-function task(id: string): SessionView { return { id, backendId: "backend", targetId: "target", name: id, state: "idle", pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1 }; }
+function task(id: string): SessionView { return { id, backendId: "backend", targetId: "target", name: id, state: "idle", pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, createdAt: 1, updatedAt: 1 }; }
 function terminal(sessionId: string, suffix = sessionId): TerminalView { return { id: `terminal-${suffix}`, sessionId, targetId: "target", generation: 1n, status: "running", exitConfirmed: false, shellId: "auto", shellLabel: `Shell ${suffix}`, cwd: "D:/project", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 }; }
 function child(index: string) {
   const frame = document.body.appendChild(document.createElement("iframe")), window = frame.contentWindow!, occurrence = `${index.repeat(8)}-${index.repeat(4)}-4${index.repeat(3)}-8${index.repeat(3)}-${index.repeat(12)}`;
@@ -91,13 +130,22 @@ function child(index: string) {
   }, selectionContextMenu: { onAddToChat: () => () => undefined } } satisfies JokoInspectorDesktopApi });
   return { window, document: window.document, occurrence, ready, close, requestClose: () => requestClose() };
 }
-async function fixture(children: readonly ReturnType<typeof child>[] = [], capabilities: readonly string[] = ["inspector.detach", "inspector.tabs"]) {
-  const snapshot = { ...emptySnapshot(), sessions: [task("one"), task("two")] } as AppSnapshot & { sessions: SessionView[] };
+async function fixture(children: readonly ReturnType<typeof child>[] = [], capabilities: readonly string[] = ["inspector.detach", "inspector.tabs"], extensions: ExtensionCatalogEntryView[] = []) {
+  const snapshot = { ...emptySnapshot(), sessions: [task("one"), task("two")], extensions } as AppSnapshot & { sessions: SessionView[]; extensions: ExtensionCatalogEntryView[] };
   const state = { activeProfile: { id: "profile", deviceId: "device", serverId: "node", name: "Node", origin: "http://127.0.0.1:4315" }, connectionGeneration: 1,
     ready: false, connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES, effectiveLocale: "en", snapshot, route: { kind: "session", sessionId: "one" } };
   const createTerminal = vi.fn(async (sessionId: string, _requestId: string, _shellId: string, _columns: number, _rows: number, _palette: TerminalPaletteView) => terminal(sessionId, "created")),
     closeTerminal = vi.fn(async (_sessionId: string, _terminalId: string, _generation: bigint) => undefined);
-  const controller = { state, createTerminal, closeTerminal, setInspectorOpen: vi.fn(async () => undefined), releaseArtifactUrl: vi.fn(),
+  const taskViewWatchers: Array<{ focusedSessionId?: string; signal: AbortSignal; onOpen: (event: ExtensionTaskViewOpenView) => void }> = [];
+  const navigate = vi.fn(), openExtensionTaskView = vi.fn((_id: string, _revision: bigint, _sessionId: string, signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  }));
+  const controller = { state, createTerminal, closeTerminal, navigate, setInspectorOpen: vi.fn(async () => undefined), releaseArtifactUrl: vi.fn(),
+    getExtension: vi.fn(async () => ({ extensions })), openExtensionTaskView,
+    watchExtensionTaskViews: (focusedSessionId: string | undefined, signal: AbortSignal, onOpen: (event: ExtensionTaskViewOpenView) => void) => {
+      taskViewWatchers.push({ focusedSessionId, signal, onOpen });
+      return new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+    },
     getTerminalCapabilities: vi.fn(async () => ({ support: "supported", shells: [{ id: "auto", label: "Auto" }], defaultShellId: "auto", maximumTerminals: 8, maximumInputBytes: 32_768, maximumColumns: 500, maximumRows: 300 })),
     listTerminals: vi.fn(async (sessionId: string) => [terminal(sessionId)]), getTerminal: vi.fn(async (sessionId: string) => terminal(sessionId)) } as unknown as AppController;
   const listeners = new Set<(event: { occurrence: string; reason: "user" | "child-failure" }) => void>();
@@ -109,7 +157,7 @@ async function fixture(children: readonly ReturnType<typeof child>[] = [], capab
   const root = createRoot(host); roots.push(root);
   const render = async (id: string): Promise<void> => { state.route.sessionId = id; await act(async () => root.render(<InspectorWorkspace controller={controller} snapshot={snapshot} session={snapshot.sessions.find(session => session.id === id)} timeline={[]} open t={t} runAction={(_key, action) => { void action().catch(() => undefined); }} onClose={() => undefined} onSelectionQuote={() => undefined} />)); await settle(); };
   await render("one");
-  return { host, render, snapshot, createTerminal, closeTerminal, onClosed, notifyClosed: (occurrence: string, reason: "user" | "child-failure") => { for (const listener of listeners) listener({ occurrence, reason }); } };
+  return { host, render, snapshot, createTerminal, closeTerminal, navigate, openExtensionTaskView, taskViewWatchers, onClosed, notifyClosed: (occurrence: string, reason: "user" | "child-failure") => { for (const listener of listeners) listener({ occurrence, reason }); } };
 }
 async function click(root: ParentNode, selector: string, text?: string): Promise<void> {
   const button = [...root.querySelectorAll<HTMLButtonElement>(selector)].find(candidate => text === undefined || candidate.textContent === text);

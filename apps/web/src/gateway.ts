@@ -6195,6 +6195,38 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapExtensionMainViewSurface(response.surface);
   }
 
+  async openExtensionTaskView(extensionId: string, expectedRevision: bigint, sessionId: string, signal: AbortSignal): Promise<ExtensionMainViewSurfaceView> {
+    const scope = this.captureActionScope(signal), client = createClient(ExtensionService, scope.transport);
+    const response = await client.openExtensionTaskView({ extensionId, expectedRevision: { value: expectedRevision }, sessionId }, { signal: scope.signal });
+    try {
+      scope.signal.throwIfAborted();
+      if (!response.surface) throw new GatewayError("Orchestrator returned an empty plugin task view.");
+      const surface = mapExtensionMainViewSurface(response.surface);
+      if (surface.extensionId !== extensionId || surface.purpose !== "task" || surface.taskSessionId !== sessionId) {
+        throw new GatewayError("Orchestrator returned a plugin page for another task.");
+      }
+      return surface;
+    } catch (error) {
+      if (response.surface?.surfaceId) void client.closeExtensionMainView({ surfaceId: response.surface.surfaceId }, { timeoutMs: 5_000 }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async watchExtensionTaskViews(focusedSessionId: string | undefined, signal: AbortSignal,
+    onOpen: (event: import("./model.js").ExtensionTaskViewOpenView) => void): Promise<void> {
+    const scope = this.captureActionScope(signal), client = createClient(ExtensionService, scope.transport);
+    for await (const response of client.watchExtensionTaskViews({ focusedSessionId: focusedSessionId ?? "" }, { signal: scope.signal })) {
+      scope.signal.throwIfAborted();
+      const event = response.open;
+      if (!event) continue;
+      if (!/^[a-f0-9-]{36}$/u.test(event.requestId) || !/^extension_[a-f0-9]{32}$/u.test(event.extensionId)
+        || !event.extensionRevision?.value || !/^[A-Za-z0-9._:-]{1,512}$/u.test(event.sessionId)) {
+        throw new GatewayError("Orchestrator returned an invalid plugin task-view request.");
+      }
+      onOpen({ ...event, extensionRevision: event.extensionRevision.value });
+    }
+  }
+
   async closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ExtensionService, scope.transport).closeExtensionMainView(
@@ -18223,6 +18255,8 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
   const settings = extension.settings === undefined ? undefined : { ...(extension.settings.title === undefined ? {} : { title: extension.settings.title }),
     height: extension.settings.height, mobileCustom: extension.settings.mobileCustom };
   if (settings && (!Number.isInteger(settings.height) || settings.height < 160 || settings.height > 800 || settings.title !== undefined && (!settings.title.trim() || settings.title.length > 80))) throw new GatewayError("Plugin settings declaration is invalid.");
+  const taskView = extension.taskView === undefined ? undefined : { title: extension.taskView.title };
+  if (taskView?.title !== undefined && (!taskView.title.trim() || taskView.title.length > 64)) throw new GatewayError("Plugin task-view declaration is invalid.");
   return {
     id: extension.extensionId,
     revision,
@@ -18240,6 +18274,7 @@ function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): Extens
     description: extension.description,
     enabled: extension.enabled,
     ...(mainView === undefined ? {} : { mainView }),
+    ...(taskView === undefined ? {} : { taskView }),
     ...(library === undefined ? {} : { library }),
     ...(settings === undefined ? {} : { settings }),
     sidebarSupported: extension.sidebarSupported,
@@ -18354,6 +18389,7 @@ function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): Ex
     || surface.backendId.trim() === "" || backendRevision === undefined || backendRevision < 1n
     || backendGeneration === undefined || expiresAt === undefined || !Number.isSafeInteger(expiresAt) || expiresAt < 0
     || !validExtensionSurfaceEndpoint(surface.endpoint, surface.surfaceId) || surface.mobileSettings && !surface.settings
+    || surface.taskSessionId !== undefined && (surface.settings || !/^[A-Za-z0-9._:-]{1,512}$/u.test(surface.taskSessionId))
     || surface.title !== undefined && (surface.title.trim() !== surface.title || surface.title.length === 0 || surface.title.length > 80)) {
     throw new GatewayError("Orchestrator returned an invalid Extension main-view surface.");
   }
@@ -18374,6 +18410,7 @@ function mapExtensionMainViewSurface(surface: ProtoExtensionMainViewSurface): Ex
     ...(icon === undefined ? {} : { icon }),
     expiresAt,
     ...(surface.settings ? { purpose: "settings" as const } : {}),
+    ...(surface.taskSessionId === undefined ? {} : { purpose: "task" as const, taskSessionId: surface.taskSessionId }),
     ...(surface.mobileSettings ? { mobileSettings: true as const } : {})
   };
 }

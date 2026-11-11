@@ -688,6 +688,8 @@ message ExtensionMainViewSurface {
   bool mobile_settings = 12;
   // Current managed Desktop locale for the original Mobile settings document.
   optional string host_locale = 13;
+  // Present only on a task view; never grants access to Task state or files.
+  optional string task_session_id = 14;
 }
 
 // Generic Extension projection. Executable bytes and secrets are deliberately
@@ -718,6 +720,19 @@ message ExtensionCatalogEntry {
   optional ExtensionLibraryDescriptor library = 22;
   repeated ExtensionRecommendationDescriptor recommendations = 23;
   optional ExtensionSettingsDescriptor settings = 24;
+  optional ExtensionTaskViewDescriptor task_view = 25;
+}
+
+message ExtensionTaskViewDescriptor {
+  optional string title = 1;
+}
+
+message ExtensionTaskViewOpen {
+  string request_id = 1;
+  string extension_id = 2;
+  Revision extension_revision = 3;
+  string session_id = 4;
+  bool focus = 5;
 }
 
 message ExtensionCatalogSnapshot {

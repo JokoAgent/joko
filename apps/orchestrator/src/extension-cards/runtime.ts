@@ -27,13 +27,19 @@ import type { ExtensionTargets } from "../extension-targets.js";
 import type { ExtensionText } from "../extension-text.js";
 import type { ExtensionProjectPolicies } from "../extension-project-policy.js";
 import type { ExtensionDeviceSync } from "../extension-device-sync.js";
+import { extensionTaskViewInstallation, type ExtensionTaskViewDispatcher } from "../extension-task-view-dispatcher.js";
 
-interface Authority extends ExtensionCardAuthority { readonly surface: ExtensionMainViewAuthority; readonly installationKey: string }
+interface Authority extends ExtensionCardAuthority {
+  readonly surface: ExtensionMainViewAuthority;
+  readonly installationKey: string;
+  readonly taskViewInstallation?: string;
+}
 interface Instance {
   readonly authority: Authority; readonly connectionId: string; readonly abort: AbortController;
   unregister: () => void; current: boolean; context?: BrowserContext; page?: Page; surface?: ExtensionMainViewSurface;
   opening?: Promise<Page>; readonly tickets: Map<string, { scope: ExtensionCardScope; assertCurrent: () => void }>;
   readonly calls: Set<string>; pending: number;
+  readonly taskViewGestures: Map<string, { connectionId: string; observedAt: number; sourceSessionId: string; assertCurrent: () => void }>;
   readonly callGuards: Map<string, { signal: AbortSignal; assertCurrent: () => void; usage?: { nonce: string; record: () => void } }>;
 }
 interface Options {
@@ -42,6 +48,7 @@ interface Options {
   readonly store: OperationalStore; readonly vault: CredentialVault;
   readonly projects?: Pick<ExtensionProjectPolicies, "enabledForTarget" | "assertEnabledForSession">;
   readonly surfaces: ExtensionMainViewManager; readonly cards: ExtensionCardsManager;
+  readonly taskViews?: ExtensionTaskViewDispatcher;
   readonly registerProvider: (provider: BridgeToolProvider) => () => void;
   readonly redact: (text: string) => string;
   readonly locale?: () => string;
@@ -163,7 +170,9 @@ export class ExtensionCardRuntime {
       extensionRevision: extension.revision.toString(), connections: runtime.network?.connections?.map(declaration => this.options.connections?.identity(id, declaration) ?? null),
       oauth: runtime.network?.secrets?.filter(secret => secret.source === "oauth").map(secret => this.options.oauth?.identity(id, secret.key) ?? null) });
     const installationKey = JSON.stringify({ ...surface, backendRevision: surface.backendRevision.toString(), resourceRevision: surface.resourceRevision.toString() });
-    return { key, installationKey, name: extension.name, runtime, surface };
+    const taskViewInstallation = extensionTaskViewInstallation(extension);
+    return { key, installationKey, name: extension.name, runtime, surface,
+      ...(taskViewInstallation === undefined ? {} : { taskViewInstallation }) };
   }
   #assert(instance: Instance): void {
     if (this.#stopped || !instance.current || this.#instances.get(instance.authority.surface.extensionId) !== instance
@@ -183,7 +192,7 @@ export class ExtensionCardRuntime {
   }
   #retire(instance: Instance): void {
     if (!instance.current) return;
-    instance.current = false; instance.abort.abort(); instance.unregister(); instance.tickets.clear();
+    instance.current = false; instance.abort.abort(); instance.unregister(); instance.tickets.clear(); instance.taskViewGestures.clear();
     this.options.deviceSync?.invalidatePlugin(instance.authority.surface.extensionId);
     this.options.cards.revoke(instance.authority.surface.extensionId);
   }
@@ -202,7 +211,8 @@ export class ExtensionCardRuntime {
       for (const [id, authority] of desired) {
         if (this.#stopped || this.#instances.has(id) || this.#instances.size >= 64) continue;
         const instance: Instance = { authority, connectionId: `extension_runtime_${randomUUID().replaceAll("-", "")}`, current: true,
-          abort: new AbortController(), unregister: () => {}, tickets: new Map(), calls: new Set(), callGuards: new Map(), pending: 0 };
+          abort: new AbortController(), unregister: () => {}, tickets: new Map(), calls: new Set(), callGuards: new Map(),
+          taskViewGestures: new Map(), pending: 0 };
         this.#instances.set(id, instance);
         const providerId = `${id}-runtime`, generation = ++this.#generation;
         const provider: BridgeToolProvider = { id: providerId, generation,
@@ -291,7 +301,7 @@ export class ExtensionCardRuntime {
       try { usage.record(); } catch { /* Usage storage does not own the dispatch outcome. */ }
       return true;
     });
-    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true })})` });
+    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true, taskView: instance.authority.taskViewInstallation !== undefined })})` });
     if (instance.authority.runtime.mail) await page.addInitScript({ content: `${MAIL_COMPOSE_RUNTIME_SOURCE}\nObject.defineProperty(window, "jokoMail", { value: jokoMail, writable: false, configurable: false });` });
     await page.goto(url.href, { waitUntil: "load", timeout: 15_000 }); this.#assert(instance);
     return page;
@@ -319,6 +329,27 @@ export class ExtensionCardRuntime {
     const request = payload as Record<string, unknown>, id = instance.authority.surface.extensionId;
     const current = () => { this.#assert(instance); };
     switch (request.type) {
+      case "task-view-request": {
+        const installation = instance.authority.taskViewInstallation;
+        if (!installation || !this.options.taskViews) return { ok: false, errorCode: "PERMISSION_DENIED" };
+        if (Object.keys(request).some(key => key !== "type" && key !== "payload")) return { ok: false, errorCode: "INVALID_REQUEST" };
+        const input = request.payload;
+        if (typeof input !== "object" || input === null || Array.isArray(input)) return { ok: false, errorCode: "INVALID_REQUEST" };
+        const { callId, userActionToken, ...payload } = input as Record<string, unknown>;
+        if (userActionToken !== undefined && typeof userActionToken !== "string") return { ok: false, errorCode: "INVALID_REQUEST" };
+        const origin = this.#requestOwner(instance, callId);
+        const gesture = userActionToken === undefined ? undefined : instance.taskViewGestures.get(userActionToken);
+        gesture?.assertCurrent();
+        const sourceSessionId = gesture?.sourceSessionId ?? origin.sourceSessionId;
+        return this.options.taskViews.request(id, installation, payload, {
+          sourceSessionId,
+          ...(gesture === undefined || userActionToken === undefined ? {} : { gesture: {
+            connectionId: gesture.connectionId, observedAt: gesture.observedAt,
+            assertCurrent: () => { origin.assertCurrent(); gesture.assertCurrent(); },
+            consume: () => instance.taskViewGestures.delete(userActionToken)
+          } })
+        });
+      }
       case "host-preference": {
         if (request.capability !== "image.generate" || Object.keys(request).length !== 2) return { ok: false, errorCode: "INVALID_REQUEST" };
         if (!instance.authority.runtime.image) return { ok: false, errorCode: "PERMISSION_DENIED" };
@@ -498,7 +529,7 @@ export class ExtensionCardRuntime {
       return undefined;
     }
   }
-  async dispatch(scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void): Promise<void> {
+  async dispatch(scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void, connectionId = ""): Promise<void> {
     const instance = this.#instances.get(scope.extensionId);
     if (!instance || instance.authority.key !== scope.authorityKey) throw new Error("Extension source changed.");
     const callerCurrent = assertCurrent;
@@ -507,11 +538,18 @@ export class ExtensionCardRuntime {
     const page = await this.#ensure(instance); this.#assert(instance); assertCurrent();
     for (const id of instance.callGuards.keys()) if (!this.options.cards.cards.callInfoOf(id)) instance.callGuards.delete(id);
     instance.callGuards.set(event.spawnCallId, { signal: instance.abort.signal, assertCurrent: () => { assertCurrent(); this.options.cards.assertAuthority(scope); } });
-    const token = event.change || !instance.authority.runtime.agent ? undefined : randomUUID();
-    if (token) {
+    const taskViewGesture = !event.change && !!connectionId && instance.authority.taskViewInstallation !== undefined;
+    const agentAction = !event.change && instance.authority.runtime.agent === true;
+    const token = taskViewGesture || agentAction ? randomUUID() : undefined;
+    if (token && agentAction) {
       if (instance.tickets.size >= 64) throw new Error("Extension action capacity reached.");
       instance.tickets.set(token, { scope, assertCurrent });
       const timer = setTimeout(() => instance.tickets.delete(token), 10 * 60_000); timer.unref();
+    }
+    if (token && taskViewGesture) {
+      if (instance.taskViewGestures.size >= 64) throw new Error("Extension task-view gesture capacity reached.");
+      instance.taskViewGestures.set(token, { connectionId, sourceSessionId: scope.sessionId, observedAt: event.ts, assertCurrent });
+      const timer = setTimeout(() => instance.taskViewGestures.delete(token), 3_000); timer.unref();
     }
     let timer: NodeJS.Timeout | undefined, timedOut = false;
     try {
@@ -520,7 +558,10 @@ export class ExtensionCardRuntime {
           timer = setTimeout(() => { timedOut = true; this.#retire(instance); void this.#reconcile(); reject(new Error("Extension action timed out. Check the current card before retrying.")); }, 8000); timer.unref();
         })]);
       this.#assert(instance); assertCurrent();
-    } catch (error) { if (token && !timedOut) instance.tickets.delete(token); throw error; }
+    } catch (error) {
+      if (token && !timedOut) { instance.tickets.delete(token); instance.taskViewGestures.delete(token); }
+      throw error;
+    }
     finally { clearTimeout(timer); }
   }
   async deliverDeviceSync(extensionId: string, event: unknown, signal: AbortSignal, assertCaller: () => void): Promise<boolean> {

@@ -35,6 +35,7 @@ import {
   parseExtensionRoutineEvents,
   parseExtensionRuntime,
   isExtensionMainViewDescriptor,
+  isExtensionTaskViewDescriptor,
   isExtensionSettingsDescriptor,
   validateExtensionRecommendations,
   type ExtensionRecommendationDescriptor
@@ -5134,10 +5135,11 @@ function copyResourceDetail(detail: PiPackageResourceDetail): PiPackageResourceD
     name: detail.name,
     ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
     ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+    ...(detail.taskView === undefined ? {} : { taskView: { ...detail.taskView } }),
     ...(detail.settings === undefined ? {} : { settings: { ...detail.settings } }),
     ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     ...(detail.routineEvents === undefined ? {} : { routineEvents: parseExtensionRoutineEvents(detail.routineEvents) }),
-    ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime) }),
+    ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime, detail.taskView !== undefined) }),
     ...(detail.recommendations === undefined ? {} : { recommendations: copyRecommendations(detail.recommendations) }),
     compatibility: detail.compatibility,
     compatibilityIssues: [...detail.compatibilityIssues],
@@ -5227,11 +5229,12 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       !detail || typeof detail !== "object" || !kinds.has(detail.kind) || !compatibility.has(detail.compatibility)
       || typeof detail.name !== "string" || detail.name.trim() === "" || detail.name.length > 256
       || Object.keys(detail).some((key) => ![
-        "kind", "name", "entryPath", "mainView", "settings", "library", "routineEvents", "runtime", "recommendations", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
+        "kind", "name", "entryPath", "mainView", "taskView", "settings", "library", "routineEvents", "runtime", "recommendations", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
       ].includes(key))
       || detail.kind === "extension" !== (typeof detail.entryPath === "string")
       || detail.entryPath !== undefined && !isStoredPackageRelativePath(detail.entryPath)
       || detail.mainView !== undefined && (detail.kind !== "extension" || !isExtensionMainViewDescriptor(detail.mainView))
+      || detail.taskView !== undefined && (detail.kind !== "extension" || !isExtensionTaskViewDescriptor(detail.taskView))
       || detail.settings !== undefined && (detail.kind !== "extension" || !isExtensionSettingsDescriptor(detail.settings))
       || detail.library !== undefined && (detail.kind !== "extension" || !isExtensionLibraryDescriptor(detail.library))
       || detail.routineEvents !== undefined && detail.kind !== "extension"
@@ -5252,10 +5255,11 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       name: detail.name,
       ...(detail.entryPath === undefined ? {} : { entryPath: detail.entryPath }),
       ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
+      ...(detail.taskView === undefined ? {} : { taskView: { ...detail.taskView } }),
       ...(detail.settings === undefined ? {} : { settings: { ...detail.settings } }),
       ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     ...(detail.routineEvents === undefined ? {} : { routineEvents: parseExtensionRoutineEvents(detail.routineEvents) }),
-    ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime) }),
+    ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime, detail.taskView !== undefined) }),
       ...(recommendations === undefined ? {} : { recommendations: recommendations.items }),
       compatibility: detail.compatibility,
       compatibilityIssues: compatibilityIssues as PiPackageResourceDetail["compatibilityIssues"],

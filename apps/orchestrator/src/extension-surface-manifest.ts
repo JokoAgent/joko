@@ -27,6 +27,11 @@ export interface ExtensionMainViewDescriptor {
   readonly multiple?: true;
 }
 
+export interface ExtensionTaskViewDescriptor {
+  readonly html: string;
+  readonly title?: string;
+}
+
 export interface ExtensionLibraryDescriptor {
   readonly schemaVersion: 1;
 }
@@ -64,6 +69,7 @@ export interface ExtensionSurfaceBinding {
   /** Exact package-relative runtime Extension entry. */
   readonly entry: string;
   readonly mainView?: ExtensionMainViewDescriptor;
+  readonly taskView?: ExtensionTaskViewDescriptor;
   readonly settings?: ExtensionSettingsDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
   readonly routineEvents?: ExtensionRoutineEventsDescriptor;
@@ -119,14 +125,14 @@ export function parseExtensionSurfaceManifest(
   const result: ExtensionSurfaceBinding[] = [];
   for (const rawBinding of surfaces.extensions) {
     const binding = requirePlainObject(rawBinding, "Extension surface declaration");
-    requireExactKeys(binding, ["entry", "mainView", "settings", "library", "routineEvents", "runtime", "recommendations"], ["entry"], "Extension surface declaration");
+    requireExactKeys(binding, ["entry", "mainView", "taskView", "settings", "library", "routineEvents", "runtime", "recommendations"], ["entry"], "Extension surface declaration");
     const entry = requirePortablePath(binding.entry, "Extension surface entry");
     if (!EXTENSION_SUFFIXES.has(extname(entry).toLowerCase())) throw new Error("Extension surface entry has an unsupported file type.");
     if (!discoveredEntries.has(entry)) throw new Error("Extension surface entry does not exactly match a discovered Extension.");
     if (seenEntries.has(entry)) throw new Error("Extension surface entry is declared more than once.");
     seenEntries.add(entry);
 
-    if (binding.mainView === undefined && binding.settings === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.runtime === undefined && binding.recommendations === undefined) {
+    if (binding.mainView === undefined && binding.taskView === undefined && binding.settings === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.runtime === undefined && binding.recommendations === undefined) {
       throw new Error("Extension surface declaration must advertise at least one current capability.");
     }
     let mainView: ExtensionMainViewDescriptor | undefined;
@@ -148,6 +154,8 @@ export function parseExtensionSurfaceManifest(
         ...(icon === undefined ? {} : { icon })
       };
     }
+    const taskView = binding.taskView === undefined ? undefined : parseExtensionTaskView(binding.taskView);
+    if (taskView && !discoveredFiles.has(taskView.html)) throw new Error("Extension task-view HTML is not an inspected regular package file.");
     const settings = binding.settings === undefined ? undefined : parseExtensionSettings(binding.settings);
     if (settings && (!discoveredFiles.has(settings.html) || settings.mobileHtml !== undefined && !discoveredFiles.has(settings.mobileHtml))) {
       throw new Error("Extension settings HTML is not an inspected regular package file.");
@@ -163,12 +171,13 @@ export function parseExtensionSurfaceManifest(
       ? undefined
       : validateExtensionRecommendations(binding.recommendations).items;
     const routineEvents = binding.routineEvents === undefined ? undefined : parseExtensionRoutineEvents(binding.routineEvents);
-    const runtime = binding.runtime === undefined ? undefined : parseExtensionRuntime(binding.runtime);
+    const runtime = binding.runtime === undefined ? undefined : parseExtensionRuntime(binding.runtime, taskView !== undefined);
     if (runtime && !discoveredFiles.has(runtime.html)) throw new Error("Extension runtime HTML is not an inspected regular package file.");
     if (routineEvents && !discoveredFiles.has(routineEvents.html)) throw new Error("Routine publisher HTML is not an inspected regular package file.");
     result.push({
       entry,
       ...(mainView === undefined ? {} : { mainView }),
+      ...(taskView === undefined ? {} : { taskView }),
       ...(settings === undefined ? {} : { settings }),
       ...(library === undefined ? {} : { library }),
       ...(routineEvents === undefined ? {} : { routineEvents }),
@@ -179,12 +188,12 @@ export function parseExtensionSurfaceManifest(
   return result;
 }
 
-export function parseExtensionRuntime(value: unknown): ExtensionRuntimeDescriptor {
+export function parseExtensionRuntime(value: unknown, taskViewAvailable = false): ExtensionRuntimeDescriptor {
   const raw = requirePlainObject(value, "Extension runtime");
   requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "tasks", "targets", "text", "showTaskPreferences", "deviceSync", "pick", "image"], ["html", "tools"], "Extension runtime");
   const html = requirePortablePath(raw.html, "Extension runtime HTML");
   if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Extension runtime HTML must be in a self-contained directory.");
-  if (!Array.isArray(raw.tools) || raw.tools.length > 64 || raw.tools.length === 0 && raw.tasks === undefined && raw.text === undefined && raw.deviceSync === undefined && raw.pick === undefined && raw.image === undefined) throw new Error("Extension runtime must declare a tool or a supported capability.");
+  if (!Array.isArray(raw.tools) || raw.tools.length > 64 || raw.tools.length === 0 && !taskViewAvailable && raw.tasks === undefined && raw.text === undefined && raw.deviceSync === undefined && raw.pick === undefined && raw.image === undefined) throw new Error("Extension runtime must declare a tool or a supported capability.");
   const tools = raw.tools.map(item => {
     const tool = requirePlainObject(item, "Extension tool");
     requireExactKeys(tool, ["name", "description", "inputSchema", "readOnly"], ["name", "description", "inputSchema"], "Extension tool");
@@ -329,6 +338,20 @@ export function isExtensionMainViewDescriptor(value: unknown): value is Extensio
   } catch {
     return false;
   }
+}
+
+export function parseExtensionTaskView(value: unknown): ExtensionTaskViewDescriptor {
+  const raw = requirePlainObject(value, "Extension task view");
+  requireExactKeys(raw, ["html", "title"], ["html"], "Extension task view");
+  const html = requirePortablePath(raw.html, "Extension task-view HTML");
+  if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Extension task-view HTML must be in a self-contained directory.");
+  const title = raw.title === undefined ? undefined : requireTitle(raw.title);
+  if (title !== undefined && title.length > 64) throw new Error("Extension task-view title must not exceed 64 characters.");
+  return { html, ...(title === undefined ? {} : { title }) };
+}
+
+export function isExtensionTaskViewDescriptor(value: unknown): value is ExtensionTaskViewDescriptor {
+  try { parseExtensionTaskView(value); return true; } catch { return false; }
 }
 
 export function parseExtensionSettings(value: unknown): ExtensionSettingsDescriptor {

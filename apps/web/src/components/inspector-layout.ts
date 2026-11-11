@@ -13,6 +13,13 @@ export interface InspectorLayoutPreferences {
   readonly groups: Readonly<Record<string, InspectorEdge>>;
   readonly plugins: Readonly<Record<string, InspectorPluginPlacement>>;
   readonly sizes?: Readonly<Partial<Record<InspectorEdge, number>>>;
+  readonly taskViews?: readonly InspectorTaskViewPlacement[];
+}
+export interface InspectorTaskViewPlacement {
+  readonly sessionId: string;
+  readonly sessionCreatedAt: number;
+  readonly extensionIdentity: string;
+  readonly selected: boolean;
 }
 const EMPTY: InspectorLayoutPreferences = { groups: {}, plugins: {} };
 const LIMIT = 1_000;
@@ -44,11 +51,14 @@ export function inspectorExtensionIdentity(extension: ExtensionCatalogEntryView)
 export function inspectorSessionTabKey(sessionId: string, generation: bigint, tabId: string): string {
   return JSON.stringify([sessionId, generation.toString(), tabId]);
 }
+export function inspectorTaskViewKey(view: InspectorTaskViewPlacement): string {
+  return JSON.stringify(["task-view", view.sessionId, view.sessionCreatedAt, view.extensionIdentity]);
+}
 export function parseInspectorLayout(raw: string | null): InspectorLayoutPreferences {
   if (raw === null || raw.length > 2 * 1_024 * 1_024) return EMPTY;
   try {
     const value: unknown = JSON.parse(raw);
-    if (!record(value) || Object.keys(value).some(key => key !== "groups" && key !== "plugins" && key !== "sizes")
+    if (!record(value) || Object.keys(value).some(key => key !== "groups" && key !== "plugins" && key !== "sizes" && key !== "taskViews")
       || !record(value.groups) || !record(value.plugins)
       || Object.keys(value.groups).length > LIMIT || Object.keys(value.plugins).length > LIMIT) return EMPTY;
     const groups: Record<string, InspectorEdge> = {}, plugins: Record<string, InspectorPluginPlacement> = {};
@@ -71,7 +81,23 @@ export function parseInspectorLayout(raw: string | null): InspectorLayoutPrefere
         sizes[edge] = size;
       }
     }
-    return { groups, plugins, ...(value.sizes === undefined ? {} : { sizes }) };
+    const taskViews: InspectorTaskViewPlacement[] = [];
+    if (value.taskViews !== undefined) {
+      if (!Array.isArray(value.taskViews) || value.taskViews.length > LIMIT) return EMPTY;
+      const keys = new Set<string>();
+      for (const view of value.taskViews) {
+        if (!record(view) || Object.keys(view).sort().join(",") !== "extensionIdentity,selected,sessionCreatedAt,sessionId"
+          || typeof view.sessionId !== "string" || !/^[A-Za-z0-9._:-]{1,512}$/u.test(view.sessionId)
+          || typeof view.sessionCreatedAt !== "number" || !Number.isSafeInteger(view.sessionCreatedAt) || view.sessionCreatedAt < 0
+          || typeof view.extensionIdentity !== "string" || !safeKey(view.extensionIdentity) || typeof view.selected !== "boolean") return EMPTY;
+        const placement = { sessionId: view.sessionId, sessionCreatedAt: view.sessionCreatedAt, extensionIdentity: view.extensionIdentity, selected: view.selected };
+        const key = inspectorTaskViewKey(placement);
+        if (keys.has(key)) return EMPTY;
+        keys.add(key);
+        taskViews.push(placement);
+      }
+    }
+    return { groups, plugins, ...(value.sizes === undefined ? {} : { sizes }), ...(value.taskViews === undefined ? {} : { taskViews }) };
   } catch { return EMPTY; }
 }
 export function readInspectorLayout(owner: string): InspectorLayoutPreferences {
@@ -79,7 +105,8 @@ export function readInspectorLayout(owner: string): InspectorLayoutPreferences {
 }
 export function updateInspectorLayout(owner: string, update: (current: InspectorLayoutPreferences) => InspectorLayoutPreferences): InspectorLayoutPreferences {
   const next = update(readInspectorLayout(owner));
-  const bounded = { ...next, groups: Object.fromEntries(Object.entries(next.groups).slice(-LIMIT)), plugins: Object.fromEntries(Object.entries(next.plugins).slice(-LIMIT)) };
+  const bounded = { ...next, groups: Object.fromEntries(Object.entries(next.groups).slice(-LIMIT)), plugins: Object.fromEntries(Object.entries(next.plugins).slice(-LIMIT)),
+    ...(next.taskViews === undefined ? {} : { taskViews: next.taskViews.slice(-LIMIT) }) };
   try { window.localStorage.setItem(inspectorLayoutKey(owner), JSON.stringify(bounded)); } catch { /* Session placement still works without storage. */ }
   return bounded;
 }

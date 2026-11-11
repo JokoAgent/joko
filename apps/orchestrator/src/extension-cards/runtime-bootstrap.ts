@@ -14,6 +14,7 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
     onHostMessage: listener => { if (typeof listener !== "function" || listeners.length >= 64) throw new Error("Invalid event listener."); listeners.push(listener); },
     tools: Object.freeze({ register: (name, handler) => { if (typeof name !== "string" || typeof handler !== "function" || handlers.has(name) || handlers.size >= 64) throw new Error("Invalid tool handler."); handlers.set(name, handler); } }),
     card: Object.freeze({ update: payload => request({ ...payload, type: "card-update", version: 1 }) }),
+    ...(capabilities.taskView ? { taskView: (payload = {}) => request({ type: "task-view-request", payload }) } : {}),
     ...(capabilities.network ? { network: Object.freeze({ fetch: payload => request({ ...payload, type: "fetch-request" }),
       connections: key => request({ type: "connections-list", key }),
       accounts: key => request({ type: "oauth-accounts", key }),

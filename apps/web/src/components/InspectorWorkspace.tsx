@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type DragEvent, type JSX } from "react";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { createPortal } from "react-dom";
 import { Maximize2, Minus, MoreHorizontal, PanelRight, PanelRightClose, Plus, Square, SquareArrowOutUpRight, X } from "lucide-react";
 import { Inspector, type InspectorProps } from "./Inspector.js";
 import { InspectorDock, InspectorTabContribution, moveInspectorMount, type InspectorDockTab } from "./inspector-layout-context.js";
 import { INSPECTOR_EDGES, INSPECTOR_EXTENSION_OPEN_EVENT, INSPECTOR_TAB_DRAG_TYPE, inspectorDropEdge, inspectorExtensionIdentity,
-  acknowledgeInspectorExtensionRequest, drainInspectorExtensionRequests, inspectorLayoutOwner, inspectorLayoutKey, readInspectorLayout, updateInspectorLayout, type InspectorEdge, type InspectorLayoutPreferences, type InspectorOpenMode } from "./inspector-layout.js";
+  acknowledgeInspectorExtensionRequest, drainInspectorExtensionRequests, inspectorLayoutOwner, inspectorLayoutKey, inspectorTaskViewKey,
+  readInspectorLayout, updateInspectorLayout, type InspectorEdge, type InspectorLayoutPreferences, type InspectorOpenMode } from "./inspector-layout.js";
 import { detachedInspectorHostAlive, initializeDetachedInspectorHost, inspectorDetachAvailable, openDetachedInspectorWindow,
   syncDetachedInspectorDocument, type DetachedInspectorHost } from "./inspector-detach.js";
-import { ExtensionMainViewPage, extensionMainViewReady } from "./ExtensionMainViewPage.js";
+import { ExtensionMainViewPage, extensionMainViewReady, extensionTaskViewReady } from "./ExtensionMainViewPage.js";
 import { isExtensionApplicationWindow, openExtensionWindowFallback } from "../extension-window-navigation.js";
 import type { AppShortcutOverrides } from "../app-shortcuts.js";
 import { isSessionApplicationWindow } from "../session-window-navigation.js";
@@ -58,6 +60,45 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
   const commit = useCallback((change: (value: InspectorLayoutPreferences) => InspectorLayoutPreferences): void => {
     const next = updateInspectorLayout(owner, change); preferencesRef.current = next; setPreferences(next);
   }, [owner]);
+  const hasTaskViews = snapshot.extensions.some(extensionTaskViewReady);
+  const focusedTaskId = session?.remoteWorkspace === undefined ? session?.id : undefined;
+  const connected = controller.state.connectionState === "connected";
+  const connectionGeneration = controller.state.connectionGeneration;
+  useEffect(() => {
+    if (!globalEnabled || !connected || !hasTaskViews) return;
+    const controllerAtOpen = current.current.controller;
+    let stream: AbortController | undefined, retry: number | undefined;
+    const stop = () => { stream?.abort(); if (retry !== undefined) window.clearTimeout(retry); };
+    const start = () => {
+      stop();
+      const abort = new AbortController(); stream = abort;
+      const signal = abort.signal;
+      const foreground = document.visibilityState !== "hidden" && document.hasFocus() ? focusedTaskId : undefined;
+      let retryAllowed = true;
+      void controllerAtOpen.watchExtensionTaskViews(foreground, signal, event => {
+        if (signal.aborted) return;
+        const live = current.current;
+        const extension = live.snapshot.extensions.find(entry => entry.id === event.extensionId && entry.revision === event.extensionRevision);
+        const task = live.snapshot.sessions.find(item => item.id === event.sessionId);
+        if (!extensionTaskViewReady(extension) || !task || task.createdAt === undefined || task.archived || task.hidden || task.remoteWorkspace) return;
+        const view = { sessionId: task.id, sessionCreatedAt: task.createdAt, extensionIdentity: inspectorExtensionIdentity(extension), selected: true };
+        commit(value => ({ ...value, taskViews: [...(value.taskViews ?? []).filter(item => inspectorTaskViewKey(item) !== inspectorTaskViewKey(view)).map(item =>
+          item.sessionId === task.id ? { ...item, selected: false } : item), view] }));
+        if (event.focus || live.session?.id === task.id) void live.controller.setInspectorOpen(true).catch(() => undefined);
+        if (event.focus && live.session?.id !== task.id) live.controller.navigate({ kind: "session", sessionId: task.id });
+      }).catch(error => {
+        if (error instanceof ConnectError && [Code.Unimplemented, Code.PermissionDenied, Code.Unauthenticated].includes(error.code)) retryAllowed = false;
+      }).finally(() => { if (!signal.aborted && retryAllowed) retry = window.setTimeout(start, 1_000); });
+    };
+    start();
+    window.addEventListener("focus", start);
+    window.addEventListener("blur", start);
+    document.addEventListener("visibilitychange", start);
+    return () => {
+      stop(); window.removeEventListener("focus", start); window.removeEventListener("blur", start);
+      document.removeEventListener("visibilitychange", start);
+    };
+  }, [commit, connected, connectionGeneration, focusedTaskId, globalEnabled, hasTaskViews]);
   const refreshWindows = (): void => { setWindows([...windowsRef.current]); dock.changed(); };
   const plugin = (identity: string): ExtensionCatalogEntryView | undefined => current.current.snapshot.extensions.find(extension => inspectorExtensionIdentity(extension) === identity && extensionMainViewReady(extension));
   const visibleTabs = (): InspectorDockTab[] => [...dock.tabs.values()].filter(tab => tab.pluginIdentity !== undefined || open && tab.sessionId === session?.id);
@@ -76,6 +117,10 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
     commit(value => ({ ...value, plugins: { ...value.plugins, [tab.pluginIdentity!]: { extensionId: extension.id, mode, edge, open: true } } }));
   };
   const activate = (tab: InspectorDockTab, place: string): void => {
+    if (tab.sessionId !== undefined && (preferencesRef.current.taskViews ?? []).some(view => view.sessionId === tab.sessionId)) {
+      commit(value => ({ ...value, taskViews: (value.taskViews ?? []).map(view => view.sessionId !== tab.sessionId
+        ? view : { ...view, selected: inspectorTaskViewKey(view) === tab.key }) }));
+    }
     dock.focusedGroup = place; dock.selected.set(place, tab.key); dock.tabs.get(tab.key)?.onActivate(); dock.changed();
   };
   dock.revealTab = key => {
@@ -157,7 +202,7 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
   };
   const guardedPlacement = (keys: readonly string[], action: () => void): void => {
     const captured = keys.flatMap(key => { const tab = dock.tabs.get(key); return tab ? [tab] : []; });
-    const guards = captured.flatMap(tab => tab.pluginIdentity === undefined ? [] : closeGuards.current.get(tab.pluginIdentity) ?? []);
+    const guards = captured.flatMap(tab => closeGuards.current.get(tab.pluginIdentity ?? tab.key) ?? []);
     if (!guards.length) { action(); return; }
     void (async () => {
       for (const guard of guards) if (!await guard()) return;
@@ -239,7 +284,7 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
     const reset = (): void => guardedPlacement([...dock.windows.keys()], () => {
       setDefaultSide("right");
       for (const identity of Object.keys(preferencesRef.current.plugins)) attemptedWindows.current.add(identity);
-      commit(value => ({ groups: {}, plugins: Object.fromEntries(Object.entries(value.plugins).map(([identity, placement]) => {
+      commit(value => ({ ...value, groups: {}, plugins: Object.fromEntries(Object.entries(value.plugins).map(([identity, placement]) => {
         const extension = plugin(identity);
         return [identity, { ...placement, mode: extension?.mainView?.open ?? "page", edge: extension?.mainView?.side ?? "right" }];
       })) }));
@@ -401,6 +446,26 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
           registerCloseGuard={guard => { closeGuards.current.set(identity, guard); return () => { if (closeGuards.current.get(identity) === guard) closeGuards.current.delete(identity); }; }} /></section>}
       />;
     })}
+    {(preferences.taskViews ?? []).map(view => {
+      if (!nativeSessionIds.has(view.sessionId)) return null;
+      const task = snapshot.sessions.find(item => item.id === view.sessionId && item.createdAt === view.sessionCreatedAt);
+      const extension = snapshot.extensions.find(item => inspectorExtensionIdentity(item) === view.extensionIdentity);
+      if (!task || task.archived || task.hidden || task.remoteWorkspace || !extensionTaskViewReady(extension)) return null;
+      const key = inspectorTaskViewKey(view);
+      return <InspectorTabContribution key={key} dock={dock} owner={key}
+        tabs={[{ key, sessionId: task.id, kind: "extension-task", label: extension.taskView.title ?? extension.name,
+          preferred: view.selected, onActivate: () => undefined,
+          onClose: async () => {
+            if (!await (closeGuards.current.get(key)?.() ?? Promise.resolve(true)) || !alive.current) return;
+            commit(value => ({ ...value, taskViews: (value.taskViews ?? []).filter(item => inspectorTaskViewKey(item) !== key) }));
+          } }]}
+        render={(_key, active, ownerDocument) => active && <section id={`inspector-panel-${key}`} role="tabpanel"
+          aria-labelledby={`inspector-tab-${key}`} className="inspector-dock-plugin">
+          <ExtensionMainViewPage controller={controller} extensionId={extension.id} taskSessionId={task.id} t={t} embedded ownerDocument={ownerDocument}
+            navigationOpen onOpenNavigation={() => undefined} onOpenIndependent={() => undefined}
+            registerCloseGuard={guard => { closeGuards.current.set(key, guard); return () => { if (closeGuards.current.get(key) === guard) closeGuards.current.delete(key); }; }} />
+        </section>} />;
+    })}
     {INSPECTOR_EDGES.map(edge => { const tabs = orderedTabs(visibleTabs().filter(tab => !dock.windows.has(tab.key) && edgeOf(tab) === edge)); return tabs.length || edge === defaultSide && open && session !== undefined && ![...dock.tabs.values()].some(tab => tab.sessionId === session.id) ? group(edge, tabs, edge) : null; })}
     {windows.map(entry => createPortal(<div className="inspector-window-shell inspector-dock-window">
       <header className="inspector-window-titlebar"><PanelRight aria-hidden="true" /><span>{t("inspector.windowLabel")}</span><IconButton label={t("inspector.mergeBack")} onClick={() => guardedPlacement(entry.order, () => returnWindow(entry))}><PanelRight /></IconButton></header>
@@ -427,7 +492,8 @@ function DockGroup({ dock, place, tabs, edge, entry, t, activate, drop, canDetac
   const resizeCleanup = useRef<(() => void) | undefined>(undefined);
   useEffect(() => () => resizeCleanup.current?.(), []);
   const [menu, setMenu] = useState(false), [adding, setAdding] = useState(false), [maximized, setMaximized] = useState(false);
-  const selected = dock.selected.get(place), active = tabs.find(tab => tab.key === selected) ?? tabs.find(tab => tab.preferred) ?? tabs[0];
+  const selected = dock.selected.get(place), active = tabs.find(tab => tab.kind === "extension-task" && tab.preferred)
+    ?? tabs.find(tab => tab.key === selected) ?? tabs.find(tab => tab.preferred) ?? tabs[0];
   useEffect(() => {
     if (!menu && !adding) return;
     const owner = entry?.host.window.document ?? document;
