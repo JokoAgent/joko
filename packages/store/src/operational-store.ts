@@ -7247,12 +7247,38 @@ export class OperationalStore {
       if (!connection.enabled || connection.runtimeStatus !== "connected") return undefined;
       const claimToken = messagingClaimToken(input.claimToken);
       const at = messagingTimestamp(input.claimedAt ?? this.now(), "delivery claim time");
+      if (connection.channel === "telegram") {
+        // A retryable rejection is returned to pending by the worker. If an
+        // earlier part is still terminal at claim time, its tail cannot be sent.
+        this.database.prepare(`
+          UPDATE messaging_deliveries AS tail
+          SET status = 'cancelled', updated_at = MAX(updated_at, ?), revision = ?
+          WHERE tail.connection_id = ? AND tail.channel_generation = ? AND tail.status = 'pending'
+            AND tail.part_index > 0 AND tail.kind IN ('text', 'file') AND tail.dedupe_key GLOB 'run:*:answer'
+            AND EXISTS (
+              SELECT 1 FROM messaging_deliveries AS prior
+              WHERE prior.connection_id = tail.connection_id AND prior.channel_generation = tail.channel_generation
+                AND prior.conversation_id = tail.conversation_id AND prior.dedupe_key = tail.dedupe_key
+                AND prior.part_index < tail.part_index AND prior.status IN ('failed', 'unknown', 'cancelled')
+            )
+        `).run(at, asSqlInteger(this.requireActiveRevision()), connection.id, connection.generation);
+      }
       // A Discord final can edit the same carrier as an in-flight progress effect.
       // Keep it pending through that effect's receipt, and keep its remaining parts behind the first.
       const row = this.database.prepare(`
         SELECT delivery.* FROM messaging_deliveries AS delivery
         WHERE delivery.connection_id = ? AND delivery.channel_generation = ?
           AND delivery.status = 'pending' AND delivery.available_at <= ?
+          AND NOT (
+            ? = 'telegram' AND delivery.part_index > 0 AND delivery.kind IN ('text', 'file')
+            AND delivery.dedupe_key GLOB 'run:*:answer'
+            AND NOT EXISTS (
+              SELECT 1 FROM messaging_deliveries AS previous
+              WHERE previous.connection_id = delivery.connection_id AND previous.channel_generation = delivery.channel_generation
+                AND previous.conversation_id = delivery.conversation_id AND previous.dedupe_key = delivery.dedupe_key
+                AND previous.part_index = delivery.part_index - 1 AND previous.status = 'sent'
+            )
+          )
           AND NOT EXISTS (
             SELECT 1 FROM messaging_deliveries AS first_part
             WHERE ? = 'discord' AND first_part.connection_id = delivery.connection_id
@@ -7275,7 +7301,7 @@ export class OperationalStore {
               )
           )
         ORDER BY delivery.available_at, delivery.created_at, delivery.id LIMIT 1
-      `).get(connection.id, connection.generation, at, connection.channel) as Row | undefined;
+      `).get(connection.id, connection.generation, at, connection.channel, connection.channel) as Row | undefined;
       if (row === undefined) return undefined;
       const current = messagingDeliveryFromRow(row);
       const result = this.database.prepare(`

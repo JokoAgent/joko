@@ -350,6 +350,41 @@ describe("MessagingManager", () => {
     await fixture.restartManager(); expect(transport.textAttempts).toBe(attempts); expect(transport.stream.removed).toEqual([]);
   });
 
+  it("sends a Telegram answer in order after the first part receives a retry_after", async () => {
+    const adapter = new ControlledReplyAdapter();
+    const transport = new StreamingTelegramTransport();
+    const fixture = await createFixture(() => transport, () => adapter);
+    const poll = transport.poll.bind(transport), normalize = transport.normalize.bind(transport);
+    vi.spyOn(transport, "poll").mockImplementation(async input => {
+      if (input.cursor === null) return poll(input);
+      await new Promise<void>(resolve => setTimeout(resolve, 15));
+      input.signal?.throwIfAborted();
+      return { updates: [], nextCursor: input.cursor };
+    });
+    vi.spyOn(transport, "normalize").mockImplementation(updates => updates.length === 0
+      ? { events: [], groupObservations: [], ignored: [] } : normalize(updates));
+    const send = transport.sendTextPart.bind(transport);
+    const attempts: { part: "first" | "tail"; at: number }[] = [];
+    const retryAfterMs = 250;
+    vi.spyOn(transport, "sendTextPart").mockImplementation(async input => {
+      const part = input.text.startsWith("FirstSegment") ? "first" : "tail";
+      attempts.push({ part, at: Date.now() });
+      if (attempts.length === 1 && part === "first") throw new MessagingTransportError("rate_limited", "Telegram asked to retry.",
+        { effect: "none", retryable: true, providerStatus: 429, retryAfterMs });
+      return send(input);
+    });
+    const connection = await enableTelegramReply(fixture, "telegram-ordered");
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.finish(`FirstSegment${"x".repeat(4_200)}`);
+    const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
+    const deliveries = () => fixture.store.listMessagingDeliveries({ connectionId: connection.id })
+      .filter(delivery => delivery.dedupeKey === `run:${request.runId}:answer`).sort((a, b) => a.partIndex - b.partIndex);
+    await vi.waitFor(() => expect(deliveries().map(({ status }) => status)).toEqual(["sent", "sent"]), { timeout: 5_000 });
+    expect(attempts.map(({ part }) => part)).toEqual(["first", "first", "tail"]);
+    expect(attempts[1]!.at - attempts[0]!.at).toBeGreaterThanOrEqual(retryAfterMs);
+    expect(deliveries().map(({ attempts }) => attempts)).toEqual([2, 1]);
+  });
+
   it("retires a pending stream when its original connection generation is disabled", async () => {
     const adapter = new ControlledReplyAdapter(), transport = new StreamingTelegramTransport();
     const fixture = await createFixture(() => transport, () => adapter, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 20, discordMs: 20 });
