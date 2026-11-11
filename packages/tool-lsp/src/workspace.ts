@@ -1,5 +1,6 @@
 import {
   lstatSync,
+  opendirSync,
   readFileSync,
   realpathSync,
   type Dirent,
@@ -70,7 +71,7 @@ export class TypeScriptWorkspace {
     this.#maximumFiles = maximumFiles;
     this.#files = scan.files;
     this.#fileByKey = new Map(scan.files.map((fileName) => [pathKey(fileName), fileName]));
-    this.#host = new GovernedLanguageServiceHost(scan);
+    this.#host = new GovernedLanguageServiceHost(scan, maximumFiles);
     this.#service = ts.createLanguageService(this.#host, ts.createDocumentRegistry());
   }
 
@@ -93,6 +94,9 @@ export class TypeScriptWorkspace {
     this.#files = scan.files;
     this.#fileByKey = new Map(scan.files.map((fileName) => [pathKey(fileName), fileName]));
     this.#host.refresh(scan);
+    // Dependency manifests and failed module lookups are outside the public
+    // index. Refresh their semantic graph along with the indexed source files.
+    this.#service.cleanupSemanticCache();
   }
 
   run<T>(control: LspOperationControl, operation: (service: ts.LanguageService) => T): T {
@@ -168,12 +172,8 @@ export class TypeScriptWorkspace {
       throw new LspToolError("UNSUPPORTED_FILE", "The requested file is not a supported TypeScript or JavaScript source file.");
     }
     const canonical = checkedRealpathSync(candidate, this.root, "FILE_UNSAFE");
-    const indexed = this.#fileByKey.get(pathKey(canonical));
-    if (indexed === undefined) {
-      throw new LspToolError("FILE_IGNORED", "The requested source file is excluded from the workspace index.");
-    }
-    const text = readTrustedRegularFileSync(indexed, this.root, MAXIMUM_LSP_FILE_BYTES, control);
-    return Object.freeze({ fileName: indexed, text });
+    const text = readTrustedRegularFileSync(canonical, this.root, MAXIMUM_LSP_FILE_BYTES, control);
+    return Object.freeze({ fileName: canonical, text });
   }
 
   indexedText(fileName: string, control: LspOperationControl): string | undefined {
@@ -216,7 +216,10 @@ export class TypeScriptWorkspace {
       directory = dirname(directory);
     }
     if (configPath === undefined) {
-      this.#host.setProject(includeUnconfiguredWorkspace ? this.#files : [anchor.fileName]);
+      const files = includeUnconfiguredWorkspace
+        ? [...this.#files, ...(this.#fileByKey.has(pathKey(anchor.fileName)) ? [] : [anchor.fileName])]
+        : [anchor.fileName];
+      this.#host.setProject(files);
       return;
     }
     const readConfig = (path: string): string | undefined => {
@@ -237,11 +240,11 @@ export class TypeScriptWorkspace {
         control.check();
         if (!isWithin(root, this.root)) return [];
         return ts.sys.readDirectory(root, extensions, exclude, include, depth)
-          .filter((path) => this.#fileByKey.has(pathKey(path)));
+          .filter((path) => this.#fileByKey.has(pathKey(path)) || samePath(path, anchor.fileName));
       }
     }, dirname(configPath), { noEmit: true }, configPath);
     if (parsed.errors.length > 0) throw new LspToolError("INVALID_ARGUMENT", "The anchor project configuration is invalid or outside the workspace.");
-    const files = parsed.fileNames.filter((path) => this.#fileByKey.has(pathKey(path)));
+    const files = parsed.fileNames.filter((path) => this.#fileByKey.has(pathKey(path)) || samePath(path, anchor.fileName));
     if (!files.some((path) => samePath(path, anchor.fileName))) this.#host.setProject([anchor.fileName]);
     else this.#host.setProject(files, parsed.options);
   }
@@ -462,8 +465,9 @@ async function readDirectoryIgnoreRules(
 class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
   readonly #root: string;
   #files: readonly string[];
-  #fileByKey: ReadonlyMap<string, string>;
-  #directoryByKey: ReadonlyMap<string, string>;
+  readonly #maximumFiles: number;
+  #semanticFiles: Set<string>;
+  #semanticDirectories: Set<string>;
   #compilerOptions: ts.CompilerOptions;
   readonly #defaultCompilerOptions: ts.CompilerOptions;
   #projectFiles: readonly string[];
@@ -471,11 +475,12 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
   #activeControl: LspOperationControl | undefined;
   #projectVersion = 0;
 
-  constructor(scan: WorkspaceScan) {
+  constructor(scan: WorkspaceScan, maximumFiles: number) {
     this.#root = scan.root;
     this.#files = scan.files;
-    this.#fileByKey = new Map(scan.files.map((fileName) => [pathKey(fileName), fileName]));
-    this.#directoryByKey = new Map(scan.directories.map((directory) => [pathKey(directory), directory]));
+    this.#maximumFiles = maximumFiles;
+    this.#semanticFiles = new Set(scan.files.map(pathKey));
+    this.#semanticDirectories = new Set(scan.directories.map(pathKey));
     this.#compilerOptions = Object.freeze({
       allowJs: true,
       allowNonTsExtensions: false,
@@ -528,8 +533,8 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
 
   refresh(scan: WorkspaceScan): void {
     this.#files = scan.files;
-    this.#fileByKey = new Map(scan.files.map((fileName) => [pathKey(fileName), fileName]));
-    this.#directoryByKey = new Map(scan.directories.map((directory) => [pathKey(directory), directory]));
+    this.#semanticFiles = new Set(scan.files.map(pathKey));
+    this.#semanticDirectories = new Set(scan.directories.map(pathKey));
     this.setProject(scan.files);
   }
 
@@ -551,11 +556,12 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
     const accepted = this.acceptedFile(fileName);
     if (accepted === undefined) return undefined;
     try {
-      const boundary = this.#fileByKey.has(pathKey(accepted)) ? this.#root : this.#libraryRoot;
+      const boundary = isWithin(accepted, this.#root) ? this.#root : this.#libraryRoot;
       return ts.ScriptSnapshot.fromString(
         readTrustedRegularFileSync(accepted, boundary, MAXIMUM_LSP_FILE_BYTES, this.#activeControl)
       );
-    } catch {
+    } catch (error) {
+      if (error instanceof LspToolError) throw error;
       return undefined;
     }
   }
@@ -587,6 +593,7 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
     case ".cjs": return ts.ScriptKind.JS;
     case ".jsx": return ts.ScriptKind.JSX;
     case ".tsx": return ts.ScriptKind.TSX;
+    case ".json": return ts.ScriptKind.JSON;
     default: return ts.ScriptKind.TS;
     }
   }
@@ -604,7 +611,11 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
   directoryExists(directoryName: string): boolean {
     this.check();
     const candidate = resolve(directoryName);
-    if (this.#directoryByKey.has(pathKey(candidate))) return isOrdinaryDirectorySync(candidate, this.#root);
+    if (isWithin(candidate, this.#root)) {
+      if (!isOrdinaryDirectorySync(candidate, this.#root)) return false;
+      this.trackWorkspacePath(candidate, this.#semanticDirectories, "directory");
+      return true;
+    }
     return isWithin(candidate, this.#libraryRoot) && isOrdinaryDirectorySync(candidate, this.#libraryRoot);
   }
 
@@ -613,10 +624,21 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
     const candidate = resolve(directoryName);
     if (!this.directoryExists(candidate)) return [];
     const result: string[] = [];
-    for (const directory of this.#directoryByKey.values()) {
-      if (samePath(dirname(directory), candidate)) result.push(directory);
+    try {
+      const directory = opendirSync(candidate);
+      try {
+        for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
+          this.check();
+          if (entry.isDirectory() && this.directoryExists(resolve(candidate, entry.name))) result.push(entry.name);
+        }
+      } finally {
+        directory.closeSync();
+      }
+    } catch (error) {
+      if (error instanceof LspToolError) throw error;
+      return [];
     }
-    return result.sort(comparePaths);
+    return this.directoryExists(candidate) ? result.sort() : [];
   }
 
   readDirectory(
@@ -645,11 +667,28 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
   }
 
   private acceptedFile(fileName: string): string | undefined {
+    this.check();
     const candidate = resolve(fileName);
-    const indexed = this.#fileByKey.get(pathKey(candidate));
-    if (indexed !== undefined && isOrdinaryFileSync(indexed, this.#root)) return indexed;
+    if (isWithin(candidate, this.#root)) {
+      if ((!isSupportedSourceFile(candidate) && extname(candidate).toLowerCase() !== ".json") ||
+        !isOrdinaryFileSync(candidate, this.#root)) return undefined;
+      this.trackWorkspacePath(candidate, this.#semanticFiles, "file");
+      return candidate;
+    }
     if (!isWithin(candidate, this.#libraryRoot) || !candidate.toLowerCase().endsWith(".d.ts")) return undefined;
     return isOrdinaryFileSync(candidate, this.#libraryRoot) ? candidate : undefined;
+  }
+
+  private trackWorkspacePath(path: string, paths: Set<string>, kind: "directory" | "file"): void {
+    this.check();
+    const key = pathKey(path);
+    if (paths.has(key)) return;
+    if (paths.size >= this.#maximumFiles) {
+      throw new LspToolError("FILE_LIMIT_EXCEEDED", `The workspace semantic ${kind} count exceeds its safe limit.`, {
+        maximum: this.#maximumFiles
+      });
+    }
+    paths.add(key);
   }
 
   private check(): void {

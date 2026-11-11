@@ -277,6 +277,35 @@ describe("LspToolBridgeProvider", () => {
     }
   });
 
+  it("resolves an installed dependency through the original authenticated tool grant", async () => {
+    const value = await routerFixture();
+    try {
+      const packageRoot = join(value.workspaceRoot, "node_modules", "example-lib");
+      await mkdir(join(packageRoot, "types"), { recursive: true });
+      await writeFile(join(packageRoot, "package.json"), JSON.stringify({ types: "types/value.d.ts" }));
+      await writeFile(join(packageRoot, "types", "value.d.ts"), "export function dependencyValue(): number;\n");
+      await writeFile(join(value.workspaceRoot, "index.ts"), 'import { dependencyValue } from "example-lib";\ndependencyValue();\n');
+      const snapshot = value.router.createPiBridgeSnapshot({
+        endpoint: "http://127.0.0.1:4318/internal/mcp", targetId: "target-trusted", expectedPiGeneration: 7
+      });
+      value.snapshots.push(snapshot);
+      const result = await value.router.executeBridgeCall({
+        authorization: `Bearer ${snapshot.mcpBridge.token}`,
+        requestId: "lsp-dependency-hover", generation: 7, sessionId: "session-7", targetId: "target-trusted",
+        serverId: LSP_BRIDGE_PROVIDER_ID, toolName: "hover",
+        arguments: { file: "index.ts", line: 2, character: 1 }
+      });
+      expect(result).toMatchObject({
+        isError: false,
+        details: {
+          mcpStructuredContent: { ok: true, result: {
+            action: "hover", items: [expect.objectContaining({ display: expect.stringContaining("number") })]
+          } }
+        }
+      });
+    } finally { await value.close(); }
+  });
+
   it("samples opt-in only for new snapshots and preserves an already frozen Session grant", async () => {
     const value = await routerFixture(false);
     try {
@@ -443,6 +472,7 @@ async function routerFixture(initialEnabled = true) {
   return {
     router,
     snapshots,
+    workspaceRoot,
     setEnabled(value: boolean) { enabled = value; },
     async close() {
       for (const snapshot of snapshots) snapshot.revoke();

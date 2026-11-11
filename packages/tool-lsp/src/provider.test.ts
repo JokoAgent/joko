@@ -13,6 +13,88 @@ afterEach(async () => {
 });
 
 describe("TypeScript LSP bridge capabilities", () => {
+  it.each(["types", "exports"])("resolves installed package %s metadata without exposing dependency locations", async (metadata) => {
+    const fixture = await workspaceFixture();
+    const packageRoot = join(fixture.root, "node_modules", "example-lib");
+    await mkdir(join(packageRoot, "types"), { recursive: true });
+    const packageManifest = (file: string) => JSON.stringify({
+      name: "example-lib", type: "module",
+      ...(metadata === "types" ? { types: file } : { exports: { ".": { types: `./${file}` } } })
+    });
+    await writeFile(join(fixture.root, "package.json"), JSON.stringify({ type: "module" }));
+    await writeFile(join(packageRoot, "package.json"), packageManifest("types/count.d.ts"));
+    const declaration = "export function getCount(): number;\n";
+    await writeFile(join(packageRoot, "types", "count.d.ts"), declaration);
+    const main = 'import { getCount } from "example-lib";\nexport const count = getCount();\n';
+    await writeFile(join(fixture.root, "main.ts"), main);
+    const bridge = new TypeScriptLspBridge();
+    const request = { workspaceRoot: fixture.root, file: "main.ts", ...oneBased(main, "getCount()") };
+    try {
+      expect((await bridge.hover(request)).items[0]?.display).toContain("number");
+      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+      const references = await bridge.findReferences({
+        workspaceRoot: fixture.root, file: "node_modules/example-lib/types/count.d.ts",
+        ...oneBased(declaration, "getCount"), includeDeclaration: true
+      });
+      expect(references.items.some((item) => item.location.path === "main.ts")).toBe(true);
+      expect(references.items.every((item) => !item.location.path.startsWith("node_modules/"))).toBe(true);
+      expect((await bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "main.ts", query: "getCount" }))
+        .items.every((item) => !item.location.path.startsWith("node_modules/"))).toBe(true);
+
+      await writeFile(join(packageRoot, "types", "count.d.ts"), "export function getCount(): string;\n");
+      expect((await bridge.hover(request)).items[0]?.display).toContain("string");
+      await writeFile(join(packageRoot, "types", "replacement.d.ts"), "export function getCount(): boolean;\n");
+      await writeFile(join(packageRoot, "package.json"), packageManifest("types/replacement.d.ts"));
+      expect((await bridge.hover(request)).items[0]?.display).toContain("boolean");
+    } finally { bridge.dispose(); }
+  });
+
+  it.each([true, false])("loads workspace type packages with explicit types configured: %s", async (explicitTypes) => {
+    const fixture = await workspaceFixture();
+    const packageRoot = join(fixture.root, "node_modules", "@types", "example-env");
+    await mkdir(packageRoot, { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ types: "environment.d.ts" }));
+    await writeFile(join(packageRoot, "environment.d.ts"), 'declare const toolEnvironment: { label: "configured" };\n');
+    await writeFile(join(fixture.root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: { ...(explicitTypes ? { types: ["example-env"] } : {}) }, files: ["main.ts"]
+    }));
+    const main = "export const label = toolEnvironment.label;\n";
+    await writeFile(join(fixture.root, "main.ts"), main);
+    const bridge = new TypeScriptLspBridge();
+    try {
+      const result = await bridge.hover({ workspaceRoot: fixture.root, file: "main.ts", ...oneBased(main, "toolEnvironment") });
+      expect(result.items[0]?.display).toContain('"configured"');
+    } finally { bridge.dispose(); }
+  });
+
+  it("uses ignored source for semantic queries while filtering its discovery locations", async () => {
+    const fixture = await workspaceFixture();
+    await mkdir(join(fixture.root, "generated"));
+    await writeFile(join(fixture.root, ".gitignore"), "generated/\n");
+    await writeFile(join(fixture.root, "tsconfig.json"), JSON.stringify({ include: ["**/*.ts"] }));
+    const declaration = 'export function hiddenValue(): "generated" { return "generated"; }\n';
+    await writeFile(join(fixture.root, "generated", "values.ts"), declaration);
+    const main = 'import { hiddenValue } from "./generated/values.js";\nexport const value = hiddenValue();\n';
+    await writeFile(join(fixture.root, "main.ts"), main);
+    const bridge = new TypeScriptLspBridge();
+    const request = { workspaceRoot: fixture.root, file: "main.ts", ...oneBased(main, "hiddenValue()") };
+    const hidden = { workspaceRoot: fixture.root, file: "generated/values.ts", ...oneBased(declaration, "hiddenValue") };
+    try {
+      expect((await bridge.hover(request)).items[0]?.display).toContain('"generated"');
+      expect((await bridge.hover(hidden)).items[0]?.display).toContain('"generated"');
+      const outline = await bridge.outline({ workspaceRoot: fixture.root, file: "generated/values.ts" });
+      expect(outline.items).toEqual([expect.objectContaining({
+        name: "hiddenValue", location: expect.objectContaining({ path: "generated/values.ts" })
+      })]);
+      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+      const references = await bridge.findReferences({ ...hidden, includeDeclaration: true });
+      expect(references.items.some((item) => item.location.path === "main.ts")).toBe(true);
+      expect(references.items.every((item) => !item.location.path.startsWith("generated/"))).toBe(true);
+      expect((await bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "main.ts", query: "hiddenValue" }))
+        .items.every((item) => !item.location.path.startsWith("generated/"))).toBe(true);
+    } finally { bridge.dispose(); }
+  });
+
   it.each(["tsconfig.json", "jsconfig.json"])("uses %s for position queries and switches between configured projects", async (configName) => {
     const fixture = await workspaceFixture();
     const extension = configName === "jsconfig.json" ? "js" : "ts";
@@ -56,7 +138,8 @@ describe("TypeScript LSP bridge capabilities", () => {
       await expect(bridge.outline({ workspaceRoot: fixture.root, file: "new/added.ts" })).rejects.toMatchObject({ code: "FILE_NOT_FOUND" });
       await writeFile(join(fixture.root, ".gitignore"), "renamed.ts\n");
       expect((await symbols()).items).toEqual([]);
-      await expect(bridge.outline({ workspaceRoot: fixture.root, file: "renamed.ts" })).rejects.toMatchObject({ code: "FILE_IGNORED" });
+      await expect(bridge.outline({ workspaceRoot: fixture.root, file: "renamed.ts" }))
+        .resolves.toMatchObject({ items: [expect.objectContaining({ name: "addedValue" })] });
       await writeFile(join(fixture.root, ".gitignore"), "");
       expect((await symbols()).items.map((item) => item.location.path)).toEqual(["renamed.ts"]);
       await rm(join(fixture.root, "renamed.ts"));
