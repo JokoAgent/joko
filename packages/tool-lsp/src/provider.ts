@@ -1,4 +1,4 @@
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 import ts from "typescript";
 
 import { isLspToolError, LspToolError } from "./errors.js";
@@ -310,7 +310,7 @@ export class TypeScriptLspBridge {
     const maximum = maximumResults(request.maxResults, DEFAULT_OUTLINE_RESULTS);
     const file = workspace.resolveFile(request.file, control);
     const tree = workspace.run(control, (service) => service.getNavigationTree(file.fileName));
-    const projection = new WorkspaceProjection(workspace, control);
+    const projection = new WorkspaceProjection(workspace, control, file);
     const stack = [...(tree.childItems ?? [])].reverse().map((item) => ({ item, depth: 0, parent: undefined as string | undefined }));
     const items: LspOutlineItem[] = [];
     while (stack.length > 0 && items.length <= maximum) {
@@ -492,10 +492,17 @@ class WorkspaceProjection {
   readonly #control: LspOperationControl;
   readonly #texts = new Map<string, string | undefined>();
   readonly #lineStarts = new Map<string, readonly number[]>();
+  readonly #explicitFile: string | undefined;
 
-  constructor(workspace: TypeScriptWorkspace, control: LspOperationControl) {
+  constructor(
+    workspace: TypeScriptWorkspace,
+    control: LspOperationControl,
+    explicitFile?: { readonly fileName: string; readonly text: string }
+  ) {
     this.#workspace = workspace;
     this.#control = control;
+    this.#explicitFile = explicitFile?.fileName;
+    if (explicitFile !== undefined) this.#texts.set(pathKey(explicitFile.fileName), explicitFile.text);
   }
 
   text(fileName: string): string | undefined {
@@ -507,7 +514,9 @@ class WorkspaceProjection {
   }
 
   location(fileName: string, span: ts.TextSpan): LspLocation | undefined {
-    const path = this.#workspace.publicPath(fileName);
+    const path = this.#explicitFile !== undefined && pathKey(fileName) === pathKey(this.#explicitFile)
+      ? relative(this.#workspace.root, this.#explicitFile).replaceAll("\\", "/")
+      : this.#workspace.publicPath(fileName);
     const range = this.range(fileName, span);
     if (path === undefined || range === undefined) return undefined;
     return Object.freeze({ path, range });

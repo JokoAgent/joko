@@ -14,7 +14,7 @@ afterEach(async () => {
 });
 
 describe("TypeScript LSP safety boundaries", () => {
-  it("filters .gitignore entries and never indexes hard-excluded dependency trees", async () => {
+  it("filters .gitignore and dependency discovery results without denying explicit source queries", async () => {
     const root = await temporaryRoot("ignore");
     await writeFile(join(root, ".gitignore"), "ignored.ts\nignored-dir/\n", "utf8");
     await writeFile(join(root, "visible.ts"), "export function visibleSymbol() {}\n", "utf8");
@@ -34,10 +34,91 @@ describe("TypeScript LSP safety boundaries", () => {
       await expect(bridge.workspaceSymbol({ workspaceRoot: root, anchorFile: "visible.ts", query: "dependencySymbol" }))
         .resolves.toMatchObject({ items: [] });
       await expect(bridge.hover({ workspaceRoot: root, file: "ignored.ts", line: 1, column: 17 }))
-        .rejects.toMatchObject({ code: "FILE_IGNORED" });
+        .resolves.toMatchObject({ items: [expect.objectContaining({ display: expect.stringContaining("hiddenSymbol") })] });
     } finally {
       bridge.dispose();
     }
+  });
+
+  it("loads only requested dependency files and applies the total file limit to them", async () => {
+    const root = await temporaryRoot("dependency-count");
+    const packageRoot = join(root, "node_modules", "selected-lib");
+    await mkdir(packageRoot, { recursive: true });
+    for (let index = 0; index < 8; index += 1) {
+      const unused = join(root, "node_modules", `unused-${index}`);
+      await mkdir(unused);
+      await writeFile(join(unused, "index.d.ts"), "export const unused: number;\n");
+    }
+    await writeFile(join(root, "main.ts"), 'import { selected } from "selected-lib";\nselected;\n');
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ types: "index.d.ts" }));
+    await writeFile(join(packageRoot, "index.d.ts"), "export const selected: number;\n");
+    const bridge = new TypeScriptLspBridge({ maximumWorkspaceFiles: 4 });
+    const request = { workspaceRoot: root, file: "main.ts", line: 2, column: 1 };
+    try {
+      expect((await bridge.hover(request)).items[0]?.display).toContain("number");
+      await writeFile(join(packageRoot, "index.d.ts"), 'export { selected } from "./first.js";\n');
+      await writeFile(join(packageRoot, "first.d.ts"), 'export { selected } from "./second.js";\n');
+      await writeFile(join(packageRoot, "second.d.ts"), "export const selected: string;\n");
+      await expect(bridge.hover(request)).rejects.toMatchObject({ code: "FILE_LIMIT_EXCEEDED" });
+    } finally { bridge.dispose(); }
+  });
+
+  it("does not follow package metadata or imports outside the authenticated workspace", async () => {
+    const root = await temporaryRoot("dependency-boundary");
+    const outside = await temporaryRoot("outside-dependency");
+    await writeFile(join(outside, "index.d.ts"), 'export const secret: "outside-value";\n');
+    const packageRoot = join(root, "node_modules", "outside-lib");
+    await mkdir(packageRoot, { recursive: true });
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ types: join(outside, "index.d.ts") }));
+    await writeFile(join(root, "main.ts"), 'import { secret } from "outside-lib";\nsecret;\n');
+    const bridge = new TypeScriptLspBridge();
+    const request = { workspaceRoot: root, file: "main.ts", line: 2, column: 1 };
+    try {
+      expect(JSON.stringify(await bridge.hover(request))).not.toContain("outside-value");
+      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+      await writeFile(join(root, "main.ts"), `import { secret } from ${JSON.stringify(join(outside, "index.d.ts").replaceAll("\\", "/"))};\nsecret;\n`);
+      expect(JSON.stringify(await bridge.hover(request))).not.toContain("outside-value");
+      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+    } finally { bridge.dispose(); }
+  });
+
+  it("does not read linked dependency declarations", async () => {
+    const root = await temporaryRoot("dependency-links");
+    const outside = await temporaryRoot("linked-dependency");
+    await writeFile(join(outside, "index.d.ts"), 'export const secret: "linked-value";\n');
+    await mkdir(join(root, "node_modules"));
+    const linked = join(root, "node_modules", "linked-lib");
+    try {
+      await symlink(outside, linked, process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (!isSymlinkUnavailable(error)) throw error;
+      return;
+    }
+    await writeFile(join(root, "main.ts"), 'import { secret } from "linked-lib";\nsecret;\n');
+    const bridge = new TypeScriptLspBridge();
+    const request = { workspaceRoot: root, file: "main.ts", line: 2, column: 1 };
+    try {
+      expect(JSON.stringify(await bridge.hover(request))).not.toContain("linked-value");
+      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+      await expect(bridge.outline({ workspaceRoot: root, file: "node_modules/linked-lib/index.d.ts" }))
+        .rejects.toMatchObject({ code: "FILE_UNSAFE" });
+    } finally { bridge.dispose(); }
+  });
+
+  it("does not read oversized dependency declarations", async () => {
+    const root = await temporaryRoot("dependency-size");
+    const large = join(root, "node_modules", "large-lib");
+    await mkdir(large, { recursive: true });
+    await writeFile(join(large, "index.d.ts"), 'export const secret: "large-value";\n');
+    await truncate(join(large, "index.d.ts"), MAXIMUM_LSP_FILE_BYTES + 1);
+    await writeFile(join(root, "main.ts"), 'import { secret } from "large-lib";\nsecret;\n');
+    const bridge = new TypeScriptLspBridge();
+    const request = { workspaceRoot: root, file: "main.ts", line: 2, column: 1 };
+    try {
+      expect(JSON.stringify(await bridge.hover(request))).not.toContain("large-value");
+      await expect(bridge.outline({ workspaceRoot: root, file: "node_modules/large-lib/index.d.ts" }))
+        .rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+    } finally { bridge.dispose(); }
   });
 
   it("rejects traversal, invalid one-based positions, oversized files, and unsafe roots", async () => {
