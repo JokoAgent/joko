@@ -19,6 +19,7 @@ export interface TelegramMessageEntity {
   readonly type: string;
   readonly offset: number;
   readonly length: number;
+  readonly user?: TelegramUser;
 }
 
 export interface TelegramPhotoSize {

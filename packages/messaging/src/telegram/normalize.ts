@@ -124,6 +124,7 @@ function normalizeMessage(
   const sourceText = message.text ?? message.caption ?? "";
   let text = sourceText;
   let ambient = false;
+  let explicitlyAddressed = false;
   if (message.chat.type === "private") {
     if (userId !== options.ownerUserId) {
       return { event: null, ignored: ignoredEntry(requestId, "unauthorized", chatId, userId) };
@@ -135,6 +136,7 @@ function normalizeMessage(
     }
     const owner = userId === options.ownerUserId;
     let trigger = detectTelegramGroupTrigger(message, options.bot);
+    explicitlyAddressed = trigger !== null;
     if (trigger === null && owner && isBareCommand(sourceText)) trigger = sourceText.trim();
     if (trigger === null && activation === "always" && sourceText.trim() !== "") {
       trigger = sourceText.trim();
@@ -150,7 +152,7 @@ function normalizeMessage(
     text = trigger;
   }
 
-  if (text.trim() === "" && collected.attachments.length === 0 && collected.unsupported.length === 0) {
+  if (!explicitlyAddressed && text.trim() === "" && collected.attachments.length === 0 && collected.unsupported.length === 0) {
     return { event: null, ignored: ignoredEntry(requestId, "service_message", chatId, userId) };
   }
   const address = addressOf(options.connectionId, message);
@@ -314,6 +316,15 @@ export function detectTelegramGroupTrigger(
   const stripped: Array<{ readonly start: number; readonly end: number }> = [];
   let addressed = message.reply_to_message?.from?.id === bot.id;
   for (const entity of entities ?? []) {
+    if (!Number.isSafeInteger(entity.offset) || !Number.isSafeInteger(entity.length) || entity.offset < 0
+      || entity.length < 1 || entity.offset + entity.length > source.length) continue;
+    if (entity.type === "text_mention") {
+      if (entity.user?.id === bot.id) {
+        addressed = true;
+        stripped.push({ start: entity.offset, end: entity.offset + entity.length });
+      }
+      continue;
+    }
     if (entity.type !== "mention" && entity.type !== "bot_command") continue;
     const value = source.slice(entity.offset, entity.offset + entity.length);
     if (entity.type === "mention" && value.toLowerCase() === usernameMention) {
@@ -388,16 +399,9 @@ function displayNameSummon(source: string, displayName: string): string | null {
   const name = displayName.trim();
   if (name.length < 2) return null;
   const escaped = escapeRegExp(name);
-  const separator = "[\\s,，。:：、!！?？~〜]";
   const atPattern = new RegExp(`@${escaped}(?![\\p{L}\\p{N}_])`, "giu");
-  const leadPattern = new RegExp(`^\\s*${escaped}(?=$|${separator})`, "iu");
-  let stripped = source.replace(atPattern, " ");
-  if (stripped === source) {
-    if (!leadPattern.test(source)) return null;
-    stripped = source.replace(leadPattern, "").replace(new RegExp(`^${separator}+`, "u"), "");
-  }
-  const cleaned = stripped.replace(/[ \t]{2,}/gu, " ").trim();
-  return cleaned || source.trim();
+  const stripped = source.replace(atPattern, " ");
+  return stripped === source ? null : stripped.replace(/[ \t]{2,}/gu, " ").trim();
 }
 
 function stripRanges(source: string, ranges: readonly { readonly start: number; readonly end: number }[]): string {
