@@ -180,15 +180,15 @@ export function DesktopPageSearchBar({ overrides, t, onOpenChange }: DesktopPage
   if (!open || !available) return null;
   const unavailable = composing || query === "" || matches === 0 || failed;
   const count = query === "" ? "" : matches === 0 ? "0/0" : `${activeMatch}/${matches}`;
+  const onBarKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key !== "Escape" || event.defaultPrevented || composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    event.stopPropagation();
+    close();
+  };
   const onInputKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
     if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) {
       event.stopPropagation();
-      return;
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      close();
       return;
     }
     if (event.key !== "Enter" || query === "") return;
@@ -197,7 +197,7 @@ export function DesktopPageSearchBar({ overrides, t, onOpenChange }: DesktopPage
     run(query, !event.shiftKey, true);
   };
 
-  return <div className="desktop-page-search-bar" role="search" aria-label={t("pageSearch.dialog")} data-page-search-ignore>
+  return <div className="desktop-page-search-bar" role="search" aria-label={t("pageSearch.dialog")} data-page-search-ignore onKeyDown={onBarKeyDown}>
     <input ref={inputRef} type="text" value={query} aria-label={t("pageSearch.dialog")} placeholder={t("pageSearch.placeholder")} spellCheck={false}
       onCompositionStart={() => {
         composingRef.current = true;
