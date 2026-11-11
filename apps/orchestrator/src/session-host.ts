@@ -652,6 +652,7 @@ export interface DeriveSessionInput {
   readonly entryId?: string;
   readonly kind: "fork" | "clone";
   readonly sideChat?: true;
+  readonly messageFork?: true;
   readonly expectedGeneration?: number;
   readonly sourceMessage?: {
     readonly messageId: string;
@@ -5160,6 +5161,7 @@ export class SessionHost {
     try {
       const admittedSource = this.#store.getSession(input.sourceSessionId);
       const admittedTarget = this.#store.getTarget(admittedSource.descriptor.targetId);
+      const piMessageFork = this.piMessageForkSource(input, admittedSource);
       this.assertInheritedSessionCreationReady(
         admittedSource.descriptor.backendId,
         {
@@ -5184,6 +5186,23 @@ export class SessionHost {
       assertMessageForkSource(this.#store, source);
       const sourceContext = sideEffectLease.context;
       this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
+      let usedPiMessageFork = false;
+      const assertPiMessageForkCurrent = (): void => {
+        this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+        const current = this.assertActiveBackendSideEffectLease(sideEffectLease!);
+        assertBindingFence(admittedSource, current);
+        assertSourceMessageVisible(this.#store);
+        const selected = this.piMessageForkSource(input, current);
+        if (!piMessageFork || !selected || selected.role !== piMessageFork.role || selected.nativeEntryId !== piMessageFork.nativeEntryId) {
+          throw new StoreError("The Pi message fork source changed.");
+        }
+        const sessionId = current.descriptor.id;
+        if (this.hasDurableSessionWork(sessionId) || this.#store.hasActiveSessionBackgroundTasks(sessionId)
+          || this.#store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0) {
+          throw new StoreError("A Pi message fork requires an idle source task.");
+        }
+        usedPiMessageFork = true;
+      };
       const derivesWorkspace = this.#store.getBackend(source.descriptor.backendId)
         .descriptor.capabilities.get("workspace.derive")?.supported === true;
       const remotePlan = derivesWorkspace && source.descriptor.remoteWorkspace !== undefined
@@ -5268,6 +5287,7 @@ export class SessionHost {
         sessionId,
         target: derivationTarget,
         ...(input.sideChat ? { completedSnapshot: { kind: "completed_assistant" as const, nativeBoundaryId: requiredEntryId(input.entryId) } } : {}),
+        ...(piMessageFork === undefined ? {} : { messageFork: { ...piMessageFork, assertCurrent: assertPiMessageForkCurrent } }),
         recordBinding: (binding) => {
           this.#store.recordNativeSessionDerivation({
             operationId: claim.operation.id,
@@ -5317,6 +5337,7 @@ export class SessionHost {
           assertBindingFence(source, currentSource);
           this.assertSessionDerivationSource(currentSource, input.sideChat === true);
           assertMessageForkSource(store, currentSource);
+          if (usedPiMessageFork) assertPiMessageForkCurrent();
           this.assertSessionDerivationTarget(admittedTarget, currentSource, sourceContext);
           if (
             store.getBackend(currentSource.descriptor.backendId).descriptor.instanceGeneration
@@ -5415,6 +5436,33 @@ export class SessionHost {
       sideEffectLease?.release();
       releaseBackendAdmission?.();
     }
+  }
+
+  private piMessageForkSource(input: DeriveSessionInput, source: StoredSession):
+    Pick<NonNullable<NativeSessionDerivation["messageFork"]>, "role" | "nativeEntryId"> | undefined {
+    if (!input.messageFork || input.kind !== "fork" || input.sideChat || !input.sourceMessage || !input.entryId) return undefined;
+    const session = source.descriptor;
+    if (this.#store.getBackend(session.backendId).descriptor.adapterKind !== "pi" || session.worktree || session.remoteWorkspace
+      || session.hidden || session.archived || session.deletedAt !== undefined || session.automationOrigin || session.derivationOrigin?.sideChat
+      || this.#store.sessionCreationServiceKind(session.id) !== undefined || this.#partnerSessionPolicy(session.id) !== undefined) return undefined;
+    const event = this.#store.findEvent(input.sourceMessage.eventId);
+    if (!event || event.sessionId !== session.id || event.backendId !== session.backendId || event.targetId !== session.targetId
+      || event.generation !== session.binding.generation || event.payload.type !== "message_complete") return undefined;
+    const identity = event.payload.nativeHistory?.identity;
+    if (!identity?.entryId) return undefined;
+    if (event.payload.role === "user") {
+      if (identity.parentEntryId !== input.entryId || identity.entryId === input.entryId) {
+        throw new StoreError("The selected Pi user message does not own the fork boundary.");
+      }
+      return { role: "user", nativeEntryId: identity.entryId };
+    }
+    if (event.payload.role !== "assistant") return undefined;
+    if (identity.entryId !== input.entryId) throw new StoreError("The selected Pi assistant message does not own the fork boundary.");
+    if (event.runId !== undefined) {
+      const run = this.#store.findRun(event.runId)?.descriptor;
+      if (!run || run.sessionId !== session.id || run.state !== "completed" || run.endedAt === undefined) return undefined;
+    }
+    return { role: "assistant", nativeEntryId: identity.entryId };
   }
 
   private assertSessionDerivationSource(source: StoredSession, completedSnapshot = false): void {

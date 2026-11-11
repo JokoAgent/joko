@@ -287,6 +287,12 @@ export interface NativeSessionDerivation {
   /** A native completed assistant boundary, never the current streaming tail.
    * The Backend must independently prove this prefix before creating a child. */
   readonly completedSnapshot?: { readonly kind: "completed_assistant"; readonly nativeBoundaryId: string };
+  /** The verified product row selected by the ordinary message Fork action. */
+  readonly messageFork?: {
+    readonly role: "assistant" | "user";
+    readonly nativeEntryId: string;
+    readonly assertCurrent: () => void;
+  };
   readonly recordBinding: (binding: NativeSessionBinding) => void;
 }
 

@@ -17786,7 +17786,7 @@ async function dispatchMutation(
             title: payload.value.newDisplayName || "",
             kind: "fork",
             entryId: payload.value.nativeEntryId,
-            ...(sourceMessage === undefined ? {} : { sourceMessage }),
+            ...(sourceMessage === undefined ? {} : { sourceMessage, messageFork: true as const }),
             ...(generation === undefined ? {} : { expectedGeneration: Number(generation) })
           });
           if (nested.value.sessionId !== sessionId) throw new Error("ForkSession returned a non-deterministic Session ID.");

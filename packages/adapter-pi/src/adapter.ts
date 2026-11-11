@@ -2960,7 +2960,10 @@ export class PiBackendAdapter implements
     const runtime = this.#runtime(context);
     return this.#runExclusiveSessionMutation(runtime, context, async () => {
       const sourceBinding = runtime.binding;
-      const sourceHistory = await this.getEntries(undefined, context);
+      const messageFork = context.target.remoteWorkspace === undefined && context.hostedExecution === undefined
+        && runtime.control.runtimePolicy === "standard" ? derivation.messageFork : undefined;
+      const sourceHistory = messageFork === undefined ? await this.getEntries(undefined, context)
+        : await this.#getEntriesRaw(undefined, runtime, context.signal);
       const sourceEntry = sourceHistory.entries.find((entry) => entry.id === entryId);
       if (sourceEntry === undefined) {
         throw piError("PI_FORK_ENTRY_NOT_DURABLE", `Pi fork entry '${entryId}' is not in durable native history`, "dispatch", {
@@ -2968,7 +2971,9 @@ export class PiBackendAdapter implements
           recovery: "Wait for the selected native history entry to become durable, then retry the fork."
         });
       }
-      if (sourceEntry.type !== "message" || !isRecord(sourceEntry.message) || sourceEntry.message.role !== "user") {
+      const nativeUserFork = sourceEntry.type === "message" && isRecord(sourceEntry.message) && sourceEntry.message.role === "user";
+      const exactFork = nativeUserFork || messageFork === undefined ? undefined : piMessageForkBoundary(sourceHistory, entryId, messageFork);
+      if (!nativeUserFork && exactFork === undefined) {
         throw piError("PI_FORK_ENTRY_INELIGIBLE", "Pi native fork requires a durable user-message entry", "dispatch");
       }
       await this.#sessionStore.assertManagedSession(sourceBinding.opaqueRef).catch((error) => {
@@ -2978,6 +2983,19 @@ export class PiBackendAdapter implements
           cause: error
         });
       });
+      const assertExactSource = async (): Promise<void> => {
+        const state = await this.#requestState(runtime, context);
+        if (state.isStreaming || state.isCompacting || state.pendingMessageCount > 0
+          || runtime.lifecycle !== undefined || runtime.runningExtensionCommand !== undefined || runtime.userShell !== undefined) {
+          throw piError("PI_SESSION_FORK_SOURCE_BUSY", "Pi message fork requires an idle native source", "dispatch", { retryable: true });
+        }
+        if (typeof state.sessionFile !== "string" || !samePath(state.sessionFile, sourceBinding.opaqueRef)
+          || (sourceBinding.nativeSessionId !== undefined && state.sessionId !== sourceBinding.nativeSessionId)) {
+          throw piError("PI_SESSION_FORK_SOURCE_FENCE_CHANGED", "The original Pi Session changed before its message fork", "session", { retryable: true });
+        }
+        messageFork!.assertCurrent();
+      };
+      if (exactFork !== undefined) await assertExactSource();
 
       const shadowKey = `fork-shadow-${randomUUID()}`;
       const sourceProfile = this.#spawnProfiles.get(runtime.key) ?? restoredSpawnProfile(context);
@@ -2998,8 +3016,20 @@ export class PiBackendAdapter implements
       let accepted = false;
       try {
         shadow = await this.#startRuntime(sourceBinding, shadowProfile, shadowContext);
+        if (exactFork !== undefined) {
+          const original = await this.#getEntriesRaw(undefined, runtime, context.signal);
+          const selected = piMessageForkBoundary(original, entryId, messageFork!);
+          const detached = await this.#getEntriesRaw(undefined, shadow, context.signal);
+          const detachedPath = piForkHistoryPath(detached.entries, exactFork.userEntry.id);
+          const expected = [...exactFork.prefix, exactFork.userEntry];
+          if (!selected || !samePiForkEntries(expected, [...selected.prefix, selected.userEntry])
+            || !detachedPath || !samePiForkEntries(expected, detachedPath)) {
+            throw piError("PI_SESSION_FORK_SOURCE_FENCE_CHANGED", "The selected Pi message boundary changed before the fork", "session", { retryable: true });
+          }
+          await assertExactSource();
+        }
         const response = await shadow.transport.request(
-          { type: "fork", entryId },
+          { type: "fork", entryId: exactFork?.userEntry.id ?? entryId },
           {
             signal: context.signal,
             stateMayHaveChanged: true,
@@ -3009,23 +3039,45 @@ export class PiBackendAdapter implements
         assertSessionChangeAccepted(response, "fork");
         accepted = true;
         const data = responseData(response);
-        const editorText = isRecord(data) && typeof data.text === "string"
+        // The product message action owns its draft. The RPC text belongs to
+        // the pivot user, which can differ from the selected product row.
+        const editorText = exactFork === undefined && isRecord(data) && typeof data.text === "string"
           ? redactManagedSecrets(data.text, runtime.redactValues)
           : undefined;
         const refreshedBinding = await this.#refreshBinding(shadow, false);
-        const derivedHistory = await this.getEntries(undefined, { ...shadowContext, binding: refreshedBinding });
-        const binding = await this.#sessionStore.materializeDetachedFork({
-          binding: refreshedBinding,
-          parentSession: sourceBinding.opaqueRef,
-          entries: derivedHistory.entries
-        });
-        if (samePath(binding.opaqueRef, sourceBinding.opaqueRef)) {
-          throw piError("PI_SESSION_FORK_IDENTITY_UNCHANGED", "Pi native fork did not create a distinct Session", "session", {
-            stateMayHaveChanged: true,
-            recovery: "Inspect the detached fork runtime and retry from the unchanged source Session."
+        const assertDistinctBinding = (candidate: NativeSessionBinding): void => {
+          if (samePath(candidate.opaqueRef, sourceBinding.opaqueRef)) {
+            throw piError("PI_SESSION_FORK_IDENTITY_UNCHANGED", "Pi native fork did not create a distinct Session", "session", {
+              stateMayHaveChanged: true,
+              recovery: "Inspect the detached fork runtime and retry from the unchanged source Session."
+            });
+          }
+        };
+        let binding: NativeSessionBinding;
+        if (exactFork !== undefined) {
+          assertDistinctBinding(refreshedBinding);
+          derivation.recordBinding(refreshedBinding);
+          binding = await this.#sessionStore.binding(refreshedBinding.opaqueRef, refreshedBinding.generation);
+          const derived = await this.#getEntriesRaw(undefined, shadow, context.signal);
+          const path = piForkHistoryPath(derived.entries, derived.leafId);
+          const expected = piForkEntriesWithoutLabels(exactFork.prefix);
+          if (binding.nativeSessionId !== refreshedBinding.nativeSessionId || !path
+            || !samePiForkEntries(expected, piForkEntriesWithoutLabels(path))
+            || !samePiForkEntries(expected, piForkEntriesWithoutLabels(derived.entries))) {
+            throw piError("PI_SESSION_FORK_PREFIX_CHANGED", "The detached Pi Session does not match the selected message prefix", "session", {
+              stateMayHaveChanged: true
+            });
+          }
+        } else {
+          const derivedHistory = await this.getEntries(undefined, { ...shadowContext, binding: refreshedBinding });
+          binding = await this.#sessionStore.materializeDetachedFork({
+            binding: refreshedBinding,
+            parentSession: sourceBinding.opaqueRef,
+            entries: derivedHistory.entries
           });
+          assertDistinctBinding(binding);
+          derivation.recordBinding(binding);
         }
-        derivation.recordBinding(binding);
         if (
           this.#runtimes.get(runtime.key) !== runtime
           || runtime.transport.closed
@@ -3050,6 +3102,7 @@ export class PiBackendAdapter implements
             recovery: "Reload the source Session identity before retrying the fork."
           });
         }
+        if (exactFork !== undefined) messageFork!.assertCurrent();
         return {
           binding,
           ...(editorText === undefined ? {} : { editorText })
@@ -8440,6 +8493,47 @@ function assertPiDerivationTarget(context: AdapterContext, derivation: NativeSes
       recovery: "Use the source workspace or a Backend that advertises workspace.derive."
     }
   );
+}
+
+function piForkHistoryPath(entries: readonly PiRpcEntry[], leafId: string | null): PiRpcEntry[] | undefined {
+  const byId = new Map(entries.map(entry => [entry.id, entry]));
+  const path: PiRpcEntry[] = [];
+  for (let id = leafId; id !== null;) {
+    const entry = byId.get(id);
+    if (!entry) return undefined;
+    byId.delete(id);
+    path.push(entry);
+    id = entry.parentId;
+  }
+  return path.reverse();
+}
+
+function piMessageForkBoundary(
+  history: { readonly entries: readonly PiRpcEntry[]; readonly leafId: string | null },
+  entryId: string,
+  source: NonNullable<NativeSessionDerivation["messageFork"]>
+): { readonly prefix: readonly PiRpcEntry[]; readonly userEntry: PiRpcEntry } | undefined {
+  const path = piForkHistoryPath(history.entries, history.leafId);
+  if (!path) return undefined;
+  const index = path.findIndex(entry => entry.id === entryId);
+  const assistant = path[index];
+  const user = path[index + 1];
+  if (assistant?.type !== "message" || !isRecord(assistant.message) || assistant.message.role !== "assistant" || assistant.message.stopReason !== "stop"
+    || user?.type !== "message" || !isRecord(user.message) || user.message.role !== "user" || user.parentId !== assistant.id) return undefined;
+  const selected = source.role === "assistant" ? assistant : user;
+  if (selected.id !== source.nativeEntryId) return undefined;
+  return { prefix: path.slice(0, index + 1), userEntry: user };
+}
+
+function samePiForkEntries(expected: readonly unknown[], actual: readonly unknown[]): boolean {
+  return expected.length === actual.length && expected.every((entry, index) => JSON.stringify(entry) === JSON.stringify(actual[index]));
+}
+
+function piForkEntriesWithoutLabels(entries: readonly PiRpcEntry[]): readonly Record<string, unknown>[] {
+  // The published manager reconstructs labels from its label map and re-links
+  // the path. Ordinary entries must still match the selected native prefix.
+  return entries.filter(entry => entry.type !== "label").map(entry => ({ ...entry, parentId: undefined,
+    ...(entry.type === "compaction" ? { firstKeptEntryId: undefined } : {}) }));
 }
 
 function projectResourceMentionText(
