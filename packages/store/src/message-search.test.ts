@@ -10,6 +10,7 @@ import {
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   nativeHistoryEventContext,
   type EventPayload,
+  type InteractionPayload,
   type PiEventMetadata
 } from "@joko/core";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,6 +29,142 @@ afterEach(() => {
 });
 
 describe("OperationalStore visible message search", () => {
+  it("searches typed answers on their original question card and repairs the derived text on reopen", () => {
+    const database = createDatabase();
+    const store = database.open();
+    seedFixture(store);
+    const payload = searchQuestion("answered-question");
+    store.openInteraction({ sessionId: "session-a", generation: 0, traceId: "question-open", payload });
+    const search = (current: OperationalStore, query: string) => current.searchSessionMessages({ scope: { owner: true }, query }).matches;
+    expect(search(store, "nebulaanswer")).toEqual([]);
+    const opened = store.listEvents({ sessionId: "session-a" }).find(event => event.payload.type === "interaction_opened")!;
+    store.resolveInteraction(payload.id, 0, { kind: "question", answers: {
+      note: { kind: "text", value: "nebulaanswer\nsecondlinewitness" },
+      single: { kind: "single", selection: { kind: "choice", choiceId: "selectionalphaid" } },
+      multiple: { kind: "multiple", choiceIds: ["selectionbetaid"], otherText: "multifreetextwitness" },
+      other: { kind: "single", selection: { kind: "other", text: "singlefreetextwitness" } },
+      confirm: { kind: "boolean", value: true }
+    } }, "question-answer");
+    // Repeated projections retain the same interaction identity, including
+    // one appended after the decision has already been persisted.
+    appendMessage(store, "question-projection", "session-a", 50, { type: "interaction_opened", interaction: payload });
+    appendMessage(store, "question-other-session", "session-b", 51, { type: "interaction_opened", interaction: payload });
+    appendMessage(store, "question-other-request", "session-a", 52, {
+      type: "interaction_opened", interaction: { ...payload, prompt: "A different request with the same claimed ID" }
+    });
+    appendMessage(store, "unowned-resolution", "session-b", 53, {
+      type: "interaction_resolved", interactionId: payload.id,
+      decision: JSON.stringify({ kind: "question", answers: { note: { kind: "text", value: "unownedanswerwitness" } } })
+    });
+    for (const query of ["nebulaanswer", "secondlinewitness", "Auroralabel", "Borealislabel", "multifreetextwitness", "singlefreetextwitness", "true"]) {
+      expect(search(store, query)).toEqual([expect.objectContaining({ sessionId: "session-a",
+        eventId: "question-projection", timelineItemId: `interaction:${payload.id}` })]);
+    }
+    for (const query of ["unownedanswerwitness", "Unselectedlabel", "selectionalphaid", "selectionbetaid"]) expect(search(store, query)).toEqual([]);
+    expect(store.listEventsAround("session-a", "question-projection", 20).map(event => event.id)).toContain("question-projection");
+    store.close();
+
+    // Recreate only the prior derived text; requests and decisions stay intact.
+    const previous = new DatabaseSync(database.filePath);
+    try {
+      previous.prepare("UPDATE message_search_fts SET visible_text = ? WHERE event_id IN (?, ?)")
+        .run(payload.prompt, opened.id, "question-projection");
+    } finally { previous.close(); }
+    const recovered = database.open();
+    expect(search(recovered, "nebulaanswer")).toEqual([expect.objectContaining({
+      eventId: "question-projection", timelineItemId: `interaction:${payload.id}`
+    })]);
+    expect(recovered.messageEmbeddingStatus().pendingCount).toBe(0);
+    recovered.runOperation({ id: "clear-answered-question", kind: "reset_session", body: { sessionId: "session-a" } }, current =>
+      current.commitSessionReset({ sessionId: "session-a", sourceBinding: current.getSession("session-a").descriptor.binding,
+        binding: { opaqueRef: "cleared-question-session", generation: 1 }, operationId: "clear-answered-question",
+        traceId: "clear-answered-question", at: 100 }));
+    expect(search(recovered, "nebulaanswer")).toEqual([]);
+    recovered.close();
+    expect(search(database.open(), "nebulaanswer")).toEqual([]);
+  });
+
+  it("excludes secrets, dismissed questions, other interaction kinds and retired question generations", () => {
+    const database = createDatabase();
+    const store = database.open();
+    seedFixture(store);
+    const payload = searchQuestion("bounded-answer");
+    store.openInteraction({ sessionId: "session-a", generation: 0, traceId: "question-open", payload });
+    store.resolveInteraction(payload.id, 0, { kind: "question", answers: {
+      note: { kind: "text", value: "ordinaryanswer sk-privatecredentialwitness0123456789" }
+    } }, "question-answer");
+    const search = (current: OperationalStore, query: string) => current.searchSessionMessages({ scope: { owner: true }, query }).matches;
+    expect(search(store, "ordinaryanswer")[0]?.snippet).toContain("[REDACTED]");
+    expect(search(store, "privatecredentialwitness")).toEqual([]);
+    store.openInteraction({ sessionId: "session-a", generation: 0, traceId: "question-dismiss", payload: {
+      ...searchQuestion("dismissed-question"), fields: [{ id: "note", kind: "text", label: "Note", required: false,
+        multiline: true, defaultValue: "discardedanswerwitness" }]
+    } });
+    store.dismissInteraction("dismissed-question", 0, "discardedanswerwitness", "question-dismissed");
+    store.openInteraction({ sessionId: "session-a", generation: 0, traceId: "extension-open", payload: {
+      id: "extension-input", kind: "extension_input", extensionId: "extension", title: "Input"
+    } });
+    store.resolveInteraction("extension-input", 0, { kind: "selected", value: "extensionanswerwitness" }, "extension-answer");
+    appendMessage(store, "tool-answer", "session-a", 60, { type: "tool_result", callId: "native-answer", name: "requestUserInput",
+      output: "toolanswerwitness", isError: false, nativeHistory: { identity: { entryId: "native-answer" } } });
+    for (const query of ["discardedanswerwitness", "extensionanswerwitness", "toolanswerwitness"]) expect(search(store, query)).toEqual([]);
+    // A secret declaration is not part of the current durable question shape.
+    expect(() => store.openInteraction({ sessionId: "session-a", generation: 0, traceId: "secret-question", payload: {
+      ...searchQuestion("secret-question"), isSecret: true
+    } as InteractionPayload })).toThrow(/Interaction/u);
+    store.updateSession("session-a", { hidden: true });
+    expect(search(store, "ordinaryanswer")).toEqual([]);
+    store.updateSession("session-a", { hidden: false, binding: { opaqueRef: "replacement-session", generation: 1 } });
+    expect(search(store, "ordinaryanswer")).toEqual([]);
+    store.close();
+    const recovered = database.open();
+    expect(search(recovered, "ordinaryanswer")).toEqual([]);
+    expect(search(recovered, "privatecredentialwitness")).toEqual([]);
+  });
+
+  it.each(["running", "done"] as const)("invalidates %s embeddings when a question gains an answer", state => {
+    const database = createDatabase();
+    const store = database.open();
+    seedFixture(store);
+    store.setMessageEmbeddingEnabled(true);
+    store.bindMessageEmbeddingProvider("embedding-backend", "embedding-provider", EMBEDDING_GENERATION_ID);
+    const payload = searchQuestion(`semantic-answer-${state}`);
+    store.openInteraction({ sessionId: "session-a", generation: 0, traceId: "question-open", payload, createdAt: 10 });
+    const [original] = store.claimMessageEmbeddingJobs(1);
+    expect(original).toBeDefined();
+    if (state === "done") store.completeMessageEmbeddingJob(original!.eventCursor, original!.claimToken,
+      "embedding-provider", EMBEDDING_GENERATION_ID, "voyage/voyage-4", embedding(0));
+    store.resolveInteraction(payload.id, 0, { kind: "question", answers: { note: { kind: "text", value: "freshanswerwitness" } } }, "question-answer");
+    expect(store.hasMessageEmbeddings("embedding-provider", EMBEDDING_GENERATION_ID, "voyage/voyage-4")).toBe(false);
+    const [refreshed] = store.claimMessageEmbeddingJobs(1);
+    expect(refreshed).toMatchObject({ eventCursor: original!.eventCursor, text: expect.stringContaining("freshanswerwitness") });
+    expect(refreshed!.claimToken).not.toBe(original!.claimToken);
+    expect(() => store.completeMessageEmbeddingJob(original!.eventCursor, original!.claimToken,
+      "embedding-provider", EMBEDDING_GENERATION_ID, "voyage/voyage-4", embedding(0))).toThrow(/not running/u);
+    store.completeMessageEmbeddingJob(refreshed!.eventCursor, refreshed!.claimToken,
+      "embedding-provider", EMBEDDING_GENERATION_ID, "voyage/voyage-4", embedding(1));
+    const result = store.searchSessionMessages({ scope: { sessionId: "session-a" }, query: "freshanswerwitness", semantic: {
+      providerId: "embedding-provider", providerGenerationId: EMBEDDING_GENERATION_ID, modelId: "voyage/voyage-4", queryEmbedding: embedding(1)
+    } });
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0]?.timelineItemId).toBe(`interaction:${payload.id}`);
+    expect(result.vectorUsed).toBe(true);
+    store.close();
+    if (state === "done") {
+      const previous = new DatabaseSync(database.filePath);
+      try {
+        previous.prepare("UPDATE message_search_fts SET visible_text = ? WHERE rowid = ?").run(payload.prompt, original!.eventCursor);
+      } finally { previous.close(); }
+    }
+    const recovered = database.open();
+    expect(recovered.messageEmbeddingStatus()).toMatchObject(state === "done"
+      ? { doneCount: 0, pendingCount: 1 } : { doneCount: 1, pendingCount: 0 });
+    if (state === "done") {
+      expect(recovered.hasMessageEmbeddings("embedding-provider", EMBEDDING_GENERATION_ID, "voyage/voyage-4")).toBe(false);
+      expect(recovered.claimMessageEmbeddingJobs(1)[0]?.text).toContain("freshanswerwitness");
+    }
+  });
+
   it("recovers a persisted parent learned after a live native message and keeps the preceding reply searchable on reopen", () => {
     const database = createDatabase();
     const store = database.open();
@@ -2046,6 +2183,18 @@ describe("OperationalStore visible message search", () => {
   });
 
 });
+
+function searchQuestion(id: string): Extract<InteractionPayload, { kind: "question" }> {
+  const choices = [{ id: "selectionalphaid", label: "Auroralabel" }, { id: "selectionbetaid", label: "Borealislabel" },
+    { id: "selectiongammaid", label: "Unselectedlabel" }];
+  return { id, kind: "question", title: "Planning question", prompt: "Choose the deployment details", fields: [
+    { id: "note", kind: "text", label: "Note", required: true, multiline: true },
+    { id: "single", kind: "single", label: "Lane", required: false, choices, allowOther: false },
+    { id: "multiple", kind: "multiple", label: "Regions", required: false, choices, defaultChoiceIds: [], minimumSelections: 0, allowOther: true },
+    { id: "other", kind: "single", label: "Alternative", required: false, choices, allowOther: true },
+    { id: "confirm", kind: "boolean", label: "Confirmed", required: false, defaultValue: false }
+  ] };
+}
 
 function visible(text: string): EventPayload {
   return { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] };

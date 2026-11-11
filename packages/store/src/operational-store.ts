@@ -801,6 +801,14 @@ export class OperationalStore {
           `);
         }
       }
+      this.database.exec("BEGIN IMMEDIATE");
+      try {
+        this.refreshQuestionAnswerSearch(undefined, messageVectorAvailable);
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      }
     } catch (error) {
       this.closed = true;
       try { this.database.close(); } finally { this.releaseWriterLease(); }
@@ -13742,11 +13750,54 @@ export class OperationalStore {
 
   private indexVisibleMessage(event: PersistedEvent): void {
     const visibleText = visibleMessageText(event.payload, this.assistantTextForSearch);
-    if (visibleText === undefined) return;
-    this.database.prepare(`
-      INSERT INTO message_search_fts(rowid, event_id, visible_text)
-      VALUES (?, ?, ?)
-    `).run(asSqlInteger(event.globalCursor), event.id, visibleText);
+    if (visibleText !== undefined) {
+      this.database.prepare(`
+        INSERT INTO message_search_fts(rowid, event_id, visible_text)
+        VALUES (?, ?, ?)
+      `).run(asSqlInteger(event.globalCursor), event.id, visibleText);
+    }
+    if (event.payload.type === "interaction_opened" && event.payload.interaction.kind === "question") {
+      this.refreshQuestionAnswerSearch(event.payload.interaction.id);
+    }
+  }
+
+  /** Answers belong to the original question card. Never index the generic
+   * resolution JSON, tool output, or a request from another routing generation. */
+  private refreshQuestionAnswerSearch(interactionId?: string, vectorAvailable = this.messageVectorAvailable): void {
+    const rows = this.database.prepare(`
+      SELECT event.*, question.decision_json AS question_decision_json
+      FROM interactions AS question
+      JOIN events AS event ON event.session_id = question.session_id AND event.generation = question.generation
+        AND event.run_id IS question.run_id AND event.attempt_id IS question.attempt_id
+        AND event.operation_id IS question.operation_id
+        AND json_extract(event.payload_json, '$.payload.type') = 'interaction_opened'
+        AND json_extract(event.payload_json, '$.payload.interaction.id') = question.id
+        AND json_extract(event.payload_json, '$.payload.interaction') = question.payload_json
+      JOIN product_sessions AS session ON session.id = question.session_id AND session.deleted_at IS NULL
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE question.kind = 'question' AND question.status = 'resolved' AND tombstone.event_id IS NULL
+        ${interactionId === undefined ? "" : "AND question.id = ?"}
+    `).iterate(...(interactionId === undefined ? [] : [interactionId]));
+    for (const row of rows) {
+      const event = eventFromRow(row);
+      if (event.payload.type !== "interaction_opened" || event.payload.interaction.kind !== "question") continue;
+      const decision = parseCurrentInteractionDecision(event.payload.interaction,
+        parseJson<unknown>(stringValue(row["question_decision_json"])));
+      const text = visibleMessageText(event.payload, this.assistantTextForSearch, decision);
+      if (text === undefined) continue;
+      const cursor = asSqlInteger(event.globalCursor);
+      const indexed = this.database.prepare("SELECT visible_text FROM message_search_fts WHERE rowid = ?").get(cursor);
+      if (indexed?.["visible_text"] === text) continue;
+      this.database.prepare("INSERT OR REPLACE INTO message_search_fts(rowid, event_id, visible_text) VALUES (?, ?, ?)")
+        .run(cursor, event.id, text);
+      if (vectorAvailable) this.database.prepare(`UPDATE ${MESSAGE_SEARCH_VECTOR_TABLE} SET live = 0 WHERE rowid = ?`).run(cursor);
+      this.database.prepare("DELETE FROM message_embedding_records WHERE event_cursor = ?").run(cursor);
+      // Keep the original opt-in boundary: refresh accepted work without
+      // backfilling questions that were never admitted to semantic indexing.
+      // Clearing the claim also fences a delayed embedding of the old prompt.
+      this.database.prepare(`UPDATE message_embedding_jobs SET status = 'pending', attempts = 0, scheduled_at = 0,
+        claimed_at = NULL, claim_token = NULL, error_code = 'QUESTION_ANSWER_CHANGED' WHERE event_cursor = ?`).run(cursor);
+    }
   }
 
   createReviewRun(input: CreateReviewRunInput): ReviewRunBundle {
@@ -15112,6 +15163,7 @@ export class OperationalStore {
             reason: outcome.reason
           }
       });
+      if (decision?.kind === "question") this.refreshQuestionAnswerSearch(id);
       const attention = this.findSessionAttention(session.descriptor.id);
       const remainingOpenSource = this.latestOpenInteractionSourceEvent(session.descriptor.id);
       if (remainingOpenSource === undefined) {
@@ -19821,7 +19873,11 @@ function escapeLikePattern(query: string): string {
   return query.replace(/[\\%_]/gu, (character) => `\\${character}`);
 }
 
-function visibleMessageText(payload: EventPayload, assistantTextForSearch?: (source: string) => string): string | undefined {
+function visibleMessageText(
+  payload: EventPayload,
+  assistantTextForSearch?: (source: string) => string,
+  questionDecision?: InteractionDecision
+): string | undefined {
   if (payload.type === "message_complete"
     && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined || payload.inputHandoffContinuation !== undefined
       || payload.role === "user" && payload.partnerPrivateOrigin !== undefined)) return undefined;
@@ -19836,7 +19892,22 @@ function visibleMessageText(payload: EventPayload, assistantTextForSearch?: (sou
       ...payload.interaction.fields.flatMap((field) => [
         field.label,
         ...(field.description === undefined ? [] : [field.description])
-      ])
+      ]),
+      ...payload.interaction.fields.flatMap((field): readonly string[] => {
+        const answer = questionDecision?.kind === "question" ? questionDecision.answers[field.id] : undefined;
+        if (field.kind === "text" && answer?.kind === "text") return [answer.value];
+        if (field.kind === "boolean" && answer?.kind === "boolean") return [String(answer.value)];
+        if (field.kind === "single" && answer?.kind === "single") {
+          const selection = answer.selection;
+          return selection.kind === "other" ? [selection.text]
+            : field.choices.filter(choice => choice.id === selection.choiceId).map(choice => choice.label);
+        }
+        if (field.kind === "multiple" && answer?.kind === "multiple") return [
+          ...field.choices.filter(choice => answer.choiceIds.includes(choice.id)).map(choice => choice.label),
+          ...(answer.otherText === undefined ? [] : [answer.otherText])
+        ];
+        return [];
+      })
     ];
   } else if (payload.type === "interaction_opened" && payload.interaction.kind === "plan_review") {
     parts = [payload.interaction.markdown];
