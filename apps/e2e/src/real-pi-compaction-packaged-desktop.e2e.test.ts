@@ -805,35 +805,44 @@ describe("packaged Desktop Pi compaction", () => {
       .waitFor({ state: "visible", timeout: 30_000 });
     await resumedPage.getByText("Context compacted", { exact: true }).first()
       .waitFor({ state: "visible", timeout: 30_000 });
-    const bindingBeforeDraft = (await resumedClients.session.getSession({ sessionId })).session?.nativeBinding;
-    const generationBeforeResume = bindingBeforeDraft?.runtimeGeneration;
     const uiGeneration = async () => resumedPage.locator(`.session-pane[data-input-session-id='${sessionId}']`)
       .getAttribute("data-input-session-generation");
-    if (generationBeforeResume !== undefined) {
-      await waitFor(uiGeneration, (value) => value === generationBeforeResume.toString(),
-        "managed Desktop resumed UI generation", 30_000);
-    }
+    const readVisibleBinding = async () => {
+      const binding = (await resumedClients.session.getSession({ sessionId })).session?.nativeBinding;
+      return binding?.runtimeGeneration.toString() === await uiGeneration() ? binding : undefined;
+    };
+    const bindingBeforeDraft = await waitFor(readVisibleBinding, binding => binding !== undefined,
+      "managed Desktop resumed UI generation", 30_000);
+    const generationBeforeResume = bindingBeforeDraft?.runtimeGeneration;
+    expect(bindingBeforeDraft?.opaqueReference === originalBinding.opaqueReference).toBe(true);
     const requestsBeforeResume = requests.length;
     const existingOperations = new Set((await resumedClients.operation.listOperations({ sessionId }))
       .operations.map(operation => operation.operationId));
-    await resumedPage.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
-      .fill("The managed Desktop Pi task continues after process restart.");
-    const readPrewarm = async (timeoutMs?: number) => (await resumedClients.operation.listOperations({ sessionId }, { timeoutMs })).operations
-      .find(operation => operation.mutation?.payload.case === "prewarmSession" && !existingOperations.has(operation.operationId));
+    const resumedDraft = "The managed Desktop Pi task continues after process restart.";
+    const resumedEditor = resumedPage.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content");
+    await resumedEditor.fill(resumedDraft);
+    const readPrewarms = async (timeoutMs?: number) => (await resumedClients.operation.listOperations({ sessionId }, { timeoutMs })).operations
+      .filter(operation => operation.mutation?.payload.case === "prewarmSession" && !existingOperations.has(operation.operationId));
     const bindingObservation = (binding: typeof bindingBeforeDraft) => binding === undefined ? undefined : {
       generation: binding.runtimeGeneration.toString(), originalNativeReference: binding.opaqueReference === originalBinding.opaqueReference
     };
     try {
-      const prewarm = await waitFor(() => readPrewarm(), operation => operation?.state === OperationState.SUCCEEDED,
-        "the resumed task's draft prewarm acknowledgement", 30_000);
-      expect(prewarm?.mutation?.preconditions.find(value => value.entity?.id === sessionId)?.expectedGeneration).toBe(generationBeforeResume);
-      const bindingAfterPrewarm = (await resumedClients.session.getSession({ sessionId })).session?.nativeBinding;
-      expect(bindingAfterPrewarm?.runtimeGeneration).toBe(generationBeforeResume);
+      const bindingAfterPrewarm = await waitFor(async () => {
+        const operations = await readPrewarms();
+        if (operations.length === 0) return undefined;
+        const binding = await readVisibleBinding();
+        if (binding === undefined) return undefined;
+        const acknowledged = operations.some(operation => operation.state === OperationState.SUCCEEDED
+          && operation.mutation?.preconditions.some(value => value.entity?.id === sessionId && value.expectedGeneration === binding.runtimeGeneration));
+        return acknowledged ? binding : undefined;
+      }, binding => binding !== undefined, "the resumed task's draft prewarm acknowledgement for its visible generation", 30_000);
       expect(bindingAfterPrewarm?.opaqueReference === originalBinding.opaqueReference).toBe(true);
+      expect(await resumedEditor.innerText()).toBe(resumedDraft);
+      expect(requests).toHaveLength(requestsBeforeRoute);
     } catch (cause) {
-      const [binding, operation, changes] = await Promise.all([
+      const [binding, operations, changes] = await Promise.all([
         resumedClients.session.getSession({ sessionId }, { timeoutMs: 2_000 }).then(response => response.session?.nativeBinding).catch(() => undefined),
-        readPrewarm(2_000).catch(() => undefined),
+        readPrewarms(2_000).catch(() => []),
         resumedClients.session.listSessionTimeline({ sessionId, limit: 40 }, { timeoutMs: 2_000 })
           .then(response => response.events.filter(event => event.payload?.kind.case === "sessionChanged").slice(-8)
             .map(event => ({ generation: event.identity?.generation?.toString(),
@@ -844,9 +853,9 @@ describe("packaged Desktop Pi compaction", () => {
         beforeExit: bindingObservation(originalBinding), beforeRoute: bindingObservation(bindingBeforeRoute),
         beforeDraft: bindingObservation(bindingBeforeDraft), afterPrewarm: bindingObservation(binding),
         sessionReads: [...sessionReadReceipts.values()], sessionChanges: changes,
-        operation: operation && { state: operation.state, errorCode: operation.error?.code,
+        operations: operations.slice(0, 8).map(operation => ({ state: operation.state, errorCode: operation.error?.code,
           expectedGeneration: operation.mutation?.preconditions.find(value => value.entity?.id === sessionId)?.expectedGeneration.toString(),
-          acceptedAt: operation.acceptedAt && Number(operation.acceptedAt.seconds) * 1_000 + operation.acceptedAt.nanos / 1_000_000 },
+          acceptedAt: operation.acceptedAt && Number(operation.acceptedAt.seconds) * 1_000 + operation.acceptedAt.nanos / 1_000_000 })),
         providerRequestsBeforeDraft: requestsBeforeResume - requestsBeforeRoute,
         providerRequestsSinceDraft: requests.length - requestsBeforeResume
       }));
@@ -879,7 +888,7 @@ describe("packaged Desktop Pi compaction", () => {
       })}`, { cause: error });
     }
     const resumedRequest = JSON.stringify(requests.at(-1)?.body);
-    expect(resumedRequest).toContain("The managed Desktop Pi task continues after process restart.");
+    expect(resumedRequest).toContain(resumedDraft);
     expect(resumedRequest).toContain(REAL_PI_RESPONSE_TEXT);
     await waitFor(() => resumedClients.session.getSession({ sessionId }),
       (response) => response.session?.state === SessionState.IDLE,

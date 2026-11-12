@@ -165,6 +165,36 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+it("acknowledges the edited draft after an existing task resumes in the same connection", async () => {
+  vi.useFakeTimers();
+  const view = await mount(draft(""));
+  const prewarmSession = vi.fn<NonNullable<AppController["prewarmSession"]>>(async () => undefined);
+  const controller = { ...view.api, prewarmSession };
+  const capabilities = new Map(view.backend.capabilities);
+  capabilities.set("session.prewarm", { name: "session.prewarm", supported: true, options: [] });
+  const backend = { ...view.backend, capabilities };
+  await view.render(baseSession, controller, backend);
+  const text = "Continue the original task";
+  await input(view.editor(), text, text.length);
+
+  await view.render({ ...baseSession, generation: 2n }, controller, backend);
+  expect(view.editor().value).toBe(text);
+  await act(async () => vi.advanceTimersByTimeAsync(350));
+  expect(prewarmSession).toHaveBeenCalledExactlyOnceWith(baseSession.id, undefined, expect.any(AbortSignal), 2n);
+  const request = prewarmSession.mock.calls[0]?.[2];
+  expect(request?.aborted).toBe(false);
+
+  await view.render({ ...baseSession, generation: 3n }, {
+    ...controller,
+    state: { ...controller.state, connectionGeneration: 2 }
+  }, backend);
+  await act(async () => vi.advanceTimersByTimeAsync(350));
+  expect(request?.aborted).toBe(true);
+  expect(view.editor().value).toBe(text);
+  expect(prewarmSession).toHaveBeenCalledOnce();
+  expect(view.api.send).not.toHaveBeenCalled();
+});
+
 it("restores an empty composer with one conditional save and no delayed autosave or Send", async () => {
   vi.useFakeTimers();
   const view = await mountRewindDraft(draft(""));
