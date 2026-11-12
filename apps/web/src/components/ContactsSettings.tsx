@@ -12,11 +12,13 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  Sparkles,
   Trash2,
   UserRound,
   UsersRound
 } from "lucide-react";
 import type { AppController } from "../controller.js";
+import { CONTACTS_TOOL_POLICY_ID, contactsDraftOwnerMatches } from "../contacts-draft.js";
 import type {
   ContactDirectoryView,
   ContactDraftView,
@@ -66,12 +68,17 @@ interface MergeConfirmation {
   readonly merged: ContactSummaryView;
 }
 
+type ContactImportSource = "vcard" | "system";
+
 export function ContactsSettings({ controller, locale, t }: {
   readonly controller: AppController;
   readonly locale: Locale;
   readonly t: Translator;
 }): JSX.Element {
   const ownerKey = controller.state.activeProfile?.id ?? "disconnected";
+  const currentController = useRef(controller);
+  currentController.current = controller;
+  const contactsPolicy = controller.state.snapshot?.settings.toolPolicies.find(policy => policy.toolProviderId === CONTACTS_TOOL_POLICY_ID);
   const [directory, setDirectory] = useState<ContactDirectoryView>();
   const [syncStatus, setSyncStatus] = useState<ContactSyncStatusView>();
   const [syncError, setSyncError] = useState<string>();
@@ -105,9 +112,13 @@ export function ContactsSettings({ controller, locale, t }: {
   const [mergeError, setMergeError] = useState<string>();
   const mergeInFlight = useRef(false);
   const mergeButtonRef = useRef<HTMLButtonElement>(null);
-  const [importPreview, setImportPreview] = useState<ContactVCardImportPreviewView>();
-  const [importResult, setImportResult] = useState<ContactVCardImportResultView>();
+  const [importPreview, setImportPreview] = useState<{ readonly source: ContactImportSource; readonly preview: ContactVCardImportPreviewView }>();
+  const [importResult, setImportResult] = useState<{ readonly source: ContactImportSource; readonly result: ContactVCardImportResultView }>();
+  const [systemImportAvailable, setSystemImportAvailable] = useState(false);
+  const systemImportRequest = useRef<AbortController | undefined>(undefined);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => () => systemImportRequest.current?.abort(), []);
 
   const listOptions = useMemo(() => ({
     ...(appliedQuery.trim() === "" ? {} : { query: appliedQuery.trim() }),
@@ -148,6 +159,7 @@ export function ContactsSettings({ controller, locale, t }: {
       if (abort.signal.aborted) return;
       loadedCatalog.current = { ownerKey, options: listOptions, revision: nextDirectory.revision, count: contacts.length };
       setDirectory(nextDirectory);
+      setSystemImportAvailable(nextDirectory.systemImportAvailable === true);
       setGroups(nextGroups);
       setPage({ ...nextPage, contacts });
       setSelectedId((current) => current !== undefined && contacts.some((contact) => contact.id === current)
@@ -192,9 +204,9 @@ export function ContactsSettings({ controller, locale, t }: {
       checkingDirectory = true;
       try {
         const next = await controller.getContactDirectory(abort.signal);
-        if (!abort.signal.aborted && !catalogRefreshing.current && loadedCatalog.current?.revision === current.revision &&
-          next.revision !== current.revision) {
-          setReloadToken(value => value + 1);
+        if (!abort.signal.aborted && !catalogRefreshing.current && loadedCatalog.current?.revision === current.revision) {
+          setSystemImportAvailable(next.systemImportAvailable === true);
+          if (next.revision !== current.revision) setReloadToken(value => value + 1);
         }
       } catch {
         // A transient background read leaves the current directory visible until the next check.
@@ -245,6 +257,32 @@ export function ContactsSettings({ controller, locale, t }: {
     } finally {
       setBusy(undefined);
     }
+  };
+
+  const organizeContacts = (trigger: HTMLButtonElement): void => {
+    const { activeProfile, connectionGeneration, navigationRevision } = controller.state;
+    if (directory?.enabled !== true || contactsPolicy === undefined || activeProfile === undefined || busy !== undefined) return;
+    const owner = { profileId: activeProfile.id, serverId: activeProfile.serverId };
+    const enableTools = !contactsPolicy.userEffectiveEnabled;
+    const isCurrent = (): boolean => {
+      const state = currentController.current.state;
+      return trigger.isConnected && trigger.ownerDocument.defaultView !== null && contactsDraftOwnerMatches(owner, state.activeProfile)
+        && state.connectionState === "connected" && state.connectionGeneration === connectionGeneration
+        && state.route.kind === "settings" && state.navigationRevision === navigationRevision;
+    };
+    if (!isCurrent()) return;
+    void run("organize", async () => {
+      const current = await controller.getContactDirectory();
+      if (!isCurrent()) return;
+      if (!current.enabled) {
+        setDirectory(current);
+        throw new Error(t("contacts.organizeDirectoryDisabled"));
+      }
+      const policy = currentController.current.state.snapshot.settings.toolPolicies.find(item => item.toolProviderId === CONTACTS_TOOL_POLICY_ID);
+      if (policy === undefined || (!policy.userEffectiveEnabled && !enableTools)) throw new Error(t("contacts.organizeToolsDisabled"));
+      if (!policy.userEffectiveEnabled) await controller.updateToolPolicySettings(CONTACTS_TOOL_POLICY_ID, undefined, { enabled: true });
+      if (isCurrent()) controller.navigate({ kind: "newSession", contactsDraft: owner }, { isCurrent });
+    });
   };
 
   const refresh = (preferredId?: string): void => {
@@ -418,19 +456,43 @@ export function ContactsSettings({ controller, locale, t }: {
     event.target.value = "";
     if (file === undefined) return;
     const preview = await run("vcard-preview", async () => controller.previewContactVCardImport(await file.text()));
-    if (preview !== undefined) setImportPreview(preview);
+    if (preview !== undefined) setImportPreview({ source: "vcard", preview });
+  };
+
+  const previewSystemImport = async (): Promise<void> => {
+    if (systemImportRequest.current !== undefined) return;
+    const request = new AbortController();
+    systemImportRequest.current = request;
+    setBusy("system-preview");
+    setError(undefined);
+    try {
+      const preview = await controller.previewSystemContactImport(request.signal);
+      if (!request.signal.aborted) setImportPreview({ source: "system", preview });
+    } catch (reason) {
+      if (!request.signal.aborted) setError(errorMessage(reason, t("contacts.actionFailed")));
+    } finally {
+      systemImportRequest.current = undefined;
+      setBusy(undefined);
+    }
   };
 
   const commitImport = async (selections: readonly ContactImportSelection[]): Promise<void> => {
     if (importPreview === undefined) return;
-    const result = await run("vcard-commit", async () => {
-      const decisions = await contactImportDecisions(controller, importPreview, selections);
-      return controller.commitContactVCardImport(importPreview.previewId, importPreview.directoryRevision, decisions);
+    const { source, preview } = importPreview;
+    const request = source === "system" ? new AbortController() : undefined;
+    systemImportRequest.current = request;
+    const result = await run("import-commit", async () => {
+      const decisions = await contactImportDecisions(controller, preview, selections, request?.signal);
+      request?.signal.throwIfAborted();
+      return source === "system"
+        ? controller.commitSystemContactImport(preview.previewId, preview.directoryRevision, decisions, request?.signal)
+        : controller.commitContactVCardImport(preview.previewId, preview.directoryRevision, decisions);
     });
-    if (result === undefined) return;
+    systemImportRequest.current = undefined;
+    if (result === undefined || request?.signal.aborted) return;
     setDirectory(result.directory);
     setImportPreview(undefined);
-    setImportResult(result);
+    setImportResult({ source, result });
     refresh(result.contactIds[0]);
   };
 
@@ -501,7 +563,15 @@ export function ContactsSettings({ controller, locale, t }: {
       <div className="contacts-settings__header-actions">
         <input ref={fileInputRef} className="contacts-settings__file" type="file" accept=".vcf,.vcard,text/vcard,text/x-vcard" onChange={selectVCard} />
         <Button onClick={() => fileInputRef.current?.click()} disabled={busy !== undefined}><FileUp aria-hidden="true" />{t("contacts.import")}</Button>
+        {systemImportAvailable && directory?.enabled === true && <Button onClick={() => void previewSystemImport()} disabled={busy !== undefined}>
+          <UsersRound aria-hidden="true" />{t("contacts.systemImport")}
+        </Button>}
         <Button onClick={() => void exportContacts([])} disabled={busy !== undefined}><Download aria-hidden="true" />{t("contacts.exportAll")}</Button>
+        {directory?.enabled === true && contactsPolicy !== undefined && <Button
+          onClick={(event) => organizeContacts(event.currentTarget)} disabled={busy !== undefined || controller.state.connectionState !== "connected"}>
+          {busy === "organize" ? <Spinner /> : <Sparkles aria-hidden="true" />}
+          {t(contactsPolicy.userEffectiveEnabled ? "contacts.organize" : "contacts.organizeEnableTools")}
+        </Button>}
         <Button tone="primary" onClick={() => setEditor({ mode: "create" })} disabled={directory === undefined || busy !== undefined}><Plus aria-hidden="true" />{t("contacts.new")}</Button>
       </div>
     </header>
@@ -658,8 +728,14 @@ export function ContactsSettings({ controller, locale, t }: {
     {manualMergeTarget !== undefined && <ContactMergePicker controller={controller} target={manualMergeTarget} t={t}
       onClose={() => { if (mergeConfirmation === undefined) setManualMergeTarget(undefined); }}
       onChoose={(merged) => confirmMerge(manualMergeTarget, merged)} />}
-    <ImportDialog preview={importPreview} busy={busy === "vcard-commit"} t={t} onClose={() => setImportPreview(undefined)} onCommit={(selections) => void commitImport(selections)} />
-    <ImportResultDialog result={importResult} t={t} onClose={() => setImportResult(undefined)} onOpen={(contactId) => { setImportResult(undefined); refresh(contactId); }} />
+    <Modal open={busy === "system-preview"} title={t("contacts.systemImport")} description={t("contacts.systemImportReading")}
+      onClose={() => systemImportRequest.current?.abort()} showClose>
+      <div className="modal__actions"><Button onClick={() => systemImportRequest.current?.abort()}>{t("common.cancel")}</Button></div>
+    </Modal>
+    <ImportDialog preview={importPreview?.preview} source={importPreview?.source} busy={busy === "import-commit"} t={t}
+      onClose={() => setImportPreview(undefined)} onCommit={(selections) => void commitImport(selections)} />
+    <ImportResultDialog result={importResult?.result} source={importResult?.source} t={t}
+      onClose={() => setImportResult(undefined)} onOpen={(contactId) => { setImportResult(undefined); refresh(contactId); }} />
     <ConfirmDialog
       open={deleteContact !== undefined}
       title={t("contacts.deleteTitle")}
@@ -811,15 +887,16 @@ function formatFingerprint(value: string): string {
   return value.toUpperCase().match(/.{1,4}/gu)?.join(" ") ?? value;
 }
 
-function ImportResultDialog({ result, t, onClose, onOpen }: {
+function ImportResultDialog({ result, source, t, onClose, onOpen }: {
   readonly result?: ContactVCardImportResultView;
+  readonly source?: ContactImportSource;
   readonly t: Translator;
   readonly onClose: () => void;
   readonly onOpen: (contactId: string) => void;
 }): JSX.Element {
   return <Modal
     open={result !== undefined}
-    title={t("contacts.importResultTitle")}
+    title={t(source === "system" ? "contacts.systemImportResultTitle" : "contacts.importResultTitle")}
     description={t("contacts.importResultBody", {
       created: result?.created ?? 0,
       enriched: result?.enriched ?? 0,
@@ -1149,8 +1226,9 @@ export interface ContactImportSelection {
   readonly organizationTarget?: string;
 }
 
-function ImportDialog({ preview, busy, t, onClose, onCommit }: {
-  readonly preview?: ContactVCardImportPreviewView; readonly busy: boolean; readonly t: Translator; readonly onClose: () => void;
+function ImportDialog({ preview, source, busy, t, onClose, onCommit }: {
+  readonly preview?: ContactVCardImportPreviewView; readonly source?: ContactImportSource;
+  readonly busy: boolean; readonly t: Translator; readonly onClose: () => void;
   readonly onCommit: (selections: readonly ContactImportSelection[]) => void;
 }): JSX.Element {
   const [selections, setSelections] = useState<readonly ContactImportSelection[]>([]);
@@ -1161,7 +1239,8 @@ function ImportDialog({ preview, busy, t, onClose, onCommit }: {
     setSelections((current) => current.map((selection) => selection.entryId === entryId ? { ...selection, ...patch } : selection));
   };
   const valid = preview !== undefined && preview.entries.every((entry) => importSelectionValid(entry, selections.find((selection) => selection.entryId === entry.entryId)));
-  return <Modal open={preview !== undefined} title={t("contacts.importTitle")} description={t("contacts.importBody", { count: (preview?.entries.length ?? 0) + (preview?.rejectedEntries?.length ?? 0) })} onClose={onClose} showClose size="large">
+  return <Modal open={preview !== undefined} title={t(source === "system" ? "contacts.systemImportTitle" : "contacts.importTitle")}
+    description={t("contacts.importBody", { count: (preview?.entries.length ?? 0) + (preview?.rejectedEntries?.length ?? 0) })} onClose={onClose} showClose size="large">
     <div className="contact-import-list">{preview?.rejectedEntries?.map((entry) => <article key={entry.entryId}>
       <header><span><strong>{entry.displayName}</strong><small>{t("contacts.importRejected")}</small></span></header>
       <p className="contact-import-reason">{entry.reason}</p>
@@ -1292,7 +1371,8 @@ function importOutcomeLabel(outcome: ContactVCardImportResultView["entries"][num
 export async function contactImportDecisions(
   controller: Pick<AppController, "getContact">,
   preview: ContactVCardImportPreviewView,
-  selections: readonly ContactImportSelection[]
+  selections: readonly ContactImportSelection[],
+  signal?: AbortSignal
 ): Promise<readonly ContactVCardImportDecisionView[]> {
   const byEntry = new Map(selections.map((selection) => [selection.entryId, selection]));
   const revisions = new Map<string, bigint>();
@@ -1302,7 +1382,7 @@ export async function contactImportDecisions(
       if (target?.startsWith("contact:") === true) contactTargets.add(target.slice("contact:".length));
     }
   }
-  await Promise.all([...contactTargets].map(async (id) => revisions.set(id, (await controller.getContact(id)).revision)));
+  await Promise.all([...contactTargets].map(async (id) => revisions.set(id, (await controller.getContact(id, signal)).revision)));
   return preview.entries.map((entry) => {
     const selection = byEntry.get(entry.entryId) ?? defaultImportSelection(entry);
     const target = importTarget(selection.target, revisions);

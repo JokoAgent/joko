@@ -28,6 +28,10 @@ import type {
   McpCallResult,
   McpToolDescriptor
 } from "./mcp-router.js";
+import {
+  captureSystemContactToolAccess, exportSystemContacts, importSystemContacts, SystemContactToolError,
+  type SystemContactToolsOptions
+} from "./system-contact-tools.js";
 
 export const CONTACT_TOOL_PROVIDER_ID = "joko_contacts";
 export const CONTACT_TOOL_POLICY_ID = "joko-contacts-tools";
@@ -42,6 +46,8 @@ export const CONTACT_TOOL_POLICY: BridgeToolPolicyDeclaration = Object.freeze({
 const LIST_TOOLS = "list_tools";
 const CALL_TOOL = "call_tool";
 const CALL_SENSITIVE_TOOL = "call_sensitive_tool";
+const IMPORT_SYSTEM = "contacts_import_system";
+const EXPORT_SYSTEM = "contacts_export_system";
 const RECENT_EVENT_LIMIT = 10;
 const COMPACT_RELATION_LIMIT = 20;
 const COMPACT_GROUP_LIMIT = 20;
@@ -287,12 +293,33 @@ export const CONTACT_NESTED_TOOL_NAMES: readonly string[] = Object.freeze(
   CONTACT_NESTED_TOOLS.map((tool) => tool.name)
 );
 
+const SYSTEM_CONTACT_TOOLS = [
+  nestedTool(IMPORT_SYSTEM, "manage",
+    "Read macOS Contacts after approval on the originating Desktop. Import new and exact matches and report ambiguous matches for review.",
+    objectSchema({
+      dry_run: { type: "boolean", default: false },
+      require_email: { type: "boolean", default: false },
+      name_contains: { type: "string", maxLength: 50 },
+      group: { type: "string", minLength: 1, maxLength: 60 }
+    }), "always"),
+  nestedTool(EXPORT_SYSTEM, "manage",
+    "Plan or write selected confirmed contacts to macOS Contacts. A real write requires approval on the originating Desktop.",
+    {
+      ...objectSchema({
+        dry_run: { type: "boolean", default: false },
+        ids: { type: "array", items: ID_SCHEMA, minItems: 1, maxItems: 200 },
+        group: { type: "string", minLength: 1, maxLength: 60 }
+      }),
+      oneOf: [{ required: ["ids"] }, { required: ["group"] }]
+    }, "conditional", ["Use dry_run for a local plan. A real write adds or updates public contact fields and leaves existing cards and addresses in place."])
+] as const;
+
 const BRIDGE_TOOLS: readonly McpToolDescriptor[] = Object.freeze([
   bridgeTool(LIST_TOOLS,
     "Discover local Contacts tools by search, read, write, or manage category, including exact schemas and safety rules.",
     objectSchema({ category: { type: "string", enum: ["search", "read", "write", "manage"] } }), false),
   bridgeTool(CALL_TOOL,
-    "Invoke a discovered Contacts tool that does not require per-call destructive confirmation.",
+    "Invoke a discovered Contacts tool whose entry tool is call_tool. macOS Contacts requests ask for approval on the originating Desktop when required.",
     objectSchema({
       name: { type: "string", minLength: 1, maxLength: 128 },
       args: { type: "object", additionalProperties: {} }
@@ -313,10 +340,12 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
   readonly tools = BRIDGE_TOOLS;
   readonly #store: OperationalStore;
   readonly #contacts: ContactManager;
+  readonly #systemContacts: SystemContactToolsOptions | undefined;
 
-  constructor(options: { readonly store: OperationalStore; readonly contacts: ContactManager }) {
+  constructor(options: { readonly store: OperationalStore; readonly contacts: ContactManager; readonly systemContacts?: SystemContactToolsOptions }) {
     this.#store = options.store;
     this.#contacts = options.contacts;
+    this.#systemContacts = options.systemContacts;
     if (CONTACT_NESTED_TOOLS.length !== 27 || new Set(CONTACT_NESTED_TOOL_NAMES).size !== 27) {
       throw new Error("The Contacts Tool catalog must expose exactly twenty-seven unique current-v1 tools.");
     }
@@ -338,21 +367,54 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
   ): Promise<McpCallResult> {
     signal?.throwIfAborted();
     try {
-      this.#requireCaller(context);
-      if (name === LIST_TOOLS) return this.#listTools(arguments_);
+      const session = this.#requireCaller(context);
+      const system = this.#systemContacts;
+      const systemRequest = name === LIST_TOOLS || arguments_["name"] === IMPORT_SYSTEM || arguments_["name"] === EXPORT_SYSTEM;
+      const access = system === undefined || !systemRequest ? undefined
+        : captureSystemContactToolAccess(this.#store, system, session, context, signal);
+      const tools = access === undefined ? CONTACT_NESTED_TOOLS : [...CONTACT_NESTED_TOOLS, ...SYSTEM_CONTACT_TOOLS];
+      if (name === LIST_TOOLS) return this.#listTools(arguments_, tools);
       if (name !== CALL_TOOL && name !== CALL_SENSITIVE_TOOL) {
         throw new ContactToolError("UNKNOWN_TOOL", "Contacts entry tool is not part of this runtime snapshot.");
       }
       assertKeys(arguments_, ["name", "args"]);
       const selectedName = requiredText(arguments_, "name", 128);
-      const selected = CONTACT_NESTED_TOOLS.find((tool) => tool.name === selectedName);
+      const selected = tools.find((tool) => tool.name === selectedName);
       if (selected === undefined) {
         throw new ContactToolError("UNKNOWN_TOOL", "The requested Contacts tool is unavailable.", {
           requested: selectedName,
-          available: CONTACT_NESTED_TOOL_NAMES
+          available: tools.map((tool) => tool.name)
         });
       }
       const input = record(arguments_["args"], "args");
+      if (system !== undefined && access !== undefined && (selectedName === IMPORT_SYSTEM || selectedName === EXPORT_SYSTEM)) {
+        if (name !== CALL_TOOL) throw new ContactToolError("INVALID_ENTRY_TOOL", "Use call_tool for macOS Contacts approval.", {
+          tool: selectedName, entry_tool: CALL_TOOL
+        });
+        this.#requireEnabledDirectory();
+        const dryRun = optionalBoolean(input, "dry_run") === true;
+        const group = optionalText(input, "group", 60, false);
+        if (selectedName === IMPORT_SYSTEM) {
+          assertKeys(input, ["dry_run", "require_email", "name_contains", "group"]);
+          const nameContains = optionalText(input, "name_contains", 50, true);
+          const data = await importSystemContacts(this.#store, this.#contacts, system, access, {
+            dryRun, requireEmail: optionalBoolean(input, "require_email") === true,
+            ...(nameContains === undefined ? {} : { nameContains }), ...(group === undefined ? {} : { group })
+          }, signal);
+          access.assertCurrent();
+          return success(data);
+        }
+        assertKeys(input, ["dry_run", "ids", "group"]);
+        const ids = input["ids"];
+        if (group === undefined && !Array.isArray(ids) || group !== undefined && ids !== undefined
+          || Array.isArray(ids) && (ids.length === 0 || ids.length > 200)) {
+          throw new ContactToolError("INVALID_ARGS", "Specify 1–200 contact IDs or one named Contacts group.");
+        }
+        const data = await exportSystemContacts(this.#store, this.#contacts, system, access, group === undefined
+          ? { dryRun, ids: [...new Set((ids as readonly unknown[]).map(id => boundedId(id, "ids")))] } : { dryRun, group }, signal);
+        access.assertCurrent();
+        return success(data);
+      }
       const sensitive = requiresConfirmation(selected, input);
       if (sensitive && name !== CALL_SENSITIVE_TOOL) {
         throw new ContactToolError(
@@ -420,7 +482,7 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
     return directory;
   }
 
-  #listTools(input: Readonly<Record<string, unknown>>): McpCallResult {
+  #listTools(input: Readonly<Record<string, unknown>>, tools: readonly ContactNestedToolDescriptor[]): McpCallResult {
     assertKeys(input, ["category"]);
     const directory = this.#contacts.directory();
     const category = input["category"];
@@ -430,7 +492,7 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
         directory_revision: directory.revision.toString(),
         categories: (["search", "read", "write", "manage"] as const).map((name) => ({
           name,
-          tool_count: CONTACT_NESTED_TOOLS.filter((tool) => tool.category === name).length
+          tool_count: tools.filter((tool) => tool.category === name).length
         })),
         hint: "Call list_tools with one category, then use call_tool or call_sensitive_tool exactly as advertised."
       });
@@ -438,7 +500,7 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
     if (!isContactCategory(category)) {
       throw new ContactToolError("INVALID_ARGS", "category must be search, read, write, or manage.");
     }
-    const selected = CONTACT_NESTED_TOOLS.filter((tool) => tool.category === category);
+    const selected = tools.filter((tool) => tool.category === category);
     return success({
       directory_enabled: directory.enabled,
       directory_revision: directory.revision.toString(),
@@ -449,7 +511,8 @@ export class ContactToolBridgeProvider implements BridgeToolProvider {
         description: tool.description,
         input_schema: tool.inputSchema,
         confirmation: tool.confirmation,
-        entry_tool: tool.confirmation === "always" ? CALL_SENSITIVE_TOOL
+        entry_tool: tool.name === IMPORT_SYSTEM || tool.name === EXPORT_SYSTEM ? CALL_TOOL
+          : tool.confirmation === "always" ? CALL_SENSITIVE_TOOL
           : tool.confirmation === "never" ? CALL_TOOL : "argument-dependent"
       }))
     });
@@ -939,6 +1002,9 @@ function classifyError(error: unknown): {
 } {
   if (error instanceof ContactToolError) {
     return { code: error.code, message: error.message, ...(error.details === undefined ? {} : { details: error.details }) };
+  }
+  if (error instanceof SystemContactToolError) {
+    return { code: error.publicError.code, message: error.message, ...(error.details === undefined ? {} : { details: error.details }) };
   }
   if (error instanceof ContactManagerError) {
     const code = error.code === "CONTACT_IMPORT_INVALID" ? "INVALID_ARGS"

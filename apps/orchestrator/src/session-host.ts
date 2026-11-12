@@ -302,6 +302,7 @@ interface PendingInteraction {
   readonly backendInstanceGeneration: number;
   readonly runId?: string;
   readonly attemptId?: string;
+  readonly approval?: { readonly connectionId: string; readonly assertCurrent: () => void };
   readonly resolve: (decision: InteractionDecision) => void;
   readonly expiryTimer?: ReturnType<typeof setTimeout>;
   readonly abortSignal?: AbortSignal;
@@ -10498,14 +10499,20 @@ export class SessionHost {
     }
   }
 
-  resolveInteraction(id: string, generation: number, submission: InteractionDecisionSubmission, traceId: string, operationId?: string): void {
+  resolveInteraction(id: string, generation: number, submission: InteractionDecisionSubmission, traceId: string, operationId?: string, connectionId?: string): void {
     const interaction = this.#store.getInteraction(id);
     if (this.#partnerSessionPaused(interaction.sessionId)) throw new StoreError("Resume the paused task before answering its pending interaction.");
     if (interaction.status !== "open") {
       throw new InvalidStateTransitionError("interaction", interaction.status, "resolved");
     }
-    const decision = validatedInteractionDecision(interaction.payload, submission);
     const pending = this.#pendingInteractions.get(id);
+    if (pending?.approval !== undefined) {
+      if (pending.approval.connectionId !== connectionId) {
+        throw new AuthorizationError("This approval belongs to the Desktop connection that started the task.");
+      }
+      pending.approval.assertCurrent();
+    }
+    const decision = validatedInteractionDecision(interaction.payload, submission);
     if (pending?.generation === generation && !this.backendInstanceGenerationOwnsContext(
       interaction.sessionId,
       pending.backendInstanceGeneration,
@@ -15837,6 +15844,30 @@ export class SessionHost {
     return this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal, true);
   }
 
+  async requestSystemContactsApproval(request: {
+    readonly queueId: string;
+    readonly connectionId: string;
+    readonly generation: number;
+    readonly action: "import" | "export";
+    readonly summary: string;
+    readonly assertCurrent: () => void;
+  }, signal?: AbortSignal): Promise<boolean> {
+    request.assertCurrent();
+    const queue = this.#store.getQueueItem(request.queueId);
+    if (queue.backendInstanceGeneration === undefined || queue.attemptId === undefined) return false;
+    const deadline = AbortSignal.timeout(120_000);
+    const approvalSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline]);
+    const answer = await this.requestInteraction(queue.sessionId, request.generation, queue.backendInstanceGeneration, {
+      id: `system-contacts-permission-${randomUUID()}`, kind: "permission", risk: "medium",
+      title: request.action === "import" ? "Read from macOS Contacts?" : "Write to macOS Contacts?",
+      toolName: "macOS Contacts", summary: redactSecrets(request.summary).slice(0, 2_000),
+      choices: ["allow_once", "deny_once"]
+    }, queue.runId, queue.attemptId, queue.operationId, approvalSignal, {
+      connectionId: request.connectionId, assertCurrent: request.assertCurrent
+    });
+    return (answer.kind === "confirmed" && answer.confirmed) || (answer.kind === "selected" && answer.value === "allow_once");
+  }
+
   #captureDocumentPathDispatch(item: QueueItemRecord, active: ActiveSession, stored: StoredSession,
     context: AdapterContext): ActiveSession["documentPathDispatch"] {
     const { attemptId, sessionId } = item;
@@ -16176,7 +16207,8 @@ export class SessionHost {
     runId?: string,
     attemptId?: string,
     operationId?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    approval?: PendingInteraction["approval"]
   ): Promise<InteractionDecision> {
     if (this.#disposed || signal?.aborted === true) return Promise.resolve({ kind: "cancelled" });
     if (!this.backendInstanceGenerationOwnsContext(
@@ -16206,6 +16238,7 @@ export class SessionHost {
         backendInstanceGeneration,
         ...(runId === undefined ? {} : { runId }),
         ...(attemptId === undefined ? {} : { attemptId }),
+        ...(approval === undefined ? {} : { approval }),
         resolve: resolvePromise,
         ...(timeoutMs === undefined ? {} : {
           expiryTimer: setTimeout(() => this.expirePendingInteraction(interaction.id, generation), timeoutMs)

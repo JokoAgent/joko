@@ -86,6 +86,23 @@ export interface ContactVCardImportResult {
   readonly directory: ContactDirectoryState;
 }
 
+export interface SystemContactImportRecord extends ParsedContactVCard {
+  readonly nativeId: string;
+}
+
+interface SystemContactImportScope {
+  readonly ownerId: string;
+  readonly deviceId: string;
+  readonly assertCurrent: () => void;
+}
+
+interface StoredContactImportPreview extends ContactVCardImportPreview {
+  readonly system?: SystemContactImportScope & {
+    readonly nativeIds: ReadonlyMap<string, string>;
+    readonly owners: ReadonlyMap<string, string | undefined>;
+  };
+}
+
 export interface ContactVCardImportEntryResult {
   readonly entryId: string;
   readonly displayName: string;
@@ -138,7 +155,7 @@ export interface ContactManagerOptions {
 
 /** Orchestrator owner for the node-local Contact authority and portable vCard flow. */
 export class ContactManager {
-  readonly #previews = new Map<string, ContactVCardImportPreview>();
+  readonly #previews = new Map<string, StoredContactImportPreview>();
   readonly #now: () => number;
   readonly #idFactory: () => string;
 
@@ -326,6 +343,20 @@ export class ContactManager {
     const parsed = parseContactVCards(text);
     if (parsed.length === 0) throw importInvalid("The file does not contain a usable vCard.");
     if (parsed.length > MAX_IMPORT_ENTRIES) throw importInvalid("The vCard import exceeds the 2,000 contact limit.");
+    return this.#previewImport(parsed);
+  }
+
+  previewSystemContactImport(records: readonly SystemContactImportRecord[], scope: SystemContactImportScope): ContactVCardImportPreview {
+    scope.assertCurrent();
+    if (!this.directory().enabled) throw importInvalid("Enable Contacts before importing system cards.");
+    if (records.length > MAX_IMPORT_ENTRIES) throw importInvalid("The macOS Contacts import exceeds the 2,000 contact limit.");
+    const nativeIds = new Map(records.map((card, index) => [`vcard-entry-${index + 1}`, card.nativeId]));
+    const owners = new Map([...nativeIds].map(([entryId, nativeId]) => [entryId,
+      nativeId === "" ? undefined : this.store.findSystemContactOwner(scope.deviceId, nativeId)]));
+    return this.#previewImport(records, { ...scope, nativeIds, owners });
+  }
+
+  #previewImport(parsed: readonly ParsedContactVCard[], system?: StoredContactImportPreview["system"]): ContactVCardImportPreview {
     this.#prunePreviews();
     if (this.#previews.size >= MAX_PREVIEWS) {
       const oldest = [...this.#previews.values()].sort((left, right) => left.expiresAt - right.expiresAt)[0];
@@ -338,6 +369,9 @@ export class ContactManager {
     for (const [index, card] of parsed.entries()) {
       const entryId = `vcard-entry-${index + 1}`;
       try {
+        if (system?.nativeIds.get(entryId) === "") {
+          throw new ContactStoreError("CONTACT_INVALID", "The system card has no stable identifier.");
+        }
         validateContactDraft(card.draft);
         if (card.organizationName !== undefined) {
           validateContactDraft({ kind: "organization", displayName: card.organizationName, source: "import" });
@@ -350,13 +384,20 @@ export class ContactManager {
         rejectedEntries.push({ entryId, displayName: displayName || entryId, reason: error.message.slice(0, 120) });
         continue;
       }
-      const candidates = this.store.findSimilar(card.draft);
+      const candidates = [...this.store.findSimilar(card.draft)];
+      const anchoredId = system?.owners.get(entryId);
+      if (anchoredId !== undefined && !candidates.some(candidate => candidate.contactId === anchoredId)) {
+        const anchored = this.store.getContact(anchoredId);
+        candidates.unshift({ matchType: "identity", contactId: anchored.id, displayName: anchored.displayName,
+          kind: anchored.kind, status: anchored.status, summary: anchored.summary });
+      }
       const existingIdentityIds = unique(candidates.filter((candidate) => candidate.matchType === "identity")
         .map((candidate) => candidate.contactId));
       const stagedIdentityIds = unique((card.draft.identities ?? []).map((identity) => stagedIdentities.get(identityKey(identity)))
         .filter((value): value is string => value !== undefined));
-      const identityOwners = [...existingIdentityIds.map((id) => ({ kind: "contact" as const, id })),
-        ...stagedIdentityIds.map((id) => ({ kind: "entry" as const, id }))];
+      const identityOwners = anchoredId === undefined
+        ? [...existingIdentityIds.map((id) => ({ kind: "contact" as const, id })), ...stagedIdentityIds.map((id) => ({ kind: "entry" as const, id }))]
+        : [{ kind: "contact" as const, id: anchoredId }];
       const similarEntryIds = entries.filter((entry) => namesSimilar(card.draft, entry.contact)).map((entry) => entry.entryId);
       const nameCandidates = candidates.filter((candidate) => candidate.matchType === "name");
       const disposition: ContactVCardImportDisposition = identityOwners.length === 1
@@ -392,14 +433,14 @@ export class ContactManager {
       ...(rejectedEntries.length === 0 ? {} : { rejectedEntries: Object.freeze(rejectedEntries) }),
       expiresAt: now + PREVIEW_LIFETIME_MS
     });
-    this.#previews.set(preview.previewId, preview);
+    this.#previews.set(preview.previewId, system === undefined ? preview : { ...preview, system });
     return preview;
   }
 
   readVCardImportPreview(previewId: string): ContactVCardImportPreview {
     this.#prunePreviews();
     const preview = this.#previews.get(previewId);
-    if (preview === undefined) {
+    if (preview === undefined || preview.system !== undefined) {
       throw new ContactManagerError("CONTACT_IMPORT_EXPIRED", "The vCard import preview expired. Preview the file again.");
     }
     return preview;
@@ -410,17 +451,41 @@ export class ContactManager {
     readonly expectedDirectoryRevision: bigint;
     readonly decisions: readonly ContactVCardImportDecision[];
   }): ContactVCardImportResult {
+    return this.#commitImport(input);
+  }
+
+  commitSystemContactImport(input: Parameters<ContactManager["commitVCardImport"]>[0], ownerId: string): ContactVCardImportResult {
+    return this.#commitImport(input, ownerId);
+  }
+
+  discardSystemContactImport(previewId: string, ownerId: string): void {
+    if (this.#previews.get(previewId)?.system?.ownerId === ownerId) this.#previews.delete(previewId);
+  }
+
+  #commitImport(input: Parameters<ContactManager["commitVCardImport"]>[0], ownerId?: string): ContactVCardImportResult {
     this.#prunePreviews();
     const preview = this.#previews.get(input.previewId);
-    if (preview === undefined) throw new ContactManagerError("CONTACT_IMPORT_EXPIRED", "The vCard import preview expired. Preview the file again.");
+    if (preview === undefined || preview.system?.ownerId !== ownerId) {
+      throw new ContactManagerError("CONTACT_IMPORT_EXPIRED", ownerId === undefined
+        ? "The vCard import preview expired. Preview the file again." : "The system contact preview expired. Open a new preview on this Mac.");
+    }
+    const system = preview.system;
+    system?.assertCurrent();
     if (preview.directoryRevision !== input.expectedDirectoryRevision
-      || this.store.directoryState().revision !== input.expectedDirectoryRevision) {
-      throw new ContactManagerError("CONTACT_IMPORT_CHANGED", "Contacts changed after the vCard preview. Preview the file again.");
+      || this.store.directoryState().revision !== input.expectedDirectoryRevision || system !== undefined && !this.directory().enabled) {
+      throw new ContactManagerError("CONTACT_IMPORT_CHANGED", system === undefined
+        ? "Contacts changed after the vCard preview. Preview the file again." : "Contacts changed after the system preview. Open a new preview.");
     }
     const decisions = decisionMap(input.decisions, preview.entries);
     this.#preflightDecisions(preview, decisions);
 
     const result = this.store.runInTransaction(() => {
+      system?.assertCurrent();
+      if (system !== undefined) for (const [entryId, nativeId] of system.nativeIds) {
+        if (nativeId && this.store.findSystemContactOwner(system.deviceId, nativeId) !== system.owners.get(entryId)) {
+          throw new ContactManagerError("CONTACT_IMPORT_CHANGED", "A system card binding changed after preview. Open a new preview.");
+        }
+      }
       const resolvedEntries = new Map<string, string>();
       const contactIds = new Set<string>();
       const entryResults: ContactVCardImportEntryResult[] = (preview.rejectedEntries ?? []).map((entry) => ({ ...entry, outcome: "skipped" }));
@@ -440,7 +505,8 @@ export class ContactManager {
         }
         let outcome: ContactVCardImportEntryResult["outcome"];
         if (action === "merge") {
-          const targetId = decision?.targetContactId ?? entry.existingContactId
+          const anchoredId = system?.owners.get(entry.entryId);
+          const targetId = anchoredId ?? decision?.targetContactId ?? entry.existingContactId
             ?? resolvedEntryId(decision?.targetEntryId ?? entry.existingEntryId, resolvedEntries, "contact import target");
           contact = this.#enrich(targetId, entry.contact);
           enriched += 1;
@@ -476,6 +542,8 @@ export class ContactManager {
         resolvedEntries.set(entry.entryId, contact.id);
         contact = this.#applyImportedOrganization(contact, entry, decision, resolvedEntries);
         contact = this.#applyImportedGroups(contact, entry.groups);
+        const nativeId = system?.nativeIds.get(entry.entryId);
+        if (system !== undefined && nativeId) this.store.bindSystemContact(system.deviceId, contact.id, nativeId);
         contactIds.add(contact.id);
         entryResults.push({
           entryId: entry.entryId,
@@ -484,6 +552,7 @@ export class ContactManager {
           contactId: contact.id
         });
       }
+      system?.assertCurrent();
       entryResults.sort((left, right) => Number(left.entryId.slice("vcard-entry-".length)) - Number(right.entryId.slice("vcard-entry-".length)));
       return { created, enriched, skipped, contactIds: [...contactIds], entries: entryResults };
     });

@@ -9,6 +9,7 @@ import {
   type NewSessionSubmissionOwner
 } from "./new-session-flow.js";
 import { recentProjectForTarget } from "./recent-projects.js";
+import { contactsDraftOwnerMatches } from "./contacts-draft.js";
 
 interface SubmissionView {
   observe(controller: AppController): void;
@@ -54,6 +55,13 @@ export function useNewSessionSubmission(
       || original.state.connectionState !== "connected" || sourceProfile === undefined
       || sourceConnectionGeneration === undefined || win === null || win.closed || win.document !== doc) {
       throw new DOMException("The initiating draft is no longer available.", "AbortError");
+    }
+    const contactsDraft = original.state.route.contactsDraft;
+    const contactsRequestId = owner.contactsDialogueRequestId;
+    if (contactsDraft !== undefined && (!contactsDraftOwnerMatches(contactsDraft, sourceProfile) || contactsRequestId === undefined
+      || draft.selection.kind !== "dialogue" || draft.nativeStart.kind !== "fresh" || draft.worktree !== undefined
+      || (input.extraDirectoryIds?.length ?? 0) > 0 || (owner.firstInputDisposition?.kind ?? "send") !== "send")) {
+      throw new Error("Sending a Contacts draft requires explicit trust for its original managed dialogue workspace.");
     }
     const acceptanceOwner: NewSessionAcceptanceOwner = {
       serverId: sourceProfile.serverId,
@@ -133,6 +141,14 @@ export function useNewSessionSubmission(
         beforeFirstInput: owner.beforeFirstInput,
         disposition: owner.firstInputDisposition,
         signal: effectLifetime.signal,
+        ...(contactsDraft === undefined || contactsRequestId === undefined ? {} : {
+          prepareDialogueTarget: async (target) => {
+            if (!isCurrent()) throw new DOMException("The initiating Contacts draft is no longer available.", "AbortError");
+            const prepared = await original.prepareContactsDialogue(target, contactsRequestId, effectLifetime.signal);
+            if (!isCurrent()) throw new DOMException("The initiating Contacts draft is no longer available.", "AbortError");
+            return prepared;
+          }
+        }),
         onAccepted: (acceptance) => {
           try { owner.onFirstInputAccepted?.(acceptance); } catch { /* Usage history cannot block accepted-input presentation. */ }
           try { acceptedObserver.current?.(acceptance, acceptanceOwner); } catch { /* Shell presentation cannot undo accepted input. */ }

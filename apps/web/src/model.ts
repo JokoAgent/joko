@@ -1050,6 +1050,7 @@ export interface ContactDirectoryView {
   readonly organizations: number;
   readonly pending: number;
   readonly groups: number;
+  readonly systemImportAvailable?: boolean;
 }
 
 export type ContactSyncPhaseView = "off" | "waiting" | "syncing" | "upToDate" | "error";
@@ -5701,6 +5702,7 @@ export interface NewSessionModelRequest {
 export interface NewSessionLocalDraft {
   readonly preparation?: ProvisionalTaskReceipt;
   readonly builtinSkillIntent?: "plugin_creator";
+  readonly contactsDialogue?: { readonly requestId: string; readonly name: string };
   readonly selection: NewSessionDraftSelection | { readonly kind: "unselected" };
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
   readonly providerId: string;
@@ -6922,6 +6924,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   mergeContacts(targetContactId: string, expectedTargetRevision: bigint, mergedContactId: string, expectedMergedRevision: bigint, signal?: AbortSignal): Promise<ContactMergeResultView>;
   previewContactVCardImport(vcardText: string, signal?: AbortSignal): Promise<ContactVCardImportPreviewView>;
   commitContactVCardImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView>;
+  previewSystemContactImport(signal?: AbortSignal): Promise<ContactVCardImportPreviewView>;
+  commitSystemContactImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView>;
   exportContactsVCard(contactIds?: readonly string[], signal?: AbortSignal): Promise<ContactVCardExportView>;
   getContactSyncStatus(signal?: AbortSignal): Promise<ContactSyncStatusView>;
   setContactSyncEnabled(expectedConfigurationRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactSyncStatusView>;

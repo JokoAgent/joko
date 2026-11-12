@@ -7,7 +7,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import type { AppController } from "./controller.js";
 import { ContactsSettings } from "./components/ContactsSettings.js";
 import { translate } from "./i18n.js";
-import type { ContactDirectoryView, ContactListOptionsView, ContactProfileView, ContactSyncStatusView } from "./model.js";
+import type {
+  ContactDirectoryView, ContactListOptionsView, ContactProfileView, ContactSyncStatusView, ContactVCardImportPreviewView
+} from "./model.js";
 
 const roots: Root[] = [];
 
@@ -26,6 +28,52 @@ afterEach(async () => {
 });
 
 describe("Contacts device sync settings", () => {
+  it("opens macOS Contacts only by request, cancels its read, and commits the reviewed native preview", async () => {
+    const base = contactController(contactSyncStatus());
+    const preview: ContactVCardImportPreviewView = {
+      previewId: "native-preview", directoryRevision: 7n, expiresAt: 50_000,
+      entries: [{ entryId: "card-one", disposition: "create",
+        contact: { kind: "person", displayName: "Ada Lovelace", source: "import", status: "confirmed",
+          aliases: [], summary: "", narrative: "", agentNotes: "", identities: [] },
+        candidates: [], similarEntryIds: [], groups: [], organizationCandidates: [] }]
+    };
+    const controller = {
+      ...base,
+      getContactDirectory: async () => ({ ...await base.getContactDirectory(), systemImportAvailable: true }),
+      previewSystemContactImport: vi.fn<AppController["previewSystemContactImport"]>()
+        .mockImplementationOnce(signal => new Promise((_resolve, reject) => {
+          signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+        }))
+        .mockResolvedValueOnce(preview),
+      commitSystemContactImport: vi.fn(async () => ({ created: 1, enriched: 0, skipped: 0,
+        contactIds: [], entries: [], directory: await base.getContactDirectory() })),
+      commitContactVCardImport: vi.fn()
+    };
+    const { container } = await render(
+      <ContactsSettings controller={controller as unknown as AppController} locale="en" t={(key, values) => translate("en", key, values)} />
+    );
+    const open = button(container, "Import from macOS Contacts");
+    expect(controller.previewSystemContactImport).not.toHaveBeenCalled();
+    await act(async () => { open.click(); });
+    const first = controller.previewSystemContactImport.mock.calls[0]?.[0];
+    const pending = document.querySelector('[role="dialog"]')!;
+    expect(pending.textContent).toContain("Reading your contacts");
+    await act(async () => { button(pending, "Cancel").click(); });
+    expect(first?.aborted).toBe(true);
+    expect(controller.commitSystemContactImport).not.toHaveBeenCalled();
+
+    await act(async () => { open.click(); });
+    const review = document.querySelector('[role="dialog"]')!;
+    expect(review.textContent).toContain("Review macOS Contacts import");
+    expect(review.textContent).toContain("Ada Lovelace");
+    await act(async () => { button(review, "Import contacts").click(); });
+    expect(controller.commitSystemContactImport).toHaveBeenCalledWith("native-preview", 7n, [
+      expect.objectContaining({ entryId: "card-one", decision: "create" })
+    ], expect.any(AbortSignal));
+    expect(controller.commitContactVCardImport).not.toHaveBeenCalled();
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("macOS Contacts import complete");
+  });
+
   it("renders trusted and nearby devices and wires every explicit sync action", async () => {
     const status = contactSyncStatus();
     const controller = contactController(status);
