@@ -230,7 +230,7 @@ describe("WorkspaceService", () => {
     const service = new WorkspaceService({
       commitWorkspaceTextFile: async (staged) => {
         stagedPath = staged;
-        throw new Error("injected commit failure");
+        throw Object.assign(new Error("injected commit failure"), { code: "EBUSY" });
       }
     });
     await service.register({ id: "workspace-failure", root, displayName: "Failure", trusted: true });
@@ -240,7 +240,7 @@ describe("WorkspaceService", () => {
       path: "safe.txt",
       text: "do not keep\n",
       expectedRevision: revision
-    })).rejects.toMatchObject({ kind: "write_failed", code: "WORKSPACE_TEXT_FILE_WRITE_FAILED" });
+    })).rejects.toMatchObject({ kind: "write_failed", code: "WORKSPACE_TEXT_FILE_WRITE_FAILED", fileSystemErrorCode: "EBUSY" });
     expect(dirname(stagedPath)).toBe(root);
     expect(await readFile(path, "utf8")).toBe("keep me\n");
     expect(await readdir(root)).toEqual(["safe.txt"]);
