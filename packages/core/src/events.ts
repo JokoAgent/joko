@@ -261,6 +261,8 @@ export type EventPayload =
       readonly parts?: readonly ToolResultContentPart[];
       readonly isError: boolean;
       readonly artifact?: BlobRef;
+      /** Service-authored result of a verified document write. */
+      readonly documentOutput?: DocumentOutputResult;
       readonly nativeHistory?: NativeHistoryEventContext;
     }
   | { readonly type: "artifact"; readonly artifact: BlobRef; readonly purpose: string; readonly audioMetadata?: AudioArtifactMetadata; readonly embeddedInExtensionCard?: boolean }
@@ -433,6 +435,23 @@ export type ToolResultContentPart =
   | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "image"; readonly blob: BlobRef; readonly alt?: string }
   | { readonly kind: "artifact"; readonly blob: BlobRef; readonly label: string; readonly audioMetadata?: AudioArtifactMetadata };
+
+export interface DocumentOutputPresentation {
+  readonly title?: string;
+  readonly subtitle?: string;
+  readonly theme: "light" | "dark" | "navy";
+  readonly cover?: boolean;
+  readonly count?: number;
+  readonly slide?: { readonly title: string; readonly subtitle?: string };
+  readonly sheet?: { readonly columns: readonly string[]; readonly rows: readonly (readonly string[])[] };
+}
+
+export interface DocumentOutputResult extends DocumentOutputPresentation {
+  readonly blob: BlobRef;
+  readonly workspaceId: string;
+  readonly relativePath: string;
+  readonly overwritten: boolean;
+}
 
 /** Public history only. App HTML, input and View-only result metadata are never events. */
 export interface McpAppCardProjection {

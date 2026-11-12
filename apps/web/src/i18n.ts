@@ -6366,7 +6366,13 @@ const en = {
   ,"timeline.originUnavailable": "Source task or message is no longer available"
   ,"timeline.generatedFiles": "Generated files"
   ,"timeline.generatedFilesCount": "{count} files"
+  ,"timeline.documentSlides": "Slides {count}"
+  ,"timeline.documentSheets": "Sheets {count}"
+  ,"timeline.documentTheme.light": "Light"
+  ,"timeline.documentTheme.dark": "Dark"
+  ,"timeline.documentTheme.navy": "Navy"
   ,"timeline.openGeneratedFile": "Open {name}"
+  ,"timeline.showGeneratedFileInFiles": "Show {name} in Files"
   ,"settings.messaging": "Messaging"
   ,"settings.messagingBody": "Connect third-party messaging channels to visible Joko tasks with durable delivery, explicit routing, and managed credentials."
   ,"messaging.channels": "Channel availability"
@@ -10440,7 +10446,13 @@ const zhBase: Record<MessageKey, string> = {
   "timeline.originUnavailable": "来源任务或消息已不可用",
   "timeline.generatedFiles": "生成的文件",
   "timeline.generatedFilesCount": "{count} 个文件",
+  "timeline.documentSlides": "{count} 张幻灯片",
+  "timeline.documentSheets": "{count} 张工作表",
+  "timeline.documentTheme.light": "浅色",
+  "timeline.documentTheme.dark": "深色",
+  "timeline.documentTheme.navy": "海军蓝",
   "timeline.openGeneratedFile": "打开 {name}",
+  "timeline.showGeneratedFileInFiles": "在文件中显示 {name}",
   "settings.localeSaveSuccess": "语言设置已保存。",
   "settings.localeSaveFailed": "无法保存语言设置。",
   "settings.themeSaveSuccess": "主题设置已保存。",

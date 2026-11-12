@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdapterContext, PromptInput } from "@joko/core";
-import { PermissionDecisionKind } from "@joko/contracts";
+import { PermissionDecisionKind, ToolFileAction, readDocumentOutput } from "@joko/contracts";
 import { CredentialManager, CredentialVault, DocumentToolBridgeProvider, McpRouter, createInternalServer, createOrchestratorApplication, type OrchestratorConfig } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it } from "vitest";
@@ -127,6 +127,7 @@ it("delivers exact Word replacements through the authenticated task Tool bridge 
     await expect(readFile(join(fixture.workspaceDirectory, "documents", "conflict.docx"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(path)).toEqual(finalBytes);
     expect(await call("# New file", true, randomUUID(), "documents/new.docx")).toMatchObject({ isError: false });
+    const newBytes = await readFile(join(fixture.workspaceDirectory, "documents", "new.docx"));
 
     holdDelivery = true;
     const late = call("# Written before the Run ended", true).catch((error: unknown) => error);
@@ -144,13 +145,26 @@ it("delivers exact Word replacements through the authenticated task Tool bridge 
     const deliveries = history.events.flatMap(event => event.payload?.kind.case === "artifactProduced"
       ? [{ identity: event.identity, artifact: event.payload.kind.value.artifact }]
       : []);
-    expect(deliveries).toHaveLength(2);
-    for (const bytes of [replacementBytes, finalBytes]) {
+    expect(deliveries).toHaveLength(3);
+    const results = history.events.flatMap(event => {
+      const result = readDocumentOutput(event);
+      return result === undefined ? [] : [{ result, identity: event.identity }];
+    });
+    expect(results.map(({ result, identity }) => ({ action: result.file.action, path: result.file.relativePath,
+      revision: result.file.revisionAfter, title: result.artifact.title, identity }))).toEqual([
+      { action: ToolFileAction.UPDATED, path: "documents/report.docx", revision: `sha256:${createHash("sha256").update(replacementBytes).digest("hex")}`,
+        title: "Task report", identity: expect.objectContaining({ runId, attemptId }) },
+      { action: ToolFileAction.UPDATED, path: "documents/report.docx", revision: `sha256:${createHash("sha256").update(finalBytes).digest("hex")}`,
+        title: "Task report", identity: expect.objectContaining({ runId, attemptId }) },
+      { action: ToolFileAction.CREATED, path: "documents/new.docx", revision: `sha256:${createHash("sha256").update(newBytes).digest("hex")}`,
+        title: "Task report", identity: expect.objectContaining({ runId, attemptId }) }
+    ]);
+    for (const [fileName, bytes] of [["report.docx", replacementBytes], ["report.docx", finalBytes], ["new.docx", newBytes]] as const) {
       const hash = createHash("sha256").update(bytes).digest("hex");
       const delivery = deliveries.find(({ artifact }) => artifact?.blob?.sha256Hex === hash);
       expect(delivery).toMatchObject({
         identity: { sessionId, runId, attemptId },
-        artifact: { sessionId, runId, blob: { fileName: "report.docx", sha256Hex: hash } }
+        artifact: { sessionId, runId, blob: { fileName, sha256Hex: hash } }
       });
       const blobId = delivery?.artifact?.blob?.blobId;
       if (blobId === undefined) throw new Error("The delivered document has no Blob identity.");

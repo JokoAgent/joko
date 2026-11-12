@@ -1,10 +1,12 @@
 import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, inspectPdf, renderPdf, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, DocumentPathError, PptxDocumentError, XlsxDocumentError, SheetReadError, PdfInspectError, PdfRenderError, PdfResourceError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, PDF_PAGE_SIZES, RENDER_PDF_MAX_HTML_BYTES, type DocsThemeName, type PdfRenderer } from "@joko/tool-document";
+import { DOCUMENT_TOOL_PROVIDER_ID } from "@joko/contracts";
+import type { DocumentOutputPresentation } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
 import { DocumentDeliveryError, DocumentOutputDelivery, type DocumentFormat, type DocumentWriteReceipt } from "./document-output-delivery.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 
-export const DOCUMENT_TOOL_PROVIDER_ID = "joko-document-tools";
+export { DOCUMENT_TOOL_PROVIDER_ID };
 
 const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: DOCUMENT_TOOL_PROVIDER_ID,
@@ -273,10 +275,10 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
         ...(subtitle === undefined ? {} : { subtitle }),
         ...(cover === undefined ? {} : { cover })
       });
-      return await this.#publishResult("docx", { root, outPath, bytes, overwrite, ...(signal === undefined ? {} : { signal }) }, context, {
-        theme,
-        cover: Boolean(title?.trim()) && (cover ?? true)
-      });
+      const hasCover = Boolean(title?.trim()) && (cover ?? true);
+      return await this.#publishResult("docx", { root, outPath, bytes, overwrite, ...(signal === undefined ? {} : { signal }) }, context,
+        { theme, cover: hasCover }, { theme: theme as DocsThemeName, cover: hasCover,
+          ...(title === undefined ? {} : { title }), ...(subtitle === undefined ? {} : { subtitle }) });
     } catch (error) {
       if (signal?.aborted) throw error;
       if (error instanceof DocumentOutputError || error instanceof DocumentDeliveryError || error instanceof DocumentInputError || error instanceof DocumentPathError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof PdfRenderError || error instanceof PdfResourceError || error instanceof DocumentToolError) {
@@ -309,6 +311,8 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
     return await this.#publishResult("pptx", { root, outPath, bytes: result.buffer, overwrite, ...(signal === undefined ? {} : { signal }) }, context, {
       slides: result.slides, layouts: result.layouts,
       theme: result.theme, footer: result.footer
+    }, {
+      title: result.title || result.firstSlide.title, theme: result.theme, count: result.slides, slide: result.firstSlide
     });
   }
 
@@ -324,6 +328,8 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
     }, signal);
     return await this.#publishResult("xlsx", { root, outPath, bytes: result.buffer, overwrite, ...(signal === undefined ? {} : { signal }) }, context, {
       sheets: result.sheets, theme: result.theme, zebra: result.zebra
+    }, {
+      title: result.sheets[0]!.name, theme: result.theme, count: result.sheets.length, sheet: result.firstSheet
     });
   }
 
@@ -361,14 +367,15 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       templateApplied: rendered.templateApplied, ...(rendered.title ? { title: rendered.title } : {}),
       ...(rendered.warning ? { warning: rendered.warning } : {}),
       nextStep: "Call inspect_pdf on this path to verify page count, size, text and blank pages before delivery."
-    });
+    }, { theme: rendered.theme, ...(rendered.title === undefined ? {} : { title: rendered.title }) });
   }
 
   async #publishResult(
     format: DocumentFormat,
     input: Parameters<DocumentToolPublisher>[0],
     context: BridgeToolCallContext,
-    details: Readonly<Record<string, unknown>>
+    details: Readonly<Record<string, unknown>>,
+    presentation: DocumentOutputPresentation
   ): Promise<McpCallResult> {
     const assertCurrent = (): void => {
       input.signal?.throwIfAborted();
@@ -380,7 +387,7 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
     const request = { ...input, assertCurrent,
       ...(context.authorizeDocumentPath === undefined ? {} : { authorizePath: context.authorizeDocumentPath }) };
     if (this.#delivery !== undefined) {
-      const result = await this.#delivery.write(format, request, context, this.#publish, respond);
+      const result = await this.#delivery.write(format, request, context, this.#publish, presentation, respond);
       assertCurrent();
       return result;
     }
