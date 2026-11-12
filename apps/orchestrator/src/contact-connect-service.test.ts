@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createContactConnectService } from "./contact-connect-service.js";
 import { ContactManager } from "./contact-manager.js";
 import type { ContactSyncManager, ContactSyncStatus } from "./contact-sync-manager.js";
+import { SystemContactsPermissionError, type NativeSystemContactsPort } from "./input-handoff/native-host.js";
 import { mkdtempSync } from "./test-paths.js";
 
 const cleanups: Array<() => void> = [];
@@ -20,6 +21,60 @@ afterEach(() => {
 });
 
 describe("ContactService", () => {
+  it("imports only on the original native connection and stores the Apple ID privately", async () => {
+    const { manager, store } = createFixture();
+    manager.setEnabled(1n, true);
+    let connectionId = "remote";
+    let current = true;
+    const port: NativeSystemContactsPort = {
+      connectionId: "desktop", deviceId: "mac",
+      assertCurrent: () => { if (!current) throw new ConnectError("Host retired", Code.FailedPrecondition); },
+      read: vi.fn<NativeSystemContactsPort["read"]>(async (_input, check) => {
+        check();
+        return create(contract.NativeSystemContactsReadResponseSchema, { cards: [{
+          nativeId: "apple-card-1", fields: { kind: contract.ContactKind.PERSON, displayName: "Ada Lovelace",
+            emails: [{ value: "ada@example.test" }, { value: "ADA@example.test" }] }
+        }] });
+      }),
+      write: async () => { throw new Error("Unexpected native write."); }
+    };
+    const service = createContactConnectService(manager, () => connectionId, undefined, id => id === port.connectionId
+      ? { ownerId: id, port, assertCurrent: port.assertCurrent } : undefined);
+    const caller = context();
+    const directory = () => service.getContactDirectory(create(contract.GetContactDirectoryRequestSchema), caller);
+    const preview = () => service.previewSystemContactImport(create(contract.PreviewSystemContactImportRequestSchema), caller);
+    expect((await directory()).systemImportAvailable).toBe(false);
+    await expect(preview()).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(port.read).not.toHaveBeenCalled();
+
+    connectionId = "desktop";
+    expect((await directory()).systemImportAvailable).toBe(true);
+    vi.mocked(port.read).mockRejectedValueOnce(new SystemContactsPermissionError());
+    await expect(preview()).rejects.toMatchObject({ code: Code.PermissionDenied });
+    const first = (await preview()).preview!;
+    expect(JSON.stringify(first, (_key, value) => typeof value === "bigint" ? String(value) : value)).not.toContain("apple-card-1");
+    expect(first.entries[0]?.contact?.identities).toHaveLength(1);
+    const confirmation = { previewId: first.previewId, expectedDirectoryRevision: first.directoryRevision };
+    expectConnectError(() => service.commitContactVCardImport(create(contract.CommitContactVCardImportRequestSchema, confirmation), caller), Code.FailedPrecondition);
+    connectionId = "remote";
+    const commit = () => service.commitSystemContactImport(create(contract.CommitSystemContactImportRequestSchema, { confirmation }), caller);
+    expectConnectError(commit, Code.FailedPrecondition);
+    expect(manager.directory().people).toBe(0);
+    connectionId = "desktop";
+    const receipt = (await commit()).receipt!;
+    expect(receipt).toMatchObject({ created: 1, enriched: 0 });
+    expect(store.systemContactAnchor("mac", receipt.contactIds[0]!)).toEqual({ nativeId: "apple-card-1", unresolved: false });
+    expect(manager.exportVCards(receipt.contactIds).text).not.toContain("apple-card-1");
+    const second = (await preview()).preview!;
+    expect(second.entries[0]).toMatchObject({ disposition: contract.ContactVCardImportDisposition.AUTO_ENRICH,
+      existingContactId: receipt.contactIds[0] });
+    current = false;
+    expectConnectError(() => service.commitSystemContactImport(create(contract.CommitSystemContactImportRequestSchema, {
+      confirmation: { previewId: second.previewId, expectedDirectoryRevision: second.directoryRevision }
+    }), caller), Code.FailedPrecondition);
+    expect(manager.directory().people).toBe(1);
+  });
+
   it("saves and syncs multiline contact prose through the formal create and update requests", async () => {
     const { store, manager } = createFixture();
     const service = createContactConnectService(manager, () => ({ connectionId: "connection-1" }));

@@ -295,6 +295,7 @@ message GetContactDirectoryRequest {}
 
 message GetContactDirectoryResponse {
   ContactDirectory directory = 1;
+  bool system_import_available = 2;
 }
 
 message SetContactDirectoryEnabledRequest {
@@ -611,6 +612,80 @@ message CommitContactVCardImportResponse {
   repeated string contact_ids = 4;
   ContactDirectory directory = 5;
   repeated ContactVCardImportEntryResult entries = 6;
+}
+
+message PreviewSystemContactImportRequest {}
+
+message PreviewSystemContactImportResponse {
+  PreviewContactVCardImportResponse preview = 1;
+}
+
+message CommitSystemContactImportRequest {
+  CommitContactVCardImportRequest confirmation = 1;
+}
+
+message CommitSystemContactImportResponse {
+  CommitContactVCardImportResponse receipt = 1;
+}
+
+// Private payloads of the committed Desktop Main mailbox. Native identifiers
+// belong to that device and are never part of the public import preview.
+message NativeSystemContactsReadRequest {
+  string name_contains = 1;
+  bool require_email = 2;
+}
+
+message NativeSystemContactAddress {
+  string value = 1;
+  string label = 2;
+}
+
+message NativeSystemContactFields {
+  string display_name = 1;
+  ContactKind kind = 2;
+  string organization_name = 3;
+  string title = 4;
+  repeated NativeSystemContactAddress emails = 5;
+  repeated NativeSystemContactAddress phones = 6;
+}
+
+message NativeSystemContactCard {
+  string native_id = 1;
+  NativeSystemContactFields fields = 2;
+  string note = 3;
+}
+
+message NativeSystemContactsReadResponse {
+  repeated NativeSystemContactCard cards = 1;
+}
+
+message NativeSystemContactWriteItem {
+  string contact_id = 1;
+  optional string native_id = 2;
+  NativeSystemContactFields fields = 3;
+}
+
+message NativeSystemContactsWriteRequest {
+  repeated NativeSystemContactWriteItem items = 1;
+}
+
+enum NativeSystemContactWriteOutcome {
+  NATIVE_SYSTEM_CONTACT_WRITE_OUTCOME_UNSPECIFIED = 0;
+  NATIVE_SYSTEM_CONTACT_WRITE_OUTCOME_CREATED = 1;
+  NATIVE_SYSTEM_CONTACT_WRITE_OUTCOME_UPDATED = 2;
+  NATIVE_SYSTEM_CONTACT_WRITE_OUTCOME_MISSING = 3;
+  NATIVE_SYSTEM_CONTACT_WRITE_OUTCOME_FAILED = 4;
+  NATIVE_SYSTEM_CONTACT_WRITE_OUTCOME_UNKNOWN = 5;
+}
+
+message NativeSystemContactWriteReceipt {
+  string contact_id = 1;
+  NativeSystemContactWriteOutcome outcome = 2;
+  optional string native_id = 3;
+}
+
+message NativeSystemContactsWriteResponse {
+  repeated NativeSystemContactWriteReceipt receipts = 1;
 }
 
 message ExportContactsVCardRequest {

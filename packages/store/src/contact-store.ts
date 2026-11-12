@@ -208,7 +208,25 @@ CREATE INDEX contact_relations_to_idx ON contact_relations(to_contact_id, create
 export const CONTACT_SCHEMA_BASELINE_ID = createHash("sha256")
   .update(`contact-v1\n${CONTACT_SCHEMA}`, "utf8").digest("hex");
 
-/** Current-v1, standalone durable Contacts database. No old-shape reader or migration exists. */
+// Device-local bindings never enter the v1 contact, search, vCard or sync projection.
+// Snapshot application replaces the contact rows in one transaction, so it prunes
+// these bindings only after the replacement rows have been inserted.
+const SYSTEM_CONTACT_ANCHORS = `
+CREATE TABLE IF NOT EXISTS contact_system_anchors (
+  id INTEGER PRIMARY KEY,
+  device_id TEXT NOT NULL,
+  contact_id TEXT NOT NULL,
+  native_id TEXT,
+  operation_id TEXT,
+  UNIQUE (device_id, native_id),
+  CHECK ((native_id IS NULL) <> (operation_id IS NULL))
+) STRICT;
+CREATE INDEX IF NOT EXISTS contact_system_anchors_contact ON contact_system_anchors(contact_id, device_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS contact_system_anchors_pending
+  ON contact_system_anchors(device_id, contact_id) WHERE native_id IS NULL;
+`;
+
+/** Current-v1, standalone durable Contacts database. */
 export class ContactStore {
   readonly #database: DatabaseSync;
   readonly #now: () => number;
@@ -229,6 +247,7 @@ export class ContactStore {
         (value) => typeof value === "string" ? folded(value) : null);
       if (filePath !== ":memory:") this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
       this.#initialize();
+      this.#write(() => this.#database.exec(SYSTEM_CONTACT_ANCHORS));
     } catch (error) {
       this.#database.close();
       this.#closed = true;
@@ -245,6 +264,61 @@ export class ContactStore {
   runInTransaction<T>(callback: () => T): T {
     if (typeof callback !== "function") throw invalid("Contact transaction callback is invalid.");
     return this.#write(callback);
+  }
+
+  findSystemContactOwner(deviceId: string, nativeId: string): string | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT contact_id FROM contact_system_anchors WHERE device_id = ? AND native_id = ?")
+      .get(entityId(deviceId, "Device ID"), systemContactId(nativeId)) as Row | undefined;
+    return row === undefined ? undefined : string(row["contact_id"]);
+  }
+
+  systemContactAnchor(deviceId: string, contactId: string): { readonly nativeId?: string; readonly unresolved: boolean } {
+    this.#assertOpen();
+    const row = this.#database.prepare(`
+      SELECT native_id FROM contact_system_anchors WHERE contact_id = ? AND device_id = ?
+      ORDER BY native_id IS NOT NULL, id LIMIT 1
+    `).get(entityId(contactId, "Contact ID"), entityId(deviceId, "Device ID")) as Row | undefined;
+    if (row === undefined) return { unresolved: false };
+    return row["native_id"] === null ? { unresolved: true } : { nativeId: string(row["native_id"]), unresolved: false };
+  }
+
+  bindSystemContact(deviceId: string, contactId: string, nativeId: string, operationId?: string): void {
+    this.#write(() => {
+      const device = entityId(deviceId, "Device ID"), contact = entityId(contactId, "Contact ID");
+      const native = systemContactId(nativeId);
+      this.#requireContactRow(contact);
+      if (operationId !== undefined && this.#database.prepare(
+        "SELECT id FROM contact_system_anchors WHERE device_id = ? AND contact_id = ? AND operation_id = ? AND native_id IS NULL"
+      ).get(device, contact, entityId(operationId, "Operation ID")) === undefined) {
+        throw new ContactStoreError("CONTACT_IDENTITY_CONFLICT", "The system card has no matching creation reservation.");
+      }
+      const owner = this.findSystemContactOwner(device, native);
+      if (owner !== undefined && owner !== contact) throw new ContactStoreError("CONTACT_IDENTITY_CONFLICT", "The system card already belongs to another contact.");
+      if (owner === undefined) {
+        this.#database.prepare("INSERT INTO contact_system_anchors(device_id, contact_id, native_id) VALUES (?, ?, ?)")
+          .run(device, contact, native);
+      }
+      if (operationId !== undefined) this.releaseSystemContactCreate(device, contact, operationId);
+    });
+  }
+
+  reserveSystemContactCreate(deviceId: string, contactId: string, operationId: string): void {
+    this.#write(() => {
+      const device = entityId(deviceId, "Device ID"), contact = entityId(contactId, "Contact ID");
+      this.#requireContactRow(contact);
+      const anchor = this.systemContactAnchor(device, contact);
+      if (anchor.unresolved || anchor.nativeId !== undefined) {
+        throw new ContactStoreError("CONTACT_IDENTITY_CONFLICT", "The system contact binding has changed.");
+      }
+      this.#database.prepare("INSERT INTO contact_system_anchors(device_id, contact_id, operation_id) VALUES (?, ?, ?)")
+        .run(device, contact, entityId(operationId, "Operation ID"));
+    });
+  }
+
+  releaseSystemContactCreate(deviceId: string, contactId: string, operationId: string): void {
+    this.#write(() => this.#database.prepare("DELETE FROM contact_system_anchors WHERE device_id = ? AND contact_id = ? AND operation_id = ?")
+      .run(entityId(deviceId, "Device ID"), entityId(contactId, "Contact ID"), entityId(operationId, "Operation ID")));
   }
 
   directoryState(): ContactDirectoryState {
@@ -494,6 +568,7 @@ export class ContactStore {
       const revision = this.#advanceDirectoryRevision();
       const at = this.#now();
       this.#database.prepare("DELETE FROM contact_search_fts WHERE contact_id = ?").run(id);
+      this.#database.prepare("DELETE FROM contact_system_anchors WHERE contact_id = ?").run(id);
       const removed = this.#database.prepare("DELETE FROM contacts WHERE id = ?").run(id).changes === 1;
       this.#touchContacts(relatedContacts, revision, at);
       this.#touchGroups(groups, revision, at);
@@ -773,6 +848,8 @@ export class ContactStore {
         .map((row) => string(row["group_id"]));
       this.#database.prepare("UPDATE contact_identities SET contact_id = ?, revision = ? WHERE contact_id = ?")
         .run(targetId, revision, sourceId);
+      this.#database.prepare("UPDATE OR IGNORE contact_system_anchors SET contact_id = ? WHERE contact_id = ?").run(targetId, sourceId);
+      this.#database.prepare("DELETE FROM contact_system_anchors WHERE contact_id = ?").run(sourceId);
       this.#database.prepare("UPDATE contact_events SET contact_id = ?, revision = ? WHERE contact_id = ?")
         .run(targetId, revision, sourceId);
       this.#database.prepare(`
@@ -1179,6 +1256,7 @@ export class ContactStore {
         contact.summary, contact.narrative, contact.agentNotes, contact.status, contact.source,
         contact.createdAt, contact.updatedAt);
     }
+    this.#database.exec("DELETE FROM contact_system_anchors WHERE contact_id NOT IN (SELECT id FROM contacts)");
     const insertGroup = this.#database.prepare(`
       INSERT INTO contact_groups(id, revision, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
     `);
@@ -1764,6 +1842,11 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 
 function entityId(value: unknown, label: string): string {
   if (typeof value !== "string" || value !== value.trim() || !ENTITY_ID.test(value)) throw invalid(`${label} is invalid.`);
+  return value;
+}
+
+function systemContactId(value: string): string {
+  if (value.length === 0 || value.length > 512 || /[\u0000-\u001f\u007f]/u.test(value)) throw invalid("System contact ID is invalid.");
   return value;
 }
 

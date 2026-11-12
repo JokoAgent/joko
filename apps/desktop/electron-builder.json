@@ -232,10 +232,13 @@
     "icon": "icon-light.svg",
     "hardenedRuntime": true,
     "sign": "scripts/sign-mac-native-credentials.cjs",
+    "entitlements": "resources/desktop.entitlements.plist",
     "binaries": ["Contents/Resources/native-remote-desktop/joko-macos-remote-credentials"],
     "extendInfo": {
       "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer.",
-      "NSAudioCaptureUsageDescription": "Joko shares computer audio only when you enable audio in Remote Desktop."
+      "NSAudioCaptureUsageDescription": "Joko shares computer audio only when you enable audio in Remote Desktop.",
+      "NSAppleEventsUsageDescription": "Joko controls Contacts to import cards you choose and to add or update cards after you approve an export.",
+      "NSContactsUsageDescription": "Joko imports contacts you choose and adds or updates cards only after you approve an export."
     },
     "target": [
       "dmg",

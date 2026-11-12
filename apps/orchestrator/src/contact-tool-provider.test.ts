@@ -2,9 +2,11 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { create } from "@bufbuild/protobuf";
+import * as contract from "@joko/contracts";
 import type { SessionDescriptor } from "@joko/core";
 import { ContactStore, OperationalStore, type ContactDraft } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ContactManager } from "./contact-manager.js";
 import {
@@ -13,6 +15,8 @@ import {
   ContactToolBridgeProvider
 } from "./contact-tool-provider.js";
 import type { BridgeToolCallContext, McpCallResult } from "./mcp-router.js";
+import { SystemContactsPermissionError, type NativeSystemContactsPort } from "./input-handoff/native-host.js";
+import type { SystemContactToolsOptions } from "./system-contact-tools.js";
 import { mkdtempSync } from "./test-paths.js";
 
 const NOW = Date.UTC(2026, 8, 21, 8, 0, 0);
@@ -23,6 +27,177 @@ afterEach(() => {
 });
 
 describe("ContactToolBridgeProvider", () => {
+  it("offers system import only to the originating Desktop and asks before every native read", async () => {
+    const f = createFixture();
+    enable(f.manager);
+    const existing = createContact(f, "Ada Lovelace", "person");
+    const read = vi.fn<NativeSystemContactsPort["read"]>(async (_input, check) => {
+      check();
+      return create(contract.NativeSystemContactsReadResponseSchema, { cards: [
+        { nativeId: "apple-ada", fields: { kind: contract.ContactKind.PERSON, displayName: "Ada Lovelace",
+          emails: [{ value: "ada@example.test" }, { value: "ADA@example.test" }] } },
+        { nativeId: "apple-grace", fields: { kind: contract.ContactKind.PERSON, displayName: "Grace Hopper" } }
+      ] });
+    });
+    const { provider, callContext, approve } = systemFixture(f, { read });
+    const input = { dry_run: true, name_contains: "Ada", require_email: true, group: "Imported" };
+    expect(errorData(await callOrdinary(provider, "contacts_import_system", input))).toMatchObject({ errorCode: "UNKNOWN_TOOL" });
+    approve.mockResolvedValueOnce(false);
+    expect(errorData(await callOrdinary(provider, "contacts_import_system", input, callContext("denied"))))
+      .toMatchObject({ errorCode: "PERMISSION_DENIED" });
+    expect(read).not.toHaveBeenCalled();
+    const before = f.manager.directory();
+    read.mockResolvedValueOnce(create(contract.NativeSystemContactsReadResponseSchema, { cards: [
+      { nativeId: "apple-ada", fields: { kind: contract.ContactKind.PERSON, displayName: "Ada Lovelace", emails: [{ value: "ada@example.test" }] } }
+    ] }));
+    expect(resultData(await callOrdinary(provider, "contacts_import_system", input, callContext("dry"))))
+      .toEqual({ dryRun: true, total: 1, withEmail: 1, withOrg: 0, sample: ["Ada Lovelace"] });
+    expect(read.mock.calls[0]?.[0]).toMatchObject({ nameContains: "Ada", requireEmail: true });
+    expect(f.manager.directory()).toEqual(before);
+    expect(f.manager.groups()).toEqual([]);
+    expect(approve).toHaveBeenCalledTimes(2);
+
+    expect(resultData(await callOrdinary(provider, "contacts_import_system", { group: "Imported" }, callContext("import"))))
+      .toMatchObject({ created: 1, enriched: 0, skipped: 1, reviewCount: 1, needsReview: ["Ada Lovelace"] });
+    expect(f.manager.get(existing.id).identities).toEqual([]);
+    const grace = f.manager.list({ query: "Grace Hopper" }).contacts[0]!;
+    expect(f.contacts.findSystemContactOwner("device-contacts", "apple-grace")).toBe(grace.id);
+    expect(f.manager.get(grace.id).groups).toEqual([expect.objectContaining({ name: "Imported" })]);
+    expect(JSON.stringify(f.contacts.readContactSyncState("source-node").state,
+      (_key, value) => typeof value === "bigint" ? String(value) : value)).not.toContain("apple-grace");
+  });
+
+  it("previews a local write, skips pending, adopts only exact native receipts and replays the original operation", async () => {
+    const f = createFixture();
+    enable(f.manager);
+    const person = f.manager.create({
+      kind: "person", displayName: "Grace Hopper", summary: "Private summary", narrative: "Private narrative",
+      agentNotes: "Private agent note", identities: [{ platform: "email", value: "grace@example.test" },
+        { platform: "signal", value: "private-signal" }], expectedDirectoryRevision: f.manager.directory().revision
+    }).contact!;
+    const pending = f.manager.create({ kind: "person", displayName: "Pending person", status: "pending",
+      expectedDirectoryRevision: f.manager.directory().revision }).contact!;
+    const organization = createContact(f, "Research Laboratory", "organization");
+    f.manager.addRelation({ fromContactId: person.id, expectedFromRevision: person.revision,
+      toContactId: organization.id, relation: "works at", note: "Engineer" });
+    const write = vi.fn<NativeSystemContactsPort["write"]>(async (request, check, admit) => {
+      check();
+      admit();
+      check();
+      return create(contract.NativeSystemContactsWriteResponseSchema, { receipts: [{
+        contactId: request.items[0]!.contactId, nativeId: "apple-grace", outcome: contract.NativeSystemContactWriteOutcome.CREATED
+      }] });
+    });
+    const { provider, callContext, approve } = systemFixture(f, { write });
+    const ids = [person.id, pending.id, person.id];
+    expect(resultData(await callOrdinary(provider, "contacts_export_system", { ids, dry_run: true }, callContext("plan"))))
+      .toMatchObject({ toCreate: ["Grace Hopper"], skippedPending: ["Pending person"] });
+    expect(approve).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+
+    const execution = () => callOrdinary(provider, "contacts_export_system", { ids }, callContext("write"));
+    const first = await execution();
+    expect(resultData(first)).toMatchObject({ created: 1, updated: 0, skippedPending: 1, operation_id: "mcp-contacts:write" });
+    expect(await execution()).toEqual(first);
+    expect(approve).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(errorData(await callOrdinary(provider, "contacts_export_system", { ids: [organization.id] }, {
+      ...callContext("write"), requestBodyHash: "conflicting-body"
+    }))).toMatchObject({ errorCode: "OPERATION_CONFLICT" });
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(write.mock.calls[0]?.[0].items).toEqual([expect.objectContaining({ contactId: person.id,
+      fields: expect.objectContaining({ displayName: "Grace Hopper", organizationName: "Research Laboratory", title: "Engineer",
+        emails: [expect.objectContaining({ value: "grace@example.test" })], phones: [] }) })]);
+    expect(JSON.stringify(write.mock.calls[0]?.[0])).not.toMatch(/Private|private-signal/u);
+    expect(f.contacts.systemContactAnchor("device-contacts", person.id)).toEqual({ nativeId: "apple-grace", unresolved: false });
+
+    write.mockImplementationOnce(async (request, check, admit) => {
+      check();
+      admit();
+      expect(request.items[0]?.nativeId).toBe("apple-grace");
+      return create(contract.NativeSystemContactsWriteResponseSchema, { receipts: [{
+        contactId: person.id, outcome: contract.NativeSystemContactWriteOutcome.MISSING
+      }] });
+    });
+    expect(resultData(await callOrdinary(provider, "contacts_export_system", { ids: [person.id] }, callContext("missing"))))
+      .toMatchObject({ created: 0, missing: 1, issues: [{ contact_id: person.id, outcome: "missing" }] });
+    expect(f.contacts.systemContactAnchor("device-contacts", person.id)).toEqual({ nativeId: "apple-grace", unresolved: false });
+  });
+
+  it("holds an unconfirmed create and releases a known denial before a later write", async () => {
+    const f = createFixture();
+    enable(f.manager);
+    const uncertain = createContact(f, "Grace Hopper", "person");
+    const denied = createContact(f, "Barbara Liskov", "person");
+    const write = vi.fn<NativeSystemContactsPort["write"]>(async (_request, _check, admit) => {
+      admit();
+      throw new Error("The Main mailbox stopped after admitting the write.");
+    });
+    const { provider, callContext } = systemFixture(f, { write });
+    const uncertainWrite = () => callOrdinary(provider, "contacts_export_system", { ids: [uncertain.id] }, callContext("unknown"));
+    expect(errorData(await uncertainWrite())).toMatchObject({
+      errorCode: "EFFECT_OUTCOME_UNKNOWN", data: { unknown: 1, operation_id: "mcp-contacts:unknown" }
+    });
+    expect(errorData(await uncertainWrite())).toMatchObject({ errorCode: "EFFECT_OUTCOME_UNKNOWN" });
+    expect(f.operational.getOperation("mcp-contacts:unknown")).toMatchObject({ status: "failed", error: { stateMayHaveChanged: true } });
+    expect(resultData(await callOrdinary(provider, "contacts_export_system", { ids: [uncertain.id] }, callContext("later"))))
+      .toMatchObject({ unresolved: 1, created: 0 });
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(f.contacts.systemContactAnchor("device-contacts", uncertain.id)).toEqual({ unresolved: true });
+
+    write.mockImplementationOnce(async (_request, _check, admit) => {
+      admit();
+      throw new SystemContactsPermissionError();
+    });
+    expect(errorData(await callOrdinary(provider, "contacts_export_system", { ids: [denied.id] }, callContext("permission"))))
+      .toMatchObject({ errorCode: "PERMISSION_DENIED", data: { unknown: 0, skipped: 1 } });
+    expect(f.contacts.systemContactAnchor("device-contacts", denied.id)).toEqual({ unresolved: false });
+  });
+
+  it("keeps the first batch's anchors when a later batch from the same group loses its receipt", async () => {
+    const f = createFixture();
+    enable(f.manager);
+    const group = f.manager.createGroup(f.manager.directory().revision, "Selected team", "");
+    const names = ["Cedar Grove", "Riverbank", "Aster Design", "Muir Lawn", "Ocean Laboratory", "Gray Stone", "Sparrow"];
+    for (const [index, displayName] of names.entries()) {
+      const profile = f.manager.create({
+        kind: "person", displayName, expectedDirectoryRevision: f.manager.directory().revision,
+        identities: Array.from({ length: 30 }, (_unused, entry) => ({
+          platform: "email", value: `${index}-${entry}-${"a".repeat(285)}@example.test`, label: "w".repeat(90)
+        }))
+      }).contact!;
+      f.manager.setGroupMembership(profile.id, profile.revision, group.id, true);
+    }
+    const write = vi.fn<NativeSystemContactsPort["write"]>()
+      .mockImplementationOnce(async (request, check, admit) => {
+        admit();
+        check();
+        return create(contract.NativeSystemContactsWriteResponseSchema, { receipts: request.items.map(item => ({
+          contactId: item.contactId, outcome: contract.NativeSystemContactWriteOutcome.CREATED, nativeId: `apple:${item.contactId}`
+        })) });
+      }).mockImplementationOnce(async (_request, _check, admit) => {
+        admit();
+        throw new Error("Lost the second native receipt.");
+      });
+    const { provider, callContext, approve } = systemFixture(f, { write });
+    const result = await callOrdinary(provider, "contacts_export_system", { group: group.name }, callContext("group"));
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(approve).toHaveBeenCalledOnce();
+    const first = write.mock.calls[0]![0].items;
+    const second = write.mock.calls[1]![0].items;
+    expect(first.length + second.length).toBe(names.length);
+    expect(errorData(result)).toMatchObject({
+      errorCode: "EFFECT_OUTCOME_UNKNOWN", data: { created: first.length, unknown: second.length, operation_id: "mcp-contacts:group" }
+    });
+    for (const item of first) expect(f.contacts.systemContactAnchor("device-contacts", item.contactId))
+      .toEqual({ unresolved: false, nativeId: `apple:${item.contactId}` });
+    for (const item of second) expect(f.contacts.systemContactAnchor("device-contacts", item.contactId))
+      .toEqual({ unresolved: true });
+    expect(f.operational.getOperation("mcp-contacts:group").error).toMatchObject({
+      message: expect.stringContaining(`Confirmed created: ${first.length}.`)
+    });
+  });
+
   it("publishes progressive discovery with separate ordinary and explicitly approved entry tools", async () => {
     const fixture = createFixture();
     expect(fixture.provider.tools.map((tool) => ({ name: tool.name, permission: tool.requiresPermission }))).toEqual([
@@ -547,6 +722,36 @@ function createSession(store: OperationalStore, id: string, targetId: string): v
     updatedAt: NOW
   };
   store.createSession(input);
+}
+
+function systemFixture(f: ReturnType<typeof createFixture>, effects: Partial<NativeSystemContactsPort>) {
+  const connection = f.operational.createConnection({ id: "connection-contacts", deviceId: "device-contacts",
+    name: "Desktop", authKeyDigest: "contacts-fixture-digest" });
+  const scope = { id: "contacts-queue", runId: "contacts-run", attemptId: "contacts-attempt" };
+  const prompt = { text: "Use my macOS Contacts", images: [], files: [], mentions: [], disposition: "prompt" } as const;
+  f.operational.runOperation({ id: "contacts-send", connectionId: connection.id, kind: "sendInput", body: prompt }, store => {
+    store.createRun({ id: scope.runId, sessionId: "session-a", source: "user", state: "queued", createdAt: NOW });
+    store.createAttempt({ id: scope.attemptId, runId: scope.runId, ordinal: 1, generation: 7, startedAt: NOW });
+    store.enqueueQueueItem({ id: scope.id, sessionId: "session-a", runId: scope.runId, attemptId: scope.attemptId,
+      operationId: "contacts-send", body: prompt, disposition: "prompt" });
+    return {};
+  });
+  expect(f.operational.claimNextQueueItem({ sessionId: "session-a", backendInstanceGeneration: 0 })?.id).toBe(scope.id);
+  const port: NativeSystemContactsPort = {
+    connectionId: connection.id, deviceId: connection.deviceId, assertCurrent: () => {},
+    read: async () => { throw new Error("Unexpected native read."); },
+    write: async () => { throw new Error("Unexpected native write."); },
+    ...effects
+  };
+  const approve = vi.fn<SystemContactToolsOptions["approve"]>(async request => {
+    request.assertCurrent();
+    return true;
+  });
+  const provider = new ContactToolBridgeProvider({ store: f.operational, contacts: f.manager,
+    systemContacts: { getPort: () => port, approve } });
+  const callContext = (id: string): BridgeToolCallContext => ({ ...context(), localProductScope: true, inputQueueItem: scope,
+    requestIdentity: id, requestBodyHash: `body-${id}`, effectIdentity: `effect-${id}`, assertCurrent: () => {} });
+  return { provider, callContext, approve };
 }
 
 function enable(manager: ContactManager): void {

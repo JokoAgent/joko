@@ -1050,6 +1050,7 @@ export interface ContactDirectoryView {
   readonly organizations: number;
   readonly pending: number;
   readonly groups: number;
+  readonly systemImportAvailable?: boolean;
 }
 
 export type ContactSyncPhaseView = "off" | "waiting" | "syncing" | "upToDate" | "error";
@@ -6922,6 +6923,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   mergeContacts(targetContactId: string, expectedTargetRevision: bigint, mergedContactId: string, expectedMergedRevision: bigint, signal?: AbortSignal): Promise<ContactMergeResultView>;
   previewContactVCardImport(vcardText: string, signal?: AbortSignal): Promise<ContactVCardImportPreviewView>;
   commitContactVCardImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView>;
+  previewSystemContactImport(signal?: AbortSignal): Promise<ContactVCardImportPreviewView>;
+  commitSystemContactImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView>;
   exportContactsVCard(contactIds?: readonly string[], signal?: AbortSignal): Promise<ContactVCardExportView>;
   getContactSyncStatus(signal?: AbortSignal): Promise<ContactSyncStatusView>;
   setContactSyncEnabled(expectedConfigurationRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactSyncStatusView>;

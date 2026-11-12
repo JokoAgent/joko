@@ -10,6 +10,7 @@ import { ConnectionService, DesktopInputHandoffHostService, NativeInputHandoffMe
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import type { DesktopManagedOrchestratorConnection } from "./channels.js";
 import { createMacHandoffDriver, isSecureInputTarget } from "./input-handoff-macos-driver.js";
+import { executeMacSystemContactsCommand, MacSystemContactsPermissionError } from "./system-contacts-macos.js";
 
 type HostClient = Client<typeof DesktopInputHandoffHostService>;
 interface RegisteredHost { readonly client: HostClient; readonly scope: { hostInstanceId: string; hostGeneration: bigint }; readonly connection: DesktopManagedOrchestratorConnection; readonly signal: AbortSignal }
@@ -25,6 +26,7 @@ export interface DesktopInputHandoffHostOptions {
 export class DesktopInputHandoffHost {
   readonly #instance = randomUUID(); #connection: DesktopManagedOrchestratorConnection | undefined; #lifetime: AbortController | undefined;
   #registered: RegisteredHost | undefined;
+  #systemContactsTask: Promise<void> | undefined;
   constructor(readonly options: DesktopInputHandoffHostOptions) {}
   setConnection(connection: DesktopManagedOrchestratorConnection | undefined): void {
     if ((this.options.platform ?? process.platform) !== "darwin") connection = undefined;
@@ -94,37 +96,77 @@ export class DesktopInputHandoffHost {
     let retry = 500;
     while (!signal.aborted) {
       try {
-        const client = await this.#client(connection, signal), registered = await client.registerNativeInputHandoffHost({ hostInstanceId: this.#instance, platform: "darwin", processId: process.pid }, { signal });
+        const client = await this.#client(connection, signal), registered = await client.registerNativeInputHandoffHost({
+          hostInstanceId: this.#instance, platform: "darwin", processId: process.pid, supportsSystemContacts: process.platform === "darwin"
+        }, { signal });
         const scope = { hostInstanceId: this.#instance, hostGeneration: registered.hostGeneration };
         this.#registered = { client, scope, connection, signal };
         while (!signal.aborted) {
           const response = await client.pollNativeInputHandoffCommand(scope, { signal }); signal.throwIfAborted();
           if (!await this.options.isAuthorityCurrent(connection)) return;
           const command = response.command; if (!command) continue;
-          const request = { ...scope, commandId: command.commandId }, active = new AbortController();
-          const abort = () => active.abort(), valid = async () => {
-            const admitted = await client.admitNativeInputHandoffCommand(request, { signal }); if (!admitted.current) abort();
-          };
-          signal.addEventListener("abort", abort, { once: true });
-          let monitoring = false;
-          const monitor = setInterval(() => { if (monitoring || active.signal.aborted) return; monitoring = true; void valid().catch(abort).finally(() => { monitoring = false; }); }, 500); monitor.unref();
-          let payload: Uint8Array = new Uint8Array(), success = false;
-          try {
-            await valid(); active.signal.throwIfAborted();
-            const driver = (this.options.createDriver ?? createMacHandoffDriver)(active.signal);
-            const value = await executeNativeInputHandoffCommand(command, driver, target => isSecureInputTarget(target, active.signal));
-            active.signal.throwIfAborted();
-            payload = encodeNativeResult(value); success = true; wipePictures(value);
-          } catch { payload = Buffer.from("null"); }
-          finally { clearInterval(monitor); signal.removeEventListener("abort", abort); active.abort(); command.payload.fill(0); }
-          // Completion retries only the receipt. A native effect never runs twice.
-          try { for (let attempt = 0; ; attempt++) { try { await client.completeNativeInputHandoffCommand({ ...request, success, payload }, { signal }); break; }
-            catch (error) { if (attempt >= 2 || signal.aborted || isEndpointTrustError(error)) throw error; await delay(500 * (attempt + 1), signal); } } }
-          finally { payload.fill(0); }
+          if (command.method === Method.READ_SYSTEM_CONTACTS || command.method === Method.WRITE_SYSTEM_CONTACTS) {
+            // macOS may wait for a TCC prompt. Keep polling input commands while
+            // serializing Contacts commands, including an old canceled script's exit.
+            const task = (this.#systemContactsTask ?? Promise.resolve()).then(() =>
+              this.#execute(client, scope, command, signal, true)).catch(() => undefined);
+            this.#systemContactsTask = task;
+            void task.then(() => { if (this.#systemContactsTask === task) this.#systemContactsTask = undefined; });
+          } else await this.#execute(client, scope, command, signal, false);
           retry = 500;
         }
       } catch (error) { if (this.#registered?.signal === signal) this.#registered = undefined; if (isEndpointTrustError(error)) return; if (!signal.aborted) await delay(retry, signal); retry = Math.min(30_000, retry * 2); }
     }
+  }
+
+  async #execute(client: HostClient, scope: RegisteredHost["scope"], command: NativeInputHandoffCommand, signal: AbortSignal, contacts: boolean): Promise<void> {
+    const request = { ...scope, commandId: command.commandId }, active = new AbortController();
+    const abort = () => active.abort(), valid = async () => {
+      const admitted = await client.admitNativeInputHandoffCommand(request, { signal });
+      if (!admitted.current) abort();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    let monitoring = false;
+    const monitor = setInterval(() => {
+      if (monitoring || active.signal.aborted) return;
+      monitoring = true;
+      void valid().catch(abort).finally(() => { monitoring = false; });
+    }, 500);
+    monitor.unref();
+    let payload: Uint8Array = new Uint8Array(), success = false;
+    try {
+      signal.throwIfAborted();
+      await valid();
+      active.signal.throwIfAborted();
+      if (contacts) payload = await executeMacSystemContactsCommand(command, active.signal);
+      else {
+        const driver = (this.options.createDriver ?? createMacHandoffDriver)(active.signal);
+        const value = await executeNativeInputHandoffCommand(command, driver, target => isSecureInputTarget(target, active.signal));
+        payload = encodeNativeResult(value);
+        wipePictures(value);
+      }
+      active.signal.throwIfAborted();
+      if (payload.byteLength > 8_000_000) throw invalid();
+      success = true;
+    } catch (error) {
+      payload.fill(0);
+      payload = Buffer.from(error instanceof MacSystemContactsPermissionError ? "permission" : "null");
+    } finally {
+      clearInterval(monitor);
+      signal.removeEventListener("abort", abort);
+      active.abort();
+      command.payload.fill(0);
+    }
+    // Completion retries only the receipt. A native effect never runs twice.
+    try {
+      for (let attempt = 0; ; attempt++) {
+        try { await client.completeNativeInputHandoffCommand({ ...request, success, payload }, { signal }); break; }
+        catch (error) {
+          if (attempt >= 2 || signal.aborted || isEndpointTrustError(error)) throw error;
+          await delay(500 * (attempt + 1), signal);
+        }
+      }
+    } finally { payload.fill(0); }
   }
 }
 

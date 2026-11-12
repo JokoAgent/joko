@@ -22,7 +22,9 @@ import {
   ContactManager,
   ContactManagerError,
   type ContactVCardImportDecision,
-  type ContactVCardImportPreviewEntry
+  type ContactVCardImportPreview,
+  type ContactVCardImportPreviewEntry,
+  type ContactVCardImportResult
 } from "./contact-manager.js";
 import {
   ContactSyncManager,
@@ -30,11 +32,14 @@ import {
   type ContactSyncStatus
 } from "./contact-sync-manager.js";
 import { fromProtoRevision, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
+import { SystemContactsPermissionError } from "./input-handoff/native-host.js";
+import { readSystemContactImport, type SystemContactsAccess } from "./system-contacts.js";
 
-export function createContactConnectService(
+export function createContactConnectService<Authority>(
   manager: ContactManager | undefined,
-  authenticate: (context: HandlerContext) => unknown,
-  syncManager?: ContactSyncManager
+  authenticate: (context: HandlerContext) => Authority,
+  syncManager?: ContactSyncManager,
+  systemContacts?: (authority: Authority) => SystemContactsAccess | undefined
 ): ServiceImpl<typeof contract.ContactService> {
   const owner = (): ContactManager => {
     if (manager === undefined) throw new ConnectError("Contacts are unavailable.", Code.Unimplemented);
@@ -44,10 +49,20 @@ export function createContactConnectService(
     if (syncManager === undefined) throw new ConnectError("Contacts device sync is unavailable.", Code.Unimplemented);
     return syncManager;
   };
+  const requireSystemContacts = (context: HandlerContext): SystemContactsAccess => {
+    const authority = authenticate(context);
+    const access = systemContacts?.(authority);
+    if (access === undefined) throw new ConnectError("System Contacts require this Mac's managed Desktop connection.", Code.FailedPrecondition);
+    context.signal.throwIfAborted();
+    access.assertCurrent();
+    return access;
+  };
   return {
     getContactDirectory: (_request, context) => {
-      authenticate(context);
-      return contactRpc(() => create(contract.GetContactDirectoryResponseSchema, { directory: toProtoDirectory(owner().directory()) }));
+      const authority = authenticate(context);
+      return contactRpc(() => create(contract.GetContactDirectoryResponseSchema, {
+        directory: toProtoDirectory(owner().directory()), systemImportAvailable: systemContacts?.(authority) !== undefined
+      }));
     },
     setContactDirectoryEnabled: (request, context) => {
       authenticate(context);
@@ -283,41 +298,29 @@ export function createContactConnectService(
     },
     previewContactVCardImport: (request, context) => {
       authenticate(context);
-      return contactRpc(() => {
-        const preview = owner().previewVCardImport(request.vcardText);
-        return create(contract.PreviewContactVCardImportResponseSchema, {
-          previewId: preview.previewId,
-          directoryRevision: toProtoRevision(preview.directoryRevision),
-          entries: preview.entries.map(toProtoImportEntry),
-          rejectedEntries: (preview.rejectedEntries ?? []).map((entry) => create(contract.ContactVCardImportRejectedEntrySchema, entry)),
-          expiresAt: toProtoTimestamp(preview.expiresAt)
-        });
-      });
+      return contactRpc(() => toProtoImportPreview(owner().previewVCardImport(request.vcardText)));
     },
     commitContactVCardImport: (request, context) => {
       authenticate(context);
+      return contactRpc(() => toProtoImportReceipt(owner().commitVCardImport(fromProtoImportRequest(request))));
+    },
+    previewSystemContactImport: async (_request, context) => {
+      const access = requireSystemContacts(context);
+      try {
+        const preview = await readSystemContactImport(owner(), access, {}, context.signal);
+        return create(contract.PreviewSystemContactImportResponseSchema, { preview: toProtoImportPreview(preview) });
+      } catch (error) {
+        context.signal.throwIfAborted();
+        if (error instanceof SystemContactsPermissionError) throw new ConnectError(error.message, Code.PermissionDenied);
+        return contactRpc(() => { throw error; });
+      }
+    },
+    commitSystemContactImport: (request, context) => {
+      const access = requireSystemContacts(context);
       return contactRpc(() => {
-        const result = owner().commitVCardImport({
-          previewId: request.previewId,
-          expectedDirectoryRevision: fromProtoRevision(request.expectedDirectoryRevision, "expected_directory_revision"),
-          decisions: request.decisions.map(fromProtoImportDecision)
-        });
-        return create(contract.CommitContactVCardImportResponseSchema, {
-          created: result.created,
-          enriched: result.enriched,
-          skipped: result.skipped,
-          contactIds: [...result.contactIds],
-          directory: toProtoDirectory(result.directory),
-          entries: result.entries.map((entry) => create(contract.ContactVCardImportEntryResultSchema, {
-            entryId: entry.entryId,
-            displayName: entry.displayName,
-            outcome: entry.outcome === "created" ? contract.ContactVCardImportOutcome.CREATED
-              : entry.outcome === "enriched" ? contract.ContactVCardImportOutcome.ENRICHED
-                : contract.ContactVCardImportOutcome.SKIPPED,
-            ...(entry.contactId === undefined ? {} : { contactId: entry.contactId }),
-            ...(entry.reason === undefined ? {} : { reason: entry.reason })
-          }))
-        });
+        const confirmation = fromProtoImportRequest(required(request.confirmation, "confirmation"));
+        const receipt = owner().commitSystemContactImport(confirmation, access.ownerId);
+        return create(contract.CommitSystemContactImportResponseSchema, { receipt: toProtoImportReceipt(receipt) });
       });
     },
     exportContactsVCard: (request, context) => {
@@ -523,6 +526,42 @@ function toProtoCandidate(value: StoredDuplicateCandidate): contract.ContactDupl
     summary: value.summary,
     ...(value.matchedPlatform === undefined ? {} : { matchedPlatform: value.matchedPlatform }),
     ...(value.matchedValue === undefined ? {} : { matchedValue: value.matchedValue })
+  });
+}
+
+function toProtoImportPreview(preview: ContactVCardImportPreview): contract.PreviewContactVCardImportResponse {
+  return create(contract.PreviewContactVCardImportResponseSchema, {
+    previewId: preview.previewId,
+    directoryRevision: toProtoRevision(preview.directoryRevision),
+    entries: preview.entries.map(toProtoImportEntry),
+    rejectedEntries: (preview.rejectedEntries ?? []).map(entry => create(contract.ContactVCardImportRejectedEntrySchema, entry)),
+    expiresAt: toProtoTimestamp(preview.expiresAt)
+  });
+}
+
+function fromProtoImportRequest(request: contract.CommitContactVCardImportRequest) {
+  return {
+    previewId: request.previewId,
+    expectedDirectoryRevision: fromProtoRevision(request.expectedDirectoryRevision, "expected_directory_revision"),
+    decisions: request.decisions.map(fromProtoImportDecision)
+  };
+}
+
+function toProtoImportReceipt(result: ContactVCardImportResult): contract.CommitContactVCardImportResponse {
+  return create(contract.CommitContactVCardImportResponseSchema, {
+    created: result.created,
+    enriched: result.enriched,
+    skipped: result.skipped,
+    contactIds: [...result.contactIds],
+    directory: toProtoDirectory(result.directory),
+    entries: result.entries.map(entry => create(contract.ContactVCardImportEntryResultSchema, {
+      entryId: entry.entryId,
+      displayName: entry.displayName,
+      outcome: entry.outcome === "created" ? contract.ContactVCardImportOutcome.CREATED
+        : entry.outcome === "enriched" ? contract.ContactVCardImportOutcome.ENRICHED : contract.ContactVCardImportOutcome.SKIPPED,
+      ...(entry.contactId === undefined ? {} : { contactId: entry.contactId }),
+      ...(entry.reason === undefined ? {} : { reason: entry.reason })
+    }))
   });
 }
 

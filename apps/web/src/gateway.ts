@@ -142,6 +142,8 @@ import {
   ContactVCardImportDecisionKind,
   ContactVCardImportDisposition,
   ContactVCardImportOutcome,
+  type CommitContactVCardImportResponse,
+  type PreviewContactVCardImportResponse,
   PartnerInitializationErrorCode,
   PartnerInitializationState,
   PartnerInvitationStage,
@@ -9617,7 +9619,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ContactService, scope.transport).getContactDirectory({}, { signal: scope.signal });
     scope.signal.throwIfAborted();
-    return mapContactDirectory(response.directory);
+    const directory = mapContactDirectory(response.directory);
+    return response.systemImportAvailable ? { ...directory, systemImportAvailable: true } : directory;
   }
 
   async setContactDirectoryEnabled(expectedRevision: bigint, enabled: boolean, signal?: AbortSignal): Promise<ContactDirectoryView> {
@@ -9852,6 +9855,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ContactService, scope.transport).previewContactVCardImport({ vcardText }, { signal: scope.signal });
     scope.signal.throwIfAborted();
+    return this.#mapContactImportPreview(response);
+  }
+
+  async previewSystemContactImport(signal?: AbortSignal): Promise<ContactVCardImportPreviewView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).previewSystemContactImport(
+      {}, { signal: scope.signal, timeoutMs: 200_000 }
+    );
+    scope.signal.throwIfAborted();
+    if (response.preview === undefined) throw new GatewayError("Orchestrator returned no system contact import preview.");
+    return this.#mapContactImportPreview(response.preview);
+  }
+
+  #mapContactImportPreview(response: PreviewContactVCardImportResponse): ContactVCardImportPreviewView {
     const rejectedEntries = response.rejectedEntries.map((entry) => {
       if (entry.displayName.trim() === "" || entry.displayName.length > 100 || entry.reason.trim() === "" || entry.reason.length > 120
         || /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(entry.displayName + entry.reason)) {
@@ -9881,6 +9898,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       decisions: decisions.map(protoContactVCardImportDecision)
     }, { signal: scope.signal });
     scope.signal.throwIfAborted();
+    return this.#mapContactImportResult(response);
+  }
+
+  async commitSystemContactImport(previewId: string, expectedDirectoryRevision: bigint, decisions: readonly ContactVCardImportDecisionView[], signal?: AbortSignal): Promise<ContactVCardImportResultView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ContactService, scope.transport).commitSystemContactImport({ confirmation: {
+      previewId,
+      expectedDirectoryRevision: { value: expectedDirectoryRevision },
+      decisions: decisions.map(protoContactVCardImportDecision)
+    } }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.receipt === undefined) throw new GatewayError("Orchestrator returned no system contact import receipt.");
+    return this.#mapContactImportResult(response.receipt);
+  }
+
+  #mapContactImportResult(response: CommitContactVCardImportResponse): ContactVCardImportResultView {
     const entries = response.entries.map((entry) => {
       const outcome = entry.outcome === ContactVCardImportOutcome.CREATED ? "created" as const
         : entry.outcome === ContactVCardImportOutcome.ENRICHED ? "enriched" as const
