@@ -241,18 +241,20 @@ describe("Telegram Messaging production product chain", () => {
     );
     telegram.addFile({ fileId: "group-photo-103", path: "photos/group-photo.png", bytes: photo, mimeType: "image/png" });
     const chatId = -100123;
+    const threadId = 7;
     const groupPrompt = "Describe the earlier group photo.";
-    telegram.enqueueGroupMessage({ chatId, updateId: 13, messageId: 103, text: "Photo from the group", photoFileId: "group-photo-103" });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 13, messageId: 103, text: "Photo from the group", photoFileId: "group-photo-103" });
     await waitFor(
       async () => fixture?.application.store.getMessagingConnection(created.connectionId).cursor,
       (cursor) => cursor === "14", "Telegram to observe the group photo", 15_000
     );
     expect(telegram.methodCount("getFile")).toBe(3);
     expect(fixture.providerRequests).toHaveLength(2);
-    telegram.enqueueGroupMessage({ chatId, updateId: 14, messageId: 104, text: `@joko_system_bot ${groupPrompt}` });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 14, messageId: 104, text: `@joko_system_bot ${groupPrompt}` });
     await waitFor(
       async () => telegram?.outboundMessages ?? [],
-      (replies) => replies.some((message) => message.chatId === chatId && message.replyToMessageId === 104 && message.text === SECOND_REPLY),
+      (replies) => replies.some((message) => message.chatId === chatId && message.threadId === threadId
+        && message.replyToMessageId === 104 && message.text === SECOND_REPLY),
       "the Telegram group photo turn to finish", 30_000
     );
     const groupRequest = required(fixture.application.store.listMessagingInboundRequests()
@@ -326,6 +328,46 @@ describe("Telegram Messaging production product chain", () => {
     expect(freshProviderInput).toContain(freshPrompt);
     expect(freshProviderInput).not.toContain("Keep this original turn running.");
     expect(freshProviderInput).not.toContain("Compare this native audio and the quoted note.");
+
+    const store = fixture.application.store;
+    const topic = store.getMessagingConversation(groupRequest.conversationId!);
+    const otherTopicText = "A message in the neighboring topic.";
+    const newBackground = "An update since the last accepted topic message.";
+    telegram.enqueueGroupMessage({ chatId, threadId: 8, updateId: 20, messageId: 110, text: otherTopicText });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 21, messageId: 111, text: newBackground });
+    await waitFor(async () => store.getMessagingConnection(created.connectionId).cursor, cursor => cursor === "22",
+      "the two topic observations", 15_000);
+    const otherTopic = required(store.listMessagingConversations({ connectionId: created.connectionId })
+      .find(conversation => conversation.providerThreadId === "8"), "the neighboring Telegram topic");
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 22, messageId: 112, text: "/new" });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.chatId === chatId && message.threadId === threadId && message.replyToMessageId === 112
+      && message.text === "A new conversation is ready. Previous task history was archived."), "the new Telegram topic task", 25_000);
+    const newTopic = store.getMessagingConversation(topic.id);
+    const newTopicId = required(newTopic.sessionId, "the replacement Telegram topic task");
+    expect(newTopicId).not.toBe(groupQueue.sessionId);
+    expect(store.getSession(groupQueue.sessionId).descriptor.archived).toBe(true);
+    expect(store.getMessagingConversation(otherTopic.id)).toEqual(otherTopic);
+    expect(store.getMessagingConversation(restartedConversation.id).sessionId).toBe(freshId);
+    expect(fixture.providerRequests).toHaveLength(5);
+
+    const newTopicPrompt = "Summarize the new topic update.";
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 23, messageId: 113, text: `@joko_system_bot ${newTopicPrompt}` });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.chatId === chatId && message.threadId === threadId && message.replyToMessageId === 113
+      && message.text === SECOND_REPLY), "the reply from the replacement Telegram topic task", 25_000);
+    const newTopicRequest = required(store.listMessagingInboundRequests().find(request => request.providerMessageId === "113"),
+      "the replacement topic input");
+    expect(store.getQueueItem(newTopicRequest.queueItemId!).sessionId).toBe(newTopicId);
+    expect(fixture.providerRequests).toHaveLength(6);
+    expect(telegram.methodCount("getFile")).toBe(4);
+    const replacementTopicInput = JSON.stringify(fixture.providerRequests[5]?.body["messages"]);
+    expect(replacementTopicInput).toContain(newBackground);
+    expect(replacementTopicInput).toContain(newTopicPrompt);
+    expect(replacementTopicInput).not.toContain(otherTopicText);
+    expect(replacementTopicInput).not.toContain("Photo from the group");
+    expect(replacementTopicInput).not.toContain(groupPrompt);
+    expect(replacementTopicInput).not.toContain(photo.toString("base64"));
 
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),

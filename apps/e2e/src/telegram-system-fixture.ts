@@ -6,6 +6,7 @@ export const TELEGRAM_SYSTEM_OWNER_ID = 42;
 
 export interface TelegramSystemOutboundMessage {
   readonly chatId: number;
+  readonly threadId?: number;
   readonly text: string;
   readonly replyToMessageId?: number;
 }
@@ -118,6 +119,7 @@ export class TelegramSystemFixture {
 
   enqueueGroupMessage(input: {
     readonly chatId: number;
+    readonly threadId?: number;
     readonly updateId: number;
     readonly messageId: number;
     readonly text: string;
@@ -133,6 +135,7 @@ export class TelegramSystemFixture {
         from: { id: TELEGRAM_SYSTEM_OWNER_ID, is_bot: false, first_name: "Owner", username: "owner" },
         chat: { id: input.chatId, type: "supergroup", title: "Product chain group" },
         date: Math.floor(Date.now() / 1_000),
+        ...(input.threadId === undefined ? {} : { message_thread_id: input.threadId, is_topic_message: true }),
         ...(photo === undefined ? {
           text: input.text,
           ...(input.text.startsWith(`${mention} `) ? { entities: [{ type: "mention", offset: 0, length: mention.length }] } : {})
@@ -219,12 +222,14 @@ export class TelegramSystemFixture {
       }
       if (method === "sendMessage") {
         const chatId = numberField(body, "chat_id");
+        const threadId = body["message_thread_id"] === undefined ? undefined : numberField(body, "message_thread_id");
         const text = stringField(body, "text");
         const reply = recordField(body, "reply_parameters");
         const replyToMessageId = reply === undefined ? undefined : numberField(reply, "message_id");
         this.outboundMessages.push({
           chatId,
           text,
+          ...(threadId === undefined ? {} : { threadId }),
           ...(replyToMessageId === undefined ? {} : { replyToMessageId })
         });
         this.#nextMessageId += 1;

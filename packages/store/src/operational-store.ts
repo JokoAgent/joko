@@ -6195,7 +6195,7 @@ export class OperationalStore {
     });
   }
 
-  /** Starts a fresh visible task for one direct peer without erasing the prior task history. */
+  /** Binds a fresh task to the existing address and retains prior task history. */
   rebindMessagingConversationSession(input: {
     readonly conversationId: string;
     readonly expectedRevision: bigint;
@@ -6212,10 +6212,11 @@ export class OperationalStore {
       assertMessagingRevision("Messaging conversation", current.id, current.revision, input.expectedRevision);
       const connection = this.getMessagingConnection(current.connectionId);
       assertMessagingGeneration(connection, input.expectedChannelGeneration);
-      if (current.status !== "active" || current.conversationKind !== "direct"
+      const ordinaryTelegramGroup = connection.channel === "telegram" && current.conversationKind === "group" && current.partnerId === undefined;
+      if (current.status !== "active" || current.conversationKind !== "direct" && !ordinaryTelegramGroup
         || current.channelGeneration !== connection.generation
         || current.sessionId !== input.expectedSessionId || current.sessionId === input.sessionId) {
-        throw new StoreError("Messaging direct conversation cannot switch a stale task binding.");
+        throw new StoreError("Messaging conversation cannot switch a stale task binding.");
       }
       if (this.listRuns({ sessionId: current.sessionId, activeOnly: true, limit: 1 }).length > 0
         || this.listQueueItems({
@@ -7078,7 +7079,7 @@ export class OperationalStore {
       JOIN messaging_conversations conversation ON conversation.id = request.conversation_id
       JOIN messaging_channels channel ON channel.id = request.connection_id
       JOIN queue_items queue ON queue.id = request.queue_item_id AND queue.run_id = request.run_id
-        AND queue.operation_id = request.operation_id AND queue.session_id = conversation.session_id
+        AND queue.operation_id = request.operation_id
       WHERE conversation.id = ? AND conversation.conversation_kind = 'group'
         AND channel.channel = 'telegram' AND conversation.connection_id = channel.id
         AND request.channel_generation = conversation.channel_generation
