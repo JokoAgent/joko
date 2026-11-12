@@ -1048,16 +1048,16 @@ export class WorkspaceService {
       readonly expectedRevision: string;
       readonly confirmRecursive: boolean;
     },
-    assertCurrent?: () => void
+    request?: WorkspaceFileRequestAuthority
   ): Promise<void> {
     if (this.#isRemote(workspaceId)) {
-      return this.#remoteInvoke(workspaceId, "deleteEntry", [input]);
+      return this.#remoteInvoke(workspaceId, "deleteEntry", [input], request);
     }
     const workspace = this.requireWorkspace(workspaceId);
     const canonicalPath = canonicalWorkspaceMutationPath(input.path);
     requireWorkspaceEntryRevision(input.expectedRevision);
     return this.#serializeWorkspaceFileMutation(`${workspace.root}\0*`, async () => {
-      assertCurrent?.();
+      request?.assertCurrent();
       const source = await this.#resolveWorkspaceMutationEntry(workspace, canonicalPath);
       assertWorkspaceEntryRevision(source.info, input.expectedRevision);
       if (source.info.isDirectory() && !input.confirmRecursive) {
@@ -1071,7 +1071,7 @@ export class WorkspaceService {
       if (this.requireWorkspace(workspaceId) !== workspace) {
         throw new WorkspaceEntryMutationError("The workspace changed before the entry could be deleted.", "stale");
       }
-      assertCurrent?.();
+      request?.assertCurrent();
       try {
         await rename(source.absolute, tombstonePath);
       } catch (error) {
