@@ -142,7 +142,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly onCompact?: () => void;
 }): JSX.Element {
   const [text, setText] = useState("");
-  const [prewarmInputIntent, setPrewarmInputIntent] = useState(false);
+  const [prewarmInputOwner, setPrewarmInputOwner] = useState<object>();
+  const sourceKey = taskSourceKey(controller.state.taskSource ?? { kind: "own" });
+  const provisionalGeneration = session.provisionalDraftId === undefined ? undefined : session.generation;
+  // A live read can resume an existing task while its draft is being edited.
+  const draftPrewarmOwner = useMemo(() => ({}), [controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    controller.state.connectionGeneration, sourceKey, session.id, session.backendId, session.targetId, session.provisionalDraftId, provisionalGeneration]);
   const partnerConversation = usePartnerConversation();
   const guest = controller.state.sessionAccess?.role === "guest";
   const readOnly = taskReadOnly || partnerConversation?.partner?.lifecycle === "paused";
@@ -206,7 +211,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   operationGuardRef.current = operationGuard;
   operationGuardRef.current.activate(session.id);
   const markDraftEdited = (sessionId: string): void => {
-    setPrewarmInputIntent(true);
+    setPrewarmInputOwner(draftPrewarmOwner);
     operationGuardRef.current.markDraftEdited(sessionId);
     onDraftMutation?.();
   };
@@ -446,7 +451,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   }, [canMention, palette]);
 
   const voiceDictionaryOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
-    taskSourceKey(controller.state.taskSource ?? { kind: "own" }), session.id, String(session.generation)]);
+    sourceKey, session.id, String(session.generation)]);
   const currentDraftOwnerRef = useRef({ key: voiceDictionaryOwnerKey, serverId: controller.state.activeProfile?.serverId, sessionId: session.id });
   currentDraftOwnerRef.current = { key: voiceDictionaryOwnerKey, serverId: controller.state.activeProfile?.serverId, sessionId: session.id };
   const queuePendingDraftSave = (pending: PendingComposerDraftSave): void => {
@@ -513,17 +518,16 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   });
   const voiceUpdate = voice.update;
   const voiceActive = voice.active;
-  useEffect(() => { setPrewarmInputIntent(false); }, [session.id, session.generation, voiceDictionaryOwnerKey]);
   useEffect(() => {
     if (readOnly || effectiveBashMode || hydratedSession !== session.id || submissionKind !== undefined || turnRunning
       || controller.state.connectionState !== "connected" || backend?.capabilities.get("session.prewarm")?.supported !== true
-      || !controller.prewarmSession || !voiceActive && (!prewarmInputIntent || text.trim() === "" && attachments.length === 0 && browserComments.length === 0)) return;
+      || !controller.prewarmSession || !voiceActive && (prewarmInputOwner !== draftPrewarmOwner || text.trim() === "" && attachments.length === 0 && browserComments.length === 0)) return;
     const request = new AbortController(), api = controller.prewarmSession, sessionId = session.id, draftId = session.provisionalDraftId;
     const generation = session.generation;
     const timer = window.setTimeout(() => { void api(sessionId, draftId, request.signal, generation).catch(() => undefined); }, 350);
     return () => { window.clearTimeout(timer); request.abort(); };
   }, [readOnly, effectiveBashMode, hydratedSession, session.id, session.generation, session.provisionalDraftId, submissionKind, turnRunning,
-    controller.state.connectionState, controller.prewarmSession, backend?.capabilities, prewarmInputIntent, text, attachments.length, browserComments.length, voiceActive]);
+    controller.state.connectionState, controller.prewarmSession, backend?.capabilities, prewarmInputOwner, draftPrewarmOwner, text, attachments.length, browserComments.length, voiceActive]);
   const composerLocked = readOnly || partnerConversation !== undefined && !partnerConversation.confirmed || submissionKind !== undefined || voiceActive;
   const composerEditorLocked = readOnly || (submissionKind !== undefined && submissionKind !== "send") || voiceActive;
   const cancelVoiceInput = voice.cancel;
