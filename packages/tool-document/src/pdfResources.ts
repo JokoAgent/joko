@@ -2,25 +2,13 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { decodeHTMLAttribute } from "entities";
-import { readDocumentInput, DocumentInputError } from "./input.js";
+import { prepareDocumentInput, readPreparedDocumentInput, DocumentInputError } from "./input.js";
+import type { DocumentPathAuthorizer } from "./document-path.js";
 import { decodeCssText, PdfResourceError } from "./pdfText.js";
 
-async function prepareInputPath(root: string, inPath: string): Promise<string> {
-  const target = path.resolve(root, inPath);
-  const relative = path.relative(root, target);
-  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new PdfResourceError("PATH_NOT_ALLOWED", "PDF resource must stay within the task working directory.");
-  }
-  const real = await fs.realpath(target).catch(() => { throw new PdfResourceError("PATH_NOT_ALLOWED", "PDF resource is unavailable."); });
-  if (real !== target) throw new PdfResourceError("PATH_NOT_ALLOWED", "PDF resource path changed or contains a link.");
-  const stat = await fs.lstat(target);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new PdfResourceError("PATH_NOT_ALLOWED", "PDF resource is not a regular file.");
-  return target;
-}
-
-async function readInputFileWithinLimit(root: string, inPath: string, maxBytes: number, tooLarge: (bytes: number) => PdfResourceError, signal?: AbortSignal): Promise<Buffer> {
+async function readInputFileWithinLimit(input: Awaited<ReturnType<typeof prepareDocumentInput>>, maxBytes: number, tooLarge: (bytes: number) => PdfResourceError, signal?: AbortSignal): Promise<Buffer> {
   try {
-    return await readDocumentInput({ root, inPath, maxBytes, ...(signal ? { signal } : {}) });
+    return await readPreparedDocumentInput(input, maxBytes, signal);
   } catch (error) {
     if (error instanceof DocumentInputError && error.code === "FILE_TOO_LARGE") throw tooLarge(maxBytes + 1);
     throw error;
@@ -56,6 +44,7 @@ const LOCAL_RESOURCE_MIME_TYPES: Record<string, string> = {
 interface ResourceSnapshotContext {
   root: string;
   signal?: AbortSignal;
+  authorizePath?: DocumentPathAuthorizer;
   totalBytes: number;
   resourceReferences: number;
   cache: Map<string, string>;
@@ -785,7 +774,13 @@ async function snapshotLocalResource(
   const lexicalCacheKey = `${path.resolve(absPath)}\0${mimeOverride ?? ''}`;
   const lexicalCached = context.lexicalCache.get(lexicalCacheKey);
   if (lexicalCached) return `${lexicalCached}${fragment}`;
-  const preparedPath = await prepareInputPath(context.root, absPath);
+  const input = await prepareDocumentInput({ root: context.root, inPath: absPath,
+    ...(context.signal ? { signal: context.signal } : {}),
+    ...(context.authorizePath ? { authorizePath: context.authorizePath } : {}) }).catch(error => {
+    if (error instanceof DocumentInputError) throw new PdfResourceError("PATH_NOT_ALLOWED", error.message);
+    throw error;
+  });
+  const preparedPath = input.path;
   const cacheKey = `${path.resolve(preparedPath)}\0${mimeOverride ?? ''}`;
   const cached = context.cache.get(cacheKey);
   if (cached) return `${cached}${fragment}`;
@@ -795,8 +790,7 @@ async function snapshotLocalResource(
   await recordDirectorySnapshot(context, resourceDirectory, beforeDirectory);
 
   const bytes = await readInputFileWithinLimit(
-    context.root,
-    preparedPath,
+    input,
     MAX_LOCAL_RESOURCE_BYTES,
     (size) =>
       new PdfResourceError(
@@ -848,10 +842,12 @@ export async function inlineLocalResources(
   expectedSourceDirectory?: DirectorySnapshot,
   initialDirectorySnapshots?: Map<string, DirectorySnapshot>,
   signal?: AbortSignal,
+  authorizePath?: DocumentPathAuthorizer,
 ): Promise<string> {
   const context: ResourceSnapshotContext = {
     root,
     ...(signal ? { signal } : {}),
+    ...(authorizePath ? { authorizePath } : {}),
     totalBytes: 0,
     resourceReferences: 0,
     cache: new Map(),

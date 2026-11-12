@@ -301,7 +301,7 @@ const SlideSchema = z
       .optional()
       .describe('整段正文。与 bullets 可并存(正文排在要点之后)。'),
     notes: z.string().max(PPTX_MAX_NOTES_CHARS).optional().describe('演讲者备注。'),
-    imagePath: z.string().min(1).max(4_096).optional().describe('工作目录内的图片路径(png/jpg/gif)。content 放右半区,image 放通栏主体。'),
+    imagePath: z.string().min(1).max(4_096).optional().describe('本机图片路径(png/jpg/gif)。工作目录外需要另行授权。content 放右半区,image 放通栏主体。'),
     columns: z
       .array(ComparisonColumnSchema)
       .length(2)

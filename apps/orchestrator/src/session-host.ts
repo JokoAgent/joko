@@ -1,5 +1,7 @@
 import { Buffer } from "node:buffer";
 import { modelPricesWithOverride, parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
+import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
+import { DOCUMENT_TOOL_PROVIDER_ID } from "./document-tool-provider.js";
 import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
   type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import type { McpAppMessageGuard } from "./mcp-apps/message.js";
@@ -228,6 +230,7 @@ interface ActiveSession {
   readonly backendInstanceGeneration: number;
   /** Resource authority observed before this native runtime began activation. */
   readonly resourceCatalogEpoch: bigint;
+  documentPathDispatch?: { readonly queueId: string; readonly attemptId: string; readonly authorize: DocumentPathAuthorizer } | undefined;
   lastActivityAt: number;
 }
 
@@ -14760,6 +14763,7 @@ export class SessionHost {
             }
           }
           dispatchPreparation.phase = "sending";
+          sending.documentPathDispatch = this.#captureDocumentPathDispatch(item, sending, stored, sendContext);
           const pendingAcceptance: PendingDispatchAcceptance = {};
           this.#pendingDispatchAcceptances.set(run.descriptor.id, pendingAcceptance);
           if (!reviewReadOnly) {
@@ -15833,6 +15837,65 @@ export class SessionHost {
     return this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal, true);
   }
 
+  #captureDocumentPathDispatch(item: QueueItemRecord, active: ActiveSession, stored: StoredSession,
+    context: AdapterContext): ActiveSession["documentPathDispatch"] {
+    const { attemptId, sessionId } = item;
+    const native = context.nativeToolAuthorization;
+    if (attemptId === undefined || native === undefined || context.runtimePolicy !== undefined || context.hostedExecution !== undefined
+      || !context.target.trusted || context.target.remoteWorkspace !== undefined || stored.descriptor.remoteWorkspace !== undefined
+      || stored.descriptor.derivationOrigin?.sideChat || item.body.messagingOrigin !== undefined || item.disposition !== "prompt"
+      || item.body.automaticContinuation !== undefined || item.body.objectiveContinuation !== undefined
+      || item.body.inputHandoffContinuation !== undefined || native.required
+      || new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId === sessionId) return undefined;
+    const run = this.#store.getRun(item.runId).descriptor;
+    if (run.source !== "user" || run.parentRunId !== undefined) return undefined;
+    const owner = this.#store.findOperation(item.operationId);
+    if (owner?.connectionId === undefined || owner.status !== "completed" || owner.kind !== "sendInput" && owner.kind !== "send_input") return undefined;
+    const connection = this.#store.getConnection(owner.connectionId);
+    if (connection.state !== "active") return undefined;
+    const revision = native.capture();
+    const mode = item.executionOverrides?.permissionMode ?? stored.descriptor.permissionMode;
+    const planMode = item.executionOverrides?.planMode ?? stored.descriptor.planMode;
+    const scope: NonNullable<ActiveSession["documentPathDispatch"]> = {
+      queueId: item.id, attemptId,
+      authorize: async request => {
+        const signal = request.signal === undefined ? context.signal : AbortSignal.any([context.signal, request.signal]);
+        const assertCurrent = (): void => {
+          signal.throwIfAborted();
+          native.assertCurrent(revision);
+          this.#store.authorizeConnection(connection.id, connection.authKeyDigest);
+          const current = this.#store.getSession(sessionId).descriptor;
+          if (this.#active.get(sessionId) !== active || active.documentPathDispatch !== scope
+            || current.permissionMode !== stored.descriptor.permissionMode || current.planMode !== stored.descriptor.planMode) {
+            throw new StoreError("The originating document permission is no longer current.");
+          }
+        };
+        assertCurrent();
+        const directories = (context.extraDirectories ?? []).filter(directory => workerPathWithin(directory.path, request.path));
+        if (request.operation === "write" && (planMode || directories.some(directory => directory.access === "read_only"))) {
+          throw new DocumentPathError("The current task permits only reading this document path.");
+        }
+        const review = await native.review({ toolName: request.operation, input: { path: request.path }, signal });
+        assertCurrent();
+        if (review.verdict === "block" || review.unavailable) throw new DocumentPathError("The document path was denied by task policy.");
+        if (review.verdict !== "ask" && (directories.length > 0 || mode === "bypassPermissions")) return assertCurrent;
+
+        const action = request.operation === "read" ? "Read" : request.overwrite ? "Write (may replace)" : "Write";
+        const answer = await context.requestInteraction({
+          id: `document-path-${randomUUID()}`, kind: "permission",
+          title: "Allow this document path?", toolName: "Document tools",
+          summary: `${action}\n${request.path}`, risk: "medium", choices: ["allow_once", "deny_once"]
+        }, { signal });
+        assertCurrent();
+        if (!(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once")) {
+          throw new DocumentPathError("The document path was not approved.");
+        }
+        return assertCurrent;
+      }
+    };
+    return scope;
+  }
+
   async #authorizeMcpTool(sessionId: string, serverId: string, toolName: string,
     args: Readonly<Record<string, unknown>>, signal: AbortSignal, nativeBridge = false): Promise<import("./mcp-router.js").NativeBridgeToolAdmission> {
     signal.throwIfAborted();
@@ -15863,9 +15926,12 @@ export class SessionHost {
       if (current.descriptor.archived || current.descriptor.deletedAt !== undefined || current.descriptor.binding.generation !== stored.descriptor.binding.generation
         || policySnapshotFor(this.#store, this.targetForSession(current)).generation !== policy.generation) throw new StoreError("MCP tool permission owner changed.");
     };
+    const documentDispatch = serverId === DOCUMENT_TOOL_PROVIDER_ID && nativeBridge
+      ? this.#active.get(sessionId)?.documentPathDispatch : undefined;
     const admission = { assertCurrent: guard, ...(currentQueue?.attemptId === undefined ? {} : {
       inputQueueItem: { id: currentQueue.id, runId: currentQueue.runId, attemptId: currentQueue.attemptId }
-    }) };
+    }), ...(documentDispatch !== undefined && currentQueue !== undefined && documentDispatch.queueId === currentQueue.id
+      && documentDispatch.attemptId === currentQueue.attemptId ? { authorizeDocumentPath: documentDispatch.authorize } : {}) };
     guard();
     const delegated = await authority?.review({ toolName: `mcp__${serverId}__${toolName}`, input: args, signal });
     const messaging = messageQueue ? this.#messagingToolReview?.(messageQueue, { toolName: `mcp__${serverId}__${toolName}`, input: args, signal }) : undefined;

@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import JSZip from "jszip";
 import { expect, it } from "vitest";
-import { markdownToDocxBuffer, publishDocumentOutput } from "./index.js";
+import { markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, type DocumentPathAuthorizer } from "./index.js";
 
 it("builds editable Word structure and publishes it only inside the task root", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-document-"));
@@ -66,5 +66,46 @@ it("builds editable Word structure and publishes it only inside the task root", 
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+it("publishes only to the exact approved directory and verifies its identity before touching the output", async () => {
+  const temp = await mkdtemp(join(tmpdir(), "joko-document-approved-"));
+  try {
+    const base = await realpath(temp);
+    const root = join(base, "workspace");
+    const outside = join(base, "outside");
+    await Promise.all([mkdir(root), mkdir(outside)]);
+    const inputPath = join(outside, "table.csv");
+    await writeFile(inputPath, "one,two\n");
+    const authorizeRead: DocumentPathAuthorizer = async request => {
+      expect(request).toMatchObject({ path: inputPath, operation: "read" });
+      return () => {};
+    };
+    expect(await readDocumentInput({ root, inPath: inputPath, maxBytes: 128, authorizePath: authorizeRead }))
+      .toEqual(Buffer.from("one,two\n"));
+    const bytes = await markdownToDocxBuffer("# Approved");
+    const nested = join(outside, "new", "report.docx");
+    await expect(publishDocumentOutput({ root, outPath: nested, bytes, overwrite: true, authorizePath: async request => {
+      expect(request).toMatchObject({ path: nested, operation: "write", overwrite: true });
+      return () => {};
+    } })).resolves.toMatchObject({ path: nested, existingTarget: false });
+    expect(await readFile(nested)).toEqual(bytes);
+
+    const retired = join(base, "retired");
+    const output = join(outside, "report.docx");
+    const oldContent = Buffer.from("original output");
+    await writeFile(output, oldContent);
+    await expect(publishDocumentOutput({ root, outPath: output, bytes, overwrite: true, authorizePath: async request => {
+      expect(request).toMatchObject({ path: output, operation: "write", overwrite: true });
+      await rename(outside, retired);
+      await mkdir(outside);
+      await writeFile(output, "replacement directory output");
+      return () => {};
+    } })).rejects.toMatchObject({ code: "PATH_NOT_ALLOWED" });
+    expect(await readFile(join(retired, "report.docx"))).toEqual(oldContent);
+    expect(await readFile(output, "utf8")).toBe("replacement directory output");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
   }
 });

@@ -2,7 +2,7 @@ import { basename } from "node:path";
 
 import { JokoError, NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type PublicError, type SessionDescriptor } from "@joko/core";
 import { OperationConflictError, OperationInProgressError, OperationPreviouslyFailedError, type OperationalStore } from "@joko/store";
-import { DocumentOutputError, type publishDocumentOutput } from "@joko/tool-document";
+import { DocumentOutputError, DocumentPathError, type publishDocumentOutput } from "@joko/tool-document";
 
 import type { ArtifactRecord, ArtifactStore } from "./artifact-store.js";
 import type { BridgeToolCallContext, McpCallResult } from "./mcp-router.js";
@@ -73,7 +73,7 @@ export class DocumentOutputDelivery {
       if (result.existingTarget) {
         try {
           staged = await this.artifacts.ingestBytes(input.bytes, {
-            fileName: redactSecrets(this.redactText(basename(result.relativePath))),
+            fileName: redactSecrets(this.redactText(basename(result.path))),
             mimeType: documentMediaTypes[format],
             expiresAt: Date.now() + 10 * 60_000
           });
@@ -110,7 +110,7 @@ export class DocumentOutputDelivery {
     } catch (error) {
       // These rejections precede publication. A lost write or readback receipt
       // leaves the original claim in place so a retry cannot replace the file again.
-      if (error instanceof DocumentOutputError && isPreWriteRejection(error.code)) {
+      if (error instanceof DocumentPathError || error instanceof DocumentOutputError && isPreWriteRejection(error.code)) {
         this.store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, new JokoError({
           code: error.code, message: error.message, phase: "effect", retryable: false, stateMayHaveChanged: false,
           recovery: "Change the document request before trying again."
@@ -144,6 +144,7 @@ export class DocumentOutputDelivery {
       if (error instanceof OperationPreviouslyFailedError && error.storedError !== null && typeof error.storedError === "object") {
         const { code, message } = error.storedError as Partial<PublicError>;
         if (isPreWriteRejection(code) && typeof message === "string") throw new DocumentOutputError(code, message);
+        if (code === "PATH_NOT_ALLOWED" && typeof message === "string") throw new DocumentPathError(message);
         if (code === "EFFECT_OUTCOME_UNKNOWN") {
           throw new DocumentDeliveryError("OUTPUT_OUTCOME_UNKNOWN", "The original document write has no confirmed receipt.");
         }
@@ -159,7 +160,7 @@ export class DocumentOutputDelivery {
 }
 
 function documentReceipt({ path, relativePath, bytes }: DocumentWriteResult): DocumentWriteReceipt {
-  return { path, relativePath, bytes };
+  return { path, ...(relativePath === undefined ? {} : { relativePath }), bytes };
 }
 
 function isPreWriteRejection(code: unknown): code is "FILE_EXISTS" | "OUTPUT_TOO_LARGE" {

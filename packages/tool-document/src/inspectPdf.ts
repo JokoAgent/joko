@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { extname, resolve } from "node:path";
 import { z } from "zod";
 import { readDocumentInput } from "./input.js";
+import type { DocumentPathAuthorizer } from "./document-path.js";
 import { createPdfParserProcess } from "./pdf-process.js";
 import type { PdfPageInspection, PdfWorkerResult } from "./inspectPdf-worker.js";
 
@@ -101,14 +102,15 @@ async function inspectInWorker(data: Buffer, pages: readonly number[], maxPages:
 }
 
 /** Inspect structural PDF evidence; this does not confirm rendered appearance. */
-export async function inspectPdf(input: unknown, root: string, signal?: AbortSignal): Promise<InspectPdfResult> {
+export async function inspectPdf(input: unknown, root: string, signal?: AbortSignal, authorizePath?: DocumentPathAuthorizer): Promise<InspectPdfResult> {
   const parsed = InspectPdfSchema.safeParse(input);
   if (!parsed.success) throw new PdfInspectError("INVALID_ARGUMENT", "PDF inspection arguments are invalid.");
   const request = parsed.data;
   if (request.inspectedThrough > 0 && (!request.previousVerdict || !request.previousPdfSha256)) {
     throw new PdfInspectError("INVALID_ARGUMENT", "A continued inspection requires the previous verdict and PDF digest.");
   }
-  const data = await readDocumentInput({ root, inPath: request.path, maxBytes: MAX_INPUT_BYTES, ...(signal ? { signal } : {}) });
+  const data = await readDocumentInput({ root, inPath: request.path, maxBytes: MAX_INPUT_BYTES,
+    ...(signal ? { signal } : {}), ...(authorizePath ? { authorizePath } : {}) });
   signal?.throwIfAborted();
   if (extname(request.path).toLowerCase() !== ".pdf") throw new PdfInspectError("UNSUPPORTED_FORMAT", "PDF inspection requires a .pdf file.");
   if (data.byteLength === 0) throw new PdfInspectError("EMPTY_FILE", "PDF file is empty.");
