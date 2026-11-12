@@ -191,13 +191,14 @@ describe("node-owned managed model runtime composition", () => {
       ) ? loopback : undefined });
     try {
       const ollama = f.system.registry.get("ollama")!;
-      expect((await ollama.snapshot()).providerRoutes.map(route => route.backendId)).toEqual(["backend-a"]);
+      const runtimeBackends = async () => (await ollama.snapshot()).providerRoutes?.map(route => route.backendId);
+      expect(await runtimeBackends()).toEqual(["backend-a"]);
       version = "0.13.2";
-      expect((await ollama.snapshot()).providerRoutes.map(route => route.backendId)).toEqual(["backend-a"]);
+      expect(await runtimeBackends()).toEqual(["backend-a"]);
       version = "0.13.3";
-      expect((await ollama.snapshot()).providerRoutes.map(route => route.backendId)).toEqual(["backend-a", "backend-c"]);
+      expect(await runtimeBackends()).toEqual(["backend-a", "backend-c"]);
       version = "0.14.0";
-      expect((await ollama.snapshot()).providerRoutes.map(route => route.backendId)).toEqual(["backend-a", "backend-b", "backend-c"]);
+      expect(await runtimeBackends()).toEqual(["backend-a", "backend-b", "backend-c"]);
       const saved = f.providers.listConfigurations().find(config => config.providerId === MANAGED_LOCAL_PROVIDER_ID)!;
       expect(saved.runtimes).toHaveLength(3);
       expect(saved.runtimes.every(runtime => runtime.version === saved.version)).toBe(true);
