@@ -1,12 +1,14 @@
-import { basename } from "node:path";
+import { basename, sep } from "node:path";
 
-import { JokoError, NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type PublicError, type SessionDescriptor } from "@joko/core";
+import { DOCUMENT_WRITE_TOOLS, isDocumentOutputPath } from "@joko/contracts";
+import { JokoError, NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type DocumentOutputPresentation, type PublicError, type SessionDescriptor } from "@joko/core";
 import { OperationConflictError, OperationInProgressError, OperationPreviouslyFailedError, type OperationalStore } from "@joko/store";
 import { DocumentOutputError, DocumentPathError, type publishDocumentOutput } from "@joko/tool-document";
 
 import type { ArtifactRecord, ArtifactStore } from "./artifact-store.js";
 import type { BridgeToolCallContext, McpCallResult } from "./mcp-router.js";
 import { nativeBindingFingerprint } from "./native-state-observation.js";
+import { workspaceIdFor } from "./workspace-run-capture.js";
 
 const documentMediaTypes = {
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -26,7 +28,7 @@ export class DocumentDeliveryError extends Error {
   constructor(readonly code: "OUTPUT_REQUEST_CONFLICT" | "OUTPUT_OUTCOME_UNKNOWN", message: string) { super(message); }
 }
 
-/** Delivers a verified replacement as a versioned Artifact of the originating Run. */
+/** Commits the verified document version and its delivery to the originating Run. */
 export class DocumentOutputDelivery {
   constructor(
     private readonly store: OperationalStore,
@@ -39,6 +41,7 @@ export class DocumentOutputDelivery {
     input: DocumentWriteInput,
     context: BridgeToolCallContext,
     publish: typeof publishDocumentOutput,
+    presentation: DocumentOutputPresentation,
     respond: (receipt: DocumentWriteReceipt) => McpCallResult
   ): Promise<McpCallResult> {
     const { inputQueueItem: owner, requestIdentity, requestBodyHash, normalizeResultForStorage } = context;
@@ -70,7 +73,9 @@ export class DocumentOutputDelivery {
       const result = await publish({ ...input, assertCurrent });
       assertCurrent();
       let receipt = documentReceipt(result);
-      if (result.existingTarget) {
+      const path = result.relativePath?.split(sep).join("/");
+      const relativePath = path !== undefined && isDocumentOutputPath(path) && this.redactText(path) === path && redactSecrets(path) === path ? path : undefined;
+      if (result.existingTarget || relativePath !== undefined) {
         try {
           staged = await this.artifacts.ingestBytes(input.bytes, {
             fileName: redactSecrets(this.redactText(basename(result.path))),
@@ -93,15 +98,24 @@ export class DocumentOutputDelivery {
           const { blob } = store.adoptSessionArtifact({
             blob: store.getArtifact(staged.id).blob, sessionId: session.id, runId: owner.runId
           });
-          store.appendEvent({
+          const scope = {
             backendId: session.backendId, targetId: session.targetId, sessionId: session.id,
             runId: owner.runId, attemptId: owner.attemptId, generation: context.generation,
-            operationId: claim.operation.id, traceId: `artifact:${blob.id}`,
+            operationId: claim.operation.id,
             metadata: { namespace: "joko.document_output", fields: {
               [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(session.binding.opaqueRef)
-            } },
+            } }
+          };
+          store.appendEvent({ ...scope, traceId: `artifact:${blob.id}`,
             payload: { type: "artifact", artifact: blob, purpose: "file" }
           });
+          if (relativePath !== undefined) {
+            const workspaceId = workspaceIdFor(store, store.getTarget(session.targetId).descriptor, session.id);
+            store.appendEvent({ ...scope, traceId: claim.operation.id, payload: {
+              type: "tool_result", callId: claim.operation.id, name: DOCUMENT_WRITE_TOOLS[format], output: "", isError: false,
+              documentOutput: { ...this.safePresentation(presentation), blob, workspaceId, relativePath, overwritten: result.existingTarget }
+            } });
+          }
         }
         return response;
       });
@@ -156,6 +170,22 @@ export class DocumentOutputDelivery {
   private canDeliver(session: SessionDescriptor): boolean {
     return this.store.findSessionRuntimePolicy(session.id)?.policy !== "review_read_only" &&
       !(session.derivationOrigin?.sideChat && session.worktree === undefined);
+  }
+
+  private safePresentation(value: DocumentOutputPresentation): DocumentOutputPresentation {
+    const text = (input: string, limit = 300): string => redactSecrets(this.redactText(input))
+      .replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, limit);
+    const { title, subtitle, slide, sheet, ...rest } = value;
+    return {
+      ...rest,
+      ...(title === undefined ? {} : { title: text(title) }),
+      ...(subtitle === undefined ? {} : { subtitle: text(subtitle) }),
+      ...(slide === undefined ? {} : { slide: { title: text(slide.title),
+        ...(slide.subtitle === undefined ? {} : { subtitle: text(slide.subtitle) }) } }),
+      ...(sheet === undefined ? {} : { sheet: {
+        columns: sheet.columns.map(cell => text(cell, 160)), rows: sheet.rows.map(row => row.map(cell => text(cell, 160)))
+      } })
+    };
   }
 }
 

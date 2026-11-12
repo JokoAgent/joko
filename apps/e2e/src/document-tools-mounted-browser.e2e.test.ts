@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import type { AdapterContext, PromptInput } from "@joko/core";
 import {
   CredentialManager,
   CredentialVault,
@@ -12,8 +13,8 @@ import {
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { OrchestratorE2eFixture } from "./fixture.js";
-import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery, waitFor } from "./fixture.js";
+import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim()
   && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
@@ -43,17 +44,22 @@ afterEach(async () => {
 mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact bytes", async () => {
   const browserExecutable = process.env.JOKO_BROWSER_EXECUTABLE!;
   const electronExecutable = process.env.JOKO_PDF_ELECTRON_TEST_EXECUTABLE!;
+  let turn: AdapterContext | undefined;
   fixture = await OrchestratorE2eFixture.start({
     webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!),
     profiles: [DOCUMENT_FILES_PROFILE],
+    createAdapter: profile => new class extends InstrumentedFakeAdapter {
+      override async send(_input: PromptInput, context: AdapterContext): Promise<void> { turn = context; }
+    }(profile),
     createAuxiliaryServices: async (store, directory, artifacts) => {
       const vault = await CredentialVault.open(join(directory, "document-vault.key"));
       const credentials = new CredentialManager({ vault, storagePath: join(directory, "document-credentials.json") });
       await credentials.initialize();
       const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
       await mcpRouter.initialize();
+      mcpRouter.setNativeToolAdmission((...args) => fixture!.application.sessionHost.authorizeNativeBridgeTool(...args));
       mcpRouter.registerBridgeToolProvider(new DocumentToolBridgeProvider({
-        store,
+        store, artifacts, redactText: value => credentials.redactText(value),
         pdfRenderer: new ElectronDocumentPdfRenderer(electronExecutable, process.env.JOKO_PDF_ELECTRON_TEST_APP)
       }));
       return { mcpRouter };
@@ -77,7 +83,7 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
   await writeFile(join(fixture.workspaceDirectory, "documents", "report.css"),
     'body { font: 18px sans-serif; color: #1f4e79; } img { width: 560px; height: 200px; } .page { break-after: page; }');
   await writeFile(join(fixture.workspaceDirectory, "documents", "report.html"),
-    '<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="report.css"></head><body><section class="page"><h1>Quarterly chart</h1><img src="charts/bars.svg" alt="Three rising bars"></section><section><h1>Second page</h1><p>Visible follow-up.</p></section></body></html>');
+    '<!doctype html><html><head><meta charset="utf-8"><title>Quarterly PDF</title><link rel="stylesheet" href="report.css"></head><body><section class="page"><h1>Quarterly chart</h1><img src="charts/bars.svg" alt="Three rising bars"></section><section><h1>Second page</h1><p>Visible follow-up.</p></section></body></html>');
 
   const call = async (toolName: string, args: Record<string, unknown>) => {
     const response = await fetch(`${internalUrl}/internal/mcp`, {
@@ -89,6 +95,9 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
     expect(response.ok).toBe(true);
     return await response.json() as { isError: boolean; details: { mcpStructuredContent: Record<string, unknown> } };
   };
+  const accepted = await submit(manager.clients.operation, manager.connectionId, sendInputMutation(sessionId, BigInt(generation), "Render the chart PDF."));
+  const queueId = queueItemIdFrom(accepted);
+  await waitFor(async () => fixture!.application.store.getQueueItem(queueId).state, state => state === "backend_accepted", "PDF delivery input accepted");
   const rendered = await call("render_pdf", { htmlPath: "documents/report.html", outPath: "documents/chart-report.pdf", template: "none" });
   expect(rendered).toMatchObject({ isError: false, details: { mcpStructuredContent: { format: "pdf", pageSize: "A4" } } });
   const inspected = await call("inspect_pdf", { path: "documents/chart-report.pdf" });
@@ -100,6 +109,10 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
   } } });
   const outputPath = join(fixture.workspaceDirectory, "documents", "chart-report.pdf");
   const expectedBytes = await readFile(outputPath);
+  if (turn === undefined) throw new Error("The PDF turn was not dispatched.");
+  await turn.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The chart is ready." }] });
+  await turn.emit({ type: "done", outcome: "completed" });
+  await waitFor(async () => fixture!.application.store.getQueueItem(queueId).state, state => state === "completed", "PDF delivery input completed");
 
   const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted Web" });
   if (!challenge.challenge) throw new Error("Mounted Web pairing returned no challenge.");
@@ -225,6 +238,127 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
   await page.locator(".workspace-file-body__state.is-error").waitFor({ state: "visible" });
   expect(await page.locator(".workspace-file-body__pdf-pages canvas").count()).toBe(0);
   expect(await page.locator(".workspace-file-body__download:not([disabled])").count()).toBe(0);
+  await page.evaluate(id => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, sessionId);
+  const pdfDelivery = page.locator(".generated-files [data-document-format='pdf']");
+  await pdfDelivery.waitFor({ state: "visible" });
+  expect(await pdfDelivery.innerText()).toContain("Quarterly PDF");
+  const retainedPdf = page.waitForEvent("download");
+  await pdfDelivery.getByRole("button", { name: "Download chart-report.pdf" }).click();
+  expect(await readFile(await (await retainedPdf).path())).toEqual(expectedBytes);
+  expect(pageErrors).toEqual([]);
+  bridge.revoke();
+}, 90_000);
+
+officeIt("retains the latest verified document for each path in the Run's mounted delivery card", async () => {
+  let turn: AdapterContext | undefined;
+  fixture = await OrchestratorE2eFixture.start({
+    webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!),
+    profiles: [{ ...DOCUMENT_FILES_PROFILE, capabilities: [
+      ...DOCUMENT_FILES_PROFILE.capabilities, { key: "workspace.generated_files", supported: true }
+    ] }],
+    createAdapter: profile => new class extends InstrumentedFakeAdapter {
+      override async send(_input: PromptInput, context: AdapterContext): Promise<void> { turn = context; }
+    }(profile),
+    createAuxiliaryServices: async (store, directory, artifacts) => {
+      const vault = await CredentialVault.open(join(directory, "delivery-vault.key"));
+      const credentials = new CredentialManager({ vault, storagePath: join(directory, "delivery-credentials.json") });
+      await credentials.initialize();
+      const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
+      await mcpRouter.initialize();
+      mcpRouter.setNativeToolAdmission((...args) => fixture!.application.sessionHost.authorizeNativeBridgeTool(...args));
+      mcpRouter.registerBridgeToolProvider(new DocumentToolBridgeProvider({ store, artifacts, redactText: value => credentials.redactText(value) }));
+      return { mcpRouter };
+    }
+  });
+  const current = fixture;
+  const { mcpRouter, store } = current.application;
+  const manager = await current.pair("Delivery manager");
+  const [backendId, targetId] = [...current.targets][0]!;
+  const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+    createSessionMutation({ backendId, targetId, displayName: "Verified delivery" })));
+  const generation = store.getSession(sessionId).descriptor.binding.generation;
+  const bridge = mcpRouter!.createPiBridgeSnapshot({ endpoint: `${current.baseUrl}/internal/mcp`, sessionId, targetId, expectedPiGeneration: generation });
+  const call = (toolName: string, arguments_: Record<string, unknown>) => mcpRouter!.executeBridgeCall({
+    authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: randomUUID(), sessionId, targetId, generation,
+    serverId: "joko-document-tools", toolName, arguments: arguments_
+  });
+  const relativePath = "documents/verified.docx";
+  const outputPath = join(current.workspaceDirectory, relativePath);
+  const codePath = join(current.workspaceDirectory, "existing.ts");
+  await expect(call("make_docx", { outPath: relativePath, markdown: "# Before the turn" })).resolves.toMatchObject({ isError: false });
+  await writeFile(codePath, "export const value = 1;\n");
+  const accepted = await submit(manager.clients.operation, manager.connectionId, sendInputMutation(sessionId, BigInt(generation), "Deliver the updated files."));
+  const queueId = queueItemIdFrom(accepted), runId = queueRunIdFrom(accepted);
+  await waitFor(async () => store.getQueueItem(queueId).state, state => state === "backend_accepted", "document delivery input accepted");
+  await expect(call("make_docx", { outPath: relativePath, markdown: "# First delivery", title: "First title", overwrite: true }))
+    .resolves.toMatchObject({ isError: false });
+  await expect(call("make_docx", { outPath: relativePath, markdown: "# Final delivery", title: "Final title", subtitle: "Verified cover", theme: "navy", overwrite: true }))
+    .resolves.toMatchObject({ isError: false });
+  const delivered = await readFile(outputPath);
+  await expect(call("make_docx", { outPath: relativePath, markdown: "# Rejected", title: "Rejected title" })).resolves.toMatchObject({ isError: true });
+  await expect(call("make_xlsx", { outPath: "documents/data.xlsx", sheets: [{ name: "Metrics", header: ["Name", "Value"], rows: [["Accuracy", 0.98]] }] }))
+    .resolves.toMatchObject({ isError: false });
+  await expect(call("make_pptx", { outPath: "documents/slides.pptx", title: "Quarterly deck", slides: [
+    { layout: "cover", title: "Opening slide", subtitle: "Preview evidence" }, { layout: "section", title: "Results" }
+  ] })).resolves.toMatchObject({ isError: false });
+  await writeFile(codePath, "export const value = 2;\n");
+  if (turn === undefined) throw new Error("The delivery turn was not dispatched.");
+  await turn.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The documents are ready." }] });
+  await turn.emit({ type: "done", outcome: "completed" });
+  await waitFor(async () => store.listEvents({ sessionId, runId }).find(event => event.payload.type === "workspace_diff"),
+    event => event !== undefined, "finished Run workspace changes");
+
+  const challenge = (await current.anonymous.connection.beginPairing({ deviceDisplayName: "Document delivery Web" })).challenge!;
+  browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1360, height: 950 }, acceptDownloads: true, locale: "en-US" });
+  await routeFixtureDiscovery(page.context(), current.baseUrl);
+  const pageErrors: string[] = [];
+  page.on("pageerror", error => pageErrors.push(error.message));
+  await page.goto(`${current.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+  await page.locator(".connection-tabs > button").nth(2).click();
+  await page.locator('details.device-authorization__manual > summary').click();
+  await page.getByLabel("Joko node address").fill(current.baseUrl);
+  await page.getByLabel("Pairing code").fill(current.pairingCode(challenge.challengeId));
+  await page.getByLabel("Device name").fill("Document delivery Web");
+  await page.locator("form.pair-form button[type=submit]").click();
+  const card = page.locator(`[data-timeline-session-id='${sessionId}'] .generated-files`);
+  const word = card.locator('[data-document-format="docx"]');
+  await word.waitFor({ state: "visible", timeout: 25_000 });
+  expect(await word.count()).toBe(1);
+  expect(await word.innerText()).toContain("Final title");
+  expect(await word.innerText()).toContain("Verified cover");
+  expect(await word.getAttribute("data-document-theme")).toBe("navy");
+  const sheet = card.locator('[data-document-format="xlsx"] table');
+  expect(await sheet.getByRole("columnheader").allTextContents()).toEqual(["Name", "Value"]);
+  expect(await sheet.getByRole("cell").allTextContents()).toEqual(["Accuracy", "0.98"]);
+  expect(await card.locator('[data-document-format="pptx"]').innerText()).toContain("Opening slide");
+  expect(await card.locator('[data-document-format="pptx"]').innerText()).toContain("Slides 2");
+  expect(await card.innerText()).not.toMatch(/First title|Rejected title|existing\.ts/u);
+  const captureDirectory = process.env.JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR?.trim();
+  if (captureDirectory) {
+    await mkdir(captureDirectory, { recursive: true });
+    await card.screenshot({ path: join(captureDirectory, "delivery-wide.png") });
+  }
+  await word.getByRole("button", { name: "Show verified.docx in Files" }).click();
+  await page.locator('[role="treeitem"][data-relative-path="documents/verified.docx"][aria-selected="true"]').waitFor();
+  await page.evaluate(id => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, sessionId);
+  await word.waitFor({ state: "visible", timeout: 25_000 });
+
+  await writeFile(outputPath, "Different workspace bytes after the Run\n");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
+  const closeNavigation = page.locator(".sidebar__mobile-close");
+  if (await closeNavigation.isVisible()) await closeNavigation.click();
+  await word.waitFor({ state: "visible", timeout: 25_000 });
+  expect(await word.count()).toBe(1);
+  expect(await card.locator(".generated-document").count()).toBe(3);
+  const download = page.waitForEvent("download");
+  await word.getByRole("button", { name: "Download verified.docx" }).click();
+  expect(await readFile(await (await download).path())).toEqual(delivered);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
+  if (captureDirectory) await card.screenshot({ path: join(captureDirectory, "delivery-compact.png") });
   expect(pageErrors).toEqual([]);
   bridge.revoke();
 }, 90_000);

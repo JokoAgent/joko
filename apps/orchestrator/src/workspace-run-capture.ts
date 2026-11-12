@@ -398,7 +398,7 @@ function stableChangeSetId(runId: string): string {
   return `change-${createHash("sha256").update(runId).digest("hex").slice(0, 32)}`;
 }
 
-function workspaceIdFor(store: OperationalStore, target: TargetDescriptor, sessionId: string): string {
+export function workspaceIdFor(store: OperationalStore, target: TargetDescriptor, sessionId: string): string {
   const isolated = store.getSession(sessionId).descriptor.worktree;
   if (isolated !== undefined) return isolated.workspaceId;
   const metadata = store.getTarget(target.id).metadata;

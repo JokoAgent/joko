@@ -422,7 +422,15 @@ export async function createPptxBuffer(
   input: unknown,
   readImage: (path: string, maximumBytes: number, signal?: AbortSignal) => Promise<Buffer>,
   signal?: AbortSignal
-): Promise<{ readonly buffer: Buffer; readonly slides: number; readonly layouts: readonly PptxLayoutName[]; readonly theme: DocsThemeName; readonly footer: boolean }> {
+): Promise<{
+  readonly buffer: Buffer;
+  readonly slides: number;
+  readonly layouts: readonly PptxLayoutName[];
+  readonly theme: DocsThemeName;
+  readonly footer: boolean;
+  readonly title?: string;
+  readonly firstSlide: { readonly title: string; readonly subtitle?: string };
+}> {
   const validated = PptxInputSchema.safeParse(input);
   if (!validated.success) throw new PptxDocumentError("INVALID_ARGUMENT", "Presentation arguments are invalid.");
   const parsed = validated.data;
@@ -763,5 +771,9 @@ export async function createPptxBuffer(
   })) as Buffer;
 
   signal?.throwIfAborted();
-  return { buffer, slides: slides.length, layouts: usedLayouts, theme, footer };
+  const first = slides[0]!;
+  return { buffer, slides: slides.length, layouts: usedLayouts, theme, footer,
+    ...(title === undefined ? {} : { title }), firstSlide: {
+      title: first.title, ...(first.subtitle === undefined ? {} : { subtitle: first.subtitle })
+    } };
 }

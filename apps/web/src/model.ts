@@ -1646,6 +1646,10 @@ export interface TimelineItemView {
   readonly nativeRewindBefore?: NativeNavigationTargetView;
   /** Durable run ownership used by turn-scoped UI projections such as plans. */
   readonly runId?: string;
+  readonly artifactOperationId?: string;
+  readonly documentFile?: TimelineDocumentFileView;
+  readonly documentFiles?: readonly TimelineDocumentFileView[];
+  readonly documentFileSourceIds?: readonly string[];
   /** Terminal outcome carried only by durable run-terminal timeline events. */
   readonly runTerminal?: "completed" | "aborted" | "failed";
   readonly sequence: bigint;
@@ -1963,6 +1967,18 @@ export interface TimelineWorkspaceDiffView extends WorkspaceDiffView {
 export interface TimelineGeneratedFileView {
   readonly relativePath: string;
   readonly displayName: string;
+}
+
+export interface TimelineDocumentFileView extends TimelineGeneratedFileView {
+  readonly workspaceId: string;
+  readonly artifact: ArtifactView;
+  readonly format: import("@joko/contracts").DocumentOutputFormat;
+  readonly theme?: "light" | "dark" | "navy";
+  readonly subtitle?: string;
+  readonly cover?: boolean;
+  readonly count?: number;
+  readonly slide?: { readonly title: string; readonly subtitle?: string };
+  readonly sheet?: { readonly columns: readonly string[]; readonly rows: readonly (readonly string[])[] };
 }
 
 export interface ToolCallView {

@@ -3203,6 +3203,11 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         outputMode: toProtoToolCallOutputMode(payload.outputMode)
       }));
     case "tool_result":
+      if (payload.documentOutput !== undefined && !payload.isError && event.metadata?.namespace === "joko.document_output") {
+        return protoPayload("toolCallCompleted", message<ToolCallCompletedEvent>("joko.v1.ToolCallCompletedEvent", {
+          toolCall: protoDocumentOutputCall(event, payload, payload.documentOutput)
+        }));
+      }
       return protoPayload("toolCallCompleted", message<ToolCallCompletedEvent>("joko.v1.ToolCallCompletedEvent", {
         toolCall: {
           ...protoToolCall(
@@ -6287,6 +6292,42 @@ function protoToolCall(
     result: undefined,
     error: undefined
   });
+}
+
+function protoDocumentOutputCall(
+  event: PersistedEvent,
+  payload: Extract<EventPayload, { readonly type: "tool_result" }>,
+  document: import("@joko/core").DocumentOutputResult
+): ToolCall {
+  const { blob, workspaceId, relativePath, overwritten, theme, subtitle, cover, count, slide, sheet } = document;
+  const argument = (fieldPath: string, value: DisplayArgument["value"]): DisplayArgument =>
+    message<DisplayArgument>("joko.v1.DisplayArgument", { fieldPath, value });
+  const args = [argument("theme", { case: "text", value: theme })];
+  if (subtitle) args.push(argument("subtitle", { case: "text", value: subtitle }));
+  if (cover !== undefined) args.push(argument("cover", { case: "boolean", value: cover }));
+  if (count !== undefined) args.push(argument("count", { case: "integer", value: BigInt(count) }));
+  if (slide?.title) args.push(argument("slide.title", { case: "text", value: slide.title }));
+  if (slide?.subtitle) args.push(argument("slide.subtitle", { case: "text", value: slide.subtitle }));
+  const parts = [
+    message<ToolResultPart>("joko.v1.ToolResultPart", { content: { case: "fileChange", value: message<contract.ToolFileChange>(
+      "joko.v1.ToolFileChange", { workspaceId, relativePath, action: overwritten ? contract.ToolFileAction.UPDATED : contract.ToolFileAction.CREATED,
+        revisionAfter: `sha256:${blob.sha256}` }
+    ) } }),
+    message<ToolResultPart>("joko.v1.ToolResultPart", { content: { case: "artifact", value: message<ArtifactRef>(
+      "joko.v1.ArtifactRef", { artifactId: blob.id, blob: toProtoBlobRef(blob), kind: ArtifactKind.FILE, title: document.title || blob.fileName || "" }
+    ) } })
+  ];
+  if (sheet !== undefined && (sheet.columns.length > 0 || sheet.rows.some(row => row.length > 0))) {
+    parts.push(message<ToolResultPart>("joko.v1.ToolResultPart", { content: { case: "table", value: message<contract.ToolTable>(
+      "joko.v1.ToolTable", { columns: [...sheet.columns], rows: sheet.rows.map(row => message<contract.ToolTableRow>(
+        "joko.v1.ToolTableRow", { cells: [...row] }
+      )) }
+    ) } }));
+  }
+  return { ...protoToolCall(event, payload.callId, payload.name, ToolCallState.SUCCEEDED),
+    toolProviderId: contract.DOCUMENT_TOOL_PROVIDER_ID, arguments: args, endedAt: toProtoTimestamp(event.emittedAt),
+    result: message<ToolResult>("joko.v1.ToolResult", { parts })
+  };
 }
 
 export function protoToolResult(

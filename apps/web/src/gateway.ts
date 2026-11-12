@@ -386,6 +386,7 @@ import {
   ToolFieldType,
   ToolCallOutputMode,
   ToolCallState,
+  readDocumentOutput,
   ToolService,
   ToolPolicyEffectiveSource,
   TransferDirection,
@@ -12789,6 +12790,20 @@ function projectTimelineEvent(
         changed = false;
         break;
       }
+      const document = readDocumentOutput(event);
+      if (document !== undefined) {
+        const { file, artifact, blob, ...presentation } = document;
+        const displayName = file.relativePath.split("/").at(-1)!;
+        replaceOrAppend({ id: event.eventId, sourceEventId: event.eventId, sequence, kind: "artifact", createdAt,
+          runId: call.runId, artifactOperationId: call.toolCallId, documentFile: {
+            ...presentation, workspaceId: file.workspaceId, relativePath: file.relativePath, displayName,
+            artifact: { id: artifact.artifactId, blobId: blob.blobId, sourceSessionId: sessionId, sourceRevealAvailable: false,
+              title: artifact.title || displayName, kind: "file", fileName: blob.fileName || displayName,
+              mediaType: blob.mediaType || "application/octet-stream", byteSize: numberValue(blob.byteSize) }
+          }
+        });
+        break;
+      }
       const existing = items.find((item) => item.id === call.toolCallId);
       const result = kind.case === "toolCallUpdated" ? kind.value.incrementalResult : call.result;
       const outputMode: "preserve" | "append" | "replace" = kind.case === "toolCallUpdated"
@@ -12862,7 +12877,9 @@ function projectTimelineEvent(
     case "artifactProduced": {
       const artifact = kind.value.artifact;
       if (artifact === undefined || kind.value.embeddedInExtensionCard) changed = false;
-      else replaceOrAppend({ id: event.eventId, sequence, kind: "artifact", createdAt, title: artifact.title, artifact: mapArtifact(artifact) });
+      else replaceOrAppend({ id: event.eventId, sequence, kind: "artifact", createdAt, title: artifact.title, artifact: mapArtifact(artifact),
+        ...(event.identity?.operationId && artifact.runId === event.identity.runId && artifact.sessionId === sessionId
+          ? { artifactOperationId: event.identity.operationId } : {}) });
       break;
     }
     case "imageProduced": {
