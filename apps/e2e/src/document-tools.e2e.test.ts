@@ -2,10 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AdapterContext, PromptInput } from "@joko/core";
 import { CredentialManager, CredentialVault, DocumentToolBridgeProvider, McpRouter, createInternalServer, createOrchestratorApplication, type OrchestratorConfig } from "@joko/orchestrator";
 import { expect, it } from "vitest";
-import { OrchestratorE2eFixture } from "./fixture.js";
-import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 function visiblePdf(): Buffer {
   const stream = "BT /F1 24 Tf 72 760 Td (Visible report) Tj ET";
@@ -26,18 +27,37 @@ function visiblePdf(): Buffer {
   return Buffer.from(output, "latin1");
 }
 
-it("creates and reads back a Word document through an authenticated task Tool bridge", async () => {
+it("delivers exact Word replacements through the authenticated task Tool bridge and Artifact history", async () => {
   let fixture: OrchestratorE2eFixture | undefined;
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
+  const dispatch: { turn?: AdapterContext } = {};
+  const releaseDelivery = Promise.withResolvers<void>();
+  let holdDelivery = false;
+  let deliveryWaiting = false;
   try {
     fixture = await OrchestratorE2eFixture.start({
+      createAdapter: profile => new class extends InstrumentedFakeAdapter {
+        override async send(_input: PromptInput, context: AdapterContext): Promise<void> { dispatch.turn = context; }
+      }(profile),
       createAuxiliaryServices: async (store, directory, artifacts) => {
         const vault = await CredentialVault.open(join(directory, "document-vault.key"));
         const credentials = new CredentialManager({ vault, storagePath: join(directory, "document-credentials.json") });
         await credentials.initialize();
         const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
         await mcpRouter.initialize();
-        mcpRouter.registerBridgeToolProvider(new DocumentToolBridgeProvider({ store }));
+        mcpRouter.setNativeToolAdmission((...args) => fixture!.application.sessionHost.authorizeNativeBridgeTool(...args));
+        mcpRouter.registerBridgeToolProvider(new DocumentToolBridgeProvider({
+          store, redactText: value => credentials.redactText(value),
+          artifacts: {
+            ingestBytes: async (bytes, options) => {
+              if (holdDelivery) {
+                deliveryWaiting = true;
+                await releaseDelivery.promise;
+              }
+              return artifacts.ingestBytes(bytes, options);
+            }
+          }
+        }));
         return { mcpRouter };
       }
     });
@@ -49,7 +69,7 @@ it("creates and reads back a Word document through an authenticated task Tool br
     const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
     const bridge = fixture.application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${internalUrl}/internal/mcp`, sessionId, targetId, expectedPiGeneration: generation });
     expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
-    const call = async (markdown: string, overwrite = false) => {
+    const call = async (markdown: string, overwrite = false, requestId = randomUUID(), outPath = "documents/report.docx") => {
       const response = await fetch(`${internalUrl}/internal/mcp`, {
         method: "POST",
         headers: {
@@ -58,13 +78,13 @@ it("creates and reads back a Word document through an authenticated task Tool br
           "x-joko-pi-generation": String(generation)
         },
         body: JSON.stringify({
-          requestId: randomUUID(),
+          requestId,
           sessionId,
           targetId,
           generation,
           serverId: "joko-document-tools",
           toolName: "make_docx",
-          arguments: { markdown, outPath: "documents/report.docx", title: "Task report", overwrite }
+          arguments: { markdown, outPath, title: "Task report", overwrite }
         })
       });
       expect(response.ok).toBe(true);
@@ -76,12 +96,70 @@ it("creates and reads back a Word document through an authenticated task Tool br
     const first = await readFile(path);
     expect(first.subarray(0, 2).toString("ascii")).toBe("PK");
     expect(first.length).toBe(created.details.mcpStructuredContent["bytes"]);
-    expect(await call("# Rejected")).toMatchObject({ isError: true, details: { mcpStructuredContent: { errorCode: "FILE_EXISTS" } } });
+
+    const accepted = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, BigInt(generation), "Update the existing report."));
+    const queueItemId = queueItemIdFrom(accepted);
+    const runId = queueRunIdFrom(accepted);
+    await waitFor(async () => fixture!.application.store.getQueueItem(queueItemId).state, state => state === "backend_accepted", "document Run input accepted");
+    const attemptId = fixture.application.store.getQueueItem(queueItemId).attemptId;
+    if (attemptId === undefined) throw new Error("The document Run has no accepted Attempt.");
+    const rejectedId = randomUUID();
+    const rejected = await call("# Rejected", false, rejectedId);
+    expect(rejected).toMatchObject({ isError: true, details: { mcpStructuredContent: { errorCode: "FILE_EXISTS" } } });
     expect(await readFile(path)).toEqual(first);
-    expect(await call("# Replacement", true)).toMatchObject({ isError: false, details: { mcpStructuredContent: { format: "docx" } } });
-    expect(await readFile(path)).not.toEqual(first);
+    const replacementId = randomUUID();
+    const replacement = await call("# Replacement", true, replacementId);
+    expect(replacement).toMatchObject({ isError: false, details: { mcpStructuredContent: { format: "docx" } } });
+    const replacementBytes = await readFile(path);
+    expect(replacementBytes).not.toEqual(first);
+    expect(await call("# Final version", true)).toMatchObject({ isError: false });
+    const finalBytes = await readFile(path);
+    expect(finalBytes).not.toEqual(replacementBytes);
+
+    expect(await call("# Rejected", false, rejectedId)).toEqual(rejected);
+    expect(await call("# Replacement", true, replacementId)).toEqual(replacement);
+    expect(await call("# Conflicting request", false, replacementId, "documents/conflict.docx")).toMatchObject({
+      isError: true, details: { mcpStructuredContent: { errorCode: "OUTPUT_REQUEST_CONFLICT" } }
+    });
+    await expect(readFile(join(fixture.workspaceDirectory, "documents", "conflict.docx"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(path)).toEqual(finalBytes);
+    expect(await call("# New file", true, randomUUID(), "documents/new.docx")).toMatchObject({ isError: false });
+
+    holdDelivery = true;
+    const late = call("# Written before the Run ended", true).catch((error: unknown) => error);
+    await waitFor(async () => deliveryWaiting, waiting => waiting, "document write verified before Artifact storage");
+    expect(await readFile(path)).not.toEqual(finalBytes);
+    const turn = dispatch.turn;
+    if (turn === undefined) throw new Error("The document Run was not dispatched.");
+    await turn.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The report is ready." }] });
+    await turn.emit({ type: "done", outcome: "completed" });
+    await waitFor(async () => fixture!.application.store.getQueueItem(queueItemId).state, state => state === "completed", "document Run retired");
+    releaseDelivery.resolve();
+    expect(await late).toMatchObject({ isError: true });
+    const reconnected = fixture.clients(paired.authKey);
+    const history = await reconnected.session.listSessionTimeline({ sessionId, limit: 100 });
+    const deliveries = history.events.flatMap(event => event.payload?.kind.case === "artifactProduced"
+      ? [{ identity: event.identity, artifact: event.payload.kind.value.artifact }]
+      : []);
+    expect(deliveries).toHaveLength(2);
+    for (const bytes of [replacementBytes, finalBytes]) {
+      const hash = createHash("sha256").update(bytes).digest("hex");
+      const delivery = deliveries.find(({ artifact }) => artifact?.blob?.sha256Hex === hash);
+      expect(delivery).toMatchObject({
+        identity: { sessionId, runId, attemptId },
+        artifact: { sessionId, runId, blob: { fileName: "report.docx", sha256Hex: hash } }
+      });
+      const blobId = delivery?.artifact?.blob?.blobId;
+      if (blobId === undefined) throw new Error("The delivered document has no Blob identity.");
+      const { ticket } = await reconnected.artifact.getBlobDownloadTicket({ blobId });
+      if (ticket === undefined) throw new Error("The document download ticket is unavailable.");
+      const download = await fetch(`${fixture.baseUrl}${ticket.relativeEndpoint}`, { headers: { authorization: `Bearer ${paired.authKey}` } });
+      expect(download.status).toBe(200);
+      expect(Buffer.from(await download.arrayBuffer())).toEqual(bytes);
+    }
     bridge.revoke();
   } finally {
+    releaseDelivery.resolve();
     await internal?.close();
     await fixture?.close();
   }

@@ -1,5 +1,7 @@
 import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, inspectPdf, renderPdf, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, SheetReadError, PdfInspectError, PdfRenderError, PdfResourceError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, PDF_PAGE_SIZES, RENDER_PDF_MAX_HTML_BYTES, type DocsThemeName, type PdfRenderer } from "@joko/tool-document";
 import type { OperationalStore } from "@joko/store";
+import type { ArtifactStore } from "./artifact-store.js";
+import { DocumentDeliveryError, DocumentOutputDelivery, type DocumentFormat, type DocumentWriteReceipt } from "./document-output-delivery.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 
 export const DOCUMENT_TOOL_PROVIDER_ID = "joko-document-tools";
@@ -194,15 +196,24 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   });
   readonly #store: Pick<OperationalStore, "getSession" | "getTarget">;
   readonly #publish: DocumentToolPublisher;
+  readonly #delivery: DocumentOutputDelivery | undefined;
   readonly #pdfRenderer: PdfRenderer | undefined;
 
   constructor(options: {
-    readonly store: Pick<OperationalStore, "getSession" | "getTarget">;
     readonly publish?: DocumentToolPublisher;
     readonly pdfRenderer?: PdfRenderer;
-  }) {
+  } & ({
+    readonly store: OperationalStore;
+    readonly artifacts: Pick<ArtifactStore, "ingestBytes">;
+    readonly redactText: (value: string) => string;
+  } | {
+    readonly store: Pick<OperationalStore, "getSession" | "getTarget">;
+    readonly artifacts?: undefined;
+  })) {
     this.#store = options.store;
     this.#publish = options.publish ?? publishDocumentOutput;
+    this.#delivery = options.artifacts === undefined
+      ? undefined : new DocumentOutputDelivery(options.store, options.artifacts, options.redactText);
     this.#pdfRenderer = options.pdfRenderer;
     this.tools = options.pdfRenderer ? TOOLS : TOOLS.filter(tool => tool.name !== "render_pdf");
   }
@@ -245,22 +256,13 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
         ...(subtitle === undefined ? {} : { subtitle }),
         ...(cover === undefined ? {} : { cover })
       });
-      signal?.throwIfAborted();
-      if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-      const output = await this.#publish({ root, outPath, bytes, overwrite, ...(signal === undefined ? {} : { signal }) });
-      signal?.throwIfAborted();
-      if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-      return response({
-        path: output.path,
-        relativePath: output.relativePath,
-        bytes: output.bytes,
-        format: "docx",
+      return await this.#publishResult("docx", { root, outPath, bytes, overwrite, ...(signal === undefined ? {} : { signal }) }, context, {
         theme,
         cover: Boolean(title?.trim()) && (cover ?? true)
-      }, false);
+      });
     } catch (error) {
       if (signal?.aborted) throw error;
-      if (error instanceof DocumentOutputError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof PdfRenderError || error instanceof PdfResourceError || error instanceof DocumentToolError) {
+      if (error instanceof DocumentOutputError || error instanceof DocumentDeliveryError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof PdfRenderError || error instanceof PdfResourceError || error instanceof DocumentToolError) {
         return response({ errorCode: error.code, message: error.message,
           ...(error instanceof SheetReadError && error.available ? { available: error.available } : {}) }, true);
       }
@@ -284,16 +286,10 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
       return bytes;
     }, signal);
-    signal?.throwIfAborted();
-    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-    const output = await this.#publish({ root, outPath, bytes: result.buffer, overwrite, ...(signal === undefined ? {} : { signal }) });
-    signal?.throwIfAborted();
-    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-    return response({
-      path: output.path, relativePath: output.relativePath, bytes: output.bytes,
-      format: "pptx", slides: result.slides, layouts: result.layouts,
+    return await this.#publishResult("pptx", { root, outPath, bytes: result.buffer, overwrite, ...(signal === undefined ? {} : { signal }) }, context, {
+      slides: result.slides, layouts: result.layouts,
       theme: result.theme, footer: result.footer
-    }, false);
+    });
   }
 
   async #makeXlsx(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
@@ -306,15 +302,9 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       ...(args["theme"] === undefined ? {} : { theme: args["theme"] }),
       ...(args["zebra"] === undefined ? {} : { zebra: args["zebra"] })
     }, signal);
-    signal?.throwIfAborted();
-    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-    const output = await this.#publish({ root, outPath, bytes: result.buffer, overwrite, ...(signal === undefined ? {} : { signal }) });
-    signal?.throwIfAborted();
-    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-    return response({
-      path: output.path, relativePath: output.relativePath, bytes: output.bytes,
-      format: "xlsx", sheets: result.sheets, theme: result.theme, zebra: result.zebra
-    }, false);
+    return await this.#publishResult("xlsx", { root, outPath, bytes: result.buffer, overwrite, ...(signal === undefined ? {} : { signal }) }, context, {
+      sheets: result.sheets, theme: result.theme, zebra: result.zebra
+    });
   }
 
   async #readSheet(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
@@ -340,17 +330,37 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
     const overwrite = optionalBoolean(args["overwrite"], "overwrite") ?? false;
     const { outPath: _outPath, overwrite: _overwrite, ...content } = args;
     const rendered = await renderPdf(content, root, this.#pdfRenderer!, signal);
-    signal?.throwIfAborted();
-    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-    const output = await this.#publish({ root, outPath, bytes: rendered.buffer, overwrite, ...(signal ? { signal } : {}) });
-    signal?.throwIfAborted();
-    if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-    return response({ path: output.path, relativePath: output.relativePath, bytes: output.bytes,
-      format: "pdf", pageSize: rendered.pageSize, landscape: rendered.landscape,
+    return await this.#publishResult("pdf", { root, outPath, bytes: rendered.buffer, overwrite, ...(signal ? { signal } : {}) }, context, {
+      pageSize: rendered.pageSize, landscape: rendered.landscape,
       fontsReady: rendered.fontsReady, template: rendered.template, theme: rendered.theme,
       templateApplied: rendered.templateApplied, ...(rendered.title ? { title: rendered.title } : {}),
       ...(rendered.warning ? { warning: rendered.warning } : {}),
-      nextStep: "Call inspect_pdf on this path to verify page count, size, text and blank pages before delivery." }, false);
+      nextStep: "Call inspect_pdf on this path to verify page count, size, text and blank pages before delivery."
+    });
+  }
+
+  async #publishResult(
+    format: DocumentFormat,
+    input: Parameters<DocumentToolPublisher>[0],
+    context: BridgeToolCallContext,
+    details: Readonly<Record<string, unknown>>
+  ): Promise<McpCallResult> {
+    const assertCurrent = (): void => {
+      input.signal?.throwIfAborted();
+      context.assertCurrent?.();
+      if (this.#requireRoot(context) !== input.root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
+    };
+    const respond = (receipt: DocumentWriteReceipt) => response({ ...receipt, format, ...details }, false);
+    assertCurrent();
+    const request = { ...input, assertCurrent };
+    if (this.#delivery !== undefined) {
+      const result = await this.#delivery.write(format, request, context, this.#publish, respond);
+      assertCurrent();
+      return result;
+    }
+    const { path, relativePath, bytes } = await this.#publish(request);
+    assertCurrent();
+    return respond({ path, relativePath, bytes });
   }
 
   #requireRoot(context: BridgeToolCallContext): string {

@@ -268,6 +268,8 @@ export interface NativeBridgeToolAdmission {
 /** Product scope authenticated from the durable Session binding, never from tool arguments. */
 export interface BridgeToolCallContext {
   readonly assertCurrent?: () => void;
+  /** Apply the same credential redaction and size limit before storing a result receipt. */
+  readonly normalizeResultForStorage?: (result: McpCallResult) => McpCallResult;
   /** Capture the original credential for a dispatched image whose model can leave discovery before completion. */
   readonly acceptDispatchedImageResult?: (assertCredentialCurrent: () => void) => void;
   /** Present only after consuming a service-owned proof of the SDK root tool. */
@@ -1422,6 +1424,7 @@ export class McpRouter {
               effectIdentity,
               requestBodyHash,
               assertCurrent: guard,
+              normalizeResultForStorage: result => this.#normalizeResult(result, "Bridge Tool result receipt").value,
               acceptDispatchedImageResult: assertCredential => {
                 guard();
                 if (assertDispatchedImageCredential !== undefined) throw new Error("The image dispatch authority was already captured.");

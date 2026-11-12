@@ -1213,7 +1213,7 @@ export async function createOrchestratorApplication(
     new RemoteHostToolBridgeProvider({ store, registry: remoteHosts, outputRedactor: credentials })
   );
   const unregisterDocumentTools = mcpRouter.registerBridgeToolProvider(
-    new DocumentToolBridgeProvider({ store,
+    new DocumentToolBridgeProvider({ store, artifacts, redactText: value => credentials.redactText(value),
       ...(config.pdfRendererHost
         ? { pdfRenderer: new ElectronDocumentPdfRenderer(config.pdfRendererHost.executablePath, config.pdfRendererHost.appPath) }
         : config.browser ? { pdfRenderer: new ChromiumDocumentPdfRenderer(config.browser.executablePath) } : {}) })
