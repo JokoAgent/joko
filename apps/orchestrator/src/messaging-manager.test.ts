@@ -342,7 +342,8 @@ describe("MessagingManager", () => {
     const destinationAdapter = new ControlledReplyAdapter({
       ...PI_LIKE_PROFILE, id: "discord-default-backend",
       capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "session.reset"
-        ? { ...capability, supported: false } : capability)
+        ? { ...capability, supported: false } : capability.key === "permission.modes"
+          ? { ...capability, options: PI_LIKE_PROFILE.permissionModes } : capability)
     });
     const inputs = [
       { id: 1, text: "/new" },
