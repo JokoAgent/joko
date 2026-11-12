@@ -1213,10 +1213,12 @@ export async function createOrchestratorApplication(
     new ContactToolBridgeProvider({ store, contacts, systemContacts: {
       getPort: () => nativeInputHandoff?.systemContacts(),
       approve: async (request, signal) => {
+        const host = sessionHostForHelperTools;
+        if (host === undefined) return false;
         const revoked = new AbortController();
         const unlisten = connections.onRevoked(request.connectionId, () => revoked.abort());
         try {
-          return await sessionHost.requestSystemContactsApproval(request,
+          return await host.requestSystemContactsApproval(request,
             signal === undefined ? revoked.signal : AbortSignal.any([signal, revoked.signal]));
         } finally {
           unlisten();
