@@ -90,10 +90,12 @@ describe("mounted Partner collaboration product chain", () => {
     const objective = "Read the independent fixture output";
     const title = "Independent inspection";
     const result = "Retained output from the independent task.";
+    let permissionReviews = 0;
     fixture = await RealPiSystemFixture.start({
       webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true,
       providerResponder: async ({ request, requestNumber }) => {
         if (JSON.stringify(request.body).includes("You are a permission reviewer for one tool call")) {
+          permissionReviews++;
           return { kind: "text", text: JSON.stringify({ verdict: "allow", reason: "The independent task uses the owned fixture." }) };
         }
         if (lastMessageRole(request) === "tool") return { kind: "text", text: "Independent task accepted." };
@@ -135,6 +137,7 @@ describe("mounted Partner collaboration product chain", () => {
       const tool = start?.type === "tool_result" ? {
         isError: start.isError,
         code: /"code"\s*:\s*"([A-Z_]{1,64})"/u.exec(start.output.replace(/\\"/gu, '"'))?.[1],
+        phase: /Auto-review blocked this tool call|The user declined this tool call|The current owner policy or delegated task authority denied this tool call|Joko policy changed while permission was pending|The original tool turn (?:was not acknowledged|bridge is unavailable)|MCP bridge request failed with status [0-9]{3}|MCP tool failed/u.exec(start.output)?.[0],
         hasTitle: start.output.includes(title)
       } : undefined;
       const storedReceipts = (activeNativeTimeline: boolean) => store.listEvents({ sessionId, activeNativeTimeline, order: "desc", limit: 120 })
@@ -145,7 +148,9 @@ describe("mounted Partner collaboration product chain", () => {
       const tasks = partnerSessionTasks?.list(partner.partnerId).filter(task => task.title === title).slice(0, 4)
         .map(task => ({ status: task.status, hasSession: task.sessionId !== undefined, hasRun: task.runId !== undefined,
           deliveredExecution: task.deliveredExecution, hasError: task.error !== undefined }));
-      throw new Error(`Independent task ${phase} was not visible. ${JSON.stringify({ tool, tasks, stored: storedReceipts(false),
+      const permissions = store.listInteractions({ sessionId, runId: parentRunId })
+        .filter(interaction => interaction.kind === "permission").map(interaction => interaction.status);
+      throw new Error(`Independent task ${phase} was not visible. ${JSON.stringify({ tool, permissionReviews, permissions, tasks, stored: storedReceipts(false),
         active: storedReceipts(true), connectReceipts })}`, { cause: error });
     }
     expect(await outcome.innerText()).toContain("Completed · #1");
