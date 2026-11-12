@@ -193,7 +193,7 @@ describe("Managed Provider native proxy", () => {
       const lease = await binding.activate({ operationId: "chat-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
       const request = (body: Record<string, unknown>, suffix = "") => fetch(`${binding.baseUrl}/responses${suffix}`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-joko-provider-proxy-token": f.token, "x-openai-fedramp": "true" },
+        headers: { "content-type": "application/json", authorization: `Bearer ${f.token}`, "x-openai-fedramp": "true" },
         body: JSON.stringify({ model: "model", ...body })
       });
       const tools = [
@@ -285,7 +285,7 @@ describe("Managed Provider native proxy", () => {
         { index: 0, id: "pending", type: "function", function: { name, arguments: "{}" } }
       ] }, finish_reason: null }] }) + (finish === undefined ? "" : chatEvent({ choices: [{ delta: {}, finish_reason: finish }] }) + "data: [DONE]\n\n"));
       const response = await fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: {
-        "content-type": "application/json", "x-joko-provider-proxy-token": f.token
+        "content-type": "application/json", authorization: `Bearer ${f.token}`
       }, body: JSON.stringify({ model: "model", stream: true, tool_choice: toolChoice, tools: [
         { type: "function", name: "read_note" }
       ], input: [
@@ -293,6 +293,7 @@ describe("Managed Provider native proxy", () => {
         { type: "custom_tool_call_output", call_id: "old", output: "previous output" },
         { role: "user", content: "Continue." }
       ] }) });
+      expect(response.status).toBe(200);
       const events = responsesEvents(await response.text());
       expect(events.some(event => event.type === "response.output_item.done")).toBe(false);
       expect(events.at(-1)).toMatchObject({ type: "response.failed", response: { status: "failed", output: [] } });
