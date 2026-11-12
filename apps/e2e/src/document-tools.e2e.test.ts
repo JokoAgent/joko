@@ -33,7 +33,8 @@ it("delivers exact Word replacements through the authenticated task Tool bridge 
   let fixture: OrchestratorE2eFixture | undefined;
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   const dispatch: { turn?: AdapterContext } = {};
-  const releaseDelivery = Promise.withResolvers<void>();
+  let releaseDelivery!: () => void;
+  const deliveryGate = new Promise<void>(resolve => { releaseDelivery = resolve; });
   let holdDelivery = false;
   let deliveryWaiting = false;
   try {
@@ -54,7 +55,7 @@ it("delivers exact Word replacements through the authenticated task Tool bridge 
             ingestBytes: async (bytes, options) => {
               if (holdDelivery) {
                 deliveryWaiting = true;
-                await releaseDelivery.promise;
+                await deliveryGate;
               }
               return artifacts.ingestBytes(bytes, options);
             }
@@ -136,7 +137,7 @@ it("delivers exact Word replacements through the authenticated task Tool bridge 
     await turn.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The report is ready." }] });
     await turn.emit({ type: "done", outcome: "completed" });
     await waitFor(async () => fixture!.application.store.getQueueItem(queueItemId).state, state => state === "completed", "document Run retired");
-    releaseDelivery.resolve();
+    releaseDelivery();
     expect(await late).toMatchObject({ isError: true });
     const reconnected = fixture.clients(paired.authKey);
     const history = await reconnected.session.listSessionTimeline({ sessionId, limit: 100 });
@@ -161,7 +162,7 @@ it("delivers exact Word replacements through the authenticated task Tool bridge 
     }
     bridge.revoke();
   } finally {
-    releaseDelivery.resolve();
+    releaseDelivery();
     await internal?.close();
     await fixture?.close();
   }
