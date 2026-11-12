@@ -82,7 +82,7 @@ import {
   type ManagedProcessPriority,
   type ProcessPriorityResult
 } from "@joko/runtime-governance";
-import { provisionManagedBridge } from "./bridge.js";
+import { PI_TRANSIENT_PROMPT_FILE, provisionManagedBridge } from "./bridge.js";
 import { assertPiHostedModel, provisionPiHostedExecution, restrictPiHostedGuestHome } from "./hosted-execution.js";
 import { handleCommandGateExtensionRequest, readCommandGateExtensionRequest } from "./command-gate-bridge.js";
 import { capturePartnerLearningExtensionRequest, consumePartnerLearningNativeReply } from "./partner-learning-bridge.js";
@@ -1438,10 +1438,17 @@ export class PiBackendAdapter implements
     if (input.images.length > 0 && bridged === undefined) {
       await this.#requireImageInputState(runtime, context, imageState);
     }
-    const unbridgedMessage = await this.#composePrompt(input, context, options);
+    const transient = input.disposition === "prompt" ? context.transientPromptAttachments : undefined;
+    const durableInput = transient === undefined ? input : {
+      ...input,
+      images: input.images.slice(0, input.images.length - transient.images.length),
+      files: input.files.slice(0, input.files.length - transient.files.length)
+    };
+    const unbridgedMessage = await this.#composePrompt(durableInput, context, options);
     const composedMessage = bridged === undefined
       ? unbridgedMessage
-      : appendVisionBridgeDescriptions(unbridgedMessage, bridged.descriptions);
+      : appendVisionBridgeDescriptions(unbridgedMessage, transient === undefined
+        ? bridged.descriptions : bridged.descriptions.slice(0, durableInput.images.length));
     const commandCatalog = composedMessage.trimStart().startsWith("/")
       ? await this.#readCommandCatalog(runtime, context).catch(() => EMPTY_PI_COMMAND_CATALOG)
       : EMPTY_PI_COMMAND_CATALOG;
@@ -1454,13 +1461,27 @@ export class PiBackendAdapter implements
         )
       : { message: composedMessage };
     const message = composerCommand.message;
-    const images = bridged === undefined ? await this.#resolveImages(input, options) : [];
+    const images = bridged === undefined ? await this.#resolveImages(durableInput, options) : [];
     const dispatchState = input.images.length > 0
       ? bridged === undefined
         ? await this.#requireImageInputState(runtime, context, imageState)
         : imageState
       : undefined;
     const extensionCommand = composerCommand.extensionCommand;
+    const transientPrompt = transient === undefined || extensionCommand !== undefined ? undefined : {
+      promptHash: createHash("sha256").update(message).digest("hex"),
+      text: appendVisionBridgeDescriptions(
+        await this.#promptFileSection(transient.files, context, options),
+        bridged?.descriptions.slice(durableInput.images.length) ?? [],
+        durableInput.images.length
+      ),
+      images: bridged === undefined ? await Promise.all(transient.images.map(async ({ blob }) => ({
+        path: await this.#resolvePromptFile({ blob }, context, options),
+        mimeType: blob.mimeType,
+        byteLength: blob.byteLength,
+        sha256: blob.sha256
+      }))) : []
+    };
     const extensionState = extensionCommand === undefined
       ? undefined
       : dispatchState ?? await this.#requestState(runtime, context);
@@ -1648,15 +1669,22 @@ export class PiBackendAdapter implements
           lifecycle.participants.push(participant);
           if (command.type === "steer") lifecycle.pendingSteering.push(participant);
           else lifecycle.pendingFollowUps.push(participant);
+          commandSent = true;
+          return runtime.transport.request(command, {
+            signal: context.signal,
+            stateMayHaveChanged: true,
+            timeoutMs: runtimeRpcTimeout(runtime, PI_STANDARD_RPC_TIMEOUT_MS)
+          });
         }
-        commandSent = true;
-        return command.type === "prompt"
-          ? requestPiPromptAcceptance(runtime, command, context.signal)
-          : runtime.transport.request(command, {
-              signal: context.signal,
-              stateMayHaveChanged: true,
-              timeoutMs: runtimeRpcTimeout(runtime, PI_STANDARD_RPC_TIMEOUT_MS)
-            });
+        const transientPath = transientPrompt === undefined ? undefined : join(runtime.runtimeDirectory, PI_TRANSIENT_PROMPT_FILE);
+        try {
+          if (transientPath !== undefined) await atomicWriteFile(transientPath, JSON.stringify(transientPrompt));
+          context.signal.throwIfAborted();
+          commandSent = true;
+          return await requestPiPromptAcceptance(runtime, command, context.signal);
+        } finally {
+          if (transientPath !== undefined) await unlink(transientPath).catch(() => undefined);
+        }
       });
     } catch (error) {
       if (input.disposition === "prompt" && runtime.lifecycle === lifecycle && !lifecycle.agentStarted) {
@@ -6761,30 +6789,7 @@ export class PiBackendAdapter implements
     if (projected.text.trim()) sections.push(projected.text);
     const attachments: string[] = [];
     for (const file of input.files) {
-      let path: string;
-      if (file.workspacePath) {
-        if (isAbsolute(file.workspacePath)) throw piError("PI_FILE_PATH_DENIED", "Workspace attachment path must be relative", "dispatch");
-        path = resolve(context.target.workspaceRoot, file.workspacePath);
-        assertContained(context.target.workspaceRoot, path, "workspace attachment");
-      } else if (options.resolveFile) {
-        path = resolve(
-          await options.resolveFile(file.blob, context).catch((error) => {
-            throw asPiError(error, {
-              code: "PI_FILE_RESOLUTION_FAILED",
-              phase: "dispatch",
-              retryable: true,
-              recovery: "Restore the attached blob and retry its managed path resolution."
-            });
-          })
-        );
-      } else {
-        throw piError("PI_FILE_RESOLVER_MISSING", "File BlobRef has no workspacePath and no resolver is configured", "dispatch");
-      }
-      const info = await lstat(path).catch((error) => {
-        throw piError("PI_FILE_UNAVAILABLE", `Attached file '${path}' is unavailable`, "dispatch", { cause: error });
-      });
-      if (!info.isFile() || info.isSymbolicLink()) throw piError("PI_FILE_UNSAFE", "Attached file must be a regular non-symlink file", "dispatch");
-      attachments.push(`- file: ${path}`);
+      attachments.push(`- file: ${await this.#resolvePromptFile(file, context, options)}`);
     }
     for (const mention of input.mentions) {
       if (mention.kind === "resource") continue;
@@ -6794,6 +6799,37 @@ export class PiBackendAdapter implements
     sections.push(...projected.supplemental);
     if (sections.length === 0 && input.images.length === 0) throw piError("PI_PROMPT_EMPTY", "Pi prompt has no text, image, file, or mention content", "dispatch");
     return sections.join("\n\n");
+  }
+
+  async #promptFileSection(files: PromptInput["files"], context: AdapterContext, options: PiAdapterOptions): Promise<string> {
+    const paths: string[] = [];
+    for (const file of files) paths.push(`- file: ${await this.#resolvePromptFile(file, context, options)}`);
+    return paths.length === 0 ? "" : `[Joko resolved resources]\n${paths.join("\n")}`;
+  }
+
+  async #resolvePromptFile(file: PromptInput["files"][number], context: AdapterContext, options: PiAdapterOptions): Promise<string> {
+    let path: string;
+    if (file.workspacePath) {
+      if (isAbsolute(file.workspacePath)) throw piError("PI_FILE_PATH_DENIED", "Workspace attachment path must be relative", "dispatch");
+      path = resolve(context.target.workspaceRoot, file.workspacePath);
+      assertContained(context.target.workspaceRoot, path, "workspace attachment");
+    } else if (options.resolveFile) {
+      path = resolve(await options.resolveFile(file.blob, context).catch((error) => {
+        throw asPiError(error, {
+          code: "PI_FILE_RESOLUTION_FAILED",
+          phase: "dispatch",
+          retryable: true,
+          recovery: "Restore the attached blob and retry its managed path resolution."
+        });
+      }));
+    } else {
+      throw piError("PI_FILE_RESOLVER_MISSING", "File BlobRef has no workspacePath and no resolver is configured", "dispatch");
+    }
+    const info = await lstat(path).catch((error) => {
+      throw piError("PI_FILE_UNAVAILABLE", `Attached file '${path}' is unavailable`, "dispatch", { cause: error });
+    });
+    if (!info.isFile() || info.isSymbolicLink()) throw piError("PI_FILE_UNSAFE", "Attached file must be a regular non-symlink file", "dispatch");
+    return path;
   }
 
   #assertProviderAuthenticationNotRevoked(
@@ -8408,9 +8444,9 @@ function normalizedPosixAbsolutePath(value: string): boolean {
   );
 }
 
-export function appendVisionBridgeDescriptions(message: string, descriptions: readonly string[]): string {
+export function appendVisionBridgeDescriptions(message: string, descriptions: readonly string[], precedingImages = 0): string {
   const blocks = descriptions.map((description, index) => [
-    `[Vision Bridge image ${index + 1}]`,
+    `[Vision Bridge image ${precedingImages + index + 1}]`,
     description.trim(),
     "[End Vision Bridge image description]"
   ].join("\n"));

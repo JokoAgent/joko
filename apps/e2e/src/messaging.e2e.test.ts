@@ -267,6 +267,10 @@ describe("Telegram Messaging production product chain", () => {
     const providerGroupInput = JSON.stringify(fixture.providerRequests[2]?.body["messages"]);
     expect(providerGroupInput).toContain(groupPrompt);
     expect(providerGroupInput).toContain(`data:image/png;base64,${photo.toString("base64")}`);
+    const nativeGroupFile = fixture.application.store.getSession(groupQueue.sessionId).descriptor.binding.opaqueRef;
+    const nativeGroupHistory = await readFile(nativeGroupFile, "utf8");
+    expect(nativeGroupHistory).toContain(groupPrompt);
+    expect(nativeGroupHistory).not.toContain(photo.toString("base64"));
 
     let releaseProvider!: () => void;
     heldProviderReply = new Promise<void>(resolve => { releaseProvider = resolve; });

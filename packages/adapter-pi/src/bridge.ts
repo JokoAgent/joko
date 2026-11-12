@@ -16,6 +16,7 @@ import {
 } from "./runtime-tool-catalog.js";
 
 const BRIDGE_FILE_NAME = "joko-managed-bridge.ts";
+export const PI_TRANSIENT_PROMPT_FILE = "transient-prompt.json";
 
 const managedShellPolicy = createPiShellPolicy();
 export const DEFAULT_MANAGED_BASH_TIMEOUT_SECONDS = managedShellPolicy.defaultTimeoutSeconds;
@@ -43,13 +44,13 @@ export async function provisionManagedBridge(agentHome: string): Promise<string>
  */
 export const MANAGED_BRIDGE_SOURCE = String.raw`
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool, createPowerShellTool, createLocalBashOperations, getPackageDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import * as piSdk from "@earendil-works/pi-coding-agent";
-import { clampThinkingLevel } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type ImageContent, type UserMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createPiAutoReviewer } from "./joko-managed-auto-review.mjs";
 import { createPiModelCatalogAdditions } from "./joko-managed-model-catalog.mjs";
@@ -82,6 +83,7 @@ const MAX_POLICY_DECISION_ENVELOPE_CHARACTERS = ${MAXIMUM_POLICY_DECISION_ENVELO
 const MAX_POLICY_DECISION_REPLY_CHARACTERS = ${MAXIMUM_POLICY_DECISION_REPLY_CHARACTERS};
 
 const controlPath = process.env.JOKO_PI_CONTROL_FILE;
+const transientPromptPath = controlPath && resolve(dirname(controlPath), ${JSON.stringify(PI_TRANSIENT_PROMPT_FILE)});
 const mcpDescriptorPath = process.env.JOKO_PI_MCP_DESCRIPTOR_FILE;
 const workspaceRoot = process.env.JOKO_PI_WORKSPACE_ROOT ? realpathSync(process.env.JOKO_PI_WORKSPACE_ROOT) : process.cwd();
 const runtimeGeneration = Number(process.env.JOKO_PI_GENERATION);
@@ -133,6 +135,64 @@ function readControl(): Control {
     throw new Error("Invalid approved-root control state");
   }
   return value;
+}
+
+function transientPromptImage(image: { path: string; mimeType: string; byteLength: number; sha256: string }): ImageContent {
+  const maximumBytes = Number(process.env.JOKO_PI_ARTIFACT_CAPACITY_BYTES);
+  if (!isAbsolute(image.path) || !/^image\/(png|jpeg|webp|gif)$/i.test(image.mimeType)
+    || !Number.isSafeInteger(maximumBytes) || !Number.isSafeInteger(image.byteLength)
+    || image.byteLength <= 0 || image.byteLength > maximumBytes) throw new Error("Invalid temporary input image");
+  const expected = lstatSync(image.path);
+  if (!expected.isFile() || expected.size !== image.byteLength || realpathSync(image.path) !== image.path) {
+    throw new Error("Temporary input image changed");
+  }
+  const handle = openSync(image.path, "r");
+  try {
+    const current = fstatSync(handle);
+    if (!current.isFile() || current.dev !== expected.dev || current.ino !== expected.ino || current.size !== expected.size) {
+      throw new Error("Temporary input image changed");
+    }
+    const bytes = readFileSync(handle);
+    if (bytes.length !== image.byteLength || createHash("sha256").update(bytes).digest("hex") !== image.sha256) {
+      throw new Error("Temporary input image changed");
+    }
+    return { type: "image", data: bytes.toString("base64"), mimeType: image.mimeType };
+  } finally {
+    closeSync(handle);
+  }
+}
+
+function takeTransientPrompt(prompt: string): { prompt: string; blocks: Exclude<UserMessage["content"], string> } | undefined {
+  if (!transientPromptPath) return;
+  let raw: string;
+  try {
+    const info = lstatSync(transientPromptPath);
+    if (!info.isFile() || info.size > 256 * 1024) return;
+    raw = readFileSync(transientPromptPath, "utf8");
+    unlinkSync(transientPromptPath);
+  } catch {
+    return;
+  }
+  try {
+    const source = JSON.parse(raw);
+    if (source.promptHash !== createHash("sha256").update(prompt).digest("hex")
+      || typeof source.text !== "string" || !Array.isArray(source.images)) return;
+    const blocks: Exclude<UserMessage["content"], string> = [];
+    if (source.text !== "") blocks.push({ type: "text", text: source.text });
+    for (const image of source.images) {
+      try { blocks.push(transientPromptImage(image)); }
+      catch { blocks.push({ type: "text", text: "[Unavailable group image]" }); }
+    }
+    return { prompt, blocks };
+  } catch {
+    return;
+  }
+}
+
+function userPromptText(message: UserMessage): string | undefined {
+  if (typeof message.content === "string") return message.content;
+  const first = message.content[0];
+  return first?.type === "text" ? first.text : undefined;
 }
 
 function assertPolicyUnchanged(expected: Control): Control {
@@ -923,10 +983,13 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     return allow();
   });
 
+  let pendingTransientPrompt: ReturnType<typeof takeTransientPrompt>;
+  let activeTransientPrompt: (NonNullable<typeof pendingTransientPrompt> & { timestamp: number }) | undefined;
   pi.on("before_agent_start", async (event, ctx) => {
     const control = readControl();
     const systemPrompt = hostedExecutor ? event.systemPrompt + "\n\n" + hostedExecutor.environmentNote : undefined;
     if (control.runtimePolicy === "review_read_only") return systemPrompt === undefined ? undefined : { systemPrompt };
+    pendingTransientPrompt = takeTransientPrompt(event.prompt);
     ctx.ui.setStatus("joko-plan", control.planMode ? "plan" : undefined);
     if (!control.planMode) return systemPrompt === undefined ? undefined : { systemPrompt };
     return {
@@ -937,6 +1000,30 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
         content: "[JOKO PLAN MODE ACTIVE]\nExplore with read-only tools, ask clarifying questions, and produce a concrete numbered implementation plan. Do not modify files or external state until the user approves the plan.",
       },
     };
+  });
+
+  // Pi supplies a deep copy to context handlers. The original user message
+  // remains the input to native history, recovery and durable fingerprinting.
+  pi.on("message_start", ({ message }) => {
+    if (message.role !== "user") return;
+    const pending = pendingTransientPrompt;
+    activeTransientPrompt = pending !== undefined && pending.prompt === userPromptText(message)
+      ? { ...pending, timestamp: message.timestamp }
+      : undefined;
+    pendingTransientPrompt = undefined;
+  });
+  pi.on("context", ({ messages }) => {
+    const transient = activeTransientPrompt;
+    if (transient === undefined) return;
+    const user = messages.findLast((message): message is UserMessage => message.role === "user");
+    if (user?.timestamp !== transient.timestamp || userPromptText(user) !== transient.prompt) return;
+    const content = typeof user.content === "string" ? [{ type: "text" as const, text: user.content }] : user.content;
+    user.content = [...content, ...transient.blocks];
+    return { messages };
+  });
+  pi.on("agent_settled", () => {
+    pendingTransientPrompt = undefined;
+    activeTransientPrompt = undefined;
   });
 
   pi.on("agent_end", async (event, ctx) => {
