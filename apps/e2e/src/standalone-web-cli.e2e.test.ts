@@ -14,7 +14,7 @@ import {
   ProviderApiCompatibility, ProviderConfigurationSchema, ProviderKind, RunState,
   SessionSnapshotScopeSchema, SnapshotScopeSchema, SubmitOperationRequestSchema
 } from "@joko/contracts";
-import { chromium, type BrowserContext, type Page } from "playwright-core";
+import { chromium, type BrowserContext, type Page, type Request } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { createE2eClients } from "./connect-clients.js";
@@ -287,6 +287,10 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
             ]);
             const snapshot = current.snapshot;
             const session = snapshot?.sessions.find(item => item.sessionId === sessionId);
+            const backend = snapshot?.backends.find(item => item.backendId === session?.backendId);
+            const provider = snapshot?.providers.find(item => item.backendId === backend?.backendId && item.providerId === REAL_PI_PROVIDER_ID);
+            const model = snapshot?.models.find(item => item.backendId === backend?.backendId
+              && item.key?.providerId === REAL_PI_PROVIDER_ID && item.key.modelId === REAL_PI_MODEL_ID);
             const ui = await page!.evaluate(({ expectedSessionId, secondPrompt }) => {
               const pane = document.querySelector<HTMLElement>(".session-pane");
               const editor = pane?.querySelector<HTMLElement>('[data-composer-editor="true"] [contenteditable]');
@@ -300,6 +304,10 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
             }, { expectedSessionId: sessionId, secondPrompt });
             return { stage, elapsedMs: Math.round(performance.now() - startedAt), generation: session?.nativeBinding?.runtimeGeneration.toString(),
               runtimeAttached: session?.nativeBinding?.runtimeAttached, sessionState: session?.state,
+              backendHealth: backend?.health, backendInstallation: backend?.installationState,
+              backendInitializationFailed: backend?.error?.code === "BACKEND_INSTANCE_INITIALIZATION_FAILED",
+              commandSupport: backend?.capabilities?.capabilities.find(item => item.name === "runtime.commands")?.support,
+              providerAuthentication: provider?.authenticationState, modelPresent: model !== undefined, modelAvailable: model?.available,
               succeededRuns: snapshot?.runs.filter(run => run.state === RunState.SUCCEEDED).length,
               acceptedUserMessages: timeline.events.filter(event => event.payload?.kind.case === "messageStarted"
                 && event.payload.kind.value.role === MessageRole.USER && event.payload.kind.value.userInputAccepted).length,
@@ -340,18 +348,30 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       // existing browser RPC is observable; no inspector call resumes a task.
       // A durable reply can render before this cold native activation finishes
       // and advances the generation used by the input admission fence.
-      const activation = page.waitForResponse(response => {
-        const url = new URL(response.url()), bytes = response.request().postDataBuffer();
-        if (url.origin !== fixture!.baseUrl || url.pathname !== "/joko.v1.SessionService/ListRuntimeCommands"
-          || response.status() !== 200 || bytes === null) return false;
+      const isActivationRequest = (request: Request): boolean => {
+        const url = new URL(request.url());
+        if (url.origin !== fixture!.baseUrl || url.pathname !== "/joko.v1.SessionService/ListRuntimeCommands") return false;
+        const bytes = request.postDataBuffer();
+        if (bytes === null) return false;
         try { return fromBinary(ListRuntimeCommandsRequestSchema, bytes).sessionId === sessionId; }
         catch { return false; }
+      };
+      page.on("request", request => {
+        if (inputEvidence.length < 32 && isActivationRequest(request)) {
+          inputEvidence.push({ stage: "browser-native-activation-request", elapsedMs: Math.round(performance.now() - startedAt) });
+        }
+      });
+      const activation = page.waitForResponse(response => {
+        if (!isActivationRequest(response.request())) return false;
+        if (inputEvidence.length < 32) {
+          inputEvidence.push({ stage: "browser-native-activation-response", elapsedMs: Math.round(performance.now() - startedAt), status: response.status() });
+        }
+        return response.status() === 200;
       }, { timeout: remainingRecoveryMs() });
       void activation.catch(() => undefined);
       await page.reload({ waitUntil: "domcontentloaded", timeout: Math.min(20_000, remainingRecoveryMs()) });
       await page.locator(".timeline").getByText(controlledReply, { exact: true }).first().waitFor({ state: "visible", timeout: remainingRecoveryMs() });
-      const activationResponse = await activation;
-      inputEvidence.push({ stage: "browser-native-activation-response", elapsedMs: Math.round(performance.now() - startedAt), status: activationResponse.status() });
+      await activation;
       await pollOwned(async () => {
         const session = (await inspector.clients.session.getSession({ sessionId }, { timeoutMs: remainingRecoveryMs() })).session;
         const pane = page!.locator(".session-pane").first();
