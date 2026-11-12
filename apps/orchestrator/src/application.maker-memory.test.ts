@@ -91,10 +91,14 @@ describe("Application ordinary native Maker Memory", () => {
     expect(f.last().prompt).not.toContain("# Maker Memory");
 
     // The ordinary setting must not replace the Partner's independent owner.
+    const model = application.store.getBackend(backendId).descriptor.models.find(candidate =>
+      candidate.providerId === f.providerId && candidate.modelId === f.modelId)!;
+    const effort = model.defaultEffort ?? model.thinkingLevels[0];
     const partner = await application.partners!.createPartner({ requestId: "independent-partner",
       expectedDirectoryRevision: application.partners!.directory().state.revision,
       displayName: "Independent memory", avatar: "orbit", templateId: "general", identitySource: "Private partner identity.",
-      usesDirectoryDefaults: false, capabilities: { modelChain: [{ backendId, providerId: f.providerId, modelId: f.modelId, fastMode: false }],
+      usesDirectoryDefaults: false, capabilities: { modelChain: [{ backendId, providerId: f.providerId, modelId: f.modelId, fastMode: false,
+        ...(effort === undefined ? {} : { effort }) }],
         permissionMode: "ask", planMode: false } });
     expect(partner.initializationState).toBe("ready");
     const partnerMemory = memory.write(partner.homeTargetId, { kind: "user", name: "partner-style", title: "Partner memory",
