@@ -9188,9 +9188,19 @@ function permissionSummary(
     const cwd = projection.text(input["cwd"] ?? input["workdir"] ?? observedWorkingDirectory, 1_024);
     return withDescription(`Run command\n${command}${cwd.length === 0 ? "" : `\n\nWorking directory\n${cwd}`}`);
   }
+  if (/^(Glob|Grep)$/i.test(toolName)) {
+    const pattern = projection.text(input["pattern"], 2_048);
+    const path = projection.text(input["path"], 2_048);
+    const evidence = [
+      pattern.length === 0 ? "" : `Search pattern\n${pattern}`,
+      path.length === 0 ? "" : `Search directory\n${path}`
+    ].filter(Boolean).join("\n\n");
+    if (evidence.length > 0) return withDescription(evidence);
+  }
   const modifiesFile = fileMutationTool(toolName);
   if (modifiesFile || /^Read$/i.test(toolName)) {
-    const path = projection.text(input["file_path"] ?? input["path"] ?? options.blockedPath, 2048);
+    const notebookPath = /^NotebookEdit$/i.test(toolName) ? input["notebook_path"] : undefined;
+    const path = projection.text(notebookPath ?? input["file_path"] ?? input["path"] ?? options.blockedPath, 2048);
     if (path.length > 0) return withDescription(`${modifiesFile ? "Modify file" : "Read file"}\n${path}`);
     if (modifiesFile) return described || "Modify a workspace file.";
   }

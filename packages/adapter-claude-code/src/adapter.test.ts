@@ -6810,6 +6810,16 @@ describe("ClaudeCodeAdapter", () => {
     const read = { file_path: "docs/report.txt" };
     await expect(query.params.options.canUseTool("Read", read, permissionOptions("permission-three", "tool-read")))
       .resolves.toMatchObject({ behavior: "allow", updatedInput: read });
+    for (const [toolName, input, description] of [
+      ["Grep", { pattern: `TODO|${secret}`, path: "docs" }, "Search the documentation."],
+      ["Glob", { pattern: "**/*.test.ts" }, undefined],
+      ["NotebookEdit", { notebook_path: "research/notes.ipynb", new_source: "Results" }, undefined]
+    ] as const) {
+      await expect(query.params.options.canUseTool(toolName, input, {
+        ...permissionOptions(`permission-${toolName}`, `tool-${toolName}`),
+        ...(description === undefined ? {} : { description })
+      })).resolves.toMatchObject({ behavior: "allow", updatedInput: input });
+    }
 
     const question = await query.params.options.canUseTool("AskUserQuestion", {
       questions: [
@@ -6845,6 +6855,9 @@ describe("ClaudeCodeAdapter", () => {
       "permission",
       "permission",
       "permission",
+      "permission",
+      "permission",
+      "permission",
       "question",
       "plan_review"
     ]);
@@ -6854,6 +6867,11 @@ describe("ClaudeCodeAdapter", () => {
       summary: "Modify file\nsrc/main.ts\n\nUpdate the entry point." });
     expect(interactions[2]).toMatchObject({ kind: "permission", risk: "low", toolName: "Read",
       summary: "Read file\ndocs/report.txt" });
+    expect(interactions.slice(3, 6)).toMatchObject([
+      { kind: "permission", risk: "low", toolName: "Grep", summary: "Search pattern\nTODO|[REDACTED]\n\nSearch directory\ndocs\n\nSearch the documentation." },
+      { kind: "permission", risk: "low", toolName: "Glob", summary: "Search pattern\n**/*.test.ts" },
+      { kind: "permission", risk: "medium", toolName: "NotebookEdit", summary: "Modify file\nresearch/notes.ipynb" }
+    ]);
 
     query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0.1 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
