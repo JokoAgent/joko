@@ -595,27 +595,105 @@ describe("Partner independent Session tasks", () => {
     await f.secondary.complete(explicit.sessionId!, "Done"); await vi.waitFor(() => expect(f.tasks.list(f.partner.id).find(task => task.id === explicit.id)!.status).toBe("completed"));
     expect(f.tasks.inspectRoute(f.parent, explicit.id).next).toBeUndefined();
   });
-  it("advances a frozen mixed Backend chain on the same independent task at its next send", async () => {
+  it("keeps independent task controls on the adopted Backend through recovery and timeout", async () => {
     const f = await fixture();
+    const backup = { ...f.route, modelId: "backup" };
     await f.partners.updatePartner(f.partner.id, f.partner.revision, { capabilities: { ...f.partner.capabilities,
-      modelChain: [...f.partner.capabilities.modelChain, f.route] } });
-    const task = await f.tasks.start(f.parent, "task:mixed", { instruction: "Start here", workingDir: f.project }, () => undefined);
+      modelChain: [...f.partner.capabilities.modelChain, f.route, backup] } });
+    const task = await f.tasks.start(f.parent, "task:mixed", { instruction: "Start here", workingDir: f.project, timeoutMs: 10_000 }, () => undefined);
+    const sessionId = task.sessionId!;
+    const currentTask = () => f.tasks.list(f.partner.id).find(candidate => candidate.id === task.id)!;
     await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
-    const original = f.store.getSession(task.sessionId!).descriptor;
+    const original = f.store.getSession(sessionId).descriptor;
     expect(f.tasks.fallback({ sessionId: original.id, current: f.host.getSessionRuntimeControl(original.id).effective!,
       visitedRoutes: [], currentHop: 0 })).toEqual({ owned: true, candidate: f.route });
-    await f.primary.fail(task.sessionId!, "Initial work done.");
+    await f.primary.fail(sessionId, "Initial work done.");
     await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("failed"));
     const route = f.tasks.inspectRoute(f.parent, task.id);
     expect(route.next?.backendId).toBe(f.secondary.id);
     await f.tasks.advanceRoute(f.parent, task.id, route.generation, route.selection_token!, () => undefined);
-    expect(f.host.getSessionRuntimeControl(task.sessionId!).pending?.profile.backendId).toBe(f.secondary.id);
+    expect(f.host.getSessionRuntimeControl(sessionId).pending?.profile.backendId).toBe(f.secondary.id);
     await f.tasks.message(f.parent, task.id, "task:mixed-next", { mode: "queue", message: "Continue there" }, () => undefined);
     await vi.waitFor(() => expect(f.secondary.inputs).toHaveLength(1));
-    expect(f.store.getSession(task.sessionId!).descriptor).toMatchObject({ id: original.id, targetId: original.targetId,
+    expect(f.store.getSession(sessionId).descriptor).toMatchObject({ id: original.id, targetId: original.targetId,
       backendId: f.secondary.id, permissionMode: original.permissionMode });
     expect(f.secondary.inputs[0]!.input.text).toContain("Initial work done.");
+    expect(f.store.getTarget(original.targetId).descriptor.backendId).toBe(f.primary.id);
+
+    const active = f.secondary.inputs[0]!.context;
+    const pending = active.requestInteraction({ id: "handoff-permission", kind: "permission", title: "Continue work",
+      toolName: "command", summary: "Run the next check", risk: "low", choices: ["allow_once", "deny_once"] });
+    await vi.waitFor(() => expect(currentTask().status).toBe("waiting"));
+    const interaction = f.store.listInteractions({ sessionId, status: "open" })[0]!;
+    const parent = f.store.getSession(f.parent).descriptor;
+    const tools = new PartnerSessionTaskTools(f.tasks);
+    const caller = { sessionId: parent.id, targetId: parent.targetId, generation: parent.binding.generation, providerGeneration: 1, effectIdentity: "b".repeat(64) };
+    const answer = (generation: number) => tools.callTool("message_session_task", { task_id: task.id,
+      interaction_id: interaction.id, interaction_generation: generation, decision: "allow_once" }, undefined, caller);
+    expect(interaction.generation).toBeGreaterThan(original.binding.generation);
+    expect((await answer(original.binding.generation)).isError).toBe(true);
+    const answered = await answer(interaction.generation);
+    expect(answered.isError, answered.content[0]!.text).toBe(false);
+    await expect(pending).resolves.toMatchObject({ kind: "selected", value: "allow_once" });
+
+    const abort = vi.spyOn(f.secondary, "abort");
+    const stopped = await tools.callTool("stop_session_task", { task_id: task.id, mode: "request-stop" }, undefined,
+      { ...caller, effectIdentity: "d".repeat(64) });
+    expect(stopped.isError, stopped.content[0]!.text).toBe(false);
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ sessionId, runId: active.runId }));
+    await vi.waitFor(() => expect(currentTask().status).toBe("cancelled"));
+
+    await f.tasks.close();
+    f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now);
+    await f.tasks.initialize();
+    expect(f.tasks.inspectRoute(f.parent, task.id).current).toMatchObject(f.route);
+    await f.tasks.message(f.parent, task.id, "task:mixed-after-restart", { mode: "queue", message: "Continue after restart" }, () => undefined);
+    await vi.waitFor(() => expect(f.secondary.inputs).toHaveLength(2));
+    await f.secondary.complete(sessionId, "Work completed on the adopted route.");
+    await vi.waitFor(() => expect(currentTask()).toMatchObject({ status: "completed", result: "Work completed on the adopted route." }));
+    await f.tasks.message(f.parent, task.id, "task:mixed-more", { mode: "queue", message: "Check one more file" }, () => undefined);
+    await vi.waitFor(() => expect(f.secondary.inputs).toHaveLength(3));
+    await f.secondary.fail(sessionId, "The second route also ran out of quota.");
+    await vi.waitFor(() => expect(currentTask().status).toBe("failed"));
+    await vi.waitFor(() => f.host.assertSessionLifecycleIdle(sessionId));
+    const next = f.tasks.inspectRoute(f.parent, task.id);
+    expect(next.next).toEqual(backup);
+    await f.tasks.advanceRoute(f.parent, task.id, next.generation, next.selection_token!, () => undefined);
+    expect(f.host.getSessionRuntimeControl(sessionId).effective).toMatchObject(backup);
+
+    await f.tasks.message(f.parent, task.id, "task:mixed-deadline", { mode: "queue", message: "Check the final result" }, () => undefined);
+    await vi.waitFor(() => expect(f.secondary.inputs).toHaveLength(4));
+    f.advance(10_001);
+    expect(await f.tasks.check(f.parent, task.id)).toMatchObject({ sessionId, status: "timed-out", timeoutMs: 10_000 });
+    const target = f.store.getTarget(original.targetId);
+    f.store.upsertTarget({ ...target.descriptor, trusted: false }, target.metadata);
+    await expect(f.tasks.message(f.parent, task.id, "task:mixed-retired", { mode: "queue", message: "More work" }, () => undefined))
+      .rejects.toMatchObject({ code: "TASK_CHANGED" });
+    expect(f.store.findOperation("task:mixed-retired")).toBeUndefined();
     expect(f.store.listSessions()).toHaveLength(2);
+  });
+  it("rechecks the original group authority inside route selection before staging a handoff", async () => {
+    const f = await fixture();
+    await f.partners.updatePartner(f.partner.id, f.partner.revision, { capabilities: { ...f.partner.capabilities,
+      modelChain: [...f.partner.capabilities.modelChain, f.route] } });
+    const group = await groupFixture(f);
+    const task = await f.tasks.start(group.sessionId, "group-route-task", { instruction: "Work in the group project", workingDir: f.project }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
+    await f.primary.fail(task.sessionId!, "The first route reached its limit.");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.status).toBe("failed"));
+    const selected = f.tasks.inspectRoute(group.sessionId, task.id);
+    expect(selected.next).toEqual(f.route);
+    const setRuntime = f.host.setSessionRuntimeControl.bind(f.host);
+    vi.spyOn(f.host, "setSessionRuntimeControl").mockImplementationOnce(async input => {
+      group.endExecution();
+      return setRuntime(input);
+    });
+    const caller = f.tasks.caller(group.sessionId);
+    await expect(f.tasks.advanceRoute(group.sessionId, task.id, selected.generation, selected.selection_token!, caller.assertCurrent))
+      .rejects.toThrow("owner execution ended");
+    expect(f.host.getSessionRuntimeControl(task.sessionId!).pending).toBeUndefined();
+    expect(f.store.getSession(task.sessionId!).descriptor.backendId).toBe(f.primary.id);
+    expect(f.secondary.inputs).toEqual([]);
   });
   it("rechecks context headroom before adopting a suggestion and leaves owner-selected routes outside the chain alone", async () => {
     const f = await fixture();

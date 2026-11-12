@@ -375,11 +375,12 @@ export class PartnerSessionTaskManager {
       if (!isActive(task.status) && task.status !== "unknown" && task.control === "active") return task;
       if (mode === "request-stop") {
         if (task.control !== "active") return task;
-        const claim = this.store.claimDeferredEffectOperation({ id: operationId, kind: "partner_task_stop_request", body: { taskId: id, sessionId: task.sessionId, execution: task.execution } }, () => assertCaller());
+        const assertOwner = () => { assertCaller(); this.#assertTaskSession(task); };
+        const claim = this.store.claimDeferredEffectOperation({ id: operationId, kind: "partner_task_stop_request", body: { taskId: id, sessionId: task.sessionId, execution: task.execution } }, assertOwner);
         if (!claim.claimed) return this.#reconcile(id);
         try {
           for (const run of this.store.listRuns({ sessionId: task.sessionId!, activeOnly: true, limit: 500 })) {
-            if (run.descriptor.state !== "queued") { assertCaller(); await this.host.abort(task.sessionId!, run.descriptor.id); }
+            if (run.descriptor.state !== "queued") await this.host.abort(task.sessionId!, run.descriptor.id, assertOwner);
           }
           this.store.completeDeferredEffectOperation(operationId, claim.operation.bodyHash, () => ({ requested: true }));
         } catch { throw new PartnerSessionTaskError("STOP_UNCONFIRMED", "The stop request is unconfirmed. Inspect the same execution before another control action."); }
@@ -413,10 +414,12 @@ export class PartnerSessionTaskManager {
   async advanceRoute(sessionId: string, id: string, generation: number, token: string, assertCaller: () => void) {
     return this.#serial(id, async () => {
       assertCaller(); const inspected = this.inspectRoute(sessionId, id);
-      if (inspected.generation !== generation || inspected.selection_token !== token || !inspected.next) throw changed();
-      const task = this.#owned(sessionId, id); this.#resolveModel(sessionId, inspected.next).assertCurrent();
+      const next = inspected.next;
+      if (inspected.generation !== generation || inspected.selection_token !== token || !next) throw changed();
+      const task = this.#owned(sessionId, id), selected = this.#resolveModel(sessionId, next);
+      const assertAuthority = () => { assertCaller(); this.#assertTaskSession(task); selected.assertCurrent(); };
       const result = await this.host.setSessionRuntimeControl({ sessionId: task.sessionId!, expectedGeneration: generation,
-        patch: { backendId: inspected.next.backendId, providerId: inspected.next.providerId, modelId: inspected.next.modelId, ...(inspected.next.effort === undefined ? {} : { effort: inspected.next.effort }), fastMode: inspected.next.fastMode } });
+        patch: next, assertAuthority });
       assertCaller(); return result;
     });
   }
@@ -746,7 +749,9 @@ export class PartnerSessionTaskManager {
   #assertTaskSession(task: PartnerSessionTaskRecord, allowRetiredTopic = false) {
     if (!task.sessionId) throw invalid("The independent task Session is unavailable.");
     const session = this.store.getSession(task.sessionId).descriptor, target = this.store.getTarget(task.targetId).descriptor;
-    if (session.targetId !== task.targetId || session.backendId !== task.route.backendId || session.archived || session.deletedAt !== undefined
+    // The target keeps the creation scope. SessionHost can adopt a new Backend
+    // on the same Session and target without transferring task ownership.
+    if (session.targetId !== task.targetId || target.backendId !== task.route.backendId || session.archived || session.deletedAt !== undefined
       || !target.trusted || target.workspaceRoot !== task.realDirectory) throw changed();
     const profile = this.partners.getPartner(task.partnerId), home = this.store.getTarget(profile.homeTargetId).descriptor;
     const requiresParent = !task.group && (!allowRetiredTopic || task.topicOperationId === undefined);
