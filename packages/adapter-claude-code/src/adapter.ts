@@ -6012,7 +6012,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         if (!turn || !this.#isTurnCurrent(runtime, turn)) return denied("The native operation has no active owner permission channel.");
         const requestId = `native-policy-${randomUUID()}`, options = { signal, requestId, toolUseID: _toolUseId ?? input.tool_use_id };
         const answer = await this.#requestInteraction(runtime, turn, { id: interactionId(runtime, requestId), kind: "permission", title: "Allow native tool?",
-          toolName: input.tool_name, summary: permissionSummary(input.tool_name, toolInput, options, this.#projection), risk: permissionRisk(input.tool_name),
+          toolName: input.tool_name, summary: permissionSummary(input.tool_name, toolInput, options, this.#projection, input.cwd), risk: permissionRisk(input.tool_name),
           choices: ["allow_once", "deny"] }, signal);
         signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
         context.assertExtraDirectoriesCurrent?.(directories);
@@ -9177,18 +9177,24 @@ function permissionSummary(
   toolName: string,
   input: Readonly<Record<string, unknown>>,
   options: ClaudeCanUseToolOptions,
-  projection: SafeProjection
+  projection: SafeProjection,
+  observedWorkingDirectory?: string
 ): string {
   const described = projection.text(options.description, 2048);
-  if (described.length > 0) return described;
+  const withDescription = (action: string) => described.length === 0 ? action : `${action}\n\n${described}`;
   if (shellTool(toolName)) {
-    const command = projection.text(input["command"], 2048);
-    return command.length === 0 ? "Run a workspace command." : `Run command: ${command}`;
+    const command = projection.text(input["command"], 4_096);
+    if (command.length === 0) return described || "Run a workspace command.";
+    const cwd = projection.text(input["cwd"] ?? input["workdir"] ?? observedWorkingDirectory, 1_024);
+    return withDescription(`Run command\n${command}${cwd.length === 0 ? "" : `\n\nWorking directory\n${cwd}`}`);
   }
-  if (fileMutationTool(toolName)) {
+  const modifiesFile = fileMutationTool(toolName);
+  if (modifiesFile || /^Read$/i.test(toolName)) {
     const path = projection.text(input["file_path"] ?? input["path"] ?? options.blockedPath, 2048);
-    return path.length === 0 ? "Modify a workspace file." : `Modify file: ${path}`;
+    if (path.length > 0) return withDescription(`${modifiesFile ? "Modify file" : "Read file"}\n${path}`);
+    if (modifiesFile) return described || "Modify a workspace file.";
   }
+  if (described.length > 0) return described;
   const titled = projection.text(options.displayName, 512);
   return titled.length === 0 ? `Use ${projection.identifier(toolName, "a tool")}.` : titled;
 }

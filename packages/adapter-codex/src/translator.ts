@@ -32,7 +32,7 @@ import {
   type RpcId,
   type ScalarCommandApprovalDecision
 } from "./protocol.js";
-import { CODEX_FILE_CHANGE_FALLBACK, projectCodexFileChanges } from "./file-change.js";
+import { CODEX_FILE_CHANGE_FALLBACK, projectCodexFileApproval, projectCodexFileChanges } from "./file-change.js";
 
 export interface ResolvedBlob {
   readonly data: Uint8Array;
@@ -562,7 +562,8 @@ export function interactionFromServerRequest(
   requestId: RpcId,
   method: string,
   params: JsonValue,
-  workspaceRoot: string
+  workspaceRoot: string,
+  cachedFileApproval?: string
 ): InteractionRequest | undefined {
   const record = objectValue(params, "interaction request");
   const interactionId = interactionIdentity(requestId, method, record);
@@ -592,13 +593,16 @@ export function interactionFromServerRequest(
   }
   if (method === "item/fileChange/requestApproval") {
     const reason = typeof record["reason"] === "string" ? safeText(record["reason"], 2_048) : "Apply the proposed workspace change.";
+    const files = record["changes"] === undefined || record["changes"] === null
+      ? cachedFileApproval : projectCodexFileApproval(record["changes"], safeText);
+    const root = typeof record["grantRoot"] === "string" ? safeText(record["grantRoot"], 1_024) : "";
     return {
       payload: {
         id: interactionId,
         kind: "permission",
         title: "Approve file changes",
         toolName: "file_change",
-        summary: reason,
+        summary: [files, root === "" ? undefined : `Requested write directory\n${root}`, reason].filter(Boolean).join("\n\n"),
         risk: "high",
         choices: ["allow_once", "deny_once"]
       },

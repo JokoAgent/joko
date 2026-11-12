@@ -199,6 +199,9 @@ describe("ClaudeCodeAdapter", () => {
         tool_name: "Read", tool_use_id: "read-ask", tool_input: { file_path: join(target.workspaceRoot, "private.txt") } };
       await expect(hook(input, "read-ask", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: outcome === "allow" ? "allow" : "deny" } });
       expect(requestInteraction).toHaveBeenCalledOnce();
+      expect(requestInteraction).toHaveBeenCalledWith(expect.objectContaining({
+        summary: `Read file\n${input.tool_input.file_path}`
+      }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
     } finally { await adapter.dispose(); }
   });
   test.each([false, true])("uses a temporary tool-free native Query for exact-model text/image review and retires it (images=%s)", async withImage => {
@@ -6759,7 +6762,8 @@ describe("ClaudeCodeAdapter", () => {
 
   test("maps permission, question, and plan tools to typed interactions with replay-safe decisions", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
-    const adapter = adapterFor(runtime);
+    const secret = "fixture-protected-value";
+    const adapter = adapterFor(runtime, { redactValues: [secret] });
     const interactions: InteractionPayload[] = [];
     const binding = await adapter.createSession(createInput(), contextFor().context);
     const active = contextFor(binding, {
@@ -6782,25 +6786,30 @@ describe("ClaudeCodeAdapter", () => {
     });
     await adapter.send(textPrompt("interact"), active.context);
     const query = runtime.queries[0]!;
-    const allowOptions = permissionOptions("permission-one", "tool-bash");
-    const allow = await query.params.options.canUseTool("Bash", { command: "pnpm test" }, {
+    const argument = "x".repeat(2_500);
+    const bash = { command: `printf '%s' '${argument}' && printf '%s' '${secret}' > report.txt`, cwd: target.workspaceRoot };
+    const allowOptions = { ...permissionOptions("permission-one", "tool-bash"), description: "Write the report." };
+    const allow = await query.params.options.canUseTool("Bash", bash, {
       ...allowOptions,
       suggestions: [
         { type: "addRules", destination: "session", rules: [], behavior: "allow" },
         { type: "addRules", destination: "projectSettings", rules: [], behavior: "allow" }
       ]
     });
-    expect(allow).toMatchObject({ behavior: "allow", updatedInput: { command: "pnpm test" } });
+    expect(allow).toMatchObject({ behavior: "allow", updatedInput: bash });
     expect(allow.behavior === "allow" ? allow.updatedPermissions : []).toHaveLength(1);
-    const replay = await query.params.options.canUseTool("Bash", { command: "pnpm test" }, allowOptions);
+    const replay = await query.params.options.canUseTool("Bash", bash, allowOptions);
     expect(replay).toEqual(allow);
 
     const denied = await query.params.options.canUseTool(
       "Edit",
       { file_path: "src/main.ts" },
-      permissionOptions("permission-two", "tool-edit")
+      { ...permissionOptions("permission-two", "tool-edit"), description: "Update the entry point." }
     );
     expect(denied).toEqual({ behavior: "deny", message: "The user denied this tool request." });
+    const read = { file_path: "docs/report.txt" };
+    await expect(query.params.options.canUseTool("Read", read, permissionOptions("permission-three", "tool-read")))
+      .resolves.toMatchObject({ behavior: "allow", updatedInput: read });
 
     const question = await query.params.options.canUseTool("AskUserQuestion", {
       questions: [
@@ -6835,11 +6844,16 @@ describe("ClaudeCodeAdapter", () => {
     expect(interactions.map((interaction) => interaction.kind)).toEqual([
       "permission",
       "permission",
+      "permission",
       "question",
       "plan_review"
     ]);
-    expect(interactions[0]).toMatchObject({ kind: "permission", risk: "high", toolName: "Bash" });
-    expect(interactions[1]).toMatchObject({ kind: "permission", risk: "medium", toolName: "Edit" });
+    expect(interactions[0]).toMatchObject({ kind: "permission", risk: "high", toolName: "Bash",
+      summary: `Run command\n${bash.command.replace(secret, "[REDACTED]")}\n\nWorking directory\n${bash.cwd}\n\nWrite the report.` });
+    expect(interactions[1]).toMatchObject({ kind: "permission", risk: "medium", toolName: "Edit",
+      summary: "Modify file\nsrc/main.ts\n\nUpdate the entry point." });
+    expect(interactions[2]).toMatchObject({ kind: "permission", risk: "low", toolName: "Read",
+      summary: "Read file\ndocs/report.txt" });
 
     query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0.1 }));
     await eventually(() => active.events.some((event) => event.type === "done"));

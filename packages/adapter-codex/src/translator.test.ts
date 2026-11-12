@@ -261,9 +261,12 @@ describe("Codex interaction translation", () => {
       threadId: "thread-one",
       turnId: "turn-one",
       itemId: "file-one",
-      reason: "Update a source file"
-    }, "D:\\workspace");
-    expect(file?.payload).toMatchObject({ kind: "permission", toolName: "file_change", choices: ["allow_once", "deny_once"] });
+      reason: "Update a source file",
+      grantRoot: "D:\\workspace",
+      changes: [{ path: "src/entry.ts", kind: { type: "update" }, diff: "-oldValue\n+newValue" }]
+    }, "D:\\workspace", "A different patch from an earlier item frame");
+    expect(file?.payload).toMatchObject({ kind: "permission", toolName: "file_change", choices: ["allow_once", "deny_once"],
+      summary: "update: src/entry.ts\n\nsrc/entry.ts\n-oldValue\n+newValue\n\nRequested write directory\nD:\\workspace\n\nUpdate a source file" });
     expect(file?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({ decision: "accept" });
     expect(file?.toResponse({ kind: "selected", value: "allow_for_session" })).toEqual({ decision: "decline" });
     expect(file?.toResponse({ kind: "cancelled" })).toEqual({ decision: "cancel" });
