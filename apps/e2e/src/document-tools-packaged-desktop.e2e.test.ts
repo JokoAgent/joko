@@ -322,12 +322,15 @@ tr:nth-child(even) td { background: #fafafa; }
   const filesHash = `#/files/${encodeURIComponent(sessionId)}?file=documents%2Fchart-report.pdf`;
   await page.evaluate((hash) => { window.location.hash = hash; }, filesHash);
   await page.locator('[data-file-kind="pdf"]').waitFor({ state: "visible", timeout: 30_000 });
-  await page.waitForFunction(() => document.querySelectorAll(".workspace-file-body__pdf-pages canvas").length === 2);
+  const pdfPages = page.locator(".workspace-file-body__pdf-pages [data-pdf-page]");
+  const firstPage = page.locator('.workspace-file-body__pdf-pages [data-pdf-page="1"]');
+  const secondPage = page.locator('.workspace-file-body__pdf-pages [data-pdf-page="2"]');
+  const firstCanvas = firstPage.locator("canvas");
+  await firstCanvas.waitFor({ state: "visible" });
   expect(await page.locator('[role="treeitem"][data-relative-path="documents/chart-report.pdf"]')
     .getAttribute("aria-selected")).toBe("true");
-  const canvases = page.locator(".workspace-file-body__pdf-pages canvas");
-  expect(await canvases.count()).toBe(2);
-  expect(await canvases.first().evaluate((element) => {
+  expect(await pdfPages.count()).toBe(2);
+  expect(await firstCanvas.evaluate((element) => {
     const canvas = element as HTMLCanvasElement;
     const pixels = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height).data;
     let colored = 0;
@@ -337,7 +340,10 @@ tr:nth-child(even) td { background: #fafafa; }
     }
     return colored;
   })).toBeGreaterThan(1000);
-  expect(await canvases.nth(1).evaluate((element) => {
+  await secondPage.evaluate(element => element.scrollIntoView({ block: "start" }));
+  const secondCanvas = secondPage.locator("canvas");
+  await secondCanvas.waitFor({ state: "visible" });
+  expect(await secondCanvas.evaluate((element) => {
     const canvas = element as HTMLCanvasElement;
     const pixels = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height).data;
     let ink = 0;
@@ -371,7 +377,8 @@ tr:nth-child(even) td { background: #fafafa; }
   await page.unroute(readPattern);
   expect(await page.locator(".workspace-file-body__pdf-pages canvas").count()).toBe(0);
   await page.evaluate((hash) => { window.location.hash = hash; }, filesHash);
-  await page.waitForFunction(() => document.querySelectorAll(".workspace-file-body__pdf-pages canvas").length === 2);
+  await firstCanvas.waitFor({ state: "visible" });
+  expect(await pdfPages.count()).toBe(2);
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForFunction(() => {
@@ -386,7 +393,8 @@ tr:nth-child(even) td { background: #fafafa; }
   await page.reload({ waitUntil: "domcontentloaded" });
   const reconnect = page.getByRole("button", { name: "Connect", exact: true });
   await reconnect.click({ timeout: 30_000 });
-  await page.waitForFunction(() => document.querySelectorAll(".workspace-file-body__pdf-pages canvas").length === 2);
+  await firstCanvas.waitFor({ state: "visible" });
+  expect(await pdfPages.count()).toBe(2);
   await rm(outputPath);
   await page.reload({ waitUntil: "domcontentloaded" });
   await reconnect.click({ timeout: 30_000 });
@@ -432,20 +440,27 @@ tr:nth-child(even) td { background: #fafafa; }
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.evaluate((hash) => { window.location.hash = hash; },
     `#/files/${encodeURIComponent(sessionId)}?file=documents%2Fvisual-report.pdf`);
-  await page.waitForFunction(() => document.querySelectorAll(".workspace-file-body__pdf-pages canvas").length === 3);
-  const visualInkByPage = await page.locator(".workspace-file-body__pdf-pages canvas").evaluateAll((elements) =>
-    elements.map((element) => {
-      const canvas = element as HTMLCanvasElement;
-      const pixels = canvas.getContext("2d")!.getImageData(0, 0, canvas.width, canvas.height).data;
+  await firstCanvas.waitFor({ state: "visible" });
+  expect(await pdfPages.count()).toBe(3);
+  expect(await pdfPages.nth(2).locator("canvas").count()).toBe(0);
+  for (const pdfPage of await pdfPages.all()) {
+    await pdfPage.evaluate(element => element.scrollIntoView({ block: "start" }));
+    const canvas = pdfPage.locator("canvas");
+    await canvas.waitFor({ state: "visible" });
+    expect(await canvas.evaluate((element) => {
+      const bitmap = element as HTMLCanvasElement;
+      const pixels = bitmap.getContext("2d")!.getImageData(0, 0, bitmap.width, bitmap.height).data;
       let ink = 0;
       for (let index = 0; index < pixels.length; index += 4) {
         if (pixels[index]! < 190 && pixels[index + 1]! < 190 && pixels[index + 2]! < 190
           && pixels[index + 3]! > 0) ink += 1;
       }
       return ink;
-    }));
-  expect(visualInkByPage).toHaveLength(3);
-  expect(visualInkByPage.every((ink) => ink > 100)).toBe(true);
+    })).toBeGreaterThan(100);
+  }
+  await firstCanvas.waitFor({ state: "detached" });
+  await firstPage.evaluate(element => element.scrollIntoView({ block: "start" }));
+  await firstCanvas.waitFor({ state: "visible" });
   expect(await page.locator('[role="treeitem"][data-relative-path="documents/visual-report.pdf"]')
     .getAttribute("aria-selected")).toBe("true");
   await expectExactNativeSave(page, desktopIdentity.pid, profileDirectory, visualBytes, "visual-report.pdf");

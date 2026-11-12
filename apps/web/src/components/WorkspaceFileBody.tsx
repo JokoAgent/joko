@@ -897,17 +897,19 @@ function AuthenticatedPdfPreview({ controller, preview, labels, className }: {
   readonly className?: string;
 }): JSX.Element {
   const artifact = useAuthenticatedArtifactUrl(controller, preview.blobId);
+  const scrollRoot = useRef<HTMLDivElement>(null);
   const [failedUrl, setFailedUrl] = useState<string>();
   if (artifact.status === "error" || (artifact.status === "ready" && failedUrl === artifact.url)) {
     return <BinaryFilePlaceholder controller={controller} preview={preview} labels={labels} className={className} />;
   }
   return <section className={cx("workspace-file-body workspace-file-body--pdf", className)} data-file-kind="pdf">
-    <div className="workspace-file-body__pdf-stage">
+    <div ref={scrollRoot} className="workspace-file-body__pdf-stage">
       {artifact.status === "loading" && <BodyInlineEmpty label={labels.loading} icon={<Spinner label={labels.loading} />} />}
       {artifact.status === "ready" && <WorkspacePdfCanvas
         url={artifact.url}
         label={`${labels.pdfPreview}: ${preview.name}`}
         loadingLabel={labels.loading}
+        scrollRoot={scrollRoot}
         onError={() => setFailedUrl(artifact.url)}
       />}
     </div>

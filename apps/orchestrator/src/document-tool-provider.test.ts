@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +24,8 @@ it("binds editable document creation to the current trusted local task and stric
     },
     publish: async input => {
       published.push(input);
-      return { path: `${input.root}/${input.outPath}`, relativePath: input.outPath, bytes: input.bytes.length };
+      return { path: `${input.root}/${input.outPath}`, relativePath: input.outPath, bytes: input.bytes.length,
+        sha256: createHash("sha256").update(input.bytes).digest("hex"), existingTarget: false };
     }
   });
   const context = { sessionId: "session", targetId: "target", generation: 3 };
@@ -113,7 +115,11 @@ it("advertises PDF rendering only with a renderer and binds publication to the c
       expect(input.html).toContain("Rendered report");
       return { buffer: Buffer.from("%PDF-1.4\nfixture"), fontsReady: false };
     } },
-    publish: async input => { published += 1; return { path: join(input.root, input.outPath), relativePath: input.outPath, bytes: input.bytes.length }; }
+    publish: async input => {
+      published += 1;
+      return { path: join(input.root, input.outPath), relativePath: input.outPath, bytes: input.bytes.length,
+        sha256: createHash("sha256").update(input.bytes).digest("hex"), existingTarget: false };
+    }
   });
   const context = { sessionId: "session", targetId: "target", generation: 7 };
   try {

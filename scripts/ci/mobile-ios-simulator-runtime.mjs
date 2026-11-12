@@ -559,6 +559,7 @@ async function capturePostUiFrame(ocr, identity, expectedPid) {
 }
 async function cleanup() {
   const errors = [];
+  let simulatorCleanup = udid ? "unconfirmed" : "not_created";
   if (metro?.pid) {
     try { process.kill(-metro.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") errors.push("Owned Metro group could not be stopped."); }
     for (let count = 0; count < 20 && !metroClosed; count++) await delay(100);
@@ -573,11 +574,12 @@ async function cleanup() {
         if (bundleId && owned.state === "Booted") await command("xcrun", ["simctl", "terminate", udid, bundleId], { cleanup: true }).catch(() => undefined);
         if (owned.state === "Booted") await command("xcrun", ["simctl", "shutdown", udid], { cleanup: true });
         await command("xcrun", ["simctl", "delete", udid], { cleanup: true });
-      }
+        simulatorCleanup = "deleted";
+      } else simulatorCleanup = "already_absent";
     } catch (error) { errors.push(error.message); }
   }
   if (evidence) save("cleanup.json", { simulatorUdid: udid, simulatorName: deviceName, ownedMetroPid: metro?.pid,
-    deletedOnlyCreatedSimulator: !!udid && errors.length === 0, errors });
+    simulatorCleanup, deletedOnlyCreatedSimulator: simulatorCleanup === "deleted" || simulatorCleanup === "already_absent", errors });
   clearTimeout(deadline); process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop);
   return errors;
 }
@@ -706,8 +708,16 @@ async function main() {
     stage = "screen observer compilation";
     await command("xcrun", ["swiftc", join(root, "scripts/ci/mobile-ios-screen-text.swift"), "-framework", "Vision", "-o", ocr],
       { timeout: 60_000, startupLabel: "compile-screen-observer" });
-    // Match React Native's Debug bundle options so the actual app can reuse
-    // the lazy graph compiled before the cold Simulator competes for resources.
+    await startOwnedSimulator({ bundleId, executable, compiledApp: app, executableSha256: await hashFile(binary),
+      startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
+    stage = "owned application installation";
+    const { container, installation } = await installOwnedApplication(app);
+    installedExecutable = realpathSync(join(requireSimulatorApplicationContainer(container), executable));
+    if (await hashFile(installedExecutable) !== await hashFile(binary)) throw new Error("The installed app bytes do not match the compiled artifact.");
+    installation.installedExecutableVerified = true;
+    save("installation-state.json", installation);
+    // Keep Metro out of the cold Simulator and installation phases. The app
+    // still reuses the same lazy Debug graph when it first launches.
     stage = "same-checkout Metro startup";
     const port = await freePort(), origin = `http://127.0.0.1:${port}`;
     startMetro(port); await waitForMetro(origin);
@@ -720,14 +730,6 @@ async function main() {
     const bundle = await fetch(bundleUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(120_000)]) });
     if (!bundle.ok) { await bundle.body?.cancel(); throw new Error("Metro could not compile the actual iOS app entry."); }
     await bundle.body?.pipeTo(new WritableStream());
-    await startOwnedSimulator({ bundleId, executable, compiledApp: app, executableSha256: await hashFile(binary),
-      startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
-    stage = "owned application installation";
-    const { container, installation } = await installOwnedApplication(app);
-    installedExecutable = realpathSync(join(requireSimulatorApplicationContainer(container), executable));
-    if (await hashFile(installedExecutable) !== await hashFile(binary)) throw new Error("The installed app bytes do not match the compiled artifact.");
-    installation.installedExecutableVerified = true;
-    save("installation-state.json", installation);
     stage = "first native launch";
     const firstStartedAt = Date.now(), firstPid = await launch(port);
     preInputApplication = { pid: firstPid, startedAt: firstStartedAt };
