@@ -93,6 +93,7 @@ export interface FixtureOptions {
   readonly backendFactories?: readonly BackendInstanceFactory[];
   readonly keepRoot?: boolean;
   readonly dictionaryPeerNodeId?: string;
+  readonly dictionaryPeerMulticastPort?: number;
   /** Rebind the same public address for paired-client restart and offline-cache journeys. */
   readonly publicPort?: number;
   readonly terminals?: OrchestratorApplication["terminals"];
@@ -475,6 +476,7 @@ export class OrchestratorE2eFixture {
     const dictionaryPeerStore = options.dictionaryPeerNodeId === undefined ? undefined : new VoiceDictionaryPeerStore(join(dataDirectory, "voice-dictionary-peers.db"));
     const voiceDictionaryPeers = dictionaryPeerStore === undefined ? undefined : new VoiceDictionaryPeerManager({
       store: dictionaryPeerStore, dictionary: voiceDictionary, nodeId: serverId, displayName: serverId,
+      ...(options.dictionaryPeerMulticastPort === undefined ? {} : { multicastPort: options.dictionaryPeerMulticastPort }),
       vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key"))
     });
     await voiceDictionaryPeers?.initialize();

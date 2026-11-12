@@ -86,6 +86,7 @@ export class VoiceDictionaryPeerManager {
     readonly logger?: NodeSyncLanLogger; readonly onChanged?: () => void;
     readonly debounceMilliseconds?: number; readonly fallbackMilliseconds?: number;
     readonly enableLan?: boolean;
+    readonly multicastPort?: number;
   }) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(options.nodeId) || options.displayName !== options.displayName.trim() ||
       options.displayName.length < 1 || options.displayName.length > 100 || /[\u0000-\u001f\u007f]/u.test(options.displayName)) throw new TypeError("Dictionary peer node metadata is invalid.");
@@ -93,7 +94,9 @@ export class VoiceDictionaryPeerManager {
     this.#nodeId = options.nodeId; this.#displayName = options.displayName;
     this.#codec = options.codec ?? new VoiceDictionaryPeerWorkerCodec();
     this.#decoder = new VoiceDictionaryPeerWireDecoder(this.#codec);
-    this.#transportFactory = options.transportFactory ?? ((value) => createVoiceDictionaryPeerTransport(value, this.#store, options.enableLan ?? true));
+    this.#transportFactory = options.transportFactory ?? ((value) => createVoiceDictionaryPeerTransport({
+      ...value, ...(options.multicastPort === undefined ? {} : { multicastPort: options.multicastPort })
+    }, this.#store, options.enableLan ?? true));
     this.#logger = options.logger ?? { debug: () => undefined, warn: () => undefined };
     this.#onChanged = options.onChanged ?? (() => undefined);
     this.#debounce = options.debounceMilliseconds ?? 8_000;
