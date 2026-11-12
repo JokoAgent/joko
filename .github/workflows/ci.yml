@@ -793,8 +793,8 @@ jobs:
         shell: bash
         run: pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
         env:
-          # Cold macOS runners reached draft recovery with under two seconds left in the full journey.
-          JOKO_DESKTOP_SMOKE_TIMEOUT_MS: ${{ runner.os == 'macOS' && '240000' || '' }}
+          # Hosted Windows and macOS runners reached late retirement or draft recovery at the 180-second deadline.
+          JOKO_DESKTOP_SMOKE_TIMEOUT_MS: "240000"
           JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
           JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
 
