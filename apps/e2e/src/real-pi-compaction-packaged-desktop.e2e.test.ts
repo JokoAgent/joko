@@ -22,7 +22,7 @@ import { _electron, type ElectronApplication, type Page, type Request } from "pl
 import { afterEach, describe, expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
-import { createE2eClients } from "./connect-clients.js";
+import { createE2eClients, type E2eClients } from "./connect-clients.js";
 import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { createPackagedDesktopStartupEvidence } from "./packaged-desktop-startup.js";
 import {
@@ -625,48 +625,24 @@ describe("packaged Desktop Pi compaction", () => {
       operation.mutation?.payload.case === "compactSession"
       && operation.state === OperationState.SUCCEEDED)).toHaveLength(2);
 
-    const requestCountBeforeSecondTurn = requests.length;
+    const secondTurnPrompt = "A second managed Desktop Pi turn before route switching.";
     secondTurn = true;
     await page.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
-      .fill("A second managed Desktop Pi turn before route switching.");
+      .fill(secondTurnPrompt);
     await page.locator(".session-pane").getByRole("button", { name: "Send", exact: true }).click();
-    await waitFor(() => Promise.resolve(requests.length), (count) => count > requestCountBeforeSecondTurn,
-      "second managed Desktop Pi provider request", 30_000);
-    await waitFor(() => managedClients.session.getSession({ sessionId }),
-      (response) => response.session?.state === SessionState.IDLE,
-      "second managed Desktop Pi turn idle", 30_000);
-    // Earlier turns may be outside the virtualized viewport after compaction.
-    // Check this completed turn in its current task rather than assuming every
-    // streaming paragraph across the whole document is globally unique.
+    const secondCompletion = await waitForManagedPiCompletion(managedClients, sessionId, secondTurnPrompt, secondTurnReply);
     const secondReply = page.locator(`[data-timeline-session-id='${sessionId}'] .message-assistant__body`)
       .getByText(secondTurnReply, { exact: true });
-    const replyDeadline = Date.now() + 30_000;
-    try {
-      await waitFor(() => secondReply.count(), count => count === 1,
-        "one completed second-turn reply in the current task", 30_000);
-      await secondReply.waitFor({ state: "visible", timeout: Math.max(1, replyDeadline - Date.now()) });
-    } catch (cause) {
-      const rendered = await secondReply.evaluateAll(elements => elements.slice(0, 8).map(element => {
-        const message = element.closest(".message-assistant");
-        const row = element.closest("[data-timeline-item-id]");
-        const owner = element.closest("[data-timeline-session-id]");
-        const style = getComputedStyle(element), bounds = element.getBoundingClientRect();
-        return { messageId: message?.getAttribute("data-message-client-id"), sourceEventId: message?.getAttribute("data-selection-quote-source-event-id"),
-          rowId: row?.getAttribute("data-timeline-item-id"), rowIds: row?.getAttribute("data-timeline-item-ids"),
-          timelineSessionId: owner?.getAttribute("data-timeline-session-id"), ownerParentClass: owner?.parentElement?.className,
-          connected: element.isConnected, textLength: element.textContent?.length, display: style.display, visibility: style.visibility,
-          opacity: style.opacity, width: bounds.width, height: bounds.height,
-          streaming: message?.querySelector(".streaming-cursor") != null };
-      })).catch(() => [{ unavailable: true }]);
-      const history = await managedClients.session.listSessionTimeline({ sessionId, limit: 80 }, { timeoutMs: 3_000 })
-        .then(response => response.events.filter(event => event.payload?.kind.case === "messageCompleted"
-          && event.payload.kind.value.role === MessageRole.ASSISTANT).slice(-12).map(event => ({
-          eventId: event.eventId, runId: event.identity?.runId, generation: event.identity?.generation?.toString()
-        }))).catch(() => [{ unavailable: true }]);
-      console.error("Managed packaged Pi: original second-turn reply observations.", JSON.stringify({ sessionId, rendered, history,
-        providerRequests: requests.length, summaryRequests: requests.filter(request => JSON.stringify(request.body).includes("You are a context summarization assistant")).length }));
-      throw cause;
-    }
+    // Read both visibility and identity in one browser task while the native
+    // history refresh replaces the live reply.
+    await waitFor(() => secondReply.evaluateAll(elements => elements.slice(0, 8).map(element => {
+      const message = element.closest(".message-assistant");
+      const bounds = element.getBoundingClientRect();
+      return { eventId: message?.getAttribute("data-selection-quote-source-event-id"),
+        streaming: message?.querySelector(".streaming-cursor") != null,
+        visible: !element.closest("[inert]") && getComputedStyle(element).visibility === "visible" && bounds.width > 0 && bounds.height > 0 };
+    })), rows => rows.length === 1 && rows[0]?.eventId === secondCompletion.eventId && rows[0].visible && !rows[0].streaming,
+    "one visible completed second-turn reply in the current task", 30_000);
     secondTurn = false;
 
     await page.evaluate(() => { window.location.hash = "/tasks/new?dialogue=pi"; });
@@ -890,19 +866,38 @@ describe("packaged Desktop Pi compaction", () => {
     const resumedRequest = JSON.stringify(requests.at(-1)?.body);
     expect(resumedRequest).toContain(resumedDraft);
     expect(resumedRequest).toContain(REAL_PI_RESPONSE_TEXT);
-    await waitFor(() => resumedClients.session.getSession({ sessionId }),
-      (response) => response.session?.state === SessionState.IDLE,
-      "resumed managed Desktop Pi turn idle", 30_000);
-    await resumedPage.getByText(REAL_PI_RESPONSE_TEXT, { exact: true }).first()
+    const resumedCompletion = await waitForManagedPiCompletion(resumedClients, sessionId, resumedDraft, REAL_PI_RESPONSE_TEXT);
+    await resumedPage.locator(`[data-timeline-session-id='${sessionId}'] [data-selection-quote-source-event-id='${resumedCompletion.eventId}'] .message-assistant__body`)
+      .getByText(REAL_PI_RESPONSE_TEXT, { exact: true })
       .waitFor({ state: "visible", timeout: 30_000 });
 
+    const previousCompactions = new Set((await resumedClients.operation.listOperations({ sessionId }))
+      .operations.map(operation => operation.operationId));
+    const requestsBeforeFailure = requests.length;
     failSummary = true;
     const resumedTrigger = resumedPage.getByRole("button", { name: "Click to compact context" });
     await resumedTrigger.click();
     await resumedPage.getByRole("dialog", { name: "Compact context?" })
       .getByRole("button", { name: "Compact", exact: true }).click();
     const failure = resumedPage.locator(".compact-action-feedback--failure");
-    await failure.waitFor({ state: "visible", timeout: 30_000 });
+    try {
+      await waitFor(() => resumedClients.operation.listOperations({ sessionId }), response => response.operations.some(operation =>
+        !previousCompactions.has(operation.operationId) && operation.mutation?.payload.case === "compactSession"
+          && operation.state === OperationState.FAILED), "failed compaction operation on the resumed task", 30_000);
+      expect(requests.slice(requestsBeforeFailure).some(request =>
+        JSON.stringify(request.body).includes("You are a context summarization assistant"))).toBe(true);
+      await failure.waitFor({ state: "visible", timeout: 30_000 });
+    } catch (cause) {
+      const operations = (await resumedClients.operation.listOperations({ sessionId }, { timeoutMs: 3_000 })).operations;
+      throw new Error(`The resumed task did not report the injected compaction failure: ${JSON.stringify({
+        requests: requests.length - requestsBeforeFailure,
+        operations: operations.filter(operation => !previousCompactions.has(operation.operationId)).map(operation => ({
+          id: operation.operationId, state: operation.state, kind: operation.mutation?.payload.case,
+          result: operation.result?.payload.case, error: operation.error?.code
+        })),
+        feedback: await resumedPage.locator(".compact-action-feedback").allInnerTexts()
+      })}`, { cause });
+    }
     failSummary = false;
     expect(await failure.getAttribute("role")).toBe("alert");
     expect(await failure.getAttribute("aria-live")).toBe("assertive");
@@ -1145,6 +1140,33 @@ describe("packaged Desktop Pi compaction", () => {
     recordLifecycle("automatic-verified");
   });
 });
+
+async function waitForManagedPiCompletion(clients: E2eClients, sessionId: string, input: string, reply: string) {
+  const accepted = await waitFor(async () => {
+    const { operations } = await clients.operation.listOperations({ sessionId });
+    return operations.find(operation => {
+      const payload = operation.mutation?.payload;
+      return operation.state === OperationState.SUCCEEDED && payload?.case === "sendInput"
+        && payload.value.input?.parts.flatMap(part => part.content.case === "text" ? [part.content.value] : []).join("") === input;
+    });
+  }, operation => operation !== undefined, "accepted SendInput for the managed Pi turn", 30_000);
+  if (accepted === undefined) throw new Error("The managed Pi input has no queue receipt.");
+  const runId = queueRunIdFrom(accepted);
+  await waitFor(() => clients.run.getRun({ runId }), response => response.run?.state === RunState.SUCCEEDED,
+    "the original managed Pi Run completed", 30_000);
+  const completions = await waitFor(async () => {
+    const history = await clients.session.listSessionTimeline({ sessionId, limit: 100 });
+    return history.events.flatMap(event => {
+      const payload = event.payload?.kind;
+      return event.identity?.runId === runId && payload?.case === "messageCompleted" && payload.value.role === MessageRole.ASSISTANT
+        ? [{ eventId: event.eventId, entryId: payload.value.nativeIdentity?.entryId,
+          text: payload.value.blocks.flatMap(block => block.content.case === "text" ? [block.content.value] : []).join("") }] : [];
+    });
+  }, rows => rows.some(row => !!row.entryId), "native completion for the original managed Pi Run", 30_000);
+  expect(completions).toHaveLength(1);
+  expect(completions[0]?.text).toBe(reply);
+  return completions[0]!;
+}
 
 function observePageErrors(page: Page): string[] {
   const errors: string[] = [];
