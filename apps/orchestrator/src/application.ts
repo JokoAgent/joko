@@ -60,7 +60,7 @@ import {
   type SshConfigFilePort
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
-import { OLLAMA_LOOPBACK_ORIGIN } from "@joko/local-model-runtime";
+import { OLLAMA_LOOPBACK_ORIGIN, OLLAMA_OPENAI_BASE_URL } from "@joko/local-model-runtime";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
 import { ContactStore, NotFoundError, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner, ProjectGitBootstrap } from "@joko/git-safety";
@@ -1547,10 +1547,13 @@ export async function createOrchestratorApplication(
   const managedProviderProxy = new ManagedProviderProxy({
     providers,
     fetch: createOutboundFetch(dependencies.resolveOutboundProxy),
-    fetchForRoute: route => route.backendId === claudeCodeBackendId && route.providerId === MANAGED_LOCAL_PROVIDER_ID
-      && route.api === "anthropic-messages" && route.baseUrl === OLLAMA_LOOPBACK_ORIGIN && route.requestPath === undefined
-      ? fetch
-      : route.backendId === codexBackendId && route.api === "openai-completions" ? streamManagedProvider : undefined,
+    fetchForRoute: route => {
+      if (route.providerId === MANAGED_LOCAL_PROVIDER_ID && route.requestPath === undefined && (
+        (route.backendId === claudeCodeBackendId && route.api === "anthropic-messages" && route.baseUrl === OLLAMA_LOOPBACK_ORIGIN)
+        || (route.backendId === codexBackendId && route.api === "openai-completions" && route.baseUrl === OLLAMA_OPENAI_BASE_URL)
+      )) return fetch;
+      return route.backendId === codexBackendId && route.api === "openai-completions" ? streamManagedProvider : undefined;
+    },
     assertOwner: (owner) => {
       const session = store.getSession(owner.sessionId).descriptor;
       const target = store.getTarget(owner.targetId).descriptor;
@@ -1571,12 +1574,12 @@ export async function createOrchestratorApplication(
         if (instance.state !== "available" || instance.generation !== generation) throw new Error("Managed Provider Backend instance is no longer current.");
       }
     });
-    if (backendId !== claudeCodeBackendId) return port;
+    if (backendId !== claudeCodeBackendId && backendId !== codexBackendId) return port;
     return {
       ...port,
       prepare: async (owner: Parameters<typeof port.prepare>[0]) => {
         if (owner.providerId === MANAGED_LOCAL_PROVIDER_ID && store.getTarget(owner.targetId).descriptor.remoteWorkspace !== undefined) {
-          throw new Error("The managed Ollama Provider requires a local Claude workspace.");
+          throw new Error("The managed Ollama Provider requires a local workspace.");
         }
         return port.prepare(owner);
       }
@@ -3202,6 +3205,7 @@ export async function createOrchestratorApplication(
     ownerId: serverId,
     ownerGeneration: durableRuntimeGeneration(),
     claudeBackendId: claudeCodeBackendId,
+    codexBackendId,
     onProviderChanged: async backendIds => {
       for (const backendId of backendIds) {
         if (backendId === providers.nativeAuthenticationBackendId) await refreshPiGeneration();

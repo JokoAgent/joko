@@ -17,12 +17,14 @@ const MANAGED_MARKER = "joko-local-runtime-v1";
 const MAX_MANAGED_MODELS = 512;
 
 type OllamaProtocol = "openai-completions" | "anthropic-messages";
+type OllamaCodingBackend = "claude-code" | "codex";
 export type LocalModelProviderCatalog = Pick<ProviderCatalogManager, "listConfigurations" | "delete" | "deleteRuntime" | "upsertConfiguration">;
 
 export interface LocalModelProviderCoordinatorOptions {
   readonly providers: LocalModelProviderCatalog;
   readonly backendId: string;
   readonly claudeBackendId?: string;
+  readonly codexBackendId?: string;
   readonly currentOwner: () => RuntimeOwnerGeneration | undefined;
   readonly bindings?: LocalModelProviderBindings;
 }
@@ -90,11 +92,16 @@ export class LocalModelProviderCoordinator {
     }
 
     const runtimes = [providerRuntime(this.options.backendId, "openai-completions", models, pi?.provider)];
-    const claudeBackendId = this.options.claudeBackendId;
-    if (claudeBackendId !== undefined) {
-      const compatible = models.filter(model => supportsClaudeOllamaModel(version, model.supportsTools, model.requiredRuntimeVersion));
-      const current = previous.find(runtime => runtime.backendId === claudeBackendId);
-      if (compatible.length > 0) runtimes.push(providerRuntime(claudeBackendId, "anthropic-messages", compatible, current?.provider));
+    const codingBackends = [
+      { id: this.options.claudeBackendId, kind: "claude-code", protocol: "anthropic-messages" },
+      { id: this.options.codexBackendId, kind: "codex", protocol: "openai-completions" }
+    ] as const;
+    for (const { id, kind, protocol } of codingBackends) {
+      if (id === undefined) continue;
+      const compatible = models.filter(model => supportsOllamaCodingModel(kind, version, model.supportsTools, model.requiredRuntimeVersion));
+      if (compatible.length === 0) continue;
+      const current = previous.find(runtime => runtime.backendId === id);
+      runtimes.push(providerRuntime(id, protocol, compatible, current?.provider, true));
     }
     if (pi !== undefined && previous.length === runtimes.length && runtimes.every(runtime => previous.some(candidate =>
       candidate.backendId === runtime.backendId && JSON.stringify(candidate.provider) === JSON.stringify(runtime.provider)))) {
@@ -122,6 +129,7 @@ export class LocalModelProviderCoordinator {
 
   private isOwnedRuntime(runtime: ProviderDescriptor): boolean {
     if (runtime.backendId === this.options.backendId) return isOwnedProvider(runtime, "openai-completions");
+    if (runtime.backendId === this.options.codexBackendId) return runtime.requestPath === undefined && isOwnedProvider(runtime, "openai-completions");
     return runtime.backendId === this.options.claudeBackendId && isOwnedProvider(runtime, "anthropic-messages");
   }
 
@@ -187,7 +195,7 @@ function validateModels(models: readonly ManagedRuntimeModel[]): readonly Manage
 }
 
 function providerRuntime(
-  backendId: string, protocol: OllamaProtocol, models: readonly ManagedRuntimeModel[], current?: PiManagedProvider
+  backendId: string, protocol: OllamaProtocol, models: readonly ManagedRuntimeModel[], current?: PiManagedProvider, coding = false
 ): ManagedProviderRuntimeInput {
   const costById = new Map((current?.models ?? []).flatMap((model) => model.cost === undefined ? [] : [[canonicalModelName(model.id), model.cost] as const]));
   return {
@@ -207,7 +215,7 @@ function providerRuntime(
           name: model.displayName,
           api: protocol,
           input: model.supportsImages ? ["text", "image"] : ["text"],
-          ...(protocol === "anthropic-messages" ? { supportsTools: model.supportsTools } : {}),
+          ...(coding ? { supportsTools: model.supportsTools } : {}),
           ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
           ...(cost === undefined ? {} : { cost }),
           compat: { supportsTools: model.supportsTools }
@@ -217,10 +225,13 @@ function providerRuntime(
   };
 }
 
-export function supportsClaudeOllamaModel(version: string | undefined, supportsTools: boolean, requires: string | undefined): boolean {
+export function supportsOllamaCodingModel(
+  backend: OllamaCodingBackend, version: string | undefined, supportsTools: boolean, requires: string | undefined
+): boolean {
   if (!supportsTools) return false;
   const current = parseVersion(version);
-  if (current === undefined || !atLeastVersion(current, [0, 14, 0])) return false;
+  const minimum = backend === "claude-code" ? [0, 14, 0] : [0, 13, 3];
+  if (current === undefined || !atLeastVersion(current, minimum)) return false;
   if (requires === undefined) return true;
   const required = parseVersion(requires);
   return required !== undefined && atLeastVersion(current, required);
