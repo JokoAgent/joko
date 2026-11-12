@@ -14149,7 +14149,12 @@ export class SessionHost {
       || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
     ) return;
     const initialBackendId = this.#store.getSession(sessionId).descriptor.backendId;
-    if (this.#backendDispatchBlocked(initialBackendId)) return;
+    if (this.#backendDispatchBlocked(initialBackendId)) {
+      // A terminal Run can reach this drain without owning a dispatch flight.
+      // Wake a deferred replacement even though the hold prevents any claim.
+      this.#onBackendMayBeIdle?.(initialBackendId);
+      return;
+    }
     let settle!: () => void;
     const settlement = new Promise<void>((resolve) => { settle = resolve; });
     this.#drainSettlements.set(sessionId, settlement);

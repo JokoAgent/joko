@@ -185,9 +185,11 @@ async function fixture(backendId: NativeBackend) {
     appServer: { ...options.appServer, transportFactory: () => { const transport = fake.createTransport(); transports.push(transport); return transport; } }
   }));
   const sdk = new PromptSdkRuntime();
-  vi.spyOn(claude, "createClaudeCodeAdapter").mockImplementation(options => new claude.ClaudeCodeAdapter({
-    ...options, runtime: sdk, initializationTimeoutMs: 1_000, teardownTimeoutMs: 500
-  }));
+  let credentialPort: claude.ClaudeCodeCredentialPort | undefined;
+  vi.spyOn(claude, "createClaudeCodeAdapter").mockImplementation(options => {
+    credentialPort = options.credentialPort;
+    return new claude.ClaudeCodeAdapter({ ...options, runtime: sdk, initializationTimeoutMs: 1_000, teardownTimeoutMs: 500 });
+  });
   const config: OrchestratorConfig = {
     host: "127.0.0.1", port: 0, internalPort: 4327,
     publicOrigin: "http://127.0.0.1", internalOrigin: "http://127.0.0.1:4327",
@@ -199,6 +201,16 @@ async function fixture(backendId: NativeBackend) {
   };
   const application = await createOrchestratorApplication(config);
   cleanups.push(() => application.close());
+  if (backendId === "claude-code") {
+    const expiresAt = Date.now() + 60 * 60_000;
+    expect(await credentialPort!.compareAndSet({
+      expected: undefined,
+      value: JSON.stringify({ format: 1, type: "oauth", accessToken: "fixture-access", refreshToken: "fixture-refresh",
+        expiresAt, scopes: ["user:inference"], subscriptionType: null, rateLimitTier: null }),
+      expiresAt
+    })).toBe(true);
+    await application.refreshBackendDescriptor(backendId);
+  }
   const challenge = application.connections.issuePairing("Maker memory owner");
   const paired = application.connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Maker memory owner" });
   const targetId = `${config.workspace.id}:${backendId}`;
@@ -208,7 +220,9 @@ async function fixture(backendId: NativeBackend) {
         nativeId: query.params.options.resume ?? query.params.options.sessionId, prompt: query.params.options.systemPrompt.append }))
     : transports.flatMap(transport => transport.requests.flatMap(request => {
         if (request.method !== "thread/start" && request.method !== "thread/resume") return [];
-        const params = request.params as { readonly threadId?: string; readonly developerInstructions?: string };
+        const params = request.params as { readonly threadId?: string; readonly developerInstructions?: string; readonly approvalPolicy?: string };
+        // Host reapplies permissions on the loaded thread after attaching it.
+        if (request.method === "thread/resume" && params.approvalPolicy !== undefined) return [];
         return [{ kind: request.method === "thread/start" ? "start" as const : "resume" as const,
           nativeId: params.threadId, prompt: params.developerInstructions }];
       }));
