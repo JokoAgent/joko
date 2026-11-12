@@ -168,6 +168,43 @@ describe("native file reading", () => {
     await act(async () => { root.unmount(); });
   });
 
+  it("renders Markdown and focuses lines beyond the bounded source list", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const text = "Introduction\r\n\r\n".repeat(2_500) + "## Closing note\r\nFinal paragraph";
+    const byteSize = BigInt(new TextEncoder().encode(text).length);
+    const preview = { ...base, sourceLabel: "docs/notes.md", fileName: "notes.md", mediaType: "text/markdown",
+      text, byteSize, endByte: byteSize, totalLines: 5_002, focusLine: 5_001 };
+    const props = { preview, colors, locale: "en" as const };
+
+    await act(async () => { root.render(createElement(MobileFileTextPreview, props)); });
+    const rendered = new DOMParser().parseFromString(native.web!.source.html, "text/html");
+    const heading = rendered.querySelector('[data-source-line="5000"]');
+    const readerScript = rendered.querySelector("script")?.textContent;
+    if (!heading || !readerScript) throw new Error("The rendered preview is missing its heading or focus script.");
+    expect(heading.querySelector("h2")?.textContent).toBe("Closing note");
+    expect(rendered.querySelector('[data-source-line="5001"] p')?.textContent).toBe("Final paragraph");
+    const scrollToHeading = vi.fn();
+    Object.defineProperty(heading, "scrollIntoView", { value: scrollToHeading });
+    new Function("document", "window", readerScript)(rendered, { addEventListener: vi.fn() });
+    expect(scrollToHeading).toHaveBeenCalledExactlyOnceWith({ block: "center" });
+    expect(container.textContent).toContain("Line 5001");
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Source"]')!.click(); });
+    expect(native.list!.data).toHaveLength(5_000);
+    expect(container.textContent).toContain("Showing the first 5000 lines.");
+    expect(container.textContent).toContain("Line 5001 is outside this preview.");
+    expect(container.querySelector("[data-document]")).toBeNull();
+
+    await act(async () => { root.render(createElement(MobileFileTextPreview, { ...props,
+      preview: { ...preview, truncated: true, byteSize: byteSize + 20n, totalLines: 5_005, focusLine: 5_005 } })); });
+    expect(container.textContent).toContain("Preview is truncated");
+    expect(container.textContent).toContain("Line 5005 is outside this preview.");
+    expect(container.textContent).not.toContain("Showing the first 5000 lines.");
+    await act(async () => { root.unmount(); });
+  });
+
   it("renders complete HTML with scripts and bounded SDK navigation, and switches the same loaded full source", async () => {
     const container = document.createElement("div"); const root = createRoot(container);
     const text = '<!doctype html><p>HTML</p>\n' + '<!-- line -->\n'.repeat(5_001) + '<button onclick="this.textContent=\'Done\'">Go</button>';

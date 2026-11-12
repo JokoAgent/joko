@@ -12703,8 +12703,9 @@ describe("native current-task Files ownership", () => {
     expect(() => copy.assertCurrent()).toThrow(); f.app.setForeground(false); expect(f.network.submit).not.toHaveBeenCalled();
   });
 
-  it("renders file Markdown resources relative to its canonical parent and retires stale or replaced preview sources", async () => {
-    const body = "## Document\n![Pixel](pixel.png) ![outside](../../private.png)\n" + "long document ".repeat(16_000);
+  it("renders file Markdown resources past the source line limit and retires stale or replaced preview sources", async () => {
+    const body = "## Document\r\n\r\n" + "Short paragraph\r\n\r\n".repeat(2_499)
+      + "![Pixel](pixel.png) ![outside](../../private.png)\r\n\r\n" + "long document ".repeat(16_000);
     const bytes = await sharp({ create: { width: 1, height: 1, channels: 3, background: "orange" } }).png().toBuffer(); const length = BigInt(new TextEncoder().encode(body).length);
     const observed = create(FileRevisionSchema, { opaqueRevision: "document-r1", byteSize: length, modifiedAt: { seconds: 100n } });
     const doc = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "docs/README.md", displayName: "README.md", kind: FileKind.REGULAR, mediaType: "text/markdown", revision: observed });
@@ -12716,7 +12717,7 @@ describe("native current-task Files ownership", () => {
     const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
     vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, parent) => ({ entries: parent === "docs" ? [doc, picture] : [sourceDirectory], revision: "directory-" + parent }));
     vi.mocked(network.readWorkspaceFile).mockImplementation(async (_credential, _workspace, path) => path === doc.relativePath
-      ? create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: { utf8Text: body, startByte: 0n, endByte: length, totalLines: 3 } } })
+      ? create(FilePreviewSchema, { entry: canonical, content: { case: "text", value: { utf8Text: body, startByte: 0n, endByte: length, totalLines: 5_003 } } })
       : create(FilePreviewSchema, { entry: picture, content: { case: "image", value: { blob, widthPixels: 1, heightPixels: 1 } } }));
     vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
     const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles(); await app.openFilesDirectory("docs");
