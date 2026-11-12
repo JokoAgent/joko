@@ -9204,9 +9204,13 @@ function permissionSummary(
     if (path.length > 0) return withDescription(`${modifiesFile ? "Modify file" : "Read file"}\n${path}`);
     if (modifiesFile) return described || "Modify a workspace file.";
   }
-  if (described.length > 0) return described;
   const titled = projection.text(options.displayName, 512);
-  return titled.length === 0 ? `Use ${projection.identifier(toolName, "a tool")}.` : titled;
+  const explanation = described || titled;
+  if (Object.keys(input).length > 0) {
+    const args = projection.json(input, 500);
+    return [`Tool arguments\n${args}`, explanation].filter(Boolean).join("\n\n");
+  }
+  return explanation || `Use ${projection.identifier(toolName, "a tool")}.`;
 }
 
 function permissionRisk(toolName: string): "low" | "medium" | "high" {

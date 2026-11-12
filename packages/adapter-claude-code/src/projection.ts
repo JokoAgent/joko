@@ -105,9 +105,9 @@ export class SafeProjection {
     return projected.length === 0 ? fallback : projected;
   }
 
-  json(value: unknown): string {
+  json(value: unknown, maximum = MAX_TOOL_TEXT): string {
     try {
-      return this.text(JSON.stringify(boundedJsonValue(value)), MAX_TOOL_TEXT);
+      return this.text(JSON.stringify(boundedJsonValue(value)), maximum);
     } catch {
       return "[Input could not be displayed.]";
     }

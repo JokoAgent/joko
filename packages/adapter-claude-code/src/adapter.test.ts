@@ -6821,6 +6821,15 @@ describe("ClaudeCodeAdapter", () => {
       })).resolves.toMatchObject({ behavior: "allow", updatedInput: input });
     }
 
+    const catalogInput = { collection: "reports", options: { filter: secret, api_key: "fixture-credential-field" } };
+    await expect(query.params.options.canUseTool("mcp__catalog__inspect", catalogInput, {
+      ...permissionOptions("permission-catalog", "tool-catalog"), description: "Inspect the selected collection."
+    })).resolves.toMatchObject({ behavior: "allow", updatedInput: catalogInput });
+    const extendedInput = { path: "docs/report.txt", body: "x".repeat(1_000) };
+    await expect(query.params.options.canUseTool("FixtureTool", extendedInput, {
+      ...permissionOptions("permission-fixture", "tool-fixture"), displayName: "Review the fixture input"
+    })).resolves.toMatchObject({ behavior: "allow", updatedInput: extendedInput });
+
     const question = await query.params.options.canUseTool("AskUserQuestion", {
       questions: [
         {
@@ -6858,6 +6867,8 @@ describe("ClaudeCodeAdapter", () => {
       "permission",
       "permission",
       "permission",
+      "permission",
+      "permission",
       "question",
       "plan_review"
     ]);
@@ -6872,6 +6883,16 @@ describe("ClaudeCodeAdapter", () => {
       { kind: "permission", risk: "low", toolName: "Glob", summary: "Search pattern\n**/*.test.ts" },
       { kind: "permission", risk: "medium", toolName: "NotebookEdit", summary: "Modify file\nresearch/notes.ipynb" }
     ]);
+    expect(interactions[6]).toMatchObject({
+      kind: "permission", risk: "low", toolName: "mcp__catalog__inspect",
+      summary: 'Tool arguments\n{"collection":"reports","options":{"filter":"[REDACTED]","api_key":"[REDACTED]"}}\n\nInspect the selected collection.'
+    });
+    const extended = interactions[7];
+    expect(extended).toMatchObject({
+      kind: "permission", risk: "low", toolName: "FixtureTool",
+      summary: expect.stringMatching(/^Tool arguments\n\{"path":"docs\/report\.txt","body":"x+\n\[Truncated\]\n\nReview the fixture input$/u)
+    });
+    expect(extended?.kind === "permission" && extended.summary.split("\n\n")[0]?.length).toBe(515);
 
     query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0.1 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
