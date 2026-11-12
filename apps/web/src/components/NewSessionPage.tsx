@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { ensureNewSessionModelProject } from "../new-session-model-project.js";
+import { contactsDraftOwnerMatches, type ContactsDraftOwner } from "../contacts-draft.js";
 import { resolveNewSessionModelRequest } from "../new-session-provider-model.js";
 import {
   composerDocumentIsEmpty,
@@ -153,6 +154,7 @@ interface NewSessionPageProps {
   readonly initialDialogueBackendId?: string;
   readonly recommendationNonce?: string;
   readonly initialModel?: NewSessionModelRequest;
+  readonly contactsDraft?: ContactsDraftOwner;
   readonly projectPickerRequest?: NewSessionProjectPickerRequest;
   readonly onProjectPickerRequestConsumed?: (requestId: number) => void;
   readonly navigationOpen: boolean;
@@ -196,8 +198,9 @@ interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation
 }
 
 /** Delayed-create route rendered within Joko's visual language. */
-export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, initialModel, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
-  const projectTargets = snapshot.targets.filter((target) => !target.archived);
+export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, initialModel, contactsDraft, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
+  const contactsOwnerCurrent = contactsDraft === undefined || contactsDraftOwnerMatches(contactsDraft, controller.state.activeProfile);
+  const projectTargets = contactsDraft === undefined ? snapshot.targets.filter((target) => !target.archived) : [];
   const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
     const candidate = snapshot.backends.find((backend) => backend.id === target.backendId);
     return candidate !== undefined
@@ -248,6 +251,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [fastMode, setFastMode] = useState<boolean | "ultrafast">(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
   const [fullAccessConfirmation, setFullAccessConfirmation] = useState<FullAccessConfirmation>();
+  const [contactsTrust, setContactsTrust] = useState<{ readonly connectionGeneration: number; readonly backendId: string }>();
   const [planMode, setPlanMode] = useState(false);
   const [worktreeEnabled, setWorktreeEnabled] = useState(() => controller.state.preferences.newSessionWorktreeEnabled);
   const [worktreeSourceRef, setWorktreeSourceRef] = useState<string>();
@@ -328,6 +332,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const translatorRef = useRef(t);
   const draftSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   const latestDraftRef = useRef<{ readonly controller: AppController; readonly draft: NewSessionLocalDraft } | undefined>(undefined);
+  const contactsDialogueRef = useRef<NewSessionLocalDraft["contactsDialogue"]>(undefined);
   const restoredExecutionRef = useRef<NewSessionLocalDraft | undefined>(undefined);
   const consumedModelRequestRef = useRef<string | undefined>(undefined);
   const typedPaletteTriggerRef = useRef<"/" | "@" | undefined>(undefined);
@@ -1063,6 +1068,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const hydrationOwnerScope = profileScope;
     setHydrated(false);
     setHydratedProfileScope(undefined);
+    contactsDialogueRef.current = undefined;
+    setContactsTrust(undefined);
     setRecommendationReturn(undefined);
     setRecommendationRetry(false);
     setRecommendationRestored(false);
@@ -1070,8 +1077,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setDraftError(undefined);
     setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends,
       readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current?.backendId));
+    if (!contactsOwnerCurrent) {
+      setDraftError(translatorRef.current("contacts.organizeOriginalNode"));
+      return;
+    }
     void (async () => {
-      const pendingReader = typeof controllerRef.current.readPendingExtensionUse === "function"
+      const pendingReader = contactsDraft === undefined && typeof controllerRef.current.readPendingExtensionUse === "function"
         ? controllerRef.current.readPendingExtensionUse()
         : Promise.resolve(undefined);
       const [draftResult, pendingResult, suggestionResult] = await Promise.allSettled([
@@ -1082,7 +1093,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (cancelled) return;
       const suggestion = suggestionResult.status === "fulfilled" ? suggestionResult.value : undefined;
       const draft = suggestion?.draft ?? (draftResult.status === "fulfilled" ? draftResult.value : undefined);
-      preparationRef.current = draft?.preparation; setPreparation(draft?.preparation);
+      const restoredPreparation = contactsDraft === undefined ? draft?.preparation : undefined;
+      preparationRef.current = restoredPreparation; setPreparation(restoredPreparation);
+      if (contactsDraft !== undefined && draftResult.status === "fulfilled") {
+        contactsDialogueRef.current = draft?.contactsDialogue ?? {
+          requestId: randomUuid(), name: translatorRef.current("contacts.organizeTaskName")
+        };
+      }
       setPrewarmInputIntent(false);
       const pending = recommendationNonce === undefined && pendingResult.status === "fulfilled" ? pendingResult.value : undefined;
       let hydrationError = draftResult.status === "rejected"
@@ -1105,13 +1122,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           ?? (draft.selection.kind === "unselected"
             ? undefined
             : draft.selection.kind === "target"
-              ? draft.selection
+              ? contactsDraft === undefined ? draft.selection : undefined
               : parseNewSessionSelection(newSessionSelectionValue(draft.selection), projectTargets, eligibleDialogueBackends))
           ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends, preferredBackend);
       const restored = draft === undefined || restoredSelection === undefined
         ? undefined
         : { ...draft, selection: restoredSelection };
-      let restoredDocument = normalizeComposerDocument(draft?.editorDocument, draft?.text ?? "");
+      const initialPrompt = contactsDialogueRef.current === undefined ? "" : translatorRef.current("contacts.organizePrompt");
+      let restoredDocument = normalizeComposerDocument(draft?.editorDocument, draft?.text ?? initialPrompt);
       let restoredText = composerDocumentPlainText(restoredDocument);
       const restoredMentions = draft?.mentions ?? [];
       let restoredRanges = restoreComposerInlineMentionRanges(restoredText, restoredMentions, draft?.inlineMentionRanges);
@@ -1179,7 +1197,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       cancelled = true;
       requestController.abort();
     };
-  }, [initialDialogueBackendId, initialTargetId, profileScope, recommendationNonce, recommendationHydrationRetryRevision]);
+  }, [initialDialogueBackendId, initialTargetId, profileScope, recommendationNonce, recommendationHydrationRetryRevision, contactsDraft, contactsOwnerCurrent]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -1431,6 +1449,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useEffect(() => {
     if (!hydrated || hydratedProfileScope !== profileScope || submitting) return;
     const draft: NewSessionLocalDraft = {
+      ...(contactsDialogueRef.current === undefined ? {} : { contactsDialogue: contactsDialogueRef.current }),
       ...(preparationRef.current === undefined ? {} : { preparation: preparationRef.current }),
       selection: selection ?? { kind: "unselected" },
       nativeStart: startKind === "attach" && selected !== undefined && nativeReference.length > 0
@@ -1482,11 +1501,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     !worktreePreferenceSaving
     && (!worktreeEnabled || (!worktreeLoading && worktreeError === undefined && worktreeEligible))
   );
-  const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmation === undefined && !submitting;
-  const personalDraft = composerBuiltInCommand(text, commandOptions)?.kind === "personalDevelopment";
+  const contactsReady = contactsDraft === undefined || (contactsOwnerCurrent && contactsDialogueRef.current !== undefined
+    && contactsTrust !== undefined && contactsTrust.connectionGeneration === controller.state.connectionGeneration
+    && contactsTrust.backendId === backend?.id);
+  const canFinishVoiceSend = contactsReady && hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmation === undefined && !submitting;
+  const personalDraft = contactsDraft === undefined && composerBuiltInCommand(text, commandOptions)?.kind === "personalDevelopment";
   const canSend = (canFinishVoiceSend || personalDraft && personalDevelopmentSupported && hydrated && !submitting)
     && hasInput && !voice.active;
-  const prewarmDraft: NewSessionDraft | undefined = selection?.kind === "target" && selected?.trusted === true
+  const prewarmDraft: NewSessionDraft | undefined = contactsDraft === undefined && selection?.kind === "target" && selected?.trusted === true
     && selected.remoteWorkspace === undefined && targetWorkspaceReady && startKind === "fresh"
     && backend?.capabilities.get("session.prewarm")?.supported === true && modelRouteReady && selectedModel !== undefined
     && !effectiveWorktreeEnabled && (!worktreeRequested || worktreeConfirmedIneligible)
@@ -1525,6 +1547,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const submissionScope = useMemo(() => ({}), [
     profileScope,
     controller.state.connectionGeneration,
+    contactsReady,
     selectionKey,
     selected?.revision,
     backend?.id,
@@ -1550,7 +1573,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const submissionEpochRef = useRef<object | undefined>(undefined);
   const submissionScopeRef = useRef(submissionScope); submissionScopeRef.current = submissionScope;
   const submissionValidityRef = useRef(false);
-  submissionValidityRef.current = hydrated && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmationRef.current === undefined && controller.state.connectionState === "connected";
+  submissionValidityRef.current = contactsReady && hydrated && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmationRef.current === undefined && controller.state.connectionState === "connected";
   useLayoutEffect(() => {
     const ownerWindow = voiceRoot?.ownerDocument.defaultView;
     const activate = (): void => { submissionEpochRef.current = {}; };
@@ -2077,7 +2100,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, sourceRanges);
     const sourceBrowserComments = browserCommentsRef.current;
     const sourceAttachments = attachmentsRef.current;
-    const candidateCommand = composerBuiltInCommand(sourceText, commandOptions);
+    const candidateCommand = contactsDraft === undefined ? composerBuiltInCommand(sourceText, commandOptions) : undefined;
     const parsedCommand = candidateCommand?.kind === "personalDevelopment" && runtimeCommandOwnsApplicationCommand(availableGlobalCommands,
       candidateCommand.mode === "check" ? "joko-make-doctor" : "joko-make") ? undefined : candidateCommand;
     const learnCommand = parsedCommand?.kind === "learn" ? parsedCommand : undefined;
@@ -2094,7 +2117,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       && !(worktreePreferenceRelevant && worktreePreferenceSavingRef.current)
       && fullAccessConfirmationRef.current === undefined
       && !submitting && !voice.isActive();
-    if (!activeCanSend || personalCommand === undefined && selection === undefined || submissionRef.current) {
+    if (!contactsReady || !activeCanSend || personalCommand === undefined && selection === undefined || submissionRef.current) {
       if (options.propagateError === true) throw new Error(t("composer.inputUnavailable"));
       return;
     }
@@ -2197,9 +2220,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     };
     const attempt = {}; submissionRef.current = attempt;
     const request = new AbortController(); submissionAbortRef.current = request;
+    const contactsDialogue = contactsDraft === undefined ? undefined : contactsDialogueRef.current;
     const owner: NewSessionSubmissionOwner = {
       ownerDocument,
       signal: request.signal,
+      ...(contactsDialogue === undefined ? {} : { contactsDialogueRequestId: contactsDialogue.requestId }),
       ...(beforeFirstInput === undefined ? {} : { beforeFirstInput }),
       ...(firstInputDisposition === undefined ? {} : { firstInputDisposition }),
       ...(onAccepted === undefined && !clearDraftOnAccepted
@@ -2269,7 +2294,16 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     try {
       await draftSaveChainRef.current;
       if (!owner.isCurrent()) return;
-      const prepared = await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
+      if (contactsDialogue !== undefined) {
+        const latest = latestDraftRef.current;
+        if (latest === undefined || latest.draft.contactsDialogue?.requestId !== contactsDialogue.requestId) throw new Error(t("composer.inputUnavailable"));
+        await enqueueNewSessionDraftSave(draftSaveChainRef, { current: latest.controller }, {
+          ...latest.draft, text: sourceText, editorDocument: sourceEditorDocument, attachments: sourceAttachments,
+          browserComments: sourceBrowserComments, mentions: sourceMentions, inlineMentionRanges: sourceRanges
+        });
+        if (!owner.isCurrent()) return;
+      }
+      const prepared = contactsDialogue !== undefined ? {} : await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
         name: t("session.newName"), nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
           ? { kind: "attach", reference: selectedNativeSession!.reference } : { kind: "fresh" }, providerId: selectedModel?.providerId ?? "", modelId: selectedModel?.modelId ?? "",
         ...(execution.effortSelectable && effort.length > 0 ? { effort } : {}), fastMode: execution.fastModeSelectable && fastMode,
@@ -2282,7 +2316,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ...(selection.kind === "target" && selected !== undefined
           ? { expectedTargetRevision: selected.revision }
           : {}),
-        name: t("session.newName"),
+        name: contactsDialogue?.name ?? t("session.newName"),
         nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
           ? { kind: "attach", reference: selectedNativeSession!.reference }
           : { kind: "fresh" },
@@ -2611,7 +2645,20 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     <header className="new-task-page__header">
       {!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
       <div className="new-task-context" aria-label={t("session.newDescription")}>
-        <NewTaskProjectPicker value={selectionKey}
+        {contactsDraft !== undefined ? <label className="new-task-context__control">
+          <span className="sr-only">{t("controls.backend")}</span>
+          <SelectControl value={selection?.kind === "dialogue" ? selection.backendId : ""}
+            disabled={!hydrated || submitting || controller.state.connectionState !== "connected"}
+            onChange={(event) => {
+              const value = event.currentTarget.value;
+              if (!eligibleDialogueBackends.some(candidate => candidate.id === value)) return;
+              setContactsTrust(undefined);
+              setSelection({ kind: "dialogue", backendId: value });
+            }}>
+            <option value="" disabled>{t("contacts.organizeChooseBackend")}</option>
+            {eligibleDialogueBackends.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
+          </SelectControl>
+        </label> : <NewTaskProjectPicker value={selectionKey}
           selectedName={selected?.name ?? (selection?.kind === "dialogue" ? `${t("newTask.dialogue")} · ${backend?.name ?? ""}` : t("session.noProjects"))}
           projects={projectPickerOptions} dialogues={dialoguePickerOptions} recent={recentOptions}
           ownerKey={`${profileScope}\u0000${snapshot.generation}`}
@@ -2624,7 +2671,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             setProjectEditorInitialDirectory(undefined);
             setProjectCreateError(undefined);
             setProjectEditorOpen(true);
-          }} onAddRemote={() => { setRemoteProjectCreateError(undefined); setRemoteProjectEditorOpen(true); }} t={t} />
+          }} onAddRemote={() => { setRemoteProjectCreateError(undefined); setRemoteProjectEditorOpen(true); }} t={t} />}
         {canDiscover && <label className="new-task-context__control new-task-context__control--native">
           <span className="sr-only">{t("session.startMode")}</span>
           <SelectControl value={startKind} disabled={submitting} onChange={(event) => { const next = event.target.value as "fresh" | "attach"; setStartKind(next); setNativeSelectionWarning(undefined); if (next === "fresh") setNativeReference(""); }}>
@@ -2658,8 +2705,19 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       <section className="new-task-page__content" aria-labelledby="new-task-title">
         <div className="new-task-brand">
           <span className="brand-mark brand-mark--avatar" aria-hidden="true" />
-          <div><strong>{t("app.name")}</strong><h1 id="new-task-title">{t("nav.newTask")}</h1></div>
+          <div><strong>{t("app.name")}</strong><h1 id="new-task-title">{t(contactsDraft === undefined ? "nav.newTask" : "contacts.organize")}</h1></div>
         </div>
+
+        {contactsDraft !== undefined && contactsOwnerCurrent && <label className="check-row">
+          <CheckboxControl checked={contactsReady} disabled={!hydrated || backend === undefined || submitting || controller.state.connectionState !== "connected"}
+            onChange={(event) => {
+              const connectionGeneration = controller.state.connectionGeneration;
+              setContactsTrust(event.currentTarget.checked && connectionGeneration !== undefined && backend !== undefined
+                ? { connectionGeneration, backendId: backend.id } : undefined);
+            }} />
+          <span><strong>{t("contacts.organizeTrust", { node: controller.state.activeProfile?.name ?? "" })}</strong>
+            <small>{t("projects.trustWarning")}</small></span>
+        </label>}
 
         {selection?.kind === "target" && workspacePreparationLoading && <div className="new-task-warning" role="status"><FolderKanban aria-hidden="true" /><span>{t("newTask.workspaceChecking")}</span></div>}
         {selection?.kind === "target" && !workspacePreparationLoading && (targetStaticUnavailableReason ?? currentWorkspacePreparationError) !== undefined && <div className="new-task-warning" role="alert"><AlertTriangle aria-hidden="true" /><span>{targetStaticUnavailableReason ?? currentWorkspacePreparationError}</span>{targetStaticReady && currentWorkspacePreparationError !== undefined && <Button tone="ghost" disabled={submitting} onClick={() => setWorkspacePreparationRevision((value) => value + 1)}>{t("common.retry")}</Button>}</div>}

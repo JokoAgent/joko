@@ -26,6 +26,7 @@ import darkAppIconUrl from "@joko/brand-assets/icon-dark.svg?url";
 import lightAppIconUrl from "@joko/brand-assets/icon-light.svg?url";
 import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type HttpLinkOpenOptions } from "./browser-action.js";
 import { isWorkspaceHtmlPreviewVisible, WorkspaceHtmlAutoReload } from "./workspace-html-auto-reload.js";
+import { contactsDraftOwnerMatches, type ContactsDraftOwner } from "./contacts-draft.js";
 import {
   createOrchestratorGateway,
   discoverOrchestratorNodesAt,
@@ -151,7 +152,7 @@ export type AppRoute =
   | { readonly kind: "sharedTask"; readonly joinId: string; readonly profileId: string }
   | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string; readonly backgroundExtensionId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
-  | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string; readonly initialModel?: NewSessionModelRequest }
+  | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string; readonly initialModel?: NewSessionModelRequest; readonly contactsDraft?: ContactsDraftOwner }
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "partners"; readonly partnerId?: string; readonly profileId?: string; readonly preparation?: boolean; readonly groupId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
@@ -350,6 +351,7 @@ export interface AppController extends OperationApi {
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
   clearNewSessionDraft(): Promise<void>;
+  prepareContactsDialogue(...args: Parameters<OrchestratorGateway["prepareContactsDialogue"]>): ReturnType<OrchestratorGateway["prepareContactsDialogue"]>;
   readRecentProjects(): Promise<readonly RecentProject[]>;
   recordRecentProject(entry: RecentProject): Promise<readonly RecentProject[]>;
   removeRecentProject(entry: RecentProject): Promise<readonly RecentProject[]>;
@@ -3028,11 +3030,18 @@ export function useAppController(): AppController {
     } finally { window.removeEventListener("pagehide", retire); }
   }, [draftServerId, draftProfileId, artifactGateway, linkGatewayGeneration]);
   const newTaskDraftScope = state.activeProfile === undefined ? undefined : newSessionDraftScope(state.activeProfile);
+  const contactsDraft = state.route.kind === "newSession" ? state.route.contactsDraft : undefined;
+  const composerDraftScope = contactsDraft === undefined ? newTaskDraftScope
+    : contactsDraftOwnerMatches(contactsDraft, state.activeProfile) ? `${newTaskDraftScope}\u0000contacts` : undefined;
   const newTaskDraftOperationTailsRef = useRef(new Map<string, Promise<void>>());
   const newTaskDraftApi = useMemo(() => {
     const scope = (): string => {
       if (newTaskDraftScope === undefined) throw new Error("Connect to Joko before using a new-task draft.");
       return newTaskDraftScope;
+    };
+    const draftScope = (): string => {
+      if (composerDraftScope === undefined) throw new Error("The draft's original connection is unavailable.");
+      return composerDraftScope;
     };
     const enqueue = (selectedScope: string, write: () => Promise<void>): Promise<void> => {
       const previous = newTaskDraftOperationTailsRef.current.get(selectedScope) ?? Promise.resolve();
@@ -3048,16 +3057,16 @@ export function useAppController(): AppController {
     };
     return {
       readNewSessionDraft: async (): Promise<NewSessionLocalDraft | undefined> => {
-        const selectedScope = scope();
+        const selectedScope = draftScope();
         await newTaskDraftOperationTailsRef.current.get(selectedScope);
         return requireLocal(draftStore).readNewSessionDraft(selectedScope);
       },
       saveNewSessionDraft: (draft: NewSessionLocalDraft): Promise<void> => {
-        const selectedScope = scope();
+        const selectedScope = draftScope();
         return enqueue(selectedScope, () => requireLocal(draftStore).saveNewSessionDraft(selectedScope, draft));
       },
       clearNewSessionDraft: (): Promise<void> => {
-        const selectedScope = scope();
+        const selectedScope = draftScope();
         return enqueue(selectedScope, () => requireLocal(draftStore).clearNewSessionDraft(selectedScope));
       },
       readRecentProjects: (): Promise<readonly RecentProject[]> => requireLocal(draftStore).readRecentProjects(scope()),
@@ -3089,7 +3098,7 @@ export function useAppController(): AppController {
         }
       }
     };
-  }, [draftStore, newTaskDraftScope, artifactGateway]);
+  }, [draftStore, newTaskDraftScope, composerDraftScope, artifactGateway]);
   const readDraft = useCallback<AppController["readDraft"]>(async (sessionId) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
     return withDraftSurface(sessionId, surface => requireLocal(draftStore).readDraft(draftServerId, draftProfileId, sessionId, surface));
@@ -3281,6 +3290,7 @@ export function useAppController(): AppController {
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
       sendRichAnswer: async (...args: Parameters<OperationApi["sendRichAnswer"]>) => original().sendRichAnswer(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
+      prepareContactsDialogue: async (...args: Parameters<OrchestratorGateway["prepareContactsDialogue"]>) => original().prepareContactsDialogue(...args),
       createRemoteTarget: async (...args: Parameters<OperationApi["createRemoteTarget"]>) => original().createRemoteTarget(...args),
       createDevicePeerTarget: async (...args: Parameters<OperationApi["createDevicePeerTarget"]>) => original().createDevicePeerTarget(...args),
       listDevicePeers: async (...args: Parameters<OperationApi["listDevicePeers"]>) => original().listDevicePeers(...args),
@@ -5178,6 +5188,15 @@ export function routeFromHash(hash: string): AppRoute {
   }
   if (parts[0] === "settings") return { kind: "settings" };
   if (parts[0] === "tasks" && parts[1] === "new") {
+    if (query.has("contacts")) {
+      const profileId = query.get("contacts"), serverId = query.get("server");
+      if ([profileId, serverId].every(value => value !== null && value.length > 0 && value.length <= 256
+        && value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value))
+        && query.getAll("contacts").length === 1 && query.getAll("server").length === 1) {
+        return { kind: "newSession", contactsDraft: { profileId: profileId!, serverId: serverId! } };
+      }
+      return { kind: "settings" };
+    }
     const targetId = query.get("target")?.trim();
     const dialogueBackendId = query.get("dialogue")?.trim();
     const recommendationNonce = routeRecommendationNonce(query);
@@ -5236,6 +5255,10 @@ export function appRouteHash(route: AppRoute): string {
   if (route.kind === "session") return sessionRouteHash(route);
   if (route.kind === "files") return workspaceFilesHash(route);
   if (route.kind === "newSession") {
+    if (route.contactsDraft !== undefined) {
+      const query = new URLSearchParams({ contacts: route.contactsDraft.profileId, server: route.contactsDraft.serverId });
+      return `#/tasks/new?${query.toString()}`;
+    }
     const query = new URLSearchParams();
     if (route.targetId !== undefined) query.set("target", route.targetId);
     else if (route.dialogueBackendId !== undefined) query.set("dialogue", route.dialogueBackendId);

@@ -9,6 +9,7 @@ import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pending
   parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
 import { readSessionArchivePreview } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
+import { CONTACTS_TOOL_POLICY_ID } from "./contacts-draft.js";
 import { projectProviderGroupRebalance } from "@joko/contracts";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
 import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
@@ -1061,6 +1062,7 @@ export interface PairingOutcome {
 
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage" | "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">,
   Required<Pick<OperationApi, "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">>, AppDefaultModelUiPort {
+  prepareContactsDialogue(draft: TargetDraft, requestId: string, signal: AbortSignal): Promise<Pick<TargetView, "id" | "revision">>;
   deviceAuthorizationOwner?(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
   inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi;
@@ -2737,7 +2739,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     });
   }
 
-  async createTarget(draft: TargetDraft): Promise<string> {
+  async createTarget(draft: TargetDraft, request?: { readonly operationId: string; readonly signal: AbortSignal }): Promise<string> {
     const name = draft.name.trim();
     const serverPath = draft.serverPath.trim();
     if (name.length === 0) throw new GatewayError("A project name is required.");
@@ -2753,7 +2755,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           createIfMissing: draft.createIfMissing
         }
       }
-    }, true);
+    }, true, [], request?.signal, undefined, request?.operationId);
     const payload = operation.result?.payload;
     if (payload?.case !== "target" || payload.value.targetId.length === 0) {
       throw new GatewayError("Orchestrator completed project creation without a typed project result.");
@@ -2763,7 +2765,59 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     // Target, so project the committed revision before returning its ID.
     await this.#refreshPromise?.catch(() => undefined);
     await this.refresh();
+    request?.signal.throwIfAborted();
     return payload.value.targetId;
+  }
+
+  async prepareContactsDialogue(draft: TargetDraft, requestId: string, signal: AbortSignal): Promise<Pick<TargetView, "id" | "revision">> {
+    if (draft.workspaceKind !== "managedDialogue" || draft.serverPath !== "" || !draft.createIfMissing) {
+      throw new GatewayError("A Contacts draft requires its own managed dialogue workspace.");
+    }
+    const scope = this.captureActionScope(signal);
+    const serviceGeneration = this.#snapshot?.generation;
+    const checkOwner = () => {
+      scope.signal.throwIfAborted();
+      if (this.requireTransport() !== scope.transport || this.#snapshot?.generation !== serviceGeneration) {
+        throw new GatewayError("The original Contacts node changed.");
+      }
+    };
+    const checkPolicy = (targetId?: string) => {
+      checkOwner();
+      const policy = this.#snapshot?.settings.toolPolicies.find(value => value.toolProviderId === CONTACTS_TOOL_POLICY_ID);
+      if (policy === undefined || !(policy.targetSettings.find(value => value.targetId === targetId)?.effectiveEnabled ?? policy.userEffectiveEnabled)) {
+        throw new GatewayError("Enable Contacts tools before sending this draft.");
+      }
+    };
+    await this.refresh();
+    if (!(await this.getContactDirectory(scope.signal)).enabled) throw new GatewayError("Enable the Contacts directory before sending this draft.");
+    checkPolicy();
+    const operationId = `contacts-dialogue:${requestId}:${draft.backendId}`;
+    const targetId = await this.createTarget(draft, { operationId, signal: scope.signal });
+    const inspectTarget = () => {
+      checkPolicy(targetId);
+      const target = this.#snapshot?.targets.find(value => value.id === targetId);
+      const workspace = this.#snapshot?.workspaces.find(value => value.id === target?.workspaceId);
+      if (target === undefined || workspace?.targetId !== targetId || target.backendId !== draft.backendId
+        || target.archived || target.remoteWorkspace !== undefined || workspace.remoteWorkspace !== undefined
+        || workspace.kind !== "managedDialogue" || target.trusted !== workspace.trusted) {
+        throw new GatewayError("The original Contacts dialogue workspace is unavailable.");
+      }
+      return target;
+    };
+    let target = inspectTarget();
+    if (!target.trusted) {
+      await this.submit({ case: "setWorkspaceTrust", value: { workspaceId: target.workspaceId, trusted: true } }, true,
+        [{ entity: { kind: EntityKind.TARGET, id: target.id }, expectedRevision: { value: target.revision } }],
+        scope.signal, undefined, `${operationId}:trust:${target.revision}`);
+      await this.#refreshPromise?.catch(() => undefined);
+      await this.refresh();
+      target = inspectTarget();
+      if (!target.trusted) throw new GatewayError("Project Trust was not applied to the Contacts dialogue workspace.");
+    }
+    if (!(await this.getContactDirectory(scope.signal)).enabled) throw new GatewayError("The Contacts directory was disabled before task creation.");
+    target = inspectTarget();
+    if (!target.trusted) throw new GatewayError("Project Trust changed before Contacts task creation.");
+    return { id: target.id, revision: target.revision };
   }
 
   async createRemoteTarget(draft: RemoteTargetDraft): Promise<string> {

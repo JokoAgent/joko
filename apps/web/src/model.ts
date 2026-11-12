@@ -5702,6 +5702,7 @@ export interface NewSessionModelRequest {
 export interface NewSessionLocalDraft {
   readonly preparation?: ProvisionalTaskReceipt;
   readonly builtinSkillIntent?: "plugin_creator";
+  readonly contactsDialogue?: { readonly requestId: string; readonly name: string };
   readonly selection: NewSessionDraftSelection | { readonly kind: "unselected" };
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
   readonly providerId: string;

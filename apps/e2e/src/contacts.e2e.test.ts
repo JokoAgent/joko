@@ -1,14 +1,116 @@
 import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
-import { ContactKind, ContactSource, ContactStatus, ContactVCardImportDisposition } from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
+import { ContactKind, ContactSource, ContactStatus, ContactVCardImportDisposition, OperationMutationSchema, OperationState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { OrchestratorE2eFixture } from "./fixture.js";
+import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { submit } from "./operations.js";
+import { RealPiSystemFixture } from "./real-pi-fixture.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
 let fixture: OrchestratorE2eFixture | undefined;
 let browser: Browser | undefined;
 let rootDirectory: string | undefined;
+
+mountedIt("opens an isolated Contacts draft and sends through its explicitly trusted local dialogue", { timeout: 120_000 }, async () => {
+  const tool = "mcp__joko_contacts__list_tools";
+  const real = await RealPiSystemFixture.start({ webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!), enableInternalServer: true,
+    providerResponder: ({ requestNumber }) => requestNumber === 1
+      ? { kind: "tool", name: tool, arguments: {} } : { kind: "text", text: "Contacts tools were checked." } });
+  try {
+    const manager = await real.pair("Contacts draft observer");
+    const contact = manager.clients.contact;
+    const initial = (await contact.getContactDirectory({})).directory!;
+    await contact.setContactDirectoryEnabled({ expectedDirectoryRevision: initial.revision, enabled: true });
+    const policy = await submit(manager.clients.operation, manager.connectionId, create(OperationMutationSchema, {
+      payload: { case: "updateToolPolicySettings", value: { patch: { toolProviderId: "joko-contacts-tools", enabled: false } } }
+    }));
+    expect(policy.state).toBe(OperationState.SUCCEEDED);
+    const { store } = real.application;
+    const targetCount = store.listTargets().length;
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    const challenge = (await real.anonymous.connection.beginPairing({ deviceDisplayName: "Contacts organizer" })).challenge!;
+    await page.goto(`${real.baseUrl}/#/tasks/new?dialogue=pi`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(real.baseUrl);
+    await page.getByLabel("Pairing code").fill(real.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("Contacts organizer");
+    await page.locator("form.pair-form button[type=submit]").click();
+    const draft = page.locator(".new-task-page");
+    const editor = draft.locator("[contenteditable=true]").first();
+    await editor.fill("Keep the ordinary draft.");
+    await page.waitForFunction(() => new Promise<boolean>((done) => {
+      const open = indexedDB.open("joko-ui");
+      open.onerror = () => done(false);
+      open.onsuccess = () => {
+        const db = open.result;
+        const all = db.transaction("drafts", "readonly").objectStore("drafts").getAll();
+        all.onerror = () => { db.close(); done(false); };
+        all.onsuccess = () => {
+          done(all.result.some(value => value?.text === "Keep the ordinary draft."));
+          db.close();
+        };
+      };
+    }));
+    await page.evaluate(() => { window.location.hash = "#/settings/contacts"; });
+    await page.getByRole("button", { name: "Enable Contacts tools and open draft", exact: true }).click();
+    const heading = draft.getByRole("heading", { name: "Organize contacts with AI", exact: true });
+    await heading.waitFor();
+    const prompt = "Help me organize my contacts.";
+    await editor.getByText(prompt, { exact: false }).waitFor();
+    expect(await editor.innerText()).not.toContain("Keep the ordinary draft.");
+    expect(await draft.getByRole("button", { name: "Send", exact: true }).isEnabled()).toBe(false);
+    expect(store.listSessions()).toHaveLength(0);
+    expect(store.listTargets()).toHaveLength(targetCount);
+    expect(real.providerRequests).toHaveLength(0);
+
+    const ownedHash = new URL(page.url()).hash;
+    const wrongNode = new URLSearchParams(ownedHash.split("?")[1]);
+    wrongNode.set("server", "different-node");
+    await page.evaluate(hash => { window.location.hash = hash; }, `#/tasks/new?${wrongNode.toString()}`);
+    await draft.getByText("Reconnect to the original Contacts node to use this draft.", { exact: true }).waitFor();
+    expect(await editor.innerText()).not.toContain(prompt);
+    await page.evaluate(hash => { window.location.hash = hash; }, ownedHash);
+    await editor.getByText(prompt, { exact: false }).waitFor();
+    await draft.getByRole("button", { name: "Close", exact: true }).click();
+    const guide = page.getByRole("button", { name: "Organize contacts with AI", exact: true });
+    await guide.waitFor();
+    expect(store.listSessions()).toHaveLength(0);
+    expect(store.listTargets()).toHaveLength(targetCount);
+
+    await page.evaluate(() => { window.location.hash = "#/tasks/new"; });
+    await editor.getByText("Keep the ordinary draft.", { exact: true }).waitFor();
+    const enabled = (await contact.getContactDirectory({})).directory!;
+    await contact.createContact({ expectedDirectoryRevision: enabled.revision,
+      contact: { kind: ContactKind.PERSON, displayName: "Contact organizer fixture" } });
+    await page.evaluate(() => { window.location.hash = "#/settings/contacts"; });
+    await page.getByText("Contact organizer fixture", { exact: true }).first().waitFor();
+    await guide.click();
+    await heading.waitFor();
+    await editor.getByText(prompt, { exact: false }).waitFor();
+    await draft.getByLabel("Backend", { exact: true }).selectOption("pi");
+    await draft.getByRole("checkbox", { name: /Trust the new dialogue workspace on/u }).check();
+    expect(store.listSessions()).toHaveLength(0);
+    expect(store.listTargets()).toHaveLength(targetCount);
+    await draft.getByRole("button", { name: "Send", exact: true }).click();
+    await waitFor(async () => real.providerRequests.length, count => count >= 2, "Contacts tool result in the next Pi request", 45_000);
+    expect(JSON.stringify(real.providerRequests[0]?.body.tools)).toContain(tool);
+    expect(JSON.stringify(real.providerRequests[1]?.body.messages)).toContain("call_tool");
+    expect(JSON.stringify(real.providerRequests[1]?.body.messages)).toContain("directory_enabled");
+    const [session] = store.listSessions();
+    expect(store.listSessions()).toHaveLength(1);
+    expect(store.getTarget(session!.descriptor.targetId).descriptor).toMatchObject({ backendId: "pi", managed: true, trusted: true });
+    expect(store.getTarget(session!.descriptor.targetId).descriptor.remoteWorkspace).toBeUndefined();
+    expect(store.listQueueItems({ sessionId: session!.descriptor.id })[0]?.body).toMatchObject({ text: expect.stringContaining(prompt), images: [], files: [] });
+  } finally {
+    await browser?.close();
+    browser = undefined;
+    await real.close();
+  }
+});
 
 afterEach(async () => {
   await browser?.close();
