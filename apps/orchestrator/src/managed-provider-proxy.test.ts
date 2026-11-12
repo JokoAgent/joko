@@ -13,7 +13,8 @@ import { mkdtemp } from "./test-paths.js";
 
 async function fixture(
   nativeResponses = false,
-  protocol: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses"
+  protocol: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses",
+  providerId = "provider"
 ) {
   const directory = await mkdtemp(join(tmpdir(), "joko-provider-proxy-"));
   const store = new OperationalStore(join(directory, "store.db"));
@@ -118,7 +119,7 @@ async function fixture(
   });
   await proxy.start();
   const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
-  const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId: "provider", modelId: "model" };
+  const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId, modelId: "model" };
   const requestPath = protocol === "anthropic-messages" ? "/custom/messages"
     : protocol === "openai-completions" ? "/custom/chat/completions" : "/custom/responses";
   const catalogModels = [
@@ -129,8 +130,8 @@ async function fixture(
     const reference = `credential-${revision}`;
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference, displayName: "Provider credential", kind: "api_key" });
-    await providers.upsertConfiguration({ providerId: "provider", displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
-      runtimes: [{ backendId: "runtime", provider: { id: "provider", api: protocol, baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY",
+    await providers.upsertConfiguration({ providerId, displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
+      runtimes: [{ backendId: "runtime", provider: { id: providerId, api: protocol, baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY",
         headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
         models: catalogModels },
         credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath }] });
@@ -141,7 +142,7 @@ async function fixture(
       backendId: "runtime",
       credentialOrigin: endpoint,
       provider: {
-        id: "provider",
+        id: providerId,
         api: protocol,
         baseUrl: endpoint,
         apiKeyEnv: "PROVIDER_KEY",
@@ -558,7 +559,8 @@ describe("Managed Provider native proxy", () => {
   const nativeFixtureCommand = process.env.JOKO_CODEX_MANAGED_FIXTURE_COMMAND ?? process.env.JOKO_CODEX_HOSTED_TEST_BINARY;
   it.skipIf(nativeFixtureCommand === undefined).each(["openai-responses", "openai-completions"] as const)(
     "runs the installed native app-server over %s on the original thread with an isolated profile", async protocol => {
-    const f = await fixture(true, protocol);
+    const providerId = protocol === "openai-completions" ? "ollama" : "provider";
+    const f = await fixture(true, protocol, providerId);
     const profile = join(f.directory, "profile"); const workspaceRoot = join(f.directory, "workspace");
     await mkdir(profile); await mkdir(workspaceRoot);
     const adapter = createCodexAdapter({ id: "runtime", instanceGeneration: 3, managedProviders: f.port,
@@ -568,11 +570,11 @@ describe("Managed Provider native proxy", () => {
     const events: EventPayload[] = [];
     let binding: NativeSessionBinding | undefined;
     const context = (operationId: string): AdapterContext => ({ sessionId: "session", generation: 4, backendInstanceGeneration: 3, target,
-      ...(binding === undefined ? {} : { binding }), modelSelection: { providerId: "provider", modelId: "model" }, operationId, signal: new AbortController().signal,
+      ...(binding === undefined ? {} : { binding }), modelSelection: { providerId, modelId: "model" }, operationId, signal: new AbortController().signal,
       emit: async (event) => { events.push(event); }, requestInteraction: async () => ({ kind: "cancelled" }), artifactCapacityBytes: 1_024,
       storeArtifact: async () => { throw new Error("No artifacts in this fixture."); } });
     try {
-      binding = await adapter.createSession({ target, providerId: "provider", modelId: "model", permissionMode: "auto", fastMode: false }, context("create"));
+      binding = await adapter.createSession({ target, providerId, modelId: "model", permissionMode: "auto", fastMode: false }, context("create"));
       const originalId = binding.nativeSessionId;
       const run = async (id: string) => {
         const initial = events.filter((event) => event.type === "done").length;
@@ -583,7 +585,7 @@ describe("Managed Provider native proxy", () => {
       await run("one");
       await f.write(1n, "second-private-provider-credential");
       await run("two");
-      expect((await adapter.inspectSession(binding, context("inspect"))).binding.nativeSessionId).toBe(originalId);
+      expect(await adapter.inspectSession(binding, context("inspect"))).toMatchObject({ binding: { nativeSessionId: originalId }, providerId });
       expect(f.received).toEqual([
         { path: f.requestPath, model: "model", authorization: "Bearer first-private-provider-credential" },
         { path: f.requestPath, model: "model", authorization: "Bearer first-private-provider-credential" },
@@ -592,11 +594,19 @@ describe("Managed Provider native proxy", () => {
       // Native policy may deny the controlled environment probe. A denial is
       // recorded separately and does not prove that a tool process was launched.
       expect(["absent", "denied"]).toContain(f.toolOutcome());
+      if (protocol === "openai-completions") {
+        await expect(adapter.compact(undefined, context("compact"))).resolves.toBe("compacted");
+        expect(f.received.at(-1)).toEqual({ path: f.requestPath, model: "model", authorization: "Bearer second-private-provider-credential" });
+        expect(f.received).toHaveLength(4);
+        await vi.waitFor(async () => expect((await adapter.inspectSession(binding!, context("compact-inspect"))).streaming).toBe(false), { timeout: 5_000 });
+      }
+      const completed = events.filter((event) => event.type === "done").length;
+      const requests = f.received.length;
       f.reject();
       await adapter.send({ disposition: "prompt", text: "Return the local failure.", images: [], files: [], mentions: [] }, context("three"));
-      await vi.waitFor(() => expect(events.filter((event) => event.type === "done")).toHaveLength(3), { timeout: 20_000 });
+      await vi.waitFor(() => expect(events.filter((event) => event.type === "done")).toHaveLength(completed + 1), { timeout: 20_000 });
       expect(events.at(-1)).toEqual({ type: "done", outcome: "failed" });
-      expect(f.received).toHaveLength(4);
+      expect(f.received).toHaveLength(requests + 1);
       const nativeFiles = await readdir(profile, { recursive: true });
       for (const path of nativeFiles.filter((path) => path.endsWith(".jsonl") || path.endsWith(".toml"))) {
         expect(await readFile(join(profile, path), "utf8")).not.toContain(f.token);

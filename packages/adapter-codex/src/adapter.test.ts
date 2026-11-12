@@ -834,20 +834,21 @@ describe("CodexBackendAdapter", () => {
     "keeps managed %s on the original thread, authorizes only the active operation, and adopts revisions before new input", async protocol => {
     let revision = "1";
     let enabled = true;
-    const model: ProviderModel = { providerId: "custom", modelId: "custom-model", displayName: "Custom", api: protocol, contextWindow: 0, maxOutputTokens: 0, supportsImages: false, supportsFastMode: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const providerId = protocol === "openai-completions" ? "ollama" : "custom";
+    const model: ProviderModel = { providerId, modelId: "custom-model", displayName: "Custom", api: protocol, contextWindow: 0, maxOutputTokens: 0, supportsImages: false, supportsFastMode: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     const released = vi.fn();
     const retired = vi.fn();
     const operations: Parameters<ManagedProviderRouteBinding["activate"]>[0][] = [];
     const port: ManagedProviderRuntimePort = {
       support: CODEX_MANAGED_PROVIDER_SUPPORT, environment: { JOKO_PROVIDER_PROXY_TOKEN: "private-fixture-token" }, secretEnvironmentNames: ["JOKO_PROVIDER_PROXY_TOKEN"],
-      dispose: retired, hasProvider: (id) => id === "custom", listModels: () => enabled ? [model] : [], listProviders: () => [], getThinkingLevelMap: () => ({}),
+      dispose: retired, hasProvider: (id) => id === providerId, listModels: () => enabled ? [model] : [], listProviders: () => [], getThinkingLevelMap: () => ({}),
       prepare: vi.fn(async (owner: Parameters<ManagedProviderRuntimePort["prepare"]>[0]): Promise<ManagedProviderRouteBinding> => {
-        expect(owner).toMatchObject({ backendId: "codex-test", backendInstanceGeneration: 7, targetId: "target-codex", sessionId: "session-codex", sessionGeneration: 1, providerId: "custom", modelId: "custom-model" });
+        expect(owner).toMatchObject({ backendId: "codex-test", backendInstanceGeneration: 7, targetId: "target-codex", sessionId: "session-codex", sessionGeneration: 1, providerId, modelId: "custom-model" });
         if (!enabled) throw new Error("route disabled");
         const captured = revision;
         let disposed = false;
         return {
-          providerId: "custom", model, protocol, revision: captured, baseUrl: `http://127.0.0.1:1234/managed/route-${captured}`, apiKeyEnvironment: "JOKO_PROVIDER_PROXY_TOKEN", thinkingLevelMap: {},
+          providerId, model, protocol, revision: captured, baseUrl: `http://127.0.0.1:1234/managed/route-${captured}`, apiKeyEnvironment: "JOKO_PROVIDER_PROXY_TOKEN", thinkingLevelMap: {},
           assertCurrent: () => { if (disposed || captured !== revision || !enabled) throw new Error("route changed"); },
           activate: async (operation) => { operation.assertCurrent(); operations.push(operation); return { release: released }; },
           dispose: () => { disposed = true; }
@@ -857,7 +858,12 @@ describe("CodexBackendAdapter", () => {
     const setup = await createSetup(7, { managedProviders: port });
     const binding = await setup.adapter.createSession({ ...sessionInput(setup.target), providerId: model.providerId, modelId: model.modelId }, context(setup.target, [], { backendInstanceGeneration: 7 }));
     const nativeStart = setup.fake.transport!.requests.find((request) => request.method === "thread/start")!;
-    expect(nativeStart.params).toMatchObject({ modelProvider: "custom", config: { model_providers: { custom: { env_key: "JOKO_PROVIDER_PROXY_TOKEN", wire_api: "responses", request_max_retries: 0 } }, "shell_environment_policy.exclude": ["JOKO_PROVIDER_PROXY_TOKEN"] } });
+    const nativeProviderId = (nativeStart.params as JsonObject)["modelProvider"] as string;
+    if (protocol === "openai-completions") expect(nativeProviderId).toMatch(/^joko-chat-[a-f0-9]{24}$/u);
+    else expect(nativeProviderId).toBe(providerId);
+    expect(nativeStart.params).toMatchObject({ modelProvider: nativeProviderId, config: { model_providers: {
+      [nativeProviderId]: { name: nativeProviderId, env_key: "JOKO_PROVIDER_PROXY_TOKEN", wire_api: "responses", request_max_retries: 0 }
+    }, "shell_environment_policy.exclude": ["JOKO_PROVIDER_PROXY_TOKEN"] } });
     expect(JSON.stringify(nativeStart)).not.toContain("private-fixture-token");
     const operationContext = (id: string) => context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: id });
     await setup.adapter.send(prompt("first"), operationContext("one"));
@@ -873,10 +879,12 @@ describe("CodexBackendAdapter", () => {
     const requests = setup.fake.transport!.requests;
     const resumeIndex = requests.findIndex((request) => request.method === "thread/resume");
     expect(requests.slice(0, resumeIndex).at(-1)?.method).toBe("thread/unsubscribe");
-    expect(requests[resumeIndex]?.params).toMatchObject({ threadId: binding.nativeSessionId, modelProvider: "custom", model: "custom-model", config: { model_providers: { custom: { base_url: "http://127.0.0.1:1234/managed/route-2" } } } });
+    expect(requests[resumeIndex]?.params).toMatchObject({ threadId: binding.nativeSessionId, modelProvider: nativeProviderId, model: "custom-model",
+      config: { model_providers: { [nativeProviderId]: { base_url: "http://127.0.0.1:1234/managed/route-2" } } } });
     expect(requests.filter((request) => request.method === "thread/start")).toHaveLength(1);
     expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);
     await setup.fake.completeTurn(binding.nativeSessionId!, "done again");
+    await expect(setup.adapter.inspectSession(binding, operationContext("inspect"))).resolves.toMatchObject({ providerId, modelId: "custom-model" });
     enabled = false;
     await expect(setup.adapter.send(prompt("retained input"), operationContext("three"))).rejects.toThrow();
     expect(requests.filter((request) => request.method === "turn/start")).toHaveLength(2);

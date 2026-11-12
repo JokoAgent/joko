@@ -1274,6 +1274,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       } catch (error) { managedRoute?.dispose(); smartRoute?.dispose(); await initialMcp?.release(); throw error; }
     }
     if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
+    else if (managedRoute !== undefined) (request.params as JsonObject)["modelProvider"] = nativeManagedProviderId(managedRoute);
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
     nativeConfiguration = workingContextConfiguration({ ...(nativeConfiguration ?? {}), ...this.#taskShellConfiguration(context),
       ...nativeWebPolicyConfiguration(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) }, context, input.providerId, input.modelId);
@@ -1356,9 +1357,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         mcp: initialMcp,
         mcpPending: runtimePolicy === "standard" && !scope.remote && scope.openMcpBridge !== undefined && initialMcp === undefined,
         nativeConfiguration,
-        providerId: smartRoute === undefined
+        providerId: managedRoute?.providerId ?? (smartRoute === undefined
           ? optionalString(record["modelProvider"]) ?? input.providerId
-          : input.providerId ?? this.#providerId,
+          : input.providerId ?? this.#providerId),
         modelId: observedModelId,
         effort: input.effort ?? optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
         fastMode: Object.hasOwn(record, "serviceTier")
@@ -1575,9 +1576,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         mcpPending,
         nativeConfiguration,
         nativeSkills,
-        providerId: smartRoute === undefined
+        providerId: managedRoute?.providerId ?? (smartRoute === undefined
           ? optionalString(record["modelProvider"])
-          : context.modelSelection?.providerId ?? this.#providerId,
+          : context.modelSelection?.providerId ?? this.#providerId),
         modelId: observedModelId,
         effort: optionalString(record["reasoningEffort"]) ?? optionalString(record["effort"]),
         fastMode: persistentReadOnly ? false : isFastServiceTier(record["serviceTier"]),
@@ -3380,7 +3381,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       excludeTurns: true,
       ...(selection === undefined
         ? smartRoute === undefined ? {} : { modelProvider: smartRoute.modelProviderId }
-        : { modelProvider: smartRoute?.modelProviderId ?? selection.providerId, model: selection.modelId }),
+        : { modelProvider: smartRoute?.modelProviderId ?? (managedRoute === undefined ? selection.providerId : nativeManagedProviderId(managedRoute)), model: selection.modelId }),
       ...(this.#hosted === undefined
         ? developerInstructions === undefined ? {} : { developerInstructions }
         : { developerInstructions: this.#hosted.instructions(developerInstructions) }),
@@ -3747,8 +3748,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         } }
       }),
       ...(route === undefined ? {} : {
-        model_providers: { [route.providerId]: {
-          name: route.providerId,
+        model_providers: { [nativeManagedProviderId(route)]: {
+          name: nativeManagedProviderId(route),
           base_url: route.baseUrl,
           wire_api: "responses",
           env_key: route.apiKeyEnvironment,
@@ -4133,7 +4134,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   #assertManagedRouteResponse(record: JsonObject, route?: ManagedProviderRouteBinding): void {
-    if (route !== undefined && (record["modelProvider"] !== route.providerId || record["model"] !== route.model.modelId)) {
+    if (route !== undefined && (record["modelProvider"] !== nativeManagedProviderId(route) || record["model"] !== route.model.modelId)) {
       throw managedRouteUnavailable(true);
     }
   }
@@ -4253,7 +4254,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       assertCurrent();
       const record = objectValue(response.value, "route resume response");
       if (smartRoute === undefined) {
-        if (record["modelProvider"] !== providerId || record["model"] !== modelId) throw managedRouteUnavailable(true);
+        const nativeProviderId = route === undefined ? providerId : nativeManagedProviderId(route);
+        if (record["modelProvider"] !== nativeProviderId || record["model"] !== modelId) throw managedRouteUnavailable(true);
       } else {
         if (record["modelProvider"] !== smartRoute.modelProviderId || record["model"] !== modelId) throw smartRouteUnavailable(true);
         smartRoute.bindRoot({ threadId: runtime.threadId, providerId, modelId });
@@ -6969,6 +6971,13 @@ function skillMentionUnavailable(): JokoError {
   return adapterError({ code: "CODEX_SKILL_MENTION_UNAVAILABLE",
     message: "The selected Skill is unavailable in this task's current native runtime.",
     phase: "dispatch", recovery: "Refresh the task's Skill catalog and explicitly select the Skill again." });
+}
+
+function nativeManagedProviderId(route: ManagedProviderRouteBinding): string {
+  // App Server reserves built-in provider names for their own inference and compaction protocols.
+  return route.protocol === "openai-completions"
+    ? `joko-chat-${createHash("sha256").update(route.providerId).digest("hex").slice(0, 24)}`
+    : route.providerId;
 }
 
 function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
