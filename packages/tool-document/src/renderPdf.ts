@@ -1,7 +1,8 @@
 import { promises as fs } from "node:fs";
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, extname, join } from "node:path";
 import { z } from "zod";
-import { readDocumentInput } from "./input.js";
+import { prepareDocumentInput, readPreparedDocumentInput } from "./input.js";
+import type { DocumentPathAuthorizer } from "./document-path.js";
 import { applyReportTemplate, extractHtmlTitle } from "./pdfTemplate.js";
 import { captureDirectorySnapshot, inlineLocalResources, sameDirectorySnapshot } from "./pdfResources.js";
 import { decodePdfText, PdfResourceError } from "./pdfText.js";
@@ -64,7 +65,10 @@ export interface RenderPdfResult {
 }
 
 /** Prepare a closed local HTML snapshot before handing bytes to an isolated renderer. */
-export async function renderPdf(input: unknown, root: string, renderer: PdfRenderer, signal?: AbortSignal): Promise<RenderPdfResult> {
+export async function renderPdf(input: unknown, root: string, renderer: PdfRenderer, signal?: AbortSignal, scope?: {
+  readonly authorizePath?: DocumentPathAuthorizer;
+  readonly assertCurrent?: () => void;
+}): Promise<RenderPdfResult> {
   const parsed = PdfRenderSchema.safeParse(input);
   if (!parsed.success) throw new PdfRenderError("INVALID_ARGUMENT", "PDF render arguments are invalid.");
   const request = parsed.data;
@@ -77,14 +81,12 @@ export async function renderPdf(input: unknown, root: string, renderer: PdfRende
   let sourcePath: string;
   let sourceDirectory: Awaited<ReturnType<typeof captureDirectorySnapshot>> | undefined;
   if (request.htmlPath) {
-    sourcePath = resolve(canonicalRoot, request.htmlPath);
-    const rel = relative(canonicalRoot, sourcePath);
-    if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-      throw new PdfResourceError("PATH_NOT_ALLOWED", "HTML source must stay in the task working directory.");
-    }
-    sourceDirectory = await captureDirectorySnapshot(dirname(sourcePath));
-    const bytes = await readDocumentInput({ root: canonicalRoot, inPath: request.htmlPath, maxBytes: RENDER_PDF_MAX_HTML_BYTES, ...(signal ? { signal } : {}) });
     if (extname(request.htmlPath).toLowerCase() !== ".html") throw new PdfRenderError("UNSUPPORTED_FORMAT", "HTML source must be a .html file.");
+    const source = await prepareDocumentInput({ root: canonicalRoot, inPath: request.htmlPath,
+      ...(signal ? { signal } : {}), ...(scope?.authorizePath ? { authorizePath: scope.authorizePath } : {}) });
+    sourcePath = source.path;
+    sourceDirectory = await captureDirectorySnapshot(dirname(sourcePath));
+    const bytes = await readPreparedDocumentInput(source, RENDER_PDF_MAX_HTML_BYTES, signal);
     if (!sameDirectorySnapshot(sourceDirectory, await captureDirectorySnapshot(dirname(sourcePath)))) {
       throw new PdfResourceError("PATH_NOT_ALLOWED", "HTML source directory changed while reading.");
     }
@@ -96,7 +98,7 @@ export async function renderPdf(input: unknown, root: string, renderer: PdfRende
   }
   signal?.throwIfAborted();
   const snapshot = await inlineLocalResources(canonicalRoot, sourcePath, sourceHtml,
-    sourceDirectory, sourceDirectory ? new Map([[dirname(sourcePath), sourceDirectory]]) : undefined, signal);
+    sourceDirectory, sourceDirectory ? new Map([[dirname(sourcePath), sourceDirectory]]) : undefined, signal, scope?.authorizePath);
   signal?.throwIfAborted();
   const wrapped = applyReportTemplate(snapshot, resolveDocsTheme(request.theme), request.template);
   if (Buffer.byteLength(wrapped.html, "utf8") > MAX_SNAPSHOT_BYTES) throw new PdfRenderError("FILE_TOO_LARGE", "HTML snapshot exceeds 64 MiB.");
@@ -104,6 +106,7 @@ export async function renderPdf(input: unknown, root: string, renderer: PdfRende
     ? { top: 0, bottom: 0, left: 0, right: 0 }
     : { top: 0.4, bottom: 0.4, left: 0.4, right: 0.4 });
   let rendered: PdfRenderOutput;
+  scope?.assertCurrent?.();
   try {
     rendered = await renderer.render({ html: wrapped.html, pageSize: request.pageSize,
       landscape: request.landscape, printBackground: request.printBackground, margins,
@@ -115,6 +118,7 @@ export async function renderPdf(input: unknown, root: string, renderer: PdfRende
     throw new PdfRenderError("RENDER_FAILED", "PDF renderer failed.");
   }
   signal?.throwIfAborted();
+  scope?.assertCurrent?.();
   if (!rendered.buffer || rendered.buffer.byteLength === 0) throw new PdfRenderError("RENDER_EMPTY", "PDF renderer returned no bytes.");
   if (rendered.buffer.byteLength > MAX_PDF_BYTES) throw new PdfRenderError("FILE_TOO_LARGE", "Rendered PDF exceeds 64 MiB.");
   const buffer = Buffer.from(rendered.buffer);

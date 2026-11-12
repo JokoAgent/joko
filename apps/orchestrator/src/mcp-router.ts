@@ -12,6 +12,7 @@ import type { PiMcpBridgeOptions, PiMcpToolDescriptor, PiNativeRootQueueInput } 
 import { validateMcpEndpoint } from "@joko/adapter-pi";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type BlobRef, type PolicySubjectKind, type PartnerLearningReceipt, type PartnerLearningTurnSource, type PartnerLearningToolAuthority, type SessionDescriptor } from "@joko/core";
 import { operationBodyHash, type OperationalStore } from "@joko/store";
+import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
 
 import type { CredentialManager } from "./credential-manager.js";
 import { McpAudioArtifacts } from "./mcp-audio-artifacts.js";
@@ -263,6 +264,7 @@ export interface BridgeToolPolicyDeclaration {
 export interface NativeBridgeToolAdmission {
   readonly assertCurrent: () => void;
   readonly inputQueueItem?: { readonly id: string; readonly runId: string; readonly attemptId: string };
+  readonly authorizeDocumentPath?: DocumentPathAuthorizer;
 }
 
 /** Product scope authenticated from the durable Session binding, never from tool arguments. */
@@ -278,6 +280,7 @@ export interface BridgeToolCallContext {
   readonly nativeRootQueueInput?: PiNativeRootQueueInput;
   /** The sole active Queue Attempt captured before native tool admission awaited policy. */
   readonly inputQueueItem?: NativeBridgeToolAdmission["inputQueueItem"];
+  readonly authorizeDocumentPath?: DocumentPathAuthorizer;
   readonly sessionId: string;
   readonly targetId: string;
   readonly generation: number;
@@ -1211,6 +1214,8 @@ export class McpRouter {
     /** In-process only. This is never accepted from a native HTTP request. */
     readonly appCall?: AppModelInvocation;
     readonly assertCallerCurrent?: () => void;
+    /** In-process calls relayed by an isolated executor use only the original workspace. */
+    readonly hostedExecutor?: true;
   }): Promise<McpBridgeCallResult> {
     this.#assertInitialized();
     input = { ...input, arguments: structuredClone(input.arguments ?? {}) };
@@ -1409,6 +1414,7 @@ export class McpRouter {
           assertDispatchedImageCredential?.();
         };
         guard();
+        const authorizeDocumentPath = !input.hostedExecutor && grant.productScope !== undefined ? admission?.authorizeDocumentPath : undefined;
         const execution = await this.#callBridgeToolProvider(
             bridgeProvider,
             serverGeneration,
@@ -1434,6 +1440,16 @@ export class McpRouter {
               ...(assertNativeRoot === undefined ? {} : { assertNativeRoot }),
               ...(nativeRootQueueInput === undefined ? {} : { nativeRootQueueInput }),
               ...(admission?.inputQueueItem === undefined ? {} : { inputQueueItem: admission.inputQueueItem }),
+              ...(authorizeDocumentPath === undefined ? {} : { authorizeDocumentPath: async request => {
+                guard();
+                if (this.#redactText(request.path) !== request.path) {
+                  throw new DocumentPathError("The exact document path cannot be displayed for approval.");
+                }
+                const assertAuthorized = await authorizeDocumentPath(request);
+                const assertCurrent = () => { guard(); assertAuthorized(); };
+                assertCurrent();
+                return assertCurrent;
+              } }),
               ...(partnerLearningSave === undefined ? {} : { partnerLearningSave })
             },
             () => assertDispatchedImageCredential !== undefined

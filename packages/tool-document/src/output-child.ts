@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { constants, promises as fs } from "node:fs";
+import { constants, promises as fs, type BigIntStats } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { documentFileVersion, sameDocumentIdentity } from "./document-path.js";
 
 interface WriterRequest {
   readonly root: string;
@@ -10,6 +11,7 @@ interface WriterRequest {
   readonly targetName: string;
   readonly bytesBase64: string;
   readonly overwrite: boolean;
+  readonly approvedTargetVersion?: string | null;
 }
 
 class WriterError extends Error {
@@ -28,10 +30,11 @@ async function assertRoot(request: WriterRequest): Promise<void> {
   }
 }
 
-async function assertParent(request: WriterRequest): Promise<void> {
+async function assertParent(request: WriterRequest, identity?: BigIntStats, parent = request.relativeParent): Promise<void> {
   await assertRoot(request);
   const current = await fs.realpath(".");
-  if (!inside(request.root, current) || relative(request.root, current) !== request.relativeParent) {
+  if (!inside(request.root, current) || relative(request.root, current) !== parent ||
+      (identity !== undefined && !sameDocumentIdentity(identity, await fs.lstat(".", { bigint: true })))) {
     throw new WriterError("PATH_NOT_ALLOWED", "Document output directory changed.");
   }
 }
@@ -67,6 +70,54 @@ async function enterParent(request: WriterRequest): Promise<void> {
   await assertParent(request);
 }
 
+async function assertApproval(): Promise<void> {
+  await new Promise<void>((accept, reject) => {
+    process.once("message", (message: unknown) => {
+      if (message !== null && typeof message === "object" && "approved" in message && message.approved === true) accept();
+      else reject(new WriterError("PATH_NOT_ALLOWED", "The external document approval was retired."));
+    });
+    process.send?.({ checkApproval: true });
+  });
+}
+
+async function enterApprovedParent(request: WriterRequest): Promise<BigIntStats> {
+  await assertApproval();
+  let parent = "";
+  let identity = await fs.lstat(".", { bigint: true });
+  if (String(identity.dev) !== request.rootDev || String(identity.ino) !== request.rootIno) {
+    throw new WriterError("PATH_NOT_ALLOWED", "The approved document directory changed.");
+  }
+  await assertParent(request, identity, parent);
+  for (const segment of request.relativeParent.split(sep).filter(Boolean)) {
+    if (segment === "." || segment === "..") throw new WriterError("PATH_NOT_ALLOWED", "Document output directory is invalid.");
+    await fs.mkdir(segment).catch(() => {
+      throw new WriterError("PATH_NOT_ALLOWED", "An approved output directory could not be created.");
+    });
+    identity = await fs.lstat(segment, { bigint: true });
+    if (!identity.isDirectory() || identity.isSymbolicLink()) {
+      throw new WriterError("PATH_NOT_ALLOWED", "The approved document directory changed.");
+    }
+    process.chdir(segment);
+    parent = join(parent, segment);
+    await assertParent(request, identity, parent);
+  }
+  return identity;
+}
+
+async function assertApprovedTarget(request: WriterRequest, identity: BigIntStats): Promise<void> {
+  await assertApproval();
+  await assertParent(request, identity);
+  let version: string | null = null;
+  try {
+    const target = await fs.lstat(request.targetName, { bigint: true });
+    if (!target.isFile() || target.isSymbolicLink()) throw new WriterError("PATH_NOT_ALLOWED", "The approved output is no longer a regular file.");
+    version = documentFileVersion(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (version !== request.approvedTargetVersion) throw new WriterError("PATH_NOT_ALLOWED", "The approved output changed before publication.");
+}
+
 async function write(request: WriterRequest): Promise<boolean> {
   if (!request || typeof request.root !== "string" || typeof request.relativeParent !== "string"
     || typeof request.targetName !== "string" || request.targetName === "." || request.targetName === ".."
@@ -78,7 +129,8 @@ async function write(request: WriterRequest): Promise<boolean> {
   if (bytes.length === 0 || bytes.length > 64 * 1024 * 1024 || bytes.toString("base64") !== request.bytesBase64) {
     throw new WriterError("OUTPUT_FAILED", "Document writer bytes are invalid.");
   }
-  await enterParent(request);
+  const approvedParent = request.approvedTargetVersion === undefined ? undefined : await enterApprovedParent(request);
+  if (approvedParent === undefined) await enterParent(request);
   const staging = `.joko-document-${randomUUID()}.tmp`;
   let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
   let existingTarget = false;
@@ -92,14 +144,18 @@ async function write(request: WriterRequest): Promise<boolean> {
     } finally {
       await handle.close();
     }
-    await assertParent(request);
-    if (request.overwrite) {
-      try {
-        const target = await fs.lstat(request.targetName);
-        if (!target.isFile() || target.isSymbolicLink()) throw new WriterError("PATH_NOT_ALLOWED", "Overwrite target is not a regular file.");
-        existingTarget = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    if (approvedParent === undefined) await assertParent(request);
+    else await assertApprovedTarget(request, approvedParent);
+    if (request.overwrite && request.approvedTargetVersion !== null) {
+      if (request.approvedTargetVersion !== undefined) existingTarget = true;
+      else {
+        try {
+          const target = await fs.lstat(request.targetName);
+          if (!target.isFile() || target.isSymbolicLink()) throw new WriterError("PATH_NOT_ALLOWED", "Overwrite target is not a regular file.");
+          existingTarget = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
       }
       await fs.rename(staging, request.targetName).catch(() => {
         throw new WriterError("ATOMIC_PUBLISH_UNSUPPORTED", "This location cannot atomically replace the document.");
@@ -110,7 +166,7 @@ async function write(request: WriterRequest): Promise<boolean> {
         throw new WriterError("ATOMIC_PUBLISH_UNSUPPORTED", "This location cannot atomically publish a new document.");
       });
     }
-    await assertParent(request);
+    await assertParent(request, approvedParent);
     return existingTarget;
   } finally {
     if (stagedIdentity !== undefined) {

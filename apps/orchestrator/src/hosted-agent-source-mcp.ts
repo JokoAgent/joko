@@ -72,7 +72,7 @@ export class HostedAgentSourceMcp {
         const result = await this.options.router.executeBridgeCall({ authorization: `Bearer ${this.#snapshot.mcpBridge.token}`,
           generation: context.generation, sessionId: context.sessionId, targetId: context.target.id, requestId: request.requestId,
           serverId: request.serverId, toolName: request.toolName, arguments: arguments_, signal: active,
-          assertCallerCurrent: assertOwner,
+          assertCallerCurrent: assertOwner, hostedExecutor: true,
           ...(rootRequired ? { nativeRootProof: this.#snapshot.mcpBridge.captureRootCall!({ requestId: request.requestId, serverId: request.serverId,
             toolName: request.toolName, arguments: arguments_, assertCurrent: assertOwner }) } : {}),
           ...(pending?.connection ? { appCall: { connection: pending.connection, params: { ...pending.request.params, arguments: arguments_ },

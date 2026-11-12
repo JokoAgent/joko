@@ -1,4 +1,4 @@
-import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, inspectPdf, renderPdf, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, PptxDocumentError, XlsxDocumentError, SheetReadError, PdfInspectError, PdfRenderError, PdfResourceError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, PDF_PAGE_SIZES, RENDER_PDF_MAX_HTML_BYTES, type DocsThemeName, type PdfRenderer } from "@joko/tool-document";
+import { createPptxBuffer, createXlsxBuffer, markdownToDocxBuffer, publishDocumentOutput, readDocumentInput, readSheet, inspectPdf, renderPdf, DOCS_THEME_NAMES, DocumentInputError, DocumentOutputError, DocumentPathError, PptxDocumentError, XlsxDocumentError, SheetReadError, PdfInspectError, PdfRenderError, PdfResourceError, PPTX_LAYOUT_NAMES, PPTX_MAX_SLIDES, PPTX_MAX_BULLETS_PER_SLIDE, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER_SHEET, MAX_XLSX_COLUMNS, MAX_XLSX_CELL_TEXT_CHARS, MAX_XLSX_FORMULA_CHARS, PDF_PAGE_SIZES, RENDER_PDF_MAX_HTML_BYTES, type DocsThemeName, type PdfRenderer } from "@joko/tool-document";
 import type { OperationalStore } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
 import { DocumentDeliveryError, DocumentOutputDelivery, type DocumentFormat, type DocumentWriteReceipt } from "./document-output-delivery.js";
@@ -10,12 +10,12 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: DOCUMENT_TOOL_PROVIDER_ID,
   name: "make_docx",
   runtimeName: "make_docx",
-  description: "Create an editable Word document from Markdown in this task's working directory. Headings, emphasis, links, lists, tables, quotes, code and explicit page breaks remain editable. An existing file is never replaced unless overwrite is true.",
+  description: "Create an editable Word document from Markdown. Headings, emphasis, links, lists, tables, quotes, code and explicit page breaks remain editable. An existing file is never replaced unless overwrite is true.",
   inputSchema: {
     type: "object",
     properties: {
       markdown: { type: "string", minLength: 1, maxLength: 4 * 1024 * 1024, description: "Markdown body, at most 4 MiB UTF-8." },
-      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Workspace-relative or in-workspace absolute .docx output path." },
+      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Local .docx output path. Paths outside the task working directory require separate authorization." },
       title: { type: "string", maxLength: 4 * 1024, description: "Optional document title and cover title." },
       subtitle: { type: "string", maxLength: 16 * 1024, description: "Optional cover subtitle." },
       cover: { type: "boolean", description: "With a title, include a cover by default." },
@@ -30,7 +30,7 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: DOCUMENT_TOOL_PROVIDER_ID,
   name: "make_pptx",
   runtimeName: "make_pptx",
-  description: "Create an editable PowerPoint deck in this task's working directory. Use cover, section, content, comparison, metrics and image layouts. Supports notes, two-column comparisons, metric cards, bounded PNG/JPEG/GIF images and three themes. Existing files require overwrite: true.",
+  description: "Create an editable PowerPoint deck. Use cover, section, content, comparison, metrics and image layouts. Supports notes, two-column comparisons, metric cards, bounded PNG/JPEG/GIF images and three themes. Existing files require overwrite: true.",
   inputSchema: {
     type: "object",
     properties: {
@@ -45,7 +45,7 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
             bullets: { type: "array", maxItems: PPTX_MAX_BULLETS_PER_SLIDE, items: { type: "string", maxLength: 4_000 } },
             body: { type: "string", maxLength: 32_000 },
             notes: { type: "string", maxLength: 64_000 },
-            imagePath: { type: "string", minLength: 1, maxLength: 4_096, description: "PNG, JPEG or GIF inside this task's working directory; only for content or image layout." },
+            imagePath: { type: "string", minLength: 1, maxLength: 4_096, description: "Local PNG, JPEG or GIF for content or image layout. Paths outside the task working directory require separate authorization." },
             columns: {
               type: "array", minItems: 2, maxItems: 2,
               items: { type: "object", properties: {
@@ -65,7 +65,7 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
           }, required: ["title"], additionalProperties: false
         }
       },
-      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Workspace-relative or in-workspace absolute .pptx output path." },
+      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Local .pptx output path. Paths outside the task working directory require separate authorization." },
       title: { type: "string", maxLength: 1_000, description: "Deck title and footer label." },
       theme: { type: "string", enum: [...DOCS_THEME_NAMES], default: "light" },
       footer: { type: "boolean", default: true },
@@ -79,7 +79,7 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: DOCUMENT_TOOL_PROVIDER_ID,
   name: "make_xlsx",
   runtimeName: "make_xlsx",
-  description: "Create an editable Excel workbook from one or more sheets in this task's working directory. Cells may contain text, numbers, booleans, blanks, or formulas with required cached results. Headers are styled, frozen and filterable; columns have readable widths and number formats. Existing files require overwrite: true.",
+  description: "Create an editable Excel workbook from one or more sheets. Cells may contain text, numbers, booleans, blanks, or formulas with required cached results. Headers are styled, frozen and filterable; columns have readable widths and number formats. Existing files require overwrite: true.",
   inputSchema: {
     type: "object",
     properties: {
@@ -101,7 +101,7 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
           } }
         }, required: ["name", "rows"], additionalProperties: false }
       },
-      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Workspace-relative or in-workspace absolute .xlsx output path." },
+      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Local .xlsx output path. Paths outside the task working directory require separate authorization." },
       theme: { type: "string", enum: [...DOCS_THEME_NAMES], default: "light" },
       zebra: { type: "boolean", default: true },
       overwrite: { type: "boolean", default: false }
@@ -114,11 +114,11 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: DOCUMENT_TOOL_PROVIDER_ID,
   name: "read_sheet",
   runtimeName: "read_sheet",
-  description: "Read a task-local XLSX, XLSM, CSV or TSV file into a bounded row and column window. Returns total dimensions and explicit continuation coordinates; workbook formulas return cached values. The call only reads files.",
+  description: "Read a local XLSX, XLSM, CSV or TSV file into a bounded row and column window. Returns total dimensions and explicit continuation coordinates. Workbook formulas return cached values.",
   inputSchema: {
     type: "object",
     properties: {
-      path: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .xlsx, .xlsm, .csv, .tsv, .tab or .txt path." },
+      path: { type: "string", minLength: 1, maxLength: 4_096, description: "Local .xlsx, .xlsm, .csv, .tsv, .tab or .txt path. Paths outside the task working directory require separate authorization." },
       sheet: { oneOf: [{ type: "string", minLength: 1, maxLength: 31 }, { type: "integer", minimum: 1 }], description: "Workbook sheet name or one-based index; defaults to first." },
       startRow: { type: "integer", minimum: 1, default: 1 },
       maxRows: { type: "integer", minimum: 1, maximum: 5_000, default: 200 },
@@ -133,11 +133,11 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: DOCUMENT_TOOL_PROVIDER_ID,
   name: "inspect_pdf",
   runtimeName: "inspect_pdf",
-  description: "Read structural evidence from a task-local PDF: page count, paper size, rotation, text preview, paint and image operations, and structurally blank pages. Inspect at most 50 pages per call. Continue with nextPages, inspectedThrough, previousVerdict and previousPdfSha256 until all pages are covered. Structural inspection does not confirm visual layout.",
+  description: "Read structural evidence from a local PDF: page count, paper size, rotation, text preview, paint and image operations, and structurally blank pages. Inspect at most 50 pages per call. Continue with nextPages, inspectedThrough, previousVerdict and previousPdfSha256 until all pages are covered. Structural inspection does not confirm visual layout.",
   inputSchema: {
     type: "object",
     properties: {
-      path: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .pdf path." },
+      path: { type: "string", minLength: 1, maxLength: 4_096, description: "Local .pdf path. Paths outside the task working directory require separate authorization." },
       pages: { type: "array", maxItems: 50, items: { type: "integer", minimum: 1 }, description: "One-based pages to inspect; defaults to the first maxPages pages." },
       inspectedThrough: { type: "integer", minimum: 0, default: 0, description: "Previous contiguous coverage cursor." },
       previousVerdict: { type: "string", enum: ["ok", "blank", "partial-blank", "warning", "incomplete"], description: "Verdict returned by the previous batch." },
@@ -152,13 +152,13 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([{
   serverId: DOCUMENT_TOOL_PROVIDER_ID,
   name: "render_pdf",
   runtimeName: "render_pdf",
-  description: "Render task-local HTML to PDF with an isolated offline Chromium job. Supply exactly one of htmlPath or html. Task-local relative styles, images and fonts are snapshotted before rendering. Report styling is added to unstyled HTML unless template is none. Existing files require overwrite: true. Inspect the PDF before delivery.",
+  description: "Render HTML to PDF with an isolated offline Chromium job. Supply exactly one of htmlPath or html. Relative styles, images and fonts are snapshotted before rendering. Paths outside the task working directory require separate authorization. Report styling is added to unstyled HTML unless template is none. Existing files require overwrite: true. Inspect the PDF before delivery.",
   inputSchema: {
     type: "object",
     properties: {
-      htmlPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .html file path; exclusive with html." },
+      htmlPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Local .html file path, exclusive with html." },
       html: { type: "string", minLength: 1, maxLength: RENDER_PDF_MAX_HTML_BYTES, description: "Inline HTML, at most 16 MiB UTF-8; exclusive with htmlPath." },
-      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Task-local .pdf output path." },
+      outPath: { type: "string", minLength: 1, maxLength: 4_096, description: "Local .pdf output path." },
       pageSize: { type: "string", enum: [...PDF_PAGE_SIZES], default: "A4" },
       landscape: { type: "boolean", default: false },
       printBackground: { type: "boolean", default: true },
@@ -182,7 +182,7 @@ export interface DocumentToolPublisher {
   (input: Parameters<typeof publishDocumentOutput>[0]): ReturnType<typeof publishDocumentOutput>;
 }
 
-/** Session-owned local document Tool Provider; no path or authority comes from the model. */
+/** Local document tools with filesystem authority supplied by the originating Session. */
 export class DocumentToolBridgeProvider implements BridgeToolProvider {
   readonly id = DOCUMENT_TOOL_PROVIDER_ID;
   readonly generation = 1;
@@ -191,7 +191,7 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
   readonly configurablePolicy = Object.freeze({
     id: "joko-document-tools-policy",
     displayName: "Document tools",
-    description: "Create and inspect documents in a trusted local task working directory.",
+    description: "Create and inspect documents for a trusted local task.",
     productDefaultEnabled: true
   });
   readonly #store: Pick<OperationalStore, "getSession" | "getTarget">;
@@ -233,6 +233,23 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       if (name !== "make_docx" && name !== "make_pptx" && name !== "make_xlsx" && name !== "read_sheet" && name !== "inspect_pdf" && name !== "render_pdf") throw new DocumentToolError("UNKNOWN_TOOL", "Document tool is not in this runtime.");
       if (name === "render_pdf" && !this.#pdfRenderer) throw new DocumentToolError("UNKNOWN_TOOL", "PDF rendering is unavailable in this runtime.");
       const root = this.#requireRoot(context);
+      const original = context;
+      const authorizePath = original.authorizeDocumentPath;
+      if (authorizePath !== undefined) {
+        const approvals: (() => void)[] = [];
+        context = {
+          ...original,
+          authorizeDocumentPath: async request => {
+            const assertAuthorized = await authorizePath(request);
+            approvals.push(assertAuthorized);
+            return assertAuthorized;
+          },
+          assertCurrent: () => {
+            original.assertCurrent?.();
+            for (const assertAuthorized of approvals) assertAuthorized();
+          }
+        };
+      }
       if (name === "make_pptx") return await this.#makePptx(args, root, signal, context);
       if (name === "make_xlsx") return await this.#makeXlsx(args, root, signal, context);
       if (name === "read_sheet") return await this.#readSheet(args, root, signal, context);
@@ -262,7 +279,7 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       });
     } catch (error) {
       if (signal?.aborted) throw error;
-      if (error instanceof DocumentOutputError || error instanceof DocumentDeliveryError || error instanceof DocumentInputError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof PdfRenderError || error instanceof PdfResourceError || error instanceof DocumentToolError) {
+      if (error instanceof DocumentOutputError || error instanceof DocumentDeliveryError || error instanceof DocumentInputError || error instanceof DocumentPathError || error instanceof PptxDocumentError || error instanceof XlsxDocumentError || error instanceof SheetReadError || error instanceof PdfInspectError || error instanceof PdfRenderError || error instanceof PdfResourceError || error instanceof DocumentToolError) {
         return response({ errorCode: error.code, message: error.message,
           ...(error instanceof SheetReadError && error.available ? { available: error.available } : {}) }, true);
       }
@@ -282,7 +299,10 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
       ...(args["footer"] === undefined ? {} : { footer: args["footer"] })
     }, async (inPath, maxBytes, imageSignal) => {
       if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
-      const bytes = await readDocumentInput({ root, inPath, maxBytes, ...(imageSignal === undefined ? {} : { signal: imageSignal }) });
+      context.assertCurrent?.();
+      const bytes = await readDocumentInput({ root, inPath, maxBytes,
+        ...(imageSignal === undefined ? {} : { signal: imageSignal }),
+        ...(context.authorizeDocumentPath === undefined ? {} : { authorizePath: context.authorizeDocumentPath }) });
       if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
       return bytes;
     }, signal);
@@ -309,16 +329,18 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
 
   async #readSheet(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     onlyKeys(args, ["path", "sheet", "startRow", "maxRows", "startColumn", "maxColumns"]);
-    const result = await readSheet(args, root, signal);
+    const result = await readSheet(args, root, signal, context.authorizeDocumentPath);
     signal?.throwIfAborted();
+    context.assertCurrent?.();
     if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
     return response({ ...result }, false);
   }
 
   async #inspectPdf(args: Readonly<Record<string, unknown>>, root: string, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     onlyKeys(args, ["path", "pages", "inspectedThrough", "previousVerdict", "previousPdfSha256", "maxPages"]);
-    const result = await inspectPdf(args, root, signal);
+    const result = await inspectPdf(args, root, signal, context.authorizeDocumentPath);
     signal?.throwIfAborted();
+    context.assertCurrent?.();
     if (this.#requireRoot(context) !== root) throw new DocumentToolError("STALE_SCOPE", "Task working directory changed.");
     return response({ ...result }, false);
   }
@@ -329,7 +351,10 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
     if (!outPath.toLowerCase().endsWith(".pdf")) throw new DocumentToolError("INVALID_EXTENSION", "Output filename must end in .pdf.");
     const overwrite = optionalBoolean(args["overwrite"], "overwrite") ?? false;
     const { outPath: _outPath, overwrite: _overwrite, ...content } = args;
-    const rendered = await renderPdf(content, root, this.#pdfRenderer!, signal);
+    const rendered = await renderPdf(content, root, this.#pdfRenderer!, signal, {
+      ...(context.authorizeDocumentPath === undefined ? {} : { authorizePath: context.authorizeDocumentPath }),
+      ...(context.assertCurrent === undefined ? {} : { assertCurrent: context.assertCurrent })
+    });
     return await this.#publishResult("pdf", { root, outPath, bytes: rendered.buffer, overwrite, ...(signal ? { signal } : {}) }, context, {
       pageSize: rendered.pageSize, landscape: rendered.landscape,
       fontsReady: rendered.fontsReady, template: rendered.template, theme: rendered.theme,
@@ -352,15 +377,17 @@ export class DocumentToolBridgeProvider implements BridgeToolProvider {
     };
     const respond = (receipt: DocumentWriteReceipt) => response({ ...receipt, format, ...details }, false);
     assertCurrent();
-    const request = { ...input, assertCurrent };
+    const request = { ...input, assertCurrent,
+      ...(context.authorizeDocumentPath === undefined ? {} : { authorizePath: context.authorizeDocumentPath }) };
     if (this.#delivery !== undefined) {
       const result = await this.#delivery.write(format, request, context, this.#publish, respond);
       assertCurrent();
       return result;
     }
-    const { path, relativePath, bytes } = await this.#publish(request);
+    const receipt = await this.#publish(request);
     assertCurrent();
-    return respond({ path, relativePath, bytes });
+    const { path, relativePath, bytes } = receipt;
+    return respond({ path, ...(relativePath === undefined ? {} : { relativePath }), bytes });
   }
 
   #requireRoot(context: BridgeToolCallContext): string {

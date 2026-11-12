@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { delimiterForExtension, parseDelimitedWindow } from "./csv.js";
 import { readDocumentInput } from "./input.js";
+import type { DocumentPathAuthorizer } from "./document-path.js";
 
 const DEFAULT_MAX_ROWS = 200;
 const HARD_MAX_ROWS = 5_000;
@@ -107,11 +108,12 @@ async function readXlsxInWorker(bytes: Buffer, input: z.output<typeof ReadSheetS
   });
 }
 
-export async function readSheet(input: unknown, root: string, signal?: AbortSignal): Promise<ReadSheetResult> {
+export async function readSheet(input: unknown, root: string, signal?: AbortSignal, authorizePath?: DocumentPathAuthorizer): Promise<ReadSheetResult> {
   const validated = ReadSheetSchema.safeParse(input);
   if (!validated.success) throw new SheetReadError("INVALID_ARGUMENT", "Table read arguments are invalid.");
   const request = validated.data;
-  const bytes = await readDocumentInput({ root, inPath: request.path, maxBytes: MAX_INPUT_BYTES, ...(signal ? { signal } : {}) });
+  const bytes = await readDocumentInput({ root, inPath: request.path, maxBytes: MAX_INPUT_BYTES,
+    ...(signal ? { signal } : {}), ...(authorizePath ? { authorizePath } : {}) });
   signal?.throwIfAborted();
   const extension = extname(request.path).toLowerCase();
   const workbook = extension === ".xlsx" || extension === ".xlsm";

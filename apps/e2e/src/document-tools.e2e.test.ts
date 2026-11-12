@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdapterContext, PromptInput } from "@joko/core";
+import { PermissionDecisionKind } from "@joko/contracts";
 import { CredentialManager, CredentialVault, DocumentToolBridgeProvider, McpRouter, createInternalServer, createOrchestratorApplication, type OrchestratorConfig } from "@joko/orchestrator";
+import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, resolvePermissionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 function visiblePdf(): Buffer {
   const stream = "BT /F1 24 Tf 72 760 Td (Visible report) Tj ET";
@@ -161,6 +163,106 @@ it("delivers exact Word replacements through the authenticated task Tool bridge 
   } finally {
     releaseDelivery.resolve();
     await internal?.close();
+    await fixture?.close();
+  }
+});
+
+it("binds external document paths to the authenticated owner input and current directory approvals", async () => {
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({
+      profiles: [{ ...PI_LIKE_PROFILE, capabilities: [
+        ...PI_LIKE_PROFILE.capabilities, { key: "workspace.extra_dirs", supported: true }
+      ] }],
+      createAdapter: profile => new class extends InstrumentedFakeAdapter {
+        override async send(): Promise<void> {}
+        async setExtraDirectories(): Promise<void> {}
+      }(profile),
+      createAuxiliaryServices: async (store, directory, artifacts) => {
+        const vault = await CredentialVault.open(join(directory, "external-document-vault.key"));
+        const credentials = new CredentialManager({ vault, storagePath: join(directory, "external-document-credentials.json") });
+        await credentials.initialize();
+        const mcpRouter = new McpRouter({ store, credentials, resultArtifacts: artifacts });
+        await mcpRouter.initialize();
+        mcpRouter.setNativeToolAdmission((...args) => fixture!.application.sessionHost.authorizeNativeBridgeTool(...args));
+        mcpRouter.registerBridgeToolProvider(new DocumentToolBridgeProvider({ store, artifacts, redactText: value => credentials.redactText(value) }));
+        return { mcpRouter };
+      }
+    });
+    const { store, mcpRouter, sessionHost } = fixture.application;
+    const router = mcpRouter!;
+    const paired = await fixture.pair("Document path owner");
+    const [backendId, targetId] = [...fixture.targets][0]!;
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, createSessionMutation({ backendId, targetId })));
+    const generation = store.getSession(sessionId).descriptor.binding.generation;
+    const directory = await realpath(fixture.rootDirectory);
+    const selected = join(directory, "approved");
+    await mkdir(selected);
+    const approval = await sessionHost.extraDirectories.add({ workspaceId: "workspace-main", serverPath: selected, access: "read_only" });
+    const oneShotInput = join(directory, "manual.csv");
+    const selectedInput = join(selected, "approved.csv");
+    await Promise.all([writeFile(oneShotInput, "label,value\nmanual,42\n"), writeFile(selectedInput, "label,value\napproved,17\n")]);
+    const bridge = router.createPiBridgeSnapshot({ endpoint: `${fixture.baseUrl}/internal/mcp`, sessionId, targetId, expectedPiGeneration: generation });
+    const call = (toolName: string, arguments_: Record<string, unknown>, requestId = randomUUID()) => router.executeBridgeCall({
+      authorization: `Bearer ${bridge.mcpBridge.token}`, requestId, sessionId, targetId, generation,
+      serverId: "joko-document-tools", toolName, arguments: arguments_
+    });
+    const failure = { isError: true, details: { mcpStructuredContent: { errorCode: "PATH_NOT_ALLOWED" } } };
+    await expect(call("read_sheet", { path: oneShotInput })).resolves.toMatchObject(failure);
+    const accepted = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, BigInt(generation), "Work with the specified document paths."));
+    const queueItemId = queueItemIdFrom(accepted), runId = queueRunIdFrom(accepted);
+    const queue = await waitFor(async () => store.getQueueItem(queueItemId), item => item.state === "backend_accepted", "document path owner accepted");
+    const open = () => store.listInteractions({ sessionId, runId, status: "open" });
+    const answer = async (summary: string, decision: PermissionDecisionKind) => {
+      const [interaction] = await waitFor(async () => open(), items => items.length === 1, "document path interaction");
+      expect(interaction).toMatchObject({ sessionId, runId, attemptId: queue.attemptId, operationId: queue.operationId,
+        payload: { kind: "permission", summary, choices: ["allow_once", "deny_once"] } });
+      const visible = (await paired.clients.interaction.getInteraction({ interactionId: interaction!.id })).interaction;
+      expect(visible).toMatchObject({ sessionId, runId, attemptId: queue.attemptId, request: { case: "permission",
+        value: { explanation: summary, allowedDecisions: [PermissionDecisionKind.ALLOW_ONCE, PermissionDecisionKind.DENY_ONCE] } } });
+      await submit(paired.clients.operation, paired.connectionId, resolvePermissionMutation({
+        connectionId: paired.connectionId, interactionId: interaction!.id, generation: BigInt(interaction!.generation), decision
+      }));
+    };
+    const deniedRead = call("read_sheet", { path: oneShotInput });
+    await answer(`Read\n${oneShotInput}`, PermissionDecisionKind.DENY_ONCE);
+    await expect(deniedRead).resolves.toMatchObject(failure);
+    const approvedRead = call("read_sheet", { path: oneShotInput });
+    await answer(`Read\n${oneShotInput}`, PermissionDecisionKind.ALLOW_ONCE);
+    expect((await approvedRead).details?.["mcpStructuredContent"]).toMatchObject({ rows: [["label", "value"], ["manual", "42"]] });
+    expect((await call("read_sheet", { path: selectedInput })).details?.["mcpStructuredContent"])
+      .toMatchObject({ rows: [["label", "value"], ["approved", "17"]] });
+    const imagePath = join(selected, "figure.gif");
+    await writeFile(imagePath, Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64"));
+    await expect(call("make_pptx", { outPath: "presentation.pptx", slides: [{ layout: "image", title: "Figure", imagePath }] }))
+      .resolves.toMatchObject({ isError: false, details: { mcpStructuredContent: { format: "pptx", slides: 1 } } });
+    expect((await readFile(join(fixture.workspaceDirectory, "presentation.pptx"))).includes("ppt/media/")).toBe(true);
+    const pdfPath = join(selected, "summary.pdf");
+    await writeFile(pdfPath, visiblePdf());
+    await expect(call("inspect_pdf", { path: pdfPath })).resolves.toMatchObject({
+      isError: false, details: { mcpStructuredContent: { numPages: 1, pagesInspected: 1 } }
+    });
+
+    const readOnlyOutput = join(selected, "blocked.docx");
+    await expect(call("make_docx", { outPath: readOnlyOutput, markdown: "# Blocked" })).resolves.toMatchObject(failure);
+    expect(open()).toHaveLength(0);
+    await expect(readFile(readOnlyOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    const output = join(directory, "manual.docx");
+    const writeArgs = { outPath: output, markdown: "# Approved document" };
+    const writeId = randomUUID();
+    const write = call("make_docx", writeArgs, writeId);
+    await answer(`Write\n${output}`, PermissionDecisionKind.ALLOW_ONCE);
+    const receipt = await write;
+    expect(receipt).toMatchObject({ isError: false, details: { mcpStructuredContent: { path: output, format: "docx" } } });
+    expect((await readFile(output)).subarray(0, 2).toString("ascii")).toBe("PK");
+    expect(await call("make_docx", writeArgs, writeId)).toEqual(receipt);
+    expect(open()).toHaveLength(0);
+
+    sessionHost.extraDirectories.remove(approval.id);
+    await expect(call("read_sheet", { path: selectedInput })).resolves.toMatchObject(failure);
+    expect(open()).toHaveLength(0);
+    bridge.revoke();
+  } finally {
     await fixture?.close();
   }
 });

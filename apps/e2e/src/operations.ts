@@ -478,12 +478,13 @@ export function resolvePermissionMutation(input: {
   readonly connectionId: string;
   readonly interactionId: string;
   readonly generation: bigint;
+  readonly decision?: PermissionDecisionKind;
 }): OperationMutation {
   const resolution = create(InteractionResolutionSchema, {
     connectionId: input.connectionId,
     decision: {
       case: "permission",
-      value: create(PermissionResolutionSchema, { decision: PermissionDecisionKind.ALLOW_ONCE })
+      value: create(PermissionResolutionSchema, { decision: input.decision ?? PermissionDecisionKind.ALLOW_ONCE })
     }
   });
   return create(OperationMutationSchema, {

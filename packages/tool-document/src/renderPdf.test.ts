@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
-import { renderPdf, type PdfRenderRequest, type PdfRenderer } from "./index.js";
+import { DocumentPathError, renderPdf, type DocumentPathAuthorizer, type PdfRenderRequest, type PdfRenderer } from "./index.js";
 
 it("snapshots task-local HTML resources and applies print defaults without leaking external reads", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-render-pdf-"));
@@ -81,5 +81,46 @@ it("snapshots task-local HTML resources and applies print defaults without leaki
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+it("snapshots an approved external PDF source and separately authorizes its local resources", async () => {
+  const temp = await mkdtemp(join(tmpdir(), "joko-pdf-approved-"));
+  try {
+    const base = await realpath(temp);
+    const root = join(base, "workspace");
+    const outside = join(base, "external");
+    await Promise.all([mkdir(root), mkdir(outside)]);
+    const htmlPath = join(outside, "report.html"), stylePath = join(outside, "style.css"), imagePath = join(outside, "figure.png");
+    await Promise.all([
+      writeFile(htmlPath, '<title>Approved report</title><link rel="stylesheet" href="style.css"><img src="figure.png">'),
+      writeFile(stylePath, 'body { background: url("figure.png"); }'),
+      writeFile(imagePath, Buffer.from([137, 80, 78, 71, 1, 2]))
+    ]);
+    const paths: string[] = [];
+    let allowImage = false;
+    const authorizePath: DocumentPathAuthorizer = async request => {
+      expect(request.operation).toBe("read");
+      paths.push(request.path);
+      if (request.path === imagePath && !allowImage) throw new DocumentPathError("Image was not approved.");
+      return () => {};
+    };
+    const seen: string[] = [];
+    const renderer: PdfRenderer = { render: async request => {
+      seen.push(request.html);
+      return { buffer: Buffer.from("%PDF-1.4\nfixture"), fontsReady: true };
+    } };
+    await expect(renderPdf({ htmlPath }, root, renderer, undefined, { authorizePath })).rejects.toMatchObject({ code: "PATH_NOT_ALLOWED" });
+    expect(paths).toEqual([htmlPath, stylePath, imagePath]);
+    expect(seen).toEqual([]);
+    paths.length = 0;
+    allowImage = true;
+    await expect(renderPdf({ htmlPath }, root, renderer, undefined, { authorizePath })).resolves.toMatchObject({ title: "Approved report" });
+    expect(paths).toEqual([htmlPath, stylePath, imagePath]);
+    expect(seen[0]).toContain("data:image/png;base64,");
+    const css = seen[0]!.match(/href="data:text\/css;base64,([^"]+)"/)?.[1];
+    expect(Buffer.from(css!, "base64").toString("utf8")).toContain("data:image/png;base64,");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
   }
 });
