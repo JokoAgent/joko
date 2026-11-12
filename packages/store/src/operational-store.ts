@@ -7492,11 +7492,22 @@ export class OperationalStore {
         SELECT * FROM messaging_interactions
         WHERE connection_id = ? AND channel_generation = ? AND provider_request_id = ?
       `).get(connection.id, connection.generation, providerRequestId) as Row | undefined;
-      if (existingRow !== undefined) {
-        const existing = messagingInteractionFromRow(existingRow);
+      // A channel command can be redelivered with a new transport request ID.
+      // Its original conversation/message identity still owns the effect.
+      const replayedCommand = existingRow === undefined && input.allowObservedConversation === true
+        ? this.database.prepare(`
+            SELECT * FROM messaging_interactions
+            WHERE connection_id = ? AND channel_generation = ? AND provider_interaction_id = ?
+          `).get(connection.id, connection.generation, providerInteractionId) as Row | undefined
+        : undefined;
+      const receipt = existingRow ?? replayedCommand;
+      if (receipt !== undefined) {
+        const existing = messagingInteractionFromRow(receipt);
         if (
           existing.actionHash !== actionHash || serializeJson(existing.payload) !== payloadJson ||
-          existing.providerInteractionId !== providerInteractionId
+          existing.providerInteractionId !== providerInteractionId ||
+          (input.allowObservedConversation === true &&
+            (existing.conversationId !== conversation.id || existing.providerMessageId !== providerMessageId))
         ) throw new StoreError("Messaging interaction dedupe identity conflicts with durable history.");
         return existing;
       }
