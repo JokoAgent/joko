@@ -7,6 +7,7 @@ import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { create } from "@bufbuild/protobuf";
 import { capabilityNames, CreateTargetMutationSchema, OperationMutationSchema, TargetWorkspaceInputSchema,
   WorkspaceKind, WorktreeEligibility } from "@joko/contracts";
+import { WorkspaceTextFileWriteError } from "@joko/orchestrator";
 import { _electron, type ElectronApplication, type Locator, type Page } from "playwright-core";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -270,13 +271,16 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
   const direct = await OrchestratorE2eFixture.start({ profiles: [profile] });
   fixture = direct;
   const proxy = await OrchestratorE2eFixture.start({ httpConnect: true });
-  const writeReceipts: { at: number; state: "pending" | "fulfilled" | "rejected" }[] = [];
+  const writeReceipts: { at: number; state: "pending" | "fulfilled" | "rejected"; fileSystemErrorCode?: string }[] = [];
   const originalWrite = direct.application.workspaces.writeTextFile;
   const observeWrite = vi.spyOn(direct.application.workspaces, "writeTextFile").mockImplementation((...args) => {
-    const receipt = { at: Date.now(), state: "pending" as "pending" | "fulfilled" | "rejected" };
+    const receipt: (typeof writeReceipts)[number] = { at: Date.now(), state: "pending" };
     if (writeReceipts.length < 12) writeReceipts.push(receipt);
     const pending = originalWrite.apply(direct.application.workspaces, args);
-    void pending.then(() => { receipt.state = "fulfilled"; }, () => { receipt.state = "rejected"; });
+    void pending.then(() => { receipt.state = "fulfilled"; }, (error: unknown) => {
+      receipt.state = "rejected";
+      if (error instanceof WorkspaceTextFileWriteError) receipt.fileSystemErrorCode = error.fileSystemErrorCode;
+    });
     return pending;
   });
   try {

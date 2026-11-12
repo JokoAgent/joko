@@ -336,7 +336,8 @@ export class WorkspaceTextFileWriteError extends Error {
 
   constructor(
     message: string,
-    readonly kind: "invalid" | "stale" | "unsupported" | "too_large" | "write_failed"
+    readonly kind: "invalid" | "stale" | "unsupported" | "too_large" | "write_failed",
+    readonly fileSystemErrorCode?: string
   ) {
     super(message);
     this.name = "WorkspaceTextFileWriteError";
@@ -921,8 +922,10 @@ export class WorkspaceService {
         assertCurrent();
         try {
           await this.#commitWorkspaceTextFile(temporaryPath, before.absolute);
-        } catch {
-          throw new WorkspaceTextFileWriteError("Workspace text could not be committed safely.", "write_failed");
+        } catch (error) {
+          const code = nodeErrorCode(error);
+          throw new WorkspaceTextFileWriteError("Workspace text could not be committed safely.", "write_failed",
+            code !== undefined && /^E[A-Z0-9]{1,23}$/u.test(code) ? code : undefined);
         }
         assertCurrent();
 
