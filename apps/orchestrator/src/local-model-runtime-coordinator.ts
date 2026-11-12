@@ -15,6 +15,7 @@ import type { ManagedProviderRuntimeInput, ProviderCatalogManager, ProviderDescr
 export const MANAGED_LOCAL_PROVIDER_ID = "joko-local-ollama";
 const MANAGED_MARKER = "joko-local-runtime-v1";
 const MAX_MANAGED_MODELS = 512;
+const CURATED_OLLAMA_QWEN_TAGS = new Set(["qwen3.8:27b", "qwen3.8:27b-mlx", "qwen3.8:27b-mxfp8"]);
 
 type OllamaProtocol = "openai-completions" | "anthropic-messages";
 type OllamaCodingBackend = "claude-code" | "codex";
@@ -210,7 +211,7 @@ function providerRuntime(
       compat: { jokoManagedRuntime: MANAGED_MARKER },
       models: models.map((model): PiManagedModel => {
         const cost = costById.get(canonicalModelName(model.id));
-        return {
+        const configured: PiManagedModel = {
           id: model.id,
           name: model.displayName,
           api: protocol,
@@ -220,8 +221,25 @@ function providerRuntime(
           ...(cost === undefined ? {} : { cost }),
           compat: { supportsTools: model.supportsTools }
         };
+        return coding ? configured : withCuratedOllamaPiProfile(configured);
       })
     }
+  };
+}
+
+function withCuratedOllamaPiProfile(model: PiManagedModel): PiManagedModel {
+  if (!CURATED_OLLAMA_QWEN_TAGS.has(model.id)) return model;
+  const contextWindow = model.contextWindow ?? 32_768;
+  return {
+    ...model,
+    input: ["text", "image"],
+    reasoning: true,
+    defaultEffort: "xhigh",
+    thinkingLevelMap: { off: "off", minimal: null, low: null, medium: null, high: null, xhigh: "xhigh", max: null },
+    contextWindow,
+    maxTokens: Math.max(1, Math.min(16_000, contextWindow - 1)),
+    compat: { ...model.compat, thinkingFormat: "qwen-chat-template", supportsDeveloperRole: false, supportsReasoningEffort: false },
+    samplingParams: { temperature: 1, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 }
   };
 }
 

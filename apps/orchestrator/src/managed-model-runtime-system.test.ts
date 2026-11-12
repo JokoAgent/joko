@@ -1,17 +1,19 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient, Code } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { CLAUDE_MANAGED_PROVIDER_SUPPORT } from "@joko/adapter-claude-code";
 import { CODEX_MANAGED_PROVIDER_SUPPORT } from "@joko/adapter-codex";
+import { createPiAdapter, piProviderModel } from "@joko/adapter-pi";
 import * as contract from "@joko/contracts";
 import { OLLAMA_LOOPBACK_ORIGIN, OLLAMA_OPENAI_BASE_URL, OllamaLoopbackClient, OllamaRuntimeLauncher, llamaCppModelId,
   type LocalRuntimeStatus, type OllamaModelDetails } from "@joko/local-model-runtime";
 import { OperationalStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
-import type { AdapterContext } from "@joko/core";
+import type { AdapterContext, EventPayload, NativeSessionBinding, TargetDescriptor } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
 import { mkdtemp } from "./test-paths.js";
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
@@ -155,6 +157,117 @@ describe("node-owned managed model runtime composition", () => {
       expect(f.streaming).not.toHaveBeenCalled();
     } finally { tags.mockRestore(); start.mockRestore(); probe.mockRestore(); await f.system.close(); f.store.close(); }
   });
+
+  it("materializes the curated Ollama profiles and sends the saved Pi thinking selection through the published client", async () => {
+    const f = await fixture();
+    const modelId = "qwen3.8:27b";
+    const tags = vi.spyOn(OllamaLoopbackClient.prototype, "tags").mockResolvedValue([
+      { name: modelId }, { name: "qwen3.8:27b-mlx" }, { name: "qwen3.8:27b-mxfp8" }, { name: "qwen3.8:latest" }
+    ]);
+    const show = vi.spyOn(OllamaLoopbackClient.prototype, "show").mockImplementation(async name => ({
+      capabilities: ["tools"], ...(name === "qwen3.8:27b-mlx" ? { contextLength: 2_048 } : {})
+    }));
+    const probe = vi.spyOn(OllamaRuntimeLauncher.prototype, "status").mockResolvedValue({
+      runtime: "ollama", source: "running", state: "ready", version: "0.14.0",
+      capabilities: { canInstall: false, canStart: true, canListModels: true, canPullModels: true, canDeleteModels: true, canPausePulls: true }
+    });
+    const received: { path: string; body: Record<string, unknown> }[] = [];
+    const modelServer = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      received.push({ path: request.url ?? "", body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+      const completion = {
+        id: `fixture-${received.length}`, model: modelId, object: "chat.completion.chunk", created: 1,
+        choices: [{ index: 0, delta: { role: "assistant", content: "Local fixture response." }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 }
+      };
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(`data: ${JSON.stringify(completion)}\n\ndata: [DONE]\n\n`);
+    });
+    let adapter: ReturnType<typeof createPiAdapter> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        modelServer.once("error", reject);
+        modelServer.listen(0, "127.0.0.1", resolve);
+      });
+      const address = modelServer.address();
+      if (address === null || typeof address === "string") throw new Error("The model fixture endpoint is unavailable.");
+      const fixtureEndpoint = `http://127.0.0.1:${address.port}/v1`;
+      await f.system.registry.get("ollama")!.snapshot();
+      await f.providers.upsertConfiguration({
+        providerId: "custom", displayName: "Custom", kind: "local_keyless", enabled: true, expectedVersion: 0n,
+        runtimes: [{ backendId: "backend-a", credentialOrigin: "", credentialBindings: {}, provider: {
+          id: "custom", api: "openai-completions", baseUrl: fixtureEndpoint, keyless: true, models: [{ id: modelId }]
+        } }]
+      });
+      const snapshot = await f.providers.createPiGenerationSnapshot({ snapshotsRoot: join(f.root, "pi-catalog") });
+      const managed = snapshot.providers.find(provider => provider.id === MANAGED_LOCAL_PROVIDER_ID)!;
+      expect(managed.baseUrl).toBe(OLLAMA_OPENAI_BASE_URL);
+      const selected = piProviderModel(managed, managed.models.find(model => model.id === modelId)!);
+      expect(selected).toMatchObject({
+        defaultEffort: "xhigh", thinkingLevels: ["off", "xhigh"], contextWindow: 32_768, maxOutputTokens: 16_000, supportsImages: true
+      });
+      const generated = JSON.parse(await readFile(join(snapshot.agentHome, "models.json"), "utf8"));
+      expect(generated.providers[MANAGED_LOCAL_PROVIDER_ID].models).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: modelId, reasoning: true, maxTokens: 16_000 }),
+        expect.objectContaining({ id: "qwen3.8:27b-mlx", reasoning: true, contextWindow: 2_048, maxTokens: 2_047 }),
+        expect.objectContaining({ id: "qwen3.8:27b-mxfp8", reasoning: true, maxTokens: 16_000 })
+      ]));
+      expect(generated.providers[MANAGED_LOCAL_PROVIDER_ID].models.find((model: { id: string }) => model.id === "qwen3.8:latest"))
+        .not.toHaveProperty("samplingParams");
+      expect(generated.providers.custom.models[0]).not.toHaveProperty("thinkingLevelMap");
+
+      const workspaceRoot = join(f.root, "pi-workspace"), sessionRoot = join(f.root, "pi-sessions");
+      await mkdir(workspaceRoot);
+      const startAdapter = (generation: number) => createPiAdapter({
+        agentHome: join(f.root, `pi-agent-${generation}`), sessionRoot, externalSessionRoots: [],
+        providers: [{ ...managed, baseUrl: fixtureEndpoint }],
+        settings: { compaction: { enabled: false }, retry: { enabled: false } }, includeManagedSubagentTools: () => false
+      });
+      const events: EventPayload[] = [];
+      let binding: NativeSessionBinding | undefined;
+      const target: TargetDescriptor = { id: "pi-target", backendId: "pi", displayName: "Local workspace", workspaceRoot, managed: true, trusted: true };
+      const context = (operationId: string): AdapterContext => ({
+        sessionId: "ollama-qwen", generation: 1, target, ...(binding === undefined ? {} : { binding }),
+        operationId, signal: new AbortController().signal, modelSelection: { providerId: MANAGED_LOCAL_PROVIDER_ID, modelId },
+        emit: async event => { events.push(event); }, requestInteraction: async () => ({ kind: "cancelled" }),
+        artifactCapacityBytes: 1_024, storeArtifact: async () => { throw new Error("The fixture has no artifacts."); }
+      });
+      const send = async (text: string) => {
+        const completed = events.filter(event => event.type === "done").length;
+        await adapter!.send({ text, disposition: "prompt", images: [], files: [], mentions: [] }, context(text));
+        await vi.waitFor(() => expect(events.filter(event => event.type === "done")).toHaveLength(completed + 1), { timeout: 15_000 });
+        expect(events.filter(event => event.type === "done").at(-1)).toMatchObject({ outcome: "completed" });
+      };
+      adapter = startAdapter(1);
+      binding = await adapter.createSession({ target, providerId: MANAGED_LOCAL_PROVIDER_ID, modelId, effort: selected.defaultEffort,
+        permissionMode: "ask", fastMode: false }, context("create"));
+      await send("Use the default reasoning level.");
+      await adapter.setEffort("off", context("save-off"));
+      await adapter.dispose();
+      adapter = startAdapter(2);
+      expect((await adapter.resumeSession(binding, context("restore"))).effort).toBe("off");
+      await send("Use the saved reasoning level.");
+
+      expect(received).toHaveLength(2);
+      for (const [index, packet] of received.entries()) {
+        expect(packet.path).toBe("/v1/chat/completions");
+        expect(packet.body).toMatchObject({
+          model: modelId, chat_template_kwargs: { enable_thinking: index === 0, preserve_thinking: true },
+          max_completion_tokens: 16_000, temperature: 1, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0
+        });
+        expect(packet.body).not.toHaveProperty("reasoning_effort");
+        expect(packet.body.messages).toEqual(expect.arrayContaining([expect.objectContaining({ role: "system" })]));
+        expect(packet.body.messages).not.toEqual(expect.arrayContaining([expect.objectContaining({ role: "developer" })]));
+      }
+    } finally {
+      await adapter?.dispose();
+      modelServer.closeAllConnections();
+      if (modelServer.listening) await new Promise<void>(resolve => modelServer.close(() => resolve()));
+      probe.mockRestore(); show.mockRestore(); tags.mockRestore();
+      await f.system.close(); f.store.close();
+    }
+  }, 60_000);
 
   it("registers eligible Ollama models at each coding Backend's floor, executes their selected routes, and retires them on inventory changes", async () => {
     const f = await fixture();
