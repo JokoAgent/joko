@@ -1,13 +1,13 @@
 import { join, resolve } from "node:path";
 
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
+import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { BackendDescriptor } from "@joko/core";
 import { CredentialManager, CredentialVault, ProviderCatalogManager, ProviderAccountBalanceProvider } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 
-import { InstrumentedFakeAdapter, OrchestratorE2eFixture } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery } from "./fixture.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
@@ -211,16 +211,6 @@ describe("mounted Provider configuration", () => {
     expect((await read()).version?.revision?.value).toBe(copied.version?.revision?.value);
   });
 });
-
-async function routeFixtureDiscovery(context: BrowserContext, baseUrl: string): Promise<void> {
-  // The page's opportunistic local-node discovery must reach this controlled
-  // node instead of depending on a daemon installed on the CI runner.
-  await context.route(/^http:\/\/(?:127\.0\.0\.1|localhost):4318\/joko\.v1\.ConnectionService\/(?:GetServerInfo|ListDiscoveredNodes)$/u, async route => {
-    const { pathname } = new URL(route.request().url());
-    const response = await route.fetch({ url: new URL(pathname, baseUrl).href, maxRetries: 0 });
-    await route.fulfill({ response });
-  });
-}
 
 function browserErrors(page: Page): string[] {
   const errors: string[] = [];

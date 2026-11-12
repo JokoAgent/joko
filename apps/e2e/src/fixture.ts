@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createConnection, createServer as createPortProbe } from "node:net";
 import { createServer as createHttpServer, type IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
+import type { BrowserContext } from "playwright-core";
 import { replaceEndpointTrust, type EndpointTransport } from "@joko/connection-transport/trust";
 
 import type { AdapterContext, BlobRef, PromptInput } from "@joko/core";
@@ -779,6 +780,15 @@ async function createHttpConnectFixture(application: OrchestratorApplication, ba
 
 export function sha256(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export async function routeFixtureDiscovery(context: BrowserContext, baseUrl: string): Promise<void> {
+  // Keep the browser's optional default-node probes inside the test fixture.
+  await context.route(/^http:\/\/(?:127\.0\.0\.1|localhost):4318\/joko\.v1\.ConnectionService\/(?:GetServerInfo|ListDiscoveredNodes)$/u, async route => {
+    const { pathname } = new URL(route.request().url());
+    const response = await route.fetch({ url: new URL(pathname, baseUrl).href, maxRetries: 0 });
+    await route.fulfill({ response });
+  });
 }
 
 export async function waitFor<T>(

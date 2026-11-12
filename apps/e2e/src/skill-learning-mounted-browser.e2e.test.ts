@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { waitFor } from "./fixture.js";
+import { routeFixtureDiscovery, waitFor } from "./fixture.js";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
 
 const executable = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
@@ -33,6 +33,7 @@ describe("mounted Skill learning review", () => {
     const code = fixture.pairingCode(challenge.challenge!.challengeId);
     browser = await chromium.launch({ executablePath: executable!, headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    await routeFixtureDiscovery(page.context(), fixture.baseUrl);
     await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.locator("details.device-authorization__manual > summary").click();
@@ -111,6 +112,7 @@ describe("mounted Skill learning review", () => {
     const code = fixture.pairingCode(challenge.challenge.challengeId);
     browser = await chromium.launch({ executablePath: executable!, headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    await routeFixtureDiscovery(page.context(), fixture.baseUrl);
     const { errors, networkFailures } = observeErrors(page);
     await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
