@@ -1604,7 +1604,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const contact = createContactConnectService(
     application.contacts,
     (context) => authenticate(context),
-    application.contactSync
+    application.contactSync,
+    connection => {
+      const port = application.nativeInputHandoff?.systemContacts();
+      if (port === undefined || port.connectionId !== connection.id || port.deviceId !== connection.deviceId) return undefined;
+      return { port, ownerId: `desktop:${connection.id}`, assertCurrent: () => {
+        dependencies.connections.fence(connection);
+        port.assertCurrent();
+      } };
+    }
   );
   const partner = createPartnerConnectService(
     application.partners,
@@ -19074,7 +19082,7 @@ async function dispatchMutation(
         body: mutation,
         commit: () => {
           if (mapped.kind === "dismissal") host.dismissInteraction(payload.value.interactionId, Number(payload.value.interactionGeneration), mapped.reason, `operation:${operationId}`, operationId);
-          else host.resolveInteraction(payload.value.interactionId, Number(payload.value.interactionGeneration), mapped.value, `operation:${operationId}`, operationId);
+          else host.resolveInteraction(payload.value.interactionId, Number(payload.value.interactionGeneration), mapped.value, `operation:${operationId}`, operationId, connection.id);
           return { accepted: true, resultCase: "interaction", entityId: payload.value.interactionId } satisfies OperationOutcome;
         }
       }).catch((error: unknown) => {

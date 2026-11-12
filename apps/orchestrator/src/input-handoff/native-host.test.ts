@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
@@ -21,6 +22,49 @@ function fixture() {
   cleanup.push(() => { host.close(); store.close(); });
   return { host, client, headers, desktop, connections, registration };
 }
+
+it("admits a typed macOS Contacts write once and rejects late read data on cancellation", async () => {
+  const f = fixture();
+  expect(f.host.systemContacts()).toBeUndefined();
+  const registered = await f.client.registerNativeInputHandoffHost({ ...f.registration, supportsSystemContacts: true }, { headers: f.headers });
+  const scope = { hostInstanceId: f.registration.hostInstanceId, hostGeneration: registered.hostGeneration };
+  const port = f.host.systemContacts()!;
+  expect(port.deviceId).toBe(f.desktop.connection.deviceId);
+  expect(port.connectionId).toBe(f.desktop.connection.id);
+  const admit = vi.fn();
+  const body = create(contract.NativeSystemContactsWriteRequestSchema, { items: [
+    { contactId: "person", fields: { displayName: "Ada Lovelace", kind: contract.ContactKind.PERSON } }
+  ] });
+  const write = port.write(body, () => {}, admit);
+  const poll = async () => (await f.client.pollNativeInputHandoffCommand(scope, { headers: f.headers })).command!;
+  const command = await poll();
+  expect(command.method).toBe(contract.NativeInputHandoffMethod.WRITE_SYSTEM_CONTACTS);
+  expect(fromBinary(contract.NativeSystemContactsWriteRequestSchema, command.payload)).toEqual(body);
+  expect(admit).not.toHaveBeenCalled();
+  const request = { ...scope, commandId: command.commandId };
+  for (let i = 0; i < 2; i++) {
+    expect((await f.client.admitNativeInputHandoffCommand(request, { headers: f.headers })).current).toBe(true);
+  }
+  expect(admit).toHaveBeenCalledOnce();
+  const result = create(contract.NativeSystemContactsWriteResponseSchema, { receipts: [
+    { contactId: "person", nativeId: "apple-card", outcome: contract.NativeSystemContactWriteOutcome.CREATED }
+  ] });
+  const completion = { ...request, success: true, payload: toBinary(contract.NativeSystemContactsWriteResponseSchema, result) };
+  expect((await f.client.completeNativeInputHandoffCommand(completion, { headers: f.headers })).accepted).toBe(true);
+  await expect(write).resolves.toEqual(result);
+  expect((await f.client.completeNativeInputHandoffCommand(completion, { headers: f.headers })).accepted).toBe(true);
+
+  const abort = new AbortController();
+  const read = port.read(create(contract.NativeSystemContactsReadRequestSchema), () => {}, abort.signal);
+  const rejected = expect(read).rejects.toThrow("unavailable");
+  const readCommand = await poll();
+  const readScope = { ...scope, commandId: readCommand.commandId };
+  expect((await f.client.admitNativeInputHandoffCommand(readScope, { headers: f.headers })).current).toBe(true);
+  abort.abort();
+  await rejected;
+  expect((await f.client.completeNativeInputHandoffCommand({ ...readScope, success: true, payload: new Uint8Array() },
+    { headers: f.headers })).accepted).toBe(false);
+});
 
 it("requires both current Main proofs and dispatches each private native effect only once", async () => {
   const f = fixture(); expect(f.host.currentDeviceId()).toBeNull(); expect(f.host.createDriver(() => {})).toBeNull();

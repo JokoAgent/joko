@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import { fastifyConnectPlugin } from "@connectrpc/connect-fastify";
 import type { FastifyInstance } from "fastify";
@@ -18,16 +18,33 @@ export interface NativeInputHandoffLivePort {
   liveViewEnded(requestId: string, controllerDeviceId: string): void;
 }
 
+export interface NativeSystemContactsPort {
+  readonly deviceId: string;
+  readonly connectionId: string;
+  assertCurrent(): void;
+  read(request: contract.NativeSystemContactsReadRequest, assertCurrent: () => void, signal?: AbortSignal): Promise<contract.NativeSystemContactsReadResponse>;
+  write(request: contract.NativeSystemContactsWriteRequest, assertCurrent: () => void, onAdmit: () => void, signal?: AbortSignal): Promise<contract.NativeSystemContactsWriteResponse>;
+}
+
+export class SystemContactsPermissionError extends Error {
+  constructor() {
+    super("Allow Joko to control Contacts in macOS System Settings under Privacy & Security, then Automation.");
+  }
+}
+
 const Method = contract.NativeInputHandoffMethod;
 const MAX_REQUEST = 65_536, MAX_RESPONSE = 8_000_000;
 interface Authority { readonly connection: ConnectionRecord; readonly proof: string }
 interface Command {
   readonly id: string; readonly method: contract.NativeInputHandoffMethod; readonly payload: Uint8Array; readonly assertCurrent: () => void;
   readonly resolve: (value: unknown) => void; readonly reject: (error: Error) => void; readonly cleanup: () => void; dispatched: boolean;
+  readonly onAdmit?: () => void;
+  admitted: boolean;
 }
 interface Host {
   readonly id: string; readonly generation: bigint; readonly pid: number; readonly authority: Authority; readonly pending: Map<string, Command>;
   readonly unlisten: () => void; readonly receipts: Map<string, { digest: string; expires: number }>;
+  readonly supportsSystemContacts: boolean;
   poll?: () => void; seenAt: number;
 }
 
@@ -43,6 +60,30 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
   }
   setLiveHandoffPort(port: NativeInputHandoffLivePort): void { this.#live = port; }
   currentDeviceId(): string | null { const host = this.#host; if (!host) return null; try { this.#current(host); return host.authority.connection.deviceId; } catch { return null; } }
+  systemContacts(): NativeSystemContactsPort | undefined {
+    const host = this.#host;
+    if (!host?.supportsSystemContacts) return undefined;
+    const assertCurrent = () => {
+      this.#current(host);
+      if (this.connections.getDevice(host.authority.connection.deviceId).platform !== "darwin") throw unavailable();
+    };
+    try { assertCurrent(); } catch { return undefined; }
+    return {
+      deviceId: host.authority.connection.deviceId,
+      connectionId: host.authority.connection.id,
+      assertCurrent,
+      read: async (request, check, signal) => {
+        const value = await this.#call(host, Method.READ_SYSTEM_CONTACTS, toBinary(contract.NativeSystemContactsReadRequestSchema, request), check, signal);
+        if (!(value instanceof Uint8Array)) throw unavailable();
+        return fromBinary(contract.NativeSystemContactsReadResponseSchema, value);
+      },
+      write: async (request, check, onAdmit, signal) => {
+        const value = await this.#call(host, Method.WRITE_SYSTEM_CONTACTS, toBinary(contract.NativeSystemContactsWriteRequestSchema, request), check, signal, onAdmit);
+        if (!(value instanceof Uint8Array)) throw unavailable();
+        return fromBinary(contract.NativeSystemContactsWriteResponseSchema, value);
+      }
+    };
+  }
   async checkSecureInputTarget(target: ComputerSecureInputTarget, signal: AbortSignal, assertCurrent: () => void): Promise<boolean> {
     const host = this.#host;
     if (host === undefined) return false;
@@ -77,13 +118,16 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
       registerNativeInputHandoffHost: (request, context) => {
         const authority = auth(context);
         if (this.#closed || request.platform !== "darwin" || !/^[a-f0-9-]{36}$/u.test(request.hostInstanceId) || !Number.isSafeInteger(request.processId) || request.processId <= 0) throw unavailable();
+        if (request.supportsSystemContacts && this.connections.getDevice(authority.connection.deviceId).platform !== "darwin") throw unavailable();
         let host = this.#host;
-        if (host && (host.id !== request.hostInstanceId || host.pid !== request.processId || host.authority.connection.id !== authority.connection.id || host.authority.proof !== authority.proof)) this.#retire(host);
+        if (host && (host.id !== request.hostInstanceId || host.pid !== request.processId || host.authority.connection.id !== authority.connection.id
+          || host.authority.proof !== authority.proof || host.supportsSystemContacts !== request.supportsSystemContacts)) this.#retire(host);
         host = this.#host;
         if (!host) {
           let captured!: Host;
           const unlisten = this.connections.onRevoked(authority.connection.id, () => this.#retire(captured));
-          host = captured = { id: request.hostInstanceId, generation: ++this.#generation, pid: request.processId, authority, pending: new Map(), receipts: new Map(), unlisten, seenAt: Date.now() }; this.#host = host;
+          host = captured = { id: request.hostInstanceId, generation: ++this.#generation, pid: request.processId, authority,
+            supportsSystemContacts: request.supportsSystemContacts, pending: new Map(), receipts: new Map(), unlisten, seenAt: Date.now() }; this.#host = host;
         }
         this.#current(host); host.seenAt = Date.now();
         return create(contract.RegisterNativeInputHandoffHostResponseSchema, { hostGeneration: host.generation });
@@ -105,7 +149,11 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
       admitNativeInputHandoffCommand: (request, context) => {
         const host = this.#entry(auth(context), request.hostInstanceId, request.hostGeneration), command = host.pending.get(request.commandId);
         host.seenAt = Date.now();
-        let current = !!command?.dispatched; try { command?.assertCurrent(); } catch { current = false; if (command) this.#fail(host, command); }
+        let current = !!command?.dispatched; try { command?.assertCurrent(); } catch (error) { current = false; if (command) this.#fail(host, command, error); }
+        if (current && command !== undefined && !command.admitted) {
+          try { command.onAdmit?.(); command.admitted = true; }
+          catch (error) { current = false; this.#fail(host, command, error); }
+        }
         return create(contract.AdmitNativeInputHandoffCommandResponseSchema, { current });
       },
       resolveNativeInputHandoffWindow: async (request, context) => {
@@ -148,31 +196,46 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
         const command = host.pending.get(request.commandId); if (!command?.dispatched) return create(contract.CompleteNativeInputHandoffCommandResponseSchema, { accepted: false });
         try {
           command.assertCurrent();
-          if (!request.success) throw new Error("Native input handoff failed.");
-          const value: unknown = JSON.parse(Buffer.from(request.payload).toString("utf8"), (key, value: unknown) => key === "jpeg" && typeof value === "string" ? decodeJpeg(value) : value);
-          this.#finish(host, command); command.resolve(value); host.receipts.set(command.id, { digest, expires: Date.now() + 60_000 });
+          if (isSystemContactsMethod(command.method)) {
+            if (!command.admitted) throw unavailable();
+            this.#finish(host, command);
+            if (request.success) command.resolve(request.payload);
+            else if (Buffer.from(request.payload).toString("utf8") === "permission") command.reject(new SystemContactsPermissionError());
+            else command.reject(new Error("The macOS Contacts command failed."));
+          } else {
+            if (!request.success) throw new Error("Native input handoff failed.");
+            const value: unknown = JSON.parse(Buffer.from(request.payload).toString("utf8"), (key, value: unknown) => key === "jpeg" && typeof value === "string" ? decodeJpeg(value) : value);
+            this.#finish(host, command); command.resolve(value);
+          }
+          host.receipts.set(command.id, { digest, expires: Date.now() + 60_000 });
           for (const [id, item] of host.receipts) if (item.expires <= Date.now()) host.receipts.delete(id);
           return create(contract.CompleteNativeInputHandoffCommandResponseSchema, { accepted: true });
-        } catch { this.#fail(host, command); return create(contract.CompleteNativeInputHandoffCommandResponseSchema, { accepted: false }); }
+        } catch (error) { this.#fail(host, command, error); return create(contract.CompleteNativeInputHandoffCommandResponseSchema, { accepted: false }); }
       }
     };
   }
   close(): void { this.#closed = true; clearInterval(this.#sweep); if (this.#host) this.#retire(this.#host); this.#input.close(); }
-  #call(host: Host, method: contract.NativeInputHandoffMethod, value: unknown, assertCurrent: () => void, signal?: AbortSignal): Promise<unknown> {
+  #call(host: Host, method: contract.NativeInputHandoffMethod, value: unknown, assertCurrent: () => void, signal?: AbortSignal, onAdmit?: () => void): Promise<unknown> {
     const assertCommandCurrent = () => { this.#current(host); signal?.throwIfAborted(); assertCurrent(); };
     assertCommandCurrent();
-    const payload = Buffer.from(JSON.stringify(value)); if (payload.length > MAX_REQUEST || host.pending.size >= 32) throw unavailable();
+    const contacts = isSystemContactsMethod(method);
+    if (contacts && [...host.pending.values()].some(command => isSystemContactsMethod(command.method))) {
+      throw new ConnectError("A macOS Contacts request is already running.", Code.ResourceExhausted);
+    }
+    const payload = value instanceof Uint8Array ? value : Buffer.from(JSON.stringify(value));
+    if (payload.length > MAX_REQUEST || host.pending.size >= 32) throw unavailable();
     return new Promise((resolve, reject) => {
       const id = randomUUID();
       const retire = () => { const entry = host.pending.get(id); if (entry) this.#fail(host, entry); };
-      const timeout = setTimeout(retire, 30_000); timeout.unref();
+      const timeout = setTimeout(retire, contacts ? 190_000 : 30_000); timeout.unref();
       const cleanup = () => { clearTimeout(timeout); signal?.removeEventListener("abort", retire); };
-      const command: Command = { id, method, payload, assertCurrent: assertCommandCurrent, resolve, reject, cleanup, dispatched: false };
+      const command: Command = { id, method, payload, assertCurrent: assertCommandCurrent, resolve, reject, cleanup,
+        ...(onAdmit === undefined ? {} : { onAdmit }), dispatched: false, admitted: false };
       host.pending.set(id, command); signal?.addEventListener("abort", retire, { once: true }); host.poll?.();
     });
   }
   #next(host: Host): Command | undefined {
-    for (const command of host.pending.values()) if (!command.dispatched) { try { command.assertCurrent(); } catch { this.#fail(host, command); continue; } command.dispatched = true; return command; } return undefined;
+    for (const command of host.pending.values()) if (!command.dispatched) { try { command.assertCurrent(); } catch (error) { this.#fail(host, command, error); continue; } command.dispatched = true; return command; } return undefined;
   }
   #entry(authority: Authority, id: string, generation: bigint): Host {
     const host = this.#host;
@@ -184,7 +247,12 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
     this.connections.authenticateDesktopHost(host.authority.connection, host.authority.proof);
   }
   #finish(host: Host, command: Command): void { command.cleanup(); host.pending.delete(command.id); command.payload.fill(0); }
-  #fail(host: Host, command: Command): void { this.#finish(host, command); command.reject(new Error("Native input handoff is unavailable.")); }
+  #fail(host: Host, command: Command, cause?: unknown): void {
+    this.#finish(host, command);
+    const contacts = isSystemContactsMethod(command.method);
+    command.reject(contacts && cause instanceof Error ? cause : new Error(contacts
+      ? "The originating macOS Contacts host is unavailable." : "Native input handoff is unavailable."));
+  }
   #retire(host: Host): void {
     this.#input.retireHost(host);
     if (this.#host === host) this.#host = undefined; host.unlisten(); host.poll?.();
@@ -199,6 +267,9 @@ export async function registerInputHandoffNativeHost(server: FastifyInstance, ho
     });
     await scope.register(fastifyConnectPlugin, { routes: router => router.service(contract.DesktopInputHandoffHostService, host.service()), readMaxBytes: MAX_RESPONSE + 4096, writeMaxBytes: MAX_RESPONSE + 4096 });
   });
+}
+function isSystemContactsMethod(method: contract.NativeInputHandoffMethod): boolean {
+  return method === Method.READ_SYSTEM_CONTACTS || method === Method.WRITE_SYSTEM_CONTACTS;
 }
 function unavailable(): ConnectError { return new ConnectError("Native input handoff is unavailable.", Code.FailedPrecondition); }
 function loopback(value: string): boolean { return value === "127.0.0.1" || value === "::1" || value.startsWith("::ffff:127."); }

@@ -134,8 +134,15 @@ enum NativeInputHandoffMethod {
   NATIVE_INPUT_HANDOFF_METHOD_POINTER = 9;
   NATIVE_INPUT_HANDOFF_METHOD_QR = 10;
   NATIVE_INPUT_HANDOFF_METHOD_RAISE = 11;
+  NATIVE_INPUT_HANDOFF_METHOD_READ_SYSTEM_CONTACTS = 12;
+  NATIVE_INPUT_HANDOFF_METHOD_WRITE_SYSTEM_CONTACTS = 13;
 }
-message RegisterNativeInputHandoffHostRequest { string host_instance_id = 1; string platform = 2; uint32 process_id = 3; }
+message RegisterNativeInputHandoffHostRequest {
+  string host_instance_id = 1;
+  string platform = 2;
+  uint32 process_id = 3;
+  bool supports_system_contacts = 4;
+}
 message RegisterNativeInputHandoffHostResponse { uint64 host_generation = 1; }
 message PollNativeInputHandoffCommandRequest { string host_instance_id = 1; uint64 host_generation = 2; }
 message NativeInputHandoffCommand { string command_id = 1; NativeInputHandoffMethod method = 2; bytes payload = 3; }

@@ -280,6 +280,7 @@ export interface BridgeToolCallContext {
   readonly nativeRootQueueInput?: PiNativeRootQueueInput;
   /** The sole active Queue Attempt captured before native tool admission awaited policy. */
   readonly inputQueueItem?: NativeBridgeToolAdmission["inputQueueItem"];
+  readonly localProductScope?: true;
   readonly authorizeDocumentPath?: DocumentPathAuthorizer;
   readonly sessionId: string;
   readonly targetId: string;
@@ -1440,6 +1441,7 @@ export class McpRouter {
               ...(assertNativeRoot === undefined ? {} : { assertNativeRoot }),
               ...(nativeRootQueueInput === undefined ? {} : { nativeRootQueueInput }),
               ...(admission?.inputQueueItem === undefined ? {} : { inputQueueItem: admission.inputQueueItem }),
+              ...(!input.hostedExecutor && grant.productScope !== undefined ? { localProductScope: true as const } : {}),
               ...(authorizeDocumentPath === undefined ? {} : { authorizeDocumentPath: async request => {
                 guard();
                 if (this.#redactText(request.path) !== request.path) {

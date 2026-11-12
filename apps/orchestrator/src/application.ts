@@ -1210,7 +1210,19 @@ export async function createOrchestratorApplication(
     })
   );
   const unregisterContactTools = mcpRouter.registerBridgeToolProvider(
-    new ContactToolBridgeProvider({ store, contacts })
+    new ContactToolBridgeProvider({ store, contacts, systemContacts: {
+      getPort: () => nativeInputHandoff?.systemContacts(),
+      approve: async (request, signal) => {
+        const revoked = new AbortController();
+        const unlisten = connections.onRevoked(request.connectionId, () => revoked.abort());
+        try {
+          return await sessionHost.requestSystemContactsApproval(request,
+            signal === undefined ? revoked.signal : AbortSignal.any([signal, revoked.signal]));
+        } finally {
+          unlisten();
+        }
+      }
+    } })
   );
   const unregisterRemoteHostTools = mcpRouter.registerBridgeToolProvider(
     new RemoteHostToolBridgeProvider({ store, registry: remoteHosts, outputRedactor: credentials })

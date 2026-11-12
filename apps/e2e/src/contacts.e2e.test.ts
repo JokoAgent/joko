@@ -37,6 +37,7 @@ mountedIt("imports valid cards beside rejected cards and shows an all-invalid re
   await page.locator("form.pair-form button[type=submit]").click();
   const upload = page.locator(".contacts-settings__file");
   await upload.waitFor({ state: "attached", timeout: 20_000 });
+  expect(await page.getByRole("button", { name: "Import from macOS Contacts", exact: true }).count()).toBe(0);
   const card = (...fields: string[]) => ["BEGIN:VCARD", "VERSION:3.0", ...fields, "END:VCARD", ""].join("\r\n");
   await upload.setInputFiles({ name: "mixed.vcf", mimeType: "text/vcard",
     buffer: Buffer.from(card(`FN:${"x".repeat(101)}`) + card("FN:Bob", "EMAIL:bob@example.test")) });

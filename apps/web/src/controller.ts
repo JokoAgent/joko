@@ -4305,6 +4305,9 @@ export function useAppController(): AppController {
     previewContactVCardImport: (vcardText, signal) => gateway().previewContactVCardImport(vcardText, signal),
     commitContactVCardImport: (previewId, expectedDirectoryRevision, decisions, signal) =>
       gateway().commitContactVCardImport(previewId, expectedDirectoryRevision, decisions, signal),
+    previewSystemContactImport: (signal) => gateway().previewSystemContactImport(signal),
+    commitSystemContactImport: (previewId, expectedDirectoryRevision, decisions, signal) =>
+      gateway().commitSystemContactImport(previewId, expectedDirectoryRevision, decisions, signal),
     exportContactsVCard: (contactIds, signal) => gateway().exportContactsVCard(contactIds, signal),
     getContactSyncStatus: (signal) => gateway().getContactSyncStatus(signal),
     setContactSyncEnabled: (expectedConfigurationRevision, enabled, signal) =>
