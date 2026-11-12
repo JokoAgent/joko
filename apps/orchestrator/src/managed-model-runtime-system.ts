@@ -16,7 +16,7 @@ import type { OperationalStore } from "@joko/store";
 
 import type { ProviderCatalogManager } from "./credential-manager.js";
 import {
-  LocalModelProviderCoordinator, MANAGED_LOCAL_PROVIDER_ID, supportsClaudeOllamaModel
+  LocalModelProviderCoordinator, MANAGED_LOCAL_PROVIDER_ID, supportsOllamaCodingModel
 } from "./local-model-runtime-coordinator.js";
 import {
   activateLocalModelRuntimePersistence,
@@ -44,6 +44,7 @@ export interface ManagedModelRuntimeSystemOptions {
   readonly ownerId: string;
   readonly ownerGeneration: number;
   readonly claudeBackendId?: string;
+  readonly codexBackendId?: string;
   readonly onProviderChanged?: (backendIds: readonly string[]) => Promise<void>;
   readonly fetchStreaming: typeof fetch;
 }
@@ -66,11 +67,12 @@ export async function createManagedModelRuntimeSystem(
     providers: options.providers,
     backendId: options.providers.nativeAuthenticationBackendId,
     ...(options.claudeBackendId === undefined ? {} : { claudeBackendId: options.claudeBackendId }),
+    ...(options.codexBackendId === undefined ? {} : { codexBackendId: options.codexBackendId }),
     currentOwner: () => activeOwner,
     bindings: new StoreLocalModelProviderBindings(options.store)
   });
   let synchronizedModels = "";
-  let synchronizedClaudeEvidence = "";
+  let synchronizedCodingEvidence = "";
   const pendingProviderRefresh = new Set<string>();
   const manager = new LocalModelRuntimeManager({
     client,
@@ -81,15 +83,15 @@ export async function createManagedModelRuntimeSystem(
     installLeases: new StoreRuntimeInstallLeaseRepository(options.store),
     onModelsChanged: async (runtimeOwner, models, version) => {
       const inventory = JSON.stringify(models.map(({ requiredRuntimeVersion: _requires, ...model }) => model));
-      const claudeEvidence = JSON.stringify([version, models.map(model => model.requiredRuntimeVersion)]);
-      if (inventory !== synchronizedModels || claudeEvidence !== synchronizedClaudeEvidence) {
+      const codingEvidence = JSON.stringify([version, models.map(model => model.requiredRuntimeVersion)]);
+      if (inventory !== synchronizedModels || codingEvidence !== synchronizedCodingEvidence) {
         const routes = providerCoordinator.routes(runtimeOwner);
         if (inventory !== synchronizedModels || routes.length > 0) {
           for (const route of routes) pendingProviderRefresh.add(route.backendId);
           for (const backendId of await providerCoordinator.sync(runtimeOwner, models, version)) pendingProviderRefresh.add(backendId);
         }
         synchronizedModels = inventory;
-        synchronizedClaudeEvidence = claudeEvidence;
+        synchronizedCodingEvidence = codingEvidence;
       }
       if (pendingProviderRefresh.size > 0) {
         await options.onProviderChanged?.([...pendingProviderRefresh]);
@@ -159,10 +161,11 @@ export async function createManagedModelRuntimeSystem(
       const { target, modelSelection, signal } = context;
       if (modelSelection === undefined) return;
       if (modelSelection.providerId === MANAGED_LOCAL_PROVIDER_ID) {
-        const claude = target.backendId === options.claudeBackendId;
+        const codingBackend = target.backendId === options.claudeBackendId ? "claude-code"
+          : target.backendId === options.codexBackendId ? "codex" : undefined;
         const unavailable = () => new LocalRuntimeError("MODEL_UNAUTHORIZED", "The selected managed Ollama route is unavailable.");
         if (target.remoteWorkspace !== undefined) {
-          if (claude) throw unavailable();
+          if (codingBackend !== undefined) throw unavailable();
           return;
         }
         const route = () => providerCoordinator.ownsModel(owner, target.backendId, modelSelection.modelId)
@@ -182,10 +185,10 @@ export async function createManagedModelRuntimeSystem(
         if (installed === undefined) {
           throw new LocalRuntimeError("MODEL_NOT_FOUND", "The selected Ollama model is no longer installed.");
         }
-        if (claude) {
+        if (codingBackend !== undefined) {
           const details = await client.show(installed.name, signal);
           signal.throwIfAborted(); assertRoute();
-          if (!supportsClaudeOllamaModel(status.version, details.capabilities.some(value => value.toLowerCase() === "tools"), details.requiredRuntimeVersion)) {
+          if (!supportsOllamaCodingModel(codingBackend, status.version, details.capabilities.some(value => value.toLowerCase() === "tools"), details.requiredRuntimeVersion)) {
             throw unavailable();
           }
         }
