@@ -60,11 +60,28 @@ export class SessionRuntimeHandoffStore {
         || (session.worktree?.path ?? target.descriptor.workspaceRoot) !== input.workspaceRoot) return false;
       if (session.backendId === input.backendId) return input.generation === session.binding.generation || input.generation === session.binding.generation + 1;
       const pending = this.read(input.sessionId)?.pending, origin = pending?.origin;
-      return pending !== undefined && ["closed", "effect", "ready"].includes(pending.phase) && origin !== undefined
+      if (pending !== undefined && ["closed", "effect", "ready"].includes(pending.phase) && origin !== undefined
         && pending.profile.backendId === input.backendId && origin.backendId === session.backendId
         && origin.targetRevision === target.revision.toString() && origin.binding.generation === session.binding.generation
         && origin.binding.opaqueRef === session.binding.opaqueRef && origin.binding.nativeSessionId === session.binding.nativeSessionId
-        && input.generation === origin.binding.generation + 1;
+        && input.generation === origin.binding.generation + 1) return true;
+      const operation = input.operationId === undefined ? undefined : this.store.findOperation(input.operationId);
+      const body = operation?.body;
+      if (operation?.kind !== "restart_discord_conversation" || operation.status !== "started"
+        || operation.connectionId !== undefined || !object(body) || typeof body["conversationId"] !== "string"
+        || body["sessionId"] !== session.id || body["targetId"] !== target.descriptor.id
+        || body["targetRevision"] !== target.revision.toString() || body["sourceBackendId"] !== session.backendId
+        || body["sourceGeneration"] !== session.binding.generation || input.generation !== session.binding.generation + 1
+        || body["backendId"] !== input.backendId || body["backendInstanceGeneration"] !== input.backendInstanceGeneration) return false;
+      const conversation = this.store.findMessagingConversation(body["conversationId"]);
+      if (!conversation || conversation.status !== "active" || conversation.conversationKind !== "direct"
+        || conversation.partnerId !== undefined || conversation.sessionId !== session.id
+        || conversation.revision.toString() !== body["conversationRevision"]) return false;
+      const connection = this.store.getMessagingConnection(conversation.connectionId);
+      const route = this.store.resolveMessagingRoute(connection.id);
+      return connection.channel === "discord" && connection.enabled && connection.generation === body["channelGeneration"]
+        && connection.generation === conversation.channelGeneration && connection.credentialGeneration === body["credentialGeneration"]
+        && route.scopeKey === body["routeScopeKey"] && route.revision.toString() === body["routeRevision"] && route.backendId === input.backendId;
     }
     const operation = input.operationId === undefined ? undefined : this.store.findOperation(input.operationId);
     const body = operation?.body;

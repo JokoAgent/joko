@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -335,6 +335,129 @@ describe("MessagingManager", () => {
     expect(fixture.store.getQueueItem(foreign.queueItemId).state).toBe("accepted");
     expect(fixture.store.getRun(requestFor("6")!.runId!).descriptor.state).toBe("running");
   }, 20_000);
+
+  it("restarts the original Discord direct task on the current default with only its old timeline hidden", async () => {
+    const transport = new FakeDiscordTransport();
+    const originalAdapter = new ControlledReplyAdapter();
+    const destinationAdapter = new ControlledReplyAdapter({
+      ...PI_LIKE_PROFILE, id: "discord-default-backend",
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "session.reset"
+        ? { ...capability, supported: false } : capability)
+    });
+    const inputs = [
+      { id: 1, text: "/new" },
+      { id: 2, text: "Original Discord prompt" },
+      { id: 3, text: "/new" },
+      { id: 4, text: "/new" },
+      { id: 4, text: "/new" },
+      { id: 5, text: "New Discord prompt" },
+      { id: 6, text: "/new" },
+      { id: 7, text: "/new" }
+    ];
+    const gates = inputs.map(() => deliveryGate());
+    const poll = vi.spyOn(transport, "poll");
+    const messageId = (id: number) => `99999999999999999${id}`;
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeDiscordUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "111111111111111111", ownerConversationId: "444444444444444444",
+      bot: { id: "222222222222222222", username: "joko_test_bot", displayName: "Joko" }, groupActivation: {}
+    }));
+    inputs.forEach((message, index) => poll.mockImplementationOnce(async ({ signal }) => {
+      await gates[index]!.wait;
+      signal?.throwIfAborted();
+      return { nextCursor: `discord-new-${index}`, updates: [{
+        sequence: index + 1, eventType: "MESSAGE_CREATE", channel: { id: "444444444444444444", type: 1 },
+        message: { id: messageId(message.id), channel_id: "444444444444444444", timestamp: new Date().toISOString(),
+          author: { id: "111111111111111111", username: "owner" }, content: message.text }
+      }] };
+    }));
+    const fixture = await createFixture(undefined, () => [originalAdapter, destinationAdapter], () => transport);
+    cleanups.push(() => gates.forEach(gate => gate.release()));
+    const { store, host } = fixture;
+    const alternateRoot = join(fixture.root, "alternate-workspace");
+    await mkdir(alternateRoot);
+    await host.registerTarget({ id: "target-two", backendId: destinationAdapter.id, displayName: "Other workspace",
+      workspaceRoot: alternateRoot, managed: true, trusted: true });
+    const connection = await enableReplyStream(fixture, "discord");
+    const requestFor = (id: number) => store.listMessagingInboundRequests({ connectionId: connection.id })
+      .find(request => request.providerMessageId === messageId(id));
+    const notices = (id: number) => transport.sentText.filter(row => row.replyToMessageId === messageId(id));
+    const nativeCreate = vi.spyOn(destinationAdapter, "createSession");
+
+    gates[0]!.release();
+    await vi.waitFor(() => expect(notices(1)).toMatchObject([{ text: "A new conversation is ready." }]), { timeout: 5_000 });
+    const conversation = store.listMessagingConversations({ connectionId: connection.id })[0]!;
+    const sessionId = conversation.sessionId!;
+    expect(requestFor(1)).toBeUndefined();
+    gates[1]!.release();
+    await vi.waitFor(() => expect(originalAdapter.context?.sessionId).toBe(sessionId), { timeout: 5_000 });
+    await originalAdapter.finish("Original Discord answer");
+    await vi.waitFor(() => expect(requestFor(2)?.status).toBe("completed"), { timeout: 5_000 });
+    await vi.waitFor(() => host.assertSessionLifecycleIdle(sessionId));
+    const original = store.getSession(sessionId).descriptor;
+    const oldMessage = store.listEvents({ sessionId }).find(event => event.payload.type === "message_complete"
+      && event.payload.role === "assistant")!;
+    const oldRun = requestFor(2)!.runId!;
+    const artifact = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "original.png", mimeType: "image/png" });
+    store.transaction(() => store.adoptSessionArtifact({ blob: artifact.blob, sessionId, runId: oldRun }));
+    fixture.manager.putRoute({ connectionId: connection.id, targetId: "target-two", providerId: "vision", modelId: "multimodal",
+      effort: "high", permissionMode: "auto", fastMode: false, planMode: true });
+
+    const enqueue = store.enqueueMessagingDelivery.bind(store);
+    const notice = vi.spyOn(store, "enqueueMessagingDelivery").mockImplementation(input => {
+      if (input.kind === "notice" && input.dedupeKey.startsWith("command:")) {
+        notice.mockRestore();
+        throw new Error("The command receipt could not be committed.");
+      }
+      return enqueue(input);
+    });
+    gates[2]!.release();
+    await vi.waitFor(() => expect(notices(3)).toMatchObject([{ text: "The original Discord task is still available." }]), { timeout: 5_000 });
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(original.binding);
+    expect(store.listEvents({ sessionId }).map(event => event.id)).toContain(oldMessage.id);
+    expect(store.findUnresolvedDiscordConversationRestart(sessionId)).toBeUndefined();
+
+    gates[3]!.release();
+    await vi.waitFor(() => expect(notices(4)).toMatchObject([{ text: "A new conversation is ready.",
+      address: { providerConversationId: "444444444444444444" } }]), { timeout: 5_000 });
+    const restarted = store.getSession(sessionId).descriptor;
+    expect(restarted).toMatchObject({ id: sessionId, targetId: original.targetId, backendId: destinationAdapter.id,
+      providerId: "vision", modelId: "multimodal", effort: "high", permissionMode: "auto", planMode: true, archived: false,
+      binding: { generation: original.binding.generation + 1 } });
+    expect(restarted.binding.opaqueRef).not.toBe(original.binding.opaqueRef);
+    expect(store.getMessagingConversation(conversation.id)).toMatchObject({ sessionId, targetId: original.targetId,
+      backendId: destinationAdapter.id, sessionGeneration: restarted.binding.generation });
+    expect(store.listSessions({ includeArchived: true })).toHaveLength(1);
+    expect(store.listEvents({ sessionId }).map(event => event.id)).not.toContain(oldMessage.id);
+    expect(store.listEvents({ sessionId, includeTombstoned: true }).map(event => event.id)).toContain(oldMessage.id);
+    expect(store.listRuns({ sessionId }).map(run => run.descriptor.id)).toContain(oldRun);
+    expect(store.listArtifacts({ sessionId }).map(row => row.id)).toContain(artifact.id);
+    expect(nativeCreate.mock.calls).toHaveLength(2);
+    expect(nativeCreate).toHaveBeenLastCalledWith(expect.objectContaining({
+      nativeStart: { kind: "new" }, target: expect.objectContaining({ id: original.targetId, workspaceRoot: fixture.root })
+    }), expect.objectContaining({ sessionId, generation: restarted.binding.generation }));
+
+    gates[4]!.release();
+    await vi.waitFor(() => expect(store.getMessagingConnection(connection.id).cursor).toBe("discord-new-4"));
+    expect(notices(4)).toHaveLength(1);
+    expect(nativeCreate.mock.calls).toHaveLength(2);
+    gates[5]!.release();
+    await vi.waitFor(() => expect(destinationAdapter.context?.sessionId).toBe(sessionId), { timeout: 5_000 });
+    await destinationAdapter.finish("New Discord answer");
+    await vi.waitFor(() => expect(requestFor(5)?.status).toBe("completed"), { timeout: 5_000 });
+    await vi.waitFor(() => host.assertSessionLifecycleIdle(sessionId));
+
+    nativeCreate.mockRejectedValueOnce(new Error("The native creation receipt was lost."));
+    gates[6]!.release();
+    await vi.waitFor(() => expect(notices(6)).toMatchObject([{ text: "The new conversation could not be confirmed. Check the original task." }]));
+    const unknown = store.findUnresolvedDiscordConversationRestart(sessionId);
+    expect(unknown).toBeDefined();
+    expect(store.getOperation(unknown!)).toMatchObject({ status: "failed", error: { stateMayHaveChanged: true } });
+    gates[7]!.release();
+    await vi.waitFor(() => expect(notices(7)).toMatchObject([{ text: "The new conversation could not be confirmed. Check the original task." }]));
+    expect(nativeCreate.mock.calls).toHaveLength(3);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(restarted.binding);
+    expect(store.listMessagingInboundRequests({ connectionId: connection.id })).toHaveLength(2);
+  }, 25_000);
 
   it.each(["telegram", "discord"] as const)("serializes %s progress before the final and retains the channel's final-message lifecycle", async channel => {
     const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
@@ -4759,7 +4882,7 @@ class SequentialInteractionAdapter extends FakeBackendAdapter {
 
 async function createFixture(
   transportFactory?: (options: TelegramTransportOptions) => FakeTelegramTransport,
-  adapterFactory?: () => FakeBackendAdapter,
+  adapterFactory?: () => FakeBackendAdapter | readonly [FakeBackendAdapter, ...FakeBackendAdapter[]],
   discordTransportFactory?: (options: DiscordTransportOptions) => FakeDiscordTransport,
   dingTalkTransportFactory?: (options: DingTalkTransportOptions) => FakeDingTalkTransport,
   feishuTransportFactory?: (options: FeishuTransportOptions) => FakeFeishuTransport,
@@ -4785,9 +4908,11 @@ async function createFixture(
     storagePath: join(root, "credentials.json")
   });
   await credentials.initialize();
-  const adapter = adapterFactory?.() ?? new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const providedAdapters = adapterFactory?.() ?? new FakeBackendAdapter(PI_LIKE_PROFILE);
+  const adapters = providedAdapters instanceof FakeBackendAdapter ? [providedAdapters] : providedAdapters;
+  const adapter = adapters[0]!;
   let manager: MessagingManager | undefined;
-  const host = new SessionHost(store, artifacts, [adapter], {
+  const host = new SessionHost(store, artifacts, adapters, {
     ...(sessionRuntimeRecoveryDelayMs === undefined ? {} : { sessionRuntimeRecoveryDelayMs }),
     prepareTelegramHistory: async input => manager?.prepareTelegramHistory(input),
     onServiceRunSettled: (input) => manager?.onRunSettled(input),

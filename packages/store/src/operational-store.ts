@@ -11858,48 +11858,7 @@ export class OperationalStore {
       const artifactBoundary = rowBoundary("artifacts");
       const leaseBoundary = rowBoundary("tool_leases");
 
-      this.database.prepare(`
-        INSERT OR IGNORE INTO message_event_tombstones(
-          event_id, session_id, deletion_operation_id, deleted_at, revision
-        )
-        SELECT event.id, event.session_id, ?, ?, ?
-        FROM events AS event
-        WHERE event.session_id = ? AND event.global_cursor <= ?
-      `).run(operationId, at, revision, sessionId, asSqlInteger(eventBoundary));
-      this.database.prepare("DELETE FROM native_history_current_markers WHERE session_id = ?")
-        .run(sessionId);
-      this.database.prepare("DELETE FROM native_history_canonical_identities WHERE session_id = ?")
-        .run(sessionId);
-      this.database.prepare(`
-        DELETE FROM message_search_fts
-        WHERE rowid IN (
-          SELECT global_cursor FROM events
-          WHERE session_id = ? AND global_cursor <= ?
-        )
-      `).run(sessionId, asSqlInteger(eventBoundary));
-      if (this.messageVectorAvailable) {
-        this.database.prepare(`
-          UPDATE ${MESSAGE_SEARCH_VECTOR_TABLE} SET live = 0
-          WHERE rowid IN (
-            SELECT global_cursor FROM events
-            WHERE session_id = ? AND global_cursor <= ?
-          )
-        `).run(sessionId, asSqlInteger(eventBoundary));
-      }
-      this.database.prepare(`
-        DELETE FROM message_embedding_records
-        WHERE event_cursor IN (
-          SELECT global_cursor FROM events
-          WHERE session_id = ? AND global_cursor <= ?
-        )
-      `).run(sessionId, asSqlInteger(eventBoundary));
-      this.database.prepare(`
-        DELETE FROM message_embedding_jobs
-        WHERE event_cursor IN (
-          SELECT global_cursor FROM events
-          WHERE session_id = ? AND global_cursor <= ?
-        )
-      `).run(sessionId, asSqlInteger(eventBoundary));
+      this.retireSessionTimeline(sessionId, operationId, eventBoundary, at);
 
       // Runtime observations/widgets are context state, while user choices
       // such as model, permission mode, and approved directories remain Session
@@ -11962,12 +11921,141 @@ export class OperationalStore {
     });
   }
 
+  private retireSessionTimeline(sessionId: string, operationId: string, eventBoundary: bigint, at: number): void {
+    const revision = asSqlInteger(this.requireActiveRevision());
+    this.database.prepare(`
+      INSERT OR IGNORE INTO message_event_tombstones(
+        event_id, session_id, deletion_operation_id, deleted_at, revision
+      )
+      SELECT event.id, event.session_id, ?, ?, ?
+      FROM events AS event
+      WHERE event.session_id = ? AND event.global_cursor <= ?
+    `).run(operationId, at, revision, sessionId, asSqlInteger(eventBoundary));
+    this.database.prepare("DELETE FROM native_history_current_markers WHERE session_id = ?")
+      .run(sessionId);
+    this.database.prepare("DELETE FROM native_history_canonical_identities WHERE session_id = ?")
+      .run(sessionId);
+    this.database.prepare(`
+      DELETE FROM message_search_fts
+      WHERE rowid IN (
+        SELECT global_cursor FROM events
+        WHERE session_id = ? AND global_cursor <= ?
+      )
+    `).run(sessionId, asSqlInteger(eventBoundary));
+    if (this.messageVectorAvailable) {
+      this.database.prepare(`
+        UPDATE ${MESSAGE_SEARCH_VECTOR_TABLE} SET live = 0
+        WHERE rowid IN (
+          SELECT global_cursor FROM events
+          WHERE session_id = ? AND global_cursor <= ?
+        )
+      `).run(sessionId, asSqlInteger(eventBoundary));
+    }
+    this.database.prepare(`
+      DELETE FROM message_embedding_records
+      WHERE event_cursor IN (
+        SELECT global_cursor FROM events
+        WHERE session_id = ? AND global_cursor <= ?
+      )
+    `).run(sessionId, asSqlInteger(eventBoundary));
+    this.database.prepare(`
+      DELETE FROM message_embedding_jobs
+      WHERE event_cursor IN (
+        SELECT global_cursor FROM events
+        WHERE session_id = ? AND global_cursor <= ?
+      )
+    `).run(sessionId, asSqlInteger(eventBoundary));
+  }
+
+  findUnresolvedDiscordConversationRestart(sessionId: string): string | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT id FROM operations
+      WHERE kind = 'restart_discord_conversation' AND connection_id IS NULL
+        AND json_extract(body_json, '$.sessionId') = ?
+        AND (status = 'started' OR (status = 'failed'
+          AND COALESCE(json_extract(error_json, '$.stateMayHaveChanged'), 1) <> 0))
+      ORDER BY created_at, id LIMIT 1
+    `).get(sessionId) as Row | undefined;
+    return row === undefined ? undefined : stringValue(row["id"]);
+  }
+
+  /** Discord retains its original product task and workspace when replacing native context. */
+  commitDiscordConversationRestart(input: {
+    readonly operationId: string;
+    readonly conversation: MessagingConversationRecord;
+    readonly route: MessagingRouteRecord;
+    readonly source: StoredSession;
+    readonly binding: NativeSessionBinding;
+    readonly providerId?: string;
+    readonly modelId?: string;
+    readonly effort?: string;
+    readonly runtimeControlGeneration: number;
+  }): StoredSession {
+    return this.write(() => {
+      const operation = this.getOperation(input.operationId);
+      const conversation = this.getMessagingConversation(input.conversation.id);
+      const connection = this.getMessagingConnection(conversation.connectionId);
+      const route = this.resolveMessagingRoute(connection.id);
+      const sessionId = input.source.descriptor.id;
+      const session = this.getSession(sessionId);
+      if (operation.kind !== "restart_discord_conversation" || operation.connectionId !== undefined || operation.status !== "started"
+        || !isRecord(operation.body) || operation.body["conversationId"] !== conversation.id || operation.body["sessionId"] !== sessionId
+        || connection.channel !== "discord" || !connection.enabled || connection.generation !== conversation.channelGeneration
+        || conversation.status !== "active" || conversation.conversationKind !== "direct" || conversation.partnerId !== undefined
+        || conversation.sessionId !== sessionId || conversation.revision !== input.conversation.revision
+        || route.scopeKey !== input.route.scopeKey || route.revision !== input.route.revision
+        || session.revision !== input.source.revision || session.descriptor.archived || session.descriptor.deletedAt !== undefined
+        || this.sessionCreationServiceKind(sessionId) !== "messaging"
+        || input.binding.generation !== session.descriptor.binding.generation + 1
+        || input.binding.opaqueRef === session.descriptor.binding.opaqueRef) {
+        throw new StoreError("Discord conversation restart lost its original task or route.");
+      }
+      if (this.listRuns({ sessionId, activeOnly: true, limit: 1 }).length > 0
+        || this.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0
+        || this.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0) {
+        throw new StoreError("Discord cannot restart while the original task is active.");
+      }
+      this.assertNativeBindingNeverAdopted(route.backendId, input.binding.opaqueRef);
+      const at = this.now();
+      const eventBoundary = this.latestEventCursor();
+      this.retireSessionTimeline(sessionId, input.operationId, eventBoundary, at);
+      this.database.prepare("DELETE FROM settings WHERE scope_type = 'session' AND scope_id = ? AND key LIKE 'runtime.%'").run(sessionId);
+      this.deleteSetting("session", sessionId, RETAINED_CONTEXT_EVENTS_KEY);
+      this.database.prepare("DELETE FROM session_context_rebuilds WHERE session_id = ?").run(sessionId);
+      this.database.prepare("DELETE FROM session_context_handoffs WHERE session_id = ?").run(sessionId);
+      new SessionRuntimeHandoffStore(this).save(sessionId, { format: 1, generation: input.runtimeControlGeneration, parked: [] });
+
+      this.database.prepare("UPDATE product_sessions SET backend_id = ?, provider_id = ?, model_id = ? WHERE id = ?")
+        .run(route.backendId, input.providerId ?? null, input.modelId ?? null, sessionId);
+      const updated = this.updateSession(sessionId, {
+        binding: input.binding, effort: input.effort ?? null, fastMode: route.fastMode,
+        permissionMode: route.permissionMode, planMode: route.planMode
+      }, session.revision, at);
+      assertMessagingSessionMatchesRoute(updated, route, route.permissionMode, session.descriptor.targetId);
+      this.setSetting("session", sessionId, NATIVE_BLANK_RECOVERY_SETTING_KEY, true, at);
+      this.database.prepare("UPDATE session_objectives SET session_generation = ?, revision = ? WHERE session_id = ?")
+        .run(input.binding.generation, asSqlInteger(this.requireActiveRevision()), sessionId);
+      this.database.prepare(`
+        UPDATE messaging_conversations SET session_generation = ?, route_scope_key = ?, backend_id = ?, provider_id = ?,
+          model_id = ?, effort = ?, fast_mode = ?, permission_mode = ?, plan_mode = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND revision = ?
+      `).run(input.binding.generation, route.scopeKey, route.backendId, input.providerId ?? null, input.modelId ?? null,
+        input.effort ?? null, speedInt(route.fastMode), route.permissionMode, boolInt(route.planMode),
+        Math.max(conversation.createdAt, at), asSqlInteger(this.requireActiveRevision()), conversation.id, asSqlInteger(conversation.revision));
+      const event = this.publishHistoryPruned({ sessionId, activeContextReset: true, operationId: input.operationId, prunedAt: at });
+      this.clearSessionAttentionFromLifecycle(updated, event, `${event.traceId}:attention-generation`, input.operationId);
+      return this.getSession(sessionId);
+    });
+  }
+
   /** Durable invalidation emitted after an offline-safe history replacement.
    * It is intentionally content-free and becomes the first surviving event so
    * every connected client discards its pre-maintenance Timeline projection. */
   publishHistoryPruned(input: {
     readonly sessionId: string;
     readonly activeContextReset: boolean;
+    readonly operationId?: string;
     readonly prunedAt?: number;
   }): PersistedEvent {
     return this.write(() => {
@@ -11977,6 +12065,7 @@ export class OperationalStore {
         backendId: session.descriptor.backendId,
         targetId: session.descriptor.targetId,
         sessionId: session.descriptor.id,
+        ...(input.operationId === undefined ? {} : { operationId: input.operationId }),
         generation: session.descriptor.binding.generation,
         emittedAt: prunedAt,
         traceId: `history-pruned:${session.descriptor.id}:${prunedAt}`,
@@ -23897,13 +23986,14 @@ function messagingRevisionConflict(
 function assertMessagingSessionMatchesRoute(
   session: StoredSession,
   route: MessagingRouteRecord,
-  expectedPermissionMode: MessagingRouteRecord["permissionMode"]
+  expectedPermissionMode: MessagingRouteRecord["permissionMode"],
+  workspaceTargetId = route.targetId
 ): void {
   const descriptor = session.descriptor;
   // Unspecified model axes delegate to Backend defaults; the binding persists
   // the Session's resolved values while every explicitly selected axis stays exact.
   if (
-    descriptor.targetId !== route.targetId || descriptor.backendId !== route.backendId ||
+    descriptor.targetId !== workspaceTargetId || descriptor.backendId !== route.backendId ||
     (route.providerId !== undefined && descriptor.providerId !== route.providerId) ||
     (route.modelId !== undefined && descriptor.modelId !== route.modelId) ||
     (route.effort !== undefined && descriptor.effort !== route.effort) || descriptor.fastMode !== route.fastMode ||
