@@ -293,7 +293,9 @@ describe("RemoteWorkspaceService", () => {
         return remove(target, options);
       });
       const operationId = "original-remote-deletion";
-      const pending = operation.submitOperation({ operationId, connectionId: "original-delete-owner", mutation }, original);
+      const pending = operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+        operationId, connectionId: "original-delete-owner", mutation
+      }), original);
       await vi.waitFor(() => expect(beforeRemoval).toHaveBeenCalledOnce());
       expect(store.getOperation(operationId).status).toBe("started");
       connections.revoke("original-delete-owner");
@@ -304,7 +306,9 @@ describe("RemoteWorkspaceService", () => {
       expect(original.signal.aborted).toBe(false);
       expect(Buffer.from(await f.files.read({ path, maximumBytes: 1024 })).toString()).toBe("Keep this file");
 
-      const allowed = await operation.submitOperation({ operationId: "current-remote-deletion", connectionId: "current-delete-owner", mutation }, current);
+      const allowed = await operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+        operationId: "current-remote-deletion", connectionId: "current-delete-owner", mutation
+      }), current);
       expect(allowed.operation?.state).toBe(contract.OperationState.SUCCEEDED);
       expect(await f.workspaces.list(workspaceId, "")).toEqual([]);
     } finally {
