@@ -305,7 +305,7 @@ officeIt("retains the latest verified document for each path in the Run's mounte
   if (turn === undefined) throw new Error("The delivery turn was not dispatched.");
   await turn.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "The documents are ready." }] });
   await turn.emit({ type: "done", outcome: "completed" });
-  await waitFor(async () => store.listEvents({ sessionId, runId }).find(event => event.payload.type === "workspace_diff"),
+  await waitFor(async () => store.listEvents({ sessionId }).find(event => event.runId === runId && event.payload.type === "workspace_diff"),
     event => event !== undefined, "finished Run workspace changes");
 
   const challenge = (await current.anonymous.connection.beginPairing({ deviceDisplayName: "Document delivery Web" })).challenge!;
