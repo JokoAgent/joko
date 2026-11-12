@@ -16,7 +16,7 @@ import type { OperationalStore } from "@joko/store";
 
 import type { ProviderCatalogManager } from "./credential-manager.js";
 import {
-  LocalModelProviderCoordinator, MANAGED_LOCAL_PROVIDER_ID, isOwnedProvider
+  LocalModelProviderCoordinator, MANAGED_LOCAL_PROVIDER_ID, supportsClaudeOllamaModel
 } from "./local-model-runtime-coordinator.js";
 import {
   activateLocalModelRuntimePersistence,
@@ -43,7 +43,7 @@ export interface ManagedModelRuntimeSystemOptions {
   readonly dataDirectory: string;
   readonly ownerId: string;
   readonly ownerGeneration: number;
-  readonly onModelsChanged?: () => Promise<void>;
+  readonly claudeBackendId?: string;
   readonly onProviderChanged?: (backendIds: readonly string[]) => Promise<void>;
   readonly fetchStreaming: typeof fetch;
 }
@@ -65,10 +65,13 @@ export async function createManagedModelRuntimeSystem(
   const providerCoordinator = new LocalModelProviderCoordinator({
     providers: options.providers,
     backendId: options.providers.nativeAuthenticationBackendId,
+    ...(options.claudeBackendId === undefined ? {} : { claudeBackendId: options.claudeBackendId }),
     currentOwner: () => activeOwner,
     bindings: new StoreLocalModelProviderBindings(options.store)
   });
   let synchronizedModels = "";
+  let synchronizedClaudeEvidence = "";
+  const pendingProviderRefresh = new Set<string>();
   const manager = new LocalModelRuntimeManager({
     client,
     launcher,
@@ -76,12 +79,22 @@ export async function createManagedModelRuntimeSystem(
     currentOwner: () => activeOwner,
     pausedPulls: new StorePausedPullRepository(options.store),
     installLeases: new StoreRuntimeInstallLeaseRepository(options.store),
-    onModelsChanged: async (runtimeOwner, models) => {
-      const fingerprint = JSON.stringify(models);
-      if (fingerprint === synchronizedModels) return;
-      await providerCoordinator.sync(runtimeOwner, models);
-      await options.onModelsChanged?.();
-      synchronizedModels = fingerprint;
+    onModelsChanged: async (runtimeOwner, models, version) => {
+      const inventory = JSON.stringify(models.map(({ requiredRuntimeVersion: _requires, ...model }) => model));
+      const claudeEvidence = JSON.stringify([version, models.map(model => model.requiredRuntimeVersion)]);
+      if (inventory !== synchronizedModels || claudeEvidence !== synchronizedClaudeEvidence) {
+        const routes = providerCoordinator.routes(runtimeOwner);
+        if (inventory !== synchronizedModels || routes.length > 0) {
+          for (const route of routes) pendingProviderRefresh.add(route.backendId);
+          for (const backendId of await providerCoordinator.sync(runtimeOwner, models, version)) pendingProviderRefresh.add(backendId);
+        }
+        synchronizedModels = inventory;
+        synchronizedClaudeEvidence = claudeEvidence;
+      }
+      if (pendingProviderRefresh.size > 0) {
+        await options.onProviderChanged?.([...pendingProviderRefresh]);
+        pendingProviderRefresh.clear();
+      }
     },
     audit: (event) => appendRuntimeAudit(options.store, event)
   });
@@ -144,26 +157,41 @@ export async function createManagedModelRuntimeSystem(
     registry,
     async prepareProviderRuntime(context) {
       const { target, modelSelection, signal } = context;
-      if (target.remoteWorkspace !== undefined || modelSelection === undefined) return;
+      if (modelSelection === undefined) return;
       if (modelSelection.providerId === MANAGED_LOCAL_PROVIDER_ID) {
+        const claude = target.backendId === options.claudeBackendId;
+        const unavailable = () => new LocalRuntimeError("MODEL_UNAUTHORIZED", "The selected managed Ollama route is unavailable.");
+        if (target.remoteWorkspace !== undefined) {
+          if (claude) throw unavailable();
+          return;
+        }
+        const route = () => providerCoordinator.ownsModel(owner, target.backendId, modelSelection.modelId)
+          ? options.providers.describeInferenceRoute(target.backendId, modelSelection.providerId, modelSelection.modelId)?.generationId
+          : undefined;
+        const admittedRoute = route();
+        if (admittedRoute === undefined) throw unavailable();
         const assertRoute = () => {
-          const provider = options.providers.list(target.backendId).find(item => item.provider.id === MANAGED_LOCAL_PROVIDER_ID);
-          if (target.backendId !== options.providers.nativeAuthenticationBackendId || !provider?.enabled || !isOwnedProvider(provider)
-            || !provider.provider.models.some(model => model.id === modelSelection.modelId)) {
-            throw new LocalRuntimeError("MODEL_UNAUTHORIZED", "The selected managed Ollama route is unavailable.");
-          }
+          if (route() !== admittedRoute) throw unavailable();
         };
         const status = await controller.ensureReadyForUse(signal, assertRoute);
         signal.throwIfAborted(); assertRoute();
         if (status.state !== "ready") throw new LocalRuntimeError(status.publicErrorCode ?? "RUNTIME_UNREACHABLE", "The managed Ollama runtime is not ready.");
         const models = await client.tags(signal);
         signal.throwIfAborted(); assertRoute();
-        if (!models.some(model => canonicalModelName(model.name) === canonicalModelName(modelSelection.modelId))) {
+        const installed = models.find(model => canonicalModelName(model.name) === canonicalModelName(modelSelection.modelId));
+        if (installed === undefined) {
           throw new LocalRuntimeError("MODEL_NOT_FOUND", "The selected Ollama model is no longer installed.");
+        }
+        if (claude) {
+          const details = await client.show(installed.name, signal);
+          signal.throwIfAborted(); assertRoute();
+          if (!supportsClaudeOllamaModel(status.version, details.capabilities.some(value => value.toLowerCase() === "tools"), details.requiredRuntimeVersion)) {
+            throw unavailable();
+          }
         }
         return;
       }
-      if (modelSelection.providerId !== MANAGED_GGUF_PROVIDER_ID) return;
+      if (target.remoteWorkspace !== undefined || modelSelection.providerId !== MANAGED_GGUF_PROVIDER_ID) return;
       ggufProviders.assertConnection(owner); context.signal.throwIfAborted();
       const route = ggufProviders.routes().find(item => item.backendId === context.target.backendId && item.providerId === context.modelSelection!.providerId);
       const state = await ggufManager.snapshot(owner); context.signal.throwIfAborted();

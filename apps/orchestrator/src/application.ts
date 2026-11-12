@@ -60,6 +60,7 @@ import {
   type SshConfigFilePort
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
+import { OLLAMA_LOOPBACK_ORIGIN } from "@joko/local-model-runtime";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
 import { ContactStore, NotFoundError, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner, ProjectGitBootstrap } from "@joko/git-safety";
@@ -198,6 +199,7 @@ import { MessagingManager, type MessagingManagerOptions } from "./messaging-mana
 import type { WeChatAuthorizationPort } from "./wechat-authorization-manager.js";
 import type { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
 import { createManagedModelRuntimeSystem, type ManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
+import { MANAGED_LOCAL_PROVIDER_ID } from "./local-model-runtime-coordinator.js";
 import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { composeModelWorkingContext } from "./model-working-context-system.js";
 import { createOutboundStreamingFetch } from "./outbound-streaming-fetch.js";
@@ -1541,6 +1543,9 @@ export async function createOrchestratorApplication(
   const managedProviderProxy = new ManagedProviderProxy({
     providers,
     fetch: createOutboundFetch(dependencies.resolveOutboundProxy),
+    fetchForRoute: route => route.backendId === claudeCodeBackendId && route.providerId === MANAGED_LOCAL_PROVIDER_ID
+      && route.api === "anthropic-messages" && route.baseUrl === OLLAMA_LOOPBACK_ORIGIN && route.requestPath === undefined
+      ? fetch : undefined,
     assertOwner: (owner) => {
       const session = store.getSession(owner.sessionId).descriptor;
       const target = store.getTarget(owner.targetId).descriptor;
@@ -1553,13 +1558,25 @@ export async function createOrchestratorApplication(
     }
   });
   await managedProviderProxy.start();
-  const managedRuntime = (backendId: string, generation: number, support: import("@joko/core").ProviderRuntimeSupport) => managedProviderProxy.createRuntime({
-    backendId, generation, support,
-    assertCurrent: () => {
-      const instance = backendInstances.get(backendId);
-      if (instance.state !== "available" || instance.generation !== generation) throw new Error("Managed Provider Backend instance is no longer current.");
-    }
-  });
+  const managedRuntime = (backendId: string, generation: number, support: import("@joko/core").ProviderRuntimeSupport) => {
+    const port = managedProviderProxy.createRuntime({
+      backendId, generation, support,
+      assertCurrent: () => {
+        const instance = backendInstances.get(backendId);
+        if (instance.state !== "available" || instance.generation !== generation) throw new Error("Managed Provider Backend instance is no longer current.");
+      }
+    });
+    if (backendId !== claudeCodeBackendId) return port;
+    return {
+      ...port,
+      prepare: async (owner: Parameters<typeof port.prepare>[0]) => {
+        if (owner.providerId === MANAGED_LOCAL_PROVIDER_ID && store.getTarget(owner.targetId).descriptor.remoteWorkspace !== undefined) {
+          throw new Error("The managed Ollama Provider requires a local Claude workspace.");
+        }
+        return port.prepare(owner);
+      }
+    };
+  };
   await backendInstances.provision([
     {
       instanceId: piBackendId,
@@ -3179,7 +3196,7 @@ export async function createOrchestratorApplication(
     dataDirectory: config.dataDirectory,
     ownerId: serverId,
     ownerGeneration: durableRuntimeGeneration(),
-    onModelsChanged: refreshPiGeneration,
+    claudeBackendId: claudeCodeBackendId,
     onProviderChanged: async backendIds => {
       for (const backendId of backendIds) {
         if (backendId === providers.nativeAuthenticationBackendId) await refreshPiGeneration();
