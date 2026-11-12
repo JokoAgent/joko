@@ -448,14 +448,18 @@ func handoffSnapshot(_ request: [String: Any]) -> [String: Any] {
  * focused element. Reads roles only, never values.
  */
 func handoffSecureTarget(_ request: [String: Any]) -> [String: Any] {
-  guard let pid = request["pid"] as? Int32 ?? (request["pid"] as? Int).map({ Int32($0) }),
+  guard let value = request["pid"] as? Int, let pid = Int32(exactly: value), pid > 0,
     NSRunningApplication(processIdentifier: pid) != nil else { return ["error": "target_gone"] }
   let app = AXUIElementCreateApplication(pid)
   AXUIElementSetMessagingTimeout(app, 0.5)
   var element: AXUIElement?
-  if let point = request["point"] as? [Double], point.count == 2 {
+  if let rawPoint = request["point"] {
+    guard let point = handoffNumbers(rawPoint, count: 2) else { return ["secure": false] }
     var hit: AXUIElement?
-    if AXUIElementCopyElementAtPosition(app, Float(point[0]), Float(point[1]), &hit) == .success { element = hit }
+    let x = Float(point[0]), y = Float(point[1])
+    var owner: pid_t = 0
+    if x.isFinite, y.isFinite, AXUIElementCopyElementAtPosition(app, x, y, &hit) == .success,
+      let hit, AXUIElementGetPid(hit, &owner) == .success, owner == pid { element = hit }
   } else {
     element = handoffElement(handoffAttr(app, kAXFocusedUIElementAttribute))
   }

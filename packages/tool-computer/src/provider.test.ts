@@ -894,6 +894,107 @@ describe("public computer automation surface", () => {
     } finally { await provider.closeAll(); }
   });
 
+  it("refuses password fields by focus, scoped token, and observed element index on macOS", async () => {
+    let observation = 0;
+    const connection = new FakeConnection({ callTool: async (name) => {
+      if (name !== "get_window_state") return { structuredContent: { ok: true } };
+      const snapshot_id = `s${(++observation).toString(16).padStart(8, "0")}`;
+      return { structuredContent: { ok: true, snapshot_id, elements: [
+        { element_index: 2, element_token: `${snapshot_id}:2`, frame: { x: -40, y: 30, w: 50, h: 12 } },
+        { element_index: 3, frame: { x: 100, y: -30, w: 80, h: 20 } },
+        { element_index: 4, element_token: `${snapshot_id}:4` }
+      ] } };
+    } });
+    const check = vi.fn(async () => true);
+    const provider = new UndecoratedComputerToolProvider({ platform: "darwin", checkSecureInputTarget: check,
+      connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("session");
+    const input = { pid: 7, window_id: 2 };
+    const inputCalls = () => connection.callRequests.filter(({ name }) => name === "type_text" || name === "set_value");
+    try {
+      const focused = await provider.callTool(fence, "type_text", { ...input, text: "private test value" });
+      expect(focused).toMatchObject({ isError: true, structuredContent: { errorCode: "SECURE_FIELD",
+        data: { hint: expect.stringContaining("request_input_handoff") } } });
+      expect(JSON.stringify(focused)).not.toContain("private test value");
+      expect(check).toHaveBeenLastCalledWith({ pid: 7 }, expect.any(AbortSignal), expect.any(Function));
+
+      const state = await provider.callTool(fence, "get_window_state", { ...input, include_screenshot: false });
+      const snapshotId = state.structuredContent?.["snapshot_id"];
+      const elements = state.structuredContent?.["elements"] as readonly { element_token?: string }[];
+      const secureValue = { ...input, value: "private test value" };
+      await expect(provider.callTool(fence, "set_value", { ...secureValue, element_token: elements[0]!.element_token }))
+        .resolves.toMatchObject({ isError: true, structuredContent: { errorCode: "SECURE_FIELD" } });
+      expect(check).toHaveBeenLastCalledWith({ pid: 7, point: { x: -15, y: 36 } }, expect.any(AbortSignal), expect.any(Function));
+
+      await expect(provider.callTool(fence, "set_value", { ...secureValue, snapshot_id: snapshotId, element_index: 3 }))
+        .resolves.toMatchObject({ isError: true, structuredContent: { errorCode: "SECURE_FIELD" } });
+      expect(check).toHaveBeenLastCalledWith({ pid: 7, point: { x: 140, y: -20 } }, expect.any(AbortSignal), expect.any(Function));
+      expect(inputCalls()).toHaveLength(0);
+
+      await provider.callTool(fence, "get_window_state", { ...input, include_screenshot: false });
+      await expect(provider.callTool(fence, "set_value", { ...secureValue, element_token: elements[0]!.element_token }))
+        .resolves.toMatchObject({ isError: true, structuredContent: { errorCode: "STALE_SNAPSHOT" } });
+      expect(check).toHaveBeenCalledTimes(3);
+      expect(inputCalls()).toHaveLength(0);
+
+      const fresh = await provider.callTool(fence, "get_window_state", { ...input, include_screenshot: false });
+      const freshElements = fresh.structuredContent?.["elements"] as readonly { element_token?: string }[];
+      await expect(provider.callTool(fence, "set_value", { ...secureValue, element_token: freshElements[2]!.element_token }))
+        .resolves.toMatchObject({ structuredContent: { ok: true } });
+      expect(check).toHaveBeenCalledTimes(3);
+      expect(inputCalls()).toHaveLength(1);
+    } finally { await provider.closeAll(); }
+  });
+
+  it("stops later typing chunks when the macOS focus becomes a password field", async () => {
+    const check = vi.fn(async () => true).mockResolvedValueOnce(false);
+    const connection = new FakeConnection({ callTool: async () => ({ structuredContent: { ok: true, inserted: 400 } }) });
+    const provider = new UndecoratedComputerToolProvider({ platform: "darwin", checkSecureInputTarget: check,
+      connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("session");
+    try {
+      await expect(provider.callTool(fence, "type_text", { pid: 7, text: "x".repeat(450) })).resolves.toMatchObject({
+        isError: true, structuredContent: { errorCode: "SECURE_FIELD", data: { inserted_chars: 400, remaining_chars: 50 } }
+      });
+      expect(check).toHaveBeenCalledTimes(2);
+      expect(connection.callRequests.filter(call => call.name === "type_text")).toHaveLength(1);
+    } finally { await provider.closeAll(); }
+  });
+
+  it("rechecks the original desktop input owner after the macOS native field read", async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let allowed = true;
+    const check = vi.fn(async () => { await held; return false; });
+    const connection = new FakeConnection();
+    const provider = new UndecoratedComputerToolProvider({ platform: "darwin", checkSecureInputTarget: check,
+      connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("session");
+    try {
+      const pending = provider.callTool(fence, "type_text", { pid: 7, text: "ordinary text" }, undefined,
+        { assertInputCurrent: () => { if (!allowed) throw new Error("Desktop input yielded to owner."); } });
+      await vi.waitFor(() => expect(check).toHaveBeenCalledOnce());
+      allowed = false;
+      release();
+      await expect(pending).resolves.toMatchObject({ isError: true });
+      expect(connection.callRequests.filter(call => call.name === "type_text")).toHaveLength(0);
+    } finally { release(); await provider.closeAll(); }
+  });
+
+  it.each(["darwin", "linux", "win32"] as const)("keeps ordinary %s typing when no secure field can be confirmed", async (platform) => {
+    const check = vi.fn(async () => { throw new Error("Native helper unavailable."); });
+    const connection = new FakeConnection({ callTool: async () => ({ structuredContent: { ok: true } }) });
+    const provider = new UndecoratedComputerToolProvider({ platform, checkSecureInputTarget: check,
+      connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("session");
+    try {
+      await expect(provider.callTool(fence, "type_text", { pid: 7, text: "ordinary text" }))
+        .resolves.toMatchObject({ structuredContent: { ok: true } });
+      expect(check).toHaveBeenCalledTimes(platform === "darwin" ? 1 : 0);
+      expect(connection.callRequests.filter(call => call.name === "type_text")).toHaveLength(1);
+    } finally { await provider.closeAll(); }
+  });
+
   it("preserves known Unicode input progress without replaying an unconfirmed chunk after transport loss", async () => {
     let firstCalls = 0;
     const first = new FakeConnection({

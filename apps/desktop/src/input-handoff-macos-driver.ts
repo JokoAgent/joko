@@ -135,12 +135,12 @@ async function detectQr(jpeg: Buffer, signal?: AbortSignal): Promise<DetectedQr[
  * a screen point, or the focused element. Used to point the agent at 代输入
  * instead of typing a secret. Unknown (no permission, helper failure) is false.
  */
-export async function isSecureInputTarget(target: { pid: number; point?: { x: number; y: number } }): Promise<boolean> {
+export async function isSecureInputTarget(target: { pid: number; point?: { x: number; y: number } }, signal?: AbortSignal): Promise<boolean> {
   if (process.platform !== 'darwin' || !Number.isSafeInteger(target.pid) || target.pid <= 0) return false;
   const point = target.point && Number.isFinite(target.point.x) && Number.isFinite(target.point.y)
     ? [target.point.x, target.point.y] : undefined;
   try {
-    const result = (await runHelper({ op: 'secure', pid: target.pid, ...(point ? { point } : {}) }, 3000)) as { secure?: unknown };
+    const result = (await runHelper({ op: 'secure', pid: target.pid, ...(point ? { point } : {}) }, 3000, signal)) as { secure?: unknown };
     return result?.secure === true;
   } catch {
     return false;

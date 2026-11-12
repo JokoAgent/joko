@@ -6,6 +6,7 @@ import type { FastifyInstance } from "fastify";
 import * as contract from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import type { ConnectionRecord } from "@joko/store";
+import type { ComputerSecureInputTarget } from "@joko/tool-computer";
 import type { ConnectionManager } from "../connection-manager.js";
 import type { InputHandoffNativePort } from "./coordinator.js";
 import type { LiveHandoffWindow } from "./session.js";
@@ -22,7 +23,7 @@ const MAX_REQUEST = 65_536, MAX_RESPONSE = 8_000_000;
 interface Authority { readonly connection: ConnectionRecord; readonly proof: string }
 interface Command {
   readonly id: string; readonly method: contract.NativeInputHandoffMethod; readonly payload: Uint8Array; readonly assertCurrent: () => void;
-  readonly resolve: (value: unknown) => void; readonly reject: (error: Error) => void; readonly timeout: ReturnType<typeof setTimeout>; dispatched: boolean;
+  readonly resolve: (value: unknown) => void; readonly reject: (error: Error) => void; readonly cleanup: () => void; dispatched: boolean;
 }
 interface Host {
   readonly id: string; readonly generation: bigint; readonly pid: number; readonly authority: Authority; readonly pending: Map<string, Command>;
@@ -42,6 +43,16 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
   }
   setLiveHandoffPort(port: NativeInputHandoffLivePort): void { this.#live = port; }
   currentDeviceId(): string | null { const host = this.#host; if (!host) return null; try { this.#current(host); return host.authority.connection.deviceId; } catch { return null; } }
+  async checkSecureInputTarget(target: ComputerSecureInputTarget, signal: AbortSignal, assertCurrent: () => void): Promise<boolean> {
+    const host = this.#host;
+    if (host === undefined) return false;
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(5_000)]);
+    // The secure-only field query uses the same Main mailbox and sends no input value.
+    return (await this.#call(host, Method.FOCUSED_FIELD, {
+      pid: target.pid, secureOnly: true, ...(target.point === undefined ? {} : { point: [target.point.x, target.point.y] })
+    }, assertCurrent, deadline)) === true;
+  }
+
   createDriver(assertCurrent: () => void): { readonly driver: contract.HandoffDriver; readonly hostPid: number } | null {
     const host = this.#host; if (!host) return null;
     try { this.#current(host); assertCurrent(); } catch { return null; }
@@ -147,14 +158,17 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
     };
   }
   close(): void { this.#closed = true; clearInterval(this.#sweep); if (this.#host) this.#retire(this.#host); this.#input.close(); }
-  #call(host: Host, method: contract.NativeInputHandoffMethod, value: unknown, assertCurrent: () => void): Promise<unknown> {
-    this.#current(host); assertCurrent();
+  #call(host: Host, method: contract.NativeInputHandoffMethod, value: unknown, assertCurrent: () => void, signal?: AbortSignal): Promise<unknown> {
+    const assertCommandCurrent = () => { this.#current(host); signal?.throwIfAborted(); assertCurrent(); };
+    assertCommandCurrent();
     const payload = Buffer.from(JSON.stringify(value)); if (payload.length > MAX_REQUEST || host.pending.size >= 32) throw unavailable();
     return new Promise((resolve, reject) => {
       const id = randomUUID();
-      const timeout = setTimeout(() => { const entry = host.pending.get(id); if (entry) this.#fail(host, entry); }, 30_000); timeout.unref();
-      const command: Command = { id, method, payload, assertCurrent: () => { this.#current(host); assertCurrent(); }, resolve, reject, timeout, dispatched: false };
-      host.pending.set(id, command); host.poll?.();
+      const retire = () => { const entry = host.pending.get(id); if (entry) this.#fail(host, entry); };
+      const timeout = setTimeout(retire, 30_000); timeout.unref();
+      const cleanup = () => { clearTimeout(timeout); signal?.removeEventListener("abort", retire); };
+      const command: Command = { id, method, payload, assertCurrent: assertCommandCurrent, resolve, reject, cleanup, dispatched: false };
+      host.pending.set(id, command); signal?.addEventListener("abort", retire, { once: true }); host.poll?.();
     });
   }
   #next(host: Host): Command | undefined {
@@ -169,7 +183,7 @@ export class NativeInputHandoffHost implements InputHandoffNativePort {
     if (this.#closed || this.#host !== host || Date.now() - host.seenAt > 45_000) throw unavailable();
     this.connections.authenticateDesktopHost(host.authority.connection, host.authority.proof);
   }
-  #finish(host: Host, command: Command): void { clearTimeout(command.timeout); host.pending.delete(command.id); command.payload.fill(0); }
+  #finish(host: Host, command: Command): void { command.cleanup(); host.pending.delete(command.id); command.payload.fill(0); }
   #fail(host: Host, command: Command): void { this.#finish(host, command); command.reject(new Error("Native input handoff is unavailable.")); }
   #retire(host: Host): void {
     this.#input.retireHost(host);

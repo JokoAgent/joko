@@ -17,7 +17,7 @@ import {
 } from "./catalog.js";
 import { safeComputerEnvironment } from "./process-runner.js";
 import { ComputerRuntime } from "./runtime.js";
-import { ComputerWindowSnapshotTracker } from "./snapshot-tracker.js";
+import { ComputerWindowSnapshotTracker, type ComputerScreenPoint } from "./snapshot-tracker.js";
 
 export interface ComputerSessionFence {
   readonly sessionId: string;
@@ -78,6 +78,11 @@ export type ComputerMcpConnectionFactory = (
   input: ComputerMcpConnectionFactoryInput
 ) => ComputerMcpConnection;
 
+export interface ComputerSecureInputTarget {
+  readonly pid: number;
+  readonly point?: ComputerScreenPoint;
+}
+
 export interface ComputerToolProviderOptions {
   readonly runtime?: ComputerRuntime;
   readonly executablePath?: string;
@@ -90,6 +95,7 @@ export interface ComputerToolProviderOptions {
   readonly idFactory?: () => string;
   readonly catalogMode?: "public" | "dynamic";
   readonly decorateCursor?: boolean;
+  readonly checkSecureInputTarget?: (target: ComputerSecureInputTarget, signal: AbortSignal, assertCurrent: () => void) => Promise<boolean>;
 }
 
 export class ComputerToolProviderError extends Error {
@@ -162,6 +168,7 @@ export class ComputerToolProvider {
   readonly #idFactory: () => string;
   readonly #catalogMode: "public" | "dynamic";
   readonly #decorateCursor: boolean;
+  readonly #checkSecureInputTarget: ComputerToolProviderOptions["checkSecureInputTarget"];
   readonly #sessions = new Map<string, SessionEntry>();
   readonly #openings = new Map<string, Promise<SessionEntry>>();
   readonly #closings = new Map<string, Promise<void>>();
@@ -184,6 +191,7 @@ export class ComputerToolProvider {
     this.#idFactory = options.idFactory ?? randomUUID;
     this.#catalogMode = options.catalogMode ?? "public";
     this.#decorateCursor = options.decorateCursor ?? true;
+    this.#checkSecureInputTarget = (options.platform ?? process.platform) === "darwin" ? options.checkSecureInputTarget : undefined;
     this.#connectionFactory = options.connectionFactory ?? ((input) => new SdkComputerMcpConnection(input));
   }
 
@@ -511,21 +519,57 @@ export class ComputerToolProvider {
     if (expected !== undefined && typeof arguments_["window_id"] !== "number") return errorToolResult("INVALID_ARGS", { message: "Postcondition requires an exact window." });
     if (name === "verify_state") invalidateWindowObservation(entry, name, arguments_);
 
+    const checkSecureInputTarget = name === "type_text" || name === "set_value" ? this.#checkSecureInputTarget : undefined;
+    let secureTarget: ComputerSecureInputTarget | undefined;
+    const pid = arguments_["pid"];
+    if (checkSecureInputTarget !== undefined && typeof pid === "number") {
+      const index = arguments_["element_index"];
+      if (element === undefined && typeof index !== "number") secureTarget = { pid };
+      else {
+        const point = element?.point ?? (typeof snapshot === "string" && typeof index === "number"
+          ? entry.snapshots.elementPoint(snapshot, index) : undefined);
+        if (point !== undefined) secureTarget = { pid, point };
+      }
+    }
+
     const chunks = name === "type_text" && typeof arguments_["text"] === "string"
       ? splitTextChunks(arguments_["text"])
       : undefined;
     let nextChunk = 0;
     let inserted = 0;
+    let refusedSecureInput = false;
 
     let result: ComputerToolCallResult;
     try {
       result = await this.#withReconnect<ComputerToolCallResult>(entry, signal, async (connection, operationSignal) => {
         entry.driverTools ??= await this.#readToolCatalog(connection, operationSignal);
         if (this.#decorateCursor) await initializeCursorDecoration(entry, connection, name, operationSignal);
+        const dispatch = async (prepared: Record<string, unknown>): Promise<ComputerToolCallResult> => {
+          assertInputCurrent?.();
+          if (secureTarget !== undefined && checkSecureInputTarget !== undefined) {
+            const assertCurrent = () => {
+              if (operationSignal.aborted) throw abortError();
+              assertInputCurrent?.();
+            };
+            if (operationSignal.aborted) throw abortError();
+            const secure = await checkSecureInputTarget(secureTarget, operationSignal, assertCurrent).catch(() => false);
+            assertCurrent();
+            if (secure) {
+              refusedSecureInput = true;
+              return errorToolResult("SECURE_FIELD", {
+                tool: name,
+                message: "The target is a password field.",
+                hint: "Use request_input_handoff with this process and window so the owner can fill it. Leave the window alone until the handoff ends.",
+                ...(chunks !== undefined && inserted > 0
+                  ? { inserted_chars: inserted, remaining_chars: Array.from(arguments_["text"] as string).length - inserted } : {})
+              });
+            }
+          }
+          return callDriverTool(connection, name, prepared, operationSignal);
+        };
         if (chunks === undefined || chunks.length === 1) {
           const prepared = prepareDriverArguments(entry, name, arguments_);
-          assertInputCurrent?.();
-          const response = await callDriverTool(connection, name, prepared, operationSignal);
+          const response = await dispatch(prepared);
           const stale = staleToolResult(response);
           if (stale !== undefined) throw new StaleTransportError(stale);
           if (chunks !== undefined && !driverResultFailed(response)) {
@@ -540,8 +584,7 @@ export class ComputerToolProvider {
             ...arguments_,
             text: chunk
           });
-          assertInputCurrent?.();
-          const response = await callDriverTool(connection, name, prepared, operationSignal);
+          const response = await dispatch(prepared);
           const stale = staleToolResult(response);
           if (stale !== undefined) throw new StaleTransportError(stale);
           if (driverResultFailed(response)) return response;
@@ -576,7 +619,7 @@ export class ComputerToolProvider {
     }
 
     if (driverResultFailed(result)) {
-      invalidateWindowObservation(entry, name, arguments_);
+      if (!refusedSecureInput || inserted > 0) invalidateWindowObservation(entry, name, arguments_);
       return { ...result, isError: true };
     }
     if (name === "verify_state") {
@@ -614,7 +657,7 @@ export class ComputerToolProvider {
     const driverSnapshotId = readDriverSnapshotId(result);
     const snapshotId = entry.snapshots.record(processId, windowId, driverSnapshotId);
     if (driverSnapshotId !== undefined) entry.snapshots.registerAlias(snapshotId, driverSnapshotId);
-    return stampSnapshotId(result, snapshotId, entry.snapshots);
+    return stampSnapshotId(result, snapshotId, entry.snapshots, this.#checkSecureInputTarget !== undefined);
   }
 
   async #postcheck(entry: SessionEntry, name: ComputerPublicToolName, arguments_: Record<string, unknown>,
@@ -1599,7 +1642,15 @@ function readDriverSnapshotId(result: ComputerToolCallResult): string | undefine
   return undefined;
 }
 
-function stampSnapshotId(result: ComputerToolCallResult, snapshotId: string, snapshots: ComputerWindowSnapshotTracker): ComputerToolCallResult {
+function elementCenter(frame: unknown): ComputerScreenPoint | undefined {
+  if (!isRecord(frame)) return undefined;
+  const { x, y, w, h } = frame;
+  if (typeof x !== "number" || typeof y !== "number" || typeof w !== "number" || typeof h !== "number" || w <= 0 || h <= 0) return undefined;
+  const center = { x: x + w / 2, y: y + h / 2 };
+  return Number.isFinite(center.x) && Number.isFinite(center.y) ? center : undefined;
+}
+
+function stampSnapshotId(result: ComputerToolCallResult, snapshotId: string, snapshots: ComputerWindowSnapshotTracker, trackElementPoints: boolean): ComputerToolCallResult {
   const payload = driverResultPayload(result);
   const stamped: Record<string, unknown> = { ...(payload ?? {}), snapshot_id: snapshotId };
   if (Array.isArray(payload?.["elements"])) {
@@ -1610,9 +1661,13 @@ function stampSnapshotId(result: ComputerToolCallResult, snapshotId: string, sna
       counts.set(token, (counts.get(token) ?? 0) + 1);
     }
     stamped["elements"] = elements.map((element) => {
-      if (!isRecord(element) || typeof element["element_token"] !== "string") return element;
+      if (!isRecord(element)) return element;
+      const index = typeof element["element_index"] === "number" ? element["element_index"] : undefined;
+      const point = trackElementPoints ? elementCenter(element["frame"]) : undefined;
+      if (trackElementPoints && index !== undefined) snapshots.recordElementPoint(snapshotId, index, point);
+      if (typeof element["element_token"] !== "string") return element;
       const token = element["element_token"];
-      const accepted = counts.get(token) === 1 ? snapshots.registerElement(snapshotId, token, typeof element["element_index"] === "number" ? element["element_index"] : undefined) : undefined;
+      const accepted = counts.get(token) === 1 ? snapshots.registerElement(snapshotId, token, index, point) : undefined;
       const output = { ...element };
       delete output["element_token"];
       return accepted === undefined ? output : { ...output, element_token: accepted };

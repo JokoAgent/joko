@@ -9,7 +9,7 @@ import { ConnectionService, DesktopInputHandoffHostService, NativeInputHandoffMe
   type NativeActRequest, type NativeInputHandoffCommand, type NativeWindowRef, type PointerRequest } from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import type { DesktopManagedOrchestratorConnection } from "./channels.js";
-import { createMacHandoffDriver } from "./input-handoff-macos-driver.js";
+import { createMacHandoffDriver, isSecureInputTarget } from "./input-handoff-macos-driver.js";
 
 type HostClient = Client<typeof DesktopInputHandoffHostService>;
 interface RegisteredHost { readonly client: HostClient; readonly scope: { hostInstanceId: string; hostGeneration: bigint }; readonly connection: DesktopManagedOrchestratorConnection; readonly signal: AbortSignal }
@@ -112,7 +112,8 @@ export class DesktopInputHandoffHost {
           try {
             await valid(); active.signal.throwIfAborted();
             const driver = (this.options.createDriver ?? createMacHandoffDriver)(active.signal);
-            const value = await executeNativeInputHandoffCommand(command, driver); active.signal.throwIfAborted();
+            const value = await executeNativeInputHandoffCommand(command, driver, target => isSecureInputTarget(target, active.signal));
+            active.signal.throwIfAborted();
             payload = encodeNativeResult(value); success = true; wipePictures(value);
           } catch { payload = Buffer.from("null"); }
           finally { clearInterval(monitor); signal.removeEventListener("abort", abort); active.abort(); command.payload.fill(0); }
@@ -127,7 +128,11 @@ export class DesktopInputHandoffHost {
   }
 }
 
-export async function executeNativeInputHandoffCommand(command: Pick<NativeInputHandoffCommand, "method" | "payload">, driver: HandoffDriver): Promise<unknown> {
+export async function executeNativeInputHandoffCommand(
+  command: Pick<NativeInputHandoffCommand, "method" | "payload">,
+  driver: HandoffDriver,
+  checkSecureInputTarget: (target: Parameters<typeof isSecureInputTarget>[0]) => Promise<boolean> = isSecureInputTarget
+): Promise<unknown> {
   if (command.payload.byteLength > 65_536) throw invalid();
   const raw: unknown = JSON.parse(Buffer.from(command.payload).toString("utf8")), body = record(raw);
   const target = (): { pid: number; window: NativeWindowRef } => ({ pid: pid(body.pid), window: windowRef(body.window) });
@@ -139,7 +144,16 @@ export async function executeNativeInputHandoffCommand(command: Pick<NativeInput
     case Method.COMMAND_LINE: exact(body, ["pid"]); return driver.commandLine(pid(body.pid));
     case Method.CAPTURE: exact(body, ["pid", "window"]); if (!driver.capture) throw invalid(); return driver.capture(target());
     case Method.RAISE: exact(body, ["pid", "window"]); if (!driver.raise) throw invalid(); return driver.raise(target());
-    case Method.FOCUSED_FIELD: exact(body, ["pid"]); if (!driver.focusedField) throw invalid(); return driver.focusedField(pid(body.pid));
+    case Method.FOCUSED_FIELD: {
+      if (body.secureOnly === true) {
+        exact(body, ["pid", "secureOnly"], ["point"]);
+        const processId = pid(body.pid);
+        if (processId > 0x7fff_ffff) throw invalid();
+        const point = body.point === undefined ? undefined : numbers(body.point, 2);
+        return checkSecureInputTarget({ pid: processId, ...(point === undefined ? {} : { point: { x: point[0]!, y: point[1]! } }) });
+      }
+      exact(body, ["pid"]); if (!driver.focusedField) throw invalid(); return driver.focusedField(pid(body.pid));
+    }
     case Method.QR: exact(body, ["pid", "window", "frame"]); if (!driver.qr) throw invalid(); return driver.qr(target(), body.frame === null ? null : numbers(body.frame, 4));
     case Method.ACT: {
       exact(body, ["pid", "window", "ref", "fp", "kind"], ["value"]); target();
