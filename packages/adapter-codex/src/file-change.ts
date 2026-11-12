@@ -4,12 +4,14 @@ const MAXIMUM_FILE_CHANGES = 256;
 const MAXIMUM_FILE_CHANGE_PATH_CHARS = 4_096;
 const MAXIMUM_FILE_CHANGE_KIND_CHARS = 128;
 const MAXIMUM_FILE_CHANGE_PAYLOAD_CHARS = 1_048_576;
+const MAXIMUM_FILE_APPROVAL_CHARS = 4_096;
 
 export const CODEX_FILE_CHANGE_FALLBACK = "Workspace file change (structured payload unavailable).";
 
 export interface CodexFileChangeProjection {
   readonly input: string;
   readonly summary: string;
+  readonly changes: readonly NormalizedFileChange[];
 }
 
 interface NormalizedFileChange {
@@ -62,6 +64,7 @@ export function projectCodexFileChanges(
   if (input.length > MAXIMUM_FILE_CHANGE_PAYLOAD_CHARS) return undefined;
   return {
     input,
+    changes,
     summary: changes.map((change) => {
       const action = change.kind.movePath === undefined ? change.kind.type : "move";
       return change.kind.movePath === undefined
@@ -69,6 +72,17 @@ export function projectCodexFileChanges(
         : `${action}: ${change.path} -> ${change.kind.movePath}`;
     }).join("\n")
   };
+}
+
+export function projectCodexFileApproval(
+  value: JsonValue | undefined,
+  sanitizeText: (value: string, limit: number) => string
+): string | undefined {
+  const projected = projectCodexFileChanges(value, sanitizeText);
+  if (projected === undefined) return undefined;
+  const patches = projected.changes.filter(change => change.diff.length > 0)
+    .map(change => `${change.path}\n${change.diff}`);
+  return sanitizeText([projected.summary, ...patches].join("\n\n"), MAXIMUM_FILE_APPROVAL_CHARS);
 }
 
 function nativeKind(value: JsonValue | undefined): {

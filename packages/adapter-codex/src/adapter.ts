@@ -104,6 +104,7 @@ import {
   type CodexCatalogSource
 } from "./session-catalog.js";
 import { CODEX_MODEL_ESTIMATES_UPDATED_AT, codexModelEstimate } from "./model-estimates.js";
+import { projectCodexFileApproval } from "./file-change.js";
 import {
   CodexNativeTaskProjection,
   type CodexNativeTaskEffects
@@ -112,6 +113,7 @@ import {
   CodexEventTranslator,
   createTranslatorState,
   interactionFromServerRequest,
+  safeText,
   translatePromptInput,
   type CodexInputResolvers,
   type ResolvedCodexSkill,
@@ -360,7 +362,7 @@ interface SessionRuntime {
   readonly planTurnIds: Set<string>;
   readonly planTextByTurn: Map<string, string>;
   readonly planContextByTurn: Map<string, AdapterContext>;
-  readonly nativeFileChanges: Map<string, JsonValue>;
+  readonly nativeFileChanges: Map<string, { readonly review: JsonValue | undefined; readonly approval: string | undefined }>;
   readonly yieldedExecCellsByTurnId: Map<string, Map<string, YieldedExecCell[]>>;
   yieldContinuation?: YieldContinuationClaim;
   yieldContinuationStartFlight?: Promise<void>;
@@ -4688,8 +4690,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
           if (method === "item/started" && isJsonObject(params) && isJsonObject(params["item"]) && params["item"]["type"] === "fileChange"
             && typeof params["item"]["id"] === "string" && typeof params["turnId"] === "string") {
-            const evidence = nativeFileReviewEvidence(params["item"]["changes"]);
-            if (evidence) runtime.nativeFileChanges.set(JSON.stringify([params["threadId"], params["turnId"], params["item"]["id"]]), evidence);
+            const changes = params["item"]["changes"];
+            const review = nativeFileReviewEvidence(changes);
+            const approval = projectCodexFileApproval(changes, safeText);
+            if (review !== undefined || approval !== undefined) {
+              runtime.nativeFileChanges.set(JSON.stringify([params["threadId"], params["turnId"], params["item"]["id"]]), { review, approval });
+            }
             if (runtime.nativeFileChanges.size > 2048) runtime.nativeFileChanges.delete(runtime.nativeFileChanges.keys().next().value!);
           }
           if (method === "turn/completed") runtime.nativeFileChanges.clear();
@@ -4830,7 +4836,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             return response;
           }
           if (descendantRequest && method === "item/tool/requestUserInput") return { answers: {} };
-          const interaction = interactionFromServerRequest(requestId, method, params, runtime.targetWorkspaceRoot);
+          const cachedFile = method === "item/fileChange/requestApproval" && isJsonObject(params)
+            ? runtime.nativeFileChanges.get(JSON.stringify([params["threadId"], params["turnId"], params["itemId"]])) : undefined;
+          const interaction = interactionFromServerRequest(requestId, method, params, runtime.targetWorkspaceRoot, cachedFile?.approval);
           if (interaction === undefined) return undefined;
           const key = rpcRequestKey(requestId);
           if (runtime.pendingServerRequests.has(key)) return undefined;
@@ -4857,7 +4865,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               const authority = requestContext.nativeToolAuthorization;
               const payload = isJsonObject(params) ? params : {};
               const fileEvidence = method === "item/fileChange/requestApproval"
-                ? nativeFileReviewEvidence(payload["changes"]) ?? runtime.nativeFileChanges.get(JSON.stringify([payload["threadId"], payload["turnId"], payload["itemId"]])) : undefined;
+                ? nativeFileReviewEvidence(payload["changes"]) ?? cachedFile?.review : undefined;
               const reviewInput = method === "item/fileChange/requestApproval" ? { grantRoot: payload["grantRoot"] ?? null,
                 ...(fileEvidence ? { changes: fileEvidence } : { evidenceUnavailable: true }) } : payload;
               const reviewed = await authority.review({ toolName: interaction.payload.toolName, input: reviewInput, signal: abort.signal });

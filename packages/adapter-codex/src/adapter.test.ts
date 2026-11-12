@@ -2197,6 +2197,38 @@ describe("CodexBackendAdapter", () => {
     await expect(approval).resolves.toEqual({ decision: "cancel" });
   });
 
+  it("shows the original file-change item in a Codex approval and keeps other items separate", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const requestInteraction = vi.fn<AdapterContext["requestInteraction"]>(async () => ({ kind: "selected", value: "allow_once" }));
+    const binding = await setup.adapter.createSession(sessionInput(setup.target),
+      context(setup.target, events, { backendInstanceGeneration: 7 }));
+    await setup.adapter.send(prompt("Update the report"), context(setup.target, events, {
+      binding, backendInstanceGeneration: 7, operationId: "file-change-approval", requestInteraction
+    }));
+    const threadId = binding.nativeSessionId!;
+    const transport = setup.fake.transport!;
+    const turnId = "turn-1", itemId = "report-patch";
+    const secret = "ghp_123456789012345678901234567890";
+    await transport.emitNotification("item/started", { threadId, turnId, item: {
+      type: "fileChange", id: itemId, status: "inProgress",
+      changes: [{ path: "report.txt", kind: { type: "update", move_path: "reports/report.txt" },
+        diff: `-previous\n+replacement\n+token=${secret}` }]
+    } });
+    const approval = { threadId, turnId, itemId, reason: "Update the report" };
+    await expect(transport.requestFromServer("item/fileChange/requestApproval", approval)).resolves.toEqual({ decision: "accept" });
+    expect(requestInteraction).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      kind: "permission", summary: "move: report.txt -> reports/report.txt\n\nreport.txt\n-previous\n+replacement\n+token=[REDACTED]\n\nUpdate the report"
+    }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+
+    await expect(transport.requestFromServer("item/fileChange/requestApproval", { ...approval, itemId: "other-item" }))
+      .resolves.toEqual({ decision: "accept" });
+    expect(requestInteraction).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      kind: "permission", summary: "Update the report"
+    }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    await setup.fake.completeTurn(threadId);
+  });
+
   it("refuses secret native user input without opening a durable Interaction", async () => {
     const setup = await createSetup();
     const events: EventPayload[] = [];
