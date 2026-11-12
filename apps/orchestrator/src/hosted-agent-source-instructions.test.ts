@@ -21,20 +21,24 @@ async function fixture() {
 it("carries the original computer's ancestors, personal instructions and bounded nested imports into the private native context", async () => {
   const f = await fixture();
   await writeFile(join(f.root, "AGENTS.md"), "SOURCE_ANCESTOR_GUIDANCE");
-  await writeFile(join(f.workspace, "CLAUDE.md"), "Source project @policy.md\n`@not-an-import.md`\n```\n@not-code.md\n```");
-  await writeFile(join(f.workspace, "policy.md"), "SOURCE_IMPORTED_POLICY @nested.md");
-  await writeFile(join(f.workspace, "nested.md"), "SOURCE_NESTED_POLICY @policy.md");
+  await writeFile(join(f.workspace, "CLAUDE.md"), "Source project @policy.md, then @exact.md,! @missing.md?\n`@not-an-import.md,`\n```\n@not-code.md.\n```");
+  await writeFile(join(f.workspace, "policy.md"), "SOURCE_IMPORTED_POLICY @nested.md;");
+  await writeFile(join(f.workspace, "nested.md"), "SOURCE_NESTED_POLICY @policy.md.");
+  await writeFile(join(f.workspace, "exact.md,!"), "SOURCE_LITERAL_FILENAME");
+  await writeFile(join(f.workspace, "exact.md"), "WRONG_PUNCTUATION_FALLBACK");
   await writeFile(join(f.home, ".claude", "CLAUDE.md"), "SOURCE_PERSONAL_GUIDANCE @personal.md");
   await writeFile(join(f.home, ".claude", "personal.md"), "SOURCE_PERSONAL_IMPORT");
   const files = await snapshotSourceInstructions(f.context, { nativeKind: "claude-agent-sdk-stdio", home: f.home, environment: {},
     files: await snapshotSourceProjectFiles(f.context), assertCurrent: () => {} });
   const contents = JSON.stringify(files);
   expect(files[0]?.content).toContain("SOURCE_PERSONAL_GUIDANCE"); expect(files.at(-1)?.path).toBe("CLAUDE.md");
-  for (const expected of ["SOURCE_ANCESTOR_GUIDANCE", "SOURCE_IMPORTED_POLICY", "SOURCE_NESTED_POLICY", "SOURCE_PERSONAL_GUIDANCE", "SOURCE_PERSONAL_IMPORT"]) expect(contents).toContain(expected);
+  for (const expected of ["SOURCE_ANCESTOR_GUIDANCE", "SOURCE_IMPORTED_POLICY", "SOURCE_NESTED_POLICY", "SOURCE_PERSONAL_GUIDANCE", "SOURCE_PERSONAL_IMPORT", "SOURCE_LITERAL_FILENAME"]) expect(contents).toContain(expected);
+  expect(contents).not.toContain("WRONG_PUNCTUATION_FALLBACK");
   expect(files.filter(file => file.content.includes("SOURCE_IMPORTED_POLICY"))).toHaveLength(1);
   const project = files.find(file => file.path === "CLAUDE.md")!;
-  expect(project.content).toMatch(/@\.claude\/rules\/source-context\/[a-f0-9]{64}\.md/u);
-  expect(project.content).toContain("`@not-an-import.md`"); expect(project.content).toContain("```\n@not-code.md\n```");
+  expect(project.content).toMatch(/@\.claude\/rules\/source-context\/[a-f0-9]{64}\.md, then @\.claude\/rules\/source-context\/[a-f0-9]{64}\.md `@missing\.md\?`/u);
+  expect(project.content).toContain("`@not-an-import.md,`"); expect(project.content).toContain("```\n@not-code.md.\n```");
+  expect(files.find(file => file.content.includes("SOURCE_IMPORTED_POLICY"))?.content).toMatch(/@[a-f0-9]{64}\.md;$/u);
   await materializeHostedProjectFiles({ root: f.host, files, assertCurrent: () => {} });
   expect(await readFile(join(f.host, "CLAUDE.md"), "utf8")).toBe(project.content);
 });

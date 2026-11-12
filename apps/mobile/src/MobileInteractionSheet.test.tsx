@@ -5,6 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import { InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { mobileMessage } from "./mobile-messages";
+import { createMobileInteractionResolution } from "./mobile-interactions";
 
 const native = vi.hoisted(() => ({ alert: vi.fn() }));
 
@@ -42,13 +43,14 @@ import { MobileInteractionSheet } from "./MobileInteractionSheet";
 const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#f90",
   negative: "#b00", brandBackground: "#eee" };
 
-function permission(revision: bigint, explanation: string) {
+function permission(revision: bigint, explanation: string, toolId?: string) {
   return create(InteractionSchema, {
     interactionId: "permission", kind: InteractionKind.PERMISSION, state: InteractionState.PENDING,
     backendId: "claude-code", targetId: "target", sessionId: "task", generation: 2n,
     version: { revision: { value: revision }, generation: 2n },
     request: { case: "permission", value: {
       title: "Approve command execution", explanation, risk: PermissionRisk.CRITICAL,
+      ...(toolId === undefined ? {} : { subject: { kind: { case: "customTool" as const, value: { toolId, displayName: toolId } } } }),
       allowedDecisions: [PermissionDecisionKind.ALLOW_ONCE, PermissionDecisionKind.ALLOW_FOR_SESSION, PermissionDecisionKind.DENY_ONCE]
     } }
   });
@@ -106,6 +108,24 @@ it("keeps the exact permission evidence selectable through confirmation and reti
       kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE
     });
     expect(onError).toHaveBeenCalledExactlyOnceWith("");
+
+    const bash = permission(5n, "Run the confirmed Bash command", "Bash");
+    await render(bash);
+    expect(button("Allow for this task")).toBeUndefined();
+    expect(button("Allow once")).toBeDefined();
+    expect(button(mobileMessage("en", "interaction.decision.deny"))).toBeDefined();
+    expect(() => createMobileInteractionResolution(bash, {
+      kind: "permission", decision: PermissionDecisionKind.ALLOW_FOR_SESSION
+    }, "connection")).toThrow(/not currently available/u);
+    onResolve.mockClear();
+    await press("Allow once");
+    expect(host.textContent).toContain(warning);
+    expect(onResolve).not.toHaveBeenCalled();
+    await press("Allow once");
+    expect(onResolve).toHaveBeenCalledExactlyOnceWith(bash, { kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE });
+    const otherBackend = create(InteractionSchema, { ...bash, backendId: "another-backend" });
+    await render(otherBackend);
+    expect(button("Allow for this task")).toBeDefined();
   } finally {
     await act(async () => root.unmount());
     host.remove();

@@ -6171,7 +6171,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           id: `q${index}`,
           label,
           description: header,
-          required: true,
+          required: false,
           kind: "text",
           multiline: false
         });
@@ -6180,7 +6180,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           id: `q${index}`,
           label,
           description: header,
-          required: true,
+          required: false,
           kind: "multiple",
           choices,
           defaultChoiceIds: [],
@@ -6192,7 +6192,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           id: `q${index}`,
           label,
           description: header,
-          required: true,
+          required: false,
           kind: "single",
           choices,
           allowOther: true
@@ -6203,7 +6203,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       id: interactionId(runtime, options.requestId),
       kind: "question",
       title: this.#projection.identifier(options.title, "Claude Code needs input"),
-      prompt: "Answer the questions required to continue the native turn.",
+      prompt: "Answer or skip each question to continue the native turn.",
       fields
     };
     const decision = await this.#requestInteraction(runtime, turn, interaction, options.signal);
@@ -6229,7 +6229,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
                   ...value.choiceIds.map((choiceId) => original.choices.get(choiceId) ?? choiceId),
                   ...(value.otherText === undefined ? [] : [value.otherText])
                 ];
-      answers[original.question] = original.multi ? labels.join(", ") : (labels[0] ?? "");
+      answers[original.question] = original.multi && labels.length > 0 ? JSON.stringify(labels) : (labels[0] ?? "");
     }
     return { behavior: "allow", updatedInput: { ...input, answers } };
   }
@@ -9201,9 +9201,13 @@ function permissionSummary(
     if (path.length > 0) return withDescription(`${modifiesFile ? "Modify file" : "Read file"}\n${path}`);
     if (modifiesFile) return described || "Modify a workspace file.";
   }
-  if (described.length > 0) return described;
   const titled = projection.text(options.displayName, 512);
-  return titled.length === 0 ? `Use ${projection.identifier(toolName, "a tool")}.` : titled;
+  const explanation = described || titled;
+  if (Object.keys(input).length > 0) {
+    const args = projection.json(input, 500);
+    return [`Tool arguments\n${args}`, explanation].filter(Boolean).join("\n\n");
+  }
+  return explanation || `Use ${projection.identifier(toolName, "a tool")}.`;
 }
 
 function permissionRisk(toolName: string): "low" | "medium" | "high" {

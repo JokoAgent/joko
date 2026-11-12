@@ -2,8 +2,9 @@
 import { act, createElement, forwardRef, useImperativeHandle, useRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, PartnerSessionTaskStatus, QueueItemSchema, QueueItemState, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
+import { AuthenticationState, CapabilitySupport, EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
+  MessageRole, ModelSourceKind, PartnerSessionTaskStatus, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
+  RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
@@ -19,6 +20,7 @@ import type { MobileObjectiveSheetProps } from "./MobileObjectiveSheet";
 import type { MobileTaskHeader } from "./MobileTaskHeader";
 import type { MobileContextSheet } from "./MobileContextSheet";
 import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
+import type { MobileProviderUsageTransport } from "./mobile-account-usage";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
 type TimelineScrollFailure = (event: { index: number; averageItemLength: number }) => void;
@@ -61,6 +63,7 @@ let objectiveSheet: MobileObjectiveSheetProps;
 let activeObjectiveApi: MobileObjectiveApi | undefined;
 let activeCollaborationApi: MobileCollaborationApi | undefined;
 let activeInputHandoffApi: import("./mobile-input-handoff").MobileInputHandoffApi | undefined;
+let providerUsage: MobileProviderUsageTransport | undefined;
 let taskRole: "ordinary" | "lead" | "worker" | undefined = "ordinary";
 let root: Root;
 let host: HTMLDivElement;
@@ -108,6 +111,7 @@ const client = new Proxy({
   taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
   taskNativeTreeControls: () => undefined, send, taskContextControls: () => undefined,
+  taskProviderUsageTransport: () => providerUsage,
   taskObjectiveApi: () => current ? activeObjectiveApi : undefined,
   taskCollaborationApi: () => current ? activeCollaborationApi : undefined,
   taskInputHandoffApi: () => current ? activeInputHandoffApi : undefined,
@@ -198,7 +202,10 @@ beforeAll(async () => {
   }));
   vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
   vi.doMock("./use-mobile-task-header-role", () => ({ useMobileTaskHeaderRole: () => ({ role: taskRole, failed: false, retry() {} }) }));
-  vi.doMock("./MobileTaskHeader", () => ({ MobileTaskHeader: (props: ComponentProps<typeof MobileTaskHeader>) => { header = props; return null; } }));
+  vi.doMock("./MobileTaskHeader", () => ({ MobileTaskHeader: (props: ComponentProps<typeof MobileTaskHeader>) => {
+    header = props;
+    return providerUsage ? createElement("div", { "data-task-menu-header": true }, props.menuHeader) : null;
+  } }));
   vi.doMock("./MobileContextSheet", () => ({ MobileContextSheet: (props: ComponentProps<typeof MobileContextSheet>) => { contextSheet = props; return null; } }));
   vi.doMock("./MobileObjectiveSheet", () => ({ MobileObjectiveSheet: (props: MobileObjectiveSheetProps) => { objectiveSheet = props; return null; } }));
   vi.doMock("./MobilePartnerAvatar", () => ({ MobilePartnerAvatar: () => null, MobilePartnerAvatarProvider: surface }));
@@ -222,7 +229,7 @@ beforeEach(async () => {
   sendFollowSourceKey = undefined; sendFollowPresentationKey = undefined; ordinaryTimelineTransportKey = undefined;
   activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
   activeObjectiveApi = undefined;
-  activeCollaborationApi = undefined; activeInputHandoffApi = undefined; taskRole = "ordinary";
+  activeCollaborationApi = undefined; activeInputHandoffApi = undefined; providerUsage = undefined; taskRole = "ordinary";
   drafts.save(identity, plainTextMobileComposerDraft("/an arguments")); await drafts.flush(identity);
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
@@ -240,6 +247,41 @@ async function render(assertPalette = true): Promise<void> {
   await act(async () => {});
   if (assertPalette) { expect(input.editable).toBe(true); expect(input.selection).toEqual({ start: 3, end: 3 }); expect(palette.visible).toBe(true); expect(palette.checkingDraft).toBe(false); }
 }
+
+it("reads the actual task menu's Claude family quota using the owning model route", async () => {
+  const model = { providerId: "provider", modelId: "claude-opus-4[1m]" };
+  const selected = create(SessionSchema, { ...session, model: { model } });
+  const owner = create(SnapshotSchema, { sessions: [selected], models: [
+    { backendId: "other-backend", key: model, source: { kind: ModelSourceKind.LOCAL, nativeAdapterKind: "pi" } },
+    { backendId: selected.backendId, key: model, source: { kind: ModelSourceKind.LOCAL, nativeAdapterKind: "claude-agent-sdk-stdio" } }
+  ] });
+  const provider = create(ProviderDescriptorSchema, { backendId: selected.backendId, providerId: model.providerId, displayName: "Owner subscription",
+    authenticationState: AuthenticationState.AUTHENTICATED, version: { generation: 0n, revision: { value: 1n } },
+    capabilities: { schemaVersion: "joko.provider.v1", capabilities: [{ name: capabilityNames.providerAccountUsage, support: CapabilitySupport.SUPPORTED }] } });
+  const read = vi.fn<MobileProviderUsageTransport["read"]>(async () => create(ProviderAccountUsageSnapshotSchema, { providerId: model.providerId,
+    observedAt: { seconds: BigInt(Math.floor(Date.now() / 1000)) }, primaryWindow: { usedPercent: 20, windowMinutes: 300 }, modelWindows: [
+      { displayName: "Claude Sonnet", window: { usedPercent: 87, windowMinutes: 10_080 } },
+      { displayName: "Claude Opus", window: { usedPercent: 100, windowMinutes: 10_080 } }
+    ] }));
+  providerUsage = { ownerKey: "owned-usage", providers: [provider], read };
+  renderedState = { ...state, detail: owner, owner };
+  await act(async () => root.render(taskScreen()));
+  expect(read).not.toHaveBeenCalled();
+  await act(async () => header.onMenuVisibilityChange(true));
+  expect(read).toHaveBeenCalledExactlyOnceWith(selected.backendId, model.providerId, expect.any(AbortSignal));
+  const menu = host.querySelector("[data-task-menu-header]");
+  expect(menu?.textContent).toContain("80% remaining");
+  expect(menu?.textContent).toContain("Claude Opus");
+  expect(Array.from(menu?.querySelectorAll("div") ?? []).some(row => row.children[0]?.textContent?.startsWith("Claude Opus")
+    && row.children[1]?.textContent === "0% remaining")).toBe(true);
+  expect(menu?.textContent).not.toContain("Claude Sonnet");
+  const other = create(SnapshotSchema, { ...owner, models: owner.models.map(row => row.backendId === selected.backendId && row.source
+    ? { ...row, source: { ...row.source, nativeAdapterKind: "pi" } } : row) });
+  renderedState = { ...state, detail: other, owner: other };
+  await act(async () => root.render(taskScreen()));
+  expect(host.querySelector("[data-task-menu-header]")?.textContent).not.toContain("Claude Opus");
+});
+
 describe("actual App slash Skill selection", () => {
   it("adopts fresh full identity into the retained draft, restores it and only sends after explicit action", async () => {
     await render();

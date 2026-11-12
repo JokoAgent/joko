@@ -6778,7 +6778,10 @@ describe("ClaudeCodeAdapter", () => {
         if (interaction.kind === "question") {
           return { kind: "question", answers: {
             q0: { kind: "single", selection: { kind: "choice", choiceId: "q0o1" } },
-            q1: { kind: "single", selection: { kind: "other", text: "q1o0" } }
+            q1: { kind: "single", selection: { kind: "other", text: "q1o0" } },
+            q2: { kind: "multiple", choiceIds: ["q2o2"] },
+            q3: { kind: "multiple", choiceIds: ["q3o0", "q3o1"] },
+            q4: { kind: "multiple", choiceIds: ["q4o0"], otherText: "Quoted \"route\", then tools" }
           } };
         }
         return { kind: "plan_review", decision: "execute", feedback: "" };
@@ -6821,6 +6824,16 @@ describe("ClaudeCodeAdapter", () => {
       })).resolves.toMatchObject({ behavior: "allow", updatedInput: input });
     }
 
+    const catalogInput = { collection: "reports", options: { filter: secret, api_key: "fixture-credential-field" } };
+    await expect(query.params.options.canUseTool("mcp__catalog__inspect", catalogInput, {
+      ...permissionOptions("permission-catalog", "tool-catalog"), description: "Inspect the selected collection."
+    })).resolves.toMatchObject({ behavior: "allow", updatedInput: catalogInput });
+    const extendedInput = { path: "docs/report.txt", body: "x".repeat(1_000) };
+    await expect(query.params.options.canUseTool("FixtureTool", extendedInput, {
+      ...permissionOptions("permission-fixture", "tool-fixture"), displayName: "Review the fixture input"
+    })).resolves.toMatchObject({ behavior: "allow", updatedInput: extendedInput });
+
+    const multiOptions = [{ label: "API" }, { label: "CLI" }, { label: "API, CLI" }];
     const question = await query.params.options.canUseTool("AskUserQuestion", {
       questions: [
         {
@@ -6837,12 +6850,17 @@ describe("ClaudeCodeAdapter", () => {
           header: "Other route",
           options: [{ label: "Slow", description: "Use the slow route." }],
           multiSelect: false
-        }
+        },
+        { question: "Select the single label", options: multiOptions, multiSelect: true },
+        { question: "Select two labels", options: multiOptions, multiSelect: true },
+        { question: "Select a label and enter text", options: multiOptions, multiSelect: true }
       ]
     }, permissionOptions("question-one", "tool-question"));
     expect(question).toMatchObject({
       behavior: "allow",
-      updatedInput: { answers: { "Choose a route": "Fast", "Name another route": "q1o0" } }
+      updatedInput: { answers: { "Choose a route": "Fast", "Name another route": "q1o0",
+        "Select the single label": '["API, CLI"]', "Select two labels": '["API","CLI"]',
+        "Select a label and enter text": JSON.stringify(["API", 'Quoted "route", then tools']) } }
     });
 
     const plan = await query.params.options.canUseTool(
@@ -6852,6 +6870,8 @@ describe("ClaudeCodeAdapter", () => {
     );
     expect(plan).toMatchObject({ behavior: "allow", updatedInput: { plan: "1. Test\n2. Ship" } });
     expect(interactions.map((interaction) => interaction.kind)).toEqual([
+      "permission",
+      "permission",
       "permission",
       "permission",
       "permission",
@@ -6872,10 +6892,46 @@ describe("ClaudeCodeAdapter", () => {
       { kind: "permission", risk: "low", toolName: "Glob", summary: "Search pattern\n**/*.test.ts" },
       { kind: "permission", risk: "medium", toolName: "NotebookEdit", summary: "Modify file\nresearch/notes.ipynb" }
     ]);
+    expect(interactions[6]).toMatchObject({
+      kind: "permission", risk: "low", toolName: "mcp__catalog__inspect",
+      summary: 'Tool arguments\n{"collection":"reports","options":{"filter":"[REDACTED]","api_key":"[REDACTED]"}}\n\nInspect the selected collection.'
+    });
+    const extended = interactions[7];
+    expect(extended).toMatchObject({
+      kind: "permission", risk: "low", toolName: "FixtureTool",
+      summary: expect.stringMatching(/^Tool arguments\n\{"path":"docs\/report\.txt","body":"x+\n\[Truncated\]\n\nReview the fixture input$/u)
+    });
+    expect(extended?.kind === "permission" && extended.summary.split("\n\n")[0]?.length).toBe(515);
 
     query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0.1 }));
     await eventually(() => active.events.some((event) => event.type === "done"));
     await adapter.closeSession(binding, contextFor(binding).context);
+  });
+
+  test("passes an explicitly skipped Claude question alongside the other answer", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const requestInteraction = vi.fn(async (_interaction: InteractionPayload) => ({ kind: "question" as const, answers: {
+      q1: { kind: "single" as const, selection: { kind: "choice" as const, choiceId: "q1o1" } }
+    } }));
+    const active = contextFor(binding, { operationId: "skip-question", requestInteraction });
+    try {
+      await adapter.send(textPrompt("Ask two questions"), active.context);
+      const input = { questions: [
+        { question: "First question", options: [{ label: "A" }, { label: "B" }] },
+        { question: "Second question", options: [{ label: "C" }, { label: "D" }] }
+      ] };
+      await expect(runtime.queries[0]!.params.options.canUseTool("AskUserQuestion", input,
+        permissionOptions("skip-first-question", "ask-two")))
+        .resolves.toMatchObject({ behavior: "allow", updatedInput: { ...input, answers: { "First question": "", "Second question": "D" } } });
+      expect(requestInteraction).toHaveBeenCalledOnce();
+      expect(requestInteraction.mock.calls[0]![0]).toMatchObject({ kind: "question", fields: [
+        expect.objectContaining({ id: "q0", required: false }), expect.objectContaining({ id: "q1", required: false })
+      ] });
+    } finally {
+      await adapter.dispose();
+    }
   });
 
   test("applies model, effort, permission, plan, and read-write directory controls to the Query", async () => {
