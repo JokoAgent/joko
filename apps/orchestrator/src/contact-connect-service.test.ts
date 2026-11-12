@@ -51,9 +51,10 @@ describe("ContactService", () => {
     expect((await directory()).systemImportAvailable).toBe(true);
     vi.mocked(port.read).mockRejectedValueOnce(new SystemContactsPermissionError());
     await expect(preview()).rejects.toMatchObject({ code: Code.PermissionDenied });
-    const first = (await preview()).preview!;
+    const first = (await preview()).preview;
+    if (!first) throw new Error("System contact import returned no preview.");
     expect(JSON.stringify(first, (_key, value) => typeof value === "bigint" ? String(value) : value)).not.toContain("apple-card-1");
-    expect(first.entries[0]?.contact?.identities).toHaveLength(1);
+    expect(first.entries?.[0]?.contact?.identities).toHaveLength(1);
     const confirmation = { previewId: first.previewId, expectedDirectoryRevision: first.directoryRevision };
     expectConnectError(() => service.commitContactVCardImport(create(contract.CommitContactVCardImportRequestSchema, confirmation), caller), Code.FailedPrecondition);
     connectionId = "remote";
@@ -61,13 +62,17 @@ describe("ContactService", () => {
     expectConnectError(commit, Code.FailedPrecondition);
     expect(manager.directory().people).toBe(0);
     connectionId = "desktop";
-    const receipt = (await commit()).receipt!;
+    const receipt = (await commit()).receipt;
     expect(receipt).toMatchObject({ created: 1, enriched: 0 });
-    expect(store.systemContactAnchor("mac", receipt.contactIds[0]!)).toEqual({ nativeId: "apple-card-1", unresolved: false });
-    expect(manager.exportVCards(receipt.contactIds).text).not.toContain("apple-card-1");
-    const second = (await preview()).preview!;
-    expect(second.entries[0]).toMatchObject({ disposition: contract.ContactVCardImportDisposition.AUTO_ENRICH,
-      existingContactId: receipt.contactIds[0] });
+    const contactIds = receipt?.contactIds;
+    const contactId = contactIds?.[0];
+    if (!contactIds || !contactId) throw new Error("System contact import returned no created contact ID.");
+    expect(store.systemContactAnchor("mac", contactId)).toEqual({ nativeId: "apple-card-1", unresolved: false });
+    expect(manager.exportVCards(contactIds).text).not.toContain("apple-card-1");
+    const second = (await preview()).preview;
+    if (!second) throw new Error("Repeated system contact import returned no preview.");
+    expect(second.entries?.[0]).toMatchObject({ disposition: contract.ContactVCardImportDisposition.AUTO_ENRICH,
+      existingContactId: contactId });
     current = false;
     expectConnectError(() => service.commitSystemContactImport(create(contract.CommitSystemContactImportRequestSchema, {
       confirmation: { previewId: second.previewId, expectedDirectoryRevision: second.directoryRevision }

@@ -4,7 +4,11 @@ import type { ContactProfileView, ContactVCardImportPreviewView } from "./model.
 
 describe("Contact vCard review", () => {
   it("resolves external merge targets to current revisions while preserving staged entry targets", async () => {
-    const getContact = vi.fn(async (id: string) => ({ id, revision: id === "person-existing" ? 11n : 13n } as ContactProfileView));
+    const getContact = vi.fn(async (id: string, signal?: AbortSignal) => {
+      signal?.throwIfAborted();
+      return { id, revision: id === "person-existing" ? 11n : 13n } as ContactProfileView;
+    });
+    const signal = new AbortController().signal;
     const preview: ContactVCardImportPreviewView = {
       previewId: "preview",
       directoryRevision: 7n,
@@ -37,7 +41,7 @@ describe("Contact vCard review", () => {
       { entryId: "entry-two", decision: "merge", target: "entry:entry-one" }
     ];
 
-    await expect(contactImportDecisions({ getContact } as never, preview, selections)).resolves.toEqual([
+    await expect(contactImportDecisions({ getContact }, preview, selections, signal)).resolves.toEqual([
       expect.objectContaining({
         entryId: "entry-one",
         decision: "merge",
@@ -50,8 +54,8 @@ describe("Contact vCard review", () => {
       expect.objectContaining({ entryId: "entry-two", decision: "merge", targetEntryId: "entry-one" })
     ]);
     expect(getContact).toHaveBeenCalledTimes(2);
-    expect(getContact).toHaveBeenCalledWith("person-existing");
-    expect(getContact).toHaveBeenCalledWith("org-existing");
+    expect(getContact).toHaveBeenCalledWith("person-existing", signal);
+    expect(getContact).toHaveBeenCalledWith("org-existing", signal);
   });
 });
 
