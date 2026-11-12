@@ -528,9 +528,10 @@ if (packagedSmokeRequested && packagedSmokeScope !== "full" && packagedSmokeScop
   throw new Error(`Unsupported packaged smoke scope: ${packagedSmokeScope}`);
 }
 const packagedSmokeTimeoutCandidate = Number(process.env["JOKO_DESKTOP_SMOKE_TIMEOUT_MS"]);
+const packagedSmokeTimeoutMaximum = process.platform === "darwin" && packagedSmokeScope === "full" ? 240_000 : 180_000;
 const packagedSmokeTimeoutMs = Number.isSafeInteger(packagedSmokeTimeoutCandidate)
   && packagedSmokeTimeoutCandidate >= 60_000
-  && packagedSmokeTimeoutCandidate <= 180_000
+  && packagedSmokeTimeoutCandidate <= packagedSmokeTimeoutMaximum
   ? packagedSmokeTimeoutCandidate
   : 90_000;
 const packagedSmokeManagedReadyTimeoutMs = Math.min(
