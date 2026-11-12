@@ -225,14 +225,18 @@ describe("MessagingManager", () => {
       prompt: { disposition: "prompt", text: "Independent input", images: [], files: [], mentions: [] }
     }).value;
     const nativeAbort = adapter.abort.bind(adapter);
+    const abortRun = vi.spyOn(fixture.host, "abort");
     const abort = vi.spyOn(adapter, "abort").mockImplementation(async context => {
-      expect(context.runId).toBe(active.runId);
+      expect(context.sessionId).toBe(activeQueue.sessionId);
+      expect(context.assertRunControlCurrent).toBeDefined();
+      context.assertRunControlCurrent?.();
       expect(fixture.store.getQueueItem(pending.queueItemId!).state).toBe("cancelled");
       expect(fixture.store.getQueueItem(independent.queueItemId).state).toBe("accepted");
       return nativeAbort(context);
     });
     gates[3]!.release();
     await vi.waitFor(() => expect(repliesTo(4)).toMatchObject([{ text: "Stopped the current turn. Cancelled 1 queued message." }]), { timeout: 5_000 });
+    expect(abortRun).toHaveBeenCalledExactlyOnceWith(activeQueue.sessionId, active.runId, expect.any(Function));
     expect(abort).toHaveBeenCalledTimes(1);
     expect(fixture.store.getRun(active.runId!).descriptor.state).toBe("aborted");
     expect(requests()).toEqual(expect.arrayContaining([
