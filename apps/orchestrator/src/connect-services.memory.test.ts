@@ -17,6 +17,7 @@ import { OperationalStore, operationBodyHash, type OperationRecord } from "@joko
 import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
+import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 import { createConnectServices } from "./connect-services.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { CredentialManager } from "./credential-manager.js";
@@ -36,6 +37,85 @@ const owner = {
 };
 
 describe("Connect Maker Memory owner and reset scopes", () => {
+  it("binds native Codex memory review approval and replay to its original queue operation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-memory-review-"));
+    const store = new OperationalStore(join(root, "orchestrator.db"));
+    const host = new SessionHost(store, {} as never, []);
+    const memory = new MakerMemoryController({ store });
+    const vault = await CredentialVault.open(join(root, "vault.key"));
+    const credentials = new CredentialManager({ vault, storagePath: join(root, "credentials.json") });
+    const router = new McpRouter({ store, credentials });
+    try {
+      await credentials.initialize();
+      await router.initialize();
+      const plan = { models: [], revision: 0n, runtimeRevision: "memory-review-fixture" };
+      const run = vi.fn<AuxiliaryTextRouting["run"]>(async () => ({ status: "ok", text: "Review the release checklist." }));
+      router.registerBridgeToolProvider(new MakerMemoryBridgeProvider(memory, {
+        auxiliary: () => ({ capture: () => plan, isCurrent: value => value === plan, run }), redact: value => value
+      }));
+      router.setNativeToolAdmission((...args) => host.authorizeNativeBridgeTool(...args));
+
+      const connection = store.createConnection({ id: owner.id, name: owner.name, authKeyDigest: owner.authKeyDigest });
+      const backendId = "memory-codex", targetId = "memory-workspace", sessionId = "memory-task";
+      store.upsertBackend({ id: backendId, displayName: "Codex", adapterKind: "codex", version: "test", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "not_required", capabilities: new Map(),
+        models: [], tools: [], diagnostics: [] });
+      store.upsertTarget({ id: targetId, backendId, displayName: "Workspace", workspaceRoot: root, trusted: true, managed: false });
+      store.createSession({ id: sessionId, backendId, targetId, title: "Memory task", binding: { opaqueRef: "memory-native", generation: 1 },
+        pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+      memory.write(targetId, { kind: "project", name: "release", title: "Release checklist", description: "Project decisions", body: "Keep the release checklist current." });
+      const bridge = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId, targetId, expectedPiGeneration: 1 });
+      expect(bridge.mcpBridge.tools).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "memory_review", requiresPermission: true }),
+        expect.objectContaining({ name: "memory_consolidate", requiresPermission: true })
+      ]));
+      const review = () => router.executeBridgeCall({ authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: "memory-native-review",
+        sessionId, targetId, generation: 1, serverId: MAKER_MEMORY_PROVIDER_ID, toolName: "memory_review", arguments: {} });
+      await expect(review()).rejects.toThrow(/current authorized task input/u);
+      const runId = "memory-run", attemptId = "memory-attempt", operationId = "memory-send-input", queueItemId = "memory-queue";
+      const body = { text: "Review workspace memory", images: [], files: [], mentions: [], disposition: "prompt" } as const;
+      store.runOperation({ id: operationId, connectionId: connection.id, kind: "sendInput", body }, transaction => {
+        transaction.createRun({ id: runId, sessionId, source: "user", state: "queued", createdAt: 1 });
+        transaction.createAttempt({ id: attemptId, runId, ordinal: 1, generation: 1, startedAt: 1 });
+        transaction.enqueueQueueItem({ id: queueItemId, sessionId, runId, attemptId, operationId, body, disposition: "prompt" });
+        return {};
+      });
+      expect(store.claimNextQueueItem({ sessionId, backendInstanceGeneration: 1 })?.id).toBe(queueItemId);
+
+      const pending = review();
+      void pending.catch(() => {});
+      const interaction = await vi.waitFor(() => {
+        const opened = store.listInteractions({ sessionId, status: "open" });
+        expect(opened).toHaveLength(1);
+        return opened[0]!;
+      }, { timeout: 5_000 });
+      expect(interaction).toMatchObject({ runId, attemptId, payload: { kind: "permission", toolName: "joko_memory/memory_review" } });
+      const original = store.listOperations().find(operation => operation.kind === "memory_review")!;
+      expect(original).toMatchObject({ status: "started", body: { sourceOperationId: operationId, queueItemId, runId, attemptId, targetId } });
+      await expect(review()).resolves.toMatchObject({ isError: true, error: expect.stringContaining(original.id) });
+      expect(run).not.toHaveBeenCalled();
+      host.resolveInteraction(interaction.id, interaction.generation, { kind: "permission", decision: "allow_once" }, "allow-memory-review");
+
+      const reply = await pending;
+      expect(reply).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+        suggestions: "Review the release checklist.", operation_id: original.id
+      } } });
+      await expect(review()).resolves.toEqual(reply);
+      expect(run).toHaveBeenCalledOnce();
+      expect(store.listInteractions({ sessionId })).toHaveLength(1);
+      expect(store.getOperation(original.id)).toMatchObject({ status: "completed", response: { suggestions: "Review the release checklist." } });
+      store.revokeConnection(connection.id);
+      await expect(review()).rejects.toThrow(/invalid or revoked/u);
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      await router.dispose();
+      await host.dispose();
+      memory.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps two existing curated memory grants when the owner turns off only Pi digests", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-memory-digest-preference-"));
     const store = new OperationalStore(join(root, "orchestrator.db"));

@@ -5,6 +5,7 @@ import { RevisionConflictError, type OperationalStore } from "@joko/store";
 import { backendModelAccessSettingKey, modelRoutingEnabled, readBackendModelAccess } from "./backend-model-access.js";
 import type { ProviderCatalogManager } from "./credential-manager.js";
 import {
+  managedTextOutcomeUnknown,
   requestManagedTextInference,
   type ModelRouteCatalog,
   type ModelRouteRef
@@ -46,12 +47,13 @@ export interface AuxiliaryTextRunOptions {
   readonly firstAttemptTimeoutMs?: number;
   readonly signal?: AbortSignal;
   readonly stillCurrent?: () => boolean;
+  readonly stopOnUnknownOutcome?: boolean;
   readonly validate: (raw: string) => string | undefined;
 }
 
 export type AuxiliaryTextRunResult =
   | { readonly status: "ok"; readonly text: string }
-  | { readonly status: "unavailable" | "exhausted" | "cancelled" | "stale" };
+  | { readonly status: "unavailable" | "exhausted" | "cancelled" | "stale" | "outcome_unknown" };
 
 export interface AuxiliaryTextRoutingOptions {
   readonly store: OperationalStore;
@@ -186,6 +188,7 @@ export class AuxiliaryTextRouting {
             system: input.system,
             user: input.user,
             maxTokens: input.maxTokens,
+            ...(input.stopOnUnknownOutcome === true ? { stopOnUnknownOutcome: true } : {}),
             timeoutMs: attemptBudget,
             signal: attemptSignal,
             assertCurrent: () => {
@@ -198,9 +201,12 @@ export class AuxiliaryTextRouting {
           const validated = stopped();
           if (validated !== undefined) return validated;
           if (text !== undefined && text.length > 0) return { status: "ok", text };
-        } catch {
+        } catch (error) {
           const failed = stopped();
           if (failed !== undefined) return failed;
+          if (input.stopOnUnknownOutcome && (attemptTimeout.aborted || deadline.aborted || managedTextOutcomeUnknown(error))) {
+            return { status: "outcome_unknown" };
+          }
           if (deadline.aborted) break;
         }
       }
