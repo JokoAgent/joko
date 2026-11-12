@@ -282,6 +282,7 @@ export async function createXlsxBuffer(input: unknown, signal?: AbortSignal): Pr
   readonly theme: DocsThemeName;
   readonly zebra: boolean;
   readonly sheets: readonly { readonly name: string; readonly rows: number }[];
+  readonly firstSheet: { readonly columns: readonly string[]; readonly rows: readonly (readonly string[])[] };
 }> {
   const validated = XlsxInputSchema.safeParse(input);
   if (!validated.success) throw new XlsxDocumentError("INVALID_ARGUMENT", "Workbook arguments are invalid.");
@@ -404,5 +405,8 @@ export async function createXlsxBuffer(input: unknown, signal?: AbortSignal): Pr
 
   const arrayBuffer = await workbook.xlsx.writeBuffer();
   signal?.throwIfAborted();
-  return { buffer: Buffer.from(arrayBuffer as ArrayBuffer), theme, zebra, sheets: writtenSheets };
+  const first = sheets[0]!;
+  return { buffer: Buffer.from(arrayBuffer as ArrayBuffer), theme, zebra, sheets: writtenSheets, firstSheet: {
+    columns: first.header?.slice(0, 3) ?? [], rows: first.rows.slice(0, 4).map(row => row.slice(0, 3).map(cellText))
+  } };
 }

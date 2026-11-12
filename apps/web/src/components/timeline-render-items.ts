@@ -1,4 +1,5 @@
 import type { SessionView, TimelineItemView } from "../model.js";
+import { projectDocumentFiles } from "../generated-files.js";
 import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
 import { readPartnerDelegationCardData } from "./partner-delegation-card-data.js";
 
@@ -111,7 +112,7 @@ export function projectTimelineRenderItems(
     workGapBefore = undefined;
   };
 
-  for (const item of sourceItems) {
+  for (const item of projectDocumentFiles(sourceItems)) {
     if (isInternalContinuationTimelineItem(item)) continue;
     const timestamp = finiteTimestamp(item.createdAt);
     const userBoundary = item.kind === "user";
@@ -139,7 +140,7 @@ export function projectTimelineRenderItems(
       projected.push({
         type: "item",
         key: item.id,
-        childIds: item.inlinePlan?.sourceItemIds ?? [item.id],
+        childIds: item.inlinePlan?.sourceItemIds ?? item.documentFileSourceIds ?? [item.id],
         item,
         ...(pendingGapBefore === undefined ? {} : { historyGapBefore: pendingGapBefore })
       });

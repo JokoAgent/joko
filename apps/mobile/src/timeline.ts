@@ -1,4 +1,4 @@
-import { MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
+import { MessageRole, readDocumentOutput, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt, type PartnerSessionTaskReceiptView } from "@joko/contracts";
 import { assistantStreamAttempt, isAssistantStreamBlock } from "@joko/contracts";
@@ -314,6 +314,7 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
       case "toolCallStarted":
       case "toolCallUpdated":
       case "toolCallCompleted": {
+        if (readDocumentOutput(event) !== undefined) break;
         const callId = kind.value.toolCall?.toolCallId ?? "";
         if (kind.case === "toolCallStarted" && callId) toolStarts.set(callId, [...(toolStarts.get(callId) ?? []), event]);
         const scopeKey = mobileToolCallScopeKey(event);

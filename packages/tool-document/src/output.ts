@@ -1,8 +1,13 @@
 import { fork } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  approveExternalDocumentPath, documentFileVersion, documentPathInside,
+  type DocumentPathAuthorizer
+} from "./document-path.js";
+import { readPreparedDocumentInput } from "./input.js";
 
 const MAXIMUM_OUTPUT_BYTES = 64 * 1024 * 1024;
 const WRITE_TIMEOUT_MS = 60_000;
@@ -29,6 +34,7 @@ interface WriterRequest {
   readonly targetName: string;
   readonly bytesBase64: string;
   readonly overwrite: boolean;
+  readonly approvedTargetVersion?: string | null;
 }
 
 type WriterResult =
@@ -43,9 +49,10 @@ export async function publishDocumentOutput(input: {
   readonly overwrite: boolean;
   readonly signal?: AbortSignal;
   readonly assertCurrent?: () => void;
+  readonly authorizePath?: DocumentPathAuthorizer;
 }): Promise<{
   readonly path: string;
-  readonly relativePath: string;
+  readonly relativePath?: string;
   readonly bytes: number;
   readonly sha256: string;
   readonly existingTarget: boolean;
@@ -64,46 +71,63 @@ export async function publishDocumentOutput(input: {
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || rootInfo.dev === 0n || rootInfo.ino === 0n) {
     throw new DocumentOutputError("PATH_NOT_ALLOWED", "Task working directory is not a stable directory.");
   }
-  const path = resolve(root, input.outPath);
-  const relativePath = relative(root, path);
-  if (relativePath === "" || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+  const requested = resolve(root, input.outPath);
+  const inTask = documentPathInside(root, requested);
+  if (!inTask && (input.authorizePath === undefined || requested === root)) {
     throw new DocumentOutputError("PATH_NOT_ALLOWED", "Document output must stay in the task working directory.");
   }
+  const approved = inTask || input.authorizePath === undefined ? undefined : await approveExternalDocumentPath({
+    path: requested, operation: "write", overwrite: input.overwrite,
+    ...(input.signal === undefined ? {} : { signal: input.signal })
+  }, input.authorizePath);
+  const path = approved?.path ?? requested;
+  const writerRoot = approved?.root ?? root;
+  const writerRootIdentity = approved?.rootIdentity ?? rootInfo;
   const targetName = basename(path);
   if (targetName === "." || targetName === ".." || targetName.includes("\0")) {
     throw new DocumentOutputError("PATH_NOT_ALLOWED", "Document output filename is invalid.");
   }
   const request: WriterRequest = {
-    root,
-    rootDev: String(rootInfo.dev),
-    rootIno: String(rootInfo.ino),
-    relativeParent: relative(root, dirname(path)),
+    root: writerRoot,
+    rootDev: String(writerRootIdentity.dev),
+    rootIno: String(writerRootIdentity.ino),
+    relativeParent: relative(writerRoot, dirname(path)),
     targetName,
     bytesBase64: Buffer.from(input.bytes).toString("base64"),
-    overwrite: input.overwrite
+    overwrite: input.overwrite,
+    ...(approved === undefined ? {} : {
+      approvedTargetVersion: approved.fileIdentity === null ? null : documentFileVersion(approved.fileIdentity)
+    })
   };
-  input.assertCurrent?.();
-  const result = await invokeWriter(request, input.signal);
+  const assertCurrent = (): void => {
+    input.signal?.throwIfAborted();
+    input.assertCurrent?.();
+    approved?.assertCurrent();
+  };
+  assertCurrent();
+  const result = await invokeWriter(request, input.signal, approved === undefined ? undefined : assertCurrent);
   if (!result.ok) throw new DocumentOutputError(result.code, result.message);
-  input.signal?.throwIfAborted();
+  assertCurrent();
   const realPath = await fs.realpath(path).catch(() => {
     throw new DocumentOutputError("OUTPUT_FAILED", "Published document could not be read back.");
   });
   if (realPath !== path) {
     throw new DocumentOutputError("PATH_NOT_ALLOWED", "Published document path changed.");
   }
-  const readback = await fs.readFile(realPath);
+  const readback = approved === undefined ? await fs.readFile(realPath) : await readPreparedDocumentInput({
+    root: writerRoot, path: realPath, expected: await fs.lstat(realPath, { bigint: true }), approved
+  }, MAXIMUM_OUTPUT_BYTES, input.signal);
   const sha256 = createHash("sha256").update(readback).digest("hex");
   if (readback.byteLength !== input.bytes.byteLength
     || sha256 !== createHash("sha256").update(input.bytes).digest("hex")) {
     throw new DocumentOutputError("OUTPUT_FAILED", "Published document failed readback verification.");
   }
-  input.signal?.throwIfAborted();
-  input.assertCurrent?.();
-  return { path, relativePath, bytes: readback.byteLength, sha256, existingTarget: result.existingTarget };
+  assertCurrent();
+  return { path, ...(inTask ? { relativePath: relative(root, path) } : {}),
+    bytes: readback.byteLength, sha256, existingTarget: result.existingTarget };
 }
 
-async function invokeWriter(request: WriterRequest, signal: AbortSignal | undefined): Promise<WriterResult> {
+async function invokeWriter(request: WriterRequest, signal: AbortSignal | undefined, authorizeCommit?: () => void): Promise<WriterResult> {
   const ownFile = fileURLToPath(import.meta.url);
   const sourceMode = ownFile.endsWith(".ts");
   const writerFile = resolve(dirname(ownFile), sourceMode ? "output-child.ts" : "output-child.js");
@@ -149,6 +173,16 @@ async function invokeWriter(request: WriterRequest, signal: AbortSignal | undefi
     if (signal?.aborted) { abort(); return; }
     child.on("message", (message: unknown) => {
       if (!message || typeof message !== "object") return;
+      if ("checkApproval" in message && message.checkApproval === true) {
+        let approved = false;
+        if (authorizeCommit !== undefined) {
+          try { authorizeCommit(); approved = true; } catch { /* The writer retires its staging file. */ }
+        }
+        if (!finished && child.connected) child.send({ approved }, error => {
+          if (error) finish(undefined, new DocumentOutputError("OUTPUT_FAILED", "Document writer approval could not be delivered."));
+        });
+        return;
+      }
       const result = message as Partial<WriterResult>;
       if (result.ok === true && typeof result.existingTarget === "boolean") finish({ ok: true, existingTarget: result.existingTarget });
       else if (result.ok === false && typeof result.code === "string" && typeof result.message === "string") {
