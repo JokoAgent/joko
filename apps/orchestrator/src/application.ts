@@ -3379,6 +3379,7 @@ export async function createOrchestratorApplication(
     computerBridge = new ComputerToolBridgeProvider({
       provider: computerTools,
       store,
+      artifacts,
       enabledForNewSessions: () => computerAutomation?.availableForNewSessions() ?? false
     });
     computerBridgeForSessionCleanup = computerBridge;

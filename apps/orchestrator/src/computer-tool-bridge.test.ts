@@ -1,7 +1,9 @@
+import { createHash, randomBytes } from "node:crypto";
 import { rmSync, symlinkSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import sharp from "sharp";
 
 import {
   COMPUTER_PUBLIC_TOOLS,
@@ -9,6 +11,7 @@ import {
   computerPublicTool,
   ComputerToolProviderError,
   type ComputerSessionFence,
+  type ComputerToolCallContext,
   type ComputerToolCallResult,
   type ComputerToolDescriptor,
   type ComputerToolProvider
@@ -18,7 +21,7 @@ import { describe, expect, it } from "vitest";
 
 import type { CredentialManager } from "./credential-manager.js";
 import { ComputerToolBridgeProvider } from "./computer-tool-bridge.js";
-import { McpRouter } from "./mcp-router.js";
+import { McpRouter, type McpResultArtifactStore } from "./mcp-router.js";
 
 const WORKSPACE_ROOT = resolve("D:\\workspace");
 const TOOL_SCHEMA = { type: "object", properties: {}, additionalProperties: false } as const;
@@ -458,6 +461,51 @@ describe("ComputerToolBridgeProvider", () => {
     }, undefined, bridgeContext("session-frozen")))["errorCode"]).toBe("UNKNOWN_TOOL");
     expect(provider.listRequests).toHaveLength(1);
   });
+
+  it("delivers a bounded visual preview and the original capture through the authenticated tool result", async () => {
+    const provider = new FakeComputerProvider(COMPUTER_PUBLIC_TOOLS);
+    const png = await sharp(randomBytes(512 * 512 * 3), { raw: { width: 512, height: 512, channels: 3 } }).png().toBuffer();
+    const digest = createHash("sha256").update(png).digest("hex");
+    provider.observationImage = png;
+    provider.result = { structuredContent: { ok: true, outcome: { status: "unknown" },
+      observation: { ok: true, snapshot_id: "exact-window", data: { element_token: "exact-token" } } } };
+    const originals: Uint8Array[] = [];
+    const bridge = createBridge(provider, () => true, WORKSPACE_ROOT, {
+      ingestBytes: async (bytes, options) => {
+        originals.push(bytes);
+        expect(options).toMatchObject({ mimeType: "image/png", fileName: "window-screenshot.png", expiresAt: expect.any(Number) });
+        return { id: "original-screenshot", sha256: digest, byteLength: bytes.byteLength, mimeType: "image/png" };
+      }
+    });
+    await bridge.prepare();
+    const { router } = await routerFixture();
+    router.registerBridgeToolProvider(bridge);
+    const active = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", expectedPiGeneration: 7 });
+    try {
+      const result = await router.executeBridgeCall({
+        authorization: `Bearer ${active.mcpBridge.token}`,
+        requestId: "computer-observe-screenshot", generation: 7, sessionId: "session-7", targetId: "target-1",
+        serverId: bridge.id, toolName: "call_tool",
+        arguments: { name: "click", args: { pid: 7, window_id: 2, x: 1, y: 2, observe: { include_screenshot: true } } }
+      });
+      expect(originals).toEqual([png]);
+      expect(textPayload(result)).toMatchObject({ ok: true, data: { outcome: { status: "unknown" } },
+        observation: { ok: true, snapshot_id: "exact-window", data: { element_token: "exact-token" },
+          screenshot: { artifact_id: "original-screenshot", mime_type: "image/png", width: 512, height: 512,
+            preview: { width: expect.any(Number), height: expect.any(Number) } } } });
+      expect(result).toMatchObject({ isError: false, content: [expect.objectContaining({ type: "image", mimeType: "image/jpeg" }), expect.anything()],
+        details: { jokoMcpBridge: { format: 1, artifactOutputs: [{ blob: { id: "original-screenshot", sha256: digest, byteLength: png.byteLength } }] } } });
+      const image = result.content[0] as { data: string };
+      const inline = Buffer.from(image.data, "base64");
+      expect(inline.byteLength).toBeLessThanOrEqual(80 * 1024);
+      expect(await sharp(inline).metadata()).toMatchObject({ format: "jpeg" });
+      expect(provider.callRequests.map(call => call.name)).toEqual(["click"]);
+    } finally {
+      active.revoke();
+      await router.dispose();
+      await bridge.close();
+    }
+  });
 });
 
 class FakeComputerProvider {
@@ -472,6 +520,7 @@ class FakeComputerProvider {
   readonly staleOnceFor = new Set<string>();
   readonly #generations = new Map<string, number>();
   result: ComputerToolCallResult = { content: [], isError: false };
+  observationImage?: Uint8Array;
   closeAllCount = 0;
 
   constructor(readonly catalog: readonly ComputerToolDescriptor[]) {}
@@ -492,11 +541,19 @@ class FakeComputerProvider {
   async callTool(
     fence: ComputerSessionFence,
     name: string,
-    arguments_: Readonly<Record<string, unknown>>
+    arguments_: Readonly<Record<string, unknown>>,
+    signal?: AbortSignal,
+    context?: ComputerToolCallContext
   ): Promise<ComputerToolCallResult> {
     this.callRequests.push({ fence, name, arguments: arguments_ });
     if (this.staleOnceFor.delete(fence.sessionId)) {
       throw new ComputerToolProviderError("stale_session");
+    }
+    if (this.observationImage !== undefined) {
+      await context?.prepareObservationImage?.(this.observationImage, () => {
+        signal?.throwIfAborted();
+        context.assertInputCurrent?.();
+      });
     }
     return this.result;
   }
@@ -518,11 +575,13 @@ class FakeComputerProvider {
 function createBridge(
   provider: FakeComputerProvider,
   enabledForNewSessions: () => boolean = () => true,
-  workspaceRoot = WORKSPACE_ROOT
+  workspaceRoot = WORKSPACE_ROOT,
+  artifacts: Pick<McpResultArtifactStore, "ingestBytes"> = { ingestBytes: async () => { throw new Error("Unexpected screenshot."); } }
 ): ComputerToolBridgeProvider {
   return new ComputerToolBridgeProvider({
     provider: provider as unknown as ComputerToolProvider,
     store: new FakeStore(workspaceRoot) as unknown as OperationalStore,
+    artifacts,
     enabledForNewSessions
   });
 }

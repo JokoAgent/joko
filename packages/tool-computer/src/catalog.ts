@@ -74,6 +74,16 @@ const snapshotId = stringValue(
 );
 const elementToken = stringValue("Exact element_token from the latest window observation. Re-observe after verification or a failed observation.");
 const deliveryMode = choice("background", "foreground");
+const windowReadScope = {
+  query: stringValue(),
+  max_elements: numberValue({ integer: true, minimum: 1, maximum: 2_000,
+    description: "Maximum number of accessibility tree elements to return." }),
+  max_depth: numberValue({ integer: true, minimum: 1, description: "Maximum depth of the accessibility tree to traverse." })
+};
+const observe = {
+  ...objectSchema({ ...windowReadScope, include_screenshot: booleanValue() }),
+  description: "Read the same window once after input, with a fresh usable snapshot. Omitted query, max_elements and max_depth inherit the last successful explicit observation. Use include_screenshot:true for visual evidence. Mutually exclusive with postcondition. The observation does not confirm the action's effect."
+};
 const postcondition = { type: "array", minItems: 1, maxItems: 8, items: objectSchema({
   element: objectSchema({
     selector: objectSchema({ role: { type: "string", minLength: 1 }, label_contains: { type: "string", minLength: 1 } }),
@@ -100,7 +110,7 @@ function tool(
       ...properties,
       session_goal: { type: "string", minLength: 1, maxLength: 80,
         description: "On the first call, name the overall objective in short English. The host claims this name once; omit it on later calls. Never include credentials or internal IDs." },
-      ...(COMPUTER_POSTCHECK_ACTIONS.has(name) ? { postcondition } : {})
+      ...(COMPUTER_POSTCHECK_ACTIONS.has(name) ? { postcondition, observe } : {})
     }
   };
   return Object.freeze({
@@ -162,20 +172,9 @@ export const COMPUTER_PUBLIC_TOOLS: readonly ComputerToolDescriptor[] = Object.f
       pid,
       window_id: windowId,
       include_screenshot: booleanValue(),
-      query: stringValue(),
       screenshot_out_file: stringValue(),
       session,
-      max_elements: numberValue({
-        integer: true,
-        minimum: 1,
-        maximum: 2_000,
-        description: "Maximum number of accessibility tree elements to return. Use to limit context size for complex windows like Chrome."
-      }),
-      max_depth: numberValue({
-        integer: true,
-        minimum: 1,
-        description: "Maximum depth of the accessibility tree to traverse. Use to limit tree depth for complex windows."
-      })
+      ...windowReadScope
     }, ["pid", "window_id"]),
     true
   ),
@@ -400,6 +399,9 @@ export function normalizeComputerToolArguments(
   }
   if (name === "set_value" && normalized["element_index"] === undefined && normalized["element_token"] === undefined) {
     throw new ComputerToolArgumentError("element_token");
+  }
+  if (normalized["observe"] !== undefined && normalized["postcondition"] !== undefined) {
+    throw new ComputerToolArgumentError("observe");
   }
   if (name === "verify_state" || normalized["postcondition"] !== undefined) {
     for (const predicate of (normalized[name === "verify_state" ? "expect" : "postcondition"]) as Record<string, unknown>[]) {
