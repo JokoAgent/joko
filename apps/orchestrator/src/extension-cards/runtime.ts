@@ -247,11 +247,12 @@ export class ExtensionCardRuntime {
   }
   async #ensure(instance: Instance): Promise<Page> {
     this.#assert(instance);
+    if (instance.opening) return instance.opening;
     if (instance.page && !instance.page.isClosed()) {
       if (instance.surface) await this.options.surfaces.getSurface(instance.surface.id, instance.connectionId, "publisher");
       this.#assert(instance); return instance.page;
     }
-    if (!instance.opening) instance.opening = this.#open(instance).catch(async error => {
+    instance.opening = this.#open(instance).catch(async error => {
       await this.#close(instance); throw error;
     }).finally(() => { instance.opening = undefined; });
     return instance.opening;
