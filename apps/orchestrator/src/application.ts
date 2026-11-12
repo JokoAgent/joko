@@ -1540,12 +1540,17 @@ export async function createOrchestratorApplication(
       });
     }
   });
+  const streamManagedProvider = createOutboundStreamingFetch({
+    resolveProxy: dependencies.resolveOutboundProxy,
+    environmentProxyForTarget: target => environmentProxyForTarget(target, process.env)
+  });
   const managedProviderProxy = new ManagedProviderProxy({
     providers,
     fetch: createOutboundFetch(dependencies.resolveOutboundProxy),
     fetchForRoute: route => route.backendId === claudeCodeBackendId && route.providerId === MANAGED_LOCAL_PROVIDER_ID
       && route.api === "anthropic-messages" && route.baseUrl === OLLAMA_LOOPBACK_ORIGIN && route.requestPath === undefined
-      ? fetch : undefined,
+      ? fetch
+      : route.backendId === codexBackendId && route.api === "openai-completions" ? streamManagedProvider : undefined,
     assertOwner: (owner) => {
       const session = store.getSession(owner.sessionId).descriptor;
       const target = store.getTarget(owner.targetId).descriptor;
