@@ -1,6 +1,7 @@
 import type { PiManagedModel, PiManagedProvider } from "@joko/adapter-pi";
 import {
   LocalRuntimeError,
+  OLLAMA_LOOPBACK_ORIGIN,
   OLLAMA_OPENAI_BASE_URL,
   assertActiveOwner,
   canonicalModelName,
@@ -9,24 +10,19 @@ import {
   type RuntimeOwnerGeneration
 } from "@joko/local-model-runtime";
 
-import type { ProviderCatalogManager, ProviderDescriptor } from "./credential-manager.js";
+import type { ManagedProviderRuntimeInput, ProviderCatalogManager, ProviderDescriptor } from "./credential-manager.js";
 
 export const MANAGED_LOCAL_PROVIDER_ID = "joko-local-ollama";
 const MANAGED_MARKER = "joko-local-runtime-v1";
 const MAX_MANAGED_MODELS = 512;
 
-type ProviderUpsertInput = Parameters<ProviderCatalogManager["upsert"]>[0];
-type ProviderWriteOptions = Parameters<ProviderCatalogManager["upsert"]>[1];
-
-export interface LocalModelProviderCatalog {
-  list(backendId: string): readonly ProviderDescriptor[];
-  upsert(input: ProviderUpsertInput, options?: ProviderWriteOptions): Promise<ProviderDescriptor>;
-  deleteRuntime: ProviderCatalogManager["deleteRuntime"];
-}
+type OllamaProtocol = "openai-completions" | "anthropic-messages";
+export type LocalModelProviderCatalog = Pick<ProviderCatalogManager, "listConfigurations" | "delete" | "deleteRuntime" | "upsertConfiguration">;
 
 export interface LocalModelProviderCoordinatorOptions {
   readonly providers: LocalModelProviderCatalog;
   readonly backendId: string;
+  readonly claudeBackendId?: string;
   readonly currentOwner: () => RuntimeOwnerGeneration | undefined;
   readonly bindings?: LocalModelProviderBindings;
 }
@@ -48,50 +44,85 @@ export class LocalModelProviderCoordinator {
 
   routes(owner: RuntimeOwnerGeneration): readonly { readonly backendId: string; readonly providerId: string }[] {
     this.assertOwner(owner);
-    const provider = this.options.providers.list(this.options.backendId).find(item => item.provider.id === MANAGED_LOCAL_PROVIDER_ID);
-    return provider !== undefined && isOwnedProvider(provider)
-      ? [{ backendId: this.options.backendId, providerId: provider.provider.id }] : [];
+    return (this.configuration()?.runtimes ?? []).filter(runtime => this.isOwnedRuntime(runtime))
+      .map(runtime => ({ backendId: runtime.backendId, providerId: runtime.provider.id }));
   }
 
-  async sync(owner: RuntimeOwnerGeneration, inputModels: readonly ManagedRuntimeModel[]): Promise<void> {
+  ownsModel(owner: RuntimeOwnerGeneration, backendId: string, modelId: string): boolean {
+    this.assertOwner(owner);
+    const runtime = this.configuration()?.runtimes.find(candidate => candidate.backendId === backendId);
+    return runtime !== undefined && runtime.enabled && this.isOwnedRuntime(runtime)
+      && runtime.provider.models.some(model => model.id === modelId);
+  }
+
+  async sync(owner: RuntimeOwnerGeneration, inputModels: readonly ManagedRuntimeModel[], version?: string): Promise<readonly string[]> {
     this.assertOwner(owner);
     const models = validateModels(inputModels);
-    const existing = this.options.providers.list(this.options.backendId).find((item) => item.provider.id === MANAGED_LOCAL_PROVIDER_ID);
-    if (existing !== undefined && !isOwnedProvider(existing)) {
+    const configuration = this.configuration();
+    const previous = configuration?.runtimes ?? [];
+    const owned = previous.filter(runtime => this.isOwnedRuntime(runtime));
+    const pi = previous.find(runtime => runtime.backendId === this.options.backendId);
+    if ((pi !== undefined && !this.isOwnedRuntime(pi))
+      || (models.length > 0 && owned.length !== previous.length)) {
       throw new LocalRuntimeError("RUNTIME_ERROR", "The managed local Provider ID is already used by a custom Provider.");
     }
     const stillActive = () => sameOwner(this.options.currentOwner(), owner);
+    const stillCurrent = () => {
+      if (!stillActive()) return false;
+      const current = this.configuration()?.runtimes ?? [];
+      return current.length === previous.length && previous.every(runtime => current.some(candidate =>
+        candidate.backendId === runtime.backendId && candidate.version === runtime.version));
+    };
     if (models.length === 0) {
-      if (existing !== undefined) {
-        await this.options.providers.deleteRuntime(this.options.backendId, MANAGED_LOCAL_PROVIDER_ID, { expectedVersion: existing.version, stillActive });
-        this.assertOwner(owner);
+      if (configuration !== undefined && owned.length === previous.length) {
+        await this.options.providers.delete(MANAGED_LOCAL_PROVIDER_ID, { expectedVersion: configuration.version, stillActive: stillCurrent });
+      } else {
+        for (const runtime of owned) {
+          await this.options.providers.deleteRuntime(runtime.backendId, MANAGED_LOCAL_PROVIDER_ID, {
+            expectedVersion: runtime.version, stillActive
+          });
+        }
       }
+      this.assertOwner(owner);
       await this.options.bindings?.remove(owner);
       this.assertOwner(owner);
-      return;
+      return owned.map(runtime => runtime.backendId);
     }
 
-    const provider = managedProvider(models, existing?.provider);
-    const next: ProviderUpsertInput = {
-      backendId: this.options.backendId,
-      credentialOrigin: "",
-      provider,
-      displayName: "Ollama (Local)",
-      kind: "local_keyless",
-      credentialBindings: {},
-      enabled: true,
-      supportsLogin: false,
-      supportsLogout: false,
-      supportsRefresh: false,
-      ...(existing === undefined ? {} : { expectedVersion: existing.version })
-    };
-    if (existing !== undefined && equivalentProvider(existing, next)) {
-      await this.writeBinding(owner, existing, models);
-      return;
+    const runtimes = [providerRuntime(this.options.backendId, "openai-completions", models, pi?.provider)];
+    const claudeBackendId = this.options.claudeBackendId;
+    if (claudeBackendId !== undefined) {
+      const compatible = models.filter(model => supportsClaudeOllamaModel(version, model.supportsTools, model.requiredRuntimeVersion));
+      const current = previous.find(runtime => runtime.backendId === claudeBackendId);
+      if (compatible.length > 0) runtimes.push(providerRuntime(claudeBackendId, "anthropic-messages", compatible, current?.provider));
     }
-    const saved = await this.options.providers.upsert(next, { stillActive });
+    if (pi !== undefined && previous.length === runtimes.length && runtimes.every(runtime => previous.some(candidate =>
+      candidate.backendId === runtime.backendId && JSON.stringify(candidate.provider) === JSON.stringify(runtime.provider)))) {
+      await this.writeBinding(owner, pi, models);
+      return [];
+    }
+    await this.options.providers.upsertConfiguration({
+      providerId: MANAGED_LOCAL_PROVIDER_ID,
+      displayName: configuration?.displayName ?? "Ollama (Local)",
+      kind: "local_keyless",
+      enabled: configuration?.enabled ?? true,
+      expectedVersion: configuration?.version ?? 0n,
+      runtimes
+    }, { stillActive: stillCurrent });
     this.assertOwner(owner);
+    const saved = this.configuration()?.runtimes.find(runtime => runtime.backendId === this.options.backendId);
+    if (saved === undefined || !this.isOwnedRuntime(saved)) throw new LocalRuntimeError("RUNTIME_ERROR", "The managed Ollama Provider changed during registration.");
     await this.writeBinding(owner, saved, models);
+    return [...new Set([...runtimes, ...owned].map(runtime => runtime.backendId))];
+  }
+
+  private configuration() {
+    return this.options.providers.listConfigurations().find(item => item.providerId === MANAGED_LOCAL_PROVIDER_ID);
+  }
+
+  private isOwnedRuntime(runtime: ProviderDescriptor): boolean {
+    if (runtime.backendId === this.options.backendId) return isOwnedProvider(runtime, "openai-completions");
+    return runtime.backendId === this.options.claudeBackendId && isOwnedProvider(runtime, "anthropic-messages");
   }
 
   private assertOwner(owner: RuntimeOwnerGeneration): void {
@@ -121,13 +152,17 @@ export class LocalModelProviderCoordinator {
   }
 }
 
-export function isOwnedProvider(descriptor: Pick<ProviderDescriptor, "provider" | "kind" | "credentialReferenceIds">): boolean {
+export function isOwnedProvider(
+  descriptor: Pick<ProviderDescriptor, "provider" | "kind" | "credentialReferenceIds" | "requestPath">,
+  protocol: OllamaProtocol = "openai-completions"
+): boolean {
   const provider = descriptor.provider;
   return provider.id === MANAGED_LOCAL_PROVIDER_ID
     && descriptor.kind === "local_keyless"
     && descriptor.credentialReferenceIds.length === 0
-    && provider.baseUrl === OLLAMA_OPENAI_BASE_URL
-    && provider.api === "openai-completions"
+    && provider.baseUrl === (protocol === "anthropic-messages" ? OLLAMA_LOOPBACK_ORIGIN : OLLAMA_OPENAI_BASE_URL)
+    && provider.api === protocol
+    && (protocol !== "anthropic-messages" || descriptor.requestPath === undefined)
     && provider.keyless === true
     && provider.apiKeyEnv === undefined
     && Object.keys(provider.headers ?? {}).length === 0
@@ -151,35 +186,59 @@ function validateModels(models: readonly ManagedRuntimeModel[]): readonly Manage
   return [...byCanonicalName.values()].sort((left, right) => canonicalModelName(left.id).localeCompare(canonicalModelName(right.id), "en"));
 }
 
-function managedProvider(models: readonly ManagedRuntimeModel[], current?: PiManagedProvider): PiManagedProvider {
+function providerRuntime(
+  backendId: string, protocol: OllamaProtocol, models: readonly ManagedRuntimeModel[], current?: PiManagedProvider
+): ManagedProviderRuntimeInput {
   const costById = new Map((current?.models ?? []).flatMap((model) => model.cost === undefined ? [] : [[canonicalModelName(model.id), model.cost] as const]));
   return {
-    id: MANAGED_LOCAL_PROVIDER_ID,
-    baseUrl: OLLAMA_OPENAI_BASE_URL,
-    api: "openai-completions",
-    keyless: true,
-    compat: { jokoManagedRuntime: MANAGED_MARKER },
-    models: models.map((model): PiManagedModel => ({
-      id: model.id,
-      name: model.displayName,
-      api: "openai-completions",
-      input: model.supportsImages ? ["text", "image"] : ["text"],
-      ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
-      ...(costById.get(canonicalModelName(model.id)) === undefined ? {} : { cost: costById.get(canonicalModelName(model.id))! }),
-      compat: { supportsTools: model.supportsTools }
-    }))
+    backendId,
+    credentialOrigin: "",
+    credentialBindings: {},
+    provider: {
+      id: MANAGED_LOCAL_PROVIDER_ID,
+      baseUrl: protocol === "anthropic-messages" ? OLLAMA_LOOPBACK_ORIGIN : OLLAMA_OPENAI_BASE_URL,
+      api: protocol,
+      keyless: true,
+      compat: { jokoManagedRuntime: MANAGED_MARKER },
+      models: models.map((model): PiManagedModel => {
+        const cost = costById.get(canonicalModelName(model.id));
+        return {
+          id: model.id,
+          name: model.displayName,
+          api: protocol,
+          input: model.supportsImages ? ["text", "image"] : ["text"],
+          ...(protocol === "anthropic-messages" ? { supportsTools: model.supportsTools } : {}),
+          ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
+          ...(cost === undefined ? {} : { cost }),
+          compat: { supportsTools: model.supportsTools }
+        };
+      })
+    }
   };
 }
 
-function equivalentProvider(existing: ProviderDescriptor, next: ProviderUpsertInput): boolean {
-  return existing.displayName === next.displayName
-    && existing.kind === next.kind
-    && existing.enabled === next.enabled
-    && existing.supportsLogin === next.supportsLogin
-    && existing.supportsLogout === next.supportsLogout
-    && existing.supportsRefresh === next.supportsRefresh
-    && existing.credentialReferenceIds.length === 0
-    && JSON.stringify(existing.provider) === JSON.stringify(next.provider);
+export function supportsClaudeOllamaModel(version: string | undefined, supportsTools: boolean, requires: string | undefined): boolean {
+  if (!supportsTools) return false;
+  const current = parseVersion(version);
+  if (current === undefined || !atLeastVersion(current, [0, 14, 0])) return false;
+  if (requires === undefined) return true;
+  const required = parseVersion(requires);
+  return required !== undefined && atLeastVersion(current, required);
+}
+
+function parseVersion(value: string | undefined): readonly number[] | undefined {
+  const match = /^(\d+)\.(\d+)(?:\.(\d+))?/u.exec(value ?? "");
+  if (match === null) return undefined;
+  const version = [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
+  return version.every(Number.isSafeInteger) ? version : undefined;
+}
+
+function atLeastVersion(actual: readonly number[], minimum: readonly number[]): boolean {
+  for (const [index, part] of minimum.entries()) {
+    const found = actual[index]!;
+    if (found !== part) return found > part;
+  }
+  return true;
 }
 
 function sameOwner(current: RuntimeOwnerGeneration | undefined, expected: RuntimeOwnerGeneration): boolean {

@@ -51,7 +51,7 @@ export interface LocalModelRuntimeManagerOptions {
   readonly now?: () => number;
   readonly onPullProgress?: (owner: RuntimeOwnerGeneration, progress: ModelPullProgress) => void;
   readonly onInstallProgress?: (owner: RuntimeOwnerGeneration, progress: RuntimeInstallProgress) => void;
-  readonly onModelsChanged?: (owner: RuntimeOwnerGeneration, models: readonly ManagedRuntimeModel[]) => Promise<void>;
+  readonly onModelsChanged?: (owner: RuntimeOwnerGeneration, models: readonly ManagedRuntimeModel[], version: string | undefined) => Promise<void>;
   readonly audit?: RuntimeAuditSink;
 }
 
@@ -63,6 +63,7 @@ export class LocalModelRuntimeManager {
   private readonly totalMemory: () => number;
   private readonly now: () => number;
   private readonly activePullsByName = new Map<string, ActivePull>();
+  private inventoryTail: Promise<unknown> = Promise.resolve();
   private latestInstallProgress: { readonly owner: RuntimeOwnerGeneration; readonly progress: RuntimeInstallProgress } | undefined;
   private installOperation: { readonly owner: RuntimeOwnerGeneration; readonly abort: AbortController; readonly promise: Promise<LocalRuntimeStatus> } | undefined;
   private startOperation: { readonly owner: RuntimeOwnerGeneration; readonly promise: Promise<LocalRuntimeStatus> } | undefined;
@@ -256,21 +257,7 @@ export class LocalModelRuntimeManager {
   }
 
   async list(owner: RuntimeOwnerGeneration, signal?: AbortSignal): Promise<readonly InstalledLocalModel[]> {
-    this.assertOwner(owner);
-    const status = await this.options.launcher.status(owner);
-    if (status.state !== "ready") return [];
-    const tags = await this.options.client.tags(signal);
-    const models = await Promise.all(tags.map(async (tag): Promise<InstalledLocalModel> => {
-      try {
-        const details = await this.options.client.show(tag.name, signal);
-        return { ...tag, ...details };
-      } catch {
-        return { ...tag, capabilities: [] };
-      }
-    }));
-    this.assertOwner(owner);
-    await this.syncModels(owner, models);
-    return models;
+    return this.refreshInstalled(owner, false, signal);
   }
 
   async paused(owner: RuntimeOwnerGeneration): Promise<readonly ModelPullProgress[]> {
@@ -367,7 +354,7 @@ export class LocalModelRuntimeManager {
     await this.options.client.delete(name);
     await this.pausedPulls.remove(owner, name);
     this.assertOwner(owner);
-    await this.syncInstalled(owner);
+    await this.refreshInstalled(owner, true);
     this.audit(owner, "model_delete", "succeeded", name);
   }
 
@@ -420,7 +407,7 @@ export class LocalModelRuntimeManager {
         }, abort.signal);
       }
       this.assertOwner(owner);
-      await this.syncInstalled(owner);
+      await this.refreshInstalled(owner, true);
       await input.getActive().checkpointTail;
       await this.pausedPulls.remove(owner, name);
       const success: ModelPullProgress = { name, phase: "success", status: "success", percent: 100, done: true };
@@ -470,29 +457,45 @@ export class LocalModelRuntimeManager {
     await active.promise.catch(() => undefined);
   }
 
-  private async syncInstalled(owner: RuntimeOwnerGeneration): Promise<void> {
-    const tags = await this.options.client.tags();
-    const models = await Promise.all(tags.map(async (tag): Promise<InstalledLocalModel> => {
-      try {
-        return { ...tag, ...await this.options.client.show(tag.name) };
-      } catch {
-        return { ...tag, capabilities: [] };
-      }
-    }));
-    this.assertOwner(owner);
-    await this.syncModels(owner, models);
+  private refreshInstalled(
+    owner: RuntimeOwnerGeneration, afterMutation: boolean, signal?: AbortSignal
+  ): Promise<readonly InstalledLocalModel[]> {
+    // A slow inventory read must publish before the refresh for a later pull or deletion.
+    const refresh = this.inventoryTail.catch(() => undefined).then(async () => {
+      this.assertOwner(owner);
+      signal?.throwIfAborted();
+      const status = await this.options.launcher.status(owner);
+      this.assertOwner(owner);
+      signal?.throwIfAborted();
+      if (!afterMutation && status.state !== "ready") return [];
+      const tags = await this.options.client.tags(signal);
+      const models = await Promise.all(tags.map(async (tag): Promise<InstalledLocalModel> => {
+        try {
+          return { ...tag, ...await this.options.client.show(tag.name, signal) };
+        } catch {
+          return { ...tag, capabilities: [] };
+        }
+      }));
+      this.assertOwner(owner);
+      signal?.throwIfAborted();
+      await this.syncModels(owner, models, status.state === "ready" ? status.version : undefined);
+      return models;
+    });
+    this.inventoryTail = refresh;
+    return refresh;
   }
 
-  private async syncModels(owner: RuntimeOwnerGeneration, models: readonly InstalledLocalModel[]): Promise<void> {
+  private async syncModels(owner: RuntimeOwnerGeneration, models: readonly InstalledLocalModel[], version: string | undefined): Promise<void> {
     if (this.options.onModelsChanged === undefined) return;
     const projected = models.map((model): ManagedRuntimeModel => ({
       id: model.name,
       displayName: model.name,
       ...(model.contextLength === undefined ? {} : { contextWindow: model.contextLength }),
+      ...(model.requiredRuntimeVersion === undefined ? {} : { requiredRuntimeVersion: model.requiredRuntimeVersion }),
       supportsTools: model.capabilities.some((value) => value.toLowerCase() === "tools"),
       supportsImages: model.capabilities.some((value) => ["vision", "images", "image"].includes(value.toLowerCase()))
     }));
-    await this.options.onModelsChanged(owner, projected);
+    await this.options.onModelsChanged(owner, projected, version);
     this.assertOwner(owner);
     this.audit(owner, "model_sync", "succeeded");
   }

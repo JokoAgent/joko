@@ -187,14 +187,17 @@ describe("LocalModelRuntimeManager", () => {
 
   it("automatically synchronizes exact installed models after pull and deletion", async () => {
     const { owner, client, manager, sync } = fixture();
-    client.details.set("model-a", { contextLength: 32768, capabilities: ["tools"] });
+    client.details.set("model-a", { contextLength: 32768, capabilities: ["tools"], requiredRuntimeVersion: "0.14.0" });
     const pulling = manager.pull(owner, "model-a");
     await vi.waitFor(() => expect(client.pulls.has("model-a")).toBe(true));
     client.complete("model-a");
     await pulling;
-    expect(sync).toHaveBeenLastCalledWith(owner, [{ id: "model-a", displayName: "model-a", contextWindow: 32768, supportsTools: true, supportsImages: false }]);
+    expect(sync).toHaveBeenLastCalledWith(owner, [{
+      id: "model-a", displayName: "model-a", contextWindow: 32768, supportsTools: true, supportsImages: false,
+      requiredRuntimeVersion: "0.14.0"
+    }], "0.14.2");
     await manager.delete(owner, "model-a");
-    expect(sync).toHaveBeenLastCalledWith(owner, []);
+    expect(sync).toHaveBeenLastCalledWith(owner, [], "0.14.2");
   });
 
   it("aborts and rejects stale owner generations before model sync", async () => {

@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient, Code } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
+import { CLAUDE_MANAGED_PROVIDER_SUPPORT } from "@joko/adapter-claude-code";
 import * as contract from "@joko/contracts";
-import { OllamaLoopbackClient, OllamaRuntimeLauncher, llamaCppModelId, type LocalRuntimeStatus } from "@joko/local-model-runtime";
+import { OLLAMA_LOOPBACK_ORIGIN, OllamaLoopbackClient, OllamaRuntimeLauncher, llamaCppModelId,
+  type LocalRuntimeStatus, type OllamaModelDetails } from "@joko/local-model-runtime";
 import { OperationalStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import type { AdapterContext } from "@joko/core";
@@ -16,6 +18,7 @@ import { CredentialVault } from "./credential-vault.js";
 import { createManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
 import { MANAGED_GGUF_PROVIDER_ID } from "./managed-gguf-provider.js";
 import { LocalModelProviderCoordinator, MANAGED_LOCAL_PROVIDER_ID } from "./local-model-runtime-coordinator.js";
+import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { ConnectionManager } from "./connection-manager.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
@@ -36,7 +39,7 @@ async function fixture() {
   const streaming = vi.fn<typeof fetch>(async () => { throw new Error("This cold inventory journey must not download or start a runtime."); });
   const changed = vi.fn(async () => undefined);
   const system = await createManagedModelRuntimeSystem({ store, providers, dataDirectory: root, ownerId: "node-owner", ownerGeneration: 1,
-    fetchStreaming: streaming, onProviderChanged: changed });
+    claudeBackendId: "backend-b", fetchStreaming: streaming, onProviderChanged: changed });
   return { root, database, store, credentials, providers, system, streaming, changed };
 }
 describe("node-owned managed model runtime composition", () => {
@@ -150,5 +153,103 @@ describe("node-owned managed model runtime composition", () => {
       expect(tags).toHaveBeenCalledTimes(2);
       expect(f.streaming).not.toHaveBeenCalled();
     } finally { tags.mockRestore(); start.mockRestore(); probe.mockRestore(); await f.system.close(); f.store.close(); }
+  });
+
+  it("registers only eligible Ollama models for Claude, executes the selected Anthropic route and retires it on inventory changes", async () => {
+    const f = await fixture();
+    const modelId = "eligible:latest";
+    let version = "0.13.9";
+    let installed = [modelId, "without-tools:latest", "requires-upgrade:latest"];
+    const details = new Map<string, OllamaModelDetails>([
+      [modelId, { capabilities: ["tools"], requiredRuntimeVersion: "0.14.0", contextLength: 32_768 }],
+      ["without-tools:latest", { capabilities: [] }],
+      ["requires-upgrade:latest", { capabilities: ["tools"], requiredRuntimeVersion: "0.15.0" }]
+    ]);
+    const probe = vi.spyOn(OllamaRuntimeLauncher.prototype, "status").mockImplementation(async () => ({
+      runtime: "ollama", source: "running", state: "ready", version,
+      capabilities: { canInstall: false, canStart: true, canListModels: true, canPullModels: true, canDeleteModels: true, canPausePulls: true }
+    }));
+    const tags = vi.spyOn(OllamaLoopbackClient.prototype, "tags").mockImplementation(async () => installed.map(name => ({ name })));
+    const show = vi.spyOn(OllamaLoopbackClient.prototype, "show").mockImplementation(async name => details.get(name)!);
+    const remove = vi.spyOn(OllamaLoopbackClient.prototype, "delete").mockImplementation(async name => {
+      installed = installed.filter(value => value !== name);
+    });
+    const stream = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const outbound = vi.fn<typeof fetch>(async () => { throw new Error("The Ollama request must use loopback."); });
+    const loopback = vi.fn<typeof fetch>(async () => new Response(stream, { headers: { "content-type": "text/event-stream" } }));
+    const proxy = new ManagedProviderProxy({ providers: f.providers, assertOwner: () => undefined, fetch: outbound,
+      fetchForRoute: route => route.providerId === MANAGED_LOCAL_PROVIDER_ID && route.baseUrl === OLLAMA_LOOPBACK_ORIGIN
+        && route.api === "anthropic-messages" ? loopback : undefined });
+    try {
+      const ollama = f.system.registry.get("ollama")!;
+      expect((await ollama.snapshot()).providerRoutes.map(route => route.backendId)).toEqual(["backend-a"]);
+      version = "0.14.0";
+      expect((await ollama.snapshot()).providerRoutes.map(route => route.backendId)).toEqual(["backend-a", "backend-b"]);
+      const saved = f.providers.listConfigurations().find(config => config.providerId === MANAGED_LOCAL_PROVIDER_ID)!;
+      expect(saved.runtimes).toHaveLength(2);
+      expect(saved.runtimes.every(runtime => runtime.version === saved.version)).toBe(true);
+      expect(f.providers.get("backend-a", MANAGED_LOCAL_PROVIDER_ID).provider.models.map(model => model.id)).toEqual([...installed].sort());
+      expect(f.changed).toHaveBeenLastCalledWith(["backend-a", "backend-b"]);
+
+      await proxy.start();
+      const port = proxy.createRuntime({ backendId: "backend-b", generation: 1, support: CLAUDE_MANAGED_PROVIDER_SUPPORT,
+        assertCurrent: () => undefined });
+      expect(port.listModels()).toMatchObject([{ modelId, api: "anthropic-messages", contextWindow: 32_768, supportsTools: true }]);
+      const signal = new AbortController().signal;
+      const prepare = (remote: boolean) => f.system.prepareProviderRuntime({
+        target: { backendId: "backend-b", ...(remote ? { remoteWorkspace: { kind: "ssh" } } : {}) },
+        signal, modelSelection: { providerId: MANAGED_LOCAL_PROVIDER_ID, modelId }
+      } as AdapterContext);
+      await expect(prepare(true)).rejects.toMatchObject({ code: "MODEL_UNAUTHORIZED" });
+      await prepare(false);
+      const binding = await port.prepare({ backendId: "backend-b", backendInstanceGeneration: 1, targetId: "target",
+        sessionId: "session", sessionGeneration: 1, providerId: MANAGED_LOCAL_PROVIDER_ID, modelId });
+      const lease = await binding.activate({ operationId: "send", signal, assertCurrent: () => undefined });
+      try {
+        const body = JSON.stringify({ model: modelId, max_tokens: 16, stream: true, messages: [{ role: "user", content: "Fixture input" }] });
+        const response = await fetch(`${binding.baseUrl}/v1/messages`, {
+          method: "POST", headers: { "x-api-key": port.environment[binding.apiKeyEnvironment]! }, body
+        });
+        expect(response.status).toBe(200);
+        expect(await response.text()).toBe(stream);
+        expect(loopback).toHaveBeenCalledOnce();
+        const [endpoint, request] = loopback.mock.calls[0]!;
+        expect(endpoint.toString()).toBe(`${OLLAMA_LOOPBACK_ORIGIN}/v1/messages`);
+        expect(request?.body?.toString()).toBe(body);
+        expect(new Headers(request?.headers).has("x-api-key")).toBe(false);
+        expect(outbound).not.toHaveBeenCalled();
+      } finally { lease.release(); binding.dispose(); }
+
+      details.set(modelId, { capabilities: [] });
+      await expect(prepare(false)).rejects.toMatchObject({ code: "MODEL_UNAUTHORIZED" });
+      details.set(modelId, { capabilities: ["tools"] });
+      version = "0.13.9";
+      await ollama.snapshot();
+      expect(port.listModels()).toEqual([]);
+      version = "0.14.0";
+      await ollama.snapshot();
+      expect(port.listModels().map(model => model.modelId)).toEqual([modelId]);
+      const current = f.providers.listConfigurations().find(config => config.providerId === MANAGED_LOCAL_PROVIDER_ID)!;
+      await f.providers.upsertConfiguration({
+        ...current,
+        enabled: false,
+        expectedVersion: current.version,
+        runtimes: current.runtimes.map(runtime => ({ backendId: runtime.backendId, provider: runtime.provider,
+          credentialOrigin: runtime.credentialOrigin, credentialBindings: {} }))
+      });
+      version = "0.14.1";
+      await ollama.snapshot();
+      await expect(prepare(false)).rejects.toMatchObject({ code: "MODEL_UNAUTHORIZED" });
+      await ollama.deleteModel(modelId);
+      expect(port.listModels()).toEqual([]);
+      expect(() => f.providers.get("backend-b", MANAGED_LOCAL_PROVIDER_ID)).toThrow(/does not exist/u);
+      const pi = f.providers.get("backend-a", MANAGED_LOCAL_PROVIDER_ID);
+      expect(pi.enabled).toBe(false);
+      expect(pi.provider.models.map(model => model.id)).toEqual([...installed].sort());
+      port.dispose();
+    } finally {
+      remove.mockRestore(); show.mockRestore(); tags.mockRestore(); probe.mockRestore();
+      await proxy.close(); await f.system.close(); f.store.close();
+    }
   });
 });

@@ -38,26 +38,40 @@ class FakeProviders implements LocalModelProviderCatalog {
   readonly deletes = vi.fn();
   values: ProviderDescriptor[] = [];
 
-  list(backendId: string): readonly ProviderDescriptor[] {
-    return this.values.filter((value) => value.backendId === backendId);
+  listConfigurations(): ReturnType<LocalModelProviderCatalog["listConfigurations"]> {
+    return [...new Set(this.values.map(value => value.provider.id))].map(providerId => {
+      const runtimes = this.values.filter(value => value.provider.id === providerId);
+      const latest = runtimes.reduce((left, right) => right.version > left.version ? right : left);
+      return { providerId, displayName: latest.displayName, kind: latest.kind, enabled: latest.enabled,
+        version: latest.version, updatedAt: latest.updatedAt, runtimes };
+    });
   }
 
-  async upsert(input: Parameters<LocalModelProviderCatalog["upsert"]>[0], options?: Parameters<LocalModelProviderCatalog["upsert"]>[1]): Promise<ProviderDescriptor> {
+  async upsertConfiguration(
+    input: Parameters<LocalModelProviderCatalog["upsertConfiguration"]>[0],
+    options?: Parameters<LocalModelProviderCatalog["upsertConfiguration"]>[1]
+  ): Promise<void> {
     if (options?.stillActive?.() === false) throw new Error("stale");
-    const next = descriptor(input.provider, {
-      backendId: input.backendId,
-      credentialOrigin: input.credentialOrigin,
+    const existing = this.listConfigurations().find(value => value.providerId === input.providerId);
+    if ((existing?.version ?? 0n) !== input.expectedVersion) throw new Error("changed concurrently");
+    const next = input.runtimes.map(runtime => descriptor(runtime.provider, {
+      backendId: runtime.backendId,
+      credentialOrigin: runtime.credentialOrigin,
       displayName: input.displayName,
       kind: input.kind,
       enabled: input.enabled,
-      supportsLogin: input.supportsLogin,
-      supportsLogout: input.supportsLogout,
-      supportsRefresh: input.supportsRefresh,
-      version: (this.values.find((item) => item.backendId === input.backendId && item.provider.id === input.provider.id)?.version ?? 0n) + 1n
-    });
-    this.values = [...this.values.filter((item) => item.backendId !== input.backendId || item.provider.id !== input.provider.id), next];
+      version: input.expectedVersion + 1n
+    }));
+    this.values = [...this.values.filter(value => value.provider.id !== input.providerId), ...next];
     this.upserts(input, options);
-    return next;
+  }
+
+  async delete(providerId: string, options?: Parameters<LocalModelProviderCatalog["delete"]>[1]): Promise<boolean> {
+    if (options?.stillActive?.() === false) throw new Error("stale");
+    const found = this.listConfigurations().find(value => value.providerId === providerId);
+    if (found !== undefined && found.version !== options?.expectedVersion) throw new Error("changed concurrently");
+    this.values = this.values.filter(value => value.provider.id !== providerId);
+    return found !== undefined;
   }
 
   async deleteRuntime(backendId: string, providerId: string, options: Parameters<LocalModelProviderCatalog["deleteRuntime"]>[2]): Promise<boolean> {
@@ -185,10 +199,9 @@ describe("LocalModelProviderCoordinator", () => {
     const owner = { ownerId: "owner-a", generation: 1 };
     let activeOwner: RuntimeOwnerGeneration = owner;
     const providers = new FakeProviders();
-    providers.upsert = async (input, options) => {
+    providers.upsertConfiguration = async (_input, options) => {
       activeOwner = { ownerId: "owner-a", generation: 2 };
       if (options?.stillActive?.() === false) throw new Error("stale");
-      return descriptor(input.provider);
     };
     const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "pi", currentOwner: () => activeOwner });
     await expect(coordinator.sync(owner, [model("model-a")])).rejects.toThrow("stale");
