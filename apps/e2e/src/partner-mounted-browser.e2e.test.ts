@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
+import { PiAdapterError, PiRpcTransport } from "@joko/adapter-pi";
 import {
   CreatePartnerRequestSchema,
   PartnerCapabilitiesSchema,
@@ -18,7 +19,7 @@ import {
   RunState
 } from "@joko/contracts";
 import { chromium, type Browser, type Page, type Request, type Response, type Route } from "playwright-core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { queueRunIdFrom, resolvePermissionMutation, sendInputMutation, submit } from "./operations.js";
 import {
@@ -49,8 +50,10 @@ const mountedIt = MOUNTED_CHAIN_ENABLED ? it : it.skip;
 describe("mounted Partner collaboration product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
+  let restoreNativeRpcObservation: (() => void) | undefined;
 
   afterEach(async ({ task }) => {
+    restoreNativeRpcObservation?.(); restoreNativeRpcObservation = undefined;
     if (task.result?.state === "fail" && process.env.RUNNER_TEMP !== undefined) {
       try {
         const page = browser?.contexts()[0]?.pages()[0];
@@ -87,10 +90,12 @@ describe("mounted Partner collaboration product chain", () => {
     const objective = "Read the independent fixture output";
     const title = "Independent inspection";
     const result = "Retained output from the independent task.";
+    let permissionReviews = 0;
     fixture = await RealPiSystemFixture.start({
       webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true,
       providerResponder: async ({ request, requestNumber }) => {
         if (JSON.stringify(request.body).includes("You are a permission reviewer for one tool call")) {
+          permissionReviews++;
           return { kind: "text", text: JSON.stringify({ verdict: "allow", reason: "The independent task uses the owned fixture." }) };
         }
         if (lastMessageRole(request) === "tool") return { kind: "text", text: "Independent task accepted." };
@@ -114,12 +119,40 @@ describe("mounted Partner collaboration product chain", () => {
     await page.locator("form.pair-form button[type=submit]").click();
     await page.locator(partnerCard(partner.partnerId)).waitFor({ state: "visible", timeout: 30_000 });
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(partner.canonicalSessionId)}`);
-    await sendPartnerPrompt(fixture, manager, partner.canonicalSessionId, command);
+    const parentRunId = await sendPartnerPrompt(fixture, manager, partner.canonicalSessionId, command);
 
     const request = page.locator('.partner-task-receipt[data-partner-task-status="preparing"]').filter({ hasText: title });
     const outcome = page.locator('.partner-task-receipt[data-partner-task-status="completed"]').filter({ hasText: result });
-    await request.waitFor({ state: "visible", timeout: 30_000 });
-    await outcome.waitFor({ state: "visible", timeout: 30_000 });
+    let phase = "preparing card";
+    try {
+      await request.waitFor({ state: "visible", timeout: 30_000 });
+      phase = "completed card";
+      await outcome.waitFor({ state: "visible", timeout: 30_000 });
+    } catch (error) {
+      const { store, partnerSessionTasks } = fixture.application;
+      const sessionId = partner.canonicalSessionId;
+      const history = store.listEvents({ sessionId, order: "desc", limit: 120 });
+      const start = history.find(event => event.runId === parentRunId && event.payload.type === "tool_result"
+        && event.payload.name.endsWith("start_session_task"))?.payload;
+      const tool = start?.type === "tool_result" ? {
+        isError: start.isError,
+        code: /"code"\s*:\s*"([A-Z_]{1,64})"/u.exec(start.output.replace(/\\"/gu, '"'))?.[1],
+        phase: /Auto-review blocked this tool call|The user declined this tool call|The current owner policy or delegated task authority denied this tool call|Joko policy changed while permission was pending|The original tool turn (?:was not acknowledged|bridge is unavailable)|MCP bridge request failed with status [0-9]{3}|MCP tool failed/u.exec(start.output)?.[0],
+        hasTitle: start.output.includes(title)
+      } : undefined;
+      const storedReceipts = (activeNativeTimeline: boolean) => store.listEvents({ sessionId, activeNativeTimeline, order: "desc", limit: 120 })
+        .flatMap(event => event.payload.type === "partner_session_task_receipt" ? [event.payload.receipt.status] : []);
+      const connectReceipts = await manager.clients.session.listSessionTimeline({ sessionId, limit: 120 }, { signal: AbortSignal.timeout(3_000) })
+        .then(value => value.events.flatMap(event => event.payload?.kind.case === "partnerSessionTaskReceipt" ? [event.payload.kind.value.status] : []),
+          () => "unavailable");
+      const tasks = partnerSessionTasks?.list(partner.partnerId).filter(task => task.title === title).slice(0, 4)
+        .map(task => ({ status: task.status, hasSession: task.sessionId !== undefined, hasRun: task.runId !== undefined,
+          deliveredExecution: task.deliveredExecution, hasError: task.error !== undefined }));
+      const permissions = store.listInteractions({ sessionId, runId: parentRunId })
+        .filter(interaction => interaction.kind === "permission").map(interaction => interaction.status);
+      throw new Error(`Independent task ${phase} was not visible. ${JSON.stringify({ tool, permissionReviews, permissions, tasks, stored: storedReceipts(false),
+        active: storedReceipts(true), connectReceipts })}`, { cause: error });
+    }
     expect(await outcome.innerText()).toContain("Completed · #1");
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
@@ -460,6 +493,39 @@ describe("mounted Partner collaboration product chain", () => {
     let releaseCancelledChild: (() => void) | undefined;
     const cancelledChildGate = new Promise<void>((resolve) => { releaseCancelledChild = resolve; });
     const responder = partnerResponder(() => targetPartnerId, cancelledChildGate);
+    const nativeRpcs: Array<{ runtime: number; command: string; startedAt: number; endedAt?: number;
+      state: "pending" | "fulfilled" | "rejected"; errorCode?: string }> = [];
+    const nativeEvents: Array<{ runtime: number; type: string; at: number }> = [];
+    const activeTransports = new Map<number, PiRpcTransport>(), stopEventObservers: Array<() => void> = [];
+    const nativeState = (response: unknown) => {
+      const data = (response as { readonly data?: Record<string, unknown> }).data;
+      return data === undefined ? undefined : { isStreaming: data["isStreaming"], isCompacting: data["isCompacting"],
+        pendingMessageCount: data["pendingMessageCount"] };
+    };
+    const runtimeIds = new WeakMap<PiRpcTransport, number>(); let runtimeCount = 0;
+    const originalRequest = PiRpcTransport.prototype.request;
+    const observation = vi.spyOn(PiRpcTransport.prototype, "request").mockImplementation(function (this: PiRpcTransport, command, options) {
+      let runtime = runtimeIds.get(this);
+      if (runtime === undefined) { runtime = ++runtimeCount; runtimeIds.set(this, runtime); }
+      // The Adapter already owns the event subscription by prompt admission.
+      // Observing earlier would consume its buffered initialization events.
+      if (command.type === "prompt" && !activeTransports.has(runtime)) {
+        const observedRuntime = runtime; activeTransports.set(runtime, this);
+        stopEventObservers.push(this.onEvent(event => {
+          nativeEvents.push({ runtime: observedRuntime, type: event.type, at: Date.now() });
+          if (nativeEvents.length > 96) nativeEvents.shift();
+        }));
+      }
+      const receipt: (typeof nativeRpcs)[number] = { runtime, command: command.type, startedAt: Date.now(), state: "pending" };
+      nativeRpcs.push(receipt); if (nativeRpcs.length > 96) nativeRpcs.shift();
+      const pending = originalRequest.call(this, command, options);
+      void pending.then(() => { receipt.state = "fulfilled"; receipt.endedAt = Date.now(); }, error => {
+        receipt.state = "rejected"; receipt.endedAt = Date.now();
+        receipt.errorCode = error instanceof PiAdapterError ? error.publicError.code : "UNCLASSIFIED";
+      });
+      return pending;
+    });
+    restoreNativeRpcObservation = () => { observation.mockRestore(); for (const stop of stopEventObservers) stop(); };
 
     fixture = await RealPiSystemFixture.start({
       webDirectory,
@@ -712,10 +778,22 @@ describe("mounted Partner collaboration product chain", () => {
         stopDelegation.click().then(() => { cancellationClicked = true; })
       ]);
     } catch (cause) {
+      const run = fixture.application.store.findRun(cancellable.runId)?.descriptor;
+      const queue = run?.sessionId === undefined ? undefined : fixture.application.store.findQueueItemByRunId(run.sessionId, run.id);
+      const pendingAbort = nativeRpcs.findLast(receipt => receipt.command === "abort" && receipt.state === "pending");
+      const transport = pendingAbort && activeTransports.get(pendingAbort.runtime);
+      const afterAbort = transport === undefined ? undefined : await originalRequest.call(transport, { type: "get_state" }, { timeoutMs: 2_000 })
+        .then(response => ({ state: nativeState(response) }), error => ({ errorCode: error instanceof PiAdapterError ? error.publicError.code : "UNCLASSIFIED" }));
       throw new Error(`The inline delegation cancellation did not settle: ${JSON.stringify({
         clicked: cancellationClicked, pointer: await pointerReceipt.evaluate(receipt => receipt.events).catch(() => []),
         requests: cancellationRequests, failures: cancellationFailures,
-        card: (await cancelCard.textContent({ timeout: 5_000 }))?.slice(-2_000), browserErrors
+        card: (await cancelCard.textContent({ timeout: 5_000 }))?.slice(-2_000), browserErrors,
+        nativeRpcs: nativeRpcs.slice(-48), nativeEvents: nativeEvents.slice(-48), afterAbort,
+        cancelledChildProviderRequests: fixture.providerRequests.filter(request => latestUserText(request).includes(CANCEL_OBJECTIVE)).length,
+        run: run === undefined ? undefined : { id: run.id, sessionId: run.sessionId, state: run.state,
+          activeAttemptId: run.activeAttemptId, endedAt: run.endedAt, errorCode: run.error?.code },
+        queue: queue === undefined ? undefined : { id: queue.id, state: queue.state, attemptId: queue.attemptId,
+          backendInstanceGeneration: queue.backendInstanceGeneration }
       })}`, { cause });
     } finally {
       page.off("request", observeCancellation); page.off("requestfailed", observeCancellationFailure);
@@ -901,7 +979,7 @@ async function sendPartnerPrompt(
   manager: Awaited<ReturnType<RealPiSystemFixture["pair"]>>,
   sessionId: string,
   prompt: string
-): Promise<void> {
+): Promise<string> {
   const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
   const submitted = await submit(
     manager.clients.operation,
@@ -925,6 +1003,7 @@ async function sendPartnerPrompt(
     );
   }
   expect(settled.run?.state).toBe(RunState.SUCCEEDED);
+  return runId;
 }
 
 async function waitForDelegation(
