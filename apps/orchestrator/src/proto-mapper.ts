@@ -6301,7 +6301,7 @@ function protoDocumentOutputCall(
 ): ToolCall {
   const { blob, workspaceId, relativePath, overwritten, theme, subtitle, cover, count, slide, sheet } = document;
   const argument = (fieldPath: string, value: DisplayArgument["value"]): DisplayArgument =>
-    message<DisplayArgument>("joko.v1.DisplayArgument", { fieldPath, value });
+    message<DisplayArgument>("joko.v1.DisplayArgument", { fieldPath, value, redacted: false, redactedPlaceholder: "" });
   const args = [argument("theme", { case: "text", value: theme })];
   if (subtitle) args.push(argument("subtitle", { case: "text", value: subtitle }));
   if (cover !== undefined) args.push(argument("cover", { case: "boolean", value: cover }));
@@ -6311,7 +6311,7 @@ function protoDocumentOutputCall(
   const parts = [
     message<ToolResultPart>("joko.v1.ToolResultPart", { content: { case: "fileChange", value: message<contract.ToolFileChange>(
       "joko.v1.ToolFileChange", { workspaceId, relativePath, action: overwritten ? contract.ToolFileAction.UPDATED : contract.ToolFileAction.CREATED,
-        revisionAfter: `sha256:${blob.sha256}` }
+        revisionBefore: "", revisionAfter: `sha256:${blob.sha256}` }
     ) } }),
     message<ToolResultPart>("joko.v1.ToolResultPart", { content: { case: "artifact", value: message<ArtifactRef>(
       "joko.v1.ArtifactRef", { artifactId: blob.id, blob: toProtoBlobRef(blob), kind: ArtifactKind.FILE, title: document.title || blob.fileName || "" }
@@ -6326,7 +6326,7 @@ function protoDocumentOutputCall(
   }
   return { ...protoToolCall(event, payload.callId, payload.name, ToolCallState.SUCCEEDED),
     toolProviderId: contract.DOCUMENT_TOOL_PROVIDER_ID, arguments: args, endedAt: toProtoTimestamp(event.emittedAt),
-    result: message<ToolResult>("joko.v1.ToolResult", { parts })
+    result: message<ToolResult>("joko.v1.ToolResult", { parts, truncated: false })
   };
 }
 
