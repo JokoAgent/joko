@@ -636,11 +636,15 @@ describe("Partner independent Session tasks", () => {
     expect(answered.isError, answered.content[0]!.text).toBe(false);
     await expect(pending).resolves.toMatchObject({ kind: "selected", value: "allow_once" });
 
+    expect(interaction.runId).toBeDefined();
+    const stopRun = vi.spyOn(f.host, "abort");
     const abort = vi.spyOn(f.secondary, "abort");
     const stopped = await tools.callTool("stop_session_task", { task_id: task.id, mode: "request-stop" }, undefined,
       { ...caller, effectIdentity: "d".repeat(64) });
     expect(stopped.isError, stopped.content[0]!.text).toBe(false);
-    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ sessionId, runId: active.runId }));
+    expect(stopRun).toHaveBeenCalledWith(sessionId, interaction.runId, expect.any(Function));
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ sessionId, generation: interaction.generation,
+      assertRunControlCurrent: expect.any(Function) }));
     await vi.waitFor(() => expect(currentTask().status).toBe("cancelled"));
 
     await f.tasks.close();
