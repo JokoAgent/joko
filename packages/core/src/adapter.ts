@@ -70,6 +70,8 @@ export interface AdapterContext {
   readonly operationId?: string;
   /** Original durable input owner, minted by SessionHost rather than native callers. */
   readonly inputQueueItemId?: QueueItemId;
+  /** Host-owned attachments appended for this dispatch, outside the durable user input. */
+  readonly transientPromptAttachments?: Pick<PromptInput, "images" | "files">;
   /** Private authority of the requested Run and Attempt for an interrupt. */
   readonly assertRunControlCurrent?: () => void;
   /** Reads a disconnected, already admitted native turn through its original durable receipt. */
