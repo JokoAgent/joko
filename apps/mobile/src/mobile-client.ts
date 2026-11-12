@@ -88,7 +88,7 @@ import {
 } from "./mobile-session-origin";
 import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, parseMobileNativeIntent } from "./mobile-native-intent";
 import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
-import { mobileFileTextSource } from "./mobile-file-text-source";
+import { mobileFileTextSource, normalizeMobileFileText } from "./mobile-file-text-source";
 import { MobileFileHtmlReader, type MobileFileHtmlContext, type MobileFileHtmlDescriptor } from "./mobile-file-html-reader";
 import { mobileFileHtmlComplete } from "./mobile-file-html";
 import { HtmlResourceBudgetError } from "./mobile-file-html-resources";
@@ -8526,7 +8526,7 @@ export class MobileClient {
         await this.network.readWorkspaceFile(credential, entry.workspaceId, resource.relativePath, resource.revision!, currentSignal), currentSignal),
       download: (blob, currentSignal) => this.network.downloadBlob(credential, blob, currentSignal) };
     await revalidateSource(signal);
-    const descriptor = await this.#markdownResources.prepare(this.newId(), mobileFileTextSource(preview.text).lines.join("\n"), context, signal);
+    const descriptor = await this.#markdownResources.prepare(this.newId(), normalizeMobileFileText(preview.text), context, signal);
     try { await revalidateSource(signal); assertCurrent(signal); return descriptor; }
     catch (error) { this.#markdownResources.release(descriptor.leaseId); throw error; }
   }

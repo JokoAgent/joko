@@ -10,7 +10,7 @@ import type { MobileMarkdownColors } from "./mobile-markdown-rich-html";
 import type { MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import { useMobilePreviewResourceLifecycle } from "./use-mobile-preview-resource-lifecycle";
 import richRuntime from "./rich-markdown-runtime.richjs";
-import { mobileFileTextSource } from "./mobile-file-text-source";
+import { mobileFileTextMaximumLines, mobileFileTextSource } from "./mobile-file-text-source";
 import { MobileFileHtmlPreview, type MobileFileHtmlClient } from "./MobileFileHtmlPreview";
 
 type TextPreview = Extract<MobileFilePreview, { kind: "text" }>;
@@ -31,8 +31,9 @@ function FileTextPage({ preview, locale, colors, client, onViewChange, actions }
   const [view, setView] = useState<"rendered" | "source">(markdown || html ? "rendered" : "source");
   useEffect(() => { onViewChange?.(view); }, [onViewChange, view]);
   const visibleSource = useMemo(() => mobileFileTextSource(preview.text), [preview.text]); const lines = visibleSource.lines;
+  const focusLineLimit = view === "rendered" && markdown && !html ? visibleSource.totalLines : lines.length;
   const focusIndex = preview.startByte === 0n && preview.focusLine && Number.isSafeInteger(preview.focusLine)
-    && preview.focusLine > 0 && preview.focusLine <= lines.length ? preview.focusLine - 1 : undefined;
+    && preview.focusLine > 0 && preview.focusLine <= focusLineLimit ? preview.focusLine - 1 : undefined;
   const list = useRef<FlatList<string>>(null); const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
   const alive = useRef(true); const jumped = useRef(false); const retries = useRef(0); const focusY = useRef(0);
   const focus = useCallback(() => { if (alive.current && focusIndex !== undefined) list.current?.scrollToIndex({
@@ -51,8 +52,8 @@ function FileTextPage({ preview, locale, colors, client, onViewChange, actions }
   };
   return <View style={styles.fill}>
     {preview.truncated && <Text accessibilityRole="alert" style={[styles.notice, { color: colors.negative }]}>{mobileMessage(locale, "preview.truncated")}</Text>}
-    {visibleSource.clipped && (view === "source" || markdown) && <Text accessibilityRole="alert" style={[styles.notice, { color: colors.muted }]}>
-      {mobileMessage(locale, "files.preview.lineLimit", { count: 5_000 })}</Text>}
+    {visibleSource.clipped && view === "source" && <Text accessibilityRole="alert" style={[styles.notice, { color: colors.muted }]}>
+      {mobileMessage(locale, "files.preview.lineLimit", { count: mobileFileTextMaximumLines })}</Text>}
     {preview.focusLine && <Text accessibilityRole={focusIndex === undefined ? "alert" : "text"} style={[styles.notice, { color: colors.muted }]}>
       {mobileMessage(locale, focusIndex === undefined ? "preview.lineOutsideWindow" : "preview.focusLine", { line: preview.focusLine })}</Text>}
     {(markdown || html) && <View style={[styles.toolbar, { borderColor: colors.border }]}>
@@ -70,7 +71,7 @@ function FileTextPage({ preview, locale, colors, client, onViewChange, actions }
       </Pressable>
     </View>}
     {view === "rendered" && lines.length === 0 && <Text style={[styles.notice, { color: colors.muted }]}>{mobileMessage(locale, "preview.emptyFile")}</Text>}
-    {view === "rendered" && html ? <MobileFileHtmlPreview preview={preview} locale={locale} colors={colors} client={client} /> : view === "rendered" ? <FileMarkdownReader preview={preview} text={lines.join("\n")} locale={locale} colors={colors} client={client}
+    {view === "rendered" && html ? <MobileFileHtmlPreview preview={preview} locale={locale} colors={colors} client={client} /> : view === "rendered" ? <FileMarkdownReader preview={preview} text={visibleSource.normalizedText} locale={locale} colors={colors} client={client}
       actions={actions}
       focusLine={focusIndex === undefined ? undefined : preview.focusLine} /> : lines.length === 0 ? <Text style={[styles.notice, { color: colors.muted }]}>
         {mobileMessage(locale, "preview.emptyFile")}</Text> : <FlatList ref={list} data={lines} initialNumToRender={40} maxToRenderPerBatch={40} windowSize={9}
