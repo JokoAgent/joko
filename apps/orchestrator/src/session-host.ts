@@ -144,6 +144,7 @@ import {
 } from "./runtime-command-state.js";
 import { activeNativeTimeline } from "./snapshot-projector.js";
 import { policySnapshotFor } from "./policy-settings.js";
+import { MAKER_MEMORY_PROVIDER_ID, MEMORY_CONSOLIDATE_TOOL, MEMORY_REVIEW_TOOL } from "./maker-memory.js";
 import { reviewNativeToolPolicy } from "./native-tool-policy.js";
 import { readNativeOwnerInstructions } from "./native-owner-intent.js";
 import { assertProvisionalSessionOwner, PROVISIONAL_SESSION_KEY, provisionalConfiguration, readProvisionalSession, SessionPrewarmer, validDraftId } from "./session-prewarm.js";
@@ -15937,15 +15938,22 @@ export class SessionHost {
     const currentQueues = nativeBridge ? this.#store.listQueueItems({ sessionId, states: ['dispatching', 'backend_accepted'], limit: 2 }) : [];
     const currentQueue = currentQueues.length === 1 ? currentQueues[0] : undefined;
     const messageQueue = currentQueue?.body.messagingOrigin ? currentQueue : undefined;
+    const memoryMaintenance = nativeBridge && serverId === MAKER_MEMORY_PROVIDER_ID
+      && (toolName === MEMORY_CONSOLIDATE_TOOL || toolName === MEMORY_REVIEW_TOOL)
+      ? this.#captureMemoryMaintenance(stored, currentQueue, toolName) : undefined;
+    // The native Codex MCP bridge has no Adapter-side permission check for these tools.
+    const codexMemoryApproval = memoryMaintenance !== undefined && this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind === "codex";
     const decision = ordered
-      ?? (nativeBridge && !authority && !messageQueue ? { action: "allow" as const } : decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
-      mode: messageQueue ? 'ask' : stored.descriptor.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
+      ?? (nativeBridge && !authority && !messageQueue && !codexMemoryApproval ? { action: "allow" as const } : decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
+      mode: messageQueue ? "ask" : (memoryMaintenance === undefined ? undefined : currentQueue?.executionOverrides?.permissionMode) ?? stored.descriptor.permissionMode,
+      workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
       explicitAllowTools: new Set(), explicitDenyTools: new Set()
     }));
     if (decision.action === "deny") throw new StoreError("MCP App tool was denied by target policy.");
     let revision = authority?.capture();
     const guard = () => {
       signal.throwIfAborted(); authority?.assertCurrent(revision);
+      memoryMaintenance?.assertCurrent();
       if (messageQueue) {
         if (!this.#messagingQueueGuard) throw new StoreError('The originating message channel is unavailable.');
         const source = this.#store.getQueueItem(messageQueue.id), run = this.#store.getRun(messageQueue.runId).descriptor;
@@ -15959,7 +15967,9 @@ export class SessionHost {
     };
     const documentDispatch = serverId === DOCUMENT_TOOL_PROVIDER_ID && nativeBridge
       ? this.#active.get(sessionId)?.documentPathDispatch : undefined;
-    const admission = { assertCurrent: guard, ...(currentQueue?.attemptId === undefined ? {} : {
+    const admission = { assertCurrent: guard,
+      ...(memoryMaintenance === undefined ? {} : { memoryMaintenance: { sourceOperationId: memoryMaintenance.sourceOperationId } }),
+      ...(currentQueue?.attemptId === undefined ? {} : {
       inputQueueItem: { id: currentQueue.id, runId: currentQueue.runId, attemptId: currentQueue.attemptId }
     }), ...(documentDispatch !== undefined && currentQueue !== undefined && documentDispatch.queueId === currentQueue.id
       && documentDispatch.attemptId === currentQueue.attemptId ? { authorizeDocumentPath: documentDispatch.authorize } : {}) };
@@ -15970,16 +15980,62 @@ export class SessionHost {
     guard();
     if (delegated?.verdict === "block") throw new StoreError(delegated.reason ?? "The delegated task denied this MCP action.");
     if (messaging?.verdict !== 'ask' && (delegated?.verdict === "allow" && ordered?.action !== "ask" || delegated?.verdict !== "ask" && delegated?.verdict !== "allow" && decision.action === "allow")) return admission;
-    const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding,
-      messageQueue?.runId, messageQueue?.attemptId, messageQueue?.operationId);
-    const answer = await context.requestInteraction({ id: `mcp-app-permission-${randomUUID()}`, kind: "permission",
-      title: "Allow this application tool?", toolName: `${serverId}/${toolName}`,
-      summary: redactSecrets(JSON.stringify(args)).slice(0, 8000), risk: "medium", choices: ["allow_once", "deny_once"] }, { signal });
-    signal.throwIfAborted();
-    guard();
-    if (!(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once"))
-      throw new StoreError("MCP App tool was not approved.");
+    const approvalQueue = messageQueue ?? (memoryMaintenance === undefined ? undefined : currentQueue);
+    const approve = async () => {
+      guard();
+      const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding,
+        approvalQueue?.runId, approvalQueue?.attemptId, approvalQueue?.operationId);
+      const answer = await context.requestInteraction({ id: `mcp-app-permission-${randomUUID()}`, kind: "permission",
+        title: "Allow this application tool?", toolName: `${serverId}/${toolName}`,
+        summary: memoryMaintenance !== undefined && toolName === MEMORY_REVIEW_TOOL
+          ? "Send this workspace's curated memory to the configured auxiliary model for a review. Provider usage may apply."
+          : redactSecrets(JSON.stringify(args)).slice(0, 8000),
+        risk: "medium", choices: ["allow_once", "deny_once"] }, { signal });
+      guard();
+      if (!(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once"))
+        throw new StoreError("MCP App tool was not approved.");
+    };
+    if (memoryMaintenance !== undefined) return { ...admission,
+      memoryMaintenance: { sourceOperationId: memoryMaintenance.sourceOperationId, authorize: approve } };
+    await approve();
     return admission;
+  }
+
+  #captureMemoryMaintenance(stored: StoredSession, queue: QueueItemRecord | undefined, toolName: string) {
+    const { id: sessionId, backendId, targetId, binding, planMode, permissionMode } = stored.descriptor;
+    const unavailable = () => new StoreError("Memory maintenance requires the current authorized task input.");
+    if (queue === undefined || queue.attemptId === undefined || queue.backendInstanceGeneration === undefined) throw unavailable();
+    const attemptId = queue.attemptId;
+    const operation = this.#store.findOperation(queue.operationId);
+    if (operation?.status !== "completed"
+      || new TaskShareStore(this.#store).getAuthorForOperation(operation.id)?.sessionId === sessionId) throw unavailable();
+    const owner = operation.connectionId === undefined ? undefined : this.#store.getConnection(operation.connectionId);
+    const targetRevision = this.#store.getTarget(targetId).revision;
+    const assertCurrent = () => {
+      const session = this.#store.getSession(sessionId);
+      const current = session.descriptor;
+      const item = this.#store.getQueueItem(queue.id);
+      const run = this.#store.getRun(queue.runId).descriptor;
+      const attempt = this.#store.getAttempt(attemptId).descriptor;
+      if (current.targetId !== targetId || current.backendId !== backendId || this.#store.getTarget(targetId).revision !== targetRevision
+        || current.binding.generation !== binding.generation || current.binding.opaqueRef !== binding.opaqueRef
+        || current.binding.nativeSessionId !== binding.nativeSessionId || current.planMode !== planMode || current.permissionMode !== permissionMode
+        || !this.targetForSession(session).trusted || this.isReviewReadOnlySession(sessionId)
+        || (current.derivationOrigin?.sideChat === true && current.worktree === undefined)
+        || item.sessionId !== sessionId || item.operationId !== operation.id || item.runId !== run.id
+        || item.attemptId !== attemptId || item.bodyHash !== queue.bodyHash
+        || (item.state !== "dispatching" && item.state !== "backend_accepted")
+        || item.backendInstanceGeneration !== queue.backendInstanceGeneration
+        || run.sessionId !== sessionId || run.activeAttemptId !== attemptId || !["queued", "running", "waiting", "retrying"].includes(run.state)
+        || attempt.runId !== run.id || attempt.generation !== binding.generation || attempt.endedAt !== undefined
+        || attempt.backendInstanceGeneration !== queue.backendInstanceGeneration) throw unavailable();
+      if (owner !== undefined) this.#store.authorizeConnection(owner.id, owner.authKeyDigest);
+      if (toolName === MEMORY_CONSOLIDATE_TOOL && (queue.executionOverrides?.planMode ?? current.planMode)) {
+        throw new StoreError("Memory consolidation is unavailable in plan mode.");
+      }
+    };
+    assertCurrent();
+    return { assertCurrent, sourceOperationId: operation.id };
   }
 
   async enqueueMcpAppMessage(sessionId: string, serverId: string, content: unknown[], guard: McpAppMessageGuard): Promise<void> {

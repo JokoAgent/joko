@@ -264,6 +264,10 @@ export interface BridgeToolPolicyDeclaration {
 export interface NativeBridgeToolAdmission {
   readonly assertCurrent: () => void;
   readonly inputQueueItem?: { readonly id: string; readonly runId: string; readonly attemptId: string };
+  readonly memoryMaintenance?: {
+    readonly sourceOperationId: string;
+    readonly authorize?: () => Promise<void>;
+  };
   readonly authorizeDocumentPath?: DocumentPathAuthorizer;
 }
 
@@ -281,6 +285,7 @@ export interface BridgeToolCallContext {
   /** The sole active Queue Attempt captured before native tool admission awaited policy. */
   readonly inputQueueItem?: NativeBridgeToolAdmission["inputQueueItem"];
   readonly localProductScope?: true;
+  readonly memoryMaintenance?: NativeBridgeToolAdmission["memoryMaintenance"];
   readonly authorizeDocumentPath?: DocumentPathAuthorizer;
   readonly sessionId: string;
   readonly targetId: string;
@@ -1442,6 +1447,8 @@ export class McpRouter {
               ...(nativeRootQueueInput === undefined ? {} : { nativeRootQueueInput }),
               ...(admission?.inputQueueItem === undefined ? {} : { inputQueueItem: admission.inputQueueItem }),
               ...(!input.hostedExecutor && grant.productScope !== undefined ? { localProductScope: true as const } : {}),
+              ...(grant.productScope !== undefined && admission?.memoryMaintenance !== undefined
+                ? { memoryMaintenance: admission.memoryMaintenance } : {}),
               ...(authorizeDocumentPath === undefined ? {} : { authorizeDocumentPath: async request => {
                 guard();
                 if (this.#redactText(request.path) !== request.path) {

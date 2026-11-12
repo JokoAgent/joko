@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AUXILIARY_TEXT_SETTING_KEY, AuxiliaryTextRouting, type AuxiliaryTextRunOptions } from "./auxiliary-text-routing.js";
 import { writeBackendModelAccess } from "./backend-model-access.js";
-import { createModelRouteCatalog, type ModelRouteRef, type ManagedTextInferenceInput } from "./personalization-inference.js";
+import { createModelRouteCatalog, requestManagedTextInference, type ModelRouteRef, type ManagedTextInferenceInput } from "./personalization-inference.js";
 
 const resources: { store: OperationalStore; routing: AuxiliaryTextRouting }[] = [];
 afterEach(() => {
@@ -82,6 +82,22 @@ describe("AuxiliaryTextRouting", () => {
     await expect(routing.run(routing.capture(), request())).resolves.toEqual({ status: "exhausted" });
     expect(infer.mock.calls.map(([input]) => input.route.modelId)).toEqual(["model-c", "model-b", "model-d"]);
   });
+
+  it.each(["before headers", "during the body"] as const)(
+    "keeps ordered fallback for a known rejection and stops a paid review when the connection drops %s", async phase => {
+      const { store, routing, infer } = setup();
+      store.transaction(() => routing.replace([ref("a"), ref("b"), ref("c")], 0n));
+      const dropped = new Error("The remote connection dropped.");
+      const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(new Response("", { status: 403 }));
+      if (phase === "before headers") fetch.mockRejectedValueOnce(dropped);
+      else fetch.mockResolvedValueOnce(new Response(new ReadableStream({ start: controller => controller.error(dropped) })));
+      infer.mockImplementation(input => requestManagedTextInference({ ...input, fetch }));
+      await expect(routing.run(routing.capture(), { ...request(), stopOnUnknownOutcome: true }))
+        .resolves.toEqual({ status: "outcome_unknown" });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(infer.mock.calls.map(([input]) => input.route.modelId)).toEqual(["model-a", "model-b"]);
+    }
+  );
 
   it("keeps unavailable selected identities visible but never dispatches disabled routes", async () => {
     const { store, routing, infer } = setup();

@@ -1272,9 +1272,14 @@ export async function createOrchestratorApplication(
     const kind = (store.getTarget(context.target.id).metadata as { kind?: unknown } | null)?.kind;
     return kind === "partner_home" || kind === "partner_workbench" || kind === "partner_session_task" || kind === "partner_group";
   };
-  const unregisterMakerMemoryBridge = mcpRouter.registerBridgeToolProvider(
-    new MakerMemoryBridgeProvider(makerMemory)
-  );
+  let auxiliaryTextForMemory: AuxiliaryTextRouting | undefined;
+  const unregisterMakerMemoryBridge = mcpRouter.registerBridgeToolProvider(new MakerMemoryBridgeProvider(makerMemory, {
+    auxiliary: () => {
+      if (auxiliaryTextForMemory === undefined) throw new Error("The auxiliary model route is unavailable.");
+      return auxiliaryTextForMemory;
+    },
+    redact: value => credentials.redactText(value)
+  }));
   const unregisterPluginAuthoringTools = mcpRouter.registerBridgeToolProvider(new PluginAuthoringTools({ store, resources: piResources, artifacts,
     workingRoot: join(config.dataDirectory, "plugin-authoring"), captureWorkspace: context => {
       if (!sessionHostForHelperTools) throw new Error("The task Workspace authority is not ready.");
@@ -2858,7 +2863,7 @@ export async function createOrchestratorApplication(
   });
   const messageSearch = new MessageSearchEmbeddingCoordinator({ store, providers });
   messageSearchForHelperTools = messageSearch;
-  const auxiliaryText = new AuxiliaryTextRouting({ store, routes: modelRoutes, providers });
+  const auxiliaryText = auxiliaryTextForMemory = new AuxiliaryTextRouting({ store, routes: modelRoutes, providers });
   hostedAgentAutoReview = createHostedAgentAutoReviewer({ store, auxiliary: auxiliaryText, readPolicy: readHostedAgentPolicy,
     redact: value => credentials.redactText(value) });
   extensionText = new ExtensionText({ store, tasks: extensionTasks, catalog: extensionCatalog, routes: modelRoutes, auxiliary: auxiliaryText,

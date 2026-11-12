@@ -692,13 +692,16 @@ export interface ManagedTextInferenceInput {
   readonly timeoutMs: number;
   readonly fetch?: typeof globalThis.fetch;
   readonly assertCurrent?: () => void;
+  readonly stopOnUnknownOutcome?: boolean;
 }
+
+export const MANAGED_TEXT_USER_LIMIT = 64 * 1024;
 
 /** Bounded Orchestrator-owned utility inference; Provider credentials stay in the request stack. */
 export function requestManagedTextInference(input: ManagedTextInferenceInput): Promise<string> {
   if (
     input.system.length === 0 || input.system.length > 32 * 1024 ||
-    input.user.length === 0 || input.user.length > 64 * 1024
+    input.user.length === 0 || input.user.length > MANAGED_TEXT_USER_LIMIT
   ) throw new RangeError("Managed text inference prompt is invalid.");
   if (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1 || input.maxTokens > 8_192) {
     throw new RangeError("Managed text inference output limit is invalid.");
@@ -712,7 +715,8 @@ export function requestManagedTextInference(input: ManagedTextInferenceInput): P
     system: input.system,
     user: input.user,
     maxTokens: input.maxTokens,
-    retryReasoningBudget: true,
+    retryReasoningBudget: input.stopOnUnknownOutcome !== true,
+    ...(input.stopOnUnknownOutcome === true ? { stopOnUnknownOutcome: true } : {}),
     ...(input.assertCurrent === undefined ? {} : { assertCurrent: input.assertCurrent }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     timeoutMs: input.timeoutMs
@@ -755,6 +759,7 @@ async function requestInference(input: {
   readonly signal?: AbortSignal;
   readonly timeoutMs: number;
   readonly retryReasoningBudget?: boolean;
+  readonly stopOnUnknownOutcome?: boolean;
   readonly assertCurrent?: () => void;
 }): Promise<string> {
   const endpoint = input.route.requestPath === undefined
@@ -791,6 +796,9 @@ async function requestInference(input: {
   } catch (error) {
     if (input.signal?.aborted) throw abortError();
     if (timeout.aborted) throw new InferenceFailure("TIMEOUT");
+    if (input.stopOnUnknownOutcome && !(error instanceof InferenceFailure)) {
+      throw new InferenceFailure("NETWORK_ERROR", { cause: error });
+    }
     throw error;
   }
   let parsed: unknown;
@@ -1025,6 +1033,11 @@ class InferenceFailure extends Error {
     super(code, options);
     this.name = "InferenceFailure";
   }
+}
+
+export function managedTextOutcomeUnknown(error: unknown): boolean {
+  return error instanceof InferenceFailure &&
+    (error.code === "NETWORK_ERROR" || error.code === "TIMEOUT" || /^HTTP_(?:408|5\d{2})$/u.test(error.code));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
