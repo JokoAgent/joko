@@ -159,6 +159,10 @@ describe("mounted Skill learning review", () => {
 
     await page.setViewportSize({ width: 1440, height: 960 });
     await page.reload({ waitUntil: "domcontentloaded" });
+    // Manual pairing saves the node and leaves automatic entry disabled.
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
+      .getByRole("button", { name: "Connect", exact: true }).click();
     await page.getByRole("tab", { name: /Skills/u }).click();
     await page.locator("button.skill-card", { hasText: "mounted-learning" }).click();
     await waitFor(() => detail.locator(".skill-file-preview__body pre").textContent(),
