@@ -61,7 +61,7 @@ describe("Discord Messaging production product chain", () => {
     const paired = await fixture.pair("Discord Messaging E2 owner");
     const authKey = paired.authKey;
 
-    await paired.clients.messaging.putMessagingRoute({
+    const initialRoute = {
       targetId: "workspace-real-pi",
       providerId: REAL_PI_PROVIDER_ID,
       modelId: REAL_PI_MODEL_ID,
@@ -69,7 +69,8 @@ describe("Discord Messaging production product chain", () => {
       fastMode: false,
       permissionMode: PermissionMode.ASK,
       planMode: false
-    });
+    };
+    await paired.clients.messaging.putMessagingRoute(initialRoute);
     const created = required((await paired.clients.messaging.createMessagingConnection({
       channel: MessagingChannel.DISCORD,
       ownerProviderUserId: DISCORD_SYSTEM_OWNER_ID,
@@ -286,6 +287,10 @@ describe("Discord Messaging production product chain", () => {
       catch { return false; }
     }, ready => ready, "the original Discord owner task to settle", 10_000);
     const originalDirect = store.getSession(directSessionId).descriptor;
+    const restartRoute = required((await restartedClients.messaging.putMessagingRoute({
+      ...initialRoute, connectionId: created.connectionId, permissionMode: PermissionMode.AUTO
+    })).route, "Discord connection default for the restart");
+    expect(restartRoute.scopeKey).not.toBe(direct.routeScopeKey);
     const resetId = "900000000000000004";
     discord.enqueueMessage({ messageId: resetId, channelId: DISCORD_SYSTEM_DM_ID, text: "/new" });
     await waitFor(async () => discord?.outboundMessages ?? [], messages => messages.some(message =>
@@ -293,9 +298,10 @@ describe("Discord Messaging production product chain", () => {
     "the original Discord owner task to start a fresh context", 25_000);
     const resetDirect = store.getSession(directSessionId).descriptor;
     expect(resetDirect).toMatchObject({ id: directSessionId, targetId: originalDirect.targetId,
-      backendId: originalDirect.backendId, binding: { generation: originalDirect.binding.generation + 1 } });
+      backendId: originalDirect.backendId, permissionMode: "auto", binding: { generation: originalDirect.binding.generation + 1 } });
     expect(resetDirect.binding.opaqueRef).not.toBe(originalDirect.binding.opaqueRef);
-    expect(store.getMessagingConversation(direct.id)).toMatchObject({ sessionId: directSessionId, sessionGeneration: resetDirect.binding.generation });
+    expect(store.getMessagingConversation(direct.id)).toMatchObject({ status: "active", sessionId: directSessionId,
+      sessionGeneration: resetDirect.binding.generation, routeScopeKey: restartRoute.scopeKey, permissionMode: "auto" });
     expect(store.getMessagingConversation(restartedConversation.id).sessionGeneration).toBe(restartedConversation.sessionGeneration);
     expect(store.listEvents({ sessionId: directSessionId }).map(event => event.payload.type)).not.toContain("message_complete");
     expect(store.listEvents({ sessionId: directSessionId, includeTombstoned: true }).map(event => event.payload.type)).toContain("message_complete");

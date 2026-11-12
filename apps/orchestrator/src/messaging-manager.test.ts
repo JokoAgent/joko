@@ -402,20 +402,28 @@ describe("MessagingManager", () => {
       fileName: "original.png", mimeType: "image/png", expiresAt: Date.now() + 60_000
     });
     store.transaction(() => store.adoptSessionArtifact({ blob: store.getArtifact(artifact.id).blob, sessionId, runId: oldRun }));
-    fixture.manager.putRoute({ connectionId: connection.id, targetId: "target-two", providerId: "vision", modelId: "multimodal",
+    const newRoute = fixture.manager.putRoute({ connectionId: connection.id, targetId: "target-two", providerId: "vision", modelId: "multimodal",
       effort: "high", permissionMode: "auto", fastMode: false, planMode: true });
+    const originalConversation = store.getMessagingConversation(conversation.id);
 
     const enqueue = store.enqueueMessagingDelivery.bind(store);
+    const rejectSuccessNotice = vi.fn(() => { throw new Error("The command receipt could not be committed."); });
     const notice = vi.spyOn(store, "enqueueMessagingDelivery").mockImplementation(input => {
-      if (input.kind === "notice" && input.dedupeKey.startsWith("command:")) {
+      const payload = input.payload;
+      if (input.kind === "notice" && input.dedupeKey.startsWith("command:") && typeof payload === "object" && payload !== null
+        && "text" in payload && payload.text === "A new conversation is ready."
+        && "replyToMessageId" in payload && payload.replyToMessageId === messageId(3)) {
         notice.mockRestore();
-        throw new Error("The command receipt could not be committed.");
+        return rejectSuccessNotice();
       }
       return enqueue(input);
     });
     gates[2]!.release();
     await vi.waitFor(() => expect(notices(3)).toMatchObject([{ text: "The original Discord task is still available." }]), { timeout: 5_000 });
+    expect(rejectSuccessNotice).toHaveBeenCalledOnce();
+    expect(nativeCreate).toHaveBeenCalledOnce();
     expect(store.getSession(sessionId).descriptor.binding).toEqual(original.binding);
+    expect(store.getMessagingConversation(conversation.id)).toEqual(originalConversation);
     expect(store.listEvents({ sessionId }).map(event => event.id)).toContain(oldMessage.id);
     expect(store.findUnresolvedDiscordConversationRestart(sessionId)).toBeUndefined();
 
@@ -427,8 +435,9 @@ describe("MessagingManager", () => {
       providerId: "vision", modelId: "multimodal", effort: "high", permissionMode: "auto", planMode: true, archived: false,
       binding: { generation: original.binding.generation + 1 } });
     expect(restarted.binding.opaqueRef).not.toBe(original.binding.opaqueRef);
-    expect(store.getMessagingConversation(conversation.id)).toMatchObject({ sessionId, targetId: original.targetId,
-      backendId: destinationAdapter.id, sessionGeneration: restarted.binding.generation });
+    expect(store.getMessagingConversation(conversation.id)).toMatchObject({ status: "active", sessionId, targetId: original.targetId,
+      routeScopeKey: newRoute.scopeKey, backendId: destinationAdapter.id, sessionGeneration: restarted.binding.generation,
+      providerId: "vision", modelId: "multimodal", effort: "high", permissionMode: "auto", planMode: true });
     expect(store.listSessions({ includeArchived: true })).toHaveLength(1);
     expect(store.listEvents({ sessionId }).map(event => event.id)).not.toContain(oldMessage.id);
     expect(store.listEvents({ sessionId, includeTombstoned: true }).map(event => event.id)).toContain(oldMessage.id);

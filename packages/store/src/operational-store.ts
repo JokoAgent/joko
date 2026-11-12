@@ -12015,6 +12015,8 @@ export class OperationalStore {
         || connection.channel !== "discord" || !connection.enabled || connection.generation !== conversation.channelGeneration
         || conversation.status !== "active" || conversation.conversationKind !== "direct" || conversation.partnerId !== undefined
         || conversation.sessionId !== sessionId || conversation.revision !== input.conversation.revision
+        || conversation.targetId !== session.descriptor.targetId || conversation.backendId !== session.descriptor.backendId
+        || conversation.sessionGeneration !== session.descriptor.binding.generation
         || route.scopeKey !== input.route.scopeKey || route.revision !== input.route.revision
         || session.revision !== input.source.revision || session.descriptor.archived || session.descriptor.deletedAt !== undefined
         || this.sessionCreationServiceKind(sessionId) !== "messaging"
@@ -12037,6 +12039,10 @@ export class OperationalStore {
       this.database.prepare("DELETE FROM session_context_handoffs WHERE session_id = ?").run(sessionId);
       new SessionRuntimeHandoffStore(this).save(sessionId, { format: 1, generation: input.runtimeControlGeneration, parked: [] });
 
+      // Exclude this conversation from the generation trigger while the Session
+      // changes. The same transaction restores it with the full route snapshot.
+      this.database.prepare("UPDATE messaging_conversations SET status = 'retired' WHERE id = ?")
+        .run(conversation.id);
       this.database.prepare("UPDATE product_sessions SET backend_id = ?, provider_id = ?, model_id = ? WHERE id = ?")
         .run(route.backendId, input.providerId ?? null, input.modelId ?? null, sessionId);
       const updated = this.updateSession(sessionId, {
@@ -12047,13 +12053,14 @@ export class OperationalStore {
       this.setSetting("session", sessionId, NATIVE_BLANK_RECOVERY_SETTING_KEY, true, at);
       this.database.prepare("UPDATE session_objectives SET session_generation = ?, revision = ? WHERE session_id = ?")
         .run(input.binding.generation, asSqlInteger(this.requireActiveRevision()), sessionId);
-      this.database.prepare(`
-        UPDATE messaging_conversations SET session_generation = ?, route_scope_key = ?, backend_id = ?, provider_id = ?,
+      const rebound = this.database.prepare(`
+        UPDATE messaging_conversations SET status = 'active', session_generation = ?, route_scope_key = ?, backend_id = ?, provider_id = ?,
           model_id = ?, effort = ?, fast_mode = ?, permission_mode = ?, plan_mode = ?, updated_at = ?, revision = ?
-        WHERE id = ? AND revision = ?
+        WHERE id = ? AND revision = ? AND status = 'retired'
       `).run(input.binding.generation, route.scopeKey, route.backendId, input.providerId ?? null, input.modelId ?? null,
         input.effort ?? null, speedInt(route.fastMode), route.permissionMode, boolInt(route.planMode),
         Math.max(conversation.createdAt, at), asSqlInteger(this.requireActiveRevision()), conversation.id, asSqlInteger(conversation.revision));
+      if (rebound.changes !== 1) throw new StoreError("Discord conversation restart did not adopt the selected route.");
       const event = this.publishHistoryPruned({ sessionId, activeContextReset: true, operationId: input.operationId, prunedAt: at });
       this.clearSessionAttentionFromLifecycle(updated, event, `${event.traceId}:attention-generation`, input.operationId);
       return this.getSession(sessionId);
