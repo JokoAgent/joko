@@ -95,6 +95,7 @@ it("keeps the exact permission evidence selectable through confirmation and reti
 
     await press("Allow once");
     expect(onResolve).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
     expect(evidence()).toBe(revised);
     await act(async () => {
       const confirm = button("Allow once");
@@ -104,7 +105,7 @@ it("keeps the exact permission evidence selectable through confirmation and reti
     expect(onResolve).toHaveBeenCalledExactlyOnceWith(replacement, {
       kind: "permission", decision: PermissionDecisionKind.ALLOW_ONCE
     });
-    expect(onError).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledExactlyOnceWith("");
   } finally {
     await act(async () => root.unmount());
     host.remove();
