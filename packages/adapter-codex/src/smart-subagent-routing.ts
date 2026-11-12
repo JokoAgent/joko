@@ -221,7 +221,8 @@ export function buildCodexSmartModelCatalog(
   });
   const managed = managedCandidates.flatMap((candidate): SmartCandidate[] =>
     NATIVE_V2_DEFAULTS.has(candidate.model.modelId)
-      || candidate.protocol !== "openai-responses" || candidate.model.api !== "openai-responses"
+      || (candidate.protocol !== "openai-responses" && candidate.protocol !== "openai-completions")
+      || candidate.model.api !== candidate.protocol
       || candidate.model.providerId !== candidate.providerId
       || candidate.model.supportsTools === false || candidate.model.defaultVisible === false
       || !validId(candidate.providerId, 128) || !validId(candidate.model.modelId, 256)

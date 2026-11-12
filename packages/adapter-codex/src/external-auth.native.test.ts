@@ -1,8 +1,9 @@
-import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import type { DurableProcessOwnerOptions } from "@joko/runtime-governance";
 import { CodexBackendAdapter } from "./adapter.js";
 import { AppServerHost } from "./host.js";
 import { useCodexHistoryHome } from "./external-auth.js";
@@ -20,31 +21,37 @@ function environment(home: string) {
 }
 
 describe.skipIf(!binary)("published native ephemeral account contract", () => {
-  it("pins reset control-plane auth to the current workspace in a separate published SDK without making quota or model requests", async () => {
+  it("pins reset control-plane auth and independent process leases to the current published SDK generation without quota or model requests", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-reset-identity-"))), auth = join(home, "auth.json");
     const credentials = (account: string, email: string) => JSON.stringify({ auth_mode: "chatgpt", tokens: {
       id_token: token("fixture", account, email), access_token: token("fixture", account, email), refresh_token: "private-original-refresh", account_id: account
     } });
     await writeFile(auth, credentials("first-workspace", "first@example.invalid"));
+    const processRoot = join(home, "processes"), processOwner: DurableProcessOwnerOptions = {
+      rootDirectory: processRoot, instanceId: "native-reset-owner", generation: 1, recoverStale: false,
+      supervisor: { capture: async pid => `owned-${pid}`, captureSync: pid => `owned-${pid}`,
+        terminate: async (pid, expected) => {
+          if (expected !== `owned-${pid}`) return "identity_mismatch";
+          try { process.kill(pid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+          return "terminated";
+        } }
+    };
     const original = new AppServerHost({ transport: { command: binary!, cwd: home, env: environment(home),
-      args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="file"'] } });
+      args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="file"'], processOwner } });
     const observations: unknown[] = [], transports: StdioJsonRpcTransport[] = [];
-    const owner = new CodexBackendAdapter({ host: original, profileDirectory: home, instanceGeneration: 1, appServer: {
-      transportFactory: () => {
-        const transport = new StdioJsonRpcTransport({ command: binary!, cwd: home, env: environment(home),
-          args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="ephemeral"'] });
-        transports.push(transport); const request = transport.request.bind(transport);
-        transport.request = async (method, params, options = {}) => {
-          if (method !== "account/rateLimits/read") return request(method, params, options);
-          // Only auth is exercised against the binary. Quota facts use the
-          // documented RPC fixture, without sending an account HTTP request.
-          options.beforeDispatch?.(); await options.beforeDispatchAsync?.(options.signal ?? new AbortController().signal); options.beforeDispatch?.();
-          observations.push(await request("account/read", { refreshToken: false }));
-          return { rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1_900_000_000 } }, rateLimitResetCredits: { availableCount: 0, credits: [] } };
-        };
-        return transport;
-      }
-    } });
+    const request = StdioJsonRpcTransport.prototype.request;
+    const observation = vi.spyOn(StdioJsonRpcTransport.prototype, "request").mockImplementation(async function (this: StdioJsonRpcTransport, method, params, options = {}) {
+      if (method !== "account/rateLimits/read") return request.call(this, method, params, options);
+      // Exercise the Adapter's production launch path and actual SDK auth.
+      // Quota stays intercepted before any account HTTP or model request.
+      options.beforeDispatch?.(); await options.beforeDispatchAsync?.(options.signal ?? new AbortController().signal); options.beforeDispatch?.();
+      transports.push(this); expect(this.processOwner).toBe(original.processOwner);
+      expect(await readdir(join(processRoot, "1"))).toHaveLength(2);
+      observations.push(await request.call(this, "account/read", { refreshToken: false }));
+      return { rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1_900_000_000 } }, rateLimitResetCredits: { availableCount: 0, credits: [] } };
+    });
+    const owner = new CodexBackendAdapter({ host: original, profileDirectory: home, instanceGeneration: 1,
+      appServer: { transport: { command: binary!, cwd: home, env: environment(home), processOwner } } });
     try {
       await original.ensureStarted();
       expect((await original.request("account/read", { refreshToken: false })).value).toMatchObject({ account: { email: "first@example.invalid" } });
@@ -54,7 +61,11 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
       expect(observations).toEqual([expect.objectContaining({ account: expect.objectContaining({ type: "chatgpt", email: "selected@example.invalid" }) })]);
       expect(await readFile(auth, "utf8")).toBe(replacement);
       expect(original.isActiveGeneration(original.generation)).toBe(true); expect(transports).toHaveLength(1); expect(transports[0]!.running).toBe(false);
-    } finally { await owner.dispose(); await original.shutdown(); await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }); }
+      expect(await readdir(join(processRoot, "1"))).toHaveLength(1);
+    } finally {
+      try { await owner.dispose(); await original.shutdown(); }
+      finally { observation.mockRestore(); await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }); }
+    }
   }, 60_000);
 
   it("installs a private API key in memory and leaves the native history credential file untouched", async () => {
