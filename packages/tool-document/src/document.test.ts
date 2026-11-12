@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +33,7 @@ it("builds editable Word structure and publishes it only inside the task root", 
     const first = await publishDocumentOutput({ root, outPath: "documents/report.docx", bytes, overwrite: false });
     expect(first.relativePath).toBe(join("documents", "report.docx"));
     expect(first.bytes).toBe(bytes.length);
+    expect(first.existingTarget).toBe(false);
     const archive = await JSZip.loadAsync(await readFile(first.path));
     const document = await archive.file("word/document.xml")!.async("string");
     const styles = await archive.file("word/styles.xml")!.async("string");
@@ -45,8 +47,11 @@ it("builds editable Word structure and publishes it only inside the task root", 
     await expect(publishDocumentOutput({ root, outPath: "documents/report.docx", bytes, overwrite: false }))
       .rejects.toMatchObject({ code: "FILE_EXISTS" });
     const replacement = await markdownToDocxBuffer("Replacement body");
-    await publishDocumentOutput({ root, outPath: "documents/report.docx", bytes: replacement, overwrite: true });
+    const replaced = await publishDocumentOutput({ root, outPath: "documents/report.docx", bytes: replacement, overwrite: true });
+    expect(replaced).toMatchObject({ existingTarget: true, sha256: createHash("sha256").update(replacement).digest("hex") });
     expect(await readFile(first.path)).toEqual(replacement);
+    expect(await publishDocumentOutput({ root, outPath: "documents/report.docx", bytes: replacement, overwrite: true }))
+      .toEqual(replaced);
     await expect(publishDocumentOutput({ root, outPath: "../escape.docx", bytes, overwrite: false }))
       .rejects.toMatchObject({ code: "PATH_NOT_ALLOWED" });
     await symlink(outside, join(root, "linked"), process.platform === "win32" ? "junction" : "dir");

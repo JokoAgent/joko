@@ -67,7 +67,7 @@ async function enterParent(request: WriterRequest): Promise<void> {
   await assertParent(request);
 }
 
-async function write(request: WriterRequest): Promise<void> {
+async function write(request: WriterRequest): Promise<boolean> {
   if (!request || typeof request.root !== "string" || typeof request.relativeParent !== "string"
     || typeof request.targetName !== "string" || request.targetName === "." || request.targetName === ".."
     || request.targetName.includes("/") || request.targetName.includes("\\") || request.targetName.includes("\0")
@@ -81,6 +81,7 @@ async function write(request: WriterRequest): Promise<void> {
   await enterParent(request);
   const staging = `.joko-document-${randomUUID()}.tmp`;
   let stagedIdentity: { dev: bigint; ino: bigint } | undefined;
+  let existingTarget = false;
   try {
     const handle = await fs.open(staging, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     try {
@@ -96,6 +97,7 @@ async function write(request: WriterRequest): Promise<void> {
       try {
         const target = await fs.lstat(request.targetName);
         if (!target.isFile() || target.isSymbolicLink()) throw new WriterError("PATH_NOT_ALLOWED", "Overwrite target is not a regular file.");
+        existingTarget = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
@@ -109,6 +111,7 @@ async function write(request: WriterRequest): Promise<void> {
       });
     }
     await assertParent(request);
+    return existingTarget;
   } finally {
     if (stagedIdentity !== undefined) {
       try {
@@ -125,7 +128,7 @@ async function write(request: WriterRequest): Promise<void> {
 
 process.once("message", (message: unknown) => {
   void write(message as WriterRequest).then(
-    () => process.send?.({ ok: true }),
+    (existingTarget) => process.send?.({ ok: true, existingTarget }),
     (error: unknown) => process.send?.({
       ok: false,
       code: error instanceof WriterError ? error.code : "OUTPUT_FAILED",

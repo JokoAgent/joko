@@ -32,7 +32,7 @@ interface WriterRequest {
 }
 
 type WriterResult =
-  | { readonly ok: true }
+  | { readonly ok: true; readonly existingTarget: boolean }
   | { readonly ok: false; readonly code: DocumentOutputErrorCode; readonly message: string };
 
 /** Publish completed document bytes through one root-bound writer process. */
@@ -42,7 +42,14 @@ export async function publishDocumentOutput(input: {
   readonly bytes: Uint8Array;
   readonly overwrite: boolean;
   readonly signal?: AbortSignal;
-}): Promise<{ readonly path: string; readonly relativePath: string; readonly bytes: number }> {
+  readonly assertCurrent?: () => void;
+}): Promise<{
+  readonly path: string;
+  readonly relativePath: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly existingTarget: boolean;
+}> {
   input.signal?.throwIfAborted();
   if (input.bytes.byteLength === 0 || input.bytes.byteLength > MAXIMUM_OUTPUT_BYTES) {
     throw new DocumentOutputError("OUTPUT_TOO_LARGE", "Document output exceeds the size limit.");
@@ -75,6 +82,7 @@ export async function publishDocumentOutput(input: {
     bytesBase64: Buffer.from(input.bytes).toString("base64"),
     overwrite: input.overwrite
   };
+  input.assertCurrent?.();
   const result = await invokeWriter(request, input.signal);
   if (!result.ok) throw new DocumentOutputError(result.code, result.message);
   input.signal?.throwIfAborted();
@@ -85,11 +93,14 @@ export async function publishDocumentOutput(input: {
     throw new DocumentOutputError("PATH_NOT_ALLOWED", "Published document path changed.");
   }
   const readback = await fs.readFile(realPath);
+  const sha256 = createHash("sha256").update(readback).digest("hex");
   if (readback.byteLength !== input.bytes.byteLength
-    || createHash("sha256").update(readback).digest("hex") !== createHash("sha256").update(input.bytes).digest("hex")) {
+    || sha256 !== createHash("sha256").update(input.bytes).digest("hex")) {
     throw new DocumentOutputError("OUTPUT_FAILED", "Published document failed readback verification.");
   }
-  return { path, relativePath, bytes: readback.byteLength };
+  input.signal?.throwIfAborted();
+  input.assertCurrent?.();
+  return { path, relativePath, bytes: readback.byteLength, sha256, existingTarget: result.existingTarget };
 }
 
 async function invokeWriter(request: WriterRequest, signal: AbortSignal | undefined): Promise<WriterResult> {
@@ -139,7 +150,7 @@ async function invokeWriter(request: WriterRequest, signal: AbortSignal | undefi
     child.on("message", (message: unknown) => {
       if (!message || typeof message !== "object") return;
       const result = message as Partial<WriterResult>;
-      if (result.ok === true) finish({ ok: true });
+      if (result.ok === true && typeof result.existingTarget === "boolean") finish({ ok: true, existingTarget: result.existingTarget });
       else if (result.ok === false && typeof result.code === "string" && typeof result.message === "string") {
         finish({ ok: false, code: result.code, message: result.message.slice(0, 2_000) });
       }
