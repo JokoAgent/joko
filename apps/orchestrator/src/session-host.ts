@@ -622,6 +622,8 @@ export interface CreateServiceSessionInput {
   readonly beforeNativeCreation?: (sessionId: string, target: TargetDescriptor) => Promise<void>;
   /** Synchronous purpose adoption in the same transaction as the visible Session. */
   readonly onAdmitted?: (store: OperationalStore, session: StoredSession) => void;
+  /** Adopt a channel-owned task and its exact command receipt together. */
+  readonly onMessagingAdmitted?: (store: OperationalStore, session: StoredSession) => void;
 }
 
 type SessionCreationInput = CreateSessionInput | CreateScheduledSessionInput | CreateServiceSessionInput;
@@ -2291,6 +2293,10 @@ export class SessionHost {
       && (input.serviceKind !== "personal_development" || input.assertServiceScope === undefined
         || input.worktree === undefined && input.beforeNativeCreation === undefined || input.nativeStart?.kind === "attach")) {
       throw new StoreError("Personal task adoption requires its exact new isolated service scope.");
+    }
+    if (input.onMessagingAdmitted !== undefined && (input.serviceKind !== "messaging"
+      || input.assertServiceScope === undefined || input.nativeStart !== undefined || input.worktree !== undefined)) {
+      throw new StoreError("Messaging task adoption requires a new task and its exact channel owner.");
     }
     const target = this.#store.getTarget(input.targetId);
     this.validateFastSelection(
@@ -12290,6 +12296,7 @@ export class SessionHost {
             groupAssignment?.commit();
             this.#runtimeHandoffs.finishCreation(claim.operation.id);
             if ("onAdmitted" in input && input.onAdmitted !== undefined) input.onAdmitted(store, created);
+            if ("onMessagingAdmitted" in input) input.onMessagingAdmitted?.(store, created);
             if ("serviceKind" in input && input.serviceKind === "extension") {
               input.assertServiceScope?.();
               input.onExtensionAdmitted?.(store, created);

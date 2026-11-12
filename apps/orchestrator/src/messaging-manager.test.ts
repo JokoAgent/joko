@@ -258,6 +258,84 @@ describe("MessagingManager", () => {
     ]);
   }, 15_000);
 
+  it("opens a fresh Telegram direct task, archives the original lane, and replays /new once", async () => {
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const adapter = new ControlledReplyAdapter();
+    const inputs = [
+      { id: 1, text: "/new" },
+      { id: 2, text: "Work in the original task" },
+      { id: 3, text: "Queue for the original task" },
+      { id: 4, text: "/new" },
+      { id: 4, text: "/new" },
+      { id: 5, text: "/new", senderId: 7 },
+      { id: 6, text: "Work in the fresh task" },
+      { id: 7, text: "/new" }
+    ];
+    const gates = inputs.map(() => deliveryGate());
+    const poll = vi.spyOn(transport, "poll");
+    const date = Math.floor(Date.now() / 1_000);
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "42", bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    inputs.forEach((input, index) => poll.mockImplementationOnce(async ({ signal }) => {
+      await gates[index]!.wait;
+      signal?.throwIfAborted();
+      return { nextCursor: String(index + 11), updates: [{ update_id: index + 10, message: {
+        message_id: input.id, chat: { id: 42, type: "private" }, date,
+        from: { id: input.senderId ?? 42, first_name: "Owner", is_bot: false }, text: input.text
+      } }] };
+    }));
+    const fixture = await createFixture(() => transport, () => adapter);
+    cleanups.push(() => gates.forEach(gate => gate.release()));
+    const send = vi.spyOn(adapter, "send");
+    const connection = await enableTelegramReply(fixture, "telegram-direct-new");
+    const notice = (id: string) => transport.sentText.filter(row => row.replyToMessageId === id);
+    const requestFor = (id: string) => fixture.store.listMessagingInboundRequests({ connectionId: connection.id })
+      .find(request => request.providerMessageId === id);
+
+    gates[0]!.release();
+    await vi.waitFor(() => expect(notice("1")).toMatchObject([{ text: "A new conversation is ready." }]), { timeout: 5_000 });
+    const original = fixture.store.listMessagingConversations({ connectionId: connection.id })[0]!;
+    const originalSession = original.sessionId!;
+    expect(send).not.toHaveBeenCalled();
+
+    gates[1]!.release();
+    await vi.waitFor(() => expect(fixture.store.getRun(requestFor("2")!.runId!).descriptor.state).toBe("running"));
+    await adapter.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Output in the original task" }] });
+    gates[2]!.release();
+    await vi.waitFor(() => expect(requestFor("3")?.status).toBe("queued"));
+    gates[3]!.release();
+    await vi.waitFor(() => expect(notice("4")).toMatchObject([{ text: "A new conversation is ready. Previous task history was archived." }]), { timeout: 8_000 });
+    const freshSession = fixture.store.getMessagingConversation(original.id).sessionId!;
+    expect(freshSession).not.toBe(originalSession);
+    expect(fixture.store.getSession(originalSession).descriptor.archived).toBe(true);
+    expect(fixture.store.getQueueItem(requestFor("2")!.queueItemId!)).toMatchObject({ sessionId: originalSession, state: "cancelled" });
+    expect(fixture.store.getQueueItem(requestFor("3")!.queueItemId!)).toMatchObject({ sessionId: originalSession, state: "cancelled" });
+    expect(fixture.store.listEvents({ sessionId: originalSession }).map(({ payload }) => payload))
+      .toContainEqual(expect.objectContaining({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Output in the original task" }] }));
+
+    gates[4]!.release();
+    gates[5]!.release();
+    gates[6]!.release();
+    await vi.waitFor(() => expect(adapter.context?.sessionId).toBe(freshSession));
+    expect(send.mock.calls.map(([prompt, context]) => [prompt.text, context.sessionId])).toEqual([
+      ["Work in the original task", originalSession], ["Work in the fresh task", freshSession]
+    ]);
+    expect(notice("4")).toHaveLength(1);
+    expect(notice("5")).toHaveLength(0);
+    expect(fixture.store.listMessagingInteractions({ connectionId: connection.id }).map(({ status, payload }) => ({ status, payload })))
+      .toEqual(Array.from({ length: 2 }, () => ({ status: "completed", payload: { format: 1, action: "new" } })));
+    expect(fixture.store.listSessions({ includeArchived: true })).toHaveLength(2);
+
+    const foreign = fixture.host.enqueueServiceInput({ operationId: "new-command-other-input", sessionId: freshSession, source: "system",
+      prompt: { disposition: "prompt", text: "Keep this other input", images: [], files: [], mentions: [] } }).value;
+    gates[7]!.release();
+    await vi.waitFor(() => expect(notice("7")).toMatchObject([{ text: "Finish the other work in the original task before starting a new conversation." }]));
+    expect(fixture.store.getMessagingConversation(original.id).sessionId).toBe(freshSession);
+    expect(fixture.store.getQueueItem(foreign.queueItemId).state).toBe("accepted");
+    expect(fixture.store.getRun(requestFor("6")!.runId!).descriptor.state).toBe("running");
+  }, 20_000);
+
   it.each(["telegram", "discord"] as const)("serializes %s progress before the final and retains the channel's final-message lifecycle", async channel => {
     const adapter = new ControlledReplyAdapter(), transport = channel === "telegram" ? new StreamingTelegramTransport() : new StreamingDiscordTransport();
     const fixture = await createFixture(channel === "telegram" ? () => transport as StreamingTelegramTransport : undefined, () => adapter,
@@ -363,6 +441,18 @@ describe("MessagingManager", () => {
         capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
           ? { ...capability, options: ["ask"] } : capability) });
       const transport = new StreamingDiscordTransport();
+      const originalPoll = transport.poll.bind(transport);
+      vi.spyOn(transport, "poll").mockImplementationOnce(async input => {
+        const first = await originalPoll(input);
+        const update = first.updates[0]!;
+        return { ...first, updates: [...first.updates, { ...update, sequence: 2, message: {
+          ...update.message!, id: "999999999999999992", content: "/new"
+        } }] };
+      });
+      vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeDiscordUpdates(updates, {
+        connectionId: transport.connectionId, ownerUserId: "111111111111111111", ownerConversationId: "444444444444444444",
+        bot: { id: "222222222222222222", username: "joko_test_bot", displayName: "Joko" }, groupActivation: {}
+      }));
       const fixture = await createFixture(undefined, () => adapter, () => transport,
         undefined, undefined, undefined, undefined, undefined, undefined, { telegramMs: 5, discordMs: 5 }, () => 10);
       const profiles = new PartnerStore(join(fixture.root, "partners.db"));
@@ -389,6 +479,10 @@ describe("MessagingManager", () => {
         expectedPartnerRevision: partner.revision });
       const connection = await replaceCredential(fixture, bound.connection, "discord-recovery", true);
       await vi.waitFor(() => expect(adapter.context?.sessionId).toBe(partner.canonicalSessionId), { timeout: 5_000 });
+      await vi.waitFor(() => expect(transport.sentText).toContainEqual(expect.objectContaining({ replyToMessageId: "999999999999999992",
+        text: "This chat shares the Partner's long-running task. To restart its context, use Joko." })));
+      expect(fixture.store.findPendingContextRebuild(partner.canonicalSessionId!)).toBeUndefined();
+      expect(fixture.store.listMessagingInboundRequests({ connectionId: connection.id })).toHaveLength(1);
       const request = fixture.store.listMessagingInboundRequests({ connectionId: connection.id })[0]!;
       const activeRunId = () => {
         const queueId = adapter.context?.inputQueueItemId;

@@ -304,6 +304,29 @@ describe("Telegram Messaging production product chain", () => {
       releaseProvider();
     }
 
+    telegram.enqueueDirectMessage({ updateId: 18, messageId: 108, text: "/new" });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.replyToMessageId === 108 && message.text === "A new conversation is ready. Previous task history was archived."),
+    "the new direct Telegram conversation", 25_000);
+    const freshId = required(fixture.application.store.getMessagingConversation(restartedConversation.id).sessionId, "fresh Telegram task");
+    expect(freshId).not.toBe(sessionId);
+    expect(fixture.application.store.getSession(sessionId).descriptor.archived).toBe(true);
+    expect(fixture.application.store.getArtifact(staged.blob.id).sessionId).toBe(sessionId);
+    expect(fixture.providerRequests).toHaveLength(4);
+
+    const freshPrompt = "Use only this fresh conversation.";
+    telegram.enqueueDirectMessage({ updateId: 19, messageId: 109, text: freshPrompt });
+    await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
+      message.replyToMessageId === 109 && message.text === SECOND_REPLY), "a reply from the fresh Telegram task", 25_000);
+    const freshRequest = required(fixture.application.store.listMessagingInboundRequests()
+      .find(request => request.providerMessageId === "109"), "fresh Telegram request");
+    expect(fixture.application.store.getQueueItem(freshRequest.queueItemId!).sessionId).toBe(freshId);
+    expect(fixture.providerRequests).toHaveLength(5);
+    const freshProviderInput = JSON.stringify(fixture.providerRequests[4]?.body["messages"]);
+    expect(freshProviderInput).toContain(freshPrompt);
+    expect(freshProviderInput).not.toContain("Keep this original turn running.");
+    expect(freshProviderInput).not.toContain("Compare this native audio and the quoted note.");
+
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),
       connections: fixture.application.store.listMessagingConnections(),

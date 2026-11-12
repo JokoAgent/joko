@@ -437,9 +437,11 @@ interface TelegramHistorySelection {
   readonly expiresAt: number;
 }
 
-interface MessagingStopResult {
+type MessagingTaskCommand = "stop" | "new";
+
+interface MessagingTaskCommandResult {
   readonly notice: string;
-  readonly failure?: "stop_unavailable" | "stop_effect_unknown";
+  readonly failure?: "stop_unavailable" | "stop_effect_unknown" | "new_unavailable" | "new_effect_unknown";
 }
 
 interface MessagingOutboundFile {
@@ -479,7 +481,7 @@ export interface MessagingManagerOptions {
   readonly contextVault?: Pick<CredentialVault, "seal" | "open">;
   readonly sessionHost: Pick<SessionHost,
     "createServiceSession" | "enqueueServiceInput" | "resolveInteraction" | "dismissInteraction"
-    | "abort" | "applySessionSettings" | "observeQueueDispatch">;
+    | "abort" | "applySessionSettings" | "observeQueueDispatch" | "assertSessionLifecycleIdle" | "closeIfActive">;
   readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob" | "createDispatchInputArtifacts">;
   readonly contacts?: Pick<ContactManager, "registerTelegramGroupSpeaker">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
@@ -1845,11 +1847,13 @@ export class MessagingManager {
       ? batch.interactionReplyCandidates
       : [];
     const interactionReplyMessageIds = new Set<string>();
-    const stopMessages = new Set<string>();
+    const taskCommands = new Map<string, MessagingTaskCommand>();
+    const partnerBound = activeConnection.channel === "discord" && this.#partnerRuntime?.binding(activeConnection.id).partnerId !== undefined;
     for (const event of events) {
       if (event.kind !== "message") continue;
-      if (isMessagingStopInput(event)) {
-        stopMessages.add(messagingMessageKey(event.address, event.messageId));
+      const command = messagingTaskCommand(event, partnerBound);
+      if (command !== undefined) {
+        taskCommands.set(messagingMessageKey(event.address, event.messageId), command);
       } else if (this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
         interactionReplyMessageIds.add(event.messageId);
       }
@@ -1862,7 +1866,7 @@ export class MessagingManager {
     for (const observation of batch.groupObservations) {
       signal.throwIfAborted();
       if (interactionReplyMessageIds.has(observation.messageId)
-        || stopMessages.has(messagingMessageKey(observation.address, observation.messageId))) continue;
+        || taskCommands.has(messagingMessageKey(observation.address, observation.messageId))) continue;
       if (activeConnection.channel === "slack"
         && !admittedAddresses.has(messagingAddressKey(observation.address))
         && this.#store.findMessagingConversationByAddress({
@@ -1881,8 +1885,9 @@ export class MessagingManager {
     for (const event of events) {
       signal.throwIfAborted();
       if (event.kind === "message") {
-        if (stopMessages.has(messagingMessageKey(event.address, event.messageId))) {
-          await this.#processTaskStop(activeConnection, event, signal);
+        const command = taskCommands.get(messagingMessageKey(event.address, event.messageId));
+        if (command !== undefined) {
+          await this.#processTaskCommand(activeConnection, event, command, signal);
           continue;
         }
         const contextToken = activeConnection.channel === "wechat"
@@ -2406,7 +2411,8 @@ export class MessagingManager {
     return stopped;
   }
 
-  async #processTaskStop(connection: MessagingConnectionRecord, event: MessagingInboundMessage, signal: AbortSignal): Promise<void> {
+  async #processTaskCommand(connection: MessagingConnectionRecord, event: MessagingInboundMessage,
+    action: MessagingTaskCommand, signal: AbortSignal): Promise<void> {
     if (event.ambient || event.speaker.isBot || !event.speaker.isOwner
       || event.speaker.providerUserId !== connection.ownerProviderUserId) return;
     const assertOwner = () => {
@@ -2421,11 +2427,11 @@ export class MessagingManager {
     const { conversation, claimed } = this.#store.transaction(store => {
       assertOwner();
       const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
-      const payload = { format: 1, action: "stop" };
+      const payload = { format: 1, action };
       const interaction = store.createMessagingInteraction({
         connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
         allowObservedConversation: true, providerRequestId: event.providerRequestIds[0]!,
-        providerInteractionId: `stop:${conversation.id}:${event.messageId}`, providerMessageId: event.messageId,
+        providerInteractionId: `${action}:${conversation.id}:${event.messageId}`, providerMessageId: event.messageId,
         actionHash: operationBodyHash(payload), payload, expiresAt: now + 30 * 60_000, createdAt: now
       });
       const claimed = interaction.status === "pending" ? store.claimMessagingInteraction({
@@ -2435,15 +2441,9 @@ export class MessagingManager {
     });
     if (claimed === undefined) return;
 
-    let result: MessagingStopResult;
-    try {
-      result = await this.#stopOwnedMessagingTurn(conversation, claimed.id, signal, assertOwner);
-    } catch {
-      result = { notice: "The stop result could not be confirmed. Check the original task.", failure: "stop_effect_unknown" };
-    }
-    assertOwner();
-    const settledAt = this.#now();
-    this.#store.transaction(store => {
+    const settle = (store: OperationalStore, result: MessagingTaskCommandResult) => {
+      assertOwner();
+      const settledAt = this.#now();
       const payload = { format: 1, address: event.address, text: result.notice, replyToMessageId: event.messageId };
       store.enqueueMessagingDelivery({
         connectionId: connection.id, expectedChannelGeneration: connection.generation, conversationId: conversation.id,
@@ -2452,11 +2452,116 @@ export class MessagingManager {
       });
       store.settleMessagingInteraction({
         interactionId: claimed.id, expectedRevision: claimed.revision, claimToken, settledAt,
-        status: result.failure === undefined ? "completed" : result.failure === "stop_unavailable" ? "failed" : "unknown",
+        status: result.failure === undefined ? "completed"
+          : result.failure === "stop_unavailable" || result.failure === "new_unavailable" ? "failed" : "unknown",
         ...(result.failure === undefined ? {} : { outcomeCode: result.failure })
       });
-    });
+    };
+    let result: MessagingTaskCommandResult | undefined;
+    try {
+      result = action === "stop" ? await this.#stopOwnedMessagingTurn(conversation, claimed.id, signal, assertOwner)
+        : await this.#startTaskConversation(connection, conversation, event, claimed.id, signal, assertOwner, settle);
+    } catch (error) {
+      if (action === "stop") result = { notice: "The stop result could not be confirmed. Check the original task.", failure: "stop_effect_unknown" };
+      else if (error instanceof MessagingManagerError && error.code === "invalid") result = { notice: error.message, failure: "new_unavailable" };
+      else result = { notice: "The new conversation could not be confirmed. Check the original task.", failure: "new_effect_unknown" };
+    }
+    const unsettledResult = result;
+    if (unsettledResult !== undefined && this.#store.getMessagingInteraction(claimed.id).status === "claimed") {
+      this.#store.transaction(store => settle(store, unsettledResult));
+    }
     this.#scheduleDeliveryDrain(connection.id);
+  }
+
+  async #startTaskConversation(
+    connection: MessagingConnectionRecord,
+    conversation: MessagingConversationRecord,
+    event: MessagingInboundMessage,
+    interactionId: string,
+    signal: AbortSignal,
+    assertOwner: () => void,
+    settle: (store: OperationalStore, result: MessagingTaskCommandResult) => void
+  ): Promise<MessagingTaskCommandResult | undefined> {
+    const partner = this.#partnerRuntime?.binding(connection.id);
+    if (partner?.partnerId !== undefined) {
+      const bound = await this.#partnerRuntime?.resolve(conversation, event);
+      assertOwner();
+      const current = this.#partnerRuntime?.binding(connection.id);
+      if (bound?.partnerId !== partner.partnerId || bound.partnerBindingRevision !== partner.revision
+        || current?.partnerId !== partner.partnerId || current.revision !== partner.revision) {
+        throw invalid("The original Partner conversation is unavailable.");
+      }
+      return { notice: "This chat shares the Partner's long-running task. To restart its context, use Joko." };
+    }
+    if (conversation.partnerId !== undefined || connection.channel !== "telegram") {
+      throw invalid("The original message task is no longer available.");
+    }
+    const route = this.#store.resolveMessagingRoute(connection.id);
+    const previousId = conversation.sessionId;
+    const assertLane = () => {
+      assertOwner();
+      const current = this.#store.getMessagingConversation(conversation.id);
+      const currentRoute = this.#store.resolveMessagingRoute(connection.id);
+      if (current.revision !== conversation.revision || current.status === "retired" || current.sessionId !== previousId
+        || this.#partnerRuntime?.binding(connection.id).partnerId !== undefined
+        || currentRoute.scopeKey !== route.scopeKey || currentRoute.revision !== route.revision) {
+        throw invalid("The original conversation or its route changed. Send /new again.");
+      }
+    };
+    const assertIdle = () => {
+      assertLane();
+      if (previousId === undefined) return;
+      const task = this.#store.getSession(previousId).descriptor;
+      if (task.archived || task.deletedAt !== undefined) throw invalid("The original message task is no longer available.");
+      try { this.#sessionHost.assertSessionLifecycleIdle(previousId); }
+      catch { throw invalid("Wait for the original task to settle, then send /new again."); }
+    };
+    if (previousId !== undefined) {
+      if (this.#store.sessionCreationServiceKind(previousId) !== "messaging") throw invalid("The original task is outside this message conversation.");
+      const activeInputs = () => listAllQueueItems(this.#store, { sessionId: previousId,
+        states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"] });
+      const inputs = activeInputs();
+      if (inputs.some(item => {
+        const request = this.#store.findMessagingInboundRequestByRunId(item.runId);
+        return request?.conversationId !== conversation.id || request.channelGeneration !== connection.generation;
+      })) throw invalid("Finish the other work in the original task before starting a new conversation.");
+      if (inputs.length > 0) {
+        const stopped = await this.#stopOwnedMessagingTurn(conversation, interactionId, signal, assertLane);
+        if (stopped.failure !== undefined) return stopped;
+        const deadline = performance.now() + 5_000;
+        while (activeInputs().length > 0 && performance.now() < deadline) {
+          await abortableDelay(50, signal);
+          assertLane();
+        }
+      }
+      assertIdle();
+      await this.#sessionHost.closeIfActive(previousId);
+    }
+    await this.#sessionHost.createServiceSession({
+      operationId: `messaging-new-session-${interactionId}`, serviceKind: "messaging",
+      targetId: route.targetId, title: `Telegram · ${safeExternalText(event.speaker.displayName, 128)}`,
+      providerId: route.providerId, modelId: route.modelId, effort: route.effort, fastMode: route.fastMode,
+      permissionMode: route.permissionMode, planMode: route.planMode, assertServiceScope: assertIdle,
+      onMessagingAdmitted: (store, session) => {
+        assertIdle();
+        const now = this.#now();
+        const binding = { conversationId: conversation.id, expectedRevision: conversation.revision,
+          expectedChannelGeneration: connection.generation, sessionId: session.descriptor.id,
+          expectedSessionGeneration: session.descriptor.binding.generation, routeScopeKey: route.scopeKey, updatedAt: now };
+        if (previousId === undefined) store.bindMessagingConversation(binding);
+        else {
+          store.rebindMessagingConversationSession({ ...binding, expectedSessionId: previousId });
+          const previous = store.getSession(previousId);
+          const archived = store.updateSession(previousId, { archived: true }, previous.revision, now).descriptor;
+          store.appendEvent({ backendId: archived.backendId, targetId: archived.targetId, sessionId: archived.id,
+            generation: archived.binding.generation, emittedAt: now, traceId: `messaging-new-session:${interactionId}`,
+            payload: { type: "session_changed" } });
+        }
+        settle(store, { notice: previousId === undefined ? "A new conversation is ready."
+          : "A new conversation is ready. Previous task history was archived." });
+      }
+    });
+    return undefined;
   }
 
   async #stopOwnedMessagingTurn(
@@ -2464,7 +2569,7 @@ export class MessagingManager {
     interactionId: string,
     signal: AbortSignal,
     assertOwner: () => void
-  ): Promise<MessagingStopResult> {
+  ): Promise<MessagingTaskCommandResult> {
     const sessionId = conversation.sessionId;
     if (sessionId === undefined) return { notice: "No active task needed stopping." };
     const assertCurrent = () => {
@@ -5706,11 +5811,12 @@ function messagingAddressKey(address: MessagingAddress): string {
   ]);
 }
 
-function isMessagingStopInput(event: MessagingInboundMessage): boolean {
-  return (event.address.channel === "telegram" || event.address.channel === "discord")
-    && event.attachments.length === 0 && event.unsupported.length === 0
-    && (event.telegramReplyParts === undefined || event.telegramReplyParts.attachments.length === 0 && event.telegramReplyParts.unsupported.length === 0)
-    && isMessagingStopCommand(event.text);
+function messagingTaskCommand(event: MessagingInboundMessage, partnerBound: boolean): MessagingTaskCommand | undefined {
+  const { channel, conversationKind } = event.address;
+  if (channel !== "telegram" && channel !== "discord" || event.attachments.length > 0 || event.unsupported.length > 0
+    || event.telegramReplyParts !== undefined && (event.telegramReplyParts.attachments.length > 0 || event.telegramReplyParts.unsupported.length > 0)) return;
+  if (isMessagingStopCommand(event.text)) return "stop";
+  if (conversationKind === "direct" && (channel === "telegram" || partnerBound) && event.text.trim().toLowerCase() === "/new") return "new";
 }
 
 function messagingMessageKey(address: MessagingAddress, messageId: string): string {
