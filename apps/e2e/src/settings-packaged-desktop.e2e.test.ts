@@ -13,7 +13,7 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
-import { createPackagedDesktopStartupEvidence } from "./packaged-desktop-startup.js";
+import { createPackagedDesktopStartupEvidence, readLaunchedWindowsDesktopProcess, type OwnedWindowsDesktopProcess } from "./packaged-desktop-startup.js";
 
 const packagedIt = process.platform === "win32" && process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE?.trim()
   ? it : it.skip;
@@ -24,15 +24,9 @@ const navigation = "Toggle question navigation rail";
 const webLinks = "Select external web link destination";
 const localLinks = "Select local and Workspace HTML destination";
 
-interface OwnedProcess {
-  readonly pid: number;
-  readonly executablePath: string;
-  readonly startedAt: string;
-}
-
 let fixture: OrchestratorE2eFixture | undefined;
 let desktop: ElectronApplication | undefined;
-let desktopIdentity: OwnedProcess | undefined;
+let desktopIdentity: OwnedWindowsDesktopProcess | undefined;
 let profileDirectory: string | undefined;
 const workspaceRequests = new WeakMap<Page, string[]>();
 const startupEvidence = createPackagedDesktopStartupEvidence();
@@ -422,7 +416,7 @@ async function launchSettingsDesktop(): Promise<{ readonly application: Electron
   console.info("Packaged settings: Desktop launch returned.");
   const launcherPid = desktop.process().pid;
   if (launcherPid === undefined) throw new Error("Settings Desktop returned no spawned process ID.");
-  desktopIdentity = await readLaunchedProcess(launcherPid, executablePath);
+  desktopIdentity = await readLaunchedWindowsDesktopProcess(launcherPid, executablePath);
   if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
     throw new Error("Settings Desktop launched an unexpected executable.");
   }
@@ -526,23 +520,7 @@ async function closeDesktop(afterFailure = false): Promise<void> {
   desktop = undefined;
 }
 
-async function readLaunchedProcess(launcherPid: number, executablePath: string): Promise<OwnedProcess> {
-  if (!Number.isSafeInteger(launcherPid) || launcherPid <= 0) throw new Error("Invalid Settings Desktop launcher PID.");
-  const script = "$ErrorActionPreference = 'Stop'; $ownedCandidates = @(Get-CimInstance Win32_Process -Filter 'ProcessId = "
-    + launcherPid + " OR ParentProcessId = " + launcherPid
-    + "' | Where-Object { $_.ExecutablePath -eq $env:JOKO_E2E_DESKTOP_EXECUTABLE }); "
-    + "if ($ownedCandidates.Count -ne 1) { throw 'Expected one Desktop main process under its launcher.' }; "
-    + "$ownedProcess = $ownedCandidates[0]; [pscustomobject]@{ pid = $ownedProcess.ProcessId; executablePath = $ownedProcess.ExecutablePath; startedAt = $ownedProcess.CreationDate.ToUniversalTime().ToString('O') } | ConvertTo-Json -Compress";
-  const output = await new Promise<string>((resolveOutput, rejectOutput) => {
-    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      windowsHide: true, timeout: 10_000,
-      env: { ...process.env, JOKO_E2E_DESKTOP_EXECUTABLE: executablePath }
-    }, (error, stdout) => error ? rejectOutput(error) : resolveOutput(stdout));
-  });
-  return JSON.parse(output) as OwnedProcess;
-}
-
-async function readProcess(pid: number): Promise<OwnedProcess | undefined> {
+async function readProcess(pid: number): Promise<OwnedWindowsDesktopProcess | undefined> {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid Settings Desktop PID.");
   const script = "$candidate = Get-CimInstance Win32_Process -Filter 'ProcessId = " + pid
     + "'; if ($null -ne $candidate) { [pscustomobject]@{ pid = $candidate.ProcessId; executablePath = $candidate.ExecutablePath; startedAt = $candidate.CreationDate.ToUniversalTime().ToString('O') } | ConvertTo-Json -Compress }";
@@ -550,7 +528,7 @@ async function readProcess(pid: number): Promise<OwnedProcess | undefined> {
     execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
       { windowsHide: true, timeout: 10_000 }, (error, stdout) => error ? rejectOutput(error) : resolveOutput(stdout));
   });
-  return output.trim() ? JSON.parse(output) as OwnedProcess : undefined;
+  return output.trim() ? JSON.parse(output) as OwnedWindowsDesktopProcess : undefined;
 }
 
 async function git(cwd: string, args: readonly string[]): Promise<void> {
