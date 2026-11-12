@@ -30,12 +30,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createE2eClients, type E2eClients, type PairedClient } from "./connect-clients.js";
 import { OrchestratorE2eFixture } from "./fixture.js";
 
+const DICTIONARY_DISCOVERY_PORT = 53_548;
+
 describe("durable voice dictionary through authenticated generated RPCs", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   let peerFixture: OrchestratorE2eFixture | undefined;
   let discovery: ReturnType<typeof observeDictionaryDiscoveryStartup> | undefined;
+  let multicastPort: number | undefined;
   const streamCleanups: Array<() => Promise<void>> = [];
-  beforeEach(() => { discovery = observeDictionaryDiscoveryStartup(); });
+  beforeEach(async () => {
+    multicastPort ??= await selectDictionaryDiscoveryPort();
+    discovery = observeDictionaryDiscoveryStartup(multicastPort);
+  });
+  const startDictionaryPeer = (options: NonNullable<Parameters<typeof OrchestratorE2eFixture.start>[0]>) =>
+    OrchestratorE2eFixture.start({ ...options, dictionaryPeerMulticastPort: multicastPort! });
   afterEach(async ({ task }) => {
     try {
       for (const close of streamCleanups.splice(0).reverse()) await close();
@@ -150,8 +158,8 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
 
   it("requires bilateral fingerprint grants through real HTTP and restores sharing authority without changing node identity", async () => {
     const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
-    fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-first", keepRoot: true });
-    peerFixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-second", keepRoot: true });
+    fixture = await startDictionaryPeer({ dictionaryPeerNodeId: "e2e-dictionary-first", keepRoot: true });
+    peerFixture = await startDictionaryPeer({ dictionaryPeerNodeId: "e2e-dictionary-second", keepRoot: true });
     const statusRequest = create(GetVoiceInputDictionaryPeerStatusRequestSchema);
     await expect(fixture.anonymous.voiceInput.getVoiceInputDictionaryPeerStatus(statusRequest)).rejects.toMatchObject({ code: Code.Unauthenticated });
     const firstPair = await fixture.pair("Sharing editor");
@@ -234,7 +242,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const rootDirectory = peerFixture.rootDirectory;
     currentPhoneAbort.abort(); await Promise.all([phoneContent.done, phoneSharing.done]);
     await peerFixture.close({ removeRoot: false });
-    peerFixture = await OrchestratorE2eFixture.start({ rootDirectory, dictionaryPeerNodeId: "e2e-dictionary-second" });
+    peerFixture = await startDictionaryPeer({ rootDirectory, dictionaryPeerNodeId: "e2e-dictionary-second" });
     expect(peerFixture.application.serverId).toBe(credential.serverId);
     expect(peerFixture.application.linkspanIdentity!.publicKey).toBe(credential.endpointPublicKey);
     expect(fixture.application.linkspanIdentity!.publicKey).toBe(firstEndpointPublicKey);
@@ -283,8 +291,8 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const { MobileOfflineCache } = await import(new URL("../../mobile/src/mobile-offline-cache.ts", import.meta.url).href);
     const { mobileReadOnlyDictionarySources } = await import(new URL("../../mobile/src/mobile-voice-dictionary-readonly.ts", import.meta.url).href);
     const { profileFromCredential } = await import(new URL("../../mobile/src/connection-storage.ts", import.meta.url).href);
-    fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-a", keepRoot: true });
-    peerFixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-b", keepRoot: true });
+    fixture = await startDictionaryPeer({ dictionaryPeerNodeId: "readonly-node-a", keepRoot: true });
+    peerFixture = await startDictionaryPeer({ dictionaryPeerNodeId: "readonly-node-b", keepRoot: true });
     const streamSignals: Array<{ method: string; signal: AbortSignal; done: Promise<void> }> = [];
     const readonlyRequests = new Map<string, { started: number; responses: number; failed: number }>();
     async function* observeStream<T>(method: string, signal: AbortSignal, stream: AsyncIterable<T>) {
@@ -405,8 +413,8 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     await vi.waitFor(() => { expect(phone.controller.state.refreshing).toBe(false); expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["offline", "offline"]); });
     expect(phone.app.state.status).toBe("offline"); expect(phone.controller.state.selected?.snapshot).toEqual(disabledSnapshot);
     expect(credentials.has(a.profileId)).toBe(true); expect(credentials.has(b.profileId)).toBe(true);
-    fixture = await OrchestratorE2eFixture.start({ rootDirectory: rootA, dictionaryPeerNodeId: "readonly-node-a", publicPort: portA });
-    peerFixture = await OrchestratorE2eFixture.start({ rootDirectory: rootB, dictionaryPeerNodeId: "readonly-node-b", publicPort: portB });
+    fixture = await startDictionaryPeer({ rootDirectory: rootA, dictionaryPeerNodeId: "readonly-node-a", publicPort: portA });
+    peerFixture = await startDictionaryPeer({ rootDirectory: rootB, dictionaryPeerNodeId: "readonly-node-b", publicPort: portB });
     expect(fixture.application.serverId).toBe(a.serverId); expect(peerFixture.application.serverId).toBe(b.serverId);
     expect(fixture.application.linkspanIdentity!.publicKey).toBe(a.endpointPublicKey);
     expect(peerFixture.application.linkspanIdentity!.publicKey).toBe(b.endpointPublicKey);
@@ -437,7 +445,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     let journeyError: unknown;
     let journeyStage = "journey";
     const start = async (name: string) => {
-      const node = await ProductionDictionaryNode.start(join(root, name), { directOnly: direct });
+      const node = await ProductionDictionaryNode.start(join(root, name), { directOnly: direct, multicastPort: multicastPort! });
       running.add(node);
       return node;
     };
@@ -789,7 +797,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
   }, 300_000);
 
   it("drains both idle dictionary projections immediately on public server shutdown", async () => {
-    fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-shutdown", keepRoot: true });
+    fixture = await startDictionaryPeer({ dictionaryPeerNodeId: "e2e-dictionary-shutdown", keepRoot: true });
     const paired = await fixture.pair("Live dictionary observer");
     const abort = new AbortController();
     const content = observedProjection(paired.clients.voiceInput.watchVoiceInputDictionary({}, { signal: abort.signal, timeoutMs: 0 }), abort.signal);
@@ -845,7 +853,34 @@ async function dictionaryDeadline<T>(operation: Promise<T>, milliseconds: number
 }
 
 /** Records only fixed native startup phases and standard errno for the dictionary discovery port. */
-function observeDictionaryDiscoveryStartup() {
+async function probeDictionaryDiscoveryPort(port: number): Promise<number> {
+  const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("error", reject);
+      socket.bind(port, "0.0.0.0", resolve);
+    });
+    return socket.address().port;
+  } finally {
+    await new Promise<void>(resolve => {
+      try { socket.close(resolve); } catch { resolve(); }
+    });
+  }
+}
+
+async function selectDictionaryDiscoveryPort(): Promise<number> {
+  if (process.platform !== "win32" || process.env.GITHUB_ACTIONS !== "true") return DICTIONARY_DISCOVERY_PORT;
+  try {
+    return await probeDictionaryDiscoveryPort(DICTIONARY_DISCOVERY_PORT);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
+    const port = await probeDictionaryDiscoveryPort(0);
+    console.info("Dictionary discovery fixture port:", { defaultPort: DICTIONARY_DISCOVERY_PORT, error: "EACCES", fixturePort: port });
+    return port;
+  }
+}
+
+function observeDictionaryDiscoveryStartup(multicastPort: number) {
   type Phase = "bind" | "discovery_socket" | "membership" | "multicast_interface" | "multicast_ttl" | "multicast_loopback";
   const entries: Array<{ readonly socket: number; readonly phase: Phase; readonly event: "start" | "complete" | "error"; readonly code?: string }> = [];
   const restore: Array<() => void> = [];
@@ -863,7 +898,7 @@ function observeDictionaryDiscoveryStartup() {
     const socket = createSocket(options, listener), id = ++nextSocket;
     let requestedPort: number | undefined, currentPhase: Phase = "bind";
     const record = (phase: Phase, event: "start" | "complete" | "error", error?: unknown) => {
-      if (requestedPort === 53_548 && entries.length < 64) entries.push({ socket: id, phase, event, ...(event === "error" ? { code: errno(error) } : {}) });
+      if (requestedPort === multicastPort && entries.length < 64) entries.push({ socket: id, phase, event, ...(event === "error" ? { code: errno(error) } : {}) });
     };
     const step = <T,>(phase: Phase, invoke: () => T): T => {
       record(phase, "start");
@@ -892,7 +927,7 @@ function observeDictionaryDiscoveryStartup() {
     });
     return socket;
   });
-  return { snapshot: () => ({ phase: "native_lan_startup", socketsCreated: nextSocket, entries: [...entries] }),
+  return { snapshot: () => ({ phase: "native_lan_startup", multicastPort, socketsCreated: nextSocket, entries: [...entries] }),
     stop: () => { create.mockRestore(); for (const undo of restore.reverse()) undo(); } };
 }
 
@@ -964,7 +999,7 @@ class ProductionDictionaryNode {
     this.#pairingCodes = input.pairingCodes; this.#removePairingListener = input.removePairingListener;
   }
 
-  static async start(root: string, options: { readonly directOnly?: boolean } = {}): Promise<ProductionDictionaryNode> {
+  static async start(root: string, options: { readonly directOnly: boolean; readonly multicastPort: number }): Promise<ProductionDictionaryNode> {
     const workspace = join(root, "workspace");
     const dataDirectory = join(root, "data");
     await mkdir(workspace, { recursive: true });
@@ -983,7 +1018,7 @@ class ProductionDictionaryNode {
     let server: Awaited<ReturnType<typeof createPublicServer>> | undefined;
     let removePairingListener: (() => void) | undefined;
     try {
-      application = await createOrchestratorApplication(config);
+      application = await createOrchestratorApplication(config, { voiceDictionaryMulticastPort: options.multicastPort });
       const pairingCodes = new Map<string, string>();
       removePairingListener = application.connections.onPairingIssued((challenge) => pairingCodes.set(challenge.id, challenge.code));
       application.connections.openPairingWindow();

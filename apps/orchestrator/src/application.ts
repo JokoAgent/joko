@@ -649,6 +649,8 @@ export interface OrchestratorApplicationDependencies {
   readonly resolveOutboundProxy?: OutboundProxyResolver;
   /** Optional speech transport owner; its credentials remain behind the factory port. */
   readonly voiceInputProvider?: VoiceInputProviderFactory;
+  /** Test-only LAN discovery port for an isolated native socket fixture. */
+  readonly voiceDictionaryMulticastPort?: number;
   /** Optional SSH transport; credential values are resolved only inside each connection attempt. */
   readonly remoteSshConnector?: ResolvedAgentAuthConnectorPort;
   readonly sshKeys?: SshKeyManager;
@@ -995,6 +997,7 @@ export async function createOrchestratorApplication(
     nodeId: serverId,
     displayName: contactSyncDisplayName(),
     enableLan: config.voiceDictionaryLanDiscoveryEnabled ?? true,
+    ...(dependencies.voiceDictionaryMulticastPort === undefined ? {} : { multicastPort: dependencies.voiceDictionaryMulticastPort }),
     logger: {
       debug: () => undefined,
       warn: () => {
