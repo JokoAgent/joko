@@ -577,6 +577,9 @@ export function interactionFromServerRequest(
     const choices = commandApprovalChoices(available.decisions);
     if (choices.length === 0) return undefined;
     const command = typeof record["command"] === "string" ? safeText(record["command"], 4_096) : "Command execution";
+    const cwd = record["cwd"];
+    const directory = typeof cwd === "string" && cwd.trim() !== "" && !/[\u0000-\u001f\u007f\u2028\u2029]/u.test(cwd)
+      ? `Working directory\n${safeText(cwd, 1_024)}` : undefined;
     const reason = typeof record["reason"] === "string" ? safeText(record["reason"], 1_024) : undefined;
     return {
       payload: {
@@ -584,7 +587,7 @@ export function interactionFromServerRequest(
         kind: "permission",
         title: "Approve command execution",
         toolName: "command",
-        summary: reason === undefined ? command : `${command}\n${reason}`,
+        summary: [command, directory, reason].filter(Boolean).join("\n\n"),
         risk: "high",
         choices
       },

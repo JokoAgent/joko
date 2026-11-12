@@ -246,11 +246,14 @@ describe("Codex interaction translation", () => {
       threadId: "thread-one",
       turnId: "turn-one",
       itemId: "command-one",
-      command: "pnpm test"
+      command: "pnpm test",
+      cwd: "D:\\other checkout",
+      reason: "Check the current changes."
     }, "D:\\workspace");
     expect(command?.payload).toMatchObject({
       kind: "permission",
       toolName: "command",
+      summary: "pnpm test\n\nWorking directory\nD:\\other checkout\n\nCheck the current changes.",
       choices: ["allow_once", "deny_once"]
     });
     expect(command?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({ decision: "accept" });
@@ -271,6 +274,16 @@ describe("Codex interaction translation", () => {
     expect(file?.toResponse({ kind: "selected", value: "allow_for_session" })).toEqual({ decision: "decline" });
     expect(file?.toResponse({ kind: "cancelled" })).toEqual({ decision: "cancel" });
   });
+
+  it.each([undefined, null, " ", "D:\\other\nworkspace", 8] as const)(
+    "leaves an unavailable command approval directory unspecified (%s)", cwd => {
+      const request = interactionFromServerRequest(11, "item/commandExecution/requestApproval", {
+        threadId: "thread-one", turnId: "turn-one", itemId: "command-one", command: "pnpm test",
+        ...(cwd === undefined ? {} : { cwd })
+      }, "D:\\workspace");
+      expect(request?.payload).toMatchObject({ kind: "permission", summary: "pnpm test" });
+    }
+  );
 
   it("narrows command choices and responses to available native decisions", () => {
     const interaction = interactionFromServerRequest(11, "item/commandExecution/requestApproval", {
