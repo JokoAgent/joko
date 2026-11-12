@@ -181,7 +181,8 @@ jobs:
     if: ${{ inputs.scope != 'windows-runtime-diagnostics' && inputs.scope != 'orchestrator-regressions' }}
     name: ${{ matrix.os }} / Node 24.19 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    # Windows product jobs have hit the job deadline after packaging and before full smoke could finish.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && matrix.workload == 'product' && 150 || 120 }}
     strategy:
       fail-fast: false
       matrix:
