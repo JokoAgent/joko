@@ -26,6 +26,7 @@ import { OperationalStore } from "@joko/store";
 import type { OrchestratorApplication } from "./application.js";
 import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
 import { createConnectServices } from "./connect-services.js";
+import { SessionHost } from "./session-host.js";
 
 describe("RemoteWorkspaceService", () => {
   it("routes bounded files, CAS mutations, search, and Git state through owner-scoped transports", async () => {
@@ -251,6 +252,65 @@ describe("RemoteWorkspaceService", () => {
     } finally {
       release?.();
       vi.restoreAllMocks();
+      await f.workspaces.close();
+      store.close();
+    }
+  });
+
+  it("retires a claimed remote deletion when its submitting connection is revoked before transport dispatch", async () => {
+    const f = await memoryWorkspaceFixture();
+    const store = new OperationalStore(":memory:");
+    const host = new SessionHost(store, {} as never, []);
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const beforeRemoval = vi.fn<(signal: AbortSignal | undefined) => void>();
+    try {
+      const workspaceId = f.registration.id;
+      store.upsertBackend({ id: "backend", displayName: "Backend", version: "test", health: "healthy", adapterKind: "fixture",
+        instanceGeneration: 0, installationState: "installed", authenticationState: "authenticated", models: [], tools: [], diagnostics: [],
+        capabilities: new Map([["workspace.files.write", { key: "workspace.files.write", supported: true }]]) });
+      store.upsertTarget({ id: "target", backendId: "backend", displayName: "Remote", workspaceRoot: f.registration.root,
+        managed: false, trusted: true, remoteWorkspace: f.registration.remote.binding }, { workspaceId });
+      const connections = new ConnectionManager(store);
+      const caller = (id: string) => {
+        const key = `key-${id}`;
+        store.createConnection({ id, name: id, authKeyDigest: digestAuthKey(key) });
+        return { requestHeader: new Headers({ authorization: `Bearer ${key}` }),
+          signal: new AbortController().signal } as HandlerContext;
+      };
+      const original = caller("original-delete-owner"), current = caller("current-delete-owner");
+      const { operation } = createConnectServices({ config: { publicOrigin: "http://127.0.0.1" }, store, connections, workspaces: f.workspaces,
+        artifacts: { maximumBlobBytes: 1024 }, sessionHost: host, scheduler: {}, adapters: [], browserActivity: [] } as unknown as OrchestratorApplication);
+      const relativePath = "note.txt", path = "/workspace/note.txt";
+      await f.files.write({ path, content: Buffer.from("Keep this file") });
+      const expectedRevision = (await f.workspaces.list(workspaceId, "")).find(entry => entry.path === relativePath)!.revision;
+      const mutation = create(contract.OperationMutationSchema, { payload: { case: "deleteWorkspaceEntry",
+        value: { workspaceId, relativePath, expectedRevision, confirmRecursive: false } } });
+      const remove = f.files.remove.bind(f.files);
+      vi.spyOn(f.files, "remove").mockImplementationOnce(async (target, options) => {
+        beforeRemoval(options?.signal);
+        await hold;
+        return remove(target, options);
+      });
+      const operationId = "original-remote-deletion";
+      const pending = operation.submitOperation({ operationId, connectionId: "original-delete-owner", mutation }, original);
+      await vi.waitFor(() => expect(beforeRemoval).toHaveBeenCalledOnce());
+      expect(store.getOperation(operationId).status).toBe("started");
+      connections.revoke("original-delete-owner");
+      const revokedBeforeRemoval = beforeRemoval.mock.calls[0]?.[0]?.aborted;
+      release();
+      expect((await pending).operation?.state).toBe(contract.OperationState.FAILED);
+      expect(revokedBeforeRemoval).toBe(true);
+      expect(original.signal.aborted).toBe(false);
+      expect(Buffer.from(await f.files.read({ path, maximumBytes: 1024 })).toString()).toBe("Keep this file");
+
+      const allowed = await operation.submitOperation({ operationId: "current-remote-deletion", connectionId: "current-delete-owner", mutation }, current);
+      expect(allowed.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+      expect(await f.workspaces.list(workspaceId, "")).toEqual([]);
+    } finally {
+      release();
+      vi.restoreAllMocks();
+      await host.dispose();
       await f.workspaces.close();
       store.close();
     }
@@ -613,7 +673,8 @@ class MemoryRemoteFiles implements RemoteFileTransportPort {
     for (const [path, entry] of moved) this.#entries.set(`${destination}${path.slice(source.length)}`, { ...entry, modifiedAt: this.#clock++ });
   }
 
-  async remove(path: string, options?: { readonly recursive?: boolean }): Promise<void> {
+  async remove(path: string, options?: { readonly recursive?: boolean; readonly signal?: AbortSignal }): Promise<void> {
+    options?.signal?.throwIfAborted();
     const accepted = normalize(path);
     this.require(accepted);
     const children = [...this.#entries.keys()].filter((candidate) => candidate.startsWith(`${accepted}/`));

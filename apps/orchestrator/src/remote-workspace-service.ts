@@ -217,7 +217,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput, request?.signal); break;
         case "createEntry": result = await this.#createEntry(registration, transports.files, args[0] as { path: string; kind: "file" | "directory"; expectedRevision: string }); break;
         case "moveEntry": result = await this.#moveEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
-        case "deleteEntry": result = await this.#deleteEntry(registration, transports.files, args[0] as { path: string; expectedRevision: string; confirmRecursive: boolean }); break;
+        case "deleteEntry": result = await this.#deleteEntry(registration, transports.files, args[0] as { path: string; expectedRevision: string; confirmRecursive: boolean }, request?.signal); break;
         case "copyEntry": result = await this.#copyEntry(registration, transports.files, args[0] as { sourcePath: string; destinationPath: string; expectedRevision: string }); break;
         case "search": result = (await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined)).matches; break;
         case "searchPage": result = await this.#searchPage(registration, transports, args[0] as string, args[1] as WorkspaceSearchOptions | undefined, request?.signal); break;
@@ -567,7 +567,8 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   async #deleteEntry(
     registration: WorkspaceRegistration,
     files: RemoteFileTransportPort,
-    input: { path: string; expectedRevision: string; confirmRecursive: boolean }
+    input: { path: string; expectedRevision: string; confirmRecursive: boolean },
+    signal?: AbortSignal
   ): Promise<void> {
     const path = remoteWorkspacePath(registration, input.path, false);
     await assertRemoteMutationPath(registration, files, path, true);
@@ -578,7 +579,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     }
     await assertRemoteMutationPath(registration, files, path, true);
     assertRemoteRevision(await files.stat(path), input.expectedRevision);
-    await files.remove(path, { recursive: before.kind === "directory" });
+    await files.remove(path, { recursive: before.kind === "directory", ...(signal === undefined ? {} : { signal }) });
   }
 
   async #copyEntry(

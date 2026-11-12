@@ -19141,11 +19141,18 @@ async function dispatchMutation(
         mutation,
         payload.case,
         payload.value.workspaceId,
-        () => dependencies.workspaceService.deleteEntry(payload.value.workspaceId, {
-          path: payload.value.relativePath,
-          expectedRevision: payload.value.expectedRevision,
-          confirmRecursive: payload.value.confirmRecursive
-        }, () => { dependencies.connections.fence(connection); })
+        async () => {
+          const owner = captureConnectionRevocation(dependencies.connections, connection);
+          try {
+            await dependencies.workspaceService.deleteEntry(payload.value.workspaceId, {
+              path: payload.value.relativePath,
+              expectedRevision: payload.value.expectedRevision,
+              confirmRecursive: payload.value.confirmRecursive
+            }, { signal: owner.signal, assertCurrent: () => { dependencies.connections.fence(connection); } });
+          } finally {
+            owner.dispose();
+          }
+        }
       );
     case "copyWorkspaceEntry":
       return workspaceEntryEffectOperation(

@@ -345,6 +345,37 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
     await connection.close();
   });
 
+  it("cancels an SFTP delete waiting for file attributes before sending REMOVE", async () => {
+    const path = "/workspace/note.txt";
+    const held = vi.fn();
+    const removed = vi.fn();
+    let hold = false;
+    const server = await startSshServer({
+      holdSftpLstat: requested => {
+        if (!hold || requested !== path) return false;
+        held();
+        return true;
+      },
+      onSftpRemove: removed
+    });
+    const connection = await connect(server.port);
+    const controller = new AbortController();
+    try {
+      const files = connection.files!;
+      await files.mkdir("/workspace");
+      await files.write({ path, content: Buffer.from("Keep this file") });
+      hold = true;
+      const retired = expect(files.remove(path, { signal: controller.signal })).rejects.toMatchObject({ code: "ABORTED" });
+      await vi.waitFor(() => expect(held).toHaveBeenCalledOnce());
+      controller.abort();
+      await retired;
+      expect(removed).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      await connection.close();
+    }
+  });
+
   it("uses standard SFTP rename when a destination appears, even when POSIX replacement is available", async () => {
     const server = await startSshServer();
     const connection = await connect(server.port);
@@ -612,7 +643,12 @@ async function connect(port: number, options: Ssh2ResolvedAgentAuthConnectorOpti
   });
 }
 
-async function startSshServer(options: { deferTerminal?: boolean; confirmTerminalStop?: boolean } = {}): Promise<TestSshServer> {
+async function startSshServer(options: {
+  deferTerminal?: boolean;
+  confirmTerminalStop?: boolean;
+  holdSftpLstat?: (path: string) => boolean;
+  onSftpRemove?: (path: string) => void;
+} = {}): Promise<TestSshServer> {
   const commands: string[] = [];
   const terminalChannels: ServerChannel[] = [];
   const terminalRequests: { term: string; cols: number; rows: number }[] = [];
@@ -700,7 +736,7 @@ async function startSshServer(options: { deferTerminal?: boolean; confirmTermina
           }
           echoProcess(stream);
         });
-        session.on("sftp", (acceptSftp) => installMemorySftp(acceptSftp()));
+        session.on("sftp", (acceptSftp) => installMemorySftp(acceptSftp(), options.holdSftpLstat, options.onSftpRemove));
       });
       client.on("tcpip", (acceptForward, reject, info) => {
         if (
@@ -779,7 +815,7 @@ interface MemoryHandle {
   sent?: boolean;
 }
 
-function installMemorySftp(sftp: SFTPWrapper): void {
+function installMemorySftp(sftp: SFTPWrapper, holdLstat?: (path: string) => boolean, onRemove?: (path: string) => void): void {
   const { OPEN_MODE, STATUS_CODE } = ssh2.utils.sftp;
   const files = new Map<string, MemoryFile>([[
     "/",
@@ -821,7 +857,9 @@ function installMemorySftp(sftp: SFTPWrapper): void {
     }
     sftp.attrs(requestId, memoryAttrs(entry));
   };
-  sftp.on("LSTAT", sendStats);
+  sftp.on("LSTAT", (requestId: number, path: string) => {
+    if (!holdLstat?.(path)) sendStats(requestId, path);
+  });
   sftp.on("STAT", sendStats);
   sftp.on("OPEN", (requestId: number, value: string, flags: number, attrs: Attributes) => {
     const path = memoryPath(value);
@@ -933,6 +971,7 @@ function installMemorySftp(sftp: SFTPWrapper): void {
     okay(requestId);
   });
   sftp.on("REMOVE", (requestId: number, value: string) => {
+    onRemove?.(value);
     const path = memoryPath(value);
     if (path === undefined || files.get(path)?.kind !== "file") {
       missing(requestId);

@@ -148,7 +148,7 @@ describe("WorkspaceService entry mutations", () => {
     try {
       await entered;
       const deletingSecond = service.deleteEntry("workspace", { path: second.path, expectedRevision: second.revision, confirmRecursive: false },
-        () => { store.authorizeConnection(owner.id, owner.authKeyDigest); });
+        { signal: new AbortController().signal, assertCurrent: () => { store.authorizeConnection(owner.id, owner.authKeyDigest); } });
       const denied = expect(deletingSecond).rejects.toMatchObject({ name: "AuthorizationError" });
       store.revokeConnection(owner.id);
       release();
