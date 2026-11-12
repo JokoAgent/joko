@@ -35,7 +35,7 @@ const hostResourceSnapshots = [];
 const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
   "install-owned-application", "locate-installed-application", "retry-locate-installed-application", "launch-owned-application", "capture-simulator-springboard",
-  "locate-application-after-install-timeout",
+  "locate-application-after-install-timeout", "retry-locate-application-after-install-timeout",
   "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance", "compile-screen-observer",
   "locate-launched-application-process", "locate-ui-tested-application-process",
   "locate-pre-ui-build-application-process", "locate-post-ui-build-application-process",
@@ -95,22 +95,18 @@ async function installOwnedApplication(app) {
       || receipt.killed !== true || receipt.signal !== "SIGTERM" || receipt.exitCode !== null || receipt.errorCode !== null) throw error;
     installation.installerTimedOut = true;
     save("installation-state.json", installation);
-    // A killed host RPC does not establish whether the device committed its
-    // installation. Read that exact application's state once; never reinstall.
-    stage = "timed-out installation identity lookup";
-    const container = await command("xcrun", ["simctl", "get_app_container", owner.udid, owner.bundleId, "app"],
-      { timeout: 30_000, startupLabel: "locate-application-after-install-timeout" });
-    return { container, installation };
   }
-  return { container: await locateInitiallyInstalledApplication(), installation };
+  // A killed host RPC leaves the installation uncertain. Query the original
+  // device and application before verifying the installed executable.
+  return { container: await locateOwnedApplication(installation.installerTimedOut), installation };
 }
-async function locateInitiallyInstalledApplication() {
+async function locateOwnedApplication(afterInstallTimeout) {
   const owner = { simulatorUdid: udid, bundleId, deviceName };
-  stage = "installed application identity lookup";
-  return locateInstalledSimulatorApplication({ owner, command, signal: abort.signal,
+  stage = afterInstallTimeout ? "timed-out installation identity lookup" : "installed application identity lookup";
+  return locateInstalledSimulatorApplication({ owner, command, signal: abort.signal, afterInstallTimeout,
     getReceipt: () => startupCommandReceipts.at(-1),
     isCurrent: () => udid === owner.simulatorUdid && bundleId === owner.bundleId && deviceName === owner.deviceName,
-    onRetry: () => { stage = "retry installed application identity lookup"; } });
+    onRetry: () => { stage = `retry ${stage}`; } });
 }
 async function hashFile(path) {
   const hash = createHash("sha256");

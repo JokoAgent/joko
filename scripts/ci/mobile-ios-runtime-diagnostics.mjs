@@ -13,7 +13,7 @@ export function requireSimulatorApplicationContainer(value) {
   return value;
 }
 
-export async function locateInstalledSimulatorApplication({ owner, command, getReceipt, isCurrent, signal, onRetry }) {
+export async function locateInstalledSimulatorApplication({ owner, command, getReceipt, isCurrent, signal, onRetry, afterInstallTimeout = false }) {
   const assertOwner = () => {
     signal.throwIfAborted();
     if (!owner.simulatorUdid || !owner.bundleId || !owner.deviceName?.startsWith("joko-ci-") || !isCurrent()) {
@@ -22,10 +22,11 @@ export async function locateInstalledSimulatorApplication({ owner, command, getR
   };
   const args = ["simctl", "get_app_container", owner.simulatorUdid, owner.bundleId, "app"];
   const query = label => command("xcrun", args, { timeout: 30_000, startupLabel: label });
+  const firstLabel = afterInstallTimeout ? "locate-application-after-install-timeout" : "locate-installed-application";
   let empty = false;
   try {
     assertOwner();
-    const container = await query("locate-installed-application");
+    const container = await query(firstLabel);
     assertOwner();
     empty = container === "";
     return requireSimulatorApplicationContainer(container);
@@ -36,12 +37,13 @@ export async function locateInstalledSimulatorApplication({ owner, command, getR
       && receipt.signal === null && receipt.killed === false && receipt.stdoutBytes === 0;
     const killedTimeout = receipt?.result === "failed" && receipt.killed === true && receipt.signal === "SIGTERM"
       && receipt.exitCode === null && receipt.errorCode === null && receipt.elapsedMs >= receipt.timeoutMs;
-    if (receipt?.step !== "locate-installed-application" || receipt.timeoutMs !== 30_000
+    if (receipt?.step !== firstLabel || receipt.timeoutMs !== 30_000
       || receipt.cancelled !== false || !emptySuccess && !killedTimeout) throw error;
     // Repeat only this read of the same owned application. Neither an empty
     // successful host reply nor a killed query establishes its installed path.
     onRetry();
-    const container = await query("retry-locate-installed-application");
+    assertOwner();
+    const container = await query(`retry-${firstLabel}`);
     assertOwner();
     return requireSimulatorApplicationContainer(container);
   }
