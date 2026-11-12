@@ -17,7 +17,7 @@ import { _electron, type ElectronApplication, type Page } from "playwright-core"
 import { afterEach, expect, it } from "vitest";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createPackagedDesktopStartupEvidence } from "./packaged-desktop-startup.js";
+import { createPackagedDesktopStartupEvidence, readLaunchedWindowsDesktopProcess, type OwnedWindowsDesktopProcess } from "./packaged-desktop-startup.js";
 import {
   archiveMutation,
   createSessionMutation,
@@ -31,12 +31,6 @@ const packagedIt = process.platform === "win32" && process.env.JOKO_PACKAGED_DES
   ? it : it.skip;
 const SECONDARY_BACKEND_ID = "search-secondary";
 const EMBEDDING_MODEL_ID = "voyage/voyage-4";
-
-interface OwnedDesktopProcess {
-  readonly pid: number;
-  readonly executablePath: string;
-  readonly startedAt: string;
-}
 
 class SearchFixtureAdapter extends InstrumentedFakeAdapter {
   override async describe(): Promise<BackendDescriptor> {
@@ -61,7 +55,7 @@ class SearchFixtureAdapter extends InstrumentedFakeAdapter {
 let fixture: OrchestratorE2eFixture | undefined;
 let embeddingServer: Server | undefined;
 let desktop: ElectronApplication | undefined;
-let desktopIdentity: OwnedDesktopProcess | undefined;
+let desktopIdentity: OwnedWindowsDesktopProcess | undefined;
 let profileDirectory: string | undefined;
 const startupEvidence = createPackagedDesktopStartupEvidence();
 
@@ -81,12 +75,12 @@ afterEach(async ({ task }) => {
         error ? rejectClose(error) : resolveClose()));
       embeddingServer = undefined;
     }
-    if (profileDirectory !== undefined) {
+    if (profileDirectory !== undefined && desktop === undefined) {
       const target = resolve(profileDirectory);
       if (dirname(target) !== resolve(tmpdir()) || !target.split(/[\\/]/u).at(-1)?.startsWith("joko-search-desktop-")) {
         throw new Error("Refusing to remove an unexpected search Desktop profile.");
       }
-      await rm(target, { recursive: true, force: true });
+      await rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
       profileDirectory = undefined;
     }
   }
@@ -198,13 +192,13 @@ packagedIt("searches completed and paged older messages through packaged Desktop
     timeout: 60_000
   });
   console.info("Packaged search: Desktop launch returned.");
-  const mainPid = desktop.process().pid;
-  if (mainPid === undefined) throw new Error("Search Desktop returned no spawned process ID.");
-  desktopIdentity = await readOwnedDesktopProcess(mainPid);
-  if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
-    desktopIdentity = undefined;
+  const launcherPid = desktop.process().pid;
+  if (launcherPid === undefined) throw new Error("Search Desktop returned no spawned process ID.");
+  const identity = await readLaunchedWindowsDesktopProcess(launcherPid, executablePath);
+  if (resolve(identity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
     throw new Error("Search Desktop launched an unexpected executable.");
   }
+  desktopIdentity = identity;
   console.info("Packaged search: owned process confirmed.");
   const page = await desktop.firstWindow({ timeout: 60_000 });
   console.info("Packaged search: first window ready.");
@@ -216,7 +210,7 @@ packagedIt("searches completed and paged older messages through packaged Desktop
     })
   ]).finally(() => clearTimeout(profileDeadline));
   const profileRelative = relative(profileDirectory, profile.path);
-  expect(profile.pid).toBe(mainPid);
+  expect(profile.pid).toBe(identity.pid);
   if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
     throw new Error("Search Desktop did not use its isolated profile.");
   }
@@ -418,12 +412,12 @@ function stopDesktopProcess(pid: number): Promise<void> {
   });
 }
 
-async function readOwnedDesktopProcess(pid: number): Promise<OwnedDesktopProcess | undefined> {
+async function readOwnedDesktopProcess(pid: number): Promise<OwnedWindowsDesktopProcess | undefined> {
   if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("Invalid Search Desktop PID.");
   const script = `$candidate = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($null -ne $candidate) { [pscustomobject]@{ pid = $candidate.ProcessId; executablePath = $candidate.ExecutablePath; startedAt = $candidate.CreationDate.ToUniversalTime().ToString('O') } | ConvertTo-Json -Compress }`;
   const output = await new Promise<string>((resolveOutput, rejectOutput) => {
     execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
       { windowsHide: true, timeout: 10_000 }, (error, stdout) => error ? rejectOutput(error) : resolveOutput(stdout));
   });
-  return output.trim() ? JSON.parse(output) as OwnedDesktopProcess : undefined;
+  return output.trim() ? JSON.parse(output) as OwnedWindowsDesktopProcess : undefined;
 }
