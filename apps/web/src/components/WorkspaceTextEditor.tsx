@@ -35,11 +35,9 @@ import { ruby } from "@codemirror/legacy-modes/mode/ruby";
 import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { swift } from "@codemirror/legacy-modes/mode/swift";
 import { toml } from "@codemirror/legacy-modes/mode/toml";
-import { SearchQuery, highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
-import { EditorState, StateEffect, StateField, type Extension } from "@codemirror/state";
+import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
+import { EditorState, type Extension } from "@codemirror/state";
 import {
-  Decoration,
-  type DecorationSet,
   EditorView,
   crosshairCursor,
   drawSelection,
@@ -54,21 +52,31 @@ import { tags } from "@lezer/highlight";
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef } from "react";
 import {
   DEFAULT_WORKSPACE_MARKDOWN_TABLE_LABELS,
+  collectWorkspaceMarkdownConcealedRanges,
   insertWorkspaceMarkdownTable,
   workspaceMarkdownLivePreviewExtensions,
   type WorkspaceMarkdownTableLabels
 } from "./workspace-markdown-live-preview.js";
 import {
+  findWorkspaceMarkdownMermaidBlocks,
   workspaceMarkdownMermaidThemeChanged,
   workspaceMarkdownMermaidExtensions,
   type WorkspaceMarkdownMermaidLabels
 } from "./workspace-markdown-mermaid.js";
 import {
+  findWorkspaceMarkdownImageTargets,
   workspaceMarkdownImageExtensions,
   type WorkspaceMarkdownImageLabels,
   type WorkspaceMarkdownImageResolver
 } from "./workspace-markdown-images.js";
 import { isWorkspaceMarkdownPath } from "./workspace-file-types.js";
+import {
+  collectWorkspaceDocumentMatches,
+  setWorkspaceSearchDecorations,
+  workspaceActiveSearchField,
+  workspaceDocumentSearchConcealedRanges,
+  type WorkspaceDocumentSearchSelection
+} from "./workspace-document-search.js";
 import { loadWorkspaceFileScroll, saveWorkspaceFileScroll } from "./workspace-file-scroll-store.js";
 import { normalizeWorkspaceFileSource, workspaceFileQuoteFromOffsets } from "./workspace-file-selection.js";
 
@@ -103,43 +111,6 @@ export interface WorkspaceEditorSearchState {
   readonly activeIndex: number;
   readonly truncated: boolean;
 }
-
-interface WorkspaceEditorSearchRange {
-  readonly from: number;
-  readonly to: number;
-}
-
-interface WorkspaceEditorSearchDecorations {
-  readonly query: string;
-  readonly matches: readonly WorkspaceEditorSearchRange[];
-  readonly activeIndex: number;
-}
-interface WorkspaceEditorSearchFieldValue extends WorkspaceEditorSearchDecorations {
-  readonly decorations: DecorationSet;
-}
-const setWorkspaceSearchDecorations = StateEffect.define<WorkspaceEditorSearchDecorations>();
-const workspaceSearchDecoration = Decoration.mark({ class: "cm-doc-search-match" });
-const workspaceActiveSearchDecoration = Decoration.mark({ class: "cm-doc-search-match cm-doc-search-active" });
-const workspaceActiveSearchField = StateField.define<WorkspaceEditorSearchFieldValue>({
-  create: () => workspaceEditorSearchFieldValue("", [], -1),
-  update(value, transaction) {
-    let next: WorkspaceEditorSearchFieldValue | undefined;
-    for (const effect of transaction.effects) {
-      if (!effect.is(setWorkspaceSearchDecorations)) continue;
-      next = workspaceEditorSearchFieldValue(effect.value.query, effect.value.matches, effect.value.activeIndex);
-    }
-    if (next !== undefined) return next;
-    if (transaction.docChanged && value.query !== "") {
-      const collected = collectWorkspaceDocumentMatches(transaction.state, value.query);
-      const activeIndex = collected.matches.length === 0
-        ? -1
-        : Math.min(Math.max(value.activeIndex, 0), collected.matches.length - 1);
-      return workspaceEditorSearchFieldValue(value.query, collected.matches, activeIndex);
-    }
-    return { ...value, decorations: value.decorations.map(transaction.changes) };
-  },
-  provide: (field) => EditorView.decorations.from(field, (value) => value.decorations)
-});
 
 export interface WorkspaceTextEditorProps {
   readonly path: string;
@@ -534,6 +505,11 @@ export function workspaceMarkdownEditorExtensions(labels: {
   readonly imageResolver?: WorkspaceMarkdownImageResolver;
 }): readonly Extension[] {
   return [
+    workspaceDocumentSearchConcealedRanges.of((doc) => [
+      ...collectWorkspaceMarkdownConcealedRanges(doc),
+      ...findWorkspaceMarkdownImageTargets(doc),
+      ...findWorkspaceMarkdownMermaidBlocks(doc)
+    ]),
     ...workspaceMarkdownLivePreviewExtensions(labels.table),
     ...workspaceMarkdownImageExtensions(labels.imageResolver, labels.image),
     ...workspaceMarkdownMermaidExtensions(labels.mermaid)
@@ -982,36 +958,7 @@ function commitWorkspaceDocumentSearch(
   return { query, total: collected.matches.length, activeIndex, truncated: collected.truncated };
 }
 
-function collectWorkspaceDocumentMatches(state: EditorState, query: string): {
-  readonly matches: readonly WorkspaceEditorSearchRange[];
-  readonly truncated: boolean;
-} {
-  const searchQuery = new SearchQuery({ search: query, caseSensitive: false, literal: true });
-  if (query === "") return { matches: [], truncated: false };
-  const matches: WorkspaceEditorSearchRange[] = [];
-  const cursor = searchQuery.getCursor(state);
-  for (let next = cursor.next(); !next.done; next = cursor.next()) {
-    matches.push({ from: next.value.from, to: next.value.to });
-  }
-  return { matches, truncated: false };
-}
-
-function workspaceEditorSearchFieldValue(
-  query: string,
-  matches: readonly WorkspaceEditorSearchRange[],
-  activeIndex: number
-): WorkspaceEditorSearchFieldValue {
-  return {
-    query,
-    matches,
-    activeIndex,
-    decorations: Decoration.set(matches.map((match, index) => (
-      index === activeIndex ? workspaceActiveSearchDecoration : workspaceSearchDecoration
-    ).range(match.from, match.to)))
-  };
-}
-
-function workspaceEditorSearchState(value: WorkspaceEditorSearchFieldValue): WorkspaceEditorSearchState {
+function workspaceEditorSearchState(value: WorkspaceDocumentSearchSelection): WorkspaceEditorSearchState {
   return {
     query: value.query,
     total: value.matches.length,
