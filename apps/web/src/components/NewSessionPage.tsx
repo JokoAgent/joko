@@ -2645,9 +2645,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     <header className="new-task-page__header">
       {!navigationOpen && <IconButton label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
       <div className="new-task-context" aria-label={t("session.newDescription")}>
-        {contactsDraft !== undefined ? <label className="new-task-context__control">
-          <span className="sr-only">{t("controls.backend")}</span>
-          <SelectControl value={selection?.kind === "dialogue" ? selection.backendId : ""}
+        {contactsDraft !== undefined ? <div className="new-task-context__control">
+          <SelectControl aria-label={t("controls.backend")} value={selection?.kind === "dialogue" ? selection.backendId : ""}
             disabled={!hydrated || submitting || controller.state.connectionState !== "connected"}
             onChange={(event) => {
               const value = event.currentTarget.value;
@@ -2658,7 +2657,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
             <option value="" disabled>{t("contacts.organizeChooseBackend")}</option>
             {eligibleDialogueBackends.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
           </SelectControl>
-        </label> : <NewTaskProjectPicker value={selectionKey}
+        </div> : <NewTaskProjectPicker value={selectionKey}
           selectedName={selected?.name ?? (selection?.kind === "dialogue" ? `${t("newTask.dialogue")} · ${backend?.name ?? ""}` : t("session.noProjects"))}
           projects={projectPickerOptions} dialogues={dialoguePickerOptions} recent={recentOptions}
           ownerKey={`${profileScope}\u0000${snapshot.generation}`}

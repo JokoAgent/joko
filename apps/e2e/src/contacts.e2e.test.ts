@@ -91,7 +91,8 @@ mountedIt("opens an isolated Contacts draft and sends through its explicitly tru
     await guide.click();
     await heading.waitFor();
     await editor.getByText(prompt, { exact: false }).waitFor();
-    await draft.getByLabel("Backend", { exact: true }).selectOption("pi");
+    await draft.getByRole("combobox", { name: "Backend", exact: true }).click();
+    await page.getByRole("option", { name: "Pi", exact: true }).click();
     await draft.getByRole("checkbox", { name: /Trust the new dialogue workspace on/u }).check();
     expect(store.listSessions()).toHaveLength(0);
     expect(store.listTargets()).toHaveLength(targetCount);
