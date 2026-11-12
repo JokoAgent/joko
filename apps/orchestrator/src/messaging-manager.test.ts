@@ -397,8 +397,10 @@ describe("MessagingManager", () => {
     const oldMessage = store.listEvents({ sessionId }).find(event => event.payload.type === "message_complete"
       && event.payload.role === "assistant")!;
     const oldRun = requestFor(2)!.runId!;
-    const artifact = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "original.png", mimeType: "image/png" });
-    store.transaction(() => store.adoptSessionArtifact({ blob: artifact.blob, sessionId, runId: oldRun }));
+    const artifact = await fixture.artifacts.ingestBytes(pngBytes(), {
+      fileName: "original.png", mimeType: "image/png", expiresAt: Date.now() + 60_000
+    });
+    store.transaction(() => store.adoptSessionArtifact({ blob: store.getArtifact(artifact.id).blob, sessionId, runId: oldRun }));
     fixture.manager.putRoute({ connectionId: connection.id, targetId: "target-two", providerId: "vision", modelId: "multimodal",
       effort: "high", permissionMode: "auto", fastMode: false, planMode: true });
 
@@ -430,7 +432,9 @@ describe("MessagingManager", () => {
     expect(store.listEvents({ sessionId }).map(event => event.id)).not.toContain(oldMessage.id);
     expect(store.listEvents({ sessionId, includeTombstoned: true }).map(event => event.id)).toContain(oldMessage.id);
     expect(store.listRuns({ sessionId }).map(run => run.descriptor.id)).toContain(oldRun);
-    expect(store.listArtifacts({ sessionId }).map(row => row.id)).toContain(artifact.id);
+    expect(store.listArtifacts({ sessionId })).toContainEqual(expect.objectContaining({
+      blob: expect.objectContaining({ id: artifact.id }), sessionId, runId: oldRun
+    }));
     expect(nativeCreate.mock.calls).toHaveLength(2);
     expect(nativeCreate).toHaveBeenLastCalledWith(expect.objectContaining({
       nativeStart: { kind: "new" }, target: expect.objectContaining({ id: original.targetId, workspaceRoot: fixture.root })
