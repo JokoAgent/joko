@@ -7,6 +7,8 @@ import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
+import type { BridgeToolCallContext } from "./mcp-router.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -15,6 +17,118 @@ afterEach(() => {
 });
 
 describe("MakerMemoryController", () => {
+  it("consolidates exact same-Target sources, updates search and records the learning receipt only once", async () => {
+    const { store, memory } = createFixture();
+    const target = { type: "project", name: "merged-policy", title: "Merged policy", description: "Project policy", body: "durablepolicy" };
+    const previous = memory.write("target-a", { ...target, kind: "project", body: "previouspolicy" });
+    const source = memory.write("target-a", { ...target, kind: "project", name: "obsolete-policy", body: "obsoletecitation" });
+    const olderSources = Array.from({ length: 20 }, (_, index) => memory.write("target-a", {
+      ...target, kind: "project", name: `older-policy-${index}`, description: "Old policy detail. ".repeat(10).trim()
+    }).id);
+    const other = memory.write("target-b", { ...target, kind: "project", body: "foreignpolicy" });
+    expect(memory.search("target-a", "obsoletecitation")).toHaveLength(1);
+    expect(memory.writeWarning(previous)?.kind).toBe("index-size-exceeded");
+    const recordSaved = vi.fn();
+    const approve = vi.fn(async () => undefined);
+    const provider = new MakerMemoryBridgeProvider(memory);
+    const context = { ...maintenanceContext("merge"), partnerLearningSave: { recordSaved },
+      memoryMaintenance: { sourceOperationId: "send-input-a", authorize: approve } };
+    const request = { sources: [previous.id, source.id, source.id, "missing-source", ...olderSources], target };
+    const receipt = await provider.callTool("memory_consolidate", request, undefined, context);
+    expect(receipt.structuredContent).toEqual({
+      entryId: previous.id, deletedSources: [source.id, ...olderSources], operation_id: "mcp-memory:merge"
+    });
+    expect(memory.read("target-a", previous.id).body).toBe("durablepolicy");
+    expect(memory.search("target-a", "obsoletecitation")).toEqual([]);
+    expect(memory.search("target-a", "durablepolicy")).toHaveLength(1);
+    expect(memory.read("target-b", other.id)).toEqual(other);
+    const adopted = memory.read("target-a", previous.id);
+    await expect(provider.callTool("memory_consolidate", request, undefined, context)).resolves.toEqual(receipt);
+    expect(memory.read("target-a", previous.id)).toEqual(adopted);
+    expect(recordSaved).toHaveBeenCalledExactlyOnceWith(store, { kind: "memory", entryId: previous.id, title: "Merged policy", action: "updated" });
+    expect(approve).toHaveBeenCalledOnce();
+    await expect(provider.callTool("memory_consolidate", { ...request, target: { ...target, body: "changed" } }, undefined,
+      { ...context, requestBodyHash: "changed-merge-body" })).rejects.toThrow();
+    expect(memory.read("target-a", previous.id)).toEqual(adopted);
+    expect(store.getOperation("mcp-memory:merge")).toMatchObject({ status: "completed", response: {
+      entryId: previous.id, deletedSources: [source.id, ...olderSources]
+    } });
+  });
+
+  it("rejects foreign and digest sources, and rolls back the target, source and FTS on a failed commit", async () => {
+    const { memory, store } = createFixture();
+    const target = { type: "project", name: "merged-policy", title: "Merged policy", description: "Project policy", body: "proposedpolicy" };
+    const source = memory.write("target-a", { ...target, kind: "project", name: "source", body: "originalsource" });
+    const foreign = memory.write("target-b", { ...target, kind: "project" });
+    memory.writeCompactionDigest({ backendId: "memory-capable", targetId: "target-a", sessionId: "session-a",
+      summary: "The private digest stays in its own scope.", reason: "manual" });
+    const digest = memory.list("target-a", "digest")[0]!;
+    const provider = new MakerMemoryBridgeProvider(memory);
+    for (const bad of [foreign.id, digest.id]) {
+      await expect(provider.callTool("memory_consolidate", { sources: [source.id, bad], target }, undefined,
+        maintenanceContext(`bad-${bad}`))).rejects.toThrow(/curated memory entry in this workspace/u);
+    }
+    await expect(provider.callTool("memory_consolidate", { sources: [source.id], target }, undefined, {
+      ...maintenanceContext("rollback"),
+      partnerLearningSave: { recordSaved: () => { throw new Error("The original learning owner retired."); } }
+    })).rejects.toThrow(/learning owner retired/u);
+    expect(memory.list("target-a", "project")).toEqual([source]);
+    expect(memory.read("target-a", digest.id)).toEqual(digest);
+    expect(memory.search("target-a", "originalsource")).toHaveLength(1);
+    expect(memory.search("target-a", "proposedpolicy")).toHaveLength(0);
+    expect(store.getOperation("mcp-memory:rollback")).toMatchObject({ status: "failed", error: { stateMayHaveChanged: false } });
+  });
+
+  it("reviews the complete curated scope through one auxiliary plan, returns advice and replays without another request", async () => {
+    const { memory, store } = createFixture();
+    const input = { kind: "project", name: "workspace-policy", title: "Policy", description: "Index text", body: "workspacepolicy" } as const;
+    const first = memory.write("target-a", input);
+    const second = memory.write("target-a", { ...input, kind: "feedback", name: "feedback", body: "redact-me" });
+    memory.write("target-b", { ...input, body: "foreignmemory" });
+    memory.writeCompactionDigest({ backendId: "memory-capable", targetId: "target-a", sessionId: "session-a",
+      summary: "privatecompactiondigest", reason: "manual" });
+    const before = memory.list("target-a");
+    const { provider, run, capture } = reviewFixture(memory);
+    const call = () => provider.callTool("memory_review", {}, undefined, maintenanceContext("review"));
+    const review = await call();
+    expect(review.structuredContent).toEqual({ suggestions: "Review the project policy.", operation_id: "mcp-memory:review" });
+    expect(await call()).toEqual(review);
+    expect(capture).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledOnce();
+    const request = run.mock.calls[0]![1];
+    expect(request).toMatchObject({ maxTokens: 800, stopOnUnknownOutcome: true });
+    expect(request.user).toContain(first.id);
+    expect(request.user).toContain(second.id);
+    expect(request.user).toContain("[redacted]");
+    expect(request.user).not.toMatch(/redact-me|foreignmemory|privatecompactiondigest/u);
+    expect(memory.list("target-a")).toEqual(before);
+    expect(store.getOperation("mcp-memory:review")).toMatchObject({ status: "completed" });
+  });
+
+  it("replays an empty review, fences late results and records the original unknown request", async () => {
+    const { memory, store } = createFixture();
+    const { provider, run } = reviewFixture(memory);
+    const empty = () => provider.callTool("memory_review", {}, undefined, maintenanceContext("empty"));
+    const receipt = await empty();
+    expect(receipt.structuredContent).toMatchObject({ suggestions: "This workspace has no curated memories to review." });
+    memory.write("target-a", { kind: "project", name: "entry", title: "Entry", description: "Description", body: "Project preference." });
+    expect(await empty()).toEqual(receipt);
+    expect(run).not.toHaveBeenCalled();
+    run.mockImplementationOnce(async (_plan, request) => {
+      expect(request.stillCurrent?.()).toBe(true);
+      memory.write("target-a", { kind: "project", name: "entry", title: "Entry", description: "Description", body: "Revised preference.", mode: "update" });
+      expect(request.stillCurrent?.()).toBe(false);
+      return { status: "ok", text: "Stale review." };
+    });
+    const stale = () => provider.callTool("memory_review", {}, undefined, maintenanceContext("stale"));
+    await expect(stale()).rejects.toMatchObject({ publicError: { code: "EFFECT_OUTCOME_UNKNOWN", stateMayHaveChanged: true } });
+    await expect(stale()).rejects.toThrow(/mcp-memory:stale/u);
+    expect(run).toHaveBeenCalledOnce();
+    const failed = store.getOperation("mcp-memory:stale");
+    expect(failed).toMatchObject({ status: "failed", error: { code: "EFFECT_OUTCOME_UNKNOWN" } });
+    expect(failed.response).toBeUndefined();
+  });
+
   it("uses capability-assigned Backend roles without recognizing Backend IDs", () => {
     const { store, memory } = createFixture();
     expect(memory.writeCompactionDigest({
@@ -264,6 +378,27 @@ describe("MakerMemoryController", () => {
     expect(store.countMakerMemoryEntries()).toBe(0);
   });
 });
+
+function maintenanceContext(id: string): BridgeToolCallContext {
+  return {
+    sessionId: "session-a", targetId: "target-a", generation: 1, memoryMaintenance: { sourceOperationId: "send-input-a" },
+    inputQueueItem: { id: "queue-a", runId: "run-a", attemptId: "attempt-a" },
+    requestIdentity: id, requestBodyHash: `body-${id}`, assertCurrent: () => {}
+  };
+}
+
+function reviewFixture(memory: MakerMemoryController) {
+  const plan = { models: [], revision: 0n, runtimeRevision: "fixture-route" };
+  const capture = vi.fn(() => plan);
+  const run = vi.fn<AuxiliaryTextRouting["run"]>(async (_plan, input) => ({
+    status: "ok", text: input.validate("  Review the project policy. ")!
+  }));
+  const provider = new MakerMemoryBridgeProvider(memory, {
+    auxiliary: () => ({ capture, run, isCurrent: value => value === plan }),
+    redact: text => text.replaceAll("redact-me", "[redacted]")
+  });
+  return { provider, run, capture };
+}
 
 function createFixture(onSettingsChanged?: () => Promise<void>) {
   const directory = mkdtempSync(path.join(tmpdir(), "joko-orchestrator-memory-"));
