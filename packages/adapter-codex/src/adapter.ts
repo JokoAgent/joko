@@ -4841,7 +4841,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           if (descendantRequest && method === "item/tool/requestUserInput") return { answers: {} };
           const cachedFile = method === "item/fileChange/requestApproval" && isJsonObject(params)
             ? runtime.nativeFileChanges.get(JSON.stringify([params["threadId"], params["turnId"], params["itemId"]])) : undefined;
-          const interaction = interactionFromServerRequest(requestId, method, params, runtime.targetWorkspaceRoot, cachedFile?.approval);
+          const interaction = interactionFromServerRequest(requestId, method, params, cachedFile?.approval);
           if (interaction === undefined) return undefined;
           const key = rpcRequestKey(requestId);
           if (runtime.pendingServerRequests.has(key)) return undefined;
