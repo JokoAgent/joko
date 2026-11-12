@@ -528,9 +528,11 @@ if (packagedSmokeRequested && packagedSmokeScope !== "full" && packagedSmokeScop
   throw new Error(`Unsupported packaged smoke scope: ${packagedSmokeScope}`);
 }
 const packagedSmokeTimeoutCandidate = Number(process.env["JOKO_DESKTOP_SMOKE_TIMEOUT_MS"]);
+const extendedPackagedSmokeScope = packagedSmokeScope === "full" && (process.platform === "darwin" || process.platform === "win32");
+const packagedSmokeTimeoutMaximum = extendedPackagedSmokeScope ? 240_000 : 180_000;
 const packagedSmokeTimeoutMs = Number.isSafeInteger(packagedSmokeTimeoutCandidate)
   && packagedSmokeTimeoutCandidate >= 60_000
-  && packagedSmokeTimeoutCandidate <= 180_000
+  && packagedSmokeTimeoutCandidate <= packagedSmokeTimeoutMaximum
   ? packagedSmokeTimeoutCandidate
   : 90_000;
 const packagedSmokeManagedReadyTimeoutMs = Math.min(
@@ -1804,10 +1806,25 @@ function createWindow(): void {
       });
     });
   } else {
-    window.once("ready-to-show", () => {
-      window.show();
+    let initialPresentationHandled = false;
+    let alreadyShown = false;
+    window.once("show", () => { alreadyShown = true; });
+    const presentInitialWindow = (): void => {
+      if (initialPresentationHandled || mainWindow !== window || window.isDestroyed() || !canShowDesktopWindow({
+        quitting,
+        channelQuitHandoffPending: desktopUpdateChannelQuitHandoffPending,
+        nativeInstallQuitHandoffPending: desktopUpdateNativeInstallQuitHandoffPending,
+        completeExitQuitHandoffPending: desktopCompleteExitQuitHandoffPending
+      })) return;
+      initialPresentationHandled = true;
+      if (!alreadyShown && !window.isMinimized()) window.show();
       desktopRemoteDesktopViewerPrewarm.schedule(window);
-    });
+    };
+    window.once("ready-to-show", presentInitialWindow);
+    if (process.platform === "linux") {
+      // A hidden Linux window can finish loading without emitting ready-to-show.
+      windowContents.once("did-finish-load", presentInitialWindow);
+    }
   }
   if (packagedSmoke) {
     void loadUi(window).catch((error: unknown) => {
@@ -2907,16 +2924,22 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   }
   recordPackagedSmokeProgress("task_window_closed_without_peer_loss");
 
+  recordPackagedSmokeProgress(`task_window_durable_recheck_started:${Date.now()}`);
   await Promise.all([
     verifyPackagedSmokeTask(taskOptions, task),
     verifyPackagedSmokeTask(concurrentTaskOptions, concurrentTask)
   ]);
-  if (!await preparePackagedSmokeTaskOwner(owner, task)
-    || !await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
+  recordPackagedSmokeProgress(`task_window_durable_recheck_completed:${Date.now()}`);
+  const originalTaskVisible = await preparePackagedSmokeTaskOwner(owner, task);
+  if (originalTaskVisible) recordPackagedSmokeProgress(`task_window_original_task_visible_in_main:${Date.now()}`);
+  if (!originalTaskVisible || !await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
     throw new Error("Closing a packaged Task window removed accepted durable Tasks from the owner product UI.");
   }
+  recordPackagedSmokeProgress(`task_window_concurrent_task_visible_in_main:${Date.now()}`);
   await closePackagedSmokeTaskWindow(peerWindow, taskOwner);
+  recordPackagedSmokeProgress(`task_window_same_session_peer_closed:${Date.now()}`);
   await waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner);
+  recordPackagedSmokeProgress(`task_window_concurrent_task_still_visible:${Date.now()}`);
   await closePackagedSmokeTaskWindow(concurrentWindow, concurrentOwner);
   if ([...sessionWindows.values()].some((candidate) => !candidate.isDestroyed())) {
     throw new Error("Packaged smoke retained a Task window after isolated cleanup.");

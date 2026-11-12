@@ -1661,7 +1661,9 @@ function closeSmokeServer(server) {
 
 function boundedTimeout(value, scope) {
   const parsed = value === undefined ? Number.NaN : Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 60_000 && parsed <= 180_000
+  const extendedFullScope = scope === "full" && (process.platform === "darwin" || process.platform === "win32");
+  const maximum = extendedFullScope ? 240_000 : 180_000;
+  return Number.isSafeInteger(parsed) && parsed >= 60_000 && parsed <= maximum
     ? parsed
     : scope === "full" ? 180_000 : 120_000;
 }

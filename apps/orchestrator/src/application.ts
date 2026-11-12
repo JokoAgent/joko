@@ -2906,7 +2906,10 @@ export async function createOrchestratorApplication(
     executablePath: process.env["JOKO_COMPUTER_DRIVER_EXECUTABLE"],
     resolveOutboundProxy: dependencies.resolveOutboundProxy
   });
-  const computerTools = new ComputerToolProvider({ runtime: computerRuntime });
+  const computerTools = new ComputerToolProvider({
+    runtime: computerRuntime,
+    checkSecureInputTarget: (target, signal, assertCurrent) => nativeInputHandoff!.checkSecureInputTarget(target, signal, assertCurrent)
+  });
   let androidAutomation: AndroidAutomationSettingsController | undefined;
   let androidBridge: AndroidToolBridgeProvider | undefined;
   let unregisterAndroidBridge: (() => void) | undefined;
@@ -3277,6 +3280,7 @@ export async function createOrchestratorApplication(
     computerBridge = new ComputerToolBridgeProvider({
       provider: computerTools,
       store,
+      artifacts,
       enabledForNewSessions: () => computerAutomation?.availableForNewSessions() ?? false
     });
     computerBridgeForSessionCleanup = computerBridge;

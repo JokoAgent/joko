@@ -57,6 +57,43 @@ it("retires an old Main mailbox without allowing its late completion to touch th
   await expect(value).resolves.toBe("granted");
 });
 
+it("admits the secure field read only on its original Main mailbox and discards a cancelled receipt", async () => {
+  const f = fixture();
+  const signal = new AbortController();
+  const target = { pid: 80, point: { x: -10, y: 24 } };
+  const assertCurrent = vi.fn();
+  await expect(f.host.checkSecureInputTarget(target, signal.signal, assertCurrent)).resolves.toBe(false);
+  const { hostGeneration } = await f.client.registerNativeInputHandoffHost(f.registration, { headers: f.headers });
+  const scope = { hostInstanceId: f.registration.hostInstanceId, hostGeneration };
+  const poll = async () => (await f.client.pollNativeInputHandoffCommand(scope, { headers: f.headers })).command!;
+  const pending = f.host.checkSecureInputTarget(target, signal.signal, assertCurrent);
+  const command = await poll();
+  expect(command.method).toBe(contract.NativeInputHandoffMethod.FOCUSED_FIELD);
+  expect(JSON.parse(Buffer.from(command.payload).toString("utf8"))).toEqual({ pid: 80, secureOnly: true, point: [-10, 24] });
+  const complete = (commandId: string) => f.client.completeNativeInputHandoffCommand({ ...scope, commandId,
+    success: true, payload: Buffer.from("true") }, { headers: f.headers });
+  expect((await f.client.admitNativeInputHandoffCommand({ ...scope, commandId: command.commandId }, { headers: f.headers })).current).toBe(true);
+  expect((await complete(command.commandId)).accepted).toBe(true);
+  await expect(pending).resolves.toBe(true);
+  expect(assertCurrent).toHaveBeenCalledTimes(4);
+
+  const cancelled = f.host.checkSecureInputTarget({ pid: 80 }, signal.signal, assertCurrent);
+  const rejected = expect(cancelled).rejects.toThrow("unavailable");
+  const old = await poll();
+  signal.abort();
+  await rejected;
+  expect((await f.client.admitNativeInputHandoffCommand({ ...scope, commandId: old.commandId }, { headers: f.headers })).current).toBe(false);
+  expect((await complete(old.commandId)).accepted).toBe(false);
+
+  const field = f.host.createDriver(() => undefined)!.driver.focusedField!(80);
+  const legacy = await poll();
+  expect(legacy.method).toBe(command.method);
+  expect(JSON.parse(Buffer.from(legacy.payload).toString("utf8"))).toEqual({ pid: 80 });
+  await f.client.completeNativeInputHandoffCommand({ ...scope, commandId: legacy.commandId, success: true,
+    payload: Buffer.from('{"editable":true,"secure":false}') }, { headers: f.headers });
+  await expect(field).resolves.toEqual({ editable: true, secure: false });
+});
+
 it("checks the Source's exact live request before a human batch and releases it only on Main acknowledgement", async () => {
   const f = fixture(), controllerDeviceId = "controller", requestId = "request";
   const live = { liveWindow: vi.fn(async () => null), isLiveViewCurrent: vi.fn((request: string, controller: string, window: number, pid: number) => request === requestId && controller === controllerDeviceId && window === 91 && pid === 80), liveViewEnded: vi.fn() };

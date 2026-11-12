@@ -181,7 +181,8 @@ jobs:
     if: ${{ inputs.scope != 'windows-runtime-diagnostics' && inputs.scope != 'orchestrator-regressions' }}
     name: ${{ matrix.os }} / Node 24.19 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    # Windows product jobs have hit the job deadline after packaging and before full smoke could finish.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && matrix.workload == 'product' && 150 || 120 }}
     strategy:
       fail-fast: false
       matrix:
@@ -783,6 +784,8 @@ jobs:
         shell: bash
         run: pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
         env:
+          # Hosted Windows and macOS runners reached late retirement or draft recovery at the 180-second deadline.
+          JOKO_DESKTOP_SMOKE_TIMEOUT_MS: "240000"
           JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
           JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
 

@@ -27,7 +27,8 @@ export function findDesktopPageMatches(root: Document, query: string): {
 } {
   const matches: DesktopPageMatch[] = [];
   const documents: Document[] = [];
-  const needle = foldText(query).text;
+  const collapsedNeedle = foldText(query).text;
+  const preservedNeedle = foldText(query, true).text;
   const visit = (owner: Document): void => {
     if (documents.includes(owner) || owner.body === null) return;
     documents.push(owner);
@@ -45,6 +46,7 @@ export function findDesktopPageMatches(root: Document, query: string): {
     let previousBlock: Element | undefined;
     let preserveWhitespace = false;
     const flush = (): void => {
+      const needle = preserveWhitespace ? preservedNeedle : collapsedNeedle;
       if (text !== "" && needle !== "") {
         const folded = foldText(text, preserveWhitespace);
         let offset = 0;
