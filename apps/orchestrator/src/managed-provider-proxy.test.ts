@@ -13,7 +13,7 @@ import { mkdtemp } from "./test-paths.js";
 
 async function fixture(
   nativeResponses = false,
-  protocol: "openai-responses" | "anthropic-messages" = "openai-responses"
+  protocol: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses"
 ) {
   const directory = await mkdtemp(join(tmpdir(), "joko-provider-proxy-"));
   const store = new OperationalStore(join(directory, "store.db"));
@@ -49,8 +49,10 @@ async function fixture(
     response.writeHead(200, { "content-type": fixtureResponseContentType });
     if (nativeResponses) {
       const index = received.length;
-      const toolOutput = Array.isArray(body.input) ? body.input.find((item: Record<string, unknown>) => item.type === "function_call_output"
-        && item.call_id === "check-tool-environment")?.output : undefined;
+      const toolOutput = protocol === "openai-completions" && Array.isArray(body.messages)
+        ? body.messages.find((item: Record<string, unknown>) => item.role === "tool" && item.tool_call_id === "check-tool-environment")?.content
+        : Array.isArray(body.input) ? body.input.find((item: Record<string, unknown>) => item.type === "function_call_output"
+          && item.call_id === "check-tool-environment")?.output : undefined;
       if (typeof toolOutput === "string") {
         if (toolOutput.includes("blocked by policy")) toolOutcome = "denied";
         else if (toolOutput.includes("TOKEN_PRESENT")) toolOutcome = "present";
@@ -65,6 +67,22 @@ async function fixture(
           }) }
         : { id: `item-${index}`, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "Local managed response", annotations: [] }] };
       const emit = (value: unknown) => response.write(`data: ${JSON.stringify(value)}\n\n`);
+      if (protocol === "openai-completions") {
+        const name: string | undefined = body.tools?.find((tool: { function: { name: string } }) =>
+          tool.function.name === "exec_command" || tool.function.name.endsWith("__exec_command"))?.function.name;
+        if (item.type === "function_call" && name === undefined) {
+          response.end('data: {"error":{"message":"Missing the advertised native fixture tool."}}\n\n');
+          return;
+        }
+        const delta = item.type === "function_call"
+          ? { tool_calls: [{ index: 0, id: item.call_id, type: "function", function: { name, arguments: item.arguments } }] }
+          : { content: "Local managed response" };
+        emit({ id: `response-${index}`, choices: [{ index: 0, delta, finish_reason: null }] });
+        emit({ id: `response-${index}`, choices: [{ index: 0, delta: {}, finish_reason: item.type === "function_call" ? "tool_calls" : "stop" }] });
+        emit({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } });
+        response.end("data: [DONE]\n\n");
+        return;
+      }
       emit({ type: "response.created", response: { id: `response-${index}`, status: "in_progress", output: [] } });
       emit({ type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } });
       if (item.type === "message") emit({ type: "response.output_text.delta", output_index: 0, item_id: item.id, content_index: 0, delta: "Local managed response" });
@@ -101,7 +119,8 @@ async function fixture(
   await proxy.start();
   const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
   const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId: "provider", modelId: "model" };
-  const requestPath = protocol === "anthropic-messages" ? "/custom/messages" : "/custom/responses";
+  const requestPath = protocol === "anthropic-messages" ? "/custom/messages"
+    : protocol === "openai-completions" ? "/custom/chat/completions" : "/custom/responses";
   const catalogModels = [
     { id: "model", input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
     { id: "child-model", input: ["text"] as const, contextWindow: 128_000, maxTokens: 8_000 }
@@ -143,7 +162,7 @@ async function fixture(
   };
   return { directory, store, credentials, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders,
     disableModel: (modelId: string) => disabledModels.add(modelId),
-    write, markProviderUnavailable,
+    write, markProviderUnavailable, requestPath,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
     hold: () => { hold = true; }, reject: () => { reject = true; },
     respondWith: (body: string, contentType = "text/event-stream") => {
@@ -157,7 +176,130 @@ async function fixture(
   };
 }
 
+function chatEvent(value: unknown): string {
+  return `data: ${JSON.stringify(value)}\n\n`;
+}
+
+function responsesEvents(body: string): Record<string, unknown>[] {
+  return body.split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6)));
+}
+
 describe("Managed Provider native proxy", () => {
+  it("translates tool calls, usage, and tool history over the configured Codex Chat path", async () => {
+    const f = await fixture(false, "openai-completions");
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "chat-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      const request = (body: Record<string, unknown>, suffix = "") => fetch(`${binding.baseUrl}/responses${suffix}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-joko-provider-proxy-token": f.token, "x-openai-fedramp": "true" },
+        body: JSON.stringify({ model: "model", ...body })
+      });
+      const tools = [
+        { type: "namespace", name: "notes", tools: [{ type: "function", name: "read_note", parameters: { type: "object", properties: {} } }] },
+        { type: "custom", name: "render", description: "Render the supplied text." }
+      ];
+      const chunks = [
+        { id: "chat-tool-turn", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "note-1", type: "function",
+          function: { name: "notes__", arguments: "" } }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: { tool_calls: [
+          { index: 0, function: { name: "read_note", arguments: "{}" } },
+          { index: 1, id: "render-1", type: "function", function: { name: "render", arguments: '{"input":"über"}' } }
+        ] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        { choices: [], usage: { prompt_tokens: 15, completion_tokens: 6, total_tokens: 21, prompt_tokens_details: { cached_tokens: 4 } } }
+      ];
+      f.respondWith(chunks.map(chatEvent).join("") + "data: [DONE]\n\n");
+      const response = await request({
+        instructions: "General instruction", input: [{ role: "developer", content: "Keep the order." }, { role: "user", content: "Read and render." }],
+        tools, stream: true, parallel_tool_calls: true, max_output_tokens: 80, store: false
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      const events = responsesEvents(await response.text());
+      expect(events.map(event => event.sequence_number)).toEqual(events.map((_, index) => index));
+      expect(events.filter(event => event.type === "response.output_item.done").map(event => event.item)).toMatchObject([
+        { type: "function_call", call_id: "note-1", name: "read_note", namespace: "notes", arguments: "{}" },
+        { type: "custom_tool_call", call_id: "render-1", name: "render", input: "über" }
+      ]);
+      expect(events.at(-1)).toMatchObject({ type: "response.completed", response: {
+        id: "chat-tool-turn", model: "model", status: "completed",
+        usage: { input_tokens: 15, output_tokens: 6, total_tokens: 21, input_tokens_details: { cached_tokens: 4 } }
+      } });
+      expect(f.receivedBodies[0]).toMatchObject({
+        model: "model", messages: [
+          { role: "system", content: "General instruction\n\nKeep the order." },
+          { role: "user", content: "Read and render." }
+        ],
+        tools: [{ function: { name: "notes__read_note" } }, { function: { name: "render" } }],
+        parallel_tool_calls: true, max_tokens: 80, stream_options: { include_usage: true }
+      });
+      expect(f.receivedBodies[0]).not.toHaveProperty("store");
+
+      f.respondWith(JSON.stringify({ id: "chat-followup", model: "upstream-alias", choices: [
+        { index: 0, message: { role: "assistant", content: "Rendered." }, finish_reason: "stop" }
+      ] }), "application/json");
+      const followUp = await request({ stream: false, tools, input: [
+        { role: "user", content: "Read and render." },
+        { type: "function_call", call_id: "note-1", namespace: "notes", name: "read_note", arguments: "{}" },
+        { type: "custom_tool_call", call_id: "render-1", name: "render", input: "über" },
+        { type: "function_call_output", call_id: "note-1", output: "Original note" },
+        { type: "custom_tool_call_output", call_id: "render-1", output: "Original rendering" }
+      ] });
+      expect(followUp.headers.get("content-type")).toBe("application/json");
+      expect(await followUp.json()).toMatchObject({ id: "chat-followup", model: "model", status: "completed",
+        output: [{ type: "message", content: [{ type: "output_text", text: "Rendered." }] }] });
+      expect(f.receivedBodies[1]).toMatchObject({
+        stream: false, messages: [
+          { role: "user", content: "Read and render." },
+          { role: "assistant", tool_calls: [
+            { id: "note-1", function: { name: "notes__read_note", arguments: "{}" } },
+            { id: "render-1", function: { name: "render", arguments: '{"input":"über"}' } }
+          ] },
+          { role: "tool", tool_call_id: "note-1", content: "Original note" },
+          { role: "tool", tool_call_id: "render-1", content: "Original rendering" }
+        ]
+      });
+      expect((await request({ input: "fixture", previous_response_id: "chat-tool-turn" })).status).toBe(400);
+      expect((await request({ input: "fixture" }, "/compact")).status).toBe(404);
+      expect(f.received).toEqual(Array.from({ length: 2 }, () => ({
+        path: f.requestPath, model: "model", authorization: "Bearer first-private-provider-credential"
+      })));
+      expect(f.forwardedProxyTokens).toEqual([undefined, undefined]);
+      expect(f.forwardedFedrampHeaders).toEqual([undefined, undefined]);
+      lease.release(); binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
+  it.each([
+    { name: "read_note", finish: undefined, toolChoice: "auto" },
+    { name: "read_note", finish: "tool_calls", toolChoice: "none" },
+    { name: "retired_tool", finish: "tool_calls", toolChoice: "auto" }
+  ])("never completes an unfinished or unauthorized Chat tool call ($name, $finish, $toolChoice)", async ({ name, finish, toolChoice }) => {
+    const f = await fixture(false, "openai-completions");
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "chat-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      f.respondWith(chatEvent({ choices: [{ index: 0, delta: { tool_calls: [
+        { index: 0, id: "pending", type: "function", function: { name, arguments: "{}" } }
+      ] }, finish_reason: null }] }) + (finish === undefined ? "" : chatEvent({ choices: [{ delta: {}, finish_reason: finish }] }) + "data: [DONE]\n\n"));
+      const response = await fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: {
+        "content-type": "application/json", "x-joko-provider-proxy-token": f.token
+      }, body: JSON.stringify({ model: "model", stream: true, tool_choice: toolChoice, tools: [
+        { type: "function", name: "read_note" }
+      ], input: [
+        { type: "custom_tool_call", call_id: "old", name: "retired_tool", input: "previous input" },
+        { type: "custom_tool_call_output", call_id: "old", output: "previous output" },
+        { role: "user", content: "Continue." }
+      ] }) });
+      const events = responsesEvents(await response.text());
+      expect(events.some(event => event.type === "response.output_item.done")).toBe(false);
+      expect(events.at(-1)).toMatchObject({ type: "response.failed", response: { status: "failed", output: [] } });
+      expect(f.receivedBodies[0]?.tools).toMatchObject([{ function: { name: "read_note" } }]);
+      lease.release(); binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
   it.each(["child-model", "model"])("retains the active smart response after %s is disabled and fences only new route admission", async modelId => {
     const f = await fixture();
     try {
@@ -187,8 +329,8 @@ describe("Managed Provider native proxy", () => {
     } finally { await f.dispose(); }
   });
 
-  it("still rejects a smart stream when its original credential is revoked", async () => {
-    const f = await fixture();
+  it.each(["openai-responses", "openai-completions"] as const)("rejects a %s smart stream when its original credential is revoked", async protocol => {
+    const f = await fixture(false, protocol);
     try {
       const child = f.port.listSmartRoutingCandidates!()[0]!;
       const binding = await f.port.prepareSmartRouting!({ ...f.owner, nativeProviderId: "openai", rootProviderId: "provider", rootModelId: "model", revision: "catalog",
@@ -196,10 +338,44 @@ describe("Managed Provider native proxy", () => {
       binding.bindRoot({ threadId: "root", providerId: "provider", modelId: "model" });
       const lease = await binding.activate({ operationId: "accepted", signal: new AbortController().signal, assertCurrent: () => undefined });
       f.hold();
-      const response = await fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: { "content-type": "application/json", "x-joko-provider-proxy-token": f.token, "thread-id": "root" }, body: JSON.stringify({ model: "model" }) });
+      if (protocol === "openai-completions") {
+        f.respondWith(chatEvent({ choices: [{ index: 0, delta: { content: "First fragment" }, finish_reason: null }] }));
+      }
+      const response = await fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: { "content-type": "application/json", "x-joko-provider-proxy-token": f.token, "thread-id": "root" }, body: JSON.stringify({ model: "model", input: "fixture" }) });
       const reading = response.text().catch(() => "revoked");
       await f.credentials.delete("credential-0"); f.finish();
       expect(await reading).toBe("revoked"); lease.release(); binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
+  it("translates a selected Chat descendant only while its exact parent, operation, and model are authorized", async () => {
+    const f = await fixture(false, "openai-completions");
+    try {
+      const child = f.port.listSmartRoutingCandidates!().find(candidate => candidate.model.modelId === "child-model")!;
+      expect(child.protocol).toBe("openai-completions");
+      const binding = await f.port.prepareSmartRouting!({ ...f.owner, nativeProviderId: "openai", rootProviderId: "provider", rootModelId: "model", revision: "catalog",
+        routes: [{ providerId: child.providerId, modelId: child.model.modelId, revision: child.revision, native: false }] });
+      binding.bindRoot({ threadId: "root", providerId: "provider", modelId: "model" });
+      const lease = await binding.activate({ operationId: "chat-smart-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      f.respondWith(chatEvent({ choices: [{ index: 0, delta: { content: "Child response" }, finish_reason: "stop" }] }) + "data: [DONE]\n\n");
+      const request = (parentThreadId: string, model: string) => fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: {
+        "content-type": "application/json", "x-joko-provider-proxy-token": f.token,
+        "thread-id": "child", "x-codex-parent-thread-id": parentThreadId, "x-openai-subagent": "collab_spawn",
+        authorization: "Bearer native-fixture-credential", "x-openai-fedramp": "true"
+      }, body: JSON.stringify({ model, input: "child prompt" }) });
+      expect((await request("unknown-parent", "child-model")).status).toBe(502);
+      const events = responsesEvents(await (await request("root", "child-model")).text());
+      expect(events.at(-1)).toMatchObject({ type: "response.completed", response: {
+        model: "child-model", output: [{ type: "message", content: [{ type: "output_text", text: "Child response" }] }]
+      } });
+      expect((await request("root", "model")).status).toBe(502);
+      lease.release();
+      expect((await request("root", "child-model")).status).toBe(409);
+      expect(f.received).toEqual([{ path: f.requestPath, model: "child-model", authorization: "Bearer first-private-provider-credential" }]);
+      expect(f.receivedBodies[0]).toMatchObject({ messages: [{ role: "user", content: "child prompt" }] });
+      expect(f.forwardedProxyTokens).toEqual([undefined]);
+      expect(f.forwardedFedrampHeaders).toEqual([undefined]);
+      binding.dispose();
     } finally { await f.dispose(); }
   });
   it("advertises smart candidates only while their Provider is currently available", async () => {
@@ -379,12 +555,14 @@ describe("Managed Provider native proxy", () => {
     }
   });
 
-  it.skipIf(process.env.JOKO_CODEX_MANAGED_FIXTURE_COMMAND === undefined)("runs the installed native app-server through the production route on the original thread with an isolated profile", async () => {
-    const f = await fixture(true);
+  const nativeFixtureCommand = process.env.JOKO_CODEX_MANAGED_FIXTURE_COMMAND ?? process.env.JOKO_CODEX_HOSTED_TEST_BINARY;
+  it.skipIf(nativeFixtureCommand === undefined).each(["openai-responses", "openai-completions"] as const)(
+    "runs the installed native app-server over %s on the original thread with an isolated profile", async protocol => {
+    const f = await fixture(true, protocol);
     const profile = join(f.directory, "profile"); const workspaceRoot = join(f.directory, "workspace");
     await mkdir(profile); await mkdir(workspaceRoot);
     const adapter = createCodexAdapter({ id: "runtime", instanceGeneration: 3, managedProviders: f.port,
-      appServer: { transport: { command: process.env.JOKO_CODEX_MANAGED_FIXTURE_COMMAND!, args: ["app-server", "--listen", "stdio://"], cwd: workspaceRoot,
+      appServer: { transport: { command: nativeFixtureCommand!, args: ["app-server", "--listen", "stdio://"], cwd: workspaceRoot,
         env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, PATH: process.env.PATH, TEMP: f.directory, TMP: f.directory, USERPROFILE: profile, HOME: profile, CODEX_HOME: profile, OTEL_SDK_DISABLED: "true" } } } });
     const target: TargetDescriptor = { id: "target", backendId: "runtime", displayName: "Isolated target", workspaceRoot, managed: true, trusted: true };
     const events: EventPayload[] = [];
@@ -407,9 +585,9 @@ describe("Managed Provider native proxy", () => {
       await run("two");
       expect((await adapter.inspectSession(binding, context("inspect"))).binding.nativeSessionId).toBe(originalId);
       expect(f.received).toEqual([
-        { path: "/custom/responses", model: "model", authorization: "Bearer first-private-provider-credential" },
-        { path: "/custom/responses", model: "model", authorization: "Bearer first-private-provider-credential" },
-        { path: "/custom/responses", model: "model", authorization: "Bearer second-private-provider-credential" }
+        { path: f.requestPath, model: "model", authorization: "Bearer first-private-provider-credential" },
+        { path: f.requestPath, model: "model", authorization: "Bearer first-private-provider-credential" },
+        { path: f.requestPath, model: "model", authorization: "Bearer second-private-provider-credential" }
       ]);
       // Native policy may deny the controlled environment probe. A denial is
       // recorded separately and does not prove that a tool process was launched.

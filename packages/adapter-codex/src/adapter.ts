@@ -253,7 +253,7 @@ export interface CodexRemoteRuntimePort {
 }
 
 export const CODEX_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze<ProviderRuntimeSupport>({
-  protocols: ["openai-responses"],
+  protocols: ["openai-responses", "openai-completions"],
   fields: ["request_path", "models_endpoint", "headers", "keyless", "model_costs", "model_input_modalities", "model_fast_mode"]
 });
 
@@ -3717,7 +3717,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       this.#assertBackendContext(context);
       assertDispatchNotCancelled(context.signal);
-      if (route.providerId !== providerId || route.model.providerId !== providerId || route.model.modelId !== modelId || route.protocol !== "openai-responses") throw managedRouteUnavailable();
+      if (route.providerId !== providerId || route.model.providerId !== providerId || route.model.modelId !== modelId
+        || route.model.api !== route.protocol || !CODEX_MANAGED_PROVIDER_SUPPORT.protocols.includes(route.protocol)) throw managedRouteUnavailable();
       route.assertCurrent();
       return route;
     } catch (error) {

@@ -9,6 +9,7 @@ import type {
 } from "@joko/core";
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
 import { createManagedResponsesSseRepair } from "./managed-responses-sse-repair.js";
+import { prepareChatCompletion, writeResponsesFromChat } from "./responses-chat-bridge/transport.js";
 
 const BODY_LIMIT = 32 * 1024 * 1024;
 const ENVIRONMENT_NAME = "JOKO_PROVIDER_PROXY_TOKEN";
@@ -34,6 +35,7 @@ interface ActiveOperation {
   readonly assertCurrent: () => void;
   readonly release: () => void;
   readonly subtasks: Map<string, ActiveSubtaskRoute>;
+  readonly assertCredentialsCurrent?: () => void;
 }
 
 interface ActiveSubtaskRoute {
@@ -45,6 +47,7 @@ interface ActiveSubtaskRoute {
   readonly abort: AbortController;
   readonly assertCurrent: () => void;
   readonly release: () => void;
+  readonly assertCredentialsCurrent?: () => void;
 }
 
 interface BindingState {
@@ -244,7 +247,9 @@ export class ManagedProviderProxy {
               abort.abort();
             };
             const active: ActiveOperation = { operationId: operation.operationId, route, abort,
-              assertCurrent: operation.assertCurrent, release, subtasks: new Map() };
+              assertCurrent: operation.assertCurrent, release, subtasks: new Map(),
+              ...(route.api === "openai-completions"
+                ? { assertCredentialsCurrent: this.#providers.captureInferenceCredentialAuthority(route) } : {}) };
             state.active = active;
             operation.signal.addEventListener("abort", release, { once: true });
             if (operation.signal.aborted) release();
@@ -288,7 +293,9 @@ export class ManagedProviderProxy {
               maxOutputTokens,
               abort,
               assertCurrent: subtask.assertCurrent,
-              release
+              release,
+              ...(route.api === "openai-completions"
+                ? { assertCredentialsCurrent: this.#providers.captureInferenceCredentialAuthority(route) } : {})
             };
             active.subtasks.set(subtask.requestId, granted);
             subtask.signal.addEventListener("abort", release, { once: true });
@@ -328,7 +335,7 @@ export class ManagedProviderProxy {
             const identity = this.#providers.describeInferenceRoute(owner.backendId, route.providerId, route.modelId);
             const resolved = this.#providers.resolveInferenceRoute(owner.backendId, route.providerId, route.modelId);
             if (identity?.generationId !== route.revision || resolved?.generationId !== route.revision
-              || resolved.api !== "openai-responses") throw unavailable();
+              || !codexManagedProtocol(resolved.api) || !supported(resolved.api)) throw unavailable();
           }
           routes.set(route.modelId, { ...route });
         }
@@ -338,7 +345,8 @@ export class ManagedProviderProxy {
           if (rootModelId === undefined) throw unavailable();
           const identity = this.#providers.describeInferenceRoute(owner.backendId, owner.rootProviderId, rootModelId);
           const route = this.#providers.resolveInferenceRoute(owner.backendId, owner.rootProviderId, rootModelId);
-          if (identity === undefined || route?.generationId !== identity.generationId || route.api !== "openai-responses") {
+          if (identity === undefined || route?.generationId !== identity.generationId
+            || !codexManagedProtocol(route.api) || !supported(route.api)) {
             throw unavailable();
           }
           rootRevision = identity.generationId;
@@ -380,7 +388,8 @@ export class ManagedProviderProxy {
             if (providerId !== state.nativeProviderId) {
               const identity = this.#providers.describeInferenceRoute(state.owner.backendId, providerId, modelId);
               const route = this.#providers.resolveInferenceRoute(state.owner.backendId, providerId, modelId);
-              if (identity === undefined || route?.generationId !== identity.generationId || route.api !== "openai-responses") throw unavailable();
+              if (identity === undefined || route?.generationId !== identity.generationId
+                || !codexManagedProtocol(route.api) || !supported(route.api)) throw unavailable();
               state.rootRevision = identity.generationId;
             } else {
               state.rootRevision = undefined;
@@ -475,6 +484,7 @@ export class ManagedProviderProxy {
       || operation.route.backendId !== state.owner.backendId || operation.route.providerId !== state.providerId
       || operation.route.modelId !== state.modelId) throw unavailable();
     operation.assertCurrent();
+    operation.assertCredentialsCurrent?.();
   }
 
   #assertSubtask(state: BindingState, operation: ActiveOperation, subtask: ActiveSubtaskRoute): void {
@@ -484,6 +494,7 @@ export class ManagedProviderProxy {
       || subtask.route.providerId !== state.providerId || subtask.route.modelId !== subtask.modelId
       || subtask.route.api !== state.protocol) throw unavailable();
     subtask.assertCurrent();
+    subtask.assertCredentialsCurrent?.();
   }
 
   #assertSmartBinding(state: SmartBindingState, admission = true): void {
@@ -509,7 +520,7 @@ export class ManagedProviderProxy {
   #captureSmartThreadRoute(state: SmartBindingState, selected: ActiveSmartThreadRoute): ActiveSmartThreadRoute {
     if (selected.native) return selected;
     const route = this.#providers.resolveInferenceRoute(state.owner.backendId, selected.providerId, selected.modelId);
-    if (selected.revision === undefined || route?.generationId !== selected.revision || route.api !== "openai-responses") throw unavailable();
+    if (selected.revision === undefined || route?.generationId !== selected.revision || !codexManagedProtocol(route.api)) throw unavailable();
     return { ...selected, route, assertCredentialsCurrent: this.#providers.captureInferenceCredentialAuthority(route) };
   }
 
@@ -596,7 +607,7 @@ export class ManagedProviderProxy {
     }
     const route = selected.route;
     if (selected.revision === undefined || route?.generationId !== selected.revision
-      || route.api !== "openai-responses") throw unavailable();
+      || !codexManagedProtocol(route.api)) throw unavailable();
     selected.assertCredentialsCurrent?.();
     return { route, native: false, ...(selected.assertCredentialsCurrent ? { assertCurrent: selected.assertCredentialsCurrent } : {}) };
   }
@@ -632,6 +643,14 @@ export class ManagedProviderProxy {
       const requestedModel = (parsed as { readonly model: string }).model;
       const selected = this.#smartRouteForRequest(state, operation, request, requestedModel);
       this.#assertSmartOperation(state, operation);
+      if (selected.route?.api === "openai-completions") {
+        if (path !== "/responses") { fail(response, 404); return; }
+        await this.#handleChat(response, parsed as Record<string, unknown>, selected.route, signal, () => {
+          this.#assertSmartOperation(state, operation);
+          selected.assertCurrent?.();
+        });
+        return;
+      }
       const nativeAuthorization = selected.native ? singleHeader(request, "authorization") : "";
       if (selected.native && (!validSecretHeader(nativeAuthorization) || selected.route !== undefined)) throw unavailable();
       const accountId = selected.native ? singleHeader(request, "chatgpt-account-id") : "";
@@ -743,6 +762,13 @@ export class ManagedProviderProxy {
         maxOutputTokens = subtask.maxOutputTokens;
         signal = AbortSignal.any([operation.abort.signal, subtask.abort.signal, abort.signal]);
       }
+      if (route.api === "openai-completions") {
+        await this.#handleChat(response, parsed as Record<string, unknown>, route, signal, () => {
+          if (subtask === undefined) this.#assertOperation(state, operation);
+          else this.#assertSubtask(state, operation, subtask);
+        });
+        return;
+      }
       const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
       const endpoint = route.requestPath === undefined
         ? new URL(match![2]!.slice(1), base)
@@ -803,6 +829,48 @@ export class ManagedProviderProxy {
       request.off("aborted", close);
       response.off("close", close);
     }
+  }
+
+  async #handleChat(
+    response: ServerResponse, parsed: Record<string, unknown>, route: ProviderInferenceRoute,
+    signal: AbortSignal, assertCurrent: () => void
+  ): Promise<void> {
+    const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
+    const endpoint = route.requestPath === undefined
+      ? new URL("chat/completions", base)
+      : new URL(route.requestPath, base.origin);
+    if (endpoint.origin !== base.origin) throw unavailable();
+    let prepared;
+    try {
+      prepared = prepareChatCompletion(parsed, { modelId: route.modelId, endpoint, supportsImages: route.supportsImages });
+    } catch {
+      fail(response, 400);
+      return;
+    }
+    const body = Buffer.from(JSON.stringify(prepared.request));
+    if (body.byteLength > BODY_LIMIT) {
+      fail(response, 413);
+      return;
+    }
+    const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream, application/json" });
+    for (const [name, value] of Object.entries(route.headers)) {
+      if (name.toLowerCase() !== SMART_TOKEN_HEADER) headers.set(name, value);
+    }
+    if (route.authorization !== undefined) headers.set("authorization", route.authorization);
+    signal.throwIfAborted();
+    assertCurrent();
+    const fetchUpstream = this.#fetchForRoute?.(route) ?? this.#fetch;
+    const upstream = await fetchUpstream(endpoint, {
+      method: "POST", headers, body, redirect: "manual", signal
+    });
+    signal.throwIfAborted();
+    assertCurrent();
+    if (!upstream.ok || upstream.body === null) {
+      await upstream.body?.cancel();
+      fail(response, upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502);
+      return;
+    }
+    await writeResponsesFromChat({ prepared, upstream, response, signal, assertCurrent });
   }
 }
 
@@ -884,8 +952,13 @@ function sameSmartThreadRoute(left: ActiveSmartThreadRoute, right: ActiveSmartTh
 
 function requestSuffix(protocol: ProviderRuntimeProtocol, path: string): string | undefined {
   if (protocol === "openai-responses") return path === "/responses" ? "" : path === "/responses/compact" ? "/compact" : undefined;
+  if (protocol === "openai-completions") return path === "/responses" ? "" : undefined;
   if (protocol === "anthropic-messages") return path === "/v1/messages" ? "" : path === "/v1/messages/count_tokens" ? "/count_tokens" : undefined;
   return undefined;
+}
+
+function codexManagedProtocol(protocol: ProviderRuntimeProtocol): boolean {
+  return protocol === "openai-responses" || protocol === "openai-completions";
 }
 
 function managedOutputLimit(value: number | undefined): number | undefined {

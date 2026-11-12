@@ -830,10 +830,11 @@ describe("CodexBackendAdapter", () => {
     expect(inspectProcessUsage).toHaveBeenCalledOnce();
   });
 
-  it("keeps managed routes on the original thread, authorizes only the active operation, and adopts revisions before new input", async () => {
+  it.each(["openai-responses", "openai-completions"] as const)(
+    "keeps managed %s on the original thread, authorizes only the active operation, and adopts revisions before new input", async protocol => {
     let revision = "1";
     let enabled = true;
-    const model: ProviderModel = { providerId: "custom", modelId: "custom-model", displayName: "Custom", api: "openai-responses", contextWindow: 0, maxOutputTokens: 0, supportsImages: false, supportsFastMode: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const model: ProviderModel = { providerId: "custom", modelId: "custom-model", displayName: "Custom", api: protocol, contextWindow: 0, maxOutputTokens: 0, supportsImages: false, supportsFastMode: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     const released = vi.fn();
     const retired = vi.fn();
     const operations: Parameters<ManagedProviderRouteBinding["activate"]>[0][] = [];
@@ -846,7 +847,7 @@ describe("CodexBackendAdapter", () => {
         const captured = revision;
         let disposed = false;
         return {
-          providerId: "custom", model, protocol: "openai-responses", revision: captured, baseUrl: `http://127.0.0.1:1234/managed/route-${captured}`, apiKeyEnvironment: "JOKO_PROVIDER_PROXY_TOKEN", thinkingLevelMap: {},
+          providerId: "custom", model, protocol, revision: captured, baseUrl: `http://127.0.0.1:1234/managed/route-${captured}`, apiKeyEnvironment: "JOKO_PROVIDER_PROXY_TOKEN", thinkingLevelMap: {},
           assertCurrent: () => { if (disposed || captured !== revision || !enabled) throw new Error("route changed"); },
           activate: async (operation) => { operation.assertCurrent(); operations.push(operation); return { release: released }; },
           dispose: () => { disposed = true; }
