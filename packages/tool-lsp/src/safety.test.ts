@@ -75,10 +75,15 @@ describe("TypeScript LSP safety boundaries", () => {
     const request = { workspaceRoot: root, file: "main.ts", line: 2, column: 1 };
     try {
       expect(JSON.stringify(await bridge.hover(request))).not.toContain("outside-value");
-      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+      // TypeScript may return the unresolved import alias in the caller.
+      for (const item of (await bridge.gotoDefinition(request)).items) {
+        expect(item).toMatchObject({ kind: "alias", name: "secret", location: { path: "main.ts" } });
+      }
       await writeFile(join(root, "main.ts"), `import { secret } from ${JSON.stringify(join(outside, "index.d.ts").replaceAll("\\", "/"))};\nsecret;\n`);
       expect(JSON.stringify(await bridge.hover(request))).not.toContain("outside-value");
-      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+      for (const item of (await bridge.gotoDefinition(request)).items) {
+        expect(item).toMatchObject({ kind: "alias", name: "secret", location: { path: "main.ts" } });
+      }
     } finally { bridge.dispose(); }
   });
 
@@ -99,7 +104,9 @@ describe("TypeScript LSP safety boundaries", () => {
     const request = { workspaceRoot: root, file: "main.ts", line: 2, column: 1 };
     try {
       expect(JSON.stringify(await bridge.hover(request))).not.toContain("linked-value");
-      expect((await bridge.gotoDefinition(request)).items).toEqual([]);
+      for (const item of (await bridge.gotoDefinition(request)).items) {
+        expect(item).toMatchObject({ kind: "alias", name: "secret", location: { path: "main.ts" } });
+      }
       await expect(bridge.outline({ workspaceRoot: root, file: "node_modules/linked-lib/index.d.ts" }))
         .rejects.toMatchObject({ code: "FILE_UNSAFE" });
     } finally { bridge.dispose(); }
