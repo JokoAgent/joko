@@ -54,7 +54,7 @@ export function readDocumentOutput(event: Event) {
   const cover = call.arguments.find(argument => argument.fieldPath === "cover" && !argument.redacted)?.value;
   const table = parts.find(part => part.case === "table")?.value;
   return { format, file, artifact, blob,
-    ...(theme === "light" || theme === "dark" || theme === "navy" ? { theme } : {}),
+    ...(theme === "light" || theme === "dark" || theme === "navy" ? { theme } as const : {}),
     ...(subtitle ? { subtitle } : {}),
     ...(count?.case === "integer" && count.value > 0n && count.value <= 10_000n ? { count: Number(count.value) } : {}),
     ...(cover?.case === "boolean" ? { cover: cover.value } : {}),
