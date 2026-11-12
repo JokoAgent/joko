@@ -434,6 +434,117 @@ describe("MessagingManager", () => {
     expect(final().find((row) => row.partIndex === 0)?.providerMessageId).toBe(carrierId);
   });
 
+  it("rotates only the owner's original Partner Telegram topic and keeps the adopted task after restart", async () => {
+    const transport = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const pending: TelegramUpdate[] = [];
+    vi.spyOn(transport, "poll").mockImplementation(async ({ signal }) => {
+      while (pending.length === 0) {
+        signal?.throwIfAborted();
+        await new Promise<void>(resolve => setTimeout(resolve, 5));
+      }
+      const updates = pending.splice(0);
+      return { updates, nextCursor: String(updates.at(-1)!.update_id + 1) };
+    });
+    vi.spyOn(transport, "normalize").mockImplementation(updates => normalizeTelegramUpdates(updates, {
+      connectionId: transport.connectionId, ownerUserId: "42",
+      bot: { id: 9001, username: "joko_test_bot", displayName: "Joko" }
+    }));
+    const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE,
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+        ? { ...capability, options: ["ask"] } : capability) });
+    const fixture = await createFixture(() => transport, () => adapter);
+    const { store, host } = fixture;
+    const profiles = new PartnerStore(join(fixture.root, "partners.db"));
+    cleanups.push(async () => { try { await fixture.manager.close(); } finally { profiles.close(); } });
+    const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host,
+      homesRoot: join(fixture.root, "homes"), workspaceService: { register: async input => input, unregister: () => undefined } });
+    const partner = await partners.createPartner({ requestId: "telegram-topic-partner", expectedDirectoryRevision: profiles.directoryState().revision,
+      displayName: "Ada", avatar: "orbit", identitySource: "A Partner who replies to the owner.", templateId: "general", usesDirectoryDefaults: false,
+      capabilities: { modelChain: [{ backendId: adapter.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }],
+        permissionMode: "ask", planMode: false } });
+    const attachRuntime = (messaging: MessagingManager) => {
+      const runtime = new PartnerMessagingRuntime({ store, profiles, partners, host, messaging, pauseGoal: async () => undefined });
+      messaging.setPartnerRuntime(runtime);
+      host.setMessagingQueueGuard(item => runtime.assertQueueCurrent(item), (item, request) => runtime.reviewTool(item, request));
+      return runtime;
+    };
+    const runtime = attachRuntime(fixture.manager);
+    const owner = store.createConnection({ id: "telegram-ui-owner", name: "Owner", authKeyDigest: "telegram-ui-auth" });
+    const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42" });
+    const bound = await runtime.setBinding({ operationId: "telegram-topic-binding", owner, connectionId: created.id, partnerId: partner.id,
+      expectedBindingRevision: 0, expectedConnectionRevision: created.revision, expectedConnectionGeneration: created.generation,
+      expectedPartnerRevision: partner.revision });
+    const connection = await replaceCredential(fixture, bound.connection, "telegram-topic-partner", true);
+    const mention = "@joko_test_bot";
+    const accept = async (updateId: number, messageId: number, threadId: number, text: string, senderId = 42) => {
+      pending.push({ update_id: updateId, message: {
+        message_id: messageId, message_thread_id: threadId, is_topic_message: true, date: Math.floor(Date.now() / 1_000),
+        chat: { id: -100555, type: "supergroup" }, from: { id: senderId, first_name: "Sender", is_bot: false }, text,
+        ...(text.startsWith(mention) ? { entities: [{ type: "mention", offset: 0, length: mention.length }] } : {})
+      } });
+      await vi.waitFor(() => expect(store.getMessagingConnection(connection.id).cursor).toBe(String(updateId + 1)), { timeout: 5_000 });
+    };
+    const topic = (id: string) => store.listMessagingConversations({ connectionId: connection.id }).find(row => row.providerThreadId === id)!;
+    const requests = () => store.listMessagingInboundRequests({ connectionId: connection.id });
+    const notices = (id: string) => transport.sentText.filter(row => row.replyToMessageId === id);
+
+    await accept(10, 10, 7, "/new");
+    await accept(11, 11, 8, "/new");
+    await vi.waitFor(() => expect(notices("10")).toMatchObject([{ address: { providerThreadId: "7" }, text: "A new conversation is ready." }]), { timeout: 5_000 });
+    const original = topic("7");
+    const sibling = topic("8");
+    expect(original.sessionId).toBeDefined();
+    expect(sibling.sessionId).toBeDefined();
+    expect(sibling.sessionId).not.toBe(original.sessionId);
+    expect(requests()).toHaveLength(0);
+
+    await accept(12, 12, 7, `${mention} Work in the first topic task`);
+    await vi.waitFor(() => expect(requests().find(row => row.providerMessageId === "12")?.status).toBe("completed"), { timeout: 5_000 });
+    const enqueue = store.enqueueMessagingDelivery.bind(store);
+    const admission = vi.spyOn(store, "enqueueMessagingDelivery").mockImplementation(input => {
+      if (input.kind === "notice" && input.dedupeKey.startsWith("command:")) {
+        admission.mockRestore();
+        throw new Error("The command notice could not be committed.");
+      }
+      return enqueue(input);
+    });
+    await accept(13, 13, 7, "/new");
+    await vi.waitFor(() => expect(notices("13")).toMatchObject([{ address: { providerThreadId: "7" },
+      text: "The new conversation could not be confirmed. Check the original task." }]), { timeout: 5_000 });
+    expect(topic("7").sessionId).toBe(original.sessionId);
+    expect(store.getSession(original.sessionId!).descriptor.archived).toBe(false);
+    const failedLink = profiles.listSessionLinks(partner.id, "channel")
+      .find(link => link.sessionId !== original.sessionId && link.sessionId !== sibling.sessionId)!;
+    expect(host.isPrivateSessionCreationClosed(failedLink.channelOperationId!, failedLink.sessionId)).toBe(true);
+
+    await accept(14, 14, 7, "/new");
+    await vi.waitFor(() => expect(notices("14")).toMatchObject([{ address: { providerThreadId: "7" },
+      text: "A new conversation is ready. Previous task history was archived." }]), { timeout: 5_000 });
+    const replacement = topic("7");
+    expect(replacement).toMatchObject({ id: original.id, partnerId: partner.id, permissionMode: "ask" });
+    expect(replacement.sessionId).not.toBe(original.sessionId);
+    expect(store.getSession(original.sessionId!).descriptor.archived).toBe(true);
+    expect(profiles.getSessionLink(failedLink.sessionId)).toBeUndefined();
+    expect(profiles.getSessionLink(original.sessionId!)).toMatchObject({ partnerId: partner.id, role: "channel" });
+    expect(profiles.getSessionLink(replacement.sessionId!)).toMatchObject({ partnerId: partner.id, role: "channel" });
+    expect(topic("8").sessionId).toBe(sibling.sessionId);
+    expect(store.getSession(sibling.sessionId!).descriptor.archived).toBe(false);
+    expect(store.getSession(partner.canonicalSessionId!).descriptor.archived).toBe(false);
+    expect(runtime.connectionsForSession(replacement.sessionId!, partner.homeTargetId, "telegram").map(row => row.id)).toEqual([connection.id]);
+
+    await accept(15, 14, 7, "/new");
+    await accept(16, 16, 7, "/new", 56);
+    expect(notices("14")).toHaveLength(1);
+    expect(notices("16")).toHaveLength(0);
+    expect(topic("7").sessionId).toBe(replacement.sessionId);
+    await fixture.restartManager(attachRuntime);
+    await accept(17, 17, 7, `${mention} Work in the adopted topic task`);
+    await vi.waitFor(() => expect(requests().find(row => row.providerMessageId === "17")?.status).toBe("completed"), { timeout: 5_000 });
+    expect(requests()).toHaveLength(2);
+    expect(store.getQueueItem(requests().find(row => row.providerMessageId === "12")!.queueItemId!).sessionId).toBe(original.sessionId);
+    expect(store.getQueueItem(requests().find(row => row.providerMessageId === "17")!.queueItemId!).sessionId).toBe(replacement.sessionId);
+  }, 20_000);
+
   it.each([{ finalStatus: "sent", continuations: 1 }, { finalStatus: "unknown", continuations: 2 }] as const)(
     "preserves the Discord carrier for a $finalStatus final after $continuations Partner continuations",
     async ({ finalStatus, continuations }) => {

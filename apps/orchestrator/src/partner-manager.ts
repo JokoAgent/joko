@@ -37,7 +37,7 @@ import {
 } from "@joko/store";
 
 import { modelRoutingEnabled } from "./backend-model-access.js";
-import type { SessionHost } from "./session-host.js";
+import type { CreateServiceSessionInput, SessionHost } from "./session-host.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import type { WorkspaceService } from "./workspace-service.js";
 import { partnerTopicRootMessage } from './partner-topic-context.js';
@@ -598,7 +598,7 @@ export class PartnerManager {
   /** The message owner supplies a private key and rechecks its exact channel
    * grant around original Host native creation. No visible-history replay. */
   async ensureChannel(input: { readonly partnerId: string; readonly key: string; readonly title: string;
-    readonly assertCurrent: () => void }): Promise<SessionDescriptor> {
+    readonly assertCurrent: () => void; readonly onMessagingAdmitted?: CreateServiceSessionInput['onMessagingAdmitted'] }): Promise<SessionDescriptor> {
     const profile = this.getPartner(input.partnerId);
     const assertOwner = () => {
       input.assertCurrent(); const current = this.getPartner(profile.id);
@@ -616,7 +616,11 @@ export class PartnerManager {
             await this.#applyCanonicalSettings({ ...profile, capabilities: { ...profile.capabilities, permissionMode: 'ask' } }, session.id);
             assertOwner(); this.#store.advanceChannelSessionProfile(session.id, existing.profileVersion, profile.revision);
           }
-          assertOwner(); return this.#operationalStore.getSession(session.id).descriptor;
+          assertOwner();
+          const stored = this.#operationalStore.getSession(session.id);
+          const adopt = input.onMessagingAdmitted;
+          if (adopt !== undefined) this.#operationalStore.transaction(store => adopt(store, stored));
+          return stored.descriptor;
         }
         throw new PartnerManagerError('PARTNER_SESSION_INACTIVE', 'The original channel task is inactive.');
       } catch (error) {
@@ -636,12 +640,14 @@ export class PartnerManager {
       providerId: primary.providerId, modelId: primary.modelId, ...(primary.effort === undefined ? {} : { effort: primary.effort }),
       fastMode: primary.fastMode, permissionMode: 'ask', planMode: profile.capabilities.planMode,
       appendSystemPrompt: profile.identitySource, assertServiceScope: assertOwner,
+      ...(input.onMessagingAdmitted === undefined ? {} : { onMessagingAdmitted: input.onMessagingAdmitted }),
       preparePrivateSession: async sessionId => {
         assertOwner(); this.#store.bindChannelSession({ partnerId: profile.id, expectedRevision: profile.revision,
           profileVersion: profile.profileVersion, sessionId, key: input.key, operationId, ...(replaces ? { replaces } : {}) });
         if (replaces) this.#sessionHost.releasePrivateSessionCreationReceipt(replaces.operationId, replaces.sessionId);
       } });
-    assertOwner(); return this.#operationalStore.getSession(result.value.sessionId).descriptor;
+    if (input.onMessagingAdmitted === undefined) assertOwner();
+    return this.#operationalStore.getSession(result.value.sessionId).descriptor;
   }
 
   async ensureTopic(input: { readonly operationId: string; readonly connection: ConnectionRecord; readonly partnerId: string;

@@ -2484,14 +2484,35 @@ export class MessagingManager {
     assertOwner: () => void,
     settle: (store: OperationalStore, result: MessagingTaskCommandResult) => void
   ): Promise<MessagingTaskCommandResult | undefined> {
-    const partner = this.#partnerRuntime?.binding(connection.id);
-    if (partner?.partnerId !== undefined) {
-      if (conversation.conversationKind !== "direct") throw invalid("The original message task changed. Send /new again.");
-      const bound = await this.#partnerRuntime?.resolve(conversation, event);
+    const partnerRuntime = this.#partnerRuntime;
+    const partner = partnerRuntime?.binding(connection.id);
+    const previousId = conversation.sessionId;
+    const publish = (store: OperationalStore) => {
+      if (previousId !== undefined) {
+        const now = this.#now();
+        const previous = store.getSession(previousId);
+        const archived = store.updateSession(previousId, { archived: true }, previous.revision, now).descriptor;
+        store.appendEvent({ backendId: archived.backendId, targetId: archived.targetId, sessionId: archived.id,
+          generation: archived.binding.generation, emittedAt: now, traceId: `messaging-new-session:${interactionId}`,
+          payload: { type: "session_changed" } });
+      }
+      settle(store, { notice: previousId === undefined ? "A new conversation is ready."
+        : "A new conversation is ready. Previous task history was archived." });
+    };
+    if (partnerRuntime !== undefined && partner?.partnerId !== undefined) {
+      if (conversation.conversationKind === "group") {
+        const rotation = partnerRuntime.prepareTelegramGroupRotation(conversation, assertOwner);
+        if (rotation === undefined) throw invalid("The original message task changed. Send /new again.");
+        const stopped = await this.#quiesceMessagingTask(conversation, interactionId, signal, rotation.assertCurrent);
+        if (stopped !== undefined) return stopped;
+        await rotation.create(() => this.#assertMessagingTaskIdle(previousId), publish);
+        return undefined;
+      }
+      const bound = await partnerRuntime.resolve(conversation, event);
       assertOwner();
-      const current = this.#partnerRuntime?.binding(connection.id);
+      const current = partnerRuntime.binding(connection.id);
       if (bound?.partnerId !== partner.partnerId || bound.partnerBindingRevision !== partner.revision
-        || current?.partnerId !== partner.partnerId || current.revision !== partner.revision) {
+        || current.partnerId !== partner.partnerId || current.revision !== partner.revision) {
         throw invalid("The original Partner conversation is unavailable.");
       }
       return { notice: "This chat shares the Partner's long-running task. To restart its context, use Joko." };
@@ -2500,7 +2521,6 @@ export class MessagingManager {
       throw invalid("The original message task is no longer available.");
     }
     const route = this.#store.resolveMessagingRoute(connection.id);
-    const previousId = conversation.sessionId;
     const assertLane = () => {
       assertOwner();
       const current = this.#store.getMessagingConversation(conversation.id);
@@ -2513,33 +2533,13 @@ export class MessagingManager {
     };
     const assertIdle = () => {
       assertLane();
-      if (previousId === undefined) return;
-      const task = this.#store.getSession(previousId).descriptor;
-      if (task.archived || task.deletedAt !== undefined) throw invalid("The original message task is no longer available.");
-      try { this.#sessionHost.assertSessionLifecycleIdle(previousId); }
-      catch { throw invalid("Wait for the original task to settle, then send /new again."); }
+      this.#assertMessagingTaskIdle(previousId);
     };
-    if (previousId !== undefined) {
-      if (this.#store.sessionCreationServiceKind(previousId) !== "messaging") throw invalid("The original task is outside this message conversation.");
-      const activeInputs = () => listAllQueueItems(this.#store, { sessionId: previousId,
-        states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"] });
-      const inputs = activeInputs();
-      if (inputs.some(item => {
-        const request = this.#store.findMessagingInboundRequestByRunId(item.runId);
-        return request?.conversationId !== conversation.id || request.channelGeneration !== connection.generation;
-      })) throw invalid("Finish the other work in the original task before starting a new conversation.");
-      if (inputs.length > 0) {
-        const stopped = await this.#stopOwnedMessagingTurn(conversation, interactionId, signal, assertLane);
-        if (stopped.failure !== undefined) return stopped;
-        const deadline = performance.now() + 5_000;
-        while (activeInputs().length > 0 && performance.now() < deadline) {
-          await abortableDelay(50, signal);
-          assertLane();
-        }
-      }
-      assertIdle();
-      await this.#sessionHost.closeIfActive(previousId);
+    if (previousId !== undefined && this.#store.sessionCreationServiceKind(previousId) !== "messaging") {
+      throw invalid("The original task is outside this message conversation.");
     }
+    const stopped = await this.#quiesceMessagingTask(conversation, interactionId, signal, assertLane);
+    if (stopped !== undefined) return stopped;
     const group = conversation.conversationKind === "group";
     await this.#sessionHost.createServiceSession({
       operationId: `messaging-new-session-${interactionId}`, serviceKind: "messaging",
@@ -2556,19 +2556,45 @@ export class MessagingManager {
           expectedChannelGeneration: connection.generation, sessionId: session.descriptor.id,
           expectedSessionGeneration: session.descriptor.binding.generation, routeScopeKey: route.scopeKey, updatedAt: now };
         if (previousId === undefined) store.bindMessagingConversation(binding);
-        else {
-          store.rebindMessagingConversationSession({ ...binding, expectedSessionId: previousId });
-          const previous = store.getSession(previousId);
-          const archived = store.updateSession(previousId, { archived: true }, previous.revision, now).descriptor;
-          store.appendEvent({ backendId: archived.backendId, targetId: archived.targetId, sessionId: archived.id,
-            generation: archived.binding.generation, emittedAt: now, traceId: `messaging-new-session:${interactionId}`,
-            payload: { type: "session_changed" } });
-        }
-        settle(store, { notice: previousId === undefined ? "A new conversation is ready."
-          : "A new conversation is ready. Previous task history was archived." });
+        else store.rebindMessagingConversationSession({ ...binding, expectedSessionId: previousId });
+        publish(store);
       }
     });
     return undefined;
+  }
+
+  #assertMessagingTaskIdle(sessionId: string | undefined): void {
+    if (sessionId === undefined) return;
+    const task = this.#store.getSession(sessionId).descriptor;
+    if (task.archived || task.deletedAt !== undefined) throw invalid("The original message task is no longer available.");
+    try { this.#sessionHost.assertSessionLifecycleIdle(sessionId); }
+    catch { throw invalid("Wait for the original task to settle, then send /new again."); }
+  }
+
+  async #quiesceMessagingTask(conversation: MessagingConversationRecord, interactionId: string, signal: AbortSignal,
+    assertLane: () => void): Promise<MessagingTaskCommandResult | undefined> {
+    const sessionId = conversation.sessionId;
+    if (sessionId === undefined) return;
+    assertLane();
+    const activeInputs = () => listAllQueueItems(this.#store, { sessionId,
+      states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"] });
+    const inputs = activeInputs();
+    if (inputs.some(item => {
+      const request = this.#store.findMessagingInboundRequestByRunId(item.runId);
+      return request?.conversationId !== conversation.id || request.channelGeneration !== conversation.channelGeneration;
+    })) throw invalid("Finish the other work in the original task before starting a new conversation.");
+    if (inputs.length > 0) {
+      const stopped = await this.#stopOwnedMessagingTurn(conversation, interactionId, signal, assertLane);
+      if (stopped.failure !== undefined) return stopped;
+      const deadline = performance.now() + 5_000;
+      while (activeInputs().length > 0 && performance.now() < deadline) {
+        await abortableDelay(50, signal);
+        assertLane();
+      }
+    }
+    assertLane();
+    this.#assertMessagingTaskIdle(sessionId);
+    await this.#sessionHost.closeIfActive(sessionId);
   }
 
   async #stopOwnedMessagingTurn(
@@ -5829,7 +5855,7 @@ function messagingTaskCommand(event: MessagingInboundMessage, partnerBound: bool
   if (isMessagingStopCommand(event.text)) return "stop";
   if (event.text.trim().toLowerCase() !== "/new") return;
   if (conversationKind === "direct" && (channel === "telegram" || partnerBound)
-    || channel === "telegram" && conversationKind === "group" && !partnerBound) return "new";
+    || channel === "telegram" && conversationKind === "group") return "new";
 }
 
 function messagingMessageKey(address: MessagingAddress, messageId: string): string {

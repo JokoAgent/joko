@@ -2294,7 +2294,9 @@ export class SessionHost {
         || input.worktree === undefined && input.beforeNativeCreation === undefined || input.nativeStart?.kind === "attach")) {
       throw new StoreError("Personal task adoption requires its exact new isolated service scope.");
     }
-    if (input.onMessagingAdmitted !== undefined && (input.serviceKind !== "messaging"
+    const privatePartnerChannel = input.serviceKind === "partner" && input.hidden === true
+      && input.preparePrivateSession !== undefined && input.permissionMode === "ask";
+    if (input.onMessagingAdmitted !== undefined && (input.serviceKind !== "messaging" && !privatePartnerChannel
       || input.assertServiceScope === undefined || input.nativeStart !== undefined || input.worktree !== undefined)) {
       throw new StoreError("Messaging task adoption requires a new task and its exact channel owner.");
     }
