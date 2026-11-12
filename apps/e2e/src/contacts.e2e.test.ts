@@ -72,7 +72,9 @@ mountedIt("opens an isolated Contacts draft and sends through its explicitly tru
     wrongNode.set("server", "different-node");
     await page.evaluate(hash => { window.location.hash = hash; }, `#/tasks/new?${wrongNode.toString()}`);
     await draft.getByText("Reconnect to the original Contacts node to use this draft.", { exact: true }).waitFor();
-    expect(await editor.innerText()).not.toContain(prompt);
+    expect(await editor.count()).toBe(0);
+    expect(await draft.locator('[data-composer-editor="true"]').innerText()).not.toContain(prompt);
+    expect(await draft.getByRole("button", { name: "Send", exact: true }).isEnabled()).toBe(false);
     await page.evaluate(hash => { window.location.hash = hash; }, ownedHash);
     await editor.getByText(prompt, { exact: false }).waitFor();
     await draft.getByRole("button", { name: "Close", exact: true }).click();
@@ -329,12 +331,14 @@ mountedIt("refreshes the mounted Contacts list and selected profile after anothe
 
   const updated = await contact.updateContact({ contactId: original.contactId, expectedRevision: original.revision,
     patch: { summary: "Updated from a separate connection" } });
-  await contact.createContactGroup({ expectedDirectoryRevision: updated.directory!.revision, name: "Computing pioneers" });
+  const createdGroup = await contact.createContactGroup({ expectedDirectoryRevision: updated.directory!.revision, name: "Computing pioneers" });
+  expect(createdGroup.directory?.groups).toBe(1);
   const selected = panel.locator(".contacts-list__item[aria-pressed=true]");
   await selected.getByText("Updated from a separate connection", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
   await details.getByText("Updated from a separate connection", { exact: true }).waitFor({ state: "visible" });
   await panel.locator("option").filter({ hasText: "Computing pioneers" }).waitFor({ state: "attached" });
-  expect(await panel.locator(".contacts-directory-card__stats").textContent()).toMatch(/1\s*Groups/u);
+  const groupCount = panel.locator(".contacts-directory-card__stats > span").filter({ has: panel.getByText("Groups", { exact: true }) });
+  await groupCount.getByText("1", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
 
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
   for (const [width, date, source] of [[1440, "2026-10", ""], [390, "2026-10-12", "meeting"]] as const) {

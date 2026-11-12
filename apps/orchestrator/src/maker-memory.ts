@@ -438,7 +438,7 @@ export class MakerMemoryController {
         assertCurrent();
         return result;
       });
-      return { ...execution.value, operation_id: operationId };
+      return { ...execution.operation.response!, operation_id: operationId };
     } catch (error) {
       const failure = error instanceof JokoError && error.publicError.phase === "memory_maintenance" ? error
         : memoryMaintenanceError(operationId, reviewPrepared ? "EFFECT_OUTCOME_UNKNOWN" : "MEMORY_MAINTENANCE_FAILED",

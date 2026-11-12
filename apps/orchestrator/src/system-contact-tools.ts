@@ -349,7 +349,7 @@ async function runSystemContactOperation(
     return store.completeAuthorizedDeferredEffectOperation(id, authKeyDigest, operationId, bodyHash, () => {
       access.assertWritable();
       return { ...result, operation_id: operationId };
-    }).value;
+    }).operation.response!;
   } catch (error) {
     const details = { ...(error instanceof SystemContactToolError ? error.details : {}), operation_id: operationId };
     const failure = error instanceof SystemContactToolError
