@@ -61,6 +61,20 @@ test("keeps the previous killed-query recovery bounded to one read and rejects o
   }
 });
 
+test("uses the same bounded read after an installation timeout and never issues a second install", async () => {
+  const error = new Error("The host query timed out.");
+  const killed = { error, receipt: { result: "failed", exitCode: null, errorCode: null, signal: "SIGTERM", killed: true, elapsedMs: 30_001 } };
+  const container = "/Users/runner/Devices/owned/Joko.app";
+  const lookup = containerLookup([killed, container]);
+  assert.equal(await locateInstalledSimulatorApplication({ ...lookup.options, afterInstallTimeout: true }), container);
+  const args = ["simctl", "get_app_container", lookup.options.owner.simulatorUdid, lookup.options.owner.bundleId, "app"];
+  assert.deepEqual(lookup.calls, ["locate-application-after-install-timeout", "retry-locate-application-after-install-timeout"]
+    .map(startupLabel => ({ binary: "xcrun", args, timeout: 30_000, startupLabel })));
+  const unresponsive = containerLookup([killed, killed]);
+  await assert.rejects(locateInstalledSimulatorApplication({ ...unresponsive.options, afterInstallTimeout: true }), error);
+  assert.equal(unresponsive.calls.length, 2);
+});
+
 test("never repeats a query after owner replacement or cancellation", async () => {
   for (const retire of [lookup => lookup.retire(), lookup => lookup.controller.abort()]) {
     const lookup = containerLookup([""]);
