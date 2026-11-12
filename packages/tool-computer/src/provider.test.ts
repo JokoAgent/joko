@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 import { COMPUTER_TEXT_CORPUS } from "./i18n/input.test-fixture.js";
@@ -439,6 +439,138 @@ describe("isStaleComputerTransportError", () => {
 });
 
 describe("public computer automation surface", () => {
+  it("inherits only the exact window's last explicit scope and publishes usable fresh element references", async () => {
+    let reads = 0;
+    const connection = new FakeConnection({ callTool: async (name, args) => {
+      if (name === "verify_state") return { structuredContent: { status: "satisfied", stable: true } };
+      if (name !== "get_window_state") return { structuredContent: { ok: true, effect: "confirmed" } };
+      const id = `window-read-${++reads}`;
+      return { structuredContent: { pid: args["pid"], window_id: args["window_id"], snapshot_id: id,
+        elements: [{ element_index: 0, element_token: `${id}:0` }] } };
+    } });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("window-scope");
+    const target = { pid: 1, window_id: 2 };
+    const first = await provider.callTool(fence, "get_window_state", { ...target, query: "form", max_elements: 12,
+      max_depth: 4, include_screenshot: false });
+    await provider.callTool(fence, "get_window_state", { pid: 1, window_id: 3, query: "elsewhere", include_screenshot: false });
+    const firstId = first.structuredContent?.["snapshot_id"];
+    const follow = await provider.callTool(fence, "click", { pid: 1, element_index: 0, snapshot_id: firstId, observe: { max_depth: 6 } });
+    expect(follow).toMatchObject({ isError: false, structuredContent: { outcome: { status: "confirmed" },
+      observation: { ok: true, tool: "get_window_state", snapshot_id: expect.any(String) } } });
+    expect(connection.callRequests.map(call => call.name)).toEqual(["get_window_state", "get_window_state", "click", "get_window_state"]);
+    expect(connection.callRequests[2]?.arguments).toMatchObject({ pid: 1, window_id: 2 });
+    expect(connection.callRequests[2]?.arguments).not.toHaveProperty("observe");
+    expect(connection.callRequests[3]?.arguments).toMatchObject({ ...target, query: "form", max_elements: 12, max_depth: 6, include_screenshot: false });
+    const observed = follow.structuredContent?.["observation"] as { snapshot_id: string; data: { elements: { element_token: string }[] } };
+    expect(observed.snapshot_id).not.toBe(firstId);
+    await expect(provider.callTool(fence, "click", { ...target, element_index: 0, snapshot_id: firstId }))
+      .resolves.toMatchObject({ structuredContent: { errorCode: "STALE_SNAPSHOT" } });
+    await provider.callTool(fence, "click", { pid: 1, element_token: observed.data.elements[0]!.element_token,
+      postcondition: [{ window: { exists: true } }] });
+    expect(connection.callRequests[4]?.arguments).toMatchObject({ ...target, element_token: "window-read-3:0" });
+    await provider.callTool(fence, "click", { ...target, x: 1, y: 2, observe: {} });
+    expect(connection.callRequests.at(-1)?.arguments).toMatchObject({ ...target, query: "form", max_elements: 12, max_depth: 6 });
+    await provider.closeAll();
+  });
+
+  it("observes an uncertain action once on a replacement transport and keeps the original outcome", async () => {
+    const first = new FakeConnection({ callTool: async name => {
+      if (name === "click") throw new Error("ECONNRESET");
+      return { structuredContent: { ok: true, snapshot_id: "native-old" } };
+    } });
+    const second = new FakeConnection({ callTool: async () => ({ structuredContent: { ok: true, snapshot_id: "native-new" } }) });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([first, second]).factory });
+    const fence = await provider.openSession("unknown-action");
+    const target = { pid: 1, window_id: 2 };
+    const original = await provider.callTool(fence, "get_window_state", { ...target, query: "original", include_screenshot: false });
+    const result = await provider.callTool(fence, "click", { ...target, x: 1, y: 2, observe: {} });
+    expect(first.callRequests.map(call => call.name)).toEqual(["get_window_state", "click", "end_session"]);
+    expect(second.callRequests.map(call => call.name)).toEqual(["get_window_state"]);
+    expect(second.callRequests[0]?.arguments).toMatchObject({ ...target, query: "original", include_screenshot: false });
+    expect(result).toMatchObject({ isError: true, structuredContent: { errorCode: "ACTION_OUTCOME_UNKNOWN",
+      outcome: { status: "unknown" }, observation: { ok: true, snapshot_id: expect.any(String) } } });
+    await expect(provider.callTool(fence, "click", { ...target, element_index: 0, snapshot_id: original.structuredContent?.["snapshot_id"] }))
+      .resolves.toMatchObject({ structuredContent: { errorCode: "STALE_SNAPSHOT" } });
+    const observation = result.structuredContent?.["observation"] as { snapshot_id: string };
+    await provider.callTool(fence, "click", { ...target, element_index: 0, snapshot_id: observation.snapshot_id });
+    expect(second.callRequests[1]?.arguments).toMatchObject({ ...target, element_index: 0, snapshot_id: "native-new" });
+    await provider.closeAll();
+  });
+
+  it("rejects conflicting, out-of-scope and untargeted observations before dispatch and skips refused actions", async () => {
+    const connection = new FakeConnection({ callTool: async () => ({ structuredContent: { ok: false, effect: "refused" } }) });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("refused-action");
+    const action = { pid: 1, window_id: 2, key: "Return" };
+    expect(() => provider.callTool(fence, "press_key", { ...action, observe: {}, postcondition: [{ window: { exists: true } }] }))
+      .toThrow(ComputerToolProviderError);
+    expect(() => provider.callTool(fence, "press_key", { ...action, observe: { screenshot_out_file: "caller.png" } }))
+      .toThrow(ComputerToolProviderError);
+    await expect(provider.callTool(fence, "press_key", { pid: 1, key: "Return", observe: {} }))
+      .resolves.toMatchObject({ structuredContent: { errorCode: "INVALID_ARGS" } });
+    expect(connection.callRequests).toEqual([]);
+    const refused = await provider.callTool(fence, "press_key", { ...action, observe: {} });
+    expect(refused).toMatchObject({ isError: true, structuredContent: { effect: "refused" } });
+    expect(refused.structuredContent).not.toHaveProperty("observation");
+    expect(connection.callRequests.map(call => call.name)).toEqual(["press_key"]);
+    await provider.closeAll();
+  });
+
+  it.each(["screenshot", "wrong window", "failed capture", "cancelled", "revoked"])("keeps window screenshot delivery scoped to the requested observation: %s", async mode => {
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==", "base64");
+    let path: string | undefined;
+    let finishRead!: () => void;
+    const pendingRead = new Promise<void>(resolve => { finishRead = resolve; });
+    const connection = new FakeConnection({ callTool: async (name, args) => {
+      if (name !== "get_window_state") return { structuredContent: { ok: true, effect: "confirmed" } };
+      if (args["include_screenshot"] === false) return { structuredContent: { ok: true, snapshot_id: "native-before" } };
+      path = args["screenshot_out_file"] as string;
+      if (mode !== "failed capture") writeFileSync(path, png);
+      if (mode === "cancelled" || mode === "revoked") await pendingRead;
+      return { structuredContent: { pid: 1, window_id: mode === "wrong window" ? 3 : 2, snapshot_id: "native-after",
+        screenshot_frame_valid: mode !== "failed capture", screenshot_error: null, screenshot_file_path: "untrusted-driver-path.png" } };
+    } });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([connection]).factory });
+    const fence = await provider.openSession("window-image");
+    const target = { pid: 1, window_id: 2 };
+    const first = await provider.callTool(fence, "get_window_state", { ...target, include_screenshot: false });
+    const abort = new AbortController();
+    let allowed = true;
+    const publish = vi.fn(async () => undefined);
+    const output = provider.callTool(fence, "click", { ...target, x: 1, y: 2, observe: { include_screenshot: true } }, abort.signal, {
+      assertInputCurrent: () => { if (!allowed) throw new Error("Original authority retired."); },
+      ...(mode === "revoked" ? { prepareObservationImage: publish } : {})
+    });
+    if (mode === "cancelled" || mode === "revoked") {
+      await vi.waitFor(() => expect(path).toBeDefined());
+      if (mode === "cancelled") abort.abort();
+      else allowed = false;
+      finishRead();
+    }
+    if (mode === "cancelled") {
+      await expect(output).rejects.toMatchObject({ name: "AbortError" });
+    } else {
+      const result = await output;
+      if (mode === "screenshot") {
+        expect(result.observationImage).toEqual(png);
+        expect(result.structuredContent).toMatchObject({ observation: { ok: true, snapshot_id: expect.any(String) } });
+        expect(JSON.stringify(result.structuredContent)).not.toContain("untrusted-driver-path");
+      } else {
+        expect(result).toMatchObject({ isError: false, structuredContent: { outcome: { status: "confirmed" },
+          observation: { ok: false, errorCode: "OBSERVATION_UNAVAILABLE" } } });
+        expect(result.observationImage).toBeUndefined();
+      }
+    }
+    expect(publish).not.toHaveBeenCalled();
+    expect(path).toBeDefined();
+    expect(existsSync(dirname(path!))).toBe(false);
+    await expect(provider.callTool(fence, "click", { ...target, element_index: 0, snapshot_id: first.structuredContent?.["snapshot_id"] }))
+      .resolves.toMatchObject({ structuredContent: { errorCode: "STALE_SNAPSHOT" } });
+    expect(connection.callRequests.map(call => call.name)).toEqual(["get_window_state", "click", "get_window_state"]);
+    await provider.closeAll();
+  });
+
   it("claims one goal and verifies a delivered input without publishing reusable automatic observations", async () => {
     const connection = new FakeConnection({ callTool: async (name) => ({ structuredContent: name === "verify_state"
       ? { status: "satisfied", stable: true }

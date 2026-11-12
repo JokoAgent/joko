@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants as fileConstants, mkdirSync, promises as fileSystem } from "node:fs";
+import { constants as fileConstants, mkdirSync, promises as fileSystem, type Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -17,7 +17,7 @@ import {
 } from "./catalog.js";
 import { safeComputerEnvironment } from "./process-runner.js";
 import { ComputerRuntime } from "./runtime.js";
-import { ComputerWindowSnapshotTracker, type ComputerScreenPoint } from "./snapshot-tracker.js";
+import { ComputerWindowSnapshotTracker, type ComputerScreenPoint, type ComputerWindowObservationScope } from "./snapshot-tracker.js";
 
 export interface ComputerSessionFence {
   readonly sessionId: string;
@@ -38,6 +38,7 @@ export interface ComputerToolCallResult {
   readonly content?: readonly unknown[];
   readonly structuredContent?: Readonly<Record<string, unknown>>;
   readonly isError?: boolean;
+  readonly observationImage?: Uint8Array;
   readonly toolResult?: unknown;
   readonly [key: string]: unknown;
 }
@@ -47,6 +48,8 @@ export interface ComputerToolCallContext {
   /** Product-owned admission for every physical primitive, including text
    * chunks and replay steps. Never supplied by native tool arguments. */
   readonly assertInputCurrent?: () => void;
+  /** Prepare the exact captured PNG for the current tool result before its snapshot is published. */
+  readonly prepareObservationImage?: (png: Uint8Array, assertCurrent: () => void) => Promise<void>;
 }
 
 export interface ComputerMcpToolPage {
@@ -126,7 +129,7 @@ interface SessionEntry {
   tail: Promise<void>;
   closed: boolean;
   transportEpoch: number;
-  snapshots: ComputerWindowSnapshotTracker;
+  readonly snapshots: ComputerWindowSnapshotTracker;
   cursorMotion: "pending" | "applied" | "unavailable";
   cursorStyle: "pending" | "applied" | "unavailable";
   runtimeHeld: boolean;
@@ -142,8 +145,19 @@ type ComputerRecoveryDecision<T> =
 interface ComputerReconnectOptions<T> {
   readonly mutation?: boolean;
   readonly retryTimeout?: boolean;
+  readonly retainOnUnknownAction?: boolean;
+  readonly singleRead?: boolean;
   readonly beforeReconnect?: (error: unknown) => Promise<ComputerRecoveryDecision<T>>;
 }
+
+interface ManagedWindowScreenshot {
+  readonly directory: string;
+  readonly directoryInfo: Stats;
+  readonly path: string;
+}
+
+type FollowupObservation = "automatic" | { readonly screenshot?: ManagedWindowScreenshot };
+type WindowObservationArguments = Record<string, unknown> & { readonly pid: number; readonly window_id: number };
 
 const MAXIMUM_TOOL_PAGES = 16;
 const MAXIMUM_TOOLS = 2_048;
@@ -282,9 +296,7 @@ export class ComputerToolProvider {
         name,
         normalized,
         signal,
-        context.workspaceRoot,
-        false,
-        context.assertInputCurrent
+        context
       ));
     }
     return enqueue(entry, async () => this.#withReconnect(entry, signal, async (connection, operationSignal) => {
@@ -425,8 +437,11 @@ export class ComputerToolProvider {
       const stale = isStaleComputerTransportError(error);
       const timedOut = isComputerTimeoutError(error);
       if (options.mutation === true) {
-        this.#retireSessionEntry(entry);
+        if (options.retainOnUnknownAction !== true) this.#retireSessionEntry(entry);
         throw new ComputerToolProviderError("action_outcome_unknown");
+      }
+      if (options.singleRead === true) {
+        throw new ComputerToolProviderError("transport_failed", undefined, error);
       }
       if (stale || timedOut) {
         const decision = await options.beforeReconnect?.(error);
@@ -444,25 +459,7 @@ export class ComputerToolProvider {
       }
     }
 
-    this.#assertCurrent(entry);
-    await endDriverSessionQuietly(entry);
-    await closeQuietly(entry.connection);
-    let replacement: ComputerMcpConnection | undefined;
-    try {
-      replacement = this.#newConnection(entry.fence.sessionId);
-      await replacement.connect(operationSignal);
-    } catch (error) {
-      if (replacement !== undefined) await closeQuietly(replacement);
-      if (isAbortError(error)) throw error;
-      throw new ComputerToolProviderError("connect_failed", undefined, error);
-    }
-    this.#assertCurrent(entry);
-    entry.connection = replacement;
-    entry.transportEpoch += 1;
-    entry.snapshots = new ComputerWindowSnapshotTracker(this.#idFactory);
-    entry.driverTools = undefined;
-    entry.cursorMotion = "pending";
-    entry.cursorStyle = "pending";
+    const replacement = await this.#replaceDriverConnection(entry, operationSignal);
     try {
       return await operation(replacement, operationSignal);
     } catch (error) {
@@ -470,6 +467,32 @@ export class ComputerToolProvider {
       if (error instanceof ComputerToolProviderError) throw error;
       throw new ComputerToolProviderError("transport_failed", undefined, error);
     }
+  }
+
+  async #replaceDriverConnection(entry: SessionEntry, signal: AbortSignal): Promise<ComputerMcpConnection> {
+    this.#assertCurrent(entry);
+    await endDriverSessionQuietly(entry, signal);
+    await closeQuietly(entry.connection);
+    this.#assertCurrent(entry);
+    signal.throwIfAborted();
+    let replacement: ComputerMcpConnection | undefined;
+    try {
+      replacement = this.#newConnection(entry.fence.sessionId);
+      await replacement.connect(signal);
+      this.#assertCurrent(entry);
+      signal.throwIfAborted();
+    } catch (error) {
+      if (replacement !== undefined) await closeQuietly(replacement);
+      if (isAbortError(error) || error instanceof ComputerToolProviderError) throw error;
+      throw new ComputerToolProviderError("connect_failed", undefined, error);
+    }
+    entry.connection = replacement;
+    entry.transportEpoch += 1;
+    entry.snapshots.resetTransportReferences();
+    entry.driverTools = undefined;
+    entry.cursorMotion = "pending";
+    entry.cursorStyle = "pending";
+    return replacement;
   }
 
   #retireSessionEntry(entry: SessionEntry): void {
@@ -487,10 +510,10 @@ export class ComputerToolProvider {
     name: ComputerPublicToolName,
     arguments_: Record<string, unknown>,
     signal: AbortSignal | undefined,
-    workspaceRoot?: string,
-    automaticObservation = false,
-    assertInputCurrent?: () => void
+    context: ComputerToolCallContext = {},
+    followup?: FollowupObservation
   ): Promise<ComputerToolCallResult> {
+    const { workspaceRoot, assertInputCurrent, prepareObservationImage } = context;
     if (name === "status" || name === "check_permissions") {
       const status = await this.#runtime.status({ signal });
       const payload = name === "status"
@@ -510,13 +533,25 @@ export class ComputerToolProvider {
     const stale = staleSnapshotResult(entry, name, arguments_);
     if (stale !== undefined) return stale;
     const expected = arguments_["postcondition"];
+    const observe = arguments_["observe"];
     arguments_ = { ...arguments_ };
     delete arguments_["postcondition"];
+    delete arguments_["observe"];
     delete arguments_["session_goal"];
     const element = typeof arguments_["element_token"] === "string" ? entry.snapshots.element(arguments_["element_token"]) : undefined;
     const snapshot = arguments_["snapshot_id"] ?? element?.snapshotId;
     if (typeof snapshot === "string") arguments_["window_id"] ??= entry.snapshots.reference(snapshot)?.windowId;
     if (expected !== undefined && typeof arguments_["window_id"] !== "number") return errorToolResult("INVALID_ARGS", { message: "Postcondition requires an exact window." });
+    let observationArgs: WindowObservationArguments | undefined;
+    if (isRecord(observe)) {
+      const pid = arguments_["pid"];
+      const windowId = arguments_["window_id"];
+      if (typeof pid !== "number" || typeof windowId !== "number") {
+        return errorToolResult("INVALID_ARGS", { message: "Observe requires an exact window or a fresh element snapshot identifying it." });
+      }
+      observationArgs = { ...entry.snapshots.observationScope(pid, windowId), ...observe, pid, window_id: windowId,
+        include_screenshot: observe["include_screenshot"] === true };
+    }
     if (name === "verify_state") invalidateWindowObservation(entry, name, arguments_);
 
     const checkSecureInputTarget = name === "type_text" || name === "set_value" ? this.#checkSecureInputTarget : undefined;
@@ -538,6 +573,7 @@ export class ComputerToolProvider {
     let nextChunk = 0;
     let inserted = 0;
     let refusedSecureInput = false;
+    let dispatched = false;
 
     let result: ComputerToolCallResult;
     try {
@@ -545,6 +581,10 @@ export class ComputerToolProvider {
         entry.driverTools ??= await this.#readToolCatalog(connection, operationSignal);
         if (this.#decorateCursor) await initializeCursorDecoration(entry, connection, name, operationSignal);
         const dispatch = async (prepared: Record<string, unknown>): Promise<ComputerToolCallResult> => {
+          if (observationArgs !== undefined || followup !== undefined && followup !== "automatic") {
+            operationSignal.throwIfAborted();
+            this.#assertCurrent(entry);
+          }
           assertInputCurrent?.();
           if (secureTarget !== undefined && checkSecureInputTarget !== undefined) {
             const assertCurrent = () => {
@@ -565,6 +605,7 @@ export class ComputerToolProvider {
               });
             }
           }
+          dispatched = true;
           return callDriverTool(connection, name, prepared, operationSignal);
         };
         if (chunks === undefined || chunks.length === 1) {
@@ -598,6 +639,8 @@ export class ComputerToolProvider {
       }, {
         mutation: computerPublicTool(name)?.annotations?.["readOnlyHint"] !== true,
         retryTimeout: LIGHTWEIGHT_TIMEOUT_RETRY_TOOLS.has(name),
+        retainOnUnknownAction: observationArgs !== undefined,
+        singleRead: followup !== undefined && followup !== "automatic",
         beforeReconnect: async (error) => {
           const fallback = await this.#fallbackAfterFailure(name, arguments_, error, signal);
           return fallback === undefined
@@ -607,11 +650,17 @@ export class ComputerToolProvider {
       });
     } catch (error) {
       invalidateWindowObservation(entry, name, arguments_);
+      if (observationArgs !== undefined && dispatched) invalidateWindowObservation(entry, "get_window_state", observationArgs);
       if (error instanceof ComputerToolProviderError && error.code === "action_outcome_unknown") {
-        const unknown = jsonToolResult({ ok: false, errorCode: "ACTION_OUTCOME_UNKNOWN",
+        const unknown = { ...jsonToolResult({ ok: false, errorCode: "ACTION_OUTCOME_UNKNOWN",
           outcome: { status: "unknown", next_step: "fresh_state" },
-          ...(chunks !== undefined && inserted > 0 ? { inserted_chars: inserted, remaining_chars: Array.from(arguments_["text"] as string).length - inserted } : {}) });
-        return this.#postcheck(entry, name, arguments_, expected, { ...unknown, isError: true }, signal);
+          ...(chunks !== undefined && inserted > 0 ? { inserted_chars: inserted, remaining_chars: Array.from(arguments_["text"] as string).length - inserted } : {}) }), isError: true };
+        if (observationArgs !== undefined) {
+          if (dispatched) return this.#observeAfterAction(entry, observationArgs, unknown, signal, context, true);
+          if (!entry.closed) this.#retireSessionEntry(entry);
+          return unknown;
+        }
+        return this.#postcheck(entry, name, arguments_, expected, unknown, signal);
       }
       const fallback = await this.#fallbackAfterFailure(name, arguments_, error, signal);
       if (fallback !== undefined) return fallback;
@@ -622,6 +671,7 @@ export class ComputerToolProvider {
       if (!refusedSecureInput || inserted > 0) invalidateWindowObservation(entry, name, arguments_);
       return { ...result, isError: true };
     }
+    if (observationArgs !== undefined) return this.#observeAfterAction(entry, observationArgs, result, signal, context);
     if (name === "verify_state") {
       const payload = driverResultPayload(result);
       const confirmed = payload?.["status"] === "satisfied" && payload["stable"] !== false;
@@ -646,18 +696,89 @@ export class ComputerToolProvider {
     const windowId = arguments_["window_id"];
     if (typeof processId !== "number" || typeof windowId !== "number") return result;
     const payload = driverResultPayload(result);
+    if (followup !== undefined && followup !== "automatic") {
+      const screenshot = followup.screenshot;
+      if (payload === undefined || failedActionObservation(payload, processId, windowId, screenshot !== undefined)) {
+        entry.snapshots.invalidate(processId, windowId);
+        return errorToolResult("OBSERVATION_UNAVAILABLE", {});
+      }
+      const assertCurrent = () => {
+        signal?.throwIfAborted();
+        this.#assertCurrent(entry);
+        assertInputCurrent?.();
+      };
+      assertCurrent();
+      if (screenshot === undefined) return result;
+      const png = await readManagedWindowScreenshot(screenshot);
+      assertCurrent();
+      if (prepareObservationImage === undefined) return { ...result, observationImage: png };
+      await prepareObservationImage(png, assertCurrent);
+      assertCurrent();
+      return result;
+    }
     if (payload?.["degraded"] === true || payload?.["frame_valid"] === false || payload?.["screenshot_error"] !== undefined) {
       entry.snapshots.invalidate(processId, windowId);
       return { ...result, isError: true };
     }
-    if (automaticObservation) {
+    if (followup === "automatic") {
       entry.snapshots.invalidate(processId, windowId);
       return result;
     }
+    return this.#registerWindowObservation(entry, result, { ...arguments_, pid: processId, window_id: windowId });
+  }
+
+  #registerWindowObservation(entry: SessionEntry, result: ComputerToolCallResult, args: WindowObservationArguments): ComputerToolCallResult {
     const driverSnapshotId = readDriverSnapshotId(result);
-    const snapshotId = entry.snapshots.record(processId, windowId, driverSnapshotId);
+    const snapshotId = entry.snapshots.record(args.pid, args.window_id, driverSnapshotId, windowObservationScope(args));
     if (driverSnapshotId !== undefined) entry.snapshots.registerAlias(snapshotId, driverSnapshotId);
     return stampSnapshotId(result, snapshotId, entry.snapshots, this.#checkSecureInputTarget !== undefined);
+  }
+
+  async #observeAfterAction(entry: SessionEntry, arguments_: WindowObservationArguments, result: ComputerToolCallResult,
+    signal: AbortSignal | undefined, context: ComputerToolCallContext, reconnect = false): Promise<ComputerToolCallResult> {
+    invalidateWindowObservation(entry, "get_window_state", arguments_);
+    const readSignal = AbortSignal.any([anySignal(entry.abort.signal, signal), AbortSignal.timeout(this.#requestTimeoutMs)]);
+    let screenshot: ManagedWindowScreenshot | undefined;
+    let observed: ComputerToolCallResult | undefined;
+    let needsReconnect = reconnect;
+    try {
+      readSignal.throwIfAborted();
+      this.#assertCurrent(entry);
+      context.assertInputCurrent?.();
+      if (needsReconnect) {
+        await this.#replaceDriverConnection(entry, readSignal);
+        needsReconnect = false;
+      }
+      if (arguments_["include_screenshot"] === true) screenshot = await createManagedWindowScreenshot();
+      const readArgs = { ...arguments_, ...(screenshot === undefined ? {} : { screenshot_out_file: screenshot.path }) };
+      observed = await this.#callPublicTool(entry, "get_window_state", readArgs, readSignal, context,
+        screenshot === undefined ? {} : { screenshot });
+    } catch {
+      if (needsReconnect && !entry.closed) this.#retireSessionEntry(entry);
+      if (signal?.aborted === true) throw abortError();
+    } finally {
+      if (screenshot !== undefined) await removeManagedWindowScreenshot(screenshot);
+    }
+    try {
+      readSignal.throwIfAborted();
+      this.#assertCurrent(entry);
+      context.assertInputCurrent?.();
+    } catch {
+      observed = undefined;
+    }
+    if (signal?.aborted === true) throw abortError();
+    const state = observed === undefined || observed.isError === true ? undefined
+      : driverResultPayload(this.#registerWindowObservation(entry, observed, arguments_));
+    const snapshotId = state?.["snapshot_id"];
+    const data = state === undefined ? undefined : { ...state };
+    if (data !== undefined && screenshot !== undefined) delete data["screenshot_file_path"];
+    const observation = typeof snapshotId === "string" && data !== undefined
+      ? { ok: true, tool: "get_window_state", snapshot_id: snapshotId, data }
+      : { ok: false, tool: "get_window_state", errorCode: "OBSERVATION_UNAVAILABLE", next_step: "get_window_state" };
+    const payload: Record<string, unknown> = driverResultPayload(result) ?? { result: result.toolResult ?? result.content ?? null };
+    const image = typeof snapshotId === "string" ? observed?.observationImage : undefined;
+    return { ...jsonToolResult({ ...payload, outcome: payload["outcome"] ?? computerOutcome("action", payload), observation }),
+      isError: result.isError === true, ...(image === undefined ? {} : { observationImage: image }) };
   }
 
   async #postcheck(entry: SessionEntry, name: ComputerPublicToolName, arguments_: Record<string, unknown>,
@@ -677,7 +798,7 @@ export class ComputerToolProvider {
       invalidateWindowObservation(reader, "get_window_state", readArgs);
       checked = await controlledPromise(this.#callPublicTool(reader, tool, readArgs,
         AbortSignal.any([reader.abort.signal, ...(signal === undefined ? [] : [signal]), AbortSignal.timeout(2_000)]),
-        undefined, true), 2_000, signal);
+        {}, "automatic"), 2_000, signal);
       // Automatic evidence never becomes a reusable element observation.
       invalidateWindowObservation(reader, "get_window_state", readArgs);
     } catch (error) {
@@ -758,7 +879,7 @@ export class ComputerToolProvider {
       const action = prepared.actions[index]!;
       let result: ComputerToolCallResult;
       try {
-        result = await this.#callPublicTool(entry, action.tool, action.arguments, signal, workspaceRoot, false, assertInputCurrent);
+        result = await this.#callPublicTool(entry, action.tool, action.arguments, signal, { workspaceRoot, assertInputCurrent });
       } catch (error) {
         if (isAbortError(error)) throw error;
         result = errorToolResult("COMPUTER_DRIVER_ERROR", { message: "Recorded action failed." });
@@ -1504,6 +1625,75 @@ function defaultScreenshotOutputPath(windowId: unknown): string {
   return join(directory, `get_window_state-${target}-${Date.now()}-${randomUUID().slice(0, 8)}.png`);
 }
 
+async function createManagedWindowScreenshot(): Promise<ManagedWindowScreenshot> {
+  const directory = await fileSystem.mkdtemp(join(await fileSystem.realpath(tmpdir()), "joko-computer-observation-"));
+  const directoryInfo = await fileSystem.lstat(directory);
+  return { directory, directoryInfo, path: join(directory, "window.png") };
+}
+
+async function readManagedWindowScreenshot(output: ManagedWindowScreenshot): Promise<Uint8Array> {
+  const maximumBytes = 32 * 1024 * 1024;
+  const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const unavailable = () => new Error("The requested window screenshot is unavailable.");
+  if (!await isManagedScreenshotDirectory(output)) throw unavailable();
+  const before = await fileSystem.lstat(output.path);
+  if (!before.isFile() || before.nlink !== 1 || before.size <= pngSignature.length || before.size > maximumBytes
+    || await fileSystem.realpath(output.path) !== output.path) throw unavailable();
+  const flags = fileConstants.O_RDONLY | (process.platform === "win32" ? 0 : fileConstants.O_NOFOLLOW | fileConstants.O_NONBLOCK);
+  const handle = await fileSystem.open(output.path, flags);
+  try {
+    const opened = await handle.stat();
+    if (!sameScreenshotFile(before, opened)) throw unavailable();
+    const bytes = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== opened.size || !bytes.subarray(0, pngSignature.length).equals(pngSignature)
+      || !sameScreenshotFile(opened, await handle.stat()) || !sameScreenshotFile(opened, await fileSystem.lstat(output.path))
+      || !await isManagedScreenshotDirectory(output)) throw unavailable();
+    return bytes.subarray(0, offset);
+  } finally {
+    await handle.close();
+  }
+}
+
+function sameScreenshotFile(before: Stats, after: Stats): boolean {
+  return after.isFile() && after.nlink === 1 && before.dev === after.dev && before.ino === after.ino
+    && before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+}
+
+async function isManagedScreenshotDirectory(output: ManagedWindowScreenshot): Promise<boolean> {
+  const current = await fileSystem.lstat(output.directory);
+  return current.isDirectory() && current.dev === output.directoryInfo.dev && current.ino === output.directoryInfo.ino
+    && await fileSystem.realpath(output.directory) === output.directory;
+}
+
+async function removeManagedWindowScreenshot(output: ManagedWindowScreenshot): Promise<void> {
+  if (!await isManagedScreenshotDirectory(output).catch(() => false)) return;
+  await fileSystem.unlink(output.path).catch(() => undefined);
+  await fileSystem.rmdir(output.directory).catch(() => undefined);
+}
+
+function windowObservationScope(args: Readonly<Record<string, unknown>>): ComputerWindowObservationScope {
+  const { query, max_elements, max_depth } = args;
+  return { ...(typeof query === "string" ? { query } : {}),
+    ...(typeof max_elements === "number" ? { max_elements } : {}), ...(typeof max_depth === "number" ? { max_depth } : {}) };
+}
+
+function failedActionObservation(payload: Record<string, unknown>, pid: number, windowId: number, screenshot: boolean): boolean {
+  const window = isRecord(payload["window"]) ? payload["window"] : undefined;
+  if ([payload["pid"], window?.["pid"]].some(value => typeof value === "number" && value !== pid)
+    || [payload["window_id"], window?.["window_id"], window?.["id"]].some(value => typeof value === "number" && value !== windowId)) return true;
+  if (screenshot) return payload["screenshot_frame_valid"] === false
+    || (payload["screenshot_error"] !== undefined && payload["screenshot_error"] !== null);
+  const hasElements = Array.isArray(payload["elements"]) && payload["elements"].length > 0;
+  const hasTree = typeof payload["tree_markdown"] === "string" && payload["tree_markdown"].trim() !== "";
+  return payload["frame_valid"] === false || payload["degraded"] === true && !hasElements && !hasTree;
+}
+
 function invalidateWindowObservation(
   entry: SessionEntry,
   name: ComputerPublicToolName,
@@ -1763,9 +1953,9 @@ function normalizedWindowFilter(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value.trim().toLowerCase() : undefined;
 }
 
-async function endDriverSessionQuietly(entry: SessionEntry): Promise<void> {
+async function endDriverSessionQuietly(entry: SessionEntry, signal?: AbortSignal): Promise<void> {
   if (entry.transportEpoch < 1) return;
-  await entry.connection.callTool("end_session", { session: driverSessionId(entry) }).catch(() => undefined);
+  await entry.connection.callTool("end_session", { session: driverSessionId(entry) }, signal).catch(() => undefined);
 }
 
 function releaseRuntimeSession(entry: SessionEntry, runtime: ComputerRuntime): void {

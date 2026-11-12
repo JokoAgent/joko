@@ -11,6 +11,12 @@ export interface ComputerScreenPoint {
   readonly y: number;
 }
 
+export interface ComputerWindowObservationScope {
+  readonly query?: string;
+  readonly max_elements?: number;
+  readonly max_depth?: number;
+}
+
 interface SnapshotElement {
   readonly token: string;
   readonly index?: number;
@@ -31,7 +37,7 @@ const MAXIMUM_SNAPSHOTS = 1_024;
 const MAXIMUM_ELEMENTS = 2_000;
 
 export class ComputerWindowSnapshotTracker {
-  readonly #latestByWindow = new Map<string, string>();
+  readonly #latestByWindow = new Map<string, { readonly id?: string; readonly scope: ComputerWindowObservationScope }>();
   readonly #metadataById = new Map<string, SnapshotMeta>();
   readonly #aliases = new Map<string, string>();
   readonly #idFactory: () => string;
@@ -41,7 +47,7 @@ export class ComputerWindowSnapshotTracker {
     this.#idFactory = idFactory;
   }
 
-  record(processId: number, windowId: number, driverSnapshotId?: string): string {
+  record(processId: number, windowId: number, driverSnapshotId?: string, scope: ComputerWindowObservationScope = {}): string {
     const windowKey = `${processId}\0${windowId}`;
     if (!this.#latestByWindow.has(windowKey) && this.#latestByWindow.size >= MAXIMUM_WINDOWS) {
       const oldest = this.#latestByWindow.keys().next().value as string | undefined;
@@ -58,7 +64,7 @@ export class ComputerWindowSnapshotTracker {
     this.#sequence += 1;
     const suffix = this.#idFactory().replace(/[^a-z0-9_-]/giu, "").slice(0, 20) || "snapshot";
     const id = `ws-${this.#sequence.toString(36)}-${suffix}`;
-    this.#latestByWindow.set(windowKey, id);
+    this.#latestByWindow.set(windowKey, { id, scope });
     this.#metadataById.set(id, { windowKey, processId, windowId, driverSnapshotId, elements: new Map() });
     return id;
   }
@@ -111,7 +117,19 @@ export class ComputerWindowSnapshotTracker {
   invalidate(processId: number, windowId: number): void {
     // Retain old identities so a driver alias cannot later rebind to a fresh
     // observation and accidentally authorize an action from the failed view.
-    this.#latestByWindow.delete(`${processId}\0${windowId}`);
+    const key = `${processId}\0${windowId}`;
+    const previous = this.#latestByWindow.get(key);
+    if (previous !== undefined) this.#latestByWindow.set(key, { scope: previous.scope });
+  }
+
+  observationScope(processId: number, windowId: number): ComputerWindowObservationScope | undefined {
+    return this.#latestByWindow.get(`${processId}\0${windowId}`)?.scope;
+  }
+
+  resetTransportReferences(): void {
+    this.#metadataById.clear();
+    this.#aliases.clear();
+    for (const [key, { scope }] of this.#latestByWindow) this.#latestByWindow.set(key, { scope });
   }
 
   validate(
@@ -126,10 +144,10 @@ export class ComputerWindowSnapshotTracker {
       return {
         ok: false,
         reason: "window_mismatch",
-        latestSnapshotId: this.#latestByWindow.get(metadata.windowKey)
+        latestSnapshotId: this.#latestByWindow.get(metadata.windowKey)?.id
       };
     }
-    const latest = this.#latestByWindow.get(metadata.windowKey);
+    const latest = this.#latestByWindow.get(metadata.windowKey)?.id;
     if (latest !== canonicalId) return { ok: false, reason: "superseded", latestSnapshotId: latest };
     return { ok: true };
   }

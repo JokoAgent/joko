@@ -1,15 +1,19 @@
 import { realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+import type { BlobRef } from "@joko/core";
 import { isWithin } from "@joko/core/policy";
+import sharp from "sharp";
 import { withAgentDesktopInput } from "./input-handoff/input-ownership.js";
 import {
+  COMPUTER_POSTCHECK_ACTIONS,
   ComputerToolArgumentError,
   ComputerToolProvider,
   ComputerToolProviderError,
   isComputerPublicToolName,
   normalizeComputerToolArguments,
   type ComputerSessionFence,
+  type ComputerToolCallContext,
   type ComputerToolCallResult,
   type ComputerToolDescriptor
 } from "@joko/tool-computer";
@@ -17,8 +21,10 @@ import type { OperationalStore } from "@joko/store";
 
 import type {
   BridgeToolCallContext,
+  BridgeToolCallResult,
   BridgeToolProvider,
   McpCallResult,
+  McpResultArtifactStore,
   McpToolDescriptor
 } from "./mcp-router.js";
 
@@ -30,13 +36,23 @@ const LIST_TOOLS_DESCRIPTION =
 const CALL_TOOL_DESCRIPTION =
   "Invoke a local desktop computer-use tool. Arguments are validated before dispatching to the host driver.";
 const COMPUTER_TOOL_WORKFLOW =
-  "Start with status and check_permissions. Use get_accessibility_tree/list_windows, optionally narrow list_windows with query/workspace_root/process_name (for example, {\"process_name\":\"Simulator\"}), and inspect the exact target with get_window_state. Targeted actions such as click/type_text require pid; include window_id whenever the target window is known, and always for coordinates. Use get_window_state with {\"include_screenshot\":true} for screenshots and leave screenshot_out_file unset for a managed temporary image. Element references only identify the latest observation of the same pid/window_id: use its element_token, or snapshot_id together with element_index. Re-observe after a stale reference or failed observation. After an action, use verify_state for bounded postconditions; only satisfied and stable confirms success. Verification invalidates previous element references, so get_window_state again before another element action. Use start_recording/stop_recording/replay_trajectory only when the user explicitly asks for recording or replay.";
+  "Start with status and check_permissions. Use get_accessibility_tree/list_windows, optionally narrow list_windows with query/workspace_root/process_name (for example, {\"process_name\":\"Simulator\"}), and inspect the exact target with get_window_state. Targeted actions such as click/type_text require pid; include window_id whenever the target window is known, and always for coordinates. Use get_window_state with {\"include_screenshot\":true} for screenshots and leave screenshot_out_file unset for a managed temporary image. Element references only identify the latest observation of the same pid/window_id: use its element_token, or snapshot_id together with element_index. Re-observe after a stale reference or failed observation. Pass observe:{} on an action for a fresh snapshot of the same window, or observe:{include_screenshot:true} for visual evidence. Keep query, max_elements and max_depth stable across reads. Use postcondition separately for bounded assertions; only satisfied and stable confirms success. Verification invalidates previous element references, so get_window_state again before another element action. Use start_recording/stop_recording/replay_trajectory only when the user explicitly asks for recording or replay.";
 const EMPTY_OBJECT_SCHEMA = Object.freeze({
   $schema: "https://json-schema.org/draft/2020-12/schema",
   type: "object",
   properties: Object.freeze({}),
   additionalProperties: false
 });
+
+const MAXIMUM_INLINE_OBSERVATION_IMAGE_BYTES = 80 * 1024;
+
+interface ComputerObservationImage {
+  readonly original: BlobRef;
+  readonly content: { readonly type: "image"; readonly data: string; readonly mimeType: "image/png" | "image/jpeg" };
+  readonly width: number;
+  readonly height: number;
+  readonly preview?: { readonly width: number; readonly height: number };
+}
 
 /**
  * Projects the installed computer MCP catalog through Orchestrator's authenticated
@@ -48,6 +64,7 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
   readonly generation = 1;
   readonly #provider: ComputerToolProvider;
   readonly #store: OperationalStore;
+  readonly #artifacts: Pick<McpResultArtifactStore, "ingestBytes">;
   readonly #enabledForNewSessions: () => boolean;
   readonly #sessionFences = new Map<string, ComputerSessionFence>();
   #catalog: readonly ComputerToolDescriptor[] = [];
@@ -58,10 +75,12 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
   constructor(input: {
     readonly provider: ComputerToolProvider;
     readonly store: OperationalStore;
+    readonly artifacts: Pick<McpResultArtifactStore, "ingestBytes">;
     readonly enabledForNewSessions: () => boolean;
   }) {
     this.#provider = input.provider;
     this.#store = input.store;
+    this.#artifacts = input.artifacts;
     this.#enabledForNewSessions = input.enabledForNewSessions;
   }
 
@@ -106,7 +125,7 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
     context: BridgeToolCallContext
-  ): Promise<McpCallResult> {
+  ): Promise<BridgeToolCallResult> {
     if (name === "list_tools") {
       if (Object.keys(arguments_).length > 0) return invalidWrapperArguments("list_tools");
       return textResult({
@@ -156,8 +175,15 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
         }
       }, true, workspaceRoot);
     }
+    let image: ComputerObservationImage | undefined;
     try {
-      const invoke = (assertInputCurrent?: () => void) => this.#callWithSession(context.sessionId, call.name, safeArguments, signal, workspaceRoot, assertInputCurrent);
+      const invoke = (assertInputCurrent?: () => void) => this.#callWithSession(context.sessionId, call.name, safeArguments, signal, {
+        workspaceRoot,
+        ...(assertInputCurrent === undefined ? {} : { assertInputCurrent }),
+        prepareObservationImage: async (png, assertCurrent) => {
+          image = await this.#prepareObservationImage(png, assertCurrent);
+        }
+      });
       context.assertCurrent?.();
       const result = definition.annotations?.["readOnlyHint"] === true ? await invoke()
         : await withAgentDesktopInput(async assertInputCurrent => {
@@ -165,7 +191,18 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
           const value = await invoke(() => { signal?.throwIfAborted(); context.assertCurrent?.(); assertInputCurrent(); });
           signal?.throwIfAborted(); context.assertCurrent?.(); assertInputCurrent(); return value;
         }, { ...(signal ? { signal } : {}), ...(context.assertCurrent ? { assertCurrent: context.assertCurrent } : {}) });
-      context.assertCurrent?.();
+      signal?.throwIfAborted(); context.assertCurrent?.();
+      const observation = result.structuredContent?.["observation"];
+      if (image !== undefined && isRecord(observation) && observation["ok"] === true) {
+        const { original, content, width, height, preview } = image;
+        const withScreenshot = { ...result, structuredContent: { ...result.structuredContent,
+          observation: { ...observation, screenshot: { artifact_id: original.id, mime_type: original.mimeType,
+            width, height, ...(preview === undefined ? {} : { preview }) } } } };
+        const mapped = mapSelectedToolResult(call.name, withScreenshot, workspaceRoot);
+        image = undefined;
+        return { ...mapped, content: [content, ...mapped.content],
+          hostArtifacts: [{ blob: original, label: "Window screenshot" }] };
+      }
       return mapSelectedToolResult(call.name, result, workspaceRoot);
     } catch (error) {
       if (isAbortError(error)) return requestCancelledResult();
@@ -192,6 +229,41 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
         errorCode: "COMPUTER_DRIVER_ERROR",
         data: { message: safeErrorMessage(error) }
       }, true, workspaceRoot);
+    } finally {
+      if (image !== undefined) this.#store.releaseArtifactStaging([image.original.id]);
+    }
+  }
+
+  async #prepareObservationImage(png: Uint8Array, assertCurrent: () => void): Promise<ComputerObservationImage> {
+    const bytes = Buffer.from(png.buffer, png.byteOffset, png.byteLength);
+    const decoder = sharp(bytes, { failOn: "warning", limitInputPixels: 64 * 1024 * 1024 }).timeout({ seconds: 5 });
+    const { width, height, format } = await decoder.metadata();
+    assertCurrent();
+    if (format !== "png" || !width || !height || width > 16_384 || height > 16_384) throw new Error("The window screenshot is not a supported PNG.");
+    let preview;
+    if (bytes.byteLength > MAXIMUM_INLINE_OBSERVATION_IMAGE_BYTES) {
+      preview = await decoder.clone().resize({ width: 512, height: 512, fit: "inside", withoutEnlargement: true })
+        .jpeg({ quality: 55 }).toBuffer({ resolveWithObject: true });
+      if (preview.data.byteLength > MAXIMUM_INLINE_OBSERVATION_IMAGE_BYTES) {
+        assertCurrent();
+        preview = await decoder.resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 45 }).toBuffer({ resolveWithObject: true });
+      }
+    }
+    assertCurrent();
+    const display = preview?.data ?? bytes;
+    if (display.byteLength === 0 || display.byteLength > MAXIMUM_INLINE_OBSERVATION_IMAGE_BYTES) throw new Error("The window screenshot preview is unavailable.");
+    const original = await this.#artifacts.ingestBytes(bytes, {
+      fileName: "window-screenshot.png", mimeType: "image/png", expiresAt: Date.now() + 10 * 60_000
+    });
+    try {
+      assertCurrent();
+      return { original, width, height,
+        content: { type: "image", data: display.toString("base64"), mimeType: preview === undefined ? "image/png" : "image/jpeg" },
+        ...(preview === undefined ? {} : { preview: { width: preview.info.width, height: preview.info.height } }) };
+    } catch (error) {
+      this.#store.releaseArtifactStaging([original.id]);
+      throw error;
     }
   }
 
@@ -216,8 +288,7 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
     name: string,
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    workspaceRoot: string,
-    assertInputCurrent?: () => void
+    context: ComputerToolCallContext
   ): Promise<ComputerToolCallResult> {
     let fence = this.#sessionFences.get(sessionId);
     if (fence === undefined) {
@@ -225,13 +296,13 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
       this.#sessionFences.set(sessionId, fence);
     }
     try {
-      return await this.#provider.callTool(fence, name, arguments_, signal, { workspaceRoot, ...(assertInputCurrent ? { assertInputCurrent } : {}) });
+      return await this.#provider.callTool(fence, name, arguments_, signal, context);
     } catch (error) {
       if (!(error instanceof ComputerToolProviderError) || error.code !== "stale_session") throw error;
       this.#sessionFences.delete(sessionId);
       const replacement = await this.#provider.openSession(sessionId, signal);
       this.#sessionFences.set(sessionId, replacement);
-      return this.#provider.callTool(replacement, name, arguments_, signal, { workspaceRoot, ...(assertInputCurrent ? { assertInputCurrent } : {}) });
+      return this.#provider.callTool(replacement, name, arguments_, signal, context);
     }
   }
 }
@@ -376,6 +447,10 @@ function mapSelectedToolResult(
   const snapshotId = name === "get_window_state" && isRecord(data) && typeof data["snapshot_id"] === "string"
     ? data["snapshot_id"]
     : undefined;
+  if (isComputerPublicToolName(name) && COMPUTER_POSTCHECK_ACTIONS.has(name) && isRecord(data) && isRecord(data["observation"])) {
+    const { observation, ...action } = data;
+    return textResult({ ok: true, tool: name, data: action, observation });
+  }
   return textResult({
     ok: true,
     tool: name,
