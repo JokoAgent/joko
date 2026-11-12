@@ -2238,6 +2238,39 @@ describe("CodexBackendAdapter", () => {
     await setup.fake.completeTurn(threadId);
   });
 
+  it("shows the active native permission scope and denies retired or undisplayable requests", async () => {
+    const setup = await createSetup();
+    const events: EventPayload[] = [];
+    const requestInteraction = vi.fn<AdapterContext["requestInteraction"]>(async () => ({ kind: "selected", value: "allow_once" }));
+    const base = context(setup.target, events, { backendInstanceGeneration: 7, requestInteraction });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), base);
+    const threadId = binding.nativeSessionId!;
+    const transport = setup.fake.transport!;
+    try {
+      await setup.adapter.send(prompt("Read the selected reports"), { ...base, binding, operationId: "runtime-permission" });
+      const permissions = { fileSystem: { read: null, write: null, entries: [
+        { access: "read", path: { type: "path", path: "/source/read-only/reports" } }
+      ] } };
+      const request = { threadId, turnId: "turn-1", itemId: "read-reports", permissions,
+        cwd: "/source/work", reason: "Read the selected reports" };
+      const method = "item/permissions/requestApproval";
+      const denied = { permissions: {}, scope: "turn" };
+      await expect(transport.requestFromServer(method, { ...request, turnId: "retired-turn" })).resolves.toEqual(denied);
+      await expect(transport.requestFromServer(method, { ...request, itemId: "unknown-scope", permissions: {
+        fileSystem: { entries: [{ access: "read", path: { type: "unsupported" } }] }
+      } })).resolves.toEqual(denied);
+      expect(requestInteraction).not.toHaveBeenCalled();
+
+      await expect(transport.requestFromServer(method, request)).resolves.toEqual({ permissions, scope: "turn" });
+      expect(requestInteraction).toHaveBeenCalledOnce();
+      expect(requestInteraction).toHaveBeenCalledWith(expect.objectContaining({
+        kind: "permission", toolName: "permissions", choices: ["allow_once", "deny_once"],
+        summary: "Read /source/read-only/reports\n\nScope\nThis turn\n\nWorking directory\n/source/work\n\nReason\nRead the selected reports"
+      }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+      await setup.fake.completeTurn(threadId);
+    } finally { await setup.adapter.dispose(); }
+  });
+
   it("refuses secret native user input without opening a durable Interaction", async () => {
     const setup = await createSetup();
     const events: EventPayload[] = [];

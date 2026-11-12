@@ -249,7 +249,7 @@ describe("Codex interaction translation", () => {
       command: "pnpm test",
       cwd: "D:\\other checkout",
       reason: "Check the current changes."
-    }, "D:\\workspace");
+    });
     expect(command?.payload).toMatchObject({
       kind: "permission",
       toolName: "command",
@@ -267,7 +267,7 @@ describe("Codex interaction translation", () => {
       reason: "Update a source file",
       grantRoot: "D:\\workspace",
       changes: [{ path: "src/entry.ts", kind: { type: "update" }, diff: "-oldValue\n+newValue" }]
-    }, "D:\\workspace", "A different patch from an earlier item frame");
+    }, "A different patch from an earlier item frame");
     expect(file?.payload).toMatchObject({ kind: "permission", toolName: "file_change", choices: ["allow_once", "deny_once"],
       summary: "update: src/entry.ts\n\nsrc/entry.ts\n-oldValue\n+newValue\n\nRequested write directory\nD:\\workspace\n\nUpdate a source file" });
     expect(file?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({ decision: "accept" });
@@ -280,7 +280,7 @@ describe("Codex interaction translation", () => {
       const request = interactionFromServerRequest(11, "item/commandExecution/requestApproval", {
         threadId: "thread-one", turnId: "turn-one", itemId: "command-one", command: "pnpm test",
         ...(cwd === undefined ? {} : { cwd })
-      }, "D:\\workspace");
+      });
       expect(request?.payload).toMatchObject({ kind: "permission", summary: "pnpm test" });
     }
   );
@@ -292,7 +292,7 @@ describe("Codex interaction translation", () => {
       itemId: "command-one",
       command: "pnpm test",
       availableDecisions: ["accept", "decline"]
-    }, "D:\\workspace");
+    });
     expect(interaction?.payload).toMatchObject({
       kind: "permission",
       choices: ["allow_once", "deny_once"]
@@ -306,21 +306,24 @@ describe("Codex interaction translation", () => {
       turnId: "turn-one",
       itemId: "command-two",
       availableDecisions: ["futureDecision"]
-    }, "D:\\workspace")).toBeUndefined();
+    })).toBeUndefined();
   });
 
-  it("returns only the requested permission object with an explicit scope", () => {
+  it("shows the exact legacy permission roots and returns the original turn-scoped request", () => {
     const requested = {
       network: { enabled: true },
-      fileSystem: { read: ["D:\\workspace\\docs"], write: ["D:\\workspace\\src"] }
+      fileSystem: { read: ["D:\\workspace\\docs"], write: ["E:\\external\\docs"] }
     };
     const interaction = interactionFromServerRequest(3, "item/permissions/requestApproval", {
       threadId: "thread-one",
       turnId: "turn-one",
       itemId: "permission-one",
       permissions: requested
-    }, "D:\\workspace");
-    expect(interaction?.payload).toMatchObject({ kind: "permission", toolName: "permissions", choices: ["allow_once", "deny_once"] });
+    });
+    expect(interaction?.payload).toMatchObject({
+      kind: "permission", toolName: "permissions", choices: ["allow_once", "deny_once"],
+      summary: "Requested network access\nEnabled\n\nRead D:\\workspace\\docs\n\nWrite E:\\external\\docs\n\nScope\nThis turn"
+    });
     expect(interaction?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({
       permissions: requested,
       scope: "turn"
@@ -333,6 +336,51 @@ describe("Codex interaction translation", () => {
       permissions: {},
       scope: "turn"
     });
+  });
+
+  it("presents the effective typed permission entries, working directory, environment, and redacted reason", () => {
+    const sourcePath = { type: "path", path: "/source/reports" };
+    const entries: JsonValue[] = [
+      { access: "read", path: sourcePath },
+      { access: "write", path: { type: "special", value: { kind: "project_roots", subpath: "reports/output" } } },
+      { access: "deny", path: { type: "glob_pattern", pattern: "**/private/**" } }
+    ];
+    const requested = {
+      network: { enabled: false },
+      fileSystem: {
+        read: ["/legacy/reports"],
+        entries,
+        globScanMaxDepth: 3
+      }
+    };
+    const secret = "ghp_123456789012345678901234567890";
+    const approved = structuredClone(requested);
+    const interaction = interactionFromServerRequest(24, "item/permissions/requestApproval", {
+      threadId: "thread-one", turnId: "turn-one", itemId: "permission-entries",
+      permissions: requested, cwd: "/source/work", environmentId: "source-runtime", reason: "Export the reports. token=" + secret
+    });
+    expect(interaction?.payload).toMatchObject({
+      kind: "permission", summary: [
+        "Requested network access\nDisabled", "Read /source/reports", "Write reports/output under the project roots",
+        "Deny access to paths matching **/private/**", "Maximum glob scan depth 3", "Scope\nThis turn",
+        "Working directory\n/source/work", "Execution environment\nsource-runtime", "Reason\nExport the reports. token=[REDACTED]"
+      ].join("\n\n")
+    });
+    sourcePath.path = "/different/reports";
+    expect(interaction?.toResponse({ kind: "selected", value: "allow_once" })).toEqual({ permissions: approved, scope: "turn" });
+  });
+
+  it("does not present approval when a requested permission scope cannot be shown in full", () => {
+    const profiles: JsonValue[] = [
+      { network: { enabled: true }, unknownGrant: true },
+      { fileSystem: { entries: [{ access: "execute", path: { type: "path", path: "/work" } }] } },
+      { fileSystem: { entries: [{ access: "read", path: { type: "special", value: { kind: "future_root" } } }] } },
+      { fileSystem: { entries: [{ access: "write", path: { type: "path", path: "/work\n/hidden" } }] } },
+      { fileSystem: { read: Array.from({ length: 80 }, (_, index) => "/source/project-" + index + "/" + "x".repeat(80)) } }
+    ];
+    for (const permissions of profiles) {
+      expect(interactionFromServerRequest(25, "item/permissions/requestApproval", { permissions })).toBeUndefined();
+    }
   });
 
   it("preserves typed user answers in the native answer envelope", () => {
@@ -351,7 +399,7 @@ describe("Codex interaction translation", () => {
           ]
         }
       ]
-    }, "D:\\workspace");
+    });
     expect(interaction?.payload).toMatchObject({
       kind: "question",
       fields: [
@@ -384,7 +432,7 @@ describe("Codex interaction translation", () => {
         isOther: true,
         options: [{ label: "Safe route", description: "Use safe mode" }]
       }]
-    }, "D:\\workspace");
+    });
     expect(interaction?.payload.kind).toBe("question");
     const field = interaction?.payload.kind === "question" ? interaction.payload.fields[0] : undefined;
     expect(field).toMatchObject({ kind: "single", allowOther: true });
@@ -421,13 +469,12 @@ describe("Codex interaction translation", () => {
     expect(interactionFromServerRequest(
       14,
       "item/tool/requestUserInput",
-      oversizedRequest,
-      "D:\\workspace"
+      oversizedRequest
     )).toBeUndefined();
     const interaction = interactionFromServerRequest(14, "item/tool/requestUserInput", {
       ...oversizedRequest,
       questions: oversizedRequest.questions.slice(0, 3)
-    }, "D:\\workspace");
+    });
     expect(interaction?.payload).toMatchObject({
       kind: "question",
       fields: [
@@ -468,13 +515,13 @@ describe("Codex interaction translation", () => {
         { id: "same", question: "One?" },
         { id: "same", question: "Two?" }
       ]
-    }, "D:\\workspace")).toBeUndefined();
+    })).toBeUndefined();
     expect(interactionFromServerRequest(16, "item/tool/requestUserInput", {
       threadId: "thread-one",
       turnId: "turn-one",
       itemId: "malformed-question",
       questions: [{ id: "question", question: "" }]
-    }, "D:\\workspace")).toBeUndefined();
+    })).toBeUndefined();
   });
 
   it("returns native question ids without prototype mutation", () => {
@@ -483,7 +530,7 @@ describe("Codex interaction translation", () => {
       turnId: "turn-one",
       itemId: "question-hostile-id",
       questions: [{ id: "__proto__", question: "Value?" }]
-    }, "D:\\workspace");
+    });
     const response = interaction?.toResponse({
       kind: "question",
       answers: Object.assign(Object.create(null) as Record<string, InteractionQuestionAnswer>, {
@@ -503,14 +550,14 @@ describe("Codex interaction translation", () => {
         { id: "secret", question: "Token?", isSecret: true },
         { id: "name", question: "Name?" }
       ]
-    }, "D:\\workspace");
+    });
     expect(interaction).toBeUndefined();
     expect(interactionFromServerRequest(18, "item/tool/requestUserInput", {
       threadId: "thread-one",
       turnId: "turn-one",
       itemId: "question-malformed-secret",
       questions: [{ id: "secret", question: "Token?", isSecret: "true" }]
-    }, "D:\\workspace")).toBeUndefined();
+    })).toBeUndefined();
   });
 
   it("fails closed for network approvals until their target can be projected exactly", () => {
@@ -520,7 +567,7 @@ describe("Codex interaction translation", () => {
       itemId: "network-approval",
       networkApprovalContext: { host: "example.com", protocol: "https" },
       availableDecisions: ["accept", "acceptForSession", "cancel"]
-    }, "D:\\workspace")).toBeUndefined();
+    })).toBeUndefined();
   });
 
   it("redacts credential-shaped progress diagnostics before event publication", () => {

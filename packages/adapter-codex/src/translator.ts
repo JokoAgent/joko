@@ -69,6 +69,7 @@ const MAXIMUM_INTERACTION_OPTIONS = 10;
 const MAXIMUM_INTERACTION_ID_CHARS = 256;
 const MAXIMUM_INTERACTION_TEXT_CHARS = 1_000;
 const MAXIMUM_INTERACTION_ANSWER_CHARS = 2_000;
+const MAXIMUM_PERMISSION_SUMMARY_CHARS = 4_000;
 const MAXIMUM_TRACKED_TOOL_ITEMS = 2_048;
 const MAXIMUM_PLAN_INPUT_BYTES = 256 * 1024;
 
@@ -562,7 +563,6 @@ export function interactionFromServerRequest(
   requestId: RpcId,
   method: string,
   params: JsonValue,
-  workspaceRoot: string,
   cachedFileApproval?: string
 ): InteractionRequest | undefined {
   const record = objectValue(params, "interaction request");
@@ -613,8 +613,11 @@ export function interactionFromServerRequest(
     };
   }
   if (method === "item/permissions/requestApproval") {
-    const requested = isJsonObject(record["permissions"]) ? record["permissions"] : {};
-    const summary = permissionSummary(requested, workspaceRoot);
+    const requested = record["permissions"];
+    if (!isJsonObject(requested)) return undefined;
+    const summary = permissionSummary(requested, record);
+    if (summary === undefined) return undefined;
+    const permissions = structuredClone(requested);
     return {
       payload: {
         id: interactionId,
@@ -628,7 +631,7 @@ export function interactionFromServerRequest(
       toResponse: (decision) => {
         const selected = selectedDecision(decision);
         return selected === "allow_once"
-          ? { permissions: requested, scope: "turn" }
+          ? { permissions, scope: "turn" }
           : { permissions: {}, scope: "turn" };
       }
     };
@@ -941,28 +944,113 @@ function interactionIdentity(requestId: RpcId, method: string, params: JsonObjec
   return `codex-interaction-${digest}`;
 }
 
-function permissionSummary(requested: JsonObject, workspaceRoot: string): string {
+function permissionSummary(requested: JsonObject, record: JsonObject): string | undefined {
+  if (Object.keys(requested).some(key => key !== "network" && key !== "fileSystem")) return undefined;
   const parts: string[] = [];
-  const network = isJsonObject(requested["network"]) ? requested["network"] : undefined;
-  if (network !== undefined) parts.push("Additional network access");
-  const fileSystem = isJsonObject(requested["fileSystem"]) ? requested["fileSystem"] : undefined;
-  if (fileSystem !== undefined) {
-    for (const key of ["read", "write"] as const) {
-      const values = Array.isArray(fileSystem[key]) ? fileSystem[key] : [];
-      for (const value of values) {
-        if (typeof value !== "string") continue;
-        parts.push(`${key}: ${displayPath(value, workspaceRoot)}`);
-      }
+  let length = 0;
+  const append = (part: string): boolean => {
+    length += (parts.length === 0 ? 0 : 2) + part.length;
+    if (length > MAXIMUM_PERMISSION_SUMMARY_CHARS) return false;
+    parts.push(part);
+    return true;
+  };
+
+  const network = requested["network"];
+  if (network != null) {
+    if (!isJsonObject(network) || Object.keys(network).some(key => key !== "enabled")) return undefined;
+    const enabled = network["enabled"];
+    if (enabled != null && (typeof enabled !== "boolean" || !append(`Requested network access\n${enabled ? "Enabled" : "Disabled"}`))) {
+      return undefined;
     }
   }
-  return parts.length === 0 ? "Additional runtime permissions" : parts.join("\n");
+
+  const fileSystem = requested["fileSystem"];
+  if (fileSystem != null) {
+    if (!isJsonObject(fileSystem) || Object.keys(fileSystem).some(key => !["entries", "read", "write", "globScanMaxDepth"].includes(key))) {
+      return undefined;
+    }
+    const entries = fileSystem["entries"];
+    if (entries != null) {
+      // The native protocol adopts entries before consulting legacy roots.
+      if (!Array.isArray(entries)) return undefined;
+      for (const entry of entries) {
+        if (!isJsonObject(entry)) return undefined;
+        const access = entry["access"];
+        if (access !== "read" && access !== "write" && access !== "deny") return undefined;
+        const target = permissionTarget(entry["path"]);
+        const label = access === "read" ? "Read" : access === "write" ? "Write" : "Deny access to";
+        if (target === undefined || !append(`${label} ${target}`)) return undefined;
+      }
+    } else {
+      for (const access of ["read", "write"] as const) {
+        const paths = fileSystem[access];
+        if (paths == null) continue;
+        if (!Array.isArray(paths)) return undefined;
+        for (const path of paths) {
+          const target = permissionText(path);
+          if (target === undefined || !append(`${access === "read" ? "Read" : "Write"} ${target}`)) return undefined;
+        }
+      }
+    }
+    const depth = fileSystem["globScanMaxDepth"];
+    if (depth != null && (typeof depth !== "number" || !Number.isSafeInteger(depth) || depth < 1
+      || !append(`Maximum glob scan depth ${depth}`))) return undefined;
+  }
+  if (parts.length === 0 || !append("Scope\nThis turn")) return undefined;
+
+  for (const [key, label] of [["cwd", "Working directory"], ["environmentId", "Execution environment"]] as const) {
+    const value = record[key];
+    if (value == null) continue;
+    const detail = permissionText(value);
+    if (detail === undefined || !append(`${label}\n${detail}`)) return undefined;
+  }
+  const reason = record["reason"];
+  if (typeof reason === "string" && reason.trim() !== "") {
+    const label = "Reason\n";
+    const available = MAXIMUM_PERMISSION_SUMMARY_CHARS - length - 2 - label.length;
+    if (available > "\n[truncated]".length) {
+      const detail = safeText(reason, Math.min(1_024, available - "\n[truncated]".length));
+      if (detail !== "") append(label + detail);
+    }
+  }
+  return parts.join("\n\n");
 }
 
-function displayPath(path: string, workspaceRoot: string): string {
-  const rel = relative(resolve(workspaceRoot), resolve(path));
-  if (rel.length === 0) return ".";
-  if (!rel.startsWith("..") && !isAbsolute(rel)) return safePath(rel);
-  return basename(path);
+function permissionText(value: JsonValue | undefined): string | undefined {
+  if (typeof value !== "string" || value.trim() === "" || value.length > MAXIMUM_PERMISSION_SUMMARY_CHARS
+    || /[\u0000-\u001f\u007f\u2028-\u202e\u2066-\u2069]/u.test(value)) return undefined;
+  return safeText(value, MAXIMUM_PERMISSION_SUMMARY_CHARS);
+}
+
+function permissionTarget(path: JsonValue | undefined): string | undefined {
+  if (!isJsonObject(path)) return undefined;
+  switch (path["type"]) {
+    case "path":
+      return permissionText(path["path"]);
+    case "glob_pattern": {
+      const pattern = permissionText(path["pattern"]);
+      return pattern === undefined ? undefined : `paths matching ${pattern}`;
+    }
+    case "special": {
+      const value = path["value"];
+      if (!isJsonObject(value)) return undefined;
+      switch (value["kind"]) {
+        case "root": return "the file system root";
+        case "minimal": return "the native minimal file system scope";
+        case "tmpdir": return "the runtime temporary directory";
+        case "slash_tmp": return "/tmp";
+        case "current_working_directory":
+        case "project_roots": {
+          const subpath = value["subpath"];
+          if (subpath == null) return "the project roots";
+          const detail = permissionText(subpath);
+          return detail === undefined ? undefined : `${detail} under the project roots`;
+        }
+        default: return undefined;
+      }
+    }
+    default: return undefined;
+  }
 }
 
 async function resolveManagedFile(blob: BlobRef, context: AdapterContext, resolvers: CodexInputResolvers): Promise<string> {
