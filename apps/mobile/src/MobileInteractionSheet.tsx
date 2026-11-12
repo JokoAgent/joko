@@ -101,6 +101,8 @@ export function MobileInteractionSheet({
   const authorityKey = interaction === undefined ? undefined : `${profileId ?? ""}\u001f${displayAuthorityKey(interaction)}`;
   const authorityRef = useRef(authorityKey);
   authorityRef.current = authorityKey;
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   const identity = useMemo(() => mobileInteractionDraftIdentity(profileId, interaction), [
     profileId,
     interaction?.interactionId,
@@ -177,7 +179,7 @@ export function MobileInteractionSheet({
   };
 
   const settle = async (submission: MobileInteractionSubmission): Promise<void> => {
-    if (disabled || !visible || !mountedRef.current || authorityRef.current !== authorityKey) return;
+    if (disabled || !visibleRef.current || !mountedRef.current || authorityRef.current !== authorityKey) return;
     const currentAuthorityKey = authorityKey;
     setSettling(true);
     onError("");
@@ -255,18 +257,8 @@ export function MobileInteractionSheet({
             : !ready
               ? <Text style={[sheetStyles.body, { color: colors.muted }]}>{mobileMessage(locale, "interaction.restoring")}</Text>
               : interaction.request.case === "permission"
-                ? <PermissionRequest interaction={interaction} disabled={disabled} colors={colors} locale={locale} onResolve={(decision) => {
-                  const submit = () => void settle({ kind: "permission", decision });
-                  if (!mobilePermissionDecisionNeedsConfirmation(interaction, decision)) { submit(); return; }
-                  Alert.alert(
-                    mobileMessage(locale, "interaction.highRiskTitle", {
-                      risk: mobilePermissionRiskLabel(interaction.request.case === "permission" ? interaction.request.value.risk : 0, locale)
-                    }),
-                    mobileMessage(locale, "interaction.highRiskBody"),
-                    [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
-                      { text: mobilePermissionDecisionLabel(decision, locale), style: "destructive", onPress: submit }]
-                  );
-                }} />
+                ? <PermissionRequest key={`${authorityKey}:${visible}`} interaction={interaction} disabled={disabled || !visible}
+                  colors={colors} locale={locale} onResolve={decision => void settle({ kind: "permission", decision })} />
                 : interaction.request.case === "question" && draft?.kind === "question"
                   ? <QuestionRequest interaction={interaction} draft={draft} disabled={disabled || !visible} colors={colors} locale={locale}
                     ownerKey={identityKey ?? authorityKey ?? interaction.interactionId} voiceTransport={voiceTransport} onError={onError} onOpenReference={onOpenReference}
@@ -292,6 +284,8 @@ function PermissionRequest({ interaction, disabled, colors, locale, onResolve }:
   readonly locale: MobileSupportedLocale;
   readonly onResolve: (decision: PermissionDecisionKind) => void;
 }) {
+  const [armedDecision, setArmedDecision] = useState<PermissionDecisionKind>();
+  const submittedConfirmation = useRef(false);
   if (interaction.request.case !== "permission") return null;
   const request = interaction.request.value;
   const riskDanger = request.risk !== PermissionRisk.READ_ONLY
@@ -310,10 +304,28 @@ function PermissionRequest({ interaction, disabled, colors, locale, onResolve }:
       </View>)}
     </View>}
     <View style={sheetStyles.decisionStack}>
-      {request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePermissionDecisionLabel(decision, locale)}
+      {armedDecision === undefined ? request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePermissionDecisionLabel(decision, locale)}
         colors={colors} disabled={disabled} danger={mobilePermissionDecisionDanger(decision)}
         quiet={decision === PermissionDecisionKind.DENY_ONCE || decision === PermissionDecisionKind.DENY_FOR_SESSION}
-        onPress={() => onResolve(decision)} />)}
+        onPress={() => {
+          if (!mobilePermissionDecisionNeedsConfirmation(interaction, decision)) { onResolve(decision); return; }
+          submittedConfirmation.current = false;
+          setArmedDecision(decision);
+        }} />) : <>
+        <Text accessibilityRole="alert" style={[sheetStyles.body, { color: colors.negative }]}>
+          {mobileMessage(locale, "interaction.highRiskTitle", { risk: mobilePermissionRiskLabel(request.risk, locale) })}
+        </Text>
+        <Text style={[sheetStyles.body, { color: colors.ink }]}>{mobileMessage(locale, "interaction.highRiskBody")}</Text>
+        <SheetButton label={mobileMessage(locale, "common.cancel")} colors={colors} quiet disabled={disabled}
+          onPress={() => setArmedDecision(undefined)} />
+        <SheetButton label={mobilePermissionDecisionLabel(armedDecision, locale)} colors={colors} danger disabled={disabled}
+          onPress={() => {
+            if (submittedConfirmation.current) return;
+            submittedConfirmation.current = true;
+            setArmedDecision(undefined);
+            onResolve(armedDecision);
+          }} />
+      </>}
     </View>
   </View>;
 }
