@@ -2577,18 +2577,23 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         >
           <Suspense fallback={<RouteLoading label={t("common.loading")} />}>
           {state.route.kind === "newSession" ? <NewSessionPage
+            key={state.route.contactsDraft === undefined ? "new-session"
+              : JSON.stringify([state.route.contactsDraft, state.activeProfile?.id, state.activeProfile?.serverId])}
             controller={controller}
             snapshot={state.snapshot}
             initialTargetId={state.route.targetId}
             initialDialogueBackendId={state.route.dialogueBackendId}
             recommendationNonce={state.route.recommendationNonce}
             initialModel={state.route.initialModel}
+            contactsDraft={state.route.contactsDraft}
             projectPickerRequest={projectPickerRequest}
             onProjectPickerRequestConsumed={(requestId) => setProjectPickerRequest((current) => current?.requestId === requestId ? undefined : current)}
             navigationOpen={navigationOpen}
             t={t}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
-            onClose={() => controller.navigate({ kind: "session" })}
+            onClose={() => state.route.kind === "newSession" && state.route.contactsDraft !== undefined
+              ? controller.navigate({ kind: "settings" }, { exactHash: "#/settings/contacts" })
+              : controller.navigate({ kind: "session" })}
             onSubmit={submitNewSession}
           /> : <>
           {state.route.kind === "session" && (activeSession === undefined ? (

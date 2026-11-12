@@ -4,7 +4,9 @@ import type {
   NewSessionDraft,
   NewSessionDraftSelection,
   ObjectiveLimitsView,
-  ObjectiveView
+  ObjectiveView,
+  TargetDraft,
+  TargetView
 } from "./model.js";
 import { runtimeCommandOwnsApplicationCommand } from "./components/composer-palette.js";
 import { requireStartedSkillLearningRun, type StartedSkillLearningRunView } from "./skill-learning-command.js";
@@ -23,6 +25,7 @@ export interface NewSessionSubmissionOwner {
   readonly ownerDocument: Document;
   readonly signal: AbortSignal;
   readonly isCurrent: () => boolean;
+  readonly contactsDialogueRequestId?: string;
   /** Validate an authored command against the newly created runtime, before
    * the first input can be accepted. A pre-existing task is not required. */
   readonly beforeFirstInput?: (sessionId: string) => Promise<void>;
@@ -36,6 +39,7 @@ export interface FirstInputLifecycle {
   readonly beforeFirstInput?: (sessionId: string) => Promise<void>;
   readonly disposition?: FirstInputDisposition;
   readonly signal?: AbortSignal;
+  readonly prepareDialogueTarget?: (draft: TargetDraft) => Promise<Pick<TargetView, "id" | "revision">>;
   readonly onAccepted?: (acceptance: FirstInputAcceptance) => void;
 }
 
@@ -200,16 +204,21 @@ export async function createDelayedSessionFromFirstInput(
       expectedTargetRevision: draft.expectedTargetRevision
     }, input, onCreated, lifecycle);
   }
-  const targetId = await api.createTarget({
+  const targetDraft: TargetDraft = {
     backendId: draft.selection.backendId,
     name: draft.name,
     workspaceKind: "managedDialogue",
     serverPath: "",
     createIfMissing: true
-  });
-  await api.refresh();
+  };
+  const prepared = lifecycle?.prepareDialogueTarget === undefined ? undefined : await lifecycle.prepareDialogueTarget(targetDraft);
+  const targetId = prepared?.id ?? await api.createTarget(targetDraft);
+  if (prepared === undefined) await api.refresh();
+  else lifecycle?.signal?.throwIfAborted();
   onManagedTargetCreated?.(targetId);
-  return createSessionFromFirstInput(api, { ...sessionDraft(draft), targetId }, input, onCreated, lifecycle);
+  return createSessionFromFirstInput(api, {
+    ...sessionDraft(draft), targetId, ...(prepared === undefined ? {} : { expectedTargetRevision: prepared.revision })
+  }, input, onCreated, lifecycle);
 }
 
 function sessionDraft(draft: DelayedNewSessionDraft): Omit<NewSessionDraft, "targetId"> {

@@ -1261,8 +1261,14 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
   if (rawWorktree !== undefined && worktree === undefined) return undefined;
   const preparation = normalizeProvisionalTaskReceipt(record["preparation"]);
   if (record["preparation"] !== undefined && preparation === undefined) return undefined;
+  const contactsDialogue = record["contactsDialogue"];
+  const dialogue = contactsDialogue !== null && typeof contactsDialogue === "object" && !Array.isArray(contactsDialogue)
+    ? contactsDialogue as Record<string, unknown> : undefined;
   return {
     ...(preparation === undefined ? {} : { preparation }),
+    ...(typeof dialogue?.["requestId"] === "string" && /^[a-f0-9-]{36}$/u.test(dialogue["requestId"])
+      && typeof dialogue["name"] === "string" && dialogue["name"].trim() !== "" && dialogue["name"].length <= 120
+      ? { contactsDialogue: { requestId: dialogue["requestId"], name: dialogue["name"] } } : {}),
     selection,
     nativeStart,
     providerId: typeof record["providerId"] === "string" ? record["providerId"] : "",

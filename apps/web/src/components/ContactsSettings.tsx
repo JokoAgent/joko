@@ -12,11 +12,13 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
+  Sparkles,
   Trash2,
   UserRound,
   UsersRound
 } from "lucide-react";
 import type { AppController } from "../controller.js";
+import { CONTACTS_TOOL_POLICY_ID, contactsDraftOwnerMatches } from "../contacts-draft.js";
 import type {
   ContactDirectoryView,
   ContactDraftView,
@@ -74,6 +76,9 @@ export function ContactsSettings({ controller, locale, t }: {
   readonly t: Translator;
 }): JSX.Element {
   const ownerKey = controller.state.activeProfile?.id ?? "disconnected";
+  const currentController = useRef(controller);
+  currentController.current = controller;
+  const contactsPolicy = controller.state.snapshot?.settings.toolPolicies.find(policy => policy.toolProviderId === CONTACTS_TOOL_POLICY_ID);
   const [directory, setDirectory] = useState<ContactDirectoryView>();
   const [syncStatus, setSyncStatus] = useState<ContactSyncStatusView>();
   const [syncError, setSyncError] = useState<string>();
@@ -252,6 +257,32 @@ export function ContactsSettings({ controller, locale, t }: {
     } finally {
       setBusy(undefined);
     }
+  };
+
+  const organizeContacts = (trigger: HTMLButtonElement): void => {
+    const { activeProfile, connectionGeneration, navigationRevision } = controller.state;
+    if (directory?.enabled !== true || contactsPolicy === undefined || activeProfile === undefined || busy !== undefined) return;
+    const owner = { profileId: activeProfile.id, serverId: activeProfile.serverId };
+    const enableTools = !contactsPolicy.userEffectiveEnabled;
+    const isCurrent = (): boolean => {
+      const state = currentController.current.state;
+      return trigger.isConnected && trigger.ownerDocument.defaultView !== null && contactsDraftOwnerMatches(owner, state.activeProfile)
+        && state.connectionState === "connected" && state.connectionGeneration === connectionGeneration
+        && state.route.kind === "settings" && state.navigationRevision === navigationRevision;
+    };
+    if (!isCurrent()) return;
+    void run("organize", async () => {
+      const current = await controller.getContactDirectory();
+      if (!isCurrent()) return;
+      if (!current.enabled) {
+        setDirectory(current);
+        throw new Error(t("contacts.organizeDirectoryDisabled"));
+      }
+      const policy = currentController.current.state.snapshot.settings.toolPolicies.find(item => item.toolProviderId === CONTACTS_TOOL_POLICY_ID);
+      if (policy === undefined || (!policy.userEffectiveEnabled && !enableTools)) throw new Error(t("contacts.organizeToolsDisabled"));
+      if (!policy.userEffectiveEnabled) await controller.updateToolPolicySettings(CONTACTS_TOOL_POLICY_ID, undefined, { enabled: true });
+      if (isCurrent()) controller.navigate({ kind: "newSession", contactsDraft: owner }, { isCurrent });
+    });
   };
 
   const refresh = (preferredId?: string): void => {
@@ -536,6 +567,11 @@ export function ContactsSettings({ controller, locale, t }: {
           <UsersRound aria-hidden="true" />{t("contacts.systemImport")}
         </Button>}
         <Button onClick={() => void exportContacts([])} disabled={busy !== undefined}><Download aria-hidden="true" />{t("contacts.exportAll")}</Button>
+        {directory?.enabled === true && contactsPolicy !== undefined && <Button
+          onClick={(event) => organizeContacts(event.currentTarget)} disabled={busy !== undefined || controller.state.connectionState !== "connected"}>
+          {busy === "organize" ? <Spinner /> : <Sparkles aria-hidden="true" />}
+          {t(contactsPolicy.userEffectiveEnabled ? "contacts.organize" : "contacts.organizeEnableTools")}
+        </Button>}
         <Button tone="primary" onClick={() => setEditor({ mode: "create" })} disabled={directory === undefined || busy !== undefined}><Plus aria-hidden="true" />{t("contacts.new")}</Button>
       </div>
     </header>
