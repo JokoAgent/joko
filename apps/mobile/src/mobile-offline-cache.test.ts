@@ -197,21 +197,29 @@ describe("current-v1 mobile offline content cache", () => {
     expect((await cache.load(profile, selected))?.detail?.timeline.map((item) => item.eventId)).toEqual(["survives"]);
   });
 
-  it("keeps a cached history prefix through overlapping background refresh and replaces it on reset", async () => {
+  it("keeps a cached history prefix through a freshly issued full page and replaces it with a complete short page", async () => {
     const fixture = cacheFixture();
     const event = (id: string, sequence: bigint) => create(EventSchema, { eventId: id, identity: { sessionId: "session-one" },
-      cursor: { generation: 42n, sequence }, payload: { kind: { case: "messageCompleted", value: { messageId: id,
+      cursor: { generation: 42n, sequence, opaqueToken: `previous-${sequence}`, issuedAt: { seconds: 10n } },
+      payload: { kind: { case: "messageCompleted", value: { messageId: id,
         role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: id } }] } } } });
-    const first = detail(); first.timeline = [event("older", 1n), event("boundary", 2n), event("latest", 3n)];
+    const first = detail();
+    if (first.scope?.kind.case !== "session") throw new Error("Missing task scope");
+    first.scope.kind.value.recentTimelineItems = 3;
+    first.timeline = [event("older", 1n), event("boundary", 2n), event("latest", 3n)];
     await fixture.cache.save(profile, node, owner(), first);
-    const refresh = detail(); refresh.timeline = [first.timeline[1]!, first.timeline[2]!, event("new", 4n)];
+    const refresh = create(SnapshotSchema, { ...first, timeline: [first.timeline[1]!, first.timeline[2]!, event("new", 4n)]
+      .map(item => create(EventSchema, { ...item,
+        cursor: { ...item.cursor!, opaqueToken: `current-${item.cursor!.sequence}`, issuedAt: { seconds: 20n } } })) });
     fixture.memory.failNextDetailRead(); await fixture.cache.save(profile, node, owner(), refresh);
     expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["older", "boundary", "latest"]);
     fixture.tick(); await fixture.cache.save(profile, node, owner(), refresh);
-    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["older", "boundary", "latest", "new"]);
-    const reset = detail(); reset.timeline = [event("replacement", 5n)];
-    await fixture.cache.save(profile, node, owner(), reset);
-    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["replacement"]);
+    const stored = (await fixture.cache.load(profile, "session-one"))?.detail?.timeline;
+    expect(stored?.map(item => item.eventId)).toEqual(["older", "boundary", "latest", "new"]);
+    expect(stored?.[1]?.cursor).toMatchObject({ sequence: 2n, generation: 42n, opaqueToken: "current-2", issuedAt: { seconds: 20n } });
+    const complete = create(SnapshotSchema, { ...refresh, timeline: refresh.timeline.slice(1) });
+    await fixture.cache.save(profile, node, owner(), complete);
+    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["latest", "new"]);
   });
 
   it("does not retain history across an event-generation or native-runtime change", async () => {
