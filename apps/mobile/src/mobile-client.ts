@@ -14284,6 +14284,34 @@ export class MobileClient {
     };
   }
 
+  async checkTaskInteractionOperation(displayed: Interaction, operationId: string): Promise<boolean> {
+    const epoch = this.#epoch;
+    const credential = this.#ready();
+    if (this.#joinedTask) return false;
+    const pending = this.#state.pending.find(item => item.operationId === operationId
+      && item.connectionId === credential.connectionId && item.taskJoinId === undefined
+      && item.sessionId === displayed.sessionId && item.interactionId === displayed.interactionId
+      && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
+    if (!pending || this.#state.selectedId !== displayed.sessionId) return false;
+    const concurrentUserShell = this.#userShellFlight?.sessionId === displayed.sessionId;
+    const action = this.#claimMutation(concurrentUserShell);
+    try {
+      const operation = await this.network.getOperation(credential, operationId, this.#abort?.signal);
+      if (!this.#current(epoch) || this.#credential !== credential || this.#state.selectedId !== displayed.sessionId
+        || !this.#state.pending.includes(pending)) return false;
+      if (!operation || !this.#operationReceiptMatches(operation, pending) || !isTerminal(operation.state)) return false;
+      await this.#receipt(operation, pending, epoch, true);
+      if (!this.#current(epoch) || this.#state.pending.some(item => item.operationId === operationId)) return false;
+      if (operation.state !== OperationState.SUCCEEDED) throw new Error(operation.error?.message || "The request response was rejected.");
+      if (!concurrentUserShell) await this.refresh();
+      return true;
+    } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return false;
+      if (!this.#current(epoch) || this.#state.selectedId !== displayed.sessionId) return false;
+      throw error;
+    } finally { this.#releaseMutation(action); }
+  }
+
   async resolveInteraction(interactionId: string, submission: MobileInteractionSubmission): Promise<boolean> {
     return this.#resolvePendingInteraction(this.#interactionContext(interactionId), submission);
   }
@@ -17096,6 +17124,24 @@ export class MobileClient {
     try {
       operation = await this.network.submit(credential, pending.operationId, mutation, operationSignal);
     } catch (error) {
+      if (!this.#joinedTask && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss")
+        && pending.sessionId === this.#state.selectedId
+        && error instanceof ConnectError && (error.code === Code.Aborted || error.code === Code.FailedPrecondition)
+        && this.#current(epoch) && requestCurrent()) {
+        // Aborted can also mean an operation is still running. Only the exact
+        // recorded terminal failure settles a rejected Interaction submission.
+        const receipt = await this.network.getOperation(credential, pending.operationId, operationSignal).catch(() => undefined);
+        if (receipt && this.#current(epoch) && requestCurrent() && this.#state.pending.includes(pending)
+          && this.#operationReceiptMatches(receipt, pending)
+          && (receipt.state === OperationState.FAILED || receipt.state === OperationState.CONFLICT)) {
+          await this.#receipt(receipt, pending, epoch);
+          if (this.#current(epoch)) {
+            if (markBusy) this.#set({ busy: false });
+            throw new Error(error.rawMessage || receipt.error?.message || "The request response was rejected.");
+          }
+          return { accepted: false, definitive: true, operation: receipt };
+        }
+      }
       if (this.#current(epoch)) this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId}: ${message(error)}. Check status; it was not resent.` });
       return { accepted: false, definitive: false };
     }

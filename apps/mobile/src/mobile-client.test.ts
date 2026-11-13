@@ -11189,6 +11189,42 @@ describe("native current-task Interaction ownership", () => {
       .toEqual(["interaction-plan", "interaction-question"]);
   });
 
+  it.each(["durable conflict", "lost response", "still running"] as const)(
+    "settles a stale permission response only from its original durable receipt (%s)", async (outcome) => {
+      const network = projectedNetwork(interactionSnapshot);
+      const saved = memoryStorage(credential);
+      const app = client(network, saved.storage, undefined, undefined, ids());
+      const failure = `Revision precondition failed for ${permissionInteraction.interactionId}.`;
+      const receipt = (state: OperationState) => create(OperationSchema, {
+        operationId: "interaction-operation-1", connectionId: credential.connectionId, state,
+        ...(state === OperationState.FAILED ? { error: { message: failure } } : {})
+      });
+      vi.mocked(network.submit).mockRejectedValueOnce(outcome === "lost response" ? new Error("link interrupted")
+        : new ConnectError(failure, Code.Aborted));
+      vi.mocked(network.getOperation).mockResolvedValue(outcome === "durable conflict" ? receipt(OperationState.FAILED)
+        : outcome === "still running" ? receipt(OperationState.RUNNING) : undefined);
+      await app.start();
+      const submit = app.resolveInteraction(permissionInteraction.interactionId, {
+        kind: "permission", decision: PermissionDecisionKind.DENY_ONCE
+      });
+      if (outcome === "durable conflict") {
+        await expect(submit).rejects.toThrow(failure);
+        expect(saved.pending()).toEqual([]);
+        expect(app.state.pending).toEqual([]);
+        expect(app.state.busy).toBe(false);
+      } else {
+        await expect(submit).resolves.toBe(false);
+        expect(saved.pending()).toMatchObject([{ operationId: "interaction-operation-1", state: "unknown" }]);
+        const displayed = app.taskInteractions().find(item => item.interactionId === permissionInteraction.interactionId)!;
+        await expect(app.checkTaskInteractionOperation(displayed, "another-operation")).resolves.toBe(false);
+        vi.mocked(network.getOperation).mockResolvedValueOnce(receipt(OperationState.FAILED));
+        await expect(app.checkTaskInteractionOperation(displayed, "interaction-operation-1")).rejects.toThrow(failure);
+        expect(saved.pending()).toEqual([]);
+      }
+      expect(network.getOperation).toHaveBeenLastCalledWith(credential, "interaction-operation-1", expect.any(AbortSignal));
+      expect(network.submit).toHaveBeenCalledOnce();
+    });
+
   it("dismisses only the exact current request and refreshes its authoritative projection", async () => {
     const network = projectedNetwork(interactionSnapshot);
     let dismissed = false;

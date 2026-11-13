@@ -131,3 +131,37 @@ it("keeps the exact permission evidence selectable through confirmation and reti
     host.remove();
   }
 });
+
+it("shows rejection in the permission sheet and checks a pending response using its original ID", async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  const initial = permission(3n, "Current permission evidence");
+  const failure = new Error("The permission request changed before the response was accepted.");
+  const onResolve = vi.fn(async () => { throw failure; });
+  const check = vi.fn(async () => false);
+  const onError = vi.fn();
+  const render = (operationId?: string) => act(async () => {
+    root.render(<MobileInteractionSheet visible profileId="profile" interactions={[initial]} busy={false} colors={colors}
+      locale="en" onSelect={() => undefined} onMinimize={() => undefined} onResolve={onResolve}
+      onDismiss={async () => true} onError={onError}
+      responseReceipt={operationId === undefined ? undefined : { operationId, state: "unknown", check }} />);
+  });
+  const button = (label: string) => Array.from(host.querySelectorAll("button")).find(candidate => candidate.getAttribute("aria-label") === label)!;
+  try {
+    await render();
+    await act(async () => button(mobileMessage("en", "interaction.decision.deny")).click());
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe(failure.message);
+    expect(onResolve).toHaveBeenCalledOnce();
+
+    await render("original-permission-response");
+    expect(button(mobileMessage("en", "interaction.decision.deny")).disabled).toBe(true);
+    await act(async () => button(mobileMessage("en", "receipt.check")).click());
+    expect(check).toHaveBeenCalledExactlyOnceWith(initial, "original-permission-response");
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe(mobileMessage("en", "interaction.responseUnconfirmed"));
+    expect(onResolve).toHaveBeenCalledOnce();
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+  }
+});

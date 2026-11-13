@@ -636,6 +636,7 @@ const mobileTaskMessageRows = [
   ["interaction.previous", "Previous request", "上一个请求", "上一個請求", "前の要求", "이전 요청"],
   ["interaction.next", "Next request", "下一个请求", "下一個請求", "次の要求", "다음 요청"],
   ["interaction.restoring", "Restoring saved response…", "正在恢复已保存的响应…", "正在還原已儲存的回應…", "保存済みの応答を復元中…", "저장된 응답을 복원하는 중…"],
+  ["interaction.responseUnconfirmed", "The response is still unconfirmed.", "这次响应仍未确认。", "這次回應仍未確認。", "応答はまだ確認できていません。", "응답이 아직 확인되지 않았습니다."],
   ["interaction.highRiskTitle", "{risk} permission", "{risk}权限", "{risk}權限", "{risk}権限", "{risk} 권한"],
   ["interaction.highRiskBody", "This approval can perform a high-impact action. Review the exact subject before continuing.", "此批准可能执行高影响操作。继续前请检查确切对象。", "此核准可能執行高影響操作。繼續前請檢查確切對象。", "この承認により影響の大きい操作が実行される可能性があります。続行前に正確な対象を確認してください。", "이 승인은 영향이 큰 동작을 수행할 수 있습니다. 계속하기 전에 정확한 대상을 검토하세요."],
   ["interaction.draftMismatch", "This response draft no longer matches the current request.", "此响应草稿已不再匹配当前请求。", "此回應草稿已不再符合目前請求。", "この応答下書きは現在の要求と一致しません。", "이 응답 초안은 더 이상 현재 요청과 일치하지 않습니다."],
