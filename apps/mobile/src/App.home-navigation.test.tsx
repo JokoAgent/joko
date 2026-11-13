@@ -611,6 +611,15 @@ describe("actual Home navigation hosts", () => {
     expect(onSelect).toHaveBeenLastCalledWith(undefined);
   });
 
+  it("opens a Home result from a saved preview without creating a message anchor", async () => {
+    await render({ state: { ...state, homeSearchQuery: "preview", homeSearchStatus: "ready", homeSearchMatches: [{ sessionId: "other" }] },
+      runNavigation: undefined, host: "home" });
+    await type(message("home.search"), "preview");
+    await press("Open task Beta");
+    expect(select).toHaveBeenLastCalledWith("other");
+    expect(onSelect).toHaveBeenLastCalledWith(undefined);
+  });
+
   it("shows a pending first search and retains a ready body result across an equivalent owner snapshot", async () => {
     await render();
     searchHome.mockClear();

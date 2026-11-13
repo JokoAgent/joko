@@ -1390,7 +1390,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
   const normalizedSearch = search.trim();
   const currentSearch = state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter;
-  const searchPending = foreground && state.status === "connected" && normalizedSearch !== ""
+  const searchPending = foreground && (state.status === "connected" || state.status === "offline") && normalizedSearch !== ""
     && (!currentSearch || state.homeSearchStatus === "idle" || state.homeSearchStatus === "searching");
   const currentMessageMatches = useMemo(() => new Map<string, MobileHomeSearchMatch>(
     state.homeSearchStatus === "ready" && currentSearch
