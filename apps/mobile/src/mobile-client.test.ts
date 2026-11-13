@@ -4432,7 +4432,8 @@ describe("mobile Partner private authority", () => {
     expect(app.state.selectedId).toBe(previous);
     const partner = { ...profilePartner, canonicalSessionId: "imported-task" };
     const importedSession = { ...snapshot.sessions[0]!, sessionId: "imported-task", displayName: "Imported Partner task" };
-    const importedEvent = create(EventSchema, { ...messageEvent, identity: { sessionId: importedSession.sessionId } });
+    const importedEvent = create(EventSchema, { ...messageEvent,
+      identity: create(EventIdentitySchema, { ...messageEvent.identity, sessionId: importedSession.sessionId }) });
     const fresh = create(SnapshotSchema, { ...snapshot, sessions: [...snapshot.sessions, importedSession] });
     const importedDetail = create(SnapshotSchema, { ...snapshot, sessions: [importedSession], timeline: [importedEvent] });
     vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: fresh });
