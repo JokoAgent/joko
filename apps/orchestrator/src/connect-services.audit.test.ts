@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,7 @@ import { toProtoEventCursor, toProtoTimestamp } from "./proto-mapper.js";
 import { SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
 import { ProviderAccountResets } from "./provider-account-resets.js";
 import { JokoError, type NativeAccountRateLimitResetOperations } from "@joko/core";
+import { WorkspaceService } from "./workspace-service.js";
 
 const cleanups: Array<() => void> = [];
 
@@ -3581,6 +3582,94 @@ describe("Connect security and protocol audit", () => {
     expect(await creationResult).toMatchObject({ message: expect.stringContaining("creation stopped") });
     expect(await archivalResult).toMatchObject({ message: expect.stringContaining("archival reached") });
     expect(mutate.mock.calls.map(([input]) => input.kind)).toEqual(["createSession", "archiveTarget"]);
+  });
+
+  it("restores an archived project and keeps a deleted project out of the catalog and workspace preparation", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-project-lifecycle-"));
+    const workspaceRoot = join(directory, "project");
+    mkdirSync(workspaceRoot);
+    const file = join(workspaceRoot, "notes.txt");
+    writeFileSync(file, "Keep this project file.");
+    const store = new OperationalStore(":memory:");
+    const workspaces = new WorkspaceService();
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [] });
+    const host = new SessionHost(store, artifacts, []);
+    const connections = new ConnectionManager(store);
+    const token = "fixture-project-owner";
+    const owner = store.createConnection({ id: "project-owner", name: "Project owner", authKeyDigest: digestAuthKey(token) });
+    const application = { ...stubApplication({ store, workspaces }), connections, sessionHost: host };
+    const transport = createRouterTransport(router => registerConnectServices(router, application));
+    const operations = createClient(contract.OperationService, transport);
+    const targets = createClient(contract.TargetService, transport);
+    const events = createClient(contract.EventService, transport);
+    const auth = { headers: { authorization: `Bearer ${token}` } };
+    const targetId = "ordinary-project";
+    const workspaceId = "ordinary-workspace";
+    const archived = (value: boolean) => create(contract.OperationMutationSchema, {
+      payload: { case: "archiveTarget", value: { targetId, archived: value } }
+    });
+    const submit = (operationId: string, mutation: contract.OperationMutation) =>
+      operations.submitOperation({ operationId, connectionId: owner.id, mutation }, auth);
+    try {
+      store.upsertBackend({
+        id: "pi", adapterKind: "fixture", instanceGeneration: 0, displayName: "Pi",
+        version: "test", health: "healthy", installationState: "installed", authenticationState: "authenticated",
+        capabilities: new Map(), models: [], tools: [], diagnostics: []
+      });
+      store.upsertTarget({
+        id: targetId, backendId: "pi", displayName: "Ordinary project", workspaceRoot, managed: false, trusted: true
+      }, { workspaceId });
+      const prepare = () => targets.prepareTargetWorkspace({
+        targetId, expectedTargetRevision: { value: store.getTarget(targetId).revision }
+      }, auth);
+      const listArchived = () => targets.listTargets({ backendId: "pi", state: contract.TargetState.ARCHIVED }, auth);
+      await expect(prepare()).resolves.toMatchObject({ workspace: { workspaceId, targetId, trusted: true } });
+      await expect(submit("archive-project", archived(true))).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      await expect(listArchived()).resolves.toMatchObject({ targets: [{ targetId }] });
+      await expect(prepare()).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      await expect(submit("restore-project", archived(false))).resolves.toMatchObject({
+        operation: { state: contract.OperationState.SUCCEEDED, result: {
+          payload: { case: "target", value: { targetId, state: contract.TargetState.ACTIVE } }
+        } }
+      });
+      await expect(prepare()).resolves.toMatchObject({ workspace: { workspaceId, targetId } });
+
+      const deletion = create(contract.OperationMutationSchema, {
+        payload: { case: "deleteTarget", value: { targetId, deleteManagedWorkspace: false } }
+      });
+      const deleted = await submit("delete-project", deletion);
+      expect(deleted.operation).toMatchObject({ state: contract.OperationState.SUCCEEDED, result: {
+        payload: { case: "target", value: { targetId } }
+      } });
+      const tombstone = store.getTarget(targetId);
+      expect(tombstone.metadata).toMatchObject({ state: "archived", deletedAt: expect.any(Number) });
+      expect(workspaces.listRegistrations()).toEqual([]);
+      expect(readFileSync(file, "utf8")).toBe("Keep this project file.");
+      await expect(listArchived()).resolves.toMatchObject({ targets: [] });
+      await expect(targets.listTargets({}, auth)).resolves.toMatchObject({ targets: [] });
+      await expect(targets.getTarget({ targetId }, auth)).rejects.toMatchObject({ code: Code.NotFound });
+      await expect(events.getSnapshot({}, auth)).resolves.toMatchObject({ snapshot: { targets: [], workspaces: [] } });
+      await expect(events.getSnapshot({ scope: { kind: { case: "target", value: { targetId } } } }, auth))
+        .rejects.toMatchObject({ code: Code.NotFound });
+      await expect(events.getSnapshot({ scope: { kind: { case: "workspace", value: { workspaceId } } } }, auth))
+        .rejects.toMatchObject({ code: Code.NotFound });
+      await expect(submit("restore-deleted-project", archived(false))).rejects.toMatchObject({ code: Code.NotFound });
+      await expect(submit("rename-deleted-project", create(contract.OperationMutationSchema, {
+        preconditions: [{ entity: { kind: contract.EntityKind.TARGET, id: targetId }, expectedRevision: { value: tombstone.revision } }],
+        payload: { case: "updateTarget", value: { targetId, displayName: "Retired project" } }
+      }))).rejects.toMatchObject({ code: Code.NotFound });
+      await expect(prepare()).rejects.toMatchObject({ code: Code.NotFound });
+      await expect(submit("delete-project-again", deletion)).rejects.toMatchObject({ code: Code.NotFound });
+      await expect(submit("delete-project", deletion)).resolves.toEqual(deleted);
+      await expect(operations.getOperation({ operationId: "delete-project" }, auth)).resolves.toEqual(deleted);
+      expect(store.getTarget(targetId)).toEqual(tombstone);
+      expect(workspaces.listRegistrations()).toEqual([]);
+    } finally {
+      await host.dispose();
+      await workspaces.close();
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("requires every product task to finish its own lifecycle deletion before deleting a Target", async () => {
