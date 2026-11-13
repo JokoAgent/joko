@@ -1115,6 +1115,8 @@ export interface TaskSharingGatewayPort {
   download(blobId: string, signal?: AbortSignal): Promise<Blob>;
 }
 
+type TaskEventResponse = { readonly event?: Event } | { readonly resync: Event["cursor"] };
+
 const APP_VERSION = "0.1.0";
 const OPERATION_TERMINAL_WAIT_TIMEOUT_MS = 600_000;
 const MAX_COMPLETE_MESSAGE_SEARCH_PAGES = 10_000;
@@ -1199,6 +1201,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   readonly #sharedTaskSubmitting = new Set<string>();
   #sharedTaskReady = false;
   #sharedTaskRecovery: Promise<void> | undefined;
+  #sharedTaskHistoryEpoch = 0;
   #transport: Transport | undefined;
   #abort: AbortController | undefined;
   #snapshot: AppSnapshot | undefined;
@@ -2166,6 +2169,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   private async loadSnapshot(): Promise<void> {
     const transport = this.requireTransport();
     const signal = this.#abort?.signal;
+    const historyEpoch = this.#sharedTaskHistoryEpoch;
     const currentDeviceNameSource = this.#taskSharing === undefined ? await this.currentDeviceNameSource(transport, signal) : undefined;
     signal?.throwIfAborted();
     const eventClient = createClient(EventService, transport);
@@ -2180,7 +2184,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (response.snapshot === undefined) throw new GatewayError("Orchestrator returned an empty snapshot.");
     let raw = response.snapshot;
     const entryMap = this.#taskSharing === undefined ? await loadWorkspaceEntries(transport, raw.workspaces, signal) : new Map<string, readonly WorkspaceEntry[]>();
-    if (signal?.aborted === true || this.#transport !== transport) return;
+    if (signal?.aborted === true || this.#transport !== transport || historyEpoch !== this.#sharedTaskHistoryEpoch) return;
     const currentCursor = this.#rawSnapshot?.resumeCursor;
     const fetchedCursor = raw.resumeCursor;
     if (
@@ -11231,7 +11235,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       try {
         // Renew the owner snapshot before a newly accepted stream restores
         // native activity. Refreshing the projection alone is not acceptance.
-        if (refreshLiveSnapshot && this.#callbacks.onLiveSnapshot) {
+        if (refreshLiveSnapshot && (this.#callbacks.onLiveSnapshot || this.#taskSharing !== undefined)) {
           await this.refresh();
           if (signal.aborted || this.#abort?.signal !== signal) return;
           refreshLiveSnapshot = false;
@@ -11253,7 +11257,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         let continuousCompactionStream = true;
         let compactionRefreshSource: Snapshot | undefined;
         const profile = this.#profile;
-        const stream = this.#taskSharing !== undefined ? this.finiteTaskEvents(signal, onAccepted)
+        const sharedTask = this.#taskSharing !== undefined;
+        const stream = sharedTask ? this.finiteTaskEvents(signal)
           : this.#transportFactory === transportFor && profile !== undefined && this.#authKey !== undefined
           && cursor !== undefined && typeof SharedWorker === "function"
           ? streamSharedOwnerEvents({ profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId, origin: profile.origin, endpointPublicKey: profile.endpointPublicKey },
@@ -11261,6 +11266,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           : client.streamEvents({ scope: OWNER_SCOPE, afterCursor: cursor }, { signal });
         for await (const response of stream) {
           if (signal.aborted || this.#abort?.signal !== signal) return;
+          if ("resync" in response) {
+            this.publishLiveSnapshot(false);
+            this.retireEventTimelineHistory();
+            // The Host may reject a cursor ahead of its current durable history.
+            if (this.#rawSnapshot !== undefined) this.#rawSnapshot = { ...this.#rawSnapshot, resumeCursor: undefined };
+            await this.flushEventRefresh(response.resync);
+            if (signal.aborted || this.#abort?.signal !== signal) return;
+            lastGeneration = consumedGeneration = this.#snapshot?.generation;
+            lastSequence = consumedSequence = this.#snapshot?.cursor;
+            onAccepted();
+            if (!this.#liveSnapshotConnected) this.publishLiveSnapshot(true);
+            delay = 350;
+            continue;
+          }
           // Connect can return HTTP 200 headers before an initial error
           // envelope. Only a decoded response proves the stream was accepted;
           // an empty response is the idle stream's in-band ready confirmation.
@@ -11268,22 +11287,30 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           const event = response.event;
           if (event === undefined) continue;
           const eventCursor = event.cursor;
+          if (sharedTask) {
+            lastGeneration = this.#snapshot?.generation;
+            lastSequence = this.#snapshot?.cursor;
+          }
           if (eventCursor !== undefined && this.#messageDeletionProjections.size > 0) {
             for (const [operationId, deletion] of this.#messageDeletionProjections) {
               if (deletion.coveredCursor !== undefined && eventCursor.generation === deletion.serviceGeneration
                 && eventCursor.sequence > deletion.coveredCursor) this.#messageDeletionProjections.delete(operationId);
             }
           }
-          const invalidated = payloadCase(event) === "projectionInvalidated";
-          const continuity = classifyEventContinuity(lastGeneration, lastSequence, event);
+          const kind = event.payload?.kind;
+          const continuity = classifyEventContinuity(lastGeneration, lastSequence, event, sharedTask ? "task" : "global");
           const duplicate = continuity === "duplicate";
+          const changedGuestBinding = sharedTask && !duplicate && kind?.case === "sessionChanged" && kind.value.session !== undefined
+            && kind.value.session.sessionId === this.#rawSnapshot?.sessions[0]?.sessionId
+            && kind.value.session.nativeBinding?.runtimeGeneration !== this.#rawSnapshot?.sessions[0]?.nativeBinding?.runtimeGeneration;
+          const invalidated = kind?.case === "projectionInvalidated" || changedGuestBinding;
           const matchedDeletion = this.messageDeletionFromEvent(event);
           const deletionApplied = matchedDeletion?.deletion.applied === "receipt";
           if (matchedDeletion !== undefined) {
             if (deletionApplied) this.#messageDeletionProjections.delete(matchedDeletion.operationId);
             else if (!duplicate && this.#rawSnapshot !== undefined && this.#snapshot !== undefined) matchedDeletion.deletion.applied = "event";
           }
-          const consumedContinuity = classifyEventContinuity(consumedGeneration, consumedSequence, event);
+          const consumedContinuity = classifyEventContinuity(consumedGeneration, consumedSequence, event, sharedTask ? "task" : "global");
           if (consumedContinuity === "contiguous") {
             consumedGeneration = event.cursor?.generation;
             consumedSequence = event.cursor?.sequence;
@@ -11300,7 +11327,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           // Transient renderer effects are valid only on a proven contiguous
           // stream edge. A gap/generation refresh restores durable status and
           // widget projections, but must never replay one-shot UI requests.
-          if (transientUiEffectContinuitySafe(continuity)) {
+          if (!sharedTask && transientUiEffectContinuitySafe(continuity)) {
             const extensionEffect = extensionUiEffect(event);
             if (extensionEffect !== undefined) this.#callbacks.onExtensionUiEffect?.(extensionEffect);
             const visionEffect = visionBridgeUiEffect(event);
@@ -11309,12 +11336,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           if (continuity === "gap" || continuity === "generationChanged" || continuity === "missingCursor" || invalidated) {
             compactionRefreshSource = undefined;
             this.publishLiveSnapshot(false);
-            if (this.#rawSnapshot !== undefined && this.#snapshot !== undefined) {
-              const retired = retireTimelineHistory(this.#rawSnapshot, this.#snapshot, undefined, event.cursor?.sequence);
-              this.#rawSnapshot = retired.rawSnapshot;
-              this.#snapshot = retired.snapshot;
-              this.#callbacks.onSnapshot?.(retired.snapshot);
-            }
+            this.retireEventTimelineHistory(event.cursor?.sequence);
             await this.flushEventRefresh(event.cursor);
             if (signal.aborted || this.#abort?.signal !== signal) return;
             this.publishLiveSnapshot(true);
@@ -11335,6 +11357,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             const projected = projectSnapshotEvent(rawSnapshot, snapshot, event, this.isLocalUserInput, deletionProjection);
             this.#rawSnapshot = projected.rawSnapshot;
             this.#snapshot = projected.snapshot;
+            if (sharedTask && projected.snapshot.timelineHistoryRevisionBySession !== snapshot.timelineHistoryRevisionBySession) {
+              this.#sharedTaskHistoryEpoch += 1;
+            }
             this.#callbacks.onSnapshot?.(projected.snapshot);
             // Run/content deltas intentionally omit Session activity ownership.
             // The native mirror needs the current durable reply and delivery
@@ -11371,7 +11396,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         if (requiresEventSnapshotResync(error)) {
           this.#callbacks.onState?.("reconnecting", "Refreshing the event snapshot…");
           try {
-            await this.refresh();
+            if (this.#taskSharing !== undefined) {
+              this.retireEventTimelineHistory();
+              await this.flushEventRefresh();
+            } else await this.refresh();
             if (signal.aborted || this.#abort?.signal !== signal) return;
             refreshLiveSnapshot = false;
             delay = 350;
@@ -11395,7 +11423,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
   }
 
-  private async *finiteTaskEvents(signal: AbortSignal, onAccepted: () => void): AsyncGenerator<{ readonly event: Event }> {
+  private retireEventTimelineHistory(revision?: bigint): void {
+    if (this.#rawSnapshot === undefined || this.#snapshot === undefined) return;
+    if (this.#taskSharing !== undefined) this.#sharedTaskHistoryEpoch += 1;
+    const retired = retireTimelineHistory(this.#rawSnapshot, this.#snapshot, undefined, revision);
+    this.#rawSnapshot = retired.rawSnapshot;
+    this.#snapshot = retired.snapshot;
+    this.#callbacks.onSnapshot?.(retired.snapshot);
+  }
+
+  private async *finiteTaskEvents(signal: AbortSignal): AsyncGenerator<TaskEventResponse> {
     const port = this.#taskSharing;
     if (port === undefined) return;
     let after = this.#rawSnapshot?.resumeCursor;
@@ -11404,19 +11441,38 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         await abortableDelay(500, signal);
         continue;
       }
+      const currentGeneration = this.#rawSnapshot?.generation;
+      if (after?.generation !== currentGeneration) after = this.#rawSnapshot?.resumeCursor;
       const batch = await port.events(after, signal);
       signal.throwIfAborted();
-      onAccepted();
-      if (batch.resyncRequired || batch.generation !== this.#rawSnapshot?.generation) {
-        await this.refresh();
+      if (currentGeneration !== this.#rawSnapshot?.generation) continue;
+      const resume = batch.resumeCursor;
+      if (batch.resyncRequired || batch.generation !== currentGeneration) {
+        yield { resync: resume?.generation === batch.generation ? resume : undefined };
         after = this.#rawSnapshot?.resumeCursor;
-      } else {
-        for (const event of batch.events) {
-          signal.throwIfAborted();
-          yield { event };
-        }
-        after = batch.resumeCursor ?? this.#rawSnapshot?.resumeCursor;
+        await abortableDelay(1_000, signal);
+        continue;
       }
+      // The authenticated Host scans one task in a global cursor range.
+      // A successful batch covers skipped positions, including when it is empty.
+      const sessionId = this.#rawSnapshot?.sessions[0]?.sessionId;
+      let sequence = after?.sequence ?? 0n;
+      if (sessionId === undefined || resume === undefined || resume.generation !== batch.generation || resume.sequence < sequence
+        || !batch.events.every(({ cursor, identity }) => {
+          if (identity?.sessionId !== sessionId || cursor === undefined
+            || cursor.generation !== batch.generation || cursor.sequence <= sequence || cursor.sequence > resume.sequence) return false;
+          sequence = cursor.sequence;
+          return true;
+        })) {
+        throw new ConnectError("The shared task event batch has an invalid cursor.", Code.DataLoss);
+      }
+      if (batch.events.length === 0) yield {};
+      for (const event of batch.events) {
+        signal.throwIfAborted();
+        if (this.#rawSnapshot?.generation !== batch.generation) break;
+        yield { event };
+      }
+      after = resume;
       await abortableDelay(batch.events.length >= 128 ? 0 : 1_000, signal);
     }
   }
@@ -11483,6 +11539,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       this.#eventRefreshTimer = undefined;
     }
     this.#eventRefreshQueued = false;
+    const historyEpoch = this.#sharedTaskHistoryEpoch;
+    if (this.#taskSharing !== undefined && this.#refreshPromise !== undefined) {
+      const signal = this.#abort?.signal;
+      await this.#refreshPromise.catch(() => undefined);
+      signal?.throwIfAborted();
+      if (this.#abort?.signal !== signal || this.#sharedTaskHistoryEpoch !== historyEpoch) return;
+    }
     await this.refresh();
     if (
       minimumCursor !== undefined
@@ -11816,14 +11879,15 @@ export type EventContinuity = "contiguous" | "duplicate" | "gap" | "generationCh
 export function classifyEventContinuity(
   generation: bigint | undefined,
   sequence: bigint | undefined,
-  event: Event
+  event: Event,
+  scope: "global" | "task" = "global"
 ): EventContinuity {
   const cursor = event.cursor;
   if (cursor === undefined) return "missingCursor";
   if (generation !== undefined && cursor.generation !== generation) return "generationChanged";
   if (sequence === undefined) return "contiguous";
   if (cursor.sequence <= sequence) return "duplicate";
-  if (cursor.sequence > sequence + 1n) return "gap";
+  if (scope === "global" && cursor.sequence > sequence + 1n) return "gap";
   return "contiguous";
 }
 

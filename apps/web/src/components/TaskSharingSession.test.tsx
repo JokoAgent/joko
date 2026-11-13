@@ -7,15 +7,21 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { createTaskSharingApi, GetTaskSharingActionReceiptResponseSchema, ListTaskSharesResponseSchema, type TaskSharingRpc } from "@joko/contracts";
 import type { AppController, AppRoute } from "../controller.js";
 import { openJoinedTask } from "../task-sharing.js";
-import { createTaskSharingGateway, type OrchestratorGateway } from "../gateway.js";
+import { createTaskSharingGateway, type GatewayCallbacks, type OrchestratorGateway } from "../gateway.js";
 import { LocalState } from "../local-state.js";
-import { emptySnapshot } from "../model.js";
+import { emptySnapshot, type TimelineHistoryPageView, type TimelineItemView } from "../model.js";
 import { TaskSharingSession } from "./TaskSharingSession.js";
 
 let renderedController: AppController | undefined;
-vi.mock("./SessionPane.js", () => ({ SessionPane: ({ controller, onArchive }: { controller: AppController; onArchive: () => void }) => {
+vi.mock("./SessionPane.js", () => ({ SessionPane: ({ controller, onArchive, timeline, timelineHasEarlier, timelineHistoryLoading, onLoadEarlierTimeline }: {
+  controller: AppController; onArchive: () => void; timeline: readonly TimelineItemView[]; timelineHasEarlier: boolean;
+  timelineHistoryLoading: boolean; onLoadEarlierTimeline: () => Promise<void>;
+}) => {
   renderedController = controller;
-  return <><p>{controller.state.snapshot.sessions[0]?.id}</p><button data-leave onClick={onArchive}>Leave</button></>;
+  return <><p>{controller.state.snapshot.sessions[0]?.id}</p><button data-leave onClick={onArchive}>Leave</button>
+    {timeline.map(item => <p key={item.id}>{item.text}</p>)}
+    {timelineHasEarlier && <button data-earlier disabled={timelineHistoryLoading} onClick={() => { void onLoadEarlierTimeline(); }}>Earlier</button>}
+    {timelineHistoryLoading && <p data-history-loading />}</>;
 } }));
 vi.mock("./TaskSharingRuntimeControls.js", () => ({ TaskSharingRuntimeControls: () => null }));
 vi.mock("./TaskSharingTaskTools.js", () => ({ TaskSharingTaskTools: () => null }));
@@ -55,7 +61,7 @@ it("returns to the original task once when gateway retirement races the applied 
   expect(f.leave).not.toHaveBeenCalled();
 });
 
-async function mountPendingLeave(rememberRoute = false) {
+async function mountPendingLeave(rememberRoute = false, loadSessionTimelinePage = vi.fn<OrchestratorGateway["loadSessionTimelinePage"]>().mockResolvedValue({ items: [] })) {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   const joined = { joinId: "joined", status: "active", share: { hostServerId: "host", shareId: "share", sessionId: "remote-task", shareGeneration: 1n, status: "active" },
     member: { memberId: "member", memberGeneration: 1n, status: "active" } };
@@ -74,17 +80,58 @@ async function mountPendingLeave(rememberRoute = false) {
   vi.spyOn(LocalState, "open").mockResolvedValue({ taskSharingActions: async () => [{ operationId: "original-leave", kind: "leave" }], finishTaskSharingAction: finish } as unknown as LocalState);
   const snapshot = { ...emptySnapshot(), sessions: [{ id: "remote-task", generation: 1n }] } as unknown as ReturnType<typeof emptySnapshot>;
   let invalidate: () => void | Promise<void> = () => undefined;
+  let publish!: NonNullable<GatewayCallbacks["onSnapshot"]>;
   vi.mocked(createTaskSharingGateway).mockImplementation((_profile, listener) => {
+    publish = listener.onSnapshot!;
     invalidate = () => listener.onAuthenticationInvalidated?.(Object.assign(new Error("Guest membership retired."), { offline: false })); return {
-    connect: async () => { listener.onSnapshot?.(snapshot); listener.onState?.("connected"); }, loadSessionTimelinePage: async () => ({ items: [] }), disconnect: vi.fn()
+    connect: async () => { publish(snapshot, true); listener.onState?.("connected"); }, loadSessionTimelinePage, disconnect: vi.fn()
     } as unknown as OrchestratorGateway;
   });
   let pending: Promise<unknown> = Promise.resolve();
   const host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
   await act(async () => root!.render(<TaskSharingSession controller={home} joinId="joined" profileId="home" t={key => key}
     runAction={(_key, work) => { pending = work(); }} onOpenNavigation={() => undefined} />));
-  return { host, receipt, finish, leave, navigate, pending: () => pending, invalidate: () => invalidate() };
+  return { host, receipt, finish, leave, navigate, snapshot, publish, pending: () => pending, invalidate: () => invalidate() };
 }
+
+it("keeps paged shared history on ordinary updates and reloads a first page after an authoritative retirement", async () => {
+  const first = { opaqueToken: "first", generation: 1n, sequence: 210n };
+  const older = { opaqueToken: "older", generation: 1n, sequence: 12n };
+  const restarted = { opaqueToken: "restarted", generation: 1n, sequence: 211n };
+  const item = (id: string, sequence: bigint): TimelineItemView => ({ id, sequence, text: id, kind: "user", createdAt: 1 });
+  let completeStale!: (page: TimelineHistoryPageView) => void;
+  let completeCurrent!: (page: TimelineHistoryPageView) => void;
+  const load = vi.fn<OrchestratorGateway["loadSessionTimelinePage"]>()
+    .mockResolvedValueOnce({ items: [item("first page", 210n)], nextBeforeCursor: first })
+    .mockResolvedValueOnce({ items: [item("older page", 12n)], nextBeforeCursor: older })
+    .mockImplementationOnce(() => new Promise(resolve => { completeStale = resolve; }))
+    .mockImplementationOnce(() => new Promise(resolve => { completeCurrent = resolve; }))
+    .mockResolvedValueOnce({ items: [item("new older page", 13n)] });
+  const f = await mountPendingLeave(false, load);
+  const earlier = () => f.host.querySelector<HTMLButtonElement>("[data-earlier]");
+  await act(async () => earlier()!.click());
+  expect(f.host.textContent).toContain("older page");
+  await act(async () => f.publish({ ...f.snapshot, cursor: 214n }));
+  expect(f.host.textContent).toContain("older page");
+  expect(load.mock.calls).toEqual([["remote-task", undefined], ["remote-task", first]]);
+  await act(async () => earlier()!.click());
+  const retired = { ...f.snapshot, cursor: 216n, timelineHistoryRevisionBySession: new Map([["remote-task", 216n]]) };
+  await act(async () => f.publish(retired));
+  expect(f.host.textContent).not.toContain("older page");
+  expect(earlier()).toBeNull();
+  expect(load).toHaveBeenCalledTimes(3);
+  await act(async () => f.publish(retired, true));
+  expect(load.mock.calls.at(-1)).toEqual(["remote-task", undefined]);
+  await act(async () => completeStale({ items: [item("retired result", 10n)] }));
+  expect(f.host.textContent).not.toContain("retired result");
+  expect(f.host.querySelector("[data-history-loading]")).not.toBeNull();
+  await act(async () => completeCurrent({ items: [item("new first page", 211n)], nextBeforeCursor: restarted }));
+  expect(f.host.textContent).toContain("new first page");
+  await act(async () => earlier()!.click());
+  expect(load.mock.calls.at(-1)).toEqual(["remote-task", restarted]);
+  expect(f.host.textContent).toContain("new older page");
+  expect(earlier()).toBeNull();
+});
 
 it("keeps the retiring shared view readable during teardown while fencing its actions", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -98,7 +145,7 @@ it("keeps the retiring shared view readable during teardown while fencing its ac
   vi.spyOn(LocalState, "open").mockResolvedValue({ taskSharingActions: async () => [] } as unknown as LocalState);
   const send = vi.fn(), disconnect = vi.fn();
   vi.mocked(createTaskSharingGateway).mockImplementation((_profile, listener) => ({
-    connect: async () => { listener.onSnapshot?.(snapshot); listener.onState?.("connected"); },
+    connect: async () => { listener.onSnapshot?.(snapshot, true); listener.onState?.("connected"); },
     loadSessionTimelinePage: async () => ({ items: [] }), disconnect, send
   }) as unknown as OrchestratorGateway);
   const host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
