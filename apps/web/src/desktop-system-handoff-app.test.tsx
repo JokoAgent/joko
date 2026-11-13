@@ -184,6 +184,36 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
+  it("marks and fills a gap between an older search hit and the newest timeline using the original history cursor", async () => {
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
+    const task = session("task-gap");
+    const linked = { ...timelineItem("older linked reply"), sequence: 10n, createdAt: 100 };
+    const between = { ...timelineItem("still-existing intermediate message"), sequence: 200n, createdAt: 200 };
+    const latest = { ...timelineItem("latest question"), kind: "user" as const, sequence: 400n, createdAt: 300 };
+    const gapPage = deferred<Awaited<ReturnType<AppController["loadSessionTimelinePage"]>>>();
+    const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>()
+      .mockResolvedValueOnce({ items: [latest], nextBeforeCursor: historyCursor(400n) })
+      .mockReturnValueOnce(gapPage.promise);
+    const loadSessionTimelineAround = vi.fn<AppController["loadSessionTimelineAround"]>().mockResolvedValue([linked]);
+    const initial = connectedState({ route: { kind: "session", sessionId: task.id, messageId: linked.id, messageEventId: "older-event" }, sessions: [task] });
+    const fixture = renderApp({ ...initial, preferences: { ...initial.preferences, messageNavRailEnabled: false } }, { loadSessionTimelinePage, loadSessionTimelineAround });
+    await fixture.render();
+    expect(loadSessionTimelinePage).toHaveBeenLastCalledWith(task.id, historyCursor(400n), 240);
+    const gap = () => fixture.container.querySelector(".timeline-history-gap");
+    expect(gap()?.textContent).toContain("Loading earlier activity");
+    expect(fixture.container.textContent).toContain(linked.text);
+    await act(async () => gapPage.resolve({ items: [linked, between], nextBeforeCursor: historyCursor(10n) }));
+    expect(fixture.container.textContent).toContain(between.text);
+    expect(gap()).toBeNull();
+    expect(loadSessionTimelinePage).toHaveBeenCalledTimes(2);
+    expect(loadSessionTimelineAround).toHaveBeenCalledExactlyOnceWith(task.id, "older-event", 160);
+  });
+
   it("keeps an adopted message link consumed after deletion and resolves a new opening separately", async () => {
     vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
       return this.classList.contains("timeline") ? 600 : 0;
