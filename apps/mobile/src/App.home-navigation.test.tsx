@@ -611,6 +611,15 @@ describe("actual Home navigation hosts", () => {
     expect(onSelect).toHaveBeenLastCalledWith(undefined);
   });
 
+  it("opens a Home result from a saved preview without creating a message anchor", async () => {
+    await render({ state: { ...state, homeSearchQuery: "preview", homeSearchStatus: "ready", homeSearchMatches: [{ sessionId: "other" }] },
+      runNavigation: undefined, host: "home" });
+    await type(message("home.search"), "preview");
+    await press("Open task Beta");
+    expect(select).toHaveBeenLastCalledWith("other");
+    expect(onSelect).toHaveBeenLastCalledWith(undefined);
+  });
+
   it("shows a pending first search and retains a ready body result across an equivalent owner snapshot", async () => {
     await render();
     searchHome.mockClear();
@@ -753,7 +762,7 @@ describe("actual Task Home navigation composition", () => {
       expect(linkListener).toBeDefined();
       linkListener!({ url: buildMobileMessageDeepLink("current", "removed-message", "removed-event") });
     });
-    expect(around).toHaveBeenCalledExactlyOnceWith("removed-event", expect.any(AbortSignal));
+    expect(around).toHaveBeenCalledExactlyOnceWith("removed-event", expect.any(AbortSignal), { allowNewer: true });
     expect(host.querySelector('[data-testid="task-header"]')).not.toBeNull();
     if (leave) await press("Task back");
 

@@ -539,6 +539,7 @@ export interface MobileState {
   readonly detail?: Snapshot;
   readonly older: readonly Event[];
   readonly window?: readonly Event[];
+  readonly windowHasNewer?: boolean;
   readonly live: readonly Event[];
   readonly liveStatus: "paused" | "verifying" | "streaming" | "polling";
   readonly historyBusy: boolean;
@@ -1124,7 +1125,7 @@ export class MobileClient {
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
-    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline" | "searchPreviews">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
     filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
     private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform),
@@ -3904,6 +3905,7 @@ export class MobileClient {
           mobilePiHistoryRetired(detail, cached) ? create(SnapshotSchema, { ...cached, timeline: [] }) : cached);
       } else next = { ...next, detail: retainMobileHistoryPrefix(detail, this.#state.detail) };
     }
+    if (!next.window && next.windowHasNewer) next = { ...next, windowHasNewer: false };
     const nextAuthority = this.#filesAuthorityKey(next);
     const nextPartnerAuthority = this.#partnerPrivateAuthorityKey(next);
     const sourceSessionChanged = this.#partnerPrivateSourceSessionId !== undefined
@@ -6217,7 +6219,9 @@ export class MobileClient {
     const owner = this.#state.owner;
     const profileId = this.#activeProfileId;
     const epoch = this.#epoch;
-    if (!credential || !owner || !profileId || this.#state.status !== "connected" || !this.#foreground) {
+    const status = this.#state.status;
+    if (!owner || !profileId || this.#joinedTask || !this.#foreground
+      || (status !== "connected" && status !== "offline") || status === "connected" && !credential) {
       this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "error",
         homeSearchMatches: [], homeSearchError: "Reconnect to search task messages." });
       return;
@@ -6228,14 +6232,29 @@ export class MobileClient {
       homeSearchMatches: [], homeSearchError: undefined });
     const currentSearch = (): boolean => {
       if (controller.signal.aborted || generation !== this.#homeSearchEpoch || !this.#current(epoch)
-        || credential !== this.#credential || profileId !== this.#activeProfileId || this.#state.status !== "connected"
+        || credential !== this.#credential || profileId !== this.#activeProfileId || this.#state.status !== status
         || this.#state.homeSearchQuery !== normalized || this.#state.homeSearchFilter !== statusFilter) return false;
       const current = this.#state.owner;
       return current === owner || (current !== undefined && current.generation === owner.generation
         && owner.revision !== undefined && current.revision?.value === owner.revision.value
         && current.resumeCursor?.generation === owner.resumeCursor?.generation && current.resumeCursor?.sequence === owner.resumeCursor?.sequence);
     };
+    const savedPreviews = async (reason: string): Promise<void> => {
+      const profile = this.#profiles.find(item => item.profileId === profileId);
+      let sessions: readonly string[] = [];
+      try {
+        if (profile && currentSearch()) sessions = await this.offlineCache?.searchPreviews(profile, owner, normalized,
+          statusFilter, controller.signal) ?? [];
+      } catch { /* Keep the original search failure if the saved copy cannot be used. */ }
+      if (!currentSearch()) return;
+      this.#set(sessions.length ? { homeSearchStatus: "ready", homeSearchMatches: sessions.map(sessionId => ({ sessionId })),
+        homeSearchError: undefined } : { homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: reason });
+    };
     try {
+      if (status === "offline" || !credential) {
+        await savedPreviews("Reconnect to search task messages.");
+        return;
+      }
       const matches = await this.network.searchSessionMessages(
         credential,
         normalized,
@@ -6252,9 +6271,13 @@ export class MobileClient {
       }
       this.#set({ homeSearchStatus: "ready", homeSearchMatches: [...firstBySession.values()], homeSearchError: undefined });
     } catch (error) {
-      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
+      if (credential && await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (!currentSearch()) return;
-      this.#set({ homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: message(error) });
+      if (isEndpointTrustError(error)) {
+        await this.#identityConflict(epoch, profileId, message(error));
+      } else if ((error as { code?: number })?.code === Code.PermissionDenied) {
+        this.#set({ homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: message(error) });
+      } else await savedPreviews(message(error));
     } finally {
       if (this.#homeSearchAbort === controller) this.#homeSearchAbort = undefined;
     }
@@ -9547,7 +9570,7 @@ export class MobileClient {
     }
   }
 
-  async around(eventId: string, signal?: AbortSignal): Promise<void> {
+  async around(eventId: string, signal?: AbortSignal, options?: { readonly allowNewer: boolean }): Promise<void> {
     if (signal?.aborted) return;
     const credential = this.#ready();
     const sessionId = this.#state.selectedId;
@@ -9559,7 +9582,9 @@ export class MobileClient {
       if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
       validateHistory(events, sessionId, this.#taskGeneration());
       if (!events.some((event) => event.eventId === eventId)) throw new Error("The selected event is no longer in task history.");
-      this.#set({ window: events, older: [], before: events[0]!.cursor, historyEnd: false });
+      const windowHasNewer = options?.allowNewer === true && !this.#joinedTask
+        && this.#selectedSession()?.derivationOrigin?.sideChat !== true && this.#historyEdgePrecedesLatest(events.at(-1)!);
+      this.#set({ window: events, windowHasNewer, older: [], before: events[0]!.cursor, historyEnd: false });
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
@@ -9568,6 +9593,57 @@ export class MobileClient {
     } finally {
       history.finish();
     }
+  }
+
+  async newer(signal?: AbortSignal): Promise<void> {
+    const { selectedId: sessionId, window, windowHasNewer, status } = this.#state;
+    const credential = this.#credential;
+    const edge = window?.at(-1);
+    const cursor = edge?.cursor;
+    if (signal?.aborted || !credential || !sessionId || !window || !edge || !cursor || !windowHasNewer
+      || status !== "connected" || !this.#foreground || this.#joinedTask || this.#historyOwner) return;
+    const epoch = this.#epoch;
+    const generation = this.#taskGeneration();
+    if (cursor.generation !== generation) return;
+    const history = this.#beginHistoryRead(signal);
+    const current = (): boolean => history.current() && this.#current(epoch) && this.#credential === credential
+      && this.#state.selectedId === sessionId && this.#state.window === window && this.#taskGeneration() === generation;
+    try {
+      const events = await this.network.readAround(credential, sessionId, edge.eventId, history.signal);
+      if (!current()) return;
+      validateHistory(events, sessionId, generation);
+      // The service returns consecutive visible events around this exact edge. Sequences
+      // are global, so only the shared event can establish where the next page starts.
+      const boundary = events.findIndex(event => event.eventId === edge.eventId && event.cursor?.sequence === cursor.sequence);
+      if (boundary < 0) throw new Error("The task history changed while loading. Reconnect before browsing it.");
+      const appended = events.slice(boundary + 1);
+      const appendedIds = new Set(appended.map(event => event.eventId));
+      if (window.some(event => appendedIds.has(event.eventId))) {
+        throw new Error("The task history returned a mismatched or cyclic page. Reconnect before browsing it.");
+      }
+      const last = appended.at(-1);
+      if (!last && this.#historyEdgePrecedesLatest(edge)) {
+        throw new Error("The task history returned no newer events for the current window. Reconnect before browsing it.");
+      }
+      this.#set(last ? { window: [...window, ...appended], windowHasNewer: this.#historyEdgePrecedesLatest(last) }
+        : { windowHasNewer: false });
+    } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
+      if (!current()) return;
+      if (isStaleHistory(error)) void this.refresh();
+      throw error;
+    } finally {
+      history.finish();
+    }
+  }
+
+  #historyEdgePrecedesLatest(edge: Event): boolean {
+    const snapshotTail = this.#state.detail?.timeline.at(-1);
+    const liveTail = this.#state.live.at(-1);
+    const cursor = edge.cursor!;
+    return [snapshotTail, liveTail].some(event => event?.cursor !== undefined
+      && event.identity?.sessionId === edge.identity?.sessionId && event.cursor.generation === cursor.generation
+      && event.cursor.sequence > cursor.sequence);
   }
 
   #beginHistoryRead(caller?: AbortSignal) {

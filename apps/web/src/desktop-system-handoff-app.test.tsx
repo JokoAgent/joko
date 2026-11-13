@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppWithController, reserveMessageDeepLinkHistoryPage } from "./App.js";
+import { CONVERSATION_KEYWORD_DEBOUNCE_MS } from "./components/Sidebar.js";
 import { useAppController, type AppController, type ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
 import { addSessionSplit, writeSessionSplitLayout } from "./session-split-layout.js";
@@ -22,9 +23,12 @@ import {
 
 Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", true);
 const originalScrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTo");
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
 const renderedApps = new Set<() => Promise<void>>();
 beforeEach(() => {
   Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() });
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   // This App boundary owns handoff and message traversal; provide a normal
   // occupied viewport so jsdom's zero dimensions do not request extra history.
   vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(600);
@@ -36,8 +40,12 @@ afterEach(async () => {
   Reflect.deleteProperty(window, "jokoDesktop");
   window.location.hash = "";
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
   if (originalScrollTo) Object.defineProperty(HTMLElement.prototype, "scrollTo", originalScrollTo);
   else Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
 describe("Desktop system handoff App boundary", () => {
@@ -50,6 +58,7 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it("passes a remote search hit into the owned machine open and lets a newer New Task navigation stand", async () => {
+    vi.useFakeTimers();
     const task = session("remote-task");
     const initial = connectedState({ route: { kind: "session" } });
     const remote = { id: "profile-b", deviceId: "device-b", serverId: "server-b", name: "Remote", origin: "https://remote.example" };
@@ -58,12 +67,14 @@ describe("Desktop system handoff App boundary", () => {
     const pending = deferred<void>();
     const navigate = vi.fn<AppController["navigate"]>();
     const openMachineSession = vi.fn<AppController["openMachineSession"]>(() => pending.promise);
+    const searchRemoteSessionMessages = vi.fn<AppController["searchRemoteSessionMessages"]>(async () => [{
+      profileId: remote.id, serverId: remote.serverId, epoch: 1, isCurrent: () => true, status: "succeeded", matches: [match]
+    }]);
     const fixture = renderApp({ ...initial, profiles: [...initial.profiles, remote], machinePresenceByProfile: { "profile-b": "online" },
       machineCaches: [{ profileId: remote.id, serverId: remote.serverId, name: remote.name, origin: remote.origin, updatedAt: 1,
         sessions: [{ id: task.id, name: task.name, state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }] }] }, {
       navigate, openMachineSession, searchAllSessionMessages: async () => ({ matches: [], totalSize: 0, revision: 1n, vectorUsed: false, poolCapped: false }),
-      searchRemoteSessionMessages: async () => [{ profileId: remote.id, serverId: remote.serverId, epoch: 1, isCurrent: () => true,
-        status: "succeeded", matches: [match] }]
+      searchRemoteSessionMessages
     });
     await fixture.render();
     const input = fixture.container.querySelector<HTMLInputElement>("#conversation-search-input")!;
@@ -71,9 +82,12 @@ describe("Desktop system handoff App boundary", () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "needle");
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    const hit = () => fixture.container.querySelector<HTMLButtonElement>(".conversation-search-result--remote .conversation-search-result__hit");
-    await act(async () => { await vi.waitFor(() => expect(hit()?.textContent).toContain(match.snippet)); });
-    await act(async () => hit()!.click());
+    await act(async () => vi.advanceTimersByTimeAsync(CONVERSATION_KEYWORD_DEBOUNCE_MS));
+    expect(searchRemoteSessionMessages).toHaveBeenCalledExactlyOnceWith("needle", expect.objectContaining({ semanticMode: "keyword" }));
+    const hit = fixture.container.querySelector<HTMLButtonElement>(".conversation-search-result--remote .conversation-search-result__hit");
+    expect(hit).not.toBeNull();
+    expect(hit?.textContent).toContain(match.snippet);
+    await act(async () => hit!.click());
     expect(openMachineSession).toHaveBeenCalledExactlyOnceWith(remote.id, task.id, { messageEventId: match.eventId, messageId: match.timelineItemId });
     await act(async () => fixture.container.querySelector<HTMLButtonElement>(".new-task-button")!.click());
     expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
@@ -1135,7 +1149,6 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it("rechecks the real controller navigation owner after its asynchronous leave gate", async () => {
-    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     vi.spyOn(LocalState, "open").mockResolvedValue({
       listProfiles: async () => [],
       listMachineCaches: async () => [],
@@ -1197,7 +1210,6 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it("restores the exact prior hash when a same-route handoff is retired before hashchange", async () => {
-    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     vi.spyOn(LocalState, "open").mockResolvedValue({
       listProfiles: async () => [],
       listMachineCaches: async () => [],
