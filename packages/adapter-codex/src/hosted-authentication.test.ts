@@ -100,7 +100,9 @@ describe("original native account authority", () => {
 
   it("classifies only a correlated expired quota read for renewal and never retains native error text", () => {
     const error = remoteRpcFault(-32000, "HTTP 401 token_expired private-native-text", undefined, undefined, "account/rateLimits/read");
-    expect(error.accountTokenExpired).toBe(true); expect(error.message).not.toContain("private-native-text");
+    expect(error).toMatchObject({ accountTokenExpired: true, requestMethod: "account/rateLimits/read" });
+    expect(JSON.stringify(error)).not.toContain("private-native-text");
+    expect(error.message).not.toContain("private-native-text");
     for (const message of ["HTTP 401 token_revoked", "HTTP 401 token_expired refresh_token_reused", "HTTP 500 token_expired", "HTTP 401 unauthorized"]) {
       expect(remoteRpcFault(-32000, message, undefined, undefined, "account/rateLimits/read").accountTokenExpired).toBe(false);
     }
