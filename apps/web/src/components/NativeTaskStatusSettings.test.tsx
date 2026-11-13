@@ -82,6 +82,51 @@ it("keeps a newer Settings event when the initial read answers late", async () =
   expect(layout?.textContent).toContain("Compact");
 });
 
+it("refreshes the selected display and its options on focus without reloading saved settings", async () => {
+  const desktop = fixture();
+  const primary = { id: 1, name: "Built-in Display", primary: true, bounds: { x: 0, y: 0, width: 1200, height: 800 } };
+  const original = { id: 2, name: "Studio", primary: false, bounds: { x: 1200, y: 0, width: 1920, height: 1080 } };
+  const changed = { ...original, name: "Studio Updated", bounds: { ...original.bounds, width: 2560 } };
+  const added = { id: 3, name: "Side Display", primary: false, bounds: { x: -800, y: 0, width: 800, height: 600 } };
+  desktop.api.getSettings.mockResolvedValue({ ...BASE, display: { mode: "display", displayId: original.id } });
+  desktop.api.getDisplays.mockResolvedValueOnce([primary, original]);
+  await render(desktop.value);
+  const picker = host.querySelector<HTMLButtonElement>('[aria-label="Display"]')!;
+  expect(picker.textContent).toContain("Studio");
+
+  const stale = deferred<readonly JokoDesktopNativeTaskStatusDisplay[]>();
+  desktop.api.getDisplays.mockReturnValueOnce(stale.promise).mockResolvedValueOnce([primary, added]);
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  await act(async () => stale.resolve([primary, original]));
+  expect(picker.textContent).toContain("Unavailable display (2)");
+
+  desktop.api.getDisplays.mockRejectedValueOnce(new Error("Display query failed"));
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(host.querySelector('[role="alert"]')).not.toBeNull();
+  expect(picker.textContent).toContain("Unavailable display (2)");
+  desktop.api.getDisplays.mockResolvedValueOnce([primary, added, changed]);
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  expect(picker.textContent).toContain("Studio Updated");
+  expect(desktop.api.getSettings).toHaveBeenCalledOnce();
+  expect(desktop.api.setSettings).not.toHaveBeenCalled();
+
+  await act(async () => picker.click());
+  const side = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(option => option.textContent === added.name);
+  expect(side).toBeDefined();
+  desktop.api.setSettings.mockRejectedValueOnce(new Error("Display could not be saved"));
+  await act(async () => side!.click());
+  expect(desktop.api.setSettings).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ display: {
+    mode: "display", displayId: added.id, displayName: added.name, displayIndex: 1, displayBounds: added.bounds
+  } }));
+  expect(picker.textContent).toContain("Studio Updated");
+  expect(host.querySelector('[role="alert"]')?.textContent).toBe(t("settings.nativeTaskStatus.saveFailed"));
+  await act(async () => root.render(<div />));
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(desktop.api.getDisplays).toHaveBeenCalledTimes(5);
+});
+
 it("does not save a file choice after its Settings owner unmounts", async () => {
   const selected = deferred<{ readonly path: string | null; readonly name: string | null }>();
   const desktop = fixture();

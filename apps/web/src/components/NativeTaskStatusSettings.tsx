@@ -9,6 +9,7 @@ export function NativeTaskStatusSettings({ t, showHeading = true }: { readonly t
   const supported = desktop?.capabilities.includes("native.taskStatus") === true;
   const [settings, setSettings] = useState<JokoDesktopNativeTaskStatusSettings>();
   const [displays, setDisplays] = useState<readonly JokoDesktopNativeTaskStatusDisplay[]>([]);
+  const [displayReadFailed, setDisplayReadFailed] = useState(false);
   const [error, setError] = useState<string>();
   const [saving, setSaving] = useState(false);
   const loadGenerationRef = useRef(0);
@@ -24,19 +25,29 @@ export function NativeTaskStatusSettings({ t, showHeading = true }: { readonly t
     if (!supported || desktop === undefined) return;
     const generation = ++loadGenerationRef.current;
     const eventVersion = settingsEventVersionRef.current;
-    void Promise.all([
-      desktop.nativeTaskStatus.getSettings(),
-      desktop.nativeTaskStatus.getDisplays()
-    ]).then(([nextSettings, nextDisplays]) => {
-      if (loadGenerationRef.current !== generation) return;
-      if (settingsEventVersionRef.current === eventVersion) acceptSettings(nextSettings);
-      setDisplays(nextDisplays);
-      setError(undefined);
+    void desktop.nativeTaskStatus.getSettings().then((nextSettings) => {
+      if (loadGenerationRef.current === generation && settingsEventVersionRef.current === eventVersion) {
+        acceptSettings(nextSettings);
+        setError(undefined);
+      }
     }).catch(() => {
       if (loadGenerationRef.current === generation && settingsEventVersionRef.current === eventVersion) {
         setError(t("settings.nativeTaskStatus.loadFailed"));
       }
     });
+    let displayRead = 0;
+    const refreshDisplays = (): void => {
+      const read = ++displayRead;
+      void desktop.nativeTaskStatus.getDisplays().then((nextDisplays) => {
+        if (loadGenerationRef.current !== generation || read !== displayRead) return;
+        setDisplays(nextDisplays);
+        setDisplayReadFailed(false);
+      }).catch(() => {
+        if (loadGenerationRef.current === generation && read === displayRead) setDisplayReadFailed(true);
+      });
+    };
+    refreshDisplays();
+    window.addEventListener("focus", refreshDisplays);
     const unsubscribe = desktop.nativeTaskStatus.onSettingsChanged((next) => {
       if (loadGenerationRef.current !== generation) return;
       settingsEventVersionRef.current += 1;
@@ -45,6 +56,7 @@ export function NativeTaskStatusSettings({ t, showHeading = true }: { readonly t
     });
     return () => {
       loadGenerationRef.current += 1;
+      window.removeEventListener("focus", refreshDisplays);
       unsubscribe();
     };
   }, [acceptSettings, desktop, supported, t]);
@@ -109,7 +121,7 @@ export function NativeTaskStatusSettings({ t, showHeading = true }: { readonly t
       <MonitorUp aria-hidden="true" />
       <div><h3 id="native-task-status-title">{t("settings.nativeTaskStatus.title")}</h3><p>{t("settings.nativeTaskStatus.body")}</p></div>
     </header>}
-    {error !== undefined && <p className="settings-inline-error" role="alert">{error}</p>}
+    {(error !== undefined || displayReadFailed) && <p className="settings-inline-error" role="alert">{error ?? t("settings.nativeTaskStatus.loadFailed")}</p>}
     {settings !== undefined && <>
       <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.enabled")}</strong><span>{t("settings.nativeTaskStatus.enabledBody")}</span></div><SwitchControl aria-label={t("settings.nativeTaskStatus.enabled")} checked={settings.enabled} disabled={saving} onChange={(event) => save({ ...settings, enabled: event.target.checked })} /></div>
       <div className="setting-row"><div><strong>{t("settings.nativeTaskStatus.display")}</strong></div><SelectControl aria-label={t("settings.nativeTaskStatus.display")} value={selectedDisplay} disabled={saving} onChange={(event) => save({ ...settings, display: nativeTaskStatusDisplayTarget(event.target.value, displays) })}>
