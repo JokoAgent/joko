@@ -299,6 +299,7 @@ describe("portable Session message projection", () => {
           cacheReadTokens: 3,
           cacheWriteTokens: 2,
           totalTokens: 23,
+          pricingContext: { inputTokens: 16, fastMode: "ultrafast", requestedAt: 1_000, cacheWriteTtl: "1h", cacheWrite1hTokens: 2 },
           cost: 0.012345
         },
         generationDurationMs: 1_200,
@@ -308,6 +309,13 @@ describe("portable Session message projection", () => {
     const projection = projectPortableSessionMessages([source]);
     expect(decodePortableSessionProjection(encodePortableSessionProjection(projection))).toEqual(projection);
     expect(portableProjectionEventPayloads(projection)[0]?.payload).toEqual(source.payload);
+    const message = projection.messages[0]!;
+    const pricingContext = message.usage!.pricingContext!;
+    for (const bad of [{ inputTokens: -1 }, { fastMode: "turbo" }, { requestedAt: -1 }, { cacheWrite1hTokens: 3 }, { unknown: true }]) {
+      expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({
+        ...projection, messages: [{ ...message, usage: { ...message.usage, pricingContext: { ...pricingContext, ...bad } } }]
+      })))).toThrow(PortableSessionProjectionError);
+    }
     expect(() => decodePortableSessionProjection(Buffer.from(JSON.stringify({
       ...projection,
       messages: [{ ...projection.messages[0], usage: { ...projection.messages[0]?.usage, cost: -1 } }]
