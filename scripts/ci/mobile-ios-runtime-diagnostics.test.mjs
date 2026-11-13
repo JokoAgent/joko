@@ -1,8 +1,36 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, parseCrashReport,
-  parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, readUiTestSummary, requireSimulatorApplicationContainer, stopOwnedMetroGroup,
-  summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+  parseVirtualMemory, prepareSimulatorService, projectOwnedCrash, projectOwnedStartupLogs, readUiTestSummary,
+  requireSimulatorApplicationContainer, stopOwnedMetroGroup, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+
+test("repeats the same Simulator service read only once after its exact command timeout", async () => {
+  const timeout = Object.assign(new Error("timed out"), { code: "ETIMEDOUT", status: null, signal: "SIGTERM" });
+  const rejected = Object.assign(new Error("list failed"), { status: 1, signal: null });
+  for (const [responses, results, failure] of [
+    [[undefined], ["passed"], undefined],
+    [[timeout, undefined], ["timed_out", "passed"], undefined],
+    [[timeout, timeout], ["timed_out", "timed_out"], timeout],
+    [[rejected], ["failed"], rejected]
+  ]) {
+    const receipts = [];
+    let calls = 0;
+    const operation = prepareSimulatorService((binary, args, options) => {
+      assert.equal(binary, "xcrun");
+      assert.deepEqual(args, ["simctl", "list", "runtimes", "--json"]);
+      assert.deepEqual(options, { timeout: 120_000, stdio: "ignore" });
+      assert.equal(receipts.length, calls);
+      assert.ok(calls < responses.length);
+      const response = responses[calls++];
+      if (response) throw response;
+    }, async receipt => { receipts.push(receipt); });
+    if (failure) await assert.rejects(operation, error => error === failure);
+    else await operation;
+    assert.deepEqual(receipts.map(({ attempt, result }) => [attempt, result]), results.map((result, index) => [index + 1, result]));
+    assert.ok(receipts.every(receipt => receipt.timeoutMs === 120_000 && receipt.elapsedMs >= 0));
+    assert.equal(calls, responses.length);
+  }
+});
 
 test("preserves the Apple UI execution timeout when the result bundle is incomplete", async () => {
   const execution = new Error("Apple UI-test execution timed out after 300000 ms.");
