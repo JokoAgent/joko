@@ -6,9 +6,9 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import type { SubagentChildRunView, SubagentRunDetailView, SubagentRunView, SubagentTranscriptEntryView } from "../model.js";
+import { emptySnapshot, type SubagentChildRunView, type SubagentRunDetailView, type SubagentRunView, type SubagentTranscriptEntryView, type SubagentTranscriptPageView } from "../model.js";
 import { SubagentsPanel } from "./SubagentsPanel.js";
-import { MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES } from "./subagent-panel-state.js";
+import { MAXIMUM_SUBAGENT_TRANSCRIPT_PAGES_PER_READ } from "./subagent-panel-state.js";
 
 const roots: Root[] = [];
 
@@ -155,39 +155,84 @@ describe("SubagentsPanel", () => {
     expect(container.textContent).not.toContain("old answer");
   });
 
-  it("does not publish a transcript prefix at the page bound and recovers on retry", async () => {
-    let overLimit = true;
-    const listSubagentTranscript = vi.fn(async () => overLimit
-      ? {
-          entries: [transcript(`partial-${listSubagentTranscript.mock.calls.length}`, listSubagentTranscript.mock.calls.length, "subagent", `partial page ${listSubagentTranscript.mock.calls.length}`)],
-          nextPageToken: `unique-${listSubagentTranscript.mock.calls.length}`,
-          tailPageToken: `tail-${listSubagentTranscript.mock.calls.length}`,
-          totalSize: MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES + 1
-        }
-      : {
-          entries: [transcript("recovered", 1, "subagent", "complete retry answer", { childId: "child-one" })],
-          tailPageToken: "recovered-tail",
-          totalSize: 1
-        });
+  it("shows the bounded prefix, retries the exact continuation, and catches up when the run ends", async () => {
+    vi.useFakeTimers();
+    const pageBound = MAXIMUM_SUBAGENT_TRANSCRIPT_PAGES_PER_READ;
+    const pendingContinuation = deferred<SubagentTranscriptPageView>();
+    let failContinuation = true;
+    let completed = false;
+    const currentRun = (): SubagentRunView => completed ? { ...run(), state: "completed" } : run();
+    const listSubagentTranscript = vi.fn(async (_session: string, _run: string, _child: unknown, token: string) => {
+      if (token === "snapshot-tail") return {
+        entries: [transcript("new", pageBound + 2, "subagent", "appended after the snapshot")],
+        tailPageToken: "current-tail",
+        totalSize: pageBound + 2
+      };
+      const offset = Number(token);
+      if (offset === pageBound) {
+        if (failContinuation) throw new Error("Temporary transcript failure");
+        return pendingContinuation.promise;
+      }
+      const sequence = offset + 1;
+      return {
+        entries: [transcript(`prefix-${sequence}`, sequence, "subagent", `snapshot row ${sequence}`)],
+        nextPageToken: String(sequence),
+        tailPageToken: "snapshot-tail",
+        totalSize: pageBound + 1
+      };
+    });
     const controller = {
-      listSubagentRuns: vi.fn(async () => ({ runs: [run()], totalSize: 1 })),
-      getSubagentRun: vi.fn(async () => detail({ returnedResult: "durable final answer" })),
+      listSubagentRuns: vi.fn(async () => ({ runs: [currentRun()], totalSize: 1 })),
+      getSubagentRun: vi.fn(async () => detail({ run: currentRun(), children: [], returnedResult: "durable final answer" })),
       listSubagentTranscript
     } as unknown as AppController;
     const { container } = await mount(controller, focused());
-    await settle(MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES + 16);
+    await settle(pageBound + 16);
+    const visibleConversationSize = () => container.querySelector("[data-subagent-conversation-id]")?.getAttribute("aria-setsize");
+    const readTokens = () => listSubagentTranscript.mock.calls.map((call) => call[3]);
+    const moreButton = () => container.querySelector<HTMLButtonElement>(".subagent-technical__more");
 
-    expect(listSubagentTranscript).toHaveBeenCalledTimes(MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES);
-    expect(container.textContent).toContain("safe page limit");
+    expect(readTokens()).toEqual(["", ...Array.from({ length: pageBound - 1 }, (_, index) => String(index + 1))]);
+    expect(visibleConversationSize()).toBe(String(pageBound));
     expect(container.textContent).toContain("durable final answer");
-    expect(container.textContent).not.toContain("partial page");
+    expect(container.querySelector(".subagents-failure")).toBeNull();
+    await act(async () => container.querySelector<HTMLElement>(".subagent-technical > summary")?.click());
+    expect(moreButton()?.textContent).toBe("Load more transcript");
+    expect(moreButton()?.disabled).toBe(false);
 
-    overLimit = false;
-    await act(async () => container.querySelector<HTMLButtonElement>(".subagents-failure button")?.click());
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(listSubagentTranscript).toHaveBeenCalledTimes(pageBound);
+    await act(async () => { moreButton()!.click(); moreButton()!.click(); });
     await settle(16);
-    expect(listSubagentTranscript).toHaveBeenCalledTimes(MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES + 1);
-    expect(container.textContent).toContain("complete retry answer");
-    expect(container.textContent).not.toContain("partial page");
+    expect(readTokens().slice(pageBound)).toEqual([String(pageBound)]);
+    expect(visibleConversationSize()).toBe(String(pageBound));
+    expect(container.querySelector(".subagents-failure")?.textContent).toContain("Temporary transcript failure");
+
+    completed = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(container.textContent).toContain("Completed");
+    expect(readTokens().slice(pageBound)).toEqual([String(pageBound)]);
+    failContinuation = false;
+    await act(async () => container.querySelector<HTMLButtonElement>(".subagents-failure button")!.click());
+    expect(moreButton()?.disabled).toBe(true);
+    expect(visibleConversationSize()).toBe(String(pageBound));
+    pendingContinuation.resolve({
+      entries: [transcript("final", pageBound + 1, "subagent", "durable final answer")],
+      tailPageToken: "snapshot-tail",
+      totalSize: pageBound + 1
+    });
+    await settle(24);
+    expect(readTokens().slice(pageBound)).toEqual([String(pageBound), String(pageBound), "snapshot-tail"]);
+    expect(visibleConversationSize()).toBe(String(pageBound + 2));
+    expect(container.querySelector(".subagent-message--durable")).toBeNull();
+    expect(container.querySelector(".subagents-failure")).toBeNull();
+    expect(moreButton()).toBeNull();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".subagent-detail-bar .icon-button")!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".subagents-run-row")!.click());
+    await settle(pageBound + 16);
+    expect(readTokens().slice(-pageBound)).toEqual(readTokens().slice(0, pageBound));
+    expect(visibleConversationSize()).toBe(String(pageBound));
     expect(container.querySelector(".subagents-failure")).toBeNull();
   });
 
@@ -425,34 +470,55 @@ describe("SubagentsPanel", () => {
     expect(container.textContent).not.toContain("stale detail");
   });
 
-  it("serializes transcript reads and drops a late transcript from the previous session", async () => {
-    const oldTranscript = deferred<{ readonly entries: readonly SubagentTranscriptEntryView[]; readonly totalSize: number }>();
-    const listSubagentTranscript = vi.fn(async (session: string) => session === "old"
-      ? oldTranscript.promise
-      : { entries: [transcript("new-line", 1, "subagent", "new conversation")], totalSize: 1 });
+  it("retires a pending continuation when the same task reconnects", async () => {
+    const pageBound = MAXIMUM_SUBAGENT_TRANSCRIPT_PAGES_PER_READ;
+    const oldTranscript = deferred<SubagentTranscriptPageView>();
+    let connectionGeneration = 1;
+    const listSubagentTranscript = vi.fn(async (_session: string, _run: string, _child: unknown, token: string) => {
+      if (connectionGeneration === 2) return {
+        entries: [transcript("new-line", 1, "subagent", "new conversation")], totalSize: 1
+      };
+      const offset = Number(token);
+      if (offset === pageBound) return oldTranscript.promise;
+      return {
+        entries: offset === 0 ? [transcript("old-prefix", 1, "subagent", "old prefix")] : [],
+        nextPageToken: String(offset + 1),
+        tailPageToken: "old-tail",
+        totalSize: pageBound + 1
+      };
+    });
     const controller = {
-      listSubagentRuns: vi.fn(async (session: string) => ({ runs: [{ ...run(), sessionId: session, id: `${session}-run` }], totalSize: 1 })),
-      getSubagentRun: vi.fn(async (session: string) => detail({
-        run: { ...run(), sessionId: session, id: `${session}-run`, title: `${session} detail` },
-        children: [],
-        returnedResult: undefined
-      })),
+      get state() { return { connectionGeneration, snapshot: emptySnapshot(), preferences: {} }; },
+      listSubagentRuns: vi.fn(async () => ({ runs: [run()], totalSize: 1 })),
+      getSubagentRun: vi.fn(async () => detail({ children: [], returnedResult: undefined })),
       listSubagentTranscript
     } as unknown as AppController;
     const container = document.body.appendChild(document.createElement("div"));
     const root = createRoot(container);
     roots.push(root);
-    await act(async () => root.render(panel(controller, "old", { focusRunId: "old-run", focusRequestId: 1 })));
-    await settle(16);
-    expect(listSubagentTranscript).toHaveBeenCalledWith("old", "old-run", undefined, "", 200);
+    await act(async () => root.render(panel(controller, "session-one", focused())));
+    await settle(pageBound + 16);
+    expect(container.textContent).toContain("old prefix");
+    await act(async () => container.querySelector<HTMLElement>(".subagent-technical > summary")!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".subagent-technical__more")!.click());
+    expect(listSubagentTranscript).toHaveBeenLastCalledWith("session-one", "delegated-one", undefined, String(pageBound), 200);
 
-    await act(async () => root.render(panel(controller, "new", { focusRunId: "new-run", focusRequestId: 2 })));
+    connectionGeneration = 2;
+    await act(async () => root.render(panel(controller, "session-one", focused())));
     await settle(16);
-    expect(listSubagentTranscript.mock.calls.some((call) => call[0] === "new")).toBe(false);
-    oldTranscript.resolve({ entries: [transcript("old-line", 1, "subagent", "stale conversation")], totalSize: 1 });
+    expect(container.textContent).not.toContain("old prefix");
+    expect(listSubagentTranscript).toHaveBeenCalledTimes(pageBound + 1);
+    oldTranscript.resolve({
+      entries: [transcript("old-line", pageBound + 1, "subagent", "stale conversation")],
+      nextPageToken: "stale-next",
+      tailPageToken: "old-tail",
+      totalSize: pageBound + 2
+    });
     await settle(32);
+    expect(listSubagentTranscript.mock.calls.slice(pageBound + 1).map((call) => call[3])).toEqual([""]);
     expect(container.textContent).toContain("new conversation");
     expect(container.textContent).not.toContain("stale conversation");
+    expect(container.querySelector(".subagent-technical__more")).toBeNull();
   });
 
   it("dispatches resume from the terminal composer", async () => {

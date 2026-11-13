@@ -3,12 +3,12 @@ import { describe, expect, it, vi } from "vitest";
 import type { ErrorView, SubagentChildRunView, SubagentTranscriptEntryView } from "../model.js";
 import {
   classifySubagentError,
-  collectAllSubagentTranscript,
   currentSubagentChildren,
   filterSubagentTranscript,
   localizeSubagentSystemEntry,
-  MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES,
+  MAXIMUM_SUBAGENT_TRANSCRIPT_PAGES_PER_READ,
   projectSubagentReply,
+  readSubagentTranscriptBatch,
   resolveCurrentSubagentChild,
   subagentChildIdentitySet
 } from "./subagent-panel-state.js";
@@ -19,45 +19,52 @@ describe("delegated-work panel state", () => {
       ? { entries: [entry("one", 1, "first")], nextPageToken: "entries-2", tailPageToken: "tail-1", totalSize: 2 }
       : { entries: [entry("two", 2, "last")], tailPageToken: "tail-2", totalSize: 2 });
 
-    await expect(collectAllSubagentTranscript(transcriptLoader)).resolves.toMatchObject({
+    await expect(readSubagentTranscriptBatch(transcriptLoader)).resolves.toMatchObject({
       entries: [expect.objectContaining({ id: "one" }), expect.objectContaining({ id: "two" })],
-      tailPageToken: "tail-2",
-      totalSize: 2
+      cursor: { kind: "tail", pageToken: "tail-2" }
     });
     expect(transcriptLoader.mock.calls.map(([token]) => token)).toEqual(["", "entries-2"]);
   });
 
   it("rejects a cyclic cursor instead of spinning or returning a silent prefix", async () => {
-    await expect(collectAllSubagentTranscript(async () => ({
+    await expect(readSubagentTranscriptBatch(async () => ({
       entries: [], nextPageToken: "same", totalSize: 0
-    }), "same")).rejects.toThrow(/cyclic token/u);
+    }), { kind: "tail", pageToken: "same" })).rejects.toThrow(/cyclic token/u);
   });
 
-  it("fails closed at the unique-page safety bound and allows a later complete retry", async () => {
-    let overLimit = true;
-    const transcriptLoader = vi.fn(async (_token: string) => overLimit
-      ? {
-          entries: [entry(`partial-${transcriptLoader.mock.calls.length}`, transcriptLoader.mock.calls.length, "partial")],
-          nextPageToken: `unique-${transcriptLoader.mock.calls.length}`,
-          tailPageToken: `tail-${transcriptLoader.mock.calls.length}`,
-          totalSize: MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES + 1
-        }
-      : {
-          entries: [entry("recovered", 1, "complete retry")],
-          tailPageToken: "recovered-tail",
-          totalSize: 1
-        });
-
-    await expect(collectAllSubagentTranscript(transcriptLoader)).rejects.toThrow(/safe page limit/u);
-    expect(transcriptLoader).toHaveBeenCalledTimes(MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES);
-
-    overLimit = false;
-    await expect(collectAllSubagentTranscript(transcriptLoader)).resolves.toMatchObject({
-      entries: [expect.objectContaining({ id: "recovered", content: "complete retry" })],
-      tailPageToken: "recovered-tail",
-      totalSize: 1
+  it.each([19_999, 20_000, 20_001])("reads the exact page boundary for %i entries", async (totalSize) => {
+    const pageSize = 200;
+    const entries = Array.from({ length: totalSize }, (_, index) => entry(`entry-${index}`, index, "text"));
+    const transcriptLoader = vi.fn(async (token: string) => {
+      const offset = Number(token);
+      const end = offset + pageSize;
+      return {
+        entries: entries.slice(offset, end),
+        ...(end < totalSize ? { nextPageToken: String(end) } : {}),
+        tailPageToken: "snapshot-tail",
+        totalSize
+      };
     });
-    expect(transcriptLoader).toHaveBeenCalledTimes(MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES + 1);
+
+    const first = await readSubagentTranscriptBatch(transcriptLoader);
+    expect(transcriptLoader.mock.calls.map(([token]) => token)).toEqual([
+      "", ...Array.from({ length: MAXIMUM_SUBAGENT_TRANSCRIPT_PAGES_PER_READ - 1 }, (_, index) => String((index + 1) * pageSize))
+    ]);
+    expect(first.entries).toEqual(entries.slice(0, 20_000));
+    if (totalSize <= 20_000) {
+      expect(first.cursor).toEqual({ kind: "tail", pageToken: "snapshot-tail" });
+      return;
+    }
+    expect(first.cursor).toMatchObject({ kind: "more", pageToken: "20000" });
+    await expect(readSubagentTranscriptBatch(transcriptLoader, first.cursor)).resolves.toEqual({
+      entries: entries.slice(20_000),
+      cursor: { kind: "tail", pageToken: "snapshot-tail" }
+    });
+    expect(transcriptLoader).toHaveBeenLastCalledWith("20000");
+
+    const cyclicPage = vi.fn(async (_token: string) => ({ entries: [], nextPageToken: "200", totalSize }));
+    await expect(readSubagentTranscriptBatch(cyclicPage, first.cursor)).rejects.toThrow(/cyclic token/u);
+    expect(cyclicPage.mock.calls).toEqual([["20000"]]);
   });
 
   it("keeps a clicked lineage on its current generation and excludes parallel siblings", () => {

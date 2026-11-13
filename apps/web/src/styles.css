@@ -2270,6 +2270,7 @@ button.attachment-chip__content:focus-visible { outline: 2px solid var(--accent-
 .subagent-transcript__truncated { display: flex; align-items: flex-start; gap: 6px; margin: 0; color: var(--amber); font-size: var(--text-9); line-height: 1.45; }
 .subagent-transcript__truncated svg { width: 13px; height: 13px; flex: 0 0 auto; margin-top: 1px; }
 .subagent-technical__empty { display: block !important; color: var(--text-faint); }
+.subagent-technical__more { margin: 6px 8px; }
 .subagents-failure.is-compact { grid-template-columns: auto minmax(0, 1fr) auto; place-items: center stretch; padding: 7px; text-align: left; }
 .subagents-failure.is-compact > svg { width: 14px; height: 14px; }
 .subagents-failure.is-compact .button { min-height: 25px; padding: 3px 7px; font-size: var(--text-8); }

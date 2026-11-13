@@ -95,6 +95,31 @@ describe("delegated-run public service", () => {
     })]);
     expect(transcript.tailPageToken).not.toBe("");
 
+    const readTranscript = (pageToken = "") => invoke<contract.ListSubagentTranscriptResponse>(
+      services.subagent.listSubagentTranscript,
+      create(contract.ListSubagentTranscriptRequestSchema, {
+        sessionId: fixture.sessionId,
+        subagentRunId: active.id,
+        page: { pageSize: 1, pageToken }
+      })
+    );
+    appendTranscript(fixture.store, active.id, {
+      id: "entry-2", sequence: 2, role: "parent", content: "continue", occurredAt: 102, isError: false
+    });
+    const firstPage = await readTranscript();
+    expect(firstPage.entries.map((entry) => entry.entryId)).toEqual(["entry-1"]);
+    expect(firstPage.page?.nextPageToken).toBeTruthy();
+    appendTranscript(fixture.store, active.id, {
+      id: "entry-3", sequence: 3, role: "subagent", content: "appended reply", occurredAt: 103, isError: false
+    });
+    const continued = await readTranscript(firstPage.page!.nextPageToken);
+    expect(continued.entries.map((entry) => entry.entryId)).toEqual(["entry-2"]);
+    expect(continued.page).toMatchObject({ nextPageToken: "", totalSize: 2n });
+    expect(continued.tailPageToken).toBe(firstPage.tailPageToken);
+    const tail = await readTranscript(continued.tailPageToken);
+    expect(tail.entries.map((entry) => entry.entryId)).toEqual(["entry-3"]);
+    expect(tail.page).toMatchObject({ nextPageToken: "", totalSize: 3n });
+
     const backend = fixture.store.getBackend(fixture.adapter.id).descriptor;
     const capabilities = new Map(backend.capabilities);
     capabilities.set(contract.capabilityNames.subagentsTranscript, {
@@ -104,13 +129,7 @@ describe("delegated-run public service", () => {
       detail: "Transcript is unavailable."
     });
     fixture.store.upsertBackend({ ...backend, capabilities });
-    await expect(invoke(
-      services.subagent.listSubagentTranscript,
-      create(contract.ListSubagentTranscriptRequestSchema, {
-        sessionId: fixture.sessionId,
-        subagentRunId: active.id
-      })
-    )).rejects.toMatchObject({ code: Code.Unimplemented });
+    await expect(readTranscript(firstPage.page!.nextPageToken)).rejects.toMatchObject({ code: Code.Unimplemented });
   });
 
   it("persists the Operation before adapter dispatch and fails closed on run-local control capability", async () => {
