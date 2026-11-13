@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -34,7 +34,7 @@ import {
   SessionState,
   SnapshotScopeSchema
 } from "@joko/contracts";
-import { preparePortableSessionImport } from "@joko/orchestrator";
+import { buildPortableSessionExport, preparePortableSessionImport } from "@joko/orchestrator";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createE2eClients } from "./connect-clients.js";
@@ -501,6 +501,72 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     } finally {
       if (movedEmpty) await rename(emptyRetainedPath, emptyPath);
     }
+  });
+
+  it("asks before replacing the same Pi transcript in a separately encrypted package", { timeout: 90_000 }, async () => {
+    fixture = await RealPiSystemFixture.start();
+    const { artifacts, store, sessionHost } = fixture.application;
+    const workspaceDirectory = fixture.workspaceDirectory;
+    const paired = await fixture.pair();
+    const client = paired.clients.portableSession;
+    const targetId = "workspace-real-pi";
+    const anotherTargetId = "workspace-second-pi";
+    await sessionHost.registerTarget({ ...store.getTarget(targetId).descriptor, id: anotherTargetId });
+    const password = "portable e2e package password";
+    const timestamp = new Date().toISOString();
+    const upload = async (nativeSessionId: string) => {
+      const bytes = Buffer.from([
+        JSON.stringify({ type: "session", version: 3, id: nativeSessionId, timestamp, cwd: workspaceDirectory }),
+        JSON.stringify({ type: "message", id: "user-one", parentId: null, timestamp, message: { role: "user", content: "Frozen Pi history" } })
+      ].join("\n") + "\n");
+      const encoded = await buildPortableSessionExport({
+        applicationVersion: "0.1.0", exportedAt: timestamp, title: "Encrypted Pi history", workspaceKind: "project",
+        backendCapability: "native-portable-session-v1", password,
+        nativeSession: { bytes, sha256: createHash("sha256").update(bytes).digest("hex"), nativeSessionId },
+        events: [{ emittedAt: Date.parse(timestamp), payload: { type: "message_complete", role: "user",
+          blocks: [{ kind: "text", text: "Frozen Pi history" }] } }],
+        readBlob: blob => artifacts.readBlob(blob)
+      });
+      const file = await artifacts.ingestBytes(encoded.bytes, { mimeType: "application/vnd.joko.session", fileName: "encrypted.jshare" });
+      return { blobId: file.id, sha256: file.sha256, byteLength: BigInt(file.byteLength), mediaType: file.mimeType, fileName: file.fileName ?? "" };
+    };
+    const prepare = async (file: Awaited<ReturnType<typeof upload>>) => {
+      const { draft } = await client.inspectPortableSessionImport({ package: file });
+      expect(draft).toMatchObject({ encrypted: true, passwordRequired: true });
+      const unlocked = await client.unlockPortableSessionImport({ draftId: draft!.draftId, password });
+      expect(unlocked.draft?.preview).toMatchObject({ fidelity: PortableSessionFidelity.FULL, nativeHistory: true });
+      return draft!.draftId;
+    };
+    const commit = (draftId: string, overwrite: boolean, destination = targetId, operationId: string = randomUUID()) =>
+      client.commitPortableSessionImport({ operationId, draftId, targetId: destination, permissionMode: PermissionMode.ASK, overwrite });
+
+    const firstPackage = await upload("frozen-history");
+    const secondPackage = await upload("frozen-history");
+    expect(secondPackage.sha256).not.toBe(firstPackage.sha256);
+    const first = await commit(await prepare(firstPackage), false);
+    if (first.result === undefined) throw new Error("First Pi package returned no import result.");
+    const firstId = first.result.sessionId;
+    expect(first.result).toMatchObject({ replacedSessionIds: [], fidelity: PortableSessionFidelity.FULL });
+    expect(store.getSession(firstId).descriptor.binding.nativeSessionId).not.toBe("frozen-history");
+
+    const secondDraftId = await prepare(secondPackage);
+    const refusedOperation = randomUUID();
+    await expect(commit(secondDraftId, false, targetId, refusedOperation)).rejects.toMatchObject({ code: Code.AlreadyExists });
+    expect(store.findOperation(refusedOperation)).toBeUndefined();
+    expect(store.listSessions({ targetId, includeArchived: true }).map(session => session.descriptor.id)).toEqual([firstId]);
+
+    const otherTarget = await commit(await prepare(secondPackage), false, anotherTargetId);
+    expect(otherTarget.result).toMatchObject({ replacedSessionIds: [] });
+    expect(store.getSession(otherTarget.result!.sessionId).descriptor.targetId).toBe(anotherTargetId);
+    const distinct = await commit(await prepare(await upload("different-native-history")), false);
+    expect(distinct.result).toMatchObject({ replacedSessionIds: [] });
+
+    const replaceOperation = randomUUID();
+    const replaced = await commit(secondDraftId, true, targetId, replaceOperation);
+    expect(replaced.result?.replacedSessionIds).toEqual([firstId]);
+    expect(store.getSession(firstId).descriptor.deletedAt).toEqual(expect.any(Number));
+    expect(store.getSession(distinct.result!.sessionId).descriptor.deletedAt).toBeUndefined();
+    expect((await commit(secondDraftId, true, targetId, replaceOperation)).result?.sessionId).toBe(replaced.result!.sessionId);
   });
 
   it("executes an installed Skill through the live Pi command catalog and records exact durable usage", { timeout: 90_000 }, async () => {

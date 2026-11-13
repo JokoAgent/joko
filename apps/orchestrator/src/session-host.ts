@@ -11568,13 +11568,20 @@ export class SessionHost {
       }
     );
     const importTitle = portableImportTitle(input.title, prepared.manifest.title);
+    const nativeTranscriptSha256 = prepared.nativeSession === undefined ? undefined
+      : createHash("sha256").update(prepared.nativeSession.bytes).digest("hex");
+    const localPiDigest = (store: OperationalStore, target: StoredTarget): string | undefined =>
+      target.descriptor.remoteWorkspace === undefined && store.getBackend(target.descriptor.backendId).descriptor.adapterKind === "pi"
+        ? nativeTranscriptSha256 : undefined;
+    const findConflict = (store: OperationalStore, target: StoredTarget): StoredSession | undefined =>
+      findPortableImportConflict(store, target.descriptor.id, input.package.sha256, localPiDigest(store, target));
     const claim = this.#store.claimAuthorizedDeferredEffectOperation<ImportPortableSessionResult>(
       input.connection.id,
       input.connection.authKeyDigest,
       { id: input.operationId, kind: "import_portable_session", body: logicalBody },
       (store) => {
-        this.assertTargetAcceptsSessionCreation(store, input.targetId);
-        const conflict = findPortableImportConflict(store, input.targetId, input.package.sha256);
+        const target = this.assertTargetAcceptsSessionCreation(store, input.targetId);
+        const conflict = findConflict(store, target);
         if (conflict !== undefined && !input.overwrite) throw portableImportConflict(conflict.descriptor.id);
       }
     );
@@ -11679,7 +11686,7 @@ export class SessionHost {
         throw new StoreError("Isolated workspace creation is unavailable on this service.");
       }
 
-      replaced = findPortableImportConflict(this.#store, input.targetId, input.package.sha256);
+      replaced = findConflict(this.#store, target);
       if (replaced !== undefined) {
         if (!input.overwrite) throw portableImportConflict(replaced.descriptor.id);
         if (this.#portableReplacementFences.has(replaced.descriptor.id)) throw portableReplacementBusy();
@@ -11783,7 +11790,10 @@ export class SessionHost {
           if (currentTarget.revision !== target.revision) {
             throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
           }
-          const currentConflict = findPortableImportConflict(store, input.targetId, input.package.sha256);
+          const currentConflict = findConflict(store, currentTarget);
+          if (currentConflict !== undefined && !input.overwrite && localPiDigest(store, currentTarget) !== undefined) {
+            throw portableImportConflict(currentConflict.descriptor.id);
+          }
           if (currentConflict?.descriptor.id !== replaced?.descriptor.id) {
             if (currentConflict !== undefined || replaced !== undefined) {
               throw new RevisionConflictError(
@@ -11835,10 +11845,14 @@ export class SessionHost {
               at: now
             });
           }
+          const storedDigest = localPiDigest(store, currentTarget);
+          // Preserve the input transcript identity before Pi rewrites its
+          // native ID and workspace for the receiving task.
           store.setSetting("session", sessionId, PORTABLE_IMPORT_SOURCE_SETTING_KEY, {
             format: 1,
             targetId: input.targetId,
             packageSha256: input.package.sha256,
+            ...(storedDigest === undefined ? {} : { nativeTranscriptSha256: storedDigest }),
             importedAt: now
           }, now);
           const initialActivation = portableActivationFailedRecord(
@@ -19197,15 +19211,22 @@ function portableImportTitle(requested: string | undefined, packageTitle: string
 function findPortableImportConflict(
   store: OperationalStore,
   targetId: string,
-  packageSha256: string
+  packageSha256: string,
+  nativeTranscriptSha256: string | undefined
 ): StoredSession | undefined {
-  return store.listSessions({ targetId, includeArchived: true }).find((session) => {
+  let sameTranscript: StoredSession | undefined;
+  for (const session of store.listSessions({ targetId, includeArchived: true })) {
     const setting = store.findSetting("session", session.descriptor.id, PORTABLE_IMPORT_SOURCE_SETTING_KEY);
-    if (!isRecord(setting?.value)) return false;
-    return setting.value["format"] === 1
-      && setting.value["targetId"] === targetId
-      && setting.value["packageSha256"] === packageSha256;
-  });
+    if (!isRecord(setting?.value) || setting.value["format"] !== 1 || setting.value["targetId"] !== targetId) continue;
+    if (setting.value["packageSha256"] === packageSha256) return session;
+    if (nativeTranscriptSha256 !== undefined
+      && setting.value["nativeTranscriptSha256"] === nativeTranscriptSha256
+      && session.descriptor.remoteWorkspace === undefined
+      && store.getBackend(session.descriptor.backendId).descriptor.adapterKind === "pi") {
+      sameTranscript ??= session;
+    }
+  }
+  return sameTranscript;
 }
 
 function portableImportConflict(sessionId: string): JokoError {
