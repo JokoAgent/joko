@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 import type { AdapterContext, BackendAdapter, BackendDescriptor, BlobRef, CreateNativeSessionInput, DurableNativeDispatchPreparation,
@@ -107,10 +107,22 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     this.#assertOpen(); input.signal.throwIfAborted(); input.assertCurrent(); input.assertModelAllowed(input.providerId, input.modelId);
     return result;
   }
-  async validateTarget(target: TargetDescriptor): Promise<void> {
+  async validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void> {
     this.#assertOpen();
-    if (target.remoteWorkspace?.kind === "device_peer" && target.backendId === this.id && target.trusted && this.#options.validateRemoteTarget) {
-      await this.#options.validateRemoteTarget(target); return;
+    if (target.remoteWorkspace?.kind === "device_peer" && target.backendId === this.id && this.#options.validateRemoteTarget) {
+      if (assertPreparedRemoteCurrent !== undefined) {
+        assertPreparedRemoteCurrent();
+        // Registration owns a local fallback and an independently authorized Device root.
+        if (!isAbsolute(target.workspaceRoot) || !(await lstat(target.workspaceRoot)).isDirectory()
+          || await realpath(target.workspaceRoot) !== target.workspaceRoot) throw new Error("Hosted native task workspace is unavailable.");
+        this.#assertOpen();
+        assertPreparedRemoteCurrent();
+        await this.#options.validateRemoteTarget({ ...target, workspaceRoot: target.remoteWorkspace.workspaceRoot });
+        this.#assertOpen();
+        assertPreparedRemoteCurrent();
+        return;
+      }
+      if (target.trusted) { await this.#options.validateRemoteTarget(target); return; }
     }
     if (target.backendId !== this.id || target.remoteWorkspace || !target.trusted || !isAbsolute(target.workspaceRoot)
       || await realpath(target.workspaceRoot) !== target.workspaceRoot) throw new Error("Hosted native task workspace is unavailable.");
