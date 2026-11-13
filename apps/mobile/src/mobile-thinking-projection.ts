@@ -1,4 +1,4 @@
-import { MessageRole, type Event } from "@joko/contracts";
+import { MessageRole, PiMessageLifecycleKind, type Event } from "@joko/contracts";
 
 export interface MobileThinkingView {
   readonly key: string;
@@ -14,6 +14,7 @@ export interface MobileThinkingView {
   readonly redacted: boolean;
   readonly completed: boolean;
   readonly streaming: boolean;
+  readonly pi?: true;
   readonly startedAtMs?: number;
   readonly lastActivityAtMs?: number;
 }
@@ -49,11 +50,15 @@ export function mobileThinkingViews(events: readonly Event[], sessionStreaming =
       const key = mobileThinkingKey(messageScope, kind.value.contentIndex);
       const previous = views.get(key);
       const redacted = previous?.redacted === true || kind.value.hidden;
+      const native = event.pi?.payload;
+      const pi = native?.case === "messageLifecycle" && native.value.kind === PiMessageLifecycleKind.MESSAGE_UPDATE
+        && native.value.contentIndex === kind.value.contentIndex;
       views.set(key, {
         ...scope, messageScope, key, messageId, contentIndex: kind.value.contentIndex,
         eventId: event.eventId, sequence: previous?.sequence ?? sequence,
         text: redacted ? "" : (previous?.text ?? "") + kind.value.delta,
         redacted, completed: false, streaming: false,
+        ...(pi || previous?.pi ? { pi: true as const } : {}),
         ...((previous?.startedAtMs ?? at) === undefined ? {} : { startedAtMs: Math.min(previous?.startedAtMs ?? at!, at ?? previous!.startedAtMs!) }),
         ...((previous?.lastActivityAtMs ?? at) === undefined ? {} : { lastActivityAtMs: Math.max(previous?.lastActivityAtMs ?? at!, at ?? previous!.lastActivityAtMs!) })
       });

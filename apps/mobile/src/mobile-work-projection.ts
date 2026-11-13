@@ -1,6 +1,7 @@
 import type { MobileThinkingView } from "./mobile-thinking-projection";
 import type { MobileToolCallView } from "./mobile-tool-call";
 import { groupMobileWorkRuns } from "./mobile-work-run-grouping";
+import type { TimelineRow } from "./timeline";
 
 export interface MobileWorkCandidate {
   readonly id: string;
@@ -123,6 +124,18 @@ export function isWorkGroup<T extends MobileWorkCandidate>(row: MobileWorkItem<T
 
 export function mobileWorkContains<T extends MobileWorkCandidate>(item: MobileWorkItem<T>, matches: (row: T) => boolean): boolean {
   return isWorkGroup(item) ? item.children.some((child) => mobileWorkContains(child, matches)) : matches(item);
+}
+
+export function mobilePiWorkThinkingPreview(group: MobileWorkGroup<TimelineRow>): string | undefined {
+  if (!group.streaming) return undefined;
+  for (let index = group.children.length - 1; index >= 0; index--) {
+    const child = group.children[index]!;
+    if (isWorkGroup(child)) continue;
+    const latest = child.messageParts?.findLast(part => part.kind === "thinking" && part.thinking.pi
+      && part.thinking.streaming && part.thinking.text.trim());
+    if (latest?.kind === "thinking") return latest.thinking.text;
+  }
+  return undefined;
 }
 
 /** Navigation opens only the ancestors of the exact original message. */

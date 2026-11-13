@@ -1555,17 +1555,15 @@ export class PiBackendAdapter implements
     }
     let durableNativeDispatchFingerprint: string | undefined;
     if (persistFence !== undefined) {
-      const redactedMessage = redactPiNativeValue({
-        role: "user",
+      durableNativeDispatchFingerprint = nativeDispatchFingerprintForUserMessage({
         content: [
-          ...(message === "" ? [] : [{ type: "text", text: message }]),
+          ...(message === "" ? [] : [{ type: "text", text: redactManagedSecrets(message, runtime.redactValues) }]),
           ...images
         ]
-      }, runtime.redactValues);
-      if (!isRecord(redactedMessage)) {
+      });
+      if (durableNativeDispatchFingerprint === undefined) {
         throw piError("PI_NATIVE_DISPATCH_FINGERPRINT_INVALID", "Pi native input fingerprint could not be established", "dispatch");
       }
-      durableNativeDispatchFingerprint = nativeDispatchFingerprintForUserMessage(redactedMessage);
     }
     const skillCommandResource = composerCommand.skillResourceId === undefined
       ? undefined
@@ -4640,7 +4638,8 @@ export class PiBackendAdapter implements
       const materialized = await runtime.translator.materializeNativeHistoryEntry({ id: native.nativeEntryId,
         type: "message", data: { message: observed.message } });
       const message = materialized.data["message"];
-      if (!isRecord(message) || native.metadata?.fields["nativeDispatchFingerprint"] !== nativeDispatchFingerprintForUserMessage(message)) return;
+      const fingerprint = isRecord(message) ? nativeDispatchFingerprintForUserMessage(message) : undefined;
+      if (fingerprint === undefined || native.metadata?.fields["nativeDispatchFingerprint"] !== fingerprint) return;
     }
     const native = users[index]!;
     occurrence.identity = { entryId: native.nativeEntryId,
@@ -7638,12 +7637,16 @@ function contextTokensFromTree(values: readonly unknown[], leafId: string | unde
     visited.add(id);
     const entry = entries.get(id);
     if (entry === undefined) return undefined;
+    // An assistant before the latest compaction measured a different context.
+    if (entry.type === "compaction") return undefined;
     const message = isRecord(entry.message) ? entry.message : undefined;
-    if (entry.type === "message" && message?.role === "assistant" && isRecord(message.usage)) {
+    if (entry.type === "message" && message?.role === "assistant" && message.stopReason !== "aborted"
+      && message.stopReason !== "error" && isRecord(message.usage)) {
       // Context is the last assistant request on this lineage, not accumulated
       // output or a sibling branch. Native statistics remain authoritative.
-      return [message.usage.input, message.usage.cacheRead, message.usage.cacheWrite]
+      const tokens = [message.usage.input, message.usage.cacheRead, message.usage.cacheWrite]
         .reduce<number>((total, value) => total + (finiteNonNegativePiNumber(value) ? value : 0), 0);
+      if (tokens > 0 && Number.isFinite(tokens)) return tokens;
     }
     id = typeof entry.parentId === "string" ? entry.parentId : undefined;
   }
@@ -7668,7 +7671,8 @@ function usageFromStats(
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
-    contextTokens: finiteNonNegativePiNumber(context?.tokens) ? context.tokens : treeContextTokens,
+    contextTokens: finiteNonNegativePiNumber(context?.tokens) ? context.tokens
+      : context?.tokens === null ? undefined : treeContextTokens,
     contextWindow: finiteNonNegativePiNumber(context?.contextWindow) && context.contextWindow > 0
       ? context.contextWindow : modelContextWindow,
     cost: numeric(stats.cost)

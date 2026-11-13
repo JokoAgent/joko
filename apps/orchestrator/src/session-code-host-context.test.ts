@@ -177,9 +177,8 @@ describe("Session code-host context", () => {
   });
 
   it("publishes references from the active native branch and restores them on a branch revisit", async () => {
-    const { store } = createFixture("Ordinary task");
+    const { store } = createFixture("Ordinary task", "pi");
     const session = store.getSession("session-1").descriptor;
-    store.upsertBackend({ ...store.getBackend(session.backendId).descriptor, adapterKind: "pi" });
     const origin = { sessionId: session.id, backendId: session.backendId, targetId: session.targetId, generation: session.binding.generation };
     const metadata = { namespace: "pi.native_history", fields: { nativeHydration: true, nativeBindingFingerprint: nativeBindingFingerprint(session.binding.opaqueRef) } };
     const retainedUrl = "https://github.com/acme/work/pull/11";
@@ -290,7 +289,7 @@ describe("Session code-host context", () => {
   });
 });
 
-function createFixture(title: string): {
+function createFixture(title: string, adapterKind = "fixture"): {
   store: OperationalStore;
   replaceStore: (replacement: OperationalStore) => void;
 } {
@@ -306,7 +305,7 @@ function createFixture(title: string): {
     displayName: "Coding agent",
     version: "1",
     health: "healthy",
-    adapterKind: "fixture",
+    adapterKind,
     instanceGeneration: 0,
     installationState: "installed",
     authenticationState: "authenticated",

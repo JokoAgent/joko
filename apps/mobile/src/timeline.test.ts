@@ -1,8 +1,8 @@
 import { create } from "@bufbuild/protobuf";
-import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageInputDelivery, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus, QueueItemState, RunSchema, RunState, RunUsageSummarySchema, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
+import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageInputDelivery, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus, PiMessageLifecycleKind, QueueItemState, RunSchema, RunState, RunUsageSummarySchema, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
-import { isWorkGroup, mobileWorkItems } from "./mobile-work-projection";
+import { isWorkGroup, mobilePiWorkThinkingPreview, mobileWorkItems } from "./mobile-work-projection";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { mobilePartnerConversationRows, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { mobileMessageShareable, projectMobileConversationShareMessage } from "./mobile-conversation-share";
@@ -474,6 +474,24 @@ describe("ordered Thinking inside canonical Mobile messages", () => {
       { id: "final", text: "Next reply finished.", completed: true },
       { id: "next-final", text: "Another turn.", completed: true }
     ]);
+  });
+
+  it("projects only current visible Pi thinking into the active folded work group", () => {
+    const visible = scoped(1, "thinkingDelta", { messageId: "pi-thought", contentIndex: 0, delta: "Inspecting the file" });
+    const pi = create(EventSchema, { ...visible, pi: { payload: { case: "messageLifecycle",
+      value: { kind: PiMessageLifecycleKind.MESSAGE_UPDATE, role: "assistant", contentIndex: 0 } } } });
+    const hidden = create(EventSchema, { ...scoped(2, "thinkingDelta", { messageId: "pi-thought", contentIndex: 0,
+      delta: "Private reasoning", hidden: true }), pi: pi.pi });
+    const complete = scoped(3, "messageCompleted", { messageId: "pi-thought", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "thinking", value: { text: "Finished" } } }] });
+    const preview = (events: readonly Event[], streaming: boolean) => mobileWorkItems(timelineRows(events, streaming), streaming)
+      .filter(isWorkGroup).map(mobilePiWorkThinkingPreview);
+
+    expect(preview([pi], true)).toEqual(["Inspecting the file"]);
+    expect(preview([visible], true)).toEqual([undefined]);
+    expect(preview([pi, hidden], true)).toEqual([undefined]);
+    expect(preview([pi, complete], true)).toEqual([undefined]);
+    expect(preview([pi], false)).toEqual([undefined]);
   });
 
   it("keeps stream/final ordered content in one original message with canonical media and fail-closed quote authority", () => {

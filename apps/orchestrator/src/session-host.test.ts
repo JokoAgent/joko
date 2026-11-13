@@ -2730,7 +2730,7 @@ describe("SessionHost", () => {
     expect(adapter.effortSelections).toEqual([]);
   });
 
-  it.each(["ssh", "local profile restore"] as const)("reconciles protocol-valid native history after service recovery without redispatching (%s)", { timeout: 20_000 }, async location => {
+  it.each(["ssh", "local profile restore", "local image"] as const)("reconciles protocol-valid native history after service recovery without redispatching (%s)", { timeout: 20_000 }, async location => {
     const directory = mkdtempSync(join(tmpdir(), "joko-host-service-recovery-"));
     const store = new OperationalStore(join(directory, "store.db"));
     const repository = new OperationalArtifactRepository(store);
@@ -2740,6 +2740,8 @@ describe("SessionHost", () => {
       ingestRoots: [directory]
     });
     await artifacts.initialize();
+    const imageBytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    const image = location === "local image" ? await artifacts.ingestBytes(imageBytes, { fileName: "pixel.png", mimeType: "image/png" }) : undefined;
     const nativeEntries: Record<string, unknown>[] = [];
     const processes: HostServiceRecoveryProcess[] = [];
     const piRoot = join(directory, "pi");
@@ -2752,12 +2754,13 @@ describe("SessionHost", () => {
         baseUrl: "http://127.0.0.1:11434/v1",
         api: "openai-completions",
         keyless: true,
-        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }]
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096, input: ["text", "image"] }]
       }],
+      readBlob: blob => artifacts.readBlob(blob),
       includeManagedSubagentTools: () => false,
       validateRemoteWorkspace: async () => undefined,
       processFactory: (spec) => {
-        const processHandle = new HostServiceRecoveryProcess(spec, nativeEntries, { recovering,
+        const processHandle = new HostServiceRecoveryProcess(spec, nativeEntries, { recovering, supportsImages: image !== undefined,
           appendModelControl: recovering && location === "local profile restore" });
         processes.push(processHandle);
         return processHandle;
@@ -2800,7 +2803,7 @@ describe("SessionHost", () => {
         sessionId,
         prompt: {
           text: "persisted input",
-          images: [],
+          images: image === undefined ? [] : [{ blob: image }],
           files: [],
           mentions: [],
           disposition: "prompt"
@@ -2822,7 +2825,7 @@ describe("SessionHost", () => {
         expect(processes[1]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY)
           .toBe(processes[0]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY);
         expect(processes[0]!.spec.env.JOKO_PI_REMOTE_RECOVERY_IDENTITY).toMatch(/^[a-f0-9]{64}$/u);
-      } else {
+      } else if (location === "local profile restore") {
         const commands = processes[1]!.commands.map(command => command.type);
         expect(commands.indexOf("set_model")).toBeGreaterThanOrEqual(0);
         expect(commands.indexOf("get_entries")).toBeGreaterThan(commands.indexOf("set_model"));
@@ -2842,6 +2845,13 @@ describe("SessionHost", () => {
           : []);
       expect(projectedText.filter((text) => text === "completed while service was unavailable")).toHaveLength(1);
       expect(projectedText).not.toContain("stale replay must remain private");
+      if (image !== undefined) {
+        const user = store.listEvents({ sessionId, activeNativeTimeline: true }).find(event => event.pi?.entryId === "service-recovery-user" && event.payload.type === "message_complete");
+        const assistant = store.listEvents({ sessionId, activeNativeTimeline: true }).find(event => event.pi?.entryId === "service-recovery-assistant" && event.payload.type === "message_complete");
+        expect(user?.payload).toMatchObject({ blocks: expect.arrayContaining([{ kind: "image", blob: expect.objectContaining({ sha256: image.sha256 }) }]) });
+        expect(assistant).toMatchObject({ runId: dispatch.value.runId, operationId: "service-recovery-input" });
+        expect(store.findSetting("session", sessionId, "native.dispatch.recovery")).toBeUndefined();
+      }
       if (location === "ssh") expect(processes[1]!.commands.slice(0, 3).map(command => command.type))
         .toEqual(["clear_queue", "abort", "get_state"]);
     } finally {
@@ -17246,6 +17256,7 @@ function reviewSeal() {
 }
 
 interface HostServiceRecoveryProcessOptions {
+  readonly supportsImages?: boolean;
   readonly recovering: boolean;
   readonly outcome?: "completed" | "aborted" | "failed";
   readonly persistNativeTurn?: boolean;
@@ -17361,7 +17372,7 @@ class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle
             name: "Test Model",
             api: "openai-completions",
             reasoning: true,
-            input: ["text"],
+            input: this.#options.supportsImages ? ["text", "image"] : ["text"],
             contextWindow: 32_768,
             maxTokens: 4_096,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
@@ -17418,7 +17429,7 @@ class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle
             timestamp: new Date(10).toISOString(),
             message: {
               role: "user",
-              content: [{ type: "text", text: String(command.message ?? "") }],
+              content: [{ type: "text", text: String(command.message ?? "") }, ...(Array.isArray(command.images) ? command.images : [])],
               timestamp: 10
             }
           };
@@ -17459,7 +17470,7 @@ class HostServiceRecoveryProcess extends EventEmitter implements PiProcessHandle
           name: "Test Model",
           api: "openai-completions",
           reasoning: true,
-          input: ["text"],
+          input: this.#options.supportsImages ? ["text", "image"] : ["text"],
           contextWindow: 32_768,
           maxTokens: 4_096,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }

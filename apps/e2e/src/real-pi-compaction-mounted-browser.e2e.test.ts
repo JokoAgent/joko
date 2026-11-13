@@ -191,6 +191,7 @@ describe("mounted Pi compaction product chain", () => {
     await waitFor(() => trigger.evaluate((element) => element === document.activeElement),
       (focused) => focused, "focus returning to the active compact control");
     expect(await timelineStates(compactSessionId)).toEqual([]);
+    expect((await manager.clients.session.getSession({ sessionId: compactSessionId })).session?.context?.usedTokens).toBeGreaterThan(0n);
 
     await trigger.click();
     await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
@@ -200,9 +201,17 @@ describe("mounted Pi compaction product chain", () => {
     expect(await feedback.getAttribute("aria-live")).toBe("polite");
     expect(await feedback.innerText()).toContain("Context compacted");
     expect(await timelineStates(compactSessionId)).toContain(CompactionState.COMPLETED);
+    const compacted = (await manager.clients.session.getSession({ sessionId: compactSessionId })).session;
+    expect(compacted?.sessionId).toBe(compactSessionId);
+    expect(compacted?.context).toBeUndefined();
+    const compactedStats = (await manager.clients.session.getSessionStatistics({ sessionId: compactSessionId })).statistics;
+    expect(compactedStats?.usage?.inputTokens).toBeGreaterThan(0n);
+    expect(compactedStats?.context).toBeUndefined();
+    await waitFor(() => trigger.innerText(), text => text.trim() === "—", "the mounted ring to display unknown context", 30_000);
     await feedback.getByRole("button", { name: "Dismiss" }).click();
 
     await trigger.click();
+    expect(await confirmation.innerText()).toContain("Current context capacity is unavailable.");
     await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
     await page.locator(".compact-action-feedback--noop").waitFor({ state: "visible", timeout: 30_000 });
     expect(await feedback.innerText()).toContain("already compact");
@@ -210,6 +219,8 @@ describe("mounted Pi compaction product chain", () => {
     await feedback.getByRole("button", { name: "Dismiss" }).click();
 
     await send(compactSessionId, "A new turn after compaction is available to summarize.");
+    await waitFor(() => manager.clients.session.getSession({ sessionId: compactSessionId }),
+      response => (response.session?.context?.usedTokens ?? 0n) > 0n, "current context usage after the next native response", 30_000);
     const requestsBeforeSummary = fixture.providerRequests.length;
     holdNextSummary = true;
     await trigger.click();

@@ -177,6 +177,29 @@ describe("native Thinking and Work cards", () => {
     expect(host.querySelector('[role="progressbar"]')).toBeNull();
   });
 
+  it("shows one current thinking line while folded and opens the original work when pressed", () => {
+    const group = (thinkingPreview: string, streaming = true) => {
+      act(() => root.render(createElement(MobileWorkGroupCard, { blockKey: "live-work", ownerKey: "owner-one",
+        streaming, thinkingPreview, enabled: true, colors, locale: "en",
+        children: createElement("div", null, "Original expanded content") })));
+    };
+    group("**Inspecting** the file\nRemaining reasoning");
+    expect(button("Inspecting the file").querySelector('[data-lines="1"]')?.textContent).toBe("Inspecting the file");
+    expect(host.textContent).not.toContain("Remaining reasoning");
+    group("Checking the next result");
+    expect(host.querySelector('[aria-label="Inspecting the file"]')).toBeNull();
+    appState("background");
+    expect(host.querySelector('[aria-label="Checking the next result"]')).toBeNull();
+    appState("active");
+    press("Checking the next result");
+    expect(button("Collapse work process").getAttribute("aria-expanded")).toBe("true");
+    expect(host.textContent).toContain("Original expanded content");
+    expect(host.querySelector('[aria-label="Checking the next result"]')).toBeNull();
+    press("Collapse work process");
+    group("Checking the next result", false);
+    expect(host.querySelector('[aria-label="Checking the next result"]')).toBeNull();
+  });
+
   it.each([
     { locale: "en", completed: "Thinking · duration unknown", empty: "No thinking yet", work: "Work process" },
     { locale: "zh-CN", completed: "思考 · 时长未知", empty: "暂无思考内容", work: "工作过程" },
