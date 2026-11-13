@@ -1,10 +1,17 @@
-import type { TimelineItemView } from "../model.js";
+import type { ContextView, TimelineItemView } from "../model.js";
 
 export interface ActiveCompactionProjection {
   readonly itemId: string;
   readonly compactionId: string;
   readonly reason: NonNullable<TimelineItemView["compaction"]>["reason"];
   readonly automatic: boolean;
+}
+
+export function hasContextToCompact(context: ContextView | undefined, items: readonly TimelineItemView[]): boolean {
+  if (context !== undefined) return context.usedTokens > 0;
+  // A completed native compaction leaves context even when current usage is
+  // unknown. The original backend decides whether another compaction is a no-op.
+  return items.some(item => item.compaction?.piContextBoundary === true);
 }
 
 export function resolveActiveCompaction(

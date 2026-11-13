@@ -52,7 +52,7 @@ import { activeBackgroundTaskIds } from "./running-status.js";
 import { collectTimelineSubagentRuns, timelineSubagentDetailResponseIsCurrent } from "./subagent-inline-card.js";
 import { RecoveryActionSingleFlight, executableRecoveryActions, nextPermissionMode, recoverySettingsHash, waitForRecoveryDelay, type ExecutableRecoveryAction, type RecoveryActionContext } from "./coding-ui-behavior.js";
 import { SessionScopedRequestGuard, type SessionScopedRequest } from "./compact-request-behavior.js";
-import { resolveActiveCompaction } from "./compaction-status-behavior.js";
+import { hasContextToCompact, resolveActiveCompaction } from "./compaction-status-behavior.js";
 import { hasPendingComposerQueueItems, pauseQueueThenAbort, pauseQueueThenAbortRetry, resolveComposerAttachmentPolicy } from "./composer-behavior.js";
 import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, resolveErrorTail } from "./error-tail-behavior.js";
 import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
@@ -336,9 +336,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [errorTailActionFailure, setErrorTailActionFailure] = useState<{ readonly localKey: string; readonly message: string }>();
   const [compactConfirmation, setCompactConfirmationState] = useState<{
     readonly request: SessionScopedRequest;
-    readonly usedTokens: number;
-    readonly contextWindow: number;
-    readonly percent: number;
+    readonly usage?: { readonly usedTokens: number; readonly contextWindow: number; readonly percent: number };
   }>();
   const [compactFeedback, setCompactFeedback] = useState<CompactRequestFeedback>();
   const [conversationCopyFeedback, setConversationCopyFeedback] = useState<ConversationCopyFeedback>();
@@ -692,6 +690,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     && backend.capabilities.get("subagents.detail")?.supported === true;
   const canStopSubagents = backend?.capabilities.get("subagents.stop")?.supported === true;
   const compactInFlight = compactGuardRef.current.isInFlight(session.id);
+  const canRequestCompaction = canCompact && !running && activeCompaction === undefined && !compactInFlight
+    && hasContextToCompact(session.context, timeline);
   const currentCompactFeedback = compactFeedback !== undefined
     && compactFeedback.sessionId === session.id
     && compactGuardRef.current.isCurrent(session.id, compactFeedback.epoch)
@@ -1303,13 +1303,15 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   };
 
   const requestCompact = (): void => {
-    const contextWindow = resolveDisplayContextWindow(session.context?.contextWindow ?? 0, session.model?.contextWindow);
-    const usedTokens = Math.min(session.context?.usedTokens ?? 0, contextWindow || Number.POSITIVE_INFINITY);
-    if (!canCompact || running || activeCompaction !== undefined || usedTokens <= 0) return;
+    if (!canRequestCompaction) return;
     const request = compactGuardRef.current.tryBegin(session.id);
     if (request === undefined) return;
-    const percent = contextWindow > 0 ? Math.round((usedTokens / contextWindow) * 100) : 0;
-    setCompactConfirmation({ request, usedTokens, contextWindow, percent });
+    const usage = session.context;
+    const contextWindow = resolveDisplayContextWindow(usage?.contextWindow ?? 0, session.model?.contextWindow);
+    const usedTokens = Math.min(usage?.usedTokens ?? 0, contextWindow);
+    setCompactConfirmation({ request, ...(usage === undefined ? {} : { usage: {
+      usedTokens, contextWindow, percent: Math.round((usedTokens / contextWindow) * 100)
+    } }) });
     setCompactRevision((current) => current + 1);
   };
 
@@ -1342,11 +1344,16 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         const latest = latestSnapshot.sessions.find((candidate) => candidate.id === sourceSessionId);
         const latestBackend = latest === undefined ? undefined : latestSnapshot.backends.find((candidate) => candidate.id === latest.backendId);
         const latestTimeline = latestSnapshot.timelineBySession.get(sourceSessionId) ?? [];
+        const compactableContext = latest !== undefined && hasContextToCompact(latest.context, latestTimeline);
+        const alreadyPagedBoundary = latest !== undefined && latest.generation === session.generation
+          && latest.backendId === session.backendId && latest.context === undefined
+          && (latestSnapshot.timelineHistoryRevisionBySession.get(sourceSessionId) ?? 0n) === historyRevision
+          && hasContextToCompact(undefined, timeline);
         if (
           !compactGuardRef.current.isCurrent(sourceSessionId, pending.request.epoch)
           || latest === undefined
           || latestBackend?.capabilities.get("context.compact")?.supported !== true
-          || (latest.context?.usedTokens ?? 0) <= 0
+          || (!compactableContext && !alreadyPagedBoundary)
           || latest.state === "running"
           || latest.state === "waiting"
           || latest.state === "retrying"
@@ -2566,7 +2573,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }
           const owner = objectiveDialogOwnerFence(controller, session);
           if (owner !== undefined) setObjectiveDialogRequest({ ...owner, id: ++objectiveDialogRequestIdRef.current, onSaved });
-        } : undefined} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canCompact && !running && activeCompaction === undefined && !compactInFlight && (session.context?.usedTokens ?? 0) > 0 ? requestCompact : undefined} />
+        } : undefined} onStop={canStop ? stopRun : undefined} stopInFlight={stopInFlight} onCompact={canRequestCompaction ? requestCompact : undefined} />
       </div>}
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
@@ -2601,11 +2608,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       <Modal
         open={compactConfirmation !== undefined && compactConfirmation.request.sessionId === session.id}
         title={t("session.compactConfirmTitle")}
-        description={compactConfirmation === undefined ? undefined : t("session.compactConfirmDescription", {
-          used: formatTokenCount(compactConfirmation.usedTokens),
-          total: formatTokenCount(compactConfirmation.contextWindow),
-          percent: compactConfirmation.percent
-        })}
+        description={compactConfirmation === undefined ? undefined : compactConfirmation.usage === undefined
+          ? t("context.unavailable")
+          : t("session.compactConfirmDescription", {
+            used: formatTokenCount(compactConfirmation.usage.usedTokens),
+            total: formatTokenCount(compactConfirmation.usage.contextWindow),
+            percent: compactConfirmation.usage.percent
+          })}
         size="small"
         className="compact-confirmation-modal"
         showClose={false}

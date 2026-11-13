@@ -267,6 +267,7 @@ import {
   PortableReplacementInspection,
   NativeCatalogAdoptionState,
   NativeCatalogAdoptionInspection,
+  PiCompactionTrigger,
   PiQueueMode,
   PolicySettingsSchema,
   ProviderConfigurationSchema,
@@ -13221,6 +13222,9 @@ function projectTimelineEvent(
       const tokensAfter = incomingTokensAfter > 0 ? incomingTokensAfter : existingCompaction?.tokensAfter;
       const boundaryId = kind.value.boundaryId || existingCompaction?.boundaryId;
       const willRetry = kind.value.willRetry ?? existingCompaction?.willRetry;
+      const nativeCompaction = event.pi?.payload;
+      const piContextBoundary = state === "completed" && (existingCompaction?.piContextBoundary === true
+        || (nativeCompaction?.case === "compactionUpdate" && nativeCompaction.value.trigger !== PiCompactionTrigger.BRANCH));
       replaceOrAppend({
         id: existing?.id ?? event.eventId,
         sequence: existing?.sequence ?? sequence,
@@ -13232,6 +13236,7 @@ function projectTimelineEvent(
           state,
           reason,
           automatic,
+          ...(piContextBoundary ? { piContextBoundary: true } : {}),
           ...(boundaryId === undefined || boundaryId.length === 0 ? {} : { boundaryId }),
           ...(tokensBefore === undefined ? {} : { tokensBefore }),
           ...(tokensAfter === undefined ? {} : { tokensAfter }),
