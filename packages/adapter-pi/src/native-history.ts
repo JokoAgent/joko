@@ -42,7 +42,8 @@ export function projectPiNativeHistory(
       if (projection.payload.type === "message_complete" && projection.payload.role === "user") {
         const message = record(entry.data["message"]);
         if (message !== undefined) {
-          fields["nativeDispatchFingerprint"] = nativeDispatchFingerprintForUserMessage(message);
+          const fingerprint = nativeDispatchFingerprintForUserMessage(message);
+          if (fingerprint !== undefined) fields["nativeDispatchFingerprint"] = fingerprint;
         }
       }
       if (projection.payload.type === "message_complete" && projection.payload.role === "assistant") {
@@ -89,10 +90,38 @@ export function projectPiNativeHistory(
   };
 }
 
-export function nativeDispatchFingerprintForUserMessage(message: Readonly<Record<string, unknown>>): string {
+export function nativeDispatchFingerprintForUserMessage(message: Readonly<Record<string, unknown>>): string | undefined {
+  const content = message["content"];
+  let identity = content;
+  if (Array.isArray(content) && content.some(value => record(value)?.["type"] === "image")) {
+    const blocks: unknown[] = [];
+    for (const [index, value] of content.entries()) {
+      const block = record(value);
+      if (block?.["type"] !== "image") {
+        if (index === 0 && block?.["type"] === "text" && block["text"] === "" && Object.keys(block).length === 2) continue;
+        blocks.push(value);
+        continue;
+      }
+      const blob = blobRef(block["blob"]);
+      const data = block["data"];
+      let image: { readonly sha256: string; readonly byteLength: number; readonly mimeType: string };
+      if (blob !== undefined && data === undefined) {
+        image = blob;
+      } else if (blob === undefined && typeof data === "string" && typeof block["mimeType"] === "string") {
+        const bytes = Buffer.from(data, "base64");
+        if (bytes.toString("base64") !== data) return undefined;
+        image = { sha256: createHash("sha256").update(bytes).digest("hex"), byteLength: bytes.byteLength, mimeType: block["mimeType"] };
+      } else return undefined;
+      const mimeType = image.mimeType.toLowerCase();
+      if (image.byteLength === 0 || !/^[a-f0-9]{64}$/u.test(image.sha256) || !/^image\/[a-z0-9][a-z0-9.+-]*$/u.test(mimeType)) return undefined;
+      blocks.push({ type: "image", sha256: image.sha256, byteLength: image.byteLength, mimeType,
+        ...(typeof block["alt"] === "string" ? { alt: block["alt"] } : {}) });
+    }
+    identity = blocks;
+  }
   return createHash("sha256").update(JSON.stringify({
     role: "user",
-    content: message["content"]
+    content: identity
   })).digest("hex");
 }
 
