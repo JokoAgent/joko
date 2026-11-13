@@ -37,7 +37,7 @@ import {
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
-  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageBlockSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
+  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageCompletedEventSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
   ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode, PiSessionEntrySchema, PiSessionSnapshotSchema, PiSnapshotSchema,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
@@ -8389,9 +8389,9 @@ describe("native mobile connection and operation ownership", () => {
   it("opens a copied old message link and reads every newer page through the latest message", async () => {
     const network = fakeNetwork();
     const assistant = (eventId: string, sequence: bigint, messageId: string, body: string) => create(EventSchema, {
-      ...event(eventId, sequence), payload: { kind: { case: "messageCompleted", value: {
-        messageId, role: MessageRole.ASSISTANT, blocks: [create(MessageBlockSchema, { content: { case: "text", value: body } })]
-      } } }
+      ...event(eventId, sequence), payload: create(EventPayloadSchema, { kind: { case: "messageCompleted", value: create(MessageCompletedEventSchema, {
+        messageId, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: body } }]
+      }) } })
     });
     const first = event("first", 2n);
     const anchor = assistant("anchor", 8n, "old-message", "Old linked reply");
