@@ -111,6 +111,7 @@ async function renderSchedules(schedules: readonly ScheduleView[], sessions: rea
     },
     navigate: vi.fn(),
     getSchedulerRuntime: vi.fn(() => new Promise<never>(() => undefined)),
+    listScheduleRunHistory: vi.fn(async () => ({ history: [], totalSize: 0 })),
     refreshProviderModels: vi.fn(async () => undefined),
     ...historyActions
   } as unknown as AppController;
