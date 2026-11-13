@@ -26,7 +26,7 @@ export class PartnerWorkbenchPullRequests {
       const current = authorize(previous.sessionOwnerId, reference);
       return current !== undefined && current.ownerRevision === previous.ownerRevision && current.referenceKey === previous.referenceKey;
     } };
-    this.#coordinator = new CodeHostProjectionCoordinator({ now, clearProjectionOnNotFound: true, providers: providers(authorization).map((provider) => ({
+    this.#coordinator = new CodeHostProjectionCoordinator({ now, clearProjectionOnNotFound: true, recheckPreferredProviders: true, providers: providers(authorization).map((provider) => ({
       capability: provider.capability,
       ...(provider.minimumTimeToLiveMs === undefined ? {} : { minimumTimeToLiveMs: provider.minimumTimeToLiveMs }),
       supports: (reference) => provider.supports(reference),
@@ -58,7 +58,10 @@ export class PartnerWorkbenchPullRequests {
       return cached.get(reference.key) ?? { reference };
     });
     if (visible.length > 0) {
-      void this.#coordinator.refreshSession(sessionId, [...scope.references.values()]).then((result) => {
+      const assertCurrent = (): void => {
+        if (this.#scopes.get(sessionId)?.key !== scope.key) throw new Error("The workbench reference owner changed.");
+      };
+      void this.#coordinator.refreshSession(sessionId, [...scope.references.values()], assertCurrent).then((result) => {
         if (this.#scopes.get(sessionId)?.key !== scope.key) return;
         for (const reference of scope.references.values()) scope.assertReference(reference);
         if (result.changed) scope.changed();
