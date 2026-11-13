@@ -454,7 +454,7 @@ import {
 } from "./mobile-timeline-artifacts";
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
 import type { MobileOfflineCache, MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
-import { historyInvalidated, mobileEventWithoutCursorTicket, retainMobileHistoryPrefix } from "./mobile-history-continuity";
+import { historyInvalidated, mobileEventWithoutCursorTicket, mobilePiHistoryRetired, retainMobileHistoryPrefix } from "./mobile-history-continuity";
 import { SnapshotSchema } from "@joko/contracts";
 import { mobileProviderUsageIdentity, mobileProviderUsageSupported, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import {
@@ -3891,7 +3891,18 @@ export class MobileClient {
     let next = { ...this.#state, ...patch };
     if (retainHistory && patch.detail && next.activeProfileId === this.#state.activeProfileId && next.selectedId === this.#state.selectedId
       && next.taskSource?.kind === this.#state.taskSource?.kind) {
-      next = { ...next, detail: retainMobileHistoryPrefix(patch.detail, this.#state.detail) };
+      const detail = patch.detail;
+      if (!this.#joinedTask && next.status === "connected" && next.selectedId && mobilePiHistoryRetired(detail, this.#state.detail)) {
+        this.#timelineRetirement += 1;
+        this.#historyOwner = undefined;
+        const sequence = detail.resumeCursor?.sequence;
+        next = { ...next, older: [], window: undefined, before: undefined, historyBusy: false, historyEnd: false,
+          live: sequence === undefined ? [] : next.live.filter(event => event.cursor?.generation === detail.generation
+            && event.cursor.sequence > sequence) };
+        const credential = this.#credential;
+        if (credential) void this.#retireSavedTaskTimeline(credential, next.selectedId, cached =>
+          mobilePiHistoryRetired(detail, cached) ? create(SnapshotSchema, { ...cached, timeline: [] }) : cached);
+      } else next = { ...next, detail: retainMobileHistoryPrefix(detail, this.#state.detail) };
     }
     const nextAuthority = this.#filesAuthorityKey(next);
     const nextPartnerAuthority = this.#partnerPrivateAuthorityKey(next);
@@ -9551,8 +9562,8 @@ export class MobileClient {
       this.#set({ window: events, older: [], before: events[0]!.cursor, historyEnd: false });
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
-      if (signal?.aborted) return;
-      if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
+      if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
+      if (isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
       history.finish();
@@ -9702,11 +9713,15 @@ export class MobileClient {
     const detail = this.#state.detail;
     this.#set({ detail: detail && projectDetail(detail), live: project(this.#state.live), window: undefined, older: [],
       before: undefined, historyEnd: false, historyBusy: false }, false);
+    await this.#retireSavedTaskTimeline(credential, session.sessionId, projectDetail);
+  }
+
+  async #retireSavedTaskTimeline(credential: PairedCredential, sessionId: string, project: (detail: Snapshot) => Snapshot): Promise<void> {
     const profile = this.#profiles.find(candidate => candidate.profileId === credential.profileId) ?? profileFromCredential(credential);
     try {
-      await this.offlineCache?.retireTaskTimeline(profile, session.sessionId, projectDetail);
+      await this.offlineCache?.retireTaskTimeline(profile, sessionId, project);
     } catch (error) {
-      if (this.#credential === credential && this.#state.selectedId === session.sessionId) {
+      if (this.#credential === credential && this.#state.selectedId === sessionId) {
         this.#set({ error: `Joko could not update the saved offline history: ${message(error)}` });
       }
     }

@@ -39,7 +39,7 @@ import {
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
   ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
-  OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
+  OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode, PiSessionEntrySchema, PiSessionSnapshotSchema, PiSnapshotSchema,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema, ManagedResourceSchema,
   VoiceInputServiceSettingsSchema, VoiceInputServiceSettingsPatchSchema, VoiceInputTranscriptionProtocol,
@@ -1364,8 +1364,9 @@ function eventFeed(network: MobileNetwork) {
   return (item: Event) => { queued.push(item); wake?.(); wake = undefined; };
 }
 
-function historyRetirementFixture() {
-  const session = messageActionSnapshot.sessions[0]!;
+function historyRetirementFixture(pi = false) {
+  const session = pi ? create(SessionSchema, { ...messageActionSnapshot.sessions[0]!, backendId: "pi", activeNativeEntryId: "old-leaf" })
+    : messageActionSnapshot.sessions[0]!;
   const identity = create(EventIdentitySchema, { sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
     generation: session.nativeBinding!.runtimeGeneration });
   const input = (id: string, sequence: bigint, text: string) => create(EventSchema, { ...event(id, sequence), identity,
@@ -1375,6 +1376,8 @@ function historyRetirementFixture() {
   const deleted = input("retired-input", 7n, deletedText);
   const neighbor = input("neighbor-input", 8n, "surviving neighbor");
   const owner = create(SnapshotSchema, { ...messageActionSnapshot, snapshotId: "history-owner", timeline: [],
+    ...(pi ? { sessions: [session], backends: [create(BackendDescriptorSchema, { ...messageActionSnapshot.backends[0]!, backendId: session.backendId })],
+      targets: [create(TargetSchema, { ...messageActionSnapshot.targets[0]!, backendId: session.backendId })] } : {}),
     scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: {} } }) });
   const detail = create(SnapshotSchema, { ...owner, snapshotId: "history-detail", timeline: [deleted, neighbor],
     scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: session.sessionId, recentTimelineItems: 120 } } }) });
@@ -8495,6 +8498,80 @@ describe("native mobile connection and operation ownership", () => {
     await vi.waitFor(() => expect(app.state.window).toBeUndefined());
     expect(app.state.older).toHaveLength(0);
   });
+
+  it.each(["refresh", "poll", "stream", "clear", "append"] as const)(
+    "adopts ordinary Pi history through %s without keeping a departed branch", async (path) => {
+      vi.useFakeTimers();
+      const { app, network, saved, offline, owner, detail, deleted, deletedText, neighbor, input, identity } = historyRetirementFixture(true);
+      const emit = path === "stream" ? eventFeed(network) : undefined;
+      if (!emit) network.streamOwner = vi.fn(async function* () { throw new Error("stream transport unavailable"); });
+      const profile = profileFromCredential(credential);
+      const readRows = () => timelineRows(app.state.window
+        ?? [...app.state.older, ...(app.state.detail?.timeline ?? []), ...app.state.live]);
+      const hits = () => findMobileConversationSearchHits(readRows(), deletedText);
+      const latest = create(SnapshotSchema, { ...detail, timeline: [neighbor] });
+      vi.mocked(network.readSession).mockResolvedValue(latest);
+      vi.mocked(network.readHistory).mockResolvedValueOnce({ events: [deleted], before: deleted.cursor });
+      await app.start();
+      await vi.advanceTimersByTimeAsync(0);
+      if (!emit) expect(app.state.liveStatus).toBe("polling");
+      await app.older();
+      expect(app.state.older).toContain(deleted);
+      expect(hits()).toHaveLength(1);
+
+      let finishPage!: (page: Awaited<ReturnType<MobileNetwork["readHistory"]>>) => void;
+      vi.mocked(network.readHistory).mockReturnValueOnce(new Promise(resolve => { finishPage = resolve; }));
+      const paging = app.older();
+      expect(app.state.historyBusy).toBe(true);
+
+      const appended = path === "append";
+      const binding = latest.sessions[0]!.nativeBinding!;
+      const nextSession = create(SessionSchema, { ...latest.sessions[0]!,
+        activeNativeEntryId: appended ? "appended-leaf" : path === "clear" ? "" : "surviving-leaf",
+        nativeBinding: path === "clear" ? create(NativeSessionBindingSchema, { ...binding,
+          runtimeGeneration: binding.runtimeGeneration + 1n, opaqueReference: "fresh-context" }) : binding });
+      const edge = event("update", 11n);
+      const nextOwner = create(SnapshotSchema, { ...owner, snapshotId: "updated-owner", sessions: [nextSession], resumeCursor: edge.cursor });
+      const nextDetail = create(SnapshotSchema, { ...latest, snapshotId: "updated-detail", sessions: [nextSession], resumeCursor: edge.cursor,
+        timeline: path === "clear" ? [] : appended ? [neighbor, input("appended-input", 11n, "Newest input")] : [neighbor],
+        pi: create(PiSnapshotSchema, { sessions: [create(PiSessionSnapshotSchema, {
+          productSessionId: nextSession.sessionId, backendId: nextSession.backendId, targetId: nextSession.targetId,
+          entriesComplete: true, activeLeafId: nextSession.activeNativeEntryId,
+          entries: [create(PiSessionEntrySchema, { entryId: "surviving-leaf" }),
+            create(PiSessionEntrySchema, { entryId: "old-leaf", parentId: "surviving-leaf" }),
+            ...(appended ? [create(PiSessionEntrySchema, { entryId: "appended-leaf", parentId: "old-leaf" })] : [])]
+        })] }) });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: nextOwner });
+      vi.mocked(network.readSession).mockResolvedValue(nextDetail);
+      if (emit) {
+        emit(create(EventSchema, { ...edge, identity, payload: create(EventPayloadSchema, { kind: { case: "nativeSessionChanged", value: {
+          productSessionId: identity.sessionId, opaqueNativeReference: binding.opaqueReference
+        } } }) }));
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(180);
+      } else if (path === "poll") await vi.advanceTimersByTimeAsync(4_000);
+      else await app.refresh();
+      expect(app.state.detail?.snapshotId).toBe(nextDetail.snapshotId);
+      expect(hits()).toHaveLength(appended ? 1 : 0);
+      expect(app.state.before?.sequence).toBe(appended ? deleted.cursor?.sequence : undefined);
+      if (!appended) expect(app.state.historyBusy).toBe(false);
+
+      finishPage({ events: [input("late-old-page", 6n, "A previously unread page")] });
+      await paging;
+      expect(hits()).toHaveLength(appended ? 1 : 0);
+      expect(readRows().some(row => row.eventId === "late-old-page")).toBe(appended);
+      const stored = await offline.cache.load(profile, identity.sessionId);
+      expect(stored?.detail?.timeline.some(item => item.eventId === deleted.eventId)).toBe(appended);
+      if (!appended) {
+        expect(readRows().map(row => row.eventId)).toEqual(path === "clear" ? [] : [neighbor.eventId]);
+        vi.mocked(network.inspect).mockRejectedValue(new Error("node unavailable"));
+        const reopened = clientWithOfflineCache(network, saved.storage, offline.cache);
+        await reopened.start();
+        expect(reopened.state.status).toBe("offline");
+        expect(findMobileConversationSearchHits(timelineRows(reopened.state.detail?.timeline ?? []), deletedText)).toEqual([]);
+        expect([...offline.values.values()].join("\n")).not.toContain(deletedText);
+      }
+    });
 
   it.each(["reset", "delete"] as const)("retires a confirmed stream %s before a failed read and offline reopen", async (change) => {
     const { app, network, offline, owner, detail, deleted, deletedText, neighbor, input, identity, rows, hits } = historyRetirementFixture();

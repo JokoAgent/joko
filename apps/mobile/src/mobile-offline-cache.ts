@@ -10,7 +10,7 @@ import type { MobileConnectionProfile } from "./connection-storage";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { NodeIdentity } from "./network";
-import { retainMobileHistoryPrefix } from "./mobile-history-continuity";
+import { mobilePiHistoryRetired, retainMobileHistoryPrefix } from "./mobile-history-continuity";
 
 export interface MobileOfflineCacheStorage {
   getItem(key: string): Promise<string | null>;
@@ -228,7 +228,7 @@ export class MobileOfflineCache {
               const record = readDetail(previousRaw, profile, previous);
               const snapshot = readSnapshot(record.snapshot, "task snapshot");
               assertDetailSnapshot(owner, detailSessionId, snapshot);
-              const merged = retainMobileHistoryPrefix(detail!, snapshot);
+              const merged = mobilePiHistoryRetired(detail!, snapshot) ? detail! : retainMobileHistoryPrefix(detail!, snapshot);
               // A background read outside the existing budget keeps the last valid offline view.
               if (merged !== detail! && new TextEncoder().encode(JSON.stringify(cacheableSnapshotJson(merged))).byteLength > maximumDetailBytes - 2048) {
                 retainedDetail = snapshot; detailCachedAt = record.cachedAt;
