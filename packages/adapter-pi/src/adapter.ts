@@ -654,7 +654,14 @@ interface PiRuntime {
   workingContextUnconfirmed?: boolean;
   pendingModelEndpoint?: PiManagedModelEndpoint;
   thresholdCheck?: Promise<void>;
-  thresholdCompaction?: { readonly id: string; readonly context: AdapterContext; nativeIdentity?: NativeMessageIdentity };
+  thresholdCompaction?: {
+    readonly id: string;
+    readonly context: AdapterContext;
+    readonly afterTurn: boolean;
+    nativeIdentity?: NativeMessageIdentity;
+    nativeState?: "starting" | "running" | "aborted" | "finished";
+    stop?: Promise<void>;
+  };
   ready: boolean;
   abortRequested: boolean;
   lifecycle?: PiNativeLifecycle;
@@ -1815,30 +1822,55 @@ export class PiBackendAdapter implements
   async abort(context: AdapterContext): Promise<void> {
     context.assertRunControlCurrent?.();
     const runtime = this.#runtime(context);
-    await this.#runExclusiveSessionMutation(runtime, context, async () => {
-      const clearResponse = await runtime.transport.request(
-        { type: "clear_queue" },
-        {
-          signal: context.signal,
-          stateMayHaveChanged: true,
-          timeoutMs: runtimeRpcTimeout(runtime, PI_STANDARD_RPC_TIMEOUT_MS)
-        }
-      );
-      validateClearedPiQueue(clearResponse);
-      try { context.assertRunControlCurrent?.(); }
-      catch (cause) { throw piError("PI_ABORT_TARGET_CHANGED_AFTER_QUEUE_CLEAR", "The original Run retired after Pi cleared its native queue", "dispatch", {
-        stateMayHaveChanged: true, recovery: "Refresh the original Run and the task queue before retrying.", cause
-      }); }
-      runtime.abortRequested = true;
-      await runtime.transport.request(
-        { type: "abort" },
-        {
-          signal: context.signal,
-          stateMayHaveChanged: true,
-          timeoutMs: runtimeRpcTimeout(runtime, PI_STANDARD_RPC_TIMEOUT_MS)
-        }
-      );
-    });
+    const compaction = runtime.thresholdCompaction;
+    if (compaction?.afterTurn === true && (compaction.nativeState === "running" || compaction.stop !== undefined)
+      && context.assertRunControlCurrent !== undefined
+      && context.inputQueueItemId !== undefined && context.inputQueueItemId === compaction.context.inputQueueItemId
+      && context.inputAttemptId !== undefined && context.inputAttemptId === compaction.context.inputAttemptId
+      && context.backendInstanceGeneration === compaction.context.backendInstanceGeneration
+      && context.generation === compaction.context.generation && context.target.id === compaction.context.target.id
+      && context.binding !== undefined && compaction.context.binding !== undefined
+      && sameNativeBinding(context.binding, runtime.binding) && sameNativeBinding(compaction.context.binding, runtime.binding)) {
+      // The native controller exists once Pi has emitted compaction_start.
+      // The compact callback keeps the mutation lane until this Stop settles.
+      if (compaction.stop !== undefined) return compaction.stop;
+      const stop = this.#abortNativeRun(runtime, context);
+      compaction.stop = stop;
+      try {
+        await stop;
+      } catch (error) {
+        // The same Run may retry a failed queue clear or authority check.
+        delete compaction.stop;
+        throw error;
+      }
+      return;
+    }
+    await this.#runExclusiveSessionMutation(runtime, context, () => this.#abortNativeRun(runtime, context));
+  }
+
+  async #abortNativeRun(runtime: PiRuntime, context: AdapterContext): Promise<void> {
+    const clearResponse = await runtime.transport.request(
+      { type: "clear_queue" },
+      {
+        signal: context.signal,
+        stateMayHaveChanged: true,
+        timeoutMs: runtimeRpcTimeout(runtime, PI_STANDARD_RPC_TIMEOUT_MS)
+      }
+    );
+    validateClearedPiQueue(clearResponse);
+    try { context.assertRunControlCurrent?.(); }
+    catch (cause) { throw piError("PI_ABORT_TARGET_CHANGED_AFTER_QUEUE_CLEAR", "The original Run retired after Pi cleared its native queue", "dispatch", {
+      stateMayHaveChanged: true, recovery: "Refresh the original Run and the task queue before retrying.", cause
+    }); }
+    runtime.abortRequested = true;
+    await runtime.transport.request(
+      { type: "abort" },
+      {
+        signal: context.signal,
+        stateMayHaveChanged: true,
+        timeoutMs: runtimeRpcTimeout(runtime, PI_STANDARD_RPC_TIMEOUT_MS)
+      }
+    );
   }
 
   async cancelBackgroundTask(context: AdapterContext, taskId: string): Promise<void> {
@@ -2519,7 +2551,7 @@ export class PiBackendAdapter implements
     );
   }
 
-  async #compactAtConfiguredThreshold(runtime: PiRuntime, context: AdapterContext): Promise<void> {
+  async #compactAtConfiguredThreshold(runtime: PiRuntime, context: AdapterContext, afterTurn = false): Promise<void> {
     if (
       runtime.control.runtimePolicy !== "standard"
       || !runtime.autoCompaction
@@ -2528,7 +2560,7 @@ export class PiBackendAdapter implements
       await runtime.thresholdCheck;
       return;
     }
-    const check = this.#compactAtConfiguredThresholdExclusive(runtime, context);
+    const check = this.#compactAtConfiguredThresholdExclusive(runtime, context, afterTurn);
     runtime.thresholdCheck = check;
     try {
       await check;
@@ -2544,7 +2576,7 @@ export class PiBackendAdapter implements
     await this.#compactAtConfiguredThreshold(runtime, context);
   }
 
-  async #compactAtConfiguredThresholdExclusive(runtime: PiRuntime, context: AdapterContext): Promise<void> {
+  async #compactAtConfiguredThresholdExclusive(runtime: PiRuntime, context: AdapterContext, afterTurn: boolean): Promise<void> {
 
     // get_session_stats is the only stock Pi RPC projection that combines the
     // current branch usage with the current model's context window. Comparing
@@ -2569,7 +2601,7 @@ export class PiBackendAdapter implements
     const crossesThreshold = () => runtime.autoCompaction && contextTokens / contextWindow >= runtime.autoCompactionThresholdPercent / 100;
     if (!crossesThreshold()) return;
 
-    const operation: NonNullable<PiRuntime["thresholdCompaction"]> = { id: randomUUID(), context };
+    const operation: NonNullable<PiRuntime["thresholdCompaction"]> = { id: randomUUID(), context, afterTurn };
     let started = false;
     try {
       const response = await this.#runExclusiveSessionMutation(
@@ -2587,15 +2619,21 @@ export class PiBackendAdapter implements
             willRetry: false
           }, piMetadata("adapter_threshold_compaction_start"));
           started = true;
-          return runtime.transport.request(
-            { type: "compact", customInstructions: undefined },
-            {
-              signal: context.signal,
-              stateMayHaveChanged: true,
-              timeoutMs: runtimeRpcTimeout(runtime, PI_LONG_RUNNING_RPC_TIMEOUT_MS),
-              refreshTimeoutOnEvent: isPiRpcProgressEvent
-            }
-          );
+          operation.nativeState = "starting";
+          try {
+            return await runtime.transport.request(
+              { type: "compact", customInstructions: undefined },
+              {
+                signal: context.signal,
+                stateMayHaveChanged: true,
+                timeoutMs: runtimeRpcTimeout(runtime, PI_LONG_RUNNING_RPC_TIMEOUT_MS),
+                refreshTimeoutOnEvent: isPiRpcProgressEvent
+              }
+            );
+          } finally {
+            if (operation.nativeState !== "aborted") operation.nativeState = "finished";
+            await operation.stop?.catch(() => undefined);
+          }
         }
       );
       if (response === undefined) return;
@@ -2619,6 +2657,18 @@ export class PiBackendAdapter implements
       }, piMetadata("adapter_threshold_compaction_end"));
     } catch (error) {
       if (!started) throw error;
+      if (operation.nativeState === "aborted" && afterTurn) {
+        await context.emit({
+          type: "compaction",
+          reason: "threshold",
+          compactionId: operation.id,
+          state: "aborted",
+          automatic: true,
+          willRetry: false,
+          tokensBefore: contextTokens
+        }, piMetadata("adapter_threshold_compaction_aborted"));
+        return;
+      }
       if (isPiCompactionNoopRejection(error)) {
         await context.emit({
           type: "compaction",
@@ -5759,8 +5809,13 @@ export class PiBackendAdapter implements
         && rawEvent.reason === "manual"
       ) {
         // The Adapter publishes this operation with the truthful `threshold`
-        // reason. Suppress the stock manual wrapper events emitted by the only
-        // available RPC command so the timeline has one lifecycle, not two.
+        // reason and keeps the wrapper's start/terminal receipt private.
+        if (event.type === "compaction_start" && thresholdCompaction.nativeState === "starting") {
+          thresholdCompaction.nativeState = "running";
+        } else if (event.type === "compaction_end" && thresholdCompaction.nativeState === "running") {
+          thresholdCompaction.nativeState = rawEvent.aborted === true && rawEvent.result === undefined
+            && rawEvent.willRetry === false ? "aborted" : "finished";
+        }
         return;
       }
       const lifecycle = runtime.lifecycle;
@@ -5929,7 +5984,7 @@ export class PiBackendAdapter implements
               // Complete relative-threshold compaction before publishing the
               // turn's terminal `done`; this keeps SessionHost's durable queue
               // fence closed for the whole automatic compaction lifecycle.
-              await this.#compactAtConfiguredThreshold(runtime, eventContext);
+              await this.#compactAtConfiguredThreshold(runtime, eventContext, true);
             }
             runtime.translator.setContext(eventContext);
             await runtime.translator.translate(
