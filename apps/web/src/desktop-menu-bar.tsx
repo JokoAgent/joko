@@ -84,6 +84,13 @@ function quotaWindow(window: ProviderAccountUsageWindowView | undefined, kind: "
     usedPercent: Math.max(0, Math.min(100, window.usedPercent)), resetsAtMs: window.resetAt ?? null,
     windowMinutes: positive(window.windowMinutes) }] : [];
 }
+function codexMenuBarBucket(buckets: NonNullable<NonNullable<ProviderRuntimeView["accountUsage"]>["buckets"]>, now: number) {
+  const active = buckets.filter(bucket => {
+    const windows = [bucket.primaryWindow, bucket.secondaryWindow].filter(window => window !== undefined);
+    return !windows.length || !windows.every(window => window.resetAt !== undefined && window.resetAt > 0 && window.resetAt + 86_400_000 < now);
+  });
+  return active.find(bucket => bucket.id === "codex") ?? active.find(bucket => bucket.id === "__default__");
+}
 const amount = (summary: UsageHistorySummaryView, currency: string): number => summary.currencyTotals
   .filter(total => total.currencyCode === currency).reduce((sum, total) => sum + positive(total.usage.costMicros) / 1_000_000, 0);
 
@@ -147,13 +154,21 @@ export async function projectDesktopMenuBar(input: { readonly sources: readonly 
     providerRoutes = new Map<string, DesktopMenuBarProviderRoute>(), detailActions = new Map<string, { id: string; name: string }>();
   for (const source of displayed) {
     const reading = input.readings.get(desktopMenuBarSourceKey(source))?.value;
+    const codexRoutes = new Set(source.snapshot.models.filter(model => model.source?.kind === "local" && model.source.nativeAdapterKind === "codex")
+      .map(model => JSON.stringify([model.backendId, model.providerId])));
     for (const provider of source.snapshot.providers.filter(provider => provider.routingEnabled !== false)) {
-      const usage = provider.accountUsage, buckets = usage?.buckets ?? [];
+      const usage = provider.accountUsage, reportedBuckets = usage?.buckets ?? [];
+      const codexSubscription = provider.kind === "subscription" && codexRoutes.has(JSON.stringify([provider.backendId, provider.id]));
+      const genericBucket = codexSubscription ? codexMenuBarBucket(reportedBuckets, input.now) : undefined;
+      const buckets = codexSubscription ? [] : reportedBuckets;
       const model = source.epoch === undefined && source.connectionGeneration !== undefined ? newSessionProviderModel(source.snapshot, provider.backendId, provider.id) : undefined;
       // Layout source IDs survive reconnects; native action IDs retain the exact live authority.
       const actionId = model ? await opaque("provider-action", [desktopMenuBarSourceKey(source), provider.backendId, provider.id, model.modelId]) : undefined;
       if (actionId && model) providerRoutes.set(actionId, { source, backendId: provider.backendId, providerId: provider.id, modelId: model.modelId });
-      const rows = buckets.length > 0 ? buckets.map(bucket => ({ ...bucket, observedAt: usage?.observedAt })) : [usage];
+      const rows = codexSubscription && reportedBuckets.length > 0
+        // The top-level windows can mirror a model-specific bucket. Retain only account metadata here.
+        ? [{ ...genericBucket, planType: genericBucket?.planType ?? usage?.planType, observedAt: usage?.observedAt }]
+        : buckets.length > 0 ? buckets.map(bucket => ({ ...bucket, observedAt: usage?.observedAt })) : [usage];
       for (let index = 0; index < rows.length && sources.length < 500; index++) {
         const row = rows[index], id = await opaque("source", [...profileKey(source.profile), provider.backendId, provider.id,
           buckets[index]?.id ?? ""]);
@@ -166,7 +181,7 @@ export async function projectDesktopMenuBar(input: { readonly sources: readonly 
         }
         const windowKind = (window: ProviderAccountUsageWindowView | undefined): "session" | "week" => (window?.windowMinutes ?? 0) >= 1440 ? "week" : "session";
         const windows = [...quotaWindow(row.primaryWindow, windowKind(row.primaryWindow)), ...quotaWindow(row.secondaryWindow, "week"),
-          ...(buckets.length ? [] : usage?.modelWindows?.slice(0, 80).flatMap(window => quotaWindow(window.window, "scoped", window.displayName)) ?? [])];
+          ...(codexSubscription || buckets.length ? [] : usage?.modelWindows?.slice(0, 80).flatMap(window => quotaWindow(window.window, "scoped", window.displayName)) ?? [])];
         const accountCredits = row.credits ?? usage?.credits;
         const balance = accountCredits?.balance;
         const credits = accountCredits?.unlimited === true ? null : accountCredits?.hasCredits === false ? 0

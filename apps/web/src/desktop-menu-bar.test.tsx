@@ -174,6 +174,47 @@ it("retires expired local and selected-node quota windows in the native menu bar
   expect(recovered.statusTextByMode.lowest).toBe("98%");
 });
 
+it("uses the Codex account bucket for the native menu bar's remaining quota and new task action", async () => {
+  const initial = actionableSource();
+  const codex = { kind: "local", displayName: "Codex account", nodeId: "", nodeName: "", nativeAdapterKind: "codex",
+    groupMemberCount: 0, grouped: false } as const;
+  const regular = { ...initial.snapshot.models[0]!, source: codex };
+  const spark = { ...regular, modelId: "gpt-5.3-codex-spark", name: "Codex Spark" };
+  const base = { usedPercent: 100, windowMinutes: 10_080, resetAt: now + 60_000 };
+  const special = { id: "spark-limit", displayName: "GPT-5.3-Codex-Spark", secondaryWindow: { ...base, usedPercent: 10 } };
+  const generic = { id: "codex", secondaryWindow: base };
+  const legacy = { id: "__default__", secondaryWindow: { ...base, usedPercent: 50 } };
+  const project = async (buckets: NonNullable<NonNullable<ProviderRuntimeView["accountUsage"]>["buckets"]>, models = [regular, spark]) => {
+    const source = { ...initial, snapshot: { ...initial.snapshot, models, providers: [{ ...provider, accountUsage: { observedAt: now,
+      secondaryWindow: special.secondaryWindow, buckets } }] } };
+    return { source, ...await projectDesktopMenuBar({ sources: [source], readings: new Map(), settings: DEFAULT_MENUBAR_SETTINGS, locale: "en", now }) };
+  };
+  const both = await project([special, legacy, generic]);
+  expect(both.view.sources).toHaveLength(1);
+  expect(both.view.sources[0]).toMatchObject({ value: "0", emphasized: false });
+  expect(both.view.headlinePrimary).toBe("Everything is used up.");
+  const [actionId, route] = [...both.providerRoutes][0]!;
+  expect(both.view.details[both.view.sources[0]!.id]?.action).toEqual({ kind: "new-task", providerId: actionId });
+  expect(route.modelId).toBe(regular.modelId);
+  expect(desktopMenuBarProviderRouteCurrent(route, state([both.source]))).toBe(true);
+  const changed = { ...both.source, snapshot: { ...both.source.snapshot, models: [spark] } };
+  expect(desktopMenuBarProviderRouteCurrent(route, state([changed]))).toBe(false);
+  const signedOut = { ...both.source, snapshot: { ...both.source.snapshot, providers: [{ ...provider, authenticationState: "signedOut" as const }] } };
+  expect(desktopMenuBarProviderRouteCurrent(route, state([signedOut]))).toBe(false);
+
+  const onlyModel = await project([{ ...special, displayName: undefined }], [spark]);
+  expect(onlyModel.view.sources).toHaveLength(1);
+  expect(onlyModel.view.sources[0]).toMatchObject({ id: both.view.sources[0]!.id, value: null, emphasized: false });
+  expect(onlyModel.view.headlinePrimary).toBe("Quota not read yet.");
+  const fallback = await project([legacy]);
+  expect(fallback.view.sources[0]).toMatchObject({ id: both.view.sources[0]!.id, value: "50", emphasized: true });
+  const retired = await project([{ ...generic, secondaryWindow: { ...base, resetAt: now - 86_401_000 } }, legacy, special]);
+  expect(retired.view.sources[0]).toMatchObject({ value: "50", emphasized: true });
+  expect((await project([])).view.sources[0]).toMatchObject({ value: "90", emphasized: true });
+  const nonCodex = await project([generic, special], [{ ...regular, source: { ...codex, nativeAdapterKind: "pi" } }]);
+  expect(nonCodex.view.sources.map(row => row.value).sort()).toEqual(["0", "90"]);
+});
+
 it("offers the exact admitted local Provider model, keeps layout IDs stable and retires action IDs with their authority", async () => {
   const initial = actionableSource(), remote = actionableSource(true), local = { ...initial, snapshot: { ...initial.snapshot,
     providers: [{ ...provider, accountUsage: { ...provider.accountUsage!, resetCredits: { availableCount: 2, earliestExpiryAt: now + 86_400_000 } } }] } };
