@@ -14,6 +14,7 @@ import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, redactSecrets, type BlobRef, 
 import { operationBodyHash, type OperationalStore } from "@joko/store";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
 
+import { ComputerToolBridgeProvider } from "./computer-tool-bridge.js";
 import type { CredentialManager } from "./credential-manager.js";
 import { McpAudioArtifacts } from "./mcp-audio-artifacts.js";
 import {
@@ -1281,6 +1282,7 @@ export class McpRouter {
       if (bridgeProvider?.policySubject === "browser" && grant.productScope === undefined) {
         throw new Error("Browser bridge grant is missing its product scope.");
       }
+      const computerResult = bridgeProvider instanceof ComputerToolBridgeProvider && input.toolName === "call_tool";
       const requestBodyHash = operationBodyHash({
         arguments: input.arguments ?? {},
         generation: input.generation,
@@ -1499,7 +1501,7 @@ export class McpRouter {
           });
         }
       }
-      const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts, completeOutputOwner);
+      const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts, completeOutputOwner, computerResult);
       adoptDispatchedImages?.();
       return modelTask ? { ...projected, details: { ...projected.details, mcpTask: modelTask } } : projected;
     } catch (error) {
@@ -2435,8 +2437,8 @@ export class McpRouter {
     return operation;
   }
 
-  #normalizeResult(result: McpCallResult, label: string): NormalizedMcpResult {
-    const normalized = normalizeMcpResult(result, (value) => this.#redactText(value), label);
+  #normalizeResult(result: McpCallResult, label: string, computerResult = false): NormalizedMcpResult {
+    const normalized = normalizeMcpResult(result, (value) => this.#redactText(value), label, computerResult);
     if (normalized.bytes.byteLength > this.#resultCapacityBytes) {
       throw new McpResultResourceExhaustedError();
     }
@@ -2447,11 +2449,12 @@ export class McpRouter {
     result: McpCallResult,
     serverId: string,
     toolName: string,
-    hostImages: readonly BridgeToolImageOutput[] = [],
-    hostArtifacts: readonly BridgeToolArtifactOutput[] = [],
-    completeOutputOwner?: McpCompleteOutputOwner
+    hostImages: readonly BridgeToolImageOutput[],
+    hostArtifacts: readonly BridgeToolArtifactOutput[],
+    completeOutputOwner: McpCompleteOutputOwner | undefined,
+    computerResult = false
   ): Promise<McpBridgeCallResult> {
-    const normalized = this.#normalizeResult(result, "MCP bridge result");
+    const normalized = this.#normalizeResult(result, "MCP bridge result", computerResult);
     const hostDetails = {
       format: 1,
       truncated: false,
@@ -2582,7 +2585,7 @@ export class McpRouter {
         content: result.content,
         ...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
         isError: result.isError
-      }, "Bridge Tool result").value,
+      }, "Bridge Tool result", provider instanceof ComputerToolBridgeProvider && toolName === "call_tool").value,
       hostImages,
       hostArtifacts
     };
@@ -3330,7 +3333,8 @@ class McpInvalidResultError extends Error {
 function normalizeMcpResult(
   value: unknown,
   redact: (value: string) => string,
-  label: string
+  label: string,
+  computerResult: boolean
 ): NormalizedMcpResult {
   let rawJson: string | undefined;
   try {
@@ -3339,7 +3343,8 @@ function normalizeMcpResult(
     throw new McpInvalidResultError(`${label} is not JSON serializable.`, { cause: error });
   }
   if (rawJson === undefined) throw new McpInvalidResultError(`${label} is not JSON serializable.`);
-  const parsed = redactJsonValue(JSON.parse(rawJson) as unknown, redact);
+  const raw = JSON.parse(rawJson) as unknown;
+  const parsed = redactJsonValue(raw, redact);
   if (!isPlainObject(parsed) || !Array.isArray(parsed["content"]) || typeof parsed["isError"] !== "boolean") {
     throw new McpInvalidResultError(`${label} has an invalid envelope.`);
   }
@@ -3347,8 +3352,14 @@ function normalizeMcpResult(
   if (structuredContent !== undefined && !isPlainObject(structuredContent)) {
     throw new McpInvalidResultError(`${label} structured content must be a JSON object.`);
   }
+  const rawContent = computerResult && isPlainObject(raw) && Array.isArray(raw["content"]) ? raw["content"] : undefined;
   const result: McpCallResult = {
-    content: parsed["content"],
+    content: rawContent === undefined ? parsed["content"] : parsed["content"].map((part, index) => {
+      const original: unknown = rawContent[index];
+      return isPlainObject(part) && part["type"] === "text" && typeof part["text"] === "string"
+        && isPlainObject(original) && typeof original["text"] === "string"
+        ? { ...part, text: restoreComputerObservationAliases(original["text"], part["text"], redact) } : part;
+    }),
     ...(structuredContent === undefined ? {} : { structuredContent }),
     isError: parsed["isError"]
   };
@@ -3369,6 +3380,33 @@ function redactJsonValue(value: unknown, redact: (value: string) => string): unk
     redacted[key] = redactJsonValue(item, redact);
   }
   return redacted;
+}
+
+function restoreComputerObservationAliases(original: string, redacted: string, redact: (value: string) => string): string {
+  // These aliases identify elements in the exact local snapshot. The driver token
+  // stays in the provider, and the generic secret redactor still covers every other field.
+  const read = (text: string) => {
+    let result: unknown;
+    try { result = JSON.parse(text); } catch { return undefined; }
+    if (!isPlainObject(result) || result["ok"] !== true) return undefined;
+    const observation = result["tool"] === "get_window_state" ? result : result["observation"];
+    if (!isPlainObject(observation) || observation["ok"] !== true || !isPlainObject(observation["data"])) return undefined;
+    const id = observation["snapshot_id"], elements = observation["data"]["elements"];
+    return typeof id === "string" && Array.isArray(elements) ? { result, id, elements: elements as unknown[] } : undefined;
+  };
+  const before = read(original), after = read(redacted);
+  if (!before || !after || before.id !== after.id || !/^ws-[a-z0-9]+-[a-z0-9_-]{1,20}$/u.test(before.id)) return redacted;
+  let restored = false;
+  for (const [index, element] of before.elements.entries()) {
+    const alias = isPlainObject(element) ? element["element_token"] : undefined;
+    const safe: unknown = after.elements[index];
+    if (typeof alias === "string" && alias.startsWith(`${before.id}:`) && /^\d{1,4}$/u.test(alias.slice(before.id.length + 1))
+      && redact(alias) === alias && isPlainObject(safe) && safe["element_token"] === "[REDACTED]") {
+      after.elements[index] = { ...safe, element_token: alias };
+      restored = true;
+    }
+  }
+  return restored ? JSON.stringify(after.result) : redacted;
 }
 
 function bridgeResultPreview(
