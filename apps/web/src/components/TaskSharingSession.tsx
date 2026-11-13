@@ -30,12 +30,11 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
   const [error, setError] = useState<string>();
   const [retry, setRetry] = useState(0), [leave, setLeave] = useState(false), [leaveOperation, setLeaveOperation] = useState<string>();
   const [history, setHistory] = useState<readonly TimelineItemView[]>([]);
-  const [before, setBefore] = useState<TimelineHistoryCursorView>();
+  const [hasEarlier, setHasEarlier] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const gatewayRef = useRef<OrchestratorGateway | undefined>(undefined);
   const owned = useRef<{ readonly abort: AbortController; readonly sourceKey: string; readonly local: LocalState; readonly leaveOwner: string } | undefined>(undefined);
-  const historyFlight = useRef(false);
-  const snapshotRef = useRef<AppSnapshot | undefined>(undefined);
+  const loadEarlierRef = useRef<(() => Promise<void>) | undefined>(undefined);
   const returning = useRef<{ readonly profileId: string; readonly joinId: string } | undefined>(undefined);
   const api = home.taskSharing, profile = home.state.activeProfile;
   const connectionKey = JSON.stringify([profile?.id, profile?.serverId, profile?.origin, home.state.connectionGeneration, home.state.connectionState]);
@@ -62,7 +61,7 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
         && state.route.kind === "sharedTask" && state.route.joinId === joinId && state.route.profileId === profileId;
     };
     if (!visible || !api || !profile || profile.id !== profileId || home.state.connectionState !== "connected") return;
-    setError(undefined); setView(undefined); setHistory([]); setBefore(undefined); setLoadingHistory(false); setLeaveOperation(undefined);
+    setError(undefined); setView(undefined); setHistory([]); setHasEarlier(false); setLoadingHistory(false); setLeaveOperation(undefined);
     let gateway: OrchestratorGateway | undefined;
     let facade: TaskSharingController | undefined;
     // Retiring the connection must not erase state still read by the outgoing React tree.
@@ -92,29 +91,67 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
       if (!currentHome()) return;
       setLeaveOperation(actions[0]?.operationId);
       owned.current = { abort, sourceKey: key, local, leaveOwner };
+      let before: TimelineHistoryCursorView | undefined;
+      let historyFlight: symbol | undefined;
+      let needsFirstPage = true;
+      let needsHistorySnapshot = true;
+      const loadHistoryPage = async (cursor?: TimelineHistoryCursorView): Promise<void> => {
+        if (!currentHome() || !ready || needsHistorySnapshot || !gateway || historyFlight !== undefined) return;
+        const flight = Symbol();
+        historyFlight = flight;
+        setLoadingHistory(true);
+        try {
+          const page = await gateway.loadSessionTimelinePage(source.sessionId, cursor);
+          if (!currentHome() || historyFlight !== flight) return;
+          before = page.nextBeforeCursor;
+          setHistory(previous => cursor === undefined ? page.items : [...new Map([...page.items, ...previous].map(item => [item.id, item])).values()]);
+          setHasEarlier(before !== undefined);
+        } catch (cause) {
+          if (!currentHome() || historyFlight !== flight) return;
+          if (cursor === undefined) fail(cause);
+          else setError(cause instanceof Error ? cause.message : t("taskSharing.unavailable"));
+        } finally {
+          if (currentHome() && historyFlight === flight) {
+            historyFlight = undefined;
+            setLoadingHistory(false);
+          }
+        }
+      };
+      const publishView = (): void => {
+        if (!ready || !facade || !ownedSnapshot) return;
+        setView({ snapshot: ownedSnapshot, source, controller: facade });
+        if (needsFirstPage && !needsHistorySnapshot) {
+          needsFirstPage = false;
+          void loadHistoryPage();
+        }
+      };
+      loadEarlierRef.current = async () => { if (before !== undefined) await loadHistoryPage(before); };
       gateway = createTaskSharingGateway(profile, {
-        onSnapshot(snapshot) {
+        onSnapshot(snapshot, authoritative) {
           if (!currentHome() || owned.current?.sourceKey !== key) return;
           const projected = { ...snapshot, backends: snapshot.backends.map(guestBackend) };
-          const previous = snapshotRef.current;
+          const previous = ownedSnapshot;
           if (previous && (previous.generation !== projected.generation
             || previous.sessions[0]?.generation !== projected.sessions[0]?.generation
             || previous.timelineHistoryRevisionBySession.get(source.sessionId) !== projected.timelineHistoryRevisionBySession.get(source.sessionId))) {
-            setHistory([]); setBefore(undefined);
+            before = undefined;
+            historyFlight = undefined;
+            needsFirstPage = needsHistorySnapshot = true;
+            setHistory([]); setHasEarlier(false); setLoadingHistory(false);
           }
-          snapshotRef.current = projected;
+          if (authoritative) needsHistorySnapshot = false;
           ownedSnapshot = projected;
           ownedAccess = { role: "guest", memberId: source.memberId, editableQueueItemIds: new Set(projected.queue.filter(item => {
             const author = item.sharedTaskAuthor;
             return author?.shareId === source.shareId && author.shareGeneration === source.generation
               && author.memberId === source.memberId && author.memberGeneration === source.memberGeneration;
           }).map(item => item.id)) };
-          if (facade && ready) setView({ snapshot: projected, source, controller: facade });
+          publishView();
         },
         onState(state) {
           if (!currentHome()) return;
           ready = state === "connected";
-          if (ready && facade && snapshotRef.current) setView({ snapshot: snapshotRef.current, source, controller: facade });
+          publishView();
         },
         onError: fail,
         onAuthenticationInvalidated: async () => { if (currentHome()) { setView(undefined); back(); } }
@@ -127,33 +164,11 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
         snapshot: () => ownedSnapshot!, access: () => ownedAccess, current: currentHome, local });
       gatewayRef.current = gateway;
       await gateway.connect();
-      if (!currentHome()) return;
-      const initial = snapshotRef.current;
-      const page = await gateway.loadSessionTimelinePage(source.sessionId);
-      if (!currentHome() || snapshotRef.current?.generation !== initial?.generation
-        || snapshotRef.current?.sessions[0]?.generation !== initial?.sessions[0]?.generation
-        || snapshotRef.current?.timelineHistoryRevisionBySession.get(source.sessionId) !== initial?.timelineHistoryRevisionBySession.get(source.sessionId)) return;
-      setHistory(page.items); setBefore(page.nextBeforeCursor);
     })().catch(fail);
     return () => { facade?.retireTaskSharingInput(); abort.abort(); gateway?.disconnect(); if (gatewayRef.current === gateway) gatewayRef.current = undefined;
-      if (owned.current?.abort === abort) owned.current = undefined; snapshotRef.current = undefined; historyFlight.current = false; };
+      if (owned.current?.abort === abort) { owned.current = undefined; loadEarlierRef.current = undefined; } };
   }, [api, connectionKey, joinId, profileId, retry, visible, back, t]);
 
-  const loadEarlier = async (): Promise<void> => {
-    const context = owned.current, gateway = gatewayRef.current, source = view?.source;
-    if (!context || !gateway || !source || !before || historyFlight.current) return;
-    historyFlight.current = true; setLoadingHistory(true);
-    const generation = view.snapshot.generation, runtimeGeneration = view.snapshot.sessions[0]?.generation;
-    const revision = view.snapshot.timelineHistoryRevisionBySession.get(source.sessionId);
-    try {
-      const page = await gateway.loadSessionTimelinePage(source.sessionId, before);
-      if (context.abort.signal.aborted || owned.current !== context || snapshotRef.current?.generation !== generation
-        || snapshotRef.current.sessions[0]?.generation !== runtimeGeneration
-        || snapshotRef.current.timelineHistoryRevisionBySession.get(source.sessionId) !== revision) return;
-      setHistory(previous => [...new Map([...page.items, ...previous].map(item => [item.id, item])).values()]); setBefore(page.nextBeforeCursor);
-    } catch (cause) { if (!context.abort.signal.aborted) setError(cause instanceof Error ? cause.message : t("taskSharing.unavailable")); }
-    finally { if (owned.current === context) { historyFlight.current = false; setLoadingHistory(false); } }
-  };
   const session = view?.snapshot.sessions.find(item => item.id === view.source.sessionId);
   const attemptLeave = (): void => { if (!api || !view) return;
     runAction("leave-shared-task", async () => {
@@ -199,7 +214,8 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
       : <>{gatewayRef.current && <TaskSharingRuntimeControls gateway={gatewayRef.current} session={session} t={t} />}<TaskSharingTaskTools controller={view.controller} sessionId={session.id} t={t} runAction={runAction} /><SessionPane controller={view.controller} session={session} target={view.snapshot.targets.find(item => item.id === session.targetId)}
         backend={view.snapshot.backends.find(item => item.id === session.backendId)} models={view.snapshot.models}
         timeline={[...new Map([...history, ...(view.snapshot.timelineBySession.get(session.id) ?? [])].map(item => [item.id, item])).values()].sort((a, b) => Number(a.sequence - b.sequence))}
-        timelineHasEarlier={before !== undefined} timelineHistoryLoading={loadingHistory} timelineHistoryError={error} onLoadEarlierTimeline={loadEarlier}
+        timelineHasEarlier={hasEarlier} timelineHistoryLoading={loadingHistory} timelineHistoryError={error}
+        onLoadEarlierTimeline={async () => { await loadEarlierRef.current?.(); }}
         extensionWidgets={[]} extensionStatuses={[]} queue={view.snapshot.queue.filter(item => item.sessionId === session.id)} queueControl={view.snapshot.queueControls.find(item => item.sessionId === session.id)}
         extraDirectories={[]} resources={[]} commandRefreshSignal={[]} interaction={view.snapshot.interactions.find(item => item.sessionId === session.id)} remainingInteractions={view.snapshot.interactions.filter(item => item.sessionId === session.id).length}
         navigationOpen={false} inspectorOpen={false} inspectorAvailable={false} t={t} runAction={runAction} onOpenNavigation={onOpenNavigation}
