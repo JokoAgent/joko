@@ -700,7 +700,8 @@ export class SnapshotProjector {
     const mappedSchedules = input.schedules.map((schedule) => toProtoSchedule(
       schedule,
       this.store.listScheduleRuns(schedule.id, 100),
-      runById
+      runById,
+      this.store.countUnreadScheduleRuns(schedule.id)
     ));
     const mappedInteractions = input.interactions.map((interaction) => {
       // A host permission request remains actionable for a hidden task without

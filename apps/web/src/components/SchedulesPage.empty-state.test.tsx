@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type ScheduleView } from "../model.js";
+import { emptySnapshot, type ScheduleView, type SessionView, type TimelineHistoryCursorView } from "../model.js";
 import { stageUsageLimitScheduleIntent } from "../usage-limit-recovery.js";
 import { SchedulesPage } from "./SchedulesPage.js";
 import type { Translator } from "./types.js";
@@ -59,8 +59,50 @@ describe("SchedulesPage empty states", () => {
   });
 });
 
-async function renderSchedules(schedules: readonly ScheduleView[]): Promise<HTMLDivElement> {
-  const snapshot = { ...emptySnapshot(), revision: 1n, schedules };
+describe("SchedulesPage unread history", () => {
+  it("acknowledges scheduled task attention using its current receipt before marking history read", async () => {
+    const subjectCursor = { sequence: 10n, generation: 1n, opaqueToken: "subject" };
+    const errorCursor = { ...subjectCursor, sequence: 13n, opaqueToken: "error-acknowledgement" };
+    const completionSubject = { ...subjectCursor, sequence: 14n, opaqueToken: "completion-subject" };
+    const completionCursor = { ...subjectCursor, sequence: 17n, opaqueToken: "completion-acknowledgement" };
+    const schedule = { ...pausedSchedule(), unreadRunCount: 2 };
+    const task: SessionView = {
+      id: "scheduled-error", backendId: schedule.backendId, targetId: schedule.targetId, name: "Failed scheduled task",
+      state: "idle", pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false,
+      updatedAt: 1, automationOrigin: { kind: "scheduler", scheduleId: schedule.id },
+      attention: { kind: "error", unread: true, subjectCursor, attentionCursor: errorCursor, readThroughCursor: subjectCursor, updatedAt: 1 }
+    };
+    const done: SessionView = { ...task, id: "scheduled-completion", name: "Completed scheduled task",
+      attention: { kind: "done", unread: true, subjectCursor: completionSubject, attentionCursor: completionCursor,
+        readThroughCursor: completionSubject, updatedAt: 1 } };
+    const acknowledgeSessionError = vi.fn(async (_id: string, cursor: TimelineHistoryCursorView) => {
+      if (cursor !== errorCursor) throw new Error("Stale error cursor");
+    });
+    const acknowledgeSessionAttention = vi.fn(async (_id: string, cursor: TimelineHistoryCursorView) => {
+      if (cursor !== completionCursor) throw new Error("Stale completion cursor");
+    });
+    const markAllScheduleRunsRead = vi.fn(async () => 2);
+    const refresh = vi.fn(async () => undefined);
+    const container = await renderSchedules([schedule], [task, done, { ...task, id: "ordinary-task", automationOrigin: undefined }], {
+      acknowledgeSessionError, acknowledgeSessionAttention, markAllScheduleRunsRead, refresh
+    });
+
+    await act(async () => { buttonsWithText(container, "scheduler.markAllRunsRead")[0]!.click(); });
+
+    expect(acknowledgeSessionError).toHaveBeenCalledExactlyOnceWith(task.id, errorCursor);
+    expect(acknowledgeSessionAttention).toHaveBeenCalledExactlyOnceWith(done.id, completionCursor);
+    expect(markAllScheduleRunsRead).toHaveBeenCalledOnce();
+    expect(acknowledgeSessionError).toHaveBeenCalledBefore(markAllScheduleRunsRead);
+    expect(acknowledgeSessionAttention).toHaveBeenCalledBefore(markAllScheduleRunsRead);
+    expect(refresh).toHaveBeenCalledOnce();
+    expect(container.querySelector(".schedule-project-notice")?.textContent).toBe("scheduler.markedRunsRead");
+  });
+});
+
+async function renderSchedules(schedules: readonly ScheduleView[], sessions: readonly SessionView[] = [],
+  historyActions?: Pick<AppController, "acknowledgeSessionError" | "acknowledgeSessionAttention" | "markAllScheduleRunsRead" | "refresh">
+): Promise<HTMLDivElement> {
+  const snapshot = { ...emptySnapshot(), revision: 1n, schedules, sessions };
   const controller = {
     state: {
       snapshot,
@@ -69,7 +111,8 @@ async function renderSchedules(schedules: readonly ScheduleView[]): Promise<HTML
     },
     navigate: vi.fn(),
     getSchedulerRuntime: vi.fn(() => new Promise<never>(() => undefined)),
-    refreshProviderModels: vi.fn(async () => undefined)
+    refreshProviderModels: vi.fn(async () => undefined),
+    ...historyActions
   } as unknown as AppController;
   const container = document.createElement("div");
   document.body.append(container);
@@ -78,7 +121,7 @@ async function renderSchedules(schedules: readonly ScheduleView[]): Promise<HTML
   await act(async () => root.render(<SchedulesPage
     controller={controller}
     schedules={schedules}
-    sessions={[]}
+    sessions={sessions}
     targets={[]}
     models={[]}
     backends={[]}

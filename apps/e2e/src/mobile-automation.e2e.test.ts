@@ -8,6 +8,7 @@ import {
   DeleteScheduleMutationSchema,
   EntityRefSchema,
   EntityKind,
+  MarkAllScheduleRunsReadMutationSchema,
   OperationMutationSchema,
   OperationPreconditionSchema,
   OperationState,
@@ -173,6 +174,45 @@ describe("Mobile Automation product chain", () => {
     );
     expect(reread.state).toBe(ScheduleState.DISABLED);
     expect(reread.version?.revision?.value).toBeGreaterThan(current.version!.revision!.value);
+  });
+
+  it("reports unread history beyond the bounded owner snapshot and acknowledges it without deleting history", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const mobile = await fixture.pair("mobile Automation history client");
+    const scheduleId = scheduleIdFrom(await submit(mobile.clients.operation, mobile.connectionId, createManualScheduleMutation({
+      backendId: fixture.adapter().id,
+      targetId: fixture.targetId(),
+      sessionId: "",
+      sessionMode: ScheduleSessionMode.PERSISTENT,
+      text: "Read automation history"
+    })));
+    const store = fixture.application.store;
+    const firstFiredAt = Date.now() - 102_000;
+    for (let index = 0; index <= 100; index += 1) {
+      const firedAt = firstFiredAt + index * 1_000;
+      const occurrence = store.recordScheduleOccurrence({
+        scheduleId, runId: `history-${index}`, status: "success", firedAt, finishedAt: firedAt + 500
+      });
+      if (index > 0) store.markScheduleRunRead(scheduleId, occurrence.id);
+    }
+    const readOwnerSchedule = async () => required((await mobile.clients.event.getSnapshot({
+      scope: { kind: { case: "owner", value: {} } }
+    })).snapshot?.schedules.find((schedule) => schedule.scheduleId === scheduleId), "Owner Schedule");
+
+    const owner = await readOwnerSchedule();
+    expect(owner.recentRuns).toHaveLength(100);
+    expect(owner.recentRuns.every((run) => run.readAt !== undefined)).toBe(true);
+    expect(owner.recentRuns.some((run) => run.runId === "history-0")).toBe(false);
+    expect(owner.unreadRunCount).toBe(1);
+    expect((await mobile.clients.scheduler.getSchedule({ scheduleId })).schedule?.unreadRunCount).toBe(1);
+
+    const receipt = await submit(mobile.clients.operation, mobile.connectionId, create(OperationMutationSchema, {
+      payload: { case: "markAllScheduleRunsRead", value: create(MarkAllScheduleRunsReadMutationSchema) }
+    }));
+    expect(receipt.state).toBe(OperationState.SUCCEEDED);
+    expect((await readOwnerSchedule()).unreadRunCount).toBe(0);
+    expect(store.countScheduleRuns(scheduleId)).toBe(101);
+    expect(store.findScheduleRunByRunId("history-0")?.readAt).toBeDefined();
   });
 
   it("persists mobile authoring, project ownership actions and typed deletion outcomes end to end", async () => {
