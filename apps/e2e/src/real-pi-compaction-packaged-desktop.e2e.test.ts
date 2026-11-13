@@ -8,9 +8,11 @@ import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "
 import { create, fromBinary } from "@bufbuild/protobuf";
 import {
   CompactionState,
+  GetSnapshotRequestSchema,
   GetSessionStatisticsRequestSchema,
   ListRuntimeCommandsRequestSchema,
   ListSessionResourcesRequestSchema,
+  ListSessionTimelineRequestSchema,
   MessageRole,
   OperationState,
   RunState,
@@ -752,7 +754,12 @@ describe("packaged Desktop Pi compaction", () => {
     const readSessionId = new Map<string, (body: Uint8Array) => string>([
       ["GetSessionStatistics", body => fromBinary(GetSessionStatisticsRequestSchema, body).sessionId],
       ["ListRuntimeCommands", body => fromBinary(ListRuntimeCommandsRequestSchema, body).sessionId],
-      ["ListSessionResources", body => fromBinary(ListSessionResourcesRequestSchema, body).sessionId]
+      ["ListSessionResources", body => fromBinary(ListSessionResourcesRequestSchema, body).sessionId],
+      ["ListSessionTimeline", body => fromBinary(ListSessionTimelineRequestSchema, body).sessionId],
+      ["GetSnapshot", body => {
+        const scope = fromBinary(GetSnapshotRequestSchema, body).scope?.kind;
+        return scope?.case === "session" ? scope.value.sessionId : "";
+      }]
     ]);
     const sessionReadReceipts = new Map<Request, { method: string; startedAt: number; status?: number; finishedAt?: number; failed?: string }>();
     const observeRead = (request: Request): void => {
@@ -760,7 +767,8 @@ describe("packaged Desktop Pi compaction", () => {
       const url = new URL(request.url());
       const method = url.pathname.split("/").at(-1) ?? "";
       const read = readSessionId.get(method);
-      if (url.origin !== resumedOrigin || url.pathname !== `/joko.v1.SessionService/${method}` || read === undefined) return;
+      const service = method === "GetSnapshot" ? "EventService" : "SessionService";
+      if (url.origin !== resumedOrigin || url.pathname !== `/joko.v1.${service}/${method}` || read === undefined) return;
       const body = request.postDataBuffer();
       if (body === null) return;
       try {
@@ -867,9 +875,35 @@ describe("packaged Desktop Pi compaction", () => {
     expect(resumedRequest).toContain(resumedDraft);
     expect(resumedRequest).toContain(REAL_PI_RESPONSE_TEXT);
     const resumedCompletion = await waitForManagedPiCompletion(resumedClients, sessionId, resumedDraft, REAL_PI_RESPONSE_TEXT);
-    await resumedPage.locator(`[data-timeline-session-id='${sessionId}'] [data-selection-quote-source-event-id='${resumedCompletion.eventId}'] .message-assistant__body`)
-      .getByText(REAL_PI_RESPONSE_TEXT, { exact: true })
-      .waitFor({ state: "visible", timeout: 30_000 });
+    const resumedTimeline = resumedPage.locator(`[data-timeline-session-id='${sessionId}']`);
+    try {
+      await resumedTimeline.locator(`[data-selection-quote-source-event-id='${resumedCompletion.eventId}'] .message-assistant__body`)
+        .getByText(REAL_PI_RESPONSE_TEXT, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    } catch (cause) {
+      const [rows, current] = await Promise.all([
+        resumedTimeline.locator(".message-assistant").evaluateAll((elements, expected) => elements.slice(-12).map(element => {
+          const body = element.querySelector(".message-assistant__body");
+          const bounds = element.getBoundingClientRect();
+          return { eventId: element.getAttribute("data-selection-quote-source-event-id"), messageId: element.getAttribute("data-message-client-id"),
+            expectedText: body?.textContent?.trim() === expected, streaming: element.querySelector(".streaming-cursor") !== null,
+            visible: !element.closest("[inert]") && getComputedStyle(element).visibility === "visible" && bounds.width > 0 && bounds.height > 0 };
+        }), REAL_PI_RESPONSE_TEXT).catch(() => []),
+        resumedClients.event.getSnapshot({ scope: sessionScope }, { timeoutMs: 2_000 }).catch(() => undefined)
+      ]);
+      const timeline = current?.snapshot?.timeline ?? [];
+      const session = current?.snapshot?.sessions.find(row => row.sessionId === sessionId);
+      console.error("Managed packaged Pi: completed response missing from the reopened task view.", JSON.stringify({
+        completion: { eventId: resumedCompletion.eventId, messageId: resumedCompletion.messageId, runId: resumedCompletion.runId,
+          generation: resumedCompletion.generation, sequence: resumedCompletion.sequence },
+        projection: { rows, visibleGeneration: await uiGeneration().catch(() => undefined),
+          currentGeneration: session?.nativeBinding?.runtimeGeneration.toString(),
+          snapshotHasCompletion: timeline.some(event => event.eventId === resumedCompletion.eventId),
+          snapshotTail: timeline.slice(-8).map(event => ({ type: event.payload?.kind.case, eventId: event.eventId,
+            generation: event.identity?.generation.toString(), sequence: event.cursor?.sequence.toString() })) },
+        sessionReads: [...sessionReadReceipts.values()]
+      }));
+      throw cause;
+    }
 
     const previousCompactions = new Set((await resumedClients.operation.listOperations({ sessionId }))
       .operations.map(operation => operation.operationId));
@@ -1159,7 +1193,8 @@ async function waitForManagedPiCompletion(clients: E2eClients, sessionId: string
     return history.events.flatMap(event => {
       const payload = event.payload?.kind;
       return event.identity?.runId === runId && payload?.case === "messageCompleted" && payload.value.role === MessageRole.ASSISTANT
-        ? [{ eventId: event.eventId, entryId: payload.value.nativeIdentity?.entryId,
+        ? [{ eventId: event.eventId, entryId: payload.value.nativeIdentity?.entryId, messageId: payload.value.messageId, runId,
+          generation: event.identity?.generation.toString(), sequence: event.cursor?.sequence.toString(),
           text: payload.value.blocks.flatMap(block => block.content.case === "text" ? [block.content.value] : []).join("") }] : [];
     });
   }, rows => rows.some(row => !!row.entryId), "native completion for the original managed Pi Run", 30_000);
