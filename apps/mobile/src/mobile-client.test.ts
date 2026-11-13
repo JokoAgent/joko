@@ -8781,7 +8781,11 @@ describe("native mobile connection and operation ownership", () => {
         } } }) }));
         await vi.advanceTimersByTimeAsync(0);
         await vi.advanceTimersByTimeAsync(180);
-      } else if (path === "poll") await vi.advanceTimersByTimeAsync(4_000);
+      } else if (path === "poll" || appended) {
+        // The polling read adopts the append in the existing connection epoch.
+        // An explicit refresh retires all of that epoch's in-flight reads.
+        await vi.advanceTimersByTimeAsync(4_000);
+      }
       else await app.refresh();
       expect(app.state.detail?.snapshotId).toBe(nextDetail.snapshotId);
       expect(hits()).toHaveLength(appended ? 1 : 0);
