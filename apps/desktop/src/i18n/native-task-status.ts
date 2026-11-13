@@ -29,7 +29,6 @@ export interface NativeStrings {
   readonly awaitingPlan: string;
   readonly inputHandoff: string;
   readonly taskCount: (count: number) => string;
-  readonly more: (count: number) => string;
 }
 
 export const EN_STRINGS: NativeStrings = Object.freeze({
@@ -62,8 +61,7 @@ export const EN_STRINGS: NativeStrings = Object.freeze({
   awaitingQuestion: "Awaiting your reply",
   awaitingPlan: "Awaiting plan review",
   inputHandoff: "Private input needed",
-  taskCount: (count: number) => `${count} ${count === 1 ? "task" : "tasks"}`,
-  more: (count: number) => `${count} more`
+  taskCount: (count: number) => `${count} ${count === 1 ? "task" : "tasks"}`
 });
 
 export const ZH_STRINGS: NativeStrings = Object.freeze({
@@ -96,6 +94,5 @@ export const ZH_STRINGS: NativeStrings = Object.freeze({
   awaitingQuestion: "等待你的回复",
   awaitingPlan: "等待计划审核",
   inputHandoff: "需要你代为输入",
-  taskCount: (count: number) => `${count} 个任务`,
-  more: (count: number) => `还有 ${count} 个`
+  taskCount: (count: number) => `${count} 个任务`
 });

@@ -22,7 +22,7 @@ import {
 } from "./native-task-status-layout-settings.js";
 
 const ACTION_SCHEME = "joko-task-status:";
-const MAXIMUM_VISIBLE_TASK_ROWS = 5;
+const MAXIMUM_TASK_ROWS_FOR_WINDOW_HEIGHT = 5;
 const MINIMUM_TASK_STATUS_WIDTH = 280;
 const MAXIMUM_TASK_STATUS_WIDTH = 920;
 const TASK_STATUS_SCREEN_EDGE_GUTTER = 12;
@@ -68,7 +68,7 @@ export type NativeTaskStatusWindowRetirementReason =
 export interface NativeTaskStatusWindow {
   readonly isDestroyed: () => boolean;
   readonly setBounds: (bounds: NativeTaskStatusWindowBounds) => void;
-  readonly loadDocument: (dataUrl: string) => Promise<void>;
+  readonly loadDocument: (document: string) => Promise<void>;
   readonly showInactive: () => void;
   readonly destroy: (reason?: NativeTaskStatusWindowRetirementReason) => void;
   readonly onClosed: (listener: () => void) => void;
@@ -707,7 +707,6 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       const displaySurface = surfaceForDisplay(surface, manualExpandedDisplayId, display.id);
       if (displaySurface === undefined) continue;
       const document = renderNativeTaskStatusDocument(displaySurface, settings, snapshot.locale);
-      const dataUrl = `data:text/html;charset=utf-8,${encodeURIComponent(document)}`;
       const displayIndex = Math.max(0, allDisplays.findIndex((candidate) => candidate.id === display.id));
       const preference = resolveDesktopNativeTaskStatusLayoutPreference(
         layoutPreferences,
@@ -750,7 +749,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       entry.renderToken += 1;
       const renderToken = entry.renderToken;
       const target = entry;
-      void entry.window.loadDocument(dataUrl).then(() => {
+      void entry.window.loadDocument(document).then(() => {
         if (!disposed && hosted.get(display.id) === target && target.renderToken === renderToken &&
           !target.window.isDestroyed()) target.window.showInactive();
       }).catch((error: unknown) => {
@@ -902,12 +901,7 @@ export function renderNativeTaskStatusDocument(
 ): string {
   const strings = locale === "zh-CN" ? ZH_STRINGS : EN_STRINGS;
   const current = surface.current;
-  const rowCandidates = surface.policy === "manual"
-    ? surface.sessions
-    : surface.policy === "transient"
-      ? current === undefined ? [] : [current]
-      : current === undefined ? [] : [current];
-  const rows = rowCandidates.slice(0, MAXIMUM_VISIBLE_TASK_ROWS);
+  const rows = surface.policy === "manual" ? surface.sessions : current === undefined ? [] : [current];
   const multipleCompletions = surface.sessions.filter(session => isTerminalPhase(session.phase)).length > 1;
   const compactBody = current === undefined
     ? `<div class="compact-row compact-row--idle">
@@ -937,7 +931,6 @@ export function renderNativeTaskStatusDocument(
   const expandedBody = `<div class="expanded-shell">
       <header><div><strong>${escapeHtml(strings.heading)}</strong><span>${escapeHtml(strings.taskCount(surface.counts.total))}</span></div><nav><a href="${ACTION_SCHEME}//toggle-sounds" aria-label="${escapeAttribute(soundLabel)}" title="${escapeAttribute(soundLabel)}">${soundIcon}</a><a href="${ACTION_SCHEME}//settings" aria-label="${escapeAttribute(strings.settings)}" title="${escapeAttribute(strings.settings)}">${nativeIcon("settings")}</a><a href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(toggleLabel)}" title="${escapeAttribute(toggleLabel)}">${toggleIcon}</a></nav></header>
       ${emptyState || `<div class="task-list">${rows.map((session) => renderSessionRow(session, strings, multipleCompletions && surface.policy !== "manual")).join("")}</div>`}
-      ${rowCandidates.length > rows.length ? `<div class="more">${escapeHtml(strings.more(rowCandidates.length - rows.length))}</div>` : ""}
     </div>`;
   const body = surface.mode === "compact" ? compactBody : expandedBody;
   const density = settings.layout === "compact" ? " density-compact" : "";
@@ -1122,7 +1115,7 @@ function nativeTaskStatusHeight(
       : surface.policy === "transient"
         ? surface.sessions.filter((session) => isTerminalPhase(session.phase)).length
         : surface.current === undefined ? 0 : 1,
-    MAXIMUM_VISIBLE_TASK_ROWS
+    MAXIMUM_TASK_ROWS_FOR_WINDOW_HEIGHT
   );
   const desired = visibleRows === 0
     ? layout === "compact" ? 190 : 210
@@ -1292,7 +1285,7 @@ const NATIVE_TASK_STATUS_CSS = `
   .idle-main span { color:var(--muted); font-size:11px; }
   .task-main { min-width:0; flex:1; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px; }
   .task-main strong, .task-copy strong { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:13px; }
-  .task-main span, .expanded-shell header span, .task-status, .more { color:var(--muted); font-size:11px; }
+  .task-main span, .expanded-shell header span, .task-status { color:var(--muted); font-size:11px; }
   .count { flex-shrink:0; min-width:21px; height:21px; display:inline-flex; align-items:center; justify-content:center; gap:4px; padding:0 6px; border-radius:999px; background:var(--raised); border:1px solid var(--line); font-size:11px; font-weight:650; font-variant-numeric:tabular-nums; white-space:nowrap; }
   .count__separator { color:var(--muted); }
   .icon-action, .expanded-shell nav a { width:28px; height:28px; display:grid; place-items:center; border:1px solid var(--line); border-radius:8px; background:var(--raised); color:var(--muted); transition:background .15s,border-color .15s,color .15s,transform .15s; }
@@ -1304,14 +1297,14 @@ const NATIVE_TASK_STATUS_CSS = `
   .expanded-shell header > div { min-width:0; display:flex; align-items:baseline; gap:8px; }
   .expanded-shell header strong { font-size:14px; }
   .expanded-shell nav { display:flex; gap:6px; }
-  .task-list { min-height:0; overflow:auto; display:flex; flex-direction:column; gap:7px; }
+  .task-list { min-height:0; overflow:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:7px; }
   .empty-state { min-height:0; flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:7px; border:1px solid var(--line); border-radius:12px; padding:14px; background:var(--raised); text-align:center; }
   .empty-state strong { font-size:13px; }
   .empty-state p { max-width:300px; margin:0; color:var(--muted); font-size:11px; line-height:1.4; }
   .new-task-action { margin-top:2px; border:1px solid var(--accent); border-radius:999px; padding:7px 12px; background:var(--accent); color:var(--accent-ink); font-size:11px; font-weight:700; transition:background .15s,border-color .15s,transform .15s; }
   .new-task-action:hover { border-color:var(--accent-hover); background:var(--accent-hover); }
   .new-task-action:active { transform:scale(.98); }
-  .task-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px 10px; padding:10px; border:1px solid var(--line); border-radius:12px; background:var(--raised); }
+  .task-row { flex:none; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:7px 10px; padding:10px; border:1px solid var(--line); border-radius:12px; background:var(--raised); }
   .task-status { grid-column:1 / -1; display:flex; align-items:center; gap:7px; }
   .task-copy { min-width:0; display:block; }
   .task-copy p { margin:3px 0 0; color:var(--muted); font-size:11px; line-height:1.35; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; }
@@ -1342,7 +1335,6 @@ const NATIVE_TASK_STATUS_CSS = `
   .phase-mark--interaction { background:var(--amber); }
   .phase-mark--completed { background:var(--green); }
   .phase-mark--error { background:var(--red); }
-  .more { text-align:center; }
   .density-compact .expanded-shell { padding:9px; gap:7px; }
   .density-compact .task-row { padding:7px 9px; gap:5px 8px; }
   @media (prefers-reduced-motion:reduce) { .icon-action, .expanded-shell nav a, .new-task-action, .focus-action, .decision { transition:none; } }

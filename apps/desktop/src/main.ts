@@ -954,6 +954,8 @@ let desktopNativeTaskStatusSettings: DesktopNativeTaskStatusSettingsStore | unde
 let desktopNativeTaskStatusLayoutSettings: DesktopNativeTaskStatusLayoutSettingsStore | undefined;
 let macNativeTaskStatusHost: MacNativeTaskStatusHost | undefined;
 let nativeTaskStatusDisplayRefresh: (() => void) | undefined;
+const NATIVE_TASK_STATUS_DOCUMENT_SCHEME = "joko-task-status-document";
+const nativeTaskStatusDocuments = new Map<string, string>();
 let desktopAttentionBadgeController: DesktopAttentionBadgeController | undefined;
 let microphoneLifecycleInstalled = false;
 let providerModelPowerLifecycleInstalled = false;
@@ -1034,6 +1036,9 @@ protocol.registerSchemesAsPrivileged([{
 }, {
   scheme: MCP_APP_SCHEME,
   privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
+}, {
+  scheme: NATIVE_TASK_STATUS_DOCUMENT_SCHEME,
+  privileges: { standard: true, secure: true }
 }]);
 
 const desktopUserDataDirectory = personalVersionProfileOverride() ?? resolveDesktopUserDataDirectory({
@@ -1930,33 +1935,74 @@ async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promis
     })}).`);
   }
   const focusedBefore = BrowserWindow.getFocusedWindow();
-  const expansionDeadline = Date.now() + 5_000;
-  await ambient.webContents.executeJavaScript(
-    "document.querySelector('a[href=\"joko-task-status://toggle\"]')?.click(); true", true
-  );
-  while (Date.now() < expansionDeadline && !ambient.isDestroyed() && ambient.getBounds().height <= compactHeight) {
-    await waitForPackagedSmokePoll();
-  }
-  const destroyed = ambient.isDestroyed();
-  const expandedHeight = destroyed ? null : ambient.getBounds().height;
-  const focusedAfter = BrowserWindow.getFocusedWindow();
-  if (expandedHeight === null || expandedHeight <= compactHeight || focusedAfter !== focusedBefore) {
-    const observation = {
-      destroyed, compactHeight, expandedHeight, focusChanged: focusedAfter !== focusedBefore,
-      before: focusedBefore === null ? "none" : focusedBefore === owner ? "owner" : focusedBefore === ambient ? "ambient" : "other",
-      after: focusedAfter === null ? "none" : focusedAfter === owner ? "owner" : focusedAfter === ambient ? "ambient" : "other",
-      pointerInside: !destroyed && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds()),
-      surfaceMode: macNativeTaskStatusHost?.surface()?.mode,
-      lifecycle: packagedSmokeNativeTaskStatusLifecycle.get(ambient) ?? []
-    };
-    process.stdout.write(`JOKO_DESKTOP_SMOKE_TASK_STATUS_EXPANSION ${JSON.stringify(observation)}\n`);
-    if (!destroyed && !ambient.webContents.isDestroyed() && packagedSmokeResultPath !== undefined) {
-      try {
-        const image = await waitForPackagedSmokeDeadline(ambient.webContents.capturePage(), 2_000, "Task Status failure capture");
-        if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.native-task-status.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
-      } catch { /* The original expansion/focus failure remains authoritative. */ }
+  // Keep the scroll assertion inside the host's ordinary manual expansion.
+  const originalCursor = process.platform === "darwin" ? screen.getCursorScreenPoint() : undefined;
+  const compactBounds = ambient.getBounds();
+  let checkFailed = false;
+  try {
+    const expansionDeadline = Date.now() + 5_000;
+    await ambient.webContents.executeJavaScript(
+      "document.querySelector('a[href=\"joko-task-status://toggle\"]')?.click(); true", true
+    );
+    if (originalCursor !== undefined) await movePackagedSmokeMacCursor({ x: compactBounds.x + 20, y: compactBounds.y + 20 });
+    while (Date.now() < expansionDeadline && !ambient.isDestroyed() && ambient.getBounds().height <= compactHeight) {
+      await waitForPackagedSmokePoll();
     }
-    throw new Error(`Native Task Status did not expand without changing application focus (${JSON.stringify(observation)}).`);
+    const destroyed = ambient.isDestroyed();
+    const expandedHeight = destroyed ? null : ambient.getBounds().height;
+    const focusedAfter = BrowserWindow.getFocusedWindow();
+    if (expandedHeight === null || expandedHeight <= compactHeight || focusedAfter !== focusedBefore) {
+      const observation = {
+        destroyed, compactHeight, expandedHeight, focusChanged: focusedAfter !== focusedBefore,
+        before: focusedBefore === null ? "none" : focusedBefore === owner ? "owner" : focusedBefore === ambient ? "ambient" : "other",
+        after: focusedAfter === null ? "none" : focusedAfter === owner ? "owner" : focusedAfter === ambient ? "ambient" : "other",
+        pointerInside: !destroyed && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds()),
+        surfaceMode: macNativeTaskStatusHost?.surface()?.mode,
+        lifecycle: packagedSmokeNativeTaskStatusLifecycle.get(ambient) ?? []
+      };
+      process.stdout.write(`JOKO_DESKTOP_SMOKE_TASK_STATUS_EXPANSION ${JSON.stringify(observation)}\n`);
+      if (!destroyed && !ambient.webContents.isDestroyed() && packagedSmokeResultPath !== undefined) {
+        try {
+          const image = await waitForPackagedSmokeDeadline(ambient.webContents.capturePage(), 2_000, "Task Status failure capture");
+          if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.native-task-status.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
+        } catch { /* The original expansion/focus failure remains authoritative. */ }
+      }
+      throw new Error(`Native Task Status did not expand without changing application focus (${JSON.stringify(observation)}).`);
+    }
+    await owner.webContents.executeJavaScript(`(async () => {
+      const sessions = Array.from({ length: 30 }, (_, index) => ({
+        sessionId: "smoke-task-" + index, title: "Smoke task " + index, detail: "", phase: "running",
+        activityLines: [], updatedAt: 30 - index
+      }));
+      await window.jokoDesktop.nativeTaskStatus.publish({
+        ownerId: "desktop-smoke-task-status", revision: "2", locale: "en", sessions
+      });
+    })()`, true);
+    const scrollDeadline = Date.now() + 5_000;
+    let lastTaskReachable = false;
+    while (!ambient.isDestroyed() && Date.now() < scrollDeadline) {
+      try {
+        lastTaskReachable = await ambient.webContents.executeJavaScript(`(() => {
+          const list = document.querySelector('.task-list');
+          if (!list || list.children.length !== 30 || list.scrollHeight <= list.clientHeight) return false;
+          list.scrollTop = list.scrollHeight;
+          const last = list.lastElementChild?.querySelector('.focus-action');
+          return last?.getAttribute('href') === 'joko-task-status://focus?sessionId=smoke-task-29' &&
+            last.getBoundingClientRect().bottom <= list.getBoundingClientRect().bottom;
+        })()`, true) === true;
+      } catch { /* The current document can be navigating after the publication. */ }
+      if (lastTaskReachable) break;
+      await waitForPackagedSmokePoll();
+    }
+    if (!lastTaskReachable) throw new Error("Native Task Status did not make the last task reachable in its scrollable list.");
+  } catch (error) {
+    checkFailed = true;
+    throw error;
+  } finally {
+    if (originalCursor !== undefined) await movePackagedSmokeMacCursor(originalCursor).catch((error: unknown) => {
+      if (!checkFailed) throw error;
+      process.stderr.write("JOKO_DESKTOP_SMOKE_CURSOR_RESTORE_FAILED\n");
+    });
   }
   await owner.webContents.executeJavaScript(`(async () => {
     const bridge = window.jokoDesktop.nativeTaskStatus;
@@ -7207,6 +7253,23 @@ async function initializeDesktopNativeTaskStatus(): Promise<void> {
 }
 
 function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): NativeTaskStatusWindow {
+  // Keep the bounded task list in the response body so artwork and task text
+  // do not count towards Chromium's navigation URL limit.
+  const documentSession = session.fromPartition("joko-task-status", { cache: false });
+  if (!documentSession.protocol.isProtocolHandled(NATIVE_TASK_STATUS_DOCUMENT_SCHEME)) {
+    documentSession.protocol.handle(NATIVE_TASK_STATUS_DOCUMENT_SCHEME, (request) => {
+      const document = request.method === "GET" ? nativeTaskStatusDocuments.get(request.url) : undefined;
+      if (document === undefined) return new Response(null, { status: 404 });
+      return new Response(document, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+    });
+    documentSession.setPermissionCheckHandler(() => false);
+    documentSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  }
+  let documentUrl: string | undefined;
+  const retireDocument = (): void => {
+    if (documentUrl !== undefined) nativeTaskStatusDocuments.delete(documentUrl);
+    documentUrl = undefined;
+  };
   const window = new BrowserWindow({
     ...bounds,
     show: false,
@@ -7227,6 +7290,7 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
     } : {}),
     title: "Joko task status",
     webPreferences: {
+      session: documentSession,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -7257,7 +7321,10 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
   } else {
     window.setAlwaysOnTop(true, "pop-up-menu");
   }
-  window.on("closed", () => record("closed"));
+  window.on("closed", () => {
+    retireDocument();
+    record("closed");
+  });
   window.webContents.on("render-process-gone", (_event, details) => {
     const reason = (["clean-exit", "abnormal-exit", "killed", "crashed", "oom", "launch-failed",
       "integrity-failure", "memory-eviction"] as const).find((candidate) => candidate === details.reason) ?? "other";
@@ -7270,10 +7337,14 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
       record("bounds-requested", { width: next.width, height: next.height });
       window.setBounds(next, false);
     },
-    loadDocument: (dataUrl: string) => {
+    loadDocument: (document: string) => {
       const load = ++loads;
       record("load-started", { load });
-      const loading = window.loadURL(dataUrl);
+      retireDocument();
+      const url = `${NATIVE_TASK_STATUS_DOCUMENT_SCHEME}://panel/${randomUUID()}`;
+      documentUrl = url;
+      nativeTaskStatusDocuments.set(url, document);
+      const loading = window.loadURL(url).finally(() => { if (documentUrl === url) retireDocument(); });
       void loading.then(() => record("load-completed", { load, current: load === loads }), (error: unknown) => {
         const code = error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
         const reason = (["ERR_ABORTED", "ERR_INVALID_URL", "ERR_FAILED", "ERR_ACCESS_DENIED"] as const)
