@@ -42,12 +42,16 @@ afterEach(async () => {
 });
 
 async function closeDetailsForCompactTimeline(page: Page): Promise<void> {
-  const dock = page.locator(".inspector-dock-group");
+  // The Details dock mounts through Suspense after the task timeline.
+  const dock = page.locator(".inspector-dock-group[data-edge]");
   const close = dock.getByRole("button", { name: "Close details", exact: true });
-  if (await close.isVisible()) {
-    await close.click();
-    await close.waitFor({ state: "hidden" });
-  }
+  const outcome = await Promise.any([
+    close.first().waitFor({ state: "visible", timeout: 15_000 }).then(() => "open" as const),
+    page.getByRole("button", { name: "Open details", exact: true }).first()
+      .waitFor({ state: "visible", timeout: 15_000 }).then(() => "closed" as const)
+  ]);
+  if (outcome === "open") await close.first().click();
+  await dock.first().waitFor({ state: "hidden", timeout: 15_000 });
 }
 
 mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact bytes", async () => {

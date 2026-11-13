@@ -99,10 +99,15 @@ mountedIt("opens an isolated Contacts draft and sends through its explicitly tru
     expect(store.listSessions()).toHaveLength(0);
     expect(store.listTargets()).toHaveLength(targetCount);
     await draft.getByRole("button", { name: "Send", exact: true }).click();
-    await waitFor(async () => real.providerRequests.length, count => count >= 2, "Contacts tool result in the next Pi request", 45_000);
+    await waitFor(async () => real.providerRequests.length, count => count >= 1, "the first Contacts Pi request");
     expect(JSON.stringify(real.providerRequests[0]?.body.tools)).toContain(tool);
-    expect(JSON.stringify(real.providerRequests[1]?.body.messages)).toContain("call_tool");
-    expect(JSON.stringify(real.providerRequests[1]?.body.messages)).toContain("directory_enabled");
+    // Ask mode still requires confirmation for this MCP call.
+    await page.locator(".decision-options .decision-option").filter({ hasText: "Allow once" }).click({ timeout: 20_000 });
+    await waitFor(async () => real.providerRequests.length, count => count >= 2, "Contacts tool result in the next Pi request", 45_000);
+    const messages = real.providerRequests[1]?.body.messages as readonly { readonly role: string; readonly content: unknown }[];
+    const result = JSON.stringify(messages.find(message => message.role === "tool")?.content);
+    expect(result).toContain("call_tool");
+    expect(result).toContain("directory_enabled");
     const [session] = store.listSessions();
     expect(store.listSessions()).toHaveLength(1);
     expect(store.getTarget(session!.descriptor.targetId).descriptor).toMatchObject({ backendId: "pi", managed: true, trusted: true });
@@ -337,7 +342,7 @@ mountedIt("refreshes the mounted Contacts list and selected profile after anothe
   await selected.getByText("Updated from a separate connection", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
   await details.getByText("Updated from a separate connection", { exact: true }).waitFor({ state: "visible" });
   await panel.locator("option").filter({ hasText: "Computing pioneers" }).waitFor({ state: "attached" });
-  const groupCount = panel.locator(".contacts-directory-card__stats > span").filter({ has: panel.getByText("Groups", { exact: true }) });
+  const groupCount = panel.locator(".contacts-directory-card__stats > span").filter({ has: page.getByText("Groups", { exact: true }) });
   await groupCount.getByText("1", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
 
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
