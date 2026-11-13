@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { copyFile, type FileHandle, lstat, mkdir, open, realpath, rename, rm, stat } from "node:fs/promises";
+import { copyFile, type FileHandle, lstat, mkdir, open, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { Readable } from "node:stream";
@@ -393,13 +393,20 @@ export class ArtifactStore {
 
   async garbageCollect(): Promise<number> {
     const records = await this.#options.repository.deleteExpiredArtifacts(this.#now());
+    const failures: unknown[] = [];
     let collected = 0;
     for (const record of records) {
-      await this.verifyStoragePath(record);
-      if (await this.#options.repository.hasLiveStorageReference(record.storagePath)) continue;
-      await rm(record.storagePath, { force: true });
-      collected += 1;
+      try {
+        const verified = await this.verifyStoragePath(record).catch(ignoreMissingArtifactFile);
+        if (verified === undefined) continue;
+        if (await this.#options.repository.hasLiveStorageReference(record.storagePath)) continue;
+        const removed = await unlink(record.storagePath).then(() => true, ignoreMissingArtifactFile);
+        if (removed) collected += 1;
+      } catch (error) {
+        failures.push(error);
+      }
     }
+    if (failures.length > 0) throw new AggregateError(failures, "Some expired artifact files could not be removed.");
     return collected;
   }
 
@@ -537,6 +544,11 @@ export class ArtifactStore {
     }
     return { canonical, info };
   }
+}
+
+function ignoreMissingArtifactFile(error: unknown): undefined {
+  if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
+  return undefined;
 }
 
 function sameFileIdentity(
