@@ -262,7 +262,7 @@ import { DesktopMenuBar, createMenuBarSettingsStore, registerMenuBarIpc } from "
 import { verifyMenuBarHelper } from "./menu-bar-native-host.js";
 import { isMenubarSupportedPlatform } from "@joko/contracts";
 import { DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler } from "./wallpaper-protocol.js";
-import { DesktopMcpAppHost, MCP_APP_SCHEME } from "./mcp-app-host.js";
+import { DesktopMcpAppHost, MCP_APP_CAPTURE, MCP_APP_SCHEME } from "./mcp-app-host.js";
 import { DesktopExtensionOAuthHost } from "./extension-oauth-host.js";
 import { registerDesktopWallpaperIpc } from "./wallpaper-ipc.js";
 import {
@@ -509,7 +509,7 @@ import {
   validateProfileId
 } from "./security.js";
 import { createDesktopEndpointRuntimePreparation, installDesktopEndpointRuntimes } from './connection-transport.js';
-import { DesktopLinkspanHost } from './linkspan-host.js';
+import { DesktopLinkspanHost, DESKTOP_LINKSPAN_CAPTURE } from './linkspan-host.js';
 
 // fileURLToPath(new URL(".", ...)) retains a trailing separator. Normalize it
 // once here so the managed-runtime resolver's absolute/canonical input fence
@@ -1355,6 +1355,25 @@ function createWindow(): void {
   mainWindow = window;
   if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
     windowContents.once("did-start-loading", () => recordPackagedSmokeProgress("main_window_load_started"));
+    windowContents.once("did-navigate", () => recordPackagedSmokeProgress("main_window_navigation_committed"));
+    windowContents.once("unresponsive", () => recordPackagedSmokeProgress("main_window_renderer_unresponsive"));
+    const pendingPreloadStages = new Map<string, string>([
+      [MCP_APP_CAPTURE, "main_window_preload_mcp_app"],
+      [DESKTOP_LINKSPAN_CAPTURE, "main_window_preload_linkspan"],
+      [DESKTOP_CHANNELS.mainDocumentOccurrenceGet, "main_window_preload_document"],
+      [DESKTOP_CHANNELS.openWithCaptureDocument, "main_window_preload_open_with"],
+      [DESKTOP_CHANNELS.nativeGamepadCaptureDocument, "main_window_preload_gamepad"],
+      [DESKTOP_CHANNELS.nativeTaskStatusGetAvailability, "main_window_preload_task_status"],
+      [DESKTOP_CHANNELS.preferredSystemLocaleGet, "main_window_preload_locale"]
+    ]);
+    const observePreload = (_event: unknown, channel: string): void => {
+      const stage = pendingPreloadStages.get(channel);
+      if (stage === undefined) return;
+      pendingPreloadStages.delete(channel);
+      recordPackagedSmokeProgress(stage);
+    };
+    windowContents.on("ipc-message-sync", observePreload);
+    windowContents.once("dom-ready", () => windowContents.off("ipc-message-sync", observePreload));
     windowContents.once("dom-ready", () => recordPackagedSmokeProgress("main_window_dom_ready"));
     windowContents.once("preload-error", () => recordPackagedSmokeProgress("main_window_preload_failed"));
     windowContents.once("did-finish-load", () => recordPackagedSmokeProgress("main_window_load_finished"));
