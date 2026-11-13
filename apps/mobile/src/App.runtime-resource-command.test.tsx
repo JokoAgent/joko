@@ -2,8 +2,8 @@
 import { act, createElement, forwardRef, useImperativeHandle, useRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
+import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventIdentitySchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
+  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, NativeMessageIdentitySchema, NativeSessionBindingSchema, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -846,7 +846,7 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
     eventId: "temporary-completion", identity, cursor: { generation: 1n, sequence: 3n },
     payload: { kind: { case: "messageCompleted", value: { messageId: "temporary-completion", role: MessageRole.ASSISTANT,
       blocks: [{ content: { case: "text", value: "A Pi reply" } }] } } },
-    pi: { rpcEventType: "message_end", payload: { case: "messageLifecycle", value: { kind: PiMessageLifecycleKind.MESSAGE_END } } }
+    pi: { payload: { case: "messageLifecycle", value: { kind: PiMessageLifecycleKind.MESSAGE_END } } }
   });
   renderedState = { ...state, owner: running, detail: running, live: [answer] };
   const more = () => Array.from(host.querySelectorAll("button")).find(button => button.getAttribute("aria-label")
@@ -860,8 +860,10 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
 
   const completed = answer.payload!.kind;
   if (completed.case !== "messageCompleted") throw new Error("Expected an assistant completion.");
-  const adopted = create(EventSchema, { ...answer, eventId: "adopted-completion", cursor: { generation: 1n, sequence: 8n },
-    payload: { kind: { case: "messageCompleted", value: { ...completed.value, messageId: "native-entry", nativeIdentity: { entryId: "native-entry" } } } } });
+  const adopted = create(EventSchema, { ...answer, eventId: "adopted-completion",
+    cursor: create(EventCursorSchema, { generation: 1n, sequence: 8n }),
+    payload: { kind: { case: "messageCompleted", value: { ...completed.value, messageId: "native-entry",
+      nativeIdentity: create(NativeMessageIdentitySchema, { entryId: "native-entry" }) } } } });
   const settled = create(SnapshotSchema, { ...running,
     sessions: [create(SessionSchema, { ...running.sessions[0]!, state: SessionState.IDLE })], timeline: [adopted] });
   renderedState = { ...state, owner: settled, detail: settled };
@@ -874,7 +876,7 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
 
 it.each(["same request", "resolved while reconnecting"] as const)("retains the original question draft across a transient empty task (%s)", async outcome => {
   const generation = 7n;
-  const runtimeSession = create(SessionSchema, { ...session, nativeBinding: { runtimeGeneration: generation } });
+  const runtimeSession = create(SessionSchema, { ...session, nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: generation }) });
   const question = create(InteractionSchema, {
     interactionId: `question-${outcome}`, sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
     kind: InteractionKind.QUESTION, state: InteractionState.PENDING, generation, version: { generation, revision: { value: 3n } },
@@ -932,7 +934,8 @@ it("renders a single resolved plan review with its decision, feedback and origin
 
   const foreign = create(InteractionSchema, { ...review, sessionId: "other-session" });
   const otherBackend = create(InteractionSchema, { ...review, backendId: "codex" });
-  const otherEvent = create(EventSchema, { ...observed("other-backend", 5n, otherBackend), identity: { ...identity, backendId: "codex" } });
+  const otherEvent = create(EventSchema, { ...observed("other-backend", 5n, otherBackend),
+    identity: create(EventIdentitySchema, { ...identity, backendId: "codex" }) });
   renderedState = { ...state, detail: create(SnapshotSchema, { ...detail, timeline: [observed("foreign", 4n, foreign), otherEvent] }) };
   await act(async () => root.render(taskScreen()));
   expect(host.textContent).not.toContain("Cover reconnect before publishing.");

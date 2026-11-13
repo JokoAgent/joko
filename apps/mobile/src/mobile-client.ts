@@ -3892,8 +3892,8 @@ export class MobileClient {
     let next = { ...this.#state, ...patch };
     if (retainHistory && patch.detail && next.activeProfileId === this.#state.activeProfileId && next.selectedId === this.#state.selectedId
       && next.taskSource?.kind === this.#state.taskSource?.kind) {
-      const detail = patch.detail;
-      if (!this.#joinedTask && next.status === "connected" && next.selectedId && mobilePiHistoryRetired(detail, this.#state.detail)) {
+      const detail = patch.detail, sessionId = next.selectedId;
+      if (!this.#joinedTask && next.status === "connected" && sessionId && mobilePiHistoryRetired(detail, this.#state.detail)) {
         this.#timelineRetirement += 1;
         this.#historyOwner = undefined;
         const sequence = detail.resumeCursor?.sequence;
@@ -3901,7 +3901,7 @@ export class MobileClient {
           live: sequence === undefined ? [] : next.live.filter(event => event.cursor?.generation === detail.generation
             && event.cursor.sequence > sequence) };
         const credential = this.#credential;
-        if (credential) void this.#retireSavedTaskTimeline(credential, next.selectedId, cached =>
+        if (credential) void this.#retireSavedTaskTimeline(credential, sessionId, cached =>
           mobilePiHistoryRetired(detail, cached) ? create(SnapshotSchema, { ...cached, timeline: [] }) : cached);
       } else next = { ...next, detail: retainMobileHistoryPrefix(detail, this.#state.detail) };
     }
