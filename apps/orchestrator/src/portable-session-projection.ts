@@ -333,6 +333,21 @@ function validateMessageUsage(value: unknown): void {
   if (typeof value["cost"] !== "number" || !Number.isFinite(value["cost"]) || value["cost"] < 0) {
     throw invalid("Portable Session message usage is invalid.");
   }
+  const pricingContext = value["pricingContext"];
+  if (pricingContext !== undefined) {
+    if (!isRecord(pricingContext) || !Number.isSafeInteger(pricingContext["inputTokens"]) || Number(pricingContext["inputTokens"]) < 0) {
+      throw invalid("Portable Session message pricing context is invalid.");
+    }
+    const { fastMode, requestedAt, cacheWriteTtl, cacheWrite1hTokens } = pricingContext;
+    if ((fastMode !== undefined && typeof fastMode !== "boolean" && fastMode !== "ultrafast")
+      || (requestedAt !== undefined && (!Number.isSafeInteger(requestedAt) || Number(requestedAt) < 0 || Number(requestedAt) > 8_640_000_000_000_000))
+      || (cacheWriteTtl !== undefined && cacheWriteTtl !== "5m" && cacheWriteTtl !== "1h")
+      || (cacheWrite1hTokens !== undefined && (!Number.isSafeInteger(cacheWrite1hTokens)
+        || Number(cacheWrite1hTokens) < 0 || Number(cacheWrite1hTokens) > Number(value["cacheWriteTokens"])))) {
+      throw invalid("Portable Session message pricing context is invalid.");
+    }
+    assertExactKeys(pricingContext, ["inputTokens", "fastMode", "requestedAt", "cacheWriteTtl", "cacheWrite1hTokens"], "message pricing context");
+  }
   assertExactKeys(value, [
     "inputTokens",
     "outputTokens",
@@ -341,7 +356,8 @@ function validateMessageUsage(value: unknown): void {
     "totalTokens",
     "contextTokens",
     "contextWindow",
-    "cost"
+    "cost",
+    "pricingContext"
   ], "message usage");
 }
 

@@ -15,6 +15,7 @@ import {
   OwnerSnapshotScopeSchema,
   PermissionMode,
   PiMessageRole,
+  PortableSessionFidelity,
   QueueDeliveryMode,
   ResourceAcquisitionSourceSchema,
   ResourceKind,
@@ -29,6 +30,7 @@ import {
   SessionState,
   SnapshotScopeSchema
 } from "@joko/contracts";
+import { preparePortableSessionImport } from "@joko/orchestrator";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createE2eClients } from "./connect-clients.js";
@@ -384,6 +386,21 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
         totalTokens: 10n
       }
     });
+
+    const source = fixture.application.store.listEvents({ sessionId }).map((event) => event.payload)
+      .find((payload) => payload.type === "message_complete" && payload.role === "assistant");
+    if (source?.type !== "message_complete") throw new Error("The settled Pi turn has no assistant message.");
+    expect(source.usage?.pricingContext).toMatchObject({ inputTokens: 7 });
+    const { artifact, fidelity } = await reconnected.portableSession.exportPortableSession({ sessionId });
+    if (artifact === undefined) throw new Error("The exported Pi task has no package.");
+    expect(fidelity).toBe(PortableSessionFidelity.FULL);
+    const { ticket } = await reconnected.artifact.getBlobDownloadTicket({ blobId: artifact.blobId });
+    if (ticket === undefined) throw new Error("The exported Pi task has no download ticket.");
+    const downloaded = await fetch(`${fixture.baseUrl}${ticket.relativeEndpoint}`, { headers: { authorization: `Bearer ${paired.authKey}` } });
+    expect(downloaded.status).toBe(200);
+    const restored = preparePortableSessionImport(new Uint8Array(await downloaded.arrayBuffer()));
+    expect(restored.projection.messages.find(message => message.role === "assistant")?.usage).toEqual(source.usage);
+    expect(restored.nativeSession?.bytes.byteLength).toBeGreaterThan(0);
   });
 
   it("executes an installed Skill through the live Pi command catalog and records exact durable usage", { timeout: 90_000 }, async () => {
