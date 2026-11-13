@@ -1,8 +1,21 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, parseCrashReport,
-  parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, requireSimulatorApplicationContainer, stopOwnedMetroGroup,
+  parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, readUiTestSummary, requireSimulatorApplicationContainer, stopOwnedMetroGroup,
   summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+
+test("preserves the Apple UI execution timeout when the result bundle is incomplete", async () => {
+  const execution = new Error("Apple UI-test execution timed out after 300000 ms.");
+  const unreadable = new Error("Info.plist does not exist");
+  const readIncomplete = async () => { throw unreadable; };
+  await assert.rejects(readUiTestSummary(readIncomplete, execution), {
+    message: `${execution.message} The xcresult summary was unavailable.`,
+    cause: unreadable
+  });
+  await assert.rejects(readUiTestSummary(readIncomplete), error => error === unreadable);
+  await assert.rejects(readUiTestSummary(async () => "{", execution), { message: /execution timed out/u });
+  assert.deepEqual(await readUiTestSummary(async () => '{"result":"Failed"}', execution), { result: "Failed" });
+});
 
 test("confirms owned Metro group absence after both graceful and forced shutdown", async () => {
   for (const forceCode of [undefined, "EPERM"]) {

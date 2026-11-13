@@ -82,6 +82,17 @@ export function isUiRunnerAccessibilityStartupFailure(summary, identityRequests,
     && /^JokoCIUITests-Runner \(\d+\) encountered an error$/.test(failure.testIdentifierString)
     && failure.failureText === "The test runner failed to initialize for UI testing. (Underlying Error: Timed out waiting for AX loaded notification)";
 }
+export async function readUiTestSummary(readSummary, executionError) {
+  try {
+    return JSON.parse(await readSummary());
+  } catch (error) {
+    if (executionError) {
+      throw new Error(`${executionError.message} The xcresult summary was unavailable.`, { cause: error });
+    }
+    throw error;
+  }
+}
+
 const processGroups = new Map([
   ["mds", "spotlight"], ["mds_stores", "spotlight"], ["mdworker", "spotlight"], ["mdworker_shared", "spotlight"],
   ["simdiskimaged", "runtimeImages"], ["com.apple.CoreSimulator.CoreSimulatorService", "simulatorService"],
