@@ -7,7 +7,8 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, requireSimulatorApplicationContainer } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure,
+  locateInstalledSimulatorApplication, requireSimulatorApplicationContainer, stopOwnedMetroGroup } from "./mobile-ios-runtime-diagnostics.mjs";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -586,10 +587,10 @@ async function capturePostUiFrame(ocr, identity, expectedPid) {
 async function cleanup() {
   const errors = [];
   let simulatorCleanup = udid ? "unconfirmed" : "not_created";
-  if (metro?.pid) {
-    try { process.kill(-metro.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") errors.push("Owned Metro group could not be stopped."); }
-    for (let count = 0; count < 20 && !metroClosed; count++) await delay(100);
-    if (!metroClosed) { try { process.kill(-metro.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") errors.push("Owned Metro group did not terminate."); } }
+  const ownedMetroPid = metro?.pid;
+  const metroCleanup = ownedMetroPid === undefined ? undefined : await stopOwnedMetroGroup(signal => process.kill(-ownedMetroPid, signal));
+  if (metroCleanup && !metroCleanup.gone) {
+    errors.push("Owned Metro group did not terminate.");
   }
   if (udid) {
     try {
@@ -604,7 +605,7 @@ async function cleanup() {
       } else simulatorCleanup = "already_absent";
     } catch (error) { errors.push(error.message); }
   }
-  if (evidence) save("cleanup.json", { simulatorUdid: udid, simulatorName: deviceName, ownedMetroPid: metro?.pid,
+  if (evidence) save("cleanup.json", { simulatorUdid: udid, simulatorName: deviceName, ownedMetroPid, metroCleanup,
     simulatorCleanup, deletedOnlyCreatedSimulator: simulatorCleanup === "deleted" || simulatorCleanup === "already_absent", errors });
   clearTimeout(deadline); process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop);
   return errors;
