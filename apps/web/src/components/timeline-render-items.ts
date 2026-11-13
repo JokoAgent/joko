@@ -22,6 +22,7 @@ interface TimelineRenderItemBase {
   readonly childIds: readonly string[];
   /** Present when a discontinuous history window starts immediately before this row. */
   readonly historyGapBefore?: TimelineHistoryGap;
+  readonly unloadedGapBefore?: true;
 }
 
 export interface TimelineLeafRenderItem extends TimelineRenderItemBase {
@@ -54,6 +55,7 @@ export interface TimelineRenderProjectionOptions {
   /** True while the owning session is running, waiting, or retrying. */
   readonly sessionActive?: boolean;
   readonly historyGapMs?: number;
+  readonly unloadedGapBefore?: string;
 }
 
 /**
@@ -86,6 +88,7 @@ export function projectTimelineRenderItems(
   const projected: TimelineRenderItem[] = [];
   let workChildren: TimelineItemView[] = [];
   let workGapBefore: TimelineHistoryGap | undefined;
+  let workUnloadedGapBefore = false;
   let pendingGapBefore: TimelineHistoryGap | undefined;
   let previousTimestamp: number | undefined;
   let previousTimestampItemId: string | undefined;
@@ -106,13 +109,21 @@ export function projectTimelineRenderItems(
       hiddenChildCount: workChildren.length,
       running: false,
       defaultCollapsed: true,
-      ...(workGapBefore === undefined ? {} : { historyGapBefore: workGapBefore })
+      ...(workGapBefore === undefined ? {} : { historyGapBefore: workGapBefore }),
+      ...(workUnloadedGapBefore ? { unloadedGapBefore: true } : {})
     });
     workChildren = [];
     workGapBefore = undefined;
+    workUnloadedGapBefore = false;
   };
 
+  let unloadedGapPending = false;
   for (const item of projectDocumentFiles(sourceItems)) {
+    if (options.unloadedGapBefore !== undefined && (item.id === options.unloadedGapBefore
+      || item.documentFileSourceIds?.includes(options.unloadedGapBefore) || item.inlinePlan?.sourceItemIds.includes(options.unloadedGapBefore))) {
+      flushWork();
+      unloadedGapPending = true;
+    }
     if (isInternalContinuationTimelineItem(item)) continue;
     const timestamp = finiteTimestamp(item.createdAt);
     const userBoundary = item.kind === "user";
@@ -132,7 +143,9 @@ export function projectTimelineRenderItems(
     if (isTimelineWorkActivity(item)) {
       if (workChildren.length === 0) {
         workGapBefore = pendingGapBefore;
+        workUnloadedGapBefore = unloadedGapPending;
         pendingGapBefore = undefined;
+        unloadedGapPending = false;
       }
       workChildren.push(item);
     } else {
@@ -142,9 +155,11 @@ export function projectTimelineRenderItems(
         key: item.id,
         childIds: item.inlinePlan?.sourceItemIds ?? item.documentFileSourceIds ?? [item.id],
         item,
-        ...(pendingGapBefore === undefined ? {} : { historyGapBefore: pendingGapBefore })
+        ...(pendingGapBefore === undefined ? {} : { historyGapBefore: pendingGapBefore }),
+        ...(unloadedGapPending ? { unloadedGapBefore: true } : {})
       });
       pendingGapBefore = undefined;
+      unloadedGapPending = false;
     }
 
     const endedAt = finiteTimestamp(item.endedAt);

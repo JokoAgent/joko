@@ -377,10 +377,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     ? sessionWindowNavigation.mode !== "hidden"
     : state.preferences.navigationOpen;
   const [searchTimelineWindow, setSearchTimelineWindow] = useState<{
-    readonly profileId: string | undefined;
-    readonly sessionId: string;
-    readonly generation: bigint;
-    readonly historyRevision: bigint;
+    readonly ownerKey: string | undefined;
+    readonly linkKey: string;
     readonly items: readonly TimelineItemView[];
   }>();
   const [timelineHistory, setTimelineHistory] = useState<ActiveTimelineHistory>();
@@ -1241,13 +1239,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const activeTimelineHistoryRevision = activeSession === undefined
     ? 0n
     : state.snapshot.timelineHistoryRevisionBySession.get(activeSession.id) ?? 0n;
+  const activeHistoryOwnerKey = activeSession === undefined ? undefined
+    : timelineHistoryOwnerKey(state.activeProfile, state.snapshot.generation, activeSession.id, activeSession.generation, activeTimelineHistoryRevision);
   const requestTimelineHistoryPage = useCallback(async (
     sessionId: string,
     generation: bigint,
     historyRevision: bigint,
     beforeCursor: TimelineHistoryCursorView | undefined,
     reset: boolean,
-    allowCached = true
+    allowCached = true,
+    searchOwner?: string
   ): Promise<void> => {
     const state = controllerRef.current.state;
     const selected = sessionForTaskRoute(state, sessionId);
@@ -1288,6 +1289,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       setTimelineHistory((current) => {
         if (current?.ownerKey !== ownerKey || current?.sessionId !== sessionId || current.generation !== generation
           || current.historyRevision !== historyRevision) return current;
+        if (searchOwner !== undefined && currentMessageDeepLinkRef.current !== searchOwner) return { ...current, loading: false };
         const currentIds = new Set(current.items.map(item => item.id));
         // An older retained window proves the prefix only when the new page
         // reaches it. Otherwise its cursor must remain available to fill the gap.
@@ -1312,7 +1314,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       setTimelineHistory((current) => current?.ownerKey !== ownerKey || current?.sessionId !== sessionId || current.generation !== generation
         || current.historyRevision !== historyRevision
         ? current
-        : { ...current, loading: false, error: messageOf(error, "Unable to load task history.") });
+        : { ...current, loading: false, ...(searchOwner !== undefined && currentMessageDeepLinkRef.current !== searchOwner
+          ? {} : { error: messageOf(error, "Unable to load task history.") }) });
     }
   }, []);
 
@@ -1333,7 +1336,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
 
   const recentActiveTimeline = activeSession === undefined ? EMPTY_TIMELINE : state.snapshot.timelineBySession.get(activeSession.id) ?? EMPTY_TIMELINE;
   const activeHistory = activeSession !== undefined && timelineHistory?.sessionId === activeSession.id
-    && timelineHistory.ownerKey === timelineHistoryOwnerKey(state.activeProfile, state.snapshot.generation, activeSession.id, activeSession.generation, activeTimelineHistoryRevision)
+    && timelineHistory.ownerKey === activeHistoryOwnerKey
     && timelineHistory.generation === state.snapshot.generation
     && timelineHistory.historyRevision === activeTimelineHistoryRevision
     ? timelineHistory
@@ -1345,18 +1348,22 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       : mergeTimelineWindows(recentActiveTimeline, activeHistoryItems),
     [activeHistoryItems, recentActiveTimeline]
   );
-  const activeTimeline = useMemo(
-    () => activeSession === undefined
-      || searchTimelineWindow === undefined
-      || searchTimelineWindow.profileId !== state.activeProfile?.id
-      || searchTimelineWindow.sessionId !== activeSession.id
-      || searchTimelineWindow.generation !== state.snapshot.generation
-      || searchTimelineWindow.historyRevision !== activeTimelineHistoryRevision
-      ? recentAndHistoricalTimeline
-      : mergeTimelineWindows(recentAndHistoricalTimeline, searchTimelineWindow.items),
-    [activeSession, activeTimelineHistoryRevision, recentAndHistoricalTimeline, searchTimelineWindow, state.activeProfile?.id, state.snapshot.generation]
-  );
-  const loadEarlierTimeline = useCallback(async (): Promise<void> => {
+  const messageId = state.route.kind === "session" ? state.route.messageId : undefined;
+  const messageEventId = state.route.kind === "session" ? state.route.messageEventId : undefined;
+  const messageLinkKey = activeSession === undefined || messageId === undefined ? undefined
+    : JSON.stringify([state.activeProfile?.id, activeSession.id, messageEventId, messageId, state.snapshot.generation.toString(), state.navigationRevision ?? 0]);
+  const searchHistory = searchTimelineWindow?.ownerKey === activeHistoryOwnerKey && searchTimelineWindow?.linkKey === messageLinkKey
+    ? searchTimelineWindow : undefined;
+  const activeTimeline = useMemo(() => searchHistory === undefined ? recentAndHistoricalTimeline
+    : mergeTimelineWindows(recentAndHistoricalTimeline, searchHistory.items), [recentAndHistoricalTimeline, searchHistory]);
+  const searchHistoryGapBefore = useMemo(() => {
+    const recentFirst = activeHistoryItems?.[0] ?? recentAndHistoricalTimeline[0];
+    if (searchHistory === undefined || recentFirst === undefined || activeHistory?.initialized !== true
+      || activeHistory.nextBeforeCursor === undefined || recentAndHistoricalTimeline.some(item => item.id === messageId)) return undefined;
+    const searchEnd = searchHistory.items.at(-1);
+    return searchEnd !== undefined && searchEnd.sequence < activeHistory.nextBeforeCursor.sequence ? recentFirst.id : undefined;
+  }, [activeHistory, activeHistoryItems, messageId, recentAndHistoricalTimeline, searchHistory]);
+  const loadEarlierTimeline = useCallback(async (searchOwner?: string): Promise<void> => {
     if (activeSession === undefined || activeHistory?.loading === true) return;
     if (activeHistory?.initialized === true && activeHistory.nextBeforeCursor === undefined) return;
     await requestTimelineHistoryPage(
@@ -1364,14 +1371,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       state.snapshot.generation,
       activeTimelineHistoryRevision,
       activeHistory?.nextBeforeCursor,
-      activeHistory?.initialized !== true
+      activeHistory?.initialized !== true,
+      true,
+      searchOwner
     );
   }, [activeHistory, activeSession, activeTimelineHistoryRevision, requestTimelineHistoryPage, state.snapshot.generation]);
 
   useEffect(() => {
-    const messageId = state.route.kind === "session" ? state.route.messageId : undefined;
-    const messageEventId = state.route.kind === "session" ? state.route.messageEventId : undefined;
-    if (activeSession === undefined || messageId === undefined) {
+    if (activeSession === undefined || messageId === undefined || messageLinkKey === undefined) {
       if (currentMessageDeepLinkRef.current !== undefined) messageJumpGenerationRef.current += 1;
       currentMessageDeepLinkRef.current = undefined;
       handledMessageDeepLinkRef.current = undefined;
@@ -1381,9 +1388,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       setRetryableMessageDeepLinkKey(undefined);
       return;
     }
-    const linkOccurrenceKey = `${state.activeProfile?.id ?? ""}\u0000${activeSession.id}\u0000${messageEventId ?? ""}\u0000${messageId}\u0000${state.snapshot.generation}\u0000${state.navigationRevision ?? 0}`;
+    const linkOccurrenceKey = messageLinkKey;
     // History changes retire pending reads. A completed jump belongs to the original navigation.
-    const deepLinkKey = `${linkOccurrenceKey}\u0000${activeTimelineHistoryRevision}`;
+    const deepLinkKey = `${linkOccurrenceKey}\u0000${activeHistoryOwnerKey ?? activeTimelineHistoryRevision}`;
     if (currentMessageDeepLinkRef.current !== deepLinkKey) {
       messageJumpGenerationRef.current += 1;
       currentMessageDeepLinkRef.current = deepLinkKey;
@@ -1430,8 +1437,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       loadingMessageDeepLinkRef.current = deepLinkKey;
       const jumpGeneration = ++messageJumpGenerationRef.current;
       const busyKey = `message-link:${jumpGeneration}`;
-      const isPending = (): boolean => messageJumpGenerationRef.current === jumpGeneration
-        && currentMessageDeepLinkRef.current === deepLinkKey && loadingMessageDeepLinkRef.current === deepLinkKey;
+      const isPending = (): boolean => {
+        const current = controllerRef.current.state;
+        const source = sessionForTaskRoute(current, activeSession.id);
+        const currentHistoryRevision = current.snapshot.timelineHistoryRevisionBySession.get(activeSession.id) ?? 0n;
+        return messageJumpGenerationRef.current === jumpGeneration && currentMessageDeepLinkRef.current === deepLinkKey
+          && loadingMessageDeepLinkRef.current === deepLinkKey && current.connectionState === "connected"
+          && current.connectionGeneration === state.connectionGeneration && current.navigationRevision === state.navigationRevision
+          && current.route.kind === "session" && current.route.messageId === messageId && current.route.messageEventId === messageEventId
+          && source !== undefined && timelineHistoryOwnerKey(current.activeProfile, current.snapshot.generation, source.id, source.generation,
+            currentHistoryRevision) === activeHistoryOwnerKey;
+      };
       setActionError(undefined);
       setBusyAction(busyKey);
       void controllerRef.current.loadSessionTimelineAround(activeSession.id, messageEventId, 160).then((items) => {
@@ -1439,10 +1455,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         if (!items.some((item) => item.id === messageId)) throw new Error(t("nav.messageJumpUnavailable"));
         handledMessageDeepLinkRef.current = linkOccurrenceKey;
         setSearchTimelineWindow({
-          profileId: state.activeProfile?.id,
-          sessionId: activeSession.id,
-          generation: state.snapshot.generation,
-          historyRevision: activeTimelineHistoryRevision,
+          ownerKey: activeHistoryOwnerKey,
+          linkKey: linkOccurrenceKey,
           items
         });
         setTimelineFocusRequest({
@@ -1459,7 +1473,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           setActionError(messageOf(error, t("nav.messageJumpUnavailable")));
         }
       }).finally(() => {
-        if (isPending()) loadingMessageDeepLinkRef.current = undefined;
+        if (messageJumpGenerationRef.current === jumpGeneration && loadingMessageDeepLinkRef.current === deepLinkKey) loadingMessageDeepLinkRef.current = undefined;
         setBusyAction((current) => current === busyKey ? undefined : current);
       });
       return;
@@ -1481,7 +1495,18 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       return;
     }
     void requestTimelineHistoryPage(activeSession.id, state.snapshot.generation, activeTimelineHistoryRevision, activeHistory.nextBeforeCursor, false);
-  }, [activeHistory, activeSession, activeTimeline, activeTimelineHistoryRevision, requestTimelineHistoryPage, state.activeProfile?.id, state.connectionState, state.navigationRevision, state.route, state.snapshot.generation, t]);
+  }, [activeHistory, activeHistoryOwnerKey, activeSession, activeTimeline, activeTimelineHistoryRevision, messageEventId, messageId, messageLinkKey,
+    requestTimelineHistoryPage, state.activeProfile?.id, state.connectionGeneration, state.connectionState, state.navigationRevision, state.snapshot.generation, t]);
+
+  useEffect(() => {
+    if (searchHistoryGapBefore === undefined || searchHistory === undefined || activeSession === undefined
+      || state.connectionState !== "connected" || activeHistory?.loading || activeHistory?.error) return;
+    const cursor = activeHistory?.nextBeforeCursor;
+    const search = messageDeepLinkHistorySearchRef.current;
+    const key = `${searchHistory.linkKey}\u0000${activeHistoryOwnerKey ?? activeTimelineHistoryRevision}`;
+    if (cursor === undefined || search?.key !== key || !reserveMessageDeepLinkHistoryPage(search, cursor)) return;
+    void loadEarlierTimeline(key);
+  }, [activeHistory, activeHistoryOwnerKey, activeSession, activeTimelineHistoryRevision, loadEarlierTimeline, searchHistory, searchHistoryGapBefore, state.connectionState]);
   const activeExtensionWidgets = activeSession === undefined ? [] : state.snapshot.extensionWidgetsBySession.get(activeSession.id) ?? [];
   const activeExtensionStatuses = activeSession === undefined ? [] : state.snapshot.extensionStatusesBySession.get(activeSession.id) ?? [];
   const interactions = useMemo(() => [...state.snapshot.interactions].sort((a, b) =>
@@ -1993,6 +2018,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       composerAutoFocus={!embeddedInFiles}
       models={state.snapshot.models}
       timeline={activeTimeline}
+      timelineUnloadedGapBefore={searchHistoryGapBefore}
       timelineHasEarlier={activeHistory === undefined || !activeHistory.initialized || activeHistory.nextBeforeCursor !== undefined}
       timelineHistoryLoading={activeHistory?.loading ?? state.connectionState === "connected"}
       timelineHistoryError={activeHistory?.error}

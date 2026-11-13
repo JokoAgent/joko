@@ -184,7 +184,7 @@ export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JS
   </PartnerConversationProvider>;
 }
 
-function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, allowSplitMessageDelete = false, onSplitMessageForkOpened, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
+function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, allowSplitMessageDelete = false, onSplitMessageForkOpened, models, timeline, timelineUnloadedGapBefore, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -196,6 +196,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly onSplitMessageForkOpened?: (completion: MessageForkCompletion) => void;
   readonly models: readonly ModelView[];
   readonly timeline: readonly TimelineItemView[];
+  readonly timelineUnloadedGapBefore?: string;
   readonly timelineHasEarlier: boolean;
   readonly timelineHistoryLoading: boolean;
   readonly timelineHistoryError?: string;
@@ -2395,6 +2396,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         onCancelPartnerDelegation={controller.state.connectionState === "connected" && !reviewReadOnly ? controller.cancelPartnerDelegation : undefined}
         onOpenPartnerSession={(sessionId) => controller.navigate({ kind: "session", sessionId })}
         hasEarlier={timelineHasEarlier}
+        unloadedGapBefore={timelineUnloadedGapBefore}
         historyLoading={timelineHistoryLoading}
         historyError={timelineHistoryError}
         historyOwnerKey={historyOwner}
