@@ -8297,6 +8297,39 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.older).toHaveLength(0);
   });
 
+  it.each(["query failure", "stale cursor", "revoked connection"] as const)(
+    "keeps the latest view after an earlier window's late %s", async kind => {
+      const network = fakeNetwork();
+      const app = client(network, memoryStorage(credential).storage);
+      await app.start();
+      vi.mocked(network.readAround).mockResolvedValueOnce([event("anchor", 8n)]);
+      await app.around("anchor");
+      const before = app.state.before;
+      let failPage!: (error: unknown) => void;
+      vi.mocked(network.readHistory).mockImplementationOnce(() => new Promise((_resolve, reject) => { failPage = reject; }));
+      const oldPage = app.older();
+      expect(network.readHistory).toHaveBeenCalledWith(credential, "session", before, expect.any(AbortSignal));
+      app.latest();
+      const error = kind === "revoked connection" ? { code: Code.Unauthenticated } : kind === "stale cursor"
+        ? { code: Code.FailedPrecondition } : new Error("Earlier page failed.");
+      failPage(error);
+      await oldPage;
+
+      expect(app.state.window).toBeUndefined();
+      expect(app.state.older).toEqual([]);
+      expect(app.state.historyBusy).toBe(false);
+      expect(network.inspect).toHaveBeenCalledOnce();
+      expect(app.state.status).toBe(kind === "revoked connection" ? "revoked" : "connected");
+
+      if (kind === "query failure") {
+        vi.mocked(network.readAround).mockResolvedValueOnce([event("new-anchor", 9n)]);
+        await app.around("new-anchor");
+        vi.mocked(network.readHistory).mockRejectedValueOnce(error);
+        await expect(app.older()).rejects.toBe(error);
+        expect(app.state.window?.map(item => item.eventId)).toEqual(["new-anchor"]);
+      }
+    });
+
   it.each(["anchor", "older page"] as const)("retires a pending message-link %s when its screen leaves", async (kind) => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);
