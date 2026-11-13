@@ -23,9 +23,11 @@ import {
 
 Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", true);
 const originalScrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTo");
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
 const renderedApps = new Set<() => Promise<void>>();
 beforeEach(() => {
   Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() });
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
   // This App boundary owns handoff and message traversal; provide a normal
   // occupied viewport so jsdom's zero dimensions do not request extra history.
   vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(600);
@@ -40,6 +42,8 @@ afterEach(async () => {
   vi.useRealTimers();
   if (originalScrollTo) Object.defineProperty(HTMLElement.prototype, "scrollTo", originalScrollTo);
   else Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
 describe("Desktop system handoff App boundary", () => {

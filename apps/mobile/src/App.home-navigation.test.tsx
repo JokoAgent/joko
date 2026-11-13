@@ -762,7 +762,7 @@ describe("actual Task Home navigation composition", () => {
       expect(linkListener).toBeDefined();
       linkListener!({ url: buildMobileMessageDeepLink("current", "removed-message", "removed-event") });
     });
-    expect(around).toHaveBeenCalledExactlyOnceWith("removed-event", expect.any(AbortSignal));
+    expect(around).toHaveBeenCalledExactlyOnceWith("removed-event", expect.any(AbortSignal), { allowNewer: true });
     expect(host.querySelector('[data-testid="task-header"]')).not.toBeNull();
     if (leave) await press("Task back");
 
