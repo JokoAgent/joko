@@ -40,6 +40,19 @@ describe("code-host pull request references", () => {
     expect(parseCodeHostPullRequestReference("https://code.example/acme/widgets/pull/2#fragment")).toBeUndefined();
   });
 
+  it("deduplicates GitHub repository casing and preserves distinct PRs and other hosts", () => {
+    const references = extractCodeHostPullRequestReferences([
+      "https://github.com/Acme/Widgets/pull/42 https://github.com/acme/widgets/pull/42",
+      "https://github.com/acme/widgets/pull/43 https://github.com/Acme/Another/pull/42",
+      "https://forge.example/Acme/Widgets/pull/42 https://forge.example/acme/widgets/pull/42"
+    ]);
+    expect(references.map(reference => reference.key)).toEqual([
+      "github.com/acme/widgets#42", "github.com/acme/widgets#43", "github.com/acme/another#42",
+      "forge.example/Acme/Widgets#42", "forge.example/acme/widgets#42"
+    ]);
+    expect(references[0]?.webUrl).toBe("https://github.com/acme/widgets/pull/42");
+  });
+
   it("bounds the number of references projected from one Session", () => {
     const references = extractCodeHostPullRequestReferences(Array.from(
       { length: 32 },

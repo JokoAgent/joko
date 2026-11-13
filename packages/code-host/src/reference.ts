@@ -45,12 +45,15 @@ export function parseCodeHostPullRequestReference(
   const segments = url.pathname.split("/").filter((segment) => segment !== "");
   const parsed = pullRequestPath(segments);
   if (parsed === undefined) return undefined;
-  const repositoryOwner = decodeRepositorySegment(parsed.owner);
-  const repositoryName = decodeRepositorySegment(parsed.repository);
-  if (repositoryOwner === undefined || repositoryName === undefined) return undefined;
+  const owner = decodeRepositorySegment(parsed.owner);
+  const repository = decodeRepositorySegment(parsed.repository);
+  if (owner === undefined || repository === undefined) return undefined;
   if (!/^[1-9][0-9]{0,9}$/u.test(parsed.number)) return undefined;
   const number = Number(parsed.number);
   if (!Number.isSafeInteger(number) || number > MAX_CHANGE_NUMBER) return undefined;
+  const githubPullRequest = host === "github.com" && parsed.kind === "pull";
+  const repositoryOwner = githubPullRequest ? owner.toLowerCase() : owner;
+  const repositoryName = githubPullRequest ? repository.toLowerCase() : repository;
   return {
     key: codeHostPullRequestReferenceKey({ host, repositoryOwner, repositoryName, number }),
     host,
