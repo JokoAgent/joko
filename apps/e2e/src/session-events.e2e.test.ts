@@ -4,6 +4,7 @@ import { create, fromBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
   CompactSessionOutcome,
+  EntityKind,
   EventCursorSchema,
   InteractionState,
   NativeNavigationTargetSchema,
@@ -340,6 +341,48 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(fixture.application.store.getSession(sourceId).descriptor.binding.opaqueRef).toBe(sourceBinding.opaqueRef);
     expect(fixture.application.store.getSession(derivedId).descriptor.binding.opaqueRef).toBe(derivedBinding.opaqueRef);
     expect(fixture.application.store.getSession(derivedId).descriptor.derivationOrigin?.sourceSessionId).toBe(sourceId);
+  });
+
+  it("fences an abort to the observed Run revision and replays the receipt after the abort advances it", async () => {
+    fixture = await OrchestratorE2eFixture.start({
+      createAdapter: profile => new class extends InstrumentedFakeAdapter {
+        override async send(): Promise<void> {}
+        override async abort(context: AdapterContext): Promise<void> {
+          context.assertRunControlCurrent?.();
+          this.abortCalls++;
+          await context.emit({ type: "done", outcome: "aborted" });
+        }
+      }(profile)
+    });
+    const paired = await fixture.pair(), adapter = fixture.adapter(), operation = paired.clients.operation;
+    const sessionId = sessionIdFrom(await submit(operation, paired.connectionId,
+      createSessionMutation({ backendId: adapter.id, targetId: fixture.targetId() })));
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const runId = queueRunIdFrom(await submit(operation, paired.connectionId, sendInputMutation(sessionId, generation, "Stop this turn")));
+    const { run } = await waitFor(() => paired.clients.run.getRun({ runId }),
+      value => value.run?.state === RunState.RUNNING && !!value.run.activeAttemptId, "the exact Run and Attempt to start");
+    const revision = run!.version!.revision!;
+    const stop = (expectedRevision: bigint) => create(OperationMutationSchema, {
+      preconditions: [{ entity: { kind: EntityKind.RUN, id: runId }, expectedRevision: { value: expectedRevision } }],
+      payload: abortRunMutation(runId).payload
+    });
+    const staleId = randomUUID();
+    await expect(submit(operation, paired.connectionId, stop(revision.value - 1n), staleId)).rejects.toMatchObject({ code: Code.Aborted });
+    const rejected = await operation.getOperation({ operationId: staleId });
+    expect(rejected.operation).toMatchObject({ operationId: staleId, state: OperationState.FAILED });
+    expect(adapter.abortCalls).toBe(0);
+
+    const acceptedId = randomUUID(), mutation = stop(revision.value);
+    const accepted = await submit(operation, paired.connectionId, mutation, acceptedId);
+    expect(accepted).toMatchObject({ operationId: acceptedId, state: OperationState.SUCCEEDED,
+      result: { payload: { case: "acknowledgement", value: { accepted: true } } } });
+    const ended = await paired.clients.run.getRun({ runId });
+    expect(ended.run?.state).toBe(RunState.ABORTED);
+    expect(ended.run?.version?.revision?.value).toBeGreaterThan(revision.value);
+    await expect(submit(operation, paired.connectionId, mutation, acceptedId)).resolves.toMatchObject({
+      operationId: acceptedId, state: OperationState.SUCCEEDED
+    });
+    expect(adapter.abortCalls).toBe(1);
   });
 
   it("executes prompt, steer, follow-up, abort/retry, tree, derive, compact, export, and interactions through operations", async () => {

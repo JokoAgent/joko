@@ -27,7 +27,7 @@ export interface PendingOperation {
   readonly kind: "create" | "send" | "logout" | "revoke" | "device-rename" | "rename" | "pin" | "archive" | "delete"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
-    | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
+    | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch" | "session-stop"
     | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-side-chat" | "session-rewind" | "workspace-rewind"
     | "task-tag"
     | "objective-set" | "objective-pause" | "objective-resume" | "objective-clear"
@@ -40,6 +40,7 @@ export interface PendingOperation {
     | "extension-setup-begin" | "extension-setup-interaction" | "extension-setup-credential"
     | "extension-setup-complete" | "extension-setup-cancel" | "extension-setup-revoke";
   readonly sessionId?: string;
+  readonly runId?: string;
   readonly eventId?: string;
   readonly backendId?: string;
   readonly sourceGeneration?: string;
@@ -522,7 +523,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
     || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
-      "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact",
+      "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact", "session-stop",
       "objective-set", "objective-pause", "objective-resume", "objective-clear",
       "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end",
       "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
@@ -568,6 +569,9 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.kind === "send" && typeof record.sessionId !== "string") return false;
   if (["rename", "pin", "archive", "delete"].includes(String(record.kind)) && typeof record.sessionId !== "string") return false;
   if (record.kind === "message-delete" && (typeof record.sessionId !== "string" || typeof record.eventId !== "string")) return false;
+  if (record.kind === "session-stop") {
+    if (!validReceiptIdentity(record.sessionId) || !validReceiptIdentity(record.runId) || record.taskJoinId !== undefined) return false;
+  } else if (record.runId !== undefined) return false;
   if (["queue-cancel", "queue-edit-lock", "queue-edit", "queue-reorder"].includes(String(record.kind))
     && (typeof record.sessionId !== "string" || typeof record.queueItemId !== "string")) return false;
   if (record.kind === "queue-interaction-lock" && typeof record.sessionId !== "string") return false;
