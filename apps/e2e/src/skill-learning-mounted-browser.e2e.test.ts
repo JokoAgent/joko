@@ -183,7 +183,9 @@ describe("mounted Skill learning review", () => {
     const removed = page.getByRole("dialog", { name: "Skill removed" });
     await removed.waitFor({ state: "visible", timeout: 20_000 });
     await removed.getByRole("button", { name: "Close", exact: true }).click();
-    await page.getByText("No local Skills", { exact: true }).waitFor({ state: "visible" });
+    await removed.waitFor({ state: "hidden" });
+    await page.locator("button.skill-card", { has: page.getByText("mounted-learning", { exact: true }) })
+      .waitFor({ state: "detached" });
     expect(fixture.application.piResources?.list({ kind: "skill", state: "removed" }).some((item) =>
       item.name === "mounted-learning" && item.state === "removed")).toBe(true);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
