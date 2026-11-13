@@ -2772,7 +2772,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         worktreeSupportedTargetIds={portableWorktreeTargetIds}
         onCloseExport={() => setPortableExportSession(undefined)}
         onCloseImport={(requestId) => setPortableImportRequest(current => current?.id === requestId ? undefined : current)}
-        onExported={() => setLayoutNotice(t("portable.exported"))}
+        onExported={(fidelity) => setLayoutNotice(t(fidelity === "full" ? "portable.exported"
+          : fidelity === "partial" ? "portable.exportedPartial" : "portable.exportedProductOnly"))}
         onOpenTask={(sessionId) => {
           setPortableImportRequest(undefined);
           controller.navigate({ kind: "session", sessionId });

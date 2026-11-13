@@ -116,7 +116,8 @@ export class PortableSessionPackageError extends Error {
       | "PASSWORD_REQUIRED"
       | "DECRYPTION_FAILED"
       | "CONTENT_LIMIT_EXCEEDED",
-    message: string
+    message: string,
+    readonly contentBytes?: number
   ) {
     super(message);
     this.name = "PortableSessionPackageError";
@@ -156,7 +157,7 @@ export function encodePortableSessionPackage(
     const bytes = Buffer.from(entry.bytes);
     totalEntryBytes += bytes.byteLength;
     if (!Number.isSafeInteger(totalEntryBytes) || totalEntryBytes > contentLimit) {
-      throw contentLimitExceeded(contentLimit);
+      throw contentLimitExceeded(contentLimit, totalEntryBytes);
     }
     return {
       path,
@@ -170,9 +171,9 @@ export function encodePortableSessionPackage(
   validateEntryReferences(value.manifest, entries);
 
   const serialized = Buffer.from(JSON.stringify({ manifest: value.manifest, entries } satisfies SerializedPackage), "utf8");
-  if (serialized.byteLength > contentLimit) throw contentLimitExceeded(contentLimit);
+  if (serialized.byteLength > contentLimit) throw contentLimitExceeded(contentLimit, serialized.byteLength);
   const compressed = gzipSync(serialized, { level: 9 });
-  if (compressed.byteLength > contentLimit) throw contentLimitExceeded(contentLimit);
+  if (compressed.byteLength > contentLimit) throw contentLimitExceeded(contentLimit, compressed.byteLength);
 
   const password = normalizePassword(options.password);
   let payload: Buffer;
@@ -546,9 +547,10 @@ function invalid(message: string): PortableSessionPackageError {
   return new PortableSessionPackageError("INVALID_PACKAGE", message);
 }
 
-function contentLimitExceeded(limit: number): PortableSessionPackageError {
+function contentLimitExceeded(limit: number, contentBytes?: number): PortableSessionPackageError {
   return new PortableSessionPackageError(
     "CONTENT_LIMIT_EXCEEDED",
-    `Portable Session package exceeds the ${limit}-byte content limit.`
+    `Portable Session package exceeds the ${limit}-byte content limit.`,
+    contentBytes
   );
 }

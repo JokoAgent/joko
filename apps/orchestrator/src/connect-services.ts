@@ -948,7 +948,10 @@ function toConnectError(error: unknown): ConnectError {
   if (error instanceof AsyncTransactionError) return new ConnectError(error.message, Code.FailedPrecondition);
   if (error instanceof ProviderAuthUnsupportedError) return new ConnectError(error.message, Code.Unimplemented);
   if (error instanceof PortableSessionExportTooLargeError) {
-    return new ConnectError(error.message, Code.ResourceExhausted);
+    return new ConnectError(error.message, Code.ResourceExhausted, {
+      [contract.PORTABLE_SESSION_MEDIA_BYTES_HEADER]: String(error.mediaBytes),
+      [contract.PORTABLE_SESSION_LIMIT_BYTES_HEADER]: String(error.limitBytes)
+    });
   }
   if (error instanceof PortableSessionPackageError) {
     const code = error.code === "PASSWORD_REQUIRED" ? Code.FailedPrecondition
