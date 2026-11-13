@@ -1,7 +1,7 @@
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EntityVersionSchema, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, capabilityNames } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
-import { mobileAccountUsageStale, mobileAccountUsageWindows, mobileProviderUsageIdentity, mobileProviderUsageSupported, mobileUsageTimestamp } from "./mobile-account-usage";
+import { mobileAccountUsageStale, mobileAccountUsageWindows, mobileCodexWeeklyUsageWindow, mobileProviderUsageIdentity, mobileProviderUsageSupported, mobileUsageTimestamp } from "./mobile-account-usage";
 
 const now = 1_800_000_000_000;
 const timestamp = (millis: number) => ({ seconds: BigInt(Math.floor(millis / 1000)), nanos: millis % 1000 * 1_000_000 });
@@ -30,6 +30,46 @@ describe("Mobile account usage", () => {
     expect(mobileAccountUsageStale(snapshot, now)).toBe(false);
     expect(mobileAccountUsageStale(snapshot, now + 5 * 60_000 + 1)).toBe(true);
     expect(mobileAccountUsageStale(create(ProviderAccountUsageSnapshotSchema), now)).toBe(true);
+  });
+
+  it("uses the exact or longest matching Codex quota bucket before the generic weekly bucket", () => {
+    const snapshot = create(ProviderAccountUsageSnapshotSchema, { providerId: "account", buckets: [
+      { id: "__default__", secondaryWindow: { usedPercent: 30, windowMinutes: 10_080 } },
+      { id: "codex", displayName: "Codex", secondaryWindow: { usedPercent: 20, windowMinutes: 10_080 } },
+      { id: "gpt-codex", displayName: "GPT-5.3-Codex", primaryWindow: { usedPercent: 70, windowMinutes: 10_080 } },
+      { id: "gpt-codex-spark", displayName: "GPT 5.3 Codex Spark", primaryWindow: { usedPercent: 99, windowMinutes: 300 },
+        secondaryWindow: { usedPercent: 90, windowMinutes: 10_080, resetAt: timestamp(now + 60_000) } },
+      { id: "other", secondaryWindow: { usedPercent: 99, windowMinutes: 10_080 } }
+    ] });
+    for (const modelId of ["gpt-5.3-codex-spark", "openai/gpt-5.3-codex-spark-2026"]) {
+      expect(mobileCodexWeeklyUsageWindow(snapshot, modelId, now)).toMatchObject({ remainingPercent: 10, resetAt: now + 60_000 });
+    }
+    expect(mobileCodexWeeklyUsageWindow(snapshot, "gpt-5.3-codex", now)).toMatchObject({ remainingPercent: 30 });
+    expect(mobileCodexWeeklyUsageWindow(snapshot, "another-codex-model", now)).toMatchObject({ remainingPercent: 80 });
+    expect(mobileCodexWeeklyUsageWindow({ ...snapshot, buckets: [snapshot.buckets[0]!] }, "model", now)).toMatchObject({ remainingPercent: 70 });
+    expect(mobileCodexWeeklyUsageWindow(snapshot, "gpt-5.3-codex-spark", now + 60_000)).toBeUndefined();
+  });
+
+  it("uses a top-level Codex weekly window only in the absence of bucket facts", () => {
+    const snapshot = create(ProviderAccountUsageSnapshotSchema, { providerId: "account",
+      primaryWindow: { usedPercent: 4, windowMinutes: 300 }, secondaryWindow: { usedPercent: 100, windowMinutes: 10_080 } });
+    expect(mobileCodexWeeklyUsageWindow(snapshot, "model", now)).toMatchObject({ remainingPercent: 0 });
+    expect(mobileCodexWeeklyUsageWindow({ ...snapshot, secondaryWindow: undefined }, "model", now)).toBeUndefined();
+    const buckets = create(ProviderAccountUsageSnapshotSchema, { buckets: [
+      { id: "unnamed-model", secondaryWindow: { usedPercent: 99, windowMinutes: 10_080 } },
+      { id: "other", displayName: "Another model", secondaryWindow: { usedPercent: 98, windowMinutes: 10_080 } }
+    ] }).buckets;
+    expect(mobileCodexWeeklyUsageWindow({ ...snapshot, buckets }, "model", now)).toBeUndefined();
+    expect(mobileCodexWeeklyUsageWindow({ ...snapshot, buckets: [buckets[0]!, { ...buckets[1]!, id: "unnamed-model", displayName: "model" }] },
+      "model", now)).toBeUndefined();
+  });
+
+  it("drops a retired matching Codex bucket and uses the reported generic weekly limit", () => {
+    const snapshot = create(ProviderAccountUsageSnapshotSchema, { buckets: [
+      { id: "codex", secondaryWindow: { usedPercent: 20, windowMinutes: 10_080 } },
+      { id: "old", displayName: "Model", secondaryWindow: { usedPercent: 90, windowMinutes: 10_080, resetAt: timestamp(now - 86_401_000) } }
+    ] });
+    expect(mobileCodexWeeklyUsageWindow(snapshot, "model", now)).toMatchObject({ remainingPercent: 80 });
   });
 
   it("accepts the formal zero Provider generation while fencing quota by auth and revision", () => {

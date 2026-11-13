@@ -1,5 +1,5 @@
 import { AuthenticationState, CapabilitySupport, ModelSourceKind, capabilityNames, type ProviderAccountUsageSnapshot,
-  type ProviderAccountUsageWindow, type ProviderDescriptor } from "@joko/contracts";
+  type ProviderAccountUsageBucket, type ProviderAccountUsageWindow, type ProviderDescriptor } from "@joko/contracts";
 
 export interface MobileProviderUsageTransport {
   readonly ownerKey: string;
@@ -16,6 +16,9 @@ export interface MobileAccountUsageWindow {
   readonly resetAt?: number;
   readonly model: boolean;
 }
+
+const CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
+const CODEX_BUCKET_RETIREMENT_MS = 24 * 60 * 60_000;
 
 export function mobileAccountResetControls(transport: MobileProviderUsageTransport | undefined, backendId: string, providerId: string, sourceKind: ModelSourceKind | undefined) {
   const api = transport?.resets;
@@ -53,14 +56,9 @@ export function mobileUsageTimestamp(value: { readonly seconds: bigint; readonly
 export function mobileAccountUsageWindows(snapshot: ProviderAccountUsageSnapshot | undefined, modelId: string | undefined, now: number): readonly MobileAccountUsageWindow[] {
   if (!snapshot) return [];
   const rows: MobileAccountUsageWindow[] = [];
-  const add = (id: string, window: ProviderAccountUsageWindow | undefined, label?: string, model = false): void => {
-    if (!window || !Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100) return;
-    const resetAt = mobileUsageTimestamp(window.resetAt);
-    if (window.resetAt !== undefined && resetAt === undefined || resetAt !== undefined && resetAt <= now) return;
-    rows.push({ id, remainingPercent: 100 - window.usedPercent, model,
-      ...(label?.trim() ? { label: label.slice(0, 512) } : {}),
-      ...(window.windowMinutes !== undefined && Number.isSafeInteger(window.windowMinutes) && window.windowMinutes > 0
-        ? { minutes: window.windowMinutes } : {}), ...(resetAt === undefined ? {} : { resetAt }) });
+  const add = (id: string, window: ProviderAccountUsageWindow | undefined, label?: string): void => {
+    const row = mobileAccountUsageWindow(id, window, now, label);
+    if (row) rows.push(row);
   };
   add("primary", snapshot.primaryWindow);
   add("secondary", snapshot.secondaryWindow);
@@ -72,13 +70,61 @@ export function mobileAccountUsageWindows(snapshot: ProviderAccountUsageSnapshot
       add(`bucket:${bucket.id}:secondary`, bucket.secondaryWindow, bucket.displayName ?? bucket.id);
     }
   }
-  if (modelId && snapshot.modelWindows.length <= 256) {
-    for (const [index, entry] of snapshot.modelWindows.entries()) {
-      if (entry.modelId !== modelId) continue;
-      add(`model:${index}`, entry.window, entry.displayName, true);
+  return modelId ? [...rows, ...mobileExactModelUsageWindows(snapshot, modelId, now)] : rows;
+}
+
+export function mobileExactModelUsageWindows(snapshot: ProviderAccountUsageSnapshot, modelId: string, now: number): readonly MobileAccountUsageWindow[] {
+  if (!modelId || snapshot.modelWindows.length > 256) return [];
+  return snapshot.modelWindows.flatMap((entry, index) => {
+    if (entry.modelId !== modelId) return [];
+    const row = mobileAccountUsageWindow(`model:${index}`, entry.window, now, entry.displayName, true);
+    return row ? [row] : [];
+  });
+}
+
+export function mobileCodexWeeklyUsageWindow(snapshot: ProviderAccountUsageSnapshot, modelId: string, now: number): MobileAccountUsageWindow | undefined {
+  // The single-window view can mirror the first model bucket when no generic bucket exists.
+  const selected = snapshot.buckets.length === 0 ? snapshot : mobileCodexModelBucket(snapshot.buckets, modelId, now);
+  const window = [selected?.primaryWindow, selected?.secondaryWindow].find(row => row?.windowMinutes === CODEX_WEEKLY_WINDOW_MINUTES);
+  const weekly = mobileAccountUsageWindow("codex-weekly", window, now);
+  return weekly ? { ...weekly, remainingPercent: Math.round(weekly.remainingPercent) } : undefined;
+}
+
+function mobileCodexModelBucket(buckets: readonly ProviderAccountUsageBucket[], modelId: string, now: number): ProviderAccountUsageBucket | undefined {
+  if (buckets.length > 256) return undefined;
+  const token = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/gu, "");
+  const model = token(modelId);
+  const ids = buckets.map(bucket => bucket.id);
+  const active = buckets.filter(bucket => {
+    if (!bucket.id || ids.indexOf(bucket.id) !== ids.lastIndexOf(bucket.id)) return false;
+    const windows = [bucket.primaryWindow, bucket.secondaryWindow].filter(window => window !== undefined);
+    return windows.length === 0 || !windows.every(window => {
+      const reset = mobileUsageTimestamp(window.resetAt);
+      return reset !== undefined && reset > 0 && reset + CODEX_BUCKET_RETIREMENT_MS < now;
+    });
+  });
+  let match: ProviderAccountUsageBucket | undefined;
+  let length = 0;
+  for (const bucket of active) {
+    if (bucket.id === "codex" || bucket.id === "__default__") continue;
+    const name = token(bucket.displayName ?? "");
+    if (name && name === model) return bucket;
+    if (name.length > length && model.includes(name)) {
+      match = bucket;
+      length = name.length;
     }
   }
-  return rows;
+  return match ?? active.find(bucket => bucket.id === "codex") ?? active.find(bucket => bucket.id === "__default__");
+}
+
+function mobileAccountUsageWindow(id: string, window: ProviderAccountUsageWindow | undefined, now: number, label?: string, model = false): MobileAccountUsageWindow | undefined {
+  if (!window || !Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100) return undefined;
+  const resetAt = mobileUsageTimestamp(window.resetAt);
+  if (window.resetAt !== undefined && resetAt === undefined || resetAt !== undefined && resetAt <= now) return undefined;
+  return { id, remainingPercent: 100 - window.usedPercent, model,
+    ...(label?.trim() ? { label: label.slice(0, 512) } : {}),
+    ...(window.windowMinutes !== undefined && Number.isSafeInteger(window.windowMinutes) && window.windowMinutes > 0
+      ? { minutes: window.windowMinutes } : {}), ...(resetAt === undefined ? {} : { resetAt }) };
 }
 
 export function mobileAccountUsageStale(snapshot: ProviderAccountUsageSnapshot, now: number): boolean {

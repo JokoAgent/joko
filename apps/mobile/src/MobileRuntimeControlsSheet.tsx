@@ -18,9 +18,7 @@ import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyb
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileUsageProviderKey, mobileAccountResetControls, type MobileProviderUsageTransport } from "./mobile-account-usage";
-import { MobileAccountUsageSummary, mobileModelAccountQuotaLabel } from "./MobileAccountUsageSummary";
-import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
-import { mobileAccountUsageWindows } from "./mobile-account-usage";
+import { MobileAccountUsageSummary, MobileModelAccountQuota, mobileModelAccountQuota } from "./MobileAccountUsageSummary";
 import { useMobileAccountUsage } from "./use-mobile-account-usage";
 import { mobileMessage } from "./mobile-messages";
 import {
@@ -277,6 +275,8 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
   const current = controls.currentModel;
   const configurableCurrent = current?.route !== undefined && current.selectable
     && (controls.canSetEffort || controls.canSetFastMode);
+  const quotaFor = (route: MobileModelRoute) => mobileModelAccountQuota(accountUsage.snapshots[mobileUsageProviderKey(route)], route,
+    accountUsage.now, locale, accountUsage.failed);
   const favoriteRows = controls.favorites.flatMap((favorite) => {
     const route = controls.models.find((candidate) => candidate.backendId === favorite.backendId && candidate.providerId === favorite.providerId
       && candidate.modelId === favorite.modelId);
@@ -316,8 +316,10 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
         <Text style={[styles.providerHeading, { color: colors.muted }]}>{mobileMessage(locale, "controls.favorites")}</Text>
         {favoriteRows.map(({ favorite, route }) => {
           const selected = sameModelConfiguration(current ? { ...current, backendId: controls.backend.backendId } : undefined, favorite);
+          const quota = quotaFor(route);
           return <Pressable key={favorite.favoriteId} accessibilityRole="radio" accessibilityState={{ selected, disabled }}
-            disabled={disabled} accessibilityLabel={`${route.displayName}${route.source ? `, ${mobileModelSourceLabel(route)}` : ""}, ${mobileMessage(locale, "controls.savedFavorite")}`}
+            disabled={disabled} accessibilityLabel={[route.displayName, route.source && mobileModelSourceLabel(route),
+              mobileMessage(locale, "controls.savedFavorite"), quota?.weekly && quota.label].filter(Boolean).join(", ")}
             onPress={() => onOpenModel(route, favorite)}
             style={[styles.routeRow, { borderColor: selected ? colors.accent : colors.border }, disabled && styles.disabled]}>
             <View style={styles.flex}>
@@ -326,6 +328,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
               <Text style={[styles.caption, { color: colors.muted }]}>{favorite.effortId
                 ? mobileMessage(locale, "controls.effortValue", { effort: favorite.effortId })
                 : mobileMessage(locale, "controls.defaultEffort")}{favorite.fastMode === "ultrafast" ? " · Ultrafast" : favorite.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}</Text>
+              {quota?.weekly && <MobileModelAccountQuota quota={quota} colors={colors} />}
             </View>
             <Text style={[styles.disclosure, { color: selected ? colors.accent : colors.muted }]}>{selected ? "✓" : "›"}</Text>
           </Pressable>;
@@ -336,7 +339,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
         const showProvider = sourceKey !== previousProvider;
         previousProvider = sourceKey;
         const selected = controls.backend.backendId === route.backendId && current?.providerId === route.providerId && current.modelId === route.modelId;
-        const modelQuota = mobileModelAccountQuotaLabel(accountUsage.snapshots[mobileUsageProviderKey(route)], route.modelId, accountUsage.now, locale, accountUsage.failed);
+        const quota = quotaFor(route);
         return <View key={route.key}>
           {showProvider && <Text style={[styles.providerHeading, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
           {showProvider && providerUsageTransport?.providers.some(provider => provider.backendId === route.backendId && provider.providerId === route.providerId)
@@ -344,16 +347,14 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
               reset={mobileAccountResetControls(providerUsageTransport, route.backendId, route.providerId, route.source?.kind)}
               loading={accountUsage.loading} failed={accountUsage.failed} now={accountUsage.now} colors={colors} locale={locale} />}
           <Pressable accessibilityRole="radio" accessibilityState={{ selected, disabled }} disabled={disabled}
-            accessibilityLabel={`${route.displayName}, ${route.providerName}`}
+            accessibilityLabel={[route.displayName, route.providerName, quota?.weekly && quota.label].filter(Boolean).join(", ")}
             onPress={() => onOpenModel(route)}
             style={[styles.routeRow, { borderColor: selected ? colors.accent : colors.border }, disabled && styles.disabled]}>
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, { color: colors.ink }]}>{route.displayName}</Text>
               {route.source && <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
               <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)} · {route.modelId}</Text>
-              {modelQuota && <Text style={[styles.caption, { color: colors.muted }]}>{modelQuota}</Text>}
-              {mobileAccountUsageWindows(accountUsage.snapshots[mobileUsageProviderKey(route)], route.modelId, accountUsage.now).filter(window => window.model)
-                .map(window => <MobileModelQuotaBar key={window.id} remaining={window.remainingPercent} label={modelQuota ?? route.displayName} colors={colors} />)}
+              <MobileModelAccountQuota quota={quota} colors={colors} />
             </View>
             <Text style={[styles.disclosure, { color: selected ? colors.accent : colors.muted }]}>{selected ? "✓" : "›"}</Text>
           </Pressable>

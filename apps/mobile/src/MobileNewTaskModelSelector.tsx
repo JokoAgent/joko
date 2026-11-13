@@ -9,9 +9,8 @@ import { mobileMessage } from "./mobile-messages";
 import type { MobileModelRoute } from "./mobile-runtime-controls";
 import type { MobileNewTaskSourceSelection } from "./mobile-new-task-model-memory";
 import { useMobileAccountUsage } from "./use-mobile-account-usage";
-import { mobileAccountUsageWindows, mobileUsageProviderKey, mobileAccountResetControls, type MobileProviderUsageTransport } from "./mobile-account-usage";
-import { MobileAccountUsageSummary, mobileModelAccountQuotaLabel } from "./MobileAccountUsageSummary";
-import { MobileModelQuotaBar } from "./MobileModelQuotaBar";
+import { mobileUsageProviderKey, mobileAccountResetControls, type MobileProviderUsageTransport } from "./mobile-account-usage";
+import { MobileAccountUsageSummary, MobileModelAccountQuota, mobileModelAccountQuota } from "./MobileAccountUsageSummary";
 
 /** The new-task entry consumes the same authoritative source routes as the
  * task picker, while its selected configuration stays a draft until send. */
@@ -35,6 +34,8 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
   const label = (model: MobileModelRoute) => model.source
     ? [model.source.displayName, model.source.nodeName, model.source.nativeAdapterKind,
       model.source.groupMemberCount ? `×${model.source.groupMemberCount}` : undefined].filter(Boolean).join(" · ") : model.providerName;
+  const quotaFor = (model: MobileModelRoute) => mobileModelAccountQuota(accountUsage.snapshots[mobileUsageProviderKey(model)], model,
+    accountUsage.now, locale, accountUsage.failed);
   const choose = (model: MobileModelRoute, saved?: MobileNewTaskSourceSelection): void => {
     setError("");
     const configuration = saved ?? (value?.backendId === model.backendId && value.providerId === model.providerId && value.modelId === model.modelId ? value : undefined);
@@ -69,18 +70,25 @@ export function MobileNewTaskModelSelector({ models, value, favorites, colors, l
         style={[styles.input, { color: colors.ink, borderColor: colors.border }]} />
       <ScrollView style={styles.list} keyboardShouldPersistTaps="handled">
         {!!saved.length && <Text style={{ color: colors.muted }}>{mobileMessage(locale, "controls.favorites")}</Text>}
-        {saved.map(({ entry, favorite, selection }) => <Pressable key={favorite.favoriteId} disabled={busy || disabled}
-          accessibilityRole="button" accessibilityLabel={`${entry.displayName}, ${mobileMessage(locale, "controls.savedFavorite")}`}
-          onPress={() => choose(entry, selection)} style={styles.model}><Text style={{ color: colors.ink }}>★ {entry.displayName}</Text>
-          <Text style={{ color: colors.muted }}>{label(entry)}</Text></Pressable>)}
-        {matching.map(model => <Pressable key={model.key} disabled={busy || disabled} accessibilityRole="radio"
-          accessibilityState={{ selected: route?.key === model.key }} accessibilityLabel={`${model.displayName}, ${label(model)}`}
-          onPress={() => choose(model)} style={styles.model}><Text style={{ color: colors.ink }}>{model.displayName}</Text>
-          <Text style={{ color: colors.muted }}>{label(model)}</Text>
-          {mobileAccountUsageWindows(accountUsage.snapshots[mobileUsageProviderKey(model)], model.modelId, accountUsage.now).filter(window => window.model)
-            .map(window => <MobileModelQuotaBar key={window.id} remaining={window.remainingPercent}
-              label={mobileModelAccountQuotaLabel(accountUsage.snapshots[mobileUsageProviderKey(model)], model.modelId, accountUsage.now, locale, accountUsage.failed) ?? model.displayName} colors={colors} />)}
-        </Pressable>)}
+        {saved.map(({ entry, favorite, selection }) => {
+          const quota = quotaFor(entry);
+          return <Pressable key={favorite.favoriteId} disabled={busy || disabled} accessibilityRole="button"
+            accessibilityLabel={[entry.displayName, mobileMessage(locale, "controls.savedFavorite"), quota?.weekly && quota.label].filter(Boolean).join(", ")}
+            onPress={() => choose(entry, selection)} style={styles.model}><Text style={{ color: colors.ink }}>★ {entry.displayName}</Text>
+            <Text style={{ color: colors.muted }}>{label(entry)}</Text>
+            {quota?.weekly && <MobileModelAccountQuota quota={quota} colors={colors} />}
+          </Pressable>;
+        })}
+        {matching.map(model => {
+          const quota = quotaFor(model);
+          return <Pressable key={model.key} disabled={busy || disabled} accessibilityRole="radio"
+            accessibilityState={{ selected: route?.key === model.key }}
+            accessibilityLabel={[model.displayName, label(model), quota?.weekly && quota.label].filter(Boolean).join(", ")}
+            onPress={() => choose(model)} style={styles.model}><Text style={{ color: colors.ink }}>{model.displayName}</Text>
+            <Text style={{ color: colors.muted }}>{label(model)}</Text>
+            <MobileModelAccountQuota quota={quota} colors={colors} showLabel={quota?.weekly === true} />
+          </Pressable>;
+        })}
         {!matching.length && <Text style={{ color: colors.muted }}>{mobileMessage(locale, "controls.noModelMatch")}</Text>}
       </ScrollView>
       {route && choice && <>
