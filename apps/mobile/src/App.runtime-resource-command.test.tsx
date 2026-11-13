@@ -2,7 +2,7 @@
 import { act, createElement, forwardRef, useImperativeHandle, useRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventIdentitySchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
+import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventIdentitySchema, EventPayloadSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
   MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, NativeMessageIdentitySchema, NativeSessionBindingSchema, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -893,8 +893,8 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
   if (completed.case !== "messageCompleted") throw new Error("Expected an assistant completion.");
   const adopted = create(EventSchema, { ...answer, eventId: "adopted-completion",
     cursor: create(EventCursorSchema, { generation: 1n, sequence: 8n }),
-    payload: { kind: { case: "messageCompleted", value: { ...completed.value, messageId: "native-entry",
-      nativeIdentity: create(NativeMessageIdentitySchema, { entryId: "native-entry" }) } } } });
+    payload: create(EventPayloadSchema, { kind: { case: "messageCompleted", value: { ...completed.value, messageId: "native-entry",
+      nativeIdentity: create(NativeMessageIdentitySchema, { entryId: "native-entry" }) } } }) });
   const settled = create(SnapshotSchema, { ...running,
     sessions: [create(SessionSchema, { ...running.sessions[0]!, state: SessionState.IDLE })], timeline: [adopted] });
   renderedState = { ...state, owner: settled, detail: settled };
