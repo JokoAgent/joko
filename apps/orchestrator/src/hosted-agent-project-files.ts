@@ -268,9 +268,19 @@ export function sanitizeHostedPermissionSettings(content: string, maximumRules =
 function protectImports(text: string, file: string, approved: ReadonlySet<string>): string {
   return mapSourceInstructionImports(text, candidate => {
     const relative = path.posix.normalize(path.posix.join(path.posix.dirname(file), candidate.replaceAll("\\", "/")));
-    return !/^(?:[~\/]|[A-Za-z]:)/u.test(candidate) && allowedPath(relative) && approved.has(key(relative)) ? `@${candidate}` : `\`@${candidate}\``;
+    if (!/^(?:[~\/]|[A-Za-z]:)/u.test(candidate) && allowedPath(relative) && approved.has(key(relative))) return `@${candidate}`;
+    const trimmed = candidate.replace(/[.,;:!?]+$/u, "");
+    // Source rewrites successful imports to its owned digest paths and leaves
+    // sentence punctuation after the path. Verify the same path before writing.
+    const canonicalImport = path.posix.normalize(path.posix.join(path.posix.dirname(file), trimmed));
+    if (trimmed !== candidate && /^(?:\.\.\/)*(?:\.claude\/rules\/source-context\/)?[a-f0-9]{64}\.md$/u.test(trimmed)
+      && /^\.claude\/rules\/source-context\/[a-f0-9]{64}\.md$/u.test(canonicalImport) && approved.has(key(canonicalImport))) {
+      return `@${candidate}`;
+    }
+    return `\`@${candidate}\``;
   });
 }
+
 /** Claude-style imports outside fenced and inline code, shared by collection
  * and materialization so the same token cannot gain a new meaning on Host. */
 export function mapSourceInstructionImports(text: string, replace: (candidate: string) => string): string {
