@@ -79,11 +79,9 @@ export class SessionNotificationTracker {
 function attentionFingerprint(session: SessionView): string | undefined {
   const attention = session.attention;
   if (attention === undefined) return undefined;
-  return [
-    attention.kind,
-    cursorFingerprint(attention.subjectCursor),
-    cursorFingerprint(attention.attentionCursor)
-  ].join("\u0000");
+  const subject = [attention.kind, cursorFingerprint(attention.subjectCursor)];
+  if (attention.kind === "awaiting") subject.push(cursorFingerprint(attention.attentionCursor));
+  return subject.join("\u0000");
 }
 
 function cursorFingerprint(cursor: TimelineHistoryCursorView): string {
