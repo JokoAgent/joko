@@ -22,6 +22,7 @@ export interface CodeHostProjectionCoordinatorOptions {
   readonly now?: () => number;
   readonly timeToLiveMs?: number;
   readonly notFoundTimeToLiveMs?: number;
+  readonly clearProjectionOnNotFound?: boolean;
   readonly failureTimeToLiveMs?: number;
   readonly requestTimeoutMs?: number;
 }
@@ -37,6 +38,7 @@ export class CodeHostProjectionCoordinator {
   private readonly now: () => number;
   private readonly timeToLiveMs: number;
   private readonly notFoundTimeToLiveMs: number;
+  private readonly clearProjectionOnNotFound: boolean;
   private readonly failureTimeToLiveMs: number;
   private readonly requestTimeoutMs: number;
   private readonly sessionInflight = new Map<string, Promise<CodeHostProjectionRefreshResult>>();
@@ -55,6 +57,7 @@ export class CodeHostProjectionCoordinator {
     this.now = options.now ?? Date.now;
     this.timeToLiveMs = positiveDuration(options.timeToLiveMs ?? 60_000, "projection TTL");
     this.notFoundTimeToLiveMs = positiveDuration(options.notFoundTimeToLiveMs ?? 30_000, "not-found TTL");
+    this.clearProjectionOnNotFound = options.clearProjectionOnNotFound ?? false;
     this.failureTimeToLiveMs = positiveDuration(options.failureTimeToLiveMs ?? 60_000, "failure TTL");
     this.requestTimeoutMs = positiveDuration(options.requestTimeoutMs ?? 15_000, "request timeout");
   }
@@ -134,9 +137,10 @@ export class CodeHostProjectionCoordinator {
     } catch (error) {
       const minimumTimeToLiveMs = provider?.minimumTimeToLiveMs ?? 0;
       if (error instanceof CodeHostPullRequestNotFoundError) {
+        const projection = this.clearProjectionOnNotFound ? undefined : entry.projection;
         return {
           reference: entry.reference,
-          ...(entry.projection === undefined ? {} : { projection: entry.projection }),
+          ...(projection === undefined ? {} : { projection }),
           notFoundUntil: observedAt + Math.max(
             this.notFoundTimeToLiveMs,
             minimumTimeToLiveMs

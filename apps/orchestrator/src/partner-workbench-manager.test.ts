@@ -23,7 +23,7 @@ import { ConnectionManager } from "./connection-manager.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
 import type { BridgeToolCallContext } from "./mcp-router.js";
-import type { CodeHostProvider, CodeHostSessionAuthorizationPort } from "@joko/code-host";
+import { CodeHostPullRequestNotFoundError, type CodeHostProvider, type CodeHostSessionAuthorizationPort } from "@joko/code-host";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -79,6 +79,32 @@ describe("Partner workbench service and Queue ownership", () => {
     await vi.waitFor(() => expect(getPullRequest).toHaveBeenCalledTimes(3));
     expect((await f.workbench.readDetail(cached.owner, "item:change")).task.pullRequest?.projection?.state).toBe("merged");
     expect(JSON.stringify((await f.workbench.readState(f.partner.id)).tasks)).not.toContain("Provider unavailable");
+
+    now += 11 * 60_000 + 1;
+    getPullRequest.mockRejectedValueOnce(new CodeHostPullRequestNotFoundError());
+    const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
+    const context = {} as HandlerContext;
+    const request = create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id });
+    const read = async () => (await methods.getPartnerWorkbench(request, context)).workbench!.tasks
+      .find(task => task.id === "item:change")?.pullRequest;
+    await vi.waitFor(async () => expect(await read()).toMatchObject({ observed: false,
+      state: contract.CodeHostPullRequestState.UNSPECIFIED, reference: { number: 42n, webUrl: reference.webUrl } }));
+    const persisted = await f.workbench.readDetail(cached.owner, "item:change");
+    expect(persisted.task.judgment?.ref).toBe(reference.webUrl);
+    expect(persisted.task.pullRequest?.projection).toBeUndefined();
+    expect(getPullRequest).toHaveBeenCalledTimes(4);
+    expect((await read())?.observed).toBe(false);
+    expect(getPullRequest).toHaveBeenCalledTimes(4);
+
+    now += 30_001;
+    getPullRequest.mockRejectedValueOnce(new Error("Temporary provider failure"));
+    expect((await read())?.observed).toBe(false);
+    await vi.waitFor(() => expect(getPullRequest).toHaveBeenCalledTimes(5));
+    expect((await read())?.observed).toBe(false);
+
+    now += 60_001;
+    await vi.waitFor(async () => expect(await read()).toMatchObject({ observed: true, state: contract.CodeHostPullRequestState.MERGED }));
+    expect(getPullRequest).toHaveBeenCalledTimes(6);
   });
   it("projects owned routines from their definition, activity and history without exposing backing schedules", async () => {
     const f = await fixture();

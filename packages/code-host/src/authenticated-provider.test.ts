@@ -196,11 +196,15 @@ describe("authenticated code-host Provider", () => {
     expect(publicFetch).toHaveBeenCalledOnce();
   });
 
-  it("does not retry a credentialed not-found response anonymously", async () => {
+  it.each([true, false])("does not retry a credentialed not-found response anonymously, credential current=%s", async staysCurrent => {
+    let current = true;
     const authenticated = new AuthenticatedCodeHostProvider({
       authorization: authorization(),
-      credentialSource: credentialSource("gho_owner_scoped"),
-      fetch: async () => new Response(null, { status: 404 })
+      credentialSource: credentialSource("gho_owner_scoped", () => current),
+      fetch: async (input) => {
+        if (new URL(String(input)).pathname !== "/graphql") current = staysCurrent;
+        return new Response(null, { status: 404 });
+      }
     });
     const publicFetch = vi.fn<typeof globalThis.fetch>();
     const values = new Map<string, CodeHostSessionProjection>();
@@ -214,7 +218,11 @@ describe("authenticated code-host Provider", () => {
 
     const result = await coordinator.refreshSession("session-a", [reference]);
     expect(result.projection.references[0]?.projection).toBeUndefined();
-    expect(result.projection.references[0]?.notFoundUntil).toBeGreaterThan(0);
+    if (staysCurrent) expect(result.projection.references[0]?.notFoundUntil).toBeGreaterThan(0);
+    else {
+      expect(result.projection.references[0]?.notFoundUntil).toBeUndefined();
+      expect(result.projection.references[0]?.retryAfterUntil).toBeGreaterThan(0);
+    }
     expect(publicFetch).not.toHaveBeenCalled();
   });
 
