@@ -85,8 +85,10 @@ describe("Partner workbench service and Queue ownership", () => {
     const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
     const context = {} as HandlerContext;
     const request = create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id });
-    const read = async () => (await methods.getPartnerWorkbench(request, context)).workbench!.tasks
-      .find(task => task.id === "item:change")?.pullRequest;
+    const read = async () => {
+      const response = create(contract.GetPartnerWorkbenchResponseSchema, await methods.getPartnerWorkbench(request, context));
+      return response.workbench?.tasks.find(task => task.id === "item:change")?.pullRequest;
+    };
     await vi.waitFor(async () => expect(await read()).toMatchObject({ observed: false,
       state: contract.CodeHostPullRequestState.UNSPECIFIED, reference: { number: 42n, webUrl: reference.webUrl } }));
     const persisted = await f.workbench.readDetail(cached.owner, "item:change");
