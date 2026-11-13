@@ -32,6 +32,7 @@ import {
   mobilePermissionDecisionDanger,
   mobilePermissionDecisionLabel,
   mobilePermissionDecisionNeedsConfirmation,
+  mobilePermissionDecisions,
   mobilePermissionDetails,
   mobilePermissionRiskLabel,
   mobilePlanDecisionLabel,
@@ -304,7 +305,7 @@ function PermissionRequest({ interaction, disabled, colors, locale, onResolve }:
       </View>)}
     </View>}
     <View style={sheetStyles.decisionStack}>
-      {armedDecision === undefined ? request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePermissionDecisionLabel(decision, locale)}
+      {armedDecision === undefined ? mobilePermissionDecisions(interaction).map((decision) => <SheetButton key={decision} label={mobilePermissionDecisionLabel(decision, locale)}
         colors={colors} disabled={disabled} danger={mobilePermissionDecisionDanger(decision)}
         quiet={decision === PermissionDecisionKind.DENY_ONCE || decision === PermissionDecisionKind.DENY_FOR_SESSION}
         onPress={() => {

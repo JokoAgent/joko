@@ -241,7 +241,7 @@ export function createMobileInteractionResolution(
   if (!connectionId.trim()) throw new Error("A current connection is required to answer this request.");
   if (interaction.request.case === "permission") {
     validatePermissionDeclaration(interaction);
-    if (submission.kind !== "permission" || !interaction.request.value.allowedDecisions.includes(submission.decision)
+    if (submission.kind !== "permission" || !mobilePermissionDecisions(interaction).includes(submission.decision)
       || !currentPermissionDecisions.has(submission.decision)) {
       throw new Error("This permission decision is not currently available.");
     }
@@ -348,6 +348,17 @@ export function mobilePermissionDecisionLabel(decision: PermissionDecisionKind, 
 
 export function mobilePermissionDecisionDanger(decision: PermissionDecisionKind): boolean {
   return decision === PermissionDecisionKind.DENY_FOR_SESSION || decision === PermissionDecisionKind.ABORT_RUN;
+}
+
+export function mobilePermissionDecisions(interaction: Interaction): readonly PermissionDecisionKind[] {
+  if (interaction.request.case !== "permission") return [];
+  const { subject, allowedDecisions } = interaction.request.value;
+  const tool = subject?.kind;
+  if (interaction.backendId === "claude-code" && tool?.case === "customTool" && tool.value.toolId === "Bash"
+    && mobilePermissionDecisionNeedsConfirmation(interaction, PermissionDecisionKind.ALLOW_FOR_SESSION)) {
+    return allowedDecisions.filter(decision => decision !== PermissionDecisionKind.ALLOW_FOR_SESSION);
+  }
+  return allowedDecisions;
 }
 
 export function mobilePermissionDecisionNeedsConfirmation(interaction: Interaction, decision: PermissionDecisionKind): boolean {
