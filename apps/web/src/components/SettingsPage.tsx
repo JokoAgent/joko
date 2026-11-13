@@ -4542,15 +4542,14 @@ function ProviderAccountUsageDetails({
   ])).concat((usage.modelWindows ?? []).map((entry, index) => ({
     key: `model:${index}`, label: entry.displayName, window: entry.window
   }))).filter((row) => row.window !== undefined);
-  const formatCredits = (credits: typeof usage.credits): string | undefined => credits?.unlimited === true
-    ? t("settings.accountCreditsUnlimited")
-    : credits?.balance !== undefined
-      ? t("settings.accountCreditsBalance", { balance: credits.balance })
-      : credits?.hasCredits === false
-        ? t("settings.accountCreditsNone")
-        : credits?.hasCredits === true
-          ? t("settings.accountCreditsAvailable")
-          : undefined;
+  const formatCredits = (credits: typeof usage.credits) => {
+    const balance = credits?.balance === undefined ? undefined : t("settings.accountCreditsBalance", { balance: credits.balance });
+    const depleted = credits?.unlimited !== true && credits?.hasCredits === false;
+    const status = credits?.unlimited === true ? t("settings.accountCreditsUnlimited")
+      : depleted ? t("settings.accountCreditsNone")
+        : credits?.hasCredits === true && balance === undefined ? t("settings.accountCreditsAvailable") : undefined;
+    return { text: [balance, status].filter(Boolean).join(" · "), depleted };
+  };
   const creditLabel = formatCredits(usage.credits);
   const observedAt = usage.credits?.observedAt ?? usage.observedAt;
   return <div className="provider-account-usage" role="list" aria-label={t("settings.accountUsage")}>
@@ -4569,13 +4568,16 @@ function ProviderAccountUsageDetails({
         : t("settings.accountUsageReset", { time: formatRelativeTime(row.window!.resetAt, locale) }),
       row.window!.severity
     ].filter(Boolean).join(" · ")}</span>)}
-    {buckets.map((bucket) => <span role="listitem" key={`bucket:${bucket.id}:details`}>{[
-      bucket.displayName ?? bucket.id,
-      bucket.planType === undefined ? undefined : t("settings.accountPlan", { plan: bucket.planType }),
-      bucket.limitReached === true ? t("settings.accountLimitReached") : undefined,
-      formatCredits(bucket.credits)
-    ].filter(Boolean).join(" · ")}</span>)}
-    {creditLabel !== undefined && <span role="listitem">{creditLabel}</span>}
+    {buckets.map((bucket) => {
+      const bucketCredits = formatCredits(bucket.credits);
+      return <span role="listitem" key={`bucket:${bucket.id}:details`} className={bucketCredits.depleted ? "danger-text" : undefined}>{[
+        bucket.displayName ?? bucket.id,
+        bucket.planType === undefined ? undefined : t("settings.accountPlan", { plan: bucket.planType }),
+        bucket.limitReached === true ? t("settings.accountLimitReached") : undefined,
+        bucketCredits.text
+      ].filter(Boolean).join(" · ")}</span>;
+    })}
+    {creditLabel.text && <span role="listitem" className={creditLabel.depleted ? "danger-text" : undefined}>{creditLabel.text}</span>}
     {usage.resetCredits !== undefined && <span role="listitem">{[
       t("settings.accountResetCredits", { count: new Intl.NumberFormat(locale).format(usage.resetCredits.availableCount) }),
       usage.resetCredits.earliestExpiryAt === undefined ? undefined : t("settings.accountResetCreditExpiry", { time: formatRelativeTime(usage.resetCredits.earliestExpiryAt, locale) })

@@ -15,14 +15,17 @@ import type { ManagedProviderRuntimeInput, ProviderCatalogManager, ProviderDescr
 export const MANAGED_LOCAL_PROVIDER_ID = "joko-local-ollama";
 const MANAGED_MARKER = "joko-local-runtime-v1";
 const MAX_MANAGED_MODELS = 512;
+const CURATED_OLLAMA_QWEN_TAGS = new Set(["qwen3.8:27b", "qwen3.8:27b-mlx", "qwen3.8:27b-mxfp8"]);
 
 type OllamaProtocol = "openai-completions" | "anthropic-messages";
+type OllamaCodingBackend = "claude-code" | "codex";
 export type LocalModelProviderCatalog = Pick<ProviderCatalogManager, "listConfigurations" | "delete" | "deleteRuntime" | "upsertConfiguration">;
 
 export interface LocalModelProviderCoordinatorOptions {
   readonly providers: LocalModelProviderCatalog;
   readonly backendId: string;
   readonly claudeBackendId?: string;
+  readonly codexBackendId?: string;
   readonly currentOwner: () => RuntimeOwnerGeneration | undefined;
   readonly bindings?: LocalModelProviderBindings;
 }
@@ -90,11 +93,16 @@ export class LocalModelProviderCoordinator {
     }
 
     const runtimes = [providerRuntime(this.options.backendId, "openai-completions", models, pi?.provider)];
-    const claudeBackendId = this.options.claudeBackendId;
-    if (claudeBackendId !== undefined) {
-      const compatible = models.filter(model => supportsClaudeOllamaModel(version, model.supportsTools, model.requiredRuntimeVersion));
-      const current = previous.find(runtime => runtime.backendId === claudeBackendId);
-      if (compatible.length > 0) runtimes.push(providerRuntime(claudeBackendId, "anthropic-messages", compatible, current?.provider));
+    const codingBackends = [
+      { id: this.options.claudeBackendId, kind: "claude-code", protocol: "anthropic-messages" },
+      { id: this.options.codexBackendId, kind: "codex", protocol: "openai-completions" }
+    ] as const;
+    for (const { id, kind, protocol } of codingBackends) {
+      if (id === undefined) continue;
+      const compatible = models.filter(model => supportsOllamaCodingModel(kind, version, model.supportsTools, model.requiredRuntimeVersion));
+      if (compatible.length === 0) continue;
+      const current = previous.find(runtime => runtime.backendId === id);
+      runtimes.push(providerRuntime(id, protocol, compatible, current?.provider, true));
     }
     if (pi !== undefined && previous.length === runtimes.length && runtimes.every(runtime => previous.some(candidate =>
       candidate.backendId === runtime.backendId && JSON.stringify(candidate.provider) === JSON.stringify(runtime.provider)))) {
@@ -122,6 +130,7 @@ export class LocalModelProviderCoordinator {
 
   private isOwnedRuntime(runtime: ProviderDescriptor): boolean {
     if (runtime.backendId === this.options.backendId) return isOwnedProvider(runtime, "openai-completions");
+    if (runtime.backendId === this.options.codexBackendId) return runtime.requestPath === undefined && isOwnedProvider(runtime, "openai-completions");
     return runtime.backendId === this.options.claudeBackendId && isOwnedProvider(runtime, "anthropic-messages");
   }
 
@@ -187,7 +196,7 @@ function validateModels(models: readonly ManagedRuntimeModel[]): readonly Manage
 }
 
 function providerRuntime(
-  backendId: string, protocol: OllamaProtocol, models: readonly ManagedRuntimeModel[], current?: PiManagedProvider
+  backendId: string, protocol: OllamaProtocol, models: readonly ManagedRuntimeModel[], current?: PiManagedProvider, coding = false
 ): ManagedProviderRuntimeInput {
   const costById = new Map((current?.models ?? []).flatMap((model) => model.cost === undefined ? [] : [[canonicalModelName(model.id), model.cost] as const]));
   return {
@@ -202,25 +211,45 @@ function providerRuntime(
       compat: { jokoManagedRuntime: MANAGED_MARKER },
       models: models.map((model): PiManagedModel => {
         const cost = costById.get(canonicalModelName(model.id));
-        return {
+        const configured: PiManagedModel = {
           id: model.id,
           name: model.displayName,
           api: protocol,
           input: model.supportsImages ? ["text", "image"] : ["text"],
-          ...(protocol === "anthropic-messages" ? { supportsTools: model.supportsTools } : {}),
+          ...(coding ? { supportsTools: model.supportsTools } : {}),
           ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
           ...(cost === undefined ? {} : { cost }),
           compat: { supportsTools: model.supportsTools }
         };
+        return coding ? configured : withCuratedOllamaPiProfile(configured);
       })
     }
   };
 }
 
-export function supportsClaudeOllamaModel(version: string | undefined, supportsTools: boolean, requires: string | undefined): boolean {
+function withCuratedOllamaPiProfile(model: PiManagedModel): PiManagedModel {
+  if (!CURATED_OLLAMA_QWEN_TAGS.has(model.id)) return model;
+  const contextWindow = model.contextWindow ?? 32_768;
+  return {
+    ...model,
+    input: ["text", "image"],
+    reasoning: true,
+    defaultEffort: "xhigh",
+    thinkingLevelMap: { off: "off", minimal: null, low: null, medium: null, high: null, xhigh: "xhigh", max: null },
+    contextWindow,
+    maxTokens: Math.max(1, Math.min(16_000, contextWindow - 1)),
+    compat: { ...model.compat, thinkingFormat: "qwen-chat-template", supportsDeveloperRole: false, supportsReasoningEffort: false },
+    samplingParams: { temperature: 1, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 }
+  };
+}
+
+export function supportsOllamaCodingModel(
+  backend: OllamaCodingBackend, version: string | undefined, supportsTools: boolean, requires: string | undefined
+): boolean {
   if (!supportsTools) return false;
   const current = parseVersion(version);
-  if (current === undefined || !atLeastVersion(current, [0, 14, 0])) return false;
+  const minimum = backend === "claude-code" ? [0, 14, 0] : [0, 13, 3];
+  if (current === undefined || !atLeastVersion(current, minimum)) return false;
   if (requires === undefined) return true;
   const required = parseVersion(requires);
   return required !== undefined && atLeastVersion(current, required);

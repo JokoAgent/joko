@@ -2,7 +2,8 @@
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { AuthenticationState, BackendDescriptorSchema, CapabilitySupport, PermissionMode, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, SessionSchema, capabilityNames, type ProviderAccountUsageSnapshot } from "@joko/contracts";
+import { AuthenticationState, BackendDescriptorSchema, CapabilitySupport, ModelFavoriteSettingsSchema, ModelSourceDescriptorSchema, ModelSourceKind, PermissionMode,
+  ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, SessionSchema, capabilityNames, type ProviderAccountUsageSnapshot } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileRuntimeControls } from "./mobile-runtime-controls";
 import type { MobileProviderUsageTransport } from "./mobile-account-usage";
@@ -223,6 +224,56 @@ describe("MobileRuntimeControlsSheet model favorites", () => {
     await clickText("Apply model");
     expect(select).toHaveBeenCalledExactlyOnceWith({ backendId: "opaque-device", providerId: "alpha", modelId: "a", effortId: "high", fastMode: false });
     expect(host.textContent).toContain("Source changed"); expect(host.querySelector('input[aria-label="Search task models"]')).not.toBeNull();
+  });
+  it.each(["new task", "existing task"] as const)("shows only the owning Codex weekly quota on %s model rows and favorites", async surface => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    const seconds = BigInt(Math.floor(now / 1000));
+    const route = { ...controls.models[0]!, modelId: "gpt-5.3-codex-spark", displayName: "Spark", source: create(ModelSourceDescriptorSchema,
+      { kind: ModelSourceKind.LOCAL, nativeAdapterKind: "codex", displayName: "Codex account" }) };
+    const models = [route,
+      { ...route, key: "other-model", modelId: "unmatched", displayName: "Unmatched" },
+      { ...route, key: "other-runtime", displayName: "Other runtime", source: { ...route.source, nativeAdapterKind: "pi" } },
+      { ...route, key: "group-route", displayName: "Group", source: { ...route.source, kind: ModelSourceKind.GROUP } },
+      { ...route, key: "other-owner", backendId: "other-backend", displayName: "Other Backend" }
+    ];
+    const provider = create(ProviderDescriptorSchema, { backendId: route.backendId, providerId: route.providerId,
+      authenticationState: AuthenticationState.AUTHENTICATED, version: { generation: 0n, revision: { value: 1n } },
+      capabilities: { schemaVersion: "joko.provider.v1", capabilities: [{ name: capabilityNames.providerAccountUsage, support: CapabilitySupport.SUPPORTED }] } });
+    const snapshot = create(ProviderAccountUsageSnapshotSchema, { providerId: route.providerId, observedAt: { seconds }, buckets: [
+      { id: "codex", secondaryWindow: { usedPercent: 20, windowMinutes: 10_080, resetAt: { seconds: seconds + 604_815n } } },
+      { id: "spark-bucket", displayName: "GPT-5.3-Codex-Spark", secondaryWindow: { usedPercent: 90, windowMinutes: 10_080,
+        resetAt: { seconds: seconds + 20n } } }
+    ] });
+    const read = vi.fn<MobileProviderUsageTransport["read"]>().mockResolvedValueOnce(snapshot).mockRejectedValueOnce(new Error("Read failed"));
+    const transport = { ownerKey: "codex-owner", providers: [provider], read };
+    if (surface === "new task") {
+      await act(async () => root.render(createElement(MobileNewTaskModelSelector, { models, colors, locale: "en", disabled: false,
+        providerUsageTransport: transport, favorites: create(ModelFavoriteSettingsSchema, { favorites: [{ favoriteId: "spark-favorite",
+          backendId: route.backendId, selection: { model: { providerId: route.providerId, modelId: route.modelId } } }] }),
+        onSelect: async () => undefined, onFavorite: async () => undefined })));
+      expect(read).not.toHaveBeenCalled();
+      await click("Model");
+    } else {
+      await render({ ...controls, models, favorites: [{ ...controls.favorites[0]!, modelId: route.modelId }] }, transport);
+    }
+    expect(read).toHaveBeenCalledExactlyOnceWith(route.backendId, route.providerId, expect.any(AbortSignal));
+    const row = (prefix: string) => host.querySelector<HTMLButtonElement>(`button[aria-label^="${prefix},"]`);
+    for (const prefix of ["Other runtime", "Group", "Other Backend"]) {
+      expect(row(prefix)).not.toBeNull();
+      expect(row(prefix)?.textContent).not.toContain("remaining");
+    }
+    const spark = Array.from(host.querySelectorAll<HTMLButtonElement>('button[aria-label^="Spark,"]'));
+    expect(spark).toHaveLength(2);
+    for (const item of spark) {
+      expect(item.textContent).toContain("10% remaining · Resets in 20s");
+      expect(item.getAttribute("aria-label")).toContain("10% remaining · Resets in 20s");
+    }
+    expect(row("Unmatched")?.textContent).toContain("80% remaining · Resets in 7d");
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    for (const item of spark) expect(item.textContent).not.toContain("remaining");
+    expect(row("Unmatched")?.textContent).toContain("Last known account limits · 80% remaining");
+    expect(read).toHaveBeenCalledTimes(2);
   });
   it("keeps a same-owner observation marked stale when the visible quota refresh fails", async () => {
     vi.useFakeTimers();

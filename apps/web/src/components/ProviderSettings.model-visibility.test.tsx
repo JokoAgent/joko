@@ -1376,7 +1376,7 @@ describe("ProviderSettings model visibility", () => {
           secondaryWindow: { usedPercent: 75.5, windowMinutes: 10_080, resetAt: Date.now() + 7_200_000 },
           limitReached: true,
           planType: "pro",
-          credits: { hasCredits: true, unlimited: false, balance: "4.50" },
+          credits: { hasCredits: false, unlimited: false, balance: "4.50" },
           resetCredits: { availableCount: 3, earliestExpiryAt: Date.now() + 86_400_000 },
           modelWindows: [{ modelId: "scoped-model", displayName: "Scoped model", window: { usedPercent: 30, windowMinutes: 10_080 } }],
           extraUsage: { enabled: true, usedCredits: 20, monthlyLimit: 100 },
@@ -1409,7 +1409,7 @@ describe("ProviderSettings model visibility", () => {
     expect(container.textContent).toContain("Account limit reached");
     expect(container.textContent).toContain("Primary window · 42% used · 300 min window");
     expect(container.textContent).toContain("Secondary window · 75.5% used · 10,080 min window");
-    expect(container.textContent).toContain("Credits 4.50");
+    expect(container.querySelector(".provider-account-usage .danger-text")?.textContent).toBe("Credits 4.50 · No credits available");
     expect(container.textContent).toContain("Scoped model · 30% used · 10,080 min window");
     expect(container.textContent).toContain("3 reset credits available");
     expect(container.textContent).toContain("Extra usage enabled · 20 credits used · Monthly limit 100 credits");
