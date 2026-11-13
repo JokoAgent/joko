@@ -6,45 +6,43 @@ import type {
   SubagentTranscriptPageView
 } from "../model.js";
 import type { Translator } from "./types.js";
-import { mergeSubagentTranscript } from "./subagent-conversation.js";
 
-export interface CompleteSubagentTranscriptPage extends SubagentTranscriptPageView {
-  readonly nextPageToken?: undefined;
+export interface SubagentTranscriptContinuation {
+  readonly kind: "more";
+  readonly pageToken: string;
+  readonly seenTokens: ReadonlySet<string>;
 }
 
+export type SubagentTranscriptCursor = SubagentTranscriptContinuation | { readonly kind: "tail"; readonly pageToken: string };
+
 /** Matches the durable reference reader's eager-page safety fence. */
-export const MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES = 100;
+export const MAXIMUM_SUBAGENT_TRANSCRIPT_PAGES_PER_READ = 100;
 
 /**
- * Reads a complete transcript range. Passing a tail token reads every page
- * appended after it; omitting it reads the record from the beginning.
+ * Reads a bounded range from the head, an unfinished snapshot, or the live tail.
+ * The Store's tail token can skip unread pages until the snapshot is complete.
  */
-export async function collectAllSubagentTranscript(
+export async function readSubagentTranscriptBatch(
   loadPage: (pageToken: string) => Promise<SubagentTranscriptPageView>,
-  startPageToken = ""
-): Promise<CompleteSubagentTranscriptPage> {
-  const seen = new Set<string>();
-  let pageToken = startPageToken;
-  let entries: readonly SubagentTranscriptEntryView[] = [];
-  let tailPageToken: string | undefined;
-  let totalSize = 0;
-  for (let pageIndex = 0; pageIndex < MAXIMUM_COMPLETE_SUBAGENT_TRANSCRIPT_PAGES; pageIndex += 1) {
-    if (seen.has(pageToken)) throw new Error("Delegated transcript pagination returned a cyclic token.");
+  cursor?: SubagentTranscriptCursor
+): Promise<{ readonly entries: readonly SubagentTranscriptEntryView[]; readonly cursor?: SubagentTranscriptCursor }> {
+  const seen = new Set(cursor?.kind === "more" ? cursor.seenTokens : undefined);
+  let pageToken = cursor?.pageToken ?? "";
+  const entries: SubagentTranscriptEntryView[] = [];
+  for (let pageIndex = 0; pageIndex < MAXIMUM_SUBAGENT_TRANSCRIPT_PAGES_PER_READ; pageIndex += 1) {
     seen.add(pageToken);
     const page = await loadPage(pageToken);
-    entries = mergeSubagentTranscript(entries, page.entries);
-    totalSize = page.totalSize;
-    tailPageToken = page.tailPageToken;
+    for (const entry of page.entries) entries.push(entry);
     if (page.nextPageToken === undefined) {
       return {
         entries,
-        ...(tailPageToken === undefined ? {} : { tailPageToken }),
-        totalSize
+        ...(page.tailPageToken === undefined ? {} : { cursor: { kind: "tail", pageToken: page.tailPageToken } })
       };
     }
+    if (seen.has(page.nextPageToken)) throw new Error("Delegated transcript pagination returned a cyclic token.");
     pageToken = page.nextPageToken;
   }
-  throw new Error("Delegated transcript pagination exceeded its safe page limit.");
+  return { entries, cursor: { kind: "more", pageToken, seenTokens: seen } };
 }
 
 /** Returns only the latest visible generation of each child lineage. */

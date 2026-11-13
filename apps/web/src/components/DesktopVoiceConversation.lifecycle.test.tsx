@@ -12,6 +12,38 @@ import { DesktopVoiceConversationPanel } from './DesktopVoiceConversation.js';
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
+it.each(['open', 'resolved'])('retires a pending START when permission is %s at its reply', async permission => {
+  vi.useFakeTimers();
+  let finish!: (call: DesktopVoiceCallRecord) => void;
+  let first = true;
+  const view = await mountCall(request => {
+    if (request.action !== Action.START || !first) return undefined;
+    first = false;
+    return new Promise(resolve => { finish = resolve; });
+  });
+  try {
+    await view.start();
+    const original = view.call();
+    expect(view.requests.filter(row => row.action === Action.START)).toHaveLength(1);
+    view.state.snapshot.interactions.push({ sessionId: 'task', generation: 1n, kind: 'permission' });
+    await view.render();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    if (permission === 'resolved') {
+      view.state.snapshot.interactions.length = 0;
+      await view.render();
+    }
+    await act(async () => finish(original));
+    expect(ContinuousVoiceListener.prototype.start).not.toHaveBeenCalled();
+    expect(view.requests.filter(row => row.action === Action.END)).toMatchObject([{ callId: original.callId }]);
+
+    view.state.snapshot.interactions.length = 0;
+    await view.render();
+    await view.start();
+    expect(ContinuousVoiceListener.prototype.start).toHaveBeenCalledOnce();
+    expect(view.call().callId).not.toBe(original.callId);
+  } finally { await view.dispose(); }
+});
+
 it('cancels a farewell countdown on new speech and ends only the call after a fresh farewell', async () => {
   vi.useFakeTimers();
   const view = await mountCall();
@@ -93,7 +125,7 @@ async function mountCall(override?: (request: ControlDesktopVoiceConversationReq
       preference: { conversation: { backendId: 'backend', providerId: 'provider', modelId: 'tts-1', protocol: 'openai', voice: 'alloy' }, sentencePlayback: true }
     }));
   } } } });
-  const state = { effectiveLocale: 'en', snapshot: { interactions: [], queueControls: [], queue: [],
+  const state = { effectiveLocale: 'en', snapshot: { interactions: [] as Array<{ sessionId: string; generation: bigint; kind: 'permission' }>, queueControls: [], queue: [],
     backgroundTasks: [] as Array<{ id: string; sessionId: string; state: string }> } };
   const controller = { state } as unknown as AppController;
   const session = { id: 'task', generation: 1n, name: 'Partner task', state: 'idle' } as SessionView;

@@ -17,6 +17,7 @@ export function speechModelKey(value: Pick<DesktopSpeechSelection, 'backendId' |
 
 function endpointProtocol(base: URL, model: string): SpeechProtocol | undefined {
   if (base.protocol !== 'https:' || base.port) return undefined;
+  if (openRouterSpeechBaseUrl(base.toString())) return 'openai';
   if (base.hostname === 'api.elevenlabs.io') return 'elevenlabs';
   if (['api.minimax.io', 'api.minimax.cn', 'api.minimaxi.com', 'api.minimax.chat', 'api-uw.minimax.io'].includes(base.hostname)) return 'minimax';
   if (base.hostname === 'api.openai.com') return 'openai';
@@ -30,6 +31,16 @@ function apiBase(raw: string): URL {
   if (url.username || url.password || url.search || url.hash || !['http:', 'https:'].includes(url.protocol)
     || url.protocol === 'http:' && !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)) throw new Error('model_unavailable');
   return url;
+}
+
+/** Only the official API roots define the OpenAI speech endpoint. */
+export function openRouterSpeechBaseUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.origin === 'https://openrouter.ai' && !url.username && !url.password && !url.search && !url.hash
+      && ['/api', '/api/v1'].includes(url.pathname.replace(/\/+$/, ''))) return `${url.origin}/api/v1`;
+  } catch { /* An invalid or custom root does not establish a speech protocol. */ }
+  return undefined;
 }
 function supportedEndpoint(route: CredentialModelRoute): boolean {
   try {
@@ -65,11 +76,12 @@ export class SpeechModelCatalog {
     if (fixed && fixed !== selection.protocol || !isSpeechSpeedSupported(route.modelId, protocol, selection.speed)) throw new Error('model_unavailable');
     const headers: Record<string, string> = {};
     for (const [key, value] of Object.entries(route.headers)) {
-      if (!['authorization', 'x-api-key', 'xi-api-key', 'cookie', 'host', 'content-type', 'content-length', 'connection', 'chatgpt-account-id', 'openai-account-id'].includes(key.toLowerCase())) headers[key] = value;
+      if (!['authorization', 'x-api-key', 'xi-api-key', 'cookie', 'host', 'content-type', 'content-length', 'connection', 'chatgpt-account-id', 'openai-account-id', 'anthropic-version', 'anthropic-beta', 'anthropic-dangerous-direct-browser-access'].includes(key.toLowerCase())) headers[key] = value;
     }
     const secret = route.authorization?.replace(/^Bearer /, '') ?? route.headers['x-api-key'];
     if (secret) headers[protocol === 'elevenlabs' ? 'xi-api-key' : 'authorization'] = protocol === 'elevenlabs' ? secret : `Bearer ${secret}`;
-    if (fixed && fixed !== 'openai') base.pathname = protocol === 'qwen-tts' || protocol === 'dashscope-tts' ? '/api/v1' : '/v1';
+    if (openRouterSpeechBaseUrl(base.toString())) base.pathname = '/api/v1';
+    else if (fixed && fixed !== 'openai') base.pathname = protocol === 'qwen-tts' || protocol === 'dashscope-tts' ? '/api/v1' : '/v1';
     else if (!base.pathname || base.pathname === '/') base.pathname = '/v1';
     const assertCurrent = () => {
       if (this.routes.resolve({ backendId: route.backendId, providerId: route.providerId, modelId: route.modelId })?.generationId !== route.generationId) throw new Error('connection_changed');

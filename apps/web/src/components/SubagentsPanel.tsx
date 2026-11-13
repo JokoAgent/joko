@@ -31,14 +31,17 @@ import type {
   SubagentRunView,
   SubagentTranscriptEntryView
 } from "../model.js";
+import { taskSourceKey } from "../task-sharing.js";
 import { buildSubagentConversation, mergeSubagentTranscript } from "./subagent-conversation.js";
 import {
   classifySubagentError,
-  collectAllSubagentTranscript,
   currentSubagentChildren,
   filterSubagentTranscript,
   projectSubagentReply,
-  resolveCurrentSubagentChild
+  readSubagentTranscriptBatch,
+  resolveCurrentSubagentChild,
+  type SubagentTranscriptContinuation,
+  type SubagentTranscriptCursor
 } from "./subagent-panel-state.js";
 import { buildSubagentTree, flattenSubagentTree } from "./subagent-tree.js";
 import {
@@ -72,6 +75,7 @@ const MAXIMUM_CONTROL_MESSAGE_LENGTH = 32_000;
 
 type ReadState = "idle" | "loading" | "ready" | "error";
 type ComposerAction = Exclude<SubagentControlActionView, "stop">;
+type TranscriptRead = "full" | "tail" | SubagentTranscriptContinuation;
 
 const STALE_READ = Symbol("stale delegated read");
 
@@ -88,7 +92,14 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
   const conversationPanelId = useId();
   controllerRef.current = controller;
   const mountedRef = useRef(true);
-  const scopeRef = useRef({ sessionId, selectedRunId: undefined as string | undefined });
+  const state = controller.state;
+  const snapshot = state?.snapshot;
+  const readOwner = JSON.stringify([sessionId, state?.activeProfile?.serverId, state?.activeProfile?.id,
+    state?.connectionGeneration, String(snapshot?.generation), taskSourceKey(state?.taskSource ?? { kind: "own" }),
+    String(snapshot?.sessions.find((session) => session.id === sessionId)?.generation),
+    String(snapshot?.timelineHistoryRevisionBySession?.get(sessionId))]);
+  const scopeRef = useRef({ readOwner, selectedRunId: undefined as string | undefined });
+  const listSessionRef = useRef(sessionId);
   const [runs, setRuns] = useState<readonly SubagentRunView[]>([]);
   const [listState, setListState] = useState<ReadState>("loading");
   const [listError, setListError] = useState<string>();
@@ -104,6 +115,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
   const [transcriptState, setTranscriptState] = useState<ReadState>("idle");
   const [transcriptError, setTranscriptError] = useState<string>();
   const [transcriptTailComplete, setTranscriptTailComplete] = useState(false);
+  const [transcriptContinuation, setTranscriptContinuation] = useState<SubagentTranscriptContinuation>();
   const [drafts, setDrafts] = useState<Readonly<Record<string, string>>>({});
   const [composerPending, setComposerPending] = useState(false);
   const [composerError, setComposerError] = useState<string>();
@@ -118,14 +130,15 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
   const listQueueRef = useRef<Promise<void>>(Promise.resolve());
   const detailQueueRef = useRef<Promise<void>>(Promise.resolve());
   const transcriptQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const transcriptTailTokenRef = useRef<string | undefined>(undefined);
+  const transcriptCursorRef = useRef<SubagentTranscriptCursor | undefined>(undefined);
+  const transcriptContinuationInFlightRef = useRef<SubagentTranscriptContinuation | undefined>(undefined);
   const handledFocusRequestRef = useRef<number | undefined>(undefined);
   const detailBackButtonRef = useRef<HTMLButtonElement>(null);
   const [returnFocusRunId, setReturnFocusRunId] = useState<string>();
   const [runFocusRequestId, setRunFocusRequestId] = useState(0);
   const [toolExpansionByScope, setToolExpansionByScope] = useState<Readonly<Record<string, Readonly<Record<string, boolean>>>>>({});
 
-  scopeRef.current = { sessionId, selectedRunId: selectedRunId || undefined };
+  scopeRef.current = { readOwner, selectedRunId: selectedRunId || undefined };
 
   useEffect(() => {
     mountedRef.current = true;
@@ -141,8 +154,8 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
   const listScopeIsCurrent = useCallback((epoch: number): boolean => (
     mountedRef.current
     && listEpochRef.current === epoch
-    && scopeRef.current.sessionId === sessionId
-  ), [sessionId]);
+    && scopeRef.current.readOwner === readOwner
+  ), [readOwner]);
 
   const loadRuns = useCallback((pageToken = "", append = false, quiet = false): Promise<void> => {
     const epoch = listEpochRef.current;
@@ -174,9 +187,9 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
   const detailScopeIsCurrent = useCallback((epoch: number, runId: string): boolean => (
     mountedRef.current
     && detailEpochRef.current === epoch
-    && scopeRef.current.sessionId === sessionId
+    && scopeRef.current.readOwner === readOwner
     && scopeRef.current.selectedRunId === runId
-  ), [sessionId]);
+  ), [readOwner]);
 
   const loadDetail = useCallback((runId: string, quiet = false): Promise<SubagentRunDetailView | undefined> => {
     const epoch = detailEpochRef.current;
@@ -206,70 +219,92 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
   const transcriptScopeIsCurrent = useCallback((epoch: number, runId: string): boolean => (
     mountedRef.current
     && transcriptEpochRef.current === epoch
-    && scopeRef.current.sessionId === sessionId
+    && scopeRef.current.readOwner === readOwner
     && scopeRef.current.selectedRunId === runId
-  ), [sessionId]);
+  ), [readOwner]);
 
-  const refreshTranscript = useCallback((runId: string, mode: "full" | "tail", quiet = false): Promise<void> => {
+  const refreshTranscript = useCallback((runId: string, mode: TranscriptRead, quiet = false): Promise<void> => {
     const epoch = transcriptEpochRef.current;
-    if (!quiet || transcript.length === 0) setTranscriptState("loading");
-    if (mode === "full") setTranscriptTailComplete(false);
-    setTranscriptError(undefined);
-    const execute = async (): Promise<void> => {
-      if (!transcriptScopeIsCurrent(epoch, runId)) return;
+    const isCurrent = () => transcriptScopeIsCurrent(epoch, runId);
+    const continuation = typeof mode === "object" ? mode : undefined;
+    if (continuation !== undefined) {
+      if (!isCurrent() || transcriptCursorRef.current !== continuation || transcriptContinuationInFlightRef.current === continuation) {
+        return Promise.resolve();
+      }
+      transcriptContinuationInFlightRef.current = continuation;
+    }
+    const execute = async (read: TranscriptRead, quietRead: boolean): Promise<SubagentTranscriptCursor | undefined> => {
+      if (!isCurrent()) return undefined;
+      const cursor = transcriptCursorRef.current;
+      const next = typeof read === "object" ? read : undefined;
+      if (cursor?.kind === "more" && cursor !== next) return undefined;
+
+      if (!quietRead) setTranscriptState("loading");
+      if (read === "full") setTranscriptTailComplete(false);
+      setTranscriptError(undefined);
       const loadPage = (pageToken: string) => {
-        if (!transcriptScopeIsCurrent(epoch, runId)) throw STALE_READ;
+        if (!isCurrent()) throw STALE_READ;
         return controllerRef.current.listSubagentTranscript(sessionId, runId, undefined, pageToken, TRANSCRIPT_PAGE_SIZE);
       };
+      let requestedCursor = read === "tail" ? cursor : next;
       try {
-        const requestedTail = mode === "tail" ? transcriptTailTokenRef.current : undefined;
-        let append = requestedTail !== undefined;
-        let page;
-        if (append) {
-          try {
-            page = await collectAllSubagentTranscript(loadPage, requestedTail);
-          } catch (error) {
-            if (error === STALE_READ || !transcriptScopeIsCurrent(epoch, runId)) throw error;
-            append = false;
-            setTranscriptTailComplete(false);
-            page = await collectAllSubagentTranscript(loadPage);
-          }
-        } else {
-          page = await collectAllSubagentTranscript(loadPage);
+        const batch = await readSubagentTranscriptBatch(loadPage, requestedCursor).catch((error: unknown) => {
+          if (requestedCursor?.kind !== "tail" || error === STALE_READ || !isCurrent()) throw error;
+          requestedCursor = undefined;
+          setTranscriptTailComplete(false);
+          return readSubagentTranscriptBatch(loadPage);
+        });
+        if (!isCurrent()) return undefined;
+        const append = requestedCursor !== undefined;
+        if (!append || batch.entries.length > 0) {
+          setTranscript((current) => mergeSubagentTranscript(append ? current : [], batch.entries));
         }
-        if (!transcriptScopeIsCurrent(epoch, runId)) return;
-        setTranscript((current) => append ? mergeSubagentTranscript(current, page.entries) : page.entries);
-        transcriptTailTokenRef.current = page.tailPageToken;
-        setTranscriptTailComplete(true);
+        transcriptCursorRef.current = batch.cursor;
+        setTranscriptContinuation(batch.cursor?.kind === "more" ? batch.cursor : undefined);
+        setTranscriptTailComplete(batch.cursor?.kind !== "more");
         setTranscriptState("ready");
+        return batch.cursor;
       } catch (error) {
-        if (error === STALE_READ || !transcriptScopeIsCurrent(epoch, runId)) return;
-        transcriptTailTokenRef.current = undefined;
+        if (error === STALE_READ || !isCurrent()) return undefined;
+        if (next === undefined) {
+          transcriptCursorRef.current = undefined;
+          setTranscriptTailComplete(false);
+        }
         setTranscriptError(messageOf(error));
         setTranscriptState("error");
+        return undefined;
       }
     };
-    const queued = transcriptQueueRef.current.then(execute, execute);
+    const run = async (): Promise<void> => {
+      try {
+        const cursor = await execute(mode, quiet);
+        // A run can finish while its snapshot is paused for manual paging.
+        if (continuation !== undefined && cursor?.kind === "tail") await execute("tail", true);
+      } finally {
+        if (continuation !== undefined && transcriptContinuationInFlightRef.current === continuation) {
+          transcriptContinuationInFlightRef.current = undefined;
+        }
+      }
+    };
+    const queued = transcriptQueueRef.current.then(run, run);
     transcriptQueueRef.current = queued.then(() => undefined, () => undefined);
     return queued;
-  }, [sessionId, transcript.length, transcriptScopeIsCurrent]);
+  }, [sessionId, transcriptScopeIsCurrent]);
 
   useEffect(() => {
     listEpochRef.current += 1;
     detailEpochRef.current += 1;
-    transcriptEpochRef.current += 1;
     setRuns([]);
     setListTotalSize(0);
     setListNextPageToken(undefined);
     setLoadingMoreRuns(false);
-    setSelectedRunId(focusRunId ?? "");
+    if (listSessionRef.current !== sessionId) {
+      listSessionRef.current = sessionId;
+      setSelectedRunId(focusRunId ?? "");
+    }
     setDetail(undefined);
     setDetailState("idle");
     setSelectedChildIdentity("");
-    setTranscript([]);
-    setTranscriptState("idle");
-    setTranscriptTailComplete(false);
-    transcriptTailTokenRef.current = undefined;
     setComposerError(undefined);
     composerPendingRef.current = undefined;
     setComposerPending(false);
@@ -279,7 +314,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
     setReturnFocusRunId(undefined);
     setToolExpansionByScope({});
     void loadRuns();
-  }, [sessionId]);
+  }, [sessionId, loadRuns]);
 
   useEffect(() => {
     if (focusRunId === undefined || focusRequestId === undefined || handledFocusRequestRef.current === focusRequestId) return;
@@ -300,23 +335,24 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
     setDetailError(undefined);
     setSelectedChildIdentity("");
     setTranscript([]);
+    setTranscriptState("idle");
     setTranscriptError(undefined);
     setTranscriptTailComplete(false);
-    transcriptTailTokenRef.current = undefined;
+    setTranscriptContinuation(undefined);
+    transcriptCursorRef.current = undefined;
+    transcriptContinuationInFlightRef.current = undefined;
     setComposerError(undefined);
     if (selectedRunId === "") {
       setDetailState("idle");
-      setTranscriptState("idle");
       return;
     }
     void loadDetail(selectedRunId).then((value) => {
       if (value?.run.capabilities.viewFullTranscript === true) {
         return refreshTranscript(selectedRunId, "full");
       }
-      if (scopeRef.current.selectedRunId === selectedRunId) setTranscriptState("idle");
       return undefined;
     });
-  }, [selectedRunId, sessionId]);
+  }, [selectedRunId, loadDetail, refreshTranscript]);
 
   useEffect(() => {
     if (selectedRunId === "") return;
@@ -342,7 +378,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
         await loadRuns("", false, true);
         if (cancelled) return;
         if (selectedRunId === "") return;
-        if (scopeRef.current.selectedRunId !== selectedRunId) return;
+        if (scopeRef.current.readOwner !== readOwner || scopeRef.current.selectedRunId !== selectedRunId) return;
         const value = await loadDetail(selectedRunId, true);
         if (cancelled || scopeRef.current.selectedRunId !== selectedRunId) return;
         if ((value?.run.capabilities.viewFullTranscript ?? runForDetail?.capabilities.viewFullTranscript) === true) {
@@ -357,7 +393,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [hasActiveRun, loadDetail, loadRuns, refreshTranscript, runForDetail?.capabilities.viewFullTranscript, selectedRunId]);
+  }, [hasActiveRun, loadDetail, loadRuns, refreshTranscript, runForDetail?.capabilities.viewFullTranscript, selectedRunId, readOwner]);
 
   const tree = useMemo(() => flattenSubagentTree(buildSubagentTree(runs)), [runs]);
   const currentChildren = useMemo(() => currentSubagentChildren(detail?.children ?? []), [detail?.children]);
@@ -412,7 +448,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
   const hasSettledReply = reply.hasReply;
   const defaultComposerAction = composerAction(runForDetail, selectedChild, false, hasSettledReply);
   const modifierComposerAction = composerAction(runForDetail, selectedChild, true, hasSettledReply);
-  const sendShortcutPreference = controller.state?.preferences.composerSendShortcut ?? "enter";
+  const sendShortcutPreference = state?.preferences.composerSendShortcut ?? "enter";
   const composerPlatform = currentComposerPlatform();
   const sendShortcutLabel = getComposerSendShortcutLabel(sendShortcutPreference, composerPlatform);
   const draftKey = `${sessionId}:${selectedRunId}:${selectedChildIdentity || selectedChild?.id || "all"}`;
@@ -447,6 +483,17 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
     if (value?.run.capabilities.viewFullTranscript === true) await refreshTranscript(runId, "full", true);
   };
 
+  const retryTranscript = (runId: string): void => {
+    void refreshTranscript(runId, transcriptContinuation ?? "full");
+  };
+
+  const reloadTranscript = (runId: string): void => {
+    transcriptEpochRef.current += 1;
+    transcriptCursorRef.current = undefined;
+    setTranscriptContinuation(undefined);
+    void refreshTranscript(runId, "full");
+  };
+
   const submitComposer = (action: ComposerAction | undefined): void => {
     const message = draft.trim();
     if (action === undefined || message === "" || runForDetail === undefined || composerPendingRef.current !== undefined) return;
@@ -459,7 +506,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
     const childId = selectedChild?.id;
     const ownsControl = (): boolean => mountedRef.current
       && controlEpochRef.current === controlEpoch
-      && scopeRef.current.sessionId === sessionId
+      && scopeRef.current.readOwner === readOwner
       && scopeRef.current.selectedRunId === runId;
     try {
       runAction(`subagent-${action}:${runId}:${childId ?? "all"}`, async () => {
@@ -516,7 +563,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
     setStopError(undefined);
     const ownsControl = (): boolean => mountedRef.current
       && controlEpochRef.current === controlEpoch
-      && scopeRef.current.sessionId === sessionId
+      && scopeRef.current.readOwner === readOwner
       && scopeRef.current.selectedRunId === target.runId;
     try {
       runAction(`subagent-stop:${target.runId}:${target.childId ?? "all"}`, async () => {
@@ -629,7 +676,10 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
           >
             {showAssignmentFallback && <article className="subagent-message subagent-message--parent subagent-message--fallback"><StreamingMarkdown text={assignment!} streaming={false} t={t} /><time>{formatDateTime(selectedChild?.startedAt ?? runForDetail.startedAt, locale)}</time></article>}
             {runForDetail.capabilities.viewFullTranscript && transcriptState === "loading" && transcript.length === 0 && <Spinner label={t("common.loading")} />}
-            {runForDetail.capabilities.viewFullTranscript && transcriptState === "error" && <InlineFailure compact={transcript.length > 0} text={transcriptError ?? t("subagents.transcriptFailed")} t={t} onRetry={() => { void refreshTranscript(runForDetail.id, "full"); }} />}
+            {runForDetail.capabilities.viewFullTranscript && transcriptState === "error" && <>
+              <InlineFailure compact={transcript.length > 0} text={transcriptError ?? t("subagents.transcriptFailed")} t={t} onRetry={() => retryTranscript(runForDetail.id)} />
+              {transcriptContinuation !== undefined && <Button tone="ghost" onClick={() => reloadTranscript(runForDetail.id)}>{t("subagents.reloadTranscript")}</Button>}
+            </>}
             {conversation.items.length > 0 && <VirtualSubagentConversation
               key={conversationScopeKey}
               scopeKey={conversationScopeKey}
@@ -646,7 +696,7 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
                 ? <SubagentNotice tone="waiting" text={t("subagents.queuedDetail")} />
                 : displayedState === "running"
                   ? <SubagentNotice tone="waiting" text={t("subagents.waitingForReply")} />
-                  : !reply.hasReply && displayedError === undefined
+                  : !reply.hasReply && displayedError === undefined && transcriptContinuation === undefined
                     ? <SubagentNotice tone="error" text={t(displayedState === "failed" ? "subagents.failedNoReply" : displayedState === "stopped" ? "subagents.stoppedNoReply" : "subagents.completedNoReply")} />
                     : null}
             {(resultTruncated || reply.recordTruncated) && <p className="subagent-transcript__truncated"><AlertTriangle aria-hidden="true" />{t(resultTruncated ? "subagents.resultTruncated" : "subagents.transcriptTruncated")}</p>}
@@ -659,7 +709,11 @@ export function SubagentsPanel({ controller, sessionId, focusRunId, focusRequest
             showActivity={runForDetail.capabilities.viewActivity}
             locale={locale}
             t={t}
-          />}
+          >{runForDetail.capabilities.viewFullTranscript && transcriptContinuation !== undefined && transcriptState !== "error" && <Button
+            className="subagent-technical__more"
+            disabled={transcriptState === "loading"}
+            onClick={() => { void refreshTranscript(runForDetail.id, transcriptContinuation); }}
+          >{transcriptState === "loading" ? t("common.loading") : t("subagents.loadMoreTranscript")}</Button>}</VirtualSubagentTechnicalDetails>}
         </>}
       </div></div>
       {runForDetail !== undefined && defaultComposerAction !== undefined && <form className="subagent-composer" onSubmit={onComposerSubmit}>
