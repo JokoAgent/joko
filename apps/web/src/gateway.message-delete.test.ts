@@ -1,13 +1,17 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
+  EntityKind,
+  EntityVersionSchema,
   EventPayloadSchema,
   EventSchema,
   GetSnapshotResponseSchema,
   MessageRole,
+  OperationResultSchema,
   OperationSchema,
   OperationState,
   SessionState,
+  StreamEventsRequestSchema,
   StreamEventsResponseSchema,
   SubmitOperationResponseSchema,
   WatchOperationResponseSchema,
@@ -32,8 +36,10 @@ describe("message deletion gateway", () => {
     try {
       await view.answer(sessionId, eventId, "Deleted answer");
       await view.answer("other-session", "other-event", "Another task's answer");
+      await expect(view.gateway.deleteSessionMessage(sessionId, eventId, 2n)).rejects.toThrow("generation is no longer current");
+      expect(view.submissions).toHaveLength(0);
       view.beforeNextSnapshot(() => refresh.promise);
-      const deletion = view.gateway.deleteSessionMessage(sessionId, eventId);
+      const deletion = view.gateway.deleteSessionMessage(sessionId, eventId, 3n);
       const settled = vi.fn();
       void deletion.then(() => settled("succeeded"), settled);
       await vi.waitFor(() => expect(view.submissions).toHaveLength(1));
@@ -42,6 +48,9 @@ describe("message deletion gateway", () => {
       expect(view.submissions[0]?.mutation?.payload).toMatchObject({
         case: "deleteSessionMessage", value: { sessionId, eventId }
       });
+      expect(view.submissions[0]?.mutation?.preconditions).toMatchObject([
+        { entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: 3n }
+      ]);
 
       view.complete();
       await vi.waitFor(() => expect(settled).toHaveBeenCalledExactlyOnceWith("succeeded"));
@@ -88,16 +97,22 @@ describe("message deletion gateway", () => {
     await view.gateway.connect();
     try {
       await view.answer(sessionId, eventId, "Deleted answer");
+      expect(view.latest().timelineBySession.get(sessionId)?.[0]?.sourceEventId).toBe(eventId);
       const deletion = view.gateway.deleteSessionMessage(sessionId, eventId);
       await vi.waitFor(() => expect(view.submissions).toHaveLength(1));
       const coveredCursor = view.coverDeletionInSnapshot();
       view.complete();
       await deletion;
       await vi.waitFor(() => expect(view.latest().cursor).toBe(coveredCursor));
+      const revision = view.latest().timelineHistoryRevisionBySession.get(sessionId);
+      expect(revision).toBeGreaterThan(0n);
+      expect(view.latest().timelineBySession.has(sessionId)).toBe(false);
       view.closeEventStream();
       await vi.waitFor(() => expect(view.streamCursors).toEqual([0n, coveredCursor]));
       await view.answer(sessionId, "later-event", "New output after reconnect");
       expect(view.latest().timelineBySession.get(sessionId)?.map((item) => item.text)).toEqual(["New output after reconnect"]);
+      expect(view.latest().timelineHistoryRevisionBySession.get(sessionId)).toBe(revision);
+      expect(view.submissions).toHaveLength(1);
     } finally { view.gateway.disconnect(); }
   });
 
@@ -177,7 +192,11 @@ describe("message deletion gateway", () => {
 type EventKind = NonNullable<MessageInitShape<typeof EventPayloadSchema>["kind"]>;
 
 function harness(directReceipt = false) {
-  vi.stubGlobal("window", { location: { href: "https://joko.test/#/tasks/current" } });
+  vi.stubGlobal("window", {
+    location: { href: "https://joko.test/#/tasks/current" },
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout
+  });
   const submissions: SubmitOperationRequest[] = [];
   const snapshots: AppSnapshot[] = [];
   const errors: string[] = [];
@@ -212,10 +231,14 @@ function harness(directReceipt = false) {
       }
       throw new Error(`Unexpected method: ${method.localName}`);
     }),
-    stream: vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown, _headers: unknown, input: any) => {
+    stream: vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown, _headers: unknown,
+      input: AsyncIterable<MessageInitShape<typeof StreamEventsRequestSchema>>) => {
       if (method.localName === "watchOperation") return response(method, watchOperation(), true);
       if (method.localName !== "streamEvents") throw new Error(`Unexpected stream: ${method.localName}`);
-      streamCursors.push(input.afterCursor?.sequence ?? 0n);
+      const request = await input[Symbol.asyncIterator]().next();
+      const sequence = request.done ? undefined : request.value.afterCursor?.sequence;
+      if (sequence === undefined) throw new Error("The owner event stream request is missing its resume cursor.");
+      streamCursors.push(sequence);
       return response(method, streamEvents(signal), true);
     })
   } as unknown as Transport;
@@ -258,8 +281,9 @@ function harness(directReceipt = false) {
     complete: (receipt: MessageInitShape<typeof OperationSchema> = {}) => {
       const request = submissions[0]!;
       terminal.resolve({ operationId: request.operationId, connectionId: request.connectionId, mutation: request.mutation,
-        state: OperationState.SUCCEEDED, result: { payload: { case: "acknowledgement", value: { accepted: true } } },
-        version: { revision: { value: 5n } }, ...receipt });
+        state: OperationState.SUCCEEDED,
+        result: create(OperationResultSchema, { payload: { case: "acknowledgement", value: { accepted: true } } }),
+        version: create(EntityVersionSchema, { revision: { value: 5n } }), ...receipt });
     },
     answer: (sourceSessionId: string, sourceEventId: string, text: string) => emit(sourceSessionId, sourceEventId, { case: "messageCompleted", value: {
       messageId: sourceEventId, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: text } }]

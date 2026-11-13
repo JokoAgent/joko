@@ -6272,7 +6272,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   abortRetry(runId: string): Promise<void>;
   retry(runId: string): Promise<void>;
   resetSession(sessionId: string): Promise<void>;
-  deleteSessionMessage(sessionId: string, eventId: string): Promise<void>;
+  deleteSessionMessage(sessionId: string, eventId: string, expectedGeneration?: bigint): Promise<void>;
   renameSession(sessionId: string, name: string): Promise<void>;
   createTaskTag(originSessionId: string, name: string, color: TaskTagColorView, expectedCatalogRevision: bigint, presetId?: string): Promise<void>;
   updateTaskTag(originSessionId: string, tagId: string, expectedRevision: bigint, patch: { readonly name?: string; readonly color?: TaskTagColorView }): Promise<void>;
@@ -6380,7 +6380,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     sessionId: string,
     entryId: string,
     name: string,
-    sourceMessage?: { readonly messageId: string; readonly eventId: string }
+    sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly expectedGeneration?: bigint }
   ): Promise<string>;
   cloneSession(
     sessionId: string,

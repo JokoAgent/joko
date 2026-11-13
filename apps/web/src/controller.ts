@@ -2809,6 +2809,11 @@ export function useAppController(): AppController {
     return value;
   }, []);
 
+  const readTaskProviderGroupUsage = useCallback<NonNullable<AppController["readTaskProviderGroupUsage"]>>(
+    (sessionId, generation, signal) => gateway().readTaskProviderGroupUsage?.(sessionId, generation, signal) ?? Promise.resolve(undefined),
+    [gateway]
+  );
+
   const revokeDevice = useCallback(async (deviceId: string): Promise<void> => {
     await gateway().revokeDevice(deviceId);
     if (automaticConnectionTargetMatchesDevice(preferencesRef.current.automaticConnectionTarget, deviceId, state.profiles)) {
@@ -2858,6 +2863,13 @@ export function useAppController(): AppController {
     if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
       || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
       throw new Error("The catalog node connection is no longer current.");
+    }
+    return artifactGateway;
+  }, [artifactGateway, linkGatewayGeneration]);
+  const taskMessageGateway = useCallback((): OrchestratorGateway => {
+    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+      || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+      throw new Error("The original task connection is no longer current.");
     }
     return artifactGateway;
   }, [artifactGateway, linkGatewayGeneration]);
@@ -3793,7 +3805,7 @@ export function useAppController(): AppController {
     providerAccountResets: () => gateway().providerAccountResets?.(),
     getSessionContextBudget: (sessionId, generation, signal) => gateway().getSessionContextBudget(sessionId, generation, signal),
     setSessionContextBudget: (observed, tokens, signal) => gateway().setSessionContextBudget(observed, tokens, signal),
-    readTaskProviderGroupUsage: (sessionId, generation, signal) => gateway().readTaskProviderGroupUsage?.(sessionId, generation, signal) ?? Promise.resolve(undefined),
+    readTaskProviderGroupUsage,
     readTaskProviderGroupRebalance: (sessionId, generation, signal) => gateway().readTaskProviderGroupRebalance?.(sessionId, generation, signal) ?? Promise.resolve(undefined),
     getArtifactStorageStats: (protectedSha256) => gateway().getArtifactStorageStats(protectedSha256),
     scanArtifactStorage: (protectedSha256) => gateway().scanArtifactStorage(protectedSha256),
@@ -3814,7 +3826,7 @@ export function useAppController(): AppController {
     abortRetry: (runId) => gateway().abortRetry(runId),
     retry: (runId) => gateway().retry(runId),
     resetSession: (sessionId) => gateway().resetSession(sessionId),
-    deleteSessionMessage: (sessionId, eventId) => gateway().deleteSessionMessage(sessionId, eventId),
+    deleteSessionMessage: async (...args) => taskMessageGateway().deleteSessionMessage(...args),
     renameSession: (sessionId, name) => gateway().renameSession(sessionId, name),
     createTaskTag: (originSessionId, name, color, expectedCatalogRevision, presetId) =>
       gateway().createTaskTag(originSessionId, name, color, expectedCatalogRevision, presetId),
@@ -3881,7 +3893,8 @@ export function useAppController(): AppController {
     getSessionStatistics: (sessionId, signal) => gateway().getSessionStatistics(sessionId, signal),
     getSessionTree: (sessionId): Promise<NativeSessionTreeView> => gateway().getSessionTree(sessionId),
     navigateSessionBranch,
-    forkSession: (sessionId, entryId, name, sourceMessage) => gateway().forkSession(sessionId, entryId, name, sourceMessage),
+    forkSession: async (sessionId, entryId, name, sourceMessage) =>
+      (sourceMessage?.expectedGeneration === undefined ? gateway() : taskMessageGateway()).forkSession(sessionId, entryId, name, sourceMessage),
     cloneSession: (sessionId, name, sourceMessage) => gateway().cloneSession(sessionId, name, sourceMessage),
     resolveInteraction: (interaction, value) => gateway().resolveInteraction(interaction, value),
     dismissInteraction: (interaction) => gateway().dismissInteraction(interaction),
@@ -4079,7 +4092,7 @@ export function useAppController(): AppController {
     searchAllSessionMessages: (query, options) => gateway().searchAllSessionMessages(query, options),
     searchRemoteSessionMessages,
     loadSessionTimelinePage: (sessionId, beforeCursor, limit) => gateway().loadSessionTimelinePage(sessionId, beforeCursor, limit),
-    loadSessionTimelineAround: (sessionId, eventId, limit) => gateway().loadSessionTimelineAround(sessionId, eventId, limit),
+    loadSessionTimelineAround: async (sessionId, eventId, limit) => taskMessageGateway().loadSessionTimelineAround(sessionId, eventId, limit),
     listWorkspaceEntries: (workspaceId, parentPath, options) => gateway().listWorkspaceEntries(workspaceId, parentPath, options),
     listWorkspaceEntryPage: (workspaceId, parentPath, pageToken, pageSize, options) => gateway().listWorkspaceEntryPage(workspaceId, parentPath, pageToken, pageSize, options),
     listWorkspaceFiles: (workspaceId, signal) => gateway().listWorkspaceFiles(workspaceId, signal),
@@ -4483,7 +4496,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, taskMessageGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

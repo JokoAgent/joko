@@ -748,7 +748,7 @@ it("retains a message deep-link target while connecting its saved machine", asyn
   expect(window.location.hash).toBe("#/tasks/missing-task?message=missing-message&profile=route-second");
 });
 
-it("does not let a stale cross-machine task open replace a newer navigation occurrence", async () => {
+it.each([undefined, { messageId: "searched-message", messageEventId: "searched-event" }])("does not let a stale cross-machine task open replace a newer navigation occurrence (%j)", async (messageTarget) => {
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   vi.mocked(persistentWebSecretEncryptionAvailable).mockResolvedValue(false);
   window.history.replaceState(window.history.state, "", "#/settings");
@@ -804,7 +804,7 @@ it("does not let a stale cross-machine task open replace a newer navigation occu
   blockSecondProbe = true;
   let staleOpen!: Promise<void>;
   await act(async () => {
-    staleOpen = current.openMachineSession(second.id, "stale-task");
+    staleOpen = current.openMachineSession(second.id, "stale-task", messageTarget);
     await secondProbeStarted;
   });
   const previousNavigationRevision = current.state.navigationRevision ?? 0;

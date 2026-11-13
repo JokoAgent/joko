@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppWithController, reserveMessageDeepLinkHistoryPage } from "./App.js";
 import { useAppController, type AppController, type ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
+import { addSessionSplit, writeSessionSplitLayout } from "./session-split-layout.js";
 import {
   emptySnapshot,
   type ScheduleRunHistoryView,
@@ -44,6 +45,38 @@ describe("Desktop system handoff App boundary", () => {
     expect(fixture.container.textContent).toContain("This linked task is unavailable on the current machine.");
     expect(fixture.container.textContent).toContain("Joko will not guess a destination.");
     await fixture.dispose();
+  });
+
+  it("passes a remote search hit into the owned machine open and lets a newer New Task navigation stand", async () => {
+    const task = session("remote-task");
+    const initial = connectedState({ route: { kind: "session" } });
+    const remote = { id: "profile-b", deviceId: "device-b", serverId: "server-b", name: "Remote", origin: "https://remote.example" };
+    const match = { sessionId: task.id, eventId: "remote-event", timelineItemId: "remote-message", role: "assistant" as const,
+      kind: "textMessage" as const, snippet: "Remote deployment needle", createdAt: 1, score: 1 };
+    const pending = deferred<void>();
+    const navigate = vi.fn<AppController["navigate"]>();
+    const openMachineSession = vi.fn<AppController["openMachineSession"]>(() => pending.promise);
+    const fixture = renderApp({ ...initial, profiles: [...initial.profiles, remote], machinePresenceByProfile: { "profile-b": "online" },
+      machineCaches: [{ profileId: remote.id, serverId: remote.serverId, name: remote.name, origin: remote.origin, updatedAt: 1,
+        sessions: [{ id: task.id, name: task.name, state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }] }] }, {
+      navigate, openMachineSession, searchAllSessionMessages: async () => ({ matches: [], totalSize: 0, revision: 1n, vectorUsed: false, poolCapped: false }),
+      searchRemoteSessionMessages: async () => [{ profileId: remote.id, serverId: remote.serverId, epoch: 1, isCurrent: () => true,
+        status: "succeeded", matches: [match] }]
+    });
+    await fixture.render();
+    const input = fixture.container.querySelector<HTMLInputElement>("#conversation-search-input")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "needle");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const hit = () => fixture.container.querySelector<HTMLButtonElement>(".conversation-search-result--remote .conversation-search-result__hit");
+    await act(async () => { await vi.waitFor(() => expect(hit()?.textContent).toContain(match.snippet)); });
+    await act(async () => hit()!.click());
+    expect(openMachineSession).toHaveBeenCalledExactlyOnceWith(remote.id, task.id, { messageEventId: match.eventId, messageId: match.timelineItemId });
+    await act(async () => fixture.container.querySelector<HTMLButtonElement>(".new-task-button")!.click());
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
+    await act(async () => pending.resolve(undefined));
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
   });
 
   it("does not resolve an exact machine link against the previous machine snapshot during handoff", async () => {
@@ -149,9 +182,16 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
-  it("does not reuse an around-message window after the authoritative history revision changes", async () => {
+  it("keeps an adopted message link consumed after deletion and resolves a new opening separately", async () => {
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
     const task = session("task-a");
     const linkedMessage = timelineItem("shared-message");
+    const neighbor = { ...timelineItem("surviving-answer"), sequence: 2n };
     const loadSessionTimelineAround = vi.fn<AppController["loadSessionTimelineAround"]>()
       .mockResolvedValueOnce([linkedMessage])
       .mockResolvedValueOnce([]);
@@ -168,22 +208,212 @@ describe("Desktop system handoff App boundary", () => {
     const fixture = renderApp(initial, { loadSessionTimelineAround });
 
     await fixture.render();
-    await act(async () => {
-      await vi.waitFor(() => expect(loadSessionTimelineAround).toHaveBeenCalledTimes(1));
-    });
-
-    await fixture.render({
+    expect(loadSessionTimelineAround).toHaveBeenCalledOnce();
+    expect(fixture.container.querySelector('[data-message-client-id="shared-message"]')?.closest(".timeline__row")
+      ?.getAttribute("aria-current")).toBe("true");
+    const afterDeletion = {
       ...initial,
       snapshot: {
         ...initial.snapshot,
-        timelineHistoryRevisionBySession: new Map([[task.id, 1n]])
+        timelineHistoryRevisionBySession: new Map([[task.id, 1n]]),
+        timelineBySession: new Map([[task.id, [neighbor]]])
       }
-    });
-    await act(async () => {
-      await vi.waitFor(() => expect(loadSessionTimelineAround).toHaveBeenCalledTimes(2));
-    });
+    };
+    await fixture.render(afterDeletion);
+    expect(loadSessionTimelineAround).toHaveBeenCalledOnce();
+    expect(fixture.container.textContent).toContain(neighbor.text);
+    expect(fixture.container.textContent).not.toContain(linkedMessage.text);
+    expect(fixture.container.textContent).not.toContain("That message is no longer available in the task timeline.");
+
+    await fixture.render({ ...afterDeletion, navigationRevision: 1 });
+    expect(loadSessionTimelineAround).toHaveBeenCalledTimes(2);
+    expect(loadSessionTimelineAround).toHaveBeenLastCalledWith(task.id, "event-a", 160);
     expect(fixture.container.textContent).toContain("That message is no longer available in the task timeline.");
     await fixture.dispose();
+  });
+
+  it("resolves an unconsumed message link against the new history revision", async () => {
+    const task = session("task-a");
+    const linkedMessage = timelineItem("shared-message");
+    const original = deferred<readonly TimelineItemView[]>();
+    const replacement = deferred<readonly TimelineItemView[]>();
+    const loadSessionTimelineAround = vi.fn<AppController["loadSessionTimelineAround"]>()
+      .mockReturnValueOnce(original.promise)
+      .mockReturnValueOnce(replacement.promise);
+    const initial = connectedState({
+      route: { kind: "session", sessionId: task.id, messageId: linkedMessage.id, messageEventId: "event-a" },
+      sessions: [task]
+    });
+    const fixture = renderApp(initial, { loadSessionTimelineAround });
+
+    await fixture.render();
+    expect(loadSessionTimelineAround).toHaveBeenCalledOnce();
+    await fixture.render({
+      ...initial,
+      snapshot: { ...initial.snapshot, timelineHistoryRevisionBySession: new Map([[task.id, 1n]]) }
+    });
+    expect(loadSessionTimelineAround).toHaveBeenCalledTimes(2);
+
+    await act(async () => original.resolve([linkedMessage]));
+    expect(fixture.container.textContent).not.toContain(linkedMessage.text);
+    expect(fixture.container.querySelector(".action-progress")).not.toBeNull();
+    await act(async () => replacement.resolve([]));
+    expect(fixture.container.textContent).toContain("That message is no longer available in the task timeline.");
+    await fixture.dispose();
+  });
+
+  it.each(["original", "rebound"] as const)("scopes message deletion in a non-route split pane to the %s view", async (scope) => {
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockReturnValue(1_000);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
+    const taskA = session("task-a");
+    const taskB = { ...session("task-b"), generation: 8n };
+    const messageA = { ...timelineItem("answer-a"), sourceEventId: "event-a" };
+    const messageB = { ...timelineItem("answer-b"), sourceEventId: "event-b" };
+    const initial = connectedState({ route: { kind: "session", sessionId: taskA.id }, sessions: [taskA, taskB] });
+    const profile = { ...initial.activeProfile!, serverId: "message-delete-split-test" };
+    const original = deferred<void>();
+    const deleteSessionMessage = vi.fn<AppController["deleteSessionMessage"]>()
+      .mockReturnValueOnce(original.promise)
+      .mockResolvedValueOnce(undefined);
+    const navigate = vi.fn();
+    const state: ControllerState = {
+      ...initial,
+      profiles: [profile],
+      activeProfile: profile,
+      snapshot: {
+        ...initial.snapshot,
+        timelineBySession: new Map([[taskA.id, [messageA]], [taskB.id, [messageB]]]),
+        backends: [{ id: taskB.backendId, name: "Pi", version: "1", health: "healthy",
+          capabilities: new Map([["session.message_delete", { name: "session.message_delete", supported: true, options: [] }]]) }]
+      }
+    };
+    window.location.hash = "#/tasks/task-a";
+    writeSessionSplitLayout(profile.serverId, addSessionSplit({}, taskB.id, taskA.id, "right"));
+    const fixture = renderApp(state, { deleteSessionMessage, navigate });
+    const dialog = () => document.querySelector(".message-delete-dialog");
+    const confirm = () => dialog()?.querySelector<HTMLButtonElement>("button.button--danger");
+    const openB = async (): Promise<void> => {
+      const pane = fixture.container.querySelector('[data-session-split-pane="task-b"]')!;
+      const row = pane.querySelector('[data-message-client-id="answer-b"]')?.closest(".timeline__row");
+      const more = row?.querySelector<HTMLElement>("summary");
+      expect(more).toBeInstanceOf(HTMLElement);
+      await act(async () => {
+        more?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+        more?.click();
+      });
+      const remove = pane.querySelector<HTMLButtonElement>(
+        '[data-message-client-id="answer-b"] button[role="menuitem"][aria-label="Delete this message"]'
+      );
+      expect(remove).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => remove?.click());
+      expect(dialog()).not.toBeNull();
+    };
+    const clickConfirm = async (): Promise<void> => {
+      const button = confirm();
+      expect(button).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => { button?.click(); button?.click(); });
+    };
+    try {
+      await fixture.render();
+      expect(fixture.container.querySelector('[data-session-split-pane="task-a"]')).not.toBeNull();
+      await openB();
+      await clickConfirm();
+      expect(deleteSessionMessage).toHaveBeenCalledExactlyOnceWith(taskB.id, "event-b", 8n);
+      expect(dialog()?.getAttribute("aria-busy")).toBe("true");
+      expect(navigate).not.toHaveBeenCalled();
+      expect(window.location.hash).toBe("#/tasks/task-a");
+      if (scope === "original") {
+        await act(async () => original.resolve());
+      } else {
+        await fixture.render({ ...state, connectionGeneration: 2 });
+        expect(dialog()).toBeNull();
+        await openB();
+        await act(async () => original.reject(new Error("Previous connection failed")));
+        expect(dialog()?.querySelector("[role='alert']")).toBeNull();
+        expect(dialog()?.getAttribute("aria-busy")).toBe("false");
+        await clickConfirm();
+        expect(deleteSessionMessage.mock.calls).toEqual([[taskB.id, "event-b", 8n], [taskB.id, "event-b", 8n]]);
+      }
+      expect(dialog()).toBeNull();
+    } finally {
+      await fixture.dispose();
+      writeSessionSplitLayout(profile.serverId, {});
+    }
+  });
+
+  it.each(["matching", "different"] as const)("only replaces the source split slot when the child has %s lineage", async (lineage) => {
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockReturnValue(1_000);
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
+    const taskA = session("task-a");
+    const taskB = { ...session("task-b"), generation: 8n };
+    const prompt = { ...timelineItem("prompt-b"), kind: "user" as const, sourceEventId: "event-b", nativeParentEntryId: "previous-native-entry" };
+    const child: SessionView = {
+      ...session("task-fork"),
+      derivationOrigin: { kind: "fork", sourceSessionId: taskB.id, sourceMessageId: prompt.id,
+        sourceEventId: lineage === "matching" ? "event-b" : "different-event", sourceSessionAvailable: true, sourceMessageAvailable: true }
+    };
+    const initial = connectedState({ route: { kind: "session", sessionId: taskA.id }, sessions: [taskA, taskB] });
+    const profile = { ...initial.activeProfile!, serverId: "message-fork-split-test" };
+    const branch = deferred<string>();
+    const forkSession = vi.fn<AppController["forkSession"]>(() => branch.promise);
+    const readDraftSnapshot = vi.fn<AppController["readDraftSnapshot"]>(async () => ({ revision: 0 }));
+    const saveDraftIfRevision = vi.fn<AppController["saveDraftIfRevision"]>(async () => 1);
+    const navigate = vi.fn();
+    const state: ControllerState = {
+      ...initial, profiles: [profile], activeProfile: profile,
+      snapshot: {
+        ...initial.snapshot,
+        timelineBySession: new Map([[taskB.id, [prompt]]]),
+        backends: [{ id: taskB.backendId, name: "Codex", version: "1", health: "healthy",
+          capabilities: new Map([["session.fork", { name: "session.fork", supported: true, options: [] }]]) }]
+      }
+    };
+    window.location.hash = "#/tasks/task-a";
+    writeSessionSplitLayout(profile.serverId, addSessionSplit({}, taskB.id, taskA.id, "right"));
+    const fixture = renderApp(state, { forkSession, readDraftSnapshot, saveDraftIfRevision, navigate });
+    try {
+      await fixture.render();
+      const pane = (id: string) => fixture.container.querySelector(`[data-session-split-pane="${id}"]`);
+      const fork = pane(taskB.id)?.querySelector<HTMLButtonElement>('button[aria-label="Fork from here"]');
+      expect(fork).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => { fork?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })); fork?.click(); });
+      const confirm = fixture.container.querySelector<HTMLButtonElement>('[data-message-fork-confirm="true"]');
+      expect(confirm).toBeInstanceOf(HTMLButtonElement);
+      await act(async () => { confirm?.click(); confirm?.click(); });
+      expect(forkSession).toHaveBeenCalledExactlyOnceWith(taskB.id, "previous-native-entry", expect.any(String), {
+        messageId: prompt.id, eventId: "event-b", expectedGeneration: 8n
+      });
+      await act(async () => { pane(taskA.id)?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })); });
+      await act(async () => branch.resolve(child.id));
+      expect(saveDraftIfRevision).toHaveBeenCalledExactlyOnceWith(child.id, expect.objectContaining({ text: "prompt-b" }), 0);
+      expect(pane(taskB.id)).not.toBeNull();
+      expect(navigate).not.toHaveBeenCalled();
+
+      await fixture.render({ ...state, snapshot: { ...state.snapshot, sessions: [taskA, taskB, child] } });
+      expect(pane(taskA.id)).not.toBeNull();
+      if (lineage === "matching") {
+        expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: child.id });
+        expect(pane(taskB.id)).toBeNull();
+        expect(pane(child.id)).not.toBeNull();
+      } else {
+        expect(navigate).not.toHaveBeenCalled();
+        expect(pane(taskB.id)).not.toBeNull();
+        expect(pane(child.id)).toBeNull();
+      }
+    } finally {
+      await fixture.dispose();
+      writeSessionSplitLayout(profile.serverId, {});
+    }
   });
 
   it.each(["succeeds", "fails"])("keeps the first message location when the later around read %s", async (outcome) => {
@@ -1035,6 +1265,7 @@ function desktopDeepLinkApi(
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => { resolve = accept; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((accept, decline) => { resolve = accept; reject = decline; });
+  return { promise, resolve, reject };
 }

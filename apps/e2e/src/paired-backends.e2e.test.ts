@@ -20,6 +20,7 @@ import {
 } from "@joko/adapter-pi";
 import {
   BeginProviderLoginMutationSchema,
+  CapabilitySupport,
   CreateDiagnosticsBundleMutationSchema,
   DiagnosticLevel,
   InteractionState,
@@ -31,10 +32,13 @@ import {
   QueueItemState,
   RefreshProviderCredentialMutationSchema,
   RunState,
-  StartReviewMutationSchema
+  StartReviewMutationSchema,
+  capabilityNames,
+  type Snapshot
 } from "@joko/contracts";
 import type {
   BackendAdapter,
+  BlobRef,
   ManagedProviderRouteBinding,
   ManagedProviderRuntimePort,
   ProviderModel,
@@ -321,18 +325,61 @@ class LifecycleObservedClaudeRuntime extends ControlledClaudeRuntime {
 }
 
 it("runs Pi, Codex and Claude through one durable service without crossing Session or failure authority", { timeout: 90_000 }, async () => {
-  const setup = await startPairedFixture();
+  const setup = await startPairedFixture(undefined, { attachmentResolvers: true });
   const { fixture, requests, codex, claude } = setup;
+  let phone: { dispose(): void } | undefined;
   try {
     const paired = await fixture.pair("Paired Backend client");
+    const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
+    const { MobileClient } = await import(new URL("../../mobile/src/mobile-client.ts", import.meta.url).href);
+    const { createMobileStorage } = await import(new URL("../../mobile/src/connection-storage.ts", import.meta.url).href);
+    const { resolveMobileAttachmentPolicy, assertMobileAttachmentCandidate } = await import(new URL("../../mobile/src/mobile-attachments.ts", import.meta.url).href);
+    const memoryDriver = () => {
+      const entries = new Map<string, string>();
+      return { getItem: async (key: string) => entries.get(key) ?? null,
+        setItem: async (key: string, value: string) => { entries.set(key, value); }, removeItem: async (key: string) => { entries.delete(key); } };
+    };
+    const mobile = new MobileClient(mobileNetwork, createMobileStorage(memoryDriver(), { ...memoryDriver(), isAvailable: async () => true }),
+      { scan: async () => [] }, randomUUID, "android");
+    phone = mobile;
+    await mobile.start();
+    const challenge = await mobile.requestPairing(fixture.baseUrl, "Paired attachment phone");
+    await mobile.pair(fixture.baseUrl, fixture.pairingCode(challenge), "Paired attachment phone");
+    const assertAttachmentPolicy = (snapshot: Snapshot | undefined, backendId: string) => {
+      const backend = snapshot?.backends.find(candidate => candidate.backendId === backendId);
+      expect(backend?.capabilities?.capabilities.find(capability => capability.name === capabilityNames.inputFile)).toMatchObject({
+        support: CapabilitySupport.SUPPORTED, options: { kind: { case: "input", value: { mediaTypes: [] } } }
+      });
+      expect(backend?.capabilities?.capabilities.find(capability => capability.name === capabilityNames.inputImage)).toMatchObject({
+        support: CapabilitySupport.SUPPORTED, options: { kind: { case: "input", value: { mediaTypes: ["image/png", "image/jpeg", "image/gif", "image/webp"] } } }
+      });
+      const textPolicy = resolveMobileAttachmentPolicy(backend, false);
+      const visionPolicy = resolveMobileAttachmentPolicy(backend, true);
+      expect(textPolicy).toMatchObject({ images: false, files: true, fileMediaTypes: [] });
+      expect(visionPolicy).toMatchObject({ images: true, files: true });
+      expect(assertMobileAttachmentCandidate({ fileName: "proof.txt", mediaType: "text/plain", byteSize: 10 }, textPolicy)).toMatchObject({ kind: "file" });
+      expect(assertMobileAttachmentCandidate({ fileName: "pixel.png", mediaType: "image/png", byteSize: 100 }, visionPolicy)).toMatchObject({ kind: "image" });
+      expect(() => assertMobileAttachmentCandidate({ fileName: "pixel.svg", mediaType: "image/svg+xml", byteSize: 100 }, visionPolicy)).toThrow(/image type/u);
+    };
     const sessions = new Map<string, string>();
     for (const backendId of ["pi", "codex-paired", "claude-paired"]) {
       const operation = await submit(paired.clients.operation, paired.connectionId,
         createSessionMutation({ backendId, targetId: fixture.targetId(backendId), displayName: `${backendId} task`,
           ...(backendId === "pi" ? { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off" } : {}) }));
       expect(operation.state).toBe(OperationState.SUCCEEDED);
-      sessions.set(backendId, sessionIdFrom(operation));
+      const sessionId = sessionIdFrom(operation);
+      sessions.set(backendId, sessionId);
     }
+    await mobile.refresh();
+    for (const [backendId, sessionId] of sessions) {
+      const targetId = fixture.targetId(backendId);
+      expect(mobile.newTaskAttachmentControls(targetId)?.policy).toMatchObject({ files: true, fileMediaTypes: [] });
+      assertAttachmentPolicy(mobile.state.owner, backendId);
+      await mobile.select(sessionId);
+      expect(mobile.taskAttachmentControls()?.policy).toMatchObject({ files: true, fileMediaTypes: [] });
+      assertAttachmentPolicy(mobile.state.detail, backendId);
+    }
+    mobile.dispose(); phone = undefined;
     const send = async (backendId: string, text: string) => {
       const sessionId = sessions.get(backendId)!;
       const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
@@ -424,7 +471,7 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
     // Run completion precedes the asynchronous workspace change-set capture.
     // Review must start from that settled evidence, not race its publication.
     await waitFor(() => paired.clients.workspace.listWorkspaceChangeSets({
-      workspaceId: "workspace-main", sessionId: reviewSourceId
+      workspaceId: fixture.targetId("claude-paired"), sessionId: reviewSourceId
     }), (response) => response.changeSets.some((changeSet) =>
       changeSet.runId === claudeSecondRunId && changeSet.completeBaseline),
     "settled Claude review source change-set");
@@ -452,6 +499,7 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
       expect(fixture.application.store.listReviewRunsBySource(sessions.get(backendId)!)).toEqual([]);
     }
   } finally {
+    phone?.dispose();
     await setup.close();
   }
 });
@@ -3533,7 +3581,7 @@ mountedIt("keeps three native tasks distinct through mounted Web, approval and o
 
 async function startPairedFixture(
   webDirectory?: string,
-  options: { readonly controlPiFault?: boolean; readonly providerAuthentication?: boolean } = {}
+  options: { readonly controlPiFault?: boolean; readonly providerAuthentication?: boolean; readonly attachmentResolvers?: boolean } = {}
 ) {
   const root = await mkdtemp(join(tmpdir(), "joko-paired-backends-"));
   const requests: Parameters<typeof startLocalProvider>[0] = [];
@@ -3699,10 +3747,23 @@ async function startPairedFixture(
           })
         };
       };
+  let attachmentStore: OrchestratorE2eFixture["application"]["artifacts"] | undefined;
+  const requireAttachmentStore = () => {
+    if (!attachmentStore) throw new Error("The paired attachment fixture has no Artifact store.");
+    return attachmentStore;
+  };
+  const inputResolvers = {
+    readBlob: (blob: BlobRef) => requireAttachmentStore().readBlob(blob),
+    resolveFile: (blob: BlobRef) => requireAttachmentStore().resolveBlobPath(blob)
+  };
   const startFixture = () => OrchestratorE2eFixture.start({ rootDirectory: root, profiles: [],
+    ...(options.attachmentResolvers ? { distinctBackendWorkspaceIds: true } : {}),
     ...(webDirectory === undefined ? {} : { webDirectory }),
-    ...(createAuxiliaryServices === undefined ? {} : {
-      createAuxiliaryServicesBeforeBackendProvision: createAuxiliaryServices
+    ...(createAuxiliaryServices === undefined && !options.attachmentResolvers ? {} : {
+      createAuxiliaryServicesBeforeBackendProvision: async (store, dataDirectory, artifacts) => {
+        if (options.attachmentResolvers) attachmentStore = artifacts;
+        return createAuxiliaryServices?.(store, dataDirectory, artifacts) ?? {};
+      }
     }),
     backendFactories: [
     { instanceId: "pi", adapterKind: "pi", displayName: "Published Pi",
@@ -3719,6 +3780,7 @@ async function startPairedFixture(
           externalSessionRoots: [],
           providers: authenticationSnapshot?.providers ?? [provider],
           versionProbe: async () => "pi 0.85.1",
+          ...(options.attachmentResolvers ? inputResolvers : {}),
           ...(authenticationSnapshot === undefined ? {} : {
             environment: authenticationSnapshot.environment,
             secretEnvironmentNames: authenticationSnapshot.secretEnvironmentNames,
@@ -3766,6 +3828,7 @@ async function startPairedFixture(
         const adapter = createCodexAdapter({
           id: "codex-paired",
           instanceGeneration: generation,
+          ...(options.attachmentResolvers ? inputResolvers : {}),
           ...(options.providerAuthentication === true ? { managedProviders: codexManagedProvider } : {}),
           ...(fault === undefined ? { host: codexHost } : {
             appServer: {
@@ -3788,6 +3851,7 @@ async function startPairedFixture(
         if (fault !== undefined) candidateRuntime.failNextProbe(fault.sentinel);
         const adapter = new ClaudeCodeAdapter({
           id: "claude-paired", instanceGeneration: generation,
+          ...(options.attachmentResolvers ? inputResolvers : {}),
           runtime: candidateRuntime, environment: {}, initializationTimeoutMs: 500, admissionTimeoutMs: 500,
           teardownTimeoutMs: 100,
           ...(options.providerAuthentication === true ? {

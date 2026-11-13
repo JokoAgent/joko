@@ -91,6 +91,7 @@ export interface FixtureOptions {
   readonly profiles?: readonly FakeAdapterProfile[];
   readonly createAdapter?: (profile: FakeAdapterProfile) => InstrumentedFakeAdapter;
   readonly backendFactories?: readonly BackendInstanceFactory[];
+  readonly distinctBackendWorkspaceIds?: boolean;
   readonly keepRoot?: boolean;
   readonly dictionaryPeerNodeId?: string;
   readonly dictionaryPeerMulticastPort?: number;
@@ -377,7 +378,16 @@ export class OrchestratorE2eFixture {
     const targets = new Map<string, string>();
     for (const factory of factories) {
       const targetId = `target-${factory.instanceId}`;
+      const workspaceId = options.distinctBackendWorkspaceIds === true ? targetId : "workspace-main";
       targets.set(factory.instanceId, targetId);
+      if (options.distinctBackendWorkspaceIds === true) {
+        await workspaces.register({
+          id: workspaceId,
+          root: workspaceDirectory,
+          displayName: `${factory.displayName} workspace`,
+          trusted: true
+        });
+      }
       await sessionHost.registerTarget({
         id: targetId,
         backendId: factory.instanceId,
@@ -385,7 +395,7 @@ export class OrchestratorE2eFixture {
         workspaceRoot: workspaceDirectory,
         managed: true,
         trusted: true
-      }, { workspaceId: "workspace-main" });
+      }, { workspaceId });
     }
     await objectives.initialize();
     await historyMaintenance.initialize();

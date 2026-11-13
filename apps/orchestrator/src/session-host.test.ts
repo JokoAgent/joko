@@ -12325,6 +12325,33 @@ describe("SessionHost", () => {
     expect(fixture.store.getSession(childId).descriptor.worktree).toBeUndefined();
   });
 
+  it("does not dispatch a generation-bound message fork after the source binding changes in native preflight", async () => {
+    const adapter = new AdapterOwnedDerivationFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({
+      operationId: "fenced-message-fork-source", connection: fixture.connection, targetId: "target-one",
+      title: "Source", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const eventId = "fenced-message-fork-event";
+    appendSessionEvent(fixture.store, sourceId, eventId, 10, {
+      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original boundary" }]
+    });
+    const generation = fixture.store.getSession(sourceId).descriptor.binding.generation;
+    const preflight = vi.spyOn(adapter, "ownsNativeSessionDerivationLifecycle").mockImplementationOnce(() => {
+      const source = fixture.store.getSession(sourceId);
+      fixture.store.updateSession(sourceId, { binding: { ...source.descriptor.binding, generation: generation + 1 } }, source.revision);
+      return false;
+    });
+    await expect(fixture.host.deriveSession({
+      operationId: "fenced-message-fork", connection: fixture.connection, sourceSessionId: sourceId,
+      title: "Retired source", kind: "fork", entryId: "root", expectedGeneration: generation,
+      sourceMessage: { messageId: eventId, eventId }
+    })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(preflight).toHaveBeenCalledOnce();
+    expect(adapter.forkCalls).toBe(0);
+    expect(fixture.store.listSessions().map((item) => item.descriptor.id)).toEqual([sourceId]);
+  });
+
   it("claims native derivation before fork and replays the completed product task without a second fork", async () => {
     const adapter = new GatedFakeAdapter();
     adapter.forkEditorText = `  restore this draft sk-abcdefghijklmnop ${"x".repeat(65_537)}\n`;
