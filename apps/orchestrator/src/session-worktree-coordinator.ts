@@ -143,6 +143,11 @@ export class SessionWorktreeCoordinator {
     const pendingReplacementPreservedSessionIds = pendingReplacementSessions
       .filter((session) => session.descriptor.worktree?.state === "preserved")
       .map((session) => session.descriptor.id);
+    // An archive in progress owns the checkout through its cleanup record,
+    // even when its physical removal finished before the product commit.
+    const pendingArchiveSessionIds = new Set(this.#store.listPendingSessionLifecycleCleanups()
+      .filter((cleanup) => cleanup.disposition === "archive" && cleanup.releaseWorktree)
+      .map((cleanup) => cleanup.sessionId));
     const liveSessionIds = localSessions
       .filter((session) => !session.descriptor.archived)
       .map((session) => session.descriptor.id);
@@ -158,7 +163,7 @@ export class SessionWorktreeCoordinator {
         ...scheduledOwnerSessionIds.filter((sessionId) => !archivedSessionIdSet.has(sessionId)),
         ...pendingDerivationSessionIds,
         ...pendingReplacementActiveSessionIds
-      ])],
+      ])].filter((sessionId) => !pendingArchiveSessionIds.has(sessionId)),
       preserveSessionIds: [...archivedSessionIds, ...pendingReplacementPreservedSessionIds]
     });
     if (!initialized.ok) throw new SessionWorktreeCoordinatorError(initialized.error.code);
@@ -906,12 +911,38 @@ export class SessionWorktreeCoordinator {
     const binding = session.descriptor.worktree;
     if (binding === undefined) return;
     if (binding.remote !== undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
-    if (this.activeWorkspacePath(sessionId, binding) === undefined) {
+    const cleanup = this.#store.findPendingSessionLifecycleCleanup(sessionId);
+    const retiredArchiveOperationId = cleanup?.disposition === "archive" && cleanup.releaseWorktree
+      && cleanup.closeCompleted && cleanup.nativeCompleted && !cleanup.worktreeCompleted ? cleanup.operationId : undefined;
+    if (retiredArchiveOperationId === undefined && this.activeWorkspacePath(sessionId, binding) === undefined) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     this.#assertCheckoutNotUnderReview(sessionId);
-    const result = await this.#service.release(sessionId, { retainForRestore: true, assertCurrent: () => this.#assertCheckoutNotUnderReview(sessionId) });
+    const assertCurrent = () => {
+      this.#assertCheckoutNotUnderReview(sessionId);
+      if (retiredArchiveOperationId === undefined) return;
+      const current = this.#store.findPendingSessionLifecycleCleanup(sessionId);
+      const currentBinding = this.#store.getSession(sessionId).descriptor.worktree;
+      if (current === undefined || current.operationId !== retiredArchiveOperationId || !current.closeCompleted || !current.nativeCompleted
+        || current.worktreeCompleted || currentBinding === undefined || !samePersistedBinding(currentBinding, binding)) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
+    };
+    const options = { retainForRestore: true, assertCurrent };
+    const result = retiredArchiveOperationId === undefined
+      ? await this.#service.release(sessionId, options)
+      : await this.#service.releaseExact({
+          sessionId, leaseId: binding.leaseId, path: binding.path, repositoryRoot: binding.repositoryRoot,
+          branch: binding.branch,
+          source: {
+            ref: binding.sourceRef, commit: binding.sourceCommit, strategy: binding.sourceStrategy,
+            refreshed: binding.sourceRefreshed,
+            ...(binding.sourceRemote === undefined ? {} : { remote: binding.sourceRemote })
+          },
+          acquiredAt: binding.acquiredAt
+        }, options);
     this.notifyRecycleOpportunity(sessionId);
+    assertCurrent();
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     if (result.value.status !== "preserved" || result.value.reason !== "restorable"
       || result.value.pathRemoved !== true) {
