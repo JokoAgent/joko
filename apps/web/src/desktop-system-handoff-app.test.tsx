@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppWithController, reserveMessageDeepLinkHistoryPage } from "./App.js";
+import { CONVERSATION_KEYWORD_DEBOUNCE_MS } from "./components/Sidebar.js";
 import { useAppController, type AppController, type ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
 import { addSessionSplit, writeSessionSplitLayout } from "./session-split-layout.js";
@@ -36,6 +37,7 @@ afterEach(async () => {
   Reflect.deleteProperty(window, "jokoDesktop");
   window.location.hash = "";
   vi.restoreAllMocks();
+  vi.useRealTimers();
   if (originalScrollTo) Object.defineProperty(HTMLElement.prototype, "scrollTo", originalScrollTo);
   else Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
 });
@@ -50,6 +52,7 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it("passes a remote search hit into the owned machine open and lets a newer New Task navigation stand", async () => {
+    vi.useFakeTimers();
     const task = session("remote-task");
     const initial = connectedState({ route: { kind: "session" } });
     const remote = { id: "profile-b", deviceId: "device-b", serverId: "server-b", name: "Remote", origin: "https://remote.example" };
@@ -58,12 +61,14 @@ describe("Desktop system handoff App boundary", () => {
     const pending = deferred<void>();
     const navigate = vi.fn<AppController["navigate"]>();
     const openMachineSession = vi.fn<AppController["openMachineSession"]>(() => pending.promise);
+    const searchRemoteSessionMessages = vi.fn<AppController["searchRemoteSessionMessages"]>(async () => [{
+      profileId: remote.id, serverId: remote.serverId, epoch: 1, isCurrent: () => true, status: "succeeded", matches: [match]
+    }]);
     const fixture = renderApp({ ...initial, profiles: [...initial.profiles, remote], machinePresenceByProfile: { "profile-b": "online" },
       machineCaches: [{ profileId: remote.id, serverId: remote.serverId, name: remote.name, origin: remote.origin, updatedAt: 1,
         sessions: [{ id: task.id, name: task.name, state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }] }] }, {
       navigate, openMachineSession, searchAllSessionMessages: async () => ({ matches: [], totalSize: 0, revision: 1n, vectorUsed: false, poolCapped: false }),
-      searchRemoteSessionMessages: async () => [{ profileId: remote.id, serverId: remote.serverId, epoch: 1, isCurrent: () => true,
-        status: "succeeded", matches: [match] }]
+      searchRemoteSessionMessages
     });
     await fixture.render();
     const input = fixture.container.querySelector<HTMLInputElement>("#conversation-search-input")!;
@@ -71,9 +76,12 @@ describe("Desktop system handoff App boundary", () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "needle");
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    const hit = () => fixture.container.querySelector<HTMLButtonElement>(".conversation-search-result--remote .conversation-search-result__hit");
-    await act(async () => { await vi.waitFor(() => expect(hit()?.textContent).toContain(match.snippet)); });
-    await act(async () => hit()!.click());
+    await act(async () => vi.advanceTimersByTimeAsync(CONVERSATION_KEYWORD_DEBOUNCE_MS));
+    expect(searchRemoteSessionMessages).toHaveBeenCalledExactlyOnceWith("needle", expect.objectContaining({ semanticMode: "keyword" }));
+    const hit = fixture.container.querySelector<HTMLButtonElement>(".conversation-search-result--remote .conversation-search-result__hit");
+    expect(hit).not.toBeNull();
+    expect(hit?.textContent).toContain(match.snippet);
+    await act(async () => hit!.click());
     expect(openMachineSession).toHaveBeenCalledExactlyOnceWith(remote.id, task.id, { messageEventId: match.eventId, messageId: match.timelineItemId });
     await act(async () => fixture.container.querySelector<HTMLButtonElement>(".new-task-button")!.click());
     expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
