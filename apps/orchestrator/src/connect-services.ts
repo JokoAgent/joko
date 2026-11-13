@@ -24147,7 +24147,7 @@ async function workspaceTrustOperation(
       }
     };
     let applyTrust: Awaited<ReturnType<NativeWorkspaceService["prepareTrustChange"]>> | undefined;
-    const execution = await dependencies.sessionHost.mutate({
+    const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
       operationId,
       connection,
       kind,
