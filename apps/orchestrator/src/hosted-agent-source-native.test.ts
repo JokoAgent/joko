@@ -70,14 +70,31 @@ it("runs a native Source child against original files, exposes native commands, 
     createHostedAgentConnectService({ host: nativeHost, authenticate: () => principal })))), principal.assertCurrent);
   let rejectNextRegistration = false;
   const rejectedRegistrations = new Set<string>();
+  const childToolRequests = new Map<string, string>();
+  const childToolReplies: { operation: string; outcome: string }[] = [];
   const poller = new HostedAgentPoller({ poll: async (cursors, signal) => {
     const batches = await client.poll(cursors, signal);
-    for (const batch of batches) for (const frame of batch.frames) if (rejectNextRegistration && frame.payload.kind === "request"
-      && frame.payload.request.kind === "tool" && (frame.payload.request.input as { operation?: unknown })?.operation === "background.register") {
-      rejectNextRegistration = false; rejectedRegistrations.add(frame.payload.id);
+    for (const batch of batches) for (const { payload } of batch.frames) {
+      if (payload.kind !== "request" || payload.request.kind !== "tool") continue;
+      const input = payload.request.input as { operation?: unknown; backgroundScope?: unknown } | null;
+      if (rejectNextRegistration && input?.operation === "background.register") {
+        rejectNextRegistration = false;
+        rejectedRegistrations.add(payload.id);
+      }
+      if (typeof input?.backgroundScope === "string" && typeof input.operation === "string"
+        && ["tool.begin", "fs.access", "fs.mime", "fs.read", "tool.end"].includes(input.operation)) {
+        childToolRequests.set(payload.id, input.operation);
+      }
     }
     return batches;
-  }, reply: (runId, id, reply, signal) => client.reply(runId, id, rejectedRegistrations.has(id) ? { ok: false, code: "EXECUTOR_FAILED" } : reply, signal),
+  }, reply: async (runId, id, reply, signal) => {
+    await client.reply(runId, id, rejectedRegistrations.has(id) ? { ok: false, code: "EXECUTOR_FAILED" } : reply, signal);
+    const operation = childToolRequests.get(id);
+    if (operation !== undefined) {
+      childToolRequests.delete(id);
+      childToolReplies.push({ operation, outcome: reply.ok ? "success" : reply.code });
+    }
+  },
   readArtifact: (runId, id, offset, maximum, signal) => client.readArtifact(runId, id, offset, maximum, signal) }), sourceId = "native-source";
   const capabilities: Capability[] = ["session.resume", "session.detach", "session.tree", "session.rewind", "session.rewind_to_start", "turn.stream", "turn.abort", "turn.follow_up",
     "input.text", "model.list", "model.switch", "context.usage", "runtime.commands", "subagents.list", "subagents.detail", "subagents.transcript", "subagents.stop", "subagents.resume"].map(key => ({ key, supported: true }));
@@ -130,7 +147,7 @@ it("runs a native Source child against original files, exposes native commands, 
     await vi.waitFor(() => expect(sourceDatabase.listSubagentRuns({ sessionId }).runs.some(run => run.state === "completed")).toBe(true), { timeout: 30_000 });
     const child = sourceDatabase.listSubagentRuns({ sessionId }).runs.find(run => run.state === "completed")!;
     expect(child).toMatchObject({ sessionId, returnedResult: "SOURCE_CHILD_DONE" });
-    expect(childReads).toBe(1);
+    expect(childReads, `Original child Source tool replies: ${JSON.stringify(childToolReplies)}`).toBe(1);
     expect(await rejectedChildTool(originalScope)).toBe(true);
     const liveBeforeControl = [...lifecycle];
     await host.mutate({ operationId: "resume-source-child", connection, kind: "controlSubagent", body: { sessionId, runId: child.id, action: "resume" },
@@ -156,7 +173,8 @@ it("runs a native Source child against original files, exposes native commands, 
     expect(await childTool(currentScope, "tool.end", heldCallId)).toBe(true);
     releaseResumedChild();
     await vi.waitFor(() => { expect(lifecycle).toEqual(liveBeforeControl); expect({ childRequests, parentRequests, childResults }).toMatchObject({ childRequests: 4, parentRequests: 3 }); }, { timeout: 15_000 });
-    expect(childResults[1]).toContain("SOURCE_CHILD_FILE_BYTES"); expect(childReads).toBe(2);
+    expect(childResults[1], `Resumed child Source tool replies: ${JSON.stringify(childToolReplies)}`).toContain("SOURCE_CHILD_FILE_BYTES");
+    expect(childReads).toBe(2);
     await vi.waitFor(() => expect(sourceDatabase.listSubagentRuns({ sessionId }).runs.find(run => run.id === child.id)?.state).toBe("completed"), { timeout: 30_000 });
     const childEvents = sourceDatabase.listEvents({ sessionId, limit: 1_000 }).filter(event => event.payload.type === "background_task" && event.payload.taskId === child.id
       || event.payload.type === "subagent_run" && event.payload.run.id === child.id || event.payload.type === "subagent_transcript" && event.payload.subagentRunId === child.id);
