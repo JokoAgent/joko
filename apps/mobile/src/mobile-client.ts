@@ -64,7 +64,7 @@ import {
   DeviceSchema, RenameDeviceMutationSchema, ResetDeviceNameMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
-  ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, RunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
+  AttemptState, ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, RunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
   SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
@@ -5691,6 +5691,68 @@ export class MobileClient {
       const result = await this.#submitTerminal(create(OperationMutationSchema, { payload: command === "stop"
         ? { case: "abortRun", value: { runId: run!.runId } }
         : { case: "resumeSession", value: { sessionId } } }), { kind: "session-model", sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  #taskStopTarget() {
+    const detail = this.#state.detail;
+    const session = this.#selectedSession();
+    if (this.#joinedTask || this.#state.taskSource?.kind === "joined" || !detail || !session || session.archived || session.state !== SessionState.RUNNING
+      || session.backendId !== "claude-code" || session.location?.kind.case !== "serviceNode"
+      || session.automationOrigin !== undefined || session.derivationOrigin?.sideChat
+      || !this.#selectedBackend(session)?.capabilities?.capabilities.some(capability =>
+        capability.name === capabilityNames.turnAbort && capability.support === CapabilitySupport.SUPPORTED)) return undefined;
+    const sourceKey = this.taskHeaderSourceKey();
+    const generation = session.nativeBinding?.runtimeGeneration;
+    if (!sourceKey || !generation || detail.backgroundTasks.some(task => task.sessionId === session.sessionId)
+      || this.taskOutboxItems().some(item => item.state !== "accepted")
+      || this.#state.pending.some(item => item.sessionId === session.sessionId && item.kind === "send")) return undefined;
+    const run = uniqueValue(detail.runs, candidate => candidate.sessionId === session.sessionId
+      && candidate.backendId === session.backendId && candidate.targetId === session.targetId
+      && candidate.state === RunState.RUNNING && candidate.version?.generation === generation);
+    const revision = run?.version?.revision;
+    if (!run?.runId || !run.activeAttemptId || !revision || revision.value < 1n) return undefined;
+    const attempt = uniqueValue(run.attempts, candidate => candidate.attemptId === run.activeAttemptId);
+    if (!attempt || attempt.runId !== run.runId || attempt.generation !== generation
+      || attempt.state !== AttemptState.RUNNING || attempt.endedAt !== undefined) return undefined;
+    const activeQueue = detail.queueItems.filter(item => item.sessionId === session.sessionId
+      && [QueueItemState.ACCEPTED, QueueItemState.DISPATCHING, QueueItemState.BACKEND_ACCEPTED, QueueItemState.DISPATCH_UNKNOWN].includes(item.state));
+    const queue = activeQueue.length === 1 ? activeQueue[0] : undefined;
+    if (!queue || queue.state !== QueueItemState.BACKEND_ACCEPTED || queue.queueItemId !== run.sourceQueueItemId
+      || queue.runId !== run.runId || queue.backendId !== session.backendId || queue.targetId !== session.targetId
+      || queue.sharedTaskAuthor !== undefined) return undefined;
+    return {
+      sourceKey, sessionId: session.sessionId, runId: run.runId, revision,
+      authorityKey: JSON.stringify([sourceKey, run.runId, attempt.attemptId, revision.value.toString()]),
+      pending: this.#state.pending.some(item => item.kind === "session-stop" && item.runId === run.runId)
+    };
+  }
+
+  taskStopControl(): { readonly authorityKey: string; readonly pending: boolean } | undefined {
+    const target = this.#taskStopTarget();
+    return target && { authorityKey: target.authorityKey, pending: target.pending };
+  }
+
+  async stopTaskTurn(authorityKey: string, isViewCurrent: () => boolean): Promise<boolean> {
+    const target = this.#taskStopTarget();
+    if (!target || target.authorityKey !== authorityKey || !isViewCurrent()) {
+      throw new Error("The displayed turn is no longer available to stop.");
+    }
+    if (target.pending) throw new Error("Check the original stop operation before stopping this turn again.");
+    const action = this.#claimMutation();
+    try {
+      const signal = this.#abort!.signal;
+      const current = () => !signal.aborted && !this.#joinedTask && this.taskHeaderSourceKey() === target.sourceKey;
+      const beforeDispatch = () => current() && isViewCurrent() && this.#taskStopTarget()?.authorityKey === authorityKey;
+      const role = await this.readTaskHeaderRole(target.sourceKey, signal);
+      if (role !== "ordinary" || !beforeDispatch()) return false;
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.RUN, id: target.runId }, expectedRevision: target.revision }],
+        payload: { case: "abortRun", value: { runId: target.runId } }
+      }), { kind: "session-stop", sessionId: target.sessionId, runId: target.runId }, undefined, false, true, {
+        signal, isCurrent: current, beforeDispatch
+      });
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -17138,7 +17200,7 @@ export class MobileClient {
 
   async #submit(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision" | "extensionResourceId">,
+    identity: Omit<PendingOperation, "operationId" | "connectionId" | "taskJoinId" | "state">,
     operationId?: string
   ): Promise<boolean> {
     return (await this.#submitTracked(mutation, identity, false, operationId)).accepted;
@@ -17146,7 +17208,7 @@ export class MobileClient {
 
   async #submitTerminal(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision" | "extensionResourceId">,
+    identity: Omit<PendingOperation, "operationId" | "connectionId" | "taskJoinId" | "state">,
     operationId?: string,
     markBusy = true,
     refreshAfter = true,
@@ -17159,7 +17221,7 @@ export class MobileClient {
 
   async #submitTracked(
     mutation: OperationMutation,
-    identity: Pick<PendingOperation, "kind" | "sessionId" | "eventId" | "queueItemId" | "interactionId" | "interactionGeneration" | "interactionRevision" | "interactionDraftKind" | "targetConnectionId" | "targetDeviceId" | "scheduleId" | "triggerId" | "targetId" | "backendId" | "sourceGeneration" | "workspaceId" | "changeSetId" | "extensionId" | "extensionRevision" | "extensionResourceId">,
+    identity: Omit<PendingOperation, "operationId" | "connectionId" | "taskJoinId" | "state">,
     waitForTerminal: boolean,
     operationId = this.newId(),
     markBusy = true,
@@ -17188,7 +17250,7 @@ export class MobileClient {
     let operation: Operation;
     if (!persisted || !requestCurrent() || authority?.beforeDispatch?.() === false) {
       if (pending.kind === "extension-settings-routing" || pending.kind === "extension-settings-credential-clear"
-        || pending.kind === "extension-settings-directory" || pending.kind === "workspace-rewind") {
+        || pending.kind === "extension-settings-directory" || pending.kind === "workspace-rewind" || pending.kind === "session-stop") {
         await this.#retireUndispatchedReceipt(pending);
         if (pending.kind === "workspace-rewind" && markBusy && this.#current(epoch)) this.#set({ busy: false });
         return { accepted: false, definitive: true };
@@ -17200,12 +17262,12 @@ export class MobileClient {
     try {
       operation = await this.network.submit(credential, pending.operationId, mutation, operationSignal);
     } catch (error) {
-      if (!this.#joinedTask && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss")
+      if (!this.#joinedTask && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss" || pending.kind === "session-stop")
         && pending.sessionId === this.#state.selectedId
         && error instanceof ConnectError && (error.code === Code.Aborted || error.code === Code.FailedPrecondition)
         && this.#current(epoch) && requestCurrent()) {
         // Aborted can also mean an operation is still running. Only the exact
-        // recorded terminal failure settles a rejected Interaction submission.
+        // recorded terminal failure settles the submission.
         const receipt = await this.network.getOperation(credential, pending.operationId, operationSignal).catch(() => undefined);
         if (receipt && this.#current(epoch) && requestCurrent() && this.#state.pending.includes(pending)
           && this.#operationReceiptMatches(receipt, pending)
@@ -17213,7 +17275,8 @@ export class MobileClient {
           await this.#receipt(receipt, pending, epoch);
           if (this.#current(epoch)) {
             if (markBusy) this.#set({ busy: false });
-            throw new Error(error.rawMessage || receipt.error?.message || "The request response was rejected.");
+            throw new Error(error.rawMessage || receipt.error?.message
+              || (pending.kind === "session-stop" ? "The stop operation was rejected." : "The request response was rejected."));
           }
           return { accepted: false, definitive: true, operation: receipt };
         }
@@ -17351,9 +17414,15 @@ export class MobileClient {
       try { assertMobileSharedTaskOperation(this.#joinedTask.source, pending.operationId, operation); return true; }
       catch { return false; }
     }
-    return !this.#joinedTask && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId
-      && (pending.kind !== "message-delete" || operation.state !== OperationState.SUCCEEDED
-        || mobileMessageDeletionGeneration(operation, pending) !== undefined);
+    if (this.#joinedTask || operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) return false;
+    if (pending.kind === "session-stop") {
+      const mutation = operation.mutation?.payload;
+      const result = operation.result?.payload;
+      return mutation?.case === "abortRun" && mutation.value.runId === pending.runId
+        && (operation.state !== OperationState.SUCCEEDED || result?.case === "acknowledgement" && result.value.accepted);
+    }
+    return pending.kind !== "message-delete" || operation.state !== OperationState.SUCCEEDED
+      || mobileMessageDeletionGeneration(operation, pending) !== undefined;
   }
 
   async reconcile(epoch = this.#epoch): Promise<void> {
@@ -17433,9 +17502,9 @@ export class MobileClient {
           if (operation.state === OperationState.SUCCEEDED
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
-              "session-model", "session-permission", "session-plan", "session-compact", "session-branch",
+              "session-model", "session-permission", "session-plan", "session-compact", "session-branch", "session-stop",
               "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
-            && this.#current(epoch) && (pending.kind !== "message-delete" || this.#operationReceiptMatches(operation, pending))) {
+            && this.#current(epoch) && (pending.kind !== "message-delete" && pending.kind !== "session-stop" || this.#operationReceiptMatches(operation, pending))) {
             await this.refresh();
             if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground && this.#credential === credential
               && this.#state.selectedId === pending.sessionId) this.#clearHistory();

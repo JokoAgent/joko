@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, useImperativeHandle, useRef, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, PiMessageLifecycleKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
+  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -99,6 +99,8 @@ const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(
   policy: { help: true as const, jumpSession: true as const, userShell: false, sessionReset: false, review: false }, jumpSessionIds: ["session"] };
 const resolveResource = vi.fn(async () => resource);
 const send = vi.fn(async (_draft: MobileComposerDraft, _observer?: MobileTaskSendObserver) => true);
+const stopTaskTurn = vi.fn(async (_authorityKey: string, _current: () => boolean) => true);
+let stopControl: { authorityKey: string; pending: boolean } | undefined;
 const loadEarlier = vi.fn(async () => undefined);
 const loadNewer = vi.fn(async (_signal: AbortSignal) => {});
 const returnToLatest = vi.fn(() => {
@@ -127,6 +129,7 @@ const client = new Proxy({
   listTaskRuntimeCommands: vi.fn(async () => catalog),
   resolveTaskRuntimeCommandResource: resolveResource,
   taskQueueItems: () => empty, taskQueueCapabilities: () => ({}),
+  taskStopControl: () => stopControl, stopTaskTurn,
   taskInteractions: () => pendingMobileInteractions(renderedState.detail, renderedState.selectedId), subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
   taskNativeTreeControls: () => undefined, send, latest: returnToLatest, older: loadEarlier, newer: loadNewer, taskContextControls: () => undefined,
@@ -257,6 +260,7 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
+  stopControl = undefined; stopTaskTurn.mockReset().mockResolvedValue(true);
   returnToLatest.mockClear();
   loadEarlier.mockReset().mockResolvedValue(undefined);
   loadNewer.mockReset().mockResolvedValue(undefined);
@@ -286,6 +290,33 @@ async function render(assertPalette = true): Promise<void> {
   await act(async () => {});
   if (assertPalette) { expect(input.editable).toBe(true); expect(input.selection).toEqual({ start: 3, end: 3 }); expect(palette.visible).toBe(true); expect(palette.checkingDraft).toBe(false); }
 }
+
+it.each(["", "Unsent follow-up"])("mounts the current ordinary stop and keeps any composer draft (%s)", async text => {
+  sendFollowSourceKey = "owned-task";
+  stopControl = { authorityKey: "displayed-turn", pending: false };
+  drafts.save(identity, plainTextMobileComposerDraft(text));
+  await drafts.flush(identity);
+  await act(async () => root.render(taskScreen()));
+  const button = (label: string) => Array.from(host.querySelectorAll("button")).find(item => item.getAttribute("aria-label") === label);
+  const stop = () => button(mobileMessage("en", "composer.stop"));
+  expect(stop()?.disabled).toBe(false);
+  expect(button(mobileMessage("en", "composer.send"))?.disabled).toBe(text ? false : undefined);
+  await act(async () => stop()!.click());
+  expect(stopTaskTurn).toHaveBeenCalledExactlyOnceWith("displayed-turn", expect.any(Function));
+  expect(stopTaskTurn.mock.calls[0]![1]()).toBe(true);
+  expect(send).not.toHaveBeenCalled();
+  expect(input.draft.text).toBe(text);
+
+  stopControl = { authorityKey: "displayed-turn", pending: true };
+  await act(async () => root.render(taskScreen()));
+  expect(stop()?.disabled).toBe(true);
+  await act(async () => stop()!.click());
+  expect(stopTaskTurn).toHaveBeenCalledOnce();
+  taskRole = "worker";
+  await act(async () => root.render(taskScreen()));
+  expect(stop()).toBeUndefined();
+  expect(stopTaskTurn.mock.calls[0]![1]()).toBe(false);
+});
 
 it("reads the actual task menu's Claude family quota using the owning model route", async () => {
   const model = create(ModelKeySchema, { providerId: "provider", modelId: "claude-opus-4[1m]" });
@@ -907,6 +938,35 @@ it.each(["same request", "resolved while reconnecting"] as const)("retains the o
   expect(interactionSheet.visible).toBe(outcome === "same request");
   await expect(new MobileInteractionDraftStore(drafts.driver).read(identity)).resolves.toEqual(outcome === "same request" ? draft : null);
   await interactionDrafts.clear(identity);
+});
+
+it("renders a single resolved plan review with its decision, feedback and original summary", async () => {
+  const identity = { sessionId: session.sessionId, backendId: "claude-code", targetId: session.targetId, generation: 1n,
+    runId: "run", attemptId: "attempt" };
+  const review = create(InteractionSchema, { ...identity, interactionId: "review", kind: InteractionKind.PLAN_REVIEW, state: InteractionState.RESOLVED,
+    request: { case: "planReview", value: { title: "Review the proposed plan", markdown: "1. Prepare\n2. Test\n3. Verify\n4. Publish",
+      allowedDecisions: [PlanReviewDecisionKind.EXECUTE, PlanReviewDecisionKind.REFINE] } },
+    resolution: { decision: { case: "planReview", value: { decision: PlanReviewDecisionKind.REFINE, feedback: "Cover reconnect before publishing." } } }
+  });
+  const observed = (eventId: string, sequence: bigint, interaction = review) => create(EventSchema, {
+    eventId, identity, cursor: { generation: 1n, sequence }, payload: { kind: { case: "interactionChanged", value: { interaction } } }
+  });
+  const detail = create(SnapshotSchema, { ...state.detail!, sessions: [create(SessionSchema, { ...session, backendId: identity.backendId })],
+    timeline: [observed("request", 2n), observed("resolution", 3n)] });
+  renderedState = { ...state, detail };
+  await act(async () => root.render(taskScreen()));
+  expect(timelineList!.data).toHaveLength(1);
+  expect(host.textContent).toContain(mobileMessage("en", "interaction.plan.refine"));
+  expect(host.textContent).toContain("Cover reconnect before publishing.");
+  expect(host.textContent).toContain("1. Prepare\n2. Test\n3. Verify\n…");
+  expect(interactionSheet.visible).toBe(false);
+
+  const foreign = create(InteractionSchema, { ...review, sessionId: "other-session" });
+  const otherBackend = create(InteractionSchema, { ...review, backendId: "codex" });
+  const otherEvent = create(EventSchema, { ...observed("other-backend", 5n, otherBackend), identity: { ...identity, backendId: "codex" } });
+  renderedState = { ...state, detail: create(SnapshotSchema, { ...detail, timeline: [observed("foreign", 4n, foreign), otherEvent] }) };
+  await act(async () => root.render(taskScreen()));
+  expect(host.textContent).not.toContain("Cover reconnect before publishing.");
 });
 
 async function mountMeasuredTimelineTail(): Promise<void> {
