@@ -2419,16 +2419,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             messageJumpGenerationRef.current += 1;
             setTimelineFocusRequest(undefined);
             setSearchTimelineWindow(undefined);
-            runAction(`open-machine-message:${profileId}:${match.sessionId}:${match.eventId}`, async () => {
-              await controller.openMachineSession(profileId, match.sessionId);
-              controller.navigate({
-                kind: "session",
-                profileId,
-                sessionId: match.sessionId,
+            runAction(`open-machine-message:${profileId}:${match.sessionId}:${match.eventId}`, () =>
+              controller.openMachineSession(profileId, match.sessionId, {
                 messageEventId: match.eventId,
                 messageId: match.timelineItemId
-              });
-            });
+              })
+            );
           }
         }}
         onNavigate={(route) => {

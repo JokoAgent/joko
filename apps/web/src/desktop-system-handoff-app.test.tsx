@@ -49,6 +49,38 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
+  it("passes a remote search hit into the owned machine open and lets a newer New Task navigation stand", async () => {
+    const task = session("remote-task");
+    const initial = connectedState({ route: { kind: "session" } });
+    const remote = { id: "profile-b", deviceId: "device-b", serverId: "server-b", name: "Remote", origin: "https://remote.example" };
+    const match = { sessionId: task.id, eventId: "remote-event", timelineItemId: "remote-message", role: "assistant" as const,
+      kind: "textMessage" as const, snippet: "Remote deployment needle", createdAt: 1, score: 1 };
+    const pending = deferred<void>();
+    const navigate = vi.fn<AppController["navigate"]>();
+    const openMachineSession = vi.fn<AppController["openMachineSession"]>(() => pending.promise);
+    const fixture = renderApp({ ...initial, profiles: [...initial.profiles, remote], machinePresenceByProfile: { "profile-b": "online" },
+      machineCaches: [{ profileId: remote.id, serverId: remote.serverId, name: remote.name, origin: remote.origin, updatedAt: 1,
+        sessions: [{ id: task.id, name: task.name, state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }] }] }, {
+      navigate, openMachineSession, searchAllSessionMessages: async () => ({ matches: [], totalSize: 0, revision: 1n, vectorUsed: false, poolCapped: false }),
+      searchRemoteSessionMessages: async () => [{ profileId: remote.id, serverId: remote.serverId, epoch: 1, isCurrent: () => true,
+        status: "succeeded", matches: [match] }]
+    });
+    await fixture.render();
+    const input = fixture.container.querySelector<HTMLInputElement>("#conversation-search-input")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "needle");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const hit = () => fixture.container.querySelector<HTMLButtonElement>(".conversation-search-result--remote .conversation-search-result__hit");
+    await act(async () => { await vi.waitFor(() => expect(hit()?.textContent).toContain(match.snippet)); });
+    await act(async () => hit()!.click());
+    expect(openMachineSession).toHaveBeenCalledExactlyOnceWith(remote.id, task.id, { messageEventId: match.eventId, messageId: match.timelineItemId });
+    await act(async () => fixture.container.querySelector<HTMLButtonElement>(".new-task-button")!.click());
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
+    await act(async () => pending.resolve(undefined));
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
+  });
+
   it("does not resolve an exact machine link against the previous machine snapshot during handoff", async () => {
     const sharedTask = session("shared-task");
     const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] }));
