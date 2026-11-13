@@ -37,7 +37,7 @@ import {
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
-  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
+  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageBlockSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
   ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode, PiSessionEntrySchema, PiSessionSnapshotSchema, PiSnapshotSchema,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
@@ -8263,7 +8263,7 @@ describe("native mobile connection and operation ownership", () => {
     const network = fakeNetwork();
     const assistant = (eventId: string, sequence: bigint, messageId: string, body: string) => create(EventSchema, {
       ...event(eventId, sequence), payload: { kind: { case: "messageCompleted", value: {
-        messageId, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: body } }]
+        messageId, role: MessageRole.ASSISTANT, blocks: [create(MessageBlockSchema, { content: { case: "text", value: body } })]
       } } }
     });
     const first = event("first", 2n);
