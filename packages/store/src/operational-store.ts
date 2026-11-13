@@ -12144,7 +12144,16 @@ export class OperationalStore {
       params.push(query.emittedBefore);
     }
     if (query.includeTombstoned !== true) clauses.push("tombstone.event_id IS NULL");
-    if (query.messageCompleteOnly === true) clauses.push("json_extract(event.payload_json, '$.payload.type') = 'message_complete'");
+    if (query.messageCompleteOnly === true || query.messageHttpsOnly === true) {
+      clauses.push("json_extract(event.payload_json, '$.payload.type') = 'message_complete'");
+    }
+    if (query.messageHttpsOnly === true) {
+      clauses.push(`event.payload_json LIKE '%https://%' AND EXISTS (
+        SELECT 1 FROM json_each(event.payload_json, '$.payload.blocks') AS block
+        WHERE json_extract(block.value, '$.kind') = 'text'
+          AND json_extract(block.value, '$.text') LIKE '%https://%'
+      )`);
+    }
     const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
     const limit = normalizeLimit(query.limit, 1000);
     const order = query.order === "desc" ? "DESC" : "ASC";
