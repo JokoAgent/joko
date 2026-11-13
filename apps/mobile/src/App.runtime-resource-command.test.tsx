@@ -2,7 +2,7 @@
 import { act, createElement, forwardRef, useImperativeHandle, useRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
+import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
   MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, PiMessageLifecycleKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +25,9 @@ import type { MobileNativeIntentMessageFocus } from "./mobile-native-intent";
 import type { MobileSheetActionItem } from "./MobileActionSheet";
 import type { MobileMessageActionId } from "./task-actions";
 import type { MobileProviderUsageTransport } from "./mobile-account-usage";
+import { MobileInteractionDraftStore, mobileInteractionDraftIdentity } from "./interaction-draft-store";
+import { pendingMobileInteractions } from "./mobile-interactions";
+import type { MobileInteractionSheet } from "./MobileInteractionSheet";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
 type TimelineScrollFailure = (event: { index: number; averageItemLength: number }) => void;
@@ -67,6 +70,7 @@ let header: ComponentProps<typeof MobileTaskHeader>;
 let contextSheet: ComponentProps<typeof MobileContextSheet>;
 let conversationSearch: ComponentProps<typeof MobileConversationSearchSheet>;
 let taskMessageActions: { items: readonly MobileSheetActionItem<MobileMessageActionId>[]; onAction: (action: MobileMessageActionId) => void } | undefined;
+let interactionSheet: ComponentProps<typeof MobileInteractionSheet>;
 let objectiveSheet: MobileObjectiveSheetProps;
 let activeObjectiveApi: MobileObjectiveApi | undefined;
 let activeCollaborationApi: MobileCollaborationApi | undefined;
@@ -83,6 +87,7 @@ const drafts = new MobileComposerDraftStore({
   setItem: async (key, value) => { values.set(key, value); },
   removeItem: async (key) => { values.delete(key); }
 });
+const interactionDrafts = new MobileInteractionDraftStore(drafts.driver);
 const runtime = { authorityKey: "authority", surfaceOwnerKey: "runtime-owner", sessionId: "session", backendId: "backend", targetId: "target", runtimeGeneration: "7", resourceMentions: true };
 const command = { commandId: "skill-analysis", name: "analysis", description: "Analyze", source: RuntimeCommandSource.SKILL,
   resourceId: "opaque-skill", inputMode: RuntimeCommandInputMode.RESOURCE_MENTION };
@@ -121,7 +126,8 @@ const client = new Proxy({
   taskRuntimeCommandControls: () => current ? runtime : undefined,
   listTaskRuntimeCommands: vi.fn(async () => catalog),
   resolveTaskRuntimeCommandResource: resolveResource,
-  taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
+  taskQueueItems: () => empty, taskQueueCapabilities: () => ({}),
+  taskInteractions: () => pendingMobileInteractions(renderedState.detail, renderedState.selectedId), subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
   taskNativeTreeControls: () => undefined, send, latest: returnToLatest, older: loadEarlier, newer: loadNewer, taskContextControls: () => undefined,
   taskProviderUsageTransport: () => providerUsage,
@@ -189,7 +195,8 @@ beforeAll(async () => {
   } }));
   vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
-  vi.doMock("./storage", () => new Proxy({ mobileComposerDrafts: drafts, mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } },
+  vi.doMock("./storage", () => new Proxy({ mobileComposerDrafts: drafts, mobileInteractionDrafts: interactionDrafts,
+    mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } },
     mobileReplyQuotePreferences: { snapshot: { ready: true, visible: true, saving: false, failed: false }, subscribe: () => () => {}, hydrate: async () => {} } }, {
     get: (object, key) => key in object ? object[key as keyof typeof object] : {},
     has: () => true,
@@ -208,7 +215,7 @@ beforeAll(async () => {
   }));
   vi.doMock("./MobileRuntimeCommandPalette", () => ({ MobileRuntimeCommandPalette: (_props: ComponentProps<typeof MobileRuntimeCommandPalette>) => { palette = _props; return null; } }));
   vi.doMock("./MobileInputHandoffPanel", () => ({ MobileInputHandoffPanel: (props: { api: import("./mobile-input-handoff").MobileInputHandoffApi }) => createElement("div", { "data-input-handoff-owner": props.api.ownerKey }, "Owner input handoff") }));
-  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
+  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
   for (const name of screens) vi.doMock(`./${name}`, () => new Proxy({}, {
     get: (_object, key) => key === "then" ? undefined : () => null,
     has: () => true,
@@ -220,6 +227,10 @@ beforeAll(async () => {
   } }));
   vi.doMock("./MobileActionSheet", () => ({ MobileActionSheet: (props: NonNullable<typeof taskMessageActions> & { visible: boolean }) => {
     if (props.visible && props.items.some(item => item.id === "copy-text")) taskMessageActions = props;
+    return null;
+  } }));
+  vi.doMock("./MobileInteractionSheet", () => ({ MobileInteractionSheet: (props: ComponentProps<typeof MobileInteractionSheet>) => {
+    interactionSheet = props;
     return null;
   } }));
   vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
@@ -859,6 +870,43 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
   expect(taskMessageActions?.items.map(item => item.id)).toContain("copy-link");
   await act(async () => taskMessageActions!.onAction("copy-link"));
   expect(writeClipboard).toHaveBeenCalledExactlyOnceWith("joko://task/session?message=native-entry&event=adopted-completion");
+});
+
+it.each(["same request", "resolved while reconnecting"] as const)("retains the original question draft across a transient empty task (%s)", async outcome => {
+  const generation = 7n;
+  const runtimeSession = create(SessionSchema, { ...session, nativeBinding: { runtimeGeneration: generation } });
+  const question = create(InteractionSchema, {
+    interactionId: `question-${outcome}`, sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
+    kind: InteractionKind.QUESTION, state: InteractionState.PENDING, generation, version: { generation, revision: { value: 3n } },
+    request: { case: "question", value: { fields: [{ fieldId: "summary", label: "Summary", required: true,
+      input: { case: "text", value: {} } }] } }
+  });
+  const snapshot = create(SnapshotSchema, { sessions: [runtimeSession], interactions: [question] });
+  const identity = mobileInteractionDraftIdentity(state.activeProfileId, question)!;
+  const draft = { kind: "question", fieldIndex: 0, answers: { summary: { kind: "text", value: "Keep this unsent answer" } } } as const;
+  renderedState = { ...state, owner: snapshot, detail: snapshot };
+  await act(async () => root.render(taskScreen()));
+  expect(interactionSheet.interactions).toEqual([question]);
+  interactionDrafts.save(identity, draft);
+  await interactionDrafts.flush(identity);
+
+  for (const status of ["connecting", "offline", "connected"] as const) {
+    renderedState = { ...renderedState, status, detail: undefined };
+    await act(async () => root.render(taskScreen()));
+    expect(interactionSheet.interactions).toEqual([]);
+    expect(interactionSheet.visible).toBe(false);
+    await expect(new MobileInteractionDraftStore(drafts.driver).read(identity)).resolves.toEqual(draft);
+  }
+
+  const returned = outcome === "same request" ? snapshot : create(SnapshotSchema, { ...snapshot,
+    interactions: [create(InteractionSchema, { ...question, state: InteractionState.RESOLVED })] });
+  renderedState = { ...renderedState, status: "connected", owner: returned, detail: returned };
+  await act(async () => root.render(taskScreen()));
+  await interactionDrafts.flush(identity);
+  expect(interactionSheet.interactions).toEqual(outcome === "same request" ? [question] : []);
+  expect(interactionSheet.visible).toBe(outcome === "same request");
+  await expect(new MobileInteractionDraftStore(drafts.driver).read(identity)).resolves.toEqual(outcome === "same request" ? draft : null);
+  await interactionDrafts.clear(identity);
 });
 
 async function mountMeasuredTimelineTail(): Promise<void> {

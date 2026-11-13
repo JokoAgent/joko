@@ -4317,6 +4317,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const interactionOwnerKey = state.activeProfileId && state.selectedId
     ? `${taskDraftProfileId}\u001f${state.selectedId}`
     : undefined;
+  const interactionDraftObservationReady = state.status === "connected"
+    && state.detail?.sessions.some(candidate => candidate.sessionId === state.selectedId) === true;
   const interactionIdsKey = JSON.stringify(interactions.map((interaction) => [
     interaction.interactionId,
     interaction.backendId,
@@ -4669,22 +4671,24 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     }
   }, [draftIdentityKey, imageGallery.close, state.status]);
   useEffect(() => {
-    const next = new Map<string, MobileInteractionDraftIdentity>();
-    if (state.activeProfileId) {
-      for (const interaction of interactions) {
-        const identity = mobileInteractionDraftIdentity(taskDraftProfileId!, interaction);
-        if (identity) next.set(mobileInteractionDraftIdentityKey(identity), identity);
-      }
+    if (interactionDraftsRef.current.ownerKey !== interactionOwnerKey) {
+      interactionDraftsRef.current = { ownerKey: interactionOwnerKey, values: new Map() };
     }
-    const previous = interactionDraftsRef.current;
+    // Only an adopted task snapshot can establish that a request has ended.
+    if (interactionOwnerKey === undefined || !interactionDraftObservationReady) return;
+    const previous = interactionDraftsRef.current.values;
+    const next = new Map<string, MobileInteractionDraftIdentity>();
+    for (const interaction of interactions) {
+      const identity = mobileInteractionDraftIdentity(taskDraftProfileId, interaction);
+      if (identity) next.set(mobileInteractionDraftIdentityKey(identity), identity);
+    }
     interactionDraftsRef.current = { ownerKey: interactionOwnerKey, values: next };
-    if (interactionOwnerKey === undefined || previous.ownerKey !== interactionOwnerKey) return;
-    for (const [key, identity] of previous.values) {
+    for (const [key, identity] of previous) {
       if (!next.has(key)) void mobileInteractionDrafts.clear(identity).catch((error) => {
         if (taskMountedRef.current) setLocalError(errorText(error));
       });
     }
-  }, [interactionIdsKey, interactionOwnerKey, state.activeProfileId]);
+  }, [interactionIdsKey, interactionOwnerKey, interactionDraftObservationReady]);
   useEffect(() => {
     const identity = draftIdentity;
     draftIdentityRef.current = identity;
