@@ -477,7 +477,9 @@ jobs:
     runs-on: macos-15-intel
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
-    timeout-minutes: 45
+    # Cold Linkspan preparation can take 20 minutes before the bounded GUI
+    # step starts. Reserve time for that preparation and the evidence upload.
+    timeout-minutes: 65
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
