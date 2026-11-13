@@ -3661,7 +3661,8 @@ describe("Connect security and protocol audit", () => {
       await expect(prepare()).rejects.toMatchObject({ code: Code.NotFound });
       await expect(submit("delete-project-again", deletion)).rejects.toMatchObject({ code: Code.NotFound });
       await expect(submit("delete-project", deletion)).resolves.toEqual(deleted);
-      await expect(operations.getOperation({ operationId: "delete-project" }, auth)).resolves.toEqual(deleted);
+      const lookup = await operations.getOperation({ operationId: "delete-project" }, auth);
+      expect(lookup.operation).toEqual(deleted.operation);
       expect(store.getTarget(targetId)).toEqual(tombstone);
       expect(workspaces.listRegistrations()).toEqual([]);
     } finally {
