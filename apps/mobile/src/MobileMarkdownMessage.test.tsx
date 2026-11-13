@@ -120,15 +120,15 @@ describe("native message Markdown", () => {
     const colors = { background: dark ? "#15191d" : "#ffffff", surface: dark ? "#24292d" : "#fafafa",
       ink: dark ? "#f4f4f2" : "#111111", muted: "#637073", border: "#e1e2df", accent: "#ff9800", negative: "#cc634e", dark };
     const props = { colors, locale: "en" as const, ownerKey: "nested-markdown" };
-    const source = '~~**_[Docs](https://example.test)_ and `value` and $x^2$**';
+    const source = 'Read ~~**_[Docs](https://example.test)_ and `value` and $x^2$**';
     try {
       await act(async () => root.render(createElement(MobileMarkdownMessage, { ...props, text: source, streaming: true })));
-      expect(container.textContent).toContain("~~");
+      expect(container.textContent).toBe("Read ~~Docs and value and x²");
       await act(async () => root.render(createElement(MobileMarkdownMessage, { ...props, text: source + "~~", streaming: false })));
       const link = container.querySelector<HTMLElement>('[role="link"]')!;
       expect(link.textContent).toBe("Docs");
       expect(link.dataset).toMatchObject({ weight: "700", slant: "italic", decoration: "underline line-through" });
-      expect(link.closest('[data-selectable="true"]')?.textContent).toBe("Docs and value and x²");
+      expect(link.closest('[data-selectable="true"]')?.textContent).toBe("Read Docs and value and x²");
       expect(container.querySelector('[data-font="monospace"][data-weight="700"]')?.textContent).toBe("value");
       await act(async () => link.click());
       expect(openUrl).toHaveBeenLastCalledWith("https://example.test");
