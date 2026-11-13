@@ -10830,6 +10830,7 @@ export class MobileClient {
         const queued = operation.result?.payload;
         const binding = session.nativeBinding?.opaqueReference;
         if (!notify || this.#joinedTask || !binding || !sourceGeneration || !isCurrent()
+          || this.#selectedSession()?.nativeBinding?.opaqueReference !== binding
           || operation.state !== OperationState.SUCCEEDED || operation.operationId !== observer.operationId
           || queued?.case !== "queueItem" || !queued.value.queueItemId || queued.value.sourceId !== operation.operationId
           || queued.value.sessionId !== sessionId || queued.value.backendId !== session.backendId || queued.value.targetId !== session.targetId) return;
