@@ -167,11 +167,13 @@ export async function projectDesktopMenuBar(input: { readonly sources: readonly 
         const windowKind = (window: ProviderAccountUsageWindowView | undefined): "session" | "week" => (window?.windowMinutes ?? 0) >= 1440 ? "week" : "session";
         const windows = [...quotaWindow(row.primaryWindow, windowKind(row.primaryWindow)), ...quotaWindow(row.secondaryWindow, "week"),
           ...(buckets.length ? [] : usage?.modelWindows?.slice(0, 80).flatMap(window => quotaWindow(window.window, "scoped", window.displayName)) ?? [])];
-        const balance = row.credits?.balance;
-        const credits = balance !== undefined && /^\d+(?:\.\d+)?$/u.test(balance) && Number.isFinite(Number(balance)) ? Number(balance) : null;
+        const accountCredits = row.credits ?? usage?.credits;
+        const balance = accountCredits?.balance;
+        const credits = accountCredits?.unlimited === true ? null : accountCredits?.hasCredits === false ? 0
+          : balance !== undefined && /^\d+(?:\.\d+)?$/u.test(balance) && Number.isFinite(Number(balance)) ? Number(balance) : null;
         const value: MenubarSubscriptionInput = { kind: "subscription", id, providerId: actionId ?? id, family: "generic", logoSvg: MARK,
           brand: text(`${provider.name}${buckets[index]?.displayName ? ` · ${buckets[index]!.displayName}` : ""}`), account: null,
-          plan: row.planType ? text(row.planType) : null, windows, credits, creditsUnlimited: row.credits?.unlimited === true,
+          plan: row.planType ? text(row.planType) : null, windows, credits, creditsUnlimited: accountCredits?.unlimited === true,
           prepaidUsd: null, updatedAtMs: row.observedAt ?? null, consuming,
           ...(usage?.resetCredits ? { resetCredits: { count: Math.floor(positive(usage.resetCredits.availableCount)),
             earliestExpiryMs: usage.resetCredits.earliestExpiryAt ?? null } } : {}),

@@ -34,6 +34,10 @@ export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loa
   const stale = failed || snapshot !== undefined && mobileAccountUsageStale(snapshot, now);
   const extra = snapshot?.extraUsage;
   const credits = snapshot?.credits;
+  const creditBalance = credits?.balance?.slice(0, 128);
+  const creditsDepleted = credits?.unlimited !== true && credits?.hasCredits === false;
+  const creditStatus = credits?.unlimited === true ? copy.unlimited : creditsDepleted ? copy.none
+    : credits?.hasCredits === true && creditBalance === undefined ? copy.available : undefined;
   const resetCredits = snapshot?.resetCredits;
   const expiry = mobileUsageTimestamp(resetCredits?.earliestExpiryAt);
   const hasResetCredits = resetCredits && Number.isInteger(resetCredits.availableCount) && resetCredits.availableCount >= 0
@@ -60,8 +64,9 @@ export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loa
         {copy.reportedCredits.replace("{used}", number.format(extra.usedCredits)).replace("{limit}", number.format(extra.monthlyLimit))}
       </Text>}
     </View>}
-    {credits && <Text style={[styles.note, { color: colors.muted }]}>{copy.credits} · {credits.unlimited === true ? copy.unlimited
-      : credits.balance !== undefined ? credits.balance.slice(0, 128) : credits.hasCredits === true ? copy.available : credits.hasCredits === false ? copy.none : "—"}</Text>}
+    {credits && <Text style={[styles.note, { color: creditsDepleted ? colors.negative ?? colors.ink : colors.muted }]}>
+      {copy.credits} · {[creditBalance, creditStatus].filter(Boolean).join(" · ") || "—"}
+    </Text>}
     {hasResetCredits && !reset && <Text style={[styles.note, { color: colors.muted }]}>{copy.resetCredits.replace("{count}", number.format(resetCredits.availableCount))}
       {expiry === undefined ? "" : ` · ${copy.expiry.replace("{time}", time(expiry))}`}</Text>}
     {!snapshot && <Text style={[styles.note, { color: colors.muted }]}>{loading && !failed ? copy.reading : copy.unavailable}</Text>}

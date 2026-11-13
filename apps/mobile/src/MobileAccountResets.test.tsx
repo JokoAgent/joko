@@ -3,7 +3,7 @@ import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { ProviderAccountResetStateSchema, ProviderAccountResetResultSchema, ProviderAccountResetAvailability, ProviderAccountResetOutcome,
-  ProviderAccountResetOfferSchema, ProviderAccountResetAutomaticSettingsSchema,
+  ProviderAccountResetOfferSchema, ProviderAccountResetAutomaticSettingsSchema, ProviderAccountUsageSnapshotSchema,
   DEFAULT_PROVIDER_ACCOUNT_RESET_SETTINGS, type ProviderAccountResetApi, type ProviderAccountResetState } from "@joko/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const native = vi.hoisted(() => ({ alert: vi.fn() }));
@@ -34,6 +34,22 @@ function fixture() {
 }
 async function click(label: string) { const button = Array.from(host.querySelectorAll("button")).find(value => value.textContent === label); if (!button) throw new Error(`Missing ${label}`); await act(async () => button.click()); }
 async function confirm() { const buttons = native.alert.mock.calls.at(-1)![2] as { onPress?: () => void }[]; await act(async () => buttons[1]!.onPress?.()); }
+
+it.each([
+  { credits: { balance: "4.25", hasCredits: false }, failed: false, label: "4.25 · No available credits" },
+  { credits: { balance: "4.25", hasCredits: false }, failed: true, label: "4.25 · No available credits" },
+  { credits: { balance: "4.25", hasCredits: true }, failed: false, label: "4.25" },
+  { credits: { balance: "4.25" }, failed: false, label: "4.25" },
+  { credits: { hasCredits: false }, failed: false, label: "No available credits" },
+  { credits: { hasCredits: true }, failed: false, label: "Available" },
+  { credits: { balance: "4.25", hasCredits: false, unlimited: true }, failed: false, label: "4.25 · Unlimited" }
+])("shows the reported balance and applicable credit status ($label, failed=$failed)", async ({ credits, failed, label }) => {
+  const snapshot = create(ProviderAccountUsageSnapshotSchema, { providerId: "openai", credits, observedAt: { seconds: 2n } });
+  await act(async () => root.render(createElement(MobileAccountUsageSummary, { colors, locale: "en", now: 2000, snapshot, failed })));
+  expect(Array.from(host.querySelectorAll("span")).map(row => row.textContent)).toContain(`Credits · ${label}`);
+  expect(host.textContent?.includes("Last known account limits")).toBe(failed);
+});
+
 it("mounts resets in the original mobile usage summary, confirms consumption, and keeps unknown retries on the same offer", async () => {
   const f = fixture(); await f.render(); await click("Use reset"); expect(f.consume).not.toHaveBeenCalled(); expect(native.alert.mock.calls[0]![1]).toContain("…ccount");
   f.consume.mockImplementationOnce(async () => { f.state = create(ProviderAccountResetStateSchema, { ...f.state, defaultOffer: create(ProviderAccountResetOfferSchema, { offerId, retryOnly: true }) }); throw new Error("Unknown"); });
