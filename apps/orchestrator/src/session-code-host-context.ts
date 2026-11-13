@@ -123,7 +123,7 @@ export class SessionCodeHostContextRuntime {
     if (this.installed || typeof (this.store as Partial<OperationalStore>).subscribe !== "function") return;
     this.installed = true;
     this.store.subscribe((event) => {
-      if (event.traceId === "session-code-host-projection" || !eventCanChangeCodeHostContext(event)) return;
+      if (event.traceId === "session-code-host-projection" || !eventCanChangeCodeHostContext(event, this.store)) return;
       queueMicrotask(() => { void this.refreshAndPublish(event.sessionId); });
     });
   }
@@ -256,12 +256,13 @@ export function refreshSessionCodeHostReferencesInBackground(store: OperationalS
 }
 
 function sessionCodeHostContext(
-  store: Pick<OperationalStore, "listEvents">,
+  store: Pick<OperationalStore, "listEvents" | "getBackend">,
   session: StoredSession
 ): readonly string[] {
   const context: string[] = [];
   for (const event of store.listEvents({
     sessionId: session.descriptor.id,
+    ...(usesPiTimeline(store, session.descriptor.backendId) ? { activeNativeTimeline: true } : {}),
     order: "desc",
     limit: CONTEXT_EVENT_LIMIT
   })) {
@@ -276,16 +277,22 @@ function sessionCodeHostContext(
   return context;
 }
 
-function eventCanChangeCodeHostContext(event: PersistedEvent): boolean {
+function eventCanChangeCodeHostContext(event: PersistedEvent, store: Pick<OperationalStore, "getBackend">): boolean {
   return event.payload.type === "message_complete"
     || event.payload.type === "message_deleted"
+    || (event.payload.type === "native_session_changed" && usesPiTimeline(store, event.backendId))
     || event.payload.type === "session_reset"
     || event.payload.type === "session_changed";
+}
+
+function usesPiTimeline(store: Pick<OperationalStore, "getBackend">, backendId: string): boolean {
+  return store.getBackend(backendId).descriptor.adapterKind === "pi";
 }
 
 function storeSupportsCodeHostProjection(store: OperationalStore): boolean {
   const candidate = store as Partial<OperationalStore>;
   return typeof candidate.getSession === "function"
+    && typeof candidate.getBackend === "function"
     && typeof candidate.listEvents === "function"
     && typeof candidate.findSetting === "function"
     && typeof candidate.setSetting === "function"
