@@ -6,7 +6,7 @@ import * as contract from "@joko/contracts";
 import type { AdapterContext, PromptInput } from "@joko/core";
 import { expect, it } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor, type PairedClient } from "./fixture.js";
-import { createSessionMutation, editQueuedInputMutation, pauseQueueMutation, queueItemFrom, sendInputMutation,
+import { createSessionMutation, editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, sendInputMutation,
   sessionIdFrom, setQueueItemEditLockMutation, submit } from "./operations.js";
 
 type SharingClient = Client<typeof contract.TaskSharingService>;
@@ -54,6 +54,25 @@ it("keeps two-node shared Task, authors, receipts, attachments and joined direct
     const initial = (await visitorApi.getJoinedTaskSnapshot({ joinId: joined.joinId })).state!.snapshot!;
     expect(initial.sessions.map(session => session.sessionId)).toEqual([sessionId]);
     expect(initial.connections).toEqual([]); expect(initial.devices).toEqual([]); expect(initial.workspaces).toEqual([]);
+    const unrelatedId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId,
+      createSessionMutation({ backendId: host.adapter().id, targetId: host.targetId(), providerId: "test", modelId: "text", displayName: "Unrelated Host task" })));
+    expect((await submit(owner.clients.operation, owner.connectionId, pinMutation(unrelatedId, true))).state).toBe(contract.OperationState.SUCCEEDED);
+    expect((await submit(owner.clients.operation, owner.connectionId, pinMutation(sessionId, true))).state).toBe(contract.OperationState.SUCCEEDED);
+    const pinned = (await visitorApi.getJoinedTaskSnapshot({ joinId: joined.joinId })).state!.snapshot!;
+    expect(pinned.sessions[0]?.pinned).toBe(true);
+    expect((await submit(owner.clients.operation, owner.connectionId, pinMutation(unrelatedId, false))).state).toBe(contract.OperationState.SUCCEEDED);
+    expect((await submit(owner.clients.operation, owner.connectionId, pinMutation(sessionId, false))).state).toBe(contract.OperationState.SUCCEEDED);
+    const sparse = (await visitorApi.readJoinedTaskEvents({ joinId: joined.joinId, after: pinned.resumeCursor })).batch!;
+    expect(sparse.resyncRequired).toBe(false);
+    const unpinned = sparse.events.find(event => event.payload?.kind.case === "sessionChanged" && event.payload.kind.value.session?.pinned === false);
+    expect(unpinned?.identity?.sessionId).toBe(sessionId);
+    expect(unpinned!.cursor!.sequence).toBeGreaterThan(pinned.resumeCursor!.sequence + 1n);
+    expect(sparse.events.every(event => event.identity?.sessionId === sessionId)).toBe(true);
+    expect((await submit(owner.clients.operation, owner.connectionId, pinMutation(unrelatedId, true))).state).toBe(contract.OperationState.SUCCEEDED);
+    const empty = (await visitorApi.readJoinedTaskEvents({ joinId: joined.joinId, after: sparse.resumeCursor })).batch!;
+    expect(empty.resyncRequired).toBe(false);
+    expect(empty.events).toEqual([]);
+    expect(empty.resumeCursor!.sequence).toBeGreaterThan(sparse.resumeCursor!.sequence);
     await expect(invoke(visitorApi, joined.joinId, contract.TaskShareMethod.GET_OPERATION, { operationId: randomUUID() }))
       .rejects.toMatchObject({ code: Code.NotFound });
     const noOutput = await invoke<contract.GetBackgroundTaskOutputResponse>(visitorApi, joined.joinId,

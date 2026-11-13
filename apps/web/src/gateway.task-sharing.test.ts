@@ -12,6 +12,12 @@ import type { AppSnapshot } from "./model.js";
 const gateways: OrchestratorGateway[] = [];
 afterEach(() => { for (const gateway of gateways.splice(0)) gateway.disconnect(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 const joined = create(JoinedTaskShareSchema, { joinId: "joined", status: "active", share: { shareId: "share", shareGeneration: 2n, sessionId: "task", hostServerId: "host", hostOrigin: "https://host.example", status: "active" }, member: { memberId: "member", memberGeneration: 3n, displayName: "Guest", status: "active" } });
+const cursor = (sequence: bigint, generation = 1n) => create(EventCursorSchema, { generation, sequence });
+function replyAt(sequence: bigint, generation = 1n) {
+  const text = `reply-${generation}-${sequence}`;
+  return create(EventSchema, { eventId: text, identity: { sessionId: "task", generation: 1n }, cursor: cursor(sequence, generation),
+    payload: { kind: { case: "messageCompleted", value: { messageId: text, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: text } }] } } } });
+}
 function fixture(initial: readonly string[] = [], status = "active", callbacks: GatewayCallbacks = {}) {
   const snapshot = create(SnapshotSchema, { server: { serverId: "host" }, generation: 1n, resumeCursor: { generation: 1n, sequence: 0n },
     scope: { kind: { case: "session", value: { sessionId: "task" } } },
@@ -40,7 +46,8 @@ describe("guest gateway operation recovery", () => {
     vi.stubGlobal("window", { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
     const seen: AppSnapshot[] = [], f = fixture([], "active", { onSnapshot: snapshot => { seen.push(snapshot); } });
     let publish!: (batch: Awaited<ReturnType<TaskSharingApi["events"]>>) => void;
-    vi.mocked(f.api.events).mockImplementationOnce(() => new Promise(resolve => { publish = resolve; })).mockResolvedValue({ events: [], generation: 1n, resyncRequired: false } as never);
+    vi.mocked(f.api.events).mockImplementationOnce(() => new Promise(resolve => { publish = resolve; }))
+      .mockResolvedValue({ events: [], generation: 1n, resyncRequired: false, resumeCursor: cursor(23n) } as never);
     f.allowSubmit(); await f.gateway.connect();
     await f.gateway.send("task", { text: "Guest input", deliveryMode: "prompt", attachments: [], mentions: [] }, { expectedGeneration: 1n });
     const author = { shareId: "share", shareGeneration: 2n, sessionId: "task", memberId: "member", memberGeneration: 3n, displayName: "Guest" };
@@ -52,11 +59,82 @@ describe("guest gateway operation recovery", () => {
       create(EventSchema, { eventId: "reply", identity: { sessionId: "task", generation: 1n }, cursor: { generation: 1n, sequence: 23n },
         payload: { kind: { case: "messageCompleted", value: { messageId: "native-reply", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Host reply" } }] } } } })];
     f.fresh.snapshot!.resumeCursor = create(EventCursorSchema, { generation: 1n, sequence: 23n });
-    publish({ events: [live], generation: 1n, resyncRequired: false, resumeCursor: create(EventCursorSchema, { generation: 1n, sequence: 23n }) } as never);
+    publish({ events: [live], generation: 1n, resyncRequired: true, resumeCursor: cursor(23n) } as never);
     await vi.waitFor(() => expect(seen.at(-1)?.timelineBySession.get("task")?.find(item => item.id === "native-user")).toMatchObject({ text: "Guest input", sharedTaskAuthor: author }));
     expect(seen.at(-1)?.timelineBySession.get("task")?.find(item => item.messageId === "native-reply" && item.kind === "assistant")?.text).toBe("Host reply");
+    expect(seen.some(snapshot => snapshot.timelineBySession.get("task")?.some(item => item.messageId === "live-message"))).toBe(false);
     expect(vi.mocked(f.api.invoke).mock.calls.filter(call => call[1] === TaskShareMethod.SUBMIT_OPERATION)).toHaveLength(1);
     f.gateway.disconnect();
+  });
+  it("projects scoped updates across skipped global positions and resumes through an empty batch without retiring history", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
+    const seen: AppSnapshot[] = [], f = fixture([], "active", { onSnapshot: snapshot => { seen.push(snapshot); } });
+    f.fresh.snapshot!.timeline = [replyAt(1n)];
+    f.fresh.snapshot!.resumeCursor = cursor(1n);
+    const unpinned = create(EventSchema, { eventId: "unpinned", identity: { sessionId: "task", generation: 1n }, cursor: cursor(3n),
+      payload: { kind: { case: "sessionChanged", value: { session: { ...f.fresh.snapshot!.sessions[0]!, pinned: false } } } } });
+    f.fresh.snapshot!.sessions[0]!.pinned = true;
+    vi.mocked(f.api.events).mockResolvedValueOnce({ events: [unpinned], generation: 1n, resyncRequired: false, resumeCursor: cursor(3n) } as never)
+      .mockResolvedValueOnce({ events: [], generation: 1n, resyncRequired: false, resumeCursor: cursor(5n) } as never)
+      .mockResolvedValueOnce({ events: [replyAt(6n)], generation: 1n, resyncRequired: false, resumeCursor: cursor(6n) } as never);
+    await f.gateway.connect(); await vi.advanceTimersByTimeAsync(0);
+    expect(seen.at(-1)?.sessions[0]?.pinned).toBe(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(vi.mocked(f.api.events).mock.calls.map(([request]) => request.after?.sequence)).toEqual([1n, 3n, 5n]);
+    expect(seen.at(-1)?.timelineBySession.get("task")?.map(item => item.text)).toEqual(["reply-1-1", "reply-1-6"]);
+    expect(seen.every(snapshot => !snapshot.timelineHistoryRevisionBySession.has("task"))).toBe(true);
+    expect(f.api.snapshot).toHaveBeenCalledOnce();
+  });
+  it.each([false, true])("restarts at the authoritative cursor after an empty batch forces resync (new service %s)", async newService => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
+    const seen: AppSnapshot[] = [], f = fixture([], "active", { onSnapshot: snapshot => { seen.push(snapshot); } });
+    f.fresh.snapshot!.timeline = [replyAt(8n)];
+    f.fresh.snapshot!.resumeCursor = cursor(8n);
+    const generation = newService ? 2n : 1n;
+    vi.mocked(f.api.snapshot).mockResolvedValueOnce(f.fresh).mockResolvedValueOnce(create(TaskShareSnapshotSchema, {
+      ...f.fresh, snapshot: { ...f.fresh.snapshot!, generation, resumeCursor: cursor(2n, generation), timeline: [replyAt(2n, generation)] }
+    }));
+    vi.mocked(f.api.events).mockResolvedValueOnce({ events: [], generation, resyncRequired: true, resumeCursor: cursor(2n, generation) } as never)
+      .mockResolvedValueOnce({ events: [replyAt(4n, generation)], generation, resyncRequired: false, resumeCursor: cursor(4n, generation) } as never);
+    await f.gateway.connect(); await vi.advanceTimersByTimeAsync(0);
+    expect(seen.some(snapshot => snapshot.timelineHistoryRevisionBySession.has("task") && !snapshot.timelineBySession.has("task"))).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(vi.mocked(f.api.events).mock.calls.map(([request]) => request.after)).toEqual([cursor(8n), cursor(2n, generation)]);
+    expect(seen.at(-1)?.generation).toBe(generation);
+    expect(seen.at(-1)?.timelineBySession.get("task")?.map(item => item.text)).toEqual([`reply-${generation}-2`, `reply-${generation}-4`]);
+    expect(f.api.snapshot).toHaveBeenCalledTimes(2);
+  });
+  it("rejects an out-of-order batch before projecting any of its events", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
+    const onError = vi.fn(), seen: AppSnapshot[] = [];
+    const f = fixture([], "active", { onError, onSnapshot: snapshot => { seen.push(snapshot); } });
+    vi.mocked(f.api.events).mockResolvedValueOnce({ events: [replyAt(4n), replyAt(3n)], generation: 1n, resyncRequired: false, resumeCursor: cursor(4n) } as never);
+    await f.gateway.connect(); await vi.advanceTimersByTimeAsync(0);
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ cause: expect.objectContaining({ code: Code.DataLoss }) }));
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.timelineBySession.has("task")).toBe(false);
+  });
+  it("retires old shared history when a sparse session update carries a new native binding", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
+    const seen: AppSnapshot[] = [], f = fixture([], "active", { onSnapshot: snapshot => { seen.push(snapshot); } });
+    f.fresh.snapshot!.timeline = [replyAt(1n)];
+    f.fresh.snapshot!.resumeCursor = cursor(1n);
+    const session = { ...f.fresh.snapshot!.sessions[0]!, nativeBinding: { runtimeGeneration: 2n }, version: { generation: 2n, revision: { value: 2n } } };
+    const bindingChanged = create(EventSchema, { eventId: "new-binding", identity: { sessionId: "task", generation: 2n }, cursor: cursor(3n),
+      payload: { kind: { case: "sessionChanged", value: { session } } } });
+    vi.mocked(f.api.snapshot).mockResolvedValueOnce(f.fresh).mockResolvedValueOnce(create(TaskShareSnapshotSchema, {
+      ...f.fresh, snapshot: { ...f.fresh.snapshot!, resumeCursor: cursor(3n), sessions: [session], timeline: [] }
+    }));
+    vi.mocked(f.api.events).mockResolvedValueOnce({ events: [bindingChanged], generation: 1n, resyncRequired: false, resumeCursor: cursor(3n) } as never);
+    await f.gateway.connect(); await vi.advanceTimersByTimeAsync(0);
+    expect(seen.at(-1)?.timelineHistoryRevisionBySession.get("task")).toBe(3n);
+    expect(seen.at(-1)?.sessions[0]?.generation).toBe(2n);
+    expect(seen.at(-1)?.timelineBySession.has("task")).toBe(false);
+    expect(f.api.snapshot).toHaveBeenCalledTimes(2);
   });
   it("admits a disconnected directory entry only after a fresh authenticated snapshot, without replaying a write", async () => {
     const f = fixture([], "disconnected"); let resolve!: (state: typeof f.fresh) => void;

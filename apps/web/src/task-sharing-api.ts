@@ -33,6 +33,9 @@ export function createJoinedTaskPort(api: TaskSharingApi, joined: JoinedTaskShar
       || snapshot.scope.kind.value.sessionId !== share.sessionId) {
       throw new ConnectError("The shared task projection changed owner.", Code.PermissionDenied);
     }
+    if (snapshot.resumeCursor?.generation !== snapshot.generation) {
+      throw new ConnectError("The shared task snapshot has an invalid cursor.", Code.DataLoss);
+    }
     return snapshot;
   };
   const transport: Transport = {
