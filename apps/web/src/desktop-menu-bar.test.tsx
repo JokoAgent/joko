@@ -184,7 +184,8 @@ it("uses the Codex account bucket for the native menu bar's remaining quota and 
   const special = { id: "spark-limit", displayName: "GPT-5.3-Codex-Spark", secondaryWindow: { ...base, usedPercent: 10 } };
   const generic = { id: "codex", secondaryWindow: base };
   const legacy = { id: "__default__", secondaryWindow: { ...base, usedPercent: 50 } };
-  const project = async (buckets: NonNullable<NonNullable<ProviderRuntimeView["accountUsage"]>["buckets"]>, models = [regular, spark]) => {
+  const project = async (buckets: NonNullable<NonNullable<ProviderRuntimeView["accountUsage"]>["buckets"]>,
+    models: DesktopMenuBarSource["snapshot"]["models"] = [regular, spark]) => {
     const source = { ...initial, snapshot: { ...initial.snapshot, models, providers: [{ ...provider, accountUsage: { observedAt: now,
       secondaryWindow: special.secondaryWindow, buckets } }] } };
     return { source, ...await projectDesktopMenuBar({ sources: [source], readings: new Map(), settings: DEFAULT_MENUBAR_SETTINGS, locale: "en", now }) };
