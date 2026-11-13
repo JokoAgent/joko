@@ -15,7 +15,7 @@ function fixture() {
   let current = true;
   const snapshot = emptySnapshot(), homeSnapshot = emptySnapshot();
   const home = { state: { snapshot: homeSnapshot, route: { kind: "session", sessionId: "same-task" } },
-    send: vi.fn(), sendRichAnswer: vi.fn(), deleteSession: vi.fn(), saveDraft: vi.fn(),
+    send: vi.fn(), sendRichAnswer: vi.fn(), deleteSession: vi.fn(), saveDraft: vi.fn(), resumeQueue: vi.fn(),
     getVoiceInputCapabilities: vi.fn().mockResolvedValue({ available: true }),
     startVoiceInput: vi.fn().mockResolvedValue({ id: "recording" }),
     appendVoiceAudio: vi.fn().mockResolvedValue({ id: "recording" }),
@@ -23,7 +23,8 @@ function fixture() {
     stopVoiceInput: vi.fn().mockResolvedValue({ id: "recording" }),
     cancelVoiceInput: vi.fn().mockResolvedValue({ id: "recording" })
   } as unknown as AppController;
-  const gateway = { send: vi.fn().mockResolvedValue(undefined), sendRichAnswer: vi.fn().mockResolvedValue(true), getArtifactUrl: vi.fn() } as unknown as OrchestratorGateway;
+  const gateway = { send: vi.fn().mockResolvedValue(undefined), sendRichAnswer: vi.fn().mockResolvedValue(true),
+    resumeQueue: vi.fn().mockResolvedValue(undefined), getArtifactUrl: vi.fn() } as unknown as OrchestratorGateway;
   const local = { readDraft: vi.fn().mockResolvedValue(undefined), saveDraft: vi.fn().mockResolvedValue(undefined) } as unknown as LocalState;
   const access = { role: "guest" as const, memberId: "member", editableQueueItemIds: new Set(["mine"]) };
   const controller = createTaskSharingController({ home: () => home, gateway, source, snapshot: () => snapshot,
@@ -54,6 +55,15 @@ describe("shared task controller authority", () => {
     expect(f.controller.getArtifactUrl).toBe(f.controller.getArtifactUrl);
     expect(taskSourceKey({ ...source, memberGeneration: 5n })).not.toBe(taskSourceKey(source));
     expect(taskSourceKey({ ...source, homeServerId: "other-home" })).not.toBe(taskSourceKey(source));
+  });
+  it("resumes only the exact shared queue through its gateway", async () => {
+    const f = fixture();
+    await expect(f.controller.resumeQueue("other-task")).rejects.toThrow("outside");
+    await f.controller.resumeQueue("same-task");
+    f.retire();
+    await expect(f.controller.resumeQueue("same-task")).rejects.toThrow("changed");
+    expect(f.gateway.resumeQueue).toHaveBeenCalledExactlyOnceWith("same-task");
+    expect(f.home.resumeQueue).not.toHaveBeenCalled();
   });
   it("uses only Home-owned voice APIs, fences late results, and retires exact recordings", async () => {
     const f = fixture();
