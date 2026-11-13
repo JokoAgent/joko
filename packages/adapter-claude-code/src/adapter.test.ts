@@ -6908,6 +6908,32 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.closeSession(binding, contextFor(binding).context);
   });
 
+  test("passes an explicitly skipped Claude question alongside the other answer", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const requestInteraction = vi.fn(async (_interaction: InteractionPayload) => ({ kind: "question" as const, answers: {
+      q1: { kind: "single" as const, selection: { kind: "choice" as const, choiceId: "q1o1" } }
+    } }));
+    const active = contextFor(binding, { operationId: "skip-question", requestInteraction });
+    try {
+      await adapter.send(textPrompt("Ask two questions"), active.context);
+      const input = { questions: [
+        { question: "First question", options: [{ label: "A" }, { label: "B" }] },
+        { question: "Second question", options: [{ label: "C" }, { label: "D" }] }
+      ] };
+      await expect(runtime.queries[0]!.params.options.canUseTool("AskUserQuestion", input,
+        permissionOptions("skip-first-question", "ask-two")))
+        .resolves.toMatchObject({ behavior: "allow", updatedInput: { ...input, answers: { "First question": "", "Second question": "D" } } });
+      expect(requestInteraction).toHaveBeenCalledOnce();
+      expect(requestInteraction.mock.calls[0]![0]).toMatchObject({ kind: "question", fields: [
+        expect.objectContaining({ id: "q0", required: false }), expect.objectContaining({ id: "q1", required: false })
+      ] });
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
   test("applies model, effort, permission, plan, and read-write directory controls to the Query", async () => {
     const runtime = new FakeSdkRuntime();
     const adapter = adapterFor(runtime);

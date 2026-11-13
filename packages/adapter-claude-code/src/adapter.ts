@@ -6176,7 +6176,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           id: `q${index}`,
           label,
           description: header,
-          required: true,
+          required: false,
           kind: "text",
           multiline: false
         });
@@ -6185,7 +6185,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           id: `q${index}`,
           label,
           description: header,
-          required: true,
+          required: false,
           kind: "multiple",
           choices,
           defaultChoiceIds: [],
@@ -6197,7 +6197,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           id: `q${index}`,
           label,
           description: header,
-          required: true,
+          required: false,
           kind: "single",
           choices,
           allowOther: true
@@ -6208,7 +6208,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       id: interactionId(runtime, options.requestId),
       kind: "question",
       title: this.#projection.identifier(options.title, "Claude Code needs input"),
-      prompt: "Answer the questions required to continue the native turn.",
+      prompt: "Answer or skip each question to continue the native turn.",
       fields
     };
     const decision = await this.#requestInteraction(runtime, turn, interaction, options.signal);
