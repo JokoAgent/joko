@@ -26,7 +26,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { waitFor } from "./fixture.js";
 import { createE2eClients, type E2eClients } from "./connect-clients.js";
 import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
-import { createPackagedDesktopStartupEvidence } from "./packaged-desktop-startup.js";
+import { createPackagedDesktopStartupEvidence, readLaunchedWindowsDesktopProcess } from "./packaged-desktop-startup.js";
 import {
   REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, REAL_PI_RESPONSE_TEXT, RealPiSystemFixture,
   startLocalProvider, type CapturedProviderRequest
@@ -47,6 +47,7 @@ describe("packaged Desktop Pi compaction", () => {
   let profileDirectory: string | undefined;
   let releasePendingProvider: (() => void) | undefined;
   let providerServer: Server | undefined;
+  let connectedDesktopIdentity: OwnedProcessIdentity | undefined;
   let managedDesktopIdentity: OwnedProcessIdentity | undefined;
   let lifecycleStarted: number | undefined;
   const lifecyclePhases: { phase: string; elapsedMs: number }[] = [];
@@ -69,8 +70,12 @@ describe("packaged Desktop Pi compaction", () => {
     releasePendingProvider?.();
     releasePendingProvider = undefined;
     if (managedDesktopIdentity !== undefined) await terminateOwnedWindowsProcess(managedDesktopIdentity);
-    else if (desktop !== undefined) await closePackagedDesktop(desktop);
+    else if (connectedDesktopIdentity !== undefined) {
+      if (task.result?.state === "fail" || desktop === undefined) await terminateOwnedWindowsProcess(connectedDesktopIdentity);
+      else await closeConnectedWindowsDesktop(desktop, connectedDesktopIdentity);
+    } else if (desktop !== undefined) await closePackagedDesktop(desktop);
     managedDesktopIdentity = undefined;
+    connectedDesktopIdentity = undefined;
     desktop = undefined;
     await fixture?.close({ removeRoot: true });
     fixture = undefined;
@@ -94,9 +99,10 @@ describe("packaged Desktop Pi compaction", () => {
     const challenge = await currentFixture.anonymous.connection.beginPairing({ deviceDisplayName: deviceName });
     if (challenge.challenge === undefined) throw new Error("Desktop pairing returned no challenge.");
     const pairingCode = currentFixture.pairingCode(challenge.challenge.challengeId);
+    const executablePath = resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!);
     profileDirectory = await mkdtemp(join(tmpdir(), "joko-pi-desktop-"));
     desktop = await _electron.launch({
-      executablePath: process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!,
+      executablePath,
       args: process.platform === "linux" && process.env.JOKO_DESKTOP_SMOKE_NO_SANDBOX === "1" ? ["--no-sandbox"] : [],
       env: {
         ...process.env,
@@ -108,12 +114,22 @@ describe("packaged Desktop Pi compaction", () => {
       },
       timeout: 60_000
     });
-    const userDataPath = await desktop.evaluate(({ app }) => app.getPath("userData"));
-    const profileRelative = relative(profileDirectory, userDataPath);
+    if (process.platform === "win32") {
+      const launcherPid = desktop.process().pid;
+      if (launcherPid === undefined) throw new Error("Packaged Pi Desktop returned no spawned process ID.");
+      connectedDesktopIdentity = await readLaunchedWindowsDesktopProcess(launcherPid, executablePath);
+    }
+    const page = await desktop.firstWindow({ timeout: 60_000 });
+    const profile = await withDesktopDeadline(desktop.evaluate(({ app }) => ({ pid: process.pid, path: app.getPath("userData") })),
+      15_000, "Packaged Pi Main did not report its process and profile.");
+    if (connectedDesktopIdentity !== undefined && profile.pid !== connectedDesktopIdentity.pid) {
+      throw new Error("Packaged Pi Desktop returned a different Main process.");
+    }
+    const profileRelative = relative(profileDirectory, profile.path);
     if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
       throw new Error("Packaged Desktop did not use its isolated test profile.");
     }
-    await desktop.evaluate(({ app, BrowserWindow }) => {
+    await withDesktopDeadline(desktop.evaluate(({ app, BrowserWindow }) => {
       type ObservedWindow = ReturnType<typeof BrowserWindow.getAllWindows>[number];
       const startedAt = Date.now(), events: unknown[] = [], observed = new Set<number>();
       const state = (window: ObservedWindow) => window.isDestroyed() ? { id: window.id, destroyed: true }
@@ -137,8 +153,7 @@ describe("packaged Desktop Pi compaction", () => {
       BrowserWindow.getAllWindows().forEach(observe); app.on("browser-window-created", (_event, window) => observe(window));
       (globalThis as typeof globalThis & { __jokoPairingWindowObservation?: { events: unknown[]; current: () => unknown[] } })
         .__jokoPairingWindowObservation = { events, current: () => BrowserWindow.getAllWindows().map(state) };
-    });
-    const page = await desktop.firstWindow({ timeout: 60_000 });
+    }), 5_000, "Packaged Pi Main did not install the window observation.");
     await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
     const pairingTab = page.locator(".connection-tabs > button").nth(2);
     try {
@@ -170,10 +185,10 @@ describe("packaged Desktop Pi compaction", () => {
         new Promise<undefined>(resolveObservation => { deadline = setNodeTimeout(() => resolveObservation(undefined), 2_000); })
       ]).finally(() => clearNodeTimeout(deadline));
       console.info("Packaged Pi pairing control:", JSON.stringify(observation ?? null));
-      const native = await desktop.evaluate(() => {
+      const native = await withDesktopDeadline(desktop.evaluate(() => {
         const receipt = (globalThis as typeof globalThis & { __jokoPairingWindowObservation?: { events: unknown[]; current: () => unknown[] } }).__jokoPairingWindowObservation;
         return receipt ? { events: receipt.events, windows: receipt.current() } : undefined;
-      }).catch(() => undefined);
+      }), 2_000, "Packaged Pi window observation timed out.").catch(() => undefined);
       console.info("Packaged Pi pairing window lifecycle:", JSON.stringify(native ?? null));
       throw error;
     }
@@ -1212,29 +1227,53 @@ function observePageErrors(page: Page): string[] {
   return errors;
 }
 
+async function withDesktopDeadline<T>(operation: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setNodeTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => { timer = setNodeTimeout(() => reject(new Error(message)), milliseconds); })
+    ]);
+  } finally {
+    clearNodeTimeout(timer);
+  }
+}
+
+async function closeConnectedWindowsDesktop(application: ElectronApplication, identity: OwnedProcessIdentity): Promise<void> {
+  try {
+    await withDesktopDeadline(application.evaluate(({ app }) => {
+      setTimeout(() => app.exit(0), 50);
+      return true;
+    }), 5_000, "Packaged Pi Desktop did not acknowledge the exit request.");
+    await waitFor(() => readOwnedWindowsProcess(identity.pid), (candidate) => candidate === undefined,
+      "Packaged Pi Desktop exit", 8_000);
+  } catch {
+    await terminateOwnedWindowsProcess(identity);
+  }
+}
+
 async function closePackagedDesktop(application: ElectronApplication): Promise<void> {
-  const [mainPid, executablePath] = await Promise.all([
-    application.evaluate(() => process.pid),
-    application.evaluate(({ app }) => app.getPath("exe"))
-  ]);
+  const { mainPid, executablePath } = await withDesktopDeadline(application.evaluate(({ app }) => ({
+    mainPid: process.pid, executablePath: app.getPath("exe")
+  })), 5_000, "Packaged Pi Desktop did not report its cleanup identity.");
   if (resolve(executablePath).toLowerCase()
     !== resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!).toLowerCase()) {
     throw new Error("Packaged Desktop cleanup refused an unexpected executable.");
   }
   // Closing the page follows close-to-tray. Schedule a full exit on the exact
   // main process after the evaluation acknowledgement reaches the harness.
-  await application.evaluate(({ app }) => {
+  await withDesktopDeadline(application.evaluate(({ app }) => {
     setTimeout(() => app.exit(0), 50);
     return true;
-  });
+  }), 5_000, "Packaged Pi Desktop did not acknowledge the exit request.");
   try {
     await waitFor(() => Promise.resolve(processIsAlive(mainPid)), (alive) => !alive,
       "Packaged Desktop application exit", 8_000);
   } catch {
-    const current = await application.evaluate(({ app }) => ({
+    const current = await withDesktopDeadline(application.evaluate(({ app }) => ({
       pid: process.pid,
       executablePath: app.getPath("exe")
-    })).catch(() => undefined);
+    })), 5_000, "Packaged Pi Desktop did not revalidate its cleanup identity.").catch(() => undefined);
     if (current?.pid !== mainPid || current.executablePath.toLowerCase() !== executablePath.toLowerCase()) {
       throw new Error("Packaged Desktop cleanup could not confirm its original process identity.");
     }
