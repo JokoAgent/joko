@@ -109,6 +109,24 @@ it("does not add different currencies and marks unavailable or stale evidence in
   }
 });
 
+it.each([
+  { hasCredits: false, unlimited: false, reserve: false },
+  { hasCredits: true, unlimited: false, reserve: true },
+  { hasCredits: undefined, unlimited: false, reserve: true },
+  { hasCredits: false, unlimited: true, reserve: true }
+])("projects only usable credits after quota exhaustion ($hasCredits, unlimited=$unlimited)", async ({ hasCredits, unlimited, reserve }) => {
+  const initial = source();
+  const accountUsage: ProviderRuntimeView["accountUsage"] = { observedAt: now,
+    buckets: [{ id: "codex", primaryWindow: { usedPercent: 100, windowMinutes: 300, resetAt: now + 60_000 } }],
+    credits: { balance: "4.25", hasCredits, unlimited } };
+  const current = { ...initial, snapshot: { ...initial.snapshot, providers: [{ ...provider, accountUsage }] } };
+  const { view } = await projectDesktopMenuBar({ sources: [current], readings: new Map(), settings: DEFAULT_MENUBAR_SETTINGS, locale: "en", now });
+  expect(view.sources[0]).toMatchObject({ reserve, value: reserve ? null : "0", valueLabel: reserve ? "credits" : null });
+  const credit = Object.values(view.details)[0]?.facts.find(fact => fact.label === "Extra credits");
+  if (!reserve) expect(credit).toMatchObject({ value: "0", sub: "No extra credits" });
+  else expect(credit?.sub).not.toBe("No extra credits");
+});
+
 it("offers the exact admitted local Provider model, keeps layout IDs stable and retires action IDs with their authority", async () => {
   const initial = actionableSource(), remote = actionableSource(true), local = { ...initial, snapshot: { ...initial.snapshot,
     providers: [{ ...provider, accountUsage: { ...provider.accountUsage!, resetCredits: { availableCount: 2, earliestExpiryAt: now + 86_400_000 } } }] } };
