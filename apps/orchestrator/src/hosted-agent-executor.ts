@@ -40,6 +40,8 @@ export interface HostedAgentExecutorOptions {
   readonly context: AdapterContext;
   readonly virtualRoot: string;
   readonly aliases?: readonly ExecutorPathAlias[];
+  /** Local Pi PATH identities are allocated before mutable Source input and resource mounts. */
+  readonly seedSearchPathsBeforeInputAliases?: boolean;
   readonly inputFiles?: () => readonly SourceInputMount[];
   readonly readPolicy: () => HostedAgentExecutorPolicy;
   /** Captured by the original SessionHost dispatch, never an inbound identity. */
@@ -102,14 +104,16 @@ export class HostedAgentExecutor {
     options.assertCurrent();
     const native = /^[A-Za-z]:|^\\\\/u.test(options.virtualRoot) ? "\\" : "/";
     const virtual = (name: string) => options.virtualRoot.replace(/[\\/]+$/u, "") + native + "additional" + native + name;
+    const inputAliases = options.aliases ?? [];
     this.#options = options;
     this.#workspace = new ExecutorWorkspace({ workingDir: options.context.target.workspaceRoot, aliases: [
       { from: options.virtualRoot, to: options.context.target.workspaceRoot },
       { from: virtual("home"), to: options.remote?.home ?? homedir() }, { from: virtual("temporary"), to: options.remote?.temporary ?? tmpdir() },
       ...(options.context.extraDirectories ?? []).map(directory => ({ from: hostedDirectoryPath(options.virtualRoot, hostedDirectoryId(directory)), to: directory.path })),
-      ...(options.aliases ?? [])
+      ...(options.seedSearchPathsBeforeInputAliases ? [] : inputAliases)
     ], ...(options.remote ? { remote: options.remote.projection } : {}) });
     this.#workspace.setVirtualRoot(options.virtualRoot);
+    if (options.seedSearchPathsBeforeInputAliases && inputAliases.length > 0) this.#workspace.addAliases(inputAliases);
   }
 
   dispose(): void { this.#lifetime.abort(); this.#seen.clear(); this.#approvals.clear(); this.#tools.clear(); }

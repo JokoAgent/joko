@@ -377,6 +377,9 @@ export class HostedAgentSources {
           const codexExecutable = peer ? "codex" : await this.#options.resolveCodexExecutable?.(); this.#assertContext(context); pool.assertCurrent();
           return { client: pool.client, assertCurrent: pool.assertCurrent, close: captured.close,
             createController: input => createHostedAgentSourceController({ ...input, poller: pool.poller, temporaryRoot: this.#options.temporaryRoot,
+              // Ordinary inputs and resources can append aliases between turns.
+              // Allocate Pi's local PATH aliases before those variable mounts.
+              seedSearchPathsBeforeInputAliases: entry.catalog.nativeAdapterKind === "pi",
               ...(peer ? { remote: peer } : {}),
               ...(mcps.get(mcpKey(input.context)) ? { mcp: mcps.get(mcpKey(input.context))! } : {}),
               readPolicy: sourceContext => {
