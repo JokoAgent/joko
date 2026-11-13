@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, promisify } from 'node:util';
 import { pnpmInvocation } from './pnpm-invocation.mjs';
@@ -67,6 +68,21 @@ export async function refreshSourceDependencies(root, pnpm) {
   await pnpm(['install', '--lockfile-only', '--ignore-scripts'], root);
 }
 
+export async function buildSourceConsumers(checkout, destination, pnpm) {
+  const args = ['build:consumers', destination];
+  try {
+    await pnpm(args, checkout);
+  } catch (error) {
+    const stderr = error?.stderr;
+    if (typeof stderr !== 'string' || !/Command failed: rustup toolchain install \S+/u.test(stderr)
+      || !/https:\/\/static\.rust-lang\.org\/dist\/channel-rust-\S+.*dns error:/iu.test(stderr)
+      || !(await readdir(destination).then(entries => entries.length === 0, () => false))) throw error;
+    console.warn('The fixed Rust download could not resolve its official host. Retrying the same Linkspan build once.');
+    await delay(1_000);
+    await pnpm(args, checkout);
+  }
+}
+
 export async function prepareLinkspan(root = repositoryRoot, { sourceDirectory } = {}) {
   const source = JSON.parse(await readFile(join(root, 'linkspan.json'), 'utf8'));
   const runtime = join(root, '.runtime');
@@ -82,7 +98,7 @@ export async function prepareLinkspan(root = repositoryRoot, { sourceDirectory }
   if (!prepared) {
     await pnpm(['install', '--frozen-lockfile'], checkout);
     const next = await mkdtemp(join(runtime, 'linkspan-packages-next-'));
-    await pnpm(['build:consumers', next], checkout);
+    await buildSourceConsumers(checkout, next, pnpm);
     prepared = await verifySourcePackages(next, identity);
     const prior = await lstat(packages).catch(error => { if (error.code !== 'ENOENT') throw error; });
     if (prior) {
