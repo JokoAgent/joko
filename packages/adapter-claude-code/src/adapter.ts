@@ -7,7 +7,7 @@ import {
   createChildRuntimeEnvironment,
   type DurableProcessOwnerOptions
 } from "@joko/runtime-governance";
-import { assertHostedExecution } from "@joko/core";
+import { NATIVE_PROMPT_IMAGE_MEDIA_TYPES, assertHostedExecution } from "@joko/core";
 import { assertClaudeHostedModel, claudeHostedEnvironment, claudeHostedPrompt, claudeHostedSettings, prepareClaudeHostedExecution, sameClaudeHostedExecution } from "./hosted-execution.js";
 import { CLAUDE_HOSTED_DISALLOWED_TOOLS, CLAUDE_HOSTED_EXECUTOR_SERVER, CLAUDE_HOSTED_GUEST_TOOLS, createClaudeHostedTools } from "./hosted-tools.js";
 import {
@@ -7873,6 +7873,8 @@ function capabilityManifest(
       ? ["oauth_browser"]
       : key === "permission.modes"
       ? ["ask", "acceptEdits", "auto", "bypassPermissions"]
+      : key === "input.image" && available
+        ? NATIVE_PROMPT_IMAGE_MEDIA_TYPES
       : key === "workspace.extra_dirs"
         ? ["read_write"]
         : key === "input.mention"

@@ -12,7 +12,7 @@ import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import { DevicePeerOwner } from "./device-peer-owner.js";
 import { SessionHost } from "./session-host.js";
 import { HostedAgentSources } from "./hosted-agent-sources.js";
-import { toProtoCapability } from "./proto-mapper.js";
+import { toProtoBackend, toProtoCapability } from "./proto-mapper.js";
 import { decodeHostedAgentInvocation, encodeHostedAgentValue } from "./hosted-agent-wire.js";
 
 it("reads a completed retained workflow through the actual paired Source without opening a native run and drops a revoked relation's late result", async () => {
@@ -87,7 +87,10 @@ it("publishes actual paired native sources, retains paused and offline choices, 
   const readBlob = async () => { throw new Error("No image dispatch in this catalog fixture."); };
   const reviewTool = async () => ({ verdict: "ask" as const });
   const resolveTextResources = async () => [];
-  let sources = new HostedAgentSources({ store, peers, registry, host, temporaryRoot: join(root, "incoming"), readPolicy, readBlob, reviewTool, resolveTextResources });
+  const resolveFile = async () => { throw new Error("No file dispatch in this catalog fixture."); };
+  const resolveArtifactMention = async () => { throw new Error("No Artifact mention dispatch in this catalog fixture."); };
+  let sources = new HostedAgentSources({ store, peers, registry, host, temporaryRoot: join(root, "incoming"), readPolicy, readBlob, reviewTool,
+    resolveTextResources, resolveFile, resolveArtifactMention });
   const controller = store.createConnection({ id: "source-connection", deviceId: "original-device", device: { defaultName: "Original", kind: "web", platform: "web" }, name: "Original", authKeyDigest: "original-digest" });
   const target = store.createConnection({ id: "node-connection", deviceId: "model-node", device: { defaultName: "Native computer", kind: "service", platform: process.platform }, name: "Native computer", authKeyDigest: "node-digest" });
   store.setDeviceRemoteControlEnabled(target.deviceId, true);
@@ -104,6 +107,8 @@ it("publishes actual paired native sources, retains paused and offline choices, 
       expect(method).toBe(contract.HostedAgentPeerMethod.GET_CATALOG);
       const backend = { backendId: "native-sdk", instanceGeneration: 1n, displayName: "Native Agent", version: "1", capabilities: [
         { name: "input.text", support: contract.CapabilitySupport.SUPPORTED }, { name: "model.switch", support: contract.CapabilitySupport.SUPPORTED },
+        { name: "workspace.files", support: contract.CapabilitySupport.SUPPORTED },
+        toProtoCapability({ key: "input.image", supported: true, options: ["image/png"] }),
         ...["runtime.commands", "subagents.list", "subagents.detail", "subagents.transcript", "subagents.resume", "session.rewind", "session.rewind_to_start", "session.fork", "session.clone"]
           .map(name => ({ name, support: contract.CapabilitySupport.SUPPORTED })),
         toProtoCapability({ key: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto", "bypassPermissions"] })
@@ -137,7 +142,15 @@ it("publishes actual paired native sources, retains paused and offline choices, 
     for (const key of ["session.fork", "session.clone"]) expect(descriptor.capabilities.get(key)).toMatchObject({ supported: true });
     expect(descriptor.capabilities.get("permission.modes")?.options).toEqual(["ask", "acceptEdits", "auto", "bypassPermissions"]);
     expect(descriptor.capabilities.get("runtime.resources")).toMatchObject({ supported: true, options: ["skill", "prompt"] });
-    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["resource"] });
+    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true,
+      options: ["resource", "workspace_file", "workspace_directory", "workspace_line_range", "artifact"] });
+    const projected = () => toProtoBackend(store.getBackend(id)).capabilities!.capabilities;
+    expect(projected().find(capability => capability.name === "input.file")).toMatchObject({
+      support: contract.CapabilitySupport.SUPPORTED, options: { kind: { case: "input", value: { mediaTypes: [], maximumBytes: 0n, maximumItems: 0 } } }
+    });
+    expect(projected().find(capability => capability.name === "input.image")).toMatchObject({
+      support: contract.CapabilitySupport.SUPPORTED, options: { kind: { case: "input", value: { mediaTypes: ["image/png"] } } }
+    });
     expect(descriptor.providers?.[0]?.displayName).toBe("Provider · Native Agent · Native computer");
     expect(descriptor.models[0]).toMatchObject({ logicalId: "stable-model", displayThinkingLevels: ["low", "high"], defaultVisible: false,
       contextWindow: 32768, contextWindowMax: 262144, declaredSupportsFastMode: false, cost: { input: 2.5 }, pricing: { source: "upstream", currencyCode: "USD" } });
@@ -168,6 +181,9 @@ it("publishes actual paired native sources, retains paused and offline choices, 
     expect(store.getBackend(id).descriptor).toMatchObject({ id, health: "unavailable", instanceGeneration: 2 });
     expect(sources.modelAvailable(id, "provider", "native-model")).toBe(false); expect(host.currentAdapter(id)?.id).toBe(id);
     expect(store.getBackend(id).descriptor.models[0]?.modelId).toBe("native-model");
+    expect(projected().find(capability => capability.name === "input.file")).toMatchObject({
+      support: contract.CapabilitySupport.NOT_IMPLEMENTED, options: undefined
+    });
   } finally {
     await host.dispose(); await sources.close(); await peers.shutdown(); store.close();
     if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
