@@ -2,7 +2,8 @@ import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  ActorKind, GitSafetyMode, JoinedTaskShareSchema, OperationState, SessionSchema, SessionState, EventSchema, EventCursorSchema, MessageRole,
+  ActorKind, EntityVersionSchema, GitSafetyMode, JoinedTaskShareSchema, OperationState, RevisionSchema, SessionSchema, SessionState,
+  EventSchema, EventCursorSchema, MessageRole,
   SnapshotSchema, TaskShareSnapshotSchema, TaskShareMethod, taskShareMethodDescriptor, type TaskSharingApi
 } from "@joko/contracts";
 import { createTaskSharingGateway, type GatewayCallbacks, type OrchestratorGateway } from "./gateway.js";
@@ -126,7 +127,7 @@ describe("guest gateway operation recovery", () => {
     const original = f.fresh.snapshot!.sessions[0]!;
     const session = create(SessionSchema, { ...original,
       nativeBinding: { ...original.nativeBinding!, runtimeGeneration: 2n },
-      version: { generation: 2n, revision: { value: 2n } } });
+      version: create(EntityVersionSchema, { generation: 2n, revision: create(RevisionSchema, { value: 2n }) }) });
     const bindingChanged = create(EventSchema, { eventId: "new-binding", identity: { sessionId: "task", generation: 2n }, cursor: cursor(3n),
       payload: { kind: { case: "sessionChanged", value: { session } } } });
     vi.mocked(f.api.snapshot).mockResolvedValueOnce(f.fresh).mockResolvedValueOnce(create(TaskShareSnapshotSchema, {
