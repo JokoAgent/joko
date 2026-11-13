@@ -801,6 +801,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       const expectedHash = desktopDeepLinkRouteHash(navigation);
       const route = desktopDeepLinkAppRoute(navigation);
       const sourceNavigationRevision = controllerRef.current.state.navigationRevision ?? 0;
+      const isCurrent = (): boolean => active && !signal.aborted
+        && desktopDeepLinkRendererOccurrenceRef.current === rendererOccurrence
+        && (controllerRef.current.state.navigationRevision ?? 0) === sourceNavigationRevision;
       setPendingDesktopDeepLinkDelivery({
         kind: "route",
         delivery,
@@ -812,9 +815,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       controllerRef.current.navigate(route, {
         exactHash: expectedHash,
         signal,
-        isCurrent: () => active
-          && desktopDeepLinkRendererOccurrenceRef.current === rendererOccurrence
-          && (controllerRef.current.state.navigationRevision ?? 0) === sourceNavigationRevision
+        isCurrent,
+        onWorkspaceLeaveCancel: () => {
+          if (!isCurrent()) return;
+          setPendingDesktopDeepLinkDelivery((current) => current?.rendererOccurrence === rendererOccurrence ? undefined : current);
+          void api.acknowledge({ documentOccurrence: delivery.documentOccurrence, deliveryOccurrence: delivery.deliveryOccurrence }).catch(() => undefined);
+        }
       });
     };
     const deliver = (delivery: JokoDesktopDeepLinkDelivery): void => {

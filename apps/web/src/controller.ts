@@ -305,6 +305,7 @@ export interface AppController extends OperationApi {
     readonly exactHash?: string;
     readonly isCurrent?: () => boolean;
     readonly signal?: AbortSignal;
+    readonly onWorkspaceLeaveCancel?: () => void;
   }): void;
   setLocale(locale: LocalePreference): Promise<void>;
   setTheme(theme: Theme): Promise<void>;
@@ -1908,12 +1909,7 @@ export function useAppController(): AppController {
     } finally { leave?.finish(); }
   }, [beginConnectionLeave, removeProfile, state.profiles]);
 
-  const navigate = useCallback((route: AppRoute, options?: {
-    readonly replace?: boolean;
-    readonly exactHash?: string;
-    readonly isCurrent?: () => boolean;
-    readonly signal?: AbortSignal;
-  }): void => {
+  const navigate = useCallback<AppController["navigate"]>((route, options) => {
     const externalOwnerIsCurrent = (): boolean => {
       if (options?.signal?.aborted === true) return false;
       try {
@@ -1997,7 +1993,10 @@ export function useAppController(): AppController {
     const afterPartner = (): void => {
       if (!ownerIsCurrent()) { finish(); return; }
       if (leave === undefined) { commit(); return; }
-      void requestWorkspaceDocumentLeave({ ...leave, signal }).then(accepted => {
+      const onCancel = options?.onWorkspaceLeaveCancel;
+      void requestWorkspaceDocumentLeave({ ...leave, signal, ...(onCancel === undefined ? {} : {
+        onCancel: () => { if (ownerIsCurrent()) onCancel(); }
+      }) }).then(accepted => {
         if (accepted && ownerIsCurrent()) commit(); else finish();
       });
     };

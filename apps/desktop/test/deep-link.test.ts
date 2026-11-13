@@ -243,6 +243,15 @@ describe("Desktop OS open intent routing", () => {
     expect(buffer.acknowledge(replacement)).toBe(true);
   });
 
+  it("does not redeliver a consumed notification to a replacement renderer", () => {
+    const buffer = new DesktopDeepLinkDeliveryBuffer();
+    expect(buffer.takeAfterRendererReady("document-one")).toBeUndefined();
+    const notification = buffer.offer({ kind: "session", sessionId: "task-b" })!;
+    expect(buffer.acknowledge({ documentOccurrence: notification.documentOccurrence, deliveryOccurrence: notification.deliveryOccurrence })).toBe(true);
+    buffer.resetRenderer();
+    expect(buffer.takeAfterRendererReady("document-two")).toBeUndefined();
+  });
+
   it("does not let a late or out-of-order acknowledgement clear a newer intent", () => {
     const buffer = new DesktopDeepLinkDeliveryBuffer();
     expect(buffer.takeAfterRendererReady("document-one")).toBeUndefined();
