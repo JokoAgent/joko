@@ -26,7 +26,7 @@ export interface PendingOperation {
   readonly taskJoinId?: string;
   readonly kind: "create" | "send" | "logout" | "revoke" | "device-rename" | "rename" | "pin" | "archive" | "delete"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
-    | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
+    | "queue-interaction-lock" | "queue-reorder" | "queue-resume" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch" | "session-stop"
     | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-side-chat" | "session-rewind" | "workspace-rewind"
     | "task-tag"
@@ -522,7 +522,7 @@ function isPending(value: unknown): value is PendingOperation {
   const record = value as Record<string, unknown>;
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
     || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "message-delete",
-      "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
+      "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact", "session-stop",
       "objective-set", "objective-pause", "objective-resume", "objective-clear",
       "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end",
@@ -575,6 +575,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (["queue-cancel", "queue-edit-lock", "queue-edit", "queue-reorder"].includes(String(record.kind))
     && (typeof record.sessionId !== "string" || typeof record.queueItemId !== "string")) return false;
   if (record.kind === "queue-interaction-lock" && typeof record.sessionId !== "string") return false;
+  if (record.kind === "queue-resume" && (!validReceiptIdentity(record.sessionId) || !validReceiptIdentity(record.taskJoinId))) return false;
   if (["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (typeof record.sessionId !== "string" || typeof record.interactionId !== "string"
       || typeof record.interactionGeneration !== "string" || typeof record.interactionRevision !== "string")) return false;

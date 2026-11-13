@@ -298,6 +298,7 @@ const mobileTaskMessageRows = [
   ["task.viewContext", "View context", "查看上下文", "檢視內容脈絡", "コンテキストを表示", "컨텍스트 보기"],
   ["task.moreFor", "More actions for {name}", "{name} 的更多操作", "{name} 的更多操作", "{name} のその他の操作", "{name} 추가 동작"],
   ["task.queue", "Queue", "队列", "佇列", "キュー", "대기열"],
+  ["task.resumeQueue", "Resume queue", "继续发送队列", "繼續傳送佇列", "キューを再開", "대기열 재개"],
   ["task.queued", "Queued", "已排队", "已排入佇列", "キュー済み", "대기 중"],
   ["task.queueState.accepted", "Queued", "已排队", "已排入佇列", "キュー済み", "대기 중"],
   ["task.queueState.dispatching", "Dispatching", "正在分发", "正在分派", "送信中", "전달 중"],

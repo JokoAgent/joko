@@ -4205,6 +4205,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }, [messageFocusIndex, messageFocusKey]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
+  const sharedQueueResume = state.taskSource?.kind === "joined" ? client.taskSharedQueueResumeControl() : undefined;
   const composerAvailable = state.status === "connected" || client.canQueueTaskInput?.() === true;
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
@@ -7208,9 +7209,18 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         </View>)}
       </ScrollView>
     </View>}
-    {queueItems.length > 0 && <View ref={queueViewportRef} collapsable={false} style={styles.queueRegion}
+    {(queueItems.length > 0 || sharedQueueResume !== undefined) && <View ref={queueViewportRef} collapsable={false} style={styles.queueRegion}
       onLayout={() => setImageViewportPulse(value => value + 1)}>
-      <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
+      <View style={sharedQueueResume === undefined ? undefined : styles.actionRow}>
+        <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
+        {sharedQueueResume && <Action label={mobileMessage(locale, sharedQueueResume.pending
+          ? "receipt.check" : "task.resumeQueue")} colors={colors} compact disabled={state.busy || queueMutationPending}
+          onPress={() => mutateQueue(() => {
+            if (!sharedQueueResume.pending) return client.resumeSharedTaskQueue(sharedQueueResume.authorityKey);
+            if (client.taskSharedQueueResumeControl()?.authorityKey === sharedQueueResume.authorityKey) return client.reconcile();
+            return Promise.resolve();
+          })} />}
+      </View>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList}
         keyboardShouldPersistTaps="handled" onScroll={() => setImageViewportPulse(value => value + 1)} scrollEventThrottle={100}>
       {queueItems.map((item, index) => {

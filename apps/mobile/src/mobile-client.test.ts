@@ -2301,6 +2301,40 @@ describe("shared task source on the native task client", () => {
     expect(instance.state.detail?.server?.serverId).toBe(credential.serverId);
     expect(instance.taskDraftProfileId()).toBe(credential.profileId);
   });
+  it("resumes only the displayed shared Queue revision and keeps an unknown receipt on the same joined task", async () => {
+    const value = sharedFixture(), network = fakeNetwork(), instance = client(network, memoryStorage(credential).storage);
+    const session = value.detail.sessions[0]!;
+    const generation = session.nativeBinding!.runtimeGeneration;
+    const paused = (revision: bigint) => create(QueueControlSchema, {
+      sessionId: session.sessionId, backendId: session.backendId, targetId: session.targetId,
+      dispatchState: QueueDispatchState.PAUSED, queuedItemCount: 1n,
+      version: { revision: { value: revision }, generation }
+    });
+    value.detail.queueControls = [paused(21n)];
+    await instance.start();
+    vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api);
+    await instance.openJoinedTask(value.joined);
+    const old = instance.taskSharedQueueResumeControl()!;
+    value.detail.queueControls = [paused(22n)];
+    await instance.refresh();
+    await expect(instance.resumeSharedTaskQueue(old.authorityKey)).rejects.toThrow(/no longer available/u);
+    expect(value.invoke).not.toHaveBeenCalled();
+
+    const current = instance.taskSharedQueueResumeControl()!;
+    expect(await instance.resumeSharedTaskQueue(current.authorityKey)).toBe(false);
+    expect(value.invoke).toHaveBeenCalledExactlyOnceWith(value.joined.joinId, TaskShareMethod.SUBMIT_OPERATION,
+      expect.objectContaining({ operationId: "operation-1", mutation: expect.objectContaining({
+        preconditions: [expect.objectContaining({ entity: expect.objectContaining({ kind: EntityKind.QUEUE_CONTROL, id: session.sessionId }),
+          expectedRevision: expect.objectContaining({ value: 22n }), expectedGeneration: generation })],
+        payload: { case: "resumeQueue", value: expect.objectContaining({ sessionId: session.sessionId }) }
+      }) }), expect.anything());
+    expect(instance.state.pending).toContainEqual(expect.objectContaining({ kind: "queue-resume", operationId: "operation-1",
+      sessionId: session.sessionId, taskJoinId: value.joined.joinId, state: "unknown" }));
+    expect(instance.taskSharedQueueResumeControl()?.pending).toBe(true);
+    expect(await instance.resumeSharedTaskQueue(current.authorityKey)).toBe(false);
+    expect(value.invoke).toHaveBeenCalledOnce();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
   it("opens and shares images from a joined task whose Target exists only on the host node", async () => {
     const value = sharedFixture(), network = fakeNetwork(), instance = client(network, memoryStorage(credential).storage);
     const bytes = galleryPngBytes(5, 4);
