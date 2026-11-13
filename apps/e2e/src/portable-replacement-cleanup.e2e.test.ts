@@ -1,10 +1,79 @@
 import { createHash, randomUUID } from "node:crypto";
-import { PermissionMode, PortableReplacementInspection, PortableReplacementNativeState } from "@joko/contracts";
+import { Code, ConnectError } from "@connectrpc/connect";
+import {
+  PermissionMode, PORTABLE_SESSION_LIMIT_BYTES_HEADER, PORTABLE_SESSION_MEDIA_BYTES_HEADER,
+  PortableReplacementInspection, PortableReplacementNativeState, PortableSessionFidelity, PortableSessionService
+} from "@joko/contracts";
 import type { AdapterContext, ImportPortableNativeSessionInput, NativeSessionBinding, PortableNativeSession } from "@joko/core";
+import { JOKO_DESKTOP_APP_ORIGIN } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+
+it("returns export size metadata through Connect and allows the same task to be exported without media", async () => {
+  class PortableAdapter extends InstrumentedFakeAdapter {
+    async exportPortableNativeSession(): Promise<PortableNativeSession> {
+      const bytes = Buffer.from('{"type":"session","id":"portable-media-source"}\n');
+      return { bytes, sha256: createHash("sha256").update(bytes).digest("hex"), nativeSessionId: "portable-media-source" };
+    }
+  }
+  const fixture = await OrchestratorE2eFixture.start({
+    profiles: [{ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "session.portable_transfer", supported: true }] }],
+    createAdapter: (profile) => new PortableAdapter(profile)
+  });
+  try {
+    const paired = await fixture.pair();
+    const backendId = fixture.adapter().id;
+    const targetId = fixture.targetId();
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, createSessionMutation({ backendId, targetId })));
+    const { artifacts, store } = fixture.application;
+    const generation = store.getSession(sessionId).descriptor.binding.generation;
+    const limit = 64 * 1_024;
+    const exportLimit = vi.spyOn(artifacts, "maximumBlobBytes", "get").mockReturnValue(limit);
+    const media = await artifacts.ingestBytes(Buffer.alloc(54 * 1_024, 7), { fileName: "notes.bin", mimeType: "application/octet-stream" });
+    store.appendEvent({ backendId, targetId, sessionId, generation, traceId: "portable-media",
+      payload: { type: "message_complete", role: "assistant", blocks: [{
+        kind: "artifact", blob: store.getArtifact(media.id).blob, label: "Notes"
+      }] } });
+
+    const rejected = await paired.clients.portableSession.exportPortableSession({ sessionId }).catch(error => error as unknown);
+    expect(rejected).toBeInstanceOf(ConnectError);
+    if (!(rejected instanceof ConnectError)) throw new Error("Expected the oversized export to fail.");
+    expect(rejected.code).toBe(Code.ResourceExhausted);
+    expect(rejected.metadata.get(PORTABLE_SESSION_MEDIA_BYTES_HEADER)).toBe(String(media.byteLength));
+    expect(rejected.metadata.get(PORTABLE_SESSION_LIMIT_BYTES_HEADER)).toBe(String(limit));
+
+    const response = await fetch(`${fixture.baseUrl}/${PortableSessionService.typeName}/ExportPortableSession`, {
+      method: "POST",
+      headers: { origin: JOKO_DESKTOP_APP_ORIGIN, authorization: `Bearer ${paired.authKey}`,
+        "content-type": "application/json", "connect-protocol-version": "1" },
+      body: JSON.stringify({ sessionId })
+    });
+    expect(response.status).toBe(429);
+    expect(response.headers.get("access-control-allow-origin")).toBe(JOKO_DESKTOP_APP_ORIGIN);
+    const exposed = response.headers.get("access-control-expose-headers")?.toLowerCase().split(/,\s*/u);
+    expect(exposed).toEqual(expect.arrayContaining([PORTABLE_SESSION_MEDIA_BYTES_HEADER, PORTABLE_SESSION_LIMIT_BYTES_HEADER]));
+    expect(response.headers.get(PORTABLE_SESSION_MEDIA_BYTES_HEADER)).toBe(String(media.byteLength));
+    await response.arrayBuffer();
+
+    await expect(paired.clients.portableSession.exportPortableSession({ sessionId, excludeMedia: true })).resolves.toMatchObject({
+      artifact: { mediaType: "application/vnd.joko.session" }, fidelity: PortableSessionFidelity.PARTIAL, mediaCount: 0n, missingMediaCount: 1n
+    });
+
+    const textSessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, createSessionMutation({ backendId, targetId })));
+    store.appendEvent({ backendId, targetId, sessionId: textSessionId, generation: store.getSession(textSessionId).descriptor.binding.generation,
+      traceId: "portable-text-only", payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "x".repeat(limit + 1) }] } });
+    const textError = await paired.clients.portableSession.exportPortableSession({ sessionId: textSessionId }).catch(error => error as unknown);
+    if (!(textError instanceof ConnectError)) throw new Error("Expected the oversized text export to fail.");
+    expect(textError.code).toBe(Code.ResourceExhausted);
+    expect(textError.metadata.get(PORTABLE_SESSION_MEDIA_BYTES_HEADER)).toBe("0");
+    exportLimit.mockRestore();
+  } finally {
+    vi.restoreAllMocks();
+    await fixture.close({ removeRoot: true });
+  }
+});
 
 it("keeps an unknown portable replacement visible across HTTP/SQLite restart and retries only after exact confirmation", async () => {
   const native = new Set<string>();

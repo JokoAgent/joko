@@ -257,6 +257,8 @@ import {
   PermissionDecisionKind,
   PermissionMode as ProtoPermissionMode,
   PermissionRisk,
+  PORTABLE_SESSION_LIMIT_BYTES_HEADER,
+  PORTABLE_SESSION_MEDIA_BYTES_HEADER,
   PortableSessionFidelity,
   PortableSessionImportStatus,
   PortableSessionService,
@@ -3470,8 +3472,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       if (error instanceof ConnectError && error.code === Code.ResourceExhausted) {
         return {
           status: "oversize",
-          mediaBytes: portableErrorByteCount(error.metadata.get("x-joko-portable-media-bytes")),
-          limitBytes: portableErrorByteCount(error.metadata.get("x-joko-portable-limit-bytes"))
+          mediaBytes: portableErrorByteCount(error.metadata.get(PORTABLE_SESSION_MEDIA_BYTES_HEADER)),
+          limitBytes: portableErrorByteCount(error.metadata.get(PORTABLE_SESSION_LIMIT_BYTES_HEADER))
         };
       }
       throw normalizeError(error);

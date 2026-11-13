@@ -5,9 +5,15 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AppWithController } from "./App.js";
 import type { AppController, ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES } from "./local-state.js";
-import { emptySnapshot } from "./model.js";
+import { emptySnapshot, type PortableSessionExportOutcomeView, type SessionView } from "./model.js";
+import type { SidebarProps } from "./components/Sidebar.js";
 
-vi.mock("./components/Sidebar.js", () => ({ Sidebar: () => null }));
+vi.mock("./components/Sidebar.js", () => ({
+  Sidebar: ({ snapshot, onExportPortableSession }: Pick<SidebarProps, "snapshot" | "onExportPortableSession">) => {
+    const task = snapshot.sessions[0];
+    return task === undefined ? null : <button onClick={() => onExportPortableSession?.(task)}>Export fixture task</button>;
+  }
+}));
 vi.mock("./components/NewSessionPage.js", () => ({ NewSessionPage: () => null }));
 vi.mock("./components/ConnectionScreen.js", () => ({ ConnectionScreen: () => <div>Choose a node</div> }));
 let root: Root | undefined;
@@ -51,6 +57,28 @@ async function drop(file: File): Promise<void> {
     window.dispatchEvent(event);
   });
 }
+
+it.each([
+  [{ status: "exported", fidelity: "full" }, "Task package exported."],
+  [{ status: "exported", fidelity: "partial" }, "Task package exported. Some media or native history could not be included."],
+  [{ status: "exported", fidelity: "product_only" }, "Task package exported without native context."],
+  [{ status: "cancelled" }, undefined]
+] satisfies readonly [PortableSessionExportOutcomeView, string | undefined][])("reports the saved package result %j", async (result, expectedNotice) => {
+  const container = document.body.appendChild(document.createElement("div"));
+  root = createRoot(container);
+  const base = controller("a");
+  const task: SessionView = { id: "source-task", name: "Source task", backendId: "backend", targetId: "target",
+    state: "idle", pinned: false, archived: false, generation: 1n, updatedAt: 1, permissionMode: "ask", planMode: false, fastMode: false };
+  const exportPortableSession = vi.fn<AppController["exportPortableSession"]>(async () => result);
+  await act(async () => root!.render(<AppWithController controller={{ ...base, exportPortableSession,
+    state: { ...base.state, snapshot: { ...base.state.snapshot, sessions: [task] } } }} />));
+  const button = (label: string) => [...document.querySelectorAll("button")].find(node => node.textContent?.trim() === label);
+  await act(async () => { button("Export fixture task")!.click(); });
+  await act(async () => { button("Export")!.click(); });
+  expect(exportPortableSession).toHaveBeenCalledExactlyOnceWith(task.id, { excludeMedia: false }, expect.anything());
+  expect(container.querySelector(".offline-banner > span")?.textContent).toBe(expectedNotice);
+  expect(document.querySelector(".portable-session-dialog--export") !== null).toBe(result.status === "cancelled");
+});
 
 function controller(id: string): AppController {
   const snapshot = { ...emptySnapshot(), generation: 1n, revision: 1n,

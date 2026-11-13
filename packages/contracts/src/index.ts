@@ -68,6 +68,8 @@ export * from "./partner-home.js";
 export * from "./gen/joko/v1/partner_workbench_pb.js";
 export * from "./gen/joko/v1/pi_pb.js";
 export * from "./gen/joko/v1/portable_session_pb.js";
+export const PORTABLE_SESSION_MEDIA_BYTES_HEADER = "x-joko-portable-media-bytes";
+export const PORTABLE_SESSION_LIMIT_BYTES_HEADER = "x-joko-portable-limit-bytes";
 export * from "./gen/joko/v1/remote_desktop_pb.js";
 export * from "./gen/joko/v1/remote_desktop_types_pb.js";
 export * from "./gen/joko/v1/remote_host_pb.js";
