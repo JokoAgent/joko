@@ -5,8 +5,44 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
-import { checkoutSource, inspectSource, refreshSourceDependencies, verifySourcePackages } from './prepare-linkspan.mjs';
+import { buildSourceConsumers, checkoutSource, inspectSource, refreshSourceDependencies, verifySourcePackages } from './prepare-linkspan.mjs';
 import { pnpmInvocation } from './pnpm-invocation.mjs';
+
+test('retries only the official Rust DNS failure on the same empty output and checkout', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'linkspan-source-test-'));
+  const checkout = join(root, 'checkout'), output = join(root, 'consumers');
+  const dnsFailure = Object.assign(new Error('Consumer build failed'), { stderr:
+    "Error: Command failed: rustup toolchain install 1.99.0 --profile minimal --target wasm32-unknown-unknown\n"
+    + "error: could not download file from 'https://static.rust-lang.org/dist/channel-rust-1.99.0.toml.sha256': client error (Connect): dns error: failed to lookup address information\n" });
+  try {
+    await mkdir(output);
+    for (const failsTwice of [false, true]) {
+      const calls = [];
+      const retry = buildSourceConsumers(checkout, output, async (args, cwd) => {
+        calls.push({ args, cwd });
+        if (calls.length === 1 || failsTwice) throw dnsFailure;
+      });
+      if (failsTwice) await assert.rejects(retry, dnsFailure);
+      else await retry;
+      assert.deepEqual(calls, Array.from({ length: 2 }, () => ({ args: ['build:consumers', output], cwd: checkout })));
+    }
+    for (const stderr of [dnsFailure.stderr.replace('dns error:', 'checksum mismatch:'),
+      dnsFailure.stderr.replace('static.rust-lang.org', 'unrelated.example'),
+      dnsFailure.stderr.replace('rustup toolchain install', 'cargo build')]) {
+      let calls = 0;
+      const failure = Object.assign(new Error('Consumer build failed'), { stderr });
+      await assert.rejects(buildSourceConsumers(checkout, output, async () => { calls++; throw failure; }), failure);
+      assert.equal(calls, 1);
+    }
+    await writeFile(join(output, 'partial'), 'partial output');
+    let calls = 0;
+    await assert.rejects(buildSourceConsumers(checkout, output, async () => { calls++; throw dnsFailure; }), dnsFailure);
+    assert.equal(calls, 1);
+  } finally {
+    if (dirname(root) !== resolve(tmpdir()) || !basename(root).startsWith('linkspan-source-test-')) throw new Error('Unexpected source fixture cleanup path.');
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('follows remote main advances and preserves edited source instead of resetting it', async () => {
   const root = await mkdtemp(join(tmpdir(), 'linkspan-source-test-'));
