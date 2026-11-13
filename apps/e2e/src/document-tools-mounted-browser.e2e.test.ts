@@ -41,13 +41,23 @@ afterEach(async () => {
   fixture = undefined;
 });
 
-async function closeDetailsForCompactTimeline(page: Page): Promise<void> {
-  const dock = page.locator(".inspector-dock-group");
+async function closeCompactTimelinePanels(page: Page): Promise<void> {
+  // The Details dock mounts through Suspense after the task timeline.
+  const dock = page.locator(".inspector-dock-group[data-edge]");
   const close = dock.getByRole("button", { name: "Close details", exact: true });
-  if (await close.isVisible()) {
-    await close.click();
-    await close.waitFor({ state: "hidden" });
+  const outcome = await Promise.any([
+    close.first().waitFor({ state: "visible", timeout: 15_000 }).then(() => "open" as const),
+    page.getByRole("button", { name: "Open details", exact: true }).first()
+      .waitFor({ state: "visible", timeout: 15_000 }).then(() => "closed" as const)
+  ]);
+  if (outcome === "open") await close.first().click();
+  await dock.first().waitFor({ state: "hidden", timeout: 15_000 });
+
+  const navigationScrim = page.locator(".panel-scrim--navigation");
+  if (await navigationScrim.isVisible()) {
+    await page.locator(".sidebar.is-open").getByRole("button", { name: "Close navigation", exact: true }).click();
   }
+  await navigationScrim.waitFor({ state: "hidden", timeout: 15_000 });
 }
 
 mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact bytes", async () => {
@@ -251,7 +261,7 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
   const pdfDelivery = page.locator(".generated-files [data-document-format='pdf']");
   await pdfDelivery.waitFor({ state: "visible" });
   expect(await pdfDelivery.innerText()).toContain("Quarterly PDF");
-  await closeDetailsForCompactTimeline(page);
+  await closeCompactTimelinePanels(page);
   const [retainedPdf] = await Promise.all([
     page.waitForEvent("download"),
     pdfDelivery.getByRole("button", { name: "Download chart-report.pdf" }).click()
@@ -361,16 +371,33 @@ officeIt("retains the latest verified document for each path in the Run's mounte
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Connect", exact: true }).click();
-  const closeNavigation = page.locator(".sidebar__mobile-close");
-  if (await closeNavigation.isVisible()) await closeNavigation.click();
   await word.waitFor({ state: "visible", timeout: 25_000 });
   expect(await word.count()).toBe(1);
   expect(await card.locator(".generated-document").count()).toBe(3);
-  await closeDetailsForCompactTimeline(page);
+  await closeCompactTimelinePanels(page);
+
+  const downloadButton = word.getByRole("button", { name: "Download verified.docx", exact: true });
+  const transfers: string[] = [];
+  const observeTransfer = (url: string, outcome: string): void => {
+    const path = new URL(url).pathname;
+    const step = path.endsWith("/joko.v1.ArtifactService/GetBlobDownloadTicket") ? "ticket"
+      : path.startsWith("/v1/blobs/download/") ? "bytes" : undefined;
+    if (step !== undefined && transfers.length < 12) transfers.push(`${step} ${outcome}`);
+  };
+  page.on("request", request => observeTransfer(request.url(), "requested"));
+  page.on("response", response => observeTransfer(response.url(), `HTTP ${response.status()}`));
+  page.on("requestfailed", request => observeTransfer(request.url(), "failed"));
+  let clicked = false;
   const [download] = await Promise.all([
     page.waitForEvent("download"),
-    word.getByRole("button", { name: "Download verified.docx" }).click()
-  ]);
+    downloadButton.click({ timeout: 20_000 }).then(() => { clicked = true; })
+  ]).catch(async (error: unknown) => {
+    const buttonBusy = await downloadButton.evaluateAll(buttons => buttons.map(button => button.getAttribute("aria-busy"))).catch(() => []);
+    const alert = await word.getByRole("alert").count().catch(() => undefined);
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message}\nVerified document download ${JSON.stringify({ clicked, buttonBusy, alert, transfers })}`, { cause: error });
+  });
+  expect(download.suggestedFilename()).toBe("verified.docx");
   expect(await readFile(await download.path())).toEqual(delivered);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
   if (captureDirectory) await card.screenshot({ path: join(captureDirectory, "delivery-compact.png") });
