@@ -41,9 +41,10 @@ export function MobileModelAccountQuota({ quota, colors, showLabel = true }: {
   </>;
 }
 
-export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loading = false, failed = false, now, colors, locale, reset }: {
+export function MobileAccountUsageSummary({ snapshot, modelId, modelScope, providerName, loading = false, failed = false, now, colors, locale, reset }: {
   readonly snapshot?: ProviderAccountUsageSnapshot;
   readonly modelId?: string;
+  readonly modelScope?: "claude-family";
   readonly providerName?: string;
   readonly loading?: boolean;
   readonly failed?: boolean;
@@ -55,7 +56,7 @@ export function MobileAccountUsageSummary({ snapshot, modelId, providerName, loa
   const copy = mobileAccountUsageCopy(locale);
   const number = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
   const time = (value: number): string => new Intl.DateTimeFormat(locale, { dateStyle: "short", timeStyle: "short" }).format(value);
-  const windows = snapshot ? mobileAccountUsageWindows(snapshot, modelId, now) : [];
+  const windows = snapshot ? mobileAccountUsageWindows(snapshot, modelId, now, modelScope) : [];
   const observedAt = mobileUsageTimestamp(snapshot?.observedAt);
   const stale = failed || snapshot !== undefined && mobileAccountUsageStale(snapshot, now);
   const extra = snapshot?.extraUsage;
