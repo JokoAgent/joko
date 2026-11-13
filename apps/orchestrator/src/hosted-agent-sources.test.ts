@@ -1,19 +1,262 @@
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
-import { createInProcessDevicePeerHarness, NodeDevicePeerAgentExecutor } from "@joko/device-peer";
+import { createInProcessDevicePeerHarness, DEVICE_PEER_RUNTIME_EXECUTABLES, NodeDevicePeerAgentExecutor, type DevicePeerAgentOutcome, type InProcessDevicePeerHarness } from "@joko/device-peer";
 import { OperationalStore } from "@joko/store";
-import { expect, it } from "vitest";
-import { ArtifactStore } from "./artifact-store.js";
+import { expect, it, vi } from "vitest";
+import type { OrchestratorApplication } from "./application.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { ArtifactStore } from "./artifact-store.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
+import { ConnectionManager, digestAuthKey } from "./connection-manager.js";
+import { registerConnectServices } from "./connect-services.js";
 import { DevicePeerOwner } from "./device-peer-owner.js";
-import { SessionHost } from "./session-host.js";
+import { HostedAgentExchange } from "./hosted-agent-exchange.js";
 import { HostedAgentSources } from "./hosted-agent-sources.js";
+import { decodeHostedAgentOpen, decodeHostedAgentInvocation, decodeHostedAgentReply, encodeHostedAgentValue } from "./hosted-agent-wire.js";
 import { toProtoBackend, toProtoCapability } from "./proto-mapper.js";
-import { decodeHostedAgentInvocation, encodeHostedAgentValue } from "./hosted-agent-wire.js";
+import { RemoteExecutionRouter } from "./remote-execution-router.js";
+import { RemoteWorkspaceService } from "./remote-workspace-service.js";
+import { SessionHost } from "./session-host.js";
+import { WorkspaceService } from "./workspace-service.js";
+
+it("registers an untrusted Device project for a paired Source and runs only from the approved Device root", { timeout: 30_000 }, async () => {
+  const temporaryRoot = await realpath(tmpdir());
+  const root = await realpath(await mkdtemp(join(temporaryRoot, "joko-source-device-project-")));
+  const projectPath = join(root, "device-project");
+  await mkdir(projectPath);
+  const deviceRoot = await realpath(projectPath);
+  await writeFile(join(deviceRoot, "AGENTS.md"), "Use the approved Device project.");
+  await writeFile(join(deviceRoot, "proof.txt"), "Original Device file");
+  const store = new OperationalStore(join(root, "source.sqlite"));
+  const peers = new DevicePeerOwner({ store });
+  const remoteExecution = new RemoteExecutionRouter({ peers, hosts: {
+    captureProcessAuthority: async () => { throw new Error("Unexpected SSH process route."); },
+    captureTransportAuthority: async () => { throw new Error("Unexpected SSH files route."); }
+  } });
+  const workspaces = new WorkspaceService({ remoteDelegate: new RemoteWorkspaceService(remoteExecution) });
+  const artifactRepository = new OperationalArtifactRepository(store);
+  const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: artifactRepository, ingestRoots: [root] });
+  const captureBeforeRun = vi.fn(async () => {}), captureAfterRun = vi.fn(async () => {});
+  const host = new SessionHost(store, artifacts, [], { workspaceCapture: { captureBeforeRun, captureAfterRun } });
+  const sources = new HostedAgentSources({ store, peers, host, remoteExecution, registry: new BackendInstanceRegistry(store),
+    temporaryRoot: join(root, "incoming"), readPolicy: () => ({ revision: "device-project", permissionMode: "ask", planMode: false,
+      approvedRoots: [], confirmCredentials: true }), readBlob: async () => { throw new Error("Unexpected Blob read."); } });
+  const authKey = "source-device-project-fixture";
+  const controller = store.createConnection({ id: "source-controller", deviceId: "source-device", name: "Source", authKeyDigest: digestAuthKey(authKey),
+    device: { defaultName: "Source", kind: "web", platform: "web" } });
+  const provider = store.createConnection({ id: "provider-agent", deviceId: "provider-device", name: "Provider", authKeyDigest: "provider-digest",
+    device: { defaultName: "Provider", kind: "service", platform: process.platform } });
+  const target = store.createConnection({ id: "project-agent", deviceId: "project-device", name: "Project", authKeyDigest: "project-digest",
+    device: { defaultName: "Project", kind: "service", platform: process.platform } });
+  store.setDeviceRemoteControlEnabled(provider.deviceId, true);
+  store.setDeviceRemoteControlEnabled(target.deviceId, true);
+  const opens: ReturnType<typeof decodeHostedAgentOpen>[] = [];
+  const exchanges = new Map<string, HostedAgentExchange>();
+  const virtualRoot = process.platform === "win32" ? "V:\\provider-private\\project" : "/provider-private/project";
+  const native = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "recent.json"), nativeAgents: {
+    invoke: async (method, bytes, signal) => {
+      switch (method) {
+        case contract.HostedAgentPeerMethod.GET_CATALOG:
+          return toBinary(contract.GetHostedAgentCatalogResponseSchema, create(contract.GetHostedAgentCatalogResponseSchema, {
+            format: 1, remoteControlEnabled: true, backends: [{ backendId: "device-pi", nativeAdapterKind: "pi", instanceGeneration: 1n,
+              displayName: "Device Pi", version: "1", capabilities: ["input.text", "model.switch", "session.resume", "session.detach", "workspace.files"]
+                .map(name => ({ name, support: contract.CapabilitySupport.SUPPORTED })),
+              providers: [{ providerId: "provider", displayName: "Provider", connected: true, remoteInvocationEnabled: true,
+                models: [{ backendId: "device-pi", key: { providerId: "provider", modelId: "model" }, displayName: "Model",
+                  api: "openai-completions", contextWindowTokens: 32_768n, maximumOutputTokens: 1_024n, inputModalities: [contract.ModelInputModality.TEXT] }] }] }]
+          }));
+        case contract.HostedAgentPeerMethod.OPEN: {
+          const request = fromBinary(contract.OpenHostedAgentRequestSchema, bytes);
+          const opened = decodeHostedAgentOpen(request.openJson);
+          opens.push(opened);
+          exchanges.set(opened.runId, new HostedAgentExchange({ assertCurrent: () => {}, onOverflow: () => { throw new Error("Unexpected Provider output limit."); } }));
+          return toBinary(contract.OpenHostedAgentResponseSchema, create(contract.OpenHostedAgentResponseSchema,
+            { format: 1, runId: opened.runId, virtualRoot }));
+        }
+        case contract.HostedAgentPeerMethod.CALL: {
+          const request = fromBinary(contract.CallHostedAgentRequestSchema, bytes);
+          const command = decodeHostedAgentInvocation(request.commandJson);
+          const opened = opens.find(value => value.runId === request.runId);
+          const exchange = exchanges.get(request.runId);
+          if (!opened || !exchange) throw new Error("The Provider call did not belong to an opened task.");
+          const state = { binding: { opaqueRef: "provider-binding", nativeSessionId: opened.nativeSessionId, generation: opened.generation },
+            providerId: "provider", modelId: "model", streaming: false, compacting: false, pendingMessages: 0, permissionMode: "ask", fastMode: false };
+          const history = { events: [], activeLineage: [] };
+          let result: unknown;
+          if (command.kind === "send") {
+            expect(command.durableFence).toBe(true);
+            await exchange.nativeDispatch(request.callId, { inputFingerprint: createHash("sha256").update(command.input.text).digest("hex"), nativeHistory: history }, signal);
+            const callId = "read-device-proof";
+            await exchange.tool({ format: 1, callId, requestId: `${callId}:1`, operation: "tool.begin",
+              payload: { name: "read", input: { path: "proof.txt" } } }, signal, request.callId);
+            const file = await exchange.tool({ format: 1, callId, requestId: `${callId}:2`, operation: "fs.read",
+              payload: { path: "proof.txt" } }, signal, request.callId);
+            if (typeof file.data !== "string") throw new Error("The Device file read did not return bytes.");
+            exchange.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: Buffer.from(file.data, "base64").toString("utf8") }] }, undefined, request.callId);
+            exchange.emit({ type: "done", outcome: "completed" }, undefined, request.callId);
+            result = null;
+          } else if (command.kind === "state" || command.kind === "set_model" || command.kind === "history") {
+            result = command.kind === "history" ? history : state;
+          } else {
+            throw new Error(`Unexpected Provider command ${command.kind}.`);
+          }
+          return toBinary(contract.CallHostedAgentResponseSchema, create(contract.CallHostedAgentResponseSchema,
+            { format: 1, resultJson: encodeHostedAgentValue(result) }));
+        }
+        case contract.HostedAgentPeerMethod.POLL: {
+          const request = fromBinary(contract.PollHostedAgentsRequestSchema, bytes);
+          const runs = await Promise.all(request.cursors.map(async ({ runId, after }) => {
+            const exchange = exchanges.get(runId);
+            if (!exchange) throw new Error("The Provider poll did not belong to an opened task.");
+            const batch = await exchange.poll(Number(after), signal, 1_000);
+            return { runId, cursor: BigInt(batch.cursor), finished: batch.finished, framesJson: encodeHostedAgentValue(batch.frames) };
+          }));
+          return toBinary(contract.PollHostedAgentsResponseSchema, create(contract.PollHostedAgentsResponseSchema, { format: 1, runs }));
+        }
+        case contract.HostedAgentPeerMethod.REPLY: {
+          const request = fromBinary(contract.ReplyHostedAgentRequestSchema, bytes);
+          const exchange = exchanges.get(request.runId);
+          if (!exchange) throw new Error("The Provider reply did not belong to an opened task.");
+          exchange.reply(request.requestId, decodeHostedAgentReply(request.resultJson));
+          return toBinary(contract.ReplyHostedAgentResponseSchema, create(contract.ReplyHostedAgentResponseSchema, { format: 1 }));
+        }
+        case contract.HostedAgentPeerMethod.CLOSE: {
+          const request = fromBinary(contract.CloseHostedAgentRequestSchema, bytes);
+          exchanges.get(request.runId)?.close();
+          exchanges.delete(request.runId);
+          return toBinary(contract.CloseHostedAgentResponseSchema, create(contract.CloseHostedAgentResponseSchema, { format: 1 }));
+        }
+        default: throw new Error(`Unexpected Provider method ${method}.`);
+      }
+    }, retire: async () => {}
+  } });
+  const files = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "project-recent.json") });
+  const execute = async (executor: NodeDevicePeerAgentExecutor, command: contract.DevicePeerCommand, signal: AbortSignal): Promise<DevicePeerAgentOutcome> => {
+    const results: contract.DevicePeerAgentResult[] = [];
+    await executor.execute(command, signal, async result => { results.push(result); });
+    const completed = results.find(result => result.phase === contract.DevicePeerResponsePhase.COMPLETED);
+    if (completed) return { outcome: "completed", value: completed.payload };
+    if (results.some(result => result.phase === contract.DevicePeerResponsePhase.ABORTED)) return { outcome: "aborted" };
+    const failure = results.find(result => result.payload.case === "failure")?.payload;
+    if (failure?.case === "failure") return { outcome: "failed",
+      errorCode: failure.value.code === contract.DevicePeerFailureCode.NOT_FOUND ? "not_found" : "native_rejected", failure: failure.value };
+    throw new Error("The Device request did not produce a terminal result.");
+  };
+  const modelHarness = createInProcessDevicePeerHarness({ targetDeviceId: provider.deviceId, capabilities: ["native_agents"], agent: {
+    handle: (frame, signal) => execute(native, frame.payload as contract.DevicePeerCommand, signal), retire: () => native.retire()
+  } });
+  const processStarts: string[] = [];
+  let routeActive = true;
+  const harness: InProcessDevicePeerHarness = createInProcessDevicePeerHarness({ targetDeviceId: target.deviceId, capabilities: ["files", "process"], agent: {
+    handle: async (frame, signal) => {
+      const command = frame.payload as contract.DevicePeerCommand;
+      if (command.action.case === "startProcess") {
+        const { executable, workingDirectory } = command.action.value;
+        expect(workingDirectory).toBe(deviceRoot);
+        expect([DEVICE_PEER_RUNTIME_EXECUTABLES.node, "git"]).toContain(executable);
+        processStarts.push(workingDirectory);
+        const identity = { protocolVersion: 1, kind: "stream_event", requestId: frame.requestId, targetDeviceId: frame.targetDeviceId,
+          routeGeneration: frame.routeGeneration, streamId: `project-process-${processStarts.length}` } as const;
+        setImmediate(() => {
+          if (!routeActive) return;
+          const data = executable === "git" ? "false" : JSON.stringify({ home: root, temporary: root, platform: process.platform });
+          harness.emit({ ...identity, sequence: 1, channel: "process_stdout", data: Buffer.from(data) });
+          harness.emit({ ...identity, sequence: 2, channel: "process_exit", exitCode: 0, signal: null });
+        });
+        return { outcome: "completed", value: { case: "processStarted", value: create(contract.DevicePeerProcessStartedResultSchema, { processId: identity.streamId }) } };
+      }
+      return execute(files, command, signal);
+    }, retire: () => { routeActive = false; return files.retire(); }
+  } });
+  peers.registerRoute(provider, modelHarness.transport);
+  peers.registerRoute(target, harness.transport);
+  try {
+    await artifacts.initialize(); await sources.initialize(); await host.initialize(); await sources.refresh(controller);
+    const backend = store.listBackends()[0]!.descriptor;
+    const application = { config: { publicOrigin: "http://127.0.0.1", dataDirectory: root }, store, devicePeers: peers,
+      sessionHost: host, workspaces, artifacts, artifactRepository, adapters: [host.currentAdapter(backend.id)!],
+      connections: new ConnectionManager(store), hostedAgentSources: sources } as unknown as OrchestratorApplication;
+    const operations = createClient(contract.OperationService, createRouterTransport(router => registerConnectServices(router, application)));
+    const submit = (operationId: string, payload: contract.OperationMutation["payload"], preconditions: contract.OperationMutation["preconditions"] = []) => operations.submitOperation({
+      operationId, connectionId: controller.id, mutation: { payload, preconditions }
+    }, { headers: { authorization: `Bearer ${authKey}` } });
+    const peer = peers.list(controller)[0]!;
+    const createProject = await submit("device-project-create", { case: "createDevicePeerTarget", value: create(contract.CreateDevicePeerTargetMutationSchema, {
+      backendId: backend.id, displayName: "Device project", workspacePath: deviceRoot, peer: {
+        targetDeviceId: peer.targetDeviceId, targetDeviceRevision: { value: peer.targetDeviceRevision }, relationId: peer.relationId,
+        relationRevision: { value: peer.relationRevision }, routeGeneration: BigInt(peer.routeGeneration)
+      }
+    }) });
+    const createdTarget = createProject.operation?.result?.payload;
+    if (createdTarget?.case !== "target") throw new Error("Device project registration did not return its target.");
+    const targetId = createdTarget.value.targetId, workspaceId = createdTarget.value.workspaceId;
+    const registered = store.getTarget(targetId).descriptor;
+    expect(registered).toMatchObject({ trusted: false, remoteWorkspace: { workspaceRoot: deviceRoot, targetDeviceId: target.deviceId } });
+    expect(registered.workspaceRoot).not.toBe(deviceRoot);
+    expect(await readdir(registered.workspaceRoot)).toEqual([]);
+    const registration = () => workspaces.listRegistrations().find(value => value.id === workspaceId);
+    expect(registration()).toMatchObject({ root: deviceRoot, trusted: false });
+    expect(processStarts).toEqual([]);
+
+    const task = create(contract.CreateSessionMutationSchema, { targetId, backendId: backend.id, displayName: "Device task",
+      model: { model: { providerId: "provider", modelId: "model" } }, permissionMode: contract.PermissionMode.ASK });
+    const rejected = await submit("device-project-untrusted", { case: "createSession", value: task });
+    expect(rejected.operation).toMatchObject({ state: contract.OperationState.FAILED, error: { message: "The original Source task authority changed." } });
+    expect(opens).toEqual([]);
+    expect(store.listSessions()).toEqual([]);
+    expect(processStarts).toEqual([]);
+    await submit("device-project-trust", { case: "setWorkspaceTrust", value: create(contract.SetWorkspaceTrustMutationSchema, { workspaceId, trusted: true }) });
+    expect(registration()).toMatchObject({ root: deviceRoot, trusted: true });
+
+    const created = await submit("device-project-task", { case: "createSession", value: task });
+    const taskResult = created.operation?.result?.payload;
+    if (taskResult?.case !== "session") throw new Error("Device task creation did not return its session.");
+    const sessionId = taskResult.value.sessionId;
+    const before = store.getSession(sessionId).descriptor;
+    expect(before.remoteWorkspace).toEqual(registered.remoteWorkspace);
+    expect(opens).toHaveLength(1);
+    expect(opens[0]).toMatchObject({ start: "create", sessionId, targetId, workspace: { contextFiles: [
+      { path: "AGENTS.md", content: "Use the approved Device project." }
+    ] } });
+    const sent = await submit("device-project-send", { case: "sendInput", value: create(contract.SendInputMutationSchema, {
+      sessionId, deliveryMode: contract.QueueDeliveryMode.PROMPT, input: { parts: [{ content: { case: "text", value: "Read proof.txt" } }] }
+    }) }, [create(contract.OperationPreconditionSchema, {
+      entity: { kind: contract.EntityKind.SESSION, id: sessionId }, expectedGeneration: BigInt(before.binding.generation)
+    })]);
+    const queued = sent.operation?.result?.payload;
+    if (queued?.case !== "queueItem") throw new Error("Device input did not return its queue item.");
+    await vi.waitFor(() => expect(store.getRun(queued.value.runId).descriptor.state).toBe("completed"), { timeout: 10_000 });
+    expect(store.listEvents({ sessionId }).filter(event => event.runId === queued.value.runId).map(event => event.payload)).toContainEqual(expect.objectContaining({
+      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original Device file" }]
+    }));
+    expect(captureBeforeRun).not.toHaveBeenCalled();
+    expect(captureAfterRun).not.toHaveBeenCalled();
+    await host.detach(sessionId);
+    await host.resume(sessionId);
+    const restored = store.getSession(sessionId).descriptor;
+    expect(restored.binding.opaqueRef).toBe(before.binding.opaqueRef);
+    expect(restored.binding.generation).toBe(before.binding.generation + 1);
+    expect(opens).toHaveLength(2);
+    expect(opens[1]).toMatchObject({ start: "resume", nativeSessionId: before.binding.nativeSessionId, sessionId, targetId });
+    expect(processStarts).toEqual(Array<string>(4).fill(deviceRoot));
+    expect(await readdir(registered.workspaceRoot)).toEqual([]);
+    await host.detach(sessionId);
+    store.setDeviceRemoteControlEnabled(target.deviceId, false);
+    expect(peers.listForCapabilities(controller, ["native_agents"]).map(device => device.targetDeviceId)).toEqual([provider.deviceId]);
+    await expect(host.resume(sessionId)).rejects.toThrow();
+    expect(opens).toHaveLength(2);
+    expect(processStarts).toEqual(Array<string>(4).fill(deviceRoot));
+  } finally {
+    await host.dispose(); await sources.close(); await peers.shutdown(); await workspaces.close(); store.close();
+    if (!root.startsWith(temporaryRoot + sep)) throw new Error("Unsafe test cleanup.");
+    await rm(root, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 it("reads a completed retained workflow through the actual paired Source without opening a native run and drops a revoked relation's late result", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-paired-workflow-"))), store = new OperationalStore(join(root, "source.sqlite"));

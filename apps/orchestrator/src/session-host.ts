@@ -5770,7 +5770,7 @@ export class SessionHost {
       || source.descriptor.backendId !== expected.descriptor.backendId && (!expected.descriptor.trusted || expectedRemote !== undefined)
       || context.target.id !== expected.descriptor.id
       || context.target.backendId !== source.descriptor.backendId
-      || context.target.workspaceRoot !== (worktree?.path ?? expected.descriptor.workspaceRoot)
+      || context.target.workspaceRoot !== (worktree?.path ?? this.sourceRuntimeTarget(expected.descriptor).workspaceRoot)
       || !remoteAuthorityMatches
     ) throw new StoreError("The derivation workspace authority changed.");
   }
@@ -5803,12 +5803,12 @@ export class SessionHost {
       throw new StoreError("The native derivation lifecycle worktree authority changed.");
     }
     const worktree = record.worktree ?? expectedWorktree;
-    let effectiveTarget = { ...target, backendId: record.backendId };
-    if (target.workspaceRoot !== record.effectiveWorkspaceRoot && readOnlySourceRoot) {
+    let effectiveTarget = this.sourceRuntimeTarget({ ...target, backendId: record.backendId });
+    if (effectiveTarget.workspaceRoot !== record.effectiveWorkspaceRoot && readOnlySourceRoot) {
       if (source.worktree !== undefined && (source.worktree.state !== "active"
         || this.#worktrees?.activeWorkspacePath(source.id, source.worktree) === undefined)) throw new StoreError("The Side Chat source workspace lease is unavailable.");
       effectiveTarget = { ...effectiveTarget, workspaceRoot: record.effectiveWorkspaceRoot };
-    } else if (target.workspaceRoot !== record.effectiveWorkspaceRoot) {
+    } else if (effectiveTarget.workspaceRoot !== record.effectiveWorkspaceRoot) {
       if (worktree === undefined || (worktree.remote === undefined
         ? resolve(worktree.path) !== resolve(record.effectiveWorkspaceRoot)
         : worktree.path !== record.effectiveWorkspaceRoot)) {
@@ -12148,7 +12148,7 @@ export class SessionHost {
         } satisfies ScheduledWorktreeOwner, now);
       }
       let runtimeTarget = sessionWorktree === undefined
-        ? target.descriptor
+        ? this.sourceRuntimeTarget(target.descriptor)
         : { ...target.descriptor, workspaceRoot: sessionWorktree.path };
       const workerWorkspace = "workerWorkspace" in input && input.workerWorkspace
         ? await prepareWorkerRuntimeWorkspace(this.#store, input.workerWorkspace, sessionId, sessionWorktree)
@@ -14590,7 +14590,8 @@ export class SessionHost {
           const stored = this.#store.getSession(sessionId);
           this.assertQueueProviderAuthentication(item, stored);
           const target = this.targetForSession(stored);
-          if (this.#workspaceCapture !== undefined && !reviewReadOnly) {
+          // The local scanner cannot attest to paths on a Source's Device.
+          if (this.#workspaceCapture !== undefined && !reviewReadOnly && !this.isSourceDeviceTarget(target)) {
             let navigationAnchor: import("@joko/core").NativeNavigationAnchor | undefined;
             if (active.adapter.getNativeHistoryProjection !== undefined) {
               const captureLease = this.beginActiveBackendSideEffect(sessionId, active);
@@ -15067,11 +15068,26 @@ export class SessionHost {
           };
         })()
       : stored.descriptor.remoteWorkspace;
-    return {
+    const effective: TargetDescriptor = {
       ...workerWorkspaceTarget(this.#store, stored.descriptor, current),
       backendId: stored.descriptor.backendId,
       remoteWorkspace
     };
+    return worktree === undefined ? this.sourceRuntimeTarget(effective, current) : effective;
+  }
+
+  private sourceRuntimeTarget(target: TargetDescriptor, registered = target): TargetDescriptor {
+    const remote = target.remoteWorkspace;
+    if (!this.isSourceDeviceTarget(target, registered.remoteWorkspace)) return target;
+    if (remote?.kind !== "device_peer" || !sameRemoteWorkspaceBinding(remote, registered.remoteWorkspace)) {
+      throw new StoreError("The original Source Device workspace changed.");
+    }
+    return target.workspaceRoot === remote.workspaceRoot ? target : { ...target, workspaceRoot: remote.workspaceRoot };
+  }
+
+  private isSourceDeviceTarget(target: TargetDescriptor, registeredRemote?: TargetDescriptor["remoteWorkspace"]): boolean {
+    return (target.remoteWorkspace?.kind === "device_peer" || registeredRemote?.kind === "device_peer")
+      && this.#store.getBackend(target.backendId).descriptor.adapterKind === "hosted";
   }
 
   private captureModelWorkingContexts(backendId: string, sessionId: string): ReadonlyMap<string, number | undefined> {
@@ -16483,8 +16499,10 @@ export class SessionHost {
       if (this.#workspaceCapture !== undefined) {
         const session = this.#store.getSession(sessionId);
         const target = this.targetForSession(session);
-        await this.#workspaceCapture.captureAfterRun({ sessionId, runId: run.descriptor.id, target })
-          .catch((captureError: unknown) => this.recordFailure("workspace-change-set", captureError));
+        if (!this.isSourceDeviceTarget(target)) {
+          await this.#workspaceCapture.captureAfterRun({ sessionId, runId: run.descriptor.id, target })
+            .catch((captureError: unknown) => this.recordFailure("workspace-change-set", captureError));
+        }
       }
       if (error !== undefined) runtimeRecoveryFailures.push({ runId: run.descriptor.id, error });
       else if (this.#sessionRuntimeRecoveries.get(sessionId)?.currentRunId === run.descriptor.id) {
@@ -17204,11 +17222,11 @@ export class SessionHost {
         await this.restoreTurnOverrideLease(recoveredRunId);
         if (this.#workspaceCapture !== undefined) {
           const recoveredSession = this.#store.getSession(sessionId);
-          await this.#workspaceCapture.captureAfterRun({
-            sessionId,
-            runId: recoveredRunId,
-            target: this.targetForSession(recoveredSession)
-          }).catch((error: unknown) => this.recordFailure("workspace-change-set", error));
+          const target = this.targetForSession(recoveredSession);
+          if (!this.isSourceDeviceTarget(target)) {
+            await this.#workspaceCapture.captureAfterRun({ sessionId, runId: recoveredRunId, target })
+              .catch((error: unknown) => this.recordFailure("workspace-change-set", error));
+          }
         }
         await this.notifyServiceRunSettled(sessionId, recoveredRunId, recovered.outcome);
         if (recovered.outcome === "failed") this.ensureContextOverflowReplay(sessionId);
