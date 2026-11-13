@@ -123,6 +123,20 @@ describe("mobile interactions", () => {
     }
   });
 
+  it("omits a skipped optional field while submitting the next selected answer", () => {
+    const interaction = questionInteraction("skip-first", [
+      create(QuestionFieldSchema, { ...single, fieldId: "first", required: false }),
+      create(QuestionFieldSchema, { ...single, fieldId: "second", required: false })
+    ]);
+    const answers = { second: { kind: "single", selection: { kind: "choice", choiceId: "preview" } } } as const;
+    expect(mobileQuestionCanSubmit(interaction, answers)).toBe(true);
+    expect(createMobileInteractionResolution(interaction, { kind: "question", answers }, "connection").decision).toMatchObject({
+      case: "question", value: { answers: [{ fieldId: "second", value: { case: "singleChoice", value: {
+        selection: { case: "choiceId", value: "preview" }
+      } } }] }
+    });
+  });
+
   it("fails closed on invalid declarations, unknown answers, bounds, and unadvertised decisions", () => {
     const missingOther = create(QuestionFieldSchema, {
       fieldId: "choice", label: "Choice",
