@@ -378,7 +378,7 @@ describe("Contacts sync node lifecycle", () => {
       const status = manager.status();
       return { phase: status.phase, errorCode: status.errorCode, candidates: status.candidates.length,
         peers: status.peers.length, onlinePeers: status.onlinePeerCount, diagnostics,
-        multicastInterface: process.platform === "win32" ? "os-default" : "loopback" };
+        multicastInterface: "loopback" };
     });
     const created = first.store.createContact({
       expectedDirectoryRevision: first.store.directoryState().revision,
@@ -502,9 +502,9 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     codec: inProcessContactSyncCodec,
     transportFactory: (options) => new NodeSyncLanTransport({
       ...options,
-      // Windows uses the same OS-selected interface as the production LAN chain;
-      // the Unix same-host fixtures use their configured loopback route.
-      ...(process.platform === "win32" ? {} : { multicastInterface: "127.0.0.1" }),
+      // Both nodes belong to this fixture. Use real multicast on the same
+      // loopback route as the Node Sync transport tests on every platform.
+      multicastInterface: "127.0.0.1",
       multicastPort,
       beaconIntervalMilliseconds: 150,
       endpointTtlMilliseconds: 2_000,
