@@ -9528,8 +9528,8 @@ export class MobileClient {
       }
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
-      if (signal?.aborted) return;
-      if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
+      if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
+      if (isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
       history.finish();
