@@ -87,6 +87,7 @@ import {
   ResourceUsageReportCapacityError,
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   deviceContentProjection,
+  isTargetDeleted,
   normalizeDeviceName,
   operationBodyHash
 } from "@joko/store";
@@ -2636,7 +2637,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const target = {
     listTargets: (request, context) => {
       authenticate(context);
-      let records = dependencies.store.listTargets(request.backendId === "" ? undefined : request.backendId);
+      let records = dependencies.store.listTargets(request.backendId === "" ? undefined : request.backendId)
+        .filter(target => !isTargetDeleted(target));
       if (request.searchQuery !== "") {
         const query = request.searchQuery.toLocaleLowerCase();
         records = records.filter((item) => item.descriptor.displayName.toLocaleLowerCase().includes(query));
@@ -2648,7 +2650,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     getTarget: (request, context) => {
       authenticate(context);
-      return { target: toProtoTarget(dependencies.store.getTarget(request.targetId)) };
+      return { target: toProtoTarget(requireUndeletedTarget(dependencies.store, request.targetId)) };
     },
     listProjectDirectories: async (request, context) => {
       const connection = authenticate(context);
@@ -9324,12 +9326,18 @@ function targetWorkspaceRegistration(target: StoredTarget): WorkspaceRegistratio
   };
 }
 
+function requireUndeletedTarget(store: OperationalStore, targetId: string): StoredTarget {
+  const target = store.getTarget(targetId);
+  if (isTargetDeleted(target)) throw new ConnectError("The selected project has been deleted.", Code.NotFound);
+  return target;
+}
+
 function assertTargetWorkspacePreparationAuthority(target: StoredTarget, expectedRevision: bigint): void {
   if (target.revision !== expectedRevision) {
     throw new RevisionConflictError("Target", target.descriptor.id, expectedRevision, target.revision);
   }
   const metadata = asRecord(target.metadata);
-  if (metadata["deletedAt"] !== undefined) {
+  if (isTargetDeleted(target)) {
     throw new ConnectError("The selected project has been deleted.", Code.NotFound);
   }
   if (metadata["state"] === "deleting") {
@@ -17082,6 +17090,7 @@ async function dispatchMutation(
           kind: payload.case,
           body: mutation,
           commit: (store) => {
+            requireUndeletedTarget(store, descriptor.id);
             store.upsertTarget(descriptor, {
               ...metadata,
               ...(payload.value.pinned === undefined ? {} : { pinned: payload.value.pinned })
@@ -17089,19 +17098,20 @@ async function dispatchMutation(
             return { accepted: true, resultCase: "target", entityId: descriptor.id } satisfies OperationOutcome;
           }
         });
-        await registerTargetWorkspace(dependencies, dependencies.store.getTarget(descriptor.id));
+        const current = dependencies.store.getTarget(descriptor.id);
+        if (!isTargetDeleted(current)) await registerTargetWorkspace(dependencies, current);
         return presented(execution);
       });
     }
     case "archiveTarget": {
       return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
-        const existing = dependencies.store.getTarget(payload.value.targetId);
         const execution = await host.mutate({
           operationId,
           connection,
           kind: payload.case,
           body: mutation,
           commit: (store) => {
+            const existing = requireUndeletedTarget(store, payload.value.targetId);
             store.upsertTarget(existing.descriptor, {
               ...asRecord(existing.metadata),
               state: payload.value.archived ? "archived" : "active",
@@ -17135,7 +17145,7 @@ async function dispatchMutation(
         const deletedAt = Date.now();
         let trashedPath: string | undefined;
         const assertDeletionPrecondition = (store: OperationalStore): void => {
-          const current = store.getTarget(existing.descriptor.id);
+          const current = requireUndeletedTarget(store, existing.descriptor.id);
           if (current.revision !== existing.revision) {
             throw new RevisionConflictError("Target", current.descriptor.id, existing.revision, current.revision);
           }

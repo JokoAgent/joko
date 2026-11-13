@@ -329,6 +329,11 @@ export interface StoredTarget {
   readonly revision: bigint;
 }
 
+export function isTargetDeleted({ metadata }: StoredTarget): boolean {
+  return typeof metadata === "object" && metadata !== null
+    && "deletedAt" in metadata && metadata.deletedAt !== undefined;
+}
+
 export interface DeviceControlRelationRecord {
   readonly controllerDeviceId: string;
   readonly targetDeviceId: string;
