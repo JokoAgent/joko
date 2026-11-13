@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, useImperativeHandle, useRef, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, PiMessageLifecycleKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
+  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -907,6 +907,35 @@ it.each(["same request", "resolved while reconnecting"] as const)("retains the o
   expect(interactionSheet.visible).toBe(outcome === "same request");
   await expect(new MobileInteractionDraftStore(drafts.driver).read(identity)).resolves.toEqual(outcome === "same request" ? draft : null);
   await interactionDrafts.clear(identity);
+});
+
+it("renders a single resolved plan review with its decision, feedback and original summary", async () => {
+  const identity = { sessionId: session.sessionId, backendId: "claude-code", targetId: session.targetId, generation: 1n,
+    runId: "run", attemptId: "attempt" };
+  const review = create(InteractionSchema, { ...identity, interactionId: "review", kind: InteractionKind.PLAN_REVIEW, state: InteractionState.RESOLVED,
+    request: { case: "planReview", value: { title: "Review the proposed plan", markdown: "1. Prepare\n2. Test\n3. Verify\n4. Publish",
+      allowedDecisions: [PlanReviewDecisionKind.EXECUTE, PlanReviewDecisionKind.REFINE] } },
+    resolution: { decision: { case: "planReview", value: { decision: PlanReviewDecisionKind.REFINE, feedback: "Cover reconnect before publishing." } } }
+  });
+  const observed = (eventId: string, sequence: bigint, interaction = review) => create(EventSchema, {
+    eventId, identity, cursor: { generation: 1n, sequence }, payload: { kind: { case: "interactionChanged", value: { interaction } } }
+  });
+  const detail = create(SnapshotSchema, { ...state.detail!, sessions: [create(SessionSchema, { ...session, backendId: identity.backendId })],
+    timeline: [observed("request", 2n), observed("resolution", 3n)] });
+  renderedState = { ...state, detail };
+  await act(async () => root.render(taskScreen()));
+  expect(timelineList!.data).toHaveLength(1);
+  expect(host.textContent).toContain(mobileMessage("en", "interaction.plan.refine"));
+  expect(host.textContent).toContain("Cover reconnect before publishing.");
+  expect(host.textContent).toContain("1. Prepare\n2. Test\n3. Verify\n…");
+  expect(interactionSheet.visible).toBe(false);
+
+  const foreign = create(InteractionSchema, { ...review, sessionId: "other-session" });
+  const otherBackend = create(InteractionSchema, { ...review, backendId: "codex" });
+  const otherEvent = create(EventSchema, { ...observed("other-backend", 5n, otherBackend), identity: { ...identity, backendId: "codex" } });
+  renderedState = { ...state, detail: create(SnapshotSchema, { ...detail, timeline: [observed("foreign", 4n, foreign), otherEvent] }) };
+  await act(async () => root.render(taskScreen()));
+  expect(host.textContent).not.toContain("Cover reconnect before publishing.");
 });
 
 async function mountMeasuredTimelineTail(): Promise<void> {

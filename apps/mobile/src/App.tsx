@@ -278,7 +278,7 @@ import {
   mobileInteractionDraftIdentityKey,
   type MobileInteractionDraftIdentity
 } from "./interaction-draft-store";
-import { mobileInteractionTitle } from "./mobile-interactions";
+import { mobileInteractionTitle, mobilePlanDecisionLabel } from "./mobile-interactions";
 import { SwipeableSessionRow } from "./SwipeableSessionRow";
 import { MobileMarkdownMessage } from "./MobileMarkdownMessage";
 import { MobileConversationShareBar } from "./MobileConversationShareBar";
@@ -6794,6 +6794,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
           : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
             automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />
+          : item.planReview ? <View style={styles.field}>
+            <Text style={[styles.label, { color: colors.ink }]}>{mobilePlanDecisionLabel(item.planReview.decision, locale)}</Text>
+            {item.planReview.feedback !== "" && <Text selectable style={[styles.body, { color: colors.ink }]}>{item.planReview.feedback}</Text>}
+            {item.planReview.summary !== "" && <Text selectable style={[styles.caption, { color: colors.muted }]}>{item.planReview.summary}</Text>}
+          </View>
           : item.objectiveLifecycle ? <View style={styles.field}>
             {item.text !== "" && <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
             <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "objective.progress", {

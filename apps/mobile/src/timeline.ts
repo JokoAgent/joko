@@ -1,4 +1,5 @@
-import { MessageRole, readDocumentOutput, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
+import { InteractionKind, InteractionState, MessageRole, readDocumentOutput, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type PlanReviewDecisionKind,
+  type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt, type PartnerSessionTaskReceiptView } from "@joko/contracts";
 import { assistantStreamAttempt, isAssistantStreamBlock } from "@joko/contracts";
@@ -94,6 +95,7 @@ export interface TimelineRow {
   /** The exact latest plan edge places its structural card without changing this row's raw cursor. */
   readonly planSequence?: bigint;
   readonly plan?: MobileInlinePlan;
+  readonly planReview?: { readonly decision: PlanReviewDecisionKind; readonly summary: string; readonly feedback: string };
   readonly objectiveLifecycle?: MobileObjectiveLifecycle;
   readonly collaboration?: MobileCollaborationMessage;
   readonly taskMessageOrigin?: TaskMessageOrigin;
@@ -345,6 +347,29 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
         byId.set(event.eventId, { id: event.eventId, label: "Run", text: "Run stopped", sequence, eventId: event.eventId,
           kind: "activity", completed: true, runStopped: true });
         break;
+      case "interactionChanged": {
+        const interaction = kind.value.interaction;
+        const resolution = interaction?.resolution;
+        if (interaction?.backendId === "claude-code" && interaction.request.case === "planReview"
+          && interaction.kind === InteractionKind.PLAN_REVIEW && interaction.state === InteractionState.RESOLVED
+          && interaction.interactionId && event.identity?.sessionId && interaction.sessionId === event.identity.sessionId
+          && interaction.backendId === event.identity.backendId && interaction.targetId === event.identity.targetId
+          && interaction.runId === event.identity.runId && interaction.attemptId === event.identity.attemptId
+          && interaction.generation === event.identity.generation && resolution?.decision.case === "planReview"
+          && interaction.request.value.allowedDecisions.includes(resolution.decision.value.decision)) {
+          const { decision, feedback } = resolution.decision.value;
+          const lines = interaction.request.value.markdown.split("\n").map(line => line.trim()).filter(Boolean);
+          const summary = lines.slice(0, 3).join("\n") + (lines.length > 3 ? "\n…" : "");
+          const text = feedback || summary;
+          const id = JSON.stringify(["plan-review", interaction.sessionId, interaction.generation.toString(), interaction.interactionId]);
+          const previous = byId.get(id);
+          byId.set(id, { id, label: interaction.request.value.title, text, sequence: previous?.sequence ?? sequence, eventId: previous?.eventId ?? event.eventId,
+            kind: "activity", completed: true, planReview: { decision, feedback, summary } });
+          break;
+        }
+        byId.set(event.eventId, { id: event.eventId, label: "Activity", text: "interaction Changed", sequence, eventId: event.eventId, kind: "activity", completed: false });
+        break;
+      }
       case "artifactProduced":
       case "imageProduced": {
         if (kind.case === "artifactProduced" && kind.value.embeddedInExtensionCard) break;
