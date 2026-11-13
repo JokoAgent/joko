@@ -375,16 +375,18 @@ describe("Partner workbench service and Queue ownership", () => {
       await held;
       await close();
     });
-    vi.mocked(open).mockResolvedValueOnce(handle);
+    const openFile = vi.mocked(open).getMockImplementation()!;
+    vi.mocked(open).mockImplementation(async (...args) => args[0] === path ? handle : openFile(...args));
     const read = f.workbench.readProjectFile(granted.owner, path);
-    const rejected = expect(read).rejects.toMatchObject({ code: "WORKBENCH_PROJECT_NOT_FOUND" });
+    void read.catch(() => undefined);
     try {
       await Promise.race([closing, read.then(() => { throw new Error("The document returned before close was observed."); })]);
       await f.workbench.removeProject(granted.owner, granted.state.revision, f.project);
     } finally {
       release();
+      vi.mocked(open).mockImplementation(openFile);
     }
-    await rejected;
+    await expect(read).rejects.toMatchObject({ code: "WORKBENCH_PROJECT_NOT_FOUND" });
     await expect(f.workbench.readProjectFile(granted.owner, path)).rejects.toMatchObject({ code: "WORKBENCH_INVALID" });
   });
 
