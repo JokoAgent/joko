@@ -468,7 +468,8 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(archived.archived).toBe(true);
     expect(archived.binding).toEqual(originalBinding);
     const archivedExport = await exportPackage(PortableSessionFidelity.FULL);
-    expect(archivedExport.nativeSession?.bytes).toEqual(new Uint8Array(await readFile(archived.binding.opaqueRef)));
+    if (archivedExport.nativeSession === undefined) throw new Error("The archived Pi package lacks its native transcript.");
+    expect(Buffer.from(archivedExport.nativeSession.bytes).equals(await readFile(archived.binding.opaqueRef))).toBe(true);
     expect(archivedExport.projection.messages).toEqual(restored.projection.messages);
     expect(store.getSession(sessionId).descriptor).toMatchObject({ archived: true, binding: archived.binding });
 
@@ -561,7 +562,10 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const secondDraftId = await prepare(secondPackage);
     const refusedOperation = randomUUID();
     await expect(commit(secondDraftId, false, targetId, refusedOperation)).rejects.toMatchObject({ code: Code.AlreadyExists });
-    expect(store.findOperation(refusedOperation)).toBeUndefined();
+    expect(store.getOperation(refusedOperation)).toMatchObject({
+      status: "failed", error: { code: "PORTABLE_SESSION_IMPORT_CONFLICT", stateMayHaveChanged: false }
+    });
+    expect(store.findPortableReplacementCleanup(refusedOperation)).toBeUndefined();
     expect(store.listSessions({ targetId, includeArchived: true }).map(session => session.descriptor.id)).toEqual([firstId]);
 
     const otherTarget = await commit(await prepare(secondPackage), false, anotherTargetId);
