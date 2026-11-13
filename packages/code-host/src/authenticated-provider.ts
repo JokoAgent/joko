@@ -129,7 +129,10 @@ export class AuthenticatedCodeHostProvider implements CodeHostProvider {
         if (options.signal.aborted) throw options.signal.reason ?? error;
         return undefined;
       });
-    const result = await this.#readPullRequest(reference, credential, options.signal);
+    const result = await this.#readPullRequest(reference, credential, options.signal).catch((error: unknown) => {
+      if (error instanceof CodeHostPullRequestNotFoundError) this.#assertFences(authorization, credential, reference);
+      throw error;
+    });
     const unresolvedReviewThreadCount = await graphQl;
     this.#assertFences(authorization, credential, reference);
     return {

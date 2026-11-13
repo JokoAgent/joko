@@ -26,16 +26,18 @@ export class PartnerWorkbenchPullRequests {
       const current = authorize(previous.sessionOwnerId, reference);
       return current !== undefined && current.ownerRevision === previous.ownerRevision && current.referenceKey === previous.referenceKey;
     } };
-    this.#coordinator = new CodeHostProjectionCoordinator({ now, providers: providers(authorization).map((provider) => ({
+    this.#coordinator = new CodeHostProjectionCoordinator({ now, clearProjectionOnNotFound: true, providers: providers(authorization).map((provider) => ({
       capability: provider.capability,
       ...(provider.minimumTimeToLiveMs === undefined ? {} : { minimumTimeToLiveMs: provider.minimumTimeToLiveMs }),
       supports: (reference) => provider.supports(reference),
       getPullRequest: async (reference, options) => {
         const scope = authorize(options.sessionOwnerId, reference);
         if (scope === undefined) throw new Error("The workbench reference is no longer available.");
-        const result = await provider.getPullRequest(reference, options);
-        if (!authorization.isCurrent(scope, reference)) throw new Error("The workbench reference owner changed.");
-        return result;
+        try {
+          return await provider.getPullRequest(reference, options);
+        } finally {
+          if (!authorization.isCurrent(scope, reference)) throw new Error("The workbench reference owner changed.");
+        }
       }
     })), repository: { read: (id) => this.#cache.get(id), write: (projection) => {
       const scope = this.#scopes.get(projection.sessionOwnerId);
@@ -60,7 +62,7 @@ export class PartnerWorkbenchPullRequests {
         if (this.#scopes.get(sessionId)?.key !== scope.key) return;
         for (const reference of scope.references.values()) scope.assertReference(reference);
         if (result.changed) scope.changed();
-      }).catch(() => { /* Failed observations keep the last successful provider facts. */ });
+      }).catch(() => { /* A retired workbench cannot publish the refresh. */ });
     } else this.#cache.delete(sessionId);
     return visible;
   }
