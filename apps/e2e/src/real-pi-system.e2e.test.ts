@@ -34,7 +34,8 @@ import {
   SetResourceEnabledMutationSchema,
   SessionSnapshotScopeSchema,
   SessionState,
-  SnapshotScopeSchema
+  SnapshotScopeSchema,
+  StateImpact
 } from "@joko/contracts";
 import { buildPortableSessionExport, preparePortableSessionImport } from "@joko/orchestrator";
 import { afterEach, describe, expect, it } from "vitest";
@@ -1014,6 +1015,18 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     });
     const { clients, connectionId } = await fixture.pair("Real Pi threshold Stop owner");
     const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const expectInactiveRunStop = async (runId: string) => {
+      const operation = await mutate(abortRunMutation(runId));
+      expect(operation).toMatchObject({
+        state: OperationState.FAILED,
+        error: {
+          code: "RUN_CONTROL_TARGET_CHANGED",
+          queueImpact: StateImpact.UNCHANGED,
+          nativeSessionImpact: StateImpact.UNCHANGED
+        }
+      });
+      expect((await clients.operation.getOperation({ operationId: operation.operationId })).operation).toEqual(operation);
+    };
     const sessionId = sessionIdFrom(await mutate(createSessionMutation({
       backendId: "pi", targetId: "workspace-real-pi", displayName: "Stop a held summary",
       providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off"
@@ -1033,7 +1046,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     if (control === undefined) throw new Error("The Pi task lost its queue control.");
     expect((await mutate(pauseQueueMutation(control))).state).toBe(OperationState.SUCCEEDED);
     const nextRunId = queueRunIdFrom(await mutate(sendInputMutation(sessionId, generation, "Run after the stopped summary.")));
-    await expect(mutate(abortRunMutation(nextRunId))).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expectInactiveRunStop(nextRunId);
     expect((await clients.pi.getPiSessionState({ sessionId })).state?.compacting).toBe(true);
 
     const revision = (await clients.run.getRun({ runId: firstRunId })).run?.version?.revision;
@@ -1054,7 +1067,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect((await clients.pi.listPiEntries({ sessionId })).entries.some((entry) => entry.payload.case === "compaction"))
       .toBe(false);
     expect((await clients.run.getRun({ runId: nextRunId })).run?.state).toBe(RunState.QUEUED);
-    await expect(mutate(abortRunMutation(firstRunId))).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expectInactiveRunStop(firstRunId);
 
     releaseSummary();
     releaseCompactionGate = undefined;
