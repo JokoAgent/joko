@@ -652,14 +652,39 @@ describe("packaged Desktop Pi compaction", () => {
       .getByText(secondTurnReply, { exact: true });
     // Read both visibility and identity in one browser task while the native
     // history refresh replaces the live reply.
-    await waitFor(() => secondReply.evaluateAll(elements => elements.slice(0, 8).map(element => {
-      const message = element.closest(".message-assistant");
-      const bounds = element.getBoundingClientRect();
-      return { eventId: message?.getAttribute("data-selection-quote-source-event-id"),
-        streaming: message?.querySelector(".streaming-cursor") != null,
-        visible: !element.closest("[inert]") && getComputedStyle(element).visibility === "visible" && bounds.width > 0 && bounds.height > 0 };
-    })), rows => rows.length === 1 && rows[0]?.eventId === secondCompletion.eventId && rows[0].visible && !rows[0].streaming,
-    "one visible completed second-turn reply in the current task", 30_000);
+    try {
+      await waitFor(() => secondReply.evaluateAll(elements => elements.slice(0, 8).map(element => {
+        const message = element.closest(".message-assistant");
+        const bounds = element.getBoundingClientRect();
+        return { eventId: message?.getAttribute("data-selection-quote-source-event-id"),
+          streaming: message?.querySelector(".streaming-cursor") != null,
+          visible: !element.closest("[inert]") && getComputedStyle(element).visibility === "visible" && bounds.width > 0 && bounds.height > 0 };
+      })), rows => rows.length === 1 && rows[0]?.eventId === secondCompletion.eventId && rows[0].visible && !rows[0].streaming,
+      "one visible completed second-turn reply in the current task", 30_000);
+    } catch (error) {
+      const view = await withDesktopDeadline(page.evaluate((reply) => {
+        const panes = Array.from(document.querySelectorAll<HTMLElement>(".session-pane .timeline[data-timeline-session-id]"));
+        return {
+          route: location.hash,
+          timelines: panes.slice(0, 4).map(timeline => ({
+            sessionId: timeline.dataset.timelineSessionId,
+            scrollTop: timeline.scrollTop,
+            height: timeline.clientHeight,
+            scrollHeight: timeline.scrollHeight,
+            rows: Array.from(timeline.querySelectorAll("[data-index]")).slice(0, 24).map(row => row.getAttribute("data-index")),
+            workGroups: Array.from(timeline.querySelectorAll(".work-group__header")).slice(0, 8).map(row => row.getAttribute("aria-expanded")),
+            replies: Array.from(timeline.querySelectorAll(".message-assistant")).slice(-12).map(row => ({
+              eventId: row.getAttribute("data-selection-quote-source-event-id"),
+              matchesExpectedText: row.querySelector(".message-assistant__body")?.textContent?.trim() === reply,
+              streaming: row.querySelector(".streaming-cursor") !== null
+            }))
+          }))
+        };
+      }, secondTurnReply), 5_000, "Managed Pi renderer evidence timed out.").catch(() => ({ unavailable: true }));
+      const { eventId, runId, messageId, entryId, sequence } = secondCompletion;
+      console.info("Managed Desktop second-turn renderer:", JSON.stringify({ eventId, runId, messageId, entryId, sequence, view }));
+      throw error;
+    }
     secondTurn = false;
 
     await page.evaluate(() => { window.location.hash = "/tasks/new?dialogue=pi"; });
