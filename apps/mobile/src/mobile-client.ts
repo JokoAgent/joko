@@ -9491,14 +9491,13 @@ export class MobileClient {
     return this.#commitImageGalleryPage(galleryLeaseId, loadId, strokes, burned, signal);
   }
 
-  async older(): Promise<void> {
+  async older(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
     const credential = this.#credential;
     const sessionId = this.#state.selectedId;
     if (!credential || !sessionId || this.#state.status !== "connected" || this.#state.historyEnd || this.#historyOwner) return;
     const epoch = this.#epoch;
-    const owner = Symbol("history page");
-    this.#historyOwner = owner;
-    this.#set({ historyBusy: true });
+    const history = this.#beginHistoryRead(signal);
     try {
       const detail = this.#state.detail;
       const scope = detail?.scope?.kind;
@@ -9512,8 +9511,8 @@ export class MobileClient {
       const snapshotBefore = hasLatestSnapshot && first?.identity?.sessionId === sessionId && first.cursor?.opaqueToken
         && first.cursor.generation === generation && first.cursor.sequence > 0n ? first.cursor : undefined;
       const before = this.#state.before ?? snapshotBefore;
-      const page = await this.network.readHistory(credential, sessionId, before, this.#abort?.signal);
-      if (!this.#current(epoch) || sessionId !== this.#state.selectedId || this.#historyOwner !== owner) return;
+      const page = await this.network.readHistory(credential, sessionId, before, history.signal);
+      if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
       validateHistory(page.events, sessionId, this.#taskGeneration(), before);
       if (page.before && (page.events.length === 0 || !page.before.opaqueToken || page.before.generation !== this.#taskGeneration()
         || (before && page.before.sequence >= before.sequence) || page.before.sequence > page.events[0]!.cursor!.sequence)) {
@@ -9529,34 +9528,54 @@ export class MobileClient {
       }
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
+      if (signal?.aborted) return;
       if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
-      if (this.#historyOwner === owner) { this.#historyOwner = undefined; this.#set({ historyBusy: false }); }
+      history.finish();
     }
   }
 
-  async around(eventId: string): Promise<void> {
+  async around(eventId: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
     const credential = this.#ready();
     const sessionId = this.#state.selectedId;
     if (!sessionId || this.#historyOwner) return;
     const epoch = this.#epoch;
-    const owner = Symbol("history anchor");
-    this.#historyOwner = owner;
-    this.#set({ historyBusy: true });
+    const history = this.#beginHistoryRead(signal);
     try {
-      const events = await this.network.readAround(credential, sessionId, eventId, this.#abort?.signal);
-      if (!this.#current(epoch) || sessionId !== this.#state.selectedId || this.#historyOwner !== owner) return;
+      const events = await this.network.readAround(credential, sessionId, eventId, history.signal);
+      if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
       validateHistory(events, sessionId, this.#taskGeneration());
       if (!events.some((event) => event.eventId === eventId)) throw new Error("The selected event is no longer in task history.");
       this.#set({ window: events, older: [], before: events[0]!.cursor, historyEnd: false });
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
+      if (signal?.aborted) return;
       if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
       throw error;
     } finally {
-      if (this.#historyOwner === owner) { this.#historyOwner = undefined; this.#set({ historyBusy: false }); }
+      history.finish();
     }
+  }
+
+  #beginHistoryRead(caller?: AbortSignal) {
+    const connection = this.#abort?.signal;
+    const signal = caller && connection ? AbortSignal.any([caller, connection]) : caller ?? connection;
+    const owner = Symbol("history read");
+    const release = (): void => {
+      if (this.#historyOwner !== owner) return;
+      this.#historyOwner = undefined;
+      this.#set({ historyBusy: false });
+    };
+    this.#historyOwner = owner;
+    caller?.addEventListener("abort", release, { once: true });
+    this.#set({ historyBusy: true });
+    return {
+      signal,
+      current: () => !signal?.aborted && this.#historyOwner === owner,
+      finish: () => { caller?.removeEventListener("abort", release); release(); }
+    };
   }
 
   async resolveComposerRouteReference(target: MobileComposerRouteResolutionTarget): Promise<string | undefined> {

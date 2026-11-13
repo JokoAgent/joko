@@ -622,13 +622,23 @@ export function App() {
     (listener) => mobilePush.subscribe(listener),
     () => mobilePush.snapshot
   );
-  const [page, setPage] = useState<Page>("home");
+  const [page, setPageState] = useState<Page>("home");
+  const nativeIntentHistoryRef = useRef<AbortController | undefined>(undefined);
+  const retireNativeIntentHistory = useCallback(() => {
+    const history = nativeIntentHistoryRef.current;
+    nativeIntentHistoryRef.current = undefined;
+    history?.abort();
+  }, []);
+  const setPage = useCallback((next: Page) => {
+    if (next !== "task") retireNativeIntentHistory();
+    setPageState(next);
+  }, [retireNativeIntentHistory]);
   const [taskInvitation, setTaskInvitation] = useState<string>();
   const [deviceInvitation, setDeviceInvitation] = useState<string>();
   const [deviceReview, setDeviceReview] = useState<DeviceAuthorizationReview>();
   const [sharingSessionId, setSharingSessionId] = useState<string>();
   const [sharingLeaveJoinId, setSharingLeaveJoinId] = useState<string>();
-  useEffect(() => { if (taskInvitation && state.status === "connected") setPage("task-sharing"); }, [taskInvitation, state.status]);
+  useEffect(() => { if (taskInvitation && state.status === "connected") setPage("task-sharing"); }, [setPage, taskInvitation, state.status]);
   const [filesInitialSource, setFilesInitialSource] = useState<MobileFilesComposerSource>();
   const [partnerReturnPage, setPartnerReturnPage] = useState<"home" | "task">("home");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -685,6 +695,7 @@ export function App() {
       const incoming = parseDeviceLink(url);
       externalNavigationRevisionRef.current++;
       nativeIntentDeliveryRef.current!.invalidate();
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       if (incoming.kind === 'review') { setDeviceReview(incoming.review); setDeviceInvitation(undefined); }
       else { setDeviceReview(undefined); setDeviceInvitation(url); client.setConnectionMode('add'); setPage('connection'); }
@@ -702,6 +713,7 @@ export function App() {
       externalNavigationRevisionRef.current++;
       externalIntentFenceRef.current!.offerShare();
       nativeIntentDeliveryRef.current!.invalidate();
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       setIncomingShareRequestRevision((value) => value + 1);
       void mobileIncomingShare.refresh().catch(() => undefined);
@@ -712,11 +724,12 @@ export function App() {
       setDeviceReview(undefined);
       externalNavigationRevisionRef.current++;
       externalIntentFenceRef.current!.offerNative(intent);
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       setNativeIntentRevision((value) => value + 1);
     }
     return intent !== undefined;
-  }, []);
+  }, [retireNativeIntentHistory, setPage]);
   const openDerivationOrigin = useCallback(async (authorityKey: string, signal: AbortSignal): Promise<boolean> => {
     const revision = externalNavigationRevisionRef.current;
     const url = await client.prepareTaskDerivationOrigin(authorityKey, signal);
@@ -758,6 +771,7 @@ export function App() {
       const transition = lifecycle.transition(status);
       const foreground = transition.interactive;
       if (!foreground) remoteDesktopLifecycle.current?.(transition);
+      if (transition.enteredBackground) retireNativeIntentHistory();
       diagnosticsState = status;
       diagnosticsTick = performance.now();
       setForeground(foreground);
@@ -812,6 +826,7 @@ export function App() {
     return () => {
       appMountedRef.current = false;
       nativeIntentDeliveryRef.current!.invalidate();
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       diagnosticsStopped = true;
       clearInterval(diagnosticTimer);
@@ -826,7 +841,7 @@ export function App() {
       void mobileNewTaskDrafts.flush().catch(() => undefined);
       void mobileDiagnostics.flush().catch(() => undefined);
     };
-  }, []);
+  }, [offerNativeUrl, retireNativeIntentHistory]);
 
   useEffect(() => {
     mobilePush.setLocale(locale.effectiveLocale);
@@ -839,8 +854,15 @@ export function App() {
     const claim = delivery.take(true);
     if (!claim) return;
     nativeIntentExecutingRef.current = true;
+    const history = claim.intent.kind === "session" && claim.intent.messageId !== undefined
+      ? new AbortController() : undefined;
+    let messagePage: { readonly profileId: string | undefined; readonly sessionId: string | undefined } | undefined;
     let groupSelection: MobilePartnerGroupSelection | undefined;
-    void executeMobileNativeIntent(claim, delivery, {
+    void executeMobileNativeIntent(claim, {
+      isCurrent: candidate => delivery.isCurrent(candidate) && history?.signal.aborted !== true
+        && (messagePage === undefined || (nativeIntentHistoryRef.current === history && AppState.currentState === "active"
+          && client.state.activeProfileId === messagePage.profileId && client.state.selectedId === messagePage.sessionId))
+    }, {
       snapshot: () => projectMobileNativeIntentSnapshot(client.state),
       connectProfile: async (profileId) => {
         nativeIntentConnectingRef.current = true;
@@ -854,10 +876,16 @@ export function App() {
       showGroup: groupId => { if (!groupSelection || groupSelection.groupId !== groupId || !client.partnerGroupSourceClaimCurrent(groupSelection)) return;
         setRemoteDesktopEntry(undefined); setNativeIntentGroupSelection(groupSelection); setPage("partner-directory");
       },
-      loadAround: (eventId) => client.around(eventId),
-      loadOlder: () => client.older(),
+      loadAround: (eventId) => client.around(eventId, history?.signal),
+      loadOlder: () => client.older(history?.signal),
       returnLatest: () => client.latest(),
-      showPage: setPage,
+      showPage: next => {
+        if (next === "task" && history && !messagePage) {
+          nativeIntentHistoryRef.current = history;
+          messagePage = { profileId: client.state.activeProfileId, sessionId: client.state.selectedId };
+        }
+        setPage(next);
+      },
       showSavedConnections: () => client.setConnectionMode("saved"),
       showRecovery: setNativeIntentRecovery,
       clearRecovery: () => setNativeIntentRecovery(undefined),
@@ -865,11 +893,12 @@ export function App() {
       clearMessageFocus: () => setNativeIntentMessageFocus(undefined),
       focusApplication: () => undefined
     }).finally(() => {
+      if (nativeIntentHistoryRef.current === history) nativeIntentHistoryRef.current = undefined;
       delivery.complete(claim);
       nativeIntentExecutingRef.current = false;
       if (appMountedRef.current) setNativeIntentRevision((value) => value + 1);
     });
-  }, [foreground, locale.status, nativeIntentRevision, state.status, theme.status]);
+  }, [foreground, locale.status, nativeIntentRevision, setPage, state.status, theme.status]);
 
   useEffect(() => {
     if (!diagnostics.enabled) {
@@ -1056,7 +1085,12 @@ export function App() {
                   homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, incomingShare,
                     menuButtonRef: homeMenuButtonRef, searchFocusRequest: homeSearchFocusRequest,
                     onSearchFocus: () => setHomeSearchFocusRequest((value) => value + 1),
-                    onNavigated: match => { focusHomeSearchMatch(match); setFocusTaskComposer(false); setPartnerSettingsEntry(undefined); },
+                    onNavigated: match => {
+                      retireNativeIntentHistory();
+                      focusHomeSearchMatch(match);
+                      setFocusTaskComposer(false);
+                      setPartnerSettingsEntry(undefined);
+                    },
                     onMenu: () => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); },
                     onOpenShare: () => setPage("new"), onPartners: entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }, registerNavigation: registerTaskHomeNavigation }}
                   partnerSettingsEntry={partnerSettingsEntry} onPartnerSettingsEntryConsumed={() => setPartnerSettingsEntry(undefined)}
