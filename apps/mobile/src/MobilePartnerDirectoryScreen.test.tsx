@@ -32,7 +32,7 @@ import { mobileMessage } from "./mobile-messages";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-const native = vi.hoisted(() => ({ back: undefined as undefined | (() => boolean), dismiss: undefined as undefined | (() => void), viewable: undefined as undefined | ((items: unknown) => void), composer: undefined as MobileComposerRichInputProps | undefined }));
+const native = vi.hoisted(() => ({ platform: "ios", back: undefined as undefined | (() => boolean), dismiss: undefined as undefined | (() => void), viewable: undefined as undefined | ((items: unknown) => void), composer: undefined as MobileComposerRichInputProps | undefined }));
 vi.mock("./MobileComposerRichInput", async () => {
   const React = await import("react");
   return { MobileComposerRichInput: React.forwardRef((props: MobileComposerRichInputProps, ref) => {
@@ -98,7 +98,7 @@ vi.mock("react-native", async () => {
       style: undefined
     }, props.children);
   return {
-    AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) }, Platform: { OS: "ios" },
+    AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) }, Platform: { get OS() { return native.platform; } },
     ActivityIndicator: () => React.createElement("span", { "data-loading": true }),
     BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
       native.back = handler;
@@ -189,7 +189,8 @@ function transport(ownerKey = "owner-a"): MobilePartnerDirectoryTransport {
   return {
     ownerKey,
     list: vi.fn(async () => catalog),
-    open: vi.fn(async () => ({ sessionId: "session-ada" }))
+    open: vi.fn(async () => ({ sessionId: "session-ada" })),
+    openImported: vi.fn()
   };
 }
 
@@ -226,7 +227,9 @@ afterEach(() => {
   if (root) act(() => root.unmount());
   container?.remove();
   root = undefined as unknown as Root;
+  native.platform = "ios";
   native.back = undefined;
+  native.dismiss = undefined;
   native.viewable = undefined;
   native.composer = undefined;
   onBack.mockReset();
@@ -432,8 +435,18 @@ it("pastes an image into the mounted group composer and reuses its uploaded byte
 });
 
 describe("MobilePartnerDirectoryScreen", () => {
-  it("preserves explicit import credentials and waits for native dismissal before opening the saved task", async () => {
+  it.each([
+    { platform: "ios", partial: false, outcome: "success" },
+    { platform: "android", partial: true, outcome: "success" },
+    { platform: "ios", partial: false, outcome: "owner change" },
+    { platform: "ios", partial: false, outcome: "unavailable task" }
+  ])("opens a saved import after dismissal on $platform ($outcome)", async ({ platform, partial, outcome }) => {
+    native.platform = platform;
     const active = transport(); const values = new Map<string, string>();
+    const observation = { ownerKey: active.ownerKey, online: true, snapshot: create(SnapshotSchema) };
+    let finish!: (result: { sessionId: string }) => void;
+    let fail!: (error: Error) => void;
+    vi.mocked(active.openImported).mockImplementation(() => new Promise((resolve, reject) => { finish = resolve; fail = reject; }));
     const api: PartnerImportApi = { ownerKey: active.ownerKey, newRequestId: () => "mobile_directory_import_0001",
       sources: vi.fn(async () => [create(PartnerImportSourceSchema, { id: "source", name: "Native analyst" })]),
       preview: vi.fn(async () => create(PartnerImportPreviewPageSchema, { id: "preview", source: { id: "source", name: "Native analyst" }, name: "Local analyst", total: 4,
@@ -444,10 +457,11 @@ describe("MobilePartnerDirectoryScreen", () => {
           { id: "other", index: 3, name: "Independent credential", category: PartnerImportCategory.CONNECTIONS }
         ] })),
       status: vi.fn(async () => undefined), retry: vi.fn(), start: vi.fn(async selection => create(PartnerImportResultSchema, { requestId: selection.requestId,
-        partnerId: "imported", canonicalSessionId: "imported-task", saved: true, savedEntryIds: ["identity"], status: PartnerImportStatus.COMPLETE })) };
+        partnerId: "imported", canonicalSessionId: "imported-task", saved: true, savedEntryIds: partial ? [] : ["identity"],
+        status: partial ? PartnerImportStatus.NEEDS_ATTENTION : PartnerImportStatus.COMPLETE })) };
     const editor = new PartnerImportEditor(api, new PartnerImportReceipts({ getItem: async key => values.get(key) ?? null,
       setItem: async (key, value) => { values.set(key, value); }, removeItem: async key => { values.delete(key); } }, "node"));
-    await render(active, undefined, undefined, undefined, undefined, undefined, undefined, () => editor);
+    await render(active, undefined, undefined, observation, undefined, undefined, undefined, () => editor);
     await press("Import a local agent"); await press("Native analyst");
     await press("Connections");
     expect([...editor.state.selected]).toEqual(["identity", "other"]);
@@ -466,8 +480,38 @@ describe("MobilePartnerDirectoryScreen", () => {
     expect([...editor.state.selected]).toEqual(["identity"]);
     await press("Save Partner");
     expect(api.start).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ name: "Local analyst", deferSetup: true, requestId: "mobile_directory_import_0001" }), expect.any(AbortSignal));
-    expect(onOpenTask).not.toHaveBeenCalled(); expect(container.textContent).not.toContain("Save Partner"); expect(values.size).toBe(0);
-    await act(async () => native.dismiss!()); expect(onOpenTask).toHaveBeenCalledExactlyOnceWith("imported-task"); expect(editor.active).toBe(false);
+    if (partial) {
+      expect(active.openImported).not.toHaveBeenCalled();
+      expect(values.size).toBe(1);
+      await press("Open task");
+    }
+    expect(onOpenTask).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(values.size).toBe(0);
+    if (platform === "ios") {
+      expect(active.openImported).not.toHaveBeenCalled();
+      await act(async () => native.dismiss!());
+    }
+    expect(active.openImported).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ partnerId: "imported", canonicalSessionId: "imported-task" }), expect.any(AbortSignal));
+    expect(editor.active).toBe(false);
+    expect(onOpenTask).not.toHaveBeenCalled();
+    const [, signal] = vi.mocked(active.openImported).mock.calls[0]!;
+    if (outcome === "owner change") {
+      await render(transport("owner-b"));
+      expect(signal.aborted).toBe(true);
+      await act(async () => finish({ sessionId: "imported-task" }));
+      expect(onOpenTask).not.toHaveBeenCalled();
+    } else if (outcome === "unavailable task") {
+      await act(async () => fail(new Error("The saved Partner task could not be loaded.")));
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain("The saved Partner task could not be loaded.");
+      expect(onOpenTask).not.toHaveBeenCalled();
+    } else {
+      await render(undefined, undefined, undefined, { ...observation, online: false });
+      expect(signal.aborted).toBe(false);
+      await render(active, undefined, undefined, observation);
+      await act(async () => finish({ sessionId: "imported-task" }));
+      expect(onOpenTask).toHaveBeenCalledExactlyOnceWith("imported-task");
+    }
   });
   it("offers paused resume from the main roster without opening a task", async () => {
     const selected = { ...catalog.partners[0]!, lifecycle: "paused" as const, pauseCleanupPending: false };

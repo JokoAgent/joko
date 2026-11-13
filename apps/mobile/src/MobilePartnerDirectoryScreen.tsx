@@ -16,6 +16,7 @@ import {
   filterMobilePartnerDirectory,
   firstIdentityLine,
   type MobilePartnerCatalog,
+  type MobilePartnerDirectoryOpenResult,
   type MobilePartnerDirectoryProfile,
   type MobilePartnerDirectoryTransport
 } from "./mobile-partner-directory";
@@ -256,6 +257,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   const generationRef = useRef(0);
   const ownerKey = observation?.ownerKey ?? transport?.ownerKey;
   const ownerRef = useRef(ownerKey); ownerRef.current = ownerKey;
+  const rosterActiveRef = useRef(rosterActive); rosterActiveRef.current = rosterActive;
   transportRef.current = transport;
 
   const load = (): void => {
@@ -288,21 +290,23 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   };
 
   useEffect(() => {
-    setOpeningId(undefined);
-    setActionError(undefined);
     setDeletion(undefined);
     setRestart(undefined);
     setResume(undefined);
     setMemory(undefined);
     requestRef.current?.abort(); requestRef.current = undefined;
-    openRef.current?.abort();
     load();
     return () => {
       generationRef.current += 1;
       requestRef.current?.abort();
-      openRef.current?.abort();
     };
   }, [ownerKey, transport?.ownerKey]);
+
+  useEffect(() => {
+    setOpeningId(undefined);
+    setActionError(undefined);
+    return () => { openRef.current?.abort(); openRef.current = undefined; };
+  }, [ownerKey, rosterActive]);
 
   useEffect(() => {
     if (!transport || state.ownerKey !== transport.ownerKey || !state.catalog || state.refreshing || state.error
@@ -444,23 +448,25 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
     }
     setActionError(mobileMessage(locale, "partnerDirectory.unavailable"));
   }, [initialHomeEntry, rosterActive, shards, groupShards, sourceOpening, creationTransport?.ownerKey, transport?.ownerKey]);
-  const open = (partner: MobilePartnerDirectoryProfile): void => {
+  const openTask = (partnerId: string, perform: (transport: MobilePartnerDirectoryTransport,
+    signal: AbortSignal) => Promise<MobilePartnerDirectoryOpenResult>): void => {
     const current = transportRef.current;
-    if (!current || openingId !== undefined || current.ownerKey !== state.ownerKey) return;
-    openRef.current?.abort();
+    if (!current || !rosterActiveRef.current || openRef.current || current.ownerKey !== state.ownerKey || current.ownerKey !== ownerRef.current) return;
     const controller = new AbortController();
     openRef.current = controller;
     const ownerKey = current.ownerKey;
-    setOpeningId(partner.partnerId);
+    const stillCurrent = (): boolean => !controller.signal.aborted && rosterActiveRef.current && ownerRef.current === ownerKey;
+    setOpeningId(partnerId);
     setActionError(undefined);
-    void current.open(partner, controller.signal).then((result) => {
-      if (controller.signal.aborted || transportRef.current?.ownerKey !== ownerKey) return;
+    void perform(current, controller.signal).then((result) => {
+      if (!stillCurrent()) return;
       onOpenTask(result.sessionId);
     }).catch((error: unknown) => {
-      if (controller.signal.aborted || transportRef.current?.ownerKey !== ownerKey) return;
+      if (!stillCurrent()) return;
       setActionError(error instanceof Error ? error.message : String(error));
     }).finally(() => {
-      if (!controller.signal.aborted && transportRef.current?.ownerKey === ownerKey) setOpeningId(undefined);
+      if (openRef.current === controller) openRef.current = undefined;
+      if (stillCurrent()) setOpeningId(undefined);
     });
   };
 
@@ -503,10 +509,12 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
       } }} />}
     {importFactory && <View style={styles.controls}><Action label={partnerImportMessages(locale).title} colors={colors}
       onPress={() => { const editor = importFactory(); if (editor?.api.ownerKey === transportRef.current?.ownerKey) setImportEditor(editor); else editor?.dispose(); }}
-      disabled={!transport || status !== "ready"} testID="partnerDirectory.import" /></View>}
+      disabled={!transport || status !== "ready" || openingId !== undefined} testID="partnerDirectory.import" /></View>}
     {importEditor && importEditor.api.ownerKey === transport?.ownerKey && importEditor.api.ownerKey === ownerKey && <MobilePartnerImportSheet
       key={`import:${ownerKey}`} editor={importEditor} colors={colors} locale={locale} onClose={() => { setImportEditor(undefined); load(); }}
-      onOpenTask={sessionId => { if (importEditor.api.ownerKey === ownerRef.current) onOpenTask(sessionId); }} />}
+      onSaved={receipt => {
+        if (importEditor.api.ownerKey === ownerRef.current) openTask(receipt.partnerId, (current, signal) => current.openImported(receipt, signal));
+      }} />}
     <MobilePartnerDeletionPanel transport={deletionTransport} colors={colors} locale={locale} onChanged={() => load()} />
     <MobilePartnerRestartPanel transport={restartTransport} colors={colors} locale={locale} onChanged={() => load()} />
     {catalog && <View style={styles.summary} accessibilityLabel={mobileMessage(locale, "partnerDirectory.summary", {
@@ -666,7 +674,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
           workingTransport={workingTransport?.ownerKey === ownerKey ? workingTransport : undefined}
           last={index === entries.length - 1} opening={openingId === item.partnerId} onOpen={() => {
             if (recoverable && transport) setInitialization({ ownerKey: transport.ownerKey, partnerId: item.partnerId });
-            else open(item);
+            else openTask(item.partnerId, (current, signal) => current.open(item, signal));
           }} /></View>{onOpenSource && shards.find(shard => shard.source.current) && <Action label={mobileMessage(locale, "settings.title")} colors={colors}
             disabled={!transport || sourceOpening !== undefined || item.lifecycle === "archived" || item.initializationState !== "ready"}
             testID={`partnerDirectory.settings.${item.partnerId}`} onPress={() => openSource(shards.find(shard => shard.source.current)!.source, item, "settings")} />}
