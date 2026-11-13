@@ -7,6 +7,27 @@ import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 
+export async function prepareSimulatorService(run, record) {
+  const args = ["simctl", "list", "runtimes", "--json"];
+  const timeoutMs = 120_000;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const started = performance.now();
+    try {
+      run("xcrun", args, { timeout: timeoutMs, stdio: "ignore" });
+    } catch (failure) {
+      const timedOut = failure?.code === "ETIMEDOUT" && failure.signal === "SIGTERM" && failure.status === null;
+      await record({ attempt, result: timedOut ? "timed_out" : "failed", timeoutMs, elapsedMs: Math.round(performance.now() - started),
+        exitCode: Number.isInteger(failure?.status) ? failure.status : null,
+        errorCode: ["ETIMEDOUT", "ENOENT", "EACCES"].includes(failure?.code) ? failure.code : null,
+        signal: ["SIGTERM", "SIGKILL", "SIGINT"].includes(failure?.signal) ? failure.signal : null });
+      if (!timedOut || attempt === 2) throw failure;
+      continue;
+    }
+    await record({ attempt, result: "passed", timeoutMs, elapsedMs: Math.round(performance.now() - started) });
+    return;
+  }
+}
+
 export async function stopOwnedMetroGroup(signalGroup, wait = delay) {
   const signal = value => {
     try { signalGroup(value); return "sent"; }

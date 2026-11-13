@@ -289,7 +289,7 @@ jobs:
     runs-on: macos-15-intel
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -300,9 +300,10 @@ jobs:
         with:
           node-version: 24.19.0
       - name: Prepare the selected Simulator service
-        timeout-minutes: 3
-        run: |
-          node --input-type=module -e "import {execFileSync} from 'node:child_process'; const started=performance.now(); execFileSync('xcrun',['simctl','list','runtimes','--json'],{timeout:120000,stdio:'ignore'}); console.log(JSON.stringify({simulatorServiceReady:true,elapsedMs:Math.round(performance.now()-started)}));"
+        timeout-minutes: 5
+        run: node scripts/ci/mobile-ios-prepare-simulator.mjs
+        env:
+          JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-startup-diagnostics
       - name: Observe owned Simulator boot, appearance and framebuffer
         timeout-minutes: 7
         run: node scripts/ci/mobile-ios-simulator-runtime.mjs --startup-diagnostics
@@ -318,6 +319,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-startup-diagnostics/identity.json
             ${{ runner.temp }}/joko-ios-startup-diagnostics/result.json
             ${{ runner.temp }}/joko-ios-startup-diagnostics/failure.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/simulator-service.json
             ${{ runner.temp }}/joko-ios-startup-diagnostics/runtime-failure-diagnostics.json
             ${{ runner.temp }}/joko-ios-startup-diagnostics/runtime-host-resources.json
             ${{ runner.temp }}/joko-ios-startup-diagnostics/cleanup.json
@@ -510,9 +512,10 @@ jobs:
         run: node --test scripts/ci/mobile-ios-runtime-diagnostics.test.mjs
 
       - name: Prepare the selected Simulator service
-        timeout-minutes: 3
-        run: |
-          node --input-type=module -e "import {execFileSync} from 'node:child_process'; const started=performance.now(); execFileSync('xcrun',['simctl','list','runtimes','--json'],{timeout:120000,stdio:'ignore'}); console.log(JSON.stringify({simulatorServiceReady:true,elapsedMs:Math.round(performance.now()-started)}));"
+        timeout-minutes: 5
+        run: node scripts/ci/mobile-ios-prepare-simulator.mjs
+        env:
+          JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-runtime-evidence
 
       - uses: actions/setup-go@v6
         with:
@@ -559,6 +562,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-runtime-evidence/identity.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/result.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/failure.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/simulator-service.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/runtime-failure-diagnostics.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/runtime-host-resources.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/installation-state.json
