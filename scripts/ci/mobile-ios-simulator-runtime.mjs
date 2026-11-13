@@ -22,7 +22,8 @@ const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 30) * 60_000;
 const observationDeadlineAt = observationStartedAt + observationBudgetMs;
 const simulatorInstallTimeoutMs = 120_000;
 const simulatorLaunchTimeoutMs = 120_000;
-const metroBundleTimeoutMs = 240_000;
+// A cold Intel runner can finish the real Debug graph after four minutes.
+const metroBundleTimeoutMs = 300_000;
 const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI operation deadline exceeded.")),
   observationBudgetMs);
 const stop = () => abort.abort(new Error("iOS startup observation was cancelled."));
