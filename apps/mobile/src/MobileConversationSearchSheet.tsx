@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, AppState, Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
@@ -16,7 +16,7 @@ export function MobileConversationSearchSheet({ visible, rows, additional, color
   readonly additional?: readonly MobileConversationSearchText[];
   readonly colors: { readonly surface: string; readonly ink: string; readonly muted: string; readonly border: string; readonly negative: string; readonly dark?: boolean };
   readonly locale: MobileSupportedLocale; readonly hasEarlier: boolean; readonly loadingEarlier: boolean; readonly canLoadEarlier: boolean;
-  readonly onClose: () => void; readonly onFocus: (hit: MobileConversationSearchHit) => void;
+  readonly onClose: () => void; readonly onFocus: (hit: MobileConversationSearchHit | undefined) => void;
   readonly onLoadEarlier: () => Promise<void>;
 }) {
   const [query, setQuery] = useState("");
@@ -33,14 +33,22 @@ export function MobileConversationSearchSheet({ visible, rows, additional, color
   const owner = useRef<object>({}); const busy = useRef(false);
   const callbacks = useRef({ onFocus, onClose }); callbacks.current = { onFocus, onClose };
   const insets = useSafeAreaInsets(), keyboard = useMobileKeyboardState();
+  useLayoutEffect(() => {
+    if (visible) return;
+    setQuery(""); setSelection(undefined); setFailed(false);
+  }, [visible]);
   useEffect(() => {
     const current = {}; owner.current = current;
     if (!visible) return;
     const subscription = AppState.addEventListener("change", (state) => { if (state !== "active") callbacks.current.onClose(); });
     return () => { owner.current = {}; busy.current = false; subscription.remove(); };
   }, [visible]);
-  useEffect(() => { if (visible && active) callbacks.current.onFocus(active); }, [visible, active?.itemKey, active?.sourceKey, query]);
-  const changeQuery = (text: string): void => { setQuery(text); setSelection(undefined); setFailed(false); };
+  useLayoutEffect(() => { if (visible) callbacks.current.onFocus(active); }, [visible, active?.itemKey, active?.sourceKey, query]);
+  const changeQuery = (text: string): void => {
+    if (!visible) return;
+    callbacks.current.onFocus(undefined);
+    setQuery(text); setSelection(undefined); setFailed(false);
+  };
   const move = (direction: "previous" | "next"): void => {
     const index = nextConversationSearchIndex(hits.length, activeIndex, direction);
     const hit = hits[index];

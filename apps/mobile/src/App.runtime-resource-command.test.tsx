@@ -19,6 +19,7 @@ import { PermissionMode } from "@joko/contracts";
 import type { MobileObjectiveSheetProps } from "./MobileObjectiveSheet";
 import type { MobileTaskHeader } from "./MobileTaskHeader";
 import type { MobileContextSheet } from "./MobileContextSheet";
+import type { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
 import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
 import type { MobileProviderUsageTransport } from "./mobile-account-usage";
 
@@ -59,6 +60,7 @@ let input: ComponentProps<typeof MobileComposerRichInput>;
 let palette: ComponentProps<typeof MobileRuntimeCommandPalette>;
 let header: ComponentProps<typeof MobileTaskHeader>;
 let contextSheet: ComponentProps<typeof MobileContextSheet>;
+let conversationSearch: ComponentProps<typeof MobileConversationSearchSheet>;
 let objectiveSheet: MobileObjectiveSheetProps;
 let activeObjectiveApi: MobileObjectiveApi | undefined;
 let activeCollaborationApi: MobileCollaborationApi | undefined;
@@ -200,6 +202,10 @@ beforeAll(async () => {
     has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null })
   }));
+  vi.doMock("./MobileConversationSearchSheet", () => ({ MobileConversationSearchSheet: (props: ComponentProps<typeof MobileConversationSearchSheet>) => {
+    conversationSearch = props;
+    return null;
+  } }));
   vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
   vi.doMock("./use-mobile-task-header-role", () => ({ useMobileTaskHeaderRole: () => ({ role: taskRole, failed: false, retry() {} }) }));
   vi.doMock("./MobileTaskHeader", () => ({ MobileTaskHeader: (props: ComponentProps<typeof MobileTaskHeader>) => {
@@ -344,6 +350,28 @@ it.each(["ordinary open", "manual drag", "explicit message focus"] as const)("us
     timelineList?.onContentSizeChange?.(400, 1_800);
   });
   expect(scrollTimelineToEnd.mock.calls).toEqual(opening === "ordinary open" ? [[{ animated: false }], [{ animated: false }]] : []);
+});
+
+it("retires the pending native scroll retry when the open conversation search clears its hit", async () => {
+  vi.useFakeTimers();
+  renderedState = { ...state, live: [taskUserInput("first", "first-operation", 1n, "First match"),
+    taskUserInput("second", "second-operation", 2n, "Second match")] };
+  await act(async () => root.render(taskScreen()));
+  const action = header.actions.find(item => item.id === "search")!;
+  expect(action.disabled).toBe(false);
+  await act(async () => action.onPress());
+  expect(conversationSearch.visible).toBe(true);
+  await act(async () => conversationSearch.onFocus({ itemKey: "second", sourceKey: "second" }));
+  await act(async () => vi.advanceTimersByTimeAsync(30));
+  expect(scrollTimelineToIndex).toHaveBeenCalledExactlyOnceWith({ index: 1, animated: false, viewPosition: 0.2 });
+  await act(async () => timelineList?.onScrollToIndexFailed?.({ index: 1, averageItemLength: 100 }));
+  expect(scrollTimelineToOffset).toHaveBeenCalledExactlyOnceWith({ offset: 100, animated: false });
+  await act(async () => {
+    conversationSearch.onFocus(undefined);
+    await vi.advanceTimersByTimeAsync(100);
+  });
+  expect(conversationSearch.visible).toBe(true);
+  expect(scrollTimelineToIndex).toHaveBeenCalledTimes(1);
 });
 
 it("follows the measured ordinary tail through streaming growth until the reader scrolls up", async () => {
