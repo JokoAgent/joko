@@ -213,7 +213,7 @@ interface TimelineReadingAnchor {
 }
 
 interface TimelineAnchorRestore extends TimelineReadingAnchor {
-  readonly earlierPage?: { readonly firstItemId: string; loadingObserved: boolean };
+  readonly earlierPage?: { readonly firstItemId: string; loadingObserved: boolean; merged: boolean };
   readonly historyOwnerKey?: string;
 }
 
@@ -478,6 +478,13 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     getScrollElement: () => scrollRef.current,
     estimateSize: (index) => estimateRenderHeight(renderItems[index]),
     scrollToFn: (offset, options, instance) => {
+      const earlier = restoreAnchorRef.current?.earlierPage;
+      if (options.adjustments !== undefined && earlier !== undefined
+        && (earlier.merged || !historyLoading && historyError === undefined && items[0]?.id !== earlier.firstItemId)) {
+        // Timeline aligns a measured row from its live viewport. The virtualizer
+        // may still have the scroll offset from before that alignment.
+        return;
+      }
       elementScroll(offset, options, instance);
       // Measurement corrections are our own movement, including when their
       // native scroll notification arrives after the programmatic window.
@@ -663,7 +670,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     const anchor = viewportAnchorRef.current;
     const firstItemId = itemsRef.current[0]?.id;
     if (!followingRef.current && anchor !== undefined && firstItemId !== undefined) {
-      restoreAnchorRef.current = { ...anchor, earlierPage: { firstItemId, loadingObserved: false } };
+      restoreAnchorRef.current = { ...anchor, earlierPage: { firstItemId, loadingObserved: false, merged: false } };
     }
     loadEarlierInFlightRef.current = true;
     void onLoadEarlier().catch(() => {
@@ -1049,6 +1056,19 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     else void historyDeletion.readNeighbor(neighbor.id, neighbor.sourceEventId, adopt).then(finish, finish);
   }, [focusRequest, historyDeletion, historyOwnerKey, items, messageNavRailEnabled, pageSearchOpen, partnerPresentation, setTimelineFollowing, shareSelection]);
 
+  const alignMergedHistoryPage = useCallback((node: HTMLDivElement): void => {
+    const pending = restoreAnchorRef.current;
+    if (pending?.earlierPage?.merged !== true || scrollbarDragRef.current !== undefined) return;
+    const row = [...node.querySelectorAll<HTMLElement>(MEASURED_TIMELINE_ROW)]
+      .find((candidate) => timelineRowContains(candidate, pending.itemId));
+    if (row === undefined) return;
+    const offset = row.getBoundingClientRect().top - node.getBoundingClientRect().top;
+    restoreAnchorRef.current = undefined;
+    viewportAnchorRef.current = { itemId: pending.itemId, offset: pending.offset };
+    if (Math.abs(offset - pending.offset) >= 0.5) writeScrollTop(Math.max(0, node.scrollTop + offset - pending.offset));
+    saveViewport();
+  }, [saveViewport, writeScrollTop]);
+
   useLayoutEffect(() => {
     const desired = restoreAnchorRef.current;
     const node = scrollRef.current;
@@ -1056,7 +1076,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     const pendingInitialHistory = desired.historyOwnerKey !== undefined;
     if (items.length === 0 && !pendingInitialHistory) return;
     const earlierPage = desired.earlierPage;
-    if (earlierPage !== undefined) {
+    if (earlierPage !== undefined && !earlierPage.merged) {
       if (historyLoading) {
         earlierPage.loadingObserved = true;
         return;
@@ -1067,7 +1087,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
         if (earlierPage.loadingObserved || previousFirstIndex < 0) restoreAnchorRef.current = undefined;
         return;
       }
-      restoreAnchorRef.current = { itemId: desired.itemId, offset: desired.offset };
+      earlierPage.merged = true;
     }
     const sameHistory = !pendingInitialHistory || desired.historyOwnerKey === historyOwnerKey;
     const index = sameHistory ? findTimelineRenderItemIndex(renderItems, desired.itemId) : -1;
@@ -1081,7 +1101,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
       }
       return;
     }
-    const row = [...node.querySelectorAll<HTMLElement>("[data-timeline-item-id]")].find((candidate) => timelineRowContains(candidate, desired.itemId));
+    const row = [...node.querySelectorAll<HTMLElement>(MEASURED_TIMELINE_ROW)].find((candidate) => timelineRowContains(candidate, desired.itemId));
     if (row === undefined) {
       programmaticScrollUntilRef.current = performance.now() + 100;
       positionVirtualRow(index, "start");
@@ -1089,11 +1109,25 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     }
     const currentOffset = row.getBoundingClientRect().top - node.getBoundingClientRect().top;
     const nextScrollTop = Math.max(0, node.scrollTop + currentOffset - desired.offset);
+    if (earlierPage !== undefined) {
+      if (Math.abs(nextScrollTop - node.scrollTop) >= 0.5) writeScrollTop(nextScrollTop);
+      const owner = navigationOwnerRef.current;
+      const generation = navigationGenerationRef.current;
+      if (navigationFrameRef.current !== undefined) cancelAnimationFrame(navigationFrameRef.current);
+      navigationFrameRef.current = requestAnimationFrame(() => {
+        navigationFrameRef.current = undefined;
+        if (navigationDocumentActiveRef.current && navigationOwnerRef.current === owner
+          && navigationGenerationRef.current === generation && scrollRef.current === node && restoreAnchorRef.current === desired) {
+          alignMergedHistoryPage(node);
+        }
+      });
+      return;
+    }
     restoreAnchorRef.current = undefined;
     viewportAnchorRef.current = desired;
     if (Math.abs(nextScrollTop - node.scrollTop) >= 0.5) writeScrollTop(nextScrollTop);
     else captureViewportAnchor();
-  }, [captureViewportAnchor, historyError, historyLoading, historyOwnerKey, items, positionVirtualRow, renderItems, renderedRowsKey, saveViewport, viewportOwnerKey, writeScrollTop]);
+  }, [alignMergedHistoryPage, captureViewportAnchor, historyError, historyLoading, historyOwnerKey, items, positionVirtualRow, renderItems, renderedRowsKey, saveViewport, viewportOwnerKey, writeScrollTop]);
 
   useLayoutEffect(() => {
     if (focusRequest === undefined) {
@@ -1179,6 +1213,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
           saveViewport();
           return;
         }
+        if (restoreAnchorRef.current?.earlierPage?.merged === true) {
+          alignMergedHistoryPage(node);
+          return;
+        }
         const anchor = viewportAnchorRef.current;
         let anchorOffsetDelta = 0;
         if (!followingRef.current && anchor !== undefined) {
@@ -1211,7 +1249,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
       if (frame !== undefined) cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [captureViewportAnchor, getWorkGroupAnchor, measuredRowsKey, ownerKey, saveViewport, sessionId, writeScrollTop]);
+  }, [alignMergedHistoryPage, captureViewportAnchor, getWorkGroupAnchor, measuredRowsKey, ownerKey, saveViewport, sessionId, writeScrollTop]);
 
   useEffect(() => () => {
     if (viewportOwnerRef.current !== viewportOwnerKey) return;
@@ -1229,7 +1267,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   }, [hasEarlier, historyError, historyLoading, items.length, requestEarlier]);
 
   useEffect(() => {
-    if (!historyLoading && (historyError !== undefined || !hasEarlier) && restoreAnchorRef.current?.earlierPage !== undefined) {
+    const earlierPage = restoreAnchorRef.current?.earlierPage;
+    if (!historyLoading && (historyError !== undefined || !hasEarlier) && earlierPage !== undefined && !earlierPage.merged) {
       restoreAnchorRef.current = undefined;
     }
   }, [hasEarlier, historyError, historyLoading]);
@@ -1246,7 +1285,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     }
     const scrollDelta = currentScrollTop - previousScrollTopRef.current;
     previousScrollTopRef.current = currentScrollTop;
-    if (getWorkGroupAnchor(node) !== undefined || performance.now() < programmaticScrollUntilRef.current) {
+    if (getWorkGroupAnchor(node) !== undefined || performance.now() < programmaticScrollUntilRef.current
+      || scrollDelta === 0 && !followingRef.current && viewportAnchorRef.current !== undefined) {
       if (followingRef.current || viewportAnchorRef.current === undefined) captureViewportAnchor();
       saveViewport();
       return;
@@ -1297,6 +1337,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     if (nestedCanScroll(node, target)) return;
     deletionReadingRequestRef.current = undefined;
     retireWorkGroupAnchorForScroll();
+    if (restoreAnchorRef.current?.earlierPage !== undefined) programmaticScrollUntilRef.current = 0;
     if (deltaY < 0) {
       if (followingRef.current && shouldUnpinTimelineOnWheel({ deltaX, deltaY, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight })) setTimelineFollowing(false);
       if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: node.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
