@@ -11,6 +11,8 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { NodeIdentity } from "./network";
 import { mobilePiHistoryRetired, retainMobileHistoryPrefix } from "./mobile-history-continuity";
+import type { MobileHomeStatusFilter } from "./home-navigation";
+import { timelineRows } from "./timeline";
 
 export interface MobileOfflineCacheStorage {
   getItem(key: string): Promise<string | null>;
@@ -172,6 +174,56 @@ export class MobileOfflineCache {
       }
     });
     return waitForCacheRead(load, signal);
+  }
+
+  searchPreviews(profile: MobileConnectionProfile, owner: Snapshot, query: string, filter: MobileHomeStatusFilter,
+    signal: AbortSignal): Promise<string[]> {
+    assertIdentity(profile);
+    const profileId = profile.profileId;
+    const epoch = this.#epoch(profileId);
+    const normalize = (text: string) => text.trim().replace(/\s+/gu, " ").toLocaleLowerCase();
+    const needle = normalize(query);
+    if (!needle) return Promise.resolve([]);
+    const visible = new Map(owner.sessions.filter(session => !session.hidden && !session.derivationOrigin?.sideChat && !session.automationOrigin
+      && (filter === "all" || session.archived === (filter === "archived"))).map(session => [session.sessionId, session] as const));
+    const taskEpochs = new Map([...visible.keys()].map(id => [id, this.#timelineEpoch(profileId, id)] as const));
+    const current = (id: string) => !signal.aborted && this.#epoch(profileId) === epoch
+      && taskEpochs.get(id) === this.#timelineEpoch(profileId, id) && !this.#unavailableTimelines.get(profileId)?.has(id);
+    const read = (key: string) => {
+      signal.throwIfAborted();
+      return waitForCacheRead(this.storage.getItem(key), signal);
+    };
+    const search = this.#serialized(profileId, async () => {
+      if (await read(tombstoneKey(profileId)) !== null) return [];
+      const raw = await read(manifestKey(profileId));
+      if (raw === null) return [];
+      const manifest = readManifest(raw, profile);
+      const cachedOwner = readSnapshot(manifest.owner, "owner snapshot");
+      assertOwnerSnapshot(profile, manifest.node, cachedOwner);
+      assertOwnerSnapshot(profile, manifest.node, owner);
+      const matches: string[] = [];
+      for (const entry of manifest.details) {
+        const session = visible.get(entry.sessionId);
+        if (!session || !current(entry.sessionId)) continue;
+        try {
+          const stored = await read(entry.key);
+          if (stored === null || utf8Size(stored, maximumDetailBytes, "offline task record") !== entry.size) continue;
+          const record = readDetail(stored, profile, entry);
+          const detail = readSnapshot(record.snapshot, "task snapshot");
+          assertDetailSnapshot(cachedOwner, entry.sessionId, detail);
+          assertDetailSnapshot(owner, entry.sessionId, detail);
+          const source = detail.sessions[0]!;
+          if (detail.generation !== owner.generation || source.nativeBinding!.runtimeGeneration.toString(10) !== record.sessionGeneration
+            || source.nativeBinding!.opaqueReference !== session.nativeBinding?.opaqueReference
+            || source.activeNativeEntryId !== session.activeNativeEntryId) continue;
+          const preview = timelineRows(detail.timeline).findLast(row => row.completed && !row.internalInput && !row.partnerPrivateOrigin
+            && (row.kind === "user" || row.kind === "assistant") && !!row.text.trim())?.text;
+          if (preview && normalize(preview).includes(needle)) matches.push(entry.sessionId);
+        } catch { signal.throwIfAborted(); }
+      }
+      return matches.filter(current);
+    });
+    return waitForCacheRead(search, signal);
   }
 
   save(

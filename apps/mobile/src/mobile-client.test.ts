@@ -2090,7 +2090,7 @@ function client(
   pdfPreviewFiles?: MobilePdfPreviewFiles,
   modelPreviewFiles?: MobileModelPreviewFiles,
   fileShare?: Pick<MobileFileShare, "perform">,
-  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
+  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline" | "searchPreviews">,
   readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> },
   deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android"),
   creationReceipts?: MobilePartnerCreationReceipts,
@@ -2107,7 +2107,7 @@ function client(
 function clientWithOfflineCache(
   network: MobileNetwork,
   storage: MobileStorage,
-  offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
+  offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline" | "searchPreviews">,
   now: () => number = () => 2_000,
   newId?: () => string
 ) {
@@ -6034,7 +6034,7 @@ describe("native mobile connection and operation ownership", () => {
       save: vi.fn()
         .mockResolvedValueOnce(undefined)
         .mockRejectedValueOnce(new Error("offline storage full")),
-      clear: vi.fn(async () => undefined), retireTaskTimeline: vi.fn(async () => undefined)
+      clear: vi.fn(async () => undefined), retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const network = fakeNetwork();
     network.readOwner = vi.fn(async (current) => current.profileId === otherCredential.profileId
@@ -6061,7 +6061,8 @@ describe("native mobile connection and operation ownership", () => {
     const offlineCache = {
       load: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
-      clear: vi.fn(() => new Promise<void>((resolve) => { releaseClear = resolve; })), retireTaskTimeline: vi.fn(async () => undefined)
+      clear: vi.fn(() => new Promise<void>((resolve) => { releaseClear = resolve; })), retireTaskTimeline: vi.fn(async () => undefined),
+      searchPreviews: vi.fn(async () => [])
     };
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
@@ -6090,7 +6091,7 @@ describe("native mobile connection and operation ownership", () => {
       load: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
       clear: vi.fn(async () => undefined),
-      retireTaskTimeline: vi.fn(async () => undefined)
+      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const firstNetwork = fakeNetwork();
     const firstSaved = memoryStorage(credential);
@@ -6530,7 +6531,7 @@ describe("native mobile connection and operation ownership", () => {
     const saved = memoryStorage(credential);
     const offlineCache = {
       load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
-      retireTaskTimeline: vi.fn(async () => undefined)
+      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -6553,7 +6554,7 @@ describe("native mobile connection and operation ownership", () => {
     const saved = memoryStorage(credential);
     const offlineCache = {
       load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
-      retireTaskTimeline: vi.fn(async () => undefined)
+      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -6583,7 +6584,7 @@ describe("native mobile connection and operation ownership", () => {
     const saved = memoryStorage([credential, otherCredential], credential.profileId);
     const offlineCache = {
       load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
-      retireTaskTimeline: vi.fn(async () => undefined)
+      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -8699,6 +8700,51 @@ describe("mobile Home search and task mutations", () => {
     await search;
     expect(app.state.homeSearchMatches).toEqual(sameRevision ? [{ sessionId: "session", eventId: "matching-message" }] : []);
   });
+
+  it.each(["offline", "search unavailable", "permission denied", "branch changed"] as const)(
+    "finds only current, authorized saved Home previews (%s)", async (condition) => {
+      const { owner, detail, identity, input } = historyRetirementFixture(true);
+      const profile = profileFromCredential(credential);
+      const originalSession = owner.sessions[0]!;
+      const hidden = create(SessionSchema, { ...originalSession, sessionId: "hidden", hidden: true });
+      const archived = create(SessionSchema, { ...originalSession, sessionId: "archived", archived: true });
+      const catalog = create(SnapshotSchema, { ...owner, sessions: [originalSession, hidden, archived] });
+      const network = projectedNetwork(catalog);
+      const saved = memoryStorage(credential), offline = memoryOfflineCache();
+      const preview = "A short durable preview for this task";
+      for (const session of catalog.sessions) {
+        const row = input(`${session.sessionId}-preview`, 8n, preview);
+        row.identity = create(EventIdentitySchema, { ...identity, sessionId: session.sessionId });
+        const scoped = create(SnapshotSchema, { ...detail, sessions: [session], timeline: [row],
+          scope: create(SnapshotScopeSchema, { kind: { case: "session",
+            value: create(SessionSnapshotScopeSchema, { sessionId: session.sessionId, recentTimelineItems: 120 }) } }) });
+        await offline.cache.save(profile, node, catalog, scoped);
+        if (session === originalSession) vi.mocked(network.readSession).mockResolvedValue(scoped);
+      }
+      if (condition === "offline") vi.mocked(network.inspect).mockRejectedValue(new Error("radio unavailable"));
+      const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+      await app.start();
+      expect(app.state.status).toBe(condition === "offline" ? "offline" : "connected");
+      if (condition === "branch changed") {
+        // A new Owner leaf alone already prevents the old saved preview from
+        // authorizing a match, even before this task's detail is refreshed.
+        const current = create(SnapshotSchema, { ...catalog, sessions: [
+          create(SessionSchema, { ...originalSession, activeNativeEntryId: "different-leaf" }), hidden, archived
+        ] });
+        vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: current });
+        await app.select(undefined);
+      }
+      vi.mocked(network.searchSessionMessages).mockRejectedValue(condition === "permission denied"
+        ? new ConnectError("Permission denied", Code.PermissionDenied) : new Error("search unavailable"));
+      await app.searchHome("durable preview", "active");
+      expect(app.state.homeSearchMatches).toEqual(condition === "offline" || condition === "search unavailable"
+        ? [{ sessionId: originalSession.sessionId }] : []);
+      if (condition === "offline") {
+        expect(network.searchSessionMessages).not.toHaveBeenCalled();
+        await app.searchHome("durable preview", "archived");
+        expect(app.state.homeSearchMatches).toEqual([{ sessionId: archived.sessionId }]);
+      }
+    });
 
   it.each(["search", "page", "anchor"] as const)("retires the original profile and its offline history when %s observes revocation", async (read) => {
     const owner = create(SnapshotSchema, { ...runtimeControlProjection(),

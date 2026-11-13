@@ -6,7 +6,7 @@ export type MobileHomeSearchSort = "relevance" | "activityDesc" | "activityAsc";
 
 export interface MobileHomeSearchMatch {
   readonly sessionId: string;
-  readonly eventId: string;
+  readonly eventId?: string;
 }
 
 export interface MobileHomeSessionItem {

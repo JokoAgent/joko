@@ -1124,7 +1124,7 @@ export class MobileClient {
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
-    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline">,
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline" | "searchPreviews">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
     filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
     private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform),
@@ -6217,7 +6217,9 @@ export class MobileClient {
     const owner = this.#state.owner;
     const profileId = this.#activeProfileId;
     const epoch = this.#epoch;
-    if (!credential || !owner || !profileId || this.#state.status !== "connected" || !this.#foreground) {
+    const status = this.#state.status;
+    if (!owner || !profileId || this.#joinedTask || !this.#foreground
+      || (status !== "connected" && status !== "offline") || status === "connected" && !credential) {
       this.#set({ homeSearchQuery: normalized, homeSearchFilter: statusFilter, homeSearchStatus: "error",
         homeSearchMatches: [], homeSearchError: "Reconnect to search task messages." });
       return;
@@ -6228,14 +6230,29 @@ export class MobileClient {
       homeSearchMatches: [], homeSearchError: undefined });
     const currentSearch = (): boolean => {
       if (controller.signal.aborted || generation !== this.#homeSearchEpoch || !this.#current(epoch)
-        || credential !== this.#credential || profileId !== this.#activeProfileId || this.#state.status !== "connected"
+        || credential !== this.#credential || profileId !== this.#activeProfileId || this.#state.status !== status
         || this.#state.homeSearchQuery !== normalized || this.#state.homeSearchFilter !== statusFilter) return false;
       const current = this.#state.owner;
       return current === owner || (current !== undefined && current.generation === owner.generation
         && owner.revision !== undefined && current.revision?.value === owner.revision.value
         && current.resumeCursor?.generation === owner.resumeCursor?.generation && current.resumeCursor?.sequence === owner.resumeCursor?.sequence);
     };
+    const savedPreviews = async (reason: string): Promise<void> => {
+      const profile = this.#profiles.find(item => item.profileId === profileId);
+      let sessions: readonly string[] = [];
+      try {
+        if (profile && currentSearch()) sessions = await this.offlineCache?.searchPreviews(profile, owner, normalized,
+          statusFilter, controller.signal) ?? [];
+      } catch { /* Keep the original search failure if the saved copy cannot be used. */ }
+      if (!currentSearch()) return;
+      this.#set(sessions.length ? { homeSearchStatus: "ready", homeSearchMatches: sessions.map(sessionId => ({ sessionId })),
+        homeSearchError: undefined } : { homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: reason });
+    };
     try {
+      if (status === "offline" || !credential) {
+        await savedPreviews("Reconnect to search task messages.");
+        return;
+      }
       const matches = await this.network.searchSessionMessages(
         credential,
         normalized,
@@ -6252,9 +6269,13 @@ export class MobileClient {
       }
       this.#set({ homeSearchStatus: "ready", homeSearchMatches: [...firstBySession.values()], homeSearchError: undefined });
     } catch (error) {
-      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
+      if (credential && await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (!currentSearch()) return;
-      this.#set({ homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: message(error) });
+      if (isEndpointTrustError(error)) {
+        await this.#identityConflict(epoch, profileId, message(error));
+      } else if ((error as { code?: number })?.code === Code.PermissionDenied) {
+        this.#set({ homeSearchStatus: "error", homeSearchMatches: [], homeSearchError: message(error) });
+      } else await savedPreviews(message(error));
     } finally {
       if (this.#homeSearchAbort === controller) this.#homeSearchAbort = undefined;
     }
