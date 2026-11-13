@@ -321,6 +321,7 @@ interface RunSilenceWatchdog {
 interface PendingDispatchAcceptance {
   settlement?: "completed" | "aborted" | "failed";
   learningSettlement?: PartnerLearningTurnRecord;
+  openPlanReview?: () => void;
 }
 
 export interface PartnerLearningHostPort {
@@ -2773,7 +2774,7 @@ export class SessionHost {
       throw new SessionRuntimeControlError("INVALID_ARGS", "At least one runtime selection axis is required.");
     }
     if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer runtime settings are immutable.");
-    this.#dismissPendingInteractions(
+    const dismissedPlanReviews = this.#dismissPendingInteractions(
       new Set([sessionId]),
       "Execution policy changed while the interaction was pending."
     );
@@ -2852,6 +2853,8 @@ export class SessionHost {
       this.#clearSessionRuntimeRecovery(sessionId);
       this.#publishSessionRuntimeControlChanged(this.#store.getSession(sessionId));
       return observed;
+    }).finally(() => {
+      if (dismissedPlanReviews.has(sessionId)) this.wakeQueueAfterPlanReview(sessionId);
     });
   }
 
@@ -5279,7 +5282,7 @@ export class SessionHost {
     this.#assertOpen();
     const sessionIds = new Set(this.#store.listSessions({ includeArchived: true, includeDeleted: true })
       .map((session) => session.descriptor.id));
-    this.#dismissPendingInteractions(
+    const dismissedPlanReviews = this.#dismissPendingInteractions(
       sessionIds,
       "Ordered policy settings changed while the interaction was pending."
     );
@@ -5293,6 +5296,7 @@ export class SessionHost {
         this.recordFailure(`policy_settings_reconciliation:${adapter.id}`, error);
       }
     }
+    for (const sessionId of dismissedPlanReviews) this.wakeQueueAfterPlanReview(sessionId);
   }
 
   sideChatSourceAllowed(sessionId: string): boolean {
@@ -7191,13 +7195,14 @@ export class SessionHost {
         "The selected Backend does not support task plan mode changes."
       );
     }
-    this.#dismissPendingInteractions(
+    const dismissedPlanReviews = this.#dismissPendingInteractions(
       new Set([sessionId]),
       "Execution policy changed while the interaction was pending."
     );
-    const active = await this.activate(sessionId);
-    const lease = this.beginActiveBackendSideEffect(sessionId, active);
+    let lease: ActiveBackendSideEffectLease | undefined;
     try {
+      const active = await this.activate(sessionId);
+      lease = this.beginActiveBackendSideEffect(sessionId, active);
       const currentBackend = this.#store.getBackend(lease.backendId).descriptor;
       if (currentBackend.instanceGeneration !== backend.instanceGeneration) {
         throw new StoreError("The Backend process instance changed while task settings were being admitted.");
@@ -7237,7 +7242,8 @@ export class SessionHost {
       this.assertActiveBackendSideEffectLease(lease);
       return undefined;
     } finally {
-      lease.release();
+      lease?.release();
+      if (dismissedPlanReviews.has(sessionId)) this.wakeQueueAfterPlanReview(sessionId);
     }
   }
 
@@ -10540,13 +10546,12 @@ export class SessionHost {
         recovery: "Refresh the task before responding to another interaction."
       });
     }
-    let continuation: EnqueueResult | undefined;
-    this.#store.transaction((store) => {
+    const continuation = this.#store.transaction((store) => {
       store.resolveInteraction(id, generation, decision, traceId, operationId);
       if (decision.kind === "plan_review" && decision.decision === "execute") {
         store.updateSession(interaction.sessionId, { planMode: false });
       }
-      continuation = this.commitPostTurnPlanReviewContinuation(store, interaction, decision);
+      return this.commitPostTurnPlanReviewContinuation(store, interaction, decision);
     });
     this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
     if (pending?.generation === generation) {
@@ -10561,13 +10566,12 @@ export class SessionHost {
         "Plan mode ended after the approved plan was scheduled for execution."
       );
     }
-    if (continuation !== undefined) {
-      queueMicrotask(() => void this.drain(continuation!.sessionId));
-    }
+    if (this.isLocalCodexPlanReview(interaction)) this.wakeQueueAfterPlanReview(interaction.sessionId);
+    else if (continuation !== undefined) queueMicrotask(() => void this.drain(continuation.sessionId));
   }
 
   /**
-   * A plan review opened after its source Run settled cannot resume an
+   * A plan review for a settled source Run cannot resume an
    * in-flight native callback. Admit its execute/refine consequence as a new
    * deterministic child Run in the same transaction that resolves the
    * Interaction, so a restart can never retain the decision without its
@@ -10673,6 +10677,50 @@ export class SessionHost {
       pending.resolve({ kind: "cancelled" });
     }
     this.refreshRunSilenceWatchdog(interaction.sessionId);
+    if (this.isLocalCodexPlanReview(interaction)) this.wakeQueueAfterPlanReview(interaction.sessionId);
+  }
+
+  private wakeQueueAfterPlanReview(sessionId: string): void {
+    queueMicrotask(() => {
+      // A user can answer as soon as the Store publishes the review. Wait
+      // for an existing dispatcher to leave before attempting a fresh drain.
+      const settling = this.#drainSettlements.get(sessionId);
+      void Promise.resolve(settling).then(() => {
+        if (!this.#disposed) return this.drain(sessionId);
+      }).catch((error: unknown) => this.recordFailure("plan-review-queue", error));
+    });
+  }
+
+  private isLocalCodexPlanReview(interaction: InteractionRecord): boolean {
+    if (interaction.kind !== "plan_review" || interaction.runId === undefined) return false;
+    const stored = this.#store.getSession(interaction.sessionId);
+    return stored.descriptor.binding.generation === interaction.generation
+      && this.isLocalCodexPlanRun(stored, interaction.runId);
+  }
+
+  private isLocalCodexPlanRun(stored: StoredSession, runId: string): boolean {
+    const session = stored.descriptor;
+    if (this.#store.getBackend(session.backendId).descriptor.adapterKind !== "codex"
+      || session.remoteWorkspace !== undefined
+      || this.#store.getTarget(session.targetId).descriptor.remoteWorkspace !== undefined
+      || session.automationOrigin !== undefined || session.derivationOrigin?.sideChat === true
+      || session.hidden || session.archived || session.deletedAt !== undefined
+      || this.#store.sessionCreationServiceKind(session.id) !== undefined
+      || this.#partnerSessionPolicy(session.id) !== undefined
+      || this.#store.findSessionRuntimePolicy(session.id) !== undefined) return false;
+    const run = this.#store.findRun(runId)?.descriptor;
+    if (run?.source !== "user" || run.parentRunId !== undefined) return false;
+    const queue = this.#store.findQueueItemByRunId(session.id, runId, { includeCleared: true });
+    return queue !== undefined && queue.disposition === "prompt" && queue.body.messagingOrigin === undefined
+      && queue.body.automaticContinuation === undefined && queue.body.objectiveContinuation === undefined
+      && !hasTurnOverrides(queue.executionOverrides);
+  }
+
+  private localCodexPlanReviewBlocksDispatch(stored: StoredSession): boolean {
+    if (this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind !== "codex") return false;
+    return listAllInteractions(this.#store, {
+      sessionId: stored.descriptor.id, status: "open", kinds: ["plan_review"]
+    }).some((interaction) => this.isLocalCodexPlanReview(interaction));
   }
 
   fencePendingInteractionsForTarget(targetId: string, reason: string): void {
@@ -10683,8 +10731,9 @@ export class SessionHost {
     this.#dismissPendingInteractions(sessionIds, reason);
   }
 
-  #dismissPendingInteractions(sessionIds: ReadonlySet<string>, reason: string): void {
-    if (sessionIds.size === 0) return;
+  #dismissPendingInteractions(sessionIds: ReadonlySet<string>, reason: string): ReadonlySet<string> {
+    const dismissedPlanReviews = new Set<string>();
+    if (sessionIds.size === 0) return dismissedPlanReviews;
     const open = listAllInteractions(this.#store, { status: "open" })
       .filter((interaction) => sessionIds.has(interaction.sessionId));
     for (const interaction of open) {
@@ -10696,6 +10745,7 @@ export class SessionHost {
           `interaction-policy:${interaction.id}`
         );
         this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
+        if (this.isLocalCodexPlanReview(interaction)) dismissedPlanReviews.add(interaction.sessionId);
       } catch (error) {
         // A newer native binding already fences this interaction in the
         // durable store. Still release any in-memory waiter so a stale bridge
@@ -10710,6 +10760,7 @@ export class SessionHost {
       }
     }
     for (const sessionId of sessionIds) this.refreshRunSilenceWatchdog(sessionId);
+    return dismissedPlanReviews;
   }
 
   /**
@@ -10752,10 +10803,11 @@ export class SessionHost {
     this.deleteActiveSession(input.sessionId);
     this.#nativeCompactions.delete(input.sessionId);
     this.clearTurnOverrideLeases(input.sessionId);
-    this.#dismissPendingInteractions(
+    const dismissedPlanReviews = this.#dismissPendingInteractions(
       new Set([input.sessionId]),
       "Backend runtime exited while the interaction was pending."
     );
+    if (dismissedPlanReviews.has(input.sessionId)) this.wakeQueueAfterPlanReview(input.sessionId);
     if (this.isReviewReadOnlySession(input.sessionId)) {
       this.#reviewRuntimeFlights.get(input.sessionId)?.rejectAcceptance(
         new StoreError("Reviewer Backend exited before acceptance.")
@@ -14383,6 +14435,7 @@ export class SessionHost {
         if (this.#store.getQueueControl(sessionId).paused) return;
         let pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
         if (pending === undefined) return;
+        if (this.localCodexPlanReviewBlocksDispatch(this.#store.getSession(sessionId))) return;
         if (this.#store.findMessagingInboundRequestByRunId(pending.runId)?.protectedContent === true
           && !this.#protectedMessagingPrompts.has(pending.id)) {
           this.#failExpiredApplicationInput(pending, protectedMessagingInputExpired().publicError);
@@ -14483,6 +14536,7 @@ export class SessionHost {
         if (!bypassesCompaction && this.compactionBlocksDispatch(sessionId)) return;
         const claimSession = this.#store.getSession(sessionId);
         if (this.#backendDispatchBlocked(claimSession.descriptor.backendId)) return;
+        if (this.localCodexPlanReviewBlocksDispatch(claimSession)) return;
         const authenticationFailure = this.queueProviderAuthenticationFailure(pending, claimSession);
         if (authenticationFailure !== undefined) {
           this.failQueueItemForAuthentication(pending, authenticationFailure);
@@ -14878,7 +14932,8 @@ export class SessionHost {
                 this.reviewRuntimeOutcome(sessionId, pendingAcceptance.settlement)
               );
             } else {
-              await this.finishSettledSession(sessionId, pendingAcceptance.settlement, run.descriptor.id, pendingAcceptance.learningSettlement);
+              await this.finishSettledSession(sessionId, pendingAcceptance.settlement, run.descriptor.id,
+                pendingAcceptance.learningSettlement, pendingAcceptance.openPlanReview);
             }
           }
         } catch (error) {
@@ -15184,6 +15239,7 @@ export class SessionHost {
     } catch (error) { if (!(error instanceof NotFoundError && error.resource === "Session")) throw error; }
     const signal = new AbortController().signal;
     const backend = this.#store.getBackend(target.backendId).descriptor;
+    let openCompletedPlanReview: (() => void) | undefined;
     const backendInstanceGeneration = backendInstanceGenerationOverride ??
       this.#active.get(sessionId)?.backendInstanceGeneration ??
       backend.instanceGeneration;
@@ -15321,6 +15377,23 @@ export class SessionHost {
             if (before !== "backend_accepted") return "retired";
             const observed = await this.synchronizeNativeHistory(sessionId, {}, { runId, attemptId, nativeTurnId });
             return state() === "backend_accepted" ? observed : "retired";
+          }
+        } : {}),
+      ...(backend.adapterKind === "codex" && runtimePolicy === undefined && nativeBackgroundTaskId === undefined
+        && runId !== undefined && attemptId !== undefined && this.isLocalCodexPlanRun(this.#store.getSession(sessionId), runId) ? {
+          registerCompletedPlanReview: (open: () => void) => {
+            openCompletedPlanReview ??= () => {
+              const stored = this.#store.getSession(sessionId);
+              const session = stored.descriptor;
+              const run = this.#store.findRun(runId)?.descriptor;
+              const queue = this.#store.findQueueItemByRunId(sessionId, runId);
+              if (!this.#disposed && session.backendId === target.backendId
+                && session.binding.generation === generation && session.binding.opaqueRef === binding?.opaqueRef
+                && this.#store.getBackend(target.backendId).descriptor.instanceGeneration === backendInstanceGeneration
+                && run?.activeAttemptId === attemptId && queue?.attemptId === attemptId
+                && queue.state === "backend_accepted" && queue.backendInstanceGeneration === backendInstanceGeneration
+                && this.isLocalCodexPlanRun(stored, runId)) open();
+            };
           }
         } : {}),
       ...(this.#partnerLearning === undefined || runtimePolicy === "review_read_only" || runId === undefined || attemptId === undefined
@@ -15551,11 +15624,15 @@ export class SessionHost {
           }
           if (payload.type === "done") {
             this.clearRunSilenceWatchdog(sessionId);
+            const openPlanReview = payload.outcome === "completed" ? openCompletedPlanReview : undefined;
+            openCompletedPlanReview = undefined;
             const pendingAcceptance = runId === undefined ? undefined : this.#pendingDispatchAcceptances.get(runId);
-            if (pendingAcceptance === undefined) await this.finishSettledSession(sessionId, payload.outcome, runId, learningTurn);
-            else {
+            if (pendingAcceptance === undefined) {
+              await this.finishSettledSession(sessionId, payload.outcome, runId, learningTurn, openPlanReview);
+            } else {
               pendingAcceptance.settlement ??= payload.outcome;
               pendingAcceptance.learningSettlement ??= learningTurn;
+              pendingAcceptance.openPlanReview ??= openPlanReview;
             }
           }
           else if (payload.type === "retry" && !isTerminalRetryState(payload.state) && runId !== undefined) {
@@ -16293,7 +16370,7 @@ export class SessionHost {
     }
     validateInteractionRequestDeclaration(interaction);
     this.touchActiveSession(sessionId);
-    this.#store.openInteraction({
+    const input = {
       sessionId,
       ...(runId === undefined ? {} : { runId }),
       ...(attemptId === undefined ? {} : { attemptId }),
@@ -16301,7 +16378,13 @@ export class SessionHost {
       generation,
       payload: interaction,
       traceId: `interaction:${interaction.id}`
-    });
+    };
+    if (interaction.kind === "plan_review" && runId !== undefined
+      && this.isLocalCodexPlanRun(this.#store.getSession(sessionId), runId)) {
+      // The Run may be settling in an outer transaction. Roll back a failed
+      // opening to its savepoint while still committing the completed Run.
+      this.#store.transaction((store) => store.openInteraction(input));
+    } else this.#store.openInteraction(input);
     return new Promise((resolvePromise) => {
       const timeoutMs = timedExtensionInteractionTimeout(interaction);
       const pending: PendingInteraction = {
@@ -16386,6 +16469,7 @@ export class SessionHost {
           `interaction-backend-cancelled:${id}`
         );
         this.notifyServiceInteractionSettled(interaction.sessionId, interaction.id);
+        if (this.isLocalCodexPlanReview(interaction)) this.wakeQueueAfterPlanReview(interaction.sessionId);
       }
     } catch (error) {
       if (!(error instanceof StaleGenerationError)) this.recordFailure("interaction_backend_cancel", error);
@@ -16425,7 +16509,8 @@ export class SessionHost {
     sessionId: string,
     outcome: "completed" | "aborted" | "failed",
     settledRunId?: string,
-    learningTurn?: PartnerLearningTurnRecord
+    learningTurn?: PartnerLearningTurnRecord,
+    openPlanReview?: () => void
   ): Promise<void> {
     this.clearRunSilenceWatchdog(sessionId);
     this.#providerGroups?.service.turnSettled(sessionId, outcome === "completed");
@@ -16468,7 +16553,7 @@ export class SessionHost {
         ? this.#scheduleRunNotifications?.settle(run.descriptor.id, state)
         : undefined;
       const groupRecovery = error !== undefined && this.#providerGroupMayHandleRun(sessionId, run.descriptor.id, error);
-      this.#store.updateRunState({
+      const runUpdate: Parameters<OperationalStore["updateRunState"]>[0] = {
         runId: run.descriptor.id,
         state,
         ...(error === undefined ? {} : { error }),
@@ -16476,7 +16561,27 @@ export class SessionHost {
         ...(groupRecovery ? { holdTerminalAttention: true } : {}),
         ...(scheduleAttention?.markHistoryRead === true ? { markScheduleRunRead: true } : {}),
         traceId: `settled:${run.descriptor.id}`
-      });
+      };
+      const settleInput = (store: OperationalStore): void => {
+        if (run.descriptor.activeAttemptId !== undefined) store.finishAttempt(run.descriptor.activeAttemptId, error);
+        for (const item of listAllQueueItems(store, { sessionId, states: ["backend_accepted"] })
+          .filter((item) => item.runId === run.descriptor.id)) {
+          store.updateQueueState({ queueItemId: item.id,
+            state: state === "completed" ? "completed" : state === "aborted" ? "cancelled" : "failed",
+            ...(error === undefined ? {} : { error }), traceId: `settled:${item.id}` });
+        }
+        removeNativeDispatchRecoveryEntry(store, sessionId, run.descriptor.id);
+      };
+      const planReviewSettlesWithRun = state === "completed" && openPlanReview !== undefined && run.descriptor.id === settledRunId;
+      if (planReviewSettlesWithRun) {
+        // Subscribers see the completed source and its pending review together.
+        // The original Run continues to hold the Queue during native settling.
+        this.#store.transaction((store) => {
+          store.updateRunState(runUpdate);
+          openPlanReview();
+          settleInput(store);
+        });
+      } else this.#store.updateRunState(runUpdate);
       if (run.descriptor.source === "schedule") {
         this.#store.finalizeScheduleRunUsage(
           run.descriptor.id,
@@ -16489,12 +16594,7 @@ export class SessionHost {
         this.#store.deleteSetting("session", sessionId, `provider.group-error:${run.descriptor.id}`);
         if (this.#providerGroupWaits.get(sessionId)?.runId === run.descriptor.id) this.#cancelProviderGroupWait(sessionId);
       }
-      if (run.descriptor.activeAttemptId !== undefined) this.#store.finishAttempt(run.descriptor.activeAttemptId, error);
-      for (const item of listAllQueueItems(this.#store, { sessionId, states: ["backend_accepted"] })
-        .filter((item) => item.runId === run.descriptor.id)) {
-        this.#store.updateQueueState({ queueItemId: item.id, state: state === "completed" ? "completed" : state === "aborted" ? "cancelled" : "failed", ...(error === undefined ? {} : { error }), traceId: `settled:${item.id}` });
-      }
-      removeNativeDispatchRecoveryEntry(this.#store, sessionId, run.descriptor.id);
+      if (!planReviewSettlesWithRun) settleInput(this.#store);
       await this.restoreTurnOverrideLease(run.descriptor.id);
       if (this.#workspaceCapture !== undefined) {
         const session = this.#store.getSession(sessionId);

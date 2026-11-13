@@ -4726,9 +4726,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               : undefined;
             const events = yieldResolution?.events ?? translatedEvents;
             logicalTerminal = yieldResolution?.logicalTerminal ?? false;
+            const plan = yieldResolution?.plan;
+            const schedulePlanReview = this.#registerPlanReview(runtime, plan, input.hostGeneration);
             for (const event of events) {
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
-              await (learningTurn?.emit ?? runtime.context.emit)(event, {
+              const eventContext = event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined
+                ? plan.context : runtime.context;
+              const emit = learningTurn?.emit ?? eventContext.emit;
+              await emit(event, {
                 namespace: "codex.app_server",
                 fields: { method, ...(event.type === "message_complete" && event.nativeHistory?.identity
                   ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : {}) }
@@ -4766,14 +4771,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
                 input.hostGeneration
               );
             }
-            if (yieldResolution?.plan !== undefined) {
-              this.#schedulePlanReview(
-                runtime,
-                yieldResolution.plan,
-                yieldResolution.plan.context,
-                input.hostGeneration
-              );
-            }
+            schedulePlanReview?.();
             if (yieldResolution?.startClaim !== undefined) {
               this.#scheduleYieldContinuation(runtime, yieldResolution.startClaim, input.hostGeneration);
             }
@@ -5162,12 +5160,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return failure;
   }
 
-  #schedulePlanReview(
+  #registerPlanReview(
     runtime: SessionRuntime,
-    plan: { readonly turnId: string; readonly markdown: string },
-    context: AdapterContext,
+    plan: CompletedPlan | undefined,
     hostGeneration: number
-  ): void {
+  ): (() => void) | undefined {
+    if (plan === undefined) return undefined;
+    const open = () => this.#openPlanReview(runtime, plan, hostGeneration);
+    const register = plan.context.registerCompletedPlanReview;
+    if (register !== undefined) {
+      register(open);
+      return undefined;
+    }
+    return () => {
+      const timer = setTimeout(open, 0);
+      timer.unref?.();
+    };
+  }
+
+  #openPlanReview(runtime: SessionRuntime, plan: CompletedPlan, hostGeneration: number): void {
+    if (!this.#isRuntimeCurrent(runtime, hostGeneration)) return;
     runtime.planReview?.abort.abort();
     const interactionId = `codex-plan-review-${createHash("sha256")
       .update(runtime.sessionId).update("\0")
@@ -5180,10 +5192,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       abort: new AbortController()
     };
     runtime.planReview = pending;
-    const timer = setTimeout(() => {
-      void this.#runPlanReview(runtime, pending, plan.markdown, context, hostGeneration);
-    }, 0);
-    timer.unref?.();
+    void this.#runPlanReview(runtime, pending, plan.markdown, plan.context, hostGeneration);
   }
 
   async #runPlanReview(
@@ -5604,9 +5613,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       : undefined;
     const translatedEvents = this.#translator.translate("turn/completed", params, runtime.state);
     const resolution = resolveYieldTurnCompletion(runtime, params, translatedEvents, completedPlan);
+    const plan = resolution.plan;
+    const schedulePlanReview = this.#registerPlanReview(runtime, plan, hostGeneration);
     for (const event of resolution.events) {
       if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
-      await (claim.partnerLearningTurn?.emit ?? claim.context.emit)(event, {
+      const eventContext = event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined
+        ? plan.context : claim.context;
+      await (claim.partnerLearningTurn?.emit ?? eventContext.emit)(event, {
         namespace: "codex.app_server",
         fields: { method: "turn/completed", reconciled: true }
       });
@@ -5614,9 +5627,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (resolution.failure !== undefined) {
       await this.#emitYieldContinuationFailure(runtime, resolution.failure, hostGeneration);
     }
-    if (resolution.plan !== undefined) {
-      this.#schedulePlanReview(runtime, resolution.plan, resolution.plan.context, hostGeneration);
-    }
+    schedulePlanReview?.();
     if (resolution.startClaim !== undefined) {
       this.#scheduleYieldContinuation(runtime, resolution.startClaim, hostGeneration);
     }

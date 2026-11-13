@@ -15337,7 +15337,8 @@ describe("SessionHost", () => {
       && fixture.store.getRun(continuation.descriptor.id).descriptor.state === "completed");
   });
 
-  it("runs the mounted Codex plan-review execute path through a durable Queue before native dispatch", async () => {
+  const planReviewDecisions = ["execute", "refine", "stay", "dismiss"] as const;
+  it.each(planReviewDecisions)("holds the mounted Codex Queue until plan review settles with %s", async (decision) => {
     const directory = mkdtempSync(join(tmpdir(), "joko-codex-plan-host-"));
     const store = new OperationalStore(join(directory, "store.db"));
     const repository = new OperationalArtifactRepository(store);
@@ -15395,10 +15396,29 @@ describe("SessionHost", () => {
       sessionId,
       prompt: { text: "Plan the change", images: [], files: [], mentions: [], disposition: "prompt" }
     });
-    await eventually(() => fake.transport?.requests.filter((request) => request.method === "turn/start").length === 1);
+    const turnStarts = () => fake.transport?.requests.filter((request) => request.method === "turn/start") ?? [];
+    await eventually(() => turnStarts().length === 1
+      && store.getRun(source.value.runId).descriptor.state === "running");
     const binding = store.getSession(sessionId).descriptor.binding;
+    const queued = host.enqueueInput({
+      operationId: "send-while-codex-plan-runs",
+      connection,
+      sessionId,
+      prompt: { text: "Already queued", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    expect(store.getQueueItem(queued.value.queueItemId).state).toBe("accepted");
+    let reviewWasReadyAtPublication = false;
+    const unsubscribe = store.subscribe((event) => {
+      if (event.sessionId === sessionId && event.payload.type === "interaction_opened") {
+        reviewWasReadyAtPublication = store.getRun(source.value.runId).descriptor.state === "completed"
+          && store.getQueueItem(source.value.queueItemId).state === "completed"
+          && store.getQueueItem(queued.value.queueItemId).state === "accepted";
+      }
+    });
     await completeFakeCodexPlanTurn(fake, binding.nativeSessionId!, "1. Inspect\n2. Implement");
     await eventually(() => store.listInteractions({ sessionId, status: "open" }).length === 1);
+    unsubscribe();
+    expect(reviewWasReadyAtPublication).toBe(true);
     const interaction = store.listInteractions({ sessionId, status: "open" })[0]!;
     expect(interaction).toMatchObject({
       runId: source.value.runId,
@@ -15409,26 +15429,49 @@ describe("SessionHost", () => {
       }
     });
 
-    host.resolveInteraction(
-      interaction.id,
-      interaction.generation,
-      { kind: "plan_review", decision: "execute", feedback: "" },
-      "test:mounted-codex-plan-execute"
-    );
+    // Exercise another real drain trigger after Done while the card is open.
+    host.drainQueuedInput(sessionId);
+    await nextTurn();
+    expect(store.getRun(source.value.runId).descriptor.state).toBe("completed");
+    expect(store.getQueueItem(queued.value.queueItemId).state).toBe("accepted");
+    expect(turnStarts()).toHaveLength(1);
+
+    const feedback = decision === "refine" ? "Narrow the second step" : "";
+    if (decision === "dismiss") {
+      host.dismissInteraction(interaction.id, interaction.generation, "Owner dismissed review", "test:mounted-plan-dismiss");
+    } else {
+      host.resolveInteraction(interaction.id, interaction.generation,
+        { kind: "plan_review", decision, feedback }, `test:mounted-plan-${decision}`);
+    }
+    expect(store.getInteraction(interaction.id).status).toBe(decision === "dismiss" ? "dismissed" : "resolved");
+    expect(store.getSession(sessionId).descriptor.planMode).toBe(decision !== "execute");
     const child = store.findRunByParentId(source.value.runId);
-    expect(child?.descriptor).toMatchObject({ source: "system", state: "queued" });
-    await eventually(() => fake.transport?.requests.filter((request) => request.method === "turn/start").length === 2);
-    expect(fake.transport?.requests.filter((request) => request.method === "turn/start").at(-1)?.params)
-      .toMatchObject({
-        clientUserMessageId: store.findQueueItemByRunId(sessionId, child!.descriptor.id)?.operationId,
-        input: [{ type: "text", text: "Implement the plan.", text_elements: [] }],
-        collaborationMode: {
-          mode: "default",
-          settings: { developer_instructions: null }
-        }
+    if (decision === "execute" || decision === "refine") {
+      expect(child?.descriptor).toMatchObject({ source: "system", state: "queued" });
+    } else expect(child).toBeUndefined();
+
+    await eventually(() => turnStarts().length === 2);
+    expect(turnStarts().at(-1)?.params).toMatchObject({
+      clientUserMessageId: "send-while-codex-plan-runs",
+      input: [{ type: "text", text: "Already queued", text_elements: [] }],
+      collaborationMode: {
+        mode: decision === "execute" ? "default" : "plan",
+        settings: { developer_instructions: null }
+      }
+    });
+    await fake.completeTurn(binding.nativeSessionId!, "Queued input handled");
+    await eventually(() => store.getRun(queued.value.runId).descriptor.state === "completed");
+    if (child !== undefined) {
+      await eventually(() => turnStarts().length === 3);
+      expect(turnStarts().at(-1)?.params).toMatchObject({
+        clientUserMessageId: store.findQueueItemByRunId(sessionId, child.descriptor.id)?.operationId,
+        input: [{ type: "text", text: decision === "execute" ? "Implement the plan." : feedback, text_elements: [] }],
+        collaborationMode: { mode: decision === "execute" ? "default" : "plan" }
       });
-    await fake.completeTurn(binding.nativeSessionId!, "Implemented");
-    await eventually(() => store.getRun(child!.descriptor.id).descriptor.state === "completed");
+      await fake.completeTurn(binding.nativeSessionId!, "Plan continuation handled");
+      await eventually(() => store.getRun(child.descriptor.id).descriptor.state === "completed");
+    }
+    expect(turnStarts()).toHaveLength(child === undefined ? 2 : 3);
   });
 
   it.each(["with surviving cursors", "from an earlier pending deletion"] as const)(
