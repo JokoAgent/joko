@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { create } from "@bufbuild/protobuf";
+import { EventSchema, MessageRole, PiMessageLifecycleKind } from "@joko/contracts";
 import {
   buildMobileMessageDeepLink,
   buildMobileTaskDeepLink,
@@ -7,8 +9,10 @@ import {
 import {
   MobileCopyLinkWriter,
   claimMobileCopyLinkAuthority,
-  mobileCopyLinkAuthorityMatches
+  mobileCopyLinkAuthorityMatches,
+  mobileMessageLinkAvailable
 } from "./mobile-copy-link";
+import { timelineRows } from "./timeline";
 
 afterEach(() => vi.useRealTimers());
 
@@ -47,6 +51,22 @@ describe("mobile public-link clipboard writer", () => {
     await expect(writer.copy("joko://task/task-one?profile=local-profile")).rejects.toThrow(/canonical public Joko task link/u);
     await expect(writer.copy("joko://task/task-one?message=message+one")).rejects.toThrow(/canonical public Joko task link/u);
     expect(writeText).toHaveBeenCalledOnce();
+  });
+
+  it("preserves links for non-Pi assistant completions and canonical user messages", () => {
+    const assistant = create(EventSchema, { eventId: "other-assistant", identity: { sessionId: "session" },
+      cursor: { sequence: 1n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "other-assistant", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Other reply" } }]
+      } } } });
+    const user = create(EventSchema, { eventId: "user", identity: { sessionId: "session" }, cursor: { sequence: 2n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "user", role: MessageRole.USER, userInputAccepted: true,
+        userInput: { parts: [{ content: { case: "text", value: "User input" } }] }
+      } } }, pi: { payload: { case: "messageLifecycle", value: { kind: PiMessageLifecycleKind.MESSAGE_END } } } });
+    const window = [assistant, user];
+    const state = { selectedId: "session", window, older: [], live: [] };
+    const rows = timelineRows(window);
+    expect(rows.map(row => row.eventId)).toEqual([assistant.eventId, user.eventId]);
+    expect(rows.every(row => mobileMessageLinkAvailable(state, row))).toBe(true);
   });
 
   it("keeps a single native owner and does not enqueue a repeated write", async () => {

@@ -76,7 +76,7 @@ export function commitMobileMessageReference(input: { readonly lease: MobileMess
 export function buildMobileMessageActions(
   row: TimelineRow,
   input: { readonly canDelete: boolean; readonly canFork?: boolean; readonly canRewind?: boolean; readonly canAddToComposer?: boolean; readonly canReplyQuote?: boolean;
-    readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly shareDisabled?: boolean }
+    readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly canCopyLink?: boolean; readonly shareDisabled?: boolean }
 ): readonly MobileMessageActionItem[] {
   if (!row.completed || row.optimistic || row.internalInput || row.kind === "user" && row.partnerPrivateOrigin
     || (row.kind !== "user" && row.kind !== "assistant")) return [];
@@ -87,7 +87,7 @@ export function buildMobileMessageActions(
   if (input.canReplyQuote) actions.push({ id: 'reply', label: input.locale === 'zh-CN' ? '引用回复' : 'Reply' });
   else if (input.canAddToComposer !== false) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
   if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: mobileMessage(input.locale, "actions.quoteSelection") });
-  actions.push({
+  if (input.canCopyLink !== false) actions.push({
     id: "copy-link",
     label: mobileMessage(input.locale, input.copyDisabled ? "actions.copyingLink" : "actions.copyMessageLink"),
     ...(input.copyDisabled ? { disabled: true } : {})

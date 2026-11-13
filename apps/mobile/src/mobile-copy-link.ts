@@ -1,9 +1,12 @@
+import { MessageRole, PiMessageLifecycleKind } from "@joko/contracts";
+import type { MobileState } from "./mobile-client";
 import {
   buildMobileMessageDeepLink,
   buildMobileTaskDeepLink,
   parseMobileNativeIntent,
   type MobileNativeIntentSnapshot
 } from "./mobile-native-intent";
+import type { TimelineRow } from "./timeline";
 
 export const mobileCopyLinkTimeoutMilliseconds = 5_000;
 
@@ -19,6 +22,22 @@ export interface MobileCopyLinkAuthority {
   readonly requiresSelectedSession: boolean;
   readonly messageId?: string;
   readonly messageEventId?: string;
+}
+
+export function mobileMessageLinkAvailable(
+  state: Pick<MobileState, "selectedId" | "taskSource" | "window" | "older" | "detail" | "live">,
+  row: Pick<TimelineRow, "kind" | "id" | "eventId">
+): boolean {
+  if (row.kind !== "assistant" || !state.selectedId || state.taskSource?.kind === "joined") return true;
+  const events = state.window ?? [...state.older, ...(state.detail?.timeline ?? []), ...state.live];
+  const event = events.findLast(candidate => candidate.eventId === row.eventId && candidate.identity?.sessionId === state.selectedId);
+  const completion = event?.payload?.kind;
+  const lifecycle = event?.pi?.payload;
+  // Pi's live message_end has a product event ID. Native adoption supplies
+  // the persisted entry identity and may remove that temporary event from history.
+  return !(completion?.case === "messageCompleted" && completion.value.role === MessageRole.ASSISTANT
+    && completion.value.messageId === row.id && lifecycle?.case === "messageLifecycle"
+    && lifecycle.value.kind === PiMessageLifecycleKind.MESSAGE_END && !completion.value.nativeIdentity?.entryId);
 }
 
 export function claimMobileCopyLinkAuthority(

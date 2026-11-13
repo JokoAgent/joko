@@ -67,7 +67,8 @@ import {
 import {
   MobileCopyLinkWriter,
   claimMobileCopyLinkAuthority,
-  mobileCopyLinkAuthorityMatches
+  mobileCopyLinkAuthorityMatches,
+  mobileMessageLinkAvailable
 } from "./mobile-copy-link";
 import {
   mobileConnectionAppIcon,
@@ -4970,6 +4971,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const messageActionItems = messageAction
     ? buildMobileMessageActions(messageAction.row, {
       canDelete: !workerReadOnly && client.canDeleteMessage(messageAction.row.eventId), locale, copyDisabled: copyBusy,
+      canCopyLink: mobileMessageLinkAvailable(state, messageAction.row),
       canAddToComposer: composerOwnerReady && messageAction.reference !== undefined,
       canReplyQuote: composerOwnerReady && partnerIdentity.partner !== undefined && messageAction.reference !== undefined,
       canFork: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && client.taskMessageForkControls(messageAction.row.eventId)?.canFork === true,
@@ -6063,7 +6065,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const initial = projectMobileNativeIntentSnapshot(client.state);
     const sessionId = initial.selectedSessionId;
     if (!sessionId || (message !== undefined
-      && (!message.completed || (message.kind !== "user" && message.kind !== "assistant")))) {
+      && (!message.completed || (message.kind !== "user" && message.kind !== "assistant")
+        || !mobileMessageLinkAvailable(client.state, message)))) {
       setLocalError(mobileMessage(locale, "actions.copyLinkFailed"));
       return;
     }
