@@ -259,8 +259,8 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
           : session.attention;
         if (attention === undefined) continue;
         try {
-          if (attention.kind === "error") await controller.acknowledgeSessionError(session.id, attention.subjectCursor);
-          else await controller.acknowledgeSessionAttention(session.id, attention.subjectCursor);
+          if (attention.kind === "error") await controller.acknowledgeSessionError(session.id, attention.attentionCursor);
+          else await controller.acknowledgeSessionAttention(session.id, attention.attentionCursor);
         } catch {
           attentionFailures.push(session.id);
         }
