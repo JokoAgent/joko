@@ -2,9 +2,33 @@ import { execFile } from "node:child_process";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { availableParallelism, freemem, homedir, loadavg, totalmem } from "node:os";
 import { join, posix } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
+
+export async function stopOwnedMetroGroup(signalGroup, wait = delay) {
+  const signal = value => {
+    try { signalGroup(value); return "sent"; }
+    catch (error) {
+      return ["ESRCH", "EPERM", "EACCES", "EINVAL", "EINTR"].includes(error?.code) ? error.code : "unknown";
+    }
+  };
+  const waitForAbsence = async () => {
+    let probe = signal(0);
+    for (let attempt = 0; attempt < 20 && probe !== "ESRCH"; attempt++) {
+      await wait(250);
+      probe = signal(0);
+    }
+    return probe;
+  };
+  const terminate = signal("SIGTERM");
+  const afterTerminate = terminate === "ESRCH" ? terminate : await waitForAbsence();
+  if (afterTerminate === "ESRCH") return { terminate, afterTerminate, gone: true };
+  const force = signal("SIGKILL");
+  const afterForce = force === "ESRCH" ? force : await waitForAbsence();
+  return { terminate, afterTerminate, force, afterForce, gone: afterForce === "ESRCH" };
+}
 
 export function requireSimulatorApplicationContainer(value) {
   if (typeof value !== "string" || !posix.isAbsolute(value) || /[\0\r\n]/u.test(value)) {

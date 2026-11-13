@@ -1,6 +1,41 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, parseCrashReport, parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, requireSimulatorApplicationContainer, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, parseCrashReport,
+  parseVirtualMemory, projectOwnedCrash, projectOwnedStartupLogs, requireSimulatorApplicationContainer, stopOwnedMetroGroup,
+  summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+
+test("confirms owned Metro group absence after both graceful and forced shutdown", async () => {
+  for (const forceCode of [undefined, "EPERM"]) {
+    const signals = [];
+    let forced = false, probes = 0;
+    const result = await stopOwnedMetroGroup(signal => {
+      if (signal !== 0) signals.push(signal);
+      if (signal === "SIGKILL") {
+        forced = true;
+        probes = 0;
+        if (forceCode) throw Object.assign(new Error(), { code: forceCode });
+      }
+      if (signal === 0 && ++probes === 3 && (forced || forceCode === undefined)) {
+        throw Object.assign(new Error(), { code: "ESRCH" });
+      }
+    }, async () => {});
+    assert.deepEqual(signals, forceCode ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
+    assert.equal(result.gone, true);
+    if (forceCode) assert.deepEqual(result, { terminate: "sent", afterTerminate: "sent", force: "EPERM", afterForce: "ESRCH", gone: true });
+  }
+});
+
+test("reports a still-present or unsignalable Metro group with bounded cleanup evidence", async () => {
+  for (const code of [undefined, "EPERM"]) {
+    let waits = 0;
+    const result = await stopOwnedMetroGroup(() => {
+      if (code) throw Object.assign(new Error(), { code });
+    }, async () => { waits++; });
+    const outcome = code ?? "sent";
+    assert.deepEqual(result, { terminate: outcome, afterTerminate: outcome, force: outcome, afterForce: outcome, gone: false });
+    assert.equal(waits, 40);
+  }
+});
 
 function containerLookup(replies) {
   const calls = [], controller = new AbortController();
