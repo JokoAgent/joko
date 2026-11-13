@@ -14,7 +14,7 @@ import type {
   SessionDescriptor
 } from "@joko/core";
 import { OperationalStore } from "@joko/store";
-import { acquireWorktreeSourceUse } from "@joko/worktree";
+import { acquireWorktreeSourceUse, EphemeralWorktreeService } from "@joko/worktree";
 import type { RemoteGitCheckoutLease, RemoteGitCheckoutPlan } from "@joko/remote-ssh";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -97,6 +97,65 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
     expect(closeNative).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ sessionId: result.reviewerSessionId,
       target: expect.objectContaining({ workspaceRoot: checkout.path }) }));
     expect(store.getSession(sourceSessionId).descriptor.worktree).toEqual(checkout);
+  });
+
+  test("adopts a removed checkout when the original archive resumes after restart", { timeout: 40_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-worktree-archive-restart-"));
+    const repositoryRoot = await createRepository(join(root, "project"));
+    const databasePath = join(root, "store.db");
+    let store = new OperationalStore(databasePath);
+    let workspaces = new WorkspaceService();
+    const storageRoot = join(root, "worktrees");
+    const service = new EphemeralWorktreeService({ storageRoot, recycle: true });
+    let worktrees = new SessionWorktreeCoordinator({ store, workspaces, storageRoot, service });
+    cleanups.push(async () => {
+      worktrees.dispose(); await workspaces.close(); store.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+    store.upsertBackend({ id: "archive-restart-backend", adapterKind: "fixture", displayName: "Local", version: "1",
+      instanceGeneration: 0, health: "healthy", installationState: "installed", authenticationState: "not_required",
+      capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+    const target = store.upsertTarget({ id: "archive-restart-target", backendId: "archive-restart-backend", displayName: "Project",
+      workspaceRoot: repositoryRoot, managed: false, trusted: true }).descriptor;
+    await worktrees.initialize();
+    const sessionId = "archive-restart-task";
+    const binding = await worktrees.acquire({ sessionId, target });
+    store.createSession({ id: sessionId, backendId: target.backendId, targetId: target.id, title: "Archive after restart",
+      binding: { opaqueRef: "native/archive-restart", generation: 0 }, worktree: binding,
+      pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    await writeFile(join(binding.path, "tracked.txt"), "Archived bytes survive restart\n", "utf8");
+    await git(binding.path, ["add", "tracked.txt"]);
+    const operationId = "archive-restart-lifecycle";
+    store.prepareSessionLifecycleCleanup({ operationId, sessionId, disposition: "archive", releaseWorktree: true });
+    store.advanceSessionLifecycleCleanup({ operationId, phase: "close" });
+
+    expect(await service.release(sessionId, { retainForRestore: true })).toMatchObject({
+      ok: true, value: { status: "preserved", reason: "restorable", pathRemoved: true }
+    });
+    expect(service.listRecycleStatus()).toEqual([]);
+    expect(store.getSession(sessionId).descriptor).toMatchObject({ archived: false, worktree: { state: "active" } });
+    expect(store.getSessionLifecycleCleanup(operationId)).toMatchObject({ closeCompleted: true, worktreeCompleted: false });
+    await expect(lstat(binding.path)).rejects.toMatchObject({ code: "ENOENT" });
+    worktrees.dispose();
+    await workspaces.close();
+    store.close();
+    store = new OperationalStore(databasePath);
+    workspaces = new WorkspaceService();
+    worktrees = new SessionWorktreeCoordinator({ store, workspaces, storageRoot });
+
+    await worktrees.initialize();
+    await expect(lstat(binding.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(workspaces.listRegistrations().some(entry => entry.id === binding.workspaceId)).toBe(false);
+    await worktrees.archive(sessionId);
+    store.advanceSessionLifecycleCleanup({ operationId, phase: "worktree" });
+    store.finalizeSessionLifecycleCleanup({ operationId });
+    expect(store.getSession(sessionId).descriptor).toMatchObject({ archived: true, worktree: { state: "preserved", leaseId: binding.leaseId } });
+    await expect(lstat(binding.path)).rejects.toMatchObject({ code: "ENOENT" });
+
+    await worktrees.restore(sessionId);
+    expect((await readFile(join(binding.path, "tracked.txt"), "utf8")).replaceAll("\r\n", "\n"))
+      .toBe("Archived bytes survive restart\n");
+    expect((await git(binding.path, ["diff", "--cached", "--name-only"])).trim()).toBe("tracked.txt");
   });
 
   test.each(["archive", "delete"] as const)("retries only the exact %s lifecycle after native and source writers retire", { timeout: 40_000 }, async disposition => {
