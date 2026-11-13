@@ -4008,8 +4008,16 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     latestSendFollowRef.current = undefined;
     Keyboard.dismiss(); setMessageFocusHighlight(undefined); setSearchOwner(searchScope);
   };
-  const focusSearchHit = (hit: MobileConversationSearchHit): void => {
+  const focusSearchHit = (hit: MobileConversationSearchHit | undefined): void => {
     if (!searchOwnerRef.current.open || searchOwnerRef.current.scope !== searchScope) return;
+    if (hit === undefined) {
+      const flight = searchScrollRef.current;
+      if (flight?.timer !== undefined) clearTimeout(flight.timer);
+      searchScrollRef.current = undefined;
+      searchFocusRef.current = undefined;
+      setSearchFocus(undefined);
+      return;
+    }
     for (const key of mobileWorkExpansionKeys(displayRows, (row) => row.id === hit.sourceKey)) mobileExpandedBlockStore.setExpanded(blockOwnerKey, key, true);
     const source = rows.find((row) => row.id === hit.sourceKey);
     if (source?.plan !== undefined) mobileExpandedBlockStore.setExpanded(blockOwnerKey, source.plan.identity, true, true);
@@ -4028,6 +4036,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const flight = { scope: searchScope, index: searchFocusIndex, retried: false, timer: undefined as ReturnType<typeof setTimeout> | undefined };
     searchScrollRef.current = flight;
     const frame = requestAnimationFrame(() => {
+      if (searchScrollRef.current !== flight || !searchOwnerRef.current.open || searchOwnerRef.current.scope !== flight.scope) return;
       if (searchFooterFocus) { if (!scrollSearchFooter()) timelineListRef.current?.scrollToEnd({ animated: false }); }
       else timelineListRef.current?.scrollToIndex({ index: flight.index, animated: false, viewPosition: 0.2 });
     });
@@ -7568,7 +7577,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const card = projectMobileDelegated(entry); return { itemKey: `delegated/${entry.key}`, sourceKey: entry.key, text: [card.title, card.assignment, card.summary, card.statusText, card.error].filter(Boolean).join("\n") };
       }) : undefined}
       hasEarlier={!state.historyEnd} loadingEarlier={state.historyBusy} canLoadEarlier={state.status === "connected"}
-      onClose={() => { if (searchOwnerRef.current.scope === searchScope) setSearchOwner(undefined); }} onFocus={focusSearchHit}
+      onClose={() => {
+        if (searchOwnerRef.current.scope !== searchScope || !searchOwnerRef.current.open) return;
+        focusSearchHit(undefined);
+        searchOwnerRef.current = { scope: searchScope, open: false };
+        setSearchOwner(undefined);
+      }} onFocus={focusSearchHit}
       onLoadEarlier={async () => { if (searchOwnerRef.current.scope === searchScope && searchOwnerRef.current.open) await client.older(); }} />
     <MobileRuntimeControlsSheet visible={!workerReadOnly && runtimeControlsVisible && runtimeControls !== undefined && partnerRead.ready && !partnerRead.partner} locale={locale}
       providerUsageTransport={providerUsageTransport}

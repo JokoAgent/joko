@@ -43,6 +43,7 @@ it("focuses the existing hit, cycles matches, clears the query and never loads h
   await press("Previous match"); expect(host.textContent).toContain("2 / 2");
   await press("Search earlier messages"); expect(earlier).toHaveBeenCalledOnce();
   await press("Clear search"); expect(host.textContent).toContain("Enter a keyword");
+  expect(focus).toHaveBeenLastCalledWith(undefined);
 });
 
 it("retains the exact selected match when an earlier page inserts a hit ahead of it", async () => {
@@ -80,4 +81,30 @@ it("retires a failed older read on close and closes when the app leaves the fore
   await press("Search earlier messages"); await act(() => { for (const listener of native.listeners) listener("background"); }); expect(close).toHaveBeenCalledOnce();
   await render(false); await act(async () => { reject(new Error("Read failed")); await Promise.resolve(); });
   await render(true); expect(host.querySelector('[role="alert"]')).toBeNull();
+  expect(host.textContent).toContain("Enter a keyword");
+});
+
+it("opens the same task with an empty query and publishes no stale hit after close", async () => {
+  const focus = vi.fn(), close = vi.fn();
+  const render = (visible: boolean) => act(() => root.render(createElement(MobileConversationSearchSheet, {
+    visible, rows, colors, locale: "en", hasEarlier: true, loadingEarlier: false, canLoadEarlier: true,
+    onClose: close, onFocus: focus, onLoadEarlier: async () => undefined
+  })));
+  await render(true);
+  await input("match");
+  await press("Next match");
+  expect(focus).toHaveBeenLastCalledWith({ itemKey: "1", sourceKey: "1" });
+  await input("different keyword");
+  expect(host.textContent).toContain("0 / 0");
+  expect(focus).toHaveBeenLastCalledWith(undefined);
+  await input("match"); await press("Next match");
+  expect(focus).toHaveBeenLastCalledWith({ itemKey: "1", sourceKey: "1" });
+  await press("Close");
+  expect(close).toHaveBeenCalledOnce();
+  await render(false);
+  focus.mockClear();
+  await render(true);
+  expect(host.querySelector("input")?.value).toBe("");
+  expect(host.textContent).toContain("Enter a keyword");
+  expect(focus).toHaveBeenCalledExactlyOnceWith(undefined);
 });
