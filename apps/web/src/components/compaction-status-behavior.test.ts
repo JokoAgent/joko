@@ -1,8 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type { TimelineItemView } from "../model.js";
-import { resolveActiveCompaction } from "./compaction-status-behavior.js";
+import { hasContextToCompact, resolveActiveCompaction } from "./compaction-status-behavior.js";
 
 describe("Pi compaction status projection", () => {
+  it("permits another confirmed compaction of a surviving compacted context while its usage is unknown", () => {
+    const completed = compaction("completed", 1n, "completed", "manual");
+    const piBoundary = { ...completed, compaction: { ...completed.compaction!, piContextBoundary: true as const } };
+    const noop = compaction("noop", 2n, "noOp", "manual");
+    expect(hasContextToCompact(undefined, [completed, noop])).toBe(false);
+    expect(hasContextToCompact(undefined, [piBoundary, noop])).toBe(true);
+    expect(hasContextToCompact({ usedTokens: 0, contextWindow: 100, reservedTokens: 100, utilizationRatio: 0 }, [piBoundary])).toBe(false);
+  });
+
   it("selects the latest open compaction lifecycle", () => {
     expect(resolveActiveCompaction([
       compaction("old", 1n, "completed", "manual"),

@@ -1823,6 +1823,7 @@ export interface TimelineCompactionView {
   readonly state: "started" | "completed" | "noOp" | "aborted" | "failed" | "unknown";
   readonly reason: "manual" | "threshold" | "overflow" | "automatic" | "branch" | "unknown";
   readonly automatic: boolean;
+  readonly piContextBoundary?: true;
   readonly boundaryId?: string;
   readonly tokensBefore?: number;
   readonly tokensAfter?: number;

@@ -95,6 +95,7 @@ class ScriptedPiProcess extends EventEmitter {
   isStreaming = false;
   isCompacting = false;
   contextUsageUnavailable = false;
+  contextUsageUnknown = false;
   omitModelFromState = false;
   contextRebuildHandoff: string | undefined;
   model = {
@@ -271,10 +272,10 @@ class ScriptedPiProcess extends EventEmitter {
         this.#success(command, {
           tokens: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1, total: 18 },
           cost: 0,
-          contextUsage: {
+          contextUsage: this.contextUsageUnavailable ? undefined : {
             ...contextUsage,
-            tokens: this.contextUsageUnavailable ? null : contextUsage.tokens,
-            percent: contextUsage.contextWindow === 0 ? 0 : contextUsage.tokens / contextUsage.contextWindow * 100
+            tokens: this.contextUsageUnknown ? null : contextUsage.tokens,
+            percent: this.contextUsageUnknown ? null : contextUsage.contextWindow === 0 ? 0 : contextUsage.tokens / contextUsage.contextWindow * 100
           }
         });
         return;
@@ -632,14 +633,25 @@ describe("PiBackendAdapter", () => {
       expect(persisted).toHaveBeenCalledTimes(revoked ? 0 : 1); await expect(access(join(home, "auth.json"))).rejects.toThrow();
     } finally { create.mockRestore(); await adapter.dispose(); await rm(home, { recursive: true, force: true }); }
   });
-  it("recovers unknown native context from the current tree without inheriting another branch's usage", async () => {
+  it("uses tree context only when statistics omit it, within the current branch and compaction boundary", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-context-tree-"));
     const options = { treeLeafId: "current", tree: [{
       entry: { type: "message", id: "root", parentId: null,
         message: { role: "user", content: [{ type: "text", text: "root" }] } },
       children: [
         { entry: { type: "message", id: "current", parentId: "root",
-          message: { role: "assistant", usage: { input: 40, cacheRead: 10, cacheWrite: 5, output: 200 } } }, children: [] },
+          message: { role: "assistant", usage: { input: 40, cacheRead: 10, cacheWrite: 5, output: 200 } } }, children: [
+          { entry: { type: "compaction", id: "compacted", parentId: "current", summary: "Short context", firstKeptEntryId: "root", tokensBefore: 55 }, children: [
+            { entry: { type: "message", id: "failed", parentId: "compacted",
+              message: { role: "assistant", stopReason: "error", usage: { input: 20 } } }, children: [
+              { entry: { type: "message", id: "empty-usage", parentId: "failed",
+                message: { role: "assistant", usage: { input: 0, output: 1 } } }, children: [
+                { entry: { type: "message", id: "next", parentId: "empty-usage",
+                  message: { role: "assistant", usage: { input: 10, cacheRead: 2, cacheWrite: 1, output: 4 } } }, children: [] }
+              ] }
+            ] }
+          ] }
+        ] },
         { entry: { type: "message", id: "other", parentId: "root",
           message: { role: "assistant", usage: { input: 800, cacheRead: 100, cacheWrite: 100 } } }, children: [] }
       ]
@@ -655,6 +667,8 @@ describe("PiBackendAdapter", () => {
       const binding = await adapter.createSession({ target, permissionMode: "ask", fastMode: false }, context);
       const bound = { ...context, binding };
       expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: 18 });
+      process.contextUsageUnknown = true;
+      expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: undefined, contextWindow: 32_768, totalTokens: 18 });
       process.contextUsageUnavailable = true;
       expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({
         contextTokens: 55, contextWindow: 32_768, totalTokens: 18
@@ -663,6 +677,10 @@ describe("PiBackendAdapter", () => {
       expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: 1_000 });
       options.treeLeafId = "root";
       expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: 0 });
+      options.treeLeafId = "empty-usage";
+      expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: undefined, totalTokens: 18 });
+      options.treeLeafId = "next";
+      expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: 13, totalTokens: 18 });
     } finally {
       await adapter.dispose();
       await rm(directory, { recursive: true, force: true });

@@ -8370,7 +8370,7 @@ export class SessionHost {
           // effect returns, matching navigateTree's persistence-confirmed sync.
           await this.synchronizeNativeHistory(sessionId);
         }
-        await this.refreshNativeStateBestEffort(sessionId, active, "native_state_compaction_sync");
+        await this.refreshNativeStateBestEffort(sessionId, active, "native_state_compaction_sync", {}, result === "compacted");
         return result;
       } finally {
         this.finishCompactionEffect(sessionId, token);
@@ -16936,10 +16936,14 @@ export class SessionHost {
     sessionId: string,
     active: ActiveSession,
     component: string,
-    allowance: BackendSideEffectAdmissionAllowance = {}
+    allowance: BackendSideEffectAdmissionAllowance = {},
+    publishClearedContext = false
   ): Promise<void> {
     await this.refreshNativeStateObservation(sessionId, active, allowance)
-      .then((state) => this.persistRuntimeUsage(sessionId, state.binding.generation, state.usage, false, state.providerId, state.modelId))
+      .then((state) => {
+        const cleared = publishClearedContext && state.pi !== undefined && state.usage?.contextTokens === undefined;
+        this.persistRuntimeUsage(sessionId, state.binding.generation, state.usage, cleared, state.providerId, state.modelId);
+      })
       .catch((error: unknown) => this.recordFailure(component, error));
   }
 
