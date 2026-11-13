@@ -11,6 +11,7 @@ import {
   BlobRefSchema,
   CompactSessionOutcome,
   CompactionState,
+  EntityKind,
   InstallationState,
   InputPartSchema,
   InstallResourceMutationSchema,
@@ -33,19 +34,23 @@ import {
   SetResourceEnabledMutationSchema,
   SessionSnapshotScopeSchema,
   SessionState,
-  SnapshotScopeSchema
+  SnapshotScopeSchema,
+  StateImpact
 } from "@joko/contracts";
 import { buildPortableSessionExport, preparePortableSessionImport } from "@joko/orchestrator";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createE2eClients } from "./connect-clients.js";
 import {
+  abortRunMutation,
   archiveMutation,
   compactMutation,
   createManualScheduleMutation,
   createSessionMutation,
+  pauseQueueMutation,
   queueRunIdFrom,
   restartBackendMutation,
+  resumeQueueMutation,
   scheduleIdFrom,
   sendInputMutation,
   sessionIdFrom,
@@ -464,7 +469,8 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(archived.archived).toBe(true);
     expect(archived.binding).toEqual(originalBinding);
     const archivedExport = await exportPackage(PortableSessionFidelity.FULL);
-    expect(archivedExport.nativeSession?.bytes).toEqual(new Uint8Array(await readFile(archived.binding.opaqueRef)));
+    if (archivedExport.nativeSession === undefined) throw new Error("The archived Pi package lacks its native transcript.");
+    expect(Buffer.from(archivedExport.nativeSession.bytes).equals(await readFile(archived.binding.opaqueRef))).toBe(true);
     expect(archivedExport.projection.messages).toEqual(restored.projection.messages);
     expect(store.getSession(sessionId).descriptor).toMatchObject({ archived: true, binding: archived.binding });
 
@@ -557,7 +563,10 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const secondDraftId = await prepare(secondPackage);
     const refusedOperation = randomUUID();
     await expect(commit(secondDraftId, false, targetId, refusedOperation)).rejects.toMatchObject({ code: Code.AlreadyExists });
-    expect(store.findOperation(refusedOperation)).toBeUndefined();
+    expect(store.getOperation(refusedOperation)).toMatchObject({
+      status: "failed", error: { code: "PORTABLE_SESSION_IMPORT_CONFLICT", stateMayHaveChanged: false }
+    });
+    expect(store.findPortableReplacementCleanup(refusedOperation)).toBeUndefined();
     expect(store.listSessions({ targetId, includeArchived: true }).map(session => session.descriptor.id)).toEqual([firstId]);
 
     const otherTarget = await commit(await prepare(secondPackage), false, anotherTargetId);
@@ -988,6 +997,86 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       "threshold compaction runtime recovery", 30_000);
     const recovered = compactionEvents((await paired.clients.event.getSnapshot({ scope: sessionScope })).snapshot?.timeline ?? []);
     expect(recovered).toEqual(compactionEvents(snapshot.snapshot?.timeline ?? []));
+  });
+
+  it("stops the original installed-Pi Run while its threshold summary is still held", { timeout: 90_000 }, async () => {
+    let releaseSummary!: () => void;
+    const summaryGate = new Promise<void>((resolve) => { releaseSummary = resolve; });
+    releaseCompactionGate = releaseSummary;
+    const isSummary = (body: Readonly<Record<string, unknown>>) =>
+      JSON.stringify(body).includes("You are a context summarization assistant");
+    fixture = await RealPiSystemFixture.start({
+      piSettings: { compaction: { enabled: true, thresholdPercent: 50, keepRecentTokens: 1 } },
+      providerUsage: { promptTokens: 10_000, completionTokens: 3 },
+      providerResponder: async ({ request, requestNumber }) => {
+        if (isSummary(request.body)) await summaryGate;
+        return { kind: "text", text: `Installed Pi Stop reply ${requestNumber}` };
+      }
+    });
+    const { clients, connectionId } = await fixture.pair("Real Pi threshold Stop owner");
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const expectInactiveRunStop = async (runId: string) => {
+      const operation = await mutate(abortRunMutation(runId));
+      expect(operation).toMatchObject({
+        state: OperationState.FAILED,
+        error: {
+          code: "RUN_CONTROL_TARGET_CHANGED",
+          queueImpact: StateImpact.UNCHANGED,
+          nativeSessionImpact: StateImpact.UNCHANGED
+        }
+      });
+      expect((await clients.operation.getOperation({ operationId: operation.operationId })).operation).toEqual(operation);
+    };
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", displayName: "Stop a held summary",
+      providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off"
+    })));
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const scope = create(SnapshotScopeSchema, {
+      kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId, recentTimelineItems: 500 }) }
+    });
+    const readCompactions = async () => compactionEvents((await clients.event.getSnapshot({ scope })).snapshot?.timeline ?? []);
+    const firstRunId = queueRunIdFrom(await mutate(sendInputMutation(sessionId, generation, "Cross the Pi threshold.")));
+    await waitForRealSystem(async () => fixture!.providerRequests.some((request) => isSummary(request.body)),
+      (requested) => requested, "held installed Pi summary request", 30_000);
+    const started = await readCompactions();
+    expect(started).toEqual([expect.objectContaining({ state: CompactionState.STARTED, reason: "threshold", automatic: true })]);
+
+    const control = (await clients.queue.getQueueControl({ sessionId })).queueControl;
+    if (control === undefined) throw new Error("The Pi task lost its queue control.");
+    expect((await mutate(pauseQueueMutation(control))).state).toBe(OperationState.SUCCEEDED);
+    const nextRunId = queueRunIdFrom(await mutate(sendInputMutation(sessionId, generation, "Run after the stopped summary.")));
+    await expectInactiveRunStop(nextRunId);
+    expect((await clients.pi.getPiSessionState({ sessionId })).state?.compacting).toBe(true);
+
+    const revision = (await clients.run.getRun({ runId: firstRunId })).run?.version?.revision;
+    if (revision === undefined) throw new Error("The active Pi Run lost its revision.");
+    expect((await mutate(create(OperationMutationSchema, {
+      payload: abortRunMutation(firstRunId).payload,
+      preconditions: [{ entity: { kind: EntityKind.RUN, id: firstRunId }, expectedRevision: revision }]
+    }))).state).toBe(OperationState.SUCCEEDED);
+    await waitForRealSystem(() => clients.run.getRun({ runId: firstRunId }),
+      (result) => result.run?.state === RunState.ABORTED, "aborted Run before releasing the summary", 15_000);
+    expect(await readCompactions()).toEqual([
+      started[0],
+      expect.objectContaining({
+        compactionId: started[0]!.compactionId, state: CompactionState.ABORTED,
+        reason: "threshold", automatic: true, willRetry: false, boundaryId: ""
+      })
+    ]);
+    expect((await clients.pi.listPiEntries({ sessionId })).entries.some((entry) => entry.payload.case === "compaction"))
+      .toBe(false);
+    expect((await clients.run.getRun({ runId: nextRunId })).run?.state).toBe(RunState.QUEUED);
+    await expectInactiveRunStop(firstRunId);
+
+    releaseSummary();
+    releaseCompactionGate = undefined;
+    const paused = (await clients.queue.getQueueControl({ sessionId })).queueControl;
+    if (paused === undefined) throw new Error("The paused Pi task lost its queue control.");
+    expect((await mutate(resumeQueueMutation(paused))).state).toBe(OperationState.SUCCEEDED);
+    await waitForRealSystem(() => clients.run.getRun({ runId: nextRunId }),
+      (result) => result.run?.state === RunState.SUCCEEDED, "subsequent Run on the same Pi generation", 30_000);
+    expect((await clients.session.getSession({ sessionId })).session?.nativeBinding?.runtimeGeneration).toBe(generation);
   });
 
   it("runs a catalogued installed-Pi extension during automatic compaction while ordinary input stays queued", { timeout: 90_000 }, async () => {

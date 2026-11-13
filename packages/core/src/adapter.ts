@@ -1,5 +1,6 @@
 import type { EventPayload, InteractionPayload, MessageBlock, PiEventMetadata, PlanReviewDecision } from "./events.js";
 import type {
+  AttemptId,
   BackendDescriptor,
   BlobRef,
   ApprovedDirectory,
@@ -70,6 +71,8 @@ export interface AdapterContext {
   readonly operationId?: string;
   /** Original durable input owner, minted by SessionHost rather than native callers. */
   readonly inputQueueItemId?: QueueItemId;
+  /** The admitted Attempt for the original input, including during owner Run control. */
+  readonly inputAttemptId?: AttemptId;
   /** Host-owned attachments appended for this dispatch, outside the durable user input. */
   readonly transientPromptAttachments?: Pick<PromptInput, "images" | "files">;
   /** Private authority of the requested Run and Attempt for an interrupt. */

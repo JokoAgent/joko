@@ -18213,7 +18213,7 @@ async function dispatchMutation(
         effect: () => host.abort(run.descriptor.sessionId, run.descriptor.id, () => {
           dependencies.connections.fence(connection);
           if (fencedRunRevision) validatePreconditions(dependencies.store, mutation);
-        }),
+        }, { ownerStop: true }),
         commit: store => {
           if (fencedRunRevision && otherPreconditions.length > 0) {
             validatePreconditions(store, { ...mutation, preconditions: otherPreconditions });

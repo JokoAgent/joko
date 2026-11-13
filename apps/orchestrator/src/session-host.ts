@@ -101,7 +101,7 @@ import type {
 } from "@joko/store";
 import type { PendingRuntimeHandoff, RuntimeHandoffSource } from "@joko/store";
 import type { ImportProbeAction } from "@joko/agent-import";
-import { assertPersonalDevelopmentInput, readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
+import { assertPersonalDevelopmentInput, PERSONAL_DEVELOPMENT_PURPOSE_KEY, readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { buildSessionHandoffText, sessionHandoffMessages } from "./session-handoff-text.js";
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease, ProviderGroupRecoveryHandoff } from "./provider-group-service.js";
@@ -246,6 +246,8 @@ interface ActiveBackendSideEffectLease {
   readonly context: AdapterContext;
   readonly release: () => void;
 }
+
+type RunAbortOptions = { readonly beforeAbort: () => void } | { readonly ownerStop: true };
 
 function samePolicyBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
   return left.nativeSessionId === right.nativeSessionId && left.generation === right.generation && left.opaqueRef === right.opaqueRef;
@@ -4432,12 +4434,12 @@ export class SessionHost {
     }
   }
 
-  async abort(sessionId: string, runId: string, assertAuthority?: () => void, beforeAbort?: () => void): Promise<void> {
-    await this.controlRun(sessionId, runId, "abort", assertAuthority, beforeAbort);
+  async abort(sessionId: string, runId: string, assertAuthority?: () => void, options?: RunAbortOptions): Promise<void> {
+    await this.controlRun(sessionId, runId, "abort", assertAuthority, options);
   }
 
   private async controlRun(sessionId: string, runId: string, action: "abort" | "abortRetry",
-    assertAuthority?: () => void, beforeAbort?: () => void): Promise<void> {
+    assertAuthority?: () => void, options?: RunAbortOptions): Promise<void> {
     const original = this.#store.getRun(runId).descriptor;
     if (original.sessionId !== sessionId) throw new StoreError("Run does not belong to the task.");
     const originalQueue = this.#store.findQueueItemByRunId(sessionId, runId);
@@ -4473,12 +4475,35 @@ export class SessionHost {
       const context = this.contextFor(lease.stored, runId, original.activeAttemptId, undefined, undefined, lease.backendInstanceGeneration);
       // The caller may commit queue control only after this exact Attempt is
       // confirmed. The Adapter still rechecks authority at native dispatch.
-      beforeAbort?.();
-      await active.adapter[action]({ ...context, assertRunControlCurrent });
+      if (options !== undefined && "beforeAbort" in options) options.beforeAbort();
+      const session = lease.stored.descriptor;
+      const stopInput = options !== undefined && "ownerStop" in options
+        && original.source === "user" && original.parentRunId === undefined
+        && original.activeAttemptId !== undefined && originalQueue !== undefined
+        && this.#store.getBackend(session.backendId).descriptor.adapterKind === "pi"
+        && context.hostedExecution === undefined && context.runtimePolicy === undefined
+        && context.target.remoteWorkspace === undefined && !session.hidden && session.automationOrigin === undefined
+        && !session.derivationOrigin?.sideChat && this.#store.sessionCreationServiceKind(sessionId) === undefined
+        && this.#partnerSessionPolicy(sessionId) === undefined
+        && this.#store.findSetting("service", sessionId, PERSONAL_DEVELOPMENT_PURPOSE_KEY) === undefined
+        && this.#store.findCollaborationWorkerBySession(sessionId) === undefined
+        && !this.#applicationQueueGuards.has(originalQueue.id)
+        && this.isOwnerRunInput(originalQueue)
+        ? { inputQueueItemId: originalQueue.id, inputAttemptId: original.activeAttemptId } : {};
+      await active.adapter[action]({ ...context, ...stopInput, assertRunControlCurrent });
       this.assertActiveBackendSideEffectLease(lease);
     } finally {
       lease.release();
     }
+  }
+
+  private isOwnerRunInput(item: QueueItemRecord): boolean {
+    if (item.body.messagingOrigin !== undefined || item.body.automaticContinuation !== undefined
+      || item.body.objectiveContinuation !== undefined || item.body.inputHandoffContinuation !== undefined
+      || new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId === item.sessionId) return false;
+    const operation = this.#store.findOperation(item.operationId);
+    return operation?.connectionId !== undefined && operation.status === "completed"
+      && (operation.kind === "sendInput" || operation.kind === "send_input");
   }
 
   async cancelBackgroundTask(sessionId: string, taskId: string, operationId?: string): Promise<void> {
@@ -14775,7 +14800,11 @@ export class SessionHost {
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
           this.assertQueueProviderAuthentication(item, stored);
-          let baseContext: AdapterContext = { ...await this.beginTurnOverrideLease(item, active, stored), inputQueueItemId: item.id };
+          let baseContext: AdapterContext = {
+            ...await this.beginTurnOverrideLease(item, active, stored),
+            inputQueueItemId: item.id,
+            ...(attemptId === undefined ? {} : { inputAttemptId: attemptId })
+          };
           if (!reviewReadOnly && run.descriptor.source === "user" && run.descriptor.parentRunId === undefined
             && target.remoteWorkspace === undefined && item.body.disposition === "prompt"
             && item.body.automaticContinuation === undefined && item.body.objectiveContinuation === undefined) {
