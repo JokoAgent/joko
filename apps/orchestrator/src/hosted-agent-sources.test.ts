@@ -63,7 +63,9 @@ it("reads a completed retained workflow through the actual paired Source without
     store.appendEvent({ backendId: backend.id, targetId: "source-target", sessionId: "retained-task", generation: 1, traceId: "retained-workflow",
       payload: { type: "background_task", taskId, title: "Workflow", state: "completed" } });
     const value = await host.getBackgroundTaskOutput("retained-task", taskId);
-    expect(value.workflow).toMatchObject({ status: "done", totalTokens: 0, agents: [{ attempt: 2, resultPreview: join(root, "evidence.txt") }], logs: [join(root, "evidence.txt")] });
+    // Workflow previews and logs retain the Provider's separator style in text.
+    const displayPath = join(root, "evidence.txt").replaceAll(sep, "/");
+    expect(value.workflow).toMatchObject({ status: "done", totalTokens: 0, agents: [{ attempt: 2, resultPreview: displayPath }], logs: [displayPath] });
     expect(JSON.stringify(value)).not.toContain(virtualRoot); expect(calls).toEqual(["workflow_progress"]);
     block = true; const pending = host.getBackgroundTaskOutput("retained-task", taskId);
     await Promise.race([reached, pending.then(() => { throw new Error("The workflow read did not enter the original paired route."); })]);

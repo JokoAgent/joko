@@ -1266,7 +1266,7 @@ export class MobileClient {
   }
 
   partnerDirectoryObservation(): MobilePartnerDirectoryObservation | undefined {
-    if (this.#state.status !== "connected" && this.#state.status !== "offline") return undefined;
+    if (this.#state.status !== "connected" && this.#state.status !== "offline" && this.#state.status !== "connecting") return undefined;
     const ownerKey = this.#partnerPrivateAuthorityKey({ ...this.#state, status: "connected" });
     return ownerKey && this.#state.owner ? { ownerKey, online: this.#state.status === "connected", snapshot: this.#state.owner } : undefined;
   }
@@ -1314,10 +1314,11 @@ export class MobileClient {
       }
       return matches[0]!;
     };
-    return {
+    const directory: MobilePartnerDirectoryTransport = {
       ownerKey,
       list,
       open: async (selected, signal, allowPaused = false) => {
+        const epoch = this.#epoch;
         const initial = exact(await list(signal), selected);
         const initialSessions = await this.network.listPartnerSessions(context.credential, initial.partnerId, signal);
         requireCurrent(signal);
@@ -1328,7 +1329,8 @@ export class MobileClient {
           || visible[0]!.state === SessionState.ARCHIVED || visible[0]!.state === SessionState.CLOSED) {
           throw new Error("The Partner canonical task is not available in the current task directory.");
         }
-        await this.select(sessionId);
+        if (!this.#current(epoch)) throw new Error("The Partner task selection changed while opening.");
+        await this.select(sessionId, signal);
         requireCurrent(signal);
         if (this.#state.selectedId !== sessionId) {
           throw new Error("The Partner canonical task was not selected by the current owner.");
@@ -1340,8 +1342,40 @@ export class MobileClient {
           throw new Error("The Partner canonical task changed while it was opening.");
         }
         return { sessionId };
+      },
+      openImported: async (receipt, signal) => {
+        const epoch = this.#epoch;
+        const sessionId = receipt.canonicalSessionId;
+        if (!receipt.saved || !sessionId) throw new Error("The import has no saved Partner task to open.");
+        const matches = (await list(signal)).partners.filter(partner => partner.partnerId === receipt.partnerId);
+        const partner = matches.length === 1 ? matches[0] : undefined;
+        if (!partner || partner.canonicalSessionId !== sessionId) {
+          throw new Error("The saved Partner task changed. Refresh the Partner directory to open its current task.");
+        }
+        if (!this.#state.owner?.sessions.some(session => session.sessionId === sessionId)) {
+          // The import receipt can arrive before the owner projection contains the new task.
+          const observed = await this.network.readOwner(context.credential, this.deviceNameSource(), signal);
+          requireCurrent(signal);
+          this.#assertOwner(context.credential, observed, this.#state.node!);
+          if (!this.#current(epoch) || this.#partnerPrivateAuthorityKey({ ...this.#state, owner: observed.snapshot }) !== ownerKey) {
+            throw new Error("The Partner import task directory owner changed.");
+          }
+          if (!this.#state.owner?.sessions.some(session => session.sessionId === sessionId)) this.#set({ owner: observed.snapshot });
+        }
+        if (!this.#current(epoch)) throw new Error("The Partner task selection changed while opening.");
+        const result = await directory.open(partner, signal);
+        requireCurrent(signal);
+        const session = this.#selectedSession();
+        if (this.#state.selectedId !== sessionId || !this.taskPresentationOwnerKey() || !session || session.targetId !== partner.homeTargetId
+          || session.archived || session.state === SessionState.ARCHIVED || session.state === SessionState.CLOSED) {
+          throw new Error("The saved Partner task could not be loaded. Refresh the Partner directory to open it.");
+        }
+        this.#partnerRosterNavigation = { sourceKey: mobilePartnerRosterSourceKey(context.credential), profileId: context.credential.profileId,
+          sessionId, partnerId: partner.partnerId, homeTargetId: partner.homeTargetId };
+        return result;
       }
     };
+    return directory;
   }
 
   partnerRosterSources(): readonly MobilePartnerRosterSource[] {
@@ -6091,13 +6125,17 @@ export class MobileClient {
     await write;
   }
 
-  async select(sessionId?: string): Promise<void> {
-    if (this.#partnerRosterNavigation?.sessionId !== sessionId) this.#partnerRosterNavigation = undefined;
+  async select(sessionId?: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const previousEpoch = this.#epoch;
     if (sessionId !== undefined && !this.#state.owner?.sessions.some((session) => session.sessionId === sessionId)) {
       throw new Error("Select a task from the current Joko node.");
     }
     if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
     await this.#releaseQueueEditBeforeTransition();
+    signal?.throwIfAborted();
+    if (signal && !this.#current(previousEpoch)) throw new Error("The task selection owner changed.");
+    if (this.#partnerRosterNavigation?.sessionId !== sessionId) this.#partnerRosterNavigation = undefined;
     this.#joinedTask?.lifetime.abort(); this.#joinedTask = undefined;
     this.#set({ taskSource: { kind: "own" }, pending: this.#allPending.filter(item =>
       item.connectionId === this.#credential?.connectionId && item.taskJoinId === undefined) });

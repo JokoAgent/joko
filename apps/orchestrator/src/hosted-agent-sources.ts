@@ -254,6 +254,7 @@ export class HostedAgentSources {
             const response = decodeHostedWorkflowProgress(await captured.client.call(`workflow:${id}`, id, command, signal)); guard();
             if (response.output.status !== "available") return response.output;
             const workspace = new ExecutorWorkspace({ workingDir: input.target.workspaceRoot,
+              aliases: [{ from: response.virtualRoot, to: input.target.workspaceRoot }],
               ...(peer ? { remote: { pathStyle: peer.pathStyle, home: input.target.workspaceRoot, temporary: input.target.workspaceRoot } } : {}) });
             workspace.setVirtualRoot(response.virtualRoot);
             const projection = new HostedAgentProjection(workspace, { sessionId: input.sessionId, target: input.target }, () => input.bindings[0]!);
