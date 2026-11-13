@@ -70,6 +70,7 @@ export {
   serializeJson
 } from "./serialization.js";
 export {
+  isTargetDeleted,
   remoteHostFailureIsRetryable,
   REMOTE_HOST_FAILURE_CODES
 } from "./types.js";

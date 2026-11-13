@@ -81,9 +81,20 @@ export interface WorkspaceRegistration {
   };
 }
 
+async function canonicalWorkspaceRoot(path: string): Promise<string> {
+  const root = await realpath(path);
+  const info = await lstat(root);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Workspace root must be a real directory.");
+  return root;
+}
+
 export interface RemoteWorkspaceDelegate {
   capturePreviewAuthority(workspaceId: string, signal?: AbortSignal): Promise<WorkspacePreviewAuthority>;
   register(input: WorkspaceRegistration): Promise<WorkspaceRegistration>;
+  changeTrust<T>(previous: WorkspaceRegistration, trusted: boolean, commit: () => T): {
+    readonly registration: WorkspaceRegistration;
+    readonly result: T;
+  };
   unregister(id: string): void;
   watchChanges(scope: WorkspaceFileChangeScope, signal?: AbortSignal): AsyncGenerator<WorkspaceFileChangeRecord>;
   invoke<Result>(workspaceId: string, method: string, args: readonly unknown[], request?: WorkspaceFileRequestAuthority): Promise<Result>;
@@ -531,14 +542,35 @@ export class WorkspaceService {
       this.#workspaces.set(input.id, registration);
       return registration;
     }
-    const root = await realpath(input.root);
-    const info = await lstat(root);
-    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Workspace root must be a real directory.");
+    const root = await canonicalWorkspaceRoot(input.root);
     const registration = { ...input, root };
     if (previous?.remote !== undefined) this.#remoteDelegate?.unregister(input.id);
     this.#workspaces.set(input.id, registration);
     await this.#changeStream.workspaceRegistered(registration);
     return registration;
+  }
+
+  async prepareTrustChange(previous: WorkspaceRegistration, trusted: boolean): Promise<<T>(commit: () => T) => T> {
+    if (previous.remote === undefined && await canonicalWorkspaceRoot(previous.root) !== previous.root) {
+      throw new WorkspaceEntryMutationError("The registered workspace root changed.", "stale");
+    }
+    return <T>(commit: () => T): T => {
+      if (this.#workspaces.get(previous.id) !== previous) {
+        throw new WorkspaceEntryMutationError("The registered workspace changed.", "stale");
+      }
+      if (previous.remote !== undefined) {
+        if (this.#remoteDelegate === undefined) throw new Error("Remote workspace files are unavailable.");
+        const { registration, result } = this.#remoteDelegate.changeTrust(previous, trusted, commit);
+        this.#workspaces.set(previous.id, registration);
+        return result;
+      }
+      // A failed durable commit must never publish a grant to workspace tools.
+      const result = commit();
+      const registration = { ...previous, trusted };
+      this.#workspaces.set(previous.id, registration);
+      void this.#changeStream.workspaceRegistered(registration).catch(() => undefined);
+      return result;
+    };
   }
 
   unregister(id: string): void {

@@ -87,6 +87,7 @@ import {
   ResourceUsageReportCapacityError,
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   deviceContentProjection,
+  isTargetDeleted,
   normalizeDeviceName,
   operationBodyHash
 } from "@joko/store";
@@ -2628,7 +2629,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const target = {
     listTargets: (request, context) => {
       authenticate(context);
-      let records = dependencies.store.listTargets(request.backendId === "" ? undefined : request.backendId);
+      let records = dependencies.store.listTargets(request.backendId === "" ? undefined : request.backendId)
+        .filter(target => !isTargetDeleted(target));
       if (request.searchQuery !== "") {
         const query = request.searchQuery.toLocaleLowerCase();
         records = records.filter((item) => item.descriptor.displayName.toLocaleLowerCase().includes(query));
@@ -2640,7 +2642,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     getTarget: (request, context) => {
       authenticate(context);
-      return { target: toProtoTarget(dependencies.store.getTarget(request.targetId)) };
+      return { target: toProtoTarget(requireUndeletedTarget(dependencies.store, request.targetId)) };
     },
     listProjectDirectories: async (request, context) => {
       const connection = authenticate(context);
@@ -9316,12 +9318,18 @@ function targetWorkspaceRegistration(target: StoredTarget): WorkspaceRegistratio
   };
 }
 
+function requireUndeletedTarget(store: OperationalStore, targetId: string): StoredTarget {
+  const target = store.getTarget(targetId);
+  if (isTargetDeleted(target)) throw new ConnectError("The selected project has been deleted.", Code.NotFound);
+  return target;
+}
+
 function assertTargetWorkspacePreparationAuthority(target: StoredTarget, expectedRevision: bigint): void {
   if (target.revision !== expectedRevision) {
     throw new RevisionConflictError("Target", target.descriptor.id, expectedRevision, target.revision);
   }
   const metadata = asRecord(target.metadata);
-  if (metadata["deletedAt"] !== undefined) {
+  if (isTargetDeleted(target)) {
     throw new ConnectError("The selected project has been deleted.", Code.NotFound);
   }
   if (metadata["state"] === "deleting") {
@@ -17074,6 +17082,7 @@ async function dispatchMutation(
           kind: payload.case,
           body: mutation,
           commit: (store) => {
+            requireUndeletedTarget(store, descriptor.id);
             store.upsertTarget(descriptor, {
               ...metadata,
               ...(payload.value.pinned === undefined ? {} : { pinned: payload.value.pinned })
@@ -17081,19 +17090,20 @@ async function dispatchMutation(
             return { accepted: true, resultCase: "target", entityId: descriptor.id } satisfies OperationOutcome;
           }
         });
-        await registerTargetWorkspace(dependencies, dependencies.store.getTarget(descriptor.id));
+        const current = dependencies.store.getTarget(descriptor.id);
+        if (!isTargetDeleted(current)) await registerTargetWorkspace(dependencies, current);
         return presented(execution);
       });
     }
     case "archiveTarget": {
       return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
-        const existing = dependencies.store.getTarget(payload.value.targetId);
         const execution = await host.mutate({
           operationId,
           connection,
           kind: payload.case,
           body: mutation,
           commit: (store) => {
+            const existing = requireUndeletedTarget(store, payload.value.targetId);
             store.upsertTarget(existing.descriptor, {
               ...asRecord(existing.metadata),
               state: payload.value.archived ? "archived" : "active",
@@ -17127,7 +17137,7 @@ async function dispatchMutation(
         const deletedAt = Date.now();
         let trashedPath: string | undefined;
         const assertDeletionPrecondition = (store: OperationalStore): void => {
-          const current = store.getTarget(existing.descriptor.id);
+          const current = requireUndeletedTarget(store, existing.descriptor.id);
           if (current.revision !== existing.revision) {
             throw new RevisionConflictError("Target", current.descriptor.id, existing.revision, current.revision);
           }
@@ -24115,23 +24125,49 @@ async function workspaceTrustOperation(
   workspaceId: string,
   trusted: boolean
 ): Promise<PresentedOperation> {
-  const target = targetForWorkspace(dependencies.store, workspaceId);
-  if (target === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, kind, "Workspace is not attached to a durable Target.");
-  const execution = await dependencies.sessionHost.mutate({
-    operationId,
-    connection,
-    kind,
-    body: mutation,
-    commit: (store) => {
-      store.upsertTarget({ ...target.descriptor, trusted }, target.metadata);
-      return { accepted: true, resultCase: "workspace", entityId: workspaceId } satisfies OperationOutcome;
-    },
-    effect: async () => {
-      const registration = requireWorkspace(dependencies.workspaceService, workspaceId);
-      await dependencies.workspaceService.register({ ...registration, trusted });
-    }
+  const original = targetForWorkspace(dependencies.store, workspaceId);
+  if (original === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, kind, "Workspace is not attached to a durable Target.");
+  const targetId = original.descriptor.id;
+  return dependencies.targetWorkspaceRuntime.run(targetId, async () => {
+    const assertCurrentTarget = (store: OperationalStore): void => {
+      const target = requireUndeletedTarget(store, targetId);
+      if (target.revision !== original.revision) {
+        throw new RevisionConflictError("Target", targetId, original.revision, target.revision);
+      }
+      if (asRecord(target.metadata)["state"] === "deleting" || targetForWorkspace(store, workspaceId)?.descriptor.id !== targetId) {
+        throw new ConnectError("The selected workspace is no longer current.", Code.FailedPrecondition);
+      }
+    };
+    let applyTrust: Awaited<ReturnType<NativeWorkspaceService["prepareTrustChange"]>> | undefined;
+    const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
+      operationId,
+      connection,
+      kind,
+      body: mutation,
+      precondition: assertCurrentTarget,
+      effect: async () => {
+        const registration = requireWorkspace(dependencies.workspaceService, workspaceId);
+        const expected = targetWorkspaceRegistration(original);
+        if (workspaceId === expected.id && (expected.remote === undefined
+          ? registration.remote !== undefined
+          : registration.remote === undefined || expected.remote.targetId !== registration.remote.targetId
+            || operationBodyHash(expected.remote.binding) !== operationBodyHash(registration.remote.binding))) {
+          throw new ConnectError("The selected workspace registration no longer belongs to this project.", Code.FailedPrecondition);
+        }
+        applyTrust = await dependencies.workspaceService.prepareTrustChange(registration, trusted);
+      },
+      complete: async (commit) => {
+        if (applyTrust === undefined) throw new Error("Workspace trust was not prepared.");
+        return applyTrust(commit);
+      },
+      commit: (store) => {
+        const target = store.getTarget(targetId);
+        store.upsertTarget({ ...target.descriptor, trusted }, target.metadata);
+        return { accepted: true, resultCase: "workspace", entityId: workspaceId } satisfies OperationOutcome;
+      }
+    });
+    return presented(execution);
   });
-  return presented(execution);
 }
 
 async function workspaceEntryEffectOperation(

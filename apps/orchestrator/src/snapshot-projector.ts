@@ -19,6 +19,7 @@ import type {
 import { NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, nativeHistoryEventContext } from "@joko/core";
 import {
   NotFoundError,
+  isTargetDeleted,
   readSideChatHistoryBoundary,
   sideChatHistoryEventVisible,
   type OperationRecord,
@@ -292,7 +293,7 @@ export class SnapshotProjector {
 
   private catalogBase(base: OperationalSnapshot): OperationalSnapshot {
     return { ...base, sessions: base.sessions.filter(session => session.descriptor.hidden !== true && this.options.hideSessionFromCatalog?.(session.descriptor.id) !== true),
-      targets: base.targets.filter(target => this.options.hideTargetFromCatalog?.(target.descriptor.id) !== true) };
+      targets: base.targets.filter(target => !isTargetDeleted(target) && this.options.hideTargetFromCatalog?.(target.descriptor.id) !== true) };
   }
 
   projectOwnerSnapshot(): Snapshot {
@@ -381,6 +382,7 @@ export class SnapshotProjector {
     });
     return this.projectFilteredSnapshot(scope, (store, base) => {
       const target = store.getTarget(targetId);
+      if (isTargetDeleted(target)) throw new NotFoundError("Target", targetId);
       const sessionIds = new Set(base.sessions
         .filter((session) => session.descriptor.targetId === targetId)
         .map((session) => session.descriptor.id));
@@ -401,7 +403,7 @@ export class SnapshotProjector {
       }
     });
     return this.projectFilteredSnapshot(scope, (store, base) => {
-      const target = store.listTargets().find((candidate) => workspaceIdForTarget(candidate) === workspaceId);
+      const target = store.listTargets().find((candidate) => !isTargetDeleted(candidate) && workspaceIdForTarget(candidate) === workspaceId);
       if (target === undefined) throw new NotFoundError("Workspace", workspaceId);
       const sessionIds = new Set(base.sessions
         .filter((session) => session.descriptor.targetId === target.descriptor.id)
