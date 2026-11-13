@@ -69,6 +69,15 @@ it("does not replace the current connection when the Partner editor declines lea
   try { await act(async () => view.app()!.disconnect()); expect(view.app()!.state.activeProfile?.id).toBe(a.id); expect(view.retiredProfiles).toEqual([]); }
   finally { unregister(); }
 });
+it("keeps the mounted task usage reader stable across snapshot updates", async () => {
+  const view = await mount();
+  const before = view.app()!;
+  await act(async () => view.emit());
+  const after = view.app()!;
+  expect(after.state.snapshot.models).toEqual([priceModel]);
+  expect(after).not.toBe(before);
+  expect(after.readTaskProviderGroupUsage).toBe(before.readTaskProviderGroupUsage);
+});
 it("adopts a verified catalog node and keeps identical plugin, resource and market IDs on that node", async () => {
   const view = await mount();
   const old = view.app()!;
