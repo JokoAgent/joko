@@ -3,7 +3,7 @@ import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController, ControllerState } from "../controller.js";
-import type { QueueItemView } from "../model.js";
+import type { QueueControlView, QueueItemView } from "../model.js";
 import { SELECTION_QUOTE_BLOCK_MARKER_LINE } from "../selection-quote.js";
 import { QueueStrip, type QueueStripActions } from "./QueueStrip.js";
 import type { RunAction } from "./types.js";
@@ -35,7 +35,7 @@ async function fixture() {
   const failures: unknown[] = [];
   const runAction: RunAction = (_key, action) => { void action().catch((error: unknown) => failures.push(error)); };
   const host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
-  const render = async (items = initial, owner = controller) => act(async () => root!.render(<QueueStrip sessionId="task" items={items}
+  const render = async (items = initial, owner = controller, control?: QueueControlView) => act(async () => root!.render(<QueueStrip sessionId="task" items={items} control={control}
     controller={owner as unknown as AppController} supportedDispositions={["followUp", "steer"]} runAction={runAction} t={(key) => key}
     expanded={false} onExpandedChange={vi.fn()} actionsRef={actions} />));
   await render();
@@ -82,6 +82,13 @@ it("keeps foreign pending input visible while exposing guest controls only for i
   expect(f.row("second").textContent).toContain("Queued second");
   expect(f.host.querySelector("[draggable='true']")).toBeNull();
   expect(f.host.querySelector("[aria-label='queue.pause']")).toBeNull();
+  expect(f.host.querySelector("[aria-label='queue.resume']")).toBeNull();
+  await f.render(initial, guest, { sessionId: "task", revision: 2n, generation: 1n,
+    state: "paused", interactionLocked: false, queuedItemCount: 2 });
+  const resume = f.host.querySelector<HTMLButtonElement>("[aria-label='queue.resume']")!;
+  await act(async () => resume.click());
+  expect(guest.resumeQueue).toHaveBeenCalledExactlyOnceWith("task");
+  expect(guest.pauseQueue).not.toHaveBeenCalled();
   await act(async () => f.button("queue.cancel").click());
   expect(guest.cancelQueueItem).toHaveBeenCalledExactlyOnceWith("first");
   expect(guest.reorderQueueItem).not.toHaveBeenCalled();

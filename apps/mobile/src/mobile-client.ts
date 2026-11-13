@@ -59,7 +59,7 @@ import {
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
   OperationPreconditionSchema, OperationState, OperationMutationSchema, PerTurnOverridesSchema, RewindSafety,
-  MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueItemState, RenameSessionMutationSchema, TaskTagColor,
+  MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueDispatchState, QueueItemState, RenameSessionMutationSchema, TaskTagColor,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
   DeviceSchema, RenameDeviceMutationSchema, ResetDeviceNameMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
@@ -5691,6 +5691,50 @@ export class MobileClient {
       const result = await this.#submitTerminal(create(OperationMutationSchema, { payload: command === "stop"
         ? { case: "abortRun", value: { runId: run!.runId } }
         : { case: "resumeSession", value: { sessionId } } }), { kind: "session-model", sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  #sharedQueueResumeTarget() {
+    const joined = this.#joinedTask;
+    if (!joined) return undefined;
+    const authority = this.#taskAuthorityKey();
+    if (!authority) return undefined;
+    const sessionId = joined.source.joined.share!.sessionId;
+    const control = this.#queueControl(sessionId);
+    const revision = control?.version?.revision;
+    const generation = control?.version?.generation;
+    if (control?.dispatchState !== QueueDispatchState.PAUSED || !revision || revision.value < 1n
+      || !generation || generation !== this.#selectedSession()?.nativeBinding?.runtimeGeneration) return undefined;
+    const pending = this.#state.pending.some(item => item.kind === "queue-resume" && item.sessionId === sessionId
+      && item.taskJoinId === joined.source.joined.joinId);
+    return {
+      sessionId, authority, revision, generation, signal: joined.lifetime.signal,
+      authorityKey: JSON.stringify([authority, this.#epoch, revision.value.toString(), generation.toString()]),
+      pending
+    };
+  }
+
+  taskSharedQueueResumeControl(): { readonly authorityKey: string; readonly pending: boolean } | undefined {
+    const target = this.#sharedQueueResumeTarget();
+    return target && { authorityKey: target.authorityKey, pending: target.pending };
+  }
+
+  async resumeSharedTaskQueue(authorityKey: string): Promise<boolean> {
+    const target = this.#sharedQueueResumeTarget();
+    if (!target || target.authorityKey !== authorityKey) throw new Error("The displayed shared queue is no longer available to resume.");
+    if (target.pending) return false;
+    const action = this.#claimMutation();
+    try {
+      const epoch = this.#epoch;
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.QUEUE_CONTROL, id: target.sessionId },
+          expectedRevision: target.revision, expectedGeneration: target.generation }],
+        payload: { case: "resumeQueue", value: { sessionId: target.sessionId } }
+      }), { kind: "queue-resume", sessionId: target.sessionId }, undefined, false, true, {
+        signal: target.signal, isCurrent: () => this.#current(epoch) && this.#taskAuthorityKey() === target.authority,
+        beforeDispatch: () => this.#sharedQueueResumeTarget()?.authorityKey === authorityKey
+      });
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -17250,7 +17294,8 @@ export class MobileClient {
     let operation: Operation;
     if (!persisted || !requestCurrent() || authority?.beforeDispatch?.() === false) {
       if (pending.kind === "extension-settings-routing" || pending.kind === "extension-settings-credential-clear"
-        || pending.kind === "extension-settings-directory" || pending.kind === "workspace-rewind" || pending.kind === "session-stop") {
+        || pending.kind === "extension-settings-directory" || pending.kind === "workspace-rewind" || pending.kind === "session-stop"
+        || pending.kind === "queue-resume") {
         await this.#retireUndispatchedReceipt(pending);
         if (pending.kind === "workspace-rewind" && markBusy && this.#current(epoch)) this.#set({ busy: false });
         return { accepted: false, definitive: true };
@@ -17411,8 +17456,11 @@ export class MobileClient {
   #operationReceiptMatches(operation: Operation, pending: PendingOperation): boolean {
     if (pending.taskJoinId !== undefined) {
       if (this.#joinedTask?.source.joined.joinId !== pending.taskJoinId) return false;
-      try { assertMobileSharedTaskOperation(this.#joinedTask.source, pending.operationId, operation); return true; }
+      try { assertMobileSharedTaskOperation(this.#joinedTask.source, pending.operationId, operation); }
       catch { return false; }
+      if (pending.kind !== "queue-resume") return true;
+      const mutation = operation.mutation?.payload;
+      return mutation?.case === "resumeQueue" && mutation.value.sessionId === pending.sessionId;
     }
     if (this.#joinedTask || operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) return false;
     if (pending.kind === "session-stop") {
@@ -17501,7 +17549,7 @@ export class MobileClient {
           }
           if (operation.state === OperationState.SUCCEEDED
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
-              "queue-edit", "queue-interaction-lock", "queue-reorder", "interaction-resolve", "interaction-dismiss",
+              "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch", "session-stop",
               "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
             && this.#current(epoch) && (pending.kind !== "message-delete" && pending.kind !== "session-stop" || this.#operationReceiptMatches(operation, pending))) {
