@@ -1476,6 +1476,8 @@ export interface EventQuery {
   readonly activeNativeTimeline?: boolean;
   /** Select complete messages before applying the page limit. */
   readonly messageCompleteOnly?: boolean;
+  /** Select candidate HTTPS references in complete message text before paging. */
+  readonly messageHttpsOnly?: boolean;
 }
 
 export interface StoredSubagentRunProjection {

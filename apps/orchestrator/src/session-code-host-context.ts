@@ -13,7 +13,7 @@ import {
 import type { OperationalStore, PersistedEvent, StoredSession } from "@joko/store";
 
 export const SESSION_CODE_HOST_PROJECTION_SETTING_KEY = "codeHost.pullRequests.v1";
-const CONTEXT_EVENT_LIMIT = 200;
+const CONTEXT_EVENT_PAGE_SIZE = 200;
 const REFRESH_CONCURRENCY = 4;
 
 const installedRuntimes = new WeakMap<OperationalStore, SessionCodeHostContextRuntime>();
@@ -255,26 +255,36 @@ export function refreshSessionCodeHostReferencesInBackground(store: OperationalS
   installedRuntimes.get(store)?.refreshSessionsInBackground(sessionIds);
 }
 
-function sessionCodeHostContext(
+function* sessionCodeHostContext(
   store: Pick<OperationalStore, "listEvents" | "getBackend">,
   session: StoredSession
-): readonly string[] {
-  const context: string[] = [];
-  for (const event of store.listEvents({
-    sessionId: session.descriptor.id,
-    ...(usesPiTimeline(store, session.descriptor.backendId) ? { activeNativeTimeline: true } : {}),
-    order: "desc",
-    limit: CONTEXT_EVENT_LIMIT
-  })) {
-    if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined
-      || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined) continue;
-    for (const block of event.payload.blocks) {
-      if (block.kind === "text") context.push(block.text);
+): Generator<string> {
+  const activeNativeTimeline = usesPiTimeline(store, session.descriptor.backendId);
+  let beforeCursor: bigint | undefined;
+  for (;;) {
+    const page = store.listEvents({
+      sessionId: session.descriptor.id,
+      activeNativeTimeline,
+      messageHttpsOnly: true,
+      order: "desc",
+      limit: CONTEXT_EVENT_PAGE_SIZE,
+      ...(beforeCursor === undefined ? {} : { beforeCursor })
+    });
+    for (const event of page) {
+      if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined
+        || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined
+        || event.payload.partnerPrivateOrigin !== undefined) continue;
+      for (const block of event.payload.blocks) {
+        if (block.kind === "text") yield block.text;
+      }
     }
+    if (page.length < CONTEXT_EVENT_PAGE_SIZE) break;
+    const nextCursor = page[page.length - 1]!.globalCursor;
+    if (beforeCursor !== undefined && nextCursor >= beforeCursor) throw new Error("Session reference history did not advance.");
+    beforeCursor = nextCursor;
   }
-  if (session.descriptor.summary !== undefined) context.push(session.descriptor.summary);
-  context.push(session.descriptor.title);
-  return context;
+  if (session.descriptor.summary !== undefined) yield session.descriptor.summary;
+  yield session.descriptor.title;
 }
 
 function eventCanChangeCodeHostContext(event: PersistedEvent, store: Pick<OperationalStore, "getBackend">): boolean {

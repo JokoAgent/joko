@@ -140,6 +140,42 @@ describe("Session code-host context", () => {
     expect(getPullRequest).not.toHaveBeenCalled();
   });
 
+  it("keeps an older live reference beyond the first candidate page and withdraws its original sources", async () => {
+    const { store } = createFixture("Current task");
+    const origin = { backendId: "backend-1", targetId: "target-1", sessionId: "session-1", generation: 0 };
+    const url = "https://github.com/acme/work/pull/42";
+    const addMessage = (traceId: string, text: string) => store.appendEvent({ ...origin, traceId,
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text }] } });
+    const older = addMessage("older-reference", url);
+    const otherSource = addMessage("another-reference", url);
+    for (let index = 0; index < 201; index++) {
+      addMessage(`later-message:${index}`, index % 2 === 0 ? "Task progress" : "See https://example.test/progress");
+      store.appendEvent({ ...origin, traceId: `later-event:${index}`, payload: { type: "session_changed" } });
+    }
+    for (let index = 0; index < 101; index++) addMessage(`more-candidates:${index}`, "See HTTPS://example.test/progress");
+    const read = vi.spyOn(store, "listEvents");
+    const runtime = new SessionCodeHostContextRuntime({ store });
+    const authorize = new OperationalCodeHostSessionAuthorization(store);
+    const reference = (await runtime.refreshSession(origin.sessionId))?.references[0]?.reference;
+    expect(reference).toMatchObject({ webUrl: url });
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(read.mock.calls[1]?.[0]?.messageHttpsOnly).toBe(true);
+    expect(typeof read.mock.calls[1]?.[0]?.beforeCursor).toBe("bigint");
+    if (reference === undefined) throw new Error("The original reference was not projected.");
+    expect(authorize.authorize(origin.sessionId, reference)).toBeDefined();
+    const deleteMessage = (id: string, operationId: string) => store.runOperation({
+      id: operationId, kind: "delete_message", body: { eventId: id }
+    }, owner => {
+      owner.commitMessageDeletion({ sessionId: origin.sessionId, requestedEventId: id, deletedEventIds: [id], operationId, traceId: operationId });
+      return {};
+    });
+    deleteMessage(otherSource.id, "delete-duplicate-reference");
+    expect((await runtime.refreshSession(origin.sessionId))?.references.map(entry => entry.reference)).toEqual([reference]);
+    deleteMessage(older.id, "delete-last-reference");
+    expect((await runtime.refreshSession(origin.sessionId))?.references).toEqual([]);
+    expect(authorize.authorize(origin.sessionId, reference)).toBeUndefined();
+  });
+
   it("publishes references from the active native branch and restores them on a branch revisit", async () => {
     const { store } = createFixture("Ordinary task");
     const session = store.getSession("session-1").descriptor;
