@@ -1265,6 +1265,7 @@ if (!app.requestSingleInstanceLock()) {
     initializeDesktopDevicePeerAgentLifecycle();
     void beginDesktopUpdateStartup();
     if (!packagedSmoke) ensureTray();
+    if (externalPackagedE2e) recordPackagedSmokeProgress("app_ready_startup_returned");
   }).catch((error: unknown) => {
     const message = safeSmokeError(error);
     recordPackagedSmokeProgress(`app_ready_failed ${message}`);
@@ -1354,6 +1355,8 @@ function createWindow(): void {
   mainWindow = window;
   if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
     windowContents.once("did-start-loading", () => recordPackagedSmokeProgress("main_window_load_started"));
+    windowContents.once("dom-ready", () => recordPackagedSmokeProgress("main_window_dom_ready"));
+    windowContents.once("preload-error", () => recordPackagedSmokeProgress("main_window_preload_failed"));
     windowContents.once("did-finish-load", () => recordPackagedSmokeProgress("main_window_load_finished"));
     windowContents.once("did-fail-load", () => recordPackagedSmokeProgress("main_window_load_failed"));
     windowContents.once("render-process-gone", (_event, details) => {
@@ -1413,6 +1416,9 @@ function createWindow(): void {
     clearNativeTaskStatusProjection();
     clearDesktopNativeTaskStatusVisibility(window.webContents);
   });
+  if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
+    windowContents.once("did-start-loading", () => recordPackagedSmokeProgress("main_window_load_start_handlers_returned"));
+  }
   window.webContents.on("render-process-gone", (_event, details) => {
     recordPackagedSmokeNativeCleanup("main_render_process_gone_entered");
     retireMainWindowDocument(window, window.webContents, true);
@@ -6596,7 +6602,12 @@ function registerPackagedAppProtocol(): void {
         headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
       });
     }
+    const observeMainEntry = externalPackagedE2e && request.method === "GET" && request.url === DESKTOP_APP_ENTRY_URL;
+    if (observeMainEntry) recordPackagedSmokeProgress("main_window_entry_requested");
     const response = await net.fetch(pathToFileURL(resourcePath).href, { bypassCustomProtocolHandlers: true });
+    if (observeMainEntry) {
+      recordPackagedSmokeProgress(response.ok ? "main_window_entry_received" : "main_window_entry_failed");
+    }
     return securePackagedAppScriptResponse(response, resourcePath);
   });
 }
