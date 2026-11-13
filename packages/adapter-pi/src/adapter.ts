@@ -55,6 +55,7 @@ import {
   type PermissionMode,
   type PiEventMetadata,
   type PortableNativeSession,
+  type StoredPortableNativeSessionInput,
   type PromptInput,
   type ProviderModel,
   type ResourceUsageEventPayload,
@@ -2777,6 +2778,18 @@ export class PiBackendAdapter implements
       throw piError("PI_SESSION_PORTABLE_BINDING_MISSING", "Portable Session export requires a native binding", "session");
     }
     return this.#sessionStore.exportPortableSession(context.binding.opaqueRef);
+  }
+
+  async readStoredPortableNativeSession(input: StoredPortableNativeSessionInput): Promise<PortableNativeSession | undefined> {
+    if (input.target.remoteWorkspace !== undefined || !input.target.trusted) {
+      throw piError("PI_SESSION_EXPORT_TARGET_DENIED", "Stored native export requires a trusted local Target", "session");
+    }
+    input.assertCurrent();
+    await this.validateTarget(input.target);
+    input.assertCurrent();
+    const result = await this.#sessionStore.readStoredPortableSession(input.binding);
+    input.assertCurrent();
+    return result;
   }
 
   async importPortableNativeSession(

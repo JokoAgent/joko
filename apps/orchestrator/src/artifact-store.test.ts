@@ -105,6 +105,44 @@ describe("ArtifactStore garbage collection", () => {
     store.close();
   });
 
+  it("fences concurrent ingests of identical bytes under each caller's authority", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-artifact-fenced-bytes-"));
+    cleanupPaths.push(directory);
+    const store = new OperationalStore(join(directory, "orchestrator.db"));
+    try {
+      const repo = new OperationalArtifactRepository(store);
+      const find = repo.findPermanentArtifact.bind(repo);
+      let firstRead!: () => void;
+      let releaseFirstRead!: () => void;
+      const first = new Promise<void>(resolve => { firstRead = resolve; });
+      const release = new Promise<void>(resolve => { releaseFirstRead = resolve; });
+      let reads = 0;
+      repo.findPermanentArtifact = async input => {
+        if (++reads === 1) { firstRead(); await release; }
+        return find(input);
+      };
+      const artifacts = new ArtifactStore({
+        rootDirectory: join(directory, "artifacts"), repository: repo, ingestRoots: [directory]
+      });
+      await artifacts.initialize();
+      const bytes = Buffer.from("portable task bytes");
+      const owner = new AbortController();
+      const retired = artifacts.ingestBytes(bytes, { assertCurrent: () => owner.signal.throwIfAborted() });
+      const rejected = expect(retired).rejects.toThrow("Export authority changed.");
+      await first;
+      const stillCurrent = artifacts.ingestBytes(bytes);
+      owner.abort(new Error("Export authority changed."));
+      releaseFirstRead();
+      await rejected;
+      const result = await stillCurrent;
+      expect(store.listArtifacts().map(record => record.blob.id)).toEqual([result.id]);
+      expect(reads).toBe(2);
+      await expect(artifacts.readBlob(result)).resolves.toMatchObject({ data: bytes });
+    } finally {
+      store.close();
+    }
+  });
+
   it("reuses a permanent BlobRef for identical content across store instances", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-artifact-stable-"));
     cleanupPaths.push(directory);
