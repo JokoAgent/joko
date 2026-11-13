@@ -649,7 +649,7 @@ describe("SessionHost", () => {
     const { sessionId } = (await f.host.createSession({ operationId: "native-mcp-policy", connection: f.connection,
       targetId: "target-one", title: "Native MCP", fastMode: false, permissionMode: "ask", planMode: false })).value;
     const signal = new AbortController().signal;
-    const unruled = await f.host.authorizeNativeBridgeTool(sessionId, "server__name", "submit", {}, signal);
+    const { assertCurrent: unruled } = await f.host.authorizeNativeBridgeTool(sessionId, "server__name", "submit", {}, signal);
     unruled(); expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
     const update = (effect: contract.PolicyEffect) => f.store.setSetting("service", "orchestrator", "settings.policy", create(contract.PolicySettingsSchema, {
       rules: [{ policyRuleId: "native-mcp", effect, subjectKind: contract.PolicySubjectKind.MCP,
@@ -663,7 +663,7 @@ describe("SessionHost", () => {
     await eventually(() => f.store.listInteractions({ sessionId, status: "open" }).length === 1);
     const opened = f.store.listInteractions({ sessionId, status: "open" })[0]!;
     f.host.resolveInteraction(opened.id, opened.generation, { kind: "permission", decision: "allow_once" }, "native-mcp-approve");
-    const guard = await pending; guard();
+    const { assertCurrent: guard } = await pending; guard();
     update(contract.PolicyEffect.DENY);
     expect(guard).toThrow();
     expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
@@ -10711,7 +10711,9 @@ describe("SessionHost", () => {
       try {
         await gate.entered;
         if (scenario === "edited") {
-          fixture.store.upsertSchedule({ ...schedule, expectedRevision: schedule.revision, expression: "180000", nextRunAt: editedNextAt });
+          const running = fixture.store.getSchedule(schedule.id);
+          expect(running).toMatchObject({ lastRunAt: startedAt, nextRunAt: startedAt });
+          fixture.store.upsertSchedule({ ...running, expectedRevision: running.revision, expression: "180000", nextRunAt: editedNextAt });
         }
         if (scenario === "cancelled") await coordinator.abortSchedule(schedule.id);
         now = startedAt + 50_000;
@@ -10723,7 +10725,9 @@ describe("SessionHost", () => {
       expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ firedAt: startedAt, finishedAt: now, status }]);
       const nextRunAt = scenario === "manual" || scenario === "cancelled" ? startedAt + interval
         : scenario === "edited" ? editedNextAt : now + interval;
-      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({ nextRunAt });
+      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({
+        nextRunAt, expression: scenario === "edited" ? "180000" : String(interval)
+      });
       if (scenario === "success" || scenario === "failed") {
         now = startedAt + interval;
         await coordinator.tick();
@@ -11307,6 +11311,34 @@ describe("SessionHost", () => {
       lastRunAt: scheduledAt,
       nextRunAt: 31_234
     });
+  });
+
+  it("runs a monthly script in a short month and keeps the next configured date after coordinator restart", async () => {
+    const fixture = await createFixture();
+    let now = Date.UTC(2027, 0, 31, 9);
+    const schedule = seedScriptSchedule(fixture, "monthly-script", {
+      kind: "cron", expression: "0 9 31 * *", nextRunAt: now
+    });
+    const executeScript = vi.fn(async () => ({ durationMs: 1, stderr: "", stderrTruncated: false }));
+    const first = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, executeScript });
+    try {
+      await first.tick();
+      expect(executeScript).toHaveBeenCalledTimes(1);
+      expect(fixture.store.listScheduleRuns(schedule.id)).toMatchObject([{ status: "success", firedAt: now }]);
+      expect(fixture.store.getSchedule(schedule.id).nextRunAt).toBe(Date.UTC(2027, 1, 28, 9));
+    } finally { first.stop(); }
+    now = Date.UTC(2027, 1, 28, 9);
+    const restarted = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, executeScript });
+    try {
+      await restarted.tick();
+      await restarted.tick();
+      expect(executeScript).toHaveBeenCalledTimes(2);
+      expect(fixture.store.listScheduleRuns(schedule.id)).toHaveLength(2);
+      expect(fixture.store.listScheduleRuns(schedule.id).every(run => run.status === "success")).toBe(true);
+      expect(fixture.store.getSchedule(schedule.id)).toMatchObject({
+        expression: "0 9 31 * *", lastRunAt: now, nextRunAt: Date.UTC(2027, 2, 31, 9)
+      });
+    } finally { restarted.stop(); }
   });
 
   it("does not dispatch the later fold after a persisted automatic cron Run consumed the earlier one", async () => {

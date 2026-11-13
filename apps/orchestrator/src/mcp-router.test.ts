@@ -311,7 +311,7 @@ describe("McpRouter", () => {
       const snapshot = f.router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
       const admitted = vi.fn(async (_session: string, _server: string, _tool: string, args: Readonly<Record<string, unknown>>) => {
         expect(args).toEqual({ destination: "approved" }); entered.resolve(); await pause.promise;
-        return () => { if (!current) throw new Error("Delegation revoked"); };
+        return { assertCurrent: () => { if (!current) throw new Error("Delegation revoked"); } };
       }); f.router.setNativeToolAdmission(admitted);
       const args = { destination: "approved" };
       const result = f.router.executeBridgeCall({ ...bridgeScope(1), authorization: `Bearer ${snapshot.mcpBridge.token}`, generation: 1, serverId: "delegated", toolName: "echo", arguments: args });

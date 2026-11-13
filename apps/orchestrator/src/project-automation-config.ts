@@ -117,7 +117,7 @@ export class ProjectAutomationConfigController {
     for (const entry of read.entries) {
       const existing = byConfigId.get(entry.id);
       const normalized = projectScheduleInput(entry.schedule, target.descriptor.backendId, targetId, existing?.enabled);
-      const candidate = materialize(projectScheduleId(targetId, entry.id), normalized, at, existing);
+      const candidate = materialize(projectScheduleId(targetId, entry.id), projectScheduleWithRuntimeBinding(normalized, existing), at, existing);
       const withOrigin: UpsertScheduleInput = {
         ...candidate,
         executionSnapshot: withScheduleProjectAutomationOrigin(candidate.executionSnapshot, { targetId, configId: entry.id }),
@@ -362,6 +362,15 @@ function projectScheduleInput(
       : ScheduleSessionMode.FRESH,
     enabled
   });
+}
+
+export function projectScheduleWithRuntimeBinding(input: ScheduleInput, existing?: ScheduleRecord): ScheduleInput {
+  const sessionId = input.sessionMode === ScheduleSessionMode.PERSISTENT && existing?.sessionMode === "persistent" &&
+    existing.backendId === input.backendId && existing.targetId === input.targetId ? existing.sessionId : undefined;
+  if (input.sessionId !== "" && input.sessionId !== sessionId) {
+    throw new Error("Project automations cannot bind a specific product task.");
+  }
+  return sessionId === undefined || input.sessionId === sessionId ? input : create(ScheduleInputSchema, { ...input, sessionId });
 }
 
 function parseProjectAutomationFile(value: unknown): readonly ProjectAutomationEntry[] {

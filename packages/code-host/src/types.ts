@@ -30,7 +30,7 @@ export interface CodeHostSessionReferenceProjection {
   readonly reference: CodeHostPullRequestReference;
   readonly projection?: CodeHostPullRequestProjection;
   readonly freshUntil?: number;
-  /** A negative-cache fence. An older successful projection, if any, remains untouched. */
+  /** A negative-cache fence for a confirmed missing or inaccessible reference. */
   readonly notFoundUntil?: number;
   /** Service-private transient failure/rate-limit fence; never projected to clients. */
   readonly retryAfterUntil?: number;

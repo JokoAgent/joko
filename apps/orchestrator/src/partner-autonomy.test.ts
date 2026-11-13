@@ -130,7 +130,7 @@ describe("Partner task observation", () => {
       canSendTaskMessage: (caller, target) => canSendFollowUpTaskMessage(f.profiles, caller, target) });
     const call = async (source: SessionDescriptor, name: string, args: Record<string, unknown>) => {
       const input = { name, args }, signal = new AbortController().signal;
-      const assertCurrent = await f.host.authorizeNativeBridgeTool(source.id, provider.id, "call_tool", input, signal);
+      const { assertCurrent } = await f.host.authorizeNativeBridgeTool(source.id, provider.id, "call_tool", input, signal);
       return provider.callTool("call_tool", input, signal, {
         sessionId: source.id, targetId: source.targetId, generation: source.binding.generation, assertCurrent
       });

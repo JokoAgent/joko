@@ -23,7 +23,8 @@ import { ConnectionManager } from "./connection-manager.js";
 import { createPublicServer } from "./server.js";
 import type { OrchestratorApplication } from "./application.js";
 import type { BridgeToolCallContext } from "./mcp-router.js";
-import type { CodeHostProvider, CodeHostSessionAuthorizationPort } from "@joko/code-host";
+import { AuthenticatedCodeHostProvider, CodeHostPullRequestNotFoundError, createGhCliTokenSource, PublicCodeHostProvider,
+  type CodeHostProvider, type CodeHostSessionAuthorizationPort } from "@joko/code-host";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -79,7 +80,121 @@ describe("Partner workbench service and Queue ownership", () => {
     await vi.waitFor(() => expect(getPullRequest).toHaveBeenCalledTimes(3));
     expect((await f.workbench.readDetail(cached.owner, "item:change")).task.pullRequest?.projection?.state).toBe("merged");
     expect(JSON.stringify((await f.workbench.readState(f.partner.id)).tasks)).not.toContain("Provider unavailable");
+
+    now += 11 * 60_000 + 1;
+    getPullRequest.mockRejectedValueOnce(new CodeHostPullRequestNotFoundError());
+    const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
+    const context = {} as HandlerContext;
+    const request = create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id });
+    const read = async () => {
+      const response = create(contract.GetPartnerWorkbenchResponseSchema, await methods.getPartnerWorkbench(request, context));
+      return response.workbench?.tasks.find(task => task.id === "item:change")?.pullRequest;
+    };
+    await vi.waitFor(async () => expect(await read()).toMatchObject({ observed: false,
+      state: contract.CodeHostPullRequestState.UNSPECIFIED, reference: { number: 42n, webUrl: reference.webUrl } }));
+    const persisted = await f.workbench.readDetail(cached.owner, "item:change");
+    expect(persisted.task.judgment?.ref).toBe(reference.webUrl);
+    expect(persisted.task.pullRequest?.projection).toBeUndefined();
+    expect(getPullRequest).toHaveBeenCalledTimes(4);
+    expect((await read())?.observed).toBe(false);
+    expect(getPullRequest).toHaveBeenCalledTimes(4);
+
+    now += 30_001;
+    getPullRequest.mockRejectedValueOnce(new Error("Temporary provider failure"));
+    expect((await read())?.observed).toBe(false);
+    await vi.waitFor(() => expect(getPullRequest).toHaveBeenCalledTimes(5));
+    expect((await read())?.observed).toBe(false);
+
+    now += 60_001;
+    await vi.waitFor(async () => expect(await read()).toMatchObject({ observed: true, state: contract.CodeHostPullRequestState.MERGED }));
+    expect(getPullRequest).toHaveBeenCalledTimes(6);
   });
+
+  it.each([[404, 200], [200, 200], [200, 404]])("refreshes an anonymous %i workbench observation with authenticated status %i", async (anonymousStatus, firstAuthenticatedStatus) => {
+    let now = Date.now();
+    let loggedIn = false;
+    let anonymousRequests = 0;
+    let authenticatedRequests = 0;
+    let authenticatedStatus: number = firstAuthenticatedStatus;
+    const token = "workbench-fixture-credential";
+    const command = vi.fn(async () => {
+      if (!loggedIn) throw new Error("The fixture is signed out.");
+      return Buffer.from(`${token}\n`);
+    });
+    const credentialSource = createGhCliTokenSource({ command, exists: () => false, now: () => now });
+    const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      const url = new URL(String(input));
+      const credential = new Headers(init?.headers).get("authorization");
+      expect(url.origin).toBe("https://api.github.com");
+      if (url.pathname === "/graphql") return new Response(null, { status: 503 });
+      expect(url.pathname).toBe("/repos/acme/work/pulls/42");
+      const authenticated = credential !== null;
+      if (authenticated) {
+        expect(credential).toBe(`Bearer ${token}`);
+        authenticatedRequests += 1;
+      } else anonymousRequests += 1;
+      const status = authenticated ? authenticatedStatus : anonymousStatus;
+      if (status !== 200) return new Response(null, { status });
+      return new Response(JSON.stringify({ state: authenticated ? "closed" : "open", draft: false, merged: authenticated,
+        merged_at: authenticated ? "2026-11-13T06:00:00Z" : null, title: "Change", head: { ref: "topic" } }),
+      { headers: { "content-type": "application/json" } });
+    });
+    const f = await fixture([], { now: () => now, pullRequestProviders: authorization => [
+      new AuthenticatedCodeHostProvider({ authorization, credentialSource, fetch, now: () => now }),
+      new PublicCodeHostProvider({ fetch, now: () => now })
+    ] });
+    const granted = await grant(f);
+    const webUrl = "https://github.com/acme/work/pull/42";
+    await f.workbench.setJudgment(granted.owner, granted.state.revision, {
+      taskId: "item:login", project: f.project, title: "Change", verdict: "unfinished", next: "Review it", ref: webUrl
+    });
+    const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
+    const request = create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id });
+    const read = async () => {
+      const response = create(contract.GetPartnerWorkbenchResponseSchema, await methods.getPartnerWorkbench(request, {} as HandlerContext));
+      return response.workbench?.tasks.find(task => task.id === "item:login")?.pullRequest;
+    };
+    await vi.waitFor(async () => {
+      expect(await read()).toMatchObject({ observed: anonymousStatus === 200, reference: { webUrl },
+        state: anonymousStatus === 200 ? contract.CodeHostPullRequestState.OPEN : contract.CodeHostPullRequestState.UNSPECIFIED });
+      expect(anonymousRequests).toBe(1);
+    });
+    expect(command).toHaveBeenCalledOnce();
+    loggedIn = true;
+    now += 29_000;
+    expect((await read())?.state).toBe(anonymousStatus === 200 ? contract.CodeHostPullRequestState.OPEN : contract.CodeHostPullRequestState.UNSPECIFIED);
+    expect(authenticatedRequests).toBe(0);
+    now += 91_000;
+    await vi.waitFor(async () => {
+      expect(await read()).toMatchObject({ observed: firstAuthenticatedStatus === 200, reference: { webUrl },
+        state: firstAuthenticatedStatus === 200 ? contract.CodeHostPullRequestState.MERGED : contract.CodeHostPullRequestState.UNSPECIFIED });
+      expect(authenticatedRequests).toBe(1);
+    });
+    expect(command).toHaveBeenCalledTimes(2);
+    expect(anonymousRequests).toBe(1);
+    expect(JSON.stringify(await read())).not.toContain(token);
+
+    now += 60_001;
+    authenticatedStatus = 503;
+    await vi.waitFor(async () => { await read(); expect(authenticatedRequests).toBe(2); });
+    expect((await read())?.observed).toBe(firstAuthenticatedStatus === 200);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    now += 60_001;
+    authenticatedStatus = 200;
+    await vi.waitFor(async () => {
+      expect(await read()).toMatchObject({ observed: true, state: contract.CodeHostPullRequestState.MERGED });
+      expect(authenticatedRequests).toBe(3);
+    });
+    expect(anonymousRequests).toBe(1);
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    loggedIn = false;
+    credentialSource.invalidate();
+    now += 60_001;
+    await vi.waitFor(async () => { await read(); expect(command).toHaveBeenCalledTimes(3); });
+    expect(anonymousRequests).toBe(1);
+  });
+
   it("projects owned routines from their definition, activity and history without exposing backing schedules", async () => {
     const f = await fixture();
     const definition = { name: "Standing review", prompt: "Review changes.", enabled: true, silentWhenIdle: true,

@@ -85,7 +85,7 @@ export class ScheduleCoordinator {
   readonly #scriptBroker: ScheduleScriptCapabilityBroker;
   readonly #runtime: SchedulerRuntimeState;
   readonly #recovery: SchedulerOccurrenceRecovery;
-  readonly #activeOccurrences = new Map<string, Set<AbortController>>();
+  readonly #activeOccurrences = new Map<string, Map<AbortController, string>>();
   readonly #deletionFences = new Map<string, string>();
   readonly #deletionCreationReceipts = new Map<string, {
     readonly operationId: string;
@@ -165,7 +165,7 @@ export class ScheduleCoordinator {
     this.#releaseDispatchGate = undefined;
     this.#deletionCreationReceipts.clear();
     for (const controllers of this.#activeOccurrences.values()) {
-      for (const controller of controllers) controller.abort();
+      for (const controller of controllers.keys()) controller.abort();
     }
     this.#runtime.clear();
     this.#admittedRuns.clear();
@@ -255,11 +255,14 @@ export class ScheduleCoordinator {
   async abortSchedule(
     scheduleId: string,
     linkedOccurrences: readonly { readonly runId: string; readonly sessionId?: string }[] =
-      listAllScheduleRuns(this.#store, scheduleId)
+      listAllScheduleRuns(this.#store, scheduleId),
+    invokingRunId?: string
   ): Promise<void> {
-    for (const controller of this.#activeOccurrences.get(scheduleId) ?? []) controller.abort();
+    for (const [controller, runId] of this.#activeOccurrences.get(scheduleId) ?? []) {
+      if (runId !== invokingRunId) controller.abort();
+    }
     for (const occurrence of linkedOccurrences) {
-      if (occurrence.sessionId === undefined) continue;
+      if (occurrence.sessionId === undefined || occurrence.runId === invokingRunId) continue;
       const run = this.#store.findRun(occurrence.runId);
       if (
         run === undefined || run.descriptor.sessionId !== occurrence.sessionId ||
@@ -477,10 +480,10 @@ export class ScheduleCoordinator {
     });
     let controllers = this.#activeOccurrences.get(schedule.id);
     if (controllers === undefined) {
-      controllers = new Set();
+      controllers = new Map();
       this.#activeOccurrences.set(schedule.id, controllers);
     }
-    controllers.add(controller);
+    controllers.set(controller, runtimeRunId);
     this.#inFlightDispatches += 1;
     this.#notifyActivityTransition();
     try {

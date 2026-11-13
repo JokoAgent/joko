@@ -42,7 +42,7 @@ export interface GhCliTokenSourceOptions {
   readonly negativeCacheTtlMs?: number;
 }
 
-/** Bounded, memory-only reader for the host CLI login credential. */
+/** Bounded, memory-only reader for the CLI's github.com login credential. */
 export class GhCliTokenSource {
   readonly #command: GhCliCommand;
   readonly #exists: (path: string) => boolean;
@@ -97,7 +97,7 @@ export class GhCliTokenSource {
     try {
       const output = await this.#command(
         resolveGhBinary(this.#platform, this.#exists),
-        Object.freeze(["auth", "token"]),
+        Object.freeze(["auth", "token", "--hostname", "github.com"]),
         { timeoutMs: COMMAND_TIMEOUT_MS, maximumOutputBytes: MAXIMUM_COMMAND_OUTPUT_BYTES }
       );
       token = parseTokenOutput(output);

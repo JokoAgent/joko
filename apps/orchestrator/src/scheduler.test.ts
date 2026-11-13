@@ -15,6 +15,49 @@ describe("schedule recurrence", () => {
     expect(next).toBe(Date.UTC(2026, 7, 21, 1));
   });
 
+  it.each([
+    [29, 2027, 1, 28], [30, 2027, 1, 28], [31, 2027, 1, 28],
+    [29, 2028, 1, 29], [30, 2028, 1, 29], [31, 2028, 1, 29], [31, 2027, 3, 30]
+  ])("runs monthly day %i at the end of %i-%i when needed", (day, year, month, actualDay) => {
+    expect(nextOccurrence({ kind: "cron", expression: `0 9 ${day} * *`, timezone: "Asia/Shanghai" },
+      Date.UTC(year, month, 15))).toBe(Date.UTC(year, month, actualDay, 1));
+  });
+
+  it("retains the configured monthly day after a short month and never repeats its current minute", () => {
+    for (const day of [30, 31]) {
+      const timing = { kind: "cron", expression: `0 9 ${day} * *`, timezone: "UTC" } as const;
+      const february = nextOccurrence(timing, Date.UTC(2027, 0, day, 9));
+      expect(february).toBe(Date.UTC(2027, 1, 28, 9));
+      expect(nextOccurrence(timing, february! + 30_000)).toBe(Date.UTC(2027, 2, day, 9));
+    }
+  });
+
+  it("keeps the monthly spring-gap occurrence while ordinary daily cron skips the missing wall time", () => {
+    const after = Date.UTC(2026, 2, 8, 5, 15);
+    expect(nextOccurrence({ kind: "cron", expression: "30 2 8 * *", timezone: "America/New_York" }, after))
+      .toBe(Date.UTC(2026, 2, 8, 7, 30));
+    expect(nextOccurrence({ kind: "cron", expression: "30 2 * * *", timezone: "America/New_York" }, after))
+      .toBe(Date.UTC(2026, 2, 9, 6, 30));
+  });
+
+  it("keeps only the later monthly fall-back occurrence even when its earlier instant is already past", () => {
+    const timing = { kind: "cron", expression: "45 1 1 * *", timezone: "America/New_York" } as const;
+    for (const after of [Date.UTC(2026, 10, 1, 4), Date.UTC(2026, 10, 1, 6, 31, 30)]) {
+      expect(nextOccurrence(timing, after)).toBe(Date.UTC(2026, 10, 1, 6, 45));
+    }
+    expect(nextOccurrence(timing, Date.UTC(2026, 10, 1, 6, 45))).toBe(Date.UTC(2026, 11, 1, 6, 45));
+  });
+
+  it.each([
+    ["0 9 30,31 * *", Date.UTC(2027, 2, 30, 9)],
+    ["0 9 30-31 * *", Date.UTC(2027, 2, 30, 9)],
+    ["0 9 31 3 *", Date.UTC(2027, 2, 31, 9)],
+    ["0 9 31 * 1", Date.UTC(2027, 1, 1, 9)],
+    ["0 0 9 31 * *", Date.UTC(2027, 2, 31, 9)]
+  ] as const)("preserves ordinary cron semantics for %s", (expression, expected) => {
+    expect(nextOccurrence({ kind: "cron", expression, timezone: "UTC" }, Date.UTC(2027, 0, 31, 9))).toBe(expected);
+  });
+
   it("keeps hourly cron occurrences strictly in the future across Lord Howe's half-hour DST transitions", () => {
     for (const [after, expected] of [
       [Date.UTC(2026, 3, 4, 14, 0, 21), Date.UTC(2026, 3, 4, 15, 30)],

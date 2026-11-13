@@ -10,8 +10,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   OperationalCodeHostSessionAuthorization,
   readSessionCodeHostProjection,
+  SESSION_CODE_HOST_PROJECTION_SETTING_KEY,
   SessionCodeHostContextRuntime
 } from "./session-code-host-context.js";
+import { nativeBindingFingerprint } from "./native-state-observation.js";
 import { toProtoSession } from "./proto-mapper.js";
 import { sessionProjectionContext } from "./snapshot-projector.js";
 
@@ -108,6 +110,119 @@ describe("Session code-host context", () => {
     expect(await runtime.refreshSession("session-1")).toMatchObject({ sessionOwnerId: "session-1", references: [] });
     const durable = fixture.store.findSetting("session", "session-1", "codeHost.pullRequests.v1");
     expect(JSON.stringify(durable?.value)).not.toContain("secret");
+  });
+
+  it("projects one GitHub PR from legacy casing variants and keeps the newest observation", async () => {
+    const canonicalUrl = "https://github.com/acme/widgets/pull/42";
+    const fixture = createFixture(`Review https://github.com/Acme/Widgets/pull/42 and ${canonicalUrl}`);
+    const sessionId = "session-1";
+    const other = { key: "forge.example/team/other#8", host: "forge.example", repositoryOwner: "team", repositoryName: "other", number: 8,
+      webUrl: "https://forge.example/team/other/-/merge_requests/8" };
+    fixture.store.appendEvent({ backendId: "backend-1", targetId: "target-1", sessionId, generation: 0, traceId: "other-reference",
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: other.webUrl }] } });
+    const reference = { key: "github.com/acme/widgets#42", host: "github.com", repositoryOwner: "acme", repositoryName: "widgets", number: 42, webUrl: canonicalUrl };
+    const old = { ...reference, key: "github.com/Acme/Widgets#42", repositoryOwner: "Acme", repositoryName: "Widgets", webUrl: "https://github.com/Acme/Widgets/pull/42" };
+    const observation = { state: "merged", draft: false, title: "Newest result", headBranch: "topic", observedAt: 200 };
+    fixture.store.setSetting("session", sessionId, SESSION_CODE_HOST_PROJECTION_SETTING_KEY, { schemaVersion: 1, sessionOwnerId: sessionId,
+      references: [{ reference: old, projection: observation, freshUntil: 8_000 },
+        { reference, projection: { ...observation, state: "open", observedAt: 100 }, freshUntil: 7_000 }, { reference: other }] });
+    const getPullRequest = vi.fn<CodeHostProvider["getPullRequest"]>();
+    const runtime = new SessionCodeHostContextRuntime({ store: fixture.store, now: () => 5_000,
+      providers: [{ capability: "code-host.pull-request", supports: candidate => candidate.host === "github.com", getPullRequest }] });
+    const session = fixture.store.getSession(sessionId);
+    const visible = () => toProtoSession(session, sessionProjectionContext(fixture.store, session)).codeHostPullRequests;
+    expect(visible().filter(item => item.reference?.host === "github.com")).toEqual([expect.objectContaining({
+      observed: true, title: "Newest result", reference: expect.objectContaining({ referenceKey: reference.key, webUrl: canonicalUrl })
+    })]);
+    const refreshed = await runtime.refreshSession(sessionId);
+    expect(refreshed?.references.map(item => item.reference)).toEqual([other, reference]);
+    expect(visible()).toHaveLength(2);
+    expect(getPullRequest).not.toHaveBeenCalled();
+  });
+
+  it("publishes references from the active native branch and restores them on a branch revisit", async () => {
+    const { store } = createFixture("Ordinary task");
+    const session = store.getSession("session-1").descriptor;
+    store.upsertBackend({ ...store.getBackend(session.backendId).descriptor, adapterKind: "pi" });
+    const origin = { sessionId: session.id, backendId: session.backendId, targetId: session.targetId, generation: session.binding.generation };
+    const metadata = { namespace: "pi.native_history", fields: { nativeHydration: true, nativeBindingFingerprint: nativeBindingFingerprint(session.binding.opaqueRef) } };
+    const retainedUrl = "https://github.com/acme/work/pull/11";
+    const branchUrl = "https://github.com/acme/work/pull/42";
+    const append = (entryId: string, url: string, parentEntryId?: string) => store.appendEvent({ ...origin, traceId: entryId, metadata,
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: `Review ${url}` }],
+        nativeHistory: { identity: { entryId, ...(parentEntryId === undefined ? {} : { parentEntryId }) } } } });
+    append("retained", retainedUrl);
+    const branch = append("branch", branchUrl, "retained");
+    const navigate = (leafId: string) => store.appendEvent({ ...origin, traceId: `native-leaf:${leafId}`,
+      payload: { type: "native_session_changed", opaqueRef: session.binding.opaqueRef, leafId } });
+    navigate("branch");
+    const runtime = new SessionCodeHostContextRuntime({ store });
+    const visible = () => readSessionCodeHostProjection(store, session.id)?.references.map(item => item.reference.webUrl);
+    await runtime.refreshSession(session.id);
+    expect(visible()).toEqual([branchUrl, retainedUrl]);
+    runtime.install();
+
+    navigate("retained");
+    await vi.waitFor(() => expect(visible()).toEqual([retainedUrl]));
+    expect(store.findEvent(branch.id)).toBeDefined();
+    navigate("branch");
+    await vi.waitFor(() => expect(visible()).toEqual([branchUrl, retainedUrl]));
+  });
+
+  it.each(["success", "revoked", "failure"] as const)("reconciles a deleted reference after an in-flight %s response", async (outcome) => {
+    const { store } = createFixture("Ordinary task");
+    const sessionId = "session-1";
+    const message = store.appendEvent({ backendId: "backend-1", targetId: "target-1", sessionId, generation: 0, traceId: "reference-message",
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Review https://github.com/acme/work/pull/42" }] } });
+    let now = 5_000;
+    const authorization = new OperationalCodeHostSessionAuthorization(store);
+    const initial = { state: "open" as const, draft: false, title: "Original status", headBranch: "topic" };
+    const late = { ...initial, state: "merged" as const };
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    const getPullRequest = vi.fn<CodeHostProvider["getPullRequest"]>().mockResolvedValueOnce(initial)
+      .mockImplementationOnce(async (reference, { sessionOwnerId }) => {
+        const lease = authorization.authorize(sessionOwnerId, reference);
+        if (lease === undefined) throw new Error("The fixture reference was not authorized.");
+        await paused;
+        if (outcome === "failure") throw new Error("Temporary Provider failure.");
+        if (outcome === "revoked" && !authorization.isCurrent(lease, reference)) throw new Error("Original reference revoked.");
+        return late;
+      });
+    const runtime = new SessionCodeHostContextRuntime({ store, now: () => now, providers: [
+      { capability: "code-host.pull-request", supports: () => true, getPullRequest }
+    ] });
+    expect((await runtime.refreshSession(sessionId))?.references[0]?.projection).toMatchObject(initial);
+    runtime.install();
+    const publish = vi.spyOn(store, "appendEvent");
+    const save = vi.spyOn(store, "setSetting");
+    now += 60_001;
+    const inflight = runtime.refreshSession(sessionId);
+    try {
+      await vi.waitFor(() => expect(getPullRequest).toHaveBeenCalledTimes(2));
+      store.runOperation({ id: "delete-reference", kind: "delete_message", body: { eventId: message.id } }, owner => {
+        owner.commitMessageDeletion({ sessionId, requestedEventId: message.id, deletedEventIds: [message.id],
+          operationId: "delete-reference", traceId: "reference:delete" });
+        return {};
+      });
+      const afterDeletion = runtime.refreshSession(sessionId);
+      release();
+      const projections = await Promise.all([inflight, afterDeletion]);
+      expect(projections.map(value => value?.references)).toEqual([[], []]);
+      expect(save).toHaveBeenCalledWith("session", sessionId, SESSION_CODE_HOST_PROJECTION_SETTING_KEY, expect.objectContaining({ references: [] }));
+      expect(JSON.stringify(save.mock.calls)).not.toContain("merged");
+      expect(readSessionCodeHostProjection(store, sessionId)?.references).toEqual([]);
+      const session = store.getSession(sessionId);
+      expect(toProtoSession(session, sessionProjectionContext(store, session)).codeHostPullRequests).toEqual([]);
+      await vi.waitFor(() => expect(publish).toHaveBeenCalledWith(expect.objectContaining({ traceId: "session-code-host-projection",
+        payload: { type: "session_changed" } })));
+      expect(getPullRequest).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      await inflight.catch(() => undefined);
+      save.mockRestore();
+      publish.mockRestore();
+    }
   });
 
   it("authorizes only references currently attached to the durable Session owner", () => {

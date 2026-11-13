@@ -29,12 +29,23 @@ export function materializeCodeHostSessionProjection(
   const rawReferences = value["references"];
   if (!Array.isArray(rawReferences) || rawReferences.length > MAX_REFERENCE_COUNT) return undefined;
   const references: CodeHostSessionReferenceProjection[] = [];
-  const keys = new Set<string>();
+  const indexes = new Map<string, number>();
+  const storedKeys = new Set<string>();
   for (const rawReference of rawReferences) {
-    const reference = materializeReferenceProjection(rawReference);
-    if (reference === undefined || keys.has(reference.reference.key)) return undefined;
-    keys.add(reference.reference.key);
-    references.push(reference);
+    const parsed = materializeReferenceProjection(rawReference);
+    if (parsed === undefined || storedKeys.has(parsed.storedKey)) return undefined;
+    storedKeys.add(parsed.storedKey);
+    const { entry } = parsed;
+    const index = indexes.get(entry.reference.key);
+    if (index !== undefined) {
+      // Older GitHub projections can contain several casing variants of the same reference.
+      const prior = references[index]!;
+      if (prior.reference.webUrl !== entry.reference.webUrl) return undefined;
+      if (observationTime(entry) > observationTime(prior)) references[index] = entry;
+      continue;
+    }
+    indexes.set(entry.reference.key, references.length);
+    references.push(entry);
   }
   return {
     schemaVersion: CODE_HOST_SESSION_PROJECTION_SCHEMA_VERSION,
@@ -71,7 +82,11 @@ export function sameCodeHostSessionProjection(
   return left !== undefined && JSON.stringify(left) === JSON.stringify(right);
 }
 
-function materializeReferenceProjection(value: unknown): CodeHostSessionReferenceProjection | undefined {
+function observationTime(entry: CodeHostSessionReferenceProjection): number {
+  return entry.projection?.observedAt ?? -1;
+}
+
+function materializeReferenceProjection(value: unknown): { readonly storedKey: string; readonly entry: CodeHostSessionReferenceProjection } | undefined {
   if (!isRecord(value) || !isRecord(value["reference"])) return undefined;
   const raw = value["reference"];
   const host = boundedText(raw["host"], 255);
@@ -83,15 +98,16 @@ function materializeReferenceProjection(value: unknown): CodeHostSessionReferenc
   if (host === undefined || repositoryOwner === undefined || repositoryName === undefined || number === undefined || key === undefined || webUrl === undefined) return undefined;
   if (key !== codeHostPullRequestReferenceKey({ host, repositoryOwner, repositoryName, number })) return undefined;
   const reparsed = parseCodeHostPullRequestReference(webUrl);
-  if (
-    reparsed === undefined
-    || reparsed.webUrl !== webUrl
+  if (reparsed === undefined) return undefined;
+  const normalizedGitHub = host === "github.com" && webUrl === `https://github.com/${repositoryOwner}/${repositoryName}/pull/${number}`;
+  if (!normalizedGitHub && (
+    reparsed.webUrl !== webUrl
     || reparsed.key !== key
     || reparsed.host !== host
     || reparsed.repositoryOwner !== repositoryOwner
     || reparsed.repositoryName !== repositoryName
     || reparsed.number !== number
-  ) return undefined;
+  )) return undefined;
   const projection = value["projection"] === undefined ? undefined : materializeProjection(value["projection"]);
   if (value["projection"] !== undefined && projection === undefined) return undefined;
   const freshUntil = value["freshUntil"] === undefined ? undefined : safeInteger(value["freshUntil"], 0, Number.MAX_SAFE_INTEGER);
@@ -103,11 +119,14 @@ function materializeReferenceProjection(value: unknown): CodeHostSessionReferenc
     || (value["retryAfterUntil"] !== undefined && retryAfterUntil === undefined)
   ) return undefined;
   return {
-    reference: { key, host, repositoryOwner, repositoryName, number, webUrl },
-    ...(projection === undefined ? {} : { projection }),
-    ...(freshUntil === undefined ? {} : { freshUntil }),
-    ...(notFoundUntil === undefined ? {} : { notFoundUntil }),
-    ...(retryAfterUntil === undefined ? {} : { retryAfterUntil })
+    storedKey: key,
+    entry: {
+      reference: reparsed,
+      ...(projection === undefined ? {} : { projection }),
+      ...(freshUntil === undefined ? {} : { freshUntil }),
+      ...(notFoundUntil === undefined ? {} : { notFoundUntil }),
+      ...(retryAfterUntil === undefined ? {} : { retryAfterUntil })
+    }
   };
 }
 
