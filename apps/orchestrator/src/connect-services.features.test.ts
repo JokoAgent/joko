@@ -247,7 +247,8 @@ describe("Connect typed feature boundaries", () => {
       3,
       { kind: "plan_review", decision: "execute", feedback: "ship" },
       "operation:resolve-interaction-wrong-oneof",
-      "resolve-interaction-wrong-oneof"
+      "resolve-interaction-wrong-oneof",
+      connection.id
     );
   });
 
@@ -376,7 +377,8 @@ describe("Connect typed feature boundaries", () => {
         { fieldId: "publish", value: { kind: "boolean", value: false } }
       ] },
       "operation:resolve-interaction-typed-question",
-      "resolve-interaction-typed-question"
+      "resolve-interaction-typed-question",
+      connection.id
     );
   });
 
