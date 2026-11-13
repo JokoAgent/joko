@@ -2601,7 +2601,9 @@ export class PiBackendAdapter implements
     const crossesThreshold = () => runtime.autoCompaction && contextTokens / contextWindow >= runtime.autoCompactionThresholdPercent / 100;
     if (!crossesThreshold()) return;
 
-    const operation: NonNullable<PiRuntime["thresholdCompaction"]> = { id: randomUUID(), context, afterTurn };
+    const operation: NonNullable<PiRuntime["thresholdCompaction"]> = {
+      id: randomUUID(), context, afterTurn, nativeState: "starting"
+    };
     let started = false;
     try {
       const response = await this.#runExclusiveSessionMutation(
@@ -2609,7 +2611,6 @@ export class PiBackendAdapter implements
         context,
         async () => {
           if (!crossesThreshold()) return undefined;
-          runtime.thresholdCompaction = operation;
           await context.emit({
             type: "compaction",
             reason: "threshold",
@@ -2619,7 +2620,7 @@ export class PiBackendAdapter implements
             willRetry: false
           }, piMetadata("adapter_threshold_compaction_start"));
           started = true;
-          operation.nativeState = "starting";
+          runtime.thresholdCompaction = operation;
           try {
             return await runtime.transport.request(
               { type: "compact", customInstructions: undefined },
