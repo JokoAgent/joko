@@ -15,6 +15,7 @@ import {
   type PartnerActivity,
   type PartnerCapabilities,
   type PartnerDirectory,
+  type PartnerImportResult,
   type PartnerProfile
 } from "@joko/contracts";
 import type { SessionWorkingStatus } from "@joko/contracts";
@@ -100,6 +101,7 @@ export interface MobilePartnerDirectoryTransport {
   readonly ownerKey: string;
   list(signal: AbortSignal): Promise<MobilePartnerCatalog>;
   open(partner: MobilePartnerDirectoryProfile, signal: AbortSignal, allowPaused?: boolean): Promise<MobilePartnerDirectoryOpenResult>;
+  openImported(result: PartnerImportResult, signal: AbortSignal): Promise<MobilePartnerDirectoryOpenResult>;
 }
 
 export function mobilePartnerDirectoryIdentity(profile: MobilePartnerDirectoryProfile): string {

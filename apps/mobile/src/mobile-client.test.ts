@@ -22,6 +22,7 @@ import { ExtensionAuthorizationPhase, ExtensionMainViewSurfaceSchema, ExtensionO
 import { rebalanceSuggestionFixture } from "./test/provider-group-rebalance";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
+import { PartnerImportResultSchema, PartnerImportStatus } from "@joko/contracts";
 import { createHash, randomUUID } from "node:crypto";
 import sharp from "sharp";
 import {
@@ -4420,6 +4421,59 @@ describe("mobile Partner private authority", () => {
     vi.mocked(network.inspect).mockResolvedValueOnce({ ...node, serverId: "another-node" });
     app.setForeground(true); await vi.waitFor(() => expect(app.state.status).not.toBe("connected"));
     await app.refresh(); expect(app.partnerDirectoryObservation()).toBeUndefined();
+  });
+
+  it.each(["session", undefined])("selects and reads the imported canonical Partner task from selection %s", async previous => {
+    const network = fakeNetwork();
+    const { storage } = memoryStorage(credential);
+    await storage.saveSelection(credential.profileId, previous);
+    const app = client(network, storage);
+    await app.start();
+    expect(app.state.selectedId).toBe(previous);
+    const partner = { ...profilePartner, canonicalSessionId: "imported-task" };
+    const importedSession = { ...snapshot.sessions[0]!, sessionId: "imported-task", displayName: "Imported Partner task" };
+    const importedEvent = create(EventSchema, { ...messageEvent, identity: { sessionId: importedSession.sessionId } });
+    const fresh = create(SnapshotSchema, { ...snapshot, sessions: [...snapshot.sessions, importedSession] });
+    const importedDetail = create(SnapshotSchema, { ...snapshot, sessions: [importedSession], timeline: [importedEvent] });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: fresh });
+    vi.mocked(network.readSession).mockClear();
+    vi.mocked(network.readSession).mockResolvedValue(importedDetail);
+    const catalog = {
+      directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2_000 }, partners: [partner]
+    };
+    const readCatalog = vi.fn(async () => catalog);
+    network.listPartnerCatalog = readCatalog;
+    vi.mocked(network.listPartnerSessions).mockResolvedValue(create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: partner.partnerId, sessionId: importedSession.sessionId, role: PartnerSessionRole.CANONICAL, available: true,
+      profileVersion: partner.profileVersion
+    }] }));
+    const directory = app.partnerDirectoryTransport()!;
+    const receipt = create(PartnerImportResultSchema, { requestId: "import-request", saved: true, partnerId: partner.partnerId,
+      canonicalSessionId: importedSession.sessionId, status: PartnerImportStatus.COMPLETE });
+
+    await expect(directory.openImported({ ...receipt, canonicalSessionId: "session" }, new AbortController().signal))
+      .rejects.toThrow(/saved Partner task changed/u);
+    expect(app.state.selectedId).toBe(previous);
+    expect(network.readSession).not.toHaveBeenCalled();
+
+    let finish!: (result: typeof catalog) => void;
+    readCatalog.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const controller = new AbortController();
+    const cancelled = directory.openImported(receipt, controller.signal);
+    controller.abort();
+    finish(catalog);
+    await expect(cancelled).rejects.toMatchObject({ name: "AbortError" });
+    expect(app.state.selectedId).toBe(previous);
+    expect(network.readSession).not.toHaveBeenCalled();
+
+    expect(app.state.owner?.sessions.map(session => session.sessionId)).toEqual(["session"]);
+    await expect(directory.openImported(receipt, new AbortController().signal)).resolves.toEqual({ sessionId: importedSession.sessionId });
+    expect(storage.saveSelection).toHaveBeenLastCalledWith(credential.profileId, importedSession.sessionId);
+    expect(app.state.selectedId).toBe(importedSession.sessionId);
+    expect(app.state.detail?.timeline).toEqual([importedEvent]);
+    expect(network.readSession).toHaveBeenCalledExactlyOnceWith(credential, importedSession.sessionId, expect.any(AbortSignal));
+    expect(network.listPartnerSessions).toHaveBeenCalledTimes(2);
+    await expect(app.partnerConversationTransport()!.resolve(new AbortController().signal)).resolves.toEqual(partner);
   });
 
   it("opens a roster Partner only after exact profile and canonical Session revalidation", async () => {

@@ -9,14 +9,14 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
 const categories = [PartnerImportCategory.PERSONALITY, PartnerImportCategory.MEMORY, PartnerImportCategory.SKILLS, PartnerImportCategory.CONNECTIONS, PartnerImportCategory.AUTOMATIONS];
-export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onOpenTask }: {
+export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onSaved }: {
   readonly editor: PartnerImportEditor; readonly colors: MobilePartnersColors; readonly locale: MobileSupportedLocale;
-  readonly onClose: () => void; readonly onOpenTask: (sessionId: string) => void;
+  readonly onClose: () => void; readonly onSaved: (result: PartnerImportResult) => void;
 }) {
   const state = useSyncExternalStore(editor.subscribe, editor.snapshot); const m = partnerImportMessages(locale);
   const [visible, setVisible] = useState(true); const [foreground, setForeground] = useState(AppState.currentState === "active");
   const [preparing, setPreparing] = useState(false); const completed = useRef<PartnerImportResult | undefined>(undefined);
-  const latest = useRef({ onClose, onOpenTask }); latest.current = { onClose, onOpenTask };
+  const latest = useRef({ onClose, onSaved }); latest.current = { onClose, onSaved };
   const keyboard = useMobileKeyboardState(); const insets = useSafeAreaInsets();
   useEffect(() => {
     if (AppState.currentState === "active") void editor.load(); const subscription = AppState.addEventListener("change", value => {
@@ -26,7 +26,7 @@ export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onOp
   const dismiss = () => {
     const result = completed.current; completed.current = undefined;
     if (!editor.active) return;
-    latest.current.onClose(); if (result?.canonicalSessionId) latest.current.onOpenTask(result.canonicalSessionId);
+    latest.current.onClose(); if (result) latest.current.onSaved(result);
   };
   useEffect(() => { if (!visible && Platform.OS !== "ios") dismiss(); }, [visible]);
   const result = state.result; const saved = new Set(result?.savedEntryIds); const entries = state.preview?.entries ?? [];
