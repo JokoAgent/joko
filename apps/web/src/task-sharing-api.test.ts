@@ -1,9 +1,11 @@
 import { clone, create } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { describe, expect, it, vi } from "vitest";
 import {
   ActorKind, JoinedTaskShareSchema, OperationSchema, OperationService, GetOperationResponseSchema,
-  SessionService, SettingsService, SnapshotSchema, TaskShareSnapshotSchema, BlobRefSchema,
+  EventCursorSchema, SessionService, SessionSnapshotScopeSchema, SessionSchema, SettingsService, SnapshotSchema, SnapshotScopeSchema,
+  TaskShareSnapshotSchema, BlobRefSchema,
   TaskShareAttachmentResultSchema, type TaskSharingApi
 } from "@joko/contracts";
 import { createJoinedTaskPort } from "./task-sharing-api.js";
@@ -39,12 +41,16 @@ describe("shared task generated transport", () => {
     }
   });
   it("rejects widened snapshots and changed membership instead of borrowing Home authority", async () => {
-    const snapshot = create(SnapshotSchema, { server: { serverId: "host" }, scope: { kind: { case: "session", value: { sessionId: "same-task" } } }, sessions: [{ sessionId: "same-task" }] });
+    const snapshot = create(SnapshotSchema, { server: { serverId: "host" }, generation: 4n,
+      resumeCursor: create(EventCursorSchema, { opaqueToken: "share-cursor", generation: 4n, sequence: 7n,
+        issuedAt: create(TimestampSchema, { seconds: 10n }) }),
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "same-task" }) } }),
+      sessions: [create(SessionSchema, { sessionId: "same-task" })] });
     const state = clone(TaskShareSnapshotSchema, create(TaskShareSnapshotSchema, { share: joined.share, member: joined.member, snapshot }));
     const api = { snapshot: vi.fn().mockResolvedValue(state) } as unknown as TaskSharingApi;
     const port = createJoinedTaskPort(api, joined, new AbortController().signal, journal());
     expect(await port.snapshot(new AbortController().signal)).toBe(state.snapshot);
-    state.snapshot!.sessions.push(create(SessionService.method.getSession.output).session!);
+    state.snapshot!.sessions.push(create(SessionSchema, { sessionId: "another-task" }));
     await expect(port.snapshot(new AbortController().signal)).rejects.toMatchObject({ code: Code.PermissionDenied });
     state.snapshot!.sessions.pop(); state.member!.status = "revoked";
     await expect(port.snapshot(new AbortController().signal)).rejects.toMatchObject({ code: Code.PermissionDenied });
