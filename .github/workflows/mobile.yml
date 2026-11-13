@@ -567,6 +567,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-runtime-evidence/*-capture.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro.log
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro-status.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/metro-bundle.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/startup-command-receipts.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/startup-state.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-build.log
