@@ -253,7 +253,8 @@ function windowState(window: MenubarWindowInput, nowMs: number): WindowState {
 }
 
 function subscriptionState(source: MenubarSubscriptionInput, nowMs: number): SubscriptionState {
-  const windows = source.windows.map((window) => windowState(window, nowMs));
+  const windows = source.windows.filter((window) => window.resetsAtMs === null || window.resetsAtMs > nowMs)
+    .map((window) => windowState(window, nowMs));
   const limits = windows.filter((state) => state.window.kind !== 'scoped');
   const limit = limits.reduce<WindowState | null>(
     (tightest, state) => (!tightest || state.remaining < tightest.remaining ? state : tightest),
@@ -1053,9 +1054,9 @@ class Builder {
     if (source.kind === 'balance') return this.t(source.quota ? 'manage.quota' : 'manage.balance');
     if (source.kind === 'payg') return this.t(source.billing === 'api' ? 'manage.payg' : 'manage.plan');
     const plan = source.plan ? ` · ${source.plan}` : '';
-    const windows = source.windows
-      .filter((window) => window.kind !== 'scoped')
-      .map((window) => this.windowLabel(window))
+    const windows = this.state(source).windows
+      .filter(({ window }) => window.kind !== 'scoped')
+      .map(({ window }) => this.windowLabel(window))
       .join(' + ');
     const subtitle = source.family === 'codex'
       ? `Codex${plan}`
