@@ -539,6 +539,7 @@ export interface MobileState {
   readonly detail?: Snapshot;
   readonly older: readonly Event[];
   readonly window?: readonly Event[];
+  readonly windowHasNewer?: boolean;
   readonly live: readonly Event[];
   readonly liveStatus: "paused" | "verifying" | "streaming" | "polling";
   readonly historyBusy: boolean;
@@ -3904,6 +3905,7 @@ export class MobileClient {
           mobilePiHistoryRetired(detail, cached) ? create(SnapshotSchema, { ...cached, timeline: [] }) : cached);
       } else next = { ...next, detail: retainMobileHistoryPrefix(detail, this.#state.detail) };
     }
+    if (!next.window && next.windowHasNewer) next = { ...next, windowHasNewer: false };
     const nextAuthority = this.#filesAuthorityKey(next);
     const nextPartnerAuthority = this.#partnerPrivateAuthorityKey(next);
     const sourceSessionChanged = this.#partnerPrivateSourceSessionId !== undefined
@@ -9568,7 +9570,7 @@ export class MobileClient {
     }
   }
 
-  async around(eventId: string, signal?: AbortSignal): Promise<void> {
+  async around(eventId: string, signal?: AbortSignal, options?: { readonly allowNewer: boolean }): Promise<void> {
     if (signal?.aborted) return;
     const credential = this.#ready();
     const sessionId = this.#state.selectedId;
@@ -9580,7 +9582,9 @@ export class MobileClient {
       if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
       validateHistory(events, sessionId, this.#taskGeneration());
       if (!events.some((event) => event.eventId === eventId)) throw new Error("The selected event is no longer in task history.");
-      this.#set({ window: events, older: [], before: events[0]!.cursor, historyEnd: false });
+      const windowHasNewer = options?.allowNewer === true && !this.#joinedTask
+        && this.#selectedSession()?.derivationOrigin?.sideChat !== true && this.#historyEdgePrecedesLatest(events.at(-1)!);
+      this.#set({ window: events, windowHasNewer, older: [], before: events[0]!.cursor, historyEnd: false });
     } catch (error) {
       if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
       if (!history.current() || !this.#current(epoch) || sessionId !== this.#state.selectedId) return;
@@ -9589,6 +9593,57 @@ export class MobileClient {
     } finally {
       history.finish();
     }
+  }
+
+  async newer(signal?: AbortSignal): Promise<void> {
+    const { selectedId: sessionId, window, windowHasNewer, status } = this.#state;
+    const credential = this.#credential;
+    const edge = window?.at(-1);
+    const cursor = edge?.cursor;
+    if (signal?.aborted || !credential || !sessionId || !window || !edge || !cursor || !windowHasNewer
+      || status !== "connected" || !this.#foreground || this.#joinedTask || this.#historyOwner) return;
+    const epoch = this.#epoch;
+    const generation = this.#taskGeneration();
+    if (cursor.generation !== generation) return;
+    const history = this.#beginHistoryRead(signal);
+    const current = (): boolean => history.current() && this.#current(epoch) && this.#credential === credential
+      && this.#state.selectedId === sessionId && this.#state.window === window && this.#taskGeneration() === generation;
+    try {
+      const events = await this.network.readAround(credential, sessionId, edge.eventId, history.signal);
+      if (!current()) return;
+      validateHistory(events, sessionId, generation);
+      // The service returns consecutive visible events around this exact edge. Sequences
+      // are global, so only the shared event can establish where the next page starts.
+      const boundary = events.findIndex(event => event.eventId === edge.eventId && event.cursor?.sequence === cursor.sequence);
+      if (boundary < 0) throw new Error("The task history changed while loading. Reconnect before browsing it.");
+      const appended = events.slice(boundary + 1);
+      const appendedIds = new Set(appended.map(event => event.eventId));
+      if (window.some(event => appendedIds.has(event.eventId))) {
+        throw new Error("The task history returned a mismatched or cyclic page. Reconnect before browsing it.");
+      }
+      const last = appended.at(-1);
+      if (!last && this.#historyEdgePrecedesLatest(edge)) {
+        throw new Error("The task history returned no newer events for the current window. Reconnect before browsing it.");
+      }
+      this.#set(last ? { window: [...window, ...appended], windowHasNewer: this.#historyEdgePrecedesLatest(last) }
+        : { windowHasNewer: false });
+    } catch (error) {
+      if (await this.#invalidateRevokedOwnerRead(error, epoch, credential)) return;
+      if (!current()) return;
+      if (isStaleHistory(error)) void this.refresh();
+      throw error;
+    } finally {
+      history.finish();
+    }
+  }
+
+  #historyEdgePrecedesLatest(edge: Event): boolean {
+    const snapshotTail = this.#state.detail?.timeline.at(-1);
+    const liveTail = this.#state.live.at(-1);
+    const cursor = edge.cursor!;
+    return [snapshotTail, liveTail].some(event => event?.cursor !== undefined
+      && event.identity?.sessionId === edge.identity?.sessionId && event.cursor.generation === cursor.generation
+      && event.cursor.sequence > cursor.sequence);
   }
 
   #beginHistoryRead(caller?: AbortSignal) {

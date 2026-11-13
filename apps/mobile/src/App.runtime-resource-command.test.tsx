@@ -91,8 +91,9 @@ const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(
 const resolveResource = vi.fn(async () => resource);
 const send = vi.fn(async (_draft: MobileComposerDraft, _observer?: MobileTaskSendObserver) => true);
 const loadEarlier = vi.fn(async () => undefined);
+const loadNewer = vi.fn(async (_signal: AbortSignal) => {});
 const returnToLatest = vi.fn(() => {
-  renderedState = { ...renderedState, window: undefined, before: undefined, historyEnd: false };
+  renderedState = { ...renderedState, window: undefined, windowHasNewer: false, before: undefined, historyEnd: false };
 });
 const empty = Object.freeze([]);
 let activePartner: MobilePartnerDirectoryProfile | undefined;
@@ -118,7 +119,7 @@ const client = new Proxy({
   resolveTaskRuntimeCommandResource: resolveResource,
   taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
-  taskNativeTreeControls: () => undefined, send, latest: returnToLatest, older: loadEarlier, taskContextControls: () => undefined,
+  taskNativeTreeControls: () => undefined, send, latest: returnToLatest, older: loadEarlier, newer: loadNewer, taskContextControls: () => undefined,
   taskProviderUsageTransport: () => providerUsage,
   taskObjectiveApi: () => current ? activeObjectiveApi : undefined,
   taskCollaborationApi: () => current ? activeCollaborationApi : undefined,
@@ -145,12 +146,13 @@ beforeAll(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
     View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
-    FlatList: forwardRef(({ data, renderItem, onViewableItemsChanged, ...scrollHandlers }: { data?: readonly unknown[];
+    FlatList: forwardRef(({ data, renderItem, ListFooterComponent, onViewableItemsChanged, ...scrollHandlers }: { data?: readonly unknown[];
+      ListFooterComponent?: ReactNode;
       renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility } & TimelineScrollHandlers, ref) => {
       const instance = useRef({}).current;
       useImperativeHandle(ref, () => ({ scrollToIndex: scrollTimelineToIndex, scrollToOffset: scrollTimelineToOffset, scrollToEnd: scrollTimelineToEnd }), []);
       if (onViewableItemsChanged) timelineList = { data: data ?? [], instance, onViewableItemsChanged, ...scrollHandlers };
-      return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))));
+      return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))), ListFooterComponent);
     }), TextInput: forwardRef(() => null),
     Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
     Pressable: ({ children, onPress, disabled, accessibilityLabel }: { children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean; accessibilityLabel?: string }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, typeof children === "function" ? children({ pressed: false }) : children),
@@ -238,6 +240,7 @@ beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
   returnToLatest.mockClear();
   loadEarlier.mockReset().mockResolvedValue(undefined);
+  loadNewer.mockReset().mockResolvedValue(undefined);
   nativeAppState.currentState = "active";
   timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear();
   sendFollowSourceKey = undefined; sendFollowPresentationKey = undefined; ordinaryTimelineTransportKey = undefined;
@@ -770,6 +773,48 @@ it("loads earlier history on an upward drag near the top and keeps native prepen
   expect(timelineList!.maintainVisibleContentPosition).toBeUndefined();
   await act(async () => timelineList!.onScrollBeginDrag!(timelineScrollSample(0, 1_900)));
   expect(loadEarlier).toHaveBeenCalledTimes(2);
+});
+
+it("reads newer history at the end of a linked window without returning to latest", async () => {
+  const anchor = taskUserInput("linked", "linked-operation", 4n, "Linked old message");
+  const middle = taskUserInput("middle", "middle-operation", 10n, "Middle reply");
+  const latest = taskUserInput("latest", "latest-operation", 30n, "Latest message");
+  const detail = create(SnapshotSchema, { ...state.detail!, timeline: [latest] });
+  renderedState = { ...state, detail, window: [anchor], windowHasNewer: true, historyEnd: false };
+  loadNewer.mockImplementationOnce(async () => {
+    renderedState = { ...renderedState, window: [anchor, middle], windowHasNewer: true };
+  }).mockImplementationOnce(async () => {
+    renderedState = { ...renderedState, window: [anchor, middle, latest], windowHasNewer: false };
+  });
+  const newerButton = () => Array.from(host.querySelectorAll("button"))
+    .find(button => button.getAttribute("aria-label") === mobileMessage("en", "task.loadNewer"));
+  const focus = { requestId: 1, sessionId: session.sessionId, messageId: anchor.eventId, messageEventId: anchor.eventId };
+  vi.useFakeTimers();
+  await act(async () => root.render(taskScreen(focus)));
+  await act(async () => vi.advanceTimersByTimeAsync(30));
+  const list = timelineList!.instance;
+  expect(timelineList!.data).toEqual([expect.objectContaining({ id: anchor.eventId, text: "Linked old message" })]);
+  expect(scrollTimelineToIndex).toHaveBeenCalledExactlyOnceWith({ index: 0, animated: false, viewPosition: 0.5 });
+  expect(newerButton()?.disabled).toBe(false);
+
+  await act(async () => { newerButton()!.click(); newerButton()!.click(); });
+  await act(async () => root.render(taskScreen(focus)));
+  expect(loadNewer).toHaveBeenCalledExactlyOnceWith(expect.any(AbortSignal));
+  expect(timelineList!.data).toEqual([
+    expect.objectContaining({ id: anchor.eventId, text: "Linked old message" }),
+    expect.objectContaining({ id: middle.eventId, text: "Middle reply" })
+  ]);
+  expect(timelineList!.instance).toBe(list);
+
+  await act(async () => newerButton()!.click());
+  await act(async () => root.render(taskScreen(focus)));
+  expect(loadNewer).toHaveBeenCalledTimes(2);
+  expect(timelineList!.data).toEqual([anchor, middle, latest].map(item => expect.objectContaining({ id: item.eventId })));
+  expect(timelineList!.instance).toBe(list);
+  expect(newerButton()).toBeUndefined();
+  expect(returnToLatest).not.toHaveBeenCalled();
+  expect(scrollTimelineToIndex).toHaveBeenCalledOnce();
+  expect(scrollTimelineToEnd).not.toHaveBeenCalled();
 });
 
 async function mountMeasuredTimelineTail(): Promise<void> {

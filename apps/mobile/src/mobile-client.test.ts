@@ -104,6 +104,7 @@ import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
 import { timelineRows } from "./timeline";
+import { buildMobileMessageDeepLink, executeMobileNativeIntent, MobileNativeIntentDelivery, projectMobileNativeIntentSnapshot } from "./mobile-native-intent";
 import { findMobileConversationSearchHits } from "./mobile-conversation-search";
 import {
   insertMobileArtifactMention,
@@ -8246,6 +8247,7 @@ describe("native mobile connection and operation ownership", () => {
     await app.around("e7");
     expect(network.readAround).toHaveBeenCalledWith(credential, "session", "e7", expect.any(AbortSignal));
     expect(app.state.window?.map((item) => item.eventId)).toEqual(["e6", "e7", "e8"]);
+    expect(app.state.windowHasNewer).toBe(false);
     vi.mocked(network.readHistory).mockResolvedValueOnce({ events: [event("e4", 4n), event("e5", 5n)],
       before: event("e4", 4n).cursor });
     await app.older();
@@ -8256,6 +8258,108 @@ describe("native mobile connection and operation ownership", () => {
     app.latest();
     expect(app.state.window).toBeUndefined();
   });
+
+  it("opens a copied old message link and reads every newer page through the latest message", async () => {
+    const network = fakeNetwork();
+    const assistant = (eventId: string, sequence: bigint, messageId: string, body: string) => create(EventSchema, {
+      ...event(eventId, sequence), payload: { kind: { case: "messageCompleted", value: {
+        messageId, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: body } }]
+      } } }
+    });
+    const first = event("first", 2n);
+    const anchor = assistant("anchor", 8n, "old-message", "Old linked reply");
+    const edge = event("edge", 19n);
+    const middle = assistant("middle", 41n, "middle-message", "Read this middle reply");
+    const recent = assistant("recent", 84n, "recent-message", "Start of the recent window");
+    const latest = assistant("latest", 120n, "latest-message", "Latest reply");
+    const detail = create(SnapshotSchema, { ...snapshot, resumeCursor: latest.cursor, timeline: [recent, latest] });
+    vi.mocked(network.readSession).mockResolvedValue(detail);
+    vi.mocked(network.readAround).mockImplementation(async (_credential, _sessionId, eventId) => {
+      if (eventId === anchor.eventId) return [first, anchor, edge];
+      if (eventId === edge.eventId) return [anchor, create(EventSchema, { ...edge, cursor: { ...edge.cursor!, opaqueToken: "reissued" } }), middle];
+      if (eventId === middle.eventId) return [edge, middle, recent, latest];
+      throw new Error(`Unexpected history edge ${eventId}`);
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const delivery = new MobileNativeIntentDelivery();
+    const focus = vi.fn();
+    expect(delivery.offer(buildMobileMessageDeepLink("session", "old-message", "anchor"), 1)).toBe(true);
+    const claim = delivery.take()!;
+    await expect(executeMobileNativeIntent(claim, delivery, {
+      snapshot: () => projectMobileNativeIntentSnapshot(app.state),
+      connectProfile: profileId => app.connectSaved(profileId), selectSession: sessionId => app.select(sessionId),
+      loadAround: eventId => app.around(eventId, undefined, { allowNewer: true }), loadOlder: () => app.older(),
+      returnLatest: () => app.latest(), showPage: vi.fn(), showSavedConnections: vi.fn(), showRecovery: vi.fn(),
+      clearRecovery: vi.fn(), focusMessage: focus, clearMessageFocus: vi.fn(), focusApplication: vi.fn()
+    })).resolves.toBe("message");
+    expect(focus).toHaveBeenCalledExactlyOnceWith({
+      requestId: claim.sequence, sessionId: "session", messageId: "old-message", messageEventId: "anchor"
+    });
+    expect(app.state.window).toEqual([first, anchor, edge]);
+    expect(app.state.windowHasNewer).toBe(true);
+
+    await app.newer();
+    expect(app.state.window).toEqual([first, anchor, edge, middle]);
+    expect(app.state.windowHasNewer).toBe(true);
+    await app.newer();
+    expect(timelineRows(app.state.window!).filter(row => row.kind === "assistant").map(row => row.text))
+      .toEqual(["Old linked reply", "Read this middle reply", "Start of the recent window", "Latest reply"]);
+    expect(app.state.windowHasNewer).toBe(false);
+    expect(app.state.before).toEqual(first.cursor);
+    await app.newer();
+    expect(vi.mocked(network.readAround).mock.calls.map(call => call.slice(0, 3))).toEqual(
+      [anchor, edge, middle].map(item => [credential, "session", item.eventId]));
+    expect(network.readHistory).not.toHaveBeenCalled();
+
+    vi.mocked(network.readHistory).mockResolvedValueOnce({ events: [event("earlier", 1n)] });
+    await app.older();
+    expect(network.readHistory).toHaveBeenCalledExactlyOnceWith(credential, "session", first.cursor, expect.any(AbortSignal));
+    expect(app.state.window?.[0]?.eventId).toBe("earlier");
+    app.latest();
+    expect(app.state.window).toBeUndefined();
+    expect(app.state.windowHasNewer).toBe(false);
+    expect(app.state.detail?.timeline).toEqual([recent, latest]);
+  });
+
+  it.each(["transport", "shifted edge", "foreign event", "no progress", "return latest", "abort"] as const)(
+    "adopts a newer page only for its current window and exact edge (%s)", async outcome => {
+      const network = fakeNetwork();
+      const anchor = event("anchor", 7n), following = event("following", 20n);
+      vi.mocked(network.readSession).mockResolvedValue(create(SnapshotSchema, {
+        ...snapshot, resumeCursor: following.cursor, timeline: [following]
+      }));
+      const app = client(network, memoryStorage(credential).storage);
+      await app.start();
+      vi.mocked(network.readAround).mockResolvedValueOnce([anchor]);
+      await app.around(anchor.eventId, undefined, { allowNewer: true });
+      const window = app.state.window;
+      const controller = new AbortController();
+      let finish!: (events: Event[]) => void;
+      let fail!: (error: Error) => void;
+      vi.mocked(network.readAround).mockImplementationOnce(() => new Promise((resolve, reject) => {
+        finish = resolve; fail = reject;
+      }));
+      const page = app.newer(controller.signal);
+      if (outcome === "return latest") app.latest();
+      if (outcome === "abort") controller.abort();
+      if (outcome === "transport" || outcome === "return latest") fail(new Error("History request failed."));
+      else if (outcome === "no progress") finish([anchor]);
+      else finish([outcome === "shifted edge" ? event(anchor.eventId, 8n) : anchor,
+        outcome === "foreign event" ? event(following.eventId, 20n, "other-session") : following]);
+
+      if (outcome === "transport" || outcome === "shifted edge" || outcome === "foreign event" || outcome === "no progress") {
+        await expect(page).rejects.toThrow(/history/i);
+      } else await expect(page).resolves.toBeUndefined();
+      expect(app.state.window).toBe(outcome === "return latest" ? undefined : window);
+      expect(app.state.windowHasNewer).toBe(outcome !== "return latest");
+      if (outcome === "transport") {
+        vi.mocked(network.readAround).mockResolvedValueOnce([anchor, following]);
+        await app.newer();
+        expect(app.state.window).toEqual([anchor, following]);
+      }
+    });
 
   it.each([120, 4])("uses the first event cursor for the first older request with %i recent events", async (count) => {
     const network = fakeNetwork();

@@ -876,7 +876,7 @@ export function App() {
       showGroup: groupId => { if (!groupSelection || groupSelection.groupId !== groupId || !client.partnerGroupSourceClaimCurrent(groupSelection)) return;
         setRemoteDesktopEntry(undefined); setNativeIntentGroupSelection(groupSelection); setPage("partner-directory");
       },
-      loadAround: (eventId) => client.around(eventId, history?.signal),
+      loadAround: (eventId) => client.around(eventId, history?.signal, { allowNewer: true }),
       loadOlder: () => client.older(history?.signal),
       returnLatest: () => client.latest(),
       showPage: next => {
@@ -3774,6 +3774,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const composerSelectionRef = useRef(composerSelection);
   const draftIdentityRef = useRef<MobileComposerDraftIdentity | undefined>(initialDraftIdentity);
   const taskMountedRef = useRef(true);
+  const newerHistoryRef = useRef<AbortController | undefined>(undefined);
   const copyGenerationRef = useRef(0);
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
@@ -4391,6 +4392,21 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (taskMountedRef.current && client.taskHeaderSourceKey() === owner && client.state.window === window) setLocalError(errorText(error));
     });
   };
+  const canLoadNewerHistory = state.windowHasNewer && partnerIdentity.ready && !partnerIdentity.partner
+    && headerRole.role === "ordinary" && !conversationShare.active && !searchVisible;
+  const loadTimelineNewer = (): void => {
+    const window = client.state.window;
+    if (!canLoadNewerHistory || !window || !client.state.windowHasNewer || client.state.historyBusy
+      || newerHistoryRef.current || AppState.currentState !== "active") return;
+    const request = new AbortController();
+    newerHistoryRef.current = request;
+    setLocalError("");
+    void client.newer(request.signal).catch((error) => {
+      if (!request.signal.aborted && taskMountedRef.current && client.state.window === window) setLocalError(errorText(error));
+    }).finally(() => {
+      if (newerHistoryRef.current === request) newerHistoryRef.current = undefined;
+    });
+  };
   const initialTailAvailable = state.status === "connected" && state.detail !== undefined && state.taskSource?.kind !== "joined"
     && state.window === undefined && !state.historyBusy && !conversationShare.active && partnerIdentity.ready && !partnerIdentity.partner
     && headerRole.role === "ordinary" && headerSourceKey !== undefined && displayRows.length > 0;
@@ -4856,6 +4872,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const subscription = client.subscribe(() => taskHomeNavigator.observeScope());
     const lifecycle = AppState.addEventListener("change", (status) => {
       if (status === "active") return;
+      newerHistoryRef.current?.abort();
+      newerHistoryRef.current = undefined;
       if (initialTimelineTailRef.current) initialTimelineTailRef.current.finished = true;
       latestSendFollowRef.current = undefined;
       latestTimelineFollowRef.current = undefined;
@@ -4866,6 +4884,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     });
     return () => {
       taskMountedRef.current = false;
+      newerHistoryRef.current?.abort();
+      newerHistoryRef.current = undefined;
       subscription(); lifecycle.remove(); taskHomeNavigator.retire();
       copyGenerationRef.current += 1;
       runtimeCommandAbortRef.current?.abort();
@@ -7078,7 +7098,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         <MobileSessionDerivationMarker controls={client.taskDerivationOriginControls()} colors={colors} locale={locale}
           busy={state.busy || attachmentBusy || voice.busy} onOpen={onOpenDerivationOrigin} />
         <View style={styles.historyActions}>
-        {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => client.latest()} />}
+        {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => {
+          const request = newerHistoryRef.current;
+          client.latest();
+          newerHistoryRef.current = undefined;
+          request?.abort();
+        }} />}
         {!state.historyEnd && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadEarlier")} colors={colors}
           disabled={state.historyBusy || state.status !== "connected"}
           onPress={loadTimelineEarlier} />}
@@ -7086,7 +7111,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       </View>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, !partnerIdentity.ready ? "task.loading" : chasingHiddenHistory
         ? "task.loadingHistory" : state.status === "offline" ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
-      ListFooterComponent={delegatedControls ? <View style={styles.list} pointerEvents={conversationShare.active ? "none" : "auto"}
+      ListFooterComponent={canLoadNewerHistory || delegatedControls ? <View style={styles.list} pointerEvents={conversationShare.active ? "none" : "auto"}
         onLayout={(event) => { if (searchOwnerRef.current.scope === searchScope) { searchFooterRef.current.y = event.nativeEvent.layout.y; scrollSearchFooter(); } }}>
         {delegatedAffinity.orphanEntries.map((entry) => <View key={entry.key}
           style={searchVisible && searchFocus?.scope === searchScope && searchFocus.sourceKey === entry.key ? { borderLeftWidth: 2, borderLeftColor: colors.accent } : undefined}
@@ -7101,6 +7126,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             delegated.phase === "cancelled" ? "cancelled" : delegated.error ?? "readFailed")}</Text>
           <Action label={mobileDelegatedTaskMessage(locale, "retry")} colors={colors} compact onPress={delegated.retry} />
         </View>}
+        {canLoadNewerHistory && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadNewer")} colors={colors}
+          disabled={state.historyBusy || state.status !== "connected"} onPress={loadTimelineNewer} />}
       </View> : undefined}
       renderItem={({ item }) => {
         const focused = searchVisible && searchFocus?.scope === searchScope && searchFocus.itemKey === item.id;
