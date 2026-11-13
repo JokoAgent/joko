@@ -38,7 +38,7 @@ export function mobilePartnerActivityState(partner: MobilePartnerDirectoryProfil
 }
 
 export function mobilePartnerDirectoryPreview(partner: MobilePartnerDirectoryProfile): string {
-  const preview = parseMobileMarkdownInlines(partner.activity.latestReplyPreview ?? "")
+  const preview = parseMobileMarkdownInlines(partner.activity.latestReplyPreview ?? "", { literalEmphasis: true })
     .map((inline) => inline.type === "image" ? inline.alt : inline.text).join("")
     .replace(/\s+/gu, " ").trim();
   return preview || firstIdentityLine(partner.identitySource).replace(/\s+/gu, " ").trim();

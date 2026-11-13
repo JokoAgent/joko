@@ -65,7 +65,7 @@ describe("native file reading", () => {
   beforeEach(() => { native.currentState = "active"; native.scrollToIndex.mockClear(); native.inject.mockClear(); native.openURL.mockClear(); });
   it("quotes from the native Markdown selection menu, copies exact source and rejects the retired rendered menu", async () => {
     const container = document.createElement("div"); const root = createRoot(container);
-    const preview = { ...base, fileName: "README.md", text: "\uFEFF# Heading\r\n\r\nSelected 😀 text" };
+    const preview = { ...base, fileName: "README.md", text: "\uFEFF# Heading\r\n\r\n**[Selected 😀 text](https://example.test/read)**" };
     const quoted = vi.fn(); const add = vi.fn(async () => undefined); const write = vi.fn(async () => true);
     const clipboard = new MobileFilesClipboard(write);
     const client = { filesHtmlResourceOwnerKey: () => "owner", subscribe: () => () => undefined,
@@ -77,6 +77,9 @@ describe("native file reading", () => {
     await act(async () => { root.render(createElement(Reader)); });
     expect(native.web?.menuItems).toEqual([{ key: "joko-file-quote", label: "Add to conversation" }]);
     const rendered = native.web!; await act(async () => { rendered.onLoad!(); });
+    expect(rendered.source.html).toContain('<strong><a href="https://example.test/read">Selected 😀 text</a></strong>');
+    expect(rendered.onShouldStartLoadWithRequest({ url: "https://example.test/read" })).toBe(false);
+    expect(native.openURL).toHaveBeenCalledExactlyOnceWith("https://example.test/read");
     await act(async () => { native.web!.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "x".repeat(4_001) } }); });
     expect(container.textContent).toContain("Select at most 4,000 characters"); expect(add).not.toHaveBeenCalled();
     await act(async () => { native.web!.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "Selected 😀 text" } }); });
@@ -85,6 +88,8 @@ describe("native file reading", () => {
     await act(async () => { (container.querySelector('[aria-label="Copy source"]') as HTMLButtonElement).click(); });
     expect(write).toHaveBeenCalledExactlyOnceWith(preview.text); expect(container.querySelector("output")?.textContent).toBe("copied");
     await act(async () => { rendered.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "late" } }); });
+    expect(rendered.onShouldStartLoadWithRequest({ url: "https://example.test/read" })).toBe(false);
+    expect(native.openURL).toHaveBeenCalledOnce();
     expect(add).toHaveBeenCalledOnce(); await act(async () => { root.unmount(); });
   });
 
@@ -165,6 +170,43 @@ describe("native file reading", () => {
     await act(async () => { native.currentState = "background"; native.appListeners.forEach((listener) => listener("background")); });
     await act(async () => { pending({ ...descriptor, leaseId: "late-resource" }); });
     expect(container.querySelector("[data-document]")).toBeNull(); expect(client.releaseMarkdownResources).toHaveBeenCalledWith("late-resource");
+    await act(async () => { root.unmount(); });
+  });
+
+  it("renders Markdown and focuses lines beyond the bounded source list", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const text = "Introduction\r\n\r\n".repeat(2_500) + "## Closing note\r\nFinal paragraph";
+    const byteSize = BigInt(new TextEncoder().encode(text).length);
+    const preview = { ...base, sourceLabel: "docs/notes.md", fileName: "notes.md", mediaType: "text/markdown",
+      text, byteSize, endByte: byteSize, totalLines: 5_002, focusLine: 5_001 };
+    const props = { preview, colors, locale: "en" as const };
+
+    await act(async () => { root.render(createElement(MobileFileTextPreview, props)); });
+    const rendered = new DOMParser().parseFromString(native.web!.source.html, "text/html");
+    const heading = rendered.querySelector('[data-source-line="5000"]');
+    const readerScript = rendered.querySelector("script")?.textContent;
+    if (!heading || !readerScript) throw new Error("The rendered preview is missing its heading or focus script.");
+    expect(heading.querySelector("h2")?.textContent).toBe("Closing note");
+    expect(rendered.querySelector('[data-source-line="5001"] p')?.textContent).toBe("Final paragraph");
+    const scrollToHeading = vi.fn();
+    Object.defineProperty(heading, "scrollIntoView", { value: scrollToHeading });
+    new Function("document", "window", readerScript)(rendered, { addEventListener: vi.fn() });
+    expect(scrollToHeading).toHaveBeenCalledExactlyOnceWith({ block: "center" });
+    expect(container.textContent).toContain("Line 5001");
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Source"]')!.click(); });
+    expect(native.list!.data).toHaveLength(5_000);
+    expect(container.textContent).toContain("Showing the first 5000 lines.");
+    expect(container.textContent).toContain("Line 5001 is outside this preview.");
+    expect(container.querySelector("[data-document]")).toBeNull();
+
+    await act(async () => { root.render(createElement(MobileFileTextPreview, { ...props,
+      preview: { ...preview, truncated: true, byteSize: byteSize + 20n, totalLines: 5_005, focusLine: 5_005 } })); });
+    expect(container.textContent).toContain("Preview is truncated");
+    expect(container.textContent).toContain("Line 5005 is outside this preview.");
+    expect(container.textContent).not.toContain("Showing the first 5000 lines.");
     await act(async () => { root.unmount(); });
   });
 

@@ -3579,6 +3579,9 @@ interface MobileTaskSendFollow {
   readonly owner: { readonly sourceKey: string };
   readonly operationId: string;
   readonly list: FlatList<MobileWorkItem<TimelineRow>>;
+  readonly listKey: string;
+  readonly draftKey: string | undefined;
+  refreshCurrent?: () => boolean;
   seek?: { readonly index: number; waitingForMeasurement: boolean };
 }
 
@@ -3736,6 +3739,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
   const initialTimelineTailRef = useRef<{ readonly ownerKey: string; requested: boolean; finished: boolean } | undefined>(undefined);
   const latestSendFollowRef = useRef<MobileTaskSendFollow | undefined>(undefined);
+  const ownedSendRefreshRef = useRef<MobileTaskSendFollow | undefined>(undefined);
   const [acceptedSendFollowId, setAcceptedSendFollowId] = useState<string>();
   const latestTimelineFollowRef = useRef<MobileTaskTimelineFollow | undefined>(undefined);
   const [timelineForegroundEpoch, setTimelineForegroundEpoch] = useState(0);
@@ -3779,17 +3783,22 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? { profileId: taskDraftProfileId!, sessionId: state.selectedId }
     : undefined;
   const draftIdentityKey = draftIdentity ? mobileComposerDraftIdentityKey(draftIdentity) : undefined;
-  const timelineListKey = `${draftIdentityKey ?? ""}\u001f${partnerConversationTransport?.ownerKey ?? ""}`;
-  const visibleTimelineRows = timelineVisibility?.key === timelineListKey ? timelineVisibility.ids : undefined;
+  const timelineOwnerKey = `${draftIdentityKey ?? ""}\u001f${partnerConversationTransport?.ownerKey ?? ""}`;
+  const sendRefresh = ownedSendRefreshRef.current;
+  // The original list survives this send's connecting state while its transport is unavailable.
+  const timelineListKey = state.status === "connecting" && partnerConversationTransport === undefined
+    && sendRefresh && sendRefresh.draftKey === draftIdentityKey && sendRefresh.refreshCurrent?.()
+    ? sendRefresh.listKey : timelineOwnerKey;
+  const visibleTimelineRows = timelineVisibility?.key === timelineOwnerKey ? timelineVisibility.ids : undefined;
   const onTimelineRowsVisible = useMemo(() => ({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
     const rowIds = (item: MobileWorkItem<TimelineRow>): string[] => isWorkGroup(item) ? item.children.flatMap(rowIds) : [item.id];
     const next = new Set(viewableItems.filter((item) => item.isViewable).flatMap((item) => rowIds(item.item)));
-    setTimelineVisibility((previous) => previous?.key === timelineListKey
-      && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous : { key: timelineListKey, ids: next });
+    setTimelineVisibility((previous) => previous?.key === timelineOwnerKey
+      && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous : { key: timelineOwnerKey, ids: next });
     setVisiblePartnerRows((previous) => previous.ownerKey === partnerConversationTransport?.ownerKey
       && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous
       : { ownerKey: partnerConversationTransport?.ownerKey, ids: next });
-  }, [timelineListKey, partnerConversationTransport?.ownerKey]);
+  }, [timelineOwnerKey, partnerConversationTransport?.ownerKey]);
   draftIdentityRef.current = draftIdentity;
   useEffect(() => {
     copyGenerationRef.current += 1;
@@ -4072,19 +4081,29 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const currentSendFollow = useCallback((request: MobileTaskSendFollow): boolean =>
     taskMountedRef.current && AppState.currentState === "active" && client.state.status === "connected"
     && client.state.window === undefined && latestSendFollowRef.current === request && timelineListRef.current === request.list
-    && client.taskHeaderSourceKey() === request.owner.sourceKey, []);
+    && (client.taskHeaderSourceKey() === request.owner.sourceKey || request.refreshCurrent?.() === true), []);
   const acceptedFollow = latestSendFollowRef.current;
   const hasAcceptedFollow = acceptedFollow !== undefined && acceptedFollow.operationId === acceptedSendFollowId
-    && acceptedFollow.owner === sendFollowOwner;
+    && sendFollowOwner !== undefined && (acceptedFollow.owner === sendFollowOwner || acceptedFollow.refreshCurrent?.() === true);
   const latestUserIndex = hasAcceptedFollow ? displayRows.findLastIndex((row) => !isWorkGroup(row) && row.kind === "user" && !row.internalInput) : -1;
   const latestUser = displayRows[latestUserIndex];
   const sendFollowTarget = hasAcceptedFollow && latestUser !== undefined && !isWorkGroup(latestUser)
     && latestUser.operationId === acceptedFollow.operationId
     && latestUser.pendingSend?.phase !== "failed" && latestUser.pendingSend?.phase !== "unknown" ? latestUser : undefined;
   const sendFollowVisible = sendFollowTarget !== undefined && visibleTimelineRows?.has(sendFollowTarget.id) === true;
-  useLayoutEffect(() => () => {
-    if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
-  }, [sendFollowOwner, activeMessageFocus?.requestId]);
+  useLayoutEffect(() => {
+    const request = latestSendFollowRef.current;
+    if (request && (request.list !== timelineListRef.current || request.owner !== sendFollowOwner
+      && (!request.refreshCurrent?.() || state.status === "offline" || state.window !== undefined || searchVisible
+        || partnerIdentity.partner !== undefined || headerRole.role !== undefined && headerRole.role !== "ordinary"))) {
+      latestSendFollowRef.current = undefined;
+    }
+  }, [sendFollowOwner, timelineListKey, state.status, state.window, searchVisible, partnerIdentity.partner, headerRole.role]);
+  useLayoutEffect(() => () => { latestSendFollowRef.current = undefined; }, [activeMessageFocus?.requestId]);
+  const retireSendFollowForTimeline = (): void => {
+    const request = latestSendFollowRef.current;
+    if (request && request.list === timelineListRef.current && request.listKey === timelineListKey) latestSendFollowRef.current = undefined;
+  };
   useLayoutEffect(() => {
     if (!hasAcceptedFollow || !currentSendFollow(acceptedFollow)) return;
     if (sendFollowTarget === undefined) {
@@ -4357,7 +4376,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const jumpToLatestTimeline = (): void => {
     const follow = currentTimelineFollow(), list = timelineListRef.current;
     if (!follow || !list || follow.position !== "earlier" || newTimelineMessages !== follow || state.historyBusy || client.state.historyBusy) return;
-    if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
+    retireSendFollowForTimeline();
     follow.position = "latest";
     follow.motion = "idle";
     follow.streamingWhenUnpinned = undefined;
@@ -6256,12 +6275,17 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (list && sendFollowOwner && rebalanceSource === sendFollowOwner.sourceKey
           && client.state.window === undefined && AppState.currentState === "active") {
           initialTimelineTail.finished = true;
-          sendFollow = { owner: sendFollowOwner, operationId, list };
+          sendFollow = { owner: sendFollowOwner, operationId, list, listKey: timelineListKey, draftKey: draftIdentityKey };
         }
         latestSendFollowRef.current = sendFollow;
         const accepted = await client.send(sourceDraft, {
           operationId,
           deliveryMode,
+          onAcceptedRefresh: refreshCurrent => {
+            if (!sendFollow || sendFollow.list !== timelineListRef.current || client.taskHeaderSourceKey() !== sendFollow.owner.sourceKey) return;
+            sendFollow.refreshCurrent = refreshCurrent;
+            ownedSendRefreshRef.current = sendFollow;
+          },
           confirmRebalance: (suggestion, signal) => confirmMobileProviderRebalance(suggestion, { signal, locale,
             current: () => taskMountedRef.current && !!rebalanceSource && client.taskHeaderSourceKey() === rebalanceSource
               && composerDraftRef.current === sourceDraft && identity !== undefined && draftIdentityRef.current !== undefined
@@ -6311,7 +6335,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           }
           return;
         }
-        if (sendFollow && currentSendFollow(sendFollow)) setAcceptedSendFollowId(sendFollow.operationId);
+        if (sendFollow) {
+          if (currentSendFollow(sendFollow)) setAcceptedSendFollowId(sendFollow.operationId);
+          else if (latestSendFollowRef.current === sendFollow) latestSendFollowRef.current = undefined;
+        }
         if (optimisticLease) {
           const lease = optimisticLease;
           setOptimisticUserRows((current) => markMobileOptimisticUserRowSubmitted(
@@ -6358,6 +6385,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         setLocalError(errorText(error));
       }
     } finally {
+      if (ownedSendRefreshRef.current === sendFollow) ownedSendRefreshRef.current = undefined;
       if (appCommandStarted && taskMountedRef.current) setAppCommandRunning(false);
     }
   };
@@ -6878,7 +6906,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       }}
       onScrollBeginDrag={(event) => {
         initialTimelineTail.finished = true;
-        if (latestSendFollowRef.current?.owner === sendFollowOwner) latestSendFollowRef.current = undefined;
+        retireSendFollowForTimeline();
         const follow = currentTimelineFollow();
         if (follow) {
           follow.motion = "dragging";

@@ -12,7 +12,7 @@ import { MobileRichAnswer } from "./MobileRichAnswer";
 import { MobileRichAnswerMedia } from "./MobileRichAnswerMedia";
 import type { MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import {
-  groupMobileMarkdownSelectableBlocks, mobileMarkdownInlineImageSize, parseMobileMarkdownIncremental,
+  groupMobileMarkdownSelectableBlocks, mobileMarkdownInlineHasMark, mobileMarkdownInlineImageSize, parseMobileMarkdownIncremental,
   type MobileMarkdownBlock, type MobileMarkdownInline, type MobileMarkdownParseResult
 } from "./mobile-markdown";
 import { latexToUnicodeApproximation } from "./mobile-markdown-math";
@@ -121,6 +121,8 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     const pathCandidate = inline.type === "link" && actionablePath ? classifyChatPathLinkTarget(inline.url) : undefined;
     const codeReference = inline.type === "code" || inline.type === "link" && !inline.bare && pathCandidate
       && chatPathLabelReadsAsFileReference(inline.text, pathCandidate, inline.url);
+    const struck = mobileMarkdownInlineHasMark(inline, "strikethrough");
+    const linked = external || actionablePath !== undefined;
     return <Text key={index} accessibilityRole={external || actionablePath ? "link" : undefined}
       onPress={actionablePath ? () => { if (AppState.currentState === "active") actionablePath(); } : external ? () => {
         if (AppState.currentState !== "active") return;
@@ -129,12 +131,12 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
         });
       } : undefined}
       style={[
-        inline.type === "strong" && styles.strong,
-        inline.type === "emphasis" && styles.emphasis,
-        inline.type === "strikethrough" && styles.strike,
+        mobileMarkdownInlineHasMark(inline, "strong") && styles.strong,
+        mobileMarkdownInlineHasMark(inline, "emphasis") && styles.emphasis,
         codeReference && [styles.inlineCode, { backgroundColor: colors.background }],
-        external && { color: colors.accent, textDecorationLine: "underline" },
-        actionablePath && { textDecorationLine: "underline" },
+        external && { color: colors.accent },
+        linked && { textDecorationLine: struck ? "underline line-through" : "underline" },
+        struck && !linked && styles.strike,
         inline.type === "image" && { color: colors.muted }
       ]}>{value}</Text>;
   });

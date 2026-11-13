@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
-import { act, createElement, forwardRef, useImperativeHandle, type ComponentProps, type ReactNode } from "react";
+import { act, createElement, forwardRef, useImperativeHandle, useRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, PartnerSessionTaskStatus, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
+  MessageRole, PartnerSessionTaskStatus, QueueItemSchema, QueueItemState, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
@@ -32,7 +32,7 @@ type TimelineScrollHandlers = {
   onContentSizeChange?: (width: number, height: number) => void;
   onScrollToIndexFailed?: TimelineScrollFailure;
 };
-let timelineList: ({ data: readonly unknown[]; onViewableItemsChanged: TimelineVisibility } & TimelineScrollHandlers) | undefined;
+let timelineList: ({ data: readonly unknown[]; instance: object; onViewableItemsChanged: TimelineVisibility } & TimelineScrollHandlers) | undefined;
 const scrollTimelineToIndex = vi.fn<(options: { index: number; animated: boolean; viewPosition?: number }) => void>();
 const scrollTimelineToOffset = vi.fn();
 const scrollTimelineToEnd = vi.fn();
@@ -46,6 +46,8 @@ const nativeAppState = {
   }
 };
 let sendFollowSourceKey: string | undefined;
+let sendFollowPresentationKey: string | undefined;
+let ordinaryTimelineTransportKey: string | undefined;
 let receiveAppMessage: ((event: { nativeEvent: { data: string } }) => void) | undefined;
 let appBridgeKey = "";
 let MobileMcpAppViewsProvider: typeof import("./MobileMcpAppViews").MobileMcpAppViewsProvider;
@@ -59,7 +61,7 @@ let objectiveSheet: MobileObjectiveSheetProps;
 let activeObjectiveApi: MobileObjectiveApi | undefined;
 let activeCollaborationApi: MobileCollaborationApi | undefined;
 let activeInputHandoffApi: import("./mobile-input-handoff").MobileInputHandoffApi | undefined;
-let taskRole: "ordinary" | "lead" | "worker" = "ordinary";
+let taskRole: "ordinary" | "lead" | "worker" | undefined = "ordinary";
 let root: Root;
 let host: HTMLDivElement;
 let TaskScreen: typeof import("./App").TaskScreen;
@@ -98,7 +100,7 @@ const client = new Proxy({
   get state() { return renderedState; },
   taskDraftProfileId: () => renderedState.activeProfileId,
   taskHeaderSourceKey: () => sendFollowSourceKey,
-  taskPresentationOwnerKey: () => sendFollowSourceKey,
+  taskPresentationOwnerKey: () => sendFollowPresentationKey ?? sendFollowSourceKey,
   taskAppCommandControls: () => current ? appControls : undefined,
   taskRuntimeCommandControls: () => current ? runtime : undefined,
   listTaskRuntimeCommands: vi.fn(async () => catalog),
@@ -110,7 +112,8 @@ const client = new Proxy({
   taskCollaborationApi: () => current ? activeCollaborationApi : undefined,
   taskInputHandoffApi: () => current ? activeInputHandoffApi : undefined,
   taskCatalogMentionControls: () => undefined, taskTimelineRows: () => empty,
-  partnerConversationTransport: () => activePartner ? { ownerKey: "private-task", sessionId: "session" } : undefined,
+  partnerConversationTransport: () => activePartner ? { ownerKey: "private-task", sessionId: "session" }
+    : ordinaryTimelineTransportKey && renderedState.status === "connected" ? { ownerKey: ordinaryTimelineTransportKey, sessionId: "session" } : undefined,
   partnerDirectoryTransport: () => activePartner ? { ownerKey: "private-node", list: privateDirectory } : undefined
 }, { get: (object, key) => key in object ? object[key as keyof typeof object] : () => undefined });
 const session = create(SessionSchema, { sessionId: "session", backendId: "backend", targetId: "target", state: SessionState.IDLE });
@@ -132,8 +135,9 @@ beforeAll(async () => {
     View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
     FlatList: forwardRef(({ data, renderItem, onViewableItemsChanged, ...scrollHandlers }: { data?: readonly unknown[];
       renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility } & TimelineScrollHandlers, ref) => {
+      const instance = useRef({}).current;
       useImperativeHandle(ref, () => ({ scrollToIndex: scrollTimelineToIndex, scrollToOffset: scrollTimelineToOffset, scrollToEnd: scrollTimelineToEnd }), []);
-      if (onViewableItemsChanged) timelineList = { data: data ?? [], onViewableItemsChanged, ...scrollHandlers };
+      if (onViewableItemsChanged) timelineList = { data: data ?? [], instance, onViewableItemsChanged, ...scrollHandlers };
       return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))));
     }), TextInput: forwardRef(() => null),
     Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
@@ -214,7 +218,8 @@ beforeAll(async () => {
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
   nativeAppState.currentState = "active";
-  timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear(); sendFollowSourceKey = undefined;
+  timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear();
+  sendFollowSourceKey = undefined; sendFollowPresentationKey = undefined; ordinaryTimelineTransportKey = undefined;
   activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
   activeObjectiveApi = undefined;
   activeCollaborationApi = undefined; activeInputHandoffApi = undefined; taskRole = "ordinary";
@@ -447,6 +452,10 @@ it.each(["unmeasured input", "fast answer", "manual drag", "newer input", "uncon
 
     if (arrival === "manual drag") await act(async () => timelineList?.onScrollBeginDrag?.());
     if (arrival === "unmeasured input") {
+      const queued = create(QueueItemSchema, { queueItemId: "queued-input", sessionId: session.sessionId, backendId: session.backendId,
+        targetId: session.targetId, sourceId: operationId, state: QueueItemState.ACCEPTED });
+      renderedState = { ...renderedState, detail: create(SnapshotSchema, { ...renderedState.detail!, queueItems: [queued] }) };
+      await act(async () => root.render(taskScreen()));
       scrollTimelineToIndex.mockImplementationOnce(({ index }) => timelineList?.onScrollToIndexFailed?.({ index, averageItemLength: 40 }));
       await act(async () => finish(true));
       expect(scrollTimelineToIndex).toHaveBeenCalledExactlyOnceWith({ index: provisional, animated: false, viewPosition: 0.2 });
@@ -481,7 +490,87 @@ it.each(["unmeasured input", "fast answer", "manual drag", "newer input", "uncon
       timelineList?.onContentSizeChange?.(400, 900);
     });
     expect(scrollTimelineToIndex).toHaveBeenCalledTimes(arrival === "unmeasured input" ? 2 : arrival === "fast answer" ? 1 : 0);
+    if (arrival === "unmeasured input") {
+      expect(scrollTimelineToIndex).toHaveBeenLastCalledWith({ index, animated: false, viewPosition: 0.2 });
+    }
     expect(scrollTimelineToEnd).not.toHaveBeenCalled();
+  });
+
+it.each(["own refresh", "reader drag", "other refresh", "replaced list"] as const)(
+  "waits for fresh ordinary authority after an accepted send through %s", async (outcome) => {
+    vi.useFakeTimers();
+    sendFollowSourceKey = "header-before";
+    sendFollowPresentationKey = "same-task";
+    ordinaryTimelineTransportKey = "same-task-transport";
+    const oldPrompt = taskUserInput("old-prompt", "previous-operation", 10n, "Older prompt");
+    renderedState = { ...state, live: [oldPrompt] };
+    let accept!: (value: boolean) => void;
+    const sendResult = new Promise<boolean>(resolve => { accept = resolve; });
+    send.mockImplementationOnce(async (draft, observer) => {
+      observer?.onProgress?.({ phase: "sending", input: draft, sentAt: 2 });
+      return sendResult;
+    });
+    await mountMeasuredTimelineTail();
+    const originalList = timelineList!.instance;
+    const bottom = timelineScrollSample(1_200, 1_600), earlier = timelineScrollSample(500, 1_600);
+    await act(async () => {
+      timelineList!.onScrollBeginDrag!(bottom);
+      timelineList!.onScroll!(earlier);
+      timelineList!.onScrollEndDrag!(earlier);
+    });
+    const text = "Follow my accepted input";
+    await act(async () => input.onEdit(replaceMobileComposerRange(input.draft, { start: 0, end: input.draft.text.length }, text), input.draft));
+    const sendButton = Array.from(host.querySelectorAll("button")).find(button => button.textContent === mobileMessage("en", "composer.send"));
+    expect(sendButton).toBeDefined();
+    await act(async () => sendButton!.click());
+    const observer = send.mock.calls[0]?.[1];
+    expect(observer?.operationId).toBe("selected-occurrence");
+    expect(observer?.onAcceptedRefresh).toBeTypeOf("function");
+    let connectionEpoch = 1;
+    await act(async () => {
+      observer!.onAcceptedRefresh!(() => connectionEpoch === 2);
+      connectionEpoch = 2;
+      sendFollowSourceKey = undefined;
+      taskRole = undefined;
+      renderedState = { ...renderedState, status: "connecting" };
+      root.render(taskScreen());
+    });
+    expect(timelineList!.instance).toBe(originalList);
+    expect(scrollTimelineToIndex).not.toHaveBeenCalled();
+    if (outcome === "reader drag") await act(async () => {
+      timelineList!.onScrollBeginDrag!(earlier);
+      timelineList!.onScroll!(timelineScrollSample(250, 1_600));
+      timelineList!.onScrollEndDrag!(timelineScrollSample(250, 1_600));
+    });
+    if (outcome === "other refresh") connectionEpoch++;
+    if (outcome === "replaced list") ordinaryTimelineTransportKey = "other-task-transport";
+    sendFollowSourceKey = "header-after";
+    const queued = create(QueueItemSchema, { queueItemId: "accepted-queue", sessionId: session.sessionId, backendId: session.backendId,
+      targetId: session.targetId, sourceId: observer!.operationId, state: QueueItemState.ACCEPTED });
+    renderedState = { ...state, live: [oldPrompt], detail: create(SnapshotSchema, { ...state.detail!, queueItems: [queued] }) };
+    await act(async () => root.render(taskScreen()));
+    if (outcome === "replaced list") expect(timelineList!.instance).not.toBe(originalList);
+    else expect(timelineList!.instance).toBe(originalList);
+    await act(async () => accept(true));
+    expect(scrollTimelineToIndex).not.toHaveBeenCalled();
+
+    scrollTimelineToIndex.mockImplementationOnce(({ index }) => timelineList!.onScrollToIndexFailed!({ index, averageItemLength: 40 }));
+    taskRole = "ordinary";
+    await act(async () => root.render(taskScreen()));
+    expect(scrollTimelineToIndex).toHaveBeenCalledTimes(outcome === "own refresh" ? 1 : 0);
+    const echo = taskUserInput("accepted-prompt", observer!.operationId!, 11n, text);
+    renderedState = { ...state, live: [oldPrompt, echo, taskAssistantAnswer("fast-answer", 12n)] };
+    await act(async () => root.render(taskScreen()));
+    expect(timelineList!.data).toContainEqual(expect.objectContaining({ id: echo.eventId, operationId: observer!.operationId }));
+    await act(async () => {
+      timelineList!.onContentSizeChange!(400, 1_800);
+      timelineList!.onContentSizeChange!(400, 1_900);
+    });
+    if (outcome === "own refresh") {
+      expect(scrollTimelineToOffset).toHaveBeenCalledExactlyOnceWith({ offset: 40, animated: false });
+      expect(scrollTimelineToIndex.mock.calls).toEqual([[{ index: 1, animated: false, viewPosition: 0.2 }],
+        [{ index: 1, animated: false, viewPosition: 0.2 }]]);
+    } else expect(scrollTimelineToIndex).not.toHaveBeenCalled();
   });
 
 function timelineScrollSample(y: number, height: number): TimelineScrollSample {
