@@ -9,7 +9,8 @@ import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
-import { MobileTaskOutboxStore, mobileTaskOutboxModel, mobileTaskOutboxOwnerMatches,
+import { MobileTaskOutboxStore, mobileTaskOutboxHistoryDeleted, mobileTaskOutboxHistoryMatches, mobileTaskOutboxModel,
+  mobileTaskOutboxOwnerMatches, mobileTaskOutboxQueueMatches, mobileTaskOutboxSessionMatches,
   type MobileTaskOutboxRecord } from "./mobile-task-outbox";
 import { projectPartnerSessionTask } from "@joko/contracts";
 import { TaskShareMethod, SetSessionRuntimeMutationSchema, type JoinedTaskShare, type TaskSharingApi, type TaskShareRuntimeControl } from "@joko/contracts";
@@ -48,7 +49,7 @@ import {
   CreateTargetMutationSchema, TargetWorkspaceInputSchema,
   CreateTaskTagMutationSchema, UpdateTaskTagMutationSchema, ReorderTaskTagsMutationSchema, SetSessionTaskTagsMutationSchema, DeleteTaskTagMutationSchema,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
-  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema,
+  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema, InputContentSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   RemoteDesktopHostMuteRequestSchema,
   RemoteDesktopPrivacyScreenRequestSchema,
@@ -1067,6 +1068,7 @@ export class MobileClient {
   #newTaskSubmissionActive = false;
   readonly #taskOutbox?: MobileTaskOutboxStore;
   #taskOutboxFlight?: Promise<void>;
+  readonly #taskOutboxCleanup = new Map<MobileTaskOutboxRecord, Promise<void>>();
   #newTaskUploadObserver?: MobileNewTaskUploadObserver;
   #composerImageEdit?: MobileComposerImageEditLease;
   #imageGallery?: MobileImageGalleryLease;
@@ -4527,12 +4529,16 @@ export class MobileClient {
       || this.#activeProfileId !== credential.profileId) return;
     const profile = this.#profiles.find((candidate) => candidate.profileId === credential.profileId)
       ?? profileFromCredential(credential);
+    const timelineRetirement = this.#timelineRetirement;
+    const current = () => this.#current(epoch) && this.#credential === credential && !this.#joinedTask
+      && this.#activeProfileId === credential.profileId && this.#state.owner === owner && this.#timelineRetirement === timelineRetirement;
+    const cachedDetail = detail && this.#state.detail === detail && this.#state.window === undefined && this.#state.older.length > 0
+      ? create(SnapshotSchema, { ...detail, timeline: [...this.#state.older, ...detail.timeline]
+        .filter((event, index, events) => events.findIndex(candidate => candidate.eventId === event.eventId) === index) })
+      : detail;
+    let durableDetail: Snapshot | undefined;
     try {
-      const cachedDetail = detail && this.#state.detail === detail && this.#state.window === undefined && this.#state.older.length > 0
-        ? create(SnapshotSchema, { ...detail, timeline: [...this.#state.older, ...detail.timeline]
-          .filter((event, index, events) => events.findIndex(candidate => candidate.eventId === event.eventId) === index) })
-        : detail;
-      await this.offlineCache.save(profile, node, owner, cachedDetail);
+      durableDetail = (await this.offlineCache.save(profile, node, owner, cachedDetail)) ?? undefined;
       if (this.#current(epoch) && this.#credential === credential
         && this.#activeProfileId === credential.profileId) {
         this.#durableSnapshotAt = this.#lastAuthenticatedAt;
@@ -4542,6 +4548,9 @@ export class MobileClient {
         const warning = `Connected, but Joko could not save the offline copy: ${message(error)}`;
         this.#set({ error: [this.#state.error, warning].filter(Boolean).join(" ") });
       }
+    }
+    if (current() && this.#state.status === "connected") {
+      await this.#reconcileAcceptedTaskOutbox(profile, owner, cachedDetail, durableDetail, this.#state.live, current);
     }
   }
 
@@ -5964,6 +5973,9 @@ export class MobileClient {
         this.#streamSequence = cursor.sequence;
         if (event.identity?.sessionId === this.#state.selectedId && historyInvalidated(event)) {
           if (!this.#retireStreamTimeline(event, cursor)) this.#clearHistory();
+        }
+        if (event.payload?.kind.case === "messageDeleted") {
+          void this.#retireAcceptedTaskOutbox(credential, record => mobileTaskOutboxHistoryDeleted(record, event));
         }
         if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
         this.#proofTimer = undefined;
@@ -10651,7 +10663,7 @@ export class MobileClient {
 
   async send(draft: MobileComposerDraft, observer: MobileTaskSendObserver = {}): Promise<boolean> {
     if (!this.#joinedTask && this.#taskOutbox && (this.#state.status === "offline"
-      || this.taskOutboxItems().length > 0)) return this.#enqueueTaskOutbox(draft, observer);
+      || this.taskOutboxItems().some(record => record.state !== "accepted"))) return this.#enqueueTaskOutbox(draft, observer);
     const exactDraft = normalizeMobileComposerDraft(draft);
     const sentAt = this.now();
     const sessionId = this.#state.selectedId;
@@ -10873,9 +10885,26 @@ export class MobileClient {
   }
 
   taskOutboxItems(): readonly MobileTaskOutboxRecord[] {
+    if (this.#joinedTask) return [];
     const profile = this.#profiles.find(profile => profile.profileId === this.#activeProfileId);
     return (this.#taskOutbox?.records ?? []).filter((record) => profile && mobileTaskOutboxOwnerMatches(record.owner, profile)
-      && record.sessionId === this.#state.selectedId && record.state !== "settled");
+      && record.sessionId === this.#state.selectedId && record.state !== "settled"
+      && (record.state !== "accepted" || this.#acceptedTaskOutboxVisible(record)));
+  }
+
+  #acceptedTaskOutboxVisible(record: MobileTaskOutboxRecord): boolean {
+    const { owner, detail, status, live } = this.#state;
+    const session = uniqueValue(owner?.sessions ?? [], item => item.sessionId === record.sessionId);
+    if (!session || session.state === SessionState.CLOSED || session.automationOrigin !== undefined
+      || !mobileTaskOutboxSessionMatches(record, session)
+      || owner?.server?.serverId !== record.owner.serverId || this.#state.activeProfileId !== record.owner.profileId
+      || status !== "connected" && !((status === "offline" || status === "connecting") && this.#hasOfflineProjection(record.owner.profileId))) return false;
+    if (detail?.sessions.some(item => item.sessionId === record.sessionId && !mobileTaskOutboxSessionMatches(record, item))
+      || detail?.timeline.some(event => mobileTaskOutboxHistoryDeleted(record, event))
+      || live.some(event => mobileTaskOutboxHistoryDeleted(record, event))) return false;
+    const item = uniqueValue(detail?.queueItems ?? [], queue => mobileTaskOutboxQueueMatches(record, queue));
+    if (item?.state === QueueItemState.ACCEPTED) return false;
+    return !item || !retiredTaskOutboxQueue(record, item) || detail?.timeline.some(event => mobileTaskOutboxHistoryMatches(record, event)) === true;
   }
 
   async retryTaskOutbox(id: string): Promise<void> {
@@ -11025,9 +11054,75 @@ export class MobileClient {
     }
   }
 
-  async #cleanupTaskOutbox(record: MobileTaskOutboxRecord): Promise<void> {
-    for (const id of record.storageIds) await this.attachmentFiles?.removeOwnedBytes(record.owner.profileId, id);
-    await this.#taskOutbox!.remove(record);
+  #cleanupTaskOutbox(record: MobileTaskOutboxRecord): Promise<void> {
+    const existing = this.#taskOutboxCleanup.get(record);
+    if (existing) return existing;
+    const cleanup = (async () => {
+      for (const id of record.storageIds) await this.attachmentFiles?.removeOwnedBytes(record.owner.profileId, id);
+      await this.#taskOutbox!.remove(record);
+    })().finally(() => this.#taskOutboxCleanup.delete(record));
+    this.#taskOutboxCleanup.set(record, cleanup);
+    return cleanup;
+  }
+
+  async #settleAcceptedTaskOutbox(record: MobileTaskOutboxRecord): Promise<void> {
+    const settled = await this.#taskOutbox!.update(record, { state: "settled", queueReceipt: undefined });
+    this.#publishTaskOutbox();
+    await this.#cleanupTaskOutbox(settled);
+  }
+
+  async #retireAcceptedTaskOutbox(credential: PairedCredential, matches: (record: MobileTaskOutboxRecord) => boolean): Promise<void> {
+    for (const record of this.#taskOutbox?.records ?? []) {
+      if (record.state !== "accepted" || !mobileTaskOutboxOwnerMatches(record.owner, credential)
+        || !matches(record)) continue;
+      if (this.#credential !== credential || this.#joinedTask) return;
+      try { await this.#settleAcceptedTaskOutbox(record); }
+      catch (error) {
+        if (this.#credential === credential && this.#taskOutbox?.records.includes(record)) {
+          this.#set({ error: `Could not retire the local copy of the task input: ${message(error)}` });
+        }
+      }
+    }
+  }
+
+  async #reconcileAcceptedTaskOutbox(profile: MobileConnectionProfile, owner: Snapshot, detail: Snapshot | undefined,
+    durableDetail: Snapshot | undefined, live: readonly Event[], current: () => boolean): Promise<void> {
+    const store = this.#taskOutbox;
+    if (!store || owner.scope?.kind.case !== "owner" || owner.server?.serverId !== profile.serverId) return;
+    for (const record of store.records) {
+      const receipt = record.queueReceipt;
+      if (!receipt || !mobileTaskOutboxOwnerMatches(record.owner, profile)) continue;
+      if (!current()) return;
+      let changed = false;
+      try {
+        const sessions = owner.sessions.filter(item => item.sessionId === record.sessionId);
+        if (sessions.length > 1) continue;
+        const session = sessions[0];
+        if (!session || session.state === SessionState.CLOSED || session.automationOrigin !== undefined
+          || !mobileTaskOutboxSessionMatches(record, session)) {
+          await this.#settleAcceptedTaskOutbox(record);
+          continue;
+        }
+        const taskDetail = detail?.scope?.kind.case === "session" && detail.scope.kind.value.sessionId === record.sessionId
+          && detail.server?.serverId === profile.serverId && detail.generation === owner.generation
+          && detail.sessions.length === 1 && mobileTaskOutboxSessionMatches(record, detail.sessions[0]!) ? detail : undefined;
+        const history = taskDetail?.timeline.find(event => mobileTaskOutboxHistoryMatches(record, event));
+        const item = uniqueValue((taskDetail ?? owner).queueItems, queue => mobileTaskOutboxQueueMatches(record, queue));
+        if (taskDetail?.timeline.some(event => mobileTaskOutboxHistoryDeleted(record, event))
+          || live.some(event => mobileTaskOutboxHistoryDeleted(record, event))
+          || taskDetail && durableDetail?.timeline.some(event => mobileTaskOutboxHistoryMatches(record, event))
+          || !history && item && retiredTaskOutboxQueue(record, item)) {
+          await this.#settleAcceptedTaskOutbox(record);
+        } else if (history && history.eventId !== receipt.historyEventId) {
+          await store.update(record, { queueReceipt: { ...receipt, historyEventId: history.eventId } });
+          changed = true;
+        }
+      } catch (error) {
+        if (current() && store.records.some(item => item.id === record.id)) {
+          this.#set({ error: `Could not update the local copy of the accepted task input: ${message(error)}` });
+        }
+      } finally { if (changed) this.#publishTaskOutbox(); }
+    }
   }
 
   #drainTaskOutbox(epoch: number): Promise<void> {
@@ -11042,7 +11137,8 @@ export class MobileClient {
   async #runTaskOutbox(epoch: number): Promise<void> {
     const store = this.#taskOutbox, credential = this.#credential;
     if (!store || !credential || this.#joinedTask || this.#state.status !== "connected" || !this.#current(epoch)
-      || this.#state.busy || this.#mutationOwner || store.records.length === 0) return;
+      || this.#state.busy || this.#mutationOwner || !store.records.some(record => record.state !== "accepted"
+        && mobileTaskOutboxOwnerMatches(record.owner, credential))) return;
     const action = this.#claimMutation(), signal = this.#abort!.signal;
     const assert = () => {
       if (!this.#current(epoch) || signal.aborted || this.#joinedTask || this.#credential !== credential
@@ -11052,7 +11148,7 @@ export class MobileClient {
     const blocked = new Set<string>();
     try {
       for (const original of [...store.records]) {
-        if (!mobileTaskOutboxOwnerMatches(original.owner, credential) || blocked.has(original.sessionId)) continue;
+        if (original.state === "accepted" || !mobileTaskOutboxOwnerMatches(original.owner, credential) || blocked.has(original.sessionId)) continue;
         assert();
         let record = original;
         const previouslyAttempted = original.attempted;
@@ -11117,11 +11213,22 @@ export class MobileClient {
             blocked.add(record.sessionId); continue;
           }
           const queued = operation.result?.payload.case === "queueItem" ? operation.result.payload.value : undefined;
-          if (!queued || queued.sessionId !== record.sessionId || queued.backendId !== record.backendId || queued.targetId !== record.targetId) {
+          if (!queued || !mobileTaskOutboxQueueMatches(record, queued)) {
             blocked.add(record.sessionId); continue;
           }
-          record = await store.update(record, { state: "settled" });
-          await this.#cleanupTaskOutbox(record);
+          const session = uniqueValue(this.#state.owner?.sessions ?? [], item => item.sessionId === record.sessionId);
+          const nativeGeneration = queued.version?.generation;
+          if (!this.offlineCache || session?.automationOrigin !== undefined || session?.state === SessionState.CLOSED
+            || session !== undefined && !mobileTaskOutboxSessionMatches(record, session)
+            || nativeGeneration?.toString() !== record.runtimeGeneration
+            || queued.state === QueueItemState.CANCELLED && queued.dispatchedAt === undefined) {
+            record = await store.update(record, { state: "settled" });
+            await this.#cleanupTaskOutbox(record);
+          } else {
+            record = await store.update(record, { state: "accepted", queueReceipt: {
+              queueItemId: queued.queueItemId, runId: queued.runId, inputKey: taskOutboxQueueInputKey(queued)
+            } });
+          }
         } catch (error) {
           if (store.records.includes(record) && record.state === "queued" && this.#current(epoch)) {
             await store.update(record, { state: "failed", failureKind: record.attempted ? "not-admitted" : "preparation",
@@ -17022,11 +17129,17 @@ export class MobileClient {
       const generation = mobileMessageDeletionGeneration(operation, pending);
       if (session && pending.eventId && pending.sessionId === session.sessionId && generation !== undefined
         && generation === session.nativeBinding?.runtimeGeneration) {
-        const target = this.#completedMessageEvent(pending.eventId)?.payload?.kind;
+        const source = this.#completedMessageEvent(pending.eventId);
+        const target = source?.payload?.kind;
         // The accepted user row carries the requested durable event ID. The
         // affected assistant-turn IDs come from the authoritative stream marker.
         if ((target?.case === "messageStarted" || target?.case === "messageCompleted") && target.value.role === MessageRole.USER) {
           const eventId = pending.eventId;
+          if (source && this.#credential) {
+            await this.#retireAcceptedTaskOutbox(this.#credential, record => mobileTaskOutboxSessionMatches(record, session)
+              && (record.queueReceipt?.historyEventId === source.eventId || mobileTaskOutboxHistoryMatches(record, source)));
+            if (!this.#current(epoch) || this.#credential?.connectionId !== pending.connectionId) return;
+          }
           await this.#retireSelectedTimeline(session, events => events.filter(item => item.identity?.sessionId !== session.sessionId
             || item.eventId !== eventId));
           if (!this.#current(epoch) || this.#credential?.connectionId !== pending.connectionId) return;
@@ -17912,6 +18025,17 @@ function timelineGalleryPagesForSelection(
 function timelineGalleryGroupKey(events: readonly Event[], pages: readonly MobileImageGalleryPage[]): string {
   const sources = new Set(pages.flatMap(page => "eventId" in page.source ? [page.source.eventId] : []));
   return mobileTimelineGalleryWindowKey(events.filter(event => sources.has(event.eventId)));
+}
+
+function retiredTaskOutboxQueue(record: MobileTaskOutboxRecord, item: QueueItem): boolean {
+  const receipt = record.queueReceipt;
+  return ((item.state === QueueItemState.CANCELLED || item.state === QueueItemState.FAILED)
+    && item.dispatchedAt === undefined && receipt?.historyEventId === undefined)
+    || (receipt?.inputKey !== undefined && item.input !== undefined && receipt.inputKey !== taskOutboxQueueInputKey(item));
+}
+
+function taskOutboxQueueInputKey(item: QueueItem): string | undefined {
+  return item.input === undefined ? undefined : bytesToHex(sha256(toBinary(InputContentSchema, item.input)));
 }
 
 function historyInvalidated(event: Event): boolean {

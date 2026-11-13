@@ -4,7 +4,7 @@ import { mobileInputSummary, mobileComposerInput } from "./mobile-composer-docum
 import type { TimelineRow } from "./timeline";
 
 export interface MobilePendingSendProgress {
-  readonly phase: "preparing" | "uploading" | "sending" | "queued" | "waiting" | "unknown" | "failed";
+  readonly phase: "preparing" | "uploading" | "sending" | "queued" | "waiting" | "unknown" | "failed" | "accepted";
   readonly input: MobileComposerDraft;
   readonly sentAt: number;
   readonly attachmentId?: string;
@@ -23,12 +23,13 @@ export function projectMobilePendingOutboxRows(rows: readonly TimelineRow[], rec
   const pending = new Map(records.map(record => [record.operationId, record]));
   const decorate = (row: TimelineRow, record: MobileTaskOutboxRecord): TimelineRow => ({ ...row,
     startedAtMs: record.createdAt, pendingSend: { input: record.input, sentAt: record.createdAt, outboxId: record.id,
-      phase: record.state === "confirming" ? "unknown" : record.state === "failed" ? "failed"
+      phase: record.state === "accepted" ? "accepted" : record.state === "confirming" ? "unknown" : record.state === "failed" ? "failed"
         : !connected ? "waiting" : record.uploadAttachmentId ? "uploading" : "preparing",
       ...(record.uploadAttachmentId ? { attachmentId: record.uploadAttachmentId } : {}), ...(record.error ? { error: record.error } : {}) } });
   const result = rows.map(row => {
     const record = row.operationId ? pending.get(row.operationId) : undefined;
     if (!record) return row;
+    if (record.queueReceipt && !row.optimistic && row.queueItemId !== record.queueReceipt.queueItemId) return row;
     pending.delete(record.operationId);
     return row.optimistic ? decorate(row, record) : row;
   });
