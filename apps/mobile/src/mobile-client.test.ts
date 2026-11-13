@@ -1,4 +1,5 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
@@ -36,7 +37,8 @@ import {
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
-  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
+  ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema, ManagedResourceSchema,
@@ -4433,7 +4435,7 @@ describe("mobile Partner private authority", () => {
     const partner = { ...profilePartner, canonicalSessionId: "imported-task" };
     const importedSession = { ...snapshot.sessions[0]!, sessionId: "imported-task", displayName: "Imported Partner task" };
     const importedEvent = create(EventSchema, { ...messageEvent,
-      identity: create(EventIdentitySchema, { ...messageEvent.identity, sessionId: importedSession.sessionId }) });
+      identity: create(EventIdentitySchema, { ...messageEvent.identity!, sessionId: importedSession.sessionId }) });
     const fresh = create(SnapshotSchema, { ...snapshot, sessions: [...snapshot.sessions, importedSession] });
     const importedDetail = create(SnapshotSchema, { ...snapshot, sessions: [importedSession], timeline: [importedEvent] });
     vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: fresh });
@@ -6823,21 +6825,37 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.submit).toHaveBeenCalledOnce();
   });
 
-  it.each(["exact queue", "other queue", "observer throws"] as const)(
-    "exposes the exact send identity before durable submit and preserves its refresh with %s", async (receipt) => {
-    const source = create(SessionSchema, { ...snapshot.sessions[0]!, nativeBinding: {
+  it.each([
+    { receipt: "exact queue", anchored: false },
+    { receipt: "other queue", anchored: false },
+    { receipt: "observer throws", anchored: false },
+    { receipt: "exact queue", anchored: true },
+    { receipt: "other queue", anchored: true }
+  ])("exposes the exact send identity before refresh with $receipt (historic window: $anchored)", async ({ receipt, anchored }) => {
+    const source = create(SessionSchema, { ...snapshot.sessions[0]!, nativeBinding: create(NativeSessionBindingSchema, {
       backendId: "backend", opaqueReference: "original-binding", runtimeGeneration: 8n
-    } });
+    }) });
     const projection = create(SnapshotSchema, { ...snapshot, sessions: [source] });
     const network = projectedNetwork(projection);
     const saved = memoryStorage(credential);
     const drafts = memoryDraftStores();
     const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
     await app.start();
+    const anchor = event("linked-event", 4n);
     const draft = plainTextMobileComposerDraft("one visible message");
+    const acceptedMessage = create(EventSchema, { ...event("visible-message", 11n),
+      identity: create(EventIdentitySchema, { sessionId: source.sessionId, operationId: "visible-operation" }),
+      payload: create(EventPayloadSchema, { kind: { case: "messageStarted", value: create(MessageStartedEventSchema, {
+        messageId: "visible-message", role: MessageRole.USER, userInputAccepted: true, userInput: mobileComposerInput(draft)
+      }) } }) });
+    if (anchored) {
+      vi.mocked(network.readAround).mockResolvedValueOnce([anchor]);
+      await app.around(anchor.eventId);
+    }
     const ownerKey = app.taskPresentationOwnerKey();
     const headerKey = app.taskHeaderSourceKey();
     expect(ownerKey).toBeTruthy();
+    let observedWindow: MobileClient["state"]["window"];
     const order: string[] = [];
     const refreshObservation: { isCurrent?: () => boolean; connecting?: { status: MobileClient["state"]["status"]; sameOwner?: boolean } } = {};
     vi.mocked(network.inspect).mockImplementationOnce(async () => {
@@ -6852,7 +6870,8 @@ describe("native mobile connection and operation ownership", () => {
       const queueItem = create(QueueItemSchema, { queueItemId: "accepted-input", sessionId: source.sessionId,
         backendId: source.backendId, targetId: source.targetId, sourceId: receipt === "other queue" ? "another-operation" : operationId,
         state: QueueItemState.ACCEPTED });
-      vi.mocked(network.readSession).mockResolvedValueOnce(create(SnapshotSchema, { ...projection, queueItems: [queueItem] }));
+      vi.mocked(network.readSession).mockResolvedValueOnce(create(SnapshotSchema, { ...projection,
+        resumeCursor: acceptedMessage.cursor, queueItems: [queueItem], timeline: [acceptedMessage] }));
       return create(OperationSchema, {
         operationId,
         connectionId: credential.connectionId,
@@ -6874,6 +6893,10 @@ describe("native mobile connection and operation ownership", () => {
       onAcceptedRefresh: (isCurrent) => {
         order.push("accepted presentation");
         refreshObservation.isCurrent = isCurrent;
+        if (anchored) {
+          observedWindow = app.state.window;
+          app.latest();
+        }
         if (receipt === "observer throws") throw new Error("presentation closed");
       }
     })).resolves.toBe(true);
@@ -6881,9 +6904,12 @@ describe("native mobile connection and operation ownership", () => {
     expect(order).toEqual(["presentation", "submit", ...(receipt === "other queue" ? [] : ["accepted presentation"]), "refresh"]);
     expect(refreshObservation.connecting).toEqual({ status: "connecting", sameOwner: receipt === "other queue" ? undefined : true });
     expect(refreshObservation.isCurrent?.()).toBe(receipt === "other queue" ? undefined : true);
+    if (anchored && receipt === "exact queue") expect(observedWindow).toEqual([anchor]);
     expect(app.taskPresentationOwnerKey()).toBe(ownerKey);
     expect(app.taskHeaderSourceKey()).not.toBe(headerKey);
     expect(app.state.detail?.queueItems.map(item => item.queueItemId)).toEqual(["accepted-input"]);
+    expect((app.state.window ?? app.state.detail?.timeline)?.map(item => item.eventId))
+      .toEqual(anchored && receipt === "other queue" ? [anchor.eventId] : [acceptedMessage.eventId]);
     expect(saved.pending()).toEqual([]);
     expect(await drafts.composer.readDurable({ profileId: credential.profileId, sessionId: source.sessionId })).toBeNull();
     await app.refresh();
@@ -8249,6 +8275,38 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.historyEnd).toBe(true);
   });
 
+  it.each(["same event", "new sequence", "new event generation", "changed body", "history deletion"] as const)(
+    "adopts a freshly issued latest window through the exact existing boundary (%s)", async (change) => {
+      const { app, network, owner, detail, deleted, neighbor, identity, input, hits } = historyRetirementFixture();
+      const first = create(SnapshotSchema, { ...detail, scope: create(SnapshotScopeSchema, { kind: { case: "session",
+        value: create(SessionSnapshotScopeSchema, { sessionId: "session", recentTimelineItems: 2 }) } }) });
+      vi.mocked(network.readSession).mockResolvedValue(first);
+      await app.start();
+      expect(hits()).toHaveLength(1);
+      const boundary = clone(EventSchema, neighbor);
+      boundary.cursor = create(EventCursorSchema, { ...boundary.cursor!, opaqueToken: "reissued",
+        issuedAt: create(TimestampSchema, { seconds: 20n }), sequence: change === "new sequence" ? 9n : 8n,
+        generation: change === "new event generation" ? 2n : 1n });
+      if (change === "changed body" && boundary.payload?.kind.case === "messageStarted") {
+        boundary.payload.kind.value.userInputAccepted = false;
+      }
+      const tail = change === "history deletion" ? create(EventSchema, {
+        ...event("deletion", 11n), identity, payload: create(EventPayloadSchema, { kind: { case: "messageDeleted", value: create(MessageDeletedEventSchema, {
+          productSessionId: "session", requestedEventId: deleted.eventId, deletedEventIds: [deleted.eventId]
+        }) } })
+      }) : input("new-message", 11n, "latest reply");
+      const observed = create(SnapshotSchema, { ...owner, resumeCursor: tail.cursor });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: observed });
+      vi.mocked(network.readSession).mockResolvedValue(create(SnapshotSchema, { ...first, resumeCursor: tail.cursor, timeline: [boundary, tail] }));
+
+      await app.refresh();
+
+      expect(app.state.detail?.timeline.map(item => item.eventId)).toEqual(change === "same event"
+        ? [deleted.eventId, boundary.eventId, tail.eventId] : [boundary.eventId, tail.eventId]);
+      expect(app.state.detail?.timeline.find(item => item.eventId === boundary.eventId)?.cursor?.opaqueToken).toBe("reissued");
+      expect(hits()).toHaveLength(change === "same event" ? 1 : 0);
+    });
+
   it("retires an in-flight historic page when returning to the latest window", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);
@@ -8263,6 +8321,71 @@ describe("native mobile connection and operation ownership", () => {
     await oldPage;
     expect(app.state.window).toBeUndefined();
     expect(app.state.older).toHaveLength(0);
+  });
+
+  it.each(["query failure", "stale cursor", "revoked connection"] as const)(
+    "keeps the latest view after an earlier window's late %s", async kind => {
+      const network = fakeNetwork();
+      const app = client(network, memoryStorage(credential).storage);
+      await app.start();
+      vi.mocked(network.readAround).mockResolvedValueOnce([event("anchor", 8n)]);
+      await app.around("anchor");
+      const before = app.state.before;
+      let failPage!: (error: unknown) => void;
+      vi.mocked(network.readHistory).mockImplementationOnce(() => new Promise((_resolve, reject) => { failPage = reject; }));
+      const oldPage = app.older();
+      expect(network.readHistory).toHaveBeenCalledWith(credential, "session", before, expect.any(AbortSignal));
+      app.latest();
+      const error = kind === "revoked connection" ? { code: Code.Unauthenticated } : kind === "stale cursor"
+        ? { code: Code.FailedPrecondition } : new Error("Earlier page failed.");
+      failPage(error);
+      await oldPage;
+
+      expect(app.state.window).toBeUndefined();
+      expect(app.state.older).toEqual([]);
+      expect(app.state.historyBusy).toBe(false);
+      expect(network.inspect).toHaveBeenCalledOnce();
+      expect(app.state.status).toBe(kind === "revoked connection" ? "revoked" : "connected");
+
+      if (kind === "query failure") {
+        vi.mocked(network.readAround).mockResolvedValueOnce([event("new-anchor", 9n)]);
+        await app.around("new-anchor");
+        vi.mocked(network.readHistory).mockRejectedValueOnce(error);
+        await expect(app.older()).rejects.toBe(error);
+        expect(app.state.window?.map(item => item.eventId)).toEqual(["new-anchor"]);
+      }
+    });
+
+  it.each(["anchor", "older page"] as const)("retires a pending message-link %s when its screen leaves", async (kind) => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const screen = new AbortController();
+    let finish!: () => void;
+    const retired = event("retired-link-event", 7n);
+    if (kind === "anchor") {
+      vi.mocked(network.readAround).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve([retired]); }));
+    } else {
+      vi.mocked(network.readHistory).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve({ events: [retired] }); }));
+    }
+    const oldRead = kind === "anchor" ? app.around(retired.eventId, screen.signal) : app.older(screen.signal);
+    const requestSignal = kind === "anchor"
+      ? vi.mocked(network.readAround).mock.calls[0]?.[3]
+      : vi.mocked(network.readHistory).mock.calls[0]?.[3];
+    expect(requestSignal?.aborted).toBe(false);
+    expect(app.state.historyBusy).toBe(true);
+    screen.abort();
+    expect(requestSignal?.aborted).toBe(true);
+    expect(app.state.historyBusy).toBe(false);
+
+    const current = event("current-link-event", 8n);
+    vi.mocked(network.readAround).mockResolvedValueOnce([current]);
+    await app.around(current.eventId);
+    finish();
+    await oldRead;
+
+    expect(app.state.window?.map(item => item.eventId)).toEqual([current.eventId]);
+    expect(app.state.historyBusy).toBe(false);
   });
 
   it("rejects another task in an anchor and retires an old page after a background transition", async () => {
@@ -10988,6 +11111,42 @@ describe("native current-task Interaction ownership", () => {
     expect(app.taskInteractions().map((interaction) => interaction.interactionId))
       .toEqual(["interaction-plan", "interaction-question"]);
   });
+
+  it.each(["durable conflict", "lost response", "still running"] as const)(
+    "settles a stale permission response only from its original durable receipt (%s)", async (outcome) => {
+      const network = projectedNetwork(interactionSnapshot);
+      const saved = memoryStorage(credential);
+      const app = client(network, saved.storage, undefined, undefined, ids());
+      const failure = `Revision precondition failed for ${permissionInteraction.interactionId}.`;
+      const receipt = (state: OperationState) => create(OperationSchema, {
+        operationId: "interaction-operation-1", connectionId: credential.connectionId, state,
+        ...(state === OperationState.FAILED ? { error: { message: failure } } : {})
+      });
+      vi.mocked(network.submit).mockRejectedValueOnce(outcome === "lost response" ? new Error("link interrupted")
+        : new ConnectError(failure, Code.Aborted));
+      vi.mocked(network.getOperation).mockResolvedValue(outcome === "durable conflict" ? receipt(OperationState.FAILED)
+        : outcome === "still running" ? receipt(OperationState.RUNNING) : undefined);
+      await app.start();
+      const submit = app.resolveInteraction(permissionInteraction.interactionId, {
+        kind: "permission", decision: PermissionDecisionKind.DENY_ONCE
+      });
+      if (outcome === "durable conflict") {
+        await expect(submit).rejects.toThrow(failure);
+        expect(saved.pending()).toEqual([]);
+        expect(app.state.pending).toEqual([]);
+        expect(app.state.busy).toBe(false);
+      } else {
+        await expect(submit).resolves.toBe(false);
+        expect(saved.pending()).toMatchObject([{ operationId: "interaction-operation-1", state: "unknown" }]);
+        const displayed = app.taskInteractions().find(item => item.interactionId === permissionInteraction.interactionId)!;
+        await expect(app.checkTaskInteractionOperation(displayed, "another-operation")).resolves.toBe(false);
+        vi.mocked(network.getOperation).mockResolvedValueOnce(receipt(OperationState.FAILED));
+        await expect(app.checkTaskInteractionOperation(displayed, "interaction-operation-1")).rejects.toThrow(failure);
+        expect(saved.pending()).toEqual([]);
+      }
+      expect(network.getOperation).toHaveBeenLastCalledWith(credential, "interaction-operation-1", expect.any(AbortSignal));
+      expect(network.submit).toHaveBeenCalledOnce();
+    });
 
   it("dismisses only the exact current request and refreshes its authoritative projection", async () => {
     const network = projectedNetwork(interactionSnapshot);

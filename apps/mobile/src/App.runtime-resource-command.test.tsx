@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, useImperativeHandle, useRef, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, ModelKeySchema, ModelSourceKind, PartnerSessionTaskStatus, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
+  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -19,7 +19,9 @@ import { PermissionMode } from "@joko/contracts";
 import type { MobileObjectiveSheetProps } from "./MobileObjectiveSheet";
 import type { MobileTaskHeader } from "./MobileTaskHeader";
 import type { MobileContextSheet } from "./MobileContextSheet";
+import type { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
 import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
+import type { MobileNativeIntentMessageFocus } from "./mobile-native-intent";
 import type { MobileProviderUsageTransport } from "./mobile-account-usage";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
@@ -59,6 +61,7 @@ let input: ComponentProps<typeof MobileComposerRichInput>;
 let palette: ComponentProps<typeof MobileRuntimeCommandPalette>;
 let header: ComponentProps<typeof MobileTaskHeader>;
 let contextSheet: ComponentProps<typeof MobileContextSheet>;
+let conversationSearch: ComponentProps<typeof MobileConversationSearchSheet>;
 let objectiveSheet: MobileObjectiveSheetProps;
 let activeObjectiveApi: MobileObjectiveApi | undefined;
 let activeCollaborationApi: MobileCollaborationApi | undefined;
@@ -86,6 +89,9 @@ const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(
   policy: { help: true as const, jumpSession: true as const, userShell: false, sessionReset: false, review: false }, jumpSessionIds: ["session"] };
 const resolveResource = vi.fn(async () => resource);
 const send = vi.fn(async (_draft: MobileComposerDraft, _observer?: MobileTaskSendObserver) => true);
+const returnToLatest = vi.fn(() => {
+  renderedState = { ...renderedState, window: undefined, before: undefined, historyEnd: false };
+});
 const empty = Object.freeze([]);
 let activePartner: MobilePartnerDirectoryProfile | undefined;
 const peer: MobilePartnerDirectoryProfile = {
@@ -110,7 +116,7 @@ const client = new Proxy({
   resolveTaskRuntimeCommandResource: resolveResource,
   taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
-  taskNativeTreeControls: () => undefined, send, taskContextControls: () => undefined,
+  taskNativeTreeControls: () => undefined, send, latest: returnToLatest, taskContextControls: () => undefined,
   taskProviderUsageTransport: () => providerUsage,
   taskObjectiveApi: () => current ? activeObjectiveApi : undefined,
   taskCollaborationApi: () => current ? activeCollaborationApi : undefined,
@@ -200,6 +206,10 @@ beforeAll(async () => {
     has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null })
   }));
+  vi.doMock("./MobileConversationSearchSheet", () => ({ MobileConversationSearchSheet: (props: ComponentProps<typeof MobileConversationSearchSheet>) => {
+    conversationSearch = props;
+    return null;
+  } }));
   vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
   vi.doMock("./use-mobile-task-header-role", () => ({ useMobileTaskHeaderRole: () => ({ role: taskRole, failed: false, retry() {} }) }));
   vi.doMock("./MobileTaskHeader", () => ({ MobileTaskHeader: (props: ComponentProps<typeof MobileTaskHeader>) => {
@@ -224,6 +234,7 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
+  returnToLatest.mockClear();
   nativeAppState.currentState = "active";
   timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear();
   sendFollowSourceKey = undefined; sendFollowPresentationKey = undefined; ordinaryTimelineTransportKey = undefined;
@@ -234,10 +245,11 @@ beforeEach(async () => {
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
 afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); vi.useRealTimers(); });
-function taskScreen(messageFocus?: ComponentProps<typeof TaskScreen>["messageFocus"]) {
+function taskScreen(messageFocus?: ComponentProps<typeof TaskScreen>["messageFocus"],
+  onMessageFocusConsumed?: ComponentProps<typeof TaskScreen>["onMessageFocusConsumed"]) {
   return createElement(TaskScreen, { colors, state: renderedState, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {},
     onOpenPartnerThread: openPrivateThread, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false,
-    messageFocus });
+    messageFocus, onMessageFocusConsumed });
 }
 async function render(assertPalette = true): Promise<void> {
   await act(async () => root.render(taskScreen()));
@@ -250,7 +262,7 @@ async function render(assertPalette = true): Promise<void> {
 
 it("reads the actual task menu's Claude family quota using the owning model route", async () => {
   const model = create(ModelKeySchema, { providerId: "provider", modelId: "claude-opus-4[1m]" });
-  const selected = create(SessionSchema, { ...session, model: { model } });
+  const selected = create(SessionSchema, { ...session, model: create(ModelSelectionSchema, { model }) });
   const owner = create(SnapshotSchema, { sessions: [selected], models: [
     { backendId: "other-backend", key: model, source: { kind: ModelSourceKind.LOCAL, nativeAdapterKind: "pi" } },
     { backendId: selected.backendId, key: model, source: { kind: ModelSourceKind.LOCAL, nativeAdapterKind: "claude-agent-sdk-stdio" } }
@@ -344,6 +356,28 @@ it.each(["ordinary open", "manual drag", "explicit message focus"] as const)("us
     timelineList?.onContentSizeChange?.(400, 1_800);
   });
   expect(scrollTimelineToEnd.mock.calls).toEqual(opening === "ordinary open" ? [[{ animated: false }], [{ animated: false }]] : []);
+});
+
+it("retires the pending native scroll retry when the open conversation search clears its hit", async () => {
+  vi.useFakeTimers();
+  renderedState = { ...state, live: [taskUserInput("first", "first-operation", 1n, "First match"),
+    taskUserInput("second", "second-operation", 2n, "Second match")] };
+  await act(async () => root.render(taskScreen()));
+  const action = header.actions.find(item => item.id === "search")!;
+  expect(action.disabled).toBe(false);
+  await act(async () => action.onPress());
+  expect(conversationSearch.visible).toBe(true);
+  await act(async () => conversationSearch.onFocus({ itemKey: "second", sourceKey: "second" }));
+  await act(async () => vi.advanceTimersByTimeAsync(30));
+  expect(scrollTimelineToIndex).toHaveBeenCalledExactlyOnceWith({ index: 1, animated: false, viewPosition: 0.2 });
+  await act(async () => timelineList?.onScrollToIndexFailed?.({ index: 1, averageItemLength: 100 }));
+  expect(scrollTimelineToOffset).toHaveBeenCalledExactlyOnceWith({ offset: 100, animated: false });
+  await act(async () => {
+    conversationSearch.onFocus(undefined);
+    await vi.advanceTimersByTimeAsync(100);
+  });
+  expect(conversationSearch.visible).toBe(true);
+  expect(scrollTimelineToIndex).toHaveBeenCalledTimes(1);
 });
 
 it("follows the measured ordinary tail through streaming growth until the reader scrolls up", async () => {
@@ -613,6 +647,80 @@ it.each(["own refresh", "reader drag", "other refresh", "replaced list"] as cons
       expect(scrollTimelineToIndex.mock.calls).toEqual([[{ index: 1, animated: false, viewPosition: 0.2 }],
         [{ index: 1, animated: false, viewPosition: 0.2 }]]);
     } else expect(scrollTimelineToIndex).not.toHaveBeenCalled();
+  });
+
+it.each(["accepted", "reader drag", "new window", "new focus", "unknown"] as const)(
+  "adopts the current accepted send from a historic window only while its presentation owns it (%s)", async outcome => {
+    sendFollowSourceKey = "anchored-task";
+    sendFollowPresentationKey = "same-task";
+    ordinaryTimelineTransportKey = "same-task-transport";
+    const anchor = taskUserInput("old-anchor", "old-operation", 4n, "Original linked message");
+    const anchorWindow = [anchor];
+    renderedState = { ...state, window: anchorWindow };
+    const originalFocus = { requestId: 1, sessionId: session.sessionId, messageId: anchor.eventId, messageEventId: anchor.eventId };
+    let focus: MobileNativeIntentMessageFocus | undefined = originalFocus;
+    const consumeFocus = vi.fn((consumed: MobileNativeIntentMessageFocus) => { if (focus === consumed) focus = undefined; });
+    let finish!: (accepted: boolean) => void;
+    send.mockImplementationOnce(async (draft, observer) => {
+      observer?.onProgress?.({ phase: "sending", input: draft, sentAt: 2 });
+      return new Promise<boolean>(resolve => { finish = resolve; });
+    });
+    await act(async () => root.render(taskScreen(focus, consumeFocus)));
+    const text = "Show the sent message";
+    await act(async () => input.onEdit(replaceMobileComposerRange(input.draft, { start: 0, end: input.draft.text.length }, text), input.draft));
+    const sendButton = Array.from(host.querySelectorAll("button")).find(button => button.textContent === mobileMessage("en", "composer.send"));
+    expect(sendButton?.disabled).toBe(false);
+    await act(async () => sendButton!.click());
+    const observer = send.mock.calls[0]![1]!;
+    expect(observer.operationId).toBe("selected-occurrence");
+    expect(timelineList!.data).toEqual([expect.objectContaining({ id: anchor.eventId })]);
+    expect(returnToLatest).not.toHaveBeenCalled();
+
+    if (outcome === "reader drag") await act(async () => timelineList!.onScrollBeginDrag!());
+    if (outcome === "new window") renderedState = { ...renderedState, window: [...anchorWindow] };
+    if (outcome === "new focus") focus = { ...originalFocus, requestId: 2 };
+    await act(async () => root.render(taskScreen(focus, consumeFocus)));
+    const latestWindow = renderedState.window;
+    const echo = taskUserInput("accepted-input", observer.operationId!, 11n, text);
+    const originalList = timelineList!.instance;
+    let refreshOwned = false;
+    await act(async () => {
+      if (outcome !== "unknown") observer.onAcceptedRefresh!(() => refreshOwned);
+      if (outcome === "accepted") {
+        refreshOwned = true;
+        sendFollowSourceKey = undefined;
+        taskRole = undefined;
+        renderedState = { ...renderedState, status: "connecting" };
+        root.render(taskScreen(focus, consumeFocus));
+      }
+    });
+    expect(timelineList!.instance).toBe(originalList);
+    await act(async () => {
+      sendFollowSourceKey = "refreshed-task";
+      taskRole = "ordinary";
+      renderedState = { ...renderedState, status: "connected", detail: create(SnapshotSchema, { ...state.detail!,
+        timeline: [taskUserInput("recent-input", "recent-operation", 10n, "Recent message"), echo,
+          taskUserInput("independent-input", "independent-operation", 12n, "A message from another client")] }) };
+      root.render(taskScreen(focus, consumeFocus));
+    });
+    await act(async () => {
+      finish(outcome !== "unknown");
+    });
+
+    const acceptedSeeks = scrollTimelineToIndex.mock.calls.filter(([args]) => args.viewPosition === 0.2);
+    if (outcome === "accepted") {
+      expect(returnToLatest).toHaveBeenCalledOnce();
+      expect(consumeFocus).toHaveBeenCalledExactlyOnceWith(originalFocus);
+      expect(renderedState.window).toBeUndefined();
+      expect(timelineList!.data).toContainEqual(expect.objectContaining({ id: echo.eventId, text, operationId: observer.operationId }));
+      expect(acceptedSeeks).toEqual([[{ index: 1, animated: false, viewPosition: 0.2 }]]);
+    } else {
+      expect(returnToLatest).not.toHaveBeenCalled();
+      expect(consumeFocus).not.toHaveBeenCalled();
+      expect(renderedState.window).toBe(latestWindow);
+      expect(timelineList!.data).toEqual([expect.objectContaining({ id: anchor.eventId })]);
+      expect(acceptedSeeks).toEqual([]);
+    }
   });
 
 function timelineScrollSample(y: number, height: number): TimelineScrollSample {

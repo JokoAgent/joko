@@ -7,7 +7,8 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, requireSimulatorApplicationContainer } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure,
+  locateInstalledSimulatorApplication, requireSimulatorApplicationContainer, stopOwnedMetroGroup } from "./mobile-ios-runtime-diagnostics.mjs";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -22,6 +23,7 @@ const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 30) * 60_000;
 const observationDeadlineAt = observationStartedAt + observationBudgetMs;
 const simulatorInstallTimeoutMs = 120_000;
 const simulatorLaunchTimeoutMs = 120_000;
+const metroBundleTimeoutMs = 240_000;
 const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI operation deadline exceeded.")),
   observationBudgetMs);
 const stop = () => abort.abort(new Error("iOS startup observation was cancelled."));
@@ -168,6 +170,34 @@ async function waitForMetro(origin) {
   }
   recordStatus(false);
   throw new Error("The matched checkout's Metro server did not become ready.");
+}
+
+async function compileIosBundle(origin, appBundleId) {
+  const bundleUrl = new URL("/.expo/.virtual-metro-entry.bundle", origin);
+  bundleUrl.search = new URLSearchParams({
+    platform: "ios", dev: "true", lazy: "true", minify: "false", inlineSourceMap: "false",
+    modulesOnly: "false", runModule: "true", excludeSource: "true", sourcePaths: "url-server", app: appBundleId
+  });
+  const startedAt = performance.now();
+  let phase = "waiting-for-headers";
+  let status = null;
+  let receivedBytes = 0;
+  try {
+    const bundle = await fetch(bundleUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(metroBundleTimeoutMs)]) });
+    status = bundle.status;
+    phase = "response-headers";
+    if (!bundle.ok || bundle.body === null) {
+      await bundle.body?.cancel();
+      throw new Error("Metro could not compile the actual iOS app entry.");
+    }
+    phase = "reading-body";
+    await bundle.body.pipeTo(new WritableStream({ write(chunk) { receivedBytes += chunk.byteLength; } }));
+    if (receivedBytes === 0) throw new Error("Metro returned an empty iOS app entry.");
+    phase = "complete";
+  } finally {
+    save("metro-bundle.json", { phase, status, receivedBytes, timeoutMs: metroBundleTimeoutMs,
+      elapsedMs: Math.round(performance.now() - startedAt) });
+  }
 }
 async function observe(phase, pid, ocr) {
   // Cold framebuffer and OCR reads can time out while the owned app remains
@@ -556,10 +586,10 @@ async function capturePostUiFrame(ocr, identity, expectedPid) {
 async function cleanup() {
   const errors = [];
   let simulatorCleanup = udid ? "unconfirmed" : "not_created";
-  if (metro?.pid) {
-    try { process.kill(-metro.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") errors.push("Owned Metro group could not be stopped."); }
-    for (let count = 0; count < 20 && !metroClosed; count++) await delay(100);
-    if (!metroClosed) { try { process.kill(-metro.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") errors.push("Owned Metro group did not terminate."); } }
+  const ownedMetroPid = metro?.pid;
+  const metroCleanup = ownedMetroPid === undefined ? undefined : await stopOwnedMetroGroup(signal => process.kill(-ownedMetroPid, signal));
+  if (metroCleanup && !metroCleanup.gone) {
+    errors.push("Owned Metro group did not terminate.");
   }
   if (udid) {
     try {
@@ -574,7 +604,7 @@ async function cleanup() {
       } else simulatorCleanup = "already_absent";
     } catch (error) { errors.push(error.message); }
   }
-  if (evidence) save("cleanup.json", { simulatorUdid: udid, simulatorName: deviceName, ownedMetroPid: metro?.pid,
+  if (evidence) save("cleanup.json", { simulatorUdid: udid, simulatorName: deviceName, ownedMetroPid, metroCleanup,
     simulatorCleanup, deletedOnlyCreatedSimulator: simulatorCleanup === "deleted" || simulatorCleanup === "already_absent", errors });
   clearTimeout(deadline); process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop);
   return errors;
@@ -718,14 +748,7 @@ async function main() {
     const port = await freePort(), origin = `http://127.0.0.1:${port}`;
     startMetro(port); await waitForMetro(origin);
     stage = "same-checkout iOS bundle compilation";
-    const bundleUrl = new URL("/.expo/.virtual-metro-entry.bundle", origin);
-    bundleUrl.search = new URLSearchParams({
-      platform: "ios", dev: "true", lazy: "true", minify: "false", inlineSourceMap: "false",
-      modulesOnly: "false", runModule: "true", excludeSource: "true", sourcePaths: "url-server", app: bundleId
-    });
-    const bundle = await fetch(bundleUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(120_000)]) });
-    if (!bundle.ok) { await bundle.body?.cancel(); throw new Error("Metro could not compile the actual iOS app entry."); }
-    await bundle.body?.pipeTo(new WritableStream());
+    await compileIosBundle(origin, bundleId);
     stage = "first native launch";
     const firstStartedAt = Date.now(), firstPid = await launch(port);
     preInputApplication = { pid: firstPid, startedAt: firstStartedAt };

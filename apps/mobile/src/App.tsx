@@ -622,13 +622,23 @@ export function App() {
     (listener) => mobilePush.subscribe(listener),
     () => mobilePush.snapshot
   );
-  const [page, setPage] = useState<Page>("home");
+  const [page, setPageState] = useState<Page>("home");
+  const nativeIntentHistoryRef = useRef<AbortController | undefined>(undefined);
+  const retireNativeIntentHistory = useCallback(() => {
+    const history = nativeIntentHistoryRef.current;
+    nativeIntentHistoryRef.current = undefined;
+    history?.abort();
+  }, []);
+  const setPage = useCallback((next: Page) => {
+    if (next !== "task") retireNativeIntentHistory();
+    setPageState(next);
+  }, [retireNativeIntentHistory]);
   const [taskInvitation, setTaskInvitation] = useState<string>();
   const [deviceInvitation, setDeviceInvitation] = useState<string>();
   const [deviceReview, setDeviceReview] = useState<DeviceAuthorizationReview>();
   const [sharingSessionId, setSharingSessionId] = useState<string>();
   const [sharingLeaveJoinId, setSharingLeaveJoinId] = useState<string>();
-  useEffect(() => { if (taskInvitation && state.status === "connected") setPage("task-sharing"); }, [taskInvitation, state.status]);
+  useEffect(() => { if (taskInvitation && state.status === "connected") setPage("task-sharing"); }, [setPage, taskInvitation, state.status]);
   const [filesInitialSource, setFilesInitialSource] = useState<MobileFilesComposerSource>();
   const [partnerReturnPage, setPartnerReturnPage] = useState<"home" | "task">("home");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -685,6 +695,7 @@ export function App() {
       const incoming = parseDeviceLink(url);
       externalNavigationRevisionRef.current++;
       nativeIntentDeliveryRef.current!.invalidate();
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       if (incoming.kind === 'review') { setDeviceReview(incoming.review); setDeviceInvitation(undefined); }
       else { setDeviceReview(undefined); setDeviceInvitation(url); client.setConnectionMode('add'); setPage('connection'); }
@@ -702,6 +713,7 @@ export function App() {
       externalNavigationRevisionRef.current++;
       externalIntentFenceRef.current!.offerShare();
       nativeIntentDeliveryRef.current!.invalidate();
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       setIncomingShareRequestRevision((value) => value + 1);
       void mobileIncomingShare.refresh().catch(() => undefined);
@@ -712,11 +724,12 @@ export function App() {
       setDeviceReview(undefined);
       externalNavigationRevisionRef.current++;
       externalIntentFenceRef.current!.offerNative(intent);
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       setNativeIntentRevision((value) => value + 1);
     }
     return intent !== undefined;
-  }, []);
+  }, [retireNativeIntentHistory, setPage]);
   const openDerivationOrigin = useCallback(async (authorityKey: string, signal: AbortSignal): Promise<boolean> => {
     const revision = externalNavigationRevisionRef.current;
     const url = await client.prepareTaskDerivationOrigin(authorityKey, signal);
@@ -758,6 +771,7 @@ export function App() {
       const transition = lifecycle.transition(status);
       const foreground = transition.interactive;
       if (!foreground) remoteDesktopLifecycle.current?.(transition);
+      if (transition.enteredBackground) retireNativeIntentHistory();
       diagnosticsState = status;
       diagnosticsTick = performance.now();
       setForeground(foreground);
@@ -812,6 +826,7 @@ export function App() {
     return () => {
       appMountedRef.current = false;
       nativeIntentDeliveryRef.current!.invalidate();
+      retireNativeIntentHistory();
       if (nativeIntentConnectingRef.current) client.cancel();
       diagnosticsStopped = true;
       clearInterval(diagnosticTimer);
@@ -826,7 +841,7 @@ export function App() {
       void mobileNewTaskDrafts.flush().catch(() => undefined);
       void mobileDiagnostics.flush().catch(() => undefined);
     };
-  }, []);
+  }, [offerNativeUrl, retireNativeIntentHistory]);
 
   useEffect(() => {
     mobilePush.setLocale(locale.effectiveLocale);
@@ -839,8 +854,15 @@ export function App() {
     const claim = delivery.take(true);
     if (!claim) return;
     nativeIntentExecutingRef.current = true;
+    const history = claim.intent.kind === "session" && claim.intent.messageId !== undefined
+      ? new AbortController() : undefined;
+    let messagePage: { readonly profileId: string | undefined; readonly sessionId: string | undefined } | undefined;
     let groupSelection: MobilePartnerGroupSelection | undefined;
-    void executeMobileNativeIntent(claim, delivery, {
+    void executeMobileNativeIntent(claim, {
+      isCurrent: candidate => delivery.isCurrent(candidate) && history?.signal.aborted !== true
+        && (messagePage === undefined || (nativeIntentHistoryRef.current === history && AppState.currentState === "active"
+          && client.state.activeProfileId === messagePage.profileId && client.state.selectedId === messagePage.sessionId))
+    }, {
       snapshot: () => projectMobileNativeIntentSnapshot(client.state),
       connectProfile: async (profileId) => {
         nativeIntentConnectingRef.current = true;
@@ -854,10 +876,16 @@ export function App() {
       showGroup: groupId => { if (!groupSelection || groupSelection.groupId !== groupId || !client.partnerGroupSourceClaimCurrent(groupSelection)) return;
         setRemoteDesktopEntry(undefined); setNativeIntentGroupSelection(groupSelection); setPage("partner-directory");
       },
-      loadAround: (eventId) => client.around(eventId),
-      loadOlder: () => client.older(),
+      loadAround: (eventId) => client.around(eventId, history?.signal),
+      loadOlder: () => client.older(history?.signal),
       returnLatest: () => client.latest(),
-      showPage: setPage,
+      showPage: next => {
+        if (next === "task" && history && !messagePage) {
+          nativeIntentHistoryRef.current = history;
+          messagePage = { profileId: client.state.activeProfileId, sessionId: client.state.selectedId };
+        }
+        setPage(next);
+      },
       showSavedConnections: () => client.setConnectionMode("saved"),
       showRecovery: setNativeIntentRecovery,
       clearRecovery: () => setNativeIntentRecovery(undefined),
@@ -865,11 +893,12 @@ export function App() {
       clearMessageFocus: () => setNativeIntentMessageFocus(undefined),
       focusApplication: () => undefined
     }).finally(() => {
+      if (nativeIntentHistoryRef.current === history) nativeIntentHistoryRef.current = undefined;
       delivery.complete(claim);
       nativeIntentExecutingRef.current = false;
       if (appMountedRef.current) setNativeIntentRevision((value) => value + 1);
     });
-  }, [foreground, locale.status, nativeIntentRevision, state.status, theme.status]);
+  }, [foreground, locale.status, nativeIntentRevision, setPage, state.status, theme.status]);
 
   useEffect(() => {
     if (!diagnostics.enabled) {
@@ -1056,7 +1085,12 @@ export function App() {
                   homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, incomingShare,
                     menuButtonRef: homeMenuButtonRef, searchFocusRequest: homeSearchFocusRequest,
                     onSearchFocus: () => setHomeSearchFocusRequest((value) => value + 1),
-                    onNavigated: match => { focusHomeSearchMatch(match); setFocusTaskComposer(false); setPartnerSettingsEntry(undefined); },
+                    onNavigated: match => {
+                      retireNativeIntentHistory();
+                      focusHomeSearchMatch(match);
+                      setFocusTaskComposer(false);
+                      setPartnerSettingsEntry(undefined);
+                    },
                     onMenu: () => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); },
                     onOpenShare: () => setPage("new"), onPartners: entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }, registerNavigation: registerTaskHomeNavigation }}
                   partnerSettingsEntry={partnerSettingsEntry} onPartnerSettingsEntryConsumed={() => setPartnerSettingsEntry(undefined)}
@@ -1073,6 +1107,7 @@ export function App() {
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
                   onOpenDerivationOrigin={openDerivationOrigin}
                   onRemoteDesktop={(targetDeviceId) => openRemoteDesktop("task", targetDeviceId)}
+                  onMessageFocusConsumed={(focus) => setNativeIntentMessageFocus((current) => current === focus ? undefined : current)}
                   messageFocus={nativeIntentMessageFocus?.homeSourceKey === undefined || nativeIntentMessageFocus.homeSourceKey === homeSourceKey
                     ? nativeIntentMessageFocus : undefined} /> :
                 page === "remote-desktop" && remoteDesktopEntry ? <View style={styles.fill} /> :
@@ -3581,6 +3616,9 @@ interface MobileTaskSendFollow {
   readonly list: FlatList<MobileWorkItem<TimelineRow>>;
   readonly listKey: string;
   readonly draftKey: string | undefined;
+  window: MobileClient["state"]["window"];
+  readonly messageFocusId?: number;
+  consumedAnchor?: true;
   refreshCurrent?: () => boolean;
   seek?: { readonly index: number; waitingForMeasurement: boolean };
 }
@@ -3599,13 +3637,14 @@ interface MobileTaskTimelineFollow {
 }
 
 export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused, onTaskSharing,
-  messageFocus, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
+  messageFocus, onMessageFocusConsumed, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   onRemoteDesktop: (targetDeviceId: string) => void;
   onTaskSharing?: () => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
+  onMessageFocusConsumed?: (focus: MobileNativeIntentMessageFocus) => void;
   onOpenDerivationOrigin: (authorityKey: string, signal: AbortSignal) => Promise<boolean>;
   partnerSettingsEntry?: { readonly profileId: string; readonly sessionId: string; readonly partnerId: string };
   onPartnerSettingsEntryConsumed?: () => void;
@@ -3944,6 +3983,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     : timelineRows([...state.window, ...taskTimelineEvents.filter(event => event.payload?.kind.case === "runChanged")], false, state.detail?.runs),
   [latestObservedRows, state.detail?.runs, state.window, taskTimelineEvents]);
   const localOutbox = client.taskOutboxItems?.() ?? [];
+  const unsentOutbox = localOutbox.filter(record => record.state !== "accepted");
   const optimisticOwnerKey = state.status === "connected" || state.status === "offline" ? client.taskPresentationOwnerKey(state.status === "offline") : undefined;
   const ownerOptimisticRows = useMemo(() => state.status === "connecting"
     ? optimisticUserRows
@@ -3954,7 +3994,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const messageRows = useMemo(() => state.window !== undefined
     ? observedRows
     : optimisticOwnerKey === undefined && state.status !== "connecting"
-      ? observedRows
+      ? projectMobilePendingOutboxRows(observedRows, localOutbox.filter(record => record.state === "accepted"), state.status === "connected")
     : projectMobilePendingOutboxRows(projectMobileOptimisticUserRows(
         observedRows,
         ownerOptimisticRows,
@@ -4007,8 +4047,16 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     latestSendFollowRef.current = undefined;
     Keyboard.dismiss(); setMessageFocusHighlight(undefined); setSearchOwner(searchScope);
   };
-  const focusSearchHit = (hit: MobileConversationSearchHit): void => {
+  const focusSearchHit = (hit: MobileConversationSearchHit | undefined): void => {
     if (!searchOwnerRef.current.open || searchOwnerRef.current.scope !== searchScope) return;
+    if (hit === undefined) {
+      const flight = searchScrollRef.current;
+      if (flight?.timer !== undefined) clearTimeout(flight.timer);
+      searchScrollRef.current = undefined;
+      searchFocusRef.current = undefined;
+      setSearchFocus(undefined);
+      return;
+    }
     for (const key of mobileWorkExpansionKeys(displayRows, (row) => row.id === hit.sourceKey)) mobileExpandedBlockStore.setExpanded(blockOwnerKey, key, true);
     const source = rows.find((row) => row.id === hit.sourceKey);
     if (source?.plan !== undefined) mobileExpandedBlockStore.setExpanded(blockOwnerKey, source.plan.identity, true, true);
@@ -4027,6 +4075,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const flight = { scope: searchScope, index: searchFocusIndex, retried: false, timer: undefined as ReturnType<typeof setTimeout> | undefined };
     searchScrollRef.current = flight;
     const frame = requestAnimationFrame(() => {
+      if (searchScrollRef.current !== flight || !searchOwnerRef.current.open || searchOwnerRef.current.scope !== flight.scope) return;
       if (searchFooterFocus) { if (!scrollSearchFooter()) timelineListRef.current?.scrollToEnd({ animated: false }); }
       else timelineListRef.current?.scrollToIndex({ index: flight.index, animated: false, viewPosition: 0.2 });
     });
@@ -4073,7 +4122,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const messageFocusKey = activeMessageFocus && messageFocusIndex >= 0
     ? `${activeMessageFocus.requestId}\u001f${activeMessageFocus.messageId}\u001f${activeMessageFocus.messageEventId ?? ""}`
     : undefined;
-  const sendFollowSource = state.status === "connected" && state.taskSource?.kind !== "joined" && state.window === undefined
+  const activeMessageFocusId = activeMessageFocus?.requestId;
+  const sendFollowSource = state.status === "connected" && state.taskSource?.kind !== "joined"
     && partnerIdentity.ready && !partnerIdentity.partner && headerRole.role === "ordinary" && !searchVisible
     ? headerSourceKey : undefined;
   const sendFollowOwner = useMemo(() => sendFollowSource ? { sourceKey: sendFollowSource } : undefined,
@@ -4083,23 +4133,25 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && client.state.window === undefined && latestSendFollowRef.current === request && timelineListRef.current === request.list
     && (client.taskHeaderSourceKey() === request.owner.sourceKey || request.refreshCurrent?.() === true), []);
   const acceptedFollow = latestSendFollowRef.current;
-  const hasAcceptedFollow = acceptedFollow !== undefined && acceptedFollow.operationId === acceptedSendFollowId
+  const hasAcceptedFollow = acceptedFollow !== undefined && acceptedFollow.operationId === acceptedSendFollowId && state.window === undefined
     && sendFollowOwner !== undefined && (acceptedFollow.owner === sendFollowOwner || acceptedFollow.refreshCurrent?.() === true);
-  const latestUserIndex = hasAcceptedFollow ? displayRows.findLastIndex((row) => !isWorkGroup(row) && row.kind === "user" && !row.internalInput) : -1;
-  const latestUser = displayRows[latestUserIndex];
-  const sendFollowTarget = hasAcceptedFollow && latestUser !== undefined && !isWorkGroup(latestUser)
-    && latestUser.operationId === acceptedFollow.operationId
-    && latestUser.pendingSend?.phase !== "failed" && latestUser.pendingSend?.phase !== "unknown" ? latestUser : undefined;
+  const sendFollowIndex = hasAcceptedFollow ? displayRows.findLastIndex(row => !isWorkGroup(row) && row.kind === "user"
+    && !row.internalInput && (!acceptedFollow.consumedAnchor || row.operationId === acceptedFollow.operationId)) : -1;
+  const followedUser = displayRows[sendFollowIndex];
+  const sendFollowTarget = hasAcceptedFollow && followedUser !== undefined && !isWorkGroup(followedUser)
+    && followedUser.operationId === acceptedFollow.operationId
+    && followedUser.pendingSend?.phase !== "failed" && followedUser.pendingSend?.phase !== "unknown" ? followedUser : undefined;
   const sendFollowVisible = sendFollowTarget !== undefined && visibleTimelineRows?.has(sendFollowTarget.id) === true;
   useLayoutEffect(() => {
     const request = latestSendFollowRef.current;
-    if (request && (request.list !== timelineListRef.current || request.owner !== sendFollowOwner
-      && (!request.refreshCurrent?.() || state.status === "offline" || state.window !== undefined || searchVisible
+    if (request && (request.list !== timelineListRef.current
+      || state.window !== request.window
+      || activeMessageFocusId !== request.messageFocusId && !(request.consumedAnchor && activeMessageFocusId === undefined)
+      || request.owner !== sendFollowOwner && (!request.refreshCurrent?.() || state.status === "offline" || searchVisible
         || partnerIdentity.partner !== undefined || headerRole.role !== undefined && headerRole.role !== "ordinary"))) {
       latestSendFollowRef.current = undefined;
     }
-  }, [sendFollowOwner, timelineListKey, state.status, state.window, searchVisible, partnerIdentity.partner, headerRole.role]);
-  useLayoutEffect(() => () => { latestSendFollowRef.current = undefined; }, [activeMessageFocus?.requestId]);
+  }, [sendFollowOwner, timelineListKey, state.status, state.window, activeMessageFocusId, searchVisible, partnerIdentity.partner, headerRole.role]);
   const retireSendFollowForTimeline = (): void => {
     const request = latestSendFollowRef.current;
     if (request && request.list === timelineListRef.current && request.listKey === timelineListKey) latestSendFollowRef.current = undefined;
@@ -4117,11 +4169,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       return;
     }
     if (acceptedFollow.seek) return;
-    const seek = { index: latestUserIndex, waitingForMeasurement: false };
+    const seek = { index: sendFollowIndex, waitingForMeasurement: false };
     acceptedFollow.seek = seek;
-    acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+    acceptedFollow.list.scrollToIndex({ index: sendFollowIndex, animated: false, viewPosition: 0.2 });
     if (!seek.waitingForMeasurement && latestSendFollowRef.current === acceptedFollow) latestSendFollowRef.current = undefined;
-  }, [acceptedFollow, currentSendFollow, hasAcceptedFollow, latestObservedRows, latestUserIndex, sendFollowTarget, sendFollowVisible]);
+  }, [acceptedFollow, currentSendFollow, hasAcceptedFollow, latestObservedRows, sendFollowIndex, sendFollowTarget, sendFollowVisible]);
   const focusedWorkKey = JSON.stringify(activeMessageFocus === undefined ? [] : mobileWorkExpansionKeys(displayRows,
     (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
   useEffect(() => {
@@ -4275,7 +4327,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? selectedInteractionId
     : interactions[0]?.interactionId;
   const activeInteraction = interactions.find((interaction) => interaction.interactionId === activeInteractionId);
-  const interactionMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
+  const interactionReceipt = state.pending.find((item) => activeInteractionId !== undefined && item.sessionId === state.selectedId
     && item.interactionId === activeInteractionId
     && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
   const appCommandReceiptPending = state.pending.some((item) => item.sessionId === state.selectedId
@@ -4293,7 +4345,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
   const conversationShare = useMobileConversationShare({ client, rows: partnerRows ?? rows, locale,
     onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
-  const timelineFollowSource = activeMessageFocus === undefined && !conversationShare.active ? sendFollowSource : undefined;
+  const timelineFollowSource = activeMessageFocus === undefined && state.window === undefined && !conversationShare.active ? sendFollowSource : undefined;
   const timelineFollow = useMemo<MobileTaskTimelineFollow | undefined>(() => timelineFollowSource === undefined ? undefined
     : { sourceKey: timelineFollowSource, position: "unmeasured", motion: "idle" }, [timelineFollowSource, timelineListKey, timelineForegroundEpoch]);
   useLayoutEffect(() => {
@@ -6277,18 +6329,29 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const rebalanceSource = client.taskHeaderSourceKey();
         const list = timelineListRef.current;
         if (list && sendFollowOwner && rebalanceSource === sendFollowOwner.sourceKey
-          && client.state.window === undefined && AppState.currentState === "active") {
+          && client.state.window === state.window && AppState.currentState === "active") {
           initialTimelineTail.finished = true;
-          sendFollow = { owner: sendFollowOwner, operationId, list, listKey: timelineListKey, draftKey: draftIdentityKey };
+          sendFollow = { owner: sendFollowOwner, operationId, list, listKey: timelineListKey, draftKey: draftIdentityKey,
+            window: state.window, messageFocusId: activeMessageFocusId };
         }
         latestSendFollowRef.current = sendFollow;
         const accepted = await client.send(sourceDraft, {
           operationId,
           deliveryMode,
           onAcceptedRefresh: refreshCurrent => {
-            if (!sendFollow || sendFollow.list !== timelineListRef.current || client.taskHeaderSourceKey() !== sendFollow.owner.sourceKey) return;
+            if (!sendFollow || sendFollow.list !== timelineListRef.current || client.taskHeaderSourceKey() !== sendFollow.owner.sourceKey
+              || client.state.window !== sendFollow.window) return;
+            if (sendFollow.window !== undefined && (latestSendFollowRef.current !== sendFollow || !taskMountedRef.current
+              || AppState.currentState !== "active" || client.state.historyBusy)) return;
             sendFollow.refreshCurrent = refreshCurrent;
             ownedSendRefreshRef.current = sendFollow;
+            if (sendFollow.window !== undefined) {
+              sendFollow.consumedAnchor = true;
+              sendFollow.window = undefined;
+              client.latest();
+              if (messageFocus) onMessageFocusConsumed?.(messageFocus);
+              if (replyQuoteFocus) setReplyQuoteFocus((current) => current === replyQuoteFocus ? undefined : current);
+            }
           },
           confirmRebalance: (suggestion, signal) => confirmMobileProviderRebalance(suggestion, { signal, locale,
             current: () => taskMountedRef.current && !!rebalanceSource && client.taskHeaderSourceKey() === rebalanceSource
@@ -6542,7 +6605,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     if (item.pendingSend && state.activeProfileId) {
       const record = item.pendingSend.outboxId ? localOutbox.find(record => record.id === item.pendingSend!.outboxId) : undefined;
       return <MobilePendingSendBubble progress={item.pendingSend} colors={colors} locale={locale} files={mobileAttachmentFiles} profileId={state.activeProfileId}>
-        {record ? <View style={styles.queueActions}>
+        {record && record.state !== "accepted" ? <View style={styles.queueActions}>
           {record.state === "confirming" || record.attempted && record.failureKind !== "rejected" ? <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact
             disabled={state.status !== "connected" || state.busy} onPress={() => void (record.state === "confirming" ? client.reconcile() : client.checkTaskOutbox(record.id)).catch(error => setLocalError(errorText(error)))} /> : <>
             {record.state === "failed" && <Action label={mobileMessage(locale, "common.retry")} colors={colors} compact disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
@@ -6762,7 +6825,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       drawerMounted={drawerMounted}
       pinned={session?.pinned}
       syncing={state.status === "connecting" || state.historyBusy}
-      notice={mobileTaskHeaderNotice({ status: state.status, session, pendingCount: queueItems.length + localOutbox.length, role: headerRole.role,
+      notice={mobileTaskHeaderNotice({ status: state.status, session, pendingCount: queueItems.length + unsentOutbox.length, role: headerRole.role,
         queueControls: state.detail?.queueControls ?? [], locale })}
       detailsOnly={headerRole.role === "worker"}
       primaryActionsReady={headerRole.role !== undefined}
@@ -6949,7 +7012,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (follow) confirmShortTimelineTail(follow);
         if (acceptedFollow?.seek?.waitingForMeasurement && sendFollowTarget && !sendFollowVisible && currentSendFollow(acceptedFollow)) {
           latestSendFollowRef.current = undefined;
-          acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+          acceptedFollow.list.scrollToIndex({ index: sendFollowIndex, animated: false, viewPosition: 0.2 });
           return;
         }
         if (initialScroll || hasAcceptedFollow || latestSendFollowRef.current !== undefined || state.historyBusy || client.state.historyBusy
@@ -7031,10 +7094,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     </View>}
     </View>
     <View testID="task.controls-viewport" pointerEvents="box-none" style={controlsRegion}>
-    {state.window !== undefined && localOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
+    {state.window !== undefined && unsentOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.outbox")}</Text>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList} keyboardShouldPersistTaps="handled">
-        {localOutbox.map((item, index) => <View key={item.id}
+        {unsentOutbox.map((item, index) => <View key={item.id}
           style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <Text style={[styles.caption, { color: item.state === "failed" ? colors.negative : colors.muted }]}>
             {index + 1} · {mobileMessage(locale, item.state === "failed" ? "task.outboxFailed"
@@ -7156,7 +7219,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{activeInteraction
           ? mobileInteractionTitle(activeInteraction, locale) : mobileMessage(locale, "task.openRequest")}</Text>
       </View>
-      <Action label={mobileMessage(locale, "task.openRequest")} colors={colors} compact disabled={interactionMutationPending}
+      <Action label={mobileMessage(locale, "task.openRequest")} colors={colors} compact
+        disabled={interactionReceipt?.taskJoinId !== undefined}
         onPress={() => setInteractionVisible(true)} />
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
       {partnerRead.partner && <Action label={[partnerRead.partner.capabilities.modelChain[0]?.modelId,
@@ -7512,7 +7576,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     <MobileInteractionSheet visible={!workerReadOnly && interactionVisible && interactions.length > 0} locale={locale}
       voiceTransport={voiceTransport} onOpenReference={openQuestionReference}
       profileId={taskDraftProfileId} interactions={interactions} selectedId={activeInteractionId}
-      busy={state.busy || interactionMutationPending} colors={colors}
+      busy={state.busy || interactionReceipt?.taskJoinId !== undefined} colors={colors}
+      responseReceipt={interactionReceipt && interactionReceipt.taskJoinId === undefined ? {
+        operationId: interactionReceipt.operationId, state: interactionReceipt.state,
+        check: (interaction, operationId) => client.checkTaskInteractionOperation(interaction, operationId)
+      } : undefined}
       onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
       onResolve={async (interaction, submission) => {
         const completed = await resolveDisplayedInteraction?.(interaction, submission) ?? false;
@@ -7569,7 +7637,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const card = projectMobileDelegated(entry); return { itemKey: `delegated/${entry.key}`, sourceKey: entry.key, text: [card.title, card.assignment, card.summary, card.statusText, card.error].filter(Boolean).join("\n") };
       }) : undefined}
       hasEarlier={!state.historyEnd} loadingEarlier={state.historyBusy} canLoadEarlier={state.status === "connected"}
-      onClose={() => { if (searchOwnerRef.current.scope === searchScope) setSearchOwner(undefined); }} onFocus={focusSearchHit}
+      onClose={() => {
+        if (searchOwnerRef.current.scope !== searchScope || !searchOwnerRef.current.open) return;
+        focusSearchHit(undefined);
+        searchOwnerRef.current = { scope: searchScope, open: false };
+        setSearchOwner(undefined);
+      }} onFocus={focusSearchHit}
       onLoadEarlier={async () => { if (searchOwnerRef.current.scope === searchScope && searchOwnerRef.current.open) await client.older(); }} />
     <MobileRuntimeControlsSheet visible={!workerReadOnly && runtimeControlsVisible && runtimeControls !== undefined && partnerRead.ready && !partnerRead.partner} locale={locale}
       providerUsageTransport={providerUsageTransport}
