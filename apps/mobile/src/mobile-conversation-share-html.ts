@@ -32,7 +32,7 @@ export function buildMobileConversationShareHtml(input: {
     }).join("");
     const body = message.bodyParts.map((part) => {
       if (part.kind === "image") return imageHtml(message, part.key, part.label) ?? imageFallback(part.label);
-      return renderBlocks(parseMobileMarkdown(redactShareMessageText(part.text)), message);
+      return renderBlocks(parseMobileMarkdown(redactShareMessageText(part.text), { literalEmphasis: true }), message);
     }).join("");
     return gap + '<article class="share-message share-message-' + message.kind + '">'
       + (attachments ? '<div class="share-attachments">' + attachments + "</div>" : "")

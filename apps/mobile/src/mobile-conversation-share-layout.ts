@@ -262,7 +262,7 @@ function conversationShareBodyParts(
     else parts.push(part);
   };
   const markdown = (text: string) => {
-    for (const block of parseMobileMarkdown(text)) {
+    for (const block of parseMobileMarkdown(text, { literalEmphasis: true })) {
       for (const part of markdownBlockParts(block, message.images))
         append(part);
       append({ text: "\n" });
