@@ -597,12 +597,24 @@ const packagedSmokeRequests = new Map<number, {
   readonly method: string; readonly path: string; readonly contents: number;
   readonly started: number; headers: boolean;
 }>();
+const packagedSmokeRecentRequests: Array<{
+  readonly path: string; readonly contents: number; readonly headers: boolean; readonly elapsedMs: number;
+  readonly outcome: "completed" | "failed";
+}> = [];
 function observePackagedSmokeRequest(details: {
   readonly id: number; readonly method: string; readonly url: string; readonly webContentsId?: number | undefined;
-}, phase: "start" | "headers" | "end"): void {
+}, phase: "start" | "headers" | "completed" | "failed"): void {
   if (!packagedSmoke) return;
-  if (phase === "end") { packagedSmokeRequests.delete(details.id); return; }
   const request = packagedSmokeRequests.get(details.id);
+  if (phase === "completed" || phase === "failed") {
+    packagedSmokeRequests.delete(details.id);
+    if (request !== undefined && /^\/joko\.v1\.(?:ConnectionService\/GetServerInfo|EventService\/GetSnapshot)$/u.test(request.path)) {
+      packagedSmokeRecentRequests.push({ path: request.path, contents: request.contents, headers: request.headers,
+        elapsedMs: Date.now() - request.started, outcome: phase });
+      if (packagedSmokeRecentRequests.length > 64) packagedSmokeRecentRequests.shift();
+    }
+    return;
+  }
   if (phase === "headers") { if (request !== undefined) request.headers = true; return; }
   try {
     const url = new URL(details.url);
@@ -1340,6 +1352,17 @@ function createWindow(): void {
   mainWindowContentsByWindow.set(window, windowContents);
   const attentionSourceId = windowContents.id;
   mainWindow = window;
+  if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
+    windowContents.once("did-start-loading", () => recordPackagedSmokeProgress("main_window_load_started"));
+    windowContents.once("did-finish-load", () => recordPackagedSmokeProgress("main_window_load_finished"));
+    windowContents.once("did-fail-load", () => recordPackagedSmokeProgress("main_window_load_failed"));
+    windowContents.once("render-process-gone", (_event, details) => {
+      recordPackagedSmokeProgress(`main_window_renderer_gone ${details.reason}`);
+    });
+    window.once("ready-to-show", () => recordPackagedSmokeProgress("main_window_ready_to_show"));
+    window.once("show", () => recordPackagedSmokeProgress("main_window_shown"));
+    window.once("closed", () => recordPackagedSmokeProgress("main_window_closed"));
+  }
   let mainUiLoadRecovery: Promise<void> | undefined;
   const beginMainUiLoadRecovery = (initialFailure?: unknown): void => {
     if (mainUiLoadRecovery !== undefined || window.isDestroyed() || quitting) return;
@@ -1574,8 +1597,8 @@ function createWindow(): void {
     });
   });
   if (packagedSmoke) {
-    electronSession.webRequest.onCompleted(details => observePackagedSmokeRequest(details, "end"));
-    electronSession.webRequest.onErrorOccurred(details => observePackagedSmokeRequest(details, "end"));
+    electronSession.webRequest.onCompleted(details => observePackagedSmokeRequest(details, "completed"));
+    electronSession.webRequest.onErrorOccurred(details => observePackagedSmokeRequest(details, "failed"));
   }
   const closeController = createDesktopMainWindowCloseController({
     isCurrent: () => mainWindow === window && !window.isDestroyed() && canApplyMainWindowClose(),
@@ -2901,10 +2924,12 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   if (!await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
     throw new Error("Packaged smoke owner did not present the concurrent durable Task.");
   }
+  recordPackagedFullSmokeStage("task_window_concurrent_owner_ready");
   const concurrentWindow = await openPackagedSmokeTaskWindow(taskWindow, concurrentTask, connection.profileId);
   if (concurrentWindow.isDestroyed() || concurrentWindow === taskWindow) {
     throw new Error("Packaged smoke did not create an independent concurrent Task window.");
   }
+  recordPackagedFullSmokeStage("task_window_concurrent_created");
   await Promise.all([
     waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner),
     waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner)
@@ -4467,6 +4492,7 @@ async function waitForPackagedSmokeTaskPresentation(
   owner: DesktopSessionWindowOwner
 ): Promise<void> {
   const deadline = Date.now() + 20_000;
+  const contentsId = window.webContents.id;
   let lastObservation: Readonly<Record<string, boolean | number>> = { observed: false };
   while (Date.now() < deadline) {
     if (window.isDestroyed() || window.webContents.isDestroyed()) {
@@ -4493,6 +4519,8 @@ async function waitForPackagedSmokeTaskPresentation(
         "    hash: location.hash,",
         "    product: Boolean(document.querySelector('.app')),",
         "    connectionScreen: Boolean(document.querySelector('.connection-screen')),",
+        "    localServiceState: document.querySelector('.connection-screen .local-connection-card')?.getAttribute('data-state'),",
+        "    connectionAlert: document.querySelector('.connection-screen [role=alert]')?.textContent ?? '',",
         "    preload: typeof window.jokoDesktop?.window?.close === 'function' &&",
         "      typeof window.jokoDesktop?.sessionWindows?.open === 'function' &&",
         "      typeof window.jokoDesktop?.sessionWindows?.getOwner === 'function',",
@@ -4517,6 +4545,8 @@ async function waitForPackagedSmokeTaskPresentation(
           routeErrorBoundary: observation["routeErrorBoundary"] === true,
           product: observation["product"] === true,
           connectionScreen: observation["connectionScreen"] === true,
+          localServiceRetryable: observation["localServiceState"] === "retryableError",
+          connectionTimedOut: typeof observation["connectionAlert"] === "string" && /signal timed out/i.test(observation["connectionAlert"]),
           preload: observation["preload"] === true,
           nodeGlobalsAbsent: observation["nodeGlobalsAbsent"] === true,
           ownerProfileMatches: observation["ownerProfileId"] === owner.profileId,
@@ -4556,6 +4586,9 @@ async function waitForPackagedSmokeTaskPresentation(
     await waitForPackagedSmokePoll();
   }
   process.stderr.write(`JOKO_DESKTOP_TASK_PRESENTATION_STATE ${JSON.stringify(lastObservation)}\n`);
+  process.stderr.write(`JOKO_DESKTOP_TASK_CONNECTION_REQUESTS ${JSON.stringify(
+    packagedSmokeRecentRequests.filter((request) => request.contents === contentsId)
+  )}\n`);
   process.stderr.write(`JOKO_DESKTOP_PENDING_RPC ${JSON.stringify([...packagedSmokeRequests].map(([id, value]) => ({
     id, method: value.method, path: value.path, contents: value.contents, headers: value.headers, ageMs: Date.now() - value.started
   })))}\n`);
