@@ -231,7 +231,7 @@ interface TimelineWorkGroupAnchor {
   readonly tail: TimelineItemView | undefined;
 }
 
-export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, historyOwnerKey, historyDeletion, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, unloadedGapBefore, historyLoading, historyError, historyOwnerKey, historyDeletion, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly ownerKey: string;
   readonly viewportOwnerKey: string;
@@ -260,6 +260,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   readonly onOpenPartnerSession?: (sessionId: string) => void;
   readonly hasEarlier: boolean;
   readonly historyLoading: boolean;
+  readonly unloadedGapBefore?: string;
   readonly historyError?: string;
   readonly historyOwnerKey?: string;
   readonly historyDeletion?: TimelineHistoryDeletion;
@@ -305,12 +306,12 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const currentPlan = useMemo(() => projectPinnedPlan(items), [items]);
   const renderItems = useMemo(
     () => insertTimelineDerivationOrigin(
-      partnerPresentation ? simplifyPartnerRenderItems(projectTimelineRenderItems(items, { sessionActive }), sessionActive, showPrivateSent)
-        : projectTimelineRenderItems(planTimelineItems, { sessionActive }),
+      partnerPresentation ? simplifyPartnerRenderItems(projectTimelineRenderItems(items, { sessionActive, unloadedGapBefore }), sessionActive, showPrivateSent)
+        : projectTimelineRenderItems(planTimelineItems, { sessionActive, unloadedGapBefore }),
       derivationOrigin,
       sessionCreatedAt
     ),
-    [derivationOrigin, items, partnerPresentation, planTimelineItems, sessionActive, sessionCreatedAt, showPrivateSent]
+    [derivationOrigin, items, partnerPresentation, planTimelineItems, sessionActive, sessionCreatedAt, showPrivateSent, unloadedGapBefore]
   );
   const partnerTimeGroups = useMemo(() => partnerPresentation ? partnerTimeGroupStarts(renderItems) : new Map<string, number>(), [partnerPresentation, renderItems]);
   const firstPartnerUnread = partnerPresentation ? firstUnreadPartnerReply(renderItems, partnerConversation.entryReadCursor) : undefined;
@@ -1458,7 +1459,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
                 inert={searchOnly || undefined}
                 style={{ transform: `translateY(${virtualRow.start}px)`, clipPath: searchOnly ? "inset(100%)" : undefined }}
               >
-                {!searchOnly && renderItem.historyGapBefore !== undefined && <div className="timeline-history-gap" role="separator"><span>{t("timeline.historyGap")}</span></div>}
+                {!searchOnly && (renderItem.unloadedGapBefore ? <div className="timeline-history-gap">
+                  {historyLoading ? <span role="status">{t("timeline.loadingEarlier")}</span>
+                    : <Button tone="ghost" onClick={requestEarlier}>{t("timeline.loadEarlier")}</Button>}
+                </div> : renderItem.historyGapBefore !== undefined && <div className="timeline-history-gap" role="separator"><span>{t("timeline.historyGap")}</span></div>)}
                 {partnerTimeGroups.has(renderItem.key) && <div className="partner-time-group"><time dateTime={new Date(partnerTimeGroups.get(renderItem.key)!).toISOString()}>{formatPartnerTimeGroup(partnerTimeGroups.get(renderItem.key)!, locale)}</time></div>}
                 {firstPartnerUnread === renderItem.key && <div className="partner-unread-divider" role="separator"><span>{t("partners.unreadDivider")}</span></div>}
                 <TimelineSearchOnly.Provider value={searchOnly}>{renderItem.type === "item"

@@ -3631,6 +3631,7 @@ interface MobileTaskTimelineFollow {
   offset?: number;
   dragStart?: number;
   viewportHeight?: number;
+  earlierRequested?: string;
   streamingWhenUnpinned?: ReadonlySet<string>;
   measurement?: { readonly width: number; readonly height: number; readonly older: MobileClient["state"]["older"] };
   tail?: { readonly row: TimelineRow; readonly older: MobileClient["state"]["older"] };
@@ -4355,6 +4356,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const currentTimelineFollow = useCallback(() => timelineFollow && latestTimelineFollowRef.current === timelineFollow
     && taskMountedRef.current && AppState.currentState === "active" && client.state.status === "connected"
     && client.state.window === undefined && client.taskHeaderSourceKey() === timelineFollow.sourceKey ? timelineFollow : undefined, [timelineFollow]);
+  const earlierPagingAvailable = timelineFollow !== undefined && state.detail !== undefined && !searchVisible
+    && !drawerMounted && !partnerSettingsOwner && !imageGallery.view;
   const visibleTimelineMessages = useMemo(() => displayRows.filter((row): row is TimelineRow => !isWorkGroup(row)
     && !row.optimistic && !row.workActivity && (row.kind === "user" || row.kind === "assistant")), [displayRows]);
   const stableTimelineMessages = useMemo(() => visibleTimelineMessages.filter(row => row.completed), [visibleTimelineMessages]);
@@ -4380,6 +4383,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }
   const initialTimelineTail = initialTimelineTailRef.current;
   if (activeMessageFocus !== undefined || searchVisible || state.window !== undefined || conversationShare.active) initialTimelineTail.finished = true;
+  const loadTimelineEarlier = (): void => {
+    initialTimelineTail.finished = true;
+    const owner = client.taskHeaderSourceKey();
+    const window = client.state.window;
+    void client.older().catch((error) => {
+      if (taskMountedRef.current && client.taskHeaderSourceKey() === owner && client.state.window === window) setLocalError(errorText(error));
+    });
+  };
   const initialTailAvailable = state.status === "connected" && state.detail !== undefined && state.taskSource?.kind !== "joined"
     && state.window === undefined && !state.historyBusy && !conversationShare.active && partnerIdentity.ready && !partnerIdentity.partner
     && headerRole.role === "ordinary" && headerSourceKey !== undefined && displayRows.length > 0;
@@ -4410,6 +4421,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     follow.offset = offset;
     follow.viewportHeight = metrics.layoutMeasurement.height;
     const userScrolling = follow.motion === "dragging" || follow.motion === "momentum";
+    const movingEarlier = previousOffset === undefined || offset < previousOffset;
     if (userScrolling) {
       follow.dragStart ??= previousOffset ?? offset;
       if (follow.position !== "earlier" && distance > 16 && offset < follow.dragStart - 16) {
@@ -4424,6 +4436,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     } else if (follow.position === "unmeasured" && follow.motion === "idle" && follow.initialRequested && distance <= 1) {
       follow.position = "latest";
     }
+    if (!earlierPagingAvailable || !userScrolling || state.busy || client.state.busy || state.historyEnd || client.state.historyEnd
+      || !Number.isFinite(offset) || metrics.contentSize.height <= metrics.layoutMeasurement.height || offset > metrics.layoutMeasurement.height / 2
+      || follow.dragStart === undefined || (offset > 1 && (!movingEarlier || offset >= follow.dragStart))) return;
+    const before = client.state.before;
+    const pageKey = before ? `${before.generation}/${before.sequence}` : "first";
+    if (follow.earlierRequested === pageKey) return;
+    follow.earlierRequested = pageKey;
+    loadTimelineEarlier();
   };
   const confirmShortTimelineTail = (follow: MobileTaskTimelineFollow): void => {
     if (follow.position === "unmeasured" && follow.motion === "idle" && follow.initialRequested
@@ -6965,6 +6985,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     }}>
     <FlatList key={timelineListKey} ref={timelineListRef} data={displayRows}
       extraData={{ selection: conversationShare.selectedIds, visibleTimelineRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => !isWorkGroup(row) && row.kind === "user" && row.operationId ? `local-send:${row.operationId}` : row.id} style={styles.fill} contentContainerStyle={styles.list}
+      maintainVisibleContentPosition={earlierPagingAvailable ? { minIndexForVisible: 1 } : undefined}
       viewabilityConfig={timelineViewability} onViewableItemsChanged={onTimelineRowsVisible}
       scrollEventThrottle={100} onScroll={(event) => {
         if (initialTimelineTail.requested && !initialTimelineTail.finished) {
@@ -6981,6 +7002,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (follow) {
           follow.motion = "dragging";
           follow.dragStart = event?.nativeEvent.contentOffset.y ?? follow.offset;
+          follow.earlierRequested = undefined;
+          if (event && follow.dragStart !== undefined && follow.dragStart <= 1) observeTimelineScroll(event.nativeEvent);
         }
       }}
       onScrollEndDrag={(event) => {
@@ -7058,7 +7081,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => client.latest()} />}
         {!state.historyEnd && <Action label={mobileMessage(locale, state.historyBusy ? "task.loadingHistory" : "task.loadEarlier")} colors={colors}
           disabled={state.historyBusy || state.status !== "connected"}
-          onPress={() => { initialTimelineTail.finished = true; void client.older().catch((error) => setLocalError(errorText(error))); }} />}
+          onPress={loadTimelineEarlier} />}
         </View>
       </View>}
       ListEmptyComponent={<Centered label={mobileMessage(locale, !partnerIdentity.ready ? "task.loading" : chasingHiddenHistory
