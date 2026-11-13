@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
@@ -111,6 +112,76 @@ it.each(["empty", "next-card", "user-focus", "owner-change"] as const)("continue
   else if (outcome === "next-card") expect(document.activeElement).toBe(button(view.host, "projects.restore"));
   else expect(document.activeElement).toBe(document.body);
 });
+
+it("keeps a conflicting project name in the editor until the user saves against the reviewed revision", async () => {
+  const updateTarget = vi.fn<AppController["updateTarget"]>()
+    .mockRejectedValueOnce(new ConnectError("Revision changed", Code.Aborted)).mockResolvedValue(undefined);
+  const view = await mountProjectEditor(updateTarget);
+  const field = await view.edit("My project name");
+  await view.save();
+  expect(updateTarget.mock.calls).toEqual([["project", { name: "My project name" }, 1n]]);
+  expect(view.refresh).toHaveBeenCalledOnce();
+  expect(field.value).toBe("My project name");
+  expect(button(view.host, "Save").disabled).toBe(true);
+  await view.replaceProject("Other window's name", 2n);
+  expect(view.host.querySelector("[role='alert']")?.textContent).toContain("Other window's name");
+  expect(field.value).toBe("My project name");
+  expect(updateTarget).toHaveBeenCalledOnce();
+  await view.save();
+  expect(updateTarget.mock.calls[1]).toEqual(["project", { name: "My project name" }, 2n]);
+  expect(view.host.querySelector("[role='dialog']")).toBeNull();
+});
+
+it("retains a failed rename for an explicit retry and discards it on cancel", async () => {
+  const updateTarget = vi.fn<AppController["updateTarget"]>().mockRejectedValue(new Error("Project save failed."));
+  const view = await mountProjectEditor(updateTarget);
+  const field = await view.edit("Unsaved project");
+  await view.save();
+  expect(field.value).toBe("Unsaved project");
+  expect(view.host.querySelector("[role='alert']")?.textContent).toBe("Project save failed.");
+  expect(view.refresh).not.toHaveBeenCalled();
+  expect(button(view.host, "Save").disabled).toBe(false);
+  await act(async () => button(view.host, "Cancel").click());
+  expect(view.host.querySelector("[role='dialog']")).toBeNull();
+  await act(async () => button(view.host, "Edit").click());
+  expect(view.input().value).toBe("Project");
+  expect(updateTarget).toHaveBeenCalledOnce();
+});
+
+async function mountProjectEditor(updateTarget: AppController["updateTarget"]) {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  roots.push(root);
+  const target: TargetView = { id: "project", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n,
+    workspaceName: "Workspace", trusted: true, pinned: false, archived: false };
+  let snapshot = { ...emptySnapshot(), targets: [target] };
+  const refresh = vi.fn(async () => undefined);
+  const controller = { state: { connectionState: "connected", activeProfile: { id: "profile", serverId: "node" },
+    preferences: DEFAULT_UI_PREFERENCES }, updateTarget, refresh } as unknown as AppController;
+  const render = () => act(async () => root.render(<ProjectsPage controller={controller} snapshot={snapshot}
+    t={(key, values) => translate("en", key, values)} runAction={(_key, action) => { void action(); }}
+    onOpenNavigation={() => undefined} prepareSessionRemoval={async () => undefined} />));
+  await render();
+  const input = () => required(host.querySelector<HTMLInputElement>("[role='dialog'] .field input"));
+  return {
+    host, refresh, input,
+    edit: async (name: string) => {
+      await act(async () => button(host, "Edit").click());
+      const field = input();
+      await act(async () => {
+        setNativeValue(field, name);
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      return field;
+    },
+    save: () => act(async () => button(host, "Save").click()),
+    replaceProject: async (name: string, revision: bigint) => {
+      snapshot = { ...snapshot, targets: [{ ...target, name, revision }] };
+      await render();
+    }
+  };
+}
 
 it("deletes each selected project task through its lifecycle operation before deleting the empty project", async () => {
   const first = { ...projectTask("first-task"), targetId: "runtime-target" };

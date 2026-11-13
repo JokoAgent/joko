@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { JSX } from "react";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { Archive, FolderKanban, FolderPlus, Menu, Pencil, Pin, Plus, ScanSearch, Shield, ShieldAlert, Trash2 } from "lucide-react";
 import type { AppController } from "../controller.js";
-import type { AppSnapshot, ExtraDirectoryView, SessionView, TargetView, WorkspaceView } from "../model.js";
+import type { AppSnapshot, ExtraDirectoryView, SessionView, TargetDraft, TargetView, WorkspaceView } from "../model.js";
 import type { WorktreeRemovalPreflightSummary } from "../worktree-removal-preflight.js";
 import { sidebarOwnerLayoutFor } from "../sidebar-layout.js";
 import { backendSupportsResourceDiscovery } from "../resource-capabilities.js";
@@ -22,6 +23,10 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
 }): JSX.Element {
   const [showArchived, setShowArchived] = useState(false);
   const [editor, setEditor] = useState<TargetView | "new">();
+  const [editorSaving, setEditorSaving] = useState(false);
+  const [editorError, setEditorError] = useState<string>();
+  const [editorConflict, setEditorConflict] = useState(false);
+  const editorAttempt = useRef<object | undefined>(undefined);
   const [trustWorkspace, setTrustWorkspace] = useState<WorkspaceView>();
   const [deleteTarget, setDeleteTarget] = useState<TargetView>();
   const [extraWorkspace, setExtraWorkspace] = useState<WorkspaceView>();
@@ -40,6 +45,19 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
     readonly complete: () => void;
   } | undefined>(undefined);
   const pageRef = useRef<HTMLElement>(null);
+  const profile = controller.state.activeProfile;
+  const openEditor = useCallback((target: TargetView | "new" | undefined): void => {
+    editorAttempt.current = undefined;
+    setEditor(target);
+    setEditorSaving(false);
+    setEditorError(undefined);
+    setEditorConflict(false);
+  }, []);
+  useLayoutEffect(() => {
+    openEditor(undefined);
+    return () => { editorAttempt.current = undefined; };
+  }, [openEditor, profile?.id, profile?.serverId, profile?.deviceId, profile?.origin,
+    snapshot.generation, controller.state.navigationRevision, controller.state.connectionGeneration]);
   useLayoutEffect(() => {
     const scope = {};
     archiveScopeRef.current = scope;
@@ -142,8 +160,51 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
     return () => window.cancelAnimationFrame(frame);
   }, [focusProjectId, showArchived, snapshot.targets]);
   const targets = snapshot.targets.filter((target) => target.archived === showArchived);
+  const editing = editor === "new" ? undefined : editor;
+  const currentEditTarget = !editorConflict || editing === undefined ? undefined : snapshot.targets.find(target =>
+    target.id === editing.id && target.revision > editing.revision);
+  const conflictError = editorConflict ? currentEditTarget === undefined
+    ? t("projects.editConflictRefresh") : t("projects.editConflict", { name: currentEditTarget.name }) : undefined;
+  const withEditorAttempt = (action: (isCurrent: () => boolean) => Promise<void>): void => {
+    if (editorAttempt.current !== undefined || controller.state.connectionState !== "connected") return;
+    const attempt = {};
+    editorAttempt.current = attempt;
+    const isCurrent = (): boolean => editorAttempt.current === attempt;
+    setEditorSaving(true);
+    setEditorError(undefined);
+    void action(isCurrent).catch((error: unknown) => {
+      if (isCurrent()) setEditorError(error instanceof Error ? error.message : t("error.unexpected"));
+    }).finally(() => {
+      if (!isCurrent()) return;
+      editorAttempt.current = undefined;
+      setEditorSaving(false);
+    });
+  };
+  const saveProject = (draft: TargetDraft): void => {
+    if (editor === "new") {
+      openEditor(undefined);
+      runAction("project-create", async () => { await controller.createTarget(draft); });
+      return;
+    }
+    const target = editorConflict ? currentEditTarget : editing;
+    if (target === undefined) return;
+    withEditorAttempt(async isCurrent => {
+      setEditor(target);
+      setEditorConflict(false);
+      try {
+        await controller.updateTarget(target.id, { name: draft.name }, target.revision);
+      } catch (error) {
+        if (!isCurrent()) return;
+        if (ConnectError.from(error).code !== Code.Aborted) throw error;
+        setEditorConflict(true);
+        await controller.refresh();
+        return;
+      }
+      if (isCurrent()) openEditor(undefined);
+    });
+  };
   return <main ref={pageRef} className="route-page projects-page">
-    <header className="route-header">{!controller.state.preferences.navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}<div><p className="eyebrow">{t("projects.eyebrow")}</p><h1>{t("nav.projects")}</h1><p>{t("projects.subtitle")}</p></div><Button tone="primary" onClick={() => setEditor("new")}><FolderPlus aria-hidden="true" />{t("projects.new")}</Button></header>
+    <header className="route-header">{!controller.state.preferences.navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}<div><p className="eyebrow">{t("projects.eyebrow")}</p><h1>{t("nav.projects")}</h1><p>{t("projects.subtitle")}</p></div><Button tone="primary" onClick={() => openEditor("new")}><FolderPlus aria-hidden="true" />{t("projects.new")}</Button></header>
     <div className="projects-toolbar"><div className="segmented" role="radiogroup" aria-label={t("projects.filter")}><button type="button" role="radio" aria-checked={!showArchived} className={!showArchived ? "segmented__item is-active" : "segmented__item"} onClick={() => setShowArchived(false)}>{t("projects.active")}</button><button type="button" role="radio" aria-checked={showArchived} className={showArchived ? "segmented__item is-active" : "segmented__item"} onClick={() => setShowArchived(true)}>{t("nav.archived")}</button></div></div>
     <section className="project-card-grid">{targets.map((target) => {
       const workspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
@@ -161,10 +222,14 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
         {target.remoteWorkspace?.kind === "ssh" && <p className="muted">{t("resource.sourceRemoteProject")}{awaitingApproval > 0 ? ` · ${t("projects.resourcesAwaitingApproval", { count: awaitingApproval })}` : ""}</p>}
         {workspace !== undefined && <section className="project-card__trust"><div><Shield aria-hidden="true" /><span><strong>{workspace.trusted ? t("projects.trusted") : t("projects.untrusted")}</strong><small>{t("projects.trustBody")}</small></span></div><div className="project-card__trust-actions">{workspace.trusted && resourceDiscoverySupported && <Button onClick={() => runAction(`project-resource-scan:${target.id}`, () => controller.discoverProjectResources(target.id))}><ScanSearch aria-hidden="true" />{t("projects.discoverResources")}{resourceCount > 0 ? ` · ${resourceCount}` : ""}</Button>}<Button tone={workspace.trusted ? "ghost" : "primary"} onClick={() => setTrustWorkspace(workspace)}>{workspace.trusted ? t("projects.revokeTrust") : t("projects.reviewTrust")}</Button></div></section>}
         {workspace !== undefined && <section className="project-card__directories"><header><h3>{t("projects.extraDirectories")}</h3><Button tone="ghost" onClick={() => setExtraWorkspace(workspace)}><Plus aria-hidden="true" />{t("common.add")}</Button></header>{directories.length === 0 ? <p className="muted">{t("projects.noExtraDirectories")}</p> : directories.map((directory) => <div key={directory.id}><span><strong>{directory.serverPath}</strong><small>{directory.access === "readWrite" ? t("projects.readWrite") : t("projects.readOnly")} · {directory.trusted ? t("projects.trusted") : t("projects.untrusted")}</small></span><IconButton label={`${t("common.remove")} ${directory.serverPath}`} onClick={() => setRemoveExtra(directory)}><Trash2 aria-hidden="true" /></IconButton></div>)}</section>}
-        <footer><Button onClick={() => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}><Pin aria-hidden="true" />{target.pinned ? t("projects.unpin") : t("projects.pin")}</Button><Button onClick={() => setEditor(target)}><Pencil aria-hidden="true" />{t("common.edit")}</Button><Button data-project-archive-action="" disabled={archivePendingIds.has(archiveOperationKey(target.id))} onClick={(event) => toggleArchived(target, event.currentTarget)}><Archive aria-hidden="true" />{archivePendingIds.has(archiveOperationKey(target.id)) ? t("common.working") : target.archived ? t("projects.restore") : t("session.archive")}</Button><Button tone="ghost" className="project-card__delete" onClick={() => setDeleteTarget(target)}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></footer>
+        <footer><Button onClick={() => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}><Pin aria-hidden="true" />{target.pinned ? t("projects.unpin") : t("projects.pin")}</Button><Button onClick={() => openEditor(target)}><Pencil aria-hidden="true" />{t("common.edit")}</Button><Button data-project-archive-action="" disabled={archivePendingIds.has(archiveOperationKey(target.id))} onClick={(event) => toggleArchived(target, event.currentTarget)}><Archive aria-hidden="true" />{archivePendingIds.has(archiveOperationKey(target.id)) ? t("common.working") : target.archived ? t("projects.restore") : t("session.archive")}</Button><Button tone="ghost" className="project-card__delete" onClick={() => setDeleteTarget(target)}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></footer>
       </article>;
-    })}{targets.length === 0 && <div className="project-empty"><FolderKanban aria-hidden="true" /><h2>{showArchived ? t("projects.noArchived") : t("projects.empty")}</h2><p>{t("projects.emptyBody")}</p>{!showArchived && <Button tone="primary" onClick={() => setEditor("new")}>{t("projects.new")}</Button>}</div>}</section>
-    <ProjectEditor open={editor !== undefined} target={editor === "new" ? undefined : editor} controller={controller} snapshot={snapshot} t={t} onClose={() => setEditor(undefined)} onSave={(draft) => { const target = editor === "new" ? undefined : editor; setEditor(undefined); runAction(target === undefined ? "project-create" : `project-edit:${target.id}`, async () => { if (target === undefined) await controller.createTarget(draft); else await controller.updateTarget(target.id, { name: draft.name }, target.revision); }); }} />
+    })}{targets.length === 0 && <div className="project-empty"><FolderKanban aria-hidden="true" /><h2>{showArchived ? t("projects.noArchived") : t("projects.empty")}</h2><p>{t("projects.emptyBody")}</p>{!showArchived && <Button tone="primary" onClick={() => openEditor("new")}>{t("projects.new")}</Button>}</div>}</section>
+    <ProjectEditor open={editor !== undefined} target={editing} controller={controller} snapshot={snapshot} t={t} saving={editorSaving}
+      error={editorError ?? conflictError}
+      saveUnavailable={editing !== undefined && (controller.state.connectionState !== "connected" || editorConflict && currentEditTarget === undefined)}
+      onRefresh={editorConflict && currentEditTarget === undefined ? () => withEditorAttempt(() => controller.refresh()) : undefined}
+      onClose={() => openEditor(undefined)} onSave={saveProject} />
     <TrustDialog workspace={trustWorkspace} t={t} onClose={() => setTrustWorkspace(undefined)} onConfirm={() => { const workspace = trustWorkspace; setTrustWorkspace(undefined); if (workspace !== undefined) runAction(`workspace-trust:${workspace.id}`, () => controller.setWorkspaceTrust(workspace.id, !workspace.trusted)); }} />
     <DeleteProjectDialog
       target={deleteTarget}

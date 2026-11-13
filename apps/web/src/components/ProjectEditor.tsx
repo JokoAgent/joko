@@ -13,7 +13,7 @@ interface DirectoryBrowserState {
   readonly error?: string;
 }
 
-export function ProjectEditor({ open, target, initialDirectory, controller, snapshot, t, saving = false, error, onClose, onSave }: {
+export function ProjectEditor({ open, target, initialDirectory, controller, snapshot, t, saving = false, saveUnavailable = false, error, onRefresh, onClose, onSave }: {
   readonly open: boolean;
   readonly target?: TargetView;
   readonly initialDirectory?: string;
@@ -21,7 +21,9 @@ export function ProjectEditor({ open, target, initialDirectory, controller, snap
   readonly snapshot: AppSnapshot;
   readonly t: Translator;
   readonly saving?: boolean;
+  readonly saveUnavailable?: boolean;
   readonly error?: string;
+  readonly onRefresh?: () => void;
   readonly onClose: () => void;
   readonly onSave: (draft: TargetDraft) => void;
 }): JSX.Element {
@@ -130,7 +132,7 @@ export function ProjectEditor({ open, target, initialDirectory, controller, snap
   return <Modal open={open} title={editing ? t("projects.edit") : t("projects.new")}
     description={editing ? t("projects.editBody") : pickerOwner === undefined ? t("projects.createBody") : t("projects.createLocalBody")} size="large"
     onClose={saving ? () => undefined : () => { closeBrowser(); onClose(); }}>
-    <form ref={formRef} className="settings-form" onSubmit={(event) => { event.preventDefault(); if (valid && !saving && visibleBrowser === undefined) onSave(draft); }}>
+    <form ref={formRef} className="settings-form" onSubmit={(event) => { event.preventDefault(); if (valid && !saving && !saveUnavailable && visibleBrowser === undefined) onSave(draft); }}>
       {visibleBrowser !== undefined ? <div className="project-editor__browser">
         <p>{t("projects.browseServiceBody")}</p>
         <div className="project-editor__browser-location"><strong>{visibleBrowser.listing?.path || visibleBrowser.requestedPath || t("projects.browseServiceHome")}</strong></div>
@@ -170,7 +172,11 @@ export function ProjectEditor({ open, target, initialDirectory, controller, snap
         </>}
       </div>
       {(error ?? pickerError) !== undefined && <p role="alert" className="project-card__error">{error ?? pickerError}</p>}
-      <div className="modal__actions"><Button disabled={saving} onClick={() => { closeBrowser(); onClose(); }}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={!valid || saving || picking}>{saving ? t("common.working") : editing ? t("common.save") : t("projects.create")}</Button></div>
+      <div className="modal__actions">
+        <Button disabled={saving} onClick={() => { closeBrowser(); onClose(); }}>{t("common.cancel")}</Button>
+        {onRefresh !== undefined && <Button disabled={saving || disconnected} onClick={onRefresh}>{t("common.refresh")}</Button>}
+        <Button type="submit" tone="primary" disabled={!valid || saving || picking || saveUnavailable}>{saving ? t("common.working") : editing ? t("common.save") : t("projects.create")}</Button>
+      </div>
       </>}
     </form>
   </Modal>;
