@@ -18,6 +18,11 @@ const REFRESH_CONCURRENCY = 4;
 
 const installedRuntimes = new WeakMap<OperationalStore, SessionCodeHostContextRuntime>();
 
+interface SessionCodeHostRefresh {
+  references: readonly CodeHostPullRequestReference[];
+  readonly result: Promise<CodeHostSessionProjection>;
+}
+
 export function installSessionCodeHostContextRuntime(options: {
   readonly store: OperationalStore;
   readonly providers?: readonly CodeHostProvider[];
@@ -98,6 +103,7 @@ export class OperationalCodeHostSessionAuthorization implements CodeHostSessionA
 export class SessionCodeHostContextRuntime {
   private readonly store: OperationalStore;
   private readonly coordinator: CodeHostProjectionCoordinator;
+  private readonly refreshes = new Map<string, SessionCodeHostRefresh>();
   private installed = false;
 
   constructor(options: {
@@ -117,7 +123,7 @@ export class SessionCodeHostContextRuntime {
     if (this.installed || typeof (this.store as Partial<OperationalStore>).subscribe !== "function") return;
     this.installed = true;
     this.store.subscribe((event) => {
-      if (!eventCanChangeCodeHostContext(event)) return;
+      if (event.traceId === "session-code-host-projection" || !eventCanChangeCodeHostContext(event)) return;
       queueMicrotask(() => { void this.refreshAndPublish(event.sessionId); });
     });
   }
@@ -130,8 +136,33 @@ export class SessionCodeHostContextRuntime {
     } catch {
       return undefined;
     }
-    const references = extractCodeHostPullRequestReferences(sessionCodeHostContext(this.store, session));
-    return (await this.coordinator.refreshSession(session.descriptor.id, references)).projection;
+    const references = session.descriptor.deletedAt === undefined
+      ? extractCodeHostPullRequestReferences(sessionCodeHostContext(this.store, session)) : [];
+    const pending = this.refreshes.get(sessionId);
+    if (pending !== undefined) {
+      if (!sameReferenceList(pending.references, references)) pending.references = references;
+      return pending.result;
+    }
+    const flight: SessionCodeHostRefresh = {
+      references,
+      result: Promise.resolve().then(async () => {
+        // Finish reconciling the latest local references before resolving any joined caller.
+        for (;;) {
+          const current = flight.references;
+          const refreshed = await this.coordinator.refreshSession(sessionId, current, (reference) => {
+            if (flight.references !== current && (reference === undefined || !flight.references.some(candidate => sameReference(candidate, reference)))) {
+              throw new Error("The Session pull request references changed.");
+            }
+          }).catch((error: unknown) => {
+            if (flight.references === current) throw error;
+            return undefined;
+          });
+          if (refreshed !== undefined && flight.references === current) return refreshed.projection;
+        }
+      }).finally(() => { this.refreshes.delete(sessionId); })
+    };
+    this.refreshes.set(sessionId, flight);
+    return flight.result;
   }
 
   async refreshSessions(sessionIds: readonly string[]): Promise<void> {
@@ -271,4 +302,8 @@ function sameReference(
     && left.repositoryName === right.repositoryName
     && left.number === right.number
     && left.webUrl === right.webUrl;
+}
+
+function sameReferenceList(left: readonly CodeHostPullRequestReference[], right: readonly CodeHostPullRequestReference[]): boolean {
+  return left.length === right.length && left.every((reference, index) => sameReference(reference, right[index]!));
 }
