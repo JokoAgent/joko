@@ -11440,17 +11440,19 @@ describe("native current-task Interaction ownership", () => {
 
   function claudeBashPermissionFixture() {
     if (permissionInteraction.request.case !== "permission") throw new Error("Expected a permission request fixture.");
+    const subject = create(PermissionSubjectSchema, {
+      kind: { case: "customTool", value: create(CustomToolPermissionSubjectSchema, { toolId: "Bash", displayName: "Bash" }) }
+    });
     const interaction = create(InteractionSchema, {
-      ...permissionInteraction, backendId: "claude-code", request: { case: "permission", value: {
-        ...permissionInteraction.request.value, subject: { kind: { case: "customTool", value: { toolId: "Bash", displayName: "Bash" } } }
-      } }
+      ...permissionInteraction, backendId: "claude-code",
+      request: { case: "permission", value: { ...permissionInteraction.request.value, subject } }
     });
     const detail = create(SnapshotSchema, {
       ...snapshot,
       backends: [{ ...snapshot.backends[0]!, backendId: interaction.backendId }],
       targets: [{ ...snapshot.targets[0]!, backendId: interaction.backendId }],
       sessions: [{ ...snapshot.sessions[0]!, backendId: interaction.backendId, state: SessionState.RUNNING,
-        location: { kind: { case: "serviceNode", value: {} } } }],
+        location: create(WorkspaceLocationSchema, { kind: { case: "serviceNode", value: {} } }) }],
       interactions: [interaction]
     });
     const network = projectedNetwork(detail);
