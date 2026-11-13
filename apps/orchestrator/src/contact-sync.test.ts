@@ -294,10 +294,16 @@ describe("Contacts sync node lifecycle", () => {
     });
     let receiver!: NodeSyncTcpTransport;
     let explicitSync = false;
+    let replyFailurePublished = false;
     const send = vi.fn<(nodeId: string, frame: NodeSyncCipherChunkFrame, delivery: NodeSyncDeliveryContext) => Promise<boolean>>();
     const candidate = { nodeId: callerId, displayName: "Caller", publicKey: identity.publicKey,
       fingerprint: contactSyncPublicKeyFingerprint(identity.publicKey), address: "127.0.0.1", port: 4318, seenAt: Date.now() };
-    const manager = new ContactSyncManager({ store, vault, nodeId: receiverId, displayName: "Receiver", codec: inProcessContactSyncCodec,
+    const manager: ContactSyncManager = new ContactSyncManager({ store, vault, nodeId: receiverId, displayName: "Receiver", codec: inProcessContactSyncCodec,
+      onChanged: () => {
+        const status = manager.status();
+        // A scheduled no-peer sync can clear the error before the next test poll.
+        replyFailurePublished ||= status.phase === "error" && status.errorCode === "sync_failed";
+      },
       transportFactory: (options) => {
         receiver = new NodeSyncTcpTransport({ ...options, listenHost: "127.0.0.1" });
         return { start: () => receiver.start(), stop: () => receiver.stop(), send,
@@ -322,8 +328,9 @@ describe("Contacts sync node lifecycle", () => {
       expect(store.getContact("contact-1").displayName).toBe("Ada");
       expect(send).toHaveBeenCalledOnce();
       expect(manager.status().phase).toBe("syncing");
+      expect(replyFailurePublished).toBe(false);
     } finally { failReply?.(false); }
-    await waitUntil(() => manager.status().errorCode === "sync_failed");
+    await waitUntil(() => replyFailurePublished);
 
     let releaseSend!: () => void;
     const pendingSend = new Promise<void>((resolve) => { releaseSend = resolve; });
