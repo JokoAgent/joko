@@ -6823,8 +6823,13 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.submit).toHaveBeenCalledOnce();
   });
 
-  it.each(["exact queue", "other queue", "observer throws"] as const)(
-    "exposes the exact send identity before durable submit and preserves its refresh with %s", async (receipt) => {
+  it.each([
+    { receipt: "exact queue", anchored: false },
+    { receipt: "other queue", anchored: false },
+    { receipt: "observer throws", anchored: false },
+    { receipt: "exact queue", anchored: true },
+    { receipt: "other queue", anchored: true }
+  ])("exposes the exact send identity before refresh with $receipt (historic window: $anchored)", async ({ receipt, anchored }) => {
     const source = create(SessionSchema, { ...snapshot.sessions[0]!, nativeBinding: create(NativeSessionBindingSchema, {
       backendId: "backend", opaqueReference: "original-binding", runtimeGeneration: 8n
     }) });
@@ -6834,10 +6839,20 @@ describe("native mobile connection and operation ownership", () => {
     const drafts = memoryDraftStores();
     const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
     await app.start();
+    const anchor = event("linked-event", 4n);
+    const acceptedMessage = create(EventSchema, { ...event("visible-message", 11n),
+      identity: { sessionId: source.sessionId, operationId: "visible-operation" },
+      payload: { kind: { case: "messageStarted", value: { messageId: "visible-message", role: MessageRole.USER, userInputAccepted: true,
+        userInput: { parts: [{ content: { case: "text", value: "one visible message" } }] } } } } });
+    if (anchored) {
+      vi.mocked(network.readAround).mockResolvedValueOnce([anchor]);
+      await app.around(anchor.eventId);
+    }
     const draft = plainTextMobileComposerDraft("one visible message");
     const ownerKey = app.taskPresentationOwnerKey();
     const headerKey = app.taskHeaderSourceKey();
     expect(ownerKey).toBeTruthy();
+    let observedWindow: MobileClient["state"]["window"];
     const order: string[] = [];
     const refreshObservation: { isCurrent?: () => boolean; connecting?: { status: MobileClient["state"]["status"]; sameOwner?: boolean } } = {};
     vi.mocked(network.inspect).mockImplementationOnce(async () => {
@@ -6852,7 +6867,8 @@ describe("native mobile connection and operation ownership", () => {
       const queueItem = create(QueueItemSchema, { queueItemId: "accepted-input", sessionId: source.sessionId,
         backendId: source.backendId, targetId: source.targetId, sourceId: receipt === "other queue" ? "another-operation" : operationId,
         state: QueueItemState.ACCEPTED });
-      vi.mocked(network.readSession).mockResolvedValueOnce(create(SnapshotSchema, { ...projection, queueItems: [queueItem] }));
+      vi.mocked(network.readSession).mockResolvedValueOnce(create(SnapshotSchema, { ...projection,
+        resumeCursor: acceptedMessage.cursor, queueItems: [queueItem], timeline: [acceptedMessage] }));
       return create(OperationSchema, {
         operationId,
         connectionId: credential.connectionId,
@@ -6874,6 +6890,10 @@ describe("native mobile connection and operation ownership", () => {
       onAcceptedRefresh: (isCurrent) => {
         order.push("accepted presentation");
         refreshObservation.isCurrent = isCurrent;
+        if (anchored) {
+          observedWindow = app.state.window;
+          app.latest();
+        }
         if (receipt === "observer throws") throw new Error("presentation closed");
       }
     })).resolves.toBe(true);
@@ -6881,9 +6901,12 @@ describe("native mobile connection and operation ownership", () => {
     expect(order).toEqual(["presentation", "submit", ...(receipt === "other queue" ? [] : ["accepted presentation"]), "refresh"]);
     expect(refreshObservation.connecting).toEqual({ status: "connecting", sameOwner: receipt === "other queue" ? undefined : true });
     expect(refreshObservation.isCurrent?.()).toBe(receipt === "other queue" ? undefined : true);
+    if (anchored && receipt === "exact queue") expect(observedWindow).toEqual([anchor]);
     expect(app.taskPresentationOwnerKey()).toBe(ownerKey);
     expect(app.taskHeaderSourceKey()).not.toBe(headerKey);
     expect(app.state.detail?.queueItems.map(item => item.queueItemId)).toEqual(["accepted-input"]);
+    expect((app.state.window ?? app.state.detail?.timeline)?.map(item => item.eventId))
+      .toEqual(anchored && receipt === "other queue" ? [anchor.eventId] : [acceptedMessage.eventId]);
     expect(saved.pending()).toEqual([]);
     expect(await drafts.composer.readDurable({ profileId: credential.profileId, sessionId: source.sessionId })).toBeNull();
     await app.refresh();

@@ -1107,6 +1107,7 @@ export function App() {
                   focusComposer={focusTaskComposer} onComposerFocused={handleComposerFocused}
                   onOpenDerivationOrigin={openDerivationOrigin}
                   onRemoteDesktop={(targetDeviceId) => openRemoteDesktop("task", targetDeviceId)}
+                  onMessageFocusConsumed={(focus) => setNativeIntentMessageFocus((current) => current === focus ? undefined : current)}
                   messageFocus={nativeIntentMessageFocus?.homeSourceKey === undefined || nativeIntentMessageFocus.homeSourceKey === homeSourceKey
                     ? nativeIntentMessageFocus : undefined} /> :
                 page === "remote-desktop" && remoteDesktopEntry ? <View style={styles.fill} /> :
@@ -3615,6 +3616,9 @@ interface MobileTaskSendFollow {
   readonly list: FlatList<MobileWorkItem<TimelineRow>>;
   readonly listKey: string;
   readonly draftKey: string | undefined;
+  window: MobileClient["state"]["window"];
+  readonly messageFocusId?: number;
+  consumedAnchor?: true;
   refreshCurrent?: () => boolean;
   seek?: { readonly index: number; waitingForMeasurement: boolean };
 }
@@ -3633,13 +3637,14 @@ interface MobileTaskTimelineFollow {
 }
 
 export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused, onTaskSharing,
-  messageFocus, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
+  messageFocus, onMessageFocusConsumed, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   onRemoteDesktop: (targetDeviceId: string) => void;
   onTaskSharing?: () => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
+  onMessageFocusConsumed?: (focus: MobileNativeIntentMessageFocus) => void;
   onOpenDerivationOrigin: (authorityKey: string, signal: AbortSignal) => Promise<boolean>;
   partnerSettingsEntry?: { readonly profileId: string; readonly sessionId: string; readonly partnerId: string };
   onPartnerSettingsEntryConsumed?: () => void;
@@ -4117,7 +4122,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const messageFocusKey = activeMessageFocus && messageFocusIndex >= 0
     ? `${activeMessageFocus.requestId}\u001f${activeMessageFocus.messageId}\u001f${activeMessageFocus.messageEventId ?? ""}`
     : undefined;
-  const sendFollowSource = state.status === "connected" && state.taskSource?.kind !== "joined" && state.window === undefined
+  const activeMessageFocusId = activeMessageFocus?.requestId;
+  const sendFollowSource = state.status === "connected" && state.taskSource?.kind !== "joined"
     && partnerIdentity.ready && !partnerIdentity.partner && headerRole.role === "ordinary" && !searchVisible
     ? headerSourceKey : undefined;
   const sendFollowOwner = useMemo(() => sendFollowSource ? { sourceKey: sendFollowSource } : undefined,
@@ -4127,23 +4133,25 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && client.state.window === undefined && latestSendFollowRef.current === request && timelineListRef.current === request.list
     && (client.taskHeaderSourceKey() === request.owner.sourceKey || request.refreshCurrent?.() === true), []);
   const acceptedFollow = latestSendFollowRef.current;
-  const hasAcceptedFollow = acceptedFollow !== undefined && acceptedFollow.operationId === acceptedSendFollowId
+  const hasAcceptedFollow = acceptedFollow !== undefined && acceptedFollow.operationId === acceptedSendFollowId && state.window === undefined
     && sendFollowOwner !== undefined && (acceptedFollow.owner === sendFollowOwner || acceptedFollow.refreshCurrent?.() === true);
-  const latestUserIndex = hasAcceptedFollow ? displayRows.findLastIndex((row) => !isWorkGroup(row) && row.kind === "user" && !row.internalInput) : -1;
-  const latestUser = displayRows[latestUserIndex];
-  const sendFollowTarget = hasAcceptedFollow && latestUser !== undefined && !isWorkGroup(latestUser)
-    && latestUser.operationId === acceptedFollow.operationId
-    && latestUser.pendingSend?.phase !== "failed" && latestUser.pendingSend?.phase !== "unknown" ? latestUser : undefined;
+  const sendFollowIndex = hasAcceptedFollow ? displayRows.findLastIndex(row => !isWorkGroup(row) && row.kind === "user"
+    && !row.internalInput && (!acceptedFollow.consumedAnchor || row.operationId === acceptedFollow.operationId)) : -1;
+  const followedUser = displayRows[sendFollowIndex];
+  const sendFollowTarget = hasAcceptedFollow && followedUser !== undefined && !isWorkGroup(followedUser)
+    && followedUser.operationId === acceptedFollow.operationId
+    && followedUser.pendingSend?.phase !== "failed" && followedUser.pendingSend?.phase !== "unknown" ? followedUser : undefined;
   const sendFollowVisible = sendFollowTarget !== undefined && visibleTimelineRows?.has(sendFollowTarget.id) === true;
   useLayoutEffect(() => {
     const request = latestSendFollowRef.current;
-    if (request && (request.list !== timelineListRef.current || request.owner !== sendFollowOwner
-      && (!request.refreshCurrent?.() || state.status === "offline" || state.window !== undefined || searchVisible
+    if (request && (request.list !== timelineListRef.current
+      || state.window !== request.window
+      || activeMessageFocusId !== request.messageFocusId && !(request.consumedAnchor && activeMessageFocusId === undefined)
+      || request.owner !== sendFollowOwner && (!request.refreshCurrent?.() || state.status === "offline" || searchVisible
         || partnerIdentity.partner !== undefined || headerRole.role !== undefined && headerRole.role !== "ordinary"))) {
       latestSendFollowRef.current = undefined;
     }
-  }, [sendFollowOwner, timelineListKey, state.status, state.window, searchVisible, partnerIdentity.partner, headerRole.role]);
-  useLayoutEffect(() => () => { latestSendFollowRef.current = undefined; }, [activeMessageFocus?.requestId]);
+  }, [sendFollowOwner, timelineListKey, state.status, state.window, activeMessageFocusId, searchVisible, partnerIdentity.partner, headerRole.role]);
   const retireSendFollowForTimeline = (): void => {
     const request = latestSendFollowRef.current;
     if (request && request.list === timelineListRef.current && request.listKey === timelineListKey) latestSendFollowRef.current = undefined;
@@ -4161,11 +4169,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       return;
     }
     if (acceptedFollow.seek) return;
-    const seek = { index: latestUserIndex, waitingForMeasurement: false };
+    const seek = { index: sendFollowIndex, waitingForMeasurement: false };
     acceptedFollow.seek = seek;
-    acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+    acceptedFollow.list.scrollToIndex({ index: sendFollowIndex, animated: false, viewPosition: 0.2 });
     if (!seek.waitingForMeasurement && latestSendFollowRef.current === acceptedFollow) latestSendFollowRef.current = undefined;
-  }, [acceptedFollow, currentSendFollow, hasAcceptedFollow, latestObservedRows, latestUserIndex, sendFollowTarget, sendFollowVisible]);
+  }, [acceptedFollow, currentSendFollow, hasAcceptedFollow, latestObservedRows, sendFollowIndex, sendFollowTarget, sendFollowVisible]);
   const focusedWorkKey = JSON.stringify(activeMessageFocus === undefined ? [] : mobileWorkExpansionKeys(displayRows,
     (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
   useEffect(() => {
@@ -4337,7 +4345,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
   const conversationShare = useMobileConversationShare({ client, rows: partnerRows ?? rows, locale,
     onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
-  const timelineFollowSource = activeMessageFocus === undefined && !conversationShare.active ? sendFollowSource : undefined;
+  const timelineFollowSource = activeMessageFocus === undefined && state.window === undefined && !conversationShare.active ? sendFollowSource : undefined;
   const timelineFollow = useMemo<MobileTaskTimelineFollow | undefined>(() => timelineFollowSource === undefined ? undefined
     : { sourceKey: timelineFollowSource, position: "unmeasured", motion: "idle" }, [timelineFollowSource, timelineListKey, timelineForegroundEpoch]);
   useLayoutEffect(() => {
@@ -6321,18 +6329,29 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const rebalanceSource = client.taskHeaderSourceKey();
         const list = timelineListRef.current;
         if (list && sendFollowOwner && rebalanceSource === sendFollowOwner.sourceKey
-          && client.state.window === undefined && AppState.currentState === "active") {
+          && client.state.window === state.window && AppState.currentState === "active") {
           initialTimelineTail.finished = true;
-          sendFollow = { owner: sendFollowOwner, operationId, list, listKey: timelineListKey, draftKey: draftIdentityKey };
+          sendFollow = { owner: sendFollowOwner, operationId, list, listKey: timelineListKey, draftKey: draftIdentityKey,
+            window: state.window, messageFocusId: activeMessageFocusId };
         }
         latestSendFollowRef.current = sendFollow;
         const accepted = await client.send(sourceDraft, {
           operationId,
           deliveryMode,
           onAcceptedRefresh: refreshCurrent => {
-            if (!sendFollow || sendFollow.list !== timelineListRef.current || client.taskHeaderSourceKey() !== sendFollow.owner.sourceKey) return;
+            if (!sendFollow || sendFollow.list !== timelineListRef.current || client.taskHeaderSourceKey() !== sendFollow.owner.sourceKey
+              || client.state.window !== sendFollow.window) return;
+            if (sendFollow.window !== undefined && (latestSendFollowRef.current !== sendFollow || !taskMountedRef.current
+              || AppState.currentState !== "active" || client.state.historyBusy)) return;
             sendFollow.refreshCurrent = refreshCurrent;
             ownedSendRefreshRef.current = sendFollow;
+            if (sendFollow.window !== undefined) {
+              sendFollow.consumedAnchor = true;
+              sendFollow.window = undefined;
+              client.latest();
+              if (messageFocus) onMessageFocusConsumed?.(messageFocus);
+              if (replyQuoteFocus) setReplyQuoteFocus((current) => current === replyQuoteFocus ? undefined : current);
+            }
           },
           confirmRebalance: (suggestion, signal) => confirmMobileProviderRebalance(suggestion, { signal, locale,
             current: () => taskMountedRef.current && !!rebalanceSource && client.taskHeaderSourceKey() === rebalanceSource
@@ -6991,7 +7010,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (follow) confirmShortTimelineTail(follow);
         if (acceptedFollow?.seek?.waitingForMeasurement && sendFollowTarget && !sendFollowVisible && currentSendFollow(acceptedFollow)) {
           latestSendFollowRef.current = undefined;
-          acceptedFollow.list.scrollToIndex({ index: latestUserIndex, animated: false, viewPosition: 0.2 });
+          acceptedFollow.list.scrollToIndex({ index: sendFollowIndex, animated: false, viewPosition: 0.2 });
           return;
         }
         if (initialScroll || hasAcceptedFollow || latestSendFollowRef.current !== undefined || state.historyBusy || client.state.historyBusy
