@@ -146,8 +146,10 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
       await vi.waitFor(() => expect(["completed", "failed"]).toContain(sourceStore.getQueueItem(admitted.queueItemId).state), { timeout: 30_000 });
       const queued = sourceStore.getQueueItem(admitted.queueItemId);
       expect({ state: queued.state, error: queued.error, errors: sourceStore.listEvents({ sessionId, limit: 1000 }).filter(event => event.payload.type === "error").map(event => event.payload),
+        modelRequestCount: requests.length, dispatchFenceRecorded: dispatchFingerprint.length > 0,
         nativeFailures: nativeFailures.map(error => error instanceof Error ? { ...error, message: error.message } : error) })
-        .toEqual({ state: "completed", error: undefined, errors: [], nativeFailures: [] });
+        .toEqual({ state: "completed", error: undefined, errors: [], nativeFailures: [],
+          modelRequestCount: withMcpTools ? 3 : 2, dispatchFenceRecorded: true });
       expect(requests).toHaveLength(withMcpTools ? 3 : 2);
       if (withMcpTools) {
         expect(requests[0]!["tools"]).toEqual(expect.arrayContaining([expect.objectContaining({ type: "namespace",
