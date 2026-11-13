@@ -564,13 +564,15 @@ export function VirtualSubagentTechnicalDetails({
   system,
   showActivity,
   locale,
-  t
+  t,
+  children
 }: {
   readonly activity: readonly SubagentRunDetailView["activity"][number][];
   readonly system: readonly SubagentTranscriptEntryView[];
   readonly showActivity: boolean;
   readonly locale: string;
   readonly t: Translator;
+  readonly children?: ReactNode;
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const items = useMemo<readonly TechnicalItem[]>(() => [
@@ -580,6 +582,7 @@ export function VirtualSubagentTechnicalDetails({
   return <details className="subagent-technical" open={open}>
     <summary onClick={(event) => { event.preventDefault(); setOpen((current) => !current); }}><Terminal aria-hidden="true" />{t("subagents.technicalDetails")}<ChevronDown aria-hidden="true" /></summary>
     {open && <VirtualTechnicalList items={items} locale={locale} t={t} />}
+    {open && children}
   </details>;
 }
 
