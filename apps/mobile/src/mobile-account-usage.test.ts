@@ -72,6 +72,26 @@ describe("Mobile account usage", () => {
     expect(mobileCodexWeeklyUsageWindow(snapshot, "model", now)).toMatchObject({ remainingPercent: 80 });
   });
 
+  it("selects an active weekly family window only for the admitted Claude task summary", () => {
+    const snapshot = create(ProviderAccountUsageSnapshotSchema, { providerId: "account",
+      primaryWindow: { usedPercent: 20, windowMinutes: 300 }, secondaryWindow: { usedPercent: 40, windowMinutes: 10_080 },
+      modelWindows: [
+        { modelId: "claude-sonnet-4", displayName: "Opus label on another family", window: { usedPercent: 93, windowMinutes: 10_080 } },
+        { displayName: "Opus expired", window: { usedPercent: 97, windowMinutes: 10_080, resetAt: timestamp(now) } },
+        { displayName: "Opus short window", window: { usedPercent: 98, windowMinutes: 300 } },
+        { displayName: "Claude Opus 4", window: { usedPercent: 100, windowMinutes: 10_080, resetAt: timestamp(now + 1000) } },
+        { displayName: "Fable", window: { usedPercent: 90, windowMinutes: 10_080 } },
+        { modelId: "claude-opus-4-exact", displayName: "Exact Opus", window: { usedPercent: 30, windowMinutes: 10_080 } }
+      ] });
+    const model = "claude-opus-4[1m]";
+    expect(mobileAccountUsageWindows(snapshot, model, now).map(row => row.remainingPercent)).toEqual([80, 60]);
+    expect(mobileAccountUsageWindows(snapshot, model, now, "claude-family").map(row => row.remainingPercent)).toEqual([80, 60, 0]);
+    expect(mobileAccountUsageWindows(snapshot, "claude-opus-4-exact", now, "claude-family").at(-1)).toMatchObject({ label: "Exact Opus", remainingPercent: 70 });
+    expect(mobileAccountUsageWindows(snapshot, "claude-fable-5[opus]", now, "claude-family").at(-1)).toMatchObject({ label: "Fable", remainingPercent: 10 });
+    const withoutExact = { ...snapshot, modelWindows: snapshot.modelWindows.slice(0, -1) };
+    expect(mobileAccountUsageWindows(withoutExact, model, now + 1000, "claude-family").map(row => row.remainingPercent)).toEqual([80, 60]);
+  });
+
   it("accepts the formal zero Provider generation while fencing quota by auth and revision", () => {
     const provider = create(ProviderDescriptorSchema, { backendId: "backend", providerId: "provider", authenticationState: AuthenticationState.AUTHENTICATED,
       version: { generation: 0n, revision: { value: 3n } }, capabilities: { schemaVersion: "joko.provider.v1", capabilities: [

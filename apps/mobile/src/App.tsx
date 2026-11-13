@@ -19,7 +19,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, capabilityNames, partnerResumeMessages,
   partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
@@ -4173,6 +4173,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const providerUsageTransport = state.status === "connected" ? client.taskProviderUsageTransport() : undefined;
   const usageProviders = providerUsageTransport?.providers.filter(provider => provider.providerId === session?.model?.model?.providerId) ?? [];
   const usageProvider = usageProviders.length === 1 ? usageProviders[0] : undefined;
+  const usageModelId = session?.model?.model?.modelId;
+  const usageModelSources = usageProvider && usageModelId ? state.owner?.models.filter(model => model.backendId === usageProvider.backendId
+    && model.key?.providerId === usageProvider.providerId && model.key?.modelId === usageModelId) ?? [] : [];
+  const usageModelSource = usageModelSources.length === 1 ? usageModelSources[0]?.source : undefined;
   const taskAccountUsage = useMobileAccountUsage(providerUsageTransport, taskActionsVisible,
     usageProvider ? [usageProvider.providerId] : []);
   const runtimeControlsOwnerRef = useRef(runtimeControls?.surfaceOwnerKey);
@@ -6767,7 +6771,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
       menuHeader={usageProvider && <MobileAccountUsageSummary snapshot={taskAccountUsage.snapshots[mobileUsageProviderKey(usageProvider)]}
         reset={mobileAccountResetControls(providerUsageTransport, usageProvider.backendId, usageProvider.providerId, runtimeControls?.currentModel?.route?.source?.kind)}
-        modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
+        modelScope={usageModelSource?.kind === ModelSourceKind.LOCAL && usageModelSource.nativeAdapterKind === "claude-agent-sdk-stdio" ? "claude-family" : undefined}
+        modelId={usageModelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
         failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
       actions={([
         ...(partnerIdentity.partner && partnerGlanceApi ? [{ id: 'partner-glance' as const, label: locale === 'zh-CN' ? '近况' : 'At a glance',

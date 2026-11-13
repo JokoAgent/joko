@@ -53,7 +53,8 @@ export function mobileUsageTimestamp(value: { readonly seconds: bigint; readonly
 }
 
 /** Overall limits and exact model windows remain separate facts from task tokens. */
-export function mobileAccountUsageWindows(snapshot: ProviderAccountUsageSnapshot | undefined, modelId: string | undefined, now: number): readonly MobileAccountUsageWindow[] {
+export function mobileAccountUsageWindows(snapshot: ProviderAccountUsageSnapshot | undefined, modelId: string | undefined, now: number,
+  modelScope?: "claude-family"): readonly MobileAccountUsageWindow[] {
   if (!snapshot) return [];
   const rows: MobileAccountUsageWindow[] = [];
   const add = (id: string, window: ProviderAccountUsageWindow | undefined, label?: string): void => {
@@ -70,7 +71,11 @@ export function mobileAccountUsageWindows(snapshot: ProviderAccountUsageSnapshot
       add(`bucket:${bucket.id}:secondary`, bucket.secondaryWindow, bucket.displayName ?? bucket.id);
     }
   }
-  return modelId ? [...rows, ...mobileExactModelUsageWindows(snapshot, modelId, now)] : rows;
+  if (!modelId) return rows;
+  const exact = mobileExactModelUsageWindows(snapshot, modelId, now);
+  if (exact.length > 0 || modelScope !== "claude-family") return [...rows, ...exact];
+  const scoped = mobileClaudeFamilyUsageWindow(snapshot, modelId, now);
+  return scoped ? [...rows, scoped] : rows;
 }
 
 export function mobileExactModelUsageWindows(snapshot: ProviderAccountUsageSnapshot, modelId: string, now: number): readonly MobileAccountUsageWindow[] {
@@ -80,6 +85,24 @@ export function mobileExactModelUsageWindows(snapshot: ProviderAccountUsageSnaps
     const row = mobileAccountUsageWindow(`model:${index}`, entry.window, now, entry.displayName, true);
     return row ? [row] : [];
   });
+}
+
+function mobileClaudeModelFamily(modelId: string | undefined): string | undefined {
+  const model = (modelId ?? "").trim().toLowerCase().replace(/\[[^\[\]]*\]$/u, "");
+  return ["fable", "mythos", "opus", "sonnet", "haiku"].find(family => model.includes(family));
+}
+
+function mobileClaudeFamilyUsageWindow(snapshot: ProviderAccountUsageSnapshot, modelId: string, now: number): MobileAccountUsageWindow | undefined {
+  const family = mobileClaudeModelFamily(modelId);
+  if (!family || snapshot.modelWindows.length > 256) return undefined;
+  for (const [index, entry] of snapshot.modelWindows.entries()) {
+    const namedFamily = mobileClaudeModelFamily(entry.modelId);
+    const belongs = namedFamily ? namedFamily === family : entry.displayName.trim().toLowerCase().includes(family);
+    if (!belongs || entry.window?.windowMinutes !== 10_080) continue;
+    const row = mobileAccountUsageWindow(`model:${index}`, entry.window, now, entry.displayName, true);
+    if (row) return row;
+  }
+  return undefined;
 }
 
 export function mobileCodexWeeklyUsageWindow(snapshot: ProviderAccountUsageSnapshot, modelId: string, now: number): MobileAccountUsageWindow | undefined {
