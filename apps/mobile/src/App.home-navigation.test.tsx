@@ -11,7 +11,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
 import { mobileMessage } from "./mobile-messages";
-import { projectMobileHomeSearchMessageFocus } from "./mobile-native-intent";
+import { buildMobileMessageDeepLink, projectMobileHomeSearchMessageFocus } from "./mobile-native-intent";
 import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
@@ -39,6 +39,9 @@ const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, a
 const empty = Object.freeze([]);
 const homeConnectionId = "home-connection";
 const select = vi.fn(async (_sessionId?: string) => {});
+const around = vi.fn<MobileClient["around"]>(async () => {});
+const latest = vi.fn();
+let linkListener: ((event: { readonly url: string }) => void) | undefined;
 const searchHome = vi.fn(async () => {});
 const scrollToIndex = vi.fn();
 const setSessionPinned = vi.fn(async () => true);
@@ -81,6 +84,7 @@ let drawerProps: MobileDrawerProps;
 let finishDrawerClose: (() => void) | undefined;
 let taskNavigationPort: import("./App").TaskHomeNavigationPort | undefined;
 let TaskScreen: typeof import("./App").TaskScreen;
+let App: typeof import("./App").App;
 let messageActionsProps: ComponentProps<typeof import("./MobileActionSheet").MobileActionSheet> | undefined;
 type TaskProps = ComponentProps<typeof import("./App").TaskScreen>;
 let taskProps: TaskProps;
@@ -105,7 +109,8 @@ let learningPartner: typeof profilePartner | undefined;
 let collaborationApi: import("./mobile-collaboration").MobileCollaborationApi | undefined;
 let learningProfileProps: ComponentProps<typeof import("./MobilePartnerProfileSheet").MobilePartnerProfileSheet> | undefined;
 const client = new Proxy({
-  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
+  get state() { return state; }, select, around, latest, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
+  partnerRosterSources: () => empty,
   taskQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
@@ -132,6 +137,8 @@ const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666"
   accent: "#f80", negative: "#c00", brandBackground: "#ffe", dark: false };
 const onNew = vi.fn(), onSelect = vi.fn(), onMenu = vi.fn(), onOpenShare = vi.fn(), runNavigation = vi.fn();
 const message = (key: Parameters<typeof mobileMessage>[1]) => mobileMessage("en", key);
+const subscribe = () => () => {};
+const hydrate = async () => {};
 
 beforeAll(async () => {
   vi.stubGlobal("__DEV__", false);
@@ -165,13 +172,16 @@ beforeAll(async () => {
       role: accessibilityRole === "tab" || accessibilityRole === "checkbox" ? accessibilityRole : undefined,
       "aria-selected": accessibilityState?.selected, "aria-checked": accessibilityState?.checked },
       typeof children === "function" ? children({ pressed: false }) : children),
-    StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 },
+    StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1, absoluteFill: {} },
     Platform: { get OS() { return platformOS; }, select: (value: Record<string, unknown>) => value[platformOS] ?? value.default },
     AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
     BackHandler: { addEventListener: () => ({ remove() {} }) }, Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) },
     PanResponder: { create: () => ({ panHandlers: {} }) },
     AccessibilityInfo: { announceForAccessibility() {}, setAccessibilityFocus() {}, addEventListener: () => ({ remove() {} }) },
-    Linking: {}, Alert: { alert }, findNodeHandle: () => null, useColorScheme: () => "light",
+    Linking: { getInitialURL: async () => null, addEventListener: (_event: string, listener: typeof linkListener) => {
+      linkListener = listener;
+      return { remove() { linkListener = undefined; } };
+    } }, Alert: { alert }, findNodeHandle: () => null, useColorScheme: () => "light",
     useWindowDimensions: () => dimensions
   }));
   vi.doMock("react-native-safe-area-context", () => ({ SafeAreaProvider: surface, SafeAreaView: surface,
@@ -199,24 +209,43 @@ beforeAll(async () => {
     NativeModule: class {}, EventEmitter: class {} }));
   vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
-  vi.doMock("./storage", () => new Proxy({ mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } },
+  vi.doMock("./storage", () => new Proxy({
+    mobileLocalePreferences: { snapshot: { effectiveLocale: "en", status: "ready" }, subscribe, hydrate },
+    mobileThemePreferences: { snapshot: { preference: "system", status: "ready" }, subscribe, hydrate },
+    mobileVoicePreferences: { snapshot: {}, subscribe, hydrate },
+    mobileDiagnostics: { snapshot: { enabled: false }, subscribe, hydrate, record() {}, flush: hydrate, maintainExportCache: hydrate },
+    mobileUpdates: { snapshot: { startup: "ready" }, subscribe, start: hydrate },
+    mobileInteractionDrafts: { flush: hydrate },
+    mobilePlainStorage: { getItem: async () => null, setItem: hydrate, removeItem: hydrate },
     mobileReplyQuotePreferences: { snapshot: { ready: true, visible: true, saving: false, failed: false }, subscribe: () => () => {}, hydrate: async () => {} },
     mobileComposerDrafts: drafts, mobileNewTaskDrafts: newTaskDrafts }, {
     get: (object, key) => key in object ? object[key as keyof typeof object] : {}, has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} })
   }));
   for (const name of ["network", "native-lan-discovery", "native-notifications", "mobile-media-preview", "mobile-pdf-preview",
-    "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache"])
+    "mobile-model-preview", "mobile-files-thumbnail-cache"])
     vi.doMock(`./${name}`, () => new Proxy({}, { get: () => ({}), has: () => true,
       getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
-  const incomingShare = { snapshot: { supported: false, busy: false }, subscribe: () => () => {} };
+  vi.doMock("./mobile-file-share", () => ({ mobileFileShare: { maintain: hydrate } }));
+  const incomingShare = { snapshot: { supported: false, busy: false }, subscribe, refresh: hydrate };
   vi.doMock("./mobile-incoming-share", () => new Proxy({ mobileIncomingShare: incomingShare }, {
     get: (object, key) => key in object ? object[key as keyof typeof object] : {}, has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
-  vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {} }));
-  vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
+  vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {
+    readonly snapshot = {};
+    subscribe = subscribe;
+    start = hydrate;
+    stop() {}
+    handleAppStateChange() {}
+    setLocale() {}
+  } }));
+  vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class { setSources() {} } }));
+  vi.doMock("./MobileLinkspanHost", () => ({ MobileLinkspanHost: () => null }));
+  vi.doMock("./MobileAndroidUpdateSheet", () => ({ MobileAndroidUpdateSheet: () => null }));
+  vi.doMock("./MobileNativeIntentNotice", () => ({ MobileNativeIntentNotice: ({ recovery }: { recovery: string }) =>
+    createElement("div", { role: "alert" }, recovery) }));
   for (const name of ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage",
-    "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard",
+    "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard",
     "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard",
     "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker",
     "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet",
@@ -267,7 +296,7 @@ beforeAll(async () => {
   vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: shareSelectionActive, busy: false, allSelected: false, toggleAll() {},
     selectedIds: [], enterVisible() {} }) }));
   vi.doMock("./use-mobile-screenshot-selection", () => ({ useMobileScreenshotSelection() {} }));
-  ({ SessionsScreen, TaskScreen, NewTaskScreen } = await import("./App"));
+  ({ App, SessionsScreen, TaskScreen, NewTaskScreen } = await import("./App"));
 });
 
 beforeEach(async () => {
@@ -288,6 +317,8 @@ beforeEach(async () => {
   drafts.save({ profileId: "profile", sessionId: "current" }, plainTextMobileComposerDraft("Retained composer"));
   await drafts.flush({ profileId: "profile", sessionId: "current" }); draftFlush.mockClear();
   select.mockImplementation(async sessionId => { state = { ...state, selectedId: sessionId }; });
+  around.mockReset();
+  latest.mockClear();
   const sessions = [
     create(SessionSchema, { sessionId: "current", targetId: "dialogue", backendId: "backend", displayName: "Alpha", pinned: true, state: SessionState.IDLE }),
     create(SessionSchema, { sessionId: "other", targetId: "project", backendId: "backend", displayName: "Beta", state: SessionState.IDLE }),
@@ -299,6 +330,7 @@ beforeEach(async () => {
       { targetId: "project", backendId: "backend", displayName: "Project" }] });
   state = { status: "connected", activeProfileId: "profile", selectedId: "current", owner, detail: owner, saved: [], pending: [],
     older: [], live: [], busy: false, historyBusy: false, historyEnd: true, readReceipts: {},
+    partnerPrivate: { open: false },
     homeSearchQuery: "", homeSearchFilter: "active", homeSearchMatches: [], homeSearchStatus: "idle" } as unknown as MobileState;
   viewState = { search: "", statusFilter: "active" };
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
@@ -709,6 +741,30 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it.each([true, false])("keeps late missing-message recovery on its original Task screen (back=%s)", async leave => {
+    state = { ...state, saved: [{ profileId: "profile", origin: "https://node.example", serverId: "node",
+      connectionId: homeConnectionId, deviceId: "phone", displayName: "Node", credentialState: "available",
+      automatic: false, pendingOperations: [] }] };
+    let rejectAnchor!: (error: Error) => void;
+    around.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectAnchor = reject; }));
+    await act(async () => root.render(createElement(App)));
+    expect(host.querySelector('[data-testid="home-list"]')).not.toBeNull();
+    await act(async () => {
+      expect(linkListener).toBeDefined();
+      linkListener!({ url: buildMobileMessageDeepLink("current", "removed-message", "removed-event") });
+    });
+    expect(around).toHaveBeenCalledExactlyOnceWith("removed-event", expect.any(AbortSignal));
+    expect(host.querySelector('[data-testid="task-header"]')).not.toBeNull();
+    if (leave) await press("Task back");
+
+    expect(around.mock.calls[0]?.[1]?.aborted).toBe(leave);
+    await act(async () => rejectAnchor(new Error("The requested anchor is no longer visible.")));
+    expect(host.querySelector('[data-testid="task-header"]') !== null).toBe(!leave);
+    expect(host.textContent?.includes("message-unavailable")).toBe(!leave);
+    expect(latest).toHaveBeenCalledTimes(leave ? 0 : 1);
+    if (leave) expect(host.querySelector('[data-testid="home-list"]')).not.toBeNull();
+  });
+
   it("locates the selected body event in the already-open wide task without selecting or flushing it again", async () => {
     dimensions = { ...dimensions, width: 900, height: 700 };
     const match = { sessionId: "current", eventId: "matching-event" };

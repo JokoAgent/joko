@@ -8297,6 +8297,38 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.older).toHaveLength(0);
   });
 
+  it.each(["anchor", "older page"] as const)("retires a pending message-link %s when its screen leaves", async (kind) => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const screen = new AbortController();
+    let finish!: () => void;
+    const retired = event("retired-link-event", 7n);
+    if (kind === "anchor") {
+      vi.mocked(network.readAround).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve([retired]); }));
+    } else {
+      vi.mocked(network.readHistory).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve({ events: [retired] }); }));
+    }
+    const oldRead = kind === "anchor" ? app.around(retired.eventId, screen.signal) : app.older(screen.signal);
+    const requestSignal = kind === "anchor"
+      ? vi.mocked(network.readAround).mock.calls[0]?.[3]
+      : vi.mocked(network.readHistory).mock.calls[0]?.[3];
+    expect(requestSignal?.aborted).toBe(false);
+    expect(app.state.historyBusy).toBe(true);
+    screen.abort();
+    expect(requestSignal?.aborted).toBe(true);
+    expect(app.state.historyBusy).toBe(false);
+
+    const current = event("current-link-event", 8n);
+    vi.mocked(network.readAround).mockResolvedValueOnce([current]);
+    await app.around(current.eventId);
+    finish();
+    await oldRead;
+
+    expect(app.state.window?.map(item => item.eventId)).toEqual([current.eventId]);
+    expect(app.state.historyBusy).toBe(false);
+  });
+
   it("rejects another task in an anchor and retires an old page after a background transition", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);
