@@ -2,7 +2,7 @@
 import { act, createElement, forwardRef, useImperativeHandle, useRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { AuthenticationState, CapabilitySupport, EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
+import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
   MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +28,7 @@ type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: 
 type TimelineScrollFailure = (event: { index: number; averageItemLength: number }) => void;
 type TimelineScrollSample = { nativeEvent: { contentOffset: { y: number }; contentSize: { height: number }; layoutMeasurement: { height: number } } };
 type TimelineScrollHandlers = {
+  maintainVisibleContentPosition?: { minIndexForVisible: number };
   onScroll?: (event: TimelineScrollSample) => void;
   onScrollBeginDrag?: (event?: TimelineScrollSample) => void;
   onScrollEndDrag?: (event: TimelineScrollSample) => void;
@@ -89,6 +90,7 @@ const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(
   policy: { help: true as const, jumpSession: true as const, userShell: false, sessionReset: false, review: false }, jumpSessionIds: ["session"] };
 const resolveResource = vi.fn(async () => resource);
 const send = vi.fn(async (_draft: MobileComposerDraft, _observer?: MobileTaskSendObserver) => true);
+const loadEarlier = vi.fn(async () => undefined);
 const returnToLatest = vi.fn(() => {
   renderedState = { ...renderedState, window: undefined, before: undefined, historyEnd: false };
 });
@@ -116,7 +118,7 @@ const client = new Proxy({
   resolveTaskRuntimeCommandResource: resolveResource,
   taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
-  taskNativeTreeControls: () => undefined, send, latest: returnToLatest, taskContextControls: () => undefined,
+  taskNativeTreeControls: () => undefined, send, latest: returnToLatest, older: loadEarlier, taskContextControls: () => undefined,
   taskProviderUsageTransport: () => providerUsage,
   taskObjectiveApi: () => current ? activeObjectiveApi : undefined,
   taskCollaborationApi: () => current ? activeCollaborationApi : undefined,
@@ -235,6 +237,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
   returnToLatest.mockClear();
+  loadEarlier.mockReset().mockResolvedValue(undefined);
   nativeAppState.currentState = "active";
   timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear();
   sendFollowSourceKey = undefined; sendFollowPresentationKey = undefined; ordinaryTimelineTransportKey = undefined;
@@ -726,6 +729,50 @@ it.each(["accepted", "reader drag", "new window", "new focus", "unknown"] as con
 function timelineScrollSample(y: number, height: number): TimelineScrollSample {
   return { nativeEvent: { contentOffset: { y }, contentSize: { height }, layoutMeasurement: { height: 400 } } };
 }
+
+it("loads earlier history on an upward drag near the top and keeps native prepend anchoring on the ordinary list", async () => {
+  vi.useFakeTimers();
+  sendFollowSourceKey = "task-source";
+  const prompt = taskUserInput("prompt", "prompt-operation", 10n, "Current window");
+  const firstPage = taskUserInput("first-page", "first-page-operation", 2n, "Older history");
+  renderedState = { ...state, live: [prompt], historyEnd: false };
+  let completePage!: () => void;
+  loadEarlier.mockImplementationOnce(async () => {
+    renderedState = { ...renderedState, historyBusy: true };
+    await new Promise<void>(resolve => { completePage = resolve; });
+    renderedState = { ...renderedState, historyBusy: false, older: [firstPage],
+      before: create(EventCursorSchema, { opaqueToken: "older-cursor", generation: 1n, sequence: 2n }) };
+  });
+  await mountMeasuredTimelineTail();
+  expect(timelineList!.maintainVisibleContentPosition).toEqual({ minIndexForVisible: 1 });
+  const nearTop = timelineScrollSample(130, 1_600);
+  await act(async () => timelineList!.onScroll!(nearTop));
+  expect(loadEarlier).not.toHaveBeenCalled();
+  await act(async () => {
+    timelineList!.onScrollBeginDrag!(timelineScrollSample(700, 1_600));
+    timelineList!.onScroll!(nearTop);
+    timelineList!.onScroll!(timelineScrollSample(75, 1_600));
+    timelineList!.onScrollEndDrag!(nearTop);
+  });
+  expect(loadEarlier).toHaveBeenCalledOnce();
+  await act(async () => { completePage(); });
+  await act(async () => root.render(taskScreen()));
+  await act(async () => timelineList!.onContentSizeChange!(400, 1_900));
+  expect(timelineList!.data).toContainEqual(expect.objectContaining({ id: "first-page" }));
+  expect(scrollTimelineToEnd).not.toHaveBeenCalled();
+
+  await act(async () => {
+    timelineList!.onScrollBeginDrag!(timelineScrollSample(0, 1_900));
+    timelineList!.onScrollEndDrag!(timelineScrollSample(0, 1_900));
+  });
+  expect(loadEarlier).toHaveBeenCalledTimes(2);
+
+  renderedState = { ...renderedState, window: [firstPage] };
+  await act(async () => root.render(taskScreen()));
+  expect(timelineList!.maintainVisibleContentPosition).toBeUndefined();
+  await act(async () => timelineList!.onScrollBeginDrag!(timelineScrollSample(0, 1_900)));
+  expect(loadEarlier).toHaveBeenCalledTimes(2);
+});
 
 async function mountMeasuredTimelineTail(): Promise<void> {
   await act(async () => root.render(taskScreen()));
