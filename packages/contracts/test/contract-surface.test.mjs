@@ -814,6 +814,8 @@ test("Contacts exposes revision-fenced local and explicit device-sync authority 
     "mergeContacts",
     "previewContactVCardImport",
     "commitContactVCardImport",
+    "previewSystemContactImport",
+    "commitSystemContactImport",
     "exportContactsVCard",
     "getContactSyncStatus",
     "setContactSyncEnabled",
@@ -827,6 +829,10 @@ test("Contacts exposes revision-fenced local and explicit device-sync authority 
     contract.ContactProfileSchema,
     contract.ContactIdentitySchema,
     contract.ContactVCardImportPreviewEntrySchema,
+    contract.PreviewSystemContactImportRequestSchema,
+    contract.PreviewSystemContactImportResponseSchema,
+    contract.CommitSystemContactImportRequestSchema,
+    contract.CommitSystemContactImportResponseSchema,
     contract.ExportContactsVCardResponseSchema,
     contract.ContactSyncStatusSchema,
     contract.ContactSyncPeerSchema,
@@ -842,6 +848,8 @@ test("Contacts exposes revision-fenced local and explicit device-sync authority 
   ]);
   assert.equal(field(contract.ContactPatchSchema, "display_name").proto.proto3Optional, true);
   assert.equal(field(contract.ContactVCardImportDecisionSchema, "target_contact_id").proto.proto3Optional, true);
+  assert.deepEqual([...fieldNames(contract.PreviewSystemContactImportRequestSchema)], []);
+  assert.deepEqual([...fieldNames(contract.CommitSystemContactImportRequestSchema)], ["confirmation"]);
 });
 
 test("Partner task output metadata preserves execution, ordered Runs, typed status and bounded inventory fields", () => {
