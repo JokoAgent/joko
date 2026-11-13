@@ -4327,7 +4327,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ? selectedInteractionId
     : interactions[0]?.interactionId;
   const activeInteraction = interactions.find((interaction) => interaction.interactionId === activeInteractionId);
-  const interactionMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
+  const interactionReceipt = state.pending.find((item) => activeInteractionId !== undefined && item.sessionId === state.selectedId
     && item.interactionId === activeInteractionId
     && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
   const appCommandReceiptPending = state.pending.some((item) => item.sessionId === state.selectedId
@@ -7219,7 +7219,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{activeInteraction
           ? mobileInteractionTitle(activeInteraction, locale) : mobileMessage(locale, "task.openRequest")}</Text>
       </View>
-      <Action label={mobileMessage(locale, "task.openRequest")} colors={colors} compact disabled={interactionMutationPending}
+      <Action label={mobileMessage(locale, "task.openRequest")} colors={colors} compact
+        disabled={interactionReceipt?.taskJoinId !== undefined}
         onPress={() => setInteractionVisible(true)} />
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
       {partnerRead.partner && <Action label={[partnerRead.partner.capabilities.modelChain[0]?.modelId,
@@ -7575,7 +7576,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     <MobileInteractionSheet visible={!workerReadOnly && interactionVisible && interactions.length > 0} locale={locale}
       voiceTransport={voiceTransport} onOpenReference={openQuestionReference}
       profileId={taskDraftProfileId} interactions={interactions} selectedId={activeInteractionId}
-      busy={state.busy || interactionMutationPending} colors={colors}
+      busy={state.busy || interactionReceipt?.taskJoinId !== undefined} colors={colors}
+      responseReceipt={interactionReceipt && interactionReceipt.taskJoinId === undefined ? {
+        operationId: interactionReceipt.operationId, state: interactionReceipt.state,
+        check: (interaction, operationId) => client.checkTaskInteractionOperation(interaction, operationId)
+      } : undefined}
       onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
       onResolve={async (interaction, submission) => {
         const completed = await resolveDisplayedInteraction?.(interaction, submission) ?? false;

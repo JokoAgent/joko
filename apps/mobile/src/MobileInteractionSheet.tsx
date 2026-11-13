@@ -77,6 +77,7 @@ export function MobileInteractionSheet({
   onMinimize,
   onResolve,
   onDismiss,
+  responseReceipt,
   onError,
   voiceTransport,
   onOpenReference
@@ -92,6 +93,8 @@ export function MobileInteractionSheet({
   readonly onMinimize: () => void;
   readonly onResolve: (interaction: Interaction, submission: MobileInteractionSubmission) => Promise<boolean>;
   readonly onDismiss: (interaction: Interaction) => Promise<boolean>;
+  readonly responseReceipt?: { readonly operationId: string; readonly state: "accepted" | "unknown";
+    readonly check: (interaction: Interaction, operationId: string) => Promise<boolean> };
   readonly onError: (message: string) => void;
   readonly voiceTransport?: MobileVoiceTransport;
   readonly onOpenReference?: (interactionId: string, href: string) => void;
@@ -120,6 +123,7 @@ export function MobileInteractionSheet({
   const [loadedKey, setLoadedKey] = useState<string | undefined>(identity === undefined ? undefined : identityKey);
   const [draftReady, setDraftReady] = useState(identity === undefined || mobileInteractionDrafts.readSync(identity) !== null);
   const [settling, setSettling] = useState(false);
+  const [responseError, setResponseError] = useState<{ authority: string | undefined; text: string }>();
   const keyboard = useMobileKeyboardState();
   const safeArea = useSafeAreaInsets();
 
@@ -136,6 +140,10 @@ export function MobileInteractionSheet({
 
   useEffect(() => {
     setSettling(false);
+    setResponseError(undefined);
+  }, [authorityKey]);
+
+  useEffect(() => {
     if (identity === undefined) {
       setDraft(validation.initialDraft);
       setLoadedKey(undefined);
@@ -171,6 +179,7 @@ export function MobileInteractionSheet({
   if (!interaction) return null;
   const ready = identity === undefined || loadedKey === identityKey && draftReady;
   const disabled = busy || settling || !ready;
+  const responseDisabled = disabled || responseReceipt !== undefined;
 
   const updateDraft = (next: MobileInteractionDraft): void => {
     setDraft(next);
@@ -180,9 +189,10 @@ export function MobileInteractionSheet({
   };
 
   const settle = async (submission: MobileInteractionSubmission): Promise<void> => {
-    if (disabled || !visibleRef.current || !mountedRef.current || authorityRef.current !== authorityKey) return;
+    if (responseDisabled || !visibleRef.current || !mountedRef.current || authorityRef.current !== authorityKey) return;
     const currentAuthorityKey = authorityKey;
     setSettling(true);
+    setResponseError(undefined);
     onError("");
     try {
       const completed = await onResolve(interaction, submission);
@@ -190,31 +200,60 @@ export function MobileInteractionSheet({
       if (identity) await mobileInteractionDrafts.clear(identity);
       if (mountedRef.current && authorityRef.current === currentAuthorityKey) setDraft(validation.initialDraft);
     } catch (error) {
-      if (mountedRef.current) onError(errorText(error, locale));
+      if (mountedRef.current && authorityRef.current === currentAuthorityKey) {
+        const text = errorText(error, locale);
+        setResponseError({ authority: currentAuthorityKey, text });
+        onError(text);
+      }
     } finally {
-      if (mountedRef.current) setSettling(false);
+      if (mountedRef.current && authorityRef.current === currentAuthorityKey) setSettling(false);
+    }
+  };
+
+  const checkResponse = async (): Promise<void> => {
+    if (!responseReceipt || busy || settling || !visibleRef.current || authorityRef.current !== authorityKey) return;
+    setSettling(true);
+    setResponseError(undefined);
+    try {
+      const confirmed = await responseReceipt.check(interaction, responseReceipt.operationId);
+      if (confirmed) return;
+      if (mountedRef.current && authorityRef.current === authorityKey) {
+        setResponseError({ authority: authorityKey, text: mobileMessage(locale, "interaction.responseUnconfirmed") });
+      }
+    } catch (error) {
+      if (mountedRef.current && authorityRef.current === authorityKey) {
+        setResponseError({ authority: authorityKey, text: errorText(error, locale) });
+      }
+    } finally {
+      if (mountedRef.current && authorityRef.current === authorityKey) setSettling(false);
     }
   };
 
   const dismiss = (): void => {
-    if (disabled) return;
+    if (responseDisabled) return;
     Alert.alert(
       mobileMessage(locale, "interaction.dismissTitle"),
       mobileMessage(locale, "interaction.dismissBody"),
       [
         { text: mobileMessage(locale, "interaction.keep"), style: "cancel" },
         { text: mobileMessage(locale, "common.dismiss"), style: "destructive", onPress: () => {
+          if (!visibleRef.current || !mountedRef.current || authorityRef.current !== authorityKey) return;
           const currentAuthorityKey = authorityKey;
           setSettling(true);
+          setResponseError(undefined);
           onError("");
           void onDismiss(interaction).then(async (completed) => {
             if (!completed) return;
             if (identity) await mobileInteractionDrafts.clear(identity);
             if (mountedRef.current && authorityRef.current === currentAuthorityKey) setDraft(validation.initialDraft);
           }).catch((error) => {
-            if (mountedRef.current) onError(errorText(error, locale));
+            if (mountedRef.current && authorityRef.current === currentAuthorityKey) {
+              const text = errorText(error, locale);
+              setResponseError({ authority: currentAuthorityKey, text });
+              onError(text);
+            }
           }).finally(() => {
-            if (mountedRef.current) setSettling(false);
+            if (mountedRef.current && authorityRef.current === currentAuthorityKey) setSettling(false);
           });
         } }
       ]
@@ -253,24 +292,32 @@ export function MobileInteractionSheet({
             onPress={() => onSelect(interactions[interactionIndex + 1]!.interactionId)} />
         </View>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={sheetStyles.content}>
+          {responseError && responseError.authority === authorityKey && <Text accessibilityRole="alert"
+            style={[sheetStyles.error, { color: colors.negative }]}>{responseError.text}</Text>}
+          {responseReceipt && <View style={sheetStyles.detailCard}>
+            <Text style={[sheetStyles.body, { color: colors.ink }]}>{mobileMessage(locale,
+              responseReceipt.state === "unknown" ? "task.operationUnknown" : "task.awaitingResult")} · {responseReceipt.operationId}</Text>
+            <SheetButton label={mobileMessage(locale, "receipt.check")} colors={colors} quiet disabled={busy || settling || !visible}
+              onPress={() => void checkResponse()} />
+          </View>}
           {validation.error !== undefined
             ? <Text accessibilityRole="alert" style={[sheetStyles.error, { color: colors.negative }]}>{validation.error}</Text>
             : !ready
               ? <Text style={[sheetStyles.body, { color: colors.muted }]}>{mobileMessage(locale, "interaction.restoring")}</Text>
               : interaction.request.case === "permission"
-                ? <PermissionRequest key={`${authorityKey}:${visible}`} interaction={interaction} disabled={disabled || !visible}
+                ? <PermissionRequest key={`${authorityKey}:${visible}`} interaction={interaction} disabled={responseDisabled || !visible}
                   colors={colors} locale={locale} onResolve={decision => void settle({ kind: "permission", decision })} />
                 : interaction.request.case === "question" && draft?.kind === "question"
-                  ? <QuestionRequest interaction={interaction} draft={draft} disabled={disabled || !visible} colors={colors} locale={locale}
+                  ? <QuestionRequest interaction={interaction} draft={draft} disabled={responseDisabled || !visible} colors={colors} locale={locale}
                     ownerKey={identityKey ?? authorityKey ?? interaction.interactionId} voiceTransport={voiceTransport} onError={onError} onOpenReference={onOpenReference}
                     onDraft={updateDraft} onResolve={(answers) => void settle({ kind: "question", answers })} />
                   : interaction.request.case === "planReview" && draft?.kind === "plan"
-                    ? <PlanRequest interaction={interaction} draft={draft} disabled={disabled} colors={colors} locale={locale}
+                    ? <PlanRequest interaction={interaction} draft={draft} disabled={responseDisabled} colors={colors} locale={locale}
                       onDraft={updateDraft} onResolve={(decision, feedback) => void settle({ kind: "plan", decision, feedback })} />
                     : <Text accessibilityRole="alert" style={[sheetStyles.error, { color: colors.negative }]}>{mobileMessage(locale, "interaction.draftMismatch")}</Text>}
         </ScrollView>
         <View style={[sheetStyles.footer, { borderColor: colors.border }]}>
-          <SheetButton label={mobileMessage(locale, "interaction.dismiss")} colors={colors} quiet danger disabled={disabled} onPress={dismiss} />
+          <SheetButton label={mobileMessage(locale, "interaction.dismiss")} colors={colors} quiet danger disabled={responseDisabled} onPress={dismiss} />
           <SheetButton label={mobileMessage(locale, "interaction.minimizeShort")} colors={colors} quiet disabled={settling} onPress={onMinimize} />
         </View>
       </SafeAreaView>
