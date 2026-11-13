@@ -585,8 +585,11 @@ export class PartnerSessionTaskManager {
     if (task.control === "active" && isActive(task.status)) {
       const execution = this.#executionRuns(task), latest = execution.leaves.at(-1);
       const runs = execution.leaves.filter(run => run.state !== "completed" && run.state !== "aborted" && run.state !== "failed");
+      const openRunIds = new Set(this.store.listInteractions({ sessionId: task.sessionId, status: "open" })
+        .map(interaction => interaction.runId));
       const status: PartnerSessionTaskStatus = runs.some(run => run.state === "dispatch_unknown") || latest?.error?.stateMayHaveChanged === true ? "unknown"
-        : runs.some(run => run.state === "waiting") ? "waiting" : runs.some(run => run.state === "running" || run.state === "retrying") ? "running"
+        : runs.some(run => run.state === "waiting" || openRunIds.has(run.id)) ? "waiting"
+        : runs.some(run => run.state === "running" || run.state === "retrying") ? "running"
         : runs.length ? "queued" : latest?.state === "completed" ? "completed" : latest?.state === "aborted" ? "cancelled" : latest?.state === "failed" ? "failed" : task.status;
       if (status !== task.status) {
         task = { ...task, status, updatedAt: this.now(), ...(status === "completed" ? { result: this.#result(task.sessionId!, execution.ids, task.group !== undefined) } : {}),

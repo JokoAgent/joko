@@ -635,6 +635,7 @@ describe("Partner independent Session tasks", () => {
     const answered = await answer(interaction.generation);
     expect(answered.isError, answered.content[0]!.text).toBe(false);
     await expect(pending).resolves.toMatchObject({ kind: "selected", value: "allow_once" });
+    expect(currentTask().status).toBe("running");
 
     expect(interaction.runId).toBeDefined();
     const stopRun = vi.spyOn(f.host, "abort");
