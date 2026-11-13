@@ -472,7 +472,10 @@ it.each(["unobserved", "validation", "cleanup-unknown"] as const)("keeps a %s Cl
       expect(started.runtime.deletes).toEqual([]);
       expect(await started.runtime.getSessionInfo(nativeId, { dir: seed.workspace })).toBeDefined();
     } else {
-      expect(receipt?.state).toBe(failure === "validation" ? "cleaned" : "cleanup_unknown");
+      const diagnostics = fixture.application.store.listDiagnostics({ component: "native_session_derivation_cleanup", limit: 4 })
+        .map(({ code, message }) => ({ code, message }));
+      expect(receipt?.state, JSON.stringify({ diagnostics, sdk: started.runtime.cleanupObservations, deleteCalls: started.runtime.deletes.length }))
+        .toBe(failure === "validation" ? "cleaned" : "cleanup_unknown");
       expect(started.runtime.deletes).toEqual([nativeId]);
       expect(await started.runtime.getSessionInfo(nativeId, { dir: forkDirectory })).toBeUndefined();
     }
@@ -1236,6 +1239,7 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   readonly forks: { sourceId: string; dir: string; upToMessageId?: string }[] = [];
   readonly created: string[] = [];
   readonly deletes: string[] = [];
+  readonly cleanupObservations: Array<{ readonly stage: "lookup" | "delete"; readonly elapsedMs: number; readonly outcome: string }> = [];
   readonly #owner: SessionSdkOwner;
   onReceipt?: (id: string) => void;
   failure?: "unobserved" | "validation" | "cleanup-unknown";
@@ -1253,7 +1257,8 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   async retireQuery(): Promise<void> { throw new Error("This Session fixture does not perform live Query replacement."); }
   async getSessionInfo(sessionId: string, options: { dir: string; signal?: AbortSignal }) {
     if (this.#failNextDerivedRead && this.created.includes(sessionId)) { this.#failNextDerivedRead = false; return undefined; }
-    return await this.#owner.run({ kind: "getSessionInfo", sessionId, options: { dir: options.dir } }, { signal: options.signal }) as ClaudeSdkSessionInfo | undefined;
+    const lookup = () => this.#owner.run({ kind: "getSessionInfo", sessionId, options: { dir: options.dir } }, { signal: options.signal }) as Promise<ClaudeSdkSessionInfo | undefined>;
+    return this.created.includes(sessionId) ? this.#observeCleanup("lookup", lookup) : lookup();
   }
   async getSessionMessages(sessionId: string, options: ClaudeSdkGetSessionMessagesOptions) {
     const { signal, ...nativeOptions } = options;
@@ -1280,8 +1285,17 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   }
   async deleteSession(sessionId: string, options: { dir: string; signal?: AbortSignal }) {
     this.deletes.push(sessionId);
-    await this.#owner.run({ kind: "deleteSession", sessionId, options: { dir: options.dir } }, { signal: options.signal });
+    await this.#observeCleanup("delete", () => this.#owner.run({ kind: "deleteSession", sessionId, options: { dir: options.dir } }, { signal: options.signal }));
     if (this.failure === "cleanup-unknown") throw new SessionSdkFailure("CLEANUP_UNKNOWN", true);
+  }
+  async #observeCleanup<T>(stage: "lookup" | "delete", call: () => Promise<T>): Promise<T> {
+    const started = performance.now();
+    let outcome = "returned";
+    try { return await call(); }
+    catch (error) { outcome = error instanceof SessionSdkFailure ? error.code : "failed"; throw error; }
+    finally {
+      if (this.cleanupObservations.length < 8) this.cleanupObservations.push({ stage, elapsedMs: Math.round(performance.now() - started), outcome });
+    }
   }
   ownsSessionFork(sessionId: string) { return this.#owner.ownsSession(sessionId); }
   async closeSessionOperations() { await this.#owner.close(); }
