@@ -122,12 +122,20 @@ export async function snapshotSourceInstructions(context: AdapterContext, input:
   for (let index = 0; index < queue.length; index++) {
     const instruction = queue[index]!, replacements = new Map<string, string>();
     if (input.nativeKind === "claude-agent-sdk-stdio" && instruction.hops < 5) {
+      const localDirectory = path.dirname(instruction.local);
       const tokens = new Set<string>(); mapSourceInstructionImports(instruction.content, token => { tokens.add(token); return `@${token}`; });
       for (const token of tokens) {
-        const local = path.resolve(path.dirname(instruction.local), token.startsWith("~/") || token.startsWith("~\\") ? path.join(home, token.slice(2)) : token);
-        if (!roots.some(parent => within(local, parent))) continue;
-        const wire = await add(local, instruction.hops + 1);
-        if (wire) replacements.set(token, path.posix.relative(path.posix.dirname(instruction.wire), wire));
+        const trimmed = token.replace(/[.,;:!?]+$/u, "");
+        for (const candidate of trimmed && trimmed !== token ? [token, trimmed] : [token]) {
+          const expanded = candidate.startsWith("~/") || candidate.startsWith("~\\") ? path.join(home, candidate.slice(2)) : candidate;
+          const local = path.resolve(localDirectory, expanded);
+          if (!roots.some(parent => within(local, parent))) break;
+          const wire = await add(local, instruction.hops + 1);
+          if (!wire) continue;
+          const relative = path.posix.relative(path.posix.dirname(instruction.wire), wire);
+          replacements.set(token, `${relative}${token.slice(candidate.length)}`);
+          break;
+        }
       }
     }
     const content = mapSourceInstructionImports(instruction.content, token => replacements.has(token) ? `@${replacements.get(token)!}` : `\`@${token}\``);

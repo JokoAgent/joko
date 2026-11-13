@@ -32,7 +32,7 @@ describe("Claude native Source product Session", () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-source-session-"))), workspace = join(root, "workspace"), nativeRoot = join(root, "model-node");
     await mkdir(workspace); await mkdir(nativeRoot);
     const personalHome = join(root, "source-home"); await mkdir(join(personalHome, ".claude"), { recursive: true });
-    await writeFile(join(personalHome, ".claude", "CLAUDE.md"), "SOURCE_PERSONAL_GUIDANCE @guide.md");
+    await writeFile(join(personalHome, ".claude", "CLAUDE.md"), "SOURCE_PERSONAL_GUIDANCE @guide.md, then continue.");
     await writeFile(join(personalHome, ".claude", "guide.md"), "SOURCE_PERSONAL_IMPORTED_GUIDANCE");
     const deniedRead = `mcp__joko_${createHash("sha256").update(CLAUDE_HOSTED_EXECUTOR_SERVER).digest("hex").slice(0, 24)}__Read`;
     await writeFile(join(personalHome, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [deniedRead] },
