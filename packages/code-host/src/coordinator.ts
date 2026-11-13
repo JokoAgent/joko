@@ -23,6 +23,8 @@ export interface CodeHostProjectionCoordinatorOptions {
   readonly timeToLiveMs?: number;
   readonly notFoundTimeToLiveMs?: number;
   readonly clearProjectionOnNotFound?: boolean;
+  /** In-memory observations may recheck a preferred provider during a fallback's TTL. */
+  readonly recheckPreferredProviders?: boolean;
   readonly failureTimeToLiveMs?: number;
   readonly requestTimeoutMs?: number;
 }
@@ -30,6 +32,11 @@ export interface CodeHostProjectionCoordinatorOptions {
 export interface CodeHostProjectionRefreshResult {
   readonly projection: CodeHostSessionProjection;
   readonly changed: boolean;
+}
+
+interface ProviderFallback {
+  readonly cooldowns: ReadonlyMap<CodeHostProvider, number>;
+  readonly preferred: readonly CodeHostProvider[];
 }
 
 export class CodeHostProjectionCoordinator {
@@ -41,6 +48,7 @@ export class CodeHostProjectionCoordinator {
   private readonly clearProjectionOnNotFound: boolean;
   private readonly failureTimeToLiveMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly fallbacks?: WeakMap<CodeHostSessionReferenceProjection, ProviderFallback>;
   private readonly sessionInflight = new Map<string, Promise<CodeHostProjectionRefreshResult>>();
 
   constructor(options: CodeHostProjectionCoordinatorOptions) {
@@ -58,17 +66,19 @@ export class CodeHostProjectionCoordinator {
     this.timeToLiveMs = positiveDuration(options.timeToLiveMs ?? 60_000, "projection TTL");
     this.notFoundTimeToLiveMs = positiveDuration(options.notFoundTimeToLiveMs ?? 30_000, "not-found TTL");
     this.clearProjectionOnNotFound = options.clearProjectionOnNotFound ?? false;
+    if (options.recheckPreferredProviders === true) this.fallbacks = new WeakMap();
     this.failureTimeToLiveMs = positiveDuration(options.failureTimeToLiveMs ?? 60_000, "failure TTL");
     this.requestTimeoutMs = positiveDuration(options.requestTimeoutMs ?? 15_000, "request timeout");
   }
 
   refreshSession(
     sessionOwnerId: string,
-    references: readonly CodeHostPullRequestReference[]
+    references: readonly CodeHostPullRequestReference[],
+    assertCurrent?: () => void
   ): Promise<CodeHostProjectionRefreshResult> {
     const pending = this.sessionInflight.get(sessionOwnerId);
     if (pending !== undefined) return pending;
-    const request = this.refreshSessionUnshared(sessionOwnerId, references).finally(() => {
+    const request = this.refreshSessionUnshared(sessionOwnerId, references, assertCurrent).finally(() => {
       if (this.sessionInflight.get(sessionOwnerId) === request) this.sessionInflight.delete(sessionOwnerId);
     });
     this.sessionInflight.set(sessionOwnerId, request);
@@ -77,15 +87,28 @@ export class CodeHostProjectionCoordinator {
 
   private async refreshSessionUnshared(
     sessionOwnerId: string,
-    references: readonly CodeHostPullRequestReference[]
+    references: readonly CodeHostPullRequestReference[],
+    assertCurrent?: () => void
   ): Promise<CodeHostProjectionRefreshResult> {
+    assertCurrent?.();
     const before = this.repository.read(sessionOwnerId);
     let current = reconcileCodeHostSessionReferences(before, sessionOwnerId, references);
+    if (before !== undefined && this.fallbacks !== undefined) {
+      // Reconciliation copies entries. Carry the private cooldown with each unchanged reference.
+      const previous = new Map(before.references.map((entry) => [entry.reference.key, entry]));
+      for (const entry of current.references) {
+        const prior = previous.get(entry.reference.key);
+        if (prior === undefined || prior.reference.webUrl !== entry.reference.webUrl) continue;
+        const fallback = this.fallbacks.get(prior);
+        if (fallback !== undefined) this.fallbacks.set(entry, fallback);
+      }
+    }
     let changed = !sameCodeHostSessionProjection(before, current);
     if (changed) this.repository.write(current);
 
     for (const entry of current.references) {
-      const refreshed = await this.refreshReference(sessionOwnerId, entry);
+      const refreshed = await this.refreshReference(sessionOwnerId, entry, assertCurrent);
+      assertCurrent?.();
       if (refreshed === entry) continue;
       current = {
         ...current,
@@ -99,20 +122,27 @@ export class CodeHostProjectionCoordinator {
 
   private async refreshReference(
     sessionOwnerId: string,
-    entry: CodeHostSessionReferenceProjection
+    entry: CodeHostSessionReferenceProjection,
+    assertCurrent?: () => void
   ): Promise<CodeHostSessionReferenceProjection> {
     const observedAt = this.now();
-    if (
-      (entry.freshUntil ?? 0) > observedAt
+    const cached = (entry.freshUntil ?? 0) > observedAt
       || (entry.notFoundUntil ?? 0) > observedAt
-      || (entry.retryAfterUntil ?? 0) > observedAt
-    ) return entry;
-    const providers = this.supportingProviders(entry.reference);
+      || (entry.retryAfterUntil ?? 0) > observedAt;
+    const fallback = this.fallbacks?.get(entry);
+    if (cached && !fallback?.preferred.length) return entry;
+    const supporting = this.supportingProviders(entry.reference);
+    const providers = cached && fallback !== undefined ? supporting.filter((provider) => fallback.preferred.includes(provider)) : supporting;
     if (providers.length === 0) return entry;
+    const unavailable: CodeHostProvider[] = [];
     let provider: CodeHostProvider | undefined;
+    let refreshed: CodeHostSessionReferenceProjection;
     try {
       let result: CodeHostProviderResult | undefined;
       for (const candidate of providers) {
+        assertCurrent?.();
+        // An authenticated refresh must not reset the anonymous endpoint's cooldown.
+        if ((fallback?.cooldowns.get(candidate) ?? 0) > observedAt) return entry;
         try {
           result = await withTimeout(
             (signal) => candidate.getPullRequest(entry.reference, { signal, sessionOwnerId }),
@@ -121,7 +151,10 @@ export class CodeHostProjectionCoordinator {
           provider = candidate;
           break;
         } catch (error) {
-          if (error instanceof CodeHostProviderUnavailableError) continue;
+          if (error instanceof CodeHostProviderUnavailableError) {
+            unavailable.push(candidate);
+            continue;
+          }
           provider = candidate;
           throw error;
         }
@@ -129,7 +162,7 @@ export class CodeHostProjectionCoordinator {
       if (result === undefined || provider === undefined) return entry;
       const projection = validatedProviderResult(result, observedAt);
       const timeToLiveMs = Math.max(this.timeToLiveMs, provider.minimumTimeToLiveMs ?? 0);
-      return {
+      refreshed = {
         reference: entry.reference,
         projection,
         freshUntil: observedAt + timeToLiveMs
@@ -138,7 +171,7 @@ export class CodeHostProjectionCoordinator {
       const minimumTimeToLiveMs = provider?.minimumTimeToLiveMs ?? 0;
       if (error instanceof CodeHostPullRequestNotFoundError) {
         const projection = this.clearProjectionOnNotFound ? undefined : entry.projection;
-        return {
+        refreshed = {
           reference: entry.reference,
           ...(projection === undefined ? {} : { projection }),
           notFoundUntil: observedAt + Math.max(
@@ -146,20 +179,26 @@ export class CodeHostProjectionCoordinator {
             minimumTimeToLiveMs
           )
         };
+      } else {
+        const requestedDelay = error instanceof CodeHostProviderRetryableError
+          ? error.retryAfterMs ?? 0
+          : 0;
+        refreshed = {
+          reference: entry.reference,
+          ...(entry.projection === undefined ? {} : { projection: entry.projection }),
+          retryAfterUntil: observedAt + Math.max(this.failureTimeToLiveMs, requestedDelay, minimumTimeToLiveMs)
+        };
       }
-      const requestedDelay = error instanceof CodeHostProviderRetryableError
-        ? error.retryAfterMs ?? 0
-        : 0;
-      return {
-        reference: entry.reference,
-        ...(entry.projection === undefined ? {} : { projection: entry.projection }),
-        retryAfterUntil: observedAt + Math.max(
-          this.failureTimeToLiveMs,
-          requestedDelay,
-          minimumTimeToLiveMs
-        )
-      };
     }
+    if (this.fallbacks !== undefined && provider !== undefined) {
+      const cooldowns = new Map(fallback?.cooldowns);
+      const deadline = refreshed.freshUntil ?? refreshed.notFoundUntil ?? refreshed.retryAfterUntil;
+      if (unavailable.length > 0 && deadline !== undefined) cooldowns.set(provider, deadline);
+      if (cooldowns.size > 0) {
+        this.fallbacks.set(refreshed, { cooldowns, preferred: refreshed.retryAfterUntil === undefined ? unavailable : [] });
+      }
+    }
+    return refreshed;
   }
 
   private supportingProviders(reference: CodeHostPullRequestReference): CodeHostProvider[] {
