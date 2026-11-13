@@ -280,6 +280,7 @@ const mobileTaskMessageRows = [
   ["task.returnLatest", "Return to latest", "返回最新消息", "返回最新訊息", "最新に戻る", "최신으로 돌아가기"],
   ["task.loadingHistory", "Loading history…", "正在加载历史记录…", "正在載入歷史記錄…", "履歴を読み込み中…", "기록 불러오는 중…"],
   ["task.loadEarlier", "Load earlier history", "加载更早的历史记录", "載入更早的歷史記錄", "以前の履歴を読み込む", "이전 기록 불러오기"],
+  ["task.loadNewer", "Load newer history", "加载较新的历史记录", "載入較新的歷史記錄", "新しい履歴を読み込む", "이후 기록 불러오기"],
   ["task.offlineEmpty", "No messages in the saved offline copy.", "已保存的离线副本中没有消息。", "已儲存的離線副本中沒有訊息。", "保存済みのオフラインコピーにメッセージはありません。", "저장된 오프라인 사본에 메시지가 없습니다."],
   ["task.offlineMissing", "No saved offline messages for this task. Reconnect to load it.", "此任务没有已保存的离线消息。请重新连接后加载。", "此任務沒有已儲存的離線訊息。請重新連線後載入。", "このタスクには保存済みのオフラインメッセージがありません。再接続して読み込んでください。", "이 작업에는 저장된 오프라인 메시지가 없습니다. 다시 연결해 불러오세요."],
   ["task.empty", "No messages yet", "还没有消息", "尚無訊息", "まだメッセージはありません", "아직 메시지가 없습니다"],
