@@ -149,6 +149,7 @@ export function PortableSessionExportDialog({
           setExcludeMedia(true);
           setOversizeMediaMb(Math.round(result.mediaBytes / (1024 * 1024)));
         } else {
+          setOversizeMediaMb(undefined);
           setError(labels.oversizeFailure);
         }
         return;

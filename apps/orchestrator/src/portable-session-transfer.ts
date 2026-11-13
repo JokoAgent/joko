@@ -9,6 +9,7 @@ import {
   createPortableSessionManifest,
   decodePortableSessionPackage,
   encodePortableSessionPackage,
+  PortableSessionPackageError,
   type PortableSessionFidelity,
   type PortableSessionPackage,
   type PortableSessionManifest,
@@ -213,10 +214,18 @@ export async function buildPortableSessionExport(
     ...(input.nativeSession === undefined ? {} : { nativeHistoryEntry: "native/main.jsonl" }),
     ...(workers.length === 0 ? {} : { workers })
   });
-  const bytes = encodePortableSessionPackage({ manifest, entries }, {
-    ...(input.password === undefined ? {} : { password: input.password }),
-    contentLimitBytes: limit
-  });
+  let bytes: Uint8Array;
+  try {
+    bytes = encodePortableSessionPackage({ manifest, entries }, {
+      ...(input.password === undefined ? {} : { password: input.password }),
+      contentLimitBytes: limit
+    });
+  } catch (error) {
+    if (error instanceof PortableSessionPackageError && error.code === "CONTENT_LIMIT_EXCEEDED" && error.contentBytes !== undefined) {
+      throw new PortableSessionExportTooLargeError(error.contentBytes, mediaBytes, limit);
+    }
+    throw error;
+  }
   if (bytes.byteLength > limit) throw new PortableSessionExportTooLargeError(bytes.byteLength, mediaBytes, limit);
   return {
     bytes,

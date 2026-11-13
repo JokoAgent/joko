@@ -182,6 +182,21 @@ describe("PortableSessionExportDialog", () => {
     expect(onExported).toHaveBeenCalledWith("partial");
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it.each([false, true])("reports a size failure when excluding media cannot help, retry=%s", async (withMedia) => {
+    const onExport = vi.fn()
+      .mockResolvedValueOnce({ status: "oversize", mediaBytes: withMedia ? 12 * 1024 * 1024 : 0, limitBytes: 10 * 1024 * 1024 })
+      .mockResolvedValueOnce({ status: "oversize", mediaBytes: 0, limitBytes: 10 * 1024 * 1024 });
+    const onExported = vi.fn();
+    const container = await render(<PortableSessionExportDialog open labels={labels} onClose={vi.fn()}
+      onExport={onExport} connectionOwner={onExport} onExported={onExported} />);
+
+    await act(async () => buttonWithText(container, "Export").click());
+    if (withMedia) await act(async () => buttonWithText(container, "Export without media").click());
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(labels.oversizeFailure);
+    expect(container.querySelector(".portable-session-form__hint")).toBeNull();
+    expect(onExported).not.toHaveBeenCalled();
+  });
 });
 
 describe("PortableSessionImportDialog", () => {

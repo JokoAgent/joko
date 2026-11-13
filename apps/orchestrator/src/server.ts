@@ -13,7 +13,7 @@ import { registerConnectServices } from "./connect-services.js";
 import { registerHostedAgentDesktopService } from "./hosted-agent-desktop-service.js";
 import { registerInputHandoffNativeHost } from "./input-handoff/native-host.js";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
-import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER } from "@joko/contracts";
+import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, PORTABLE_SESSION_LIMIT_BYTES_HEADER, PORTABLE_SESSION_MEDIA_BYTES_HEADER } from "@joko/contracts";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
 import { ExtensionMainViewError, surfaceHeaders } from "./extension-main-view-manager.js";
 import { ISOLATED_EXTENSION_CSP } from "./extension-main-view-document.js";
@@ -182,7 +182,8 @@ export async function createPublicServer(application: OrchestratorApplication, o
   await server.register(cors, {
     credentials: false,
     allowedHeaders: ["authorization", "content-type", "connect-protocol-version", "connect-timeout-ms", "x-joko-client-version", "x-joko-isolated-document", "if-match", EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER],
-    exposedHeaders: ["connect-content-encoding", "connect-accept-encoding", "grpc-status", "grpc-message", "content-security-policy", "etag"],
+    exposedHeaders: ["connect-content-encoding", "connect-accept-encoding", "grpc-status", "grpc-message", "content-security-policy", "etag",
+      PORTABLE_SESSION_LIMIT_BYTES_HEADER, PORTABLE_SESSION_MEDIA_BYTES_HEADER],
     methods: ["GET", "POST", "PUT", "OPTIONS"],
     origin(origin, callback) {
       const allowed = origin === undefined || origin === JOKO_DESKTOP_APP_ORIGIN ||
