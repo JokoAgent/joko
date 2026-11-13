@@ -2,6 +2,7 @@ import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { ContactKind, ContactSource, ContactStatus, ContactVCardImportDisposition, OperationMutationSchema, OperationState } from "@joko/contracts";
+import { redactSecrets } from "@joko/core";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -98,8 +99,36 @@ mountedIt("opens an isolated Contacts draft and sends through its explicitly tru
     await draft.getByRole("checkbox", { name: /Trust the new dialogue workspace on/u }).check();
     expect(store.listSessions()).toHaveLength(0);
     expect(store.listTargets()).toHaveLength(targetCount);
+    const sendStartedAt = Date.now();
+    const rpc: string[] = [];
+    const recordRpc = (url: string, phase: string): void => {
+      const method = new URL(url).pathname.match(/^\/joko\.v1\.(?:ContactService|OperationService|TargetService)\/(GetContactDirectory|SubmitOperation|WatchOperation|PrepareTargetWorkspace)$/u)?.[1];
+      if (method !== undefined && rpc.length < 24) rpc.push(`${Date.now() - sendStartedAt}ms ${method} ${phase}`);
+    };
+    page.on("request", request => recordRpc(request.url(), "requested"));
+    page.on("response", response => recordRpc(response.url(), String(response.status())));
+    page.on("requestfailed", request => recordRpc(request.url(), "failed"));
     await draft.getByRole("button", { name: "Send", exact: true }).click();
-    await waitFor(async () => real.providerRequests.length, count => count >= 1, "the first Contacts Pi request");
+    await waitFor(async () => real.providerRequests.length, count => count >= 1, "the first Contacts Pi request").catch(async (error: unknown) => {
+      const operations = store.listOperations({ limit: 12 }).map(({ kind, status, error: failure }) => ({
+        kind, status,
+        code: typeof failure === "object" && failure !== null && "code" in failure && typeof failure.code === "string" ? failure.code : undefined
+      }));
+      const targets = store.listTargets().map(({ descriptor }) => ({
+        backend: descriptor.backendId, managed: descriptor.managed, trusted: descriptor.trusted
+      }));
+      const queue = store.listQueueItems({ limit: 4 }).map(({ state, error: failure }) => ({ state, code: failure?.code, phase: failure?.phase }));
+      const runs = store.listRuns({ limit: 4 }).map(({ descriptor: { state, error: failure } }) => ({ state, code: failure?.code, phase: failure?.phase }));
+      const ui = await page.evaluate(() => ({
+        onContactsDraft: window.location.hash.startsWith("#/tasks/new?contacts="),
+        alerts: Array.from(document.querySelectorAll(".error-banner[role=alert] > span, .new-task-warning[role=alert] > span"))
+          .slice(0, 3).map(element => element.textContent?.trim().slice(0, 240) ?? "")
+      })).catch(() => undefined);
+      throw new Error(`Contacts send observation: ${JSON.stringify({
+        rpc, operations, targets, sessions: store.listSessions().length, queue, runs,
+        ui: ui === undefined ? undefined : { ...ui, alerts: ui.alerts.map(redactSecrets) }
+      })}`, { cause: error });
+    });
     expect(JSON.stringify(real.providerRequests[0]?.body.tools)).toContain(tool);
     // Ask mode still requires confirmation for this MCP call.
     await page.locator(".decision-options .decision-option").filter({ hasText: "Allow once" }).click({ timeout: 20_000 });
