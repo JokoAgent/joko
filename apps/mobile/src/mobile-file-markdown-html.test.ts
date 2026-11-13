@@ -18,9 +18,10 @@ describe("file Markdown document", () => {
       border: dark ? "#394246" : "#e1e2df", accent: "#ff9800", negative: "#cc634e",
       brandBackground: dark ? "#302920" : "#fff1db", dark
     };
-    const html = buildMobileFileMarkdownHtml({ text: "first\nfocus line\nlast\n", label: "README.md", colors: theme, focusLine: 2 },
+    const html = buildMobileFileMarkdownHtml({ text: "first\nfocus line **_[Docs](https://example.test)_**\nlast\n", label: "README.md", colors: theme, focusLine: 2 },
       { katexScript: "", katexCss: "", mermaidScript: "" });
     expect(html).toContain("focus line");
+    expect(html).toContain('<strong><em><a href="https://example.test">Docs</a></em></strong>');
     expect(html).toContain(`background:${theme.background};color:${theme.ink}`);
     expect(html).not.toContain(theme.brandBackground);
   });
@@ -56,7 +57,8 @@ describe("file Markdown document", () => {
     const module = transformer.testing.buildRichMarkdownRuntimeModule(readFileSync(entry, "utf8"), entry);
     const runtime = JSON.parse(module.slice("module.exports = ".length, -1)) as MobileMarkdownRichRuntime;
     const text = ["# Title", "", "| Key | Value |", "| --- | --- |", "| a | b |", "", "$$", "x^2 + \\frac{1}{2}", "$$", "",
-      "```ts", "const value = '<script>window.spoof=1</script>';", "```", "", "![Pixel](pixel.png)", "", "[web](https://example.invalid) [unsafe](javascript:alert(1))", "",
+      "```ts", "const value = '<script>window.spoof=1</script>';", "```", "", "![Pixel](pixel.png)", "",
+      "**_[web](https://example.invalid)_ and `source` and $x^2$** ~~[unsafe](javascript:alert(1))~~", "",
       "```mermaid", "graph TD; A-->B", "```"].join("\n");
     const scrolled: string[] = [];
     const dom = new JSDOM(buildMobileFileMarkdownHtml({ text, colors, label: "File <title>", focusLine: 4 }, runtime), { runScripts: "dangerously", beforeParse(window: Window) {
@@ -67,6 +69,10 @@ describe("file Markdown document", () => {
     expect(document.querySelector(".katex")).not.toBeNull(); expect(document.querySelector("pre code")?.textContent).toContain("<script>window.spoof=1</script>");
     expect(dom.window.spoof).toBeUndefined(); expect(document.querySelectorAll("a")).toHaveLength(1);
     expect(document.querySelector("a")?.getAttribute("href")).toBe("https://example.invalid"); expect(scrolled).toContain("2");
+    expect(document.querySelector("strong em a")?.textContent).toBe("web");
+    expect(document.querySelector("strong code")?.textContent).toBe("source");
+    expect(document.querySelector('strong [data-latex="x^2"] .katex')).not.toBeNull();
+    expect(document.querySelector("del")?.textContent).toContain("[unsafe](javascript:alert(1))");
     expect(document.querySelector("main")?.getAttribute("aria-label")).toBe("File <title>");
     expect(document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content")).toContain("connect-src 'none'");
     expect(document.querySelector("img")).toBeNull(); const article = document.querySelector("main");

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupMobileMarkdownSelectableBlocks, parseMobileMarkdown, parseMobileMarkdownIncremental } from "./mobile-markdown";
+import { collectMobileMarkdownImages, groupMobileMarkdownSelectableBlocks, parseMobileMarkdown, parseMobileMarkdownIncremental, parseMobileMarkdownInlines } from "./mobile-markdown";
 import { mobileCodeHighlight } from "./mobile-code-highlight";
 
 describe("mobile Markdown presentation", () => {
@@ -19,6 +19,31 @@ describe("mobile Markdown presentation", () => {
     const edited = parseMobileMarkdownIncremental("Changed\n\n" + prefix, appended);
     expect(edited.incremental).toBe(false);
     expect(edited.blocks[0]).not.toBe(first.blocks[0]);
+  });
+
+  it("preserves typed links, code and math through nested inline emphasis", () => {
+    const text = '**_[Docs](https://example.test)_ and `code`** ~~$x^2$~~';
+    expect(parseMobileMarkdownInlines(text)).toEqual([
+      { type: "link", text: "Docs", url: "https://example.test", marks: ["strong", "emphasis"] },
+      { type: "strong", text: " and " }, { type: "code", text: "code", marks: ["strong"] },
+      { type: "text", text: " " }, { type: "math", text: "x^2", marks: ["strikethrough"] }
+    ]);
+    expect(parseMobileMarkdown(text, { literalEmphasis: true })[0]).toMatchObject({ inlines: [
+      { type: "strong", text: "_[Docs](https://example.test)_ and `code`" },
+      { type: "text", text: " " }, { type: "strikethrough", text: "$x^2$" }
+    ] });
+  });
+
+  it("leaves images and escaped or incomplete inner markup literal inside an emphasis body", () => {
+    const badge = '<sub>![Badge](https://example.test/badge.png)</sub>';
+    const raw = '<img src="https://example.test/icon.png">';
+    const text = `**${badge} ${raw} _partial**`;
+    expect(parseMobileMarkdownInlines(text)).toEqual([{ type: "strong", text: `${badge} ${raw} _partial` }]);
+    expect(collectMobileMarkdownImages(`${text}\n\n![Visible](https://example.test/image.png)`))
+      .toEqual([{ type: "image", alt: "Visible", url: "https://example.test/image.png" }]);
+    expect(parseMobileMarkdownInlines(String.raw`**\_literal_ and \[Docs](https://example.test)**`))
+      .toEqual([{ type: "strong", text: String.raw`\_literal_ and \[Docs](https://example.test)` }]);
+    expect(parseMobileMarkdownInlines(String.raw`\**literal**`)).toEqual([{ type: "text", text: String.raw`\**literal**` }]);
   });
 
   it("keeps exact source through syntax highlighting and bounds selectable text runs without dropping text", () => {

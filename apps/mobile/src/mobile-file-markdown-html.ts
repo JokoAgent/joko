@@ -1,6 +1,7 @@
 import { mobileCodeHighlight } from "./mobile-code-highlight";
 import { parseMobileMarkdown, type MobileMarkdownBlock, type MobileMarkdownInline } from "./mobile-markdown";
-import { escapeMobileMarkdownHtml as escapeHtml, mobileMarkdownScriptValue, type MobileMarkdownColors, type MobileMarkdownRichRuntime } from "./mobile-markdown-rich-html";
+import { escapeMobileMarkdownHtml as escapeHtml, mobileMarkdownScriptValue, wrapMobileMarkdownHtmlMarks,
+  type MobileMarkdownColors, type MobileMarkdownRichRuntime } from "./mobile-markdown-rich-html";
 import { mobileMarkdownResourceKey, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 
 /** A scrolling document, using the same parser and highlighting as task messages. */
@@ -14,7 +15,7 @@ export function buildMobileFileMarkdownHtml(input: {
     throw new Error("The Markdown file preview is too large or has invalid colors.");
   }
   const blocks = parseMobileMarkdown(input.text, { srcLines: true });
-  const inlines = (values: readonly MobileMarkdownInline[]): string => values.map(inline).join("");
+  const inlines = (values: readonly MobileMarkdownInline[]): string => values.map(value => wrapMobileMarkdownHtmlMarks(inline(value), value.marks)).join("");
   const inline = (value: MobileMarkdownInline): string => {
     if (value.type === "image") {
       const key = mobileMarkdownResourceKey(value); const image = key ? input.resources?.references.get(key)?.image : undefined;

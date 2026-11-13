@@ -65,7 +65,7 @@ describe("native file reading", () => {
   beforeEach(() => { native.currentState = "active"; native.scrollToIndex.mockClear(); native.inject.mockClear(); native.openURL.mockClear(); });
   it("quotes from the native Markdown selection menu, copies exact source and rejects the retired rendered menu", async () => {
     const container = document.createElement("div"); const root = createRoot(container);
-    const preview = { ...base, fileName: "README.md", text: "\uFEFF# Heading\r\n\r\nSelected 😀 text" };
+    const preview = { ...base, fileName: "README.md", text: "\uFEFF# Heading\r\n\r\n**[Selected 😀 text](https://example.test/read)**" };
     const quoted = vi.fn(); const add = vi.fn(async () => undefined); const write = vi.fn(async () => true);
     const clipboard = new MobileFilesClipboard(write);
     const client = { filesHtmlResourceOwnerKey: () => "owner", subscribe: () => () => undefined,
@@ -77,6 +77,9 @@ describe("native file reading", () => {
     await act(async () => { root.render(createElement(Reader)); });
     expect(native.web?.menuItems).toEqual([{ key: "joko-file-quote", label: "Add to conversation" }]);
     const rendered = native.web!; await act(async () => { rendered.onLoad!(); });
+    expect(rendered.source.html).toContain('<strong><a href="https://example.test/read">Selected 😀 text</a></strong>');
+    expect(rendered.onShouldStartLoadWithRequest({ url: "https://example.test/read" })).toBe(false);
+    expect(native.openURL).toHaveBeenCalledExactlyOnceWith("https://example.test/read");
     await act(async () => { native.web!.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "x".repeat(4_001) } }); });
     expect(container.textContent).toContain("Select at most 4,000 characters"); expect(add).not.toHaveBeenCalled();
     await act(async () => { native.web!.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "Selected 😀 text" } }); });
@@ -85,6 +88,8 @@ describe("native file reading", () => {
     await act(async () => { (container.querySelector('[aria-label="Copy source"]') as HTMLButtonElement).click(); });
     expect(write).toHaveBeenCalledExactlyOnceWith(preview.text); expect(container.querySelector("output")?.textContent).toBe("copied");
     await act(async () => { rendered.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "late" } }); });
+    expect(rendered.onShouldStartLoadWithRequest({ url: "https://example.test/read" })).toBe(false);
+    expect(native.openURL).toHaveBeenCalledOnce();
     expect(add).toHaveBeenCalledOnce(); await act(async () => { root.unmount(); });
   });
 

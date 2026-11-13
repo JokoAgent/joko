@@ -1,3 +1,5 @@
+import type { MobileMarkdownInlineMark } from "./mobile-markdown";
+
 export interface MobileMarkdownRichRuntime {
   readonly mermaidScript: string;
   readonly katexScript: string;
@@ -23,6 +25,12 @@ export function mobileMarkdownScriptValue(value: string): string {
 export function escapeMobileMarkdownHtml(value: string): string {
   return value.replace(/&/gu, "&amp;").replace(/</gu, "&lt;").replace(/>/gu, "&gt;")
     .replace(/"/gu, "&quot;").replace(/'/gu, "&#39;");
+}
+
+const markTags = { strong: "strong", emphasis: "em", strikethrough: "del" } as const;
+
+export function wrapMobileMarkdownHtmlMarks(html: string, marks: readonly MobileMarkdownInlineMark[] | undefined): string {
+  return marks?.reduceRight((inner, mark) => `<${markTags[mark]}>${inner}</${markTags[mark]}>`, html) ?? html;
 }
 
 export function buildMobileMarkdownRichHtml(input: {

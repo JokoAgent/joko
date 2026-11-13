@@ -10,7 +10,9 @@ import {
 } from './mobile-markdown-path-candidate';
 const DEEP_LINK_SCHEME_GROUP = 'joko';
 
-export type MobileMarkdownInline =
+export type MobileMarkdownInlineMark = 'strong' | 'emphasis' | 'strikethrough';
+
+export type MobileMarkdownInline = (
   | { type: 'text'; text: string }
   // bare:这条 link 是从正文纯文本里切出来的裸路径(matchBareFilePathLink),不是作者
   // 手写的 `[label](url)`。渲染层据此决定点亮后是否套等宽 chip —— 裸路径的未点亮态是
@@ -26,7 +28,8 @@ export type MobileMarkdownInline =
   // 原生 Text 流渲染时经 latexToUnicodeApproximation 近似;WebView 面(文件
   // 阅读器)可用 KaTeX 精确渲染。
   | { type: 'math'; text: string }
-  | MobileMarkdownImageInline;
+  | MobileMarkdownImageInline
+) & { readonly marks?: readonly MobileMarkdownInlineMark[] };
 
 // 正文图片:来自 ![alt](url) 或模型常用的 raw HTML <img src="..." width="150">(见桌面端 remarkHtmlImages)。
 // Markdown 图片还可保留桌面本地/相对路径;会话渲染时再结合被控端 workdir
@@ -63,6 +66,8 @@ export interface ParseMobileMarkdownOptions {
    * 默认关闭:聊天气泡路径不需要,且既有消费方/测试按无此字段的形状断言。
    */
   srcLines?: boolean;
+  /** Keep emphasis bodies intact for consumers that redact the original text runs. */
+  literalEmphasis?: boolean;
   /** Internal offsets used when parsing an append-only suffix. */
   lineOffset?: number;
   blockIndexOffset?: number;
@@ -136,6 +141,8 @@ export function parseMobileMarkdownDocument(
   options?: ParseMobileMarkdownOptions,
 ): MobileMarkdownParseResult {
   const withSrc = options?.srcLines === true;
+  const inlineMode = options?.literalEmphasis ? 'literal-emphasis' : 'markdown';
+  const parseInlines = (text: string, startsInsideHtmlComment: boolean) => parseInlineBody(text, startsInsideHtmlComment, inlineMode);
   // LaTeX 定界符归一化(\(...\) / \[...\] → $...$ / $$...$$,desktop/mobile 共用
   // 实现)。srcLines 模式走保行数变体:单行 inline 照常转换(同行替换,不破坏
   // 「块 srcLine ↔ 源码行」映射),会插行的 display 保持源码——与桌面端
@@ -197,7 +204,7 @@ export function parseMobileMarkdownDocument(
       type: 'paragraph',
       key: `p:${lineNumber(lineIndex)}:${blockNumber()}`,
       ...(withSrc ? { srcLine: lineNumber(paragraphStart) } : {}),
-      inlines: parseMobileMarkdownInlines(text, paragraphStartsInComment),
+      inlines: parseInlines(text, paragraphStartsInComment),
     }, paragraphStart, lineIndex);
   };
 
@@ -311,7 +318,7 @@ export function parseMobileMarkdownDocument(
         key: `h:${lineNumber(index)}:${blockNumber()}`,
         ...(withSrc ? { srcLine: lineNumber(index) } : {}),
         level: heading[1].length,
-        inlines: parseMobileMarkdownInlines(heading[2].trim(), lineStartsInComment),
+        inlines: parseInlines(heading[2].trim(), lineStartsInComment),
       }, index, index + 1);
       continue;
     }
@@ -330,7 +337,7 @@ export function parseMobileMarkdownDocument(
         type: 'blockquote',
         key: `quote:${lineNumber(quoteStart)}:${blockNumber()}`,
         ...(withSrc ? { srcLine: lineNumber(quoteStart) } : {}),
-        inlines: parseMobileMarkdownInlines(quoteLines.join('\n').trim(), lineStartsInComment),
+        inlines: parseInlines(quoteLines.join('\n').trim(), lineStartsInComment),
       }, quoteStart, index + 1);
       continue;
     }
@@ -346,7 +353,7 @@ export function parseMobileMarkdownDocument(
       const parseCellsWithCommentState = (cells: readonly string[], rowState: boolean) => {
         let cellState = rowState;
         return cells.map((cell) => {
-          const parsed = parseMobileMarkdownInlines(cell, cellState);
+          const parsed = parseInlines(cell, cellState);
           cellState = advanceHtmlCommentState(cell, cellState);
           return parsed;
         });
@@ -384,7 +391,7 @@ export function parseMobileMarkdownDocument(
         ordered: /^\d/.test(marker),
         marker,
         checked: task ? task[1].toLowerCase() === 'x' : undefined,
-        inlines: parseMobileMarkdownInlines(task ? task[2] : list[3], lineStartsInComment),
+        inlines: parseInlines(task ? task[2] : list[3], lineStartsInComment),
       }, index, index + 1);
       continue;
     }
@@ -992,22 +999,58 @@ function stripCodeFenceIndent(line: string, indent: string): string {
 
 export function parseMobileMarkdownInlines(
   input: string,
-  startsInsideHtmlComment = false,
+  options?: Pick<ParseMobileMarkdownOptions, 'literalEmphasis'>,
 ): MobileMarkdownInline[] {
+  return parseInlineBody(input, false, options?.literalEmphasis ? 'literal-emphasis' : 'markdown');
+}
+
+export function mobileMarkdownInlineHasMark(inline: MobileMarkdownInline, mark: MobileMarkdownInlineMark): boolean {
+  return inline.type === mark || inline.marks?.includes(mark) === true;
+}
+
+function parseInlineBody(input: string, startsInsideHtmlComment: boolean, mode: 'markdown' | 'emphasis-body' | 'literal-emphasis'): MobileMarkdownInline[] {
   const out: MobileMarkdownInline[] = [];
+  const insideMark = mode === 'emphasis-body';
+  const hasComments = startsInsideHtmlComment || input.includes('<!--');
+  let commentProbe: string | undefined;
+  const inMarkup = (index: number): boolean => (hasComments && isInsideHtmlComment(
+    commentProbe ??= blankEscapedAngles(blankCodeSpans(input)), index, startsInsideHtmlComment,
+  )) || isInsideHtmlTagMarkup(input, index);
   let cursor = 0;
   while (cursor < input.length) {
-    const token = findNextInlineToken(input, cursor, startsInsideHtmlComment);
+    const token = findNextInlineToken(input, cursor, startsInsideHtmlComment, insideMark);
     if (!token) {
       pushText(out, input.slice(cursor));
       break;
     }
     if (token.index > cursor) pushText(out, input.slice(cursor, token.index));
-    out.push(token.inline);
+    const inline = token.inline;
+    if (mode === 'literal-emphasis') {
+      out.push(inline);
+    } else if (inline.type === 'text' || insideMark && (inMarkup(token.index) || isBackslashEscaped(input, token.index))) {
+      pushText(out, input.slice(token.index, token.end));
+    } else if (inline.type === 'strong' || inline.type === 'emphasis' || inline.type === 'strikethrough') {
+      const mark = inline.type;
+      const closing = token.end - (mark === 'emphasis' ? 1 : 2);
+      if (isBackslashEscaped(input, token.index) || isBackslashEscaped(input, closing)) {
+        pushText(out, input.slice(token.index, token.end));
+      } else if (inMarkup(token.index) || !INLINE_SYNTAX_HINT_RE.test(inline.text)) {
+        out.push(inline);
+      } else {
+        // The delimiter is excluded from its body by the emphasis matcher.
+        for (const child of parseInlineBody(inline.text, false, 'emphasis-body')) {
+          out.push(child.type === 'text' ? { type: mark, text: child.text } : { ...child, marks: [mark, ...(child.marks ?? [])] });
+        }
+      }
+    } else {
+      out.push(inline);
+    }
     cursor = token.end;
   }
   return out.length > 0 ? out : [{ type: 'text', text: input }];
 }
+
+const INLINE_SYNTAX_HINT_RE = /[\x60$*_~\[<\/\\]/u;
 
 /** Mobile 只把 `~~` 当删除线，单个 `~` 是普通字符，不能当 URL 包裹标记。 */
 function mobileMarkdownWrapMarker(prefix: string): string | null {
@@ -1019,12 +1062,15 @@ function findNextInlineToken(
   input: string,
   from: number,
   startsInsideHtmlComment: boolean,
+  insideMark: boolean,
 ): { index: number; end: number; inline: MobileMarkdownInline } | null {
+  const literalText = (match: RegExpExecArray): MobileMarkdownInline => ({ type: 'text', text: match[0] });
   const candidates = [
-    // 图片要放在 link / 裸 URL 之前:![alt](url) 的 "[alt](url)" 子串会被 link 规则命中,
-    // 靠 image 的起点(`!`)更靠前在排序里胜出,这里的顺序只是可读性上的强调。
-    matchMarkdownImage(input, from, startsInsideHtmlComment),
-    matchHtmlImage(input, from, startsInsideHtmlComment),
+    // An emphasized image remains source text, including its entire destination.
+    insideMark ? matchRegex(input, from, LOCAL_MARKDOWN_IMAGE_RE, literalText)
+      : matchMarkdownImage(input, from, startsInsideHtmlComment),
+    insideMark ? matchRegex(input, from, HTML_IMG_TAG_RE, literalText)
+      : matchHtmlImage(input, from, startsInsideHtmlComment),
     // 仅识别 HTTP(S) 与当前 Joko task/session/project 链接；识别不是读取或导航授权。
     matchRegex(
       input,

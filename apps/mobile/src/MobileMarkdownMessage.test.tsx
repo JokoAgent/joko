@@ -5,8 +5,9 @@ import { describe, expect, it, vi } from "vitest";
 import { MobileMarkdownMessage } from "./MobileMarkdownMessage";
 import type { MobileMarkdownResourceClient } from "./use-mobile-markdown-resources";
 
-const { copy, appStateListeners, pressureListeners, nativeImages } = vi.hoisted(() => ({
-  copy: vi.fn(async () => undefined), appStateListeners: new Set<(state: string) => void>(), pressureListeners: new Set<() => void>(),
+const { copy, openUrl, appStateListeners, pressureListeners, nativeImages } = vi.hoisted(() => ({
+  copy: vi.fn(async () => undefined), openUrl: vi.fn(async () => undefined),
+  appStateListeners: new Set<(state: string) => void>(), pressureListeners: new Set<() => void>(),
   nativeImages: new Map<string, { onError(): void; onLoad(event: { source: { width: number; height: number; isAnimated?: boolean } }): void }>()
 }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: copy }));
@@ -34,14 +35,18 @@ vi.mock("react-native", () => {
     Switch: ({ value, onValueChange }: { value: boolean; onValueChange(value: boolean): void }) => createElement("button", { role: "switch", "aria-checked": value, onClick: () => onValueChange(!value) }),
     Text: ({ children, onPress, accessibilityRole, accessibilityLabel, selectable, style }: {
     children?: ReactNode; onPress?: () => void; accessibilityRole?: string; accessibilityLabel?: string; selectable?: boolean; style?: unknown;
-  }) => createElement("span", { onClick: onPress, role: accessibilityRole, "aria-label": accessibilityLabel,
-    "data-selectable": selectable === undefined ? undefined : String(selectable),
-    "data-line-height": (Array.isArray(style) ? Object.assign({}, ...style) : style)?.lineHeight }, children),
+    }) => {
+      const textStyle = Array.isArray(style) ? Object.assign({}, ...style.flat()) : style as Record<string, unknown> | undefined;
+      return createElement("span", { onClick: onPress, role: accessibilityRole, "aria-label": accessibilityLabel,
+        "data-selectable": selectable === undefined ? undefined : String(selectable), "data-line-height": textStyle?.lineHeight,
+        "data-decoration": textStyle?.textDecorationLine, "data-weight": textStyle?.fontWeight, "data-slant": textStyle?.fontStyle,
+        "data-font": textStyle?.fontFamily }, children);
+    },
     Modal: ({ visible, children }: { visible: boolean; children?: ReactNode }) => visible ? createElement("div", {}, children) : null,
     Pressable: ({ onPress, children, accessibilityRole, accessibilityLabel, disabled }: { onPress: () => void; children?: ReactNode;
       accessibilityRole?: string; accessibilityLabel?: string; disabled?: boolean }) =>
       createElement("button", { onClick: onPress, role: accessibilityRole, disabled, "aria-label": accessibilityLabel }, children),
-    StyleSheet: { create: (value: unknown) => value }, Linking: { openURL: vi.fn() },
+    StyleSheet: { create: (value: unknown) => value }, Linking: { openURL: openUrl },
     AppState: { currentState: "active", addEventListener: (_kind: string, listener: (state: string) => void) => {
       appStateListeners.add(listener); return { remove: () => appStateListeners.delete(listener) };
     } }
@@ -107,6 +112,26 @@ describe("native message Markdown", () => {
       expect(container.textContent).toContain("x^2");
       expect(container.textContent).toContain("graph TD; A-->B");
       expect(container.textContent).toContain("After");
+    } finally { await act(async () => root.unmount()); }
+  });
+
+  it.each([false, true])("keeps marked links, code and inline math selectable after a streamed append, dark=%s", async dark => {
+    const container = document.createElement("div"), root = createRoot(container);
+    const colors = { background: dark ? "#15191d" : "#ffffff", surface: dark ? "#24292d" : "#fafafa",
+      ink: dark ? "#f4f4f2" : "#111111", muted: "#637073", border: "#e1e2df", accent: "#ff9800", negative: "#cc634e", dark };
+    const props = { colors, locale: "en" as const, ownerKey: "nested-markdown" };
+    const source = '~~**_[Docs](https://example.test)_ and `value` and $x^2$**';
+    try {
+      await act(async () => root.render(createElement(MobileMarkdownMessage, { ...props, text: source, streaming: true })));
+      expect(container.textContent).toContain("~~");
+      await act(async () => root.render(createElement(MobileMarkdownMessage, { ...props, text: source + "~~", streaming: false })));
+      const link = container.querySelector<HTMLElement>('[role="link"]')!;
+      expect(link.textContent).toBe("Docs");
+      expect(link.dataset).toMatchObject({ weight: "700", slant: "italic", decoration: "underline line-through" });
+      expect(link.closest('[data-selectable="true"]')?.textContent).toBe("Docs and value and x²");
+      expect(container.querySelector('[data-font="monospace"][data-weight="700"]')?.textContent).toBe("value");
+      await act(async () => link.click());
+      expect(openUrl).toHaveBeenLastCalledWith("https://example.test");
     } finally { await act(async () => root.unmount()); }
   });
 
