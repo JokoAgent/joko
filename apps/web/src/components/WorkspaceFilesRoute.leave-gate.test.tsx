@@ -109,11 +109,12 @@ describe("WorkspaceFilesRoute leave gate", () => {
     }
   });
 
-  it("closes an aborted dirty-document prompt without saving or discarding", async () => {
+  it.each(["cancel", "abort", "unmount"] as const)("retires a dirty-document prompt after %s without saving or discarding", async outcome => {
     vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     const save = vi.fn(async () => true);
     const discard = vi.fn();
     const focus = vi.fn();
+    const onCancel = vi.fn();
     const dirty = { current: true };
     const registration = workspaceDocumentController.register({
       identity: { sessionId: "leave-task", workspaceId: "leave-workspace", path: "src/dirty.ts" },
@@ -130,17 +131,23 @@ describe("WorkspaceFilesRoute leave gate", () => {
       await act(async () => root.render(routeView(controller())));
 
       await act(async () => {
-        leave = requestWorkspaceDocumentLeave({ reason: "route-change", signal: owner.signal });
+        leave = requestWorkspaceDocumentLeave({ reason: "route-change", signal: owner.signal, onCancel });
         await Promise.resolve();
       });
-      expect(document.body.querySelector('[role="dialog"][aria-modal="true"]')).not.toBeNull();
-      await act(async () => owner.abort());
+      const dialog = document.body.querySelector('[role="dialog"][aria-modal="true"]');
+      expect(dialog).not.toBeNull();
+      await act(async () => {
+        if (outcome === "cancel") dialog!.querySelector<HTMLButtonElement>("[data-leave-cancel]")!.click();
+        else if (outcome === "abort") owner.abort();
+        else root.render(null);
+      });
 
       await expect(leave).resolves.toBe(false);
       await vi.waitFor(() => expect(document.body.querySelector('[role="dialog"][aria-modal="true"]')).toBeNull());
       expect(save).not.toHaveBeenCalled();
       expect(discard).not.toHaveBeenCalled();
-      expect(focus).not.toHaveBeenCalled();
+      expect(focus).toHaveBeenCalledTimes(outcome === "abort" ? 0 : 1);
+      expect(onCancel).toHaveBeenCalledTimes(outcome === "cancel" ? 1 : 0);
       expect(dirty.current).toBe(true);
     } finally {
       registration.unregister();

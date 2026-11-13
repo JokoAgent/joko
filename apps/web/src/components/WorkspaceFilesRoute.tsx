@@ -119,6 +119,7 @@ export type WorkspaceFilesNavigationShell = Pick<SidebarFrameProps,
 interface LeavePromptState {
   readonly input: WorkspaceLeavePromptInput;
   readonly resolve: (choice: WorkspaceLeaveChoice) => void;
+  readonly onCancel: (() => void) | undefined;
 }
 
 interface RailDragState {
@@ -242,6 +243,7 @@ export function WorkspaceFilesRoute({
     leavePromptRef.current = undefined;
     setLeavePrompt(undefined);
     pending.resolve(choice);
+    if (choice === "cancel") pending.onCancel?.();
   }, []);
 
   useEffect(() => {
@@ -275,7 +277,7 @@ export function WorkspaceFilesRoute({
           }
           finish("cancel");
         };
-        next = { input, resolve: finish };
+        next = { input, resolve: finish, onCancel: request.onCancel };
         request.signal?.addEventListener("abort", onAbort, { once: true });
         leavePromptRef.current = next;
         setLeavePrompt(next);

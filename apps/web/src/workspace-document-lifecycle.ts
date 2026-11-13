@@ -12,6 +12,8 @@ export interface WorkspaceDocumentLeaveGateRequest {
   readonly matches?: (identity: WorkspaceDocumentIdentity) => boolean;
   /** Exact request owner; aborting it must close any prompt without mutation. */
   readonly signal?: AbortSignal;
+  /** The mounted prompt explicitly declined this request. */
+  readonly onCancel?: () => void;
 }
 
 export type WorkspaceDocumentLeaveGate = (request: WorkspaceDocumentLeaveGateRequest) => Promise<boolean>;

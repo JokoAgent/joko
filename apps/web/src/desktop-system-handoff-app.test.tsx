@@ -8,6 +8,8 @@ import { AppWithController, reserveMessageDeepLinkHistoryPage } from "./App.js";
 import { useAppController, type AppController, type ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
 import { addSessionSplit, writeSessionSplitLayout } from "./session-split-layout.js";
+import { workspaceDocumentController } from "./workspace-document-controller.js";
+import { registerWorkspaceDocumentLeaveGate } from "./workspace-document-lifecycle.js";
 import {
   emptySnapshot,
   type ScheduleRunHistoryView,
@@ -840,6 +842,34 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
+  it("consumes only the notification whose exact file-leave prompt was cancelled", async () => {
+    let navigateListener: ((delivery: JokoDesktopDeepLinkDelivery) => void) | undefined;
+    const acknowledge = vi.fn(async () => true);
+    const navigate = vi.fn<AppController["navigate"]>();
+    Object.defineProperty(window, "jokoDesktop", {
+      configurable: true,
+      value: desktopDeepLinkApi(listener => { navigateListener = listener; }, acknowledge)
+    });
+    const route = { kind: "files", sessionId: "task-a", file: "notes.md" } as const;
+    window.history.replaceState(window.history.state, "", "#/files/task-a?file=notes.md");
+    const fixture = renderApp(connectedState({ route, sessions: [session("task-a")] }), { navigate });
+    await fixture.render();
+
+    await act(async () => navigateListener?.(delivery(11, { kind: "session", sessionId: "task-b" })));
+    await act(async () => navigateListener?.(delivery(12, { kind: "session", sessionId: "task-c" })));
+    const first = navigate.mock.calls[0]?.[1];
+    const latest = navigate.mock.calls[1]?.[1];
+    expect(first?.signal?.aborted).toBe(true);
+    expect(latest?.signal?.aborted).toBe(false);
+    await act(async () => first?.onWorkspaceLeaveCancel?.());
+    expect(acknowledge).not.toHaveBeenCalled();
+
+    await act(async () => latest?.onWorkspaceLeaveCancel?.());
+    expect(acknowledge).toHaveBeenCalledExactlyOnceWith({ documentOccurrence: "document-one", deliveryOccurrence: 12 });
+    expect(window.location.hash).toBe("#/files/task-a?file=notes.md");
+    await fixture.dispose();
+  });
+
   it("lets only the newest controller-gated route delivery commit and acknowledge", async () => {
     let navigateListener: ((delivery: JokoDesktopDeepLinkDelivery) => void) | undefined;
     const acknowledge = vi.fn(async () => true);
@@ -1057,22 +1087,48 @@ describe("Desktop system handoff App boundary", () => {
       current = useAppController();
       return null;
     }
+    const choice = deferred<void>();
+    const prompt = vi.fn();
+    const unregisterGate = registerWorkspaceDocumentLeaveGate(async ({ onCancel }) => {
+      prompt();
+      await choice.promise;
+      onCancel?.();
+      return false;
+    });
+    const documentRegistration = workspaceDocumentController.register({
+      identity: { sessionId: "task-a", workspaceId: "task-files", path: "notes.md" },
+      isDirty: () => true,
+      save: async () => false,
+      discard: vi.fn()
+    });
     try {
       await act(async () => { root.render(createElement(ControllerProbe)); });
       await vi.waitFor(() => expect(current.state.ready).toBe(true));
       expect(current.state.route).toEqual({ kind: "files", sessionId: "task-a", file: "notes.md" });
       const navigationRevision = current.state.navigationRevision;
       let ownerCurrent = true;
+      const onWorkspaceLeaveCancel = vi.fn();
       await act(async () => {
-        current.navigate({ kind: "settings" }, { isCurrent: () => ownerCurrent });
+        current.navigate({ kind: "settings" }, { isCurrent: () => ownerCurrent, onWorkspaceLeaveCancel });
+        await Promise.resolve();
+        expect(prompt).toHaveBeenCalledOnce();
         ownerCurrent = false;
-        await Promise.resolve();
-        await Promise.resolve();
+        choice.resolve(undefined);
       });
+      expect(onWorkspaceLeaveCancel).not.toHaveBeenCalled();
       expect(current.state.route).toEqual({ kind: "files", sessionId: "task-a", file: "notes.md" });
       expect(current.state.navigationRevision).toBe(navigationRevision);
       expect(window.location.hash).toBe("#/files/task-a?file=notes.md");
+
+      await act(async () => {
+        current.navigate({ kind: "settings" }, { onWorkspaceLeaveCancel });
+      });
+      expect(onWorkspaceLeaveCancel).toHaveBeenCalledOnce();
+      expect(current.state.navigationRevision).toBe(navigationRevision);
+      expect(window.location.hash).toBe("#/files/task-a?file=notes.md");
     } finally {
+      unregisterGate();
+      documentRegistration.unregister();
       await act(async () => { root.unmount(); });
       host.remove();
     }
