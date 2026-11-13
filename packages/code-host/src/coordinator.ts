@@ -74,7 +74,7 @@ export class CodeHostProjectionCoordinator {
   refreshSession(
     sessionOwnerId: string,
     references: readonly CodeHostPullRequestReference[],
-    assertCurrent?: () => void
+    assertCurrent?: (reference?: CodeHostPullRequestReference) => void
   ): Promise<CodeHostProjectionRefreshResult> {
     const pending = this.sessionInflight.get(sessionOwnerId);
     if (pending !== undefined) return pending;
@@ -88,7 +88,7 @@ export class CodeHostProjectionCoordinator {
   private async refreshSessionUnshared(
     sessionOwnerId: string,
     references: readonly CodeHostPullRequestReference[],
-    assertCurrent?: () => void
+    assertCurrent?: (reference?: CodeHostPullRequestReference) => void
   ): Promise<CodeHostProjectionRefreshResult> {
     assertCurrent?.();
     const before = this.repository.read(sessionOwnerId);
@@ -107,8 +107,10 @@ export class CodeHostProjectionCoordinator {
     if (changed) this.repository.write(current);
 
     for (const entry of current.references) {
-      const refreshed = await this.refreshReference(sessionOwnerId, entry, assertCurrent);
-      assertCurrent?.();
+      const assertReferenceCurrent = assertCurrent === undefined ? undefined : () => assertCurrent(entry.reference);
+      assertReferenceCurrent?.();
+      const refreshed = await this.refreshReference(sessionOwnerId, entry, assertReferenceCurrent);
+      assertReferenceCurrent?.();
       if (refreshed === entry) continue;
       current = {
         ...current,

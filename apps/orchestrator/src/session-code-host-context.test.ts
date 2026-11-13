@@ -110,6 +110,62 @@ describe("Session code-host context", () => {
     expect(JSON.stringify(durable?.value)).not.toContain("secret");
   });
 
+  it.each(["success", "revoked", "failure"] as const)("reconciles a deleted reference after an in-flight %s response", async (outcome) => {
+    const { store } = createFixture("Ordinary task");
+    const sessionId = "session-1";
+    const message = store.appendEvent({ backendId: "backend-1", targetId: "target-1", sessionId, generation: 0, traceId: "reference-message",
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Review https://github.com/acme/work/pull/42" }] } });
+    let now = 5_000;
+    const authorization = new OperationalCodeHostSessionAuthorization(store);
+    const initial = { state: "open" as const, draft: false, title: "Original status", headBranch: "topic" };
+    const late = { ...initial, state: "merged" as const };
+    let release!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    const getPullRequest = vi.fn<CodeHostProvider["getPullRequest"]>().mockResolvedValueOnce(initial)
+      .mockImplementationOnce(async (reference, { sessionOwnerId }) => {
+        const lease = authorization.authorize(sessionOwnerId, reference);
+        if (lease === undefined) throw new Error("The fixture reference was not authorized.");
+        await paused;
+        if (outcome === "failure") throw new Error("Temporary Provider failure.");
+        if (outcome === "revoked" && !authorization.isCurrent(lease, reference)) throw new Error("Original reference revoked.");
+        return late;
+      });
+    const runtime = new SessionCodeHostContextRuntime({ store, now: () => now, providers: [
+      { capability: "code-host.pull-request", supports: () => true, getPullRequest }
+    ] });
+    expect((await runtime.refreshSession(sessionId))?.references[0]?.projection).toMatchObject(initial);
+    runtime.install();
+    const publish = vi.spyOn(store, "appendEvent");
+    const save = vi.spyOn(store, "setSetting");
+    now += 60_001;
+    const inflight = runtime.refreshSession(sessionId);
+    try {
+      await vi.waitFor(() => expect(getPullRequest).toHaveBeenCalledTimes(2));
+      store.runOperation({ id: "delete-reference", kind: "delete_message", body: { eventId: message.id } }, owner => {
+        owner.commitMessageDeletion({ sessionId, requestedEventId: message.id, deletedEventIds: [message.id],
+          operationId: "delete-reference", traceId: "reference:delete" });
+        return {};
+      });
+      const afterDeletion = runtime.refreshSession(sessionId);
+      release();
+      const projections = await Promise.all([inflight, afterDeletion]);
+      expect(projections.map(value => value?.references)).toEqual([[], []]);
+      expect(save).toHaveBeenCalledWith("session", sessionId, "codeHost.pullRequests.v1", expect.objectContaining({ references: [] }));
+      expect(JSON.stringify(save.mock.calls)).not.toContain("merged");
+      expect(readSessionCodeHostProjection(store, sessionId)?.references).toEqual([]);
+      const session = store.getSession(sessionId);
+      expect(toProtoSession(session, sessionProjectionContext(store, session)).codeHostPullRequests).toEqual([]);
+      await vi.waitFor(() => expect(publish).toHaveBeenCalledWith(expect.objectContaining({ traceId: "session-code-host-projection",
+        payload: { type: "session_changed" } })));
+      expect(getPullRequest).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      await inflight.catch(() => undefined);
+      save.mockRestore();
+      publish.mockRestore();
+    }
+  });
+
   it("authorizes only references currently attached to the durable Session owner", () => {
     const fixture = createFixture("Track https://github.com/acme/private-repo/pull/42");
     const authorization = new OperationalCodeHostSessionAuthorization(fixture.store);
