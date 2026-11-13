@@ -2781,8 +2781,8 @@ export class PiBackendAdapter implements
   }
 
   async readStoredPortableNativeSession(input: StoredPortableNativeSessionInput): Promise<PortableNativeSession | undefined> {
-    if (input.target.remoteWorkspace !== undefined || !input.target.trusted) {
-      throw piError("PI_SESSION_EXPORT_TARGET_DENIED", "Stored native export requires a trusted local Target", "session");
+    if (input.target.remoteWorkspace !== undefined) {
+      throw piError("PI_SESSION_EXPORT_TARGET_DENIED", "Stored native export requires a local Target", "session");
     }
     input.assertCurrent();
     await this.validateTarget(input.target);

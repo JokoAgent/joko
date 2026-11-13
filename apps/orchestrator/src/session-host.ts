@@ -8515,7 +8515,7 @@ export class SessionHost {
     const session = stored.descriptor;
     return session.deletedAt === undefined && !session.hidden && session.remoteWorkspace === undefined
       && session.worktree === undefined && session.automationOrigin === undefined && !session.derivationOrigin?.sideChat
-      && target.descriptor.remoteWorkspace === undefined && target.descriptor.trusted
+      && target.descriptor.remoteWorkspace === undefined
       && !(isRecord(target.metadata) && target.metadata["deletedAt"] !== undefined)
       && this.#store.sessionCreationServiceKind(session.id) === undefined && this.#partnerSessionPolicy(session.id) === undefined
       && !this.isPartnerSessionRetiring(session.id) && this.#store.findSessionRuntimePolicy(session.id) === undefined

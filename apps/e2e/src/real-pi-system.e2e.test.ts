@@ -8,6 +8,7 @@ import {
   ApproveResourceMutationSchema,
   BackendHealth,
   BlobDisposition,
+  BlobRefSchema,
   CompactSessionOutcome,
   CompactionState,
   InstallationState,
@@ -454,6 +455,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(restored.nativeSession?.bytes.byteLength).toBeGreaterThan(0);
 
     const store = fixture.application.store;
+    expect(store.getTarget("workspace-real-pi").descriptor.trusted).toBe(false);
     const originalBinding = store.getSession(sessionId).descriptor.binding;
     await expect(fixture.anonymous.portableSession.exportPortableSession({ sessionId })).rejects.toMatchObject({ code: Code.Unauthenticated });
     const archive = await submit(reconnected.operation, paired.connectionId, archiveMutation(sessionId, true));
@@ -528,7 +530,10 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
         readBlob: blob => artifacts.readBlob(blob)
       });
       const file = await artifacts.ingestBytes(encoded.bytes, { mimeType: "application/vnd.joko.session", fileName: "encrypted.jshare" });
-      return { blobId: file.id, sha256: file.sha256, byteLength: BigInt(file.byteLength), mediaType: file.mimeType, fileName: file.fileName ?? "" };
+      return create(BlobRefSchema, {
+        blobId: file.id, sha256Hex: file.sha256, byteSize: BigInt(file.byteLength),
+        mediaType: file.mimeType, fileName: file.fileName ?? ""
+      });
     };
     const prepare = async (file: Awaited<ReturnType<typeof upload>>) => {
       const { draft } = await client.inspectPortableSessionImport({ package: file });
@@ -542,7 +547,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
 
     const firstPackage = await upload("frozen-history");
     const secondPackage = await upload("frozen-history");
-    expect(secondPackage.sha256).not.toBe(firstPackage.sha256);
+    expect(secondPackage.sha256Hex).not.toBe(firstPackage.sha256Hex);
     const first = await commit(await prepare(firstPackage), false);
     if (first.result === undefined) throw new Error("First Pi package returned no import result.");
     const firstId = first.result.sessionId;
