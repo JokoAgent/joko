@@ -6778,7 +6778,10 @@ describe("ClaudeCodeAdapter", () => {
         if (interaction.kind === "question") {
           return { kind: "question", answers: {
             q0: { kind: "single", selection: { kind: "choice", choiceId: "q0o1" } },
-            q1: { kind: "single", selection: { kind: "other", text: "q1o0" } }
+            q1: { kind: "single", selection: { kind: "other", text: "q1o0" } },
+            q2: { kind: "multiple", choiceIds: ["q2o2"] },
+            q3: { kind: "multiple", choiceIds: ["q3o0", "q3o1"] },
+            q4: { kind: "multiple", choiceIds: ["q4o0"], otherText: "Quoted \"route\", then tools" }
           } };
         }
         return { kind: "plan_review", decision: "execute", feedback: "" };
@@ -6830,6 +6833,7 @@ describe("ClaudeCodeAdapter", () => {
       ...permissionOptions("permission-fixture", "tool-fixture"), displayName: "Review the fixture input"
     })).resolves.toMatchObject({ behavior: "allow", updatedInput: extendedInput });
 
+    const multiOptions = [{ label: "API" }, { label: "CLI" }, { label: "API, CLI" }];
     const question = await query.params.options.canUseTool("AskUserQuestion", {
       questions: [
         {
@@ -6846,12 +6850,17 @@ describe("ClaudeCodeAdapter", () => {
           header: "Other route",
           options: [{ label: "Slow", description: "Use the slow route." }],
           multiSelect: false
-        }
+        },
+        { question: "Select the single label", options: multiOptions, multiSelect: true },
+        { question: "Select two labels", options: multiOptions, multiSelect: true },
+        { question: "Select a label and enter text", options: multiOptions, multiSelect: true }
       ]
     }, permissionOptions("question-one", "tool-question"));
     expect(question).toMatchObject({
       behavior: "allow",
-      updatedInput: { answers: { "Choose a route": "Fast", "Name another route": "q1o0" } }
+      updatedInput: { answers: { "Choose a route": "Fast", "Name another route": "q1o0",
+        "Select the single label": '["API, CLI"]', "Select two labels": '["API","CLI"]',
+        "Select a label and enter text": JSON.stringify(["API", 'Quoted "route", then tools']) } }
     });
 
     const plan = await query.params.options.canUseTool(

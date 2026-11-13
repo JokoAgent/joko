@@ -6234,7 +6234,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
                   ...value.choiceIds.map((choiceId) => original.choices.get(choiceId) ?? choiceId),
                   ...(value.otherText === undefined ? [] : [value.otherText])
                 ];
-      answers[original.question] = original.multi ? labels.join(", ") : (labels[0] ?? "");
+      answers[original.question] = original.multi && labels.length > 0 ? JSON.stringify(labels) : (labels[0] ?? "");
     }
     return { behavior: "allow", updatedInput: { ...input, answers } };
   }
