@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { OperationalStore, type ArtifactRecord } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ArtifactMaintenance,
@@ -13,6 +13,11 @@ import {
 } from "./artifact-maintenance.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...fs, unlink: vi.fn(fs.unlink) };
+});
 
 const cleanupPaths: string[] = [];
 const openStores: OperationalStore[] = [];
@@ -23,6 +28,77 @@ afterEach(async () => {
 });
 
 describe("ArtifactMaintenance", () => {
+  it.each([0, 1])("collects the remaining due files when file %i is already missing", async (missingIndex) => {
+    const fixture = await createFixture(1_000);
+    const due = [];
+    for (const index of [0, 1, 2]) {
+      fixture.setNow(1_000 + index);
+      due.push(await fixture.artifacts.ingestBytes(Buffer.from(`due-${index}`), { expiresAt: 1_500 }));
+    }
+    await rm(due[missingIndex]!.storagePath);
+
+    fixture.setNow(2_000);
+    await expect(fixture.artifacts.garbageCollect()).resolves.toBe(2);
+    for (const record of due) {
+      expect(fixture.store.findArtifact(record.id, true)?.deletedAt).toBe(2_000);
+      await expect(stat(record.storagePath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    await expect(fixture.artifacts.garbageCollect()).resolves.toBe(0);
+  });
+
+  it("reports a failed deletion after trying the remaining files and lets manual maintenance recover its bytes after restart", async () => {
+    const fixture = await createFixture(1_000);
+    const blocked = await fixture.artifacts.ingestBytes(Buffer.from("temporarily busy"), { expiresAt: 1_500 });
+    fixture.setNow(1_100);
+    const due = await fixture.artifacts.ingestBytes(Buffer.from("also due"), { expiresAt: 1_500 });
+    const shared = await fixture.artifacts.ingestBytes(Buffer.from("adopted content"), { expiresAt: 1_500 });
+    const adopted = await fixture.artifacts.ingestBytes(Buffer.from("adopted content"), { expiresAt: 1_500 });
+    fixture.store.upsertBackend({ id: "backend", displayName: "Backend", version: "fixture", health: "healthy",
+      adapterKind: "fixture", instanceGeneration: 0, installationState: "installed", authenticationState: "not_required",
+      capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+    fixture.store.upsertTarget({ id: "target", backendId: "backend", displayName: "Workspace", workspaceRoot: fixture.root,
+      managed: false, trusted: true });
+    const sessionId = "media-task";
+    fixture.store.createSession({ id: sessionId, backendId: "backend", targetId: "target", title: "Media task",
+      binding: { opaqueRef: "native/task", generation: 0 }, pinned: false, archived: false, permissionMode: "ask", planMode: false,
+      fastMode: false, createdAt: 1_100, updatedAt: 1_100 });
+    const blob = fixture.store.getArtifact(adopted.id).blob;
+    fixture.store.transaction(() => fixture.store.adoptSessionArtifact({ blob, sessionId }));
+    expect(shared.storagePath).toBe(adopted.storagePath);
+    const failure = Object.assign(new Error("The fixture blob is busy."), { code: "EBUSY" });
+    vi.mocked(unlink).mockImplementationOnce(async path => {
+      expect(path).toBe(blocked.storagePath);
+      throw failure;
+    });
+
+    fixture.setNow(2_000);
+    await expect(fixture.artifacts.garbageCollect()).rejects.toMatchObject({ errors: [failure] });
+    for (const record of [blocked, due, shared]) {
+      expect(fixture.store.findArtifact(record.id, true)?.deletedAt).toBe(2_000);
+    }
+    await expect(stat(due.storagePath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(blocked.storagePath)).resolves.toMatchObject({ size: blocked.byteLength });
+    expect(fixture.store.findArtifact(adopted.id)?.sessionId).toBe(sessionId);
+    await expect(fixture.artifacts.readBlob(blob)).resolves.toMatchObject({ data: Buffer.from("adopted content") });
+    fixture.setNow(3_000);
+    await expect(fixture.artifacts.garbageCollect()).resolves.toBe(0);
+
+    fixture.store.close();
+    const reopened = new OperationalStore(fixture.store.filePath, { now: () => 4_000 });
+    openStores.push(reopened);
+    const artifacts = new ArtifactStore({ rootDirectory: fixture.root, repository: new OperationalArtifactRepository(reopened),
+      ingestRoots: [], now: () => 4_000 });
+    await artifacts.initialize();
+    await expect(artifacts.garbageCollect()).resolves.toBe(0);
+    const maintenance = new ArtifactMaintenance({ store: reopened, rootDirectory: fixture.root, now: () => 4_000 });
+    await maintenance.initialize();
+    const scan = await maintenance.scan();
+    expect(scan).toMatchObject({ expiredReferenceCount: 0, orphanBlobCount: 1, orphanBlobBytes: blocked.byteLength });
+    await expect(completedCleanup(maintenance, scan.token)).resolves.toMatchObject({ blobsRemoved: 1, freedBytes: blocked.byteLength });
+    await expect(stat(blocked.storagePath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(artifacts.readBlob(blob)).resolves.toMatchObject({ data: Buffer.from("adopted content") });
+  });
+
   it("reports unique live storage and removes expired references before their blobs", async () => {
     const fixture = await createFixture(1_000);
     const permanent = await fixture.artifacts.ingestBytes(Buffer.from("permanent"));
