@@ -12,6 +12,7 @@ import {
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
+  NATIVE_PROMPT_IMAGE_MEDIA_TYPES,
   SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
   snapshotNativeSkills,
   nativeTextInferenceImages,
@@ -6250,6 +6251,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           ...(this.#models.some(model => model.supportsUltrafastMode) ? ["ultrafast"] : [])
         ] } : {}),
         ...(key === "runtime.resources" && available ? { options: ["skill"] } : {}),
+        ...(key === "input.image" && available ? { options: NATIVE_PROMPT_IMAGE_MEDIA_TYPES } : {}),
         ...(key === "input.mention" && available
           ? { options: ["workspace_file", ...(this.#resolvers.resolveArtifactMention === undefined ? [] : ["artifact"]),
               ...(this.#resolveNativeSkills === undefined ? [] : ["resource"])] }

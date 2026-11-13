@@ -3,6 +3,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import {
   JokoError,
+  NATIVE_PROMPT_IMAGE_MEDIA_TYPES,
   redactSecrets,
   validInputMentionRanges,
   type AdapterContext,
@@ -233,7 +234,7 @@ export async function translatePromptInput(
       });
     }
     const mimeType = resolved.mimeType ?? image.blob.mimeType;
-    if (!/^image\/(?:png|jpeg|webp|gif)$/i.test(mimeType)) {
+    if (!NATIVE_PROMPT_IMAGE_MEDIA_TYPES.includes(mimeType.toLowerCase())) {
       throw adapterError({
         code: "CODEX_IMAGE_TYPE_UNSUPPORTED",
         message: "The selected image format is not supported by this Codex adapter.",

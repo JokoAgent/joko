@@ -91,6 +91,7 @@ export interface FixtureOptions {
   readonly profiles?: readonly FakeAdapterProfile[];
   readonly createAdapter?: (profile: FakeAdapterProfile) => InstrumentedFakeAdapter;
   readonly backendFactories?: readonly BackendInstanceFactory[];
+  readonly distinctBackendWorkspaceIds?: boolean;
   readonly keepRoot?: boolean;
   readonly dictionaryPeerNodeId?: string;
   readonly dictionaryPeerMulticastPort?: number;
@@ -385,7 +386,7 @@ export class OrchestratorE2eFixture {
         workspaceRoot: workspaceDirectory,
         managed: true,
         trusted: true
-      }, { workspaceId: "workspace-main" });
+      }, { workspaceId: options.distinctBackendWorkspaceIds === true ? targetId : "workspace-main" });
     }
     await objectives.initialize();
     await historyMaintenance.initialize();

@@ -14,6 +14,7 @@ import {
   SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
   evaluateOrderedPolicyRules,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
+  NATIVE_PROMPT_IMAGE_MEDIA_TYPES,
   redactSecrets,
   snapshotNativeSkills,
   nativeTextInferenceImages,
@@ -6776,7 +6777,7 @@ export class PiBackendAdapter implements
         });
       }
       const mimeType = resolvedImage.mimeType ?? image.blob.mimeType;
-      if (!/^image\/(?:png|jpeg|webp|gif)$/i.test(mimeType)) throw piError("PI_IMAGE_TYPE_UNSUPPORTED", `Pi image type '${mimeType}' is unsupported`, "dispatch");
+      if (!NATIVE_PROMPT_IMAGE_MEDIA_TYPES.includes(mimeType.toLowerCase())) throw piError("PI_IMAGE_TYPE_UNSUPPORTED", `Pi image type '${mimeType}' is unsupported`, "dispatch");
       images.push({ type: "image", data: Buffer.from(resolvedImage.data).toString("base64"), mimeType });
     }
     return images;
@@ -7062,6 +7063,7 @@ export class PiBackendAdapter implements
             supported: true,
             ...(key === "session.rewind_to_start" && this.#options.remoteNavigationOwner === undefined
               ? { options: [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] } : {}),
+            ...(key === "input.image" ? { options: NATIVE_PROMPT_IMAGE_MEDIA_TYPES } : {}),
             ...(key === "input.mention" ? { options: ["workspace_file", "resource"] } : {}),
             ...(key === "runtime.resources" ? { options: ["extension", "skill", "prompt", "package"] } : {}),
             ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {})

@@ -10,6 +10,7 @@ import {
   ProtoMappingError,
   decodeCursorToken,
   fromProtoAttempt,
+  fromProtoCapability,
   fromProtoEvent,
   fromProtoInputContent,
   fromProtoInteraction,
@@ -25,6 +26,7 @@ import {
   mapErrorToPublic,
   toProtoEvent,
   toProtoBackend,
+  toProtoCapability,
   toProtoAttempt,
   toProtoArtifact,
   toProtoEventCursor,
@@ -302,6 +304,20 @@ describe("proto mapper", () => {
     ]));
     expect(capabilities?.filter((capability) => capability.name === capabilityNames.queueEdit)).toHaveLength(1);
     expect(stored.descriptor.capabilities.get(capabilityNames.queueEdit)?.supported).toBe(false);
+  });
+
+  it.each([capabilityNames.inputFile, capabilityNames.inputImage])("publishes a typed input default for supported %s", (key) => {
+    const legacy = { key, supported: true };
+    const projected = toProtoCapability(legacy);
+    expect(projected).toMatchObject({ support: CapabilitySupport.SUPPORTED, options: {
+      kind: { case: "input", value: { mediaTypes: [], maximumBytes: 0n, maximumItems: 0 } }
+    } });
+    expect(fromProtoCapability(projected)).toEqual(legacy);
+    expect(toProtoCapability({ ...legacy, options: [] })).toEqual(projected);
+    expect(toProtoCapability({ key, supported: false, reason: "policy_denied" })).toMatchObject({
+      support: CapabilitySupport.DISABLED_BY_POLICY, options: undefined
+    });
+    expect(toProtoCapability({ key: "input.text", supported: true }).options).toBeUndefined();
   });
 
   it.each([

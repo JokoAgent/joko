@@ -207,6 +207,10 @@ export interface BlobRef {
   readonly fileName?: string;
 }
 
+export const NATIVE_PROMPT_IMAGE_MEDIA_TYPES: readonly string[] = Object.freeze([
+  "image/png", "image/jpeg", "image/gif", "image/webp"
+]);
+
 export interface ImageInput {
   readonly blob: BlobRef;
   readonly alt?: string;

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
-import { JokoError, type AdapterContext, type ArtifactMentionResolver, type BlobRef, type PromptInput } from "@joko/core";
+import { JokoError, NATIVE_PROMPT_IMAGE_MEDIA_TYPES, type AdapterContext, type ArtifactMentionResolver, type BlobRef, type PromptInput } from "@joko/core";
 import { claudeCodeError } from "./errors.js";
 import {
   resolveClaudeResourceMention,
@@ -64,7 +64,7 @@ export async function prepareClaudePrompt(
       throw inputError("IMAGE_INTEGRITY_FAILED", "An image attachment no longer matches its immutable Artifact reference.");
     }
     const mimeType = (loaded.mimeType ?? blob.mimeType).toLowerCase();
-    if (mimeType !== blob.mimeType.toLowerCase() || !/^image\/(?:png|jpeg|gif|webp)$/u.test(mimeType)) {
+    if (mimeType !== blob.mimeType.toLowerCase() || !NATIVE_PROMPT_IMAGE_MEDIA_TYPES.includes(mimeType)) {
       throw inputError("IMAGE_TYPE_UNSUPPORTED", "Image input requires PNG, JPEG, GIF, or WebP with a matching Artifact media type.");
     }
     blocks.push({ type: "image", source: { type: "base64", media_type: mimeType, data: Buffer.from(loaded.data).toString("base64") } });

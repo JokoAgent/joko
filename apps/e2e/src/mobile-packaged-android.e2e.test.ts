@@ -20,7 +20,7 @@ const evidenceSteps = {
   "install-apk": { action: "installation", assertions: ["fresh-application-data", "installed-apk-sha256"] },
   "prepare-fixture": { action: "fixture-setup", assertions: ["local-orchestrator-ready", "fixture-task-created", "port-reverse-ready"] },
   "pair-application": { action: "pairing", assertions: ["application-started", "trusted-endpoint-public-key-entered", "pairing-request-issued"] },
-  "open-task-header": { action: "navigation", assertions: ["task-title-visible", "title-between-header-controls", "header-actions-within-viewport"] },
+  "open-task-header": { action: "navigation", assertions: ["task-title-visible", "title-between-header-controls", "header-actions-within-viewport", "file-attachment-control-enabled"] },
   "task-actions-menu": { action: "menu", assertions: ["complete-task-actions", "actions-within-viewport"] },
   "send-native-input": { action: "text-entry", assertions: ["one-completed-run", "exact-fixture-dispatch", "one-active-mobile-connection", "persisted-timeline", "owner-generation-consistent"] },
   "open-image-gallery": { action: "resource-navigation", assertions: ["gallery-visible", "image-decoded", "gallery-retained-across-observations"] },
@@ -213,6 +213,7 @@ async function runNativeScenario(): Promise<void> {
   await beginStep("prepare-fixture");
   const profile = { ...PI_LIKE_PROFILE, capabilities: [
     ...PI_LIKE_PROFILE.capabilities,
+    { key: capabilityNames.inputFile, supported: true as const },
     { key: capabilityNames.workspaceFiles, supported: true as const }
   ] };
   fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new AndroidResourceAdapter(entry), collaborationGoals: true,
@@ -322,6 +323,7 @@ async function runNativeScenario(): Promise<void> {
   const title = headerNodes.find((node) => node.text === taskName)!;
   const headerControls = headerLabels.map((label) => headerNodes.find((node) => node.contentDescription === label)!);
   assertTaskHeaderBounds(title, headerControls, screenWidth);
+  await waitNode((node) => node.contentDescription === "Attach" && node.enabled && node.clickable, "file attachment on the existing task");
   await completeStep();
   await beginStep("task-actions-menu");
   await tap("Task actions");

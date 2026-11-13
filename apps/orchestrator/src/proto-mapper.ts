@@ -4879,19 +4879,21 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         reportsCost: false
       }
     };
-  } else if (capability.options === undefined || capability.options.length === 0) {
-    return undefined;
   } else if (capability.key.startsWith("input.")) {
+    const mediaTypes = capability.options ?? [];
+    const supportedAttachment = capability.supported && (capability.key === contract.capabilityNames.inputFile
+      || capability.key === contract.capabilityNames.inputImage);
+    if (mediaTypes.length === 0 && !supportedAttachment) return undefined;
     kind = {
       case: "input",
       value: {
         $typeName: "joko.v1.InputCapabilityOptions",
-        mediaTypes: [...capability.options],
+        mediaTypes: [...mediaTypes],
         maximumBytes: 0n,
         maximumItems: 0
       }
     };
-  } else if (capability.key === "runtime.resources") {
+  } else if (capability.key === "runtime.resources" && capability.options?.length) {
     kind = {
       case: "runtime",
       value: {
