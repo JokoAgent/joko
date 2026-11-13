@@ -111,6 +111,9 @@ export interface AdapterContext {
     interaction: InteractionPayload,
     options?: { readonly signal?: AbortSignal }
   ) => Promise<InteractionDecision>;
+  /** Register a completed native plan with the owning Run's settlement. The
+   * callback opens the Interaction synchronously before queued input can claim. */
+  readonly registerCompletedPlanReview?: (open: () => void) => void;
   /** Exact host ArtifactStore ceiling for this invocation. Adapters must
    * reject larger materializations before reading or decoding their bytes. */
   readonly artifactCapacityBytes: number;
