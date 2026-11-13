@@ -4969,6 +4969,25 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && !composerOperationPending && !conversationShare.active
     && !voice.busy && !attachmentBusy;
   composerPasteEditableRef.current = composerPasteEditable;
+  const taskStop = state.status === "connected" && state.taskSource?.kind !== "joined" && composerOwnerReady
+    && headerRole.role === "ordinary" && partnerIdentity.ready && !partnerIdentity.partner
+    && !queueEdit && !conversationShare.active && AppState.currentState === "active"
+    ? client.taskStopControl() : undefined;
+  const taskStopAuthorityRef = useRef(taskStop?.authorityKey);
+  taskStopAuthorityRef.current = taskStop?.authorityKey;
+  const stopInSendSlot = taskStop !== undefined && !draft.text.trim() && draft.attachments.length === 0 && !voice.busy;
+  const stopAction = taskStop && <Action label={mobileMessage(locale, taskStop.pending && state.busy ? "composer.stopping" : "composer.stop")}
+    accessibilityLabel={mobileMessage(locale, "composer.stop")} colors={colors} compact
+    disabled={taskStop.pending || state.busy || composerOperationPending || attachmentBusy}
+    onPress={() => {
+      if (!headerSourceKey || taskStop.pending || client.state.busy) return;
+      const current = () => taskMetadataCurrent(headerSourceKey) && taskStopAuthorityRef.current === taskStop.authorityKey;
+      if (!current()) return;
+      setLocalError("");
+      void client.stopTaskTurn(taskStop.authorityKey, current).catch(error => {
+        if (current()) setLocalError(errorText(error, locale));
+      });
+    }} />;
   const conversationShareDisabled = state.status !== "connected" || state.busy || attachmentBusy || voice.busy
     || fileShareBusy || galleryOpening || imageGallery.view !== undefined || state.timelinePreview !== undefined
     || queueEdit !== undefined || conversationShare.busy;
@@ -7312,9 +7331,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         style={styles.composerResizeHandle} {...composerResizeResponder.panHandlers}>
         <View style={[styles.composerGrabber, { backgroundColor: colors.border }]} />
       </View>
-      {!queueEdit && (voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || catalogMentionControls
+      {!queueEdit && (taskStop || voice.available || voice.checking || voice.busy || sessionMentionControls || workspaceMentionControls || catalogMentionControls
         || attachmentControls || composerOwnerReady || draft.mentions.length > 0 || draft.atoms.length > 0
         || draft.attachments.length > 0) && <View style={styles.composerTools}>
+        {!stopInSendSlot && stopAction}
         {(voice.available || voice.checking || voice.busy) && <MobileVoiceAction voice={voice} colors={colors} locale={locale}
           disabled={!composerOwnerReady || state.busy || composerOperationPending || attachmentBusy
             || state.status !== "connected"} />}
@@ -7487,13 +7507,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
               composerSelectionRef.current = nextSelection;
               setComposerSelection(nextSelection);
             }} />}
-        <Action label={mobileMessage(locale, state.busy || appCommandRunning
+        {stopInSendSlot ? stopAction : <Action label={mobileMessage(locale, state.busy || appCommandRunning
           ? queueEdit ? "common.saving" : "common.sending"
           : queueEdit ? "composer.saveEdit" : "composer.send")} colors={colors} compact
           disabled={!composerOwnerReady || (!draft.text.trim() && (queueEdit !== undefined || draft.attachments.length === 0))
             || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || composerOperationPending
             || (queueEdit ? state.status !== "connected" : !composerAvailable)}
-          onPress={() => void submitComposer()} />
+          onPress={() => void submitComposer()} />}
         {state.taskSource?.kind === "joined" && <Action label={mobileTaskSharingCopy(locale).steer} colors={colors} compact
           disabled={!composerOwnerReady || !draft.text.trim() || unknown || attachmentBusy || state.busy || state.status !== "connected"}
           onPress={() => void submitComposer(QueueDeliveryMode.STEER)} />}

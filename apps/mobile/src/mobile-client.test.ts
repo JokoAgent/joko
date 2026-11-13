@@ -27,7 +27,7 @@ import { PartnerImportResultSchema, PartnerImportStatus } from "@joko/contracts"
 import { createHash, randomUUID } from "node:crypto";
 import sharp from "sharp";
 import {
-  AuthenticationState, ProviderAccountUsageSnapshotSchema,
+  AttemptState, AuthenticationState, ProviderAccountUsageSnapshotSchema,
   AcknowledgementSchema, ArtifactKind, ArtifactSchema, AudioArtifactKind, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
@@ -1888,6 +1888,133 @@ describe("mobile current task delegated reads", () => {
     caller.abort(); expect(signal.aborted).toBe(true); app.setForeground(false);
     expect(app.taskDelegatedControls()).toBeUndefined(); resolve({ runs: [], nextPageToken: "" });
     await expect(pending).rejects.toThrow("owner changed");
+  });
+});
+
+describe("ordinary Mobile turn stop", () => {
+  function stopFixture() {
+    const projection = clone(SnapshotSchema, snapshot);
+    const session = projection.sessions[0]!;
+    session.backendId = "claude-code";
+    session.state = SessionState.RUNNING;
+    session.version!.generation = 8n;
+    session.location = create(WorkspaceLocationSchema, { kind: { case: "serviceNode", value: {} } });
+    projection.backends[0]!.backendId = session.backendId;
+    projection.backends[0]!.capabilities!.capabilities.push(
+      create(CapabilitySchema, { name: capabilityNames.turnAbort, support: CapabilitySupport.SUPPORTED }));
+    projection.targets[0]!.backendId = session.backendId;
+    const identity = { sessionId: session.sessionId, targetId: session.targetId, backendId: session.backendId, runId: "run-one" };
+    const active = create(SnapshotSchema, {
+      runs: [{ ...identity, state: RunState.RUNNING, sourceQueueItemId: "running-input", activeAttemptId: "attempt-one",
+        version: { generation: 8n, revision: { value: 14n } },
+        attempts: [{ attemptId: "attempt-one", runId: identity.runId, state: AttemptState.RUNNING, generation: 8n }] }],
+      queueItems: [{ ...identity, queueItemId: "running-input", state: QueueItemState.BACKEND_ACCEPTED }]
+    });
+    projection.runs = active.runs;
+    projection.queueItems = active.queueItems;
+    const network = projectedNetwork(projection);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    return { app, network, saved, projection };
+  }
+
+  const stopReceipt = (runId = "run-one") => create(OperationSchema, {
+    operationId: "operation-1", connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+    mutation: { payload: { case: "abortRun", value: { runId } } },
+    result: { payload: { case: "acknowledgement", value: { accepted: true } } }
+  });
+
+  it("persists the displayed Run, submits its revision and adopts the node's terminal state", async () => {
+    const { app, network, saved, projection } = stopFixture();
+    await app.start();
+    vi.mocked(network.submit).mockImplementationOnce(async () => {
+      expect(saved.pending()).toEqual([expect.objectContaining({ kind: "session-stop", sessionId: "session", runId: "run-one" })]);
+      projection.sessions[0]!.state = SessionState.IDLE;
+      projection.runs[0]!.state = RunState.ABORTED;
+      return stopReceipt();
+    });
+    await expect(app.stopTaskTurn(app.taskStopControl()!.authorityKey, () => true)).resolves.toBe(true);
+    expect(network.readTaskHeaderRole).toHaveBeenCalledExactlyOnceWith(credential, "session", expect.any(AbortSignal));
+    expect(network.submit).toHaveBeenCalledExactlyOnceWith(credential, "operation-1", expect.objectContaining({
+      payload: expect.objectContaining({ case: "abortRun", value: expect.objectContaining({ runId: "run-one" }) }),
+      preconditions: [expect.objectContaining({ entity: expect.objectContaining({ kind: EntityKind.RUN, id: "run-one" }),
+        expectedRevision: expect.objectContaining({ value: 14n }), expectedGeneration: 0n })]
+    }), expect.any(AbortSignal));
+    expect(saved.pending()).toEqual([]);
+    expect(app.taskStopControl()).toBeUndefined();
+    expect(app.state.busy).toBe(false);
+  });
+
+  it.each(["attempt replaced", "background", "view closed"] as const)("retires an unsent stop when %s during receipt persistence", async change => {
+    const { app, network, saved, projection } = stopFixture();
+    await app.start();
+    const persist = vi.mocked(saved.storage.savePending).getMockImplementation()!;
+    let release!: () => void;
+    vi.mocked(saved.storage.savePending).mockImplementationOnce(async items => {
+      await new Promise<void>(resolve => { release = resolve; });
+      await persist(items);
+    });
+    let current = true;
+    const stopped = app.stopTaskTurn(app.taskStopControl()!.authorityKey, () => current);
+    await vi.waitFor(() => expect(release).toBeDefined());
+    if (change === "attempt replaced") {
+      const run = projection.runs[0]!;
+      run.activeAttemptId = "attempt-two";
+      run.attempts[0]!.attemptId = run.activeAttemptId;
+      run.version!.revision!.value++;
+    } else if (change === "background") app.setForeground(false);
+    else current = false;
+    release();
+    await expect(stopped).resolves.toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
+    expect(saved.pending()).toEqual([]);
+    expect(app.state.pending).toEqual([]);
+    expect(app.state.busy).toBe(false);
+  });
+
+  it("queries the same lost Stop receipt and rejects both a second stop and a mismatched acknowledgement", async () => {
+    const { app, network, saved } = stopFixture();
+    await app.start();
+    const stop = app.taskStopControl()!;
+    vi.mocked(network.submit).mockRejectedValueOnce(new ConnectError("disconnected", Code.Unavailable));
+    await expect(app.stopTaskTurn(stop.authorityKey, () => true)).resolves.toBe(false);
+    expect(app.taskStopControl()?.pending).toBe(true);
+    await expect(app.stopTaskTurn(stop.authorityKey, () => true)).rejects.toThrow("original stop operation");
+    vi.mocked(network.getOperation).mockResolvedValueOnce(stopReceipt("other-run"));
+    await app.reconcile();
+    expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "operation-1", runId: "run-one", state: "unknown" })]);
+    vi.mocked(network.getOperation).mockResolvedValueOnce(stopReceipt());
+    await app.reconcile();
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(vi.mocked(network.getOperation).mock.calls.map(call => call[1])).toEqual(["operation-1", "operation-1"]);
+    expect(saved.pending()).toEqual([]);
+  });
+
+  it("settles a stale revision only after reading its exact failed Stop receipt", async () => {
+    const { app, network, saved } = stopFixture();
+    await app.start();
+    vi.mocked(network.submit).mockRejectedValueOnce(new ConnectError("The Run revision changed.", Code.Aborted));
+    vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, {
+      ...stopReceipt(), state: OperationState.FAILED, result: undefined
+    }));
+    await expect(app.stopTaskTurn(app.taskStopControl()!.authorityKey, () => true)).rejects.toThrow("The Run revision changed.");
+    expect(network.getOperation).toHaveBeenCalledExactlyOnceWith(credential, "operation-1", expect.any(AbortSignal));
+    expect(saved.pending()).toEqual([]);
+    expect(app.state.busy).toBe(false);
+  });
+
+  it("leaves another queued input and a newly observed worker outside the ordinary control", async () => {
+    const { app, network, projection } = stopFixture();
+    await app.start();
+    const stop = app.taskStopControl()!;
+    const ownQueue = projection.queueItems[0]!;
+    projection.queueItems.push(create(QueueItemSchema, { ...ownQueue, queueItemId: "queued-input", runId: "next", state: QueueItemState.ACCEPTED }));
+    expect(app.taskStopControl()).toBeUndefined();
+    await expect(app.stopTaskTurn(stop.authorityKey, () => true)).rejects.toThrow("no longer available");
+    projection.queueItems.pop();
+    vi.mocked(network.readTaskHeaderRole).mockResolvedValueOnce("worker");
+    await expect(app.stopTaskTurn(stop.authorityKey, () => true)).resolves.toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
   });
 });
 

@@ -253,6 +253,8 @@ const mobileTaskMessageRows = [
   ["composer.returnActive", "Return to the active task composer before editing this message.", "请先返回当前任务编辑器，再编辑此消息。", "請先返回目前任務編輯器，再編輯此訊息。", "このメッセージを編集する前に、有効なタスク入力欄へ戻ってください。", "이 메시지를 편집하기 전에 활성 작업 작성기로 돌아가세요."],
   ["composer.saveEdit", "Save edit", "保存编辑", "儲存編輯", "編集を保存", "편집 저장"],
   ["composer.send", "Send", "发送", "傳送", "送信", "전송"],
+  ["composer.stop", "Stop current turn", "停止当前回合", "停止目前回合", "現在のターンを停止", "현재 차례 중지"],
+  ["composer.stopping", "Stopping…", "正在停止…", "正在停止…", "停止中…", "중지 중…"],
   ["composer.editingStructured", "Editing queued input · changing its text removes structured reference and quote authority", "正在编辑队列输入 · 更改文本会移除结构化引用和引文权限", "正在編輯佇列輸入 · 變更文字會移除結構化參照與引文權限", "キュー入力を編集中 · テキストを変更すると構造化参照と引用権限が失われます", "대기열 입력 편집 중 · 텍스트를 변경하면 구조화 참조와 인용 권한이 제거됩니다"],
   ["composer.editing", "Editing queued input", "正在编辑队列输入", "正在編輯佇列輸入", "キュー入力を編集中", "대기열 입력 편집 중"],
   ["composer.cancelEdit", "Cancel edit", "取消编辑", "取消編輯", "編集をキャンセル", "편집 취소"],

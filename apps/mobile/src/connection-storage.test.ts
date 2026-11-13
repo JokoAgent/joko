@@ -287,6 +287,21 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
 
+  it("retains only ordinary stop receipts with their original Run identity", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const receipt = { operationId: "stop", connectionId: first.connectionId, kind: "session-stop" as const,
+      sessionId: "session-one", runId: "run-one", state: "unknown" as const };
+    await storage.savePending([receipt]);
+    await expect(storage.loadPending()).resolves.toEqual([receipt]);
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      receipt, { ...receipt, operationId: "no-run", runId: undefined },
+      { ...receipt, operationId: "shared-stop", taskJoinId: "join" },
+      { ...receipt, operationId: "other-mutation", kind: "rename" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual([receipt]);
+  });
+
   it("round-trips body-free new-task creation and exact first-send receipts", async () => {
     const memory = drivers();
     const storage = createMobileStorage(memory.plain, memory.secure);

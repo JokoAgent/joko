@@ -18195,8 +18195,25 @@ async function dispatchMutation(
     }
     case "abortRun": {
       const run = dependencies.store.getRun(payload.value.runId);
-      return ackOperation(dependencies, operationId, connection, mutation, payload.case,
-        () => host.abort(run.descriptor.sessionId, run.descriptor.id, () => { dependencies.connections.fence(connection); }));
+      const otherPreconditions = mutation.preconditions.filter(condition =>
+        condition.entity?.kind !== contract.EntityKind.RUN || condition.entity.id !== run.descriptor.id
+        || condition.expectedRevision === undefined);
+      const fencedRunRevision = otherPreconditions.length !== mutation.preconditions.length;
+      return presented(await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation,
+        // Stopping can advance the very Run revision that authorized the effect.
+        preconditionScope: fencedRunRevision ? "claim" : "claim-and-commit",
+        effect: () => host.abort(run.descriptor.sessionId, run.descriptor.id, () => {
+          dependencies.connections.fence(connection);
+          if (fencedRunRevision) validatePreconditions(dependencies.store, mutation);
+        }),
+        commit: store => {
+          if (fencedRunRevision && otherPreconditions.length > 0) {
+            validatePreconditions(store, { ...mutation, preconditions: otherPreconditions });
+          }
+          return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
+        }
+      }));
     }
     case "terminateRuntimeProcess": {
       const backendId = strictRuntimeProcessIdentity(payload.value.backendId, "terminate_runtime_process.backend_id");
