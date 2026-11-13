@@ -67,7 +67,6 @@ const cachePrefix = "joko.mobile.offline-cache.v1.";
 const maximumManifestBytes = 4 * 1024 * 1024;
 const maximumDetailBytes = 12 * 1024 * 1024;
 const maximumDetailTotalBytes = 32 * 1024 * 1024;
-const maximumDetails = 16;
 const maximumClockValue = Number.MAX_SAFE_INTEGER;
 
 class MobileOfflineCacheReadError extends Error {}
@@ -418,7 +417,7 @@ function readManifest(raw: string, profile: MobileConnectionProfile): CacheManif
   assertSameIdentity(profile, identity);
   const node = readNode(value.node);
   const cachedAt = validTimestamp(value.cachedAt);
-  if (!Array.isArray(value.details) || value.details.length > maximumDetails) {
+  if (!Array.isArray(value.details)) {
     throw new Error("the offline task index is invalid");
   }
   const details = value.details.map(readDetailIndexEntry);
@@ -573,7 +572,7 @@ function boundedDetails(entries: readonly DetailIndexEntry[]): DetailIndexEntry[
   const result: DetailIndexEntry[] = [];
   let total = 0;
   for (const entry of newestFirst(entries)) {
-    if (result.length >= maximumDetails || total + entry.size > maximumDetailTotalBytes) continue;
+    if (total + entry.size > maximumDetailTotalBytes) continue;
     result.push(entry);
     total += entry.size;
   }

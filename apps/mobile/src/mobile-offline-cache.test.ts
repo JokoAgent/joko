@@ -344,32 +344,33 @@ describe("current-v1 mobile offline content cache", () => {
     });
   });
 
-  it("bounds regular task details to the sixteen most recently used records even within one clock tick", async () => {
+  it("retains seventeen short task histories across restart when they fit the disk budget", async () => {
     const fixture = cacheFixture();
     const sessions = Array.from({ length: 17 }, (_, index) => session(`session-${index + 1}`));
     for (let index = 0; index < sessions.length; index += 1) {
       await fixture.cache.save(profile, node, owner(sessions), detail(`session-${index + 1}`));
     }
 
-    expect((await fixture.cache.load(profile, "session-1"))?.detail).toBeUndefined();
-    expect((await fixture.cache.load(profile, "session-17"))?.detail?.sessions[0]?.sessionId).toBe("session-17");
-    expect([...fixture.memory.values.keys()].filter((key) => key.includes(".detail."))).toHaveLength(16);
+    const restarted = new MobileOfflineCache(fixture.memory.storage, () => 2_000, () => "restart");
+    expect((await restarted.load(profile, "session-1"))?.detail?.sessions[0]?.sessionId).toBe("session-1");
+    expect((await restarted.load(profile, "session-17"))?.detail?.sessions[0]?.sessionId).toBe("session-17");
+    expect([...fixture.memory.values.keys()].filter((key) => key.includes(".detail."))).toHaveLength(17);
   });
 
-  it("keeps a recently opened task ahead of an equally-timestamped LRU eviction", async () => {
+  it("keeps a recently opened task when a real byte-budget eviction is required", { timeout: 15_000 }, async () => {
     const fixture = cacheFixture();
-    const sessions = Array.from({ length: 17 }, (_, index) => session(`session-${index + 1}`));
-    for (let index = 0; index < 16; index += 1) {
-      await fixture.cache.save(profile, node, owner(sessions), detail(`session-${index + 1}`));
-    }
+    const sessions = [session("session-1"), session("session-2"), session("session-3")];
+    const history = (sessionId: string) => detail(sessionId, 7n, "a".repeat(11 * 1024 * 1024));
+    await fixture.cache.save(profile, node, owner(sessions), history("session-1"));
+    await fixture.cache.save(profile, node, owner(sessions), history("session-2"));
     await expect(fixture.cache.load(profile, "session-1")).resolves.toMatchObject({
       detail: { snapshotId: "detail-session-1-7" }
     });
-    await fixture.cache.save(profile, node, owner(sessions), detail("session-17"));
+    await fixture.cache.save(profile, node, owner(sessions), history("session-3"));
 
     expect((await fixture.cache.load(profile, "session-1"))?.detail?.sessions[0]?.sessionId).toBe("session-1");
     expect((await fixture.cache.load(profile, "session-2"))?.detail).toBeUndefined();
-    expect((await fixture.cache.load(profile, "session-17"))?.detail?.sessions[0]?.sessionId).toBe("session-17");
+    expect((await fixture.cache.load(profile, "session-3"))?.detail?.sessions[0]?.sessionId).toBe("session-3");
   });
 
   it("serializes clear behind an in-flight write so stale bytes cannot resurrect", async () => {

@@ -5969,6 +5969,34 @@ describe("native mobile connection and operation ownership", () => {
     expect(saved.storage.saveSelection).toHaveBeenCalledWith(credential.profileId, relatedSession.sessionId);
   });
 
+  it("reopens the first saved message after reading seventeen tasks and restarting offline", async () => {
+    const sessions = Array.from({ length: 17 }, (_, index) => create(SessionSchema, {
+      ...runtimeSession, sessionId: `cached-${index + 1}`
+    }));
+    const projection = offlineOwnerProjection(sessions), offline = memoryOfflineCache();
+    for (const session of sessions) {
+      const detail = offlineDetailProjection(session);
+      const original = clone(EventSchema, messageEvent);
+      original.identity!.sessionId = session.sessionId;
+      original.cursor!.generation = detail.generation;
+      detail.timeline = [original];
+      detail.resumeCursor = original.cursor;
+      await offline.cache.save(profileFromCredential(credential), node, projection, detail);
+    }
+    const saved = memoryStorage(credential);
+    await saved.storage.saveSelection(credential.profileId, sessions.at(-1)!.sessionId);
+    const network = fakeNetwork();
+    vi.mocked(network.inspect).mockRejectedValue(new Error("offline"));
+    const restarted = new MobileOfflineCache(offline.driver, () => 2_000, () => "restart");
+    const app = clientWithOfflineCache(network, saved.storage, restarted);
+    await app.start();
+    expect(app.state).toMatchObject({ status: "offline", selectedId: "cached-17" });
+    await app.select(sessions[0]!.sessionId);
+    expect(app.state).toMatchObject({ status: "offline", selectedId: "cached-1" });
+    expect(timelineRows(app.state.detail?.timeline ?? [])).toMatchObject([{ text: "Durable answer" }]);
+    expect(network.readSession).not.toHaveBeenCalled();
+  });
+
   it("uses a valid cached view when protected storage is temporarily unavailable", async () => {
     const cachedOwner = offlineOwnerProjection();
     const cachedDetail = offlineDetailProjection();
