@@ -154,7 +154,7 @@ export function createTaskSharingRuntime(
               if (store.getRun(run.descriptor.id).descriptor.activeAttemptId !== attemptId) {
                 throw new ConnectError("The shared Run changed before it could be stopped.", Code.Aborted);
               }
-            }, () => {
+            }, { beforeAbort: () => {
               assertCurrent(); signal.throwIfAborted();
               if (store.getQueueControl(sessionId).paused) return;
               const next = store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
@@ -164,7 +164,7 @@ export function createTaskSharingRuntime(
                 && author.memberId === lease.author.memberId && author.memberGeneration === lease.author.memberGeneration) {
                 store.setQueuePaused({ sessionId, paused: true, traceId: `operation:${request.operationId}:stop-queue` });
               }
-            });
+            } });
             return complete();
           }, { accepted: true });
         }
