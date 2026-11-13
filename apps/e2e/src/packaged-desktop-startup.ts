@@ -49,7 +49,7 @@ export function createPackagedDesktopStartupEvidence() {
         launcherExitCode: application?.process().exitCode ?? null,
         launcherSignal: application?.process().signalCode ?? null,
         nativeState: nativeState ?? null,
-        stages: progress.split(/\r?\n/u).filter(Boolean).slice(0, 16).map((line) => line.split(" ", 1)[0])
+        stages: progress.split(/\r?\n/u).filter(Boolean).slice(0, 24).map((line) => line.split(" ", 1)[0])
       };
     },
     reset() { resultPath = undefined; }
