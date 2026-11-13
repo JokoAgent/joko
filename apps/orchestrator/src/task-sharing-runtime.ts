@@ -147,10 +147,24 @@ export function createTaskSharingRuntime(
         case "abortRun": {
           const run = store.getRun(payload.value.runId);
           if (run.descriptor.sessionId !== sessionId) throw denied();
-          // The original abort only stops the active Run and retains pending input.
+          const attemptId = run.descriptor.activeAttemptId;
           return effect(async (signal, complete) => {
-            lease.assertCurrent(); signal.throwIfAborted();
-            await host.abort(sessionId, run.descriptor.id);
+            await host.abort(sessionId, run.descriptor.id, () => {
+              lease.assertCurrent(); signal.throwIfAborted();
+              if (store.getRun(run.descriptor.id).descriptor.activeAttemptId !== attemptId) {
+                throw new ConnectError("The shared Run changed before it could be stopped.", Code.Aborted);
+              }
+            }, () => {
+              assertCurrent(); signal.throwIfAborted();
+              if (store.getQueueControl(sessionId).paused) return;
+              const next = store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+              if (next === undefined) return;
+              const author = new TaskShareStore(store).getAuthorForOperation(next.operationId);
+              if (author?.shareId === lease.author.shareId && author.shareGeneration === lease.author.shareGeneration
+                && author.memberId === lease.author.memberId && author.memberGeneration === lease.author.memberGeneration) {
+                store.setQueuePaused({ sessionId, paused: true, traceId: `operation:${request.operationId}:stop-queue` });
+              }
+            });
             return complete();
           }, { accepted: true });
         }

@@ -4431,11 +4431,12 @@ export class SessionHost {
     }
   }
 
-  async abort(sessionId: string, runId: string, assertAuthority?: () => void): Promise<void> {
-    await this.controlRun(sessionId, runId, "abort", assertAuthority);
+  async abort(sessionId: string, runId: string, assertAuthority?: () => void, beforeAbort?: () => void): Promise<void> {
+    await this.controlRun(sessionId, runId, "abort", assertAuthority, beforeAbort);
   }
 
-  private async controlRun(sessionId: string, runId: string, action: "abort" | "abortRetry", assertAuthority?: () => void): Promise<void> {
+  private async controlRun(sessionId: string, runId: string, action: "abort" | "abortRetry",
+    assertAuthority?: () => void, beforeAbort?: () => void): Promise<void> {
     const original = this.#store.getRun(runId).descriptor;
     if (original.sessionId !== sessionId) throw new StoreError("Run does not belong to the task.");
     const originalQueue = this.#store.findQueueItemByRunId(sessionId, runId);
@@ -4469,6 +4470,9 @@ export class SessionHost {
       };
       assertRunControlCurrent();
       const context = this.contextFor(lease.stored, runId, original.activeAttemptId, undefined, undefined, lease.backendInstanceGeneration);
+      // The caller may commit queue control only after this exact Attempt is
+      // confirmed. The Adapter still rechecks authority at native dispatch.
+      beforeAbort?.();
       await active.adapter[action]({ ...context, assertRunControlCurrent });
       this.assertActiveBackendSideEffectLease(lease);
     } finally {

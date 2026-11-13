@@ -6,7 +6,7 @@ import * as contract from "@joko/contracts";
 import type { AdapterContext, PromptInput } from "@joko/core";
 import { expect, it } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor, type PairedClient } from "./fixture.js";
-import { createSessionMutation, editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, sendInputMutation,
+import { abortRunMutation, createSessionMutation, editQueuedInputMutation, pauseQueueMutation, pinMutation, queueItemFrom, sendInputMutation,
   sessionIdFrom, setQueueItemEditLockMutation, submit } from "./operations.js";
 
 type SharingClient = Client<typeof contract.TaskSharingService>;
@@ -34,6 +34,28 @@ class SharingAdapter extends InstrumentedFakeAdapter {
       fields: [{ id: "continue", kind: "boolean", label: "Continue", required: true, defaultValue: false }] });
     if (input.text === "[plan]") await context.requestInteraction({ id: `plan-${randomUUID()}`, kind: "plan_review", title: "Review plan", markdown: "Read the fixture.", choices: ["execute", "stay", "refine"] });
     await super.send(input, context);
+  }
+}
+
+class SharedStopAdapter extends InstrumentedFakeAdapter {
+  #activeInput: AdapterContext | undefined;
+
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    if (input.text === "Hold the original turn") {
+      this.sendCalls.push(input);
+      this.#activeInput = context;
+      return;
+    }
+    await super.send(input, context);
+  }
+
+  override async abort(context: AdapterContext): Promise<void> {
+    const active = this.#activeInput;
+    if (active?.sessionId !== context.sessionId) throw new Error("No original shared turn is active.");
+    context.assertRunControlCurrent?.();
+    this.#activeInput = undefined;
+    this.abortCalls += 1;
+    await active.emit({ type: "done", outcome: "aborted" });
   }
 }
 
@@ -142,6 +164,53 @@ it("keeps two-node shared Task, authors, receipts, attachments and joined direct
     await ownerApi.endTaskShare({ operationId: randomUUID(), shareId: share.shareId });
     expect((await host.clients(owner.authKey).session.getSession({ sessionId })).session?.sessionId).toBe(sessionId);
     expect(host.application.store.listSessions({ includeArchived: true }).filter(row => row.descriptor.id === sessionId)).toHaveLength(1);
+  } finally { await home?.close(); await host?.close(); }
+}, 60_000);
+
+it.each(["guest", "owner"] as const)("stops the original shared turn with the %s's accepted input at the head", async (queueOwner) => {
+  let host: OrchestratorE2eFixture | undefined, home: OrchestratorE2eFixture | undefined;
+  try {
+    host = await OrchestratorE2eFixture.start({ taskSharing: true, serverId: "stop-host", createAdapter: profile => new SharedStopAdapter(profile) });
+    home = await OrchestratorE2eFixture.start({ taskSharing: true, serverId: "stop-home" });
+    const owner = await host.pair(), visitor = await home.pair(), ownerApi = sharing(host, owner), visitorApi = sharing(home, visitor);
+    const sessionId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId, createSessionMutation({
+      backendId: host.adapter().id, targetId: host.targetId(), providerId: "test", modelId: "text"
+    })));
+    const share = (await ownerApi.createTaskShare({ operationId: randomUUID(), sessionId })).share!;
+    const invitation = (await ownerApi.createTaskShareInvitation({ operationId: randomUUID(), shareId: share.shareId })).invitation;
+    const joined = (await visitorApi.joinTaskShare({ operationId: randomUUID(), invitation, displayName: "Participant" })).intent!.joined!;
+    const store = host.application.store;
+    const generation = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+    const running = queueItemFrom(await submit(owner.clients.operation, owner.connectionId,
+      sendInputMutation(sessionId, generation, "Hold the original turn")));
+    await waitFor(() => owner.clients.run.getRun({ runId: running.runId }),
+      response => response.run?.state === contract.RunState.RUNNING, "original shared run to be active");
+    const activeGeneration = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+    const followUp = sendInputMutation(sessionId, activeGeneration, "Queued follow-up");
+    const queued = queueItemFrom(queueOwner === "guest"
+      ? await guestSubmit(visitorApi, joined.joinId, followUp)
+      : await submit(owner.clients.operation, owner.connectionId, followUp));
+    expect(store.getQueueItem(queued.queueItemId).state).toBe("accepted");
+
+    const stopId = randomUUID(), stop = abortRunMutation(running.runId);
+    expect((await guestSubmit(visitorApi, joined.joinId, stop, stopId)).state).toBe(contract.OperationState.SUCCEEDED);
+    expect(store.getRun(running.runId).descriptor.state).toBe("aborted");
+    expect(store.getQueueControl(sessionId)).toMatchObject({ paused: queueOwner === "guest", resumeOnUserInput: false });
+    expect((await guestSubmit(visitorApi, joined.joinId, stop, stopId)).state).toBe(contract.OperationState.SUCCEEDED);
+    expect(host.adapter().abortCalls).toBe(1);
+
+    if (queueOwner === "guest") {
+      expect(store.getQueueItem(queued.queueItemId).state).toBe("accepted");
+      expect(host.adapter().sendCalls.map(input => input.text)).toEqual(["Hold the original turn"]);
+      const control = (await owner.clients.queue.getQueueControl({ sessionId })).queueControl!;
+      await guestSubmit(visitorApi, joined.joinId, create(contract.OperationMutationSchema, {
+        preconditions: [{ entity: { kind: contract.EntityKind.QUEUE_CONTROL, id: sessionId }, expectedRevision: control.version!.revision }],
+        payload: { case: "resumeQueue", value: { sessionId } }
+      }));
+    }
+    await waitFor(() => owner.clients.run.getRun({ runId: queued.runId }),
+      response => response.run?.state === contract.RunState.SUCCEEDED, "the original queued input to finish");
+    expect(host.adapter().sendCalls.map(input => input.text)).toEqual(["Hold the original turn", "Queued follow-up"]);
   } finally { await home?.close(); await host?.close(); }
 }, 60_000);
 
