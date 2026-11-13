@@ -1555,17 +1555,15 @@ export class PiBackendAdapter implements
     }
     let durableNativeDispatchFingerprint: string | undefined;
     if (persistFence !== undefined) {
-      const redactedMessage = redactPiNativeValue({
-        role: "user",
+      durableNativeDispatchFingerprint = nativeDispatchFingerprintForUserMessage({
         content: [
-          ...(message === "" ? [] : [{ type: "text", text: message }]),
+          ...(message === "" ? [] : [{ type: "text", text: redactManagedSecrets(message, runtime.redactValues) }]),
           ...images
         ]
-      }, runtime.redactValues);
-      if (!isRecord(redactedMessage)) {
+      });
+      if (durableNativeDispatchFingerprint === undefined) {
         throw piError("PI_NATIVE_DISPATCH_FINGERPRINT_INVALID", "Pi native input fingerprint could not be established", "dispatch");
       }
-      durableNativeDispatchFingerprint = nativeDispatchFingerprintForUserMessage(redactedMessage);
     }
     const skillCommandResource = composerCommand.skillResourceId === undefined
       ? undefined
@@ -4640,7 +4638,8 @@ export class PiBackendAdapter implements
       const materialized = await runtime.translator.materializeNativeHistoryEntry({ id: native.nativeEntryId,
         type: "message", data: { message: observed.message } });
       const message = materialized.data["message"];
-      if (!isRecord(message) || native.metadata?.fields["nativeDispatchFingerprint"] !== nativeDispatchFingerprintForUserMessage(message)) return;
+      const fingerprint = isRecord(message) ? nativeDispatchFingerprintForUserMessage(message) : undefined;
+      if (fingerprint === undefined || native.metadata?.fields["nativeDispatchFingerprint"] !== fingerprint) return;
     }
     const native = users[index]!;
     occurrence.identity = { entryId: native.nativeEntryId,

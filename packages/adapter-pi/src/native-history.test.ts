@@ -1,9 +1,29 @@
+import { createHash } from "node:crypto";
 import type { BlobRef } from "@joko/core";
 import { describe, expect, it } from "vitest";
 
-import { projectPiNativeHistory, type PiNativeSessionHistory } from "./native-history.js";
+import { nativeDispatchFingerprintForUserMessage, projectPiNativeHistory, type PiNativeSessionHistory } from "./native-history.js";
 
 describe("Pi native history projection", () => {
+  it("matches identical native and materialized image content without equating altered inputs", () => {
+    const bytes = Buffer.from("fixture pixels");
+    const image = { type: "image", data: bytes.toString("base64"), mimeType: "image/PNG" };
+    const blob = { id: "owned-image", sha256: createHash("sha256").update(bytes).digest("hex"), byteLength: bytes.length,
+      mimeType: "image/png", fileName: "pixel.png" };
+    const text = { type: "text", text: "Retain these exact pixels" };
+    const fingerprint = (content: readonly unknown[]) => nativeDispatchFingerprintForUserMessage({ role: "user", content });
+    const original = fingerprint([text, image]);
+    expect(original).toMatch(/^[a-f0-9]{64}$/u);
+    expect(fingerprint([text, { type: "image", blob }])).toBe(original);
+    expect(fingerprint([text, { type: "image", blob: { ...blob, id: "new-owned-ref" } }])).toBe(original);
+    expect(fingerprint([text, { ...image, data: Buffer.from("other pixels").toString("base64") }])).not.toBe(original);
+    expect(fingerprint([text, { ...image, mimeType: "image/jpeg" }])).not.toBe(original);
+    expect(fingerprint([image, text])).not.toBe(original);
+    expect(fingerprint([text, { ...image, data: "not base64" }])).toBeUndefined();
+    expect(fingerprint([image])).toBe(fingerprint([{ type: "text", text: "" }, image]));
+    expect(fingerprint([text])).toBe(createHash("sha256").update(JSON.stringify({ role: "user", content: [text] })).digest("hex"));
+  });
+
   it("keeps an explicit native start empty even when abandoned entries remain", () => {
     const root = { id: "root-user", type: "message", data: { message: { role: "user", content: "Old context" } } };
     const projected = projectPiNativeHistory("native-at-start", { entries: [root], leafId: null });

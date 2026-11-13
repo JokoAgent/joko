@@ -6,10 +6,13 @@ import {
   AddResourceMutationSchema,
   ApproveResourceMutationSchema,
   BackendHealth,
+  BlobDisposition,
   CompactSessionOutcome,
   CompactionState,
   InstallationState,
+  InputPartSchema,
   InstallResourceMutationSchema,
+  MessageRole,
   OperationMutationSchema,
   OperationState,
   OwnerSnapshotScopeSchema,
@@ -64,6 +67,49 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     releaseCompactionGate = undefined;
     await fixture?.close();
     fixture = undefined;
+  });
+
+  it("binds a native Pi image turn and its usage to the original Run after a fresh timeline read", { timeout: 60_000 }, async () => {
+    fixture = await RealPiSystemFixture.start({ providerSupportsImages: true });
+    const paired = await fixture.pair("Pi image turn owner");
+    const created = await submit(paired.clients.operation, paired.connectionId, createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+    }));
+    const sessionId = sessionIdFrom(created);
+    const generation = (await paired.clients.session.getSession({ sessionId })).session!.nativeBinding!.runtimeGeneration;
+    const pixels = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"
+    );
+    const pixel = await fixture.application.artifacts.ingestBytes(pixels, { fileName: "pixel.png", mimeType: "image/png" });
+    const prompt = "Reply to the image fixture.";
+    const send = sendInputMutation(sessionId, generation, prompt);
+    if (send.payload.case !== "sendInput") throw new Error("The image fixture has no Send mutation.");
+    send.payload.value.input!.parts.push(create(InputPartSchema, { content: { case: "image", value: { blob: {
+      blobId: pixel.id, fileName: "pixel.png", mediaType: pixel.mimeType, byteSize: BigInt(pixel.byteLength),
+      sha256Hex: pixel.sha256, disposition: BlobDisposition.ATTACHMENT
+    } } } }));
+    const operation = await submit(paired.clients.operation, paired.connectionId, send);
+    const runId = queueRunIdFrom(operation);
+    const reconnected = fixture.clients(paired.authKey);
+    await waitForRealSystem(() => reconnected.run.getRun({ runId }), response => response.run?.state === RunState.SUCCEEDED,
+      "the installed Pi image turn to settle", 30_000);
+    expect(fixture.providerRequests).toHaveLength(1);
+    const request = JSON.stringify(fixture.providerRequests[0]?.body);
+    expect(request).toContain(prompt);
+    expect(request).toContain(`data:image/png;base64,${pixels.toString("base64")}`);
+    const { events } = await reconnected.session.listSessionTimeline({ sessionId });
+    const assistant = events.filter(event => event.payload?.kind.case === "messageCompleted"
+      && event.payload.kind.value.role === MessageRole.ASSISTANT);
+    expect(assistant).toHaveLength(1);
+    const [completion] = assistant;
+    expect(completion?.identity).toMatchObject({ runId, operationId: operation.operationId });
+    const message = completion?.payload?.kind;
+    if (message?.case !== "messageCompleted") throw new Error("No durable assistant completion was returned.");
+    expect(message.value.turnUsage).toMatchObject({ completionEventId: completion?.eventId,
+      messageId: message.value.messageId, usage: { totalTokens: 10n } });
+    const usage = (await reconnected.run.getRun({ runId })).run?.usage;
+    expect(usage?.completionEventId).toBe(completion?.eventId);
+    expect(usage?.usage?.totalTokens).toBe(10n);
   });
 
   it("preserves omitted, explicit and null Schedule patches through the published Pi tool bridge", { timeout: 60_000 }, async () => {
