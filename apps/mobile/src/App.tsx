@@ -3944,6 +3944,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     : timelineRows([...state.window, ...taskTimelineEvents.filter(event => event.payload?.kind.case === "runChanged")], false, state.detail?.runs),
   [latestObservedRows, state.detail?.runs, state.window, taskTimelineEvents]);
   const localOutbox = client.taskOutboxItems?.() ?? [];
+  const unsentOutbox = localOutbox.filter(record => record.state !== "accepted");
   const optimisticOwnerKey = state.status === "connected" || state.status === "offline" ? client.taskPresentationOwnerKey(state.status === "offline") : undefined;
   const ownerOptimisticRows = useMemo(() => state.status === "connecting"
     ? optimisticUserRows
@@ -3954,7 +3955,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const messageRows = useMemo(() => state.window !== undefined
     ? observedRows
     : optimisticOwnerKey === undefined && state.status !== "connecting"
-      ? observedRows
+      ? projectMobilePendingOutboxRows(observedRows, localOutbox.filter(record => record.state === "accepted"), state.status === "connected")
     : projectMobilePendingOutboxRows(projectMobileOptimisticUserRows(
         observedRows,
         ownerOptimisticRows,
@@ -6540,7 +6541,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     if (item.pendingSend && state.activeProfileId) {
       const record = item.pendingSend.outboxId ? localOutbox.find(record => record.id === item.pendingSend!.outboxId) : undefined;
       return <MobilePendingSendBubble progress={item.pendingSend} colors={colors} locale={locale} files={mobileAttachmentFiles} profileId={state.activeProfileId}>
-        {record ? <View style={styles.queueActions}>
+        {record && record.state !== "accepted" ? <View style={styles.queueActions}>
           {record.state === "confirming" || record.attempted && record.failureKind !== "rejected" ? <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact
             disabled={state.status !== "connected" || state.busy} onPress={() => void (record.state === "confirming" ? client.reconcile() : client.checkTaskOutbox(record.id)).catch(error => setLocalError(errorText(error)))} /> : <>
             {record.state === "failed" && <Action label={mobileMessage(locale, "common.retry")} colors={colors} compact disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
@@ -6760,7 +6761,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       drawerMounted={drawerMounted}
       pinned={session?.pinned}
       syncing={state.status === "connecting" || state.historyBusy}
-      notice={mobileTaskHeaderNotice({ status: state.status, session, pendingCount: queueItems.length + localOutbox.length, role: headerRole.role,
+      notice={mobileTaskHeaderNotice({ status: state.status, session, pendingCount: queueItems.length + unsentOutbox.length, role: headerRole.role,
         queueControls: state.detail?.queueControls ?? [], locale })}
       detailsOnly={headerRole.role === "worker"}
       primaryActionsReady={headerRole.role !== undefined}
@@ -7029,10 +7030,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     </View>}
     </View>
     <View testID="task.controls-viewport" pointerEvents="box-none" style={controlsRegion}>
-    {state.window !== undefined && localOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
+    {state.window !== undefined && unsentOutbox.length > 0 && <View style={styles.queueRegion} testID="task.local-outbox">
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.outbox")}</Text>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList} keyboardShouldPersistTaps="handled">
-        {localOutbox.map((item, index) => <View key={item.id}
+        {unsentOutbox.map((item, index) => <View key={item.id}
           style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
           <Text style={[styles.caption, { color: item.state === "failed" ? colors.negative : colors.muted }]}>
             {index + 1} · {mobileMessage(locale, item.state === "failed" ? "task.outboxFailed"

@@ -1,5 +1,6 @@
 import { fromJsonString, toJsonString } from "@bufbuild/protobuf";
-import { ModelSelectionSchema, PermissionMode, QueueDeliveryMode, type Session } from "@joko/contracts";
+import { MessageRole, ModelSelectionSchema, PermissionMode, QueueDeliveryMode, QueueSourceKind,
+  type Event, type QueueItem, type Session } from "@joko/contracts";
 import type { MobileConnectionProfile, MobilePlainStorageDriver } from "./connection-storage";
 import { normalizeMobileComposerDraft, type MobileComposerDraft } from "./mobile-composer-document";
 
@@ -23,8 +24,15 @@ export interface MobileTaskOutboxRecord {
   readonly storageIds: readonly string[];
   /** Reconciled before delivery, including after an interrupted composer handoff. */
   readonly sourceDraft?: MobileComposerDraft;
-  readonly state: "staging" | "queued" | "confirming" | "failed" | "restoring" | "settled";
+  readonly state: "staging" | "queued" | "confirming" | "failed" | "restoring" | "accepted" | "settled";
   readonly attempted: boolean;
+  /** The node owns delivery. Keep the local input until its exact history is saved. */
+  readonly queueReceipt?: {
+    readonly queueItemId: string;
+    readonly runId: string;
+    readonly inputKey?: string;
+    readonly historyEventId?: string;
+  };
   readonly failureKind?: "preparation" | "not-admitted" | "rejected";
   readonly error?: string;
   /** The actual current upload slot, retained on a preparation failure. */
@@ -96,7 +104,7 @@ export class MobileTaskOutboxStore {
   }
 
   update(record: MobileTaskOutboxRecord, patch: Partial<Pick<MobileTaskOutboxRecord,
-    "operationId" | "input" | "sourceDraft" | "state" | "attempted" | "failureKind" | "error" | "uploadAttachmentId">>): Promise<MobileTaskOutboxRecord> {
+    "operationId" | "input" | "sourceDraft" | "state" | "attempted" | "queueReceipt" | "failureKind" | "error" | "uploadAttachmentId">>): Promise<MobileTaskOutboxRecord> {
     return this.#mutate((records) => {
       if (!records.includes(record)) throw new Error("The retained task input changed.");
       const next = readRecord({ ...record, ...patch });
@@ -242,6 +250,35 @@ export function mobileTaskOutboxModel(session: Session): string | undefined {
   return session.model === undefined ? undefined : toJsonString(ModelSelectionSchema, session.model);
 }
 
+export function mobileTaskOutboxSessionMatches(record: MobileTaskOutboxRecord, session: Session): boolean {
+  return session.sessionId === record.sessionId && session.backendId === record.backendId && session.targetId === record.targetId
+    && session.nativeBinding?.runtimeGeneration.toString() === record.runtimeGeneration;
+}
+
+export function mobileTaskOutboxQueueMatches(record: MobileTaskOutboxRecord, item: QueueItem): boolean {
+  return item.sourceId === record.operationId && item.sourceKind === QueueSourceKind.UI
+    && item.sessionId === record.sessionId && item.backendId === record.backendId && item.targetId === record.targetId
+    && validIdentity(item.queueItemId) && validIdentity(item.runId)
+    && (!record.queueReceipt || item.queueItemId === record.queueReceipt.queueItemId && item.runId === record.queueReceipt.runId);
+}
+
+export function mobileTaskOutboxHistoryMatches(record: MobileTaskOutboxRecord, event: Event): boolean {
+  const receipt = record.queueReceipt, identity = event.identity, payload = event.payload?.kind;
+  return receipt !== undefined && event.eventId !== "" && identity !== undefined && identity.operationId === record.operationId
+    && identity.queueItemId === receipt.queueItemId && identity.runId === receipt.runId
+    && identity.sessionId === record.sessionId && identity.backendId === record.backendId && identity.targetId === record.targetId
+    && identity.generation.toString() === record.runtimeGeneration && payload?.case === "messageStarted"
+    && payload.value.role === MessageRole.USER && payload.value.userInputAccepted && payload.value.userInput !== undefined;
+}
+
+export function mobileTaskOutboxHistoryDeleted(record: MobileTaskOutboxRecord, event: Event): boolean {
+  const eventId = record.queueReceipt?.historyEventId, identity = event.identity, payload = event.payload?.kind;
+  return eventId !== undefined && identity?.sessionId === record.sessionId && identity.backendId === record.backendId
+    && identity.targetId === record.targetId && identity.generation.toString() === record.runtimeGeneration
+    && payload?.case === "messageDeleted" && payload.value.productSessionId === record.sessionId
+    && payload.value.deletedEventIds.includes(eventId);
+}
+
 function readRecord(value: unknown): MobileTaskOutboxRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The retained task input is damaged.");
   const record = value as MobileTaskOutboxRecord;
@@ -257,7 +294,7 @@ function readRecord(value: unknown): MobileTaskOutboxRecord {
     || ![QueueDeliveryMode.PROMPT, QueueDeliveryMode.STEER, QueueDeliveryMode.FOLLOW_UP].includes(record.deliveryMode)
     || !Number.isSafeInteger(record.permissionMode) || !Object.values(PermissionMode).includes(record.permissionMode)
     || typeof record.planMode !== "boolean" || typeof record.attempted !== "boolean"
-    || !["staging", "queued", "confirming", "failed", "restoring", "settled"].includes(record.state)
+    || !["staging", "queued", "confirming", "failed", "restoring", "accepted", "settled"].includes(record.state)
     || !Array.isArray(record.storageIds) || record.storageIds.some((id) => typeof id !== "string" || !/^[A-Za-z0-9_-]{1,256}$/u.test(id))
     || new Set(record.storageIds).size !== record.storageIds.length
     || record.state === "confirming" && !record.attempted
@@ -266,6 +303,13 @@ function readRecord(value: unknown): MobileTaskOutboxRecord {
     || (record.state === "failed") !== (record.failureKind !== undefined)
     || record.error !== undefined && (typeof record.error !== "string" || record.error.length > 4_096)) {
     throw new Error("The retained task input contains invalid delivery state.");
+  }
+  const receipt = record.queueReceipt;
+  if ((record.state === "accepted") !== (receipt !== undefined) || receipt !== undefined
+    && (!receipt || !record.attempted || !validIdentity(receipt.queueItemId) || !validIdentity(receipt.runId)
+      || receipt.inputKey !== undefined && !/^[a-f0-9]{64}$/u.test(receipt.inputKey)
+      || receipt.historyEventId !== undefined && !validIdentity(receipt.historyEventId))) {
+    throw new Error("The retained task input has an invalid queue receipt.");
   }
   if (record.modelJson !== undefined) fromJsonString(ModelSelectionSchema, record.modelJson);
   const rebalance = record.providerGroupRebalance;
@@ -290,6 +334,9 @@ function readRecord(value: unknown): MobileTaskOutboxRecord {
     ...(record.modelJson === undefined ? {} : { modelJson: record.modelJson }), input, storageIds: [...record.storageIds],
     ...(record.sourceDraft === undefined ? {} : { sourceDraft: normalizeMobileComposerDraft(record.sourceDraft) }),
     state: record.state, attempted: record.attempted,
+    ...(receipt === undefined ? {} : { queueReceipt: { queueItemId: receipt.queueItemId, runId: receipt.runId,
+      ...(receipt.inputKey === undefined ? {} : { inputKey: receipt.inputKey }),
+      ...(receipt.historyEventId === undefined ? {} : { historyEventId: receipt.historyEventId }) } }),
     ...(record.failureKind === undefined ? {} : { failureKind: record.failureKind }),
     ...(record.error === undefined ? {} : { error: record.error }),
     ...(rebalance ? { providerGroupRebalance: { suggestionKey: rebalance.suggestionKey, remember: rebalance.remember } } : {}),

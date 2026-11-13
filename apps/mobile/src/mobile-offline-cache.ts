@@ -179,7 +179,7 @@ export class MobileOfflineCache {
     node: NodeIdentity,
     owner: Snapshot,
     detail?: Snapshot
-  ): Promise<void> {
+  ): Promise<Snapshot | void> {
     assertIdentity(profile);
     assertOwnerSnapshot(profile, node, owner);
     const detailSessionId = detail?.scope?.kind.case === "session" ? detail.scope.kind.value.sessionId : undefined;
@@ -215,6 +215,7 @@ export class MobileOfflineCache {
       let details = (prior?.details ?? []).filter((entry) =>
         regularGenerations.get(entry.sessionId) === entry.sessionGeneration && !unavailable?.has(entry.sessionId));
       const createdKeys: string[] = [];
+      let writtenDetail: { readonly key: string; readonly snapshot: Snapshot } | undefined;
       if (detailSessionId !== undefined) {
         let retainedDetail = detail!;
         let detailCachedAt = cachedAt;
@@ -263,6 +264,7 @@ export class MobileOfflineCache {
             key,
             size
           });
+          writtenDetail = { key, snapshot: retainedDetail };
         }
       }
       details = boundedDetails(details);
@@ -284,6 +286,8 @@ export class MobileOfflineCache {
       for (const key of createdKeys) {
         if (!retained.has(key)) await this.storage.removeItem(key).catch(() => undefined);
       }
+      // The caller can retire a local input only when this exact history reached the manifest.
+      return current() && writtenDetail && retained.has(writtenDetail.key) ? writtenDetail.snapshot : undefined;
     });
   }
 

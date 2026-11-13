@@ -17,14 +17,14 @@ export function MobilePendingSendBubble({ progress, colors, locale, files, profi
     const remaining = progress.sentAt + 300 - Date.now(); if (remaining <= 0) { setVisible(true); return; }
     setVisible(false); const timer = setTimeout(() => setVisible(true), remaining); return () => clearTimeout(timer);
   }, [progress.sentAt]);
-  const failed = progress.phase === "failed", unknown = progress.phase === "unknown";
-  const status = mobileMessage(locale, progress.phase === "waiting" ? "task.outboxQueued" : unknown ? "task.operationUnknown"
+  const failed = progress.phase === "failed", unknown = progress.phase === "unknown", accepted = progress.phase === "accepted";
+  const status = mobileMessage(locale, accepted ? "task.outboxAccepted" : progress.phase === "waiting" ? "task.outboxQueued" : unknown ? "task.operationUnknown"
     : failed ? "task.outboxFailed" : progress.phase === "uploading" ? "task.pendingUploading" : progress.phase === "preparing" ? "task.pendingPreparing"
       : progress.phase === "queued" ? "task.queued" : "common.sending");
   const text = mobilePendingSendText(progress.input);
   return <View style={styles.root} testID="task.pending-send">
     <View style={styles.line}>
-      <View style={styles.indicator}>{(visible || failed || unknown) && (failed || unknown ? <Text style={{ color: failed ? colors.negative : colors.muted }}>!</Text>
+      <View style={styles.indicator}>{!accepted && (visible || failed || unknown) && (failed || unknown ? <Text style={{ color: failed ? colors.negative : colors.muted }}>!</Text>
         : <ActivityIndicator size="small" color={colors.muted} />)}</View>
       <View style={[styles.bubble, { backgroundColor: colors.brandBackground, borderColor: colors.border }]}>
         {progress.input.replyQuote && <Text numberOfLines={3} style={{ color: colors.muted }}>{progress.input.replyQuote.excerpt}</Text>}
@@ -41,7 +41,7 @@ export function MobilePendingSendBubble({ progress, colors, locale, files, profi
         </View>)}
       </View>
     </View>
-    {(visible || failed || unknown) && <Text accessibilityLiveRegion="polite" style={[styles.status, { color: failed ? colors.negative : colors.muted }]}>
+    {(visible || failed || unknown || accepted) && <Text accessibilityLiveRegion="polite" style={[styles.status, { color: failed ? colors.negative : colors.muted }]}>
       {status}{progress.phase === "uploading" ? ` ${progress.input.attachments.filter(item => item.state === "uploaded").length}/${progress.input.attachments.length}` : ""}
       {failed && progress.error ? ` · ${progress.error}` : ""}
     </Text>}

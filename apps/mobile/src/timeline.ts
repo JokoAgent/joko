@@ -53,6 +53,7 @@ export interface TimelineRow {
   readonly completed: boolean;
   /** Exact durable send identity; present only on canonical accepted user input. */
   readonly operationId?: string;
+  readonly queueItemId?: string;
   /** Page-local presentation only; never sourced from or written to durable events. */
   readonly optimistic?: boolean;
   readonly pendingSend?: import("./mobile-pending-send").MobilePendingSendProgress;
@@ -189,6 +190,8 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           ...(message.role === MessageRole.USER && message.userInputAccepted && event.identity?.operationId
             ? { operationId: event.identity.operationId }
             : {}),
+          ...(message.role === MessageRole.USER && message.userInputAccepted && event.identity?.queueItemId
+            ? { queueItemId: event.identity.queueItemId } : {}),
           ...(message.role === MessageRole.USER && message.userInputAccepted && message.userInput?.replyQuote ? {
             replyQuote: normalizeMobileReplyQuote({ ...message.userInput.replyQuote, generation: message.userInput.replyQuote.generation.toString() })
           } : {}),
@@ -272,6 +275,7 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           ...((message.partnerPrivateOrigin ?? previous?.partnerPrivateOrigin) === undefined ? {}
             : { partnerPrivateOrigin: message.partnerPrivateOrigin ?? previous?.partnerPrivateOrigin }),
           ...(previous?.operationId === undefined ? {} : { operationId: previous.operationId }),
+          ...(previous?.queueItemId === undefined ? {} : { queueItemId: previous.queueItemId }),
           ...(quoteText?.trim() ? { quoteSource: {
             sourceMessageId: message.messageId,
             sourceEventId: event.eventId,

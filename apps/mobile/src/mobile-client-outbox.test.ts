@@ -2,10 +2,10 @@ import { clone, create, toBinary } from "@bufbuild/protobuf";
 import { createHash } from "node:crypto";
 import {
   BlobDisposition, BlobRefSchema, CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DeviceSchema,
-  JOKO_API_VERSION, OperationMutationSchema, OperationSchema, OperationState, PermissionMode,
-  QueueDeliveryMode, SessionState, SnapshotSchema, SnapshotScopeSchema, TargetState, WorkspaceKind, capabilityNames,
+  EventCursorSchema, EventSchema, InputContentSchema, JOKO_API_VERSION, MessageRole, OperationMutationSchema, OperationSchema, OperationState, PermissionMode,
+  QueueDeliveryMode, QueueItemSchema, QueueItemState, QueueSourceKind, SessionState, SnapshotSchema, SnapshotScopeSchema, TargetState, WorkspaceKind, capabilityNames,
   extensionCardFormDeliveryScope, releaseExtensionCardFormDelivery, trackExtensionCardFormDelivery,
-  type Operation
+  type InputContent, type Operation
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient } from "./mobile-client";
@@ -17,6 +17,7 @@ import { mobileIncomingShareStorageId, parseMobileIncomingSharePartIdentity } fr
 import { MobileOfflineCache } from "./mobile-offline-cache";
 import { MobileTaskOutboxStore, type MobileTaskOutboxRecord } from "./mobile-task-outbox";
 import { projectMobilePendingOutboxRows } from "./mobile-pending-send";
+import { timelineRows } from "./timeline";
 import { rebalanceSuggestionFixture } from "./test/provider-group-rebalance";
 import type { MobileNetwork, NodeIdentity, PairedCredential } from "./network";
 
@@ -28,17 +29,31 @@ const serviceEpoch = 123n, nativeGeneration = 8n;
 const clients: MobileClient[] = [];
 afterEach(() => { for (const client of clients.splice(0)) client.dispose(); });
 
-function receipt(operationId: string, state = OperationState.SUCCEEDED): Operation {
+function admittedQueue(operationId: string, input?: InputContent) {
+  return create(QueueItemSchema, { queueItemId: `queue-${operationId}`, runId: `run-${operationId}`,
+    sourceId: operationId, sourceKind: QueueSourceKind.UI, sessionId: "session", backendId: "backend", targetId: "target",
+    state: QueueItemState.DISPATCHING, version: { generation: nativeGeneration }, input });
+}
+
+function receipt(operationId: string, state = OperationState.SUCCEEDED, input?: InputContent): Operation {
   return create(OperationSchema, { operationId, connectionId: credential.connectionId, state,
-    ...(state === OperationState.SUCCEEDED ? { result: { payload: { case: "queueItem", value: {
-      queueItemId: `queue-${operationId}`, sessionId: "session", backendId: "backend", targetId: "target"
-    } } } } : { error: { message: "Rejected by current task policy" } }) });
+    ...(state === OperationState.SUCCEEDED ? { result: { payload: { case: "queueItem", value: admittedQueue(operationId, input) } } }
+      : { error: { message: "Rejected by current task policy" } }) });
+}
+
+function acceptedHistory(operationId: string, input: InputContent, sequence: number) {
+  return create(EventSchema, { eventId: `history-${operationId}`, identity: { operationId, queueItemId: `queue-${operationId}`,
+    runId: `run-${operationId}`, sessionId: "session", backendId: "backend", targetId: "target", generation: nativeGeneration,
+    sequence: BigInt(sequence) }, cursor: { opaqueToken: `event-${sequence}`, generation: serviceEpoch, sequence: BigInt(sequence) },
+    payload: { kind: { case: "messageStarted", value: { role: MessageRole.USER, messageId: `message-${operationId}`,
+      userInputAccepted: true, userInput: input } } } });
 }
 
 async function fixture() {
   const values = new Map<string, string>(), protectedValues = new Map<string, string>();
   let rejectOutboxWrite = false;
   let beforeOutboxWrite: ((value: string) => Promise<void>) | undefined;
+  let failedCacheWrite: "detail" | "manifest" | undefined;
   const plain: MobilePlainStorageDriver = {
     async getItem(key) { return values.get(key) ?? null; },
     async setItem(key, value) {
@@ -76,7 +91,14 @@ async function fixture() {
   });
   let sequence = 0, online = false, clock = 2_000;
   const cache = new MobileOfflineCache({ ...plain, async getAllKeys() { return [...values.keys()]; },
-    async multiRemove(keys) { for (const key of keys) values.delete(key); } }, () => 1_500, () => `cache-${++sequence}`);
+    async multiRemove(keys) { for (const key of keys) values.delete(key); },
+    async setItem(key, value) {
+      if (failedCacheWrite && key.startsWith("joko.mobile.offline-cache.v1.") && key.includes(`.${failedCacheWrite}`)) {
+        throw new Error(`Offline ${failedCacheWrite} write failed`);
+      }
+      await plain.setItem(key, value);
+    }
+  }, () => 1_500, () => `cache-${++sequence}`);
   await cache.save(profileFromCredential(credential), node, owner, detail);
   const blobs = new Map<string, Uint8Array>();
   const fileKey = (profile: string, id: string) => `${profile}/${id}`;
@@ -92,15 +114,28 @@ async function fixture() {
     async clearProfile(profile) { for (const key of blobs.keys()) if (key.startsWith(`${profile}/`)) blobs.delete(key); }
   };
   const files = new MobileAttachmentFiles(fileDriver, async bytes => createHash("sha256").update(bytes).digest("hex"), () => 2_000);
+  let acceptIntoHistory = true;
+  const publishAccepted = (operationId: string, input: InputContent) => {
+    const item = admittedQueue(operationId, input);
+    detail.queueItems.push(item);
+    if (acceptIntoHistory) {
+      const next = detail.timeline.length + 10;
+      detail.timeline.push(acceptedHistory(operationId, input, next));
+      detail.resumeCursor = create(EventCursorSchema, { opaqueToken: `event-${next}`, generation: serviceEpoch, sequence: BigInt(next) });
+    }
+  };
   const network = {
     inspect: vi.fn(async () => { if (!online) throw new Error("Network is offline"); return node; }),
     readOwner: vi.fn(async (_credential: PairedCredential) => ({ connection, device, snapshot: owner })),
-    readSession: vi.fn(async () => detail),
+    readSession: vi.fn(async () => clone(SnapshotSchema, detail)),
     streamOwner: vi.fn(async function* (_credential: PairedCredential, _cursor: unknown, signal: AbortSignal) {
       if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
     }),
     submit: vi.fn(async (_credential: PairedCredential, operationId: string, mutation: Parameters<MobileNetwork["submit"]>[2]) => {
-      toBinary(OperationMutationSchema, mutation); return receipt(operationId);
+      toBinary(OperationMutationSchema, mutation);
+      const input = mutation.payload.case === "sendInput" ? mutation.payload.value.input : undefined;
+      if (input) publishAccepted(operationId, input);
+      return receipt(operationId, OperationState.SUCCEEDED, input);
     }),
     getOperation: vi.fn(async (_credential: PairedCredential, _operationId: string): Promise<Operation | undefined> => undefined),
     uploadBlob: vi.fn(async (_credential: PairedCredential, source: Parameters<MobileNetwork["uploadBlob"]>[1]) => create(BlobRefSchema, {
@@ -115,8 +150,10 @@ async function fixture() {
       undefined, undefined, undefined, undefined, cache);
     clients.push(client); return { client, drafts };
   };
-  return { makeClient, storage, plain, values, owner, detail, network, files, blobs, fileKey,
-    online() { online = true; }, setClock(value: number) { clock = value; }, failWrite(value: boolean) { rejectOutboxWrite = value; },
+  return { makeClient, storage, plain, values, owner, detail, cache, network, files, blobs, fileKey, publishAccepted,
+    online(value = true) { online = value; }, setClock(value: number) { clock = value; }, failWrite(value: boolean) { rejectOutboxWrite = value; },
+    failCacheWrite(kind?: "detail" | "manifest") { failedCacheWrite = kind; },
+    publishHistory(value: boolean) { acceptIntoHistory = value; },
     interceptWrite(value?: (body: string) => Promise<void>) { beforeOutboxWrite = value; } };
 }
 
@@ -135,7 +172,82 @@ describe("durable ordinary mobile task inputs", () => {
     expect(f.network.submit.mock.calls.map(call => call[2].preconditions[0]?.expectedGeneration)).toEqual([nativeGeneration, nativeGeneration]);
     expect(f.network.submit.mock.calls[1]?.[2].payload.value).toMatchObject({ deliveryMode: QueueDeliveryMode.FOLLOW_UP,
       overrides: { permissionMode: PermissionMode.ASK, planMode: false } });
+    expect(recovered.client.taskOutboxItems().map(item => item.state)).toEqual(["accepted", "accepted"]);
+    await recovered.client.refresh();
     expect(recovered.client.taskOutboxItems()).toEqual([]);
+  });
+
+  it.each(["detail", "manifest"] as const)("keeps an accepted input across a failed offline %s write and hands it to disk once", async (failure) => {
+    const f = await fixture(), first = f.makeClient();
+    await first.client.start();
+    const operationId = "accepted-before-cache";
+    await first.client.send(plainTextMobileComposerDraft("Keep this accepted message"), { operationId });
+    f.publishHistory(false);
+    f.online();
+    await first.client.refresh();
+    expect(first.client.taskOutboxItems()[0]).toMatchObject({ state: "accepted", operationId,
+      queueReceipt: { queueItemId: `queue-${operationId}`, runId: `run-${operationId}` } });
+    expect(first.client.state.detail?.timeline).toEqual([]);
+    expect(await first.drafts.readDurable({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+    await expect(first.client.retryTaskOutbox(operationId)).rejects.toThrow("Only a failed");
+    await expect(first.client.cancelTaskOutbox(operationId)).rejects.toThrow("original operation");
+
+    const input = create(InputContentSchema, { parts: [{ content: { case: "text", value: "Keep this accepted message" } }] });
+    const history = acceptedHistory(operationId, input, 11);
+    const unrelated = clone(EventSchema, history);
+    unrelated.eventId = "different-queue-history";
+    unrelated.identity!.queueItemId = "different-queue";
+    f.detail.timeline.push(unrelated);
+    await first.client.refresh();
+    expect(first.client.taskOutboxItems()[0]?.state).toBe("accepted");
+    expect(projectMobilePendingOutboxRows(timelineRows([unrelated]), first.client.taskOutboxItems(), true)).toHaveLength(2);
+    f.detail.timeline = [history];
+    f.failCacheWrite(failure);
+    await first.client.refresh();
+    expect(first.client.state.error).toContain(`Offline ${failure} write failed`);
+    const liveRows = timelineRows(first.client.state.detail!.timeline);
+    expect(projectMobilePendingOutboxRows(liveRows, first.client.taskOutboxItems(), true)).toEqual(liveRows);
+    expect(first.client.taskOutboxItems()[0]?.queueReceipt?.historyEventId).toBe(history.eventId);
+    const previous = await f.cache.load(profileFromCredential(credential), "session");
+    expect(previous?.detail?.timeline.map(event => event.eventId)).toEqual([unrelated.eventId]);
+
+    first.client.dispose();
+    f.online(false);
+    const reopened = f.makeClient();
+    await reopened.client.start();
+    expect(reopened.client.state.status).toBe("offline");
+    expect(projectMobilePendingOutboxRows([], reopened.client.taskOutboxItems(), false)).toEqual([
+      expect.objectContaining({ text: "Keep this accepted message", pendingSend: expect.objectContaining({ phase: "accepted" }) })
+    ]);
+    f.failCacheWrite();
+    f.online();
+    await reopened.client.refresh();
+    expect(reopened.client.taskOutboxItems()).toEqual([]);
+    const cached = await f.cache.load(profileFromCredential(credential), "session");
+    expect(cached?.detail?.timeline.map(event => event.eventId)).toEqual([history.eventId]);
+    expect(f.network.submit.mock.calls.map(call => call[1])).toEqual([operationId]);
+    expect(f.network.getOperation).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancelled", "edited", "generation", "deleted"] as const)("retires an accepted local copy when its host input is %s", async outcome => {
+    const f = await fixture(), { client } = f.makeClient();
+    await client.start();
+    await client.send(plainTextMobileComposerDraft("Original queued content"), { operationId: "accepted-queue" });
+    f.publishHistory(false);
+    f.online();
+    await client.refresh();
+    expect(client.taskOutboxItems()[0]?.state).toBe("accepted");
+    if (outcome === "cancelled") f.detail.queueItems[0]!.state = QueueItemState.CANCELLED;
+    if (outcome === "edited") f.detail.queueItems[0]!.input = create(InputContentSchema, { parts: [{ content: { case: "text", value: "Edited" } }] });
+    if (outcome === "generation") {
+      f.owner.sessions[0]!.nativeBinding!.runtimeGeneration += 1n;
+      f.detail.sessions[0]!.nativeBinding!.runtimeGeneration += 1n;
+    }
+    if (outcome === "deleted") f.owner.sessions = [];
+    await client.refresh();
+    const store = new MobileTaskOutboxStore(f.plain); await store.load();
+    expect(store.records).toEqual([]);
+    expect(f.network.submit).toHaveBeenCalledTimes(1);
   });
 
   it.each(["owner", "state", "input"] as const)("recovers the saved connection and valid sends when another outbox %s is damaged", async (field) => {
@@ -156,6 +268,7 @@ describe("durable ordinary mobile task inputs", () => {
     expect(recovered.client.state).toMatchObject({ status: "connected", selectedId: "session",
       activeProfileId: credential.profileId, automaticProfileId: credential.profileId });
     expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["good-first", "good-second"]);
+    await recovered.client.refresh();
     expect(recovered.client.taskOutboxItems()).toEqual([]);
     expect(f.values.get(key)).toBe(`{"format":1,"records":[${damaged}]}`);
     await recovered.client.refreshSaved();
@@ -184,8 +297,11 @@ describe("durable ordinary mobile task inputs", () => {
     await expect(client.cancelTaskOutbox("lost-result")).rejects.toThrow("original operation");
     client.dispose(); const restarted = f.makeClient(); await restarted.client.start();
     expect(f.network.submit).toHaveBeenCalledTimes(1);
-    f.network.getOperation.mockResolvedValue(receipt("lost-result")); await restarted.client.reconcile();
+    const input = create(InputContentSchema, { parts: [{ content: { case: "text", value: "First" } }] });
+    f.publishAccepted("lost-result", input);
+    f.network.getOperation.mockResolvedValue(receipt("lost-result", OperationState.SUCCEEDED, input)); await restarted.client.reconcile();
     expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["lost-result", "after-result"]);
+    await restarted.client.refresh();
     expect(restarted.client.taskOutboxItems()).toEqual([]);
   });
 
@@ -198,6 +314,7 @@ describe("durable ordinary mobile task inputs", () => {
     expect(f.network.submit).toHaveBeenCalledTimes(1);
     await client.retryTaskOutbox("rejected-input");
     expect(f.network.submit).toHaveBeenCalledTimes(2);
+    await client.refresh();
     expect(f.network.submit.mock.calls[1]?.[1]).not.toBe("rejected-input"); expect(client.taskOutboxItems()).toEqual([]);
   });
 
@@ -215,6 +332,7 @@ describe("durable ordinary mobile task inputs", () => {
     await restarted.client.reconcile(); expect(f.network.submit).not.toHaveBeenCalled();
     await restarted.client.retryTaskOutbox("not-admitted");
     expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["not-admitted"]);
+    await restarted.client.refresh();
     expect(restarted.client.taskOutboxItems()).toEqual([]);
   });
 
@@ -322,6 +440,9 @@ describe("durable ordinary mobile task inputs", () => {
     expect(f.network.uploadBlob).toHaveBeenCalledWith(credential, expect.objectContaining({ uri: `file:///${credential.profileId}/${copiedId}`,
       sha256Hex: hash, fileName: "owned.txt", byteSize: bytes.byteLength }), expect.any(AbortSignal));
     expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["upload-after-restart"]);
+    expect(restarted.client.taskOutboxItems()[0]?.state).toBe("accepted");
+    expect(f.blobs.has(f.fileKey(credential.profileId, copiedId))).toBe(true);
+    await restarted.client.refresh();
     expect(restarted.client.taskOutboxItems()).toEqual([]);
     expect(f.blobs.has(f.fileKey(credential.profileId, copiedId))).toBe(false);
   });
@@ -451,6 +572,7 @@ describe("durable ordinary mobile task inputs", () => {
     await restored.client.retryTaskOutbox("partial-upload");
     expect(f.network.uploadBlob.mock.calls.map(call => call[1].fileName)).toEqual(["first.txt", "second.txt", "second.txt"]);
     expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["partial-upload"]);
+    await restored.client.refresh();
     expect(restored.client.taskOutboxItems()).toEqual([]);
   });
 
