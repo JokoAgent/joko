@@ -1,16 +1,49 @@
-import { create, equals } from "@bufbuild/protobuf";
-import { EventSchema, SnapshotSchema, type Snapshot } from "@joko/contracts";
+import { clone, create, equals } from "@bufbuild/protobuf";
+import { EventSchema, SnapshotSchema, type Event, type Snapshot } from "@joko/contracts";
+
+export function mobileEventWithoutCursorTicket(event: Event): Event {
+  const exact = clone(EventSchema, event);
+  // Independent reads issue fresh tickets for the same durable event.
+  if (exact.cursor) {
+    exact.cursor.opaqueToken = "";
+    exact.cursor.issuedAt = undefined;
+  }
+  return exact;
+}
+
+export function historyInvalidated(event: Event): boolean {
+  switch (event.payload?.kind.case) {
+    case "messageDeleted":
+    case "sessionReset":
+    case "historyPruned": return true;
+    case "nativeBranchChanged": return event.payload.kind.value.timelineRebuilt;
+    default: return false;
+  }
+}
 
 /** Retain an older prefix only when the new first event proves the same immutable history boundary. */
 export function retainMobileHistoryPrefix(next: Snapshot, previous: Snapshot | undefined): Snapshot {
+  const session = next.sessions[0];
+  const prior = previous?.sessions[0];
   if (!previous || next.generation !== previous.generation || next.server?.serverId !== previous.server?.serverId
-    || next.sessions.length !== 1 || previous.sessions.length !== 1
-    || next.sessions[0]!.sessionId !== previous.sessions[0]!.sessionId
-    || next.sessions[0]!.nativeBinding?.runtimeGeneration !== previous.sessions[0]!.nativeBinding?.runtimeGeneration
+    || next.sessions.length !== 1 || previous.sessions.length !== 1 || !session || !prior
+    || session.sessionId !== prior.sessionId || session.backendId !== prior.backendId || session.targetId !== prior.targetId
+    || session.nativeBinding?.runtimeGeneration !== prior.nativeBinding?.runtimeGeneration
+    || session.nativeBinding?.opaqueReference !== prior.nativeBinding?.opaqueReference
     || next.timeline.length === 0 || previous.timeline.length === 0) return next;
+  // A short Session snapshot already includes the whole visible timeline.
+  if (next.scope?.kind.case === "session" && next.timeline.length < next.scope.kind.value.recentTimelineItems) return next;
+  const previousEdge = previous.resumeCursor?.sequence ?? previous.timeline.at(-1)?.cursor?.sequence;
+  if (next.timeline.some(event => historyInvalidated(event)
+    && (previousEdge === undefined || event.cursor === undefined || event.cursor.sequence > previousEdge))) return next;
+
   const first = next.timeline[0]!;
-  const boundary = previous.timeline.findIndex(event => event.eventId === first.eventId && equals(EventSchema, event, first));
-  if (boundary <= 0) return next;
+  const boundary = previous.timeline.findIndex(event => event.eventId === first.eventId);
+  if (boundary <= 0 || !equals(
+    EventSchema,
+    mobileEventWithoutCursorTicket(previous.timeline[boundary]!),
+    mobileEventWithoutCursorTicket(first)
+  )) return next;
   const timeline = [...previous.timeline.slice(0, boundary), ...next.timeline];
   if (new Set(timeline.map(event => event.eventId)).size !== timeline.length) return next;
   return create(SnapshotSchema, { ...next, timeline });

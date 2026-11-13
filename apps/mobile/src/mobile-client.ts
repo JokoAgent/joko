@@ -454,7 +454,7 @@ import {
 } from "./mobile-timeline-artifacts";
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
 import type { MobileOfflineCache, MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
-import { retainMobileHistoryPrefix } from "./mobile-history-continuity";
+import { historyInvalidated, mobileEventWithoutCursorTicket, retainMobileHistoryPrefix } from "./mobile-history-continuity";
 import { SnapshotSchema } from "@joko/contracts";
 import { mobileProviderUsageIdentity, mobileProviderUsageSupported, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import {
@@ -17526,11 +17526,7 @@ export class MobileClient {
 }
 
 function mobileConversationShareEventDigest(event: Event): string {
-  const exact = clone(EventSchema, event);
-  // Snapshot and history reads issue different cursor tickets for the same
-  // durable Event. Preserve its sequence/generation and all message content.
-  if (exact.cursor) { exact.cursor.opaqueToken = ""; exact.cursor.issuedAt = undefined; }
-  return bytesToHex(sha256(toBinary(EventSchema, exact)));
+  return bytesToHex(sha256(toBinary(EventSchema, mobileEventWithoutCursorTicket(event))));
 }
 
 function mobileStateTimelineEvents(state: MobileState): readonly Event[] {
@@ -18036,16 +18032,6 @@ function retiredTaskOutboxQueue(record: MobileTaskOutboxRecord, item: QueueItem)
 
 function taskOutboxQueueInputKey(item: QueueItem): string | undefined {
   return item.input === undefined ? undefined : bytesToHex(sha256(toBinary(InputContentSchema, item.input)));
-}
-
-function historyInvalidated(event: Event): boolean {
-  switch (event.payload?.kind.case) {
-    case "messageDeleted":
-    case "sessionReset":
-    case "historyPruned": return true;
-    case "nativeBranchChanged": return event.payload.kind.value.timelineRebuilt;
-    default: return false;
-  }
 }
 
 function mobileMessageDeletionGeneration(operation: Operation, pending: PendingOperation): bigint | undefined {

@@ -8249,6 +8249,38 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.historyEnd).toBe(true);
   });
 
+  it.each(["same event", "new sequence", "new event generation", "changed body", "history deletion"] as const)(
+    "adopts a freshly issued latest window through the exact existing boundary (%s)", async (change) => {
+      const { app, network, owner, detail, deleted, neighbor, identity, input, hits } = historyRetirementFixture();
+      const first = create(SnapshotSchema, { ...detail, scope: { kind: { case: "session",
+        value: { sessionId: "session", recentTimelineItems: 2 } } } });
+      vi.mocked(network.readSession).mockResolvedValue(first);
+      await app.start();
+      expect(hits()).toHaveLength(1);
+      const boundary = clone(EventSchema, neighbor);
+      boundary.cursor = create(EventCursorSchema, { ...boundary.cursor!, opaqueToken: "reissued",
+        issuedAt: { seconds: 20n }, sequence: change === "new sequence" ? 9n : 8n,
+        generation: change === "new event generation" ? 2n : 1n });
+      if (change === "changed body" && boundary.payload?.kind.case === "messageStarted") {
+        boundary.payload.kind.value.userInputAccepted = false;
+      }
+      const tail = change === "history deletion" ? create(EventSchema, {
+        ...event("deletion", 11n), identity, payload: { kind: { case: "messageDeleted", value: {
+          productSessionId: "session", requestedEventId: deleted.eventId, deletedEventIds: [deleted.eventId]
+        } } }
+      }) : input("new-message", 11n, "latest reply");
+      const observed = create(SnapshotSchema, { ...owner, resumeCursor: tail.cursor });
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: observed });
+      vi.mocked(network.readSession).mockResolvedValue(create(SnapshotSchema, { ...first, resumeCursor: tail.cursor, timeline: [boundary, tail] }));
+
+      await app.refresh();
+
+      expect(app.state.detail?.timeline.map(item => item.eventId)).toEqual(change === "same event"
+        ? [deleted.eventId, boundary.eventId, tail.eventId] : [boundary.eventId, tail.eventId]);
+      expect(app.state.detail?.timeline.find(item => item.eventId === boundary.eventId)?.cursor?.opaqueToken).toBe("reissued");
+      expect(hits()).toHaveLength(change === "same event" ? 1 : 0);
+    });
+
   it("retires an in-flight historic page when returning to the latest window", async () => {
     const network = fakeNetwork();
     const app = client(network, memoryStorage(credential).storage);
