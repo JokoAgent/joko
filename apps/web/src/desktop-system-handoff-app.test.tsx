@@ -28,6 +28,7 @@ const renderedApps = new Set<() => Promise<void>>();
 beforeEach(() => {
   Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() });
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   // This App boundary owns handoff and message traversal; provide a normal
   // occupied viewport so jsdom's zero dimensions do not request extra history.
   vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(600);
@@ -39,6 +40,7 @@ afterEach(async () => {
   Reflect.deleteProperty(window, "jokoDesktop");
   window.location.hash = "";
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
   if (originalScrollTo) Object.defineProperty(HTMLElement.prototype, "scrollTo", originalScrollTo);
   else Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
@@ -1147,7 +1149,6 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it("rechecks the real controller navigation owner after its asynchronous leave gate", async () => {
-    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     vi.spyOn(LocalState, "open").mockResolvedValue({
       listProfiles: async () => [],
       listMachineCaches: async () => [],
@@ -1209,7 +1210,6 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it("restores the exact prior hash when a same-route handoff is retired before hashchange", async () => {
-    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
     vi.spyOn(LocalState, "open").mockResolvedValue({
       listProfiles: async () => [],
       listMachineCaches: async () => [],
