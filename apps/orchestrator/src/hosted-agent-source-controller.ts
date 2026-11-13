@@ -21,6 +21,7 @@ import type { HostedAgentPeerWorkspace } from "./hosted-agent-peer-workspace.js"
 export function createHostedAgentSourceController(options: {
   readonly poller: HostedAgentPoller; readonly runId: string; readonly shadow: string; readonly context: AdapterContext;
   readonly remote?: HostedAgentPeerWorkspace;
+  readonly seedSearchPathsBeforeInputAliases?: boolean;
   readonly binding: () => NativeSessionBinding; readonly temporaryRoot: string;
   readonly readPolicy: (context: AdapterContext) => HostedAgentExecutorPolicy;
   readonly aliases?: (context: AdapterContext) => readonly ExecutorPathAlias[];
@@ -42,6 +43,7 @@ export function createHostedAgentSourceController(options: {
   const backgroundResumes = new Map<string, string>();
   const executor = (context: AdapterContext) => new HostedAgentExecutor({ context, virtualRoot: options.shadow,
     ...(options.remote ? { remote: options.remote } : {}),
+    seedSearchPathsBeforeInputAliases: options.seedSearchPathsBeforeInputAliases === true && !options.remote,
     ...(options.aliases === undefined ? {} : { aliases: options.aliases(context) }),
     ...(options.inputFiles === undefined ? {} : { inputFiles: () => options.inputFiles!(context) }),
     readPolicy: () => options.readPolicy(context), assertCurrent: () => { options.assertContext(context); options.assertCurrent(); },
