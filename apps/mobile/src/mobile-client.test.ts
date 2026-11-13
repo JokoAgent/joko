@@ -11438,6 +11438,106 @@ describe("native current-task Interaction ownership", () => {
     return () => `interaction-operation-${++value}`;
   };
 
+  function claudeBashPermissionFixture() {
+    if (permissionInteraction.request.case !== "permission") throw new Error("Expected a permission request fixture.");
+    const interaction = create(InteractionSchema, {
+      ...permissionInteraction, backendId: "claude-code", request: { case: "permission", value: {
+        ...permissionInteraction.request.value, subject: { kind: { case: "customTool", value: { toolId: "Bash", displayName: "Bash" } } }
+      } }
+    });
+    const detail = create(SnapshotSchema, {
+      ...snapshot,
+      backends: [{ ...snapshot.backends[0]!, backendId: interaction.backendId }],
+      targets: [{ ...snapshot.targets[0]!, backendId: interaction.backendId }],
+      sessions: [{ ...snapshot.sessions[0]!, backendId: interaction.backendId, state: SessionState.RUNNING,
+        location: { kind: { case: "serviceNode", value: {} } } }],
+      interactions: [interaction]
+    });
+    const network = projectedNetwork(detail);
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    return { app, detail, interaction, network, saved };
+  }
+
+  it.each(["before reopening", "after reopening"] as const)(
+    "releases the original Claude permission card when its unsent receipt write completes %s", async (timing) => {
+      const { app, detail, interaction, network, saved } = claudeBashPermissionFixture();
+      await app.start();
+      const persist = vi.mocked(saved.storage.savePending).getMockImplementation()!;
+      let release!: () => void;
+      vi.mocked(saved.storage.savePending).mockImplementationOnce(async items => {
+        await new Promise<void>(resolve => { release = resolve; });
+        await persist(items);
+      });
+      const displayed = app.taskInteractions()[0]!;
+      expect(displayed).toEqual(interaction);
+      const resolveDisplayed = app.captureTaskInteractionResolver();
+      const denial = { kind: "permission", decision: PermissionDecisionKind.DENY_ONCE } as const;
+      const first = resolveDisplayed(displayed, denial);
+      await vi.waitFor(() => expect(release).toBeDefined());
+      app.setForeground(false);
+      const reopen = async () => {
+        app.setForeground(true);
+        await vi.waitFor(() => expect(app.state.status).toBe("connected"));
+      };
+      if (timing === "after reopening") {
+        await reopen();
+        await expect(app.captureTaskInteractionResolver()(displayed, denial)).rejects.toThrow("previous response");
+        await expect(app.checkTaskInteractionOperation(displayed, "interaction-operation-1")).resolves.toBe(false);
+        await app.reconcile();
+        expect(network.getOperation).not.toHaveBeenCalled();
+      }
+      release();
+      await expect(first).resolves.toBe(false);
+      if (timing === "before reopening") await reopen();
+      expect(saved.pending()).toEqual([]);
+      expect(app.state.pending).toEqual([]);
+      expect(app.state.busy).toBe(false);
+      expect(network.submit).not.toHaveBeenCalled();
+      expect(network.getOperation).not.toHaveBeenCalled();
+      expect(app.taskInteractions()).toEqual([displayed]);
+      await expect(resolveDisplayed(displayed, denial)).resolves.toBe(false);
+
+      vi.mocked(network.submit).mockImplementationOnce(async (active, operationId, mutation) => {
+        detail.interactions = [];
+        return create(OperationSchema, { operationId, connectionId: active.connectionId, state: OperationState.SUCCEEDED, mutation });
+      });
+      await expect(app.captureTaskInteractionResolver()(displayed, denial)).resolves.toBe(true);
+      expect(network.submit).toHaveBeenCalledExactlyOnceWith(credential, "interaction-operation-2", expect.objectContaining({
+        preconditions: [expect.objectContaining({ expectedRevision: displayed.version!.revision, expectedGeneration: displayed.generation })],
+        payload: expect.objectContaining({ case: "resolveInteraction", value: expect.objectContaining({ interactionId: displayed.interactionId }) })
+      }), expect.any(AbortSignal));
+      expect(app.taskInteractions()).toEqual([]);
+      expect(saved.pending()).toEqual([]);
+    });
+
+  it("recovers a Claude permission already submitted before backgrounding using its original operation", async () => {
+    const { app, detail, interaction, network, saved } = claudeBashPermissionFixture();
+    await app.start();
+    let deliver!: () => void;
+    vi.mocked(network.submit).mockImplementationOnce((active, operationId, mutation) => {
+      const receipt = create(OperationSchema, { operationId, connectionId: active.connectionId, state: OperationState.SUCCEEDED, mutation });
+      return new Promise<Operation>(resolve => { deliver = () => resolve(receipt); });
+    });
+    const first = app.captureTaskInteractionResolver()(interaction, { kind: "permission", decision: PermissionDecisionKind.DENY_ONCE });
+    await vi.waitFor(() => expect(deliver).toBeDefined());
+    app.setForeground(false);
+    deliver();
+    await expect(first).resolves.toBe(false);
+    expect(saved.pending()).toEqual([expect.objectContaining({ operationId: "interaction-operation-1", kind: "interaction-resolve", state: "unknown" })]);
+
+    detail.interactions = [];
+    vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, {
+      operationId: "interaction-operation-1", connectionId: credential.connectionId, state: OperationState.SUCCEEDED
+    }));
+    app.setForeground(true);
+    await vi.waitFor(() => expect(app.state).toMatchObject({ status: "connected", pending: [] }));
+    expect(saved.pending()).toEqual([]);
+    expect(network.getOperation).toHaveBeenCalledExactlyOnceWith(credential, "interaction-operation-1", expect.any(AbortSignal));
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(app.taskInteractions()).toEqual([]);
+  });
+
   it("discards a displayed permission decision after adopting a new connection for the same saved node", async () => {
     const network = projectedNetwork(interactionSnapshot);
     const saved = memoryStorage(credential);

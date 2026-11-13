@@ -749,6 +749,15 @@ type TrackedMutationResult =
   | { readonly accepted: true; readonly definitive: boolean; readonly operation?: Operation }
   | { readonly accepted: false; readonly definitive: boolean; readonly operation?: Operation };
 
+interface TrackedMutationAuthority {
+  readonly signal: AbortSignal;
+  readonly isCurrent: () => boolean;
+  readonly beforeDispatch?: () => boolean;
+  readonly retireUndispatched?: boolean;
+  readonly beforeTerminalReceipt?: (operation: Operation) => Promise<void>;
+  readonly beforeRefresh?: (operation: Operation) => void;
+}
+
 interface MobileDialogueRewindDispatch {
   readonly session: Session;
   readonly serviceGeneration: bigint;
@@ -1040,6 +1049,7 @@ export class MobileClient {
   #mutationOwner?: symbol;
   #userShellFlight?: { readonly owner: symbol; readonly sessionId: string };
   #pendingWrite: Promise<void> = Promise.resolve();
+  #preparingInteractionReceipts = new Set<PendingOperation>();
   #catalogEpoch = 0;
   #catalogAbort?: AbortController;
   #connectionAttemptEpoch = 0;
@@ -14474,7 +14484,7 @@ export class MobileClient {
       && item.connectionId === credential.connectionId && item.taskJoinId === undefined
       && item.sessionId === displayed.sessionId && item.interactionId === displayed.interactionId
       && (item.kind === "interaction-resolve" || item.kind === "interaction-dismiss"));
-    if (!pending || this.#state.selectedId !== displayed.sessionId) return false;
+    if (!pending || this.#preparingInteractionReceipts.has(pending) || this.#state.selectedId !== displayed.sessionId) return false;
     const concurrentUserShell = this.#userShellFlight?.sessionId === displayed.sessionId;
     const action = this.#claimMutation(concurrentUserShell);
     try {
@@ -14503,6 +14513,12 @@ export class MobileClient {
     const credential = this.#ready();
     const resolution = createMobileInteractionResolution(interaction, submission, credential.connectionId);
     const concurrentUserShell = this.#userShellFlight?.sessionId === interaction.sessionId;
+    const session = this.#selectedSession();
+    const epoch = this.#epoch;
+    const retireUndispatched = refreshAfter && !concurrentUserShell && !this.#joinedTask
+      && interaction.request.case === "permission" && session !== undefined && session.sessionId === interaction.sessionId
+      && !session.archived && session.backendId === "claude-code" && session.location?.kind.case === "serviceNode"
+      && !session.automationOrigin && !session.derivationOrigin?.sideChat;
     const action = this.#claimMutation(concurrentUserShell);
     try {
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
@@ -14513,7 +14529,12 @@ export class MobileClient {
           resolution
         }) }
       }), { kind: "interaction-resolve", sessionId: interaction.sessionId, interactionId: interaction.interactionId,
-        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, refreshAfter && !concurrentUserShell);
+        ...this.#interactionReceiptIdentity(interaction) }, undefined, true, refreshAfter && !concurrentUserShell, retireUndispatched ? {
+        signal: this.#abort!.signal,
+        isCurrent: () => this.#current(epoch) && this.#credential === credential,
+        beforeDispatch: () => this.taskInteractions().some(current => equals(InteractionSchema, current, interaction)),
+        retireUndispatched: true
+      } : undefined);
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
@@ -17256,9 +17277,7 @@ export class MobileClient {
     operationId?: string,
     markBusy = true,
     refreshAfter = true,
-    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean;
-      readonly beforeDispatch?: () => boolean;
-      readonly beforeTerminalReceipt?: (operation: Operation) => Promise<void> }
+    authority?: TrackedMutationAuthority
   ): Promise<TrackedMutationResult> {
     return this.#submitTracked(mutation, identity, true, operationId, markBusy, refreshAfter, authority);
   }
@@ -17270,10 +17289,7 @@ export class MobileClient {
     operationId = this.newId(),
     markBusy = true,
     refreshAfter = true,
-    authority?: { readonly signal: AbortSignal; readonly isCurrent: () => boolean;
-      readonly beforeDispatch?: () => boolean;
-      readonly beforeTerminalReceipt?: (operation: Operation) => Promise<void>;
-      readonly beforeRefresh?: (operation: Operation) => void }
+    authority?: TrackedMutationAuthority
   ): Promise<TrackedMutationResult> {
     const requestCurrent = (): boolean => authority === undefined || !authority.signal.aborted && authority.isCurrent();
     if (!requestCurrent()) return { accepted: false, definitive: false };
@@ -17283,11 +17299,15 @@ export class MobileClient {
       ...(this.#joinedTask ? { taskJoinId: this.#joinedTask.source.joined.joinId } : {}) };
     const before = this.#state.pending;
     const next = [...before, pending];
+    // Keep the request locked while its receipt is written, including during
+    // a foreground reconnect. Server reconciliation starts at dispatch.
+    if (authority?.retireUndispatched) this.#preparingInteractionReceipts.add(pending);
     this.#set({ pending: next, ...(markBusy ? { busy: true } : {}), error: undefined });
     let persisted: boolean;
     try {
       persisted = await this.#persistPending(next, epoch);
     } catch (error) {
+      this.#preparingInteractionReceipts.delete(pending);
       if (this.#current(epoch)) this.#set({ pending: before, ...(markBusy ? { busy: false } : {}) });
       throw error;
     }
@@ -17295,13 +17315,15 @@ export class MobileClient {
     if (!persisted || !requestCurrent() || authority?.beforeDispatch?.() === false) {
       if (pending.kind === "extension-settings-routing" || pending.kind === "extension-settings-credential-clear"
         || pending.kind === "extension-settings-directory" || pending.kind === "workspace-rewind" || pending.kind === "session-stop"
-        || pending.kind === "queue-resume") {
-        await this.#retireUndispatchedReceipt(pending);
+        || pending.kind === "queue-resume" || authority?.retireUndispatched) {
+        try { await this.#retireUndispatchedReceipt(pending); }
+        finally { this.#preparingInteractionReceipts.delete(pending); }
         if (pending.kind === "workspace-rewind" && markBusy && this.#current(epoch)) this.#set({ busy: false });
         return { accepted: false, definitive: true };
       }
       return { accepted: false, definitive: false };
     }
+    this.#preparingInteractionReceipts.delete(pending);
     const operationSignal = authority === undefined ? this.#abort?.signal
       : this.#abort === undefined ? authority.signal : AbortSignal.any([this.#abort.signal, authority.signal]);
     try {
@@ -17477,7 +17499,7 @@ export class MobileClient {
     const credential = this.#credential;
     if (!credential || !this.#current(epoch)) return;
     for (const pending of this.#state.pending) {
-      if (pending.connectionId !== credential.connectionId) continue;
+      if (pending.connectionId !== credential.connectionId || this.#preparingInteractionReceipts.has(pending)) continue;
       try {
         const operation = pending.kind.startsWith("objective-") || pending.kind.startsWith("collaboration-")
           ? await this.network.getServiceOperation?.(credential, pending.operationId, this.#abort?.signal)
@@ -17715,6 +17737,7 @@ export class MobileClient {
     const credential = this.#ready();
     const pending = this.#state.pending.find((item) => item.operationId === operationId && item.connectionId === credential.connectionId);
     if (!pending || pending.state !== "unknown") throw new Error("Only an unconfirmed operation can be cleared.");
+    if (this.#preparingInteractionReceipts.has(pending)) throw new Error("The permission response is still being prepared.");
     if (pending.kind.startsWith("objective-") || pending.kind.startsWith("collaboration-")) {
       await this.reconcile();
       if (this.#state.pending.some(value => value.operationId === operationId)) throw new Error("The service operation is still unconfirmed. Refresh its original receipt before retrying.");
