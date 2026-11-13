@@ -165,6 +165,41 @@ it("hides retained transcript and actions after a project grant is withdrawn whi
   expect(f.drafts.messages.get("task:one")).toBe("Unsent direction");
 });
 
+it.each(["before response", "after preview"] as const)("retires the original document when its project is withdrawn %s", async order => {
+  const f = fixture();
+  const path = "D:/project/README.md";
+  const otherPath = "D:/other/README.md";
+  const task = { ...f.view.tasks[0]!, judgment: {
+    taskId: "task:one", project: "D:/project", title: "Draft", verdict: "idea" as const, next: "Read this", ref: path, updatedAt: 1_000
+  } };
+  const otherTask = { ...task, id: "task:other", project: "D:/other", judgment: {
+    ...task.judgment, taskId: "task:other", project: "D:/other", ref: otherPath
+  } };
+  const otherProject = { path: "D:/other", name: "Other", addedAt: 1_000, exists: true };
+  f.app.getPartnerWorkbench.mockResolvedValue({ ...f.view, tasks: [task, otherTask], projects: [...f.view.projects, otherProject] });
+  let complete!: (value: { path: string; text: string; truncated: boolean }) => void;
+  const response = new Promise<{ path: string; text: string; truncated: boolean }>(resolve => { complete = resolve; });
+  f.app.readPartnerWorkbenchDocument.mockReturnValueOnce(response);
+  const ui = await mount(f, task.id);
+  await click(button(ui.host, path));
+  expect(f.app.readPartnerWorkbenchDocument).toHaveBeenCalledOnce();
+  const resolve = () => act(async () => { complete({ path, text: "Original project document", truncated: false }); await settle(); });
+  if (order === "after preview") {
+    await resolve();
+    expect(ui.host.querySelector(".partner-workbench__document")?.textContent).toBe("Original project document");
+  }
+  f.app.getPartnerWorkbench.mockResolvedValue({ ...f.view, revision: 2n, tasks: [otherTask],
+    projects: [otherProject, { ...f.view.projects[0]!, sourceComputerId: "other-computer", readOnly: true }] });
+  f.app.state.snapshot = { ...f.app.state.snapshot, cursor: 1n };
+  await ui.render(true, task.id);
+  if (order === "before response") await resolve();
+  expect(ui.host.querySelector(".partner-workbench__document")).toBeNull();
+  expect(ui.host.textContent).not.toContain("Original project document");
+  await ui.render(true, otherTask.id);
+  await click(button(ui.host, otherPath));
+  expect(ui.host.querySelector(".partner-workbench__document")?.textContent).toBe("Other document");
+});
+
 it("opens the Inspector singleton once, hides it from Add, and preserves selection and draft through explicit close and reopen", async () => {
   const f = fixture(); context.current = f.conversation;
   const host = document.body.appendChild(document.createElement("main")); const root = createRoot(host); roots.push(root);
@@ -196,6 +231,8 @@ function fixture(granted = true) {
   const app = { state: { ready: true, connectionState: "connected", route: { kind: "session", sessionId: session.id }, activeProfile: { id: "profile", serverId: "server", deviceId: "device", origin: "http://127.0.0.1" }, snapshot, preferences: DEFAULT_UI_PREFERENCES, effectiveLocale: "en" },
     partnerRoutineApi: vi.fn(() => routineApi),
     getPartnerWorkbench: vi.fn(async () => view), getPartnerWorkbenchDetail: vi.fn(async () => ({ task, transcript: [{ role: "user", text: "Original purpose", at: 1_000 }], truncated: false, artifacts: [] })),
+    resolvePartnerWorkbenchReference: vi.fn<AppController["resolvePartnerWorkbenchReference"]>(async (_owner, path) => ({ kind: "file", value: path, directory: false })),
+    readPartnerWorkbenchDocument: vi.fn<AppController["readPartnerWorkbenchDocument"]>(async (_owner, path) => ({ path, text: "Other document", truncated: false })),
     addPartnerWorkbenchProject: vi.fn(async (_owner: PartnerWorkbenchView["owner"], _revision: bigint, _path: string, _signal?: AbortSignal) => { view = { ...view, revision: view.revision + 1n, projects: [{ path: "D:/project", name: "project", addedAt: 1_000, exists: true }] }; return { ...view, acceptedProject: "D:/project" }; }),
     send: vi.fn(async (_sessionId: string, _draft: unknown, _options: unknown) => undefined), navigate: vi.fn(), releaseArtifactUrl: vi.fn() };
   const conversation: PartnerConversationView = { sessionId: session.id, ownerKey: "profile/server/canonical/1", kind: "partner", partner, confirmed: true, editable: true, failed: false, connected: true, readFailed: false, readRetry: 0,

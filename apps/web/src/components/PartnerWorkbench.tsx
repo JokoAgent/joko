@@ -1,5 +1,5 @@
 import { ArrowLeft, CheckCircle2, ChevronDown, ChevronRight, CirclePause, FolderOpen, Lightbulb, Plus, RefreshCcw, Send, Square, SquareArrowOutUpRight, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type JSX } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
 
 import type { AppController } from "../controller.js";
 import type { PartnerWorkbenchDetailView, PartnerWorkbenchTaskView, PartnerWorkbenchView, ProjectDirectoryListingView, SessionView, WorkspaceEntryView } from "../model.js";
@@ -18,6 +18,9 @@ import "./partner-workbench.css";
 export interface PartnerWorkbenchDrafts { readonly messages: Map<string, string> }
 type Projection = { readonly key: string; readonly view: PartnerWorkbenchView };
 type DocumentPreview = { readonly path: string; readonly text: string; readonly truncated: boolean };
+type WorkbenchProject = PartnerWorkbenchView["projects"][number];
+type ProjectGrant = Pick<WorkbenchProject, "path" | "addedAt">;
+type ScopedDocumentPreview = DocumentPreview & { readonly key: string; readonly grant?: ProjectGrant };
 const GROUPS = ["waiting", "running", "todo", "done"] as const;
 const DONE_LIMIT = 30;
 
@@ -59,7 +62,7 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
   const [pinned, setPinned] = useState<{ readonly key: string; readonly task: PartnerWorkbenchTaskView }>();
   const [messageDraft, setMessageDraft] = useState("");
   const [sent, setSent] = useState<string>();
-  const [documentPreview, setDocumentPreview] = useState<DocumentPreview>();
+  const [documentPreview, setDocumentPreview] = useState<ScopedDocumentPreview>();
   const [referenceDirectory, setReferenceDirectory] = useState<{ readonly path: string; readonly relativePath: string; readonly entries: readonly WorkspaceEntryView[] }>();
   const [pendingHandover, setPendingHandover] = useState<{ readonly project: string; readonly text: string } | undefined>(() => {
     const pending = [...drafts.messages].find(([key]) => key.startsWith("handover:"));
@@ -74,6 +77,8 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
   const currentRef = useRef({ controller, session, conversation, active, ownerDocument, selectedTaskId });
   currentRef.current = { controller, session, conversation, active, ownerDocument, selectedTaskId };
   const view = projection?.key === key ? projection.view : undefined;
+  const currentView = useRef(view);
+  useLayoutEffect(() => { currentView.current = view; }, [view]);
   const editable = active && conversation.editable && view !== undefined && partner !== undefined
     && view.owner.partnerId === partner.id && view.owner.profileVersion === partner.profileVersion
     && view.owner.sessionId === session.id && view.owner.targetId === session.targetId && view.owner.sessionGeneration === session.generation;
@@ -158,15 +163,16 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
   const liveTask = view?.tasks.find((task) => task.id === selectedTaskId) ?? view?.candidates.find((task) => task.id === selectedTaskId);
   const retainedTask = liveTask ?? (pinned?.key === key && pinned.task.id === selectedTaskId ? pinned.task : undefined);
   const selected = retainedTask !== undefined && (retainedTask.project === "" || view?.projects.some((project) => project.path === retainedTask.project)) ? retainedTask : undefined;
+  const visibleDocument = documentPreview?.key === key
+    && (documentPreview.grant === undefined
+      ? workbenchProjectForPath(view, documentPreview.path) !== undefined
+      : hasWorkbenchProjectGrant(view, documentPreview.grant)) ? documentPreview : undefined;
+  useEffect(() => {
+    if (documentPreview !== undefined && visibleDocument === undefined) setDocumentPreview(undefined);
+  }, [documentPreview, visibleDocument]);
   useEffect(() => {
     if (view === undefined) return;
-    const insideGrant = (path: string): boolean => view.projects.some((project) => {
-      const key = (value: string): string => /^[A-Za-z]:[\\/]|^\\\\/u.test(value) ? value.replaceAll("\\", "/").toLowerCase() : value;
-      const root = key(project.path).replace(/\/$/u, ""); const child = key(path);
-      return child === root || child.startsWith(`${root}/`);
-    });
-    if (documentPreview !== undefined && !insideGrant(documentPreview.path)) setDocumentPreview(undefined);
-    if (referenceDirectory !== undefined && !insideGrant(referenceDirectory.path)) setReferenceDirectory(undefined);
+    if (referenceDirectory !== undefined && workbenchProjectForPath(view, referenceDirectory.path) === undefined) setReferenceDirectory(undefined);
     if (retainedTask !== undefined && selected === undefined) { setDetail(undefined); setDetailError(t("workbench.projectUnavailable")); }
   }, [view?.revision, view?.projects, selected?.id]);
   useEffect(() => { if (liveTask !== undefined) setPinned({ key, task: liveTask }); }, [key, liveTask]);
@@ -234,14 +240,16 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
       await controller.resolvePartnerWorkbenchReference(view!.owner, ref, signal);
       if (current()) setReferenceDirectory({ path: result.value, relativePath: result.relativePath!, entries });
     } else if (/\.(md|mdx|txt)$/iu.test(result.value)) {
-      const preview = await controller.readPartnerWorkbenchDocument(view!.owner, result.value, signal);
-      if (current()) setDocumentPreview(preview);
+      const grant = workbenchProjectForPath(view, ref.trim()) ?? workbenchProjectForPath(view, result.value);
+      if (grant === undefined || !hasWorkbenchProjectGrant(currentView.current, grant)) throw new Error(t("workbench.projectUnavailable"));
+      const preview = await controller.readPartnerWorkbenchDocument(view!.owner, ref, signal);
+      if (current() && !signal.aborted && hasWorkbenchProjectGrant(currentView.current, grant)) setDocumentPreview({ ...preview, key, grant });
     } else {
       const preview = await controller.readWorkspaceFile(result.workspaceId!, result.relativePath!);
       await controller.resolvePartnerWorkbenchReference(view!.owner, ref, signal);
       if (!current()) return;
       if (preview.blobId !== undefined) await controller.openArtifactFile(preview.blobId, preview.name, preview.byteSize ?? 0, { ownerDocument, signal });
-      else if (preview.text !== undefined) setDocumentPreview({ path: result.value, text: preview.text, truncated: preview.truncated });
+      else if (preview.text !== undefined) setDocumentPreview({ key, path: result.value, text: preview.text, truncated: preview.truncated });
       else throw new Error(t("workbench.fileUnavailable"));
     }
   }); };
@@ -335,7 +343,7 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
     {sent !== undefined && <p className="partner-workbench__notice" role="status">{sent}</p>}
     {!conversation.connected && <p role="status" className="muted">{t("workbench.disconnected")}</p>}
     {view === undefined ? <div className="partner-workbench__empty">{loading ? <Spinner /> : <Button disabled={!conversation.editable} onClick={() => setRefresh((value) => value + 1)}>{t("common.retry")}</Button>}<p>{t("workbench.loading")}</p></div>
-      : documentPreview !== undefined ? <><header className="partner-workbench__heading"><IconButton label={t("workbench.back")} onClick={() => setDocumentPreview(undefined)}><ArrowLeft aria-hidden="true" /></IconButton><strong title={documentPreview.path}>{fileName(documentPreview.path)}</strong></header>{documentPreview.truncated && <p className="muted">{t("workbench.truncated")}</p>}<pre className="partner-workbench__document">{documentPreview.text}</pre></>
+      : visibleDocument !== undefined ? <><header className="partner-workbench__heading"><IconButton label={t("workbench.back")} onClick={() => setDocumentPreview(undefined)}><ArrowLeft aria-hidden="true" /></IconButton><strong title={visibleDocument.path}>{fileName(visibleDocument.path)}</strong></header>{visibleDocument.truncated && <p className="muted">{t("workbench.truncated")}</p>}<pre className="partner-workbench__document">{visibleDocument.text}</pre></>
       : referenceDirectory !== undefined ? <><header className="partner-workbench__heading"><IconButton label={t("workbench.back")} onClick={() => setReferenceDirectory(undefined)}><ArrowLeft aria-hidden="true" /></IconButton><strong title={referenceDirectory.path}>{fileName(referenceDirectory.path)}</strong></header><div className="partner-workbench__directory">{referenceDirectory.entries.map((entry) => <Button key={entry.path} disabled={disabled} onClick={() => {
         const suffix = referenceDirectory.relativePath === "" ? entry.path : entry.path.slice(referenceDirectory.relativePath.length + 1);
         openReference(`${referenceDirectory.path.replace(/[\\/]$/u, "")}/${suffix}`);
@@ -418,6 +426,21 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
     {routinesOwner === key && partner !== undefined && <PartnerRoutineDialog controller={controller} partnerId={partner.id} ownerKey={conversation.ownerKey} ownerDocument={ownerDocument}
       onClose={() => { setRoutinesOwner(undefined); if (current()) setRefresh((value) => value + 1); }} />}
   </div>;
+}
+
+function workbenchProjectForPath(view: PartnerWorkbenchView | undefined, path: string): WorkbenchProject | undefined {
+  const pathKey = (value: string): string => /^[A-Za-z]:[\\/]|^\\\\/u.test(value) ? value.replaceAll("\\", "/").toLowerCase() : value;
+  const child = pathKey(path);
+  return view?.projects.filter(project => project.exists && !project.readOnly)
+    .sort((left, right) => right.path.length - left.path.length)
+    .find(project => {
+      const root = pathKey(project.path).replace(/\/$/u, "");
+      return child === root || child.startsWith(`${root}/`);
+    });
+}
+
+function hasWorkbenchProjectGrant(view: PartnerWorkbenchView | undefined, grant: ProjectGrant): boolean {
+  return view?.projects.some(project => project.exists && !project.readOnly && project.path === grant.path && project.addedAt === grant.addedAt) === true;
 }
 
 function messageOf(cause: unknown, t: Translator): string { return cause instanceof Error ? cause.message : t("error.unexpected"); }

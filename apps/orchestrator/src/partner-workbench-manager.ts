@@ -110,6 +110,14 @@ interface OwnedPartnerWorkbench {
   readonly stamp: PartnerWorkbenchOwner;
 }
 
+interface WorkbenchReference {
+  readonly kind: "https" | "file";
+  readonly value: string;
+  readonly workspaceId?: string;
+  readonly relativePath?: string;
+  readonly directory?: boolean;
+}
+
 interface ResolvedWorkbenchGrant {
   readonly project: string;
   readonly path: string;
@@ -314,28 +322,39 @@ export class PartnerWorkbenchManager {
       if (!project) throw invalid("The reference is outside the current project scope.");
       return this.#remoteProjects!.read(remote, project, path, () => this.#assertScope(owner, project));
     }
-    const reference = await this.resolveReference(owner, path);
-    if (reference.kind !== "file" || ![".md", ".mdx", ".txt"].includes(extname(reference.value).toLowerCase())) throw invalid("Select a text document in a handed-over project.");
+    const reference = await this.#resolveReference(owner, path);
+    if (reference.kind !== "file" || reference.approval === undefined
+      || ![".md", ".mdx", ".txt"].includes(extname(reference.value).toLowerCase())) throw invalid("Select a text document in a handed-over project.");
+    const approval = reference.approval;
     const handle = await open(reference.value, "r");
+    let document: { readonly path: string; readonly text: string; readonly truncated: boolean };
     try {
       const metadata = await handle.stat();
       const before = await lstat(reference.value);
       if (!metadata.isFile() || !before.isFile() || before.isSymbolicLink() || metadata.dev !== before.dev || metadata.ino !== before.ino) throw invalid("The document is unavailable.");
       const bytes = Buffer.alloc(Math.min(metadata.size, 16_384));
       const read = await handle.read(bytes, 0, bytes.length, 0);
-      const current = await this.resolveReference(owner, path);
-      if (current.value !== reference.value || current.workspaceId !== reference.workspaceId) throw projectChanged();
+      const current = await this.#resolveReference(owner, path);
+      if (current.value !== reference.value || current.workspaceId !== reference.workspaceId
+        || current.approval === undefined || !sameProjectApproval(current.approval, approval)) throw projectChanged();
       const after = await lstat(reference.value);
       const observed = await handle.stat();
       if (!after.isFile() || after.isSymbolicLink() || after.dev !== metadata.dev || after.ino !== metadata.ino
         || after.size !== metadata.size || after.mtimeMs !== metadata.mtimeMs || observed.size !== metadata.size || observed.mtimeMs !== metadata.mtimeMs) throw invalid("The document changed while it was being read.");
       const source = bytes.subarray(0, read.bytesRead).toString("utf8");
       const text = redactSecrets(source).slice(0, 4_000);
-      return { path: reference.value, text, truncated: metadata.size > read.bytesRead || source.length > 4_000 };
+      document = { path: reference.value, text, truncated: metadata.size > read.bytesRead || source.length > 4_000 };
     } finally { await handle.close(); }
+    await this.#assertScopeAfter(owner, approval.path, approval);
+    return document;
   }
 
-  async resolveReference(owner: PartnerWorkbenchOwner, ref: string): Promise<{ readonly kind: "https" | "file"; readonly value: string; readonly workspaceId?: string; readonly relativePath?: string; readonly directory?: boolean }> {
+  async resolveReference(owner: PartnerWorkbenchOwner, ref: string): Promise<WorkbenchReference> {
+    const { approval: _approval, ...reference } = await this.#resolveReference(owner, ref);
+    return reference;
+  }
+
+  async #resolveReference(owner: PartnerWorkbenchOwner, ref: string): Promise<WorkbenchReference & { readonly approval?: PartnerWorkbenchProject }> {
     const state = await this.#stateFor(owner);
     const remote = this.#remote(owner);
     if (remote && !ref.startsWith("https://")) {
@@ -372,7 +391,7 @@ export class PartnerWorkbenchManager {
       if (this.#referenceWorkspaces.get(workspaceId) === referenceScope) { this.#workspaces.unregister(workspaceId); this.#referenceWorkspaces.delete(workspaceId); }
       throw error;
     }
-    return { kind: "file", value: actual, workspaceId, relativePath: relative(actualProject, actual).replaceAll("\\", "/"), directory: metadata.isDirectory() };
+    return { kind: "file", value: actual, workspaceId, relativePath: relative(actualProject, actual).replaceAll("\\", "/"), directory: metadata.isDirectory(), approval };
   }
 
   /** One durable effect identity owns creation and dispatch. An ambiguous

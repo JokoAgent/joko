@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { NativeSessionBinding, NativeSessionCatalogEntry, NativeSessionCatalogResult, NativeSessionPreview } from "@joko/core";
@@ -25,6 +26,11 @@ import type { OrchestratorApplication } from "./application.js";
 import type { BridgeToolCallContext } from "./mcp-router.js";
 import { AuthenticatedCodeHostProvider, CodeHostPullRequestNotFoundError, createGhCliTokenSource, PublicCodeHostProvider,
   type CodeHostProvider, type CodeHostSessionAuthorizationPort } from "@joko/code-host";
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...fs, open: vi.fn(fs.open) };
+});
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -351,6 +357,35 @@ describe("Partner workbench service and Queue ownership", () => {
     await expect(f.workbench.readProjectFile(view.owner, join(f.project, "README.md"))).rejects.toMatchObject({ code: "WORKBENCH_INVALID" });
     expect(f.workspace.unregister).toHaveBeenCalled();
     await expect(f.workbench.addProject({ ...view.owner, sessionGeneration: view.owner.sessionGeneration + 1 }, view.state.revision, f.project)).rejects.toMatchObject({ code: "WORKBENCH_OWNER_CHANGED" });
+  });
+
+  it("checks the original document grant after closing its file handle", async () => {
+    const f = await fixture();
+    const granted = await grant(f);
+    const path = join(f.project, "README.md");
+    writeFileSync(path, "Approved workbench content");
+    const handle = await open(path, "r");
+    const close = handle.close.bind(handle);
+    let entered!: () => void;
+    let release!: () => void;
+    const closing = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(handle, "close").mockImplementationOnce(async () => {
+      entered();
+      await held;
+      await close();
+    });
+    vi.mocked(open).mockResolvedValueOnce(handle);
+    const read = f.workbench.readProjectFile(granted.owner, path);
+    const rejected = expect(read).rejects.toMatchObject({ code: "WORKBENCH_PROJECT_NOT_FOUND" });
+    try {
+      await Promise.race([closing, read.then(() => { throw new Error("The document returned before close was observed."); })]);
+      await f.workbench.removeProject(granted.owner, granted.state.revision, f.project);
+    } finally {
+      release();
+    }
+    await rejected;
+    await expect(f.workbench.readProjectFile(granted.owner, path)).rejects.toMatchObject({ code: "WORKBENCH_INVALID" });
   });
 
   it("ties a handed-over alias to the original directory across reference and runtime reads", async () => {
