@@ -24133,23 +24133,49 @@ async function workspaceTrustOperation(
   workspaceId: string,
   trusted: boolean
 ): Promise<PresentedOperation> {
-  const target = targetForWorkspace(dependencies.store, workspaceId);
-  if (target === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, kind, "Workspace is not attached to a durable Target.");
-  const execution = await dependencies.sessionHost.mutate({
-    operationId,
-    connection,
-    kind,
-    body: mutation,
-    commit: (store) => {
-      store.upsertTarget({ ...target.descriptor, trusted }, target.metadata);
-      return { accepted: true, resultCase: "workspace", entityId: workspaceId } satisfies OperationOutcome;
-    },
-    effect: async () => {
-      const registration = requireWorkspace(dependencies.workspaceService, workspaceId);
-      await dependencies.workspaceService.register({ ...registration, trusted });
-    }
+  const original = targetForWorkspace(dependencies.store, workspaceId);
+  if (original === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, kind, "Workspace is not attached to a durable Target.");
+  const targetId = original.descriptor.id;
+  return dependencies.targetWorkspaceRuntime.run(targetId, async () => {
+    const assertCurrentTarget = (store: OperationalStore): void => {
+      const target = requireUndeletedTarget(store, targetId);
+      if (target.revision !== original.revision) {
+        throw new RevisionConflictError("Target", targetId, original.revision, target.revision);
+      }
+      if (asRecord(target.metadata)["state"] === "deleting" || targetForWorkspace(store, workspaceId)?.descriptor.id !== targetId) {
+        throw new ConnectError("The selected workspace is no longer current.", Code.FailedPrecondition);
+      }
+    };
+    let applyTrust: Awaited<ReturnType<NativeWorkspaceService["prepareTrustChange"]>> | undefined;
+    const execution = await dependencies.sessionHost.mutate({
+      operationId,
+      connection,
+      kind,
+      body: mutation,
+      precondition: assertCurrentTarget,
+      effect: async () => {
+        const registration = requireWorkspace(dependencies.workspaceService, workspaceId);
+        const expected = targetWorkspaceRegistration(original);
+        if (workspaceId === expected.id && (expected.remote === undefined
+          ? registration.remote !== undefined
+          : registration.remote === undefined || expected.remote.targetId !== registration.remote.targetId
+            || operationBodyHash(expected.remote.binding) !== operationBodyHash(registration.remote.binding))) {
+          throw new ConnectError("The selected workspace registration no longer belongs to this project.", Code.FailedPrecondition);
+        }
+        applyTrust = await dependencies.workspaceService.prepareTrustChange(registration, trusted);
+      },
+      complete: async (commit) => {
+        if (applyTrust === undefined) throw new Error("Workspace trust was not prepared.");
+        return applyTrust(commit);
+      },
+      commit: (store) => {
+        const target = store.getTarget(targetId);
+        store.upsertTarget({ ...target.descriptor, trusted }, target.metadata);
+        return { accepted: true, resultCase: "workspace", entityId: workspaceId } satisfies OperationOutcome;
+      }
+    });
+    return presented(execution);
   });
-  return presented(execution);
 }
 
 async function workspaceEntryEffectOperation(

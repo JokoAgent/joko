@@ -129,6 +129,20 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     return registration;
   }
 
+  changeTrust<T>(previous: WorkspaceRegistration, trusted: boolean, commit: () => T): {
+    readonly registration: WorkspaceRegistration;
+    readonly result: T;
+  } {
+    this.#assertOpen();
+    if (this.#registrations.get(previous.id) !== previous) {
+      throw new WorkspaceEntryMutationError("The registered remote workspace changed.", "stale");
+    }
+    const result = commit();
+    const registration = Object.freeze({ ...previous, trusted });
+    this.#registrations.set(previous.id, registration);
+    return { registration, result };
+  }
+
   unregister(id: string): void {
     this.#registrations.delete(id);
   }

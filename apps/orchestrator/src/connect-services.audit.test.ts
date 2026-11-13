@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3665,6 +3665,127 @@ describe("Connect security and protocol audit", () => {
       expect(store.getTarget(targetId)).toEqual(tombstone);
       expect(workspaces.listRegistrations()).toEqual([]);
     } finally {
+      await host.dispose();
+      await workspaces.close();
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes project trust with rename, archival and deletion and publishes trust only after an authorized commit", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-project-trust-"));
+    const store = new OperationalStore(":memory:");
+    const workspaces = new WorkspaceService();
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [] });
+    const host = new SessionHost(store, artifacts, []);
+    const connections = new ConnectionManager(store);
+    const token = "fixture-trust-owner";
+    const owner = store.createConnection({ id: "trust-owner", name: "Trust owner", authKeyDigest: digestAuthKey(token) });
+    const otherToken = "fixture-edit-owner";
+    const other = store.createConnection({ id: "edit-owner", name: "Edit owner", authKeyDigest: digestAuthKey(otherToken) });
+    const application = { ...stubApplication({ store, workspaces }), connections, sessionHost: host };
+    const transport = createRouterTransport(router => registerConnectServices(router, application));
+    const operations = createClient(contract.OperationService, transport);
+    const targetId = "trust-project";
+    const workspaceId = "trust-workspace";
+    const request = (operationId: string, payload: contract.OperationMutation["payload"]) => ({
+      operationId, connectionId: owner.id, mutation: create(contract.OperationMutationSchema, { payload })
+    });
+    const authenticate = (key: string) => ({ headers: { authorization: `Bearer ${key}` } });
+    const auth = authenticate(token);
+    const originalPrepare = workspaces.prepareTrustChange.bind(workspaces);
+    let release!: () => void;
+    const holdTrust = () => {
+      let entered!: () => void;
+      const preparing = new Promise<void>(resolve => { entered = resolve; });
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      vi.spyOn(workspaces, "prepareTrustChange").mockImplementationOnce(async (registration, trusted) => {
+        entered();
+        await gate;
+        return originalPrepare(registration, trusted);
+      });
+      return preparing;
+    };
+    try {
+      store.upsertBackend({
+        id: "pi", adapterKind: "fixture", instanceGeneration: 0, displayName: "Pi",
+        version: "test", health: "healthy", installationState: "installed", authenticationState: "authenticated",
+        capabilities: new Map(), models: [], tools: [], diagnostics: []
+      });
+      const root = join(directory, "project");
+      mkdirSync(root);
+      store.upsertTarget({ id: targetId, backendId: "pi", displayName: "Before", workspaceRoot: root, managed: false, trusted: true }, { workspaceId });
+      await workspaces.register({ id: workspaceId, root, displayName: "Before", trusted: true });
+      const trust = (operationId: string, trusted: boolean) => request(operationId, {
+        case: "setWorkspaceTrust", value: create(contract.SetWorkspaceTrustMutationSchema, { workspaceId, trusted })
+      });
+      const archive = request("archive-trust-project", { case: "archiveTarget", value: create(contract.ArchiveTargetMutationSchema, {
+        targetId, archived: true
+      }) });
+      const rename = {
+        operationId: "rename-trust-project",
+        connectionId: other.id,
+        mutation: create(contract.OperationMutationSchema, {
+          preconditions: [{ entity: { kind: contract.EntityKind.TARGET, id: targetId }, expectedRevision: { value: store.getTarget(targetId).revision } }],
+          payload: { case: "updateTarget", value: { targetId, displayName: "After" } }
+        })
+      };
+      const revokeRequest = trust("revoke-project-trust", false);
+      const preparation = holdTrust();
+      const revocation = operations.submitOperation(revokeRequest, auth);
+      await preparation;
+      const concurrentRename = operations.submitOperation(rename, authenticate(otherToken));
+      const checkedRename = expect(concurrentRename).rejects.toMatchObject({ code: Code.Aborted });
+      expect(store.getTarget(targetId).descriptor).toMatchObject({ displayName: "Before", trusted: true });
+      expect(workspaces.listRegistrations()[0]?.trusted).toBe(true);
+      release();
+      const revoked = await revocation;
+      expect(revoked.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+      await checkedRename;
+      rename.mutation.preconditions[0]!.expectedRevision = create(contract.RevisionSchema, { value: store.getTarget(targetId).revision });
+      await expect(operations.submitOperation({ ...rename, operationId: "rename-current-trust-project" }, authenticate(otherToken)))
+        .resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      await expect(operations.submitOperation(archive, auth)).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      await expect(operations.submitOperation(revokeRequest, auth)).resolves.toMatchObject({
+        operation: { operationId: revokeRequest.operationId, state: contract.OperationState.SUCCEEDED }
+      });
+      expect(store.getTarget(targetId)).toMatchObject({ descriptor: { displayName: "After", trusted: false }, metadata: { state: "archived" } });
+      expect(workspaces.listRegistrations()[0]).toMatchObject({ displayName: "After", trusted: false });
+
+      const failedPreparation = holdTrust();
+      const grant = operations.submitOperation(trust("grant-while-revoked", true), auth);
+      await failedPreparation;
+      connections.revoke(owner.id);
+      release();
+      await expect(grant).resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED } });
+      expect(store.getTarget(targetId)).toMatchObject({ descriptor: { displayName: "After", trusted: false }, metadata: { state: "archived" } });
+      expect(workspaces.listRegistrations()[0]?.trusted).toBe(false);
+
+      rmdirSync(root);
+      await expect(operations.submitOperation({ ...trust("grant-unavailable-project", true), connectionId: other.id }, authenticate(otherToken)))
+        .resolves.toMatchObject({ operation: { state: contract.OperationState.FAILED } });
+      expect(store.getTarget(targetId).descriptor.trusted).toBe(false);
+      expect(workspaces.listRegistrations()[0]?.trusted).toBe(false);
+      mkdirSync(root);
+
+      const deletionPreparation = holdTrust();
+      const grantBeforeDeletion = operations.submitOperation({ ...trust("grant-before-delete-project", true), connectionId: other.id }, authenticate(otherToken));
+      await deletionPreparation;
+      const deleteProject = create(contract.OperationMutationSchema, {
+        payload: { case: "deleteTarget", value: { targetId, deleteManagedWorkspace: false } }
+      });
+      const deletion = operations.submitOperation({ operationId: "delete-trust-project", connectionId: other.id, mutation: deleteProject }, authenticate(otherToken));
+      release();
+      await expect(grantBeforeDeletion).resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      await expect(deletion)
+        .resolves.toMatchObject({ operation: { state: contract.OperationState.SUCCEEDED } });
+      const deletedTrust = trust("trust-deleted-project", true);
+      await expect(operations.submitOperation({ ...deletedTrust, connectionId: other.id }, authenticate(otherToken)))
+        .rejects.toMatchObject({ code: Code.NotFound });
+      expect(store.getTarget(targetId).metadata).toMatchObject({ deletedAt: expect.any(Number) });
+      expect(workspaces.listRegistrations()).toEqual([]);
+    } finally {
+      release?.();
       await host.dispose();
       await workspaces.close();
       store.close();
