@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, useImperativeHandle, useRef, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, ModelKeySchema, ModelSourceKind, PartnerSessionTaskStatus, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
+  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -250,7 +250,7 @@ async function render(assertPalette = true): Promise<void> {
 
 it("reads the actual task menu's Claude family quota using the owning model route", async () => {
   const model = create(ModelKeySchema, { providerId: "provider", modelId: "claude-opus-4[1m]" });
-  const selected = create(SessionSchema, { ...session, model: { model } });
+  const selected = create(SessionSchema, { ...session, model: create(ModelSelectionSchema, { model }) });
   const owner = create(SnapshotSchema, { sessions: [selected], models: [
     { backendId: "other-backend", key: model, source: { kind: ModelSourceKind.LOCAL, nativeAdapterKind: "pi" } },
     { backendId: selected.backendId, key: model, source: { kind: ModelSourceKind.LOCAL, nativeAdapterKind: "claude-agent-sdk-stdio" } }
