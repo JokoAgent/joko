@@ -1,4 +1,5 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
@@ -36,7 +37,8 @@ import {
   ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
-  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageInputDelivery, MessageRole, ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
+  EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
+  ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
   OperationMutationSchema, OperationState, OwnerSnapshotScopeSchema, PermissionMode,
   ProviderDescriptorSchema, ProviderKind, RevisionSchema, SessionMessageSearchMatchSchema, SessionSnapshotScopeSchema,
   SettingsSnapshotSchema, SnapshotScopeSchema, UsageSchema, ManagedResourceSchema,
@@ -6840,15 +6842,16 @@ describe("native mobile connection and operation ownership", () => {
     const app = client(network, saved.storage, undefined, undefined, undefined, undefined, drafts);
     await app.start();
     const anchor = event("linked-event", 4n);
+    const draft = plainTextMobileComposerDraft("one visible message");
     const acceptedMessage = create(EventSchema, { ...event("visible-message", 11n),
-      identity: { sessionId: source.sessionId, operationId: "visible-operation" },
-      payload: { kind: { case: "messageStarted", value: { messageId: "visible-message", role: MessageRole.USER, userInputAccepted: true,
-        userInput: { parts: [{ content: { case: "text", value: "one visible message" } }] } } } } });
+      identity: create(EventIdentitySchema, { sessionId: source.sessionId, operationId: "visible-operation" }),
+      payload: create(EventPayloadSchema, { kind: { case: "messageStarted", value: create(MessageStartedEventSchema, {
+        messageId: "visible-message", role: MessageRole.USER, userInputAccepted: true, userInput: mobileComposerInput(draft)
+      }) } }) });
     if (anchored) {
       vi.mocked(network.readAround).mockResolvedValueOnce([anchor]);
       await app.around(anchor.eventId);
     }
-    const draft = plainTextMobileComposerDraft("one visible message");
     const ownerKey = app.taskPresentationOwnerKey();
     const headerKey = app.taskHeaderSourceKey();
     expect(ownerKey).toBeTruthy();
@@ -8275,22 +8278,22 @@ describe("native mobile connection and operation ownership", () => {
   it.each(["same event", "new sequence", "new event generation", "changed body", "history deletion"] as const)(
     "adopts a freshly issued latest window through the exact existing boundary (%s)", async (change) => {
       const { app, network, owner, detail, deleted, neighbor, identity, input, hits } = historyRetirementFixture();
-      const first = create(SnapshotSchema, { ...detail, scope: { kind: { case: "session",
-        value: { sessionId: "session", recentTimelineItems: 2 } } } });
+      const first = create(SnapshotSchema, { ...detail, scope: create(SnapshotScopeSchema, { kind: { case: "session",
+        value: create(SessionSnapshotScopeSchema, { sessionId: "session", recentTimelineItems: 2 }) } }) });
       vi.mocked(network.readSession).mockResolvedValue(first);
       await app.start();
       expect(hits()).toHaveLength(1);
       const boundary = clone(EventSchema, neighbor);
       boundary.cursor = create(EventCursorSchema, { ...boundary.cursor!, opaqueToken: "reissued",
-        issuedAt: { seconds: 20n }, sequence: change === "new sequence" ? 9n : 8n,
+        issuedAt: create(TimestampSchema, { seconds: 20n }), sequence: change === "new sequence" ? 9n : 8n,
         generation: change === "new event generation" ? 2n : 1n });
       if (change === "changed body" && boundary.payload?.kind.case === "messageStarted") {
         boundary.payload.kind.value.userInputAccepted = false;
       }
       const tail = change === "history deletion" ? create(EventSchema, {
-        ...event("deletion", 11n), identity, payload: { kind: { case: "messageDeleted", value: {
+        ...event("deletion", 11n), identity, payload: create(EventPayloadSchema, { kind: { case: "messageDeleted", value: create(MessageDeletedEventSchema, {
           productSessionId: "session", requestedEventId: deleted.eventId, deletedEventIds: [deleted.eventId]
-        } } }
+        }) } })
       }) : input("new-message", 11n, "latest reply");
       const observed = create(SnapshotSchema, { ...owner, resumeCursor: tail.cursor });
       vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: observed });

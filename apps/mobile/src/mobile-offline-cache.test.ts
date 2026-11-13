@@ -1,9 +1,11 @@
 import { create } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import {
   ConnectionSchema,
   ConnectionState,
   DeviceKind,
   DeviceSchema,
+  EventCursorSchema,
   EventSchema,
   MessageRole,
   OperationSchema,
@@ -210,7 +212,8 @@ describe("current-v1 mobile offline content cache", () => {
     await fixture.cache.save(profile, node, owner(), first);
     const refresh = create(SnapshotSchema, { ...first, timeline: [first.timeline[1]!, first.timeline[2]!, event("new", 4n)]
       .map(item => create(EventSchema, { ...item,
-        cursor: { ...item.cursor!, opaqueToken: `current-${item.cursor!.sequence}`, issuedAt: { seconds: 20n } } })) });
+        cursor: create(EventCursorSchema, { ...item.cursor!, opaqueToken: `current-${item.cursor!.sequence}`,
+          issuedAt: create(TimestampSchema, { seconds: 20n }) }) })) });
     fixture.memory.failNextDetailRead(); await fixture.cache.save(profile, node, owner(), refresh);
     expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["older", "boundary", "latest"]);
     fixture.tick(); await fixture.cache.save(profile, node, owner(), refresh);

@@ -1,5 +1,7 @@
 import { create } from "@bufbuild/protobuf";
-import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageInputDelivery, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus, PiMessageLifecycleKind, QueueItemState, RunSchema, RunState, RunUsageSummarySchema, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
+import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageInputDelivery, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus,
+  PiEventMetadataSchema, PiMessageLifecycleKind, PiMessageLifecycleSchema, QueueItemState, RunSchema, RunState, RunUsageSummarySchema,
+  ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema, type Event } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
 import { isWorkGroup, mobilePiWorkThinkingPreview, mobileWorkItems } from "./mobile-work-projection";
@@ -478,8 +480,8 @@ describe("ordered Thinking inside canonical Mobile messages", () => {
 
   it("projects only current visible Pi thinking into the active folded work group", () => {
     const visible = scoped(1, "thinkingDelta", { messageId: "pi-thought", contentIndex: 0, delta: "Inspecting the file" });
-    const pi = create(EventSchema, { ...visible, pi: { payload: { case: "messageLifecycle",
-      value: { kind: PiMessageLifecycleKind.MESSAGE_UPDATE, role: "assistant", contentIndex: 0 } } } });
+    const pi = create(EventSchema, { ...visible, pi: create(PiEventMetadataSchema, { payload: { case: "messageLifecycle",
+      value: create(PiMessageLifecycleSchema, { kind: PiMessageLifecycleKind.MESSAGE_UPDATE, role: "assistant", contentIndex: 0 }) } }) });
     const hidden = create(EventSchema, { ...scoped(2, "thinkingDelta", { messageId: "pi-thought", contentIndex: 0,
       delta: "Private reasoning", hidden: true }), pi: pi.pi });
     const complete = scoped(3, "messageCompleted", { messageId: "pi-thought", role: MessageRole.ASSISTANT,

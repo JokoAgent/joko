@@ -21,6 +21,7 @@ import type { MobileTaskHeader } from "./MobileTaskHeader";
 import type { MobileContextSheet } from "./MobileContextSheet";
 import type { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
 import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
+import type { MobileNativeIntentMessageFocus } from "./mobile-native-intent";
 import type { MobileProviderUsageTransport } from "./mobile-account-usage";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
@@ -657,8 +658,8 @@ it.each(["accepted", "reader drag", "new window", "new focus", "unknown"] as con
     const anchorWindow = [anchor];
     renderedState = { ...state, window: anchorWindow };
     const originalFocus = { requestId: 1, sessionId: session.sessionId, messageId: anchor.eventId, messageEventId: anchor.eventId };
-    let focus: typeof originalFocus | undefined = originalFocus;
-    const consumeFocus = vi.fn((consumed: typeof originalFocus) => { if (focus === consumed) focus = undefined; });
+    let focus: MobileNativeIntentMessageFocus | undefined = originalFocus;
+    const consumeFocus = vi.fn((consumed: MobileNativeIntentMessageFocus) => { if (focus === consumed) focus = undefined; });
     let finish!: (accepted: boolean) => void;
     send.mockImplementationOnce(async (draft, observer) => {
       observer?.onProgress?.({ phase: "sending", input: draft, sentAt: 2 });
