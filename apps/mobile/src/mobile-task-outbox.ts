@@ -39,6 +39,7 @@ const maximumStoredCharacters = 24_200_000;
 /** Write-through ownership: an input is visible only after its durable write. */
 export class MobileTaskOutboxStore {
   #records: readonly MobileTaskOutboxRecord[] = [];
+  #unreadable: readonly UnreadableOutboxRecord[] = [];
   #loaded = false;
   #tail: Promise<unknown> = Promise.resolve();
 
@@ -57,12 +58,28 @@ export class MobileTaskOutboxStore {
           || (parsed as { format?: unknown }).format !== 1 || !Array.isArray((parsed as { records?: unknown }).records)) {
           throw new Error("The retained task outbox is damaged.");
         }
-        const records = (parsed as { records: unknown[] }).records.map(readRecord);
-        if (records.length > maximumRecords || new Set(records.map((record) => record.id)).size !== records.length
-          || new Set(records.map((record) => record.operationId)).size !== records.length) {
+        const stored = (parsed as { records: unknown[] }).records;
+        if (stored.length > maximumRecords) {
           throw new Error("The retained task outbox contains invalid identities.");
         }
+        const ids = new Set<string>(), operationIds = new Set<string>();
+        const records: MobileTaskOutboxRecord[] = [], unreadableIndexes: number[] = [];
+        for (const [index, value] of stored.entries()) {
+          const recordId = storedIdentity(value, "id"), operationId = storedIdentity(value, "operationId");
+          if ((recordId !== undefined && ids.has(recordId)) || (operationId !== undefined && operationIds.has(operationId))) {
+            throw new Error("The retained task outbox contains invalid identities.");
+          }
+          if (recordId !== undefined) ids.add(recordId);
+          if (operationId !== undefined) operationIds.add(operationId);
+          try { records.push(readRecord(value)); }
+          catch { unreadableIndexes.push(index); }
+        }
+        const sources = unreadableIndexes.length === 0 ? [] : taskOutboxRecordSources(raw, stored.length, new Set(unreadableIndexes));
         this.#records = records;
+        this.#unreadable = unreadableIndexes.map((index, offset) => ({
+          id: storedIdentity(stored[index], "id"), operationId: storedIdentity(stored[index], "operationId"),
+          profileId: storedIdentity(storedProperty(stored[index], "owner"), "profileId"), source: sources[offset]!
+        }));
       }
       this.#loaded = true;
     });
@@ -98,18 +115,33 @@ export class MobileTaskOutboxStore {
   }
 
   clearProfile(profileId: string): Promise<void> {
-    return this.#mutate((records) => ({ records: records.filter((record) => record.owner.profileId !== profileId), result: undefined }));
+    return this.#mutate((records) => ({ records: records.filter((record) => record.owner.profileId !== profileId), result: undefined }), profileId);
   }
 
-  async #mutate<T>(change: (records: readonly MobileTaskOutboxRecord[]) => { records: readonly MobileTaskOutboxRecord[]; result: T }): Promise<T> {
+  async #mutate<T>(change: (records: readonly MobileTaskOutboxRecord[]) => { records: readonly MobileTaskOutboxRecord[]; result: T }, clearProfileId?: string): Promise<T> {
     await this.load();
     return this.#serialize(async () => {
       const next = change(this.#records);
-      if (next.records.length > maximumRecords) throw new Error("The task outbox is full. Remove an unsent input before adding another.");
-      const body = JSON.stringify({ format: 1, records: next.records });
+      const unreadable = clearProfileId === undefined ? this.#unreadable
+        : this.#unreadable.filter(record => record.profileId !== clearProfileId);
+      if (next.records.length + unreadable.length > maximumRecords) throw new Error("The task outbox is full. Remove an unsent input before adding another.");
+      let body: string;
+      if (unreadable.length > 0) {
+        const reservedIds = new Set(unreadable.map(record => record.id));
+        const reservedOperations = new Set(unreadable.map(record => record.operationId));
+        if (next.records.some(record => reservedIds.has(record.id) || reservedOperations.has(record.operationId))) {
+          throw new Error("This task input conflicts with a retained unreadable record.");
+        }
+        const entries = next.records.map(record => JSON.stringify(record));
+        for (const record of unreadable) entries.push(record.source);
+        body = `{"format":1,"records":[${entries.join(",")}]}`;
+      } else {
+        body = JSON.stringify({ format: 1, records: next.records });
+      }
       if (body.length > maximumStoredCharacters) throw new Error("The task outbox exceeds its storage limit.");
       await this.driver.setItem(storageKey, body);
       this.#records = next.records;
+      this.#unreadable = unreadable;
       return next.result;
     });
   }
@@ -119,6 +151,86 @@ export class MobileTaskOutboxStore {
     this.#tail = result.then(() => undefined, () => undefined);
     return result;
   }
+}
+
+interface UnreadableOutboxRecord {
+  readonly id: string | undefined;
+  readonly operationId: string | undefined;
+  readonly profileId: string | undefined;
+  readonly source: string;
+}
+
+/** Retain the exact JSON of a damaged entry when another entry advances. */
+function taskOutboxRecordSources(raw: string, recordCount: number, unreadableIndexes: ReadonlySet<number>): string[] {
+  // The envelope already passed JSON.parse. Only find its entry boundaries.
+  let arrayStart: number | undefined;
+  let cursor = afterJsonSpace(raw, afterJsonSpace(raw, 0) + 1);
+  while (raw[cursor] !== "}") {
+    const keyEnd = afterJsonString(raw, cursor);
+    const key = JSON.parse(raw.slice(cursor, keyEnd)) as string;
+    const start = afterJsonSpace(raw, afterJsonSpace(raw, keyEnd) + 1);
+    if (key === "records") arrayStart = raw[start] === "[" ? start : undefined;
+    const delimiter = afterJsonSpace(raw, afterJsonValue(raw, start));
+    cursor = raw[delimiter] === "," ? afterJsonSpace(raw, delimiter + 1) : delimiter;
+  }
+  const sources: string[] = [];
+  let count = 0;
+  if (arrayStart !== undefined) {
+    let start = afterJsonSpace(raw, arrayStart + 1);
+    while (raw[start] !== "]") {
+      const end = afterJsonValue(raw, start);
+      if (unreadableIndexes.has(count)) sources.push(raw.slice(start, end));
+      count += 1;
+      const delimiter = afterJsonSpace(raw, end);
+      start = raw[delimiter] === "," ? afterJsonSpace(raw, delimiter + 1) : delimiter;
+    }
+  }
+  if (count !== recordCount) throw new Error("The retained task outbox record positions are invalid.");
+  return sources;
+}
+
+function afterJsonSpace(raw: string, start: number): number {
+  let cursor = start;
+  while (cursor < raw.length && " \r\n\t".includes(raw[cursor]!)) cursor += 1;
+  return cursor;
+}
+
+function afterJsonString(raw: string, start: number): number {
+  let cursor = start + 1;
+  while (cursor < raw.length) {
+    const character = raw[cursor++];
+    if (character === '"') return cursor;
+    if (character === "\\") cursor += 1;
+  }
+  throw new Error("The retained task outbox string is incomplete.");
+}
+
+function afterJsonValue(raw: string, start: number): number {
+  let depth = 0, cursor = start;
+  while (cursor < raw.length) {
+    const character = raw[cursor]!;
+    if (character === '"') { cursor = afterJsonString(raw, cursor); continue; }
+    if (character === "{" || character === "[") depth += 1;
+    else if (depth === 0 && ",}] \r\n\t".includes(character)) return cursor;
+    else if (character === "}" || character === "]") depth -= 1;
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function storedProperty(value: unknown, key: string): unknown {
+  return value !== null && typeof value === "object" && Object.hasOwn(value, key)
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
+function storedIdentity(value: unknown, key: string): string | undefined {
+  const property = storedProperty(value, key);
+  return validIdentity(property) ? property : undefined;
+}
+
+function validIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "" && value.length <= 1_024 && !/[\u0000-\u001f]/u.test(value);
 }
 
 export function mobileTaskOutboxOwnerMatches(left: MobileTaskOutboxOwner, right: MobileTaskOutboxOwner): boolean {
@@ -135,7 +247,7 @@ function readRecord(value: unknown): MobileTaskOutboxRecord {
   const record = value as MobileTaskOutboxRecord;
   for (const id of [record.id, record.operationId, record.sessionId, record.backendId, record.targetId,
     record.owner?.profileId, record.owner?.serverId, record.owner?.connectionId, record.owner?.deviceId]) {
-    if (typeof id !== "string" || !id.trim() || id.length > 1_024 || /[\u0000-\u001f]/u.test(id)) {
+    if (!validIdentity(id)) {
       throw new Error("The retained task input has an invalid owner.");
     }
   }

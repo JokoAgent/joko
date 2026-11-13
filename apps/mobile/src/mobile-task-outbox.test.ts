@@ -137,4 +137,33 @@ describe("durable mobile task outbox storage", () => {
     const restarted = new MobileTaskOutboxStore(f.driver); await expect(restarted.load()).rejects.toThrow("invalid identities");
     expect(restarted.records).toEqual([]); expect(f.values.get(key)).toBe(damaged);
   });
+
+  it.each([0, 1])("isolates an unreadable entry at position %i and preserves its exact bytes across writes", async (index) => {
+    const f = memory(), store = new MobileTaskOutboxStore(f.driver);
+    const first = await store.add(input()), last = await store.add(input("input-last"));
+    const key = [...f.values.keys()][0]!;
+    const foreignOwner = { ...first.owner, profileId: "tablet" };
+    const damaged = String.raw`{ "id" : "broken", "operationId":"original-operation", "owner": ${JSON.stringify(foreignOwner)}, "input": {"text":"some \\\" [nested] } ", "number":9007199254740993}, "state":"invalid" }`;
+    const entries = [JSON.stringify(first), JSON.stringify(last)];
+    entries.splice(index, 0, damaged);
+    const original = String.raw`{ "records":false, "format":1, "rec\u006frds":[ ${entries.join(",\n")} ], "extra": { "records":[] } }`;
+    f.values.set(key, original);
+
+    const restarted = new MobileTaskOutboxStore(f.driver);
+    await restarted.load();
+    expect(restarted.records).toEqual([first, last]);
+    expect(f.values.get(key)).toBe(original);
+    await expect(restarted.add({ ...input("conflict"), operationId: "original-operation" })).rejects.toThrow("unreadable record");
+    await restarted.remove(restarted.records[0]!);
+    expect(f.values.get(key)).toContain(damaged);
+    await restarted.clearProfile(first.owner.profileId);
+    expect(f.values.get(key)).toContain(damaged);
+    const repaired = { ...input("broken"), operationId: "original-operation", owner: foreignOwner };
+    f.values.set(key, f.values.get(key)!.replace(damaged, JSON.stringify(repaired)));
+    const afterRepair = new MobileTaskOutboxStore(f.driver);
+    await afterRepair.load();
+    expect(afterRepair.records).toEqual([repaired]);
+    await afterRepair.clearProfile(foreignOwner.profileId);
+    expect(JSON.parse(f.values.get(key)!)).toEqual({ format: 1, records: [] });
+  });
 });

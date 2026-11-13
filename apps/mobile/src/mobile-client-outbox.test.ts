@@ -138,6 +138,30 @@ describe("durable ordinary mobile task inputs", () => {
     expect(recovered.client.taskOutboxItems()).toEqual([]);
   });
 
+  it.each(["owner", "state", "input"] as const)("recovers the saved connection and valid sends when another outbox %s is damaged", async (field) => {
+    const f = await fixture(), first = f.makeClient();
+    await first.client.start();
+    await first.client.send(plainTextMobileComposerDraft("First valid input"), { operationId: "good-first" });
+    await first.client.send(plainTextMobileComposerDraft("Second valid input"), { operationId: "good-second" });
+    const [before, after] = first.client.taskOutboxItems();
+    const foreign = { ...before!, id: "bad-record", operationId: "bad-operation",
+      owner: { ...before!.owner, profileId: "another-profile", serverId: "another-node" } };
+    const damaged = JSON.stringify({ ...foreign, [field]: null });
+    const key = "joko.mobile.task-outbox.v1";
+    f.values.set(key, `{"format":1,"records":[${JSON.stringify(before)},${damaged},${JSON.stringify(after)}]}`);
+    first.client.dispose();
+    f.online();
+    const recovered = f.makeClient();
+    await recovered.client.start();
+    expect(recovered.client.state).toMatchObject({ status: "connected", selectedId: "session",
+      activeProfileId: credential.profileId, automaticProfileId: credential.profileId });
+    expect(f.network.submit.mock.calls.map(call => call[1])).toEqual(["good-first", "good-second"]);
+    expect(recovered.client.taskOutboxItems()).toEqual([]);
+    expect(f.values.get(key)).toBe(`{"format":1,"records":[${damaged}]}`);
+    await recovered.client.refreshSaved();
+    expect(recovered.client.state.saved).toHaveLength(1);
+  });
+
   it("leaves a durable editable composer and no queue item when the handoff write fails", async () => {
     const f = await fixture(), { client, drafts } = f.makeClient(); await client.start(); f.failWrite(true);
     await expect(client.send(plainTextMobileComposerDraft("Keep this input"))).rejects.toThrow("storage is full");
