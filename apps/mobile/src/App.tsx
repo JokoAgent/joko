@@ -180,7 +180,7 @@ import { MobileAudioMetadataCard } from "./MobileAudioMetadataCard";
 import { useMobileAudioArtwork } from "./use-mobile-audio-artwork";
 import { projectMobileInlinePlans } from "./mobile-plan-projection";
 import { mobilePlanMessage } from "./mobile-plan-messages";
-import { isWorkGroup, mobileWorkContains, mobileWorkExpansionKeys, mobileWorkItems, type MobileWorkItem } from "./mobile-work-projection";
+import { isWorkGroup, mobilePiWorkThinkingPreview, mobileWorkContains, mobileWorkExpansionKeys, mobileWorkItems, type MobileWorkItem } from "./mobile-work-projection";
 import { mobileExpandedBlockStore } from "./mobile-expanded-block-memory";
 import { MobileToolCallCard } from "./MobileToolCallCard";
 import { MobileDelegatedTaskCard } from "./MobileDelegatedTaskCard";
@@ -6597,7 +6597,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   };
   const renderTimelineItem = (item: MobileWorkItem<TimelineRow>, focused: boolean, compactThinking = false): ReactElement => {
     if (isWorkGroup(item)) return <MobileWorkGroupCard blockKey={item.id} ownerKey={blockOwnerKey} streaming={item.streaming}
-      enabled={state.status === "connected" || state.status === "offline"} colors={colors} locale={locale}>
+      enabled={state.status === "connected" || state.status === "offline"}
+      thinkingPreview={state.status === "connected" && state.window === undefined ? mobilePiWorkThinkingPreview(item) : undefined}
+      colors={colors} locale={locale}>
       {item.children.map((child) => <Fragment key={child.id}>{renderTimelineItem(child, focused, true)}</Fragment>)}
     </MobileWorkGroupCard>;
     if (item.pendingSend && state.activeProfileId) {

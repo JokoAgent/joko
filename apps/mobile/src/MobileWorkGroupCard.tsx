@@ -4,19 +4,21 @@ import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { useMobileExpandedBlock } from "./mobile-expanded-block-memory";
 import { mobileThinkingMessage } from "./mobile-thinking-messages";
+import { tokenizeMobileThinkingText } from "./mobile-thinking-text";
 
 export interface MobileWorkGroupCardProps {
   readonly blockKey: string;
   readonly ownerKey: string;
   readonly streaming: boolean;
   readonly enabled: boolean;
+  readonly thinkingPreview?: string;
   readonly colors: MobileInteractionSheetColors;
   readonly locale: MobileSupportedLocale;
   readonly children: ReactNode;
 }
 
 export const MobileWorkGroupCard = memo(function MobileWorkGroupCard({ blockKey, ownerKey, streaming, enabled,
-  colors, locale, children }: MobileWorkGroupCardProps) {
+  thinkingPreview, colors, locale, children }: MobileWorkGroupCardProps) {
   const [expanded, toggle] = useMobileExpandedBlock(ownerKey, blockKey);
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   useEffect(() => {
@@ -25,10 +27,13 @@ export const MobileWorkGroupCard = memo(function MobileWorkGroupCard({ blockKey,
   }, []);
   const interactive = enabled && foreground;
   const active = streaming && interactive;
+  const toggleCurrent = () => { if (interactive && AppState.currentState === "active") toggle(); };
+  const firstLine = !expanded && active ? thinkingPreview?.trim().split(/[\r\n]/u, 1)[0] : undefined;
+  const preview = firstLine && tokenizeMobileThinkingText(firstLine).map(token => token.value).join("");
   return <View style={[styles.group, { borderColor: colors.border }]}>
     <Pressable accessibilityRole="button"
       accessibilityLabel={mobileThinkingMessage(locale, expanded ? "collapseWork" : "expandWork")}
-      accessibilityState={{ expanded, disabled: !interactive }} disabled={!interactive} onPress={() => { if (interactive) toggle(); }}
+      accessibilityState={{ expanded, disabled: !interactive }} disabled={!interactive} onPress={toggleCurrent}
       style={styles.toggle}>
       {active && <ActivityIndicator size="small" color={colors.muted} accessibilityLabel={mobileThinkingMessage(locale, "workActive")} />}
       <Text numberOfLines={1} style={[styles.title, { color: colors.muted }]}>
@@ -36,6 +41,10 @@ export const MobileWorkGroupCard = memo(function MobileWorkGroupCard({ blockKey,
       </Text>
       <Text accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={[styles.chevron, { color: colors.muted }]}>{expanded ? "⌃" : "⌄"}</Text>
     </Pressable>
+    {preview && <Pressable accessibilityRole="button" accessibilityLabel={preview} accessibilityState={{ expanded: false }}
+      onPress={toggleCurrent} style={styles.previewToggle}>
+      <Text numberOfLines={1} style={[styles.preview, { color: colors.muted }]}>{preview}</Text>
+    </Pressable>}
     {expanded && <View style={styles.children}>{children}</View>}
   </View>;
 });
@@ -45,5 +54,7 @@ const styles = StyleSheet.create({
   toggle: { minHeight: 44, paddingHorizontal: 12, paddingVertical: 10, flexDirection: "row", alignItems: "center", gap: 8 },
   title: { flex: 1, minWidth: 0, fontSize: 13, lineHeight: 20 },
   chevron: { width: 16, fontSize: 16, textAlign: "center" },
+  previewToggle: { minHeight: 44, paddingHorizontal: 12, justifyContent: "center" },
+  preview: { fontSize: 13, lineHeight: 20, fontStyle: "italic" },
   children: { paddingLeft: 12 }
 });
