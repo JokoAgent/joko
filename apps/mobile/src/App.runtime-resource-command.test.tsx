@@ -3,7 +3,7 @@ import { act, createElement, forwardRef, useImperativeHandle, useRef, type Compo
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventSchema, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
-  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
+  MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, PartnerSessionTaskStatus, PiMessageLifecycleKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
   RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
@@ -22,6 +22,8 @@ import type { MobileContextSheet } from "./MobileContextSheet";
 import type { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
 import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
 import type { MobileNativeIntentMessageFocus } from "./mobile-native-intent";
+import type { MobileSheetActionItem } from "./MobileActionSheet";
+import type { MobileMessageActionId } from "./task-actions";
 import type { MobileProviderUsageTransport } from "./mobile-account-usage";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
@@ -57,12 +59,14 @@ let receiveAppMessage: ((event: { nativeEvent: { data: string } }) => void) | un
 let appBridgeKey = "";
 let MobileMcpAppViewsProvider: typeof import("./MobileMcpAppViews").MobileMcpAppViewsProvider;
 const openSystemLink = vi.fn(async (_url: string) => {});
+const writeClipboard = vi.fn(async (_text: string) => true);
 
 let input: ComponentProps<typeof MobileComposerRichInput>;
 let palette: ComponentProps<typeof MobileRuntimeCommandPalette>;
 let header: ComponentProps<typeof MobileTaskHeader>;
 let contextSheet: ComponentProps<typeof MobileContextSheet>;
 let conversationSearch: ComponentProps<typeof MobileConversationSearchSheet>;
+let taskMessageActions: { items: readonly MobileSheetActionItem<MobileMessageActionId>[]; onAction: (action: MobileMessageActionId) => void } | undefined;
 let objectiveSheet: MobileObjectiveSheetProps;
 let activeObjectiveApi: MobileObjectiveApi | undefined;
 let activeCollaborationApi: MobileCollaborationApi | undefined;
@@ -170,7 +174,7 @@ beforeAll(async () => {
     let nextByte = 0;
     return { randomUUID: () => "selected-occurrence", getRandomBytes: (count: number) => new Uint8Array(count).fill(++nextByte) };
   });
-  vi.doMock("expo-clipboard", () => ({}));
+  vi.doMock("expo-clipboard", () => ({ setStringAsync: writeClipboard }));
   vi.doMock("expo-camera", () => ({ CameraView: () => null, useCameraPermissions: () => [undefined, vi.fn()] }));
   for (const name of ["expo-image-picker", "expo-image-manipulator", "expo-image", "expo-sharing", "expo-file-system", "expo-media-library", "expo-audio", "expo-network", "expo-secure-store", "expo-notifications", "expo-application"]) vi.doMock(name, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => undefined }));
   vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}), requireOptionalNativeModule: () => ({}),
@@ -204,7 +208,7 @@ beforeAll(async () => {
   }));
   vi.doMock("./MobileRuntimeCommandPalette", () => ({ MobileRuntimeCommandPalette: (_props: ComponentProps<typeof MobileRuntimeCommandPalette>) => { palette = _props; return null; } }));
   vi.doMock("./MobileInputHandoffPanel", () => ({ MobileInputHandoffPanel: (props: { api: import("./mobile-input-handoff").MobileInputHandoffApi }) => createElement("div", { "data-input-handoff-owner": props.api.ownerKey }, "Owner input handoff") }));
-  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileActionSheet", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
+  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
   for (const name of screens) vi.doMock(`./${name}`, () => new Proxy({}, {
     get: (_object, key) => key === "then" ? undefined : () => null,
     has: () => true,
@@ -212,6 +216,10 @@ beforeAll(async () => {
   }));
   vi.doMock("./MobileConversationSearchSheet", () => ({ MobileConversationSearchSheet: (props: ComponentProps<typeof MobileConversationSearchSheet>) => {
     conversationSearch = props;
+    return null;
+  } }));
+  vi.doMock("./MobileActionSheet", () => ({ MobileActionSheet: (props: NonNullable<typeof taskMessageActions> & { visible: boolean }) => {
+    if (props.visible && props.items.some(item => item.id === "copy-text")) taskMessageActions = props;
     return null;
   } }));
   vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
@@ -241,6 +249,8 @@ beforeEach(async () => {
   returnToLatest.mockClear();
   loadEarlier.mockReset().mockResolvedValue(undefined);
   loadNewer.mockReset().mockResolvedValue(undefined);
+  taskMessageActions = undefined;
+  writeClipboard.mockClear();
   nativeAppState.currentState = "active";
   timelineList = undefined; scrollTimelineToIndex.mockReset(); scrollTimelineToOffset.mockClear(); scrollTimelineToEnd.mockClear();
   sendFollowSourceKey = undefined; sendFollowPresentationKey = undefined; ordinaryTimelineTransportKey = undefined;
@@ -815,6 +825,40 @@ it("reads newer history at the end of a linked window without returning to lates
   expect(returnToLatest).not.toHaveBeenCalled();
   expect(scrollTimelineToIndex).toHaveBeenCalledOnce();
   expect(scrollTimelineToEnd).not.toHaveBeenCalled();
+});
+
+it("copies the adopted Pi entry from the message menu after withholding the temporary link", async () => {
+  sendFollowSourceKey = "task-source";
+  const identity = { sessionId: session.sessionId, backendId: "pi", targetId: session.targetId, runId: "run", generation: 1n };
+  const running = create(SnapshotSchema, { sessions: [create(SessionSchema, { ...session, backendId: "pi", state: SessionState.RUNNING })] });
+  const answer = create(EventSchema, {
+    eventId: "temporary-completion", identity, cursor: { generation: 1n, sequence: 3n },
+    payload: { kind: { case: "messageCompleted", value: { messageId: "temporary-completion", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "A Pi reply" } }] } } },
+    pi: { rpcEventType: "message_end", payload: { case: "messageLifecycle", value: { kind: PiMessageLifecycleKind.MESSAGE_END } } }
+  });
+  renderedState = { ...state, owner: running, detail: running, live: [answer] };
+  const more = () => Array.from(host.querySelectorAll("button")).find(button => button.getAttribute("aria-label")
+    === mobileMessage("en", "task.moreFor", { name: "Assistant" }));
+  await act(async () => root.render(taskScreen()));
+  await act(async () => more()!.click());
+  expect(taskMessageActions?.items.map(item => item.id)).toContain("copy-text");
+  expect(taskMessageActions?.items.map(item => item.id)).not.toContain("copy-link");
+  await act(async () => taskMessageActions!.onAction("copy-link"));
+  expect(writeClipboard).not.toHaveBeenCalled();
+
+  const completed = answer.payload!.kind;
+  if (completed.case !== "messageCompleted") throw new Error("Expected an assistant completion.");
+  const adopted = create(EventSchema, { ...answer, eventId: "adopted-completion", cursor: { generation: 1n, sequence: 8n },
+    payload: { kind: { case: "messageCompleted", value: { ...completed.value, messageId: "native-entry", nativeIdentity: { entryId: "native-entry" } } } } });
+  const settled = create(SnapshotSchema, { ...running,
+    sessions: [create(SessionSchema, { ...running.sessions[0]!, state: SessionState.IDLE })], timeline: [adopted] });
+  renderedState = { ...state, owner: settled, detail: settled };
+  await act(async () => root.render(taskScreen()));
+  await act(async () => more()!.click());
+  expect(taskMessageActions?.items.map(item => item.id)).toContain("copy-link");
+  await act(async () => taskMessageActions!.onAction("copy-link"));
+  expect(writeClipboard).toHaveBeenCalledExactlyOnceWith("joko://task/session?message=native-entry&event=adopted-completion");
 });
 
 async function mountMeasuredTimelineTail(): Promise<void> {
