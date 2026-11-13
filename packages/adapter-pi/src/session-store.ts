@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { constants, createReadStream, type Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -209,7 +209,7 @@ export class PiSessionStore {
         });
         if (
           after === undefined || !after.isFile() || after.isSymbolicLink() ||
-          !sameExternalFileSnapshot(before, after)
+          !sameFileSnapshot(before, after)
         ) {
           throw piError(
             "PI_EXTERNAL_SESSION_DISCOVERY_RACE",
@@ -307,7 +307,7 @@ export class PiSessionStore {
       }
       bytes = await handle.readFile();
       const after = await handle.stat();
-      if (!sameExternalFileSnapshot(before, after) || !sameExternalIdentity(source.identity, after)) {
+      if (!sameFileSnapshot(before, after) || !sameExternalIdentity(source.identity, after)) {
         throw externalSessionChanged();
       }
     } finally {
@@ -325,8 +325,34 @@ export class PiSessionStore {
     maximumBytes = DEFAULT_PORTABLE_SESSION_LIMIT_BYTES
   ): Promise<PiPortableNativeSession> {
     const limit = portableSessionLimit(maximumBytes);
-    const safePath = await this.assertManagedSession(path);
-    const handle = await open(safePath, "r").catch((error) => {
+    const source = await this.#locateManagedSession(path, true);
+    return this.#readPortableSessionFile(source.path, source.info, limit);
+  }
+
+  async readStoredPortableSession(binding: NativeSessionBinding): Promise<PiPortableNativeSession | undefined> {
+    if (!binding.nativeSessionId) throw piError("PI_SESSION_PORTABLE_BINDING_MISSING", "Portable export requires an exact native Session identity", "session");
+    const source = await this.#locateManagedSession(binding.opaqueRef, false);
+    if (!samePath(source.path, binding.opaqueRef)) {
+      throw piError("PI_SESSION_PATH_DENIED", "Portable export requires the original managed Session path", "session");
+    }
+    if (source.info === undefined) {
+      const latest = await lstat(source.path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (latest === undefined && samePath(await managedRealpath(dirname(source.path)), dirname(source.path))) return undefined;
+      throw portableSessionExportChanged();
+    }
+    const native = await this.#readPortableSessionFile(source.path, source.info, DEFAULT_PORTABLE_SESSION_LIMIT_BYTES);
+    if (native.nativeSessionId !== binding.nativeSessionId) {
+      throw piError("PI_SESSION_EXPORT_IDENTITY_MISMATCH", "The native Session file no longer matches the task binding", "session");
+    }
+    return native;
+  }
+
+  async #readPortableSessionFile(path: string, observed: Stats, limit: number): Promise<PiPortableNativeSession> {
+    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+    const handle = await open(path, flags).catch((error) => {
       throw asPiError(error, {
         code: "PI_SESSION_EXPORT_OPEN_FAILED",
         phase: "session",
@@ -342,14 +368,12 @@ export class PiSessionStore {
         }
         throw piError("PI_SESSION_EXPORT_UNSAFE", "Native Session export requires a regular non-symlink file", "session");
       }
+      if (!sameFileSnapshot(observed, before) || !samePath(await managedRealpath(path), path)) throw portableSessionExportChanged();
       const bytes = await handle.readFile();
       const after = await handle.stat();
-      if (!sameIdentity(before, after) || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-        throw piError("PI_SESSION_EXPORT_RACE", "Native Session changed while it was being exported", "session", {
-          retryable: true,
-          recovery: "Retry after the active turn and native Session write settle."
-        });
-      }
+      const published = await lstat(path);
+      if (!sameFileSnapshot(before, after) || !published.isFile() || published.isSymbolicLink()
+        || !sameFileSnapshot(after, published) || !samePath(await managedRealpath(path), path)) throw portableSessionExportChanged();
       const inspected = inspectPortableSessionBytes(bytes, limit);
       return {
         bytes,
@@ -687,13 +711,19 @@ export class PiSessionStore {
   }
 
   async assertManagedSessionReference(path: string, options: { readonly requireExists: boolean }): Promise<string> {
+    return (await this.#locateManagedSession(path, options.requireExists)).path;
+  }
+
+  #locateManagedSession(path: string, requireExists: true): Promise<{ readonly path: string; readonly info: Stats }>;
+  #locateManagedSession(path: string, requireExists: boolean): Promise<{ readonly path: string; readonly info?: Stats }>;
+  async #locateManagedSession(path: string, requireExists: boolean): Promise<{ readonly path: string; readonly info?: Stats }> {
     if (!isAbsolute(path) || extname(path).toLowerCase() !== ".jsonl") {
       throw piError("PI_SESSION_PATH_DENIED", "Native session reference is not an absolute JSONL path", "session");
     }
     const resolved = resolve(path);
     assertContained(this.sessionsRoot, resolved);
     const info = await lstat(resolved).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT" && !options.requireExists) return undefined;
+      if (error.code === "ENOENT" && !requireExists) return undefined;
       throw piError("PI_SESSION_NOT_FOUND", `Native Pi session '${resolved}' does not exist`, "session", {
         recovery: "Select another session or restore the missing native JSONL file.",
         cause: error
@@ -703,14 +733,14 @@ export class PiSessionStore {
       const canonicalRoot = await managedRealpath(this.sessionsRoot);
       const canonicalParent = await managedRealpath(dirname(resolved));
       assertContained(canonicalRoot, canonicalParent);
-      return resolved;
+      return { path: resolved };
     }
     if (!info.isFile() || info.isSymbolicLink()) {
       throw piError("PI_SESSION_PATH_DENIED", "Native session reference must be a regular non-symlink file", "session");
     }
     const canonical = await managedRealpath(resolved);
     assertContained(await managedRealpath(this.sessionsRoot), canonical);
-    return canonical;
+    return { path: canonical, info };
   }
 }
 
@@ -988,7 +1018,7 @@ function sameExternalIdentity(
     expected.ctimeMs === actual.ctimeMs;
 }
 
-function sameExternalFileSnapshot(
+function sameFileSnapshot(
   left: { readonly dev: number; readonly ino: number; readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number },
   right: { readonly dev: number; readonly ino: number; readonly size: number; readonly mtimeMs: number; readonly ctimeMs: number }
 ): boolean {
@@ -996,6 +1026,13 @@ function sameExternalFileSnapshot(
     left.size === right.size &&
     left.mtimeMs === right.mtimeMs &&
     left.ctimeMs === right.ctimeMs;
+}
+
+function portableSessionExportChanged(): ReturnType<typeof piError> {
+  return piError("PI_SESSION_EXPORT_RACE", "Native Session changed while it was being exported", "session", {
+    retryable: true,
+    recovery: "Retry after the active turn and native Session write settle."
+  });
 }
 
 function externalSessionReference(

@@ -84,7 +84,7 @@ export class ArtifactStore {
   readonly #maximumBlobBytes: number;
   readonly #ticketTtlMs: number;
   readonly #now: () => number;
-  readonly #permanentIngests = new Map<string, Promise<ArtifactRecord>>();
+  readonly #permanentIngests = new Map<string, Promise<void>>();
   readonly #dispatchInputArtifacts = new AsyncLocalStorage<ActiveDispatchInputArtifacts>();
 
   constructor(options: ArtifactStoreOptions) {
@@ -179,8 +179,9 @@ export class ArtifactStore {
   /** Materialize service-produced bytes without routing them through a public upload ticket. */
   async ingestBytes(
     bytes: Uint8Array,
-    options?: { fileName?: string; mimeType?: string; expiresAt?: number }
+    options?: { fileName?: string; mimeType?: string; expiresAt?: number; assertCurrent?: () => void }
   ): Promise<ArtifactRecord> {
+    options?.assertCurrent?.();
     if (bytes.byteLength > this.#maximumBlobBytes) throw new Error("Artifact exceeds the configured size limit.");
     const temporaryPath = join(this.#options.rootDirectory, "incoming", randomUUID());
     const handle = await open(temporaryPath, "wx", 0o600);
@@ -197,7 +198,8 @@ export class ArtifactStore {
         expectedSize: bytes.byteLength,
         ...(options?.fileName === undefined ? {} : { fileName: options.fileName }),
         ...(options?.mimeType === undefined ? {} : { mimeType: options.mimeType }),
-        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt })
+        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+        ...(options?.assertCurrent === undefined ? {} : { assertCurrent: options.assertCurrent })
       });
     } catch (error) {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
@@ -436,6 +438,7 @@ export class ArtifactStore {
     mimeType?: string;
     expiresAt?: number;
     beforeFinalize?: (snapshot: ArtifactSnapshotDigest) => Promise<void>;
+    assertCurrent?: () => void;
   }): Promise<ArtifactRecord> {
     const { sha256, byteLength } = await hashFile(temporaryPath, this.#maximumBlobBytes);
     if (input.expectedSha256 !== undefined && input.expectedSha256.toLowerCase() !== sha256) {
@@ -449,6 +452,7 @@ export class ArtifactStore {
     await input.beforeFinalize?.({ sha256, byteLength });
     const storagePath = join(this.#options.rootDirectory, "blobs", sha256.slice(0, 2), sha256.slice(2, 4), sha256);
     await mkdir(dirname(storagePath), { recursive: true });
+    input.assertCurrent?.();
     try {
       await rename(temporaryPath, storagePath);
     } catch (error) {
@@ -458,13 +462,17 @@ export class ArtifactStore {
     const fileName = input.fileName === undefined ? undefined : sanitizeFileName(input.fileName);
     const mimeType = input.mimeType ?? inferMediaType(fileName ?? "");
     const persist = async (): Promise<ArtifactRecord> => {
+      input.assertCurrent?.();
       if (input.expiresAt === undefined) {
         const existing = await this.#options.repository.findPermanentArtifact({
           storagePath,
           mimeType,
           ...(fileName === undefined ? {} : { fileName })
         });
-        if (existing !== undefined) return existing;
+        if (existing !== undefined) {
+          input.assertCurrent?.();
+          return existing;
+        }
       }
       const record: ArtifactRecord = {
         id: randomUUID(),
@@ -476,19 +484,21 @@ export class ArtifactStore {
         createdAt: this.#now(),
         ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt })
       };
+      input.assertCurrent?.();
       await this.#options.repository.putArtifact(record);
       return record;
     };
     if (input.expiresAt !== undefined) return persist();
     const identity = `${storagePath}\0${mimeType}\0${fileName ?? ""}`;
+    // Keep deduplication serialized while each caller checks its own authority.
     const pending = this.#permanentIngests.get(identity);
-    if (pending !== undefined) return pending;
-    const operation = persist();
-    this.#permanentIngests.set(identity, operation);
+    const operation = pending === undefined ? persist() : pending.then(persist);
+    const settled = operation.then(() => undefined, () => undefined);
+    this.#permanentIngests.set(identity, settled);
     try {
       return await operation;
     } finally {
-      if (this.#permanentIngests.get(identity) === operation) this.#permanentIngests.delete(identity);
+      if (this.#permanentIngests.get(identity) === settled) this.#permanentIngests.delete(identity);
     }
   }
 

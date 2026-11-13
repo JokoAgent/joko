@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -125,6 +125,30 @@ describe("PiSessionStore", () => {
     expect(records[0]).toMatchObject({ type: "session", id: "imported-native", cwd: targetWorkspace });
     expect(records[0]).not.toHaveProperty("parentSession");
     expect(records[1]).toMatchObject({ type: "message", id: "one" });
+  });
+
+  it("reads the exact stored transcript and distinguishes absence from invalid and unsafe persistence", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-stored-export-"));
+    const store = new PiSessionStore(home);
+    await store.initialize();
+    const path = join(store.sessionsRoot, "stored.jsonl");
+    const binding = { opaqueRef: path, nativeSessionId: "exact-native", generation: 8 };
+    await expect(store.readStoredPortableSession(binding)).resolves.toBeUndefined();
+
+    const jsonl = (id: string) => `${JSON.stringify({ type: "session", version: 3, id, cwd: home })}\n`;
+    await writeFile(path, jsonl(binding.nativeSessionId));
+    await expect(store.readStoredPortableSession(binding)).resolves.toMatchObject({ nativeSessionId: binding.nativeSessionId,
+      sha256: createHash("sha256").update(jsonl(binding.nativeSessionId)).digest("hex") });
+    await writeFile(path, jsonl("replaced-native"));
+    await expect(store.readStoredPortableSession(binding)).rejects.toMatchObject({ publicError: { code: "PI_SESSION_EXPORT_IDENTITY_MISMATCH" } });
+    await writeFile(path, "{broken\n");
+    await expect(store.readStoredPortableSession(binding)).rejects.toMatchObject({ publicError: { code: "PI_SESSION_PORTABLE_JSONL_INVALID" } });
+
+    const alias = join(store.sessionsRoot, "outside-alias");
+    const outside = await mkdtemp(join(tmpdir(), "joko-pi-export-outside-"));
+    await symlink(outside, alias, process.platform === "win32" ? "junction" : "dir");
+    await expect(store.readStoredPortableSession({ ...binding, opaqueRef: join(alias, "absent.jsonl") }))
+      .rejects.toMatchObject({ publicError: { code: "PI_SESSION_PATH_ESCAPE" } });
   });
 
   it("lists and portable-round-trips a native message line containing an image larger than 25 MiB", async () => {

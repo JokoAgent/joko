@@ -339,6 +339,12 @@ export interface PortableNativeSession {
   readonly nativeSessionId: string;
 }
 
+export interface StoredPortableNativeSessionInput {
+  readonly target: TargetDescriptor;
+  readonly binding: NativeSessionBinding;
+  readonly assertCurrent: () => void;
+}
+
 export interface ImportPortableNativeSessionInput {
   readonly target: TargetDescriptor;
   readonly bytes: Uint8Array;
@@ -711,6 +717,8 @@ export interface BackendAdapter {
   exportSession(context: AdapterContext): Promise<BlobRef>;
   /** Read native persistence without exposing its service-node path to public layers. */
   exportPortableNativeSession?(context: AdapterContext): Promise<PortableNativeSession>;
+  /** Read the exact stored binding without activation. Undefined means its transcript is absent. */
+  readStoredPortableNativeSession?(input: StoredPortableNativeSessionInput): Promise<PortableNativeSession | undefined>;
   /** Materialize validated native persistence beneath the Adapter-owned Session store. */
   importPortableNativeSession?(
     input: ImportPortableNativeSessionInput,

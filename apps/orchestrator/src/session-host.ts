@@ -47,6 +47,7 @@ import type {
   PartnerLearningTurnHandle,
   PartnerLearningToolAuthority,
   PermissionMode,
+  PortableNativeSession,
   PromptInput,
   ProviderModel,
   PublicError,
@@ -8422,18 +8423,19 @@ export class SessionHost {
   }
 
   /**
-   * Builds a full portable task package. The package is materialized as an
+   * Builds a portable task package. The package is materialized as an
    * authenticated Artifact; neither a service path nor the transient password
    * enters durable product state.
    */
-  async exportPortableSession(input: ExportPortableSessionInput): Promise<ExportPortableSessionResult> {
+  async exportPortableSession(input: ExportPortableSessionInput, assertConnectionCurrent?: () => void): Promise<ExportPortableSessionResult> {
     this.#assertOpen();
     if (this.isReviewReadOnlySession(input.sessionId)) throw new StoreError("Reviewer portable export is disabled.");
     const stored = this.#store.getSession(input.sessionId);
+    if (stored.descriptor.deletedAt !== undefined) throw new StoreError("A deleted task cannot be exported.");
     assertProtectedNativeExport(this.#store, stored.descriptor);
     const adapter = this.requireAdapter(stored.descriptor.backendId);
-    const capability = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities
-      .get("session.portable_transfer");
+    const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
+    const capability = backend.capabilities.get("session.portable_transfer");
     if (capability?.supported !== true || adapter.exportPortableNativeSession === undefined) {
       throw new JokoError({
         code: "PORTABLE_SESSION_EXPORT_UNSUPPORTED",
@@ -8445,20 +8447,90 @@ export class SessionHost {
       });
     }
 
+    const target = this.#store.getTarget(stored.descriptor.targetId);
+    const readStored = adapter.readStoredPortableNativeSession;
+    if (backend.adapterKind === "pi" && readStored !== undefined && this.canReadStoredPortableSession(stored, target)) {
+      const { backendId, id: sessionId, binding } = stored.descriptor;
+      const backendGeneration = this.requireAdapterGeneration(backendId, adapter);
+      const assertCurrent = (): void => {
+        this.#assertOpen();
+        assertConnectionCurrent?.();
+        this.assertBackendAdmissionOpen(backendId);
+        this.assertCurrentAdapterGeneration(backendId, adapter, backendGeneration);
+        const latest = this.#store.getSession(sessionId);
+        const latestTarget = this.#store.getTarget(target.descriptor.id);
+        if (latest.descriptor.backendId !== backendId || latest.descriptor.targetId !== target.descriptor.id
+          || latest.descriptor.archived !== stored.descriptor.archived || !sameNativeBinding(latest.descriptor.binding, binding)
+          || latestTarget.revision !== target.revision || !this.canReadStoredPortableSession(latest, latestTarget)
+          || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined || this.#sessionLifecycleFences.has(sessionId)
+          || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
+          || this.#store.findPendingContextRebuild(sessionId) !== undefined || this.#sessionResetLocks.has(sessionId)
+          || this.#messageDeletionLocks.has(sessionId) || this.#runtimeRestartFences.has(sessionId)
+          || this.#store.findProductAdoptedNativeSessionDerivation(sessionId) !== undefined
+          || this.#partnerPolicyRetirements.has(sessionId)
+          || this.#closeIfActiveFlights.has(sessionId)
+          || ["effect", "unknown"].includes(this.#runtimeHandoffs.read(sessionId)?.pending?.phase ?? "")) {
+          throw new JokoError({
+            code: "PORTABLE_SESSION_EXPORT_SOURCE_CHANGED",
+            message: "The original task export authority changed.",
+            phase: "session",
+            retryable: true,
+            stateMayHaveChanged: false,
+            recovery: "Refresh the task before exporting it again."
+          });
+        }
+        assertProtectedNativeExport(this.#store, latest.descriptor);
+      };
+      assertCurrent();
+      const release = this.registerBackendSideEffectFlight(backendId, sessionId);
+      try {
+        const nativeSession = await readStored.call(adapter, {
+          target: { ...target.descriptor, backendId }, binding, assertCurrent
+        });
+        assertCurrent();
+        return await this.buildPortableTaskArtifact(input, stored, nativeSession, assertCurrent);
+      } finally {
+        release();
+      }
+    }
+
+    assertConnectionCurrent?.();
     const active = await this.activate(input.sessionId);
     const lease = this.beginActiveBackendSideEffect(input.sessionId, active);
     const current = lease.stored;
-    let nativeSession: Awaited<ReturnType<NonNullable<BackendAdapter["exportPortableNativeSession"]>>>;
+    let nativeSession: PortableNativeSession;
     try {
-      if (active.adapter !== adapter || active.adapter.exportPortableNativeSession === undefined) {
-        throw staleBackendInstanceContextError();
-      }
+      if (active.adapter !== adapter || active.adapter.exportPortableNativeSession === undefined) throw staleBackendInstanceContextError();
+      assertConnectionCurrent?.();
       nativeSession = await active.adapter.exportPortableNativeSession(lease.context);
       this.assertActiveBackendSideEffectLease(lease);
       assertProtectedNativeExport(this.#store, current.descriptor);
     } finally {
       lease.release();
     }
+    return this.buildPortableTaskArtifact(input, current, nativeSession);
+  }
+
+  private canReadStoredPortableSession(stored: StoredSession, target: StoredTarget): boolean {
+    const session = stored.descriptor;
+    return session.deletedAt === undefined && !session.hidden && session.remoteWorkspace === undefined
+      && session.worktree === undefined && session.automationOrigin === undefined && !session.derivationOrigin?.sideChat
+      && target.descriptor.remoteWorkspace === undefined && target.descriptor.trusted
+      && !(isRecord(target.metadata) && target.metadata["deletedAt"] !== undefined)
+      && this.#store.sessionCreationServiceKind(session.id) === undefined && this.#partnerSessionPolicy(session.id) === undefined
+      && !this.isPartnerSessionRetiring(session.id) && this.#store.findSessionRuntimePolicy(session.id) === undefined
+      && readPersonalDevelopmentPurpose(this.#store, session.id) === undefined
+      && this.#store.findCollaborationWorkerBySession(session.id) === undefined
+      && this.#store.listCollaborationGoals({ leadSessionId: session.id }).length === 0;
+  }
+
+  private async buildPortableTaskArtifact(
+    input: ExportPortableSessionInput,
+    current: StoredSession,
+    nativeSession: PortableNativeSession | undefined,
+    assertCurrent?: () => void
+  ): Promise<ExportPortableSessionResult> {
+    assertCurrent?.();
     const events: PersistedEvent[] = [];
     let portableMessageCount = 0;
     visitVisibleSessionEvents(this.#store, input.sessionId, (event) => {
@@ -8471,6 +8543,16 @@ export class SessionHost {
       }
       events.push(event);
     });
+    if (nativeSession === undefined && portableMessageCount === 0) {
+      throw new JokoError({
+        code: "PORTABLE_SESSION_EXPORT_EMPTY",
+        message: "This task has no native transcript or conversation messages to export.",
+        phase: "session",
+        retryable: false,
+        stateMayHaveChanged: false,
+        recovery: "Choose a task with conversation history."
+      });
+    }
     const workerDetail: SubagentRunDetail[] = [];
     const workerPageTokens = new Set<string>();
     let pageToken: string | undefined;
@@ -8511,7 +8593,7 @@ export class SessionHost {
         workspaceKind: target.managed ? "dialogue" : "project",
         backendCapability: "native-portable-session-v1",
         events,
-        nativeSession,
+        ...(nativeSession === undefined ? {} : { nativeSession }),
         workers,
         workerDetail,
         ...(input.password === undefined ? {} : { password: input.password }),
@@ -8523,10 +8605,13 @@ export class SessionHost {
       if (error instanceof PortableSessionProjectionError) throw portableSessionProjectionLimitError();
       throw error;
     }
+    assertCurrent?.();
     const storedArtifact = await this.#artifactStore.ingestBytes(built.bytes, {
       fileName: `${portableFileStem(current.descriptor.title)}.jshare`,
-      mimeType: "application/vnd.joko.session"
+      mimeType: "application/vnd.joko.session",
+      ...(assertCurrent === undefined ? {} : { assertCurrent })
     });
+    assertCurrent?.();
     const artifact: BlobRef = {
       id: storedArtifact.id,
       sha256: storedArtifact.sha256,

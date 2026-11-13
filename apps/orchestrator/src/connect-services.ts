@@ -3108,14 +3108,16 @@ export function createConnectServices(application: OrchestratorApplication, proj
 
   const portableSession = {
     exportPortableSession: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
+      const assertCurrent = () => { context.signal.throwIfAborted(); dependencies.connections.fence(connection); };
       const sessionId = nonBlankRequest(request.sessionId, "session_id");
       const result = await dependencies.sessionHost.exportPortableSession({
         sessionId,
         ...(request.password === undefined ? {} : { password: request.password }),
         excludeMedia: request.excludeMedia,
         applicationVersion: dependencies.server?.version ?? "0.1.0"
-      });
+      }, assertCurrent);
+      assertCurrent();
       return {
         artifact: toProtoBlobRef(result.artifact),
         fidelity: protoPortableSessionFidelity(result.fidelity),
