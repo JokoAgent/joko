@@ -11,7 +11,7 @@ import {
   createInternalServer
 } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
-import { chromium, type Browser } from "playwright-core";
+import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery, waitFor } from "./fixture.js";
 import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
@@ -40,6 +40,15 @@ afterEach(async () => {
   await fixture?.close();
   fixture = undefined;
 });
+
+async function closeDetailsForCompactTimeline(page: Page): Promise<void> {
+  const dock = page.locator(".inspector-dock-group");
+  const close = dock.getByRole("button", { name: "Close details", exact: true });
+  if (await close.isVisible()) {
+    await close.click();
+    await close.waitFor({ state: "hidden" });
+  }
+}
 
 mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact bytes", async () => {
   const browserExecutable = process.env.JOKO_BROWSER_EXECUTABLE!;
@@ -242,9 +251,12 @@ mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact
   const pdfDelivery = page.locator(".generated-files [data-document-format='pdf']");
   await pdfDelivery.waitFor({ state: "visible" });
   expect(await pdfDelivery.innerText()).toContain("Quarterly PDF");
-  const retainedPdf = page.waitForEvent("download");
-  await pdfDelivery.getByRole("button", { name: "Download chart-report.pdf" }).click();
-  expect(await readFile(await (await retainedPdf).path())).toEqual(expectedBytes);
+  await closeDetailsForCompactTimeline(page);
+  const [retainedPdf] = await Promise.all([
+    page.waitForEvent("download"),
+    pdfDelivery.getByRole("button", { name: "Download chart-report.pdf" }).click()
+  ]);
+  expect(await readFile(await retainedPdf.path())).toEqual(expectedBytes);
   expect(pageErrors).toEqual([]);
   bridge.revoke();
 }, 90_000);
@@ -354,9 +366,12 @@ officeIt("retains the latest verified document for each path in the Run's mounte
   await word.waitFor({ state: "visible", timeout: 25_000 });
   expect(await word.count()).toBe(1);
   expect(await card.locator(".generated-document").count()).toBe(3);
-  const download = page.waitForEvent("download");
-  await word.getByRole("button", { name: "Download verified.docx" }).click();
-  expect(await readFile(await (await download).path())).toEqual(delivered);
+  await closeDetailsForCompactTimeline(page);
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    word.getByRole("button", { name: "Download verified.docx" }).click()
+  ]);
+  expect(await readFile(await download.path())).toEqual(delivered);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
   if (captureDirectory) await card.screenshot({ path: join(captureDirectory, "delivery-compact.png") });
   expect(pageErrors).toEqual([]);
