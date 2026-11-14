@@ -35,7 +35,7 @@ const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.c
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true },
   { key: "runtime.resources", supported: true, options: ["skill", "prompt"] }] };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined; probePlan?: string } = {}) {
+async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined; probePlan?: string; planMode?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-import-owner-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
   await writeFile(join(native, "config.yaml"), "name: Analyst\n" + (options.nativeTools ? "tools:\n  allowed: [read]\n" : "")); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
@@ -61,7 +61,12 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     workspaceService: { register: async input => input, unregister: () => undefined },
     onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id), onReady: async id => { await imports?.activatePackage(id); } });
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
-  if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: false });
+  if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: options.planMode ?? false });
+  const makeRuntime = (importStorage: PartnerImportStorage) => new PartnerImportRuntime({
+    partners, store, host, routines, storage: importStorage, imports,
+    assertServiceOwner: () => {}, auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }),
+      run: async () => ({ status: "ok", text: options.probePlan! }) }
+  });
   const makeImportManager = (importStorage: PartnerImportStorage) => new PartnerImportManager({ storage: importStorage, home: root, environment: {}, assertServiceOwner: () => {},
     getPartner: id => partners.getPartner(id),
     ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
@@ -74,10 +79,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, storage, id, assertOwner),
     runPass: (id, action) => partners.runImportManagement(id, options.observeImport ? observedImportEffect("pass", action, options.observeImport) : action), effects: context => {
       options.observeImport?.("effects-start");
-      const probePlan = options.probePlan;
-      const runtime = probePlan === undefined ? undefined : new PartnerImportRuntime({ partners, store, host, routines, storage: importStorage, imports,
-        assertServiceOwner: () => {}, auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }),
-          run: async () => ({ status: "ok", text: probePlan }) } });
+      const runtime = options.probePlan === undefined ? undefined : makeRuntime(importStorage);
       const pendingEffects = createPartnerImportEffects({ partners, routines, storage: importStorage, store, memory, resources, artifacts,
       verification: runtime?.verification ?? { readEnvironment: (id, owner) => importStorage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
         plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context);
@@ -100,6 +102,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
       });
     } });
   imports = makeImportManager(storage);
+  if (options.planMode !== undefined) routines.setImportedRuntime(makeRuntime(storage));
   let authenticated = "device-a";
   const context = (): HandlerContext => ({ signal: new AbortController().signal } as HandlerContext);
   const authenticate = () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; };
@@ -572,6 +575,56 @@ describe("native import service and owning effects", () => {
       expect(committed.profileProjection.identity).toBe(frozenIdentity);
       expect(committed.profileUpdate).toBeUndefined();
       expect(committed.targetOwner?.profileVersion).toBe(profile.profileVersion);
+    }
+  }, 20_000);
+
+  it.each([true, false])("checks the source monitor before enabling an imported routine with Plan set to %s", async planMode => {
+    const f = await fixture({ planMode, probePlan: JSON.stringify({ reads: [] }) });
+    const requests: Array<{ method: string | undefined; url: string | undefined }> = [];
+    const server = createServer((request, response) => {
+      requests.push({ method: request.method, url: request.url });
+      response.writeHead(200, { "content-type": "text/plain" }).end("fixture monitor");
+    });
+    await new Promise<void>(listen => server.listen(0, "127.0.0.1", listen));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("No fixture server address.");
+      const jobs = join(f.native, "cron", "jobs.json");
+      await writeFile(jobs, JSON.stringify([{
+        id: "monitor", name: "Original monitor", prompt: "Send a local reminder.", enabled: true, state: "scheduled",
+        schedule: { kind: "cron", expr: "0 9 1 1 *" }, monitor_url: `http://127.0.0.1:${address.port}/original-monitor`
+      }]));
+      const signal = new AbortController().signal;
+      const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+      const selected = preview.entries.find(item => item.category === PartnerImportCategory.AUTOMATIONS)!;
+      const selection = {
+        previewId: preview.id, requestId: "owner_import_monitor_0001", name: "Monitor takeover fixture",
+        entryIds: [selected.id], takeover: true, deferSetup: true
+      };
+      await f.api.start(selection, signal);
+      const imported = await f.imports.waitForRequest(selection.requestId);
+      expect(imported.checks).toContainEqual(expect.objectContaining({ message: "IMPORT_SETUP_DEFERRED" }));
+      const partner = f.partners.getPartner(imported.partnerId);
+      const session = f.store.getSession(partner.canonicalSessionId!).descriptor;
+      expect(session).toMatchObject({ planMode, permissionMode: "bypassPermissions" });
+      expect(partner.initializationState).toBe("ready");
+      const routine = f.routines.list(partner.id)[0]!;
+      expect(routine.enabled).toBe(false);
+      expect(requests).toHaveLength(0);
+      const enabled = f.routines.save({ partnerId: partner.id, partnerRevision: partner.revision,
+        routineId: routine.id, revision: routine.revision, definition: { ...routine, enabled: true } });
+      await expect(enabled).rejects.toMatchObject({ code: "AUTOMATION_HANDOVER_REQUIRED" });
+      expect(requests).toEqual(planMode ? [] : [{ method: "GET", url: "/original-monitor" }]);
+      const verified = await f.imports.waitForRequest(selection.requestId);
+      expect(verified.checks).toContainEqual(expect.objectContaining({
+        message: planMode ? "AUTOMATION_DATA_READ_FAILED" : "AUTOMATION_READ_NOT_VERIFIED"
+      }));
+      expect(f.store.listInteractions({ sessionId: session.id })).toHaveLength(0);
+      expect(f.routines.list(partner.id)[0]?.enabled).toBe(false);
+      expect(JSON.parse(await readFile(jobs, "utf8"))[0]).toMatchObject({ enabled: true });
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(closed => server.close(() => closed()));
     }
   }, 20_000);
 
