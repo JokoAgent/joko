@@ -8,6 +8,7 @@ import type { ArtifactRecord, MaintenanceEffectRecord, MaintenanceJobRecord, Ope
 const ARTIFACT_ROW_PAGE_SIZE = 100_000;
 const MAXIMUM_PROTECTED_DIGESTS = 1_000;
 const DEFAULT_TEMPORARY_FILE_MINIMUM_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+const PORTABLE_REPLACEMENT_MEDIA_MINIMUM_AGE_MS = 72 * 60 * 60 * 1_000;
 const DEFAULT_SCAN_TOKEN_TTL_MS = 5 * 60 * 1_000;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const HASH_DIRECTORY_PATTERN = /^[a-f0-9]{2}$/u;
@@ -86,6 +87,7 @@ interface ScanState {
   readonly report: Omit<ArtifactMaintenanceScan, "token" | "expiresAt">;
   readonly fingerprint: string;
   readonly expired: readonly ArtifactRecord[];
+  readonly hasReplacementMedia: boolean;
   readonly orphanBlobs: readonly FileIdentity[];
   readonly temporaryFiles: readonly FileIdentity[];
 }
@@ -272,6 +274,7 @@ export class ArtifactMaintenance {
         ...scan.temporaryFiles.map((identity) => ({ identity, kind: "artifact_temporary" as const }))
       ];
       const created = this.#store.transaction((store) => {
+        const replacedMedia = scan.hasReplacementMedia ? this.#reclaimableReplacementMedia(now) : undefined;
         const claimed = store.claimMaintenanceScan("artifact", token, now);
         if (claimed?.state !== "claimed") throw new ArtifactMaintenanceScanExpiredError();
         const job = store.createMaintenanceJob<DurableArtifactJob, ArtifactCleanupResult>({
@@ -286,7 +289,8 @@ export class ArtifactMaintenance {
         });
         for (const record of scan.expired) {
           const current = store.getArtifact(record.blob.id, true);
-          if (current.revision !== record.revision || !isExpired(current, now)) {
+          if (current.revision !== record.revision || current.deletedAt !== undefined
+            || !(isExpired(current, now) || replacedMedia?.has(record.blob.id) === true)) {
             throw new ArtifactMaintenanceScanChangedError();
           }
           store.deleteArtifact(record.blob.id, now);
@@ -309,17 +313,31 @@ export class ArtifactMaintenance {
     const now = this.#now();
     const records = this.#liveRecords();
     const protectedSet = new Set(protectedDigests);
-    const protectedRecords = records.filter((record) => isExpired(record, now) && protectedSet.has(record.blob.sha256));
-    const expired = records.filter((record) => isExpired(record, now) && !protectedSet.has(record.blob.sha256));
-    const active = records.filter((record) => !isExpired(record, now) || protectedSet.has(record.blob.sha256));
+    const replacedMedia = this.#reclaimableReplacementMedia(now);
+    const expired: ArtifactRecord[] = [];
+    const protectedRecords: ArtifactRecord[] = [];
+    const active: ArtifactRecord[] = [];
+    for (const record of records) {
+      if (isExpired(record, now) || replacedMedia.has(record.blob.id)) {
+        if (!protectedSet.has(record.blob.sha256)) {
+          expired.push(record);
+          continue;
+        }
+        protectedRecords.push(record);
+      }
+      active.push(record);
+    }
     const activeStorageKeys = new Set(active.map((record) => resolve(record.storageKey)));
+    // Leave replacement rows alone while another live Artifact owns their file.
+    const removableReferences = replacedMedia.size === 0 ? expired : expired.filter((record) =>
+      !replacedMedia.has(record.blob.id) || !activeStorageKeys.has(resolve(record.storageKey)));
     const blobWalk = await this.#blobFiles(activeStorageKeys);
     const temporary = await this.#temporaryFiles(now, true);
     const missingBlobCount = await countMissingStorageKeys(activeStorageKeys, this.#blobsDirectory);
     const trashUnsafeEntryCount = await this.#trashUnsafeEntryCount();
 
     const tokenMaterial = [
-      ...expired.map((record) => `expired\0${record.blob.id}\0${record.revision.toString(10)}`),
+      ...removableReferences.map((record) => `expired\0${record.blob.id}\0${record.revision.toString(10)}`),
       ...protectedRecords.map((record) => `protected\0${record.blob.id}\0${record.revision.toString(10)}`),
       ...blobWalk.orphans.map(identityToken),
       ...temporary.files.map(identityToken),
@@ -332,7 +350,7 @@ export class ArtifactMaintenance {
     return {
       report: {
         protectedReferenceCount: protectedRecords.length,
-        expiredReferenceCount: expired.length,
+        expiredReferenceCount: removableReferences.length,
         orphanBlobCount: blobWalk.orphans.length,
         orphanBlobBytes,
         temporaryFileCount: temporary.files.length,
@@ -342,10 +360,15 @@ export class ArtifactMaintenance {
         cleanableBytes: orphanBlobBytes + temporaryBytes
       },
       fingerprint,
-      expired,
+      expired: removableReferences,
+      hasReplacementMedia: replacedMedia.size > 0 && removableReferences.some((record) => replacedMedia.has(record.blob.id)),
       orphanBlobs: blobWalk.orphans,
       temporaryFiles: temporary.files
     };
+  }
+
+  #reclaimableReplacementMedia(now: number): ReadonlySet<string> {
+    return new Set(this.#store.listReclaimablePortableReplacementImages(now - PORTABLE_REPLACEMENT_MEDIA_MINIMUM_AGE_MS));
   }
 
   #liveRecords(): ArtifactRecord[] {

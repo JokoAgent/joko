@@ -32,6 +32,7 @@ export interface TransferTicket {
 export interface ArtifactRepository {
   putArtifact(record: ArtifactRecord): Promise<void>;
   getArtifact(id: string): Promise<ArtifactRecord | undefined>;
+  recordStorageAccess?(id: string, at: number): void;
   findPermanentArtifact(input: { readonly storagePath: string; readonly mimeType: string; readonly fileName?: string }): Promise<ArtifactRecord | undefined>;
   createTransferTicket(ticket: TransferTicket): Promise<void>;
   consumeTransferTicket(id: string, secretDigest: string, direction: TransferTicket["direction"], now: number): Promise<TransferTicket | undefined>;
@@ -313,6 +314,7 @@ export class ArtifactStore {
     const artifact = await this.requireArtifact(blob.id);
     assertBlobIdentity(blob, artifact);
     await this.verifyStoragePath(artifact);
+    this.#recordStorageAccess(artifact);
     return artifact.storagePath;
   }
 
@@ -338,6 +340,7 @@ export class ArtifactStore {
         || createHash("sha256").update(data).digest("hex") !== artifact.sha256.toLowerCase()) {
         throw new Error("Artifact content changed after it was registered.");
       }
+      if (dispatch === undefined) this.#recordStorageAccess(artifact);
       return { data, mimeType: artifact.mimeType };
     } finally {
       await handle.close().catch(() => undefined);
@@ -386,10 +389,20 @@ export class ArtifactStore {
       // Bind the stream to the verified handle. Opening by path after the
       // verification would leave a replace-with-symlink race between those
       // two operations. autoClose transfers handle ownership to the stream.
+      this.#recordStorageAccess(artifact);
       return { artifact, stream: handle.createReadStream({ autoClose: true, start: 0 }) };
     } catch (error) {
       await handle.close().catch(() => undefined);
       throw error;
+    }
+  }
+
+  #recordStorageAccess(artifact: ArtifactRecord): void {
+    if (!artifact.mimeType.startsWith("image/")) return;
+    try {
+      this.#options.repository.recordStorageAccess?.(artifact.id, this.#now());
+    } catch {
+      // Optional retention bookkeeping must not interrupt reads.
     }
   }
 

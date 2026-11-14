@@ -30,6 +30,10 @@ export class OperationalArtifactRepository implements ArtifactRepository {
     return record === undefined ? undefined : fromStored(record);
   }
 
+  recordStorageAccess(id: string, at: number): void {
+    this.#store.recordArtifactStorageAccess(id, at);
+  }
+
   async findPermanentArtifact(input: {
     readonly storagePath: string;
     readonly mimeType: string;

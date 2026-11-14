@@ -49,6 +49,7 @@ export type RealPiProviderResponder = (input: {
 
 export interface RealPiSystemFixtureOptions {
   readonly agentImportSources?: OrchestratorApplicationDependencies["agentImportSources"];
+  readonly artifactClock?: () => number;
   readonly rootDirectory?: string;
   readonly keepRoot?: boolean;
   readonly webDirectory?: string;
@@ -222,6 +223,7 @@ export class RealPiSystemFixture {
       };
       application = await createOrchestratorApplication(config, {
         ...(options.agentImportSources === undefined ? {} : { agentImportSources: options.agentImportSources }),
+        ...(options.artifactClock === undefined ? {} : { artifactClock: options.artifactClock }),
         ...(options.telegramApiBaseUrl === undefined
           ? {}
           : { messagingTelegramApiBaseUrl: options.telegramApiBaseUrl }),
