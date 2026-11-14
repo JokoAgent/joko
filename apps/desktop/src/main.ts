@@ -8574,11 +8574,17 @@ function registerIpc(): void {
   });
   desktopRemoteDesktopViewers.register();
   ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
-    assertTrustedIpcSender(event);
-    if (parameters.length !== 0) {
-      throw new TypeError("Preferred system locale does not accept parameters.");
+    let locale: DesktopSystemLocale | undefined;
+    try {
+      if (parameters.length === 0 && isTrustedDesktopIpcSender(event)) locale = preferredSystemLocale;
+    } finally {
+      // Preload waits for a synchronous reply even if the frame has not committed yet.
+      event.returnValue = locale;
+      if (externalPackagedE2e && event.sender === mainWindow?.webContents) {
+        recordPackagedSmokeProgress(locale === undefined
+          ? "main_window_preload_locale_denied" : "main_window_preload_locale_replied");
+      }
     }
-    event.returnValue = preferredSystemLocale;
   });
   ipcMain.on(DESKTOP_CHANNELS.mainDocumentOccurrenceGet, (event, ...parameters: unknown[]) => {
     event.returnValue = parameters.length === 1 && isDesktopMainDocumentClaim(parameters[0])
