@@ -596,11 +596,13 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGAAAAAHAALpEtlMAAAAAElFTkSuQmCC", "base64"),
       Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYmAAAAAKAANQonMOAAAAAElFTkSuQmCC", "base64")
     ];
+    const seedText = "Prepare the original portable task.";
     let requestedImage = "";
     fixture = await RealPiSystemFixture.start({
       artifactClock: () => Date.now() + elapsedStorageTime,
       providerSupportsImages: true,
       providerResponder: ({ request }) => {
+        if (requestedImage === "") return { kind: "text", text: "The original portable task is ready." };
         const messages = request.body["messages"] as readonly { readonly role: string }[];
         return messages.at(-1)?.role === "tool"
           ? { kind: "text", text: "Pi read the test image." }
@@ -612,41 +614,38 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const targetId = "workspace-real-pi";
     const target = store.getTarget(targetId);
     store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
-    const isoTime = new Date().toISOString();
-    const nativeSessionId = randomUUID();
-    const transcript = Buffer.from([
-      JSON.stringify({ type: "session", version: 3, id: nativeSessionId, timestamp: isoTime, cwd: fixture.workspaceDirectory }),
-      JSON.stringify({ type: "message", id: "user-one", parentId: null, timestamp: isoTime, message: { role: "user", content: "Original portable task" } })
-    ].join("\n") + "\n");
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const seedSessionId = sessionIdFrom(await mutate(createSessionMutation({
+      backendId: "pi", targetId, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+    })));
+    const seedGeneration = BigInt(store.getSession(seedSessionId).descriptor.binding.generation);
+    const seedRunId = queueRunIdFrom(await mutate(sendInputMutation(seedSessionId, seedGeneration, seedText)));
+    await waitForRealSystem(() => clients.run.getRun({ runId: seedRunId }),
+      ({ run }) => run?.state === RunState.SUCCEEDED, "the published Pi export seed", 15_000);
+    const exported = await clients.portableSession.exportPortableSession({ sessionId: seedSessionId });
+    expect(exported).toMatchObject({ fidelity: PortableSessionFidelity.FULL, mediaCount: 0n });
+    const bundle = exported.artifact;
+    if (bundle === undefined) throw new Error("The exported Pi seed has no package.");
     const hash = (data: Buffer) => createHash("sha256").update(data).digest("hex");
-    const encoded = await buildPortableSessionExport({
-      applicationVersion: "0.1.0", exportedAt: isoTime, title: "Media-free Pi task", workspaceKind: "project",
-      backendCapability: "native-portable-session-v1",
-      nativeSession: { bytes: transcript, sha256: hash(transcript), nativeSessionId },
-      events: [{ emittedAt: Date.parse(isoTime), payload: { type: "message_complete", role: "user",
-        blocks: [{ kind: "text", text: "Original portable task" }] } }],
-      readBlob: blob => artifacts.readBlob(blob)
-    });
-    const bundle = await artifacts.ingestBytes(encoded.bytes, { fileName: "media-free.jshare", mimeType: "application/vnd.joko.session" });
     const toWireBlob = (blob: BlobRef) =>
       create(BlobRefSchema, {
         blobId: blob.id, sha256Hex: blob.sha256, byteSize: BigInt(blob.byteLength),
         mediaType: blob.mimeType, fileName: blob.fileName ?? ""
       });
     const importTask = async (overwrite: boolean) => {
-      const { draft } = await clients.portableSession.inspectPortableSessionImport({ package: toWireBlob(bundle) });
+      const { draft } = await clients.portableSession.inspectPortableSessionImport({ package: bundle });
       if (draft === undefined) throw new Error("The media-free Pi package has no draft.");
       const { result } = await clients.portableSession.commitPortableSessionImport({
         operationId: randomUUID(), draftId: draft.draftId, targetId, overwrite, permissionMode: PermissionMode.ASK,
-        model: create(ModelSelectionSchema, { model: { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID }, effortId: "off" })
+        model: create(ModelSelectionSchema, { model: { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID } })
       });
       if (result === undefined) throw new Error("The media-free Pi package has no import receipt.");
-      expect(result).toMatchObject({ mediaCount: 0n, status: PortableSessionImportStatus.READY });
+      expect(result, `Pi import activation: ${result.activationError?.code ?? "ready"}`)
+        .toMatchObject({ mediaCount: 0n, status: PortableSessionImportStatus.READY });
       return result;
     };
     const original = await importTask(false);
     const generation = BigInt(store.getSession(original.sessionId).descriptor.binding.generation);
-    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
     const oldImages = [];
     for (const [index, bytes] of pixels.entries()) {
       requestedImage = `pixel-${index}.png`;
