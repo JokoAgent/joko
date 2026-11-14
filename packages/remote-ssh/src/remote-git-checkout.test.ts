@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants as fileConstants } from "node:fs";
-import { posix, win32 } from "node:path";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, posix, win32 } from "node:path";
 import { Script, runInNewContext } from "node:vm";
 
 import {
@@ -318,6 +321,63 @@ describe("remote Git checkout authority", () => {
     await expect(service.derive(plan)).rejects.toMatchObject({ code: "OUTCOME_UNKNOWN" });
     expect(await service.inspectExact(plan)).toEqual({ status: "pending" });
     expect(await service.cleanupPending(plan)).toBe("preserved");
+  });
+
+  it("resumes a released Git checkout from its exact releasing lease", { timeout: 60_000 }, async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-remote-release-")));
+    const repositoryRoot = join(root, "project");
+    const storageRoot = join(root, "worktrees");
+    const git = (args: readonly string[]) => execFileSync("git", args, {
+      cwd: repositoryRoot, encoding: "utf8", windowsHide: true, timeout: 30_000
+    });
+    try {
+      await mkdir(repositoryRoot);
+      git(["init", "--initial-branch=main"]);
+      git(["-c", "user.name=Joko Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "initial"]);
+      const service = new RemoteGitCheckoutService({
+        storageRoot, nodeExecutable: await realpath(process.execPath),
+        pathStyle: process.platform === "win32" ? "win32" : "posix",
+        assertCurrent: () => undefined,
+        execute: async (request) => ({
+          stdout: execFileSync(request.executable, request.args, {
+            input: request.input, encoding: "utf8", windowsHide: true, timeout: request.timeoutMs
+          }), stderr: "", exitCode: 0, outputCapped: false
+        })
+      });
+      const plan = await service.plan({
+        sessionId: "child", sourceSessionId: "parent", workspaceId: "workspace-child", sourceCwd: repositoryRoot,
+        authority: { ...authority, binding: { ...authority.binding, workspaceRoot: repositoryRoot } }
+      });
+      const lease = await service.derive(plan);
+      const manifestPath = join(storageRoot, "leases", `${lease.id}.json`);
+      const active = JSON.parse(await readFile(manifestPath, "utf8")) as { phase: string };
+      expect(active.phase).toBe("active");
+      await writeFile(manifestPath, JSON.stringify({ ...active, phase: "releasing" }));
+      git(["worktree", "remove", lease.path]);
+      await expect(readFile(join(lease.path, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(git(["worktree", "list", "--porcelain"]).split(/\r?\n/u)
+        .filter((line) => line.startsWith("worktree "))).toHaveLength(1);
+
+      await expect(service.inspectExact(plan)).resolves.toEqual({ status: "releasing", lease });
+      await expect(service.assertExact(lease)).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      await expect(service.cleanupPending(plan)).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      const originalRepository = join(root, "original-project");
+      await rename(repositoryRoot, originalRepository);
+      execFileSync("git", ["clone", "--local", originalRepository, repositoryRoot], {
+        windowsHide: true, timeout: 30_000
+      });
+      await expect(service.releaseExact(lease)).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      await expect(service.inspectExact(plan)).resolves.toEqual({ status: "releasing", lease });
+      await rename(repositoryRoot, join(root, "replacement-project"));
+      await rename(originalRepository, repositoryRoot);
+
+      await expect(service.releaseExact(lease)).resolves.toBe("released");
+      await expect(service.inspectExact(plan)).resolves.toEqual({ status: "released" });
+      await expect(service.releaseExact(lease)).resolves.toBe("released");
+      expect(git(["show-ref", "--verify", "--hash", `refs/heads/${lease.branch}`]).trim()).toBe(plan.sourceCommit);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
   });
 });
 

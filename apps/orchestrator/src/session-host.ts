@@ -6168,7 +6168,7 @@ export class SessionHost {
         throw new StoreError("The remote checkout cleanup owner is unavailable.");
       }
       const inspection = await this.#worktrees.inspectPlannedRemoteDerivation(record.remoteWorktreePlan);
-      if (inspection.status === "active") {
+      if (inspection.status === "active" || inspection.status === "releasing") {
         const outcome = await this.#worktrees.releasePlannedRemoteDerivation(
           record.remoteWorktreePlan, inspection.lease
         );

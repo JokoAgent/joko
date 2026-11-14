@@ -56,7 +56,7 @@ export interface RemoteGitCheckoutLease {
 
 export type RemoteGitCheckoutInspection =
   | { readonly status: "absent" | "pending" | "released" }
-  | { readonly status: "active"; readonly lease: RemoteGitCheckoutLease };
+  | { readonly status: "active" | "releasing"; readonly lease: RemoteGitCheckoutLease };
 
 export class RemoteGitCheckoutError extends Error {
   constructor(
@@ -189,10 +189,10 @@ export class RemoteGitCheckoutService {
   async inspectExact(plan: RemoteGitCheckoutPlan, signal?: AbortSignal): Promise<RemoteGitCheckoutInspection> {
     this.#validatePlan(plan);
     const response = await this.#invoke("inspect", plan, false, signal);
-    if (response.status === "active" && response.lease !== undefined) {
+    if ((response.status === "active" || response.status === "releasing") && response.lease !== undefined) {
       const lease = validateLease(response.lease, this.#paths);
       this.#assertLeaseMatchesPlan(lease, plan);
-      return { status: "active", lease };
+      return { status: response.status, lease };
     }
     if (response.status === "absent" || response.status === "pending" || response.status === "released") {
       return { status: response.status };
@@ -632,14 +632,20 @@ function checkLayout(root,p) {
   if(!absolute(root)||!absolute(p)||!inside(path.join(root,'checkouts'),p)||!samePath(path.dirname(p),path.join(root,'checkouts'))) fail('CHECKOUT_UNSAFE');
   ordinary(root); ordinary(path.join(root,'checkouts')); ordinary(path.join(root,'leases'));
 }
+function verifyLeaseRepository(m) {
+  const repositoryRoot=m.lease.repositoryRoot;
+  const source=metadata(repositoryRoot);
+  if(!samePath(source.root,repositoryRoot)||!samePath(source.dir,source.common)||
+    !samePath(source.common,m.repositoryCommon)||source.commonDev!==m.repositoryCommonDev||
+    source.commonIno!==m.repositoryCommonIno) fail('LEASE_CONFLICT');
+  return source;
+}
 function verifyActive(root,m) {
   if((m.phase!=='active'&&m.phase!=='releasing')||!m.lease) fail('LEASE_CONFLICT');
   const l=m.lease; checkLayout(root,l.path); ordinary(l.path);
-  const meta=metadata(l.path); const source=metadata(l.repositoryRoot);
-  if(!samePath(meta.root,l.path)||samePath(meta.dir,meta.common)||!samePath(meta.common,source.common)||!samePath(source.dir,source.common)||
-    !samePath(source.root,l.repositoryRoot)||meta.branch!==l.branch||
-    !samePath(source.common,m.repositoryCommon)||source.commonDev!==m.repositoryCommonDev||
-    source.commonIno!==m.repositoryCommonIno||!samePath(meta.dir,m.checkoutGitDirectory)||
+  const meta=metadata(l.path); const source=verifyLeaseRepository(m);
+  if(!samePath(meta.root,l.path)||samePath(meta.dir,meta.common)||!samePath(meta.common,source.common)||
+    meta.branch!==l.branch||!samePath(meta.dir,m.checkoutGitDirectory)||
     meta.dirDev!==m.checkoutGitDevice||meta.dirIno!==m.checkoutGitInode) fail('LEASE_CONFLICT');
   if(!sameOwner(l.remote,m.plan.authority)||l.remote.manifestId!==m.plan.manifestId||
     l.id!==m.plan.leaseId||l.path!==m.plan.path||l.branch!==m.plan.branch||l.sessionId!==m.plan.sessionId) fail('LEASE_CONFLICT');
@@ -781,9 +787,13 @@ function release(root,lease) {
   const m=readManifest(root,lease.id);
   if(!m||!m.lease||!sameLease(m.lease,lease)) fail('LEASE_CONFLICT');
   if(m.phase==='released') return 'released';
-  if(m.phase==='releasing'&&!fs.existsSync(lease.path)) {
-    if(registered(lease.repositoryRoot,lease.path)) fail('OUTCOME_UNKNOWN',true);
-    saveManifest(root,{...m,phase:'released'}); return 'released';
+  if(m.phase==='releasing') {
+    checkLayout(root,lease.path);
+    if(fs.lstatSync(lease.path,{throwIfNoEntry:false})===undefined) {
+      verifyLeaseRepository(m);
+      if(registered(lease.repositoryRoot,lease.path)) fail('OUTCOME_UNKNOWN',true);
+      saveManifest(root,{...m,phase:'released'}); return 'released';
+    }
   }
   verifyActive(root,m);
   const state=git(lease.path,['status','--porcelain=v2','-z','--untracked-files=all','--ignored=matching']).toString('utf8');
@@ -816,6 +826,10 @@ try {
     if(!m) { if(orphaned(plan)) fail('LEASE_CONFLICT'); respond({status:'absent'}); }
     else if(!samePlan(m.plan,plan)) fail('LEASE_CONFLICT');
     else if(m.phase==='active') respond({status:'active',lease:verifyActive(root,m)});
+    else if(m.phase==='releasing') {
+      if(!m.lease) fail('LEASE_CONFLICT');
+      respond({status:'releasing',lease:m.lease});
+    }
     else if(m.phase==='released') respond({status:'released'});
     else respond({status:'pending'});
   } else if(request.operation==='assert') {

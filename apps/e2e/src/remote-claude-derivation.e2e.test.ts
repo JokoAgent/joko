@@ -19,7 +19,7 @@ import { expect, it } from "vitest";
 import { createE2eClients, type E2eClients } from "./connect-clients.js";
 import { waitFor } from "./fixture.js";
 import {
-  createSessionMutation, deleteMutation, forkMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit
+  cloneMutation, createSessionMutation, deleteMutation, forkMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit
 } from "./operations.js";
 
 const BACKEND_ID = "claude-code";
@@ -203,6 +203,45 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(remote.activePaths()).toEqual([derived.worktree.path]);
     expect(remote.releasedPaths).toContain(refork.worktree.path);
     expect(restarted.store.getSession(derivedId).descriptor.worktree).toEqual(derived.worktree);
+
+    remote.interruptNextCheckoutDerivation = true;
+    const clone = cloneMutation(sourceId, "Interrupted remote clone");
+    const cloneId = randomUUID();
+    const callsBeforeClone = remote.checkoutCalls.length;
+    const nativeCallsBeforeClone = remote.managerCalls.length;
+    const interrupted = await submit(restartedClients.operation, paired.connection.id, clone, cloneId);
+    expect(interrupted.state).toBe(OperationState.FAILED);
+    const plan = remote.lastPlan!;
+    const pending = restarted.store.listUnadoptedNativeSessionDerivations()
+      .find((record) => record.remoteWorktreePlan?.leaseId === plan.leaseId);
+    expect(pending).toMatchObject({ state: "workspace_cleanup_pending", cleanupToken: expect.any(String) });
+    expect(pending?.worktree).toBeUndefined();
+    expect(pending?.binding).toBeUndefined();
+    expect(remote.checkoutCalls.slice(callsBeforeClone)).toEqual(["probe", "derive", "inspect", "release"]);
+    expect(remote.activePaths()).toEqual([derived.worktree.path]);
+    expect(remote.releasedPaths.filter((path) => path === plan.path)).toHaveLength(1);
+
+    const callsBeforeRecovery = remote.checkoutCalls.length;
+    await running.close();
+    running = await start(config, remote);
+    const recovered = running.application;
+    const recoveryCalls = remote.checkoutCalls.slice(callsBeforeRecovery);
+    expect(recoveryCalls.filter((call) => call !== "assert")).toEqual(["inspect", "release"]);
+    expect(recovered.store.findNativeSessionDerivation(pending!.operationId)).toMatchObject({
+      state: "cleaned", cleanupToken: pending!.cleanupToken, remoteWorktreePlan: plan
+    });
+    expect(recovered.store.listSessions({ includeArchived: true, includeDeleted: true })
+      .some((session) => session.descriptor.id === plan.sessionId)).toBe(false);
+    expect(remote.managerCalls.slice(nativeCallsBeforeClone)).not.toContain("store.fork");
+    expect(remote.managerCalls.slice(nativeCallsBeforeClone)).not.toContain("store.cleanupOperation");
+    expect(remote.releasedPaths.filter((path) => path === plan.path)).toHaveLength(1);
+    expect(remote.activePaths()).toEqual([derived.worktree.path]);
+    expect(remote.messages(sourceNativeId)).toEqual(sourceHistory);
+    const recoveredClients = createE2eClients(running.baseUrl, paired.authKey);
+    const receipt = (await recoveredClients.operation.getOperation({ operationId: cloneId })).operation;
+    expect(receipt).toMatchObject({ operationId: cloneId, state: OperationState.FAILED, error: interrupted.error });
+    expect(await submit(recoveredClients.operation, paired.connection.id, clone, cloneId)).toEqual(receipt);
+    expect(remote.checkoutCalls.slice(callsBeforeRecovery)).toEqual(recoveryCalls);
   } finally {
     await running?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
@@ -239,6 +278,8 @@ type NativeMessage = Readonly<Record<string, unknown>>;
 class ControlledRemoteClaude {
   readonly #processes = new ControlledProcesses(this);
   readonly #checkouts = new Map<string, RemoteGitCheckoutLease>();
+  #interruptReleaseFor: string | undefined;
+  #releasing: RemoteGitCheckoutLease | undefined;
   readonly #files: RemoteFileTransportPort = {
     realpath: async (path) => {
       if (!this.hasDirectory(path)) throw new Error(`Unknown remote directory ${path}.`);
@@ -268,6 +309,7 @@ class ControlledRemoteClaude {
   managerSha256 = "";
   deriveCount = 0;
   lastPlan: RemoteGitCheckoutPlan | undefined;
+  interruptNextCheckoutDerivation = false;
 
   constructor() {
     const capabilities = {
@@ -327,11 +369,23 @@ class ControlledRemoteClaude {
         acquiredAt: Date.now(), remote: plan.remote
       };
       this.#checkouts.set(plan.leaseId, lease);
+      if (this.interruptNextCheckoutDerivation) {
+        this.interruptNextCheckoutDerivation = false;
+        this.#interruptReleaseFor = lease.id;
+        return { ...respond({}), exitCode: 1 };
+      }
       return respond({ status: "active", lease });
     }
     const data = request.data as { leaseId?: string; id?: string; path?: string };
     const leaseId = data.leaseId ?? data.id;
     const lease = leaseId === undefined ? undefined : this.#checkouts.get(leaseId);
+    if (this.#releasing !== undefined && leaseId === this.#releasing.id) {
+      if (request.operation === "inspect") return respond({ status: "releasing", lease: this.#releasing });
+      if (request.operation !== "release") return respond({ status: "error", code: "LEASE_CONFLICT" });
+      expect(request.data).toEqual(this.#releasing);
+      this.#releasing = undefined;
+      return respond({ status: "released" });
+    }
     if (request.operation === "inspect" || request.operation === "assert") {
       return respond(lease === undefined ? { status: "absent" } : { status: "active", lease });
     }
@@ -339,6 +393,11 @@ class ControlledRemoteClaude {
       if (lease !== undefined) {
         this.#checkouts.delete(lease.id);
         this.releasedPaths.push(lease.path);
+        if (request.operation === "release" && lease.id === this.#interruptReleaseFor) {
+          this.#interruptReleaseFor = undefined;
+          this.#releasing = lease;
+          return { ...respond({}), exitCode: 1 };
+        }
       }
       return respond({ status: lease === undefined ? "absent" : "released" });
     }
