@@ -76,5 +76,6 @@ it("imports into the production HTTP/SQLite/published runtime, uses its full red
   expect((await clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id })).runs[0]?.id).toBe(history.runs[0]?.id);
   expect(fixture.application.store.getTarget(partner.homeTargetId).descriptor.workspaceRoot).toBe(home);
   await clients.partner.deletePartner({ requestId: "product_import_delete_request", partnerId: partner.partnerId, expectedRevision: (await clients.partner.getPartner({ partnerId: partner.partnerId })).partner!.revision, confirmName: partner.displayName });
-  expect(fixture.application.partnerImports?.status(selection.requestId, { ownerKey: "service-check", assertCurrent() {} })?.status).toBe("needs-attention");
+  const deletedImport = await fixture.application.partnerImports?.status(selection.requestId, { ownerKey: "service-check", assertCurrent() {} });
+  expect(deletedImport?.status).toBe("needs-attention");
 }, 150000);
