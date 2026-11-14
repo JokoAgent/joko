@@ -747,6 +747,36 @@ describe("MobilePartnerDirectoryScreen", () => {
     expect(onOpenTask).toHaveBeenCalledWith("remote-canonical");
   });
 
+  it("cancels remote Partner preparation on Back before the directory unmounts", async () => {
+    const remote = { profileId: "remote", origin: "https://remote.test", serverId: "remote-node", connectionId: "remote-connection",
+      deviceId: "phone", displayName: "Remote node" };
+    const source = { key: mobilePartnerRosterSourceKey(remote), profile: remote, current: false };
+    const roster = new MobilePartnerRoster({ getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined },
+      async (_id, signal) => ({ sourceKey: source.key, ownerKey: "remote-roster", profile: remote, isCurrent: () => !signal.aborted,
+        list: async () => ({ ...catalog, partners: [pending] }), observation: () => undefined,
+        canonical: async () => { throw new Error("Unfinished Partner cannot open a generic Task."); } }));
+    roster.setSources([source]);
+    let navigation: AbortSignal | undefined;
+    let finish!: () => void;
+    const adopt: NonNullable<MobilePartnerDirectoryScreenProps["onOpenSourceInitialization"]> = async (_source, partner, signal) => {
+      navigation = signal;
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { ownerKey: "remote-owner", partnerId: partner.partnerId };
+    };
+    await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { roster, onOpenSourceInitialization: adopt });
+    await act(async () => { await vi.waitFor(() => expect(roster.snapshot[0]?.status).toBe("online")); });
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-testid="partnerDirectory.sourceItem.remote.pending"] [data-testid="partnerDirectory.item.pending"]')!.click());
+    expect(navigation?.aborted).toBe(false);
+    onBack.mockImplementation(() => expect(navigation?.aborted).toBe(true));
+    await press(mobileMessage("en", "common.back"));
+    expect(onBack).toHaveBeenCalledOnce();
+    await act(async () => finish());
+    expect(container.querySelector('[data-testid="partnerInitialization.screen"]')).toBeNull();
+    expect(onOpenTask).not.toHaveBeenCalled();
+  });
+
   it("opens cached Partner text read-only and retires it when the original source is forgotten", async () => {
     const profile = { profileId: "remote", origin: "https://remote.test", serverId: "remote-server", connectionId: "remote-connection", deviceId: "phone", displayName: "Remote node" };
     const source = { key: mobilePartnerRosterSourceKey(profile), profile, current: false };

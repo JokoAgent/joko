@@ -316,9 +316,10 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   }, [transport?.ownerKey, state.catalog, state.refreshing, state.error, initialization, creation, deletion, openingId, resume, memory]);
 
   const leaveInitialization = (): void => { setInitialization(undefined); load(); };
+  const leaveDirectory = (): void => { sourceOpenRef.current?.abort(); onBack(); };
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (offlineConversation) setOfflineConversation(undefined); else if (selectedGroupId) setGroupEntry(undefined); else if (initialization) leaveInitialization(); else onBack();
+      if (offlineConversation) setOfflineConversation(undefined); else if (selectedGroupId) setGroupEntry(undefined); else if (initialization) leaveInitialization(); else leaveDirectory();
       return true;
     });
     return () => subscription.remove();
@@ -481,7 +482,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
     foreground={rosterActive} colors={colors} locale={locale} onBack={leaveInitialization} onOpenTask={onOpenTask} />;
   return <View style={[styles.screen, { backgroundColor: colors.background }]} testID="partnerDirectory.screen">
     <View style={styles.header}>
-      <Action label={mobileMessage(locale, "common.back")} colors={colors} onPress={onBack} />
+      <Action label={mobileMessage(locale, "common.back")} colors={colors} onPress={leaveDirectory} />
       {onOpenConversations && <Action label={locale === "zh-CN" ? "群聊" : "Group conversations"} colors={colors} onPress={onOpenConversations} />}
       {onOpenIdentities && <Action label={partnerIdentityMessages(locale).title} colors={colors} onPress={onOpenIdentities} />}
       <View style={styles.grow}>
