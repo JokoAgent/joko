@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventIdentitySchema, EventPayloadSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
   MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, NativeMessageIdentitySchema, NativeSessionBindingSchema, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
-  RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
+  RetryState, RunState, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
@@ -316,6 +316,31 @@ it.each(["", "Unsent follow-up"])("mounts the current ordinary stop and keeps an
   await act(async () => root.render(taskScreen()));
   expect(stop()).toBeUndefined();
   expect(stopTaskTurn.mock.calls[0]![1]()).toBe(false);
+});
+
+it("shows Codex reconnect counts on the current Mobile task and clears them when the same Run resumes", async () => {
+  const running = create(SnapshotSchema, { generation: 14n,
+    sessions: [{ ...session, state: SessionState.RUNNING, nativeBinding: { runtimeGeneration: 7n } }],
+    runs: [{ runId: "run", sessionId: "session", activeAttemptId: "attempt", state: RunState.RETRYING }] });
+  const retry = (sequence: bigint, status: RetryState, attemptNumber: number) => create(EventSchema, {
+    eventId: `codex-reconnect-${sequence}`, identity: { sessionId: "session", runId: "run", attemptId: "attempt", generation: 7n },
+    cursor: { generation: 14n, sequence }, payload: { kind: { case: "retryChanged", value: {
+      runId: "run", attemptId: "attempt", state: status, attemptNumber, maxAttempts: 5, error: { code: "CODEX_NATIVE_RECONNECT" }
+    } } }
+  });
+  const first = retry(1n, RetryState.WAITING, 1);
+  renderedState = { ...state, owner: running, detail: running, liveStatus: "streaming", live: [first] };
+  await act(async () => root.render(taskScreen()));
+  expect(host.textContent).toContain(mobileMessage("en", "task.codexReconnecting", { attempt: 1, maxAttempts: 5 }));
+  const second = retry(2n, RetryState.WAITING, 2);
+  renderedState = { ...renderedState, live: [first, second] };
+  await act(async () => root.render(taskScreen()));
+  expect(host.textContent).toContain(mobileMessage("en", "task.codexReconnecting", { attempt: 2, maxAttempts: 5 }));
+  renderedState = { ...renderedState, live: [first, second, retry(3n, RetryState.SUCCEEDED, 2)] };
+  await act(async () => root.render(taskScreen()));
+  expect(host.textContent).toContain(mobileMessage("en", "task.live"));
+  expect(host.textContent).not.toContain("Codex is reconnecting");
+  expect(timelineList?.data).toEqual([]);
 });
 
 it("reads the actual task menu's Claude family quota using the owning model route", async () => {

@@ -4726,7 +4726,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             const translatedEvents = (planTurnId !== undefined && runtime.planTurnIds.has(planTurnId))
               || isAnonymousYieldHelperCompletion(method, params)
               ? []
-              : this.#translator.translate(method, params, runtime.state);
+              : this.#translator.translate(method, params, runtime.state, {
+                observeNativeReconnect: !runtime.remote && runtime.runtimePolicy === "standard"
+                  && runtime.pendingTurnStart === undefined && runtime.yieldContinuation === undefined
+                  && runtime.activeTurnContext?.inputAttemptId !== undefined && runtime.activeTurnContext.onNativeTurnDispatch !== undefined
+              });
             const yieldResolution = method === "turn/completed"
               ? resolveYieldTurnCompletion(runtime, params, translatedEvents, completedPlan)
               : undefined;
@@ -4736,8 +4740,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             const schedulePlanReview = this.#registerPlanReview(runtime, plan, input.hostGeneration);
             for (const event of events) {
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
-              const eventContext = event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined
-                ? plan.context : runtime.context;
+              const eventContext = event.type === "retry" && event.error?.code === "CODEX_NATIVE_RECONNECT"
+                ? runtime.activeTurnContext ?? runtime.context
+                : event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined ? plan.context : runtime.context;
               const emit = learningTurn?.emit ?? eventContext.emit;
               await emit(event, {
                 namespace: "codex.app_server",

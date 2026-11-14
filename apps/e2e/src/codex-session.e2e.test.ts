@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { ObjectiveStatus, OperationMutationSchema, OperationState, RunState, ToolCallState } from "@joko/contracts";
+import { ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
@@ -301,9 +301,34 @@ it("keeps a Codex thread and durable Queue on the production HTTP/SQLite/Connect
       (dispatched) => dispatched, "Codex native turn dispatch");
     expect(committedBeforeNativeDispatch).toBe(true);
     expect(native.threads.size).toBe(1);
+    await waitFor(async () => fixture!.application.store.findQueueItemByRunId(codexSessionId, runId),
+      item => item?.state === "backend_accepted", "the admitted original Codex turn");
+    const original = (await paired.clients.run.getRun({ runId })).run!;
+    await reconnectCodexTurn(native, threadId!, 2);
+    const reconnecting = await waitFor(() => paired.clients.run.getRun({ runId }), value => value.run?.state === RunState.RETRYING,
+      "the same Codex Run during native reconnect");
+    expect(reconnecting.run).toMatchObject({ runId, activeAttemptId: original.activeAttemptId, attempts: [expect.any(Object)] });
+    expect(reconnecting.run?.error).toBeUndefined();
+    const readTimeline = () => paired.clients.session.listSessionTimeline({ sessionId: codexSessionId, limit: 200 });
+    const pending = (await readTimeline()).events.find(event => event.payload?.kind.case === "retryChanged");
+    expect(pending?.identity).toMatchObject({ runId, attemptId: original.activeAttemptId, generation: BigInt(binding.generation) });
+    const retry = pending?.payload?.kind;
+    if (retry?.case !== "retryChanged") throw new Error("The original Run has no reconnect event.");
+    expect(retry.value).toMatchObject({ state: RetryState.WAITING, attemptNumber: 2, maxAttempts: 5,
+      error: { code: "CODEX_NATIVE_RECONNECT" } });
+    expect(retry.value.retryAt).toBeUndefined();
     await native.completeTurn(threadId!, "One native response");
-    await waitFor(() => paired.clients.run.getRun({ runId }), (value) => value.run?.state === RunState.SUCCEEDED,
+    const completed = await waitFor(() => paired.clients.run.getRun({ runId }), (value) => value.run?.state === RunState.SUCCEEDED,
       "Codex terminal projection");
+    expect(completed.run?.attempts.map(attempt => attempt.attemptId)).toEqual([original.activeAttemptId]);
+    expect(native.transport?.requests.filter(request => request.method === "turn/start")).toHaveLength(1);
+    const restored = (await readTimeline()).events.filter(event => event.identity?.runId === runId);
+    expect(restored.map(event => event.payload?.kind.case)).not.toContain("terminalError");
+    expect(restored.map(event => event.payload?.kind.case)).not.toContain("recoverableError");
+    expect(restored.flatMap(event => event.payload?.kind.case === "retryChanged" ? [event.payload.kind.value.state] : []))
+      .toEqual([RetryState.WAITING, RetryState.SUCCEEDED]);
+    expect(fixture.application.store.listEvents({ sessionId: codexSessionId }).filter(event => event.runId === runId)
+      .some(event => event.payload.type === "error")).toBe(false);
     expect(fixture.application.store.findQueueItemByRunId(codexSessionId, runId)?.state).toBe("completed");
     expect(fixture.application.store.listEvents({ sessionId: codexSessionId }).some((event) =>
       event.payload.type === "message_complete" && event.payload.role === "assistant")).toBe(true);
@@ -435,12 +460,22 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await page.getByRole("button", { name: "Send", exact: true }).click();
     await waitFor(async () => native.transport?.requests.some((request) => request.method === "turn/start") ?? false,
       (dispatched) => dispatched, "mounted Codex dispatch");
+    await waitFor(async () => fixture!.application.store.listQueueItems({ sessionId }),
+      items => items.some(item => item.state === "backend_accepted"), "the mounted original Codex turn");
+    const status = page.locator(".retry-status-indicator");
+    await reconnectCodexTurn(native, threadId, 1);
+    await status.getByText("Retrying (1/5)...", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await reconnectCodexTurn(native, threadId, 2);
+    await status.getByText("Retrying (2/5)...", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await native.completeTurn(threadId, "Codex mounted answer");
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await status.waitFor({ state: "hidden" });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Connect", exact: true }).click();
     await composer.waitFor({ state: "visible", timeout: 20_000 });
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    expect(await status.count()).toBe(0);
+    expect(await page.locator(".timeline").getByText(/Retrying|provider connection|fixture provider detail/).count()).toBe(0);
 
     await page.evaluate((id) => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, otherSessionId);
     await page.getByText("Other runtime task", { exact: true }).first().waitFor({ state: "visible", timeout: 20_000 });
@@ -463,3 +498,11 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await host.shutdown();
   }
 });
+
+async function reconnectCodexTurn(native: FakeCodexAppServer, threadId: string, attempt: number): Promise<void> {
+  const turnId = native.threads.get(threadId)?.turns.at(-1)?.["id"];
+  if (typeof turnId !== "string" || native.transport === undefined) throw new Error("The original native turn is absent.");
+  await native.transport.emitNotification("error", { threadId, turnId, willRetry: true,
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+      message: `Reconnecting... ${attempt}/5`, additionalDetails: "fixture provider detail" } });
+}

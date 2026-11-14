@@ -29,6 +29,16 @@ describe("Pi retry status projection", () => {
     expect(resolveActiveRetry([waiting, retryItem("done", 2n, "run-a", "succeeded", 1)], retryingSession)).toBeUndefined();
   });
 
+  it("restores Codex reconnect progress only for the current Attempt and native binding", () => {
+    const waiting = retryItem("native", 1n, "run-a", "waiting", 2, 5);
+    const item = { ...waiting, retry: { ...waiting.retry!, source: "unknown" as const, attemptId: "attempt", generation: 5n,
+      error: retryError("CODEX_NATIVE_RECONNECT") } };
+    const session = { ...retryingSession, generation: 5n, activeAttemptId: "attempt" };
+    expect(resolveActiveRetry([item], session)?.attemptNumber).toBe(2);
+    expect(resolveActiveRetry([item], { ...session, activeAttemptId: "replacement" })).toBeUndefined();
+    expect(resolveActiveRetry([item], { ...session, generation: 6n })).toBeUndefined();
+  });
+
   it("ceil-counts to zero and never becomes negative", () => {
     expect(retryCountdownSeconds(5_001, 4_000)).toBe(2);
     expect(retryCountdownSeconds(5_000, 4_000)).toBe(1);

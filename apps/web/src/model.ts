@@ -1811,6 +1811,8 @@ export interface TimelineAutomationOriginView {
 export interface TimelineRetryView {
   readonly state: "waiting" | "started" | "aborted" | "succeeded" | "exhausted" | "unknown";
   readonly source: "auto" | "summarization" | "unknown";
+  readonly attemptId?: string;
+  readonly generation?: bigint;
   readonly attemptNumber: number;
   readonly maxAttempts?: number;
   readonly retryAt?: number;

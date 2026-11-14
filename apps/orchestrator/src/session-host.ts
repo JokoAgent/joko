@@ -15858,6 +15858,13 @@ export class SessionHost {
             if (current.descriptor.state === "running" || current.descriptor.state === "waiting") {
               this.#store.updateRunState({ runId, state: "retrying", traceId: `retry:${runId}`, operationId });
             }
+          } else if (payload.type === "retry" && payload.state === "succeeded" && payload.error?.code === "CODEX_NATIVE_RECONNECT"
+            && metadata?.namespace === "codex.app_server"
+            && runId !== undefined) {
+            const current = this.#store.getRun(runId).descriptor;
+            if (current.state === "retrying" && current.activeAttemptId === attemptId) {
+              this.#store.updateRunState({ runId, state: "running", traceId: `retry:${runId}`, operationId });
+            }
           }
         })();
         const inflight = this.#inflightEmissions.get(sessionId) ?? new Set<Promise<void>>();

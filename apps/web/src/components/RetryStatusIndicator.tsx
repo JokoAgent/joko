@@ -10,7 +10,8 @@ export function RetryStatusIndicator({ retry, t }: {
   readonly retry: ActiveRetryProjection;
   readonly t: Translator;
 }): JSX.Element | null {
-  if (retry.source === "auto" ? !hasVisibleAutoRetryNotice(retry) : retry.source !== "summarization") return null;
+  if (retry.source === "auto" ? !hasVisibleAutoRetryNotice(retry)
+    : retry.source !== "summarization" && retry.error?.code !== "CODEX_NATIVE_RECONNECT") return null;
   return <VisibleRetryStatusIndicator retry={retry} t={t} />;
 }
 
@@ -39,7 +40,8 @@ function VisibleRetryStatusIndicator({ retry, t }: {
       ? t(cancellable ? "retryStatus.countdownUnknownMax" : "retryStatus.countdownUnknownMaxNoCancel", { attempt: retry.attemptNumber, seconds })
       : t(cancellable ? "retryStatus.countdown" : "retryStatus.countdownNoCancel", { attempt: retry.attemptNumber, maxAttempts: retry.maxAttempts, seconds });
   }, [cancellable, retry.attemptNumber, retry.maxAttempts, seconds, t]);
-  const friendly = retry.error === undefined ? undefined : timelineErrorCopy(retry.error.code);
+  const friendly = retry.error === undefined || retry.error.code === "CODEX_NATIVE_RECONNECT"
+    ? undefined : timelineErrorCopy(retry.error.code);
   const message = `${friendly === undefined ? "" : t(friendly.messageKey)} ${progress}`.trim();
 
   return (

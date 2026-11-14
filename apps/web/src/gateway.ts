@@ -12242,17 +12242,24 @@ export function projectSnapshotEvent(
       break;
     }
     case "retryChanged": {
-      const run = raw.runs.find((candidate) => candidate.runId === kind.value.runId);
+      const retry = kind.value;
+      const run = raw.runs.find((candidate) => candidate.runId === retry.runId);
       if (run !== undefined) {
-        const state = kind.value.state === RetryState.EXHAUSTED
+        const nativeReconnect = retry.error?.code === "CODEX_NATIVE_RECONNECT";
+        if (nativeReconnect && (!retry.attemptId || retry.attemptId !== run.activeAttemptId
+          || event.identity?.runId !== run.runId || event.identity.sessionId !== run.sessionId || event.identity.attemptId !== retry.attemptId
+          || event.identity.generation !== run.version?.generation
+          || ![RunState.RUNNING, RunState.WAITING, RunState.RETRYING].includes(run.state))) break;
+        const state = retry.state === RetryState.EXHAUSTED && !nativeReconnect
           ? RunState.FAILED
-          : kind.value.state === RetryState.SUCCEEDED
+          : retry.state === RetryState.SUCCEEDED
             ? RunState.RUNNING
-            : kind.value.state === RetryState.WAITING || kind.value.state === RetryState.STARTED
+            : retry.state === RetryState.WAITING || retry.state === RetryState.STARTED
               ? RunState.RETRYING
               : run.state;
         const { error: _previousRetryError, ...runWithoutRetryError } = run;
-        const updated = { ...runWithoutRetryError, state, ...(kind.value.error === undefined ? {} : { error: kind.value.error }) };
+        const updated = nativeReconnect ? { ...run, state }
+          : { ...runWithoutRetryError, state, ...(retry.error === undefined ? {} : { error: retry.error }) };
         raw = { ...raw, runs: upsertBy(raw.runs, updated, (value) => value.runId) };
         projected = remapSessionProjection(raw, projected, run.sessionId);
         diagnosticsChanged = true;
@@ -13126,8 +13133,11 @@ function projectTimelineEvent(
     case "retryChanged": {
       const maxAttempts = kind.value.maxAttempts;
       const code = kind.value.error?.code;
+      const nativeReconnect = code === "CODEX_NATIVE_RECONNECT";
+      if (nativeReconnect && (!kind.value.runId || !kind.value.attemptId || event.identity?.runId !== kind.value.runId
+        || event.identity.attemptId !== kind.value.attemptId)) break;
       const source = code === "PI_SUMMARIZATION_RETRY" ? "summarization"
-        : kind.value.state === RetryState.WAITING && code !== "CLAUDE_CODE_API_RETRY" ? "auto" : "unknown";
+        : kind.value.state === RetryState.WAITING && code !== "CLAUDE_CODE_API_RETRY" && !nativeReconnect ? "auto" : "unknown";
       replaceOrAppend({
         id: event.eventId,
         ...(kind.value.runId || event.identity?.runId ? { runId: kind.value.runId || event.identity?.runId } : {}),
@@ -13139,6 +13149,7 @@ function projectTimelineEvent(
         retry: {
           state: retryTimelineState(kind.value.state),
           source,
+          ...(nativeReconnect && event.identity !== undefined ? { attemptId: kind.value.attemptId, generation: event.identity.generation } : {}),
           attemptNumber: kind.value.attemptNumber,
           ...(maxAttempts === undefined || maxAttempts <= 0 ? {} : { maxAttempts }),
           ...(kind.value.retryAt === undefined ? {} : { retryAt: timestampMs(kind.value.retryAt) }),

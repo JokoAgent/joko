@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { translate } from "../i18n.js";
 import { RetryStatusIndicator } from "./RetryStatusIndicator.js";
+import { resolveRetryStopAction } from "./retry-status-behavior.js";
 
 describe("Pi retry status text", () => {
   it("shows later overload retries with capacity-specific copy and a cancellable progress status", () => {
@@ -35,6 +36,17 @@ describe("Pi retry status text", () => {
     expect(summarization).not.toContain("Esc to cancel");
     expect(summarization).toContain("Retrying (2/5)");
   });
+});
+
+it("shows Codex native reconnect progress and uses the original Run's Stop action", () => {
+  const retry = { itemId: "codex-reconnect", runId: "run", source: "unknown" as const, attemptNumber: 1, maxAttempts: 5,
+    error: retryError("CODEX_NATIVE_RECONNECT") };
+  const html = renderToStaticMarkup(<RetryStatusIndicator retry={retry} t={(key, values) => translate("en", key, values)} />);
+  expect(html).toContain("<span>Retrying (1/5)...</span>");
+  expect(html).not.toContain("The task could not continue");
+  expect(html).not.toContain("redacted provider detail");
+  expect(html).toContain('role="status"');
+  expect(resolveRetryStopAction(retry, { canAbortRetry: true, canAbortRun: true })).toBe("abort");
 });
 
 function retryError(code: string) {
