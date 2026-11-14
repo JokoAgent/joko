@@ -135,9 +135,10 @@ packagedIt("converges conversation settings across real application windows and 
     await main.locator('.timeline[data-timeline-session-id="' + sessionId + '"]')
       .waitFor({ state: "visible", timeout: 30_000 });
     await main.locator('.sidebar [data-session-id="' + sessionId + '"]').first().click({ button: "right" });
+    // Electron opens a separate window over IPC. Its mounted Task is the readiness check below.
     const [page] = await Promise.all([
       application.waitForEvent("window", { timeout: 30_000 }),
-      main.getByRole("menuitem", { name: "Open in new window", exact: true }).click()
+      main.getByRole("menuitem", { name: "Open in new window", exact: true }).click({ noWaitAfter: true })
     ]);
     observe(page);
     await page.locator('.timeline[data-timeline-session-id="' + sessionId + '"]')

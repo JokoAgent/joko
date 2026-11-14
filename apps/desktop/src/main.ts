@@ -262,7 +262,7 @@ import { DesktopMenuBar, createMenuBarSettingsStore, registerMenuBarIpc } from "
 import { verifyMenuBarHelper } from "./menu-bar-native-host.js";
 import { isMenubarSupportedPlatform } from "@joko/contracts";
 import { DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler } from "./wallpaper-protocol.js";
-import { DesktopMcpAppHost, MCP_APP_SCHEME } from "./mcp-app-host.js";
+import { DesktopMcpAppHost, MCP_APP_CAPTURE, MCP_APP_SCHEME } from "./mcp-app-host.js";
 import { DesktopExtensionOAuthHost } from "./extension-oauth-host.js";
 import { registerDesktopWallpaperIpc } from "./wallpaper-ipc.js";
 import {
@@ -509,7 +509,7 @@ import {
   validateProfileId
 } from "./security.js";
 import { createDesktopEndpointRuntimePreparation, installDesktopEndpointRuntimes } from './connection-transport.js';
-import { DesktopLinkspanHost } from './linkspan-host.js';
+import { DesktopLinkspanHost, DESKTOP_LINKSPAN_CAPTURE } from './linkspan-host.js';
 
 // fileURLToPath(new URL(".", ...)) retains a trailing separator. Normalize it
 // once here so the managed-runtime resolver's absolute/canonical input fence
@@ -597,12 +597,24 @@ const packagedSmokeRequests = new Map<number, {
   readonly method: string; readonly path: string; readonly contents: number;
   readonly started: number; headers: boolean;
 }>();
+const packagedSmokeRecentRequests: Array<{
+  readonly path: string; readonly contents: number; readonly headers: boolean; readonly elapsedMs: number;
+  readonly outcome: "completed" | "failed";
+}> = [];
 function observePackagedSmokeRequest(details: {
   readonly id: number; readonly method: string; readonly url: string; readonly webContentsId?: number | undefined;
-}, phase: "start" | "headers" | "end"): void {
+}, phase: "start" | "headers" | "completed" | "failed"): void {
   if (!packagedSmoke) return;
-  if (phase === "end") { packagedSmokeRequests.delete(details.id); return; }
   const request = packagedSmokeRequests.get(details.id);
+  if (phase === "completed" || phase === "failed") {
+    packagedSmokeRequests.delete(details.id);
+    if (request !== undefined && /^\/joko\.v1\.(?:ConnectionService\/GetServerInfo|EventService\/GetSnapshot)$/u.test(request.path)) {
+      packagedSmokeRecentRequests.push({ path: request.path, contents: request.contents, headers: request.headers,
+        elapsedMs: Date.now() - request.started, outcome: phase });
+      if (packagedSmokeRecentRequests.length > 64) packagedSmokeRecentRequests.shift();
+    }
+    return;
+  }
   if (phase === "headers") { if (request !== undefined) request.headers = true; return; }
   try {
     const url = new URL(details.url);
@@ -954,6 +966,8 @@ let desktopNativeTaskStatusSettings: DesktopNativeTaskStatusSettingsStore | unde
 let desktopNativeTaskStatusLayoutSettings: DesktopNativeTaskStatusLayoutSettingsStore | undefined;
 let macNativeTaskStatusHost: MacNativeTaskStatusHost | undefined;
 let nativeTaskStatusDisplayRefresh: (() => void) | undefined;
+const NATIVE_TASK_STATUS_DOCUMENT_SCHEME = "joko-task-status-document";
+const nativeTaskStatusDocuments = new Map<string, string>();
 let desktopAttentionBadgeController: DesktopAttentionBadgeController | undefined;
 let microphoneLifecycleInstalled = false;
 let providerModelPowerLifecycleInstalled = false;
@@ -1034,6 +1048,9 @@ protocol.registerSchemesAsPrivileged([{
 }, {
   scheme: MCP_APP_SCHEME,
   privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
+}, {
+  scheme: NATIVE_TASK_STATUS_DOCUMENT_SCHEME,
+  privileges: { standard: true, secure: true }
 }]);
 
 const desktopUserDataDirectory = personalVersionProfileOverride() ?? resolveDesktopUserDataDirectory({
@@ -1248,6 +1265,7 @@ if (!app.requestSingleInstanceLock()) {
     initializeDesktopDevicePeerAgentLifecycle();
     void beginDesktopUpdateStartup();
     if (!packagedSmoke) ensureTray();
+    if (externalPackagedE2e) recordPackagedSmokeProgress("app_ready_startup_returned");
   }).catch((error: unknown) => {
     const message = safeSmokeError(error);
     recordPackagedSmokeProgress(`app_ready_failed ${message}`);
@@ -1335,6 +1353,38 @@ function createWindow(): void {
   mainWindowContentsByWindow.set(window, windowContents);
   const attentionSourceId = windowContents.id;
   mainWindow = window;
+  if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
+    windowContents.once("did-start-loading", () => recordPackagedSmokeProgress("main_window_load_started"));
+    windowContents.once("did-navigate", () => recordPackagedSmokeProgress("main_window_navigation_committed"));
+    windowContents.once("unresponsive", () => recordPackagedSmokeProgress("main_window_renderer_unresponsive"));
+    const pendingPreloadStages = new Map<string, string>([
+      [MCP_APP_CAPTURE, "main_window_preload_mcp_app"],
+      [DESKTOP_LINKSPAN_CAPTURE, "main_window_preload_linkspan"],
+      [DESKTOP_CHANNELS.mainDocumentOccurrenceGet, "main_window_preload_document"],
+      [DESKTOP_CHANNELS.openWithCaptureDocument, "main_window_preload_open_with"],
+      [DESKTOP_CHANNELS.nativeGamepadCaptureDocument, "main_window_preload_gamepad"],
+      [DESKTOP_CHANNELS.nativeTaskStatusGetAvailability, "main_window_preload_task_status"],
+      [DESKTOP_CHANNELS.preferredSystemLocaleGet, "main_window_preload_locale"]
+    ]);
+    const observePreload = (_event: unknown, channel: string): void => {
+      const stage = pendingPreloadStages.get(channel);
+      if (stage === undefined) return;
+      pendingPreloadStages.delete(channel);
+      recordPackagedSmokeProgress(stage);
+    };
+    windowContents.on("ipc-message-sync", observePreload);
+    windowContents.once("dom-ready", () => windowContents.off("ipc-message-sync", observePreload));
+    windowContents.once("dom-ready", () => recordPackagedSmokeProgress("main_window_dom_ready"));
+    windowContents.once("preload-error", () => recordPackagedSmokeProgress("main_window_preload_failed"));
+    windowContents.once("did-finish-load", () => recordPackagedSmokeProgress("main_window_load_finished"));
+    windowContents.once("did-fail-load", () => recordPackagedSmokeProgress("main_window_load_failed"));
+    windowContents.once("render-process-gone", (_event, details) => {
+      recordPackagedSmokeProgress(`main_window_renderer_gone ${details.reason}`);
+    });
+    window.once("ready-to-show", () => recordPackagedSmokeProgress("main_window_ready_to_show"));
+    window.once("show", () => recordPackagedSmokeProgress("main_window_shown"));
+    window.once("closed", () => recordPackagedSmokeProgress("main_window_closed"));
+  }
   let mainUiLoadRecovery: Promise<void> | undefined;
   const beginMainUiLoadRecovery = (initialFailure?: unknown): void => {
     if (mainUiLoadRecovery !== undefined || window.isDestroyed() || quitting) return;
@@ -1385,6 +1435,9 @@ function createWindow(): void {
     clearNativeTaskStatusProjection();
     clearDesktopNativeTaskStatusVisibility(window.webContents);
   });
+  if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
+    windowContents.once("did-start-loading", () => recordPackagedSmokeProgress("main_window_load_start_handlers_returned"));
+  }
   window.webContents.on("render-process-gone", (_event, details) => {
     recordPackagedSmokeNativeCleanup("main_render_process_gone_entered");
     retireMainWindowDocument(window, window.webContents, true);
@@ -1569,8 +1622,8 @@ function createWindow(): void {
     });
   });
   if (packagedSmoke) {
-    electronSession.webRequest.onCompleted(details => observePackagedSmokeRequest(details, "end"));
-    electronSession.webRequest.onErrorOccurred(details => observePackagedSmokeRequest(details, "end"));
+    electronSession.webRequest.onCompleted(details => observePackagedSmokeRequest(details, "completed"));
+    electronSession.webRequest.onErrorOccurred(details => observePackagedSmokeRequest(details, "failed"));
   }
   const closeController = createDesktopMainWindowCloseController({
     isCurrent: () => mainWindow === window && !window.isDestroyed() && canApplyMainWindowClose(),
@@ -1643,7 +1696,6 @@ function createWindow(): void {
         [
           "(async () => {",
           "  const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));",
-          `  const runFullJourney = ${JSON.stringify(packagedSmokeScope === "full")};`,
           "  let genericConnectionScreenSeen = Boolean(document.querySelector('.connection-screen'));",
           "  const observer = new MutationObserver(() => {",
           "    if (document.querySelector('.connection-screen')) genericConnectionScreenSeen = true;",
@@ -1731,16 +1783,6 @@ function createWindow(): void {
           "    while (!document.querySelector('.app') && Date.now() < productDeadline) await sleep(100);",
           "    if (!document.querySelector('.app') || document.querySelector('.connection-screen')) {",
           "      throw new Error('The local connection action did not reach the product UI.');",
-          "    }",
-          "    if (runFullJourney) {",
-          "      window.location.hash = '#/settings/about';",
-          "      const monitorActionDeadline = Date.now() + 5_000;",
-          "      while (!document.querySelector('[data-runtime-process-monitor-open]') && Date.now() < monitorActionDeadline) await sleep(100);",
-          "      const monitorOpen = document.querySelector('[data-runtime-process-monitor-open]');",
-          "      if (!(monitorOpen instanceof HTMLButtonElement) || monitorOpen.disabled) {",
-          "        throw new Error('The standalone runtime resource monitor action is unavailable.');",
-          "      }",
-          "      monitorOpen.click();",
           "    }",
           "    const response = await fetch(`${connectOrigin}/joko.v1.ConnectionService/GetServerInfo`, {",
           "      method: 'POST',",
@@ -1930,33 +1972,90 @@ async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promis
     })}).`);
   }
   const focusedBefore = BrowserWindow.getFocusedWindow();
-  const expansionDeadline = Date.now() + 5_000;
-  await ambient.webContents.executeJavaScript(
-    "document.querySelector('a[href=\"joko-task-status://toggle\"]')?.click(); true", true
-  );
-  while (Date.now() < expansionDeadline && !ambient.isDestroyed() && ambient.getBounds().height <= compactHeight) {
-    await waitForPackagedSmokePoll();
-  }
-  const destroyed = ambient.isDestroyed();
-  const expandedHeight = destroyed ? null : ambient.getBounds().height;
-  const focusedAfter = BrowserWindow.getFocusedWindow();
-  if (expandedHeight === null || expandedHeight <= compactHeight || focusedAfter !== focusedBefore) {
-    const observation = {
-      destroyed, compactHeight, expandedHeight, focusChanged: focusedAfter !== focusedBefore,
-      before: focusedBefore === null ? "none" : focusedBefore === owner ? "owner" : focusedBefore === ambient ? "ambient" : "other",
-      after: focusedAfter === null ? "none" : focusedAfter === owner ? "owner" : focusedAfter === ambient ? "ambient" : "other",
-      pointerInside: !destroyed && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds()),
-      surfaceMode: macNativeTaskStatusHost?.surface()?.mode,
-      lifecycle: packagedSmokeNativeTaskStatusLifecycle.get(ambient) ?? []
-    };
-    process.stdout.write(`JOKO_DESKTOP_SMOKE_TASK_STATUS_EXPANSION ${JSON.stringify(observation)}\n`);
-    if (!destroyed && !ambient.webContents.isDestroyed() && packagedSmokeResultPath !== undefined) {
-      try {
-        const image = await waitForPackagedSmokeDeadline(ambient.webContents.capturePage(), 2_000, "Task Status failure capture");
-        if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.native-task-status.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
-      } catch { /* The original expansion/focus failure remains authoritative. */ }
+  const originalCursor = process.platform === "darwin" ? screen.getCursorScreenPoint() : undefined;
+  const compactBounds = ambient.getBounds();
+  let cursorMoveAttempted = false;
+  let checkFailed = false;
+  try {
+    const expansionDeadline = Date.now() + 5_000;
+    await ambient.webContents.executeJavaScript(
+      "document.querySelector('a[href=\"joko-task-status://toggle\"]')?.click(); true", true
+    );
+    while (Date.now() < expansionDeadline && !ambient.isDestroyed() && ambient.getBounds().height <= compactHeight) {
+      await waitForPackagedSmokePoll();
     }
-    throw new Error(`Native Task Status did not expand without changing application focus (${JSON.stringify(observation)}).`);
+    const destroyed = ambient.isDestroyed();
+    const expandedHeight = destroyed ? null : ambient.getBounds().height;
+    const focusedAfter = BrowserWindow.getFocusedWindow();
+    if (expandedHeight === null || expandedHeight <= compactHeight || focusedAfter !== focusedBefore) {
+      const observation = {
+        destroyed, compactHeight, expandedHeight, focusChanged: focusedAfter !== focusedBefore,
+        before: focusedBefore === null ? "none" : focusedBefore === owner ? "owner" : focusedBefore === ambient ? "ambient" : "other",
+        after: focusedAfter === null ? "none" : focusedAfter === owner ? "owner" : focusedAfter === ambient ? "ambient" : "other",
+        pointerInside: !destroyed && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds()),
+        surfaceMode: macNativeTaskStatusHost?.surface()?.mode,
+        lifecycle: packagedSmokeNativeTaskStatusLifecycle.get(ambient) ?? []
+      };
+      process.stdout.write(`JOKO_DESKTOP_SMOKE_TASK_STATUS_EXPANSION ${JSON.stringify(observation)}\n`);
+      if (!destroyed && !ambient.webContents.isDestroyed() && packagedSmokeResultPath !== undefined) {
+        try {
+          const image = await waitForPackagedSmokeDeadline(ambient.webContents.capturePage(), 2_000, "Task Status failure capture");
+          if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.native-task-status.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
+        } catch { /* The original expansion/focus failure remains authoritative. */ }
+      }
+      throw new Error(`Native Task Status did not expand without changing application focus (${JSON.stringify(observation)}).`);
+    }
+    if (originalCursor !== undefined) {
+      // The cursor helper can outlast the minimum expansion dwell. The
+      // ordinary hover path can reopen the list when the pointer arrives.
+      const point = {
+        x: compactBounds.x + Math.floor(compactBounds.width / 2),
+        y: compactBounds.y + Math.floor(compactHeight / 2)
+      };
+      cursorMoveAttempted = true;
+      await movePackagedSmokeMacCursor(point);
+      const pointerDeadline = Date.now() + 5_000;
+      const expandedUnderPointer = (): boolean => !ambient.isDestroyed() && ambient.getBounds().height > compactHeight
+        && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds())
+        && macNativeTaskStatusHost?.surface()?.policy === "manual";
+      while (Date.now() < pointerDeadline && !expandedUnderPointer() && !ambient.isDestroyed()) await waitForPackagedSmokePoll();
+      if (!expandedUnderPointer()) throw new Error("Native Task Status did not remain expanded under the scroll pointer.");
+    }
+    await owner.webContents.executeJavaScript(`(async () => {
+      const sessions = Array.from({ length: 30 }, (_, index) => ({
+        sessionId: "smoke-task-" + index, title: "Smoke task " + index, detail: "", phase: "running",
+        activityLines: [], updatedAt: 30 - index
+      }));
+      await window.jokoDesktop.nativeTaskStatus.publish({
+        ownerId: "desktop-smoke-task-status", revision: "2", locale: "en", sessions
+      });
+    })()`, true);
+    const scrollDeadline = Date.now() + 5_000;
+    let lastTaskReachable = false;
+    while (!ambient.isDestroyed() && Date.now() < scrollDeadline) {
+      try {
+        lastTaskReachable = await ambient.webContents.executeJavaScript(`(() => {
+          const list = document.querySelector('.task-list');
+          if (!list || list.children.length !== 30 || list.scrollHeight <= list.clientHeight) return false;
+          list.scrollTop = list.scrollHeight;
+          const last = list.lastElementChild?.querySelector('.focus-action');
+          return last?.getAttribute('href') === 'joko-task-status://focus?sessionId=smoke-task-29' &&
+            last.getBoundingClientRect().bottom <= list.getBoundingClientRect().bottom;
+        })()`, true) === true;
+      } catch { /* The current document can be navigating after the publication. */ }
+      if (lastTaskReachable) break;
+      await waitForPackagedSmokePoll();
+    }
+    if (!lastTaskReachable) throw new Error("Native Task Status did not make the last task reachable in its scrollable list.");
+    if (BrowserWindow.getFocusedWindow() !== focusedBefore) throw new Error("Native Task Status changed application focus during scrolling.");
+  } catch (error) {
+    checkFailed = true;
+    throw error;
+  } finally {
+    if (cursorMoveAttempted && originalCursor !== undefined) await movePackagedSmokeMacCursor(originalCursor).catch((error: unknown) => {
+      if (!checkFailed) throw error;
+      process.stderr.write("JOKO_DESKTOP_SMOKE_CURSOR_RESTORE_FAILED\n");
+    });
   }
   await owner.webContents.executeJavaScript(`(async () => {
     const bridge = window.jokoDesktop.nativeTaskStatus;
@@ -2458,6 +2557,18 @@ function waitForPackagedSmokeOwnerDocument(
 }
 
 async function verifyPackagedSmokeRuntimeProcessMonitor(ownerWindow: BrowserWindow): Promise<void> {
+  // Open the focusable monitor after the nonactivating Task Status journey.
+  await ownerWindow.webContents.executeJavaScript(`(async () => {
+    window.location.hash = '#/settings/about';
+    const deadline = Date.now() + 5_000;
+    const action = () => document.querySelector('[data-runtime-process-monitor-open]');
+    while (!action() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
+    const button = action();
+    if (!(button instanceof HTMLButtonElement) || button.disabled) {
+      throw new Error('The standalone runtime resource monitor action is unavailable.');
+    }
+    button.click();
+  })()`, true);
   const initial = await waitForPackagedSmokeRuntimeProcessMonitor();
   const owner = runtimeProcessMonitorBroker.ownerForMonitor(initial.webContents);
   await inspectPackagedSmokeRuntimeProcessMonitorSurface(initial, owner);
@@ -2838,10 +2949,12 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
   if (!await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
     throw new Error("Packaged smoke owner did not present the concurrent durable Task.");
   }
+  recordPackagedFullSmokeStage("task_window_concurrent_owner_ready");
   const concurrentWindow = await openPackagedSmokeTaskWindow(taskWindow, concurrentTask, connection.profileId);
   if (concurrentWindow.isDestroyed() || concurrentWindow === taskWindow) {
     throw new Error("Packaged smoke did not create an independent concurrent Task window.");
   }
+  recordPackagedFullSmokeStage("task_window_concurrent_created");
   await Promise.all([
     waitForPackagedSmokeTaskPresentation(taskWindow, task, taskOwner),
     waitForPackagedSmokeTaskPresentation(concurrentWindow, concurrentTask, concurrentOwner)
@@ -3195,19 +3308,24 @@ async function clickPackagedSmokeTimelineCopy(
   blockSelector: string,
   buttonSelector: string
 ): Promise<void> {
-  const clicked = await window.webContents.executeJavaScript([
+  const observation = await window.webContents.executeJavaScript([
     "(() => {",
     `  const blocks = document.querySelectorAll(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
-    "  if (blocks.length !== 1) return false;",
+    "  const state = { clicked: false, blocks: blocks.length, focused: document.hasFocus(), visibility: document.visibilityState };",
+    "  if (blocks.length !== 1) return state;",
     `  const buttons = blocks[0].querySelectorAll(${JSON.stringify(buttonSelector)});`,
-    "  if (buttons.length !== 1) return false;",
+    "  if (buttons.length !== 1) return { ...state, buttons: buttons.length };",
     "  const button = buttons[0];",
-    "  if (!(button instanceof HTMLButtonElement) || button.disabled || button.getAttribute('aria-busy') === 'true') return false;",
+    "  if (!(button instanceof HTMLButtonElement)) return { ...state, buttons: 1, tag: button.tagName };",
+    "  const control = { buttons: 1, disabled: button.disabled, busy: button.getAttribute('aria-busy'), ariaDisabled: button.getAttribute('aria-disabled') };",
+    "  if (button.disabled || button.getAttribute('aria-busy') === 'true') return { ...state, ...control };",
     "  button.click();",
-    "  return true;",
+    "  return { ...state, ...control, clicked: true };",
     "})()"
   ].join("\n"), true) as unknown;
-  if (clicked !== true) throw new Error(`Packaged smoke could not dispatch one Copy action for ${blockSelector}.`);
+  if (typeof observation !== "object" || observation === null || !("clicked" in observation) || observation.clicked !== true) {
+    throw new Error(`Packaged smoke could not dispatch one Copy action for ${blockSelector} (${JSON.stringify(observation)}).`);
+  }
 }
 
 async function waitForPackagedSmokeTimelineTextClipboard(
@@ -4404,6 +4522,7 @@ async function waitForPackagedSmokeTaskPresentation(
   owner: DesktopSessionWindowOwner
 ): Promise<void> {
   const deadline = Date.now() + 20_000;
+  const contentsId = window.webContents.id;
   let lastObservation: Readonly<Record<string, boolean | number>> = { observed: false };
   while (Date.now() < deadline) {
     if (window.isDestroyed() || window.webContents.isDestroyed()) {
@@ -4430,6 +4549,8 @@ async function waitForPackagedSmokeTaskPresentation(
         "    hash: location.hash,",
         "    product: Boolean(document.querySelector('.app')),",
         "    connectionScreen: Boolean(document.querySelector('.connection-screen')),",
+        "    localServiceState: document.querySelector('.connection-screen .local-connection-card')?.getAttribute('data-state'),",
+        "    connectionAlert: document.querySelector('.connection-screen [role=alert]')?.textContent ?? '',",
         "    preload: typeof window.jokoDesktop?.window?.close === 'function' &&",
         "      typeof window.jokoDesktop?.sessionWindows?.open === 'function' &&",
         "      typeof window.jokoDesktop?.sessionWindows?.getOwner === 'function',",
@@ -4454,6 +4575,8 @@ async function waitForPackagedSmokeTaskPresentation(
           routeErrorBoundary: observation["routeErrorBoundary"] === true,
           product: observation["product"] === true,
           connectionScreen: observation["connectionScreen"] === true,
+          localServiceRetryable: observation["localServiceState"] === "retryableError",
+          connectionTimedOut: typeof observation["connectionAlert"] === "string" && /signal timed out/i.test(observation["connectionAlert"]),
           preload: observation["preload"] === true,
           nodeGlobalsAbsent: observation["nodeGlobalsAbsent"] === true,
           ownerProfileMatches: observation["ownerProfileId"] === owner.profileId,
@@ -4493,6 +4616,9 @@ async function waitForPackagedSmokeTaskPresentation(
     await waitForPackagedSmokePoll();
   }
   process.stderr.write(`JOKO_DESKTOP_TASK_PRESENTATION_STATE ${JSON.stringify(lastObservation)}\n`);
+  process.stderr.write(`JOKO_DESKTOP_TASK_CONNECTION_REQUESTS ${JSON.stringify(
+    packagedSmokeRecentRequests.filter((request) => request.contents === contentsId)
+  )}\n`);
   process.stderr.write(`JOKO_DESKTOP_PENDING_RPC ${JSON.stringify([...packagedSmokeRequests].map(([id, value]) => ({
     id, method: value.method, path: value.path, contents: value.contents, headers: value.headers, ageMs: Date.now() - value.started
   })))}\n`);
@@ -6500,7 +6626,12 @@ function registerPackagedAppProtocol(): void {
         headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
       });
     }
+    const observeMainEntry = externalPackagedE2e && request.method === "GET" && request.url === DESKTOP_APP_ENTRY_URL;
+    if (observeMainEntry) recordPackagedSmokeProgress("main_window_entry_requested");
     const response = await net.fetch(pathToFileURL(resourcePath).href, { bypassCustomProtocolHandlers: true });
+    if (observeMainEntry) {
+      recordPackagedSmokeProgress(response.ok ? "main_window_entry_received" : "main_window_entry_failed");
+    }
     return securePackagedAppScriptResponse(response, resourcePath);
   });
 }
@@ -7207,6 +7338,23 @@ async function initializeDesktopNativeTaskStatus(): Promise<void> {
 }
 
 function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): NativeTaskStatusWindow {
+  // Keep the bounded task list in the response body so artwork and task text
+  // do not count towards Chromium's navigation URL limit.
+  const documentSession = session.fromPartition("joko-task-status", { cache: false });
+  if (!documentSession.protocol.isProtocolHandled(NATIVE_TASK_STATUS_DOCUMENT_SCHEME)) {
+    documentSession.protocol.handle(NATIVE_TASK_STATUS_DOCUMENT_SCHEME, (request) => {
+      const document = request.method === "GET" ? nativeTaskStatusDocuments.get(request.url) : undefined;
+      if (document === undefined) return new Response(null, { status: 404 });
+      return new Response(document, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+    });
+    documentSession.setPermissionCheckHandler(() => false);
+    documentSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  }
+  let documentUrl: string | undefined;
+  const retireDocument = (): void => {
+    if (documentUrl !== undefined) nativeTaskStatusDocuments.delete(documentUrl);
+    documentUrl = undefined;
+  };
   const window = new BrowserWindow({
     ...bounds,
     show: false,
@@ -7227,6 +7375,7 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
     } : {}),
     title: "Joko task status",
     webPreferences: {
+      session: documentSession,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -7257,7 +7406,10 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
   } else {
     window.setAlwaysOnTop(true, "pop-up-menu");
   }
-  window.on("closed", () => record("closed"));
+  window.on("closed", () => {
+    retireDocument();
+    record("closed");
+  });
   window.webContents.on("render-process-gone", (_event, details) => {
     const reason = (["clean-exit", "abnormal-exit", "killed", "crashed", "oom", "launch-failed",
       "integrity-failure", "memory-eviction"] as const).find((candidate) => candidate === details.reason) ?? "other";
@@ -7270,10 +7422,14 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
       record("bounds-requested", { width: next.width, height: next.height });
       window.setBounds(next, false);
     },
-    loadDocument: (dataUrl: string) => {
+    loadDocument: (document: string) => {
       const load = ++loads;
       record("load-started", { load });
-      const loading = window.loadURL(dataUrl);
+      retireDocument();
+      const url = `${NATIVE_TASK_STATUS_DOCUMENT_SCHEME}://panel/${randomUUID()}`;
+      documentUrl = url;
+      nativeTaskStatusDocuments.set(url, document);
+      const loading = window.loadURL(url).finally(() => { if (documentUrl === url) retireDocument(); });
       void loading.then(() => record("load-completed", { load, current: load === loads }), (error: unknown) => {
         const code = error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
         const reason = (["ERR_ABORTED", "ERR_INVALID_URL", "ERR_FAILED", "ERR_ACCESS_DENIED"] as const)
@@ -8423,11 +8579,17 @@ function registerIpc(): void {
   });
   desktopRemoteDesktopViewers.register();
   ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
-    assertTrustedIpcSender(event);
-    if (parameters.length !== 0) {
-      throw new TypeError("Preferred system locale does not accept parameters.");
+    let locale: DesktopSystemLocale | undefined;
+    try {
+      if (parameters.length === 0 && isTrustedDesktopIpcSender(event)) locale = preferredSystemLocale;
+    } finally {
+      // Preload waits for a synchronous reply even if the frame has not committed yet.
+      event.returnValue = locale;
+      if (externalPackagedE2e && event.sender === mainWindow?.webContents) {
+        recordPackagedSmokeProgress(locale === undefined
+          ? "main_window_preload_locale_denied" : "main_window_preload_locale_replied");
+      }
     }
-    event.returnValue = preferredSystemLocale;
   });
   ipcMain.on(DESKTOP_CHANNELS.mainDocumentOccurrenceGet, (event, ...parameters: unknown[]) => {
     event.returnValue = parameters.length === 1 && isDesktopMainDocumentClaim(parameters[0])

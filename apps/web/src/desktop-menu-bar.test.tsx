@@ -127,6 +127,53 @@ it.each([
   else expect(credit?.sub).not.toBe("No extra credits");
 });
 
+it("retires expired local and selected-node quota windows in the native menu bar projection", async () => {
+  const initial = source();
+  const remote = source(true);
+  const resetAt = now + 5000;
+  const localProvider = { ...provider, name: "Local subscription" };
+  const remoteProvider = { ...provider, name: "Remote subscription" };
+  const localWindow = { usedPercent: 100, windowMinutes: 300, resetAt };
+  const remoteWindow = { usedPercent: 10, windowMinutes: 10_080, resetAt };
+  const withProviders = (owner: DesktopMenuBarSource, providers: ProviderRuntimeView[]): DesktopMenuBarSource =>
+    ({ ...owner, snapshot: { ...owner.snapshot, providers } });
+  const local = withProviders(initial, [{ ...localProvider, accountUsage: { observedAt: now, primaryWindow: localWindow,
+    modelWindows: [{ modelId: "exact", displayName: "Old scoped window", window: localWindow }] } }]);
+  const peer = withProviders(remote, [{ ...remoteProvider, accountUsage: { observedAt: now, buckets: [{ id: "codex", secondaryWindow: remoteWindow }] } }]);
+  const publish = async (sources: readonly DesktopMenuBarSource[], time: number) => (await projectDesktopMenuBar({ sources,
+    readings: new Map([[desktopMenuBarSourceKey(local), { value: { ...usage(), accountRefreshFailed: true } }]]),
+    settings: DEFAULT_MENUBAR_SETTINGS, locale: "en", now: time })).view;
+
+  const before = await publish([local, peer], resetAt - 1);
+  expect(before.sources).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "Local subscription", value: "0", fill: 0 }),
+    expect.objectContaining({ value: "90", emphasized: true })
+  ]));
+  const expired = await publish([local, peer], resetAt);
+  expect(expired.sources).toHaveLength(2);
+  for (const row of expired.sources) expect(row).toMatchObject({ value: null, fill: null, emphasized: false, reserve: false, when: "No data yet" });
+  expect(expired.statusTextByMode.lowest).toBeNull();
+  expect(expired.headlinePrimary).toBe("Quota not read yet.");
+  expect(expired.headlineAlert).toBe(false);
+  expect(expired.usage.scopes.local.note).toContain("original observation times");
+  expect(Object.values(expired.details).every(detail => detail.bigValue === "—" && detail.legend.length === 0)).toBe(true);
+  expect(expired.manage.every(row => row.value === "—" && row.subtitle.endsWith(" · —"))).toBe(true);
+
+  const partial = withProviders(initial, [{ ...localProvider, accountUsage: { ...local.snapshot.providers[0]!.accountUsage!,
+    secondaryWindow: { usedPercent: 75, windowMinutes: 10_080 } } }]);
+  const remaining = await publish([partial, peer], resetAt + 1);
+  expect(remaining.sources.find(row => row.name === "Local subscription")).toMatchObject({ value: "25", emphasized: true });
+  const detail = Object.values(remaining.details).find(item => item.title === "Local subscription");
+  expect(detail?.bigValue).toBe("25");
+  expect(JSON.stringify(detail)).not.toContain("Old scoped window");
+
+  const refreshed = withProviders(initial, [{ ...localProvider, accountUsage: { observedAt: resetAt + 1,
+    primaryWindow: { ...localWindow, usedPercent: 2, resetAt: resetAt + 1000 } } }]);
+  const recovered = await publish([refreshed, peer], resetAt + 1);
+  expect(recovered.sources.find(row => row.name === "Local subscription")).toMatchObject({ value: "98", emphasized: true });
+  expect(recovered.statusTextByMode.lowest).toBe("98%");
+});
+
 it("offers the exact admitted local Provider model, keeps layout IDs stable and retires action IDs with their authority", async () => {
   const initial = actionableSource(), remote = actionableSource(true), local = { ...initial, snapshot: { ...initial.snapshot,
     providers: [{ ...provider, accountUsage: { ...provider.accountUsage!, resetCredits: { availableCount: 2, earliestExpiryAt: now + 86_400_000 } } }] } };

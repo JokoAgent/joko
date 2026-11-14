@@ -50,7 +50,7 @@ class FakeWindow implements NativeTaskStatusWindow {
   constructor(bounds: NativeTaskStatusWindowBounds) { this.bounds = bounds; }
   isDestroyed = (): boolean => this.destroyed;
   setBounds = (bounds: NativeTaskStatusWindowBounds): void => { this.bounds = bounds; };
-  loadDocument = async (dataUrl: string): Promise<void> => { this.documents.push(dataUrl); };
+  loadDocument = async (document: string): Promise<void> => { this.documents.push(document); };
   showInactive = (): void => { this.shown += 1; };
   destroy = (): void => { this.destroyed = true; this.closed?.(); };
   onClosed = (listener: () => void): void => { this.closed = listener; };
@@ -510,11 +510,58 @@ describe("macOS native task-status host", () => {
     expect(host.surface()).toMatchObject({ mode: "compact", policy: "peek", sessions: [] });
     windows[0]?.navigate?.("joko-task-status://toggle");
     expect(host.surface()).toMatchObject({ mode: "expanded", policy: "manual", sessions: [] });
-    const document = decodeDataDocument(windows[0]?.documents.at(-1));
+    const document = windows[0]?.documents.at(-1);
     expect(document).toContain("Ready for a new task");
     expect(document).toContain("joko-task-status://new-task");
     windows[0]?.navigate?.("joko-task-status://new-task");
     expect(newTasks).toBe(1);
+  });
+
+  it.each([1, 5, 6, 500])("renders all %i tasks and dispatches only current actions from the last row", (count) => {
+    const windows: FakeWindow[] = [], actions: DesktopNativeTaskStatusAction[] = [];
+    const host = createMacNativeTaskStatusHost({
+      supported: true,
+      getDisplays: () => [
+        { id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1200, height: 800 } },
+        { id: 2, name: "Small", primary: false, bounds: { x: 1200, y: 0, width: 340, height: 420 } }
+      ],
+      createWindow: bounds => { const window = new FakeWindow(bounds); windows.push(window); return window; },
+      onAction: action => actions.push(action), onNewTask: () => undefined, onOpenSettings: () => undefined,
+      onToggleSounds: () => undefined, playSound: () => undefined
+    });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    const tasks = Array.from({ length: count }, (_, index) => ({
+      sessionId: `task-${index}`, title: `Task ${index}`, detail: "", phase: "interaction", interactionKind: "permission",
+      activityLines: [], updatedAt: count - index,
+      permission: { interactionId: `permission-${index}`, generation: "8", allow: true, allowForSession: false, deny: true }
+    }));
+    const publish = (revision: string, sessions: typeof tasks) =>
+      host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "owner", revision, locale: "en", sessions }));
+    publish("1", tasks);
+    const [primary, small] = windows;
+    expect(small?.documents.at(-1)?.match(/<article class="task-row\b/gu)).toHaveLength(1);
+    small?.navigate?.("joko-task-status://toggle");
+    const document = small?.documents.at(-1) ?? "";
+    expect(document.match(/<article class="task-row\b/gu)).toHaveLength(count);
+    expect(primary?.documents.at(-1)).toContain('class="compact-row"');
+    expect(small?.bounds).toMatchObject({ width: 316, height: Math.min(396, 72 + count * 148) });
+
+    const last = tasks.at(-1)!;
+    const row = document.split("<article").at(-1)!;
+    const focus = row.match(/class="focus-action" href="([^"]+)"/u)?.[1];
+    const permission = row.match(/href="([^"]+decision=allow)"/u)?.[1];
+    expect(focus).toBeDefined(); expect(permission).toBeDefined();
+    small?.navigate?.(focus!);
+    small?.navigate?.(permission!);
+    expect(actions).toEqual([
+      { kind: "focus", sessionId: last.sessionId },
+      { kind: "permission", sessionId: last.sessionId, interactionId: last.permission.interactionId, generation: "8", decision: "allow" }
+    ]);
+    publish("2", tasks.map(task => task === last ? { ...task, permission: { ...task.permission, generation: "9" } } : task));
+    expect(small?.documents.at(-1)).toContain(`interactionId=${last.permission.interactionId}&generation=9`);
+    small?.navigate?.(permission!);
+    expect(actions).toHaveLength(2);
+    host.dispose();
   });
 
   it("uses hover intent and leave grace for deliberate ambient expansion", () => {
@@ -584,8 +631,8 @@ describe("macOS native task-status host", () => {
     pointer = { x: windows[1]!.bounds.x + 10, y: windows[1]!.bounds.y + 10 };
     clock.advance(NATIVE_TASK_STATUS_HOVER_INTENT_MS + 70);
     expect(windows.map((window) => window.bounds.height)).toEqual([46, 220]);
-    expect(decodeDataDocument(windows[0]?.documents.at(-1))).toContain("compact-row");
-    expect(decodeDataDocument(windows[1]?.documents.at(-1))).toContain("expanded-shell");
+    expect(windows[0]?.documents.at(-1)).toContain('class="compact-row');
+    expect(windows[1]?.documents.at(-1)).toContain('class="expanded-shell');
 
     pointer = { x: windows[0]!.bounds.x + 10, y: windows[0]!.bounds.y + 10 };
     clock.advance(50);
@@ -896,8 +943,3 @@ describe("macOS native task-status host", () => {
     expect(windows.every((window) => window.destroyed)).toBe(true);
   });
 });
-
-function decodeDataDocument(value: string | undefined): string {
-  if (value === undefined) return "";
-  return decodeURIComponent(value.slice(value.indexOf(",") + 1));
-}
