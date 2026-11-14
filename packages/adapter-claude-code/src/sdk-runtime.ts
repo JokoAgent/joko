@@ -510,11 +510,24 @@ export interface ClaudeTargetRuntime {
 }
 
 /** Adapter-owned resolver for Target-scoped remote Claude runtimes. */
+export interface ClaudeRemoteDerivationCleanup {
+  readonly operationId: string;
+  readonly sessionId: string;
+  readonly token: string;
+}
+
+export interface ClaudeRemoteDerivationCleanupCatalog {
+  readonly assertCurrent: () => void;
+  readonly storedSessions: Pick<ClaudeSdkStoredSessionRuntime, "recoverOperation" | "cleanupOperation">;
+}
+
 export interface ClaudeRemoteRuntimePort {
   /** The resolver composes a route-owned durable context and native consumption fence. */
   readonly supportsFreshContexts?: boolean;
   validateRegistration?(target: TargetDescriptor, assertCurrent: () => void): Promise<void>;
   resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<ClaudeTargetRuntime>;
+  resolveDerivationCleanup?(target: TargetDescriptor, cleanup: ClaudeRemoteDerivationCleanup,
+    signal: AbortSignal): Promise<ClaudeRemoteDerivationCleanupCatalog>;
   close(): Promise<void>;
 }
 

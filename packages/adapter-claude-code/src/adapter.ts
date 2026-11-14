@@ -127,6 +127,7 @@ import {
   type ClaudeSdkRuntime,
   type ClaudeSdkSessionInfo,
   type ClaudeSdkSessionMessage,
+  type ClaudeSdkStoredSessionRuntime,
   type ClaudeTargetRuntime,
   type ClaudeSdkUserMessage
 } from "./sdk-runtime.js";
@@ -2373,7 +2374,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
   async cleanupNativeSessionDerivation(
     lifecycle: NativeSessionDerivationLifecycle,
-    signal: AbortSignal
+    signal: AbortSignal,
+    claim?: { readonly token: string }
   ): Promise<void> {
     signal.throwIfAborted();
     const fresh = await this.#freshLifecycleRecord(lifecycle, signal);
@@ -2394,9 +2396,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       parseBindingRoute(lifecycle.sourceBinding);
       return;
     }
-    let scoped: ClaudeTargetRuntime;
+    let storedSessions: Pick<ClaudeSdkStoredSessionRuntime, "recoverOperation" | "cleanupOperation"> | undefined;
+    let assertCurrent: () => void = () => undefined;
     try {
-      scoped = await this.#targetRuntime(lifecycle.target, signal);
+      if (claim !== undefined && lifecycle.target.remoteWorkspace?.kind === "ssh"
+        && this.#remoteRuntimes?.resolveDerivationCleanup !== undefined) {
+        const scoped = await this.#remoteRuntimes.resolveDerivationCleanup(lifecycle.target, {
+          operationId: lifecycle.operationId, sessionId: lifecycle.sessionId, token: claim.token
+        }, signal);
+        storedSessions = scoped.storedSessions;
+        assertCurrent = scoped.assertCurrent;
+      } else {
+        const scoped = await this.#targetRuntime(lifecycle.target, signal);
+        storedSessions = scoped.runtime.storedSessions;
+        assertCurrent = scoped.assertCurrent;
+      }
     } catch {
       throw claudeCodeError(
         "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
@@ -2405,7 +2419,6 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         { stateMayHaveChanged: true, recovery: "Restore the exact Store owner before reconciling cleanup." }
       );
     }
-    const storedSessions = scoped.runtime.storedSessions;
     if (storedSessions === undefined) {
       throw claudeCodeError(
         "NATIVE_SESSION_DERIVATION_CLEANUP_UNKNOWN",
@@ -2444,7 +2457,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         ...(parsed === undefined ? {} : { expectedChildSessionId: parsed.nativeSessionId })
       });
       if (snapshot.state !== "cleaned") throw new Error("Stored derivation cleanup did not settle.");
-      scoped.assertCurrent();
+      assertCurrent();
       signal.throwIfAborted();
     } catch {
       throw claudeCodeError(
@@ -9099,11 +9112,12 @@ function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: Manag
   };
 }
 
-function operationUuid(operationId: string): string {
+export function claudeNativeDerivationOperationId(operationId: string): string {
   const digest = createHash("sha256").update("joko-claude-operation\0").update(operationId).digest("hex");
   const variant = ((Number.parseInt(digest[16] ?? "0", 16) & 0x3) | 0x8).toString(16);
   return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-${variant}${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
+const operationUuid = claudeNativeDerivationOperationId;
 
 function interactionId(runtime: NativeRuntime, requestId: string): string {
   return `claude-interaction-${createHash("sha256")

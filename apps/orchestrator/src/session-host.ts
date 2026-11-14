@@ -5871,7 +5871,8 @@ export class SessionHost {
 
   private async nativeSessionDerivationLifecycle(
     record: NativeSessionDerivationRecord,
-    expectedWorktree?: SessionWorktreeBinding
+    expectedWorktree?: SessionWorktreeBinding,
+    remoteCleanup = false
   ): Promise<NativeSessionDerivationLifecycle> {
     const target = this.#store.getTarget(record.targetId).descriptor;
     const sourceStored = this.#store.getSession(record.sourceSessionId), source = sourceStored.descriptor;
@@ -5888,6 +5889,7 @@ export class SessionHost {
       throw new StoreError("The native derivation lifecycle worktree authority changed.");
     }
     const worktree = record.worktree ?? expectedWorktree;
+    const registration = remoteCleanup ? { register: false } : undefined;
     let effectiveTarget = this.sourceRuntimeTarget({ ...target, backendId: record.backendId });
     if (effectiveTarget.workspaceRoot !== record.effectiveWorkspaceRoot && readOnlySourceRoot) {
       if (source.worktree !== undefined && (source.worktree.state !== "active"
@@ -5901,7 +5903,7 @@ export class SessionHost {
       }
       const activePath = worktree.remote === undefined
         ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree)
-        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree);
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree, registration);
       if (activePath === undefined || (target.remoteWorkspace === undefined) !== (worktree.remote === undefined)) {
         throw new StoreError("The native derivation lifecycle workspace authority changed.");
       }
@@ -5909,7 +5911,7 @@ export class SessionHost {
     } else if (worktree !== undefined
       && (worktree.remote === undefined
         ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree) === undefined
-        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree) === undefined)) {
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree, registration) === undefined)) {
       throw new StoreError("The native derivation lifecycle worktree is no longer active.");
     }
     if (record.state === "product_adopted") {
@@ -6079,13 +6081,19 @@ export class SessionHost {
       // shutdown. Startup cleanup instead acquires its own admission authority.
       if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(current.backendId);
       const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(current, adapter);
-      const lifecycle = await this.nativeSessionDerivationLifecycle(record, expectedWorktree);
+      const remoteCleanup = record.externalLifecycle && record.worktree?.remote?.binding.kind === "ssh"
+        && record.remoteWorktreePlan !== undefined && this.#store.getBackend(record.backendId).descriptor.adapterKind === "claude-code";
+      const lifecycle = await this.nativeSessionDerivationLifecycle(record, expectedWorktree, remoteCleanup);
       const call = this.beginNativeDerivationLifecycleCall(record.backendId);
       let deletion: Promise<void>;
       try {
         if (record.externalLifecycle) {
           claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: record.revision });
-          deletion = adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal);
+          const cleanupClaim = remoteCleanup
+            && (lifecycle.kind === "fork" || lifecycle.kind === "clone") ? { token: claim.token } : undefined;
+          deletion = cleanupClaim === undefined
+            ? adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal)
+            : adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal, cleanupClaim);
         } else {
           const binding = record.binding;
           if (binding === undefined) {

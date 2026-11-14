@@ -58,7 +58,9 @@ function fixture() {
   const storedTarget = { descriptor: sourceTarget, revision: targetRevision } as StoredTarget;
   const store = {
     getTarget: () => ({ descriptor: sourceTarget, revision: targetRevision }),
-    getOperation: () => ({ status: operationStatus }),
+    getOperation: () => ({ status: operationStatus, kind: "clone_session", bodyHash: "original-body" }),
+    getBackend: () => ({ descriptor: { instanceGeneration: 4 } }),
+    findNativeSessionDerivation: (id: string) => receipts.find(receipt => receipt.operationId === id),
     listSessions: () => sessions,
     listUnadoptedNativeSessionDerivations: () => receipts
   } as unknown as OperationalStore;
@@ -74,6 +76,25 @@ function fixture() {
       receipts = [];
     },
     failOperation: () => { operationStatus = "failed"; },
+    claimCleanup: () => {
+      operationStatus = "failed";
+      const remote = binding.remote!;
+      const plan: NonNullable<NativeSessionDerivationRecord["remoteWorktreePlan"]> = {
+        format: 1, leaseId: binding.leaseId, manifestId: remote.manifestId,
+        sessionId: "child", sourceSessionId: "parent", workspaceId: binding.workspaceId,
+        sourceCwd: sourceRemote.workspaceRoot, sourceSnapshot: `sha256:${"b".repeat(64)}`,
+        path: binding.path, repositoryRoot: binding.repositoryRoot, branch: binding.branch,
+        sourceRef: binding.sourceRef, sourceCommit: binding.sourceCommit, sourceStrategy: "explicit", sourceRefreshed: false,
+        storageRoot: "/srv/runtime/worktrees", remote,
+        authority: { targetId: remote.targetId, binding: remote.binding, targetRevision: remote.targetRevision,
+          executionIdentity: remote.executionIdentity }
+      };
+      receipts = [{ ...receipts[0]!, state: "cleanup_claimed", cleanupToken: "exact-claim", externalLifecycle: true,
+        expectedBodyHash: "original-body", backendId: sourceTarget.backendId, lifecycleOwnerGeneration: 4,
+        effectiveWorkspaceRoot: binding.path, remoteWorkspace: sourceRemote, sourceSessionId: "parent",
+        remoteWorktreePlan: plan
+      }];
+    },
     addConflictingSession: () => {
       sessions = [{ descriptor: {
         id: "other-child", targetId: sourceTarget.id, archived: false, worktree: binding
@@ -130,5 +151,23 @@ describe("remote Claude derived workspace authority", () => {
       remoteWorkspace: { ...sourceRemote, hostId: "other-host" }
     }, f.storedTarget)).rejects.toThrow(/Target authority is invalid/u);
     expect(f.assertActiveRemoteWorktree).not.toHaveBeenCalled();
+  });
+
+  it("cannot use a cleanup claim as ordinary runtime authority and rechecks the exact lease owner", async () => {
+    const f = fixture();
+    f.claimCleanup();
+    const claim = { operationId: "derive-child", sessionId: "child", token: "exact-claim" };
+    await expect(f.authorize(derivedTarget, f.storedTarget)).rejects.toThrow(/not uniquely owned/u);
+    await expect(f.authorize(derivedTarget, f.storedTarget, undefined, { ...claim, token: "other-claim" }))
+      .rejects.toThrow(/cleanup claim is invalid/u);
+    await expect(f.authorize(derivedTarget, f.storedTarget, undefined, { ...claim, sessionId: "other-child" }))
+      .rejects.toThrow(/cleanup claim is invalid/u);
+    expect(f.assertActiveRemoteWorktree).not.toHaveBeenCalled();
+    const cleanup = await f.authorize(derivedTarget, f.storedTarget, undefined, claim);
+    await cleanup.verifyExact();
+    expect(f.assertActiveRemoteWorktree).toHaveBeenCalledWith("child", binding, { register: false });
+    f.addConflictingSession();
+    await expect(cleanup.verifyExact()).rejects.toThrow(/cleanup claim is invalid/u);
+    expect(f.assertActiveRemoteWorktree).toHaveBeenCalledTimes(1);
   });
 });
