@@ -223,6 +223,24 @@ describe("registered project Skill source", () => {
     } finally { await f.cleanup(); }
   });
 
+  it("keeps captured runtime Skill authority through a display-name edit and retires it on trust ABA", async () => {
+    const f = await fixture();
+    try {
+      const original = await f.remote.captureSkillSourceAuthority("workspace");
+      const renamed = f.remote.changeDisplayName(original.registration, "Renamed remote project");
+      expect(renamed.displayName).toBe("Renamed remote project");
+      expect(() => original.assertCurrent()).not.toThrow();
+      expect(() => original.assertFilesCurrent()).not.toThrow();
+      const current = await f.remote.captureSkillSourceAuthority("workspace");
+      expect(current.registration).toBe(renamed);
+      expect(current.rootRegistrationId).toBe(original.rootRegistrationId);
+      const untrusted = f.remote.changeTrust(renamed, false, () => undefined).registration;
+      f.remote.changeTrust(untrusted, true, () => undefined);
+      expect(() => original.assertCurrent()).toThrow("workspace changed");
+      expect(() => current.assertFilesCurrent()).toThrow("workspace changed");
+    } finally { await f.cleanup(); }
+  });
+
   it("fences prepared approval and leased seeds on exact file authority, registration, trust and execution changes", async () => {
     const f = await fixture();
     try {

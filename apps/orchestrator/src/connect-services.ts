@@ -17091,6 +17091,10 @@ async function dispatchMutation(
         if (payload.value.displayName !== undefined) {
           descriptor = { ...descriptor, displayName: payload.value.displayName };
         }
+        const displayNameOnly = existing.descriptor.remoteWorkspace?.kind === "ssh"
+          && dependencies.store.getBackend(existing.descriptor.backendId).descriptor.adapterKind === "codex"
+          && payload.value.location === undefined && payload.value.pinned === undefined
+          && descriptor.displayName !== existing.descriptor.displayName;
         const execution = await host.mutate({
           operationId,
           connection,
@@ -17103,10 +17107,16 @@ async function dispatchMutation(
               ...(payload.value.pinned === undefined ? {} : { pinned: payload.value.pinned })
             });
             return { accepted: true, resultCase: "target", entityId: descriptor.id } satisfies OperationOutcome;
+          },
+          afterCommit: ({ replayed }) => {
+            if (!displayNameOnly || replayed) return;
+            const current = dependencies.store.getTarget(descriptor.id);
+            dependencies.workspaceService.changeRemoteDisplayName(targetWorkspaceRegistration(current).id, current.descriptor.displayName);
+            dependencies.sessionHost.adoptTargetDisplayNameChange(existing, current);
           }
         });
         const current = dependencies.store.getTarget(descriptor.id);
-        if (!isTargetDeleted(current)) await registerTargetWorkspace(dependencies, current);
+        if (!isTargetDeleted(current)) await registerTargetWorkspace(dependencies, current, { reuseExistingSsh: displayNameOnly });
         return presented(execution);
       });
     }

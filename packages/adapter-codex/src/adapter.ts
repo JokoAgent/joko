@@ -248,6 +248,7 @@ export interface CodexMcpOpenInput extends CodexMcpSessionInput {
 
 export interface CodexRemoteRuntimePort {
   validateRegistration?(target: TargetDescriptor, assertCurrent: () => void): Promise<void>;
+  adoptTargetDisplayNameChange?(targetId: string, previousRevision: bigint, currentRevision: bigint): void;
   resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime>;
   shutdown(): Promise<void>;
   forceShutdown?(): Promise<void>;
@@ -1148,6 +1149,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       return;
     }
     await this.#readScope(target, undefined, { startLocalHost: false });
+  }
+
+  adoptTargetDisplayNameChange(targetId: string, previousRevision: bigint, currentRevision: bigint): void {
+    this.#assertOpen();
+    this.#remoteRuntimes?.adoptTargetDisplayNameChange?.(targetId, previousRevision, currentRevision);
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {

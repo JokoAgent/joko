@@ -625,6 +625,8 @@ export interface BackendAdapter {
   inferNativeText?(input: NativeTextInferenceInput): Promise<string>;
   /** A prepared remote registration has a live source but no stored Target yet. */
   validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void>;
+  /** Adopt an authorized display-name-only edit into an already active runtime. */
+  adoptTargetDisplayNameChange?(targetId: string, previousRevision: bigint, currentRevision: bigint): void;
   /** Resolve and validate an opaque native reference without starting a runtime. */
   resolveNativeSessionReference?(
     nativeReference: string,

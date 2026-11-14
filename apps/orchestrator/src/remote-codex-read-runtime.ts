@@ -38,9 +38,11 @@ const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 interface ResolverEntry {
   readonly key: string;
   readonly targetId: string;
-  readonly targetRevision: bigint;
-  readonly targetSignature: string;
-  readonly storedSignature: string;
+  readonly target: {
+    revision: bigint;
+    requested: TargetDescriptor;
+    stored: TargetDescriptor;
+  };
   readonly authority: RemoteProcessAuthority;
   readonly runtime: CodexRemoteRuntime;
 }
@@ -90,8 +92,8 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     const signature = targetSignature(target);
     const existing = this.#entries.get(key);
     if (existing !== undefined
-      && existing.targetRevision === stored.revision
-      && existing.targetSignature === signature) {
+      && existing.target.revision === stored.revision
+      && targetSignature(existing.target.requested) === signature) {
       try {
         existing.runtime.assertCurrent();
         return existing.runtime;
@@ -103,12 +105,30 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     }
     const activeFlight = this.#flights.get(key);
     if (activeFlight !== undefined) return activeFlight;
-    const flight = this.#resolveFresh(target, stored, signature, key, signal);
+    const flight = this.#resolveFresh(target, stored, key, signal);
     this.#flights.set(key, flight);
     try {
       return await flight;
     } finally {
       if (this.#flights.get(key) === flight) this.#flights.delete(key);
+    }
+  }
+
+  adoptTargetDisplayNameChange(targetId: string, previousRevision: bigint, currentRevision: bigint): void {
+    this.#assertOpen();
+    const current = this.#store.getTarget(targetId);
+    if (current.revision !== currentRevision || current.descriptor.remoteWorkspace?.kind !== "ssh") return;
+    for (const entry of this.#entries.values()) {
+      const host = entry.runtime.host;
+      if (entry.targetId !== targetId || entry.target.revision !== previousRevision
+        || host.initializeResult === undefined || !host.isActiveGeneration(host.generation)
+        || current.descriptor.displayName === entry.target.stored.displayName
+        || targetSignature({ ...current.descriptor, displayName: entry.target.stored.displayName }) !== targetSignature(entry.target.stored)) continue;
+      try { entry.authority.assertCurrent(); }
+      catch { continue; }
+      entry.target.requested = { ...entry.target.requested, displayName: current.descriptor.displayName };
+      entry.target.stored = current.descriptor;
+      entry.target.revision = currentRevision;
     }
   }
 
@@ -135,7 +155,6 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   async #resolveFresh(
     target: TargetDescriptor,
     stored: StoredTarget,
-    signature: string,
     key: string,
     signal?: AbortSignal
   ): Promise<CodexRemoteRuntime> {
@@ -157,13 +176,13 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
     const executionDomain = executionDomainFor(authority.executionIdentity, installation.profileRoot);
     const profileKey = createHash("sha256").update(executionDomain, "utf8").digest("hex");
-    const storedSignature = targetSignature(stored.descriptor);
+    const targetState = { revision: stored.revision, requested: target, stored: stored.descriptor };
     let entry: ResolverEntry;
     const assertCurrent = (): void => {
       this.#assertOpen();
       const current = this.#store.getTarget(target.id);
-      if (current.revision !== stored.revision
-        || targetSignature(current.descriptor) !== storedSignature
+      if (current.revision !== targetState.revision
+        || targetSignature(current.descriptor) !== targetSignature(targetState.stored)
         || this.#entries.get(key) !== entry) {
         throw remoteRuntimeFault("The remote Codex Target authority changed.");
       }
@@ -233,9 +252,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     entry = Object.freeze({
       key,
       targetId: target.id,
-      targetRevision: stored.revision,
-      targetSignature: signature,
-      storedSignature,
+      target: targetState,
       authority,
       runtime
     });

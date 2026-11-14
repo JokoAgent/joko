@@ -1657,6 +1657,20 @@ export class SessionHost {
     }
   }
 
+  /** Preserve an active native runtime only across this exact committed display-name edit. */
+  adoptTargetDisplayNameChange(previous: StoredTarget, current: StoredTarget): void {
+    this.#assertOpen();
+    if (previous.revision >= current.revision || current.descriptor.remoteWorkspace?.kind !== "ssh"
+      || previous.descriptor.displayName === current.descriptor.displayName
+      || operationBodyHash({ ...previous.descriptor, displayName: current.descriptor.displayName }) !== operationBodyHash(current.descriptor)
+      || operationBodyHash(previous.metadata) !== operationBodyHash(current.metadata)
+      || this.#store.getTarget(current.descriptor.id).revision !== current.revision) return;
+    const adapter = this.requireAdapter(current.descriptor.backendId);
+    const generation = this.requireAdapterGeneration(current.descriptor.backendId, adapter);
+    this.assertCurrentAdapterGeneration(current.descriptor.backendId, adapter, generation);
+    adapter.adoptTargetDisplayNameChange?.(current.descriptor.id, previous.revision, current.revision);
+  }
+
   /** Validate adapter ownership and workspace safety without mutating product state. */
   async validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void> {
     this.#assertOpen();

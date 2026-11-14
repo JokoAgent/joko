@@ -32,7 +32,8 @@ const serialize = (value: unknown): string => JSON.stringify(value, (_key, item:
 const profile = "/home/test/.joko/runtime/v1/codex-home";
 
 describe("registered remote project Skill input composition", () => {
-  it.each(["idle", "active"] as const)("keeps the Run through repeated project selection and handles its %s mount on shutdown", async (shutdownState) => {
+  it.each([["selection", "idle"], ["selection", "active"], ["rename", "idle"], ["rename", "active"]] as const)(
+    "keeps the original Run through project %s and handles its %s mount on shutdown", async (projectEdit, shutdownState) => {
     const root = await mkdtemp(join(tmpdir(), "joko-remote-skill-chain-"));
     const database = join(root, "store.db");
     const store = new OperationalStore(database);
@@ -152,6 +153,7 @@ describe("registered remote project Skill input composition", () => {
               resourceId, displayText: "@Public-report", discoveredRevision: loaded.discoveredRevision, resourceVersion: loaded.resourceVersion,
               runtimeGeneration: loaded.runtimeGeneration } } }], mentionRanges: [{ start: 4, end: 18, mentionIndex: 0 }] } } } } });
       await expect.poll(() => daemon.messages.filter(message => message.method === "turn/start").length, { timeout: 10_000 }).toBe(1);
+      await expect.poll(() => store.getQueueItem(queueId).state, { timeout: 10_000 }).toBe("backend_accepted");
       expect(queueId).not.toBe("");
       expect(daemon.messages.find(message => message.method === "turn/start")!.params).toMatchObject({
         input: expect.arrayContaining([{ type: "skill", name: "native-report", path: mountedPath }]) });
@@ -162,13 +164,36 @@ describe("registered remote project Skill input composition", () => {
         expect(serialize(publicValue)).not.toContain(privateBody); expect(serialize(publicValue)).not.toContain(mountedPath);
       }
       const targets = createClient(contract.TargetService, transport);
-      const selected = await targets.prepareTargetWorkspace({
-        targetId: target.id, expectedTargetRevision: { value: store.getTarget(target.id).revision }
-      });
-      expect(selected.workspace?.workspaceId).toBe("remote-workspace");
+      const originalRunId = store.getQueueItem(queueId).runId!;
+      const originalAttemptId = store.getRun(originalRunId).descriptor.activeAttemptId;
+      const originalBinding = store.getSession(sessionId).descriptor.binding;
+      if (projectEdit === "rename") {
+        await operations.submitOperation({ operationId: "rename-active-remote-project", connectionId: paired.connection.id,
+          mutation: { preconditions: [{ entity: { kind: contract.EntityKind.TARGET, id: target.id },
+            expectedRevision: { value: store.getTarget(target.id).revision } }],
+            payload: { case: "updateTarget", value: { targetId: target.id, displayName: "Renamed remote project" } } } });
+        expect(store.getTarget(target.id).descriptor.displayName).toBe("Renamed remote project");
+        expect(workspaceService.requireWorkspace("remote-workspace").displayName).toBe("Renamed remote project");
+      }
+      const selectProject = async () => {
+        const selected = await targets.prepareTargetWorkspace({
+          targetId: target.id, expectedTargetRevision: { value: store.getTarget(target.id).revision }
+        });
+        expect(selected.workspace?.workspaceId).toBe("remote-workspace");
+        expect(daemon.messages.filter(message => message.method === "initialize")).toHaveLength(1);
+      };
+      if (projectEdit === "selection" || shutdownState === "active") await selectProject();
+      expect(store.getRun(originalRunId).descriptor.activeAttemptId).toBe(originalAttemptId);
+      expect(store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
       if (shutdownState === "idle") {
-        await daemon.fake.completeTurn(store.getSession(sessionId).descriptor.binding.nativeSessionId!);
+        const text = "Original remote Run completed after the project edit";
+        await daemon.fake.completeTurn(originalBinding.nativeSessionId!, text);
         await expect.poll(() => store.getQueueItem(queueId).state, { timeout: 10_000 }).toBe("completed");
+        expect(store.getQueueItem(queueId).runId).toBe(originalRunId);
+        expect(store.getRun(originalRunId).descriptor.state).toBe("completed");
+        expect(store.listEvents({ sessionId }).filter(event => event.payload.type === "message_complete"
+          && event.payload.role === "assistant" && serialize(event.payload).includes(text))).toHaveLength(1);
+        if (projectEdit === "rename") await selectProject();
       }
       const releasesBeforeShutdown = daemon.messages.filter(message => message.method === "thread/unsubscribe").length;
       await host.dispose();
