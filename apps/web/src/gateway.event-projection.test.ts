@@ -2644,11 +2644,12 @@ describe("incremental event projection", () => {
     const terminal = create(EventSchema, { eventId: "terminal", identity, cursor: { generation: 14n, sequence: 2n }, payload });
     const raw = create(SnapshotSchema, { generation: 14n, resumeCursor: { generation: 14n, sequence: 1n }, timeline: [delta] });
     for (const changed of [{ runId: "other" }, { attemptId: "other" }, { generation: 8n }]) {
-      const stale = create(EventSchema, { ...terminal, identity: { ...identity, ...changed } });
+      const stale = create(EventSchema, { eventId: terminal.eventId, identity: { ...identity, ...changed }, cursor: terminal.cursor, payload });
       expect(projectSnapshotEvent(raw, mapSnapshot(raw), stale).snapshot.timelineBySession.get("session-1")?.[0])
         .toMatchObject({ id: "native-item-A", text: "Received partial text.", streaming: true });
     }
-    const recoverable = create(EventSchema, { ...terminal, payload: { kind: { case: "recoverableError", value: { error: { message: "Retrying" } } } } });
+    const recoverable = create(EventSchema, { eventId: terminal.eventId, identity, cursor: terminal.cursor,
+      payload: { kind: { case: "recoverableError", value: { error: { message: "Retrying" } } } } });
     expect(projectSnapshotEvent(raw, mapSnapshot(raw), recoverable).snapshot.timelineBySession.get("session-1")?.[0]?.streaming).toBe(true);
     const ended = projectSnapshotEvent(raw, mapSnapshot(raw), terminal);
     const item = ended.snapshot.timelineBySession.get("session-1")?.[0];
@@ -2660,8 +2661,8 @@ describe("incremental event projection", () => {
         nativeIdentity: { entryId: "native-item-B" }, blocks: [{ content: { case: "text", value: "Different native item." } }] } } } });
     expect(projectSnapshotEvent(ended.rawSnapshot, ended.snapshot, nextMessage).snapshot.timelineBySession.get("session-1")?.[0])
       .toEqual(item);
-    const otherService = create(SnapshotSchema, { ...raw, generation: 15n, resumeCursor: { generation: 15n, sequence: 1n } });
-    const laterTerminal = create(EventSchema, { ...terminal, cursor: { generation: 15n, sequence: 2n } });
+    const otherService = create(SnapshotSchema, { generation: 15n, resumeCursor: { generation: 15n, sequence: 1n }, timeline: raw.timeline });
+    const laterTerminal = create(EventSchema, { eventId: terminal.eventId, identity, cursor: { generation: 15n, sequence: 2n }, payload });
     expect(projectSnapshotEvent(otherService, mapSnapshot(otherService), laterTerminal).snapshot.timelineBySession.get("session-1")?.[0]?.streaming).toBe(true);
   });
 

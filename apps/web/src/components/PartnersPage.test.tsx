@@ -204,7 +204,7 @@ describe("PartnersPage", () => {
   it("lets a waiting imported Partner leave missing defaults and save an explicitly chosen model", async () => {
     vi.useFakeTimers();
     const { defaultCapabilities: _defaults, ...missingDefaults } = directory();
-    let current = partner({ canonicalSessionId: undefined, initializationState: "error", initializationErrorCode: "model_unavailable",
+    let current = partner({ canonicalSessionId: undefined, initializationState: "error", initializationErrorCode: "modelUnavailable",
       usesDirectoryDefaults: true, capabilities: { ...capabilities(), modelChain: [] } });
     const updatePartner = vi.fn<AppController["updatePartner"]>(async (_id, _revision, patch) => ({ partner: current = {
       ...current, usesDirectoryDefaults: patch.usesDirectoryDefaults ?? current.usesDirectoryDefaults,
