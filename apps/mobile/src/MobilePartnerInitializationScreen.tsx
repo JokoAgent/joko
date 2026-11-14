@@ -14,15 +14,16 @@ interface InitializationState {
   readonly error?: "read" | "retry" | "open" | "configure";
 }
 
-export function MobilePartnerInitializationScreen({ partnerId, transport, colors, locale, onBack, onOpenTask }: {
+export function MobilePartnerInitializationScreen({ partnerId, transport, foreground, colors, locale, onBack, onOpenTask }: {
   readonly partnerId: string;
   readonly transport?: MobilePartnerInitializationTransport;
+  readonly foreground: boolean;
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
   readonly onBack: () => void;
   readonly onOpenTask: (sessionId: string) => void;
 }) {
-  const binding = transport ? `${transport.ownerKey}\u001f${partnerId}` : undefined;
+  const binding = foreground && transport ? `${transport.ownerKey}\u001f${partnerId}` : undefined;
   const bindingRef = useRef(binding); bindingRef.current = binding;
   const transportRef = useRef(transport); transportRef.current = transport;
   const requestRef = useRef<AbortController | undefined>(undefined);
@@ -75,7 +76,9 @@ export function MobilePartnerInitializationScreen({ partnerId, transport, colors
   useEffect(() => {
     if (!current || !partner || busy || state.loading || error) return;
     if (partner.initializationState === "ready") { if (!attemptedOpenRef.current) run("open"); return; }
-    if (partner.initializationState !== "pending") return;
+    const waitingForModel = partner.initializationState === "error" && partner.initializationErrorCode === "modelUnavailable"
+      && partner.canonicalSessionId === undefined;
+    if (partner.initializationState !== "pending" && !waitingForModel) return;
     const timer = setTimeout(() => run("read"), 2_500);
     return () => clearTimeout(timer);
   }, [binding, state, busy]);

@@ -478,7 +478,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
     attachments={groupAttachments?.ownerKey === groups.view.api.ownerKey ? groupAttachments : undefined} onBack={() => setGroupEntry(undefined)} />;
   if (initialization) return <MobilePartnerInitializationScreen partnerId={initialization.partnerId}
     transport={initializationTransport?.ownerKey === initialization.ownerKey ? initializationTransport : undefined}
-    colors={colors} locale={locale} onBack={leaveInitialization} onOpenTask={onOpenTask} />;
+    foreground={rosterActive} colors={colors} locale={locale} onBack={leaveInitialization} onOpenTask={onOpenTask} />;
   return <View style={[styles.screen, { backgroundColor: colors.background }]} testID="partnerDirectory.screen">
     <View style={styles.header}>
       <Action label={mobileMessage(locale, "common.back")} colors={colors} onPress={onBack} />

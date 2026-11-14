@@ -606,6 +606,45 @@ describe("MobilePartnerDirectoryScreen", () => {
     await render(active, { ...initialization, ownerKey: "another-node" });
     expect((container.querySelector('[aria-label="Open Pending\'s task"]') as HTMLButtonElement).disabled).toBe(true);
   });
+  it("opens the same Partner when a model is configured elsewhere while Mobile remains on setup", async () => {
+    vi.useFakeTimers();
+    try {
+      const active = transport();
+      const failed = { ...pending, initializationState: "error" as const, invitationStage: "failed" as const,
+        initializationErrorCode: "modelUnavailable" as const };
+      const ready = profile({ partnerId: failed.partnerId, displayName: failed.displayName, revision: failed.revision + 1n,
+        profileVersion: failed.profileVersion + 1n });
+      vi.mocked(active.list).mockResolvedValue({ ...catalog, partners: [failed] });
+      const load = vi.fn(async (): Promise<MobilePartnerDirectoryProfile> => failed);
+      const initialization: MobilePartnerInitializationTransport = { ownerKey: active.ownerKey, load,
+        retry: vi.fn(), configure: vi.fn(), open: vi.fn(async (partner: MobilePartnerDirectoryProfile) => ({ sessionId: partner.canonicalSessionId! })) };
+      await render(active, initialization);
+      await press("View Pending's setup");
+      expect(container.textContent).toContain(mobileMessage("en", "partnerInitialization.reason.modelUnavailable"));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+      expect(load).toHaveBeenCalledTimes(2);
+      expect(initialization.open).not.toHaveBeenCalled();
+
+      await render(active, initialization, undefined, undefined, undefined, undefined, undefined, undefined, { rosterActive: false });
+      await act(async () => { await vi.advanceTimersByTimeAsync(7500); });
+      expect(load).toHaveBeenCalledTimes(2);
+      expect(onOpenTask).not.toHaveBeenCalled();
+
+      await render(active, initialization);
+      expect(load).toHaveBeenCalledTimes(3);
+      load.mockResolvedValue(ready);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+      expect(load).toHaveBeenCalledTimes(4);
+      expect(load).toHaveBeenLastCalledWith(failed.partnerId, expect.any(AbortSignal));
+      expect(initialization.open).toHaveBeenCalledExactlyOnceWith(ready, expect.any(AbortSignal));
+      expect(onOpenTask).toHaveBeenCalledExactlyOnceWith(ready.canonicalSessionId);
+      expect(initialization.retry).not.toHaveBeenCalled();
+      expect(initialization.configure).not.toHaveBeenCalled();
+      expect(active.open).not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(7500); });
+      expect(load).toHaveBeenCalledTimes(4);
+    } finally { vi.useRealTimers(); }
+  });
   it("shows activity, disables unavailable entries, searches and opens an exact Partner task", async () => {
     const active = transport();
     await render(active);
