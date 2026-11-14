@@ -44,6 +44,8 @@ export class ScriptedRpcTransport implements RpcTransport {
       if (!this.#running || options.signal?.aborted) throw new TransportFault("closed", "The scripted request retired during preparation.");
       options.beforeDispatch?.();
     }
+    if (!this.#running || options.signal?.aborted) throw new TransportFault("closed", "The scripted request retired before write.");
+    options.onDispatch?.();
     this.requests.push({ method, params, options });
     return this.#handler(method, params, options);
   }

@@ -2094,6 +2094,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }, {
         mutation: true,
         signal: dispatchSignal,
+        ...(yieldDispatch === undefined && context.onNativeTurnDispatch !== undefined
+          ? { onDispatch: context.onNativeTurnDispatch }
+          : {}),
         ...(beforeDispatchAsync === undefined ? {} : { beforeDispatchAsync }),
         beforeDispatch: () => {
           durableHistory?.assertCurrent();

@@ -10,12 +10,100 @@ import { expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
-  createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
+  abortRunMutation, createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
   scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
 } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it("stops the original Codex Run before the first native turn write and leaves the queue paused", async () => {
+  const backendId = "codex-pre-dispatch-stop";
+  const native = new FakeCodexAppServer();
+  let enteredPreparation = false;
+  let releasePreparation!: () => void;
+  const holdPreparation = new Promise<void>(resolveHold => { releasePreparation = resolveHold; });
+  const host = new AppServerHost({ transportFactory: () => {
+    const transport = native.createTransport();
+    const request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => {
+      if (method !== "turn/start" || enteredPreparation) return request(method, params, options);
+      const prepare = options?.beforeDispatchAsync;
+      if (prepare === undefined) throw new Error("Expected a durable write fence for the first Codex turn.");
+      return request(method, params, {
+        ...options,
+        beforeDispatchAsync: async (signal) => {
+          await prepare(signal);
+          enteredPreparation = true;
+          await holdPreparation;
+        }
+      });
+    };
+    return transport;
+  } });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Stop fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Codex Stop owner");
+    const mutate = (mutation: Parameters<typeof submit>[2], operationId?: string) =>
+      submit(clients.operation, connectionId, mutation, operationId);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const { store, sessionHost } = fixture.application;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const generation = BigInt(binding.generation);
+    const originalText = "Stop this original input before its native write.";
+    const laterText = "Only this queued input may reach Codex.";
+    const firstRunId = queueRunIdFrom(await mutate(sendInputMutation(sessionId, generation, originalText)));
+    await waitFor(async () => enteredPreparation, Boolean, "the original Codex native write preparation");
+    const firstQueue = store.findQueueItemByRunId(sessionId, firstRunId);
+    if (firstQueue?.attemptId === undefined) throw new Error("The original Codex input has no claimed Attempt.");
+    expect(firstQueue.state).toBe("dispatching");
+    expect(store.findSetting("session", sessionId, "native.dispatch.recovery")?.value).toMatchObject({
+      entries: [expect.objectContaining({ runId: firstRunId, queueItemId: firstQueue.id, attemptId: firstQueue.attemptId })]
+    });
+    const controls = async () => (await clients.queue.getQueueControl({ sessionId })).queueControl!;
+    const nextRunId = queueRunIdFrom(await mutate(sendInputMutation(sessionId, generation, laterText)));
+    expect((await mutate(pauseQueueMutation(await controls()))).state).toBe(OperationState.SUCCEEDED);
+    expect((await clients.run.getRun({ runId: firstRunId })).run?.state).toBe(RunState.QUEUED);
+    const abort = abortRunMutation(firstRunId);
+    const stopId = randomUUID();
+    const stopped = await mutate(abort, stopId);
+    expect(stopped.state).toBe(OperationState.SUCCEEDED);
+    expect((await clients.operation.getOperation({ operationId: stopId })).operation).toEqual(stopped);
+    expect((await clients.run.getRun({ runId: firstRunId })).run?.state).toBe(RunState.ABORTED);
+    expect(store.getQueueItem(firstQueue.id).state).toBe("cancelled");
+    expect(store.getAttempt(firstQueue.attemptId).descriptor.endedAt).toEqual(expect.any(Number));
+    expect(store.findSetting("session", sessionId, "native.dispatch.recovery")).toBeUndefined();
+    expect(store.getQueueControl(sessionId).paused).toBe(true);
+    expect((await clients.run.getRun({ runId: nextRunId })).run?.state).toBe(RunState.QUEUED);
+    const turnWrites = () => native.transport?.requests.filter(request =>
+      request.method === "turn/start" || request.method === "turn/interrupt") ?? [];
+    expect(turnWrites()).toHaveLength(0);
+    releasePreparation();
+    await waitFor(async () => sessionHost.observeQueueDispatch(firstQueue),
+      preparation => preparation === undefined, "the original Codex preparation to retire");
+    expect(turnWrites()).toHaveLength(0);
+    expect(await mutate(abort, stopId)).toEqual(stopped);
+    expect((await mutate(resumeQueueMutation(await controls()))).state).toBe(OperationState.SUCCEEDED);
+    const writes = await waitFor(async () => turnWrites(), requests => requests.length > 0, "the next Codex turn write");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.method).toBe("turn/start");
+    expect(JSON.stringify(writes[0]?.params)).toContain(laterText);
+    expect(JSON.stringify(writes[0]?.params)).not.toContain(originalText);
+    await native.completeTurn(binding.nativeSessionId!, "The next Codex turn completed.");
+    await waitFor(() => clients.run.getRun({ runId: nextRunId }), value => value.run?.state === RunState.SUCCEEDED,
+      "the resumed Codex Run to complete");
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    expect(turnWrites()).toHaveLength(1);
+  } finally {
+    releasePreparation();
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
 
 it("honors a Codex schedule admitted before model disablement and rejects later runs on the same route", async () => {
   const backendId = "codex-scheduled-model";
