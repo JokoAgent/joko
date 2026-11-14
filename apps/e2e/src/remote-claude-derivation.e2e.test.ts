@@ -282,14 +282,20 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
       }
       expect(recovered.store.getOperation(operationId).status).toBe("started");
       expect(recovered.store.findNativeSessionDerivation(operationId)?.state).toBe(boundary === "recorded" ? "recorded" : "prepared");
-      checkpoints.push({ operationId, sessionId, worktree, childId, nativeOperationId });
+      checkpoints.push({ operationId, sessionId, worktree, childId, nativeOperationId, boundary });
     }
     const beforeCleanup = remote.managerCalls.length;
+    const beforeCheckout = remote.checkoutCalls.length;
     await running.close();
     running = await start(config, remote);
     for (const checkpoint of checkpoints) {
       expect(running.application.store.getOperation(checkpoint.operationId).status).toBe("failed");
-      expect(running.application.store.findNativeSessionDerivation(checkpoint.operationId)).toMatchObject({
+      const diagnostics = running.application.store.listDiagnostics({ component: "native_session_derivation_cleanup", limit: 6 })
+        .map(({ code, message }) => ({ code, message }));
+      expect(running.application.store.findNativeSessionDerivation(checkpoint.operationId), JSON.stringify({
+        checkpoint: checkpoint.boundary, diagnostics, manager: remote.managerCalls.slice(beforeCleanup),
+        checkout: remote.checkoutCalls.slice(beforeCheckout), cleanupOperations: remote.cleanupOperations.length
+      })).toMatchObject({
         state: "cleaned", cleanupToken: expect.any(String), worktree: checkpoint.worktree
       });
       expect(remote.releasedPaths.filter(path => path === checkpoint.worktree.path)).toHaveLength(1);
