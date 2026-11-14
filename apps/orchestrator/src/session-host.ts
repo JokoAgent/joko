@@ -15861,6 +15861,10 @@ export class SessionHost {
               blob: store.getArtifact(artifact.id).blob, sessionId, ...(runId === undefined ? {} : { runId })
             });
             const selected = adopted.blob;
+            if (target.remoteWorkspace === undefined && selected.mimeType.startsWith("image/")
+              && store.getBackend(current.descriptor.backendId).descriptor.adapterKind === "pi") {
+              store.markBackendImageArtifact(selected.id);
+            }
             if (existing !== undefined) store.releaseArtifactStaging([artifact.id]);
             if (localSource !== undefined && !store.hasArtifactSource(selected.id)) {
               store.putArtifactSource({

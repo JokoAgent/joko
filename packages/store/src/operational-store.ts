@@ -17839,13 +17839,25 @@ export class OperationalStore {
     `).get(nonBlank(artifactId, "Artifact ID")) !== undefined;
   }
 
+  /** Preserve the native producer's identity independently of the task timeline. */
+  markBackendImageArtifact(id: string): void {
+    this.requireActiveRevision();
+    this.database.prepare(`
+      UPDATE artifacts
+      SET metadata_json = json_set(metadata_json, '$.backendImage', json('true'))
+      WHERE id = ? AND session_id IS NOT NULL AND mime_type LIKE 'image/%' AND deleted_at IS NULL
+        AND json_type(metadata_json, '$.expiresAt') IS NULL
+        AND json_type(metadata_json, '$.backendImage') IS NULL
+    `).run(id);
+  }
+
   /** Reuse a plain committed output only within its original product Session. */
   findSessionArtifactByStorage(sessionId: string, storageKey: string, mimeType: string, fileName: string | undefined): ArtifactRecord | undefined {
     this.assertOpen();
     const row = this.database.prepare(`
       SELECT * FROM artifacts
       WHERE session_id = ? AND storage_key = ? AND mime_type = ? AND file_name IS ?
-        AND deleted_at IS NULL AND metadata_json = '{}'
+        AND deleted_at IS NULL AND json_remove(metadata_json, '$.backendImage', '$.lastStorageAccessAt') = '{}'
       ORDER BY created_at, id LIMIT 1
     `).get(nonBlank(sessionId, "Artifact Session ID"), nonBlank(storageKey, "Artifact storage key"), mimeType, fileName ?? null) as Row | undefined;
     return row === undefined ? undefined : artifactFromRow(row);
@@ -17928,6 +17940,109 @@ export class OperationalStore {
       `SELECT COUNT(*) AS count FROM artifacts AS artifact ${filter.where}`
     ).get(...filter.params) as Row;
     return numberValue(row["count"]);
+  }
+
+  /** Record use of an adopted local Pi image for the explicit storage cleanup. */
+  recordArtifactStorageAccess(id: string, at: number): void {
+    this.assertOpen();
+    const candidates = `
+      FROM artifacts AS artifact
+      JOIN product_sessions AS session ON session.id = artifact.session_id
+      JOIN backends AS backend ON backend.id = session.backend_id
+      WHERE artifact.storage_key = (SELECT storage_key FROM artifacts WHERE id = ? AND deleted_at IS NULL)
+        AND artifact.deleted_at IS NULL AND artifact.mime_type LIKE 'image/%'
+        AND json_type(artifact.metadata_json, '$.expiresAt') IS NULL
+        AND COALESCE(json_extract(artifact.metadata_json, '$.lastStorageAccessAt'), artifact.created_at) < ?
+        AND session.remote_location_kind IS NULL AND backend.adapter_kind = 'pi'
+    `;
+    if (this.database.prepare(`SELECT 1 ${candidates} LIMIT 1`).get(id, at) === undefined) return;
+    this.write(() => {
+      // Advance the Store revision so a concurrent history copy cannot discard
+      // the access. Artifact content and authority keep their own revision.
+      this.database.prepare(`
+        UPDATE artifacts
+        SET metadata_json = json_set(metadata_json, '$.lastStorageAccessAt', ?)
+        WHERE id IN (SELECT artifact.id ${candidates})
+      `).run(at, id, at);
+    });
+  }
+
+  /** Only completed portable replacements can retire their old native image references. */
+  listReclaimablePortableReplacementImages(olderThan: number): string[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      WITH candidates AS MATERIALIZED (
+        SELECT artifact.id, artifact.sha256
+        FROM portable_replacement_cleanups AS cleanup
+        JOIN product_sessions AS replaced ON replaced.id = cleanup.replaced_session_id
+        JOIN backends AS backend ON backend.id = replaced.backend_id
+        JOIN artifacts AS artifact ON artifact.session_id = replaced.id
+        WHERE cleanup.native_state = 'completed' AND cleanup.worktree_state = 'completed'
+          AND replaced.deleted_at IS NOT NULL AND replaced.remote_location_kind IS NULL
+          AND replaced.hidden = 0 AND replaced.automation_schedule_id IS NULL
+          AND replaced.derivation_kind IS NULL AND backend.adapter_kind = 'pi'
+          AND artifact.deleted_at IS NULL AND artifact.mime_type LIKE 'image/%'
+          AND json_type(artifact.metadata_json, '$.expiresAt') IS NULL
+          AND artifact.created_at < ?
+          AND COALESCE(json_extract(artifact.metadata_json, '$.lastStorageAccessAt'), artifact.created_at) < ?
+          AND (json_extract(artifact.metadata_json, '$.backendImage') = 1 OR EXISTS (
+            SELECT 1 FROM events AS produced
+            WHERE produced.session_id = replaced.id AND produced.backend_id = replaced.backend_id
+              AND produced.target_id = replaced.target_id
+              AND produced.id GLOB 'backend-artifact-*'
+              AND json_extract(produced.payload_json, '$.payload.type') = 'artifact'
+              AND json_extract(produced.payload_json, '$.payload.purpose') = 'backend_artifact'
+              AND json_extract(produced.payload_json, '$.payload.artifact.id') = artifact.id
+              AND json_extract(produced.payload_json, '$.payload.artifact.sha256') = artifact.sha256
+          ))
+      )
+      SELECT candidate.id
+      FROM candidates AS candidate
+      WHERE NOT EXISTS (SELECT 1 FROM artifact_relations WHERE child_id = candidate.id)
+        AND NOT EXISTS (SELECT 1 FROM review_attachments WHERE blob_id = candidate.id)
+        AND NOT EXISTS (SELECT 1 FROM messaging_request_artifacts WHERE artifact_id = candidate.id)
+        AND NOT EXISTS (
+          SELECT 1 FROM queue_items AS item
+          JOIN product_sessions AS receiver ON receiver.id = item.session_id
+          WHERE receiver.deleted_at IS NULL AND instr(item.body_json, candidate.id) > 0
+            AND NOT EXISTS (
+              SELECT 1 FROM session_reset_boundaries AS reset
+              WHERE reset.session_id = receiver.id AND item.rowid <= reset.cleared_through_queue_rowid
+            )
+            AND (
+              EXISTS (SELECT 1 FROM json_each(item.body_json, '$.images') AS image
+                WHERE json_extract(item.body_json, image.fullkey || '.blob.id') = candidate.id)
+              OR EXISTS (SELECT 1 FROM json_each(item.body_json, '$.files') AS file
+                WHERE json_extract(item.body_json, file.fullkey || '.blob.id') = candidate.id)
+            )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM schedules AS schedule, json_tree(schedule.prompt_json) AS part
+          WHERE instr(schedule.prompt_json, candidate.id) > 0
+            AND part.key = 'blob' AND part.type = 'object'
+            AND json_extract(schedule.prompt_json, part.fullkey || '.id') = candidate.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM messaging_deliveries AS delivery, json_each(delivery.payload_json, '$.files') AS file
+          WHERE delivery.status NOT IN ('sent', 'cancelled') AND instr(delivery.payload_json, candidate.id) > 0
+            AND json_extract(delivery.payload_json, file.fullkey || '.blob.id') = candidate.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM events AS event
+          JOIN product_sessions AS receiver ON receiver.id = event.session_id
+          LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+          JOIN json_tree(event.payload_json, '$.payload') AS blob
+          WHERE receiver.deleted_at IS NULL AND tombstone.event_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM session_reset_boundaries AS reset
+              WHERE reset.session_id = receiver.id AND event.global_cursor <= reset.cleared_through_event_cursor
+            )
+            AND instr(event.payload_json, candidate.id) > 0
+            AND blob.key IN ('blob', 'artifact') AND blob.type = 'object'
+            AND json_extract(event.payload_json, blob.fullkey || '.id') = candidate.id
+            AND json_extract(event.payload_json, blob.fullkey || '.sha256') = candidate.sha256
+        )
+    `).all(olderThan, olderThan) as Row[]).map((row) => stringValue(row["id"]));
   }
 
   /**
@@ -22271,6 +22386,11 @@ function toolLeaseFromRow(row: Row): ToolLeaseRecord {
 }
 
 function artifactFromRow(row: Row): ArtifactRecord {
+  const storedMetadata = parseJson<unknown>(stringValue(row["metadata_json"]));
+  // Retention bookkeeping does not change the public metadata or content fingerprint.
+  const metadata = isRecord(storedMetadata) && (Object.hasOwn(storedMetadata, "backendImage") || Object.hasOwn(storedMetadata, "lastStorageAccessAt"))
+    ? Object.fromEntries(Object.entries(storedMetadata).filter(([key]) => key !== "backendImage" && key !== "lastStorageAccessAt"))
+    : storedMetadata;
   return {
     blob: {
       id: stringValue(row["id"]),
@@ -22282,7 +22402,7 @@ function artifactFromRow(row: Row): ArtifactRecord {
     storageKey: stringValue(row["storage_key"]),
     ...optionalString("sessionId", row["session_id"]),
     ...optionalString("runId", row["run_id"]),
-    metadata: parseJson(stringValue(row["metadata_json"])),
+    metadata,
     createdAt: numberValue(row["created_at"]),
     ...optionalNumber("deletedAt", row["deleted_at"]),
     revision: toBigInt(row["revision"])

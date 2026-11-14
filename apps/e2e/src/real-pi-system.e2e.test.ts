@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   AddResourceMutationSchema,
   ApproveResourceMutationSchema,
+  ArtifactStorageCleanupStatus,
   BackendHealth,
   BlobDisposition,
   BlobRefSchema,
@@ -16,12 +17,16 @@ import {
   InputPartSchema,
   InstallResourceMutationSchema,
   MessageRole,
+  ModelSelectionSchema,
   OperationMutationSchema,
   OperationState,
   OwnerSnapshotScopeSchema,
   PermissionMode,
   PiMessageRole,
+  PortableReplacementNativeState,
+  PortableReplacementWorktreeState,
   PortableSessionFidelity,
+  PortableSessionImportStatus,
   QueueDeliveryMode,
   ResourceAcquisitionSourceSchema,
   ResourceKind,
@@ -37,6 +42,7 @@ import {
   SnapshotScopeSchema,
   StateImpact
 } from "@joko/contracts";
+import type { BlobRef } from "@joko/core";
 import { buildPortableSessionExport, preparePortableSessionImport } from "@joko/orchestrator";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -581,6 +587,149 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(store.getSession(firstId).descriptor.deletedAt).toEqual(expect.any(Number));
     expect(store.getSession(distinct.result!.sessionId).descriptor.deletedAt).toBeUndefined();
     expect((await commit(secondDraftId, true, targetId, replaceOperation)).result?.sessionId).toBe(replaced.result!.sessionId);
+  });
+
+  it("reclaims an overwritten imported Pi task's aged native images while preserving live references", { timeout: 90_000 }, async () => {
+    let elapsedStorageTime = 0;
+    const retentionMs = 72 * 60 * 60 * 1_000;
+    const pixels = [
+      Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGAAAAAHAALpEtlMAAAAAElFTkSuQmCC", "base64"),
+      Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYmAAAAAKAANQonMOAAAAAElFTkSuQmCC", "base64")
+    ];
+    let requestedImage = "";
+    fixture = await RealPiSystemFixture.start({
+      artifactClock: () => Date.now() + elapsedStorageTime,
+      providerSupportsImages: true,
+      providerResponder: ({ request }) => {
+        const messages = request.body["messages"] as readonly { readonly role: string }[];
+        return messages.at(-1)?.role === "tool"
+          ? { kind: "text", text: "Pi read the test image." }
+          : { kind: "tool", name: "read", arguments: { path: requestedImage } };
+      }
+    });
+    const { artifacts, store } = fixture.application;
+    const { clients, connectionId, authKey } = await fixture.pair("Pi replacement storage owner");
+    const targetId = "workspace-real-pi";
+    const target = store.getTarget(targetId);
+    store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
+    const isoTime = new Date().toISOString();
+    const nativeSessionId = randomUUID();
+    const transcript = Buffer.from([
+      JSON.stringify({ type: "session", version: 3, id: nativeSessionId, timestamp: isoTime, cwd: fixture.workspaceDirectory }),
+      JSON.stringify({ type: "message", id: "user-one", parentId: null, timestamp: isoTime, message: { role: "user", content: "Original portable task" } })
+    ].join("\n") + "\n");
+    const hash = (data: Buffer) => createHash("sha256").update(data).digest("hex");
+    const encoded = await buildPortableSessionExport({
+      applicationVersion: "0.1.0", exportedAt: isoTime, title: "Media-free Pi task", workspaceKind: "project",
+      backendCapability: "native-portable-session-v1",
+      nativeSession: { bytes: transcript, sha256: hash(transcript), nativeSessionId },
+      events: [{ emittedAt: Date.parse(isoTime), payload: { type: "message_complete", role: "user",
+        blocks: [{ kind: "text", text: "Original portable task" }] } }],
+      readBlob: blob => artifacts.readBlob(blob)
+    });
+    const bundle = await artifacts.ingestBytes(encoded.bytes, { fileName: "media-free.jshare", mimeType: "application/vnd.joko.session" });
+    const toWireBlob = (blob: BlobRef) =>
+      create(BlobRefSchema, {
+        blobId: blob.id, sha256Hex: blob.sha256, byteSize: BigInt(blob.byteLength),
+        mediaType: blob.mimeType, fileName: blob.fileName ?? ""
+      });
+    const importTask = async (overwrite: boolean) => {
+      const { draft } = await clients.portableSession.inspectPortableSessionImport({ package: toWireBlob(bundle) });
+      if (draft === undefined) throw new Error("The media-free Pi package has no draft.");
+      const { result } = await clients.portableSession.commitPortableSessionImport({
+        operationId: randomUUID(), draftId: draft.draftId, targetId, overwrite, permissionMode: PermissionMode.ASK,
+        model: create(ModelSelectionSchema, { model: { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID }, effortId: "off" })
+      });
+      if (result === undefined) throw new Error("The media-free Pi package has no import receipt.");
+      expect(result).toMatchObject({ mediaCount: 0n, status: PortableSessionImportStatus.READY });
+      return result;
+    };
+    const original = await importTask(false);
+    const generation = BigInt(store.getSession(original.sessionId).descriptor.binding.generation);
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const oldImages = [];
+    for (const [index, bytes] of pixels.entries()) {
+      requestedImage = `pixel-${index}.png`;
+      await writeFile(join(fixture.workspaceDirectory, requestedImage), bytes);
+      const operation = await mutate(sendInputMutation(original.sessionId, generation, `Read ${requestedImage}.`));
+      expect(operation.state).toBe(OperationState.SUCCEEDED);
+      const runId = queueRunIdFrom(operation);
+      const { run } = await waitForRealSystem(() => clients.run.getRun({ runId }),
+        ({ run }) => run?.state === RunState.SUCCEEDED || run?.state === RunState.FAILED,
+        "original Pi image tool Run", 15_000);
+      expect(run?.state).toBe(RunState.SUCCEEDED);
+      const events = store.listEvents({ sessionId: original.sessionId, runId }).map(event => event.payload);
+      const output = events.find(payload => payload.type === "tool_result" && payload.name === "read");
+      expect(output).toMatchObject({ isError: false, parts: expect.arrayContaining([expect.objectContaining({ kind: "image" })]) });
+      const produced = events.find(payload => payload.type === "artifact" && payload.purpose === "backend_artifact");
+      if (produced?.type !== "artifact") throw new Error("The original Pi Run has no adopted image.");
+      expect(produced.artifact.sha256).toBe(hash(bytes));
+      const image = store.getArtifact(produced.artifact.id);
+      expect(image).toMatchObject({ sessionId: original.sessionId, metadata: {} });
+      oldImages.push(image);
+    }
+    const [unreferenced, retained] = oldImages;
+    if (unreferenced === undefined || retained === undefined) throw new Error("The Pi runs did not produce both images.");
+    const replacement = await importTask(true);
+    expect(replacement.replacedSessionIds).toEqual([original.sessionId]);
+    expect(store.getSession(original.sessionId).descriptor.deletedAt).toEqual(expect.any(Number));
+    expect((await clients.portableSession.getPortableReplacementCleanup({ importedSessionId: replacement.sessionId })).cleanup)
+      .toMatchObject({ nativeState: PortableReplacementNativeState.COMPLETED, worktreeState: PortableReplacementWorktreeState.COMPLETED });
+    expect((await clients.artifact.listArtifacts({ sessionId: replacement.sessionId })).artifacts).toHaveLength(0);
+    const scan = async (protectedSha256: string[] = []) => {
+      const response = await clients.artifact.scanArtifactStorage({ protectedSha256 });
+      if (response.scan === undefined) throw new Error("Artifact storage returned no scan receipt.");
+      return response.scan;
+    };
+    const freshStats = (await clients.artifact.getArtifactStorageStats({})).stats;
+    if (freshStats === undefined) throw new Error("Artifact storage returned no statistics.");
+    expect((await scan()).orphanBlobCount).toBe(0n);
+
+    elapsedStorageTime = retentionMs + 60_000;
+    const { ticket } = await clients.artifact.getBlobDownloadTicket({ blobId: unreferenced.blob.id });
+    if (ticket === undefined) throw new Error("The original image has no download ticket.");
+    const downloaded = await fetch(`${fixture.baseUrl}${ticket.relativeEndpoint}`, { headers: { authorization: `Bearer ${authKey}` } });
+    expect(downloaded.status).toBe(200);
+    expect(Buffer.from(await downloaded.arrayBuffer()).equals(pixels[0]!)).toBe(true);
+    expect(await scan([retained.blob.sha256])).toMatchObject({ protectedReferenceCount: 1n, orphanBlobCount: 0n });
+
+    elapsedStorageTime += retentionMs + 60_000;
+    const prior = await scan();
+    expect(prior.orphanBlobCount).toBe(2n);
+    const nextId = replacement.sessionId;
+    const hold = (await clients.queue.getQueueControl({ sessionId: nextId })).queueControl;
+    if (hold === undefined) throw new Error("The replacement task has no Queue control.");
+    expect((await mutate(pauseQueueMutation(hold))).state).toBe(OperationState.SUCCEEDED);
+    const send = sendInputMutation(nextId, BigInt(store.getSession(nextId).descriptor.binding.generation), "Keep the original image bytes.");
+    if (send.payload.case !== "sendInput" || send.payload.value.input === undefined) throw new Error("No image input to queue.");
+    send.payload.value.input.parts.push(create(InputPartSchema, {
+      content: { case: "image", value: { blob: toWireBlob(retained.blob) } }
+    }));
+    const queued = await mutate(send);
+    expect(queued.state).toBe(OperationState.SUCCEEDED);
+    const refused = (await clients.artifact.beginArtifactStorageCleanup({ scanToken: prior.token })).progress;
+    expect(refused?.status).toBe(ArtifactStorageCleanupStatus.STORAGE_CHANGED);
+    const current = await scan();
+    expect(current).toMatchObject({ orphanBlobCount: 1n, orphanBlobBytes: BigInt(unreferenced.blob.byteLength) });
+    await clients.artifact.beginArtifactStorageCleanup({ scanToken: current.token });
+    const cleaned = await waitForRealSystem(
+      async () => (await clients.artifact.getArtifactStorageCleanup({ maintenanceId: current.token })).progress,
+      (progress) => progress !== undefined && progress.status !== ArtifactStorageCleanupStatus.RUNNING,
+      "original Pi storage cleanup receipt", 15_000
+    );
+    expect(cleaned).toMatchObject({
+      status: ArtifactStorageCleanupStatus.COMPLETED,
+      result: { expiredReferencesDeleted: 1n, blobsRemoved: 1n, freedBytes: BigInt(unreferenced.blob.byteLength) }
+    });
+    await expect(stat(unreferenced.storageKey)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(fixture.workspaceDirectory, "pixel-0.png"))).resolves.toMatchObject({ size: pixels[0]!.byteLength });
+    await expect(clients.artifact.getArtifact({ artifactId: unreferenced.blob.id })).rejects.toMatchObject({ code: Code.NotFound });
+    expect((await clients.run.getRun({ runId: queueRunIdFrom(queued) })).run?.state).toBe(RunState.QUEUED);
+    expect(Buffer.from((await artifacts.readBlob(retained.blob)).data).equals(pixels[1]!)).toBe(true);
+    expect((await clients.artifact.getArtifactStorageStats({})).stats).toMatchObject({
+      referenceCount: freshStats.referenceCount - 1n,
+      totalBytes: freshStats.totalBytes - BigInt(unreferenced.blob.byteLength)
+    });
   });
 
   it("executes an installed Skill through the live Pi command catalog and records exact durable usage", { timeout: 90_000 }, async () => {
