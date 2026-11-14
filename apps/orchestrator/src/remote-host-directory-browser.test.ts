@@ -80,6 +80,9 @@ it("classifies only an absent SSH entry as missing and keeps existing directorie
     .resolves.toEqual({ exists: true, path: "/srv/shared" });
   await expect(inspectRemoteHostDirectory(files, "/home/maker/new/sub", signal, () => undefined))
     .resolves.toEqual({ exists: false, path: "/home/maker/new/sub" });
+  await expect(inspectRemoteHostDirectory(files, "/home/maker/link/new/sub", signal, () => undefined))
+    .resolves.toEqual({ exists: false, path: "/srv/shared/new/sub" });
+  expect(files.realpath).not.toHaveBeenCalledWith("/srv/shared/new", signal);
   await expect(inspectRemoteHostDirectory(files, "/home/maker/file", signal, () => undefined))
     .rejects.toMatchObject({ code: Code.FailedPrecondition });
   list.mockRejectedValueOnce(new Error("Permission denied"));
