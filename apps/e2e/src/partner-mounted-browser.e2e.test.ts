@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
-import { PiAdapterError, PiRpcTransport } from "@joko/adapter-pi";
+import { isExtensionUiRequest, PiAdapterError, PiRpcTransport } from "@joko/adapter-pi";
 import {
   CreatePartnerRequestSchema,
   PartnerCapabilitiesSchema,
@@ -91,6 +91,8 @@ describe("mounted Partner collaboration product chain", () => {
     const title = "Independent inspection";
     const result = "Retained output from the independent task.";
     let permissionReviews = 0;
+    const nativeTool = observeIndependentTaskTool(command);
+    restoreNativeRpcObservation = nativeTool.stop;
     fixture = await RealPiSystemFixture.start({
       webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true,
       providerResponder: async ({ request, requestNumber }) => {
@@ -136,8 +138,7 @@ describe("mounted Partner collaboration product chain", () => {
         && event.payload.name.endsWith("start_session_task"))?.payload;
       const tool = start?.type === "tool_result" ? {
         isError: start.isError,
-        code: /"code"\s*:\s*"([A-Z_]{1,64})"/u.exec(start.output.replace(/\\"/gu, '"'))?.[1],
-        phase: /Auto-review blocked this tool call|The user declined this tool call|The current owner policy or delegated task authority denied this tool call|Joko policy changed while permission was pending|The original tool turn (?:was not acknowledged|bridge is unavailable)|MCP bridge request failed with status [0-9]{3}|MCP tool failed/u.exec(start.output)?.[0],
+        ...independentTaskToolFailure(start.output),
         hasTitle: start.output.includes(title)
       } : undefined;
       const storedReceipts = (activeNativeTimeline: boolean) => store.listEvents({ sessionId, activeNativeTimeline, order: "desc", limit: 120 })
@@ -150,7 +151,7 @@ describe("mounted Partner collaboration product chain", () => {
           deliveredExecution: task.deliveredExecution, hasError: task.error !== undefined }));
       const permissions = store.listInteractions({ sessionId, runId: parentRunId })
         .filter(interaction => interaction.kind === "permission").map(interaction => interaction.status);
-      throw new Error(`Independent task ${phase} was not visible. ${JSON.stringify({ tool, permissionReviews, permissions, tasks, stored: storedReceipts(false),
+      throw new Error(`Independent task ${phase} was not visible. ${JSON.stringify({ tool, nativeTool: nativeTool.receipts, permissionReviews, permissions, tasks, stored: storedReceipts(false),
         active: storedReceipts(true), connectReceipts })}`, { cause: error });
     }
     expect(await outcome.innerText()).toContain("Completed · #1");
@@ -1056,6 +1057,73 @@ function lastMessageRole(request: CapturedProviderRequest): string | undefined {
   return last !== null && typeof last === "object" && !Array.isArray(last)
     ? String((last as Record<string, unknown>)["role"] ?? "")
     : undefined;
+}
+
+function independentTaskToolFailure(output: string) {
+  const code = /"code"\s*:\s*"(TASK_[A-Z_]{1,56})"/u.exec(output.replace(/\\"/gu, '"'))?.[1]
+    ?? /\[(resource_exhausted|artifact_unavailable|invalid_result)\]/u.exec(output)?.[1];
+  const knownPhases = [
+    "Tool arguments could not be frozen", "Ordered policy evaluation was unavailable or stale",
+    "Joko policy changed", "Joko control file is unavailable", "Joko runtime generation fence mismatch",
+    "Invalid policy generation", "Invalid permission control state", "Invalid execution mode control state",
+    "Invalid immutable runtime policy", "Invalid approved-root control state", "Plan mode blocked a tool",
+    "Auto-review blocked this tool call", "The user declined this tool call",
+    "The current owner policy or delegated task authority denied this tool call",
+    "This tool call requires explicit user confirmation", "The original tool turn was not acknowledged",
+    "The original tool turn bridge is unavailable", "MCP bridge response exceeded",
+    "MCP bridge returned an invalid JSON body", "MCP tool failed", "fetch failed"
+  ];
+  const phase = knownPhases.find(text => output.includes(text))
+    ?? /MCP bridge request failed with status [0-9]{3}|\b(?:EACCES|EPERM|EBUSY|ENOENT)\b/u.exec(output)?.[0];
+  return { bytes: Buffer.byteLength(output), code, phase };
+}
+
+function observeIndependentTaskTool(prompt: string) {
+  const receipts: Array<{ readonly stage: string; readonly failure?: ReturnType<typeof independentTaskToolFailure>; response?: string }> = [];
+  const pendingUi = new Map<string, (typeof receipts)[number]>();
+  let transport: PiRpcTransport | undefined;
+  let unobserve: (() => void) | undefined;
+  const request = PiRpcTransport.prototype.request;
+  const requests = vi.spyOn(PiRpcTransport.prototype, "request").mockImplementation(function (this: PiRpcTransport, command, options) {
+    if (transport === undefined && command.type === "prompt" && typeof command.message === "string" && command.message.includes(prompt)) {
+      transport = this;
+      // The Adapter is already subscribed before issuing the real prompt.
+      unobserve = this.onEvent(event => {
+        if (receipts.length >= 24) return;
+        if (isExtensionUiRequest(event) && "title" in event && typeof event.title === "string") {
+          const stage = event.title.startsWith("joko:policy-decision/v1/") ? "ordered-policy"
+            : event.title.startsWith("joko:tool-turn/v1/") ? "tool-turn"
+              : event.title.startsWith("joko:permission:") ? "manual-permission" : undefined;
+          if (stage === undefined) return;
+          const row = { stage };
+          receipts.push(row);
+          pendingUi.set(event.id, row);
+          return;
+        }
+        if (event.type !== "tool_execution_end" || !("toolName" in event) || typeof event.toolName !== "string"
+          || !event.toolName.endsWith("start_session_task") || !("isError" in event) || event.isError !== true) return;
+        const result = "result" in event ? event.result : undefined;
+        receipts.push({ stage: "native-tool-error", failure: independentTaskToolFailure(JSON.stringify(result ?? null)) });
+      });
+    }
+    return request.call(this, command, options);
+  });
+  const notify = PiRpcTransport.prototype.notify;
+  const notifications = vi.spyOn(PiRpcTransport.prototype, "notify").mockImplementation(function (this: PiRpcTransport, command) {
+    if (this === transport && command.type === "extension_ui_response") {
+      const row = pendingUi.get(command.id);
+      if (row !== undefined) {
+        pendingUi.delete(command.id);
+        const value = "value" in command && typeof command.value === "string" ? command.value : "";
+        if ("cancelled" in command && command.cancelled === true) row.response = "cancelled";
+        else if (row.stage === "ordered-policy") row.response = /^(?:\{"decision":")?(allow|deny|ask|default|stale|delegated_allow)(?:"|$)/u.exec(value)?.[1] ?? "unclassified";
+        else if (row.stage === "tool-turn") row.response = value === "untracked" ? "untracked" : /^[A-Za-z0-9_-]{43}$/u.test(value) ? "acknowledged" : "unclassified";
+        else row.response = "confirmed" in command && typeof command.confirmed === "boolean" ? String(command.confirmed) : "unclassified";
+      }
+    }
+    return notify.call(this, command);
+  });
+  return { receipts, stop: () => { notifications.mockRestore(); requests.mockRestore(); unobserve?.(); } };
 }
 
 function latestUserText(request: CapturedProviderRequest): string {
