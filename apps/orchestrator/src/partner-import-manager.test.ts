@@ -22,7 +22,7 @@ import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
-import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
+import { adoptPartnerImportSettings, createPartnerImportEffects, importedPartnerId, isSavedPackageMissingDefault, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { SessionHost } from "./session-host.js";
@@ -35,7 +35,7 @@ const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.c
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true },
   { key: "runtime.resources", supported: true, options: ["skill", "prompt"] }] };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined; probePlan?: string } = {}) {
+async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined; probePlan?: string; planMode?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-import-owner-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
   await writeFile(join(native, "config.yaml"), "name: Analyst\n" + (options.nativeTools ? "tools:\n  allowed: [read]\n" : "")); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
@@ -59,10 +59,16 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   let imports: PartnerImportManager; let routines: PartnerRoutineManager;
   const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(root, "homes"),
     workspaceService: { register: async input => input, unregister: () => undefined },
+    isSavedPackageMissingDefault: (profile, assertCurrent) => isSavedPackageMissingDefault(profile, storage, assertCurrent),
     onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id), onReady: async id => { await imports?.activatePackage(id); } });
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
-  if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: false });
-  imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {},
+  if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: options.planMode ?? false });
+  const makeRuntime = (importStorage: PartnerImportStorage) => new PartnerImportRuntime({
+    partners, store, host, routines, storage: importStorage, imports,
+    assertServiceOwner: () => {}, auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }),
+      run: async () => ({ status: "ok", text: options.probePlan! }) }
+  });
+  const makeImportManager = (importStorage: PartnerImportStorage) => new PartnerImportManager({ storage: importStorage, home: root, environment: {}, assertServiceOwner: () => {},
     getPartner: id => partners.getPartner(id),
     ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
     nativeRuntimeReady: id => partners.getPartner(id).initializationState === "ready",
@@ -74,12 +80,9 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, storage, id, assertOwner),
     runPass: (id, action) => partners.runImportManagement(id, options.observeImport ? observedImportEffect("pass", action, options.observeImport) : action), effects: context => {
       options.observeImport?.("effects-start");
-      const probePlan = options.probePlan;
-      const runtime = probePlan === undefined ? undefined : new PartnerImportRuntime({ partners, store, host, routines, storage, imports,
-        assertServiceOwner: () => {}, auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }),
-          run: async () => ({ status: "ok", text: probePlan }) } });
-      const pendingEffects = createPartnerImportEffects({ partners, routines, storage, store, memory, resources, artifacts,
-      verification: runtime?.verification ?? { readEnvironment: (id, owner) => storage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
+      const runtime = options.probePlan === undefined ? undefined : makeRuntime(importStorage);
+      const pendingEffects = createPartnerImportEffects({ partners, routines, storage: importStorage, store, memory, resources, artifacts,
+      verification: runtime?.verification ?? { readEnvironment: (id, owner) => importStorage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
         plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context);
       if (!options.observeImport) return pendingEffects;
       const observe = options.observeImport;
@@ -99,14 +102,26 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
         };
       });
     } });
+  imports = makeImportManager(storage);
+  if (options.planMode !== undefined) routines.setImportedRuntime(makeRuntime(storage));
   let authenticated = "device-a";
   const context = (): HandlerContext => ({ signal: new AbortController().signal } as HandlerContext);
-  const service = createPartnerImportConnectService(imports, () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; });
-  const api = createPartnerImportApi({ ownerKey: "device-a:sheet", controllerId: "sheet", assertCurrent: () => {}, newRequestId: () => "owner_import_request_0001",
-    rpc: createClient(PartnerImportService, createRouterTransport(router => { router.service(PartnerImportService, service); })) });
+  const authenticate = () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; };
+  const service = createPartnerImportConnectService(imports, authenticate);
+  const connect = (server: typeof service) => createPartnerImportApi({
+    ownerKey: "device-a:sheet", controllerId: "sheet", assertCurrent: () => {}, newRequestId: () => "owner_import_request_0001",
+    rpc: createClient(PartnerImportService, createRouterTransport(router => { router.service(PartnerImportService, server); }))
+  });
+  const api = connect(service);
+  const reopenImports = async () => {
+    await imports.close();
+    const reopened = new PartnerImportStorage(store, await CredentialVault.open(join(root, "credentials", "master.key")), root);
+    imports = makeImportManager(reopened);
+    return { manager: imports, storage: reopened, api: connect(createPartnerImportConnectService(imports, authenticate)) };
+  };
   cleanups.push(async () => { await imports.close(); await routines.stop(); await scheduler.stop(); await host.dispose(); memory.dispose(); profiles.close(); store.close();
     if (dirname(resolve(root)) !== resolve(tmpdir()) || !basename(root).startsWith("joko-import-owner-")) throw new Error("Unsafe fixture cleanup"); await rm(root, { recursive: true, force: true }); });
-  return { root, native, store, profiles, artifacts, host, storage, resources, memory, partners, routines, imports, service, api, context, manifest,
+  return { root, native, store, profiles, artifacts, host, storage, resources, memory, partners, routines, imports, service, api, context, manifest, reopenImports,
     authenticate: (value: string) => { authenticated = value; } };
 }
 
@@ -425,7 +440,7 @@ describe("native import service and owning effects", () => {
       capabilities: { modelChain: [], permissionMode: "ask", planMode: false } })).rejects.toMatchObject({ code: "PARTNER_INVALID" });
     await f.imports.recover();
     expect((await f.api.invitePackage!(entry, "zh-CN", signal)).requestId).toBe(saved.requestId);
-    const ready = await f.partners.updatePartner(pending.id, pending.revision, { capabilities: { modelChain: [{ backendId: PI_LIKE_PROFILE.id,
+    const ready = await f.partners.updatePartner(pending.id, pending.revision, { usesDirectoryDefaults: false, capabilities: { modelChain: [{ backendId: PI_LIKE_PROFILE.id,
       providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
     expect(ready.initializationState).toBe("ready"); expect(ready.canonicalSessionId).toBeDefined();
     expect(f.resources.list({ targetId: ready.homeTargetId })).toHaveLength(3);
@@ -438,6 +453,219 @@ describe("native import service and owning effects", () => {
     expect((await f.api.retry(saved.requestId, false, signal)).canonicalSessionId).toBe(ready.canonicalSessionId);
     expect(f.profiles.listPartners()).toHaveLength(1);
   }, 20_000);
+
+  it("adopts a previously saved v1 package on the directory default while leaving a changed package alone", async () => {
+    const f = await fixture({ resourceFiles: 20, noDefaults: true });
+    // Recreate the old writer's durable profile and import fingerprint without changing the package or receipt.
+    const createImportedPartner = f.profiles.createImportedPartner.bind(f.profiles);
+    const oldWriter = vi.spyOn(f.profiles, "createImportedPartner").mockImplementation(input =>
+      createImportedPartner({ ...input, usesDirectoryDefaults: false }));
+    const signal = new AbortController().signal;
+    const catalog = await f.api.packages!("en", signal);
+    const first = await f.api.invitePackage!(catalog.find(row => row.packageId === "engineer-bot")!, "en", signal);
+    const second = await f.api.invitePackage!(catalog.find(row => row.packageId === "nightly-audit-engineer")!, "en", signal);
+    const saved = await f.imports.waitForRequest(first.requestId);
+    const changedImport = await f.imports.waitForRequest(second.requestId);
+    oldWriter.mockRestore();
+    const pending = f.partners.getPartner(saved.partnerId);
+    expect(pending).toMatchObject({ usesDirectoryDefaults: false, initializationErrorCode: "model_unavailable" });
+    const changed = f.partners.getPartner(changedImport.partnerId);
+    const edited = await f.partners.updatePartner(changed.id, changed.revision, { displayName: "A separately edited Partner" });
+    const defaults = { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }],
+      permissionMode: "ask" as const, planMode: false, inputHandoff: true };
+
+    const [ready] = await f.partners.updateDirectoryDefaults(f.partners.directory().state.revision, defaults);
+    expect(ready).toMatchObject({ id: pending.id, usesDirectoryDefaults: true, initializationState: "ready", canonicalSessionId: expect.any(String) });
+    expect(f.storage.readReceipt(saved.requestId)).toMatchObject({ checkpointCleared: true,
+      result: { partnerId: pending.id, canonicalSessionId: ready!.canonicalSessionId, status: "complete" } });
+    expect(f.partners.getPartner(edited.id)).toEqual(edited);
+    expect(f.storage.readReceipt(changedImport.requestId)?.checkpointCleared).toBe(false);
+  }, 20_000);
+
+  it.each(["startup", "status", "missing checkpoint"] as const)("settles an interrupted first import through %s", async entry => {
+    const phases: string[] = [];
+    const f = await fixture({ observeImport: phase => phases.push(phase) });
+    const firstIdentity = "Frozen identity for the original request.";
+    const sourceIdentity = join(f.native, "SOUL.md");
+    await writeFile(sourceIdentity, firstIdentity);
+    const signal = new AbortController().signal;
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+    const selected = preview.entries.find(item => item.category === PartnerImportCategory.PERSONALITY && item.name === "SOUL.md")!;
+    const selection = {
+      previewId: preview.id, requestId: "owner_import_checkpoint_0001", name: "Checkpoint recovery",
+      entryIds: [selected.id], takeover: false, deferSetup: true
+    };
+    let interruptedReceipt: ReturnType<PartnerImportStorage["readReceipt"]>;
+    const saveReceipt = f.storage.saveReceipt.bind(f.storage);
+    const writeCheckpoint = f.storage.environment.write.bind(f.storage.environment);
+    const marker = vi.spyOn(f.storage, "saveReceipt").mockImplementation(receipt => {
+      if (receipt.checkpointSaved) throw new Error("Fixture interruption before checkpoint marker");
+      return saveReceipt(receipt);
+    });
+    const checkpointWrite = vi.spyOn(f.storage.environment, "write").mockImplementation((...args) => {
+      interruptedReceipt = f.storage.readReceipt(selection.requestId);
+      if (entry === "missing checkpoint") throw new Error("Fixture interruption before checkpoint storage");
+      return writeCheckpoint(...args);
+    });
+    try {
+      await f.api.start(selection, signal);
+      await f.imports.waitForRequest(selection.requestId);
+    } finally {
+      checkpointWrite.mockRestore();
+      marker.mockRestore();
+    }
+    const original = interruptedReceipt!;
+    expect(original).toMatchObject({ checkpointSaved: false, partnerCreated: false,
+      result: { requestId: selection.requestId, status: "running", saved: false } });
+    expect(f.profiles.listPartners()).toHaveLength(0);
+    const { partnerId } = original.result;
+    const checkpoint = (await f.storage.environment.read(partnerId, () => {}))?.pendingImport;
+    if (entry === "missing checkpoint") expect(checkpoint).toBeUndefined();
+    else expect(checkpoint?.selection).toEqual(selection);
+    // Restore the exact durable receipt that a process exit would leave behind.
+    f.storage.saveReceipt(original);
+    await writeFile(sourceIdentity, "A later source edit must never replace the checkpoint.");
+    const reopened = await f.reopenImports();
+    if (entry === "startup") await reopened.manager.recover();
+    const statuses = await Promise.all([reopened.api.status(selection.requestId, signal), reopened.api.status(selection.requestId, signal)]);
+    expect(statuses.every(value => value?.requestId === selection.requestId && value.partnerId === partnerId)).toBe(true);
+    const settled = await reopened.manager.waitForRequest(selection.requestId);
+    const receipt = reopened.storage.readReceipt(selection.requestId);
+    if (entry === "missing checkpoint") {
+      expect(settled).toMatchObject({ status: "needs-attention", saved: false,
+        checks: [{ entryId: "import", status: "needs-attention", message: "IMPORT_INTERRUPTED" }] });
+      expect((await reopened.api.status(selection.requestId, signal))?.status).toBe(PartnerImportStatus.NEEDS_ATTENTION);
+      expect(f.profiles.listPartners()).toHaveLength(0);
+      expect(phases).not.toContain("create-partner-start");
+    } else {
+      expect(settled).toMatchObject({ status: "complete", partnerId, saved: true, savedEntryIds: [selected.id] });
+      expect(receipt).toMatchObject({ checkpointSaved: true, checkpointCleared: true, partnerCreated: true });
+      expect(f.partners.getPartner(partnerId).identitySource).toContain(firstIdentity);
+      expect(f.profiles.listPartners()).toHaveLength(1);
+      expect(phases.filter(phase => phase === "create-partner-start")).toHaveLength(1);
+      expect((await reopened.api.status(selection.requestId, signal))?.status).toBe(PartnerImportStatus.COMPLETE);
+      expect(await reopened.api.start(selection, signal)).toMatchObject({ requestId: selection.requestId, partnerId });
+    }
+  }, 20_000);
+
+  it.each(["before profile write", "after ready", "owner edit"] as const)("reconciles the saved first identity projection after %s", async interruptionStage => {
+    const f = await fixture();
+    const frozenIdentity = "Hermes import identity before the first completed profile write.";
+    const sourceIdentity = join(f.native, "SOUL.md");
+    await writeFile(sourceIdentity, frozenIdentity);
+    const signal = new AbortController().signal;
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+    const selected = preview.entries.find(item => item.category === PartnerImportCategory.PERSONALITY && item.name === "SOUL.md")!;
+    const selection = {
+      previewId: preview.id, requestId: "owner_import_first_profile_0001", name: "Profile recovery fixture",
+      entryIds: [selected.id], takeover: false, deferSetup: true
+    };
+    const partnerId = importedPartnerId(selection.requestId);
+    let originalIdentity: string | undefined;
+    const update = f.partners.updatePartner.bind(f.partners);
+    const interruption = vi.spyOn(f.partners, "updatePartner").mockImplementation((...args) => {
+      if (args[0] !== partnerId || args[2].identitySource !== frozenIdentity) return update(...args);
+      originalIdentity = f.partners.getPartner(partnerId).identitySource;
+      return Promise.reject(new Error("Fixture interruption before the first profile write"));
+    });
+    try {
+      await f.api.start(selection, signal);
+      expect((await f.imports.waitForRequest(selection.requestId)).status).toBe("needs-attention");
+    } finally {
+      interruption.mockRestore();
+    }
+    expect(originalIdentity).toBeDefined();
+    const original = f.partners.getPartner(partnerId);
+    expect(original).toMatchObject({ profileVersion: 1, identitySource: originalIdentity });
+    const environment = (await f.storage.environment.read(partnerId, () => {}))!;
+    expect(Object.values(environment.documents)).toContain(frozenIdentity);
+    expect(environment.pendingImport?.selection.requestId).toBe(selection.requestId);
+    // Persist the older projection ordering with or without its intent, as at the selected interruption.
+    await f.storage.environment.update(partnerId, () => {}, value => {
+      value.profileProjection.identity = frozenIdentity;
+      if (interruptionStage !== "after ready") delete value.profileUpdate;
+    });
+    const userIdentity = "The owner supplied a different identity.";
+    if (interruptionStage === "after ready") {
+      expect(environment.profileUpdate?.fromRevision).toBe(original.revision.toString());
+      const ready = await update(partnerId, original.revision, { identitySource: frozenIdentity });
+      expect(ready).toMatchObject({ canonicalSessionId: original.canonicalSessionId, initializationState: "ready",
+        profileVersion: original.profileVersion + 1, revision: original.revision + 4n });
+      expect((await f.storage.environment.read(partnerId, () => {}))?.targetOwner?.revision).toBe(original.revision.toString());
+    } else if (interruptionStage === "owner edit") {
+      await update(partnerId, original.revision, { identitySource: userIdentity });
+    }
+    await writeFile(sourceIdentity, "A later source edit.");
+    const reopened = await f.reopenImports();
+    await reopened.api.retry(selection.requestId, false, signal);
+    const settled = await reopened.manager.waitForRequest(selection.requestId);
+    const profile = f.partners.getPartner(partnerId);
+    expect(profile.identitySource).toBe(interruptionStage === "owner edit" ? userIdentity : frozenIdentity);
+    expect(profile.canonicalSessionId).toBe(original.canonicalSessionId);
+    expect(f.profiles.listPartners()).toHaveLength(1);
+    if (interruptionStage === "owner edit") {
+      expect(settled.status).toBe("needs-attention");
+      expect(settled.checks).toContainEqual(expect.objectContaining({ message: "IMPORT_OWNER_CHANGED" }));
+    } else {
+      expect(settled).toMatchObject({ status: "complete", savedEntryIds: [selected.id], partnerId });
+      expect(profile.profileVersion).toBe(original.profileVersion + 1);
+      const committed = (await reopened.storage.environment.read(partnerId, () => {}))!;
+      expect(committed.profileProjection.identity).toBe(frozenIdentity);
+      expect(committed.profileUpdate).toBeUndefined();
+      expect(committed.targetOwner?.profileVersion).toBe(profile.profileVersion);
+    }
+  }, 20_000);
+
+  it.each([true, false])("checks the source monitor before enabling an imported routine with Plan set to %s", async planMode => {
+    const f = await fixture({ planMode, probePlan: JSON.stringify({ reads: [] }) });
+    const requests: Array<{ method: string | undefined; url: string | undefined }> = [];
+    const server = createServer((request, response) => {
+      requests.push({ method: request.method, url: request.url });
+      response.writeHead(200, { "content-type": "text/plain" }).end("fixture monitor");
+    });
+    await new Promise<void>(listen => server.listen(0, "127.0.0.1", listen));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("No fixture server address.");
+      const jobs = join(f.native, "cron", "jobs.json");
+      await writeFile(jobs, JSON.stringify([{
+        id: "monitor", name: "Original monitor", prompt: "Send a local reminder.", enabled: true, state: "scheduled",
+        schedule: { kind: "cron", expr: "0 9 1 1 *" }, monitor_url: `http://127.0.0.1:${address.port}/original-monitor`
+      }]));
+      const signal = new AbortController().signal;
+      const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+      const selected = preview.entries.find(item => item.category === PartnerImportCategory.AUTOMATIONS)!;
+      const selection = {
+        previewId: preview.id, requestId: "owner_import_monitor_0001", name: "Monitor takeover fixture",
+        entryIds: [selected.id], takeover: true, deferSetup: true
+      };
+      await f.api.start(selection, signal);
+      const imported = await f.imports.waitForRequest(selection.requestId);
+      expect(imported.checks).toContainEqual(expect.objectContaining({ message: "IMPORT_SETUP_DEFERRED" }));
+      const partner = f.partners.getPartner(imported.partnerId);
+      const session = f.store.getSession(partner.canonicalSessionId!).descriptor;
+      expect(session).toMatchObject({ planMode, permissionMode: "bypassPermissions" });
+      expect(partner.initializationState).toBe("ready");
+      const routine = f.routines.list(partner.id)[0]!;
+      expect(routine.enabled).toBe(false);
+      expect(requests).toHaveLength(0);
+      const enabled = f.routines.save({ partnerId: partner.id, partnerRevision: partner.revision,
+        routineId: routine.id, revision: routine.revision, definition: { ...routine, enabled: true } });
+      await expect(enabled).rejects.toMatchObject({ code: "AUTOMATION_HANDOVER_REQUIRED" });
+      expect(requests).toEqual(planMode ? [] : [{ method: "GET", url: "/original-monitor" }]);
+      const verified = await f.imports.waitForRequest(selection.requestId);
+      expect(verified.checks).toContainEqual(expect.objectContaining({
+        message: planMode ? "AUTOMATION_DATA_READ_FAILED" : "AUTOMATION_READ_NOT_VERIFIED"
+      }));
+      expect(f.store.listInteractions({ sessionId: session.id })).toHaveLength(0);
+      expect(f.routines.list(partner.id)[0]?.enabled).toBe(false);
+      expect(JSON.parse(await readFile(jobs, "utf8"))[0]).toMatchObject({ enabled: true });
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(closed => server.close(() => closed()));
+    }
+  }, 20_000);
+
   it("discovers bundled partners and admits one durable installation with skills, knowledge and disabled routines", async () => {
     let canonical: string | undefined;
     const f = await fixture({ resourceFiles: 20, currentCanonicalSession: () => canonical }); const signal = new AbortController().signal;

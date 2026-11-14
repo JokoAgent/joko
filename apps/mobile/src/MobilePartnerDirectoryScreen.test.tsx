@@ -606,6 +606,45 @@ describe("MobilePartnerDirectoryScreen", () => {
     await render(active, { ...initialization, ownerKey: "another-node" });
     expect((container.querySelector('[aria-label="Open Pending\'s task"]') as HTMLButtonElement).disabled).toBe(true);
   });
+  it("opens the same Partner when a model is configured elsewhere while Mobile remains on setup", async () => {
+    vi.useFakeTimers();
+    try {
+      const active = transport();
+      const failed = { ...pending, initializationState: "error" as const, invitationStage: "failed" as const,
+        initializationErrorCode: "modelUnavailable" as const };
+      const ready = profile({ partnerId: failed.partnerId, displayName: failed.displayName, revision: failed.revision + 1n,
+        profileVersion: failed.profileVersion + 1n });
+      vi.mocked(active.list).mockResolvedValue({ ...catalog, partners: [failed] });
+      const load = vi.fn(async (): Promise<MobilePartnerDirectoryProfile> => failed);
+      const initialization: MobilePartnerInitializationTransport = { ownerKey: active.ownerKey, load,
+        retry: vi.fn(), configure: vi.fn(), open: vi.fn(async (partner: MobilePartnerDirectoryProfile) => ({ sessionId: partner.canonicalSessionId! })) };
+      await render(active, initialization);
+      await press("View Pending's setup");
+      expect(container.textContent).toContain(mobileMessage("en", "partnerInitialization.reason.modelUnavailable"));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+      expect(load).toHaveBeenCalledTimes(2);
+      expect(initialization.open).not.toHaveBeenCalled();
+
+      await render(active, initialization, undefined, undefined, undefined, undefined, undefined, undefined, { rosterActive: false });
+      await act(async () => { await vi.advanceTimersByTimeAsync(7500); });
+      expect(load).toHaveBeenCalledTimes(2);
+      expect(onOpenTask).not.toHaveBeenCalled();
+
+      await render(active, initialization);
+      expect(load).toHaveBeenCalledTimes(3);
+      load.mockResolvedValue(ready);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+      expect(load).toHaveBeenCalledTimes(4);
+      expect(load).toHaveBeenLastCalledWith(failed.partnerId, expect.any(AbortSignal));
+      expect(initialization.open).toHaveBeenCalledExactlyOnceWith(ready, expect.any(AbortSignal));
+      expect(onOpenTask).toHaveBeenCalledExactlyOnceWith(ready.canonicalSessionId);
+      expect(initialization.retry).not.toHaveBeenCalled();
+      expect(initialization.configure).not.toHaveBeenCalled();
+      expect(active.open).not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(7500); });
+      expect(load).toHaveBeenCalledTimes(4);
+    } finally { vi.useRealTimers(); }
+  });
   it("shows activity, disables unavailable entries, searches and opens an exact Partner task", async () => {
     const active = transport();
     await render(active);
@@ -706,6 +745,36 @@ describe("MobilePartnerDirectoryScreen", () => {
     await press(mobileMessage("en", "partnerInitialization.retry"));
     expect(initialization.retry).toHaveBeenCalledWith(failed, expect.any(AbortSignal));
     expect(onOpenTask).toHaveBeenCalledWith("remote-canonical");
+  });
+
+  it("cancels remote Partner preparation on Back before the directory unmounts", async () => {
+    const remote = { profileId: "remote", origin: "https://remote.test", serverId: "remote-node", connectionId: "remote-connection",
+      deviceId: "phone", displayName: "Remote node" };
+    const source = { key: mobilePartnerRosterSourceKey(remote), profile: remote, current: false };
+    const roster = new MobilePartnerRoster({ getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined },
+      async (_id, signal) => ({ sourceKey: source.key, ownerKey: "remote-roster", profile: remote, isCurrent: () => !signal.aborted,
+        list: async () => ({ ...catalog, partners: [pending] }), observation: () => undefined,
+        canonical: async () => { throw new Error("Unfinished Partner cannot open a generic Task."); } }));
+    roster.setSources([source]);
+    let navigation: AbortSignal | undefined;
+    let finish!: () => void;
+    const adopt: NonNullable<MobilePartnerDirectoryScreenProps["onOpenSourceInitialization"]> = async (_source, partner, signal) => {
+      navigation = signal;
+      await new Promise<void>(resolve => { finish = resolve; });
+      return { ownerKey: "remote-owner", partnerId: partner.partnerId };
+    };
+    await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { roster, onOpenSourceInitialization: adopt });
+    await act(async () => { await vi.waitFor(() => expect(roster.snapshot[0]?.status).toBe("online")); });
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-testid="partnerDirectory.sourceItem.remote.pending"] [data-testid="partnerDirectory.item.pending"]')!.click());
+    expect(navigation?.aborted).toBe(false);
+    onBack.mockImplementation(() => expect(navigation?.aborted).toBe(true));
+    await press(mobileMessage("en", "common.back"));
+    expect(onBack).toHaveBeenCalledOnce();
+    await act(async () => finish());
+    expect(container.querySelector('[data-testid="partnerInitialization.screen"]')).toBeNull();
+    expect(onOpenTask).not.toHaveBeenCalled();
   });
 
   it("opens cached Partner text read-only and retires it when the original source is forgotten", async () => {

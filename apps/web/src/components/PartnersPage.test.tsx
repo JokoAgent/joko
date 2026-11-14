@@ -201,6 +201,36 @@ describe("PartnersPage", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(1200); await settle(); });
     expect(current.capabilities.modelChain).toEqual([secondary, { ...primary, modelId: "fallback" }]);
   });
+  it("lets a waiting imported Partner leave missing defaults and save an explicitly chosen model", async () => {
+    vi.useFakeTimers();
+    const { defaultCapabilities: _defaults, ...missingDefaults } = directory();
+    let current = partner({ canonicalSessionId: undefined, initializationState: "error", initializationErrorCode: "model_unavailable",
+      usesDirectoryDefaults: true, capabilities: { ...capabilities(), modelChain: [] } });
+    const updatePartner = vi.fn<AppController["updatePartner"]>(async (_id, _revision, patch) => ({ partner: current = {
+      ...current, usesDirectoryDefaults: patch.usesDirectoryDefaults ?? current.usesDirectoryDefaults,
+      capabilities: { ...current.capabilities, modelChain: patch.modelChain ?? current.capabilities.modelChain },
+      revision: current.revision + 1n, profileVersion: current.profileVersion + 1n
+    }, directory: missingDefaults }));
+    await mount({ partners: [current], focusPartnerId: current.id, updatePartner, getPartner: vi.fn(async () => current),
+      controllerOverrides: { listPartners: vi.fn(async () => ({ partners: [current], directory: missingDefaults })),
+        getPartnerDirectory: vi.fn(async () => missingDefaults) } });
+    const defaults = required([...document.body.querySelectorAll<HTMLLabelElement>("label")]
+      .find(label => label.textContent?.startsWith("partners.useDefaults"))?.querySelector<HTMLInputElement>("input"));
+    expect(defaults.checked).toBe(true); expect(defaults.disabled).toBe(false);
+    await act(async () => { defaults.click(); await settle(); });
+    expect(defaults.checked).toBe(false); expect(defaults.disabled).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200); await settle(); });
+    expect(updatePartner).not.toHaveBeenCalled();
+    const primary = required([...document.body.querySelectorAll<HTMLSelectElement>("select")]
+      .find(select => select.closest("label")?.textContent?.startsWith("partners.primaryModel")));
+    await act(async () => { setNativeValue(primary, JSON.stringify(["backend-1", "provider-1", "model-1"]));
+      primary.dispatchEvent(new Event("change", { bubbles: true })); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200); await settle(); });
+    expect(updatePartner).toHaveBeenCalledOnce();
+    expect(current.usesDirectoryDefaults).toBe(false);
+    expect(current.capabilities.modelChain).toMatchObject([{ backendId: "backend-1", providerId: "provider-1", modelId: "model-1" }]);
+  });
+
   it("autosaves one independent task model and restores inheritance without changing the primary chain", async () => {
     vi.useFakeTimers();
     const pageSnapshot = snapshot(), task = { ...pageSnapshot.models[0]!, backendId: "task-backend", modelId: "task-model", name: "Task Model" };

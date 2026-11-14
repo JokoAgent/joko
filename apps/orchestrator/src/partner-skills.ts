@@ -101,16 +101,18 @@ export class PartnerSkillsManager {
     return this.resources.listPartnerSkills(owner.partnerId, owner.homeTargetId).find(item => item.resource.id === id)
       ?? fail("Skill not found.", Code.NotFound);
   }
-  async #file(item: PersonalSkill, signal?: AbortSignal): Promise<SkillFileMetadata> {
+  async #file(item: PersonalSkill, signal?: AbortSignal, content: "full" | "metadata" = "full"): Promise<SkillFileMetadata> {
     const lease = await this.resources.acquireSkillContent({ resourceId: item.resource.id, expectedResourceVersion: item.resource.versionNumber });
     try {
       const source = await readFile(lease.entryFilePath, { encoding: "utf8", ...(signal ? { signal } : {}) });
       await lease.assertCurrent(signal);
       if (lease.dirty) return fail("Skill files changed. Review them before editing.", Code.Aborted);
       const file = readSkillFile(source, item.slug);
+      const projected = content === "metadata" ? { ...file, body: "" } : file;
+      const visible = content === "metadata" ? JSON.stringify(projected) : source;
       // Imported current files are already projected by their credential owner.
-      if (redactSecrets(source) !== source) return fail("Skill content is unavailable.");
-      return file;
+      if (redactSecrets(visible) !== visible) return fail("Skill content is unavailable.");
+      return projected;
     } finally { await lease.release(); }
   }
   async list(partnerId: string, query = "", offset = 0, limit = 20, signal?: AbortSignal, assertCaller?: () => void) {
@@ -146,7 +148,7 @@ export class PartnerSkillsManager {
     for (const resource of this.resources.list({ kind: "skill" }).filter(item => item.backendId === backendId || personal.has(item.id))) {
       if (resource.targetId !== undefined && resource.targetId !== target.id || !resource.enabled
         || !["approved", "installed", "loaded"].includes(resource.state)) continue;
-      const file = await this.#file({ resource, slug: resource.name, relativeFilePath: "" }, signal);
+      const file = await this.#file({ resource, slug: resource.name, relativeFilePath: "" }, signal, "metadata");
       scope.assertCurrent(); entries.push({ id: resource.id, name: file.name, nativeName: file.slug, description: file.description });
     }
     scope.assertCurrent(); return entries;

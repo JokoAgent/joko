@@ -374,7 +374,8 @@ export function createPartnerConnectService(
         const active = owner();
         const affected = await active.updateDirectoryDefaults(
           fromProtoRevision(request.expectedDirectoryRevision, "expected_directory_revision"),
-          fromProtoCapabilities(required(request.capabilities, "capabilities"))
+          fromProtoCapabilities(required(request.capabilities, "capabilities")),
+          () => assertPermissionOwner(context)
         );
         assertPermissionOwner(context);
         return create(contract.UpdatePartnerDefaultsResponseSchema, {

@@ -419,12 +419,24 @@ describe("PartnerService", () => {
       const item = await resources.discover({ id: `shared-${suffix}`, backendId: task.backendId, ...(suffix === "a" ? { targetId: task.targetId, scope: "project" as const, workspaceRoot: target.workspaceRoot } : { scope: "managed" as const }), kind: "skill", name: "Shared report", source: { kind: "local", path } });
       await resources.approve(item.id, item.discoveredRevision, "test"); if (suffix === "b") await resources.install(item.id); await resources.setEnabled(item.id, true); shared.push(item.id);
     }
+    const unselectedPath = join(f.directory, "unselected-template");
+    await mkdir(unselectedPath);
+    const unselectedSource = renderSkillFile({ slug: "unselected-template", name: "Template example", description: "An external template",
+      body: "Authorization: <PLACEHOLDER>\nUNSELECTED_TEMPLATE_BODY", updatedAt: "2026-11-14" });
+    await writeFile(join(unselectedPath, "SKILL.md"), unselectedSource);
+    const unselected = await resources.discover({ id: "unselected-template", backendId: task.backendId, scope: "managed",
+      kind: "skill", name: "Template example", source: { kind: "local", path: unselectedPath } });
+    await resources.approve(unselected.id, unselected.discoveredRevision, "test");
+    await resources.install(unselected.id);
+    await resources.setEnabled(unselected.id, true);
     const preferences = new PartnerConnectionPreferences(f.operationalStore), router = await connectionRouter(f);
     const manager = new PartnerConnectionsManager(f.manager, f.partnerStore, f.operationalStore, preferences, router, undefined, resources,
       (id, signal) => personal.referenceMetadata(id, signal));
     const signal = new AbortController().signal, initial = await manager.readForClient(partner.id, signal);
     expect(initial.skills).toMatchObject({ mode: contract.PartnerConnectionMode.ALLOWLIST, ids: [] });
-    expect(initial.entries.filter(item => item.kind === contract.PartnerConnectionKind.SKILL)).toHaveLength(3);
+    expect(initial.entries.filter(item => item.kind === contract.PartnerConnectionKind.SKILL)).toHaveLength(4);
+    expect(initial.entries.find(item => item.id === unselected.id)).toMatchObject({ available: true, name: "Template example" });
+    expect(JSON.stringify(initial, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).not.toContain("UNSELECTED_TEMPLATE_BODY");
     expect(initial.entries.find(item => item.id === own.id)).toMatchObject({ personal: true, available: true, name: "Personal report" });
     expect(initial.entries.filter(item => item.name === "Shared report").map(item => item.id)).toEqual(shared);
     expect((await resources.runtimeSkillSnapshot(task.backendId, task.targetId, signal, manager.targetSkillReferences(task.targetId))).map(item => item.resource.id)).toEqual([own.id]);
@@ -441,7 +453,11 @@ describe("PartnerService", () => {
       backendInstanceGeneration: backend.instanceGeneration, signal, emit: async () => undefined,
       artifactCapacityBytes: 1024, requestInteraction: async () => { throw Error("No interaction expected"); },
       storeArtifact: async () => { throw Error("No artifact expected"); } }))!;
-    expect(policy.mode).toBe("explicit"); expect(policy.overrides).toMatchObject({ "personal-report": "on", report: "on" });
+    expect(policy.mode).toBe("explicit"); expect(policy.overrides).toMatchObject({ "personal-report": "on", report: "on", "unselected-template": "off" });
+    const unselectedRecord = resources.get(unselected.id);
+    const unselectedLease = await resources.acquireSkillContent({ resourceId: unselected.id, expectedResourceVersion: unselectedRecord.versionNumber });
+    try { expect(await readFile(unselectedLease.entryFilePath, "utf8")).toBe(unselectedSource); }
+    finally { await unselectedLease.release(); }
     const snapshot = await snapshotNativeSkills(seeds, signal, undefined, policy);
     try { expect(snapshot.restrictImplicit).toBe(true); const mount = snapshot.skills.find(item => item.seed.resource.id === shared[0])!;
       expect(await readFile(join(mount.path, "assets", "template.bin"))).toEqual(Buffer.from([0, 255, 17])); } finally { await snapshot.dispose(); }
@@ -963,7 +979,7 @@ describe("PartnerService", () => {
       expectedDirectoryRevision: initial.directory!.revision,
       capabilities: protoCapabilities()
     }), callContext);
-    expectAuthentication("request", "after updating defaults, before response");
+    expectAuthentication("request", "before directory defaults commit", "after updating defaults, before response");
     expect(defaults.directory).toMatchObject({ defaultCapabilities: protoCapabilities() });
 
     const created = await service.createPartner(create(contract.CreatePartnerRequestSchema, {

@@ -13,6 +13,7 @@ import { PartnerStoreError, type PartnerProfileRecord } from "@joko/store";
 import { parseRoutineInput } from "./partner-routine-definition.js";
 import { readOpenClawCronDatabase } from "@joko/agent-import";
 import type { PartnerImportStorage } from "./partner-import-storage.js";
+import { importedPartnerId } from "./partner-import-effects.js";
 import { PARTNER_PACKAGE_IDS, applyNativeLocale, readNativePartnerPackage } from "./partner-package-reader.js";
 import { localizedPartnerPackageEntry, type PartnerPackageEntry, type PartnerPackageIdentity } from "./partner-package-types.js";
 
@@ -197,9 +198,15 @@ export class PartnerImportManager {
       entries: snapshot.items.map(item => ({ ...item.view, name: redact(item.view.name), ...(item.view.description !== undefined ? { description: redact(item.view.description) } : {}) })) };
   }
 
-  status(requestId: string, scope: PartnerImportController): AgentImportResult | undefined {
-    const assertOwner = this.#controller(scope); assertOwner(); const receipt = this.options.storage.readReceipt(requestId); assertOwner();
-    return receipt ? this.#present(receipt.result) : (this.#jobs.has(requestId) ? { requestId, partnerId: `agent_import_${fingerprint(requestId).slice(0, 32)}`, status: "running", checks: [], saved: false, savedEntryIds: [] } : undefined);
+  async status(requestId: string, scope: PartnerImportController): Promise<AgentImportResult | undefined> {
+    const assertOwner = this.#controller(scope); assertOwner();
+    let receipt = this.options.storage.readReceipt(requestId);
+    if (receipt !== undefined && !receipt.checkpointSaved && this.#shouldRecoverRunning(receipt)) {
+      await this.#recoverRunning(receipt, assertOwner);
+      receipt = this.options.storage.readReceipt(requestId);
+    }
+    assertOwner();
+    return receipt ? this.#present(receipt.result) : (this.#jobs.has(requestId) ? { requestId, partnerId: importedPartnerId(requestId), status: "running", checks: [], saved: false, savedEntryIds: [] } : undefined);
   }
   entryNames(requestId: string): Readonly<Record<string, string>> { this.#assert(); return this.options.storage.readReceipt(requestId)?.entryNames ?? {}; }
 
@@ -292,7 +299,7 @@ export class PartnerImportManager {
       if (running.submissionHash !== submissionHash) throw new AgentImportError("REQUEST_ALREADY_USED");
       return this.#accepted(selection.requestId, running.promise);
     }
-    const partnerId = `agent_import_${fingerprint(selection.requestId).slice(0, 32)}`;
+    const partnerId = importedPartnerId(selection.requestId);
     const assertOwner = () => { this.#assert(); if (this.#deletedPartners.has(partnerId)) throw new AgentImportError("IMPORT_CANCELLED"); };
     const selected = validateImportSelection(selection, snapshot);
     const recapturing = selected.some(item => item.captureIssue || item.filesComplete === false);
@@ -388,22 +395,65 @@ export class PartnerImportManager {
   async recover(): Promise<void> {
     this.#assert();
     for (const receipt of this.options.storage.listReceipts()) {
-      this.#assert(); if (receipt.cancelled || receipt.creationRejected || !receipt.checkpointSaved) continue;
-      if (receipt.result.status === "complete") {
+      this.#assert(); if (receipt.cancelled || receipt.creationRejected) continue;
+      if (receipt.result.status === "complete" && receipt.checkpointSaved) {
         if (receipt.nativePackage && !receipt.result.canonicalSessionId) { await this.activatePackage(receipt.result.partnerId); continue; }
         if (receipt.nativePackage) await this.options.onSaved?.(receipt.result, receipt.nativePackage);
         if (!receipt.checkpointCleared) await this.#clearCheckpoint(receipt); continue;
       }
-      if (receipt.result.status !== "running") continue;
-      const pending = (await this.options.storage.environment.read(receipt.result.partnerId, () => this.#assert()))?.pendingImport;
-      if (!pending) {
-        receipt.result.status = "needs-attention";
-        receipt.result.checks = [...receipt.result.checks.filter(check => check.entryId !== "import"), { entryId: "import", status: "needs-attention", message: "IMPORT_INTERRUPTED" }];
-        this.options.storage.saveReceipt(receipt); continue;
-      }
-      const snapshot = await deserializeImportSnapshotAsync(pending.snapshotJson, () => this.#assert());
-      await this.#dispatch(snapshot, pending.selection, pending.creationJson, true);
+      if (this.#shouldRecoverRunning(receipt)) await this.#recoverRunning(receipt, () => this.#assert());
     }
+  }
+
+  #shouldRecoverRunning(receipt: ImportReceipt): boolean {
+    return !receipt.cancelled && receipt.creationRejected === undefined && !receipt.checkpointCleared
+      && receipt.result.status === "running" && !this.#jobs.has(receipt.result.requestId);
+  }
+
+  async #recoverRunning(receipt: ImportReceipt, assertOwner: () => void): Promise<void> {
+    const { requestId, partnerId } = receipt.result;
+    const assertOriginal = () => {
+      assertOwner();
+      const current = this.options.storage.readReceipt(requestId);
+      if (current === undefined || !this.#shouldRecoverRunning(current) || current.result.partnerId !== partnerId
+        || current.submissionHash !== receipt.submissionHash || current.selectionHash !== receipt.selectionHash
+        || current.checkpointSaved !== receipt.checkpointSaved || this.#deletedPartners.has(partnerId)) return undefined;
+      return current;
+    };
+    const needsAttention = (current: ImportReceipt, message: string) => {
+      current.result.status = "needs-attention";
+      current.result.checks = [...current.result.checks.filter(check => check.entryId !== "import"),
+        { entryId: "import", status: "needs-attention", message }];
+      this.options.storage.saveReceipt(current);
+    };
+    const checkpoint = (await this.options.storage.environment.read(partnerId, assertOwner))?.pendingImport;
+    const current = assertOriginal();
+    if (current === undefined) return;
+    if (checkpoint === undefined) {
+      needsAttention(current, "IMPORT_INTERRUPTED");
+      return;
+    }
+    if (checkpoint.selection.requestId !== requestId || partnerId !== importedPartnerId(requestId)) {
+      needsAttention(current, "REQUEST_ALREADY_USED");
+      return;
+    }
+    let snapshot: ImportSnapshot;
+    try {
+      snapshot = await deserializeImportSnapshotAsync(checkpoint.snapshotJson, assertOwner);
+      await validateImportRequestIdentity(snapshot, checkpoint.selection, current);
+    } catch (error) {
+      const failed = assertOriginal();
+      if (failed !== undefined) needsAttention(failed, importFailureCode(error));
+      return;
+    }
+    const ready = assertOriginal();
+    if (ready === undefined) return;
+    if (!ready.checkpointSaved) {
+      // The validated, encrypted checkpoint may have committed before its receipt marker.
+      ready.checkpointSaved = true;
+      this.options.storage.saveReceipt(ready);
+    }
+    await this.#dispatch(snapshot, checkpoint.selection, checkpoint.creationJson, true);
   }
 
   async #clearCheckpoint(receipt: ImportReceipt): Promise<void> {

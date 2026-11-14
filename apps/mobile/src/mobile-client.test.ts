@@ -2488,6 +2488,65 @@ describe("paired Partner group sources", () => {
     await app.openPartnerGroupRosterSource(credential.profileId, "same-group", signal);
     expect(app.partnerGroupSourceClaimCurrent(selected)).toBe(false); expect(app.partnerGroupSourceClaimRetained(selected)).toBe(false);
   });
+  it.each(["setup", "conversation", "settings", "group", "create group"] as const)
+    ("keeps the original node when leaving the roster during a saved-node %s read", async (entry) => {
+      // Use distinct nodes and leave the authenticated candidate read alive even if its request is aborted.
+      const { network, saved, app } = fixture();
+      const remote = { ...otherCredential, origin: "http://192.168.1.21:4318", serverId: "node-2" };
+      const remoteNode = { ...node, serverId: remote.serverId };
+      await saved.storage.saveConnection(remote);
+      const remoteOwner = { connection: otherConnection, device: otherDevice, snapshot: create(SnapshotSchema, {
+        ...snapshot, server: { ...snapshot.server!, serverId: remoteNode.serverId },
+        connections: [otherConnection], devices: [otherDevice]
+      }) };
+      vi.mocked(network.inspect).mockImplementation(async origin => origin === remote.origin ? remoteNode : node);
+      const failed = { ...profilePartner, initializationState: "error" as const, invitationStage: "failed" as const,
+        initializationErrorCode: "modelUnavailable" as const, canonicalSessionId: undefined };
+      if (entry === "setup") vi.mocked(network.listPartnerCatalog!).mockResolvedValue({
+        directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 1, updatedAt: 1_000 }, partners: [failed]
+      });
+      network.retryPartnerInitialization = vi.fn();
+      vi.mocked(network.listPartnerSessions).mockResolvedValue(create(ListPartnerSessionsResponseSchema, { sessions: [{
+        partnerId: profilePartner.partnerId, sessionId: profilePartner.canonicalSessionId, role: PartnerSessionRole.CANONICAL,
+        profileVersion: profilePartner.profileVersion, available: true
+      }] }));
+      let pendingRead: { signal: AbortSignal; finish: () => void } | undefined;
+      vi.mocked(network.readOwner).mockImplementation(async (value, _name, signal) => {
+        if (value.profileId === credential.profileId) return { connection, device, snapshot };
+        if (app.state.candidate?.origin !== remote.origin || pendingRead) return remoteOwner;
+        return new Promise(resolve => { pendingRead = { signal: signal!, finish: () => resolve(remoteOwner) }; });
+      });
+      await app.start();
+      await app.select("session");
+      const activeStream = vi.mocked(network.streamOwner).mock.calls.at(-1)![2];
+      const activeOwner = app.state.owner;
+      const priorSavedView = app.state.saved.find(item => item.profileId === remote.profileId);
+      const page = new AbortController();
+      const signal = page.signal;
+      const opening = entry === "setup" ? app.openPartnerRosterInitializationSource(remote.profileId, failed, signal)
+        : entry === "group" || entry === "create group" ? app.openPartnerGroupRosterSource(remote.profileId,
+          entry === "group" ? "same-group" : undefined, signal)
+          : app.openPartnerRosterSource(remote.profileId, profilePartner, signal, entry);
+      const outcome = opening.catch(error => error);
+      await vi.waitFor(() => expect(pendingRead).toBeDefined());
+      expect(app.state).toMatchObject({ status: "connected", activeProfileId: credential.profileId, busy: true });
+      page.abort(new Error("Left the Partner directory"));
+      expect(pendingRead!.signal.aborted).toBe(true);
+      pendingRead!.finish();
+      expect(await outcome).toBe(signal.reason);
+      expect(app.state).toMatchObject({ status: "connected", activeProfileId: credential.profileId, selectedId: "session",
+        taskSource: { kind: "own" }, busy: false });
+      expect(app.state.owner).toBe(activeOwner);
+      expect(app.state.candidate).toBeUndefined();
+      expect(app.state.saved.find(item => item.profileId === remote.profileId)).toEqual(priorSavedView);
+      expect(activeStream.aborted).toBe(false);
+      expect(saved.automaticProfile()).toBe(credential.profileId);
+      expect(network.retryPartnerInitialization).not.toHaveBeenCalled();
+
+      await app.connectSaved(remote.profileId);
+      expect(app.state.activeProfileId).toBe(remote.profileId);
+      expect(saved.automaticProfile()).toBe(credential.profileId);
+    });
   it("retains completed same-source presentation offline but retires foreground late reads and never reads a mismatched source credential", async () => {
     const { network, saved, app } = fixture(); await app.start(); const signal = new AbortController().signal;
     const claim = await app.openPartnerGroupRosterSource(credential.profileId, "same-group", signal);

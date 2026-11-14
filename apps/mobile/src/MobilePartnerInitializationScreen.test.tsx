@@ -32,7 +32,7 @@ const onBack = vi.fn(); const onOpenTask = vi.fn();
 async function render(active?: MobilePartnerInitializationTransport) {
   if (!root) { container = document.createElement("div"); document.body.append(container); root = createRoot(container); }
   await act(async () => root!.render(createElement(MobilePartnerInitializationScreen, { partnerId: "partner-a",
-    transport: active, colors, locale: "en", onBack, onOpenTask })));
+    transport: active, foreground: true, colors, locale: "en", onBack, onOpenTask })));
 }
 const button = (label: string): HTMLButtonElement => {
   const found = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((item) => item.getAttribute("aria-label") === label);

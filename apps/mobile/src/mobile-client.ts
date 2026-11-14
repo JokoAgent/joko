@@ -1577,7 +1577,7 @@ export class MobileClient {
     };
     await read(api, () => source.list(signal), requireSource);
     await this.composerDrafts?.flush(); await this.newTaskDrafts?.flush(); requireSource();
-    await this.connectSaved(profileId); requireSource();
+    await this.#connectSavedWithAttempt(profileId, { caller: signal }); requireSource();
     const context = this.#partnerPrivateContext(), currentApi = this.partnerGroupApi(), directory = this.partnerDirectoryTransport();
     if (!context || !currentApi || !directory || this.#activeProfileId !== profileId
       || mobilePartnerRosterSourceKey(context.credential) !== source.sourceKey) throw new Error("The Partner group source was not adopted by this node.");
@@ -1604,7 +1604,7 @@ export class MobileClient {
     await this.composerDrafts?.flush(); await this.newTaskDrafts?.flush();
     signal.throwIfAborted();
     if (!source.isCurrent()) throw new Error("The Partner source retired before navigation.");
-    await this.connectSaved(profileId);
+    await this.#connectSavedWithAttempt(profileId, { caller: signal });
     signal.throwIfAborted();
     const requireOwner = (): void => {
       if (epoch !== this.#partnerRosterEpoch || this.#disposed || !this.#foreground
@@ -1643,7 +1643,7 @@ export class MobileClient {
     exact(await source.list(signal));
     await this.composerDrafts?.flush(); await this.newTaskDrafts?.flush(); signal.throwIfAborted();
     if (!source.isCurrent()) throw new Error("The Partner preparation source retired before navigation.");
-    await this.connectSaved(profileId); signal.throwIfAborted();
+    await this.#connectSavedWithAttempt(profileId, { caller: signal }); signal.throwIfAborted();
     const requireCurrent = (): void => {
       if (epoch !== this.#partnerRosterEpoch || !source.isCurrent() || this.#activeProfileId !== profileId
         || this.#state.status !== "connected" || !this.#credential
@@ -4964,15 +4964,33 @@ export class MobileClient {
   }
 
   async connectSaved(profileId: string, automatic?: boolean, entryId?: string, entryRecovery = false): Promise<void> {
+    await this.#connectSavedWithAttempt(profileId, { automatic, entryId, entryRecovery });
+  }
+
+  async #connectSavedWithAttempt(profileId: string, { automatic, entryId, entryRecovery = false, caller }: {
+    readonly automatic?: boolean;
+    readonly entryId?: string;
+    readonly entryRecovery?: boolean;
+    readonly caller?: AbortSignal;
+  }): Promise<void> {
+    caller?.throwIfAborted();
     this.#entryAttempt?.abort();
     const attempt = new AbortController(); this.#entryAttempt = attempt;
     const epoch = this.#epoch;
-    try { return await this.#changeEntries(async () => {
-      if (attempt.signal.aborted || !this.#current(epoch)) return;
-      await this.#connectSaved(profileId, automatic, entryId, entryRecovery, attempt);
-    }); } finally { if (this.#entryAttempt === attempt) this.#entryAttempt = undefined; }
+    const cancel = () => attempt.abort(caller?.reason);
+    caller?.addEventListener("abort", cancel, { once: true });
+    try {
+      await this.#changeEntries(async () => {
+        if (attempt.signal.aborted || !this.#current(epoch)) return;
+        await this.#connectSaved(profileId, automatic, entryId, entryRecovery, attempt, caller);
+      });
+    } finally {
+      caller?.removeEventListener("abort", cancel);
+      if (this.#entryAttempt === attempt) this.#entryAttempt = undefined;
+    }
   }
-  async #connectSaved(profileId: string, automatic: boolean | undefined, entryId: string | undefined, entryRecovery: boolean, entryAttempt: AbortController): Promise<void> {
+  async #connectSaved(profileId: string, automatic: boolean | undefined, entryId: string | undefined, entryRecovery: boolean,
+    entryAttempt: AbortController, caller?: AbortSignal): Promise<void> {
     if (entryAttempt.signal.aborted || !this.#foreground || this.#disposed) return;
     let profile = this.#profiles.find((candidate) => candidate.profileId === profileId);
     if (!profile) throw new Error("This saved Joko connection is no longer available on this device.");
@@ -5007,21 +5025,34 @@ export class MobileClient {
       if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
       preflight = false;
       const preserveActiveConnection = this.#hasActiveConnection();
+      const priorView = caller && this.#state.saved.find(item => item.profileId === profileId);
       const { generation, controller } = this.#beginConnectionAttempt();
+      const cancelEntryAttempt = (): void => {
+        controller.abort();
+        if (!caller?.aborted || this.#connectionAttemptAbort !== controller || this.#connectionAttemptEpoch !== generation) return;
+        this.#connectionAttemptAbort = undefined;
+        this.#set({
+          busy: this.#mutationOwner !== undefined, candidate: undefined, challenge: undefined,
+          saved: this.#savedViews(profileId, priorView?.credentialState ?? "unknown", priorView?.error),
+          ...(!this.#hasActiveConnection() && this.#state.status === "connecting"
+            ? { status: this.#hasOfflineProjection() ? "offline" as const : "unpaired" as const } : {})
+        });
+      };
+      if (entryAttempt.signal.aborted) { cancelEntryAttempt(); return; }
+      entryAttempt.signal.addEventListener("abort", cancelEntryAttempt, { once: true });
       this.#set({
         ...(!this.#hasActiveConnection() ? { status: "connecting" as const } : {}),
         candidate: undefined,
         challenge: undefined,
         saved: this.#savedViews(profileId, "checking")
       });
-      const cancelEntryAttempt = () => controller.abort();
-      entryAttempt.signal.addEventListener('abort', cancelEntryAttempt, { once: true });
       let selection: string | undefined;
       let cached: MobileOfflineCacheSnapshot | undefined;
       let cacheLoadWarning: string | undefined;
       let credential: PairedCredential | undefined;
       let offlineEligible = true;
       try {
+        if (!this.#connectionAttemptCurrent(generation, controller)) return;
         selection = await this.storage.loadSelection(profileId);
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         if (!preserveActiveConnection && this.offlineCache) {
@@ -5101,6 +5132,7 @@ export class MobileClient {
         const detail = selected ? await this.network.readSession(credential, selected, controller.signal) : undefined;
         if (!this.#connectionAttemptCurrent(generation, controller)) return;
         if (selected !== selection) await this.storage.saveSelection(profileId, selected);
+        if (caller?.aborted) return;
         if (savedEntries && entryOwner) {
           const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
           await this.storage.writeConnectionEntries?.(profile, next);

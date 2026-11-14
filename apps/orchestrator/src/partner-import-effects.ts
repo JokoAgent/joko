@@ -32,6 +32,27 @@ export function preparePartnerImportCreation(partners: PartnerManager, selection
     ?? { modelChain: [], permissionMode: "ask", planMode: false, inputHandoff: true } } satisfies CreationDraft);
 }
 
+/** Match an installed v1 package that was saved before missing models could follow directory defaults. */
+export async function isSavedPackageMissingDefault(profile: PartnerProfileRecord, storage: PartnerImportStorage, assertCurrent: () => void): Promise<boolean> {
+  if (profile.lifecycle !== "active" || profile.usesDirectoryDefaults || profile.canonicalSessionId !== undefined
+    || profile.initializationState !== "error" || profile.initializationErrorCode !== "model_unavailable"
+    || profile.capabilities.modelChain.length !== 0) return false;
+  const receipt = storage.listReceipts().find(row => row.result.partnerId === profile.id && row.nativePackage
+    && row.result.saved && row.partnerCreated && row.environmentSaved && row.checkpointSaved && !row.checkpointCleared
+    && !row.cancelled && !row.creationRejected);
+  if (!receipt?.nativePackage || receipt.result.canonicalSessionId !== undefined || importedPartnerId(receipt.result.requestId) !== profile.id) return false;
+  const environment = await storage.environment.read(profile.id, assertCurrent).catch(error => {
+    assertCurrent();
+    if (error instanceof AgentImportError && error.code === "CREDENTIAL_STORAGE_INVALID") return null;
+    throw error;
+  });
+  const owner = environment?.packageOwner;
+  return environment?.source.kind === "package" && environment.source.agentId === receipt.nativePackage.packageId
+    && environment.pendingImport?.selection.requestId === receipt.result.requestId && owner !== undefined
+    && owner.revision === profile.revision.toString() && owner.profileVersion === profile.profileVersion
+    && owner.profileFingerprint === importProfileFingerprint(profile);
+}
+
 /** Explicit model/policy mapping can adopt those fields, but cannot adopt edits to imported identity or a different task. */
 export async function adoptPartnerImportSettings(partners: PartnerManager, store: OperationalStore, storage: PartnerImportStorage, partnerId: string, assertOwner: () => void): Promise<void> {
   const environment = await storage.environment.read(partnerId, assertOwner); assertOwner();
@@ -67,7 +88,11 @@ export async function createPartnerImportEffects(options: {
   const captureOwner = (profile: PartnerProfileRecord) => captureImportOwner(profile, store);
   if (prior?.profileUpdate && (stamp || packageStamp)) {
     const current = partners.getPartner(partnerId);
-    if ((packagePending(current) ? current.revision >= BigInt(prior.profileUpdate.fromRevision) + 1n : current.revision === BigInt(prior.profileUpdate.fromRevision) + 1n) && current.profileVersion === (stamp ?? packageStamp)!.profileVersion + 1
+    const priorRevision = BigInt(prior.profileUpdate.fromRevision);
+    const completedFirstHermesProfile = snapshot.source.kind === "hermes" && !snapshot.nativePackage && stamp !== undefined
+      && firstImportedProfileUpdateReady(store, current, stamp, priorRevision);
+    if ((completedFirstHermesProfile || (packagePending(current) ? current.revision >= priorRevision + 1n : current.revision === priorRevision + 1n))
+      && current.profileVersion === (stamp ?? packageStamp)!.profileVersion + 1
       && current.canonicalSessionId === stamp?.sessionId && importProfileFingerprint(current) === prior.profileUpdate.expectedFingerprint) {
       if (packagePending(current)) packageStamp = capturePackageOwner(current); else stamp = captureOwner(current);
       await storage.environment.update(partnerId, assertOwner, value => { value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate; });
@@ -145,14 +170,24 @@ export async function createPartnerImportEffects(options: {
     }
     const current = assertPartner(partnerId);
     const identity = profilePrefix(profile.identity, 8_000) || PARTNER_TEMPLATES[0].identitySource;
-    const baseline = profilePrefix(previous.profileProjection.identity, 8_000) || PARTNER_TEMPLATES[0].identitySource;
+    // The original profile can still be current after the prior v1 importer
+    // saved its first projection but stopped before writing the Partner.
+    const originalProfile = snapshot.source.kind === "hermes" && !snapshot.nativePackage
+      && stamp?.profileVersion === 1 && current.profileVersion === 1
+      && current.identitySource === PARTNER_TEMPLATES[0].identitySource;
+    const baseline = originalProfile ? current.identitySource
+      : profilePrefix(previous.profileProjection.identity, 8_000) || PARTNER_TEMPLATES[0].identitySource;
     if (current.identitySource !== baseline && current.identitySource !== identity) throw new AgentImportError("PROFILE_CHANGED");
-    await update(partnerId, value => { value.profileProjection = profile; });
     if (current.identitySource !== identity || previous.profileProjection.user !== profile.user || previous.profileProjection.instructions !== profile.instructions) {
       await update(partnerId, value => { value.profileUpdate = { fromRevision: current.revision.toString(), expectedFingerprint: importProfileFingerprint({ ...current, identitySource: identity }) }; });
       const changed = await partners.updatePartner(partnerId, current.revision, { identitySource: identity }); assertOwner(); owner = changed;
       if (packagePending(changed)) packageStamp = capturePackageOwner(changed); else stamp = captureOwner(changed);
-      await update(partnerId, value => { value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate; });
+      await update(partnerId, value => {
+        value.profileProjection = profile;
+        value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate;
+      });
+    } else if (previous.profileProjection.identity !== profile.identity) {
+      await update(partnerId, value => { value.profileProjection = profile; });
     }
   };
   return {
@@ -176,18 +211,20 @@ export async function createPartnerImportEffects(options: {
       let draft: CreationDraft;
       try { draft = JSON.parse(context.creationJson) as CreationDraft; } catch { throw new AgentImportError("IMPORT_CREATION_INVALID"); }
       if (draft.version !== 1 || !/^\d+$/.test(draft.directoryRevision) || !draft.capabilities) throw new AgentImportError("IMPORT_CREATION_INVALID");
+      const waitForDefault = snapshot.nativePackage !== undefined && draft.capabilities.modelChain.length === 0;
       let created = await partners.createImportedPartner({ id: partnerId, requestId: creationRequestId(input.requestId),
         ...(snapshot.nativePackage ? { allowUnconfiguredModel: true as const } : {}),
         expectedDirectoryRevision: BigInt(draft.directoryRevision), displayName: redact(input.name),
         avatar: input.avatarImageBase64 ? { base64: input.avatarImageBase64 } : snapshot.nativePackage?.avatarPreset ?? "orbit", templateId: "general",
-        identitySource: PARTNER_TEMPLATES[0].identitySource, description: snapshot.nativePackage?.description ?? "", capabilities: draft.capabilities, usesDirectoryDefaults: false });
+        identitySource: PARTNER_TEMPLATES[0].identitySource, description: snapshot.nativePackage?.description ?? "", capabilities: draft.capabilities,
+        usesDirectoryDefaults: waitForDefault });
       assertOwner();
       if (snapshot.nativePackage && !created.canonicalSessionId && created.initializationState === "pending") created = await partners.retryInitialization(partnerId, created.revision);
       if (created.lifecycle === "active" && created.initializationState === "error" && !packagePending(created)) created = await partners.retryInitialization(partnerId, created.revision);
       if (created.initializationState !== "ready" && !packagePending(created)) throw new AgentImportError("IMPORT_PARTNER_SETUP_REQUIRED");
       if (!stamp && !packageStamp && (created.profileVersion !== 1 || created.displayName !== redact(input.name).trim() || created.templateId !== "general"
-        || created.identitySource !== PARTNER_TEMPLATES[0].identitySource || created.usesDirectoryDefaults
-        || fingerprint(created.capabilities) !== fingerprint(draft.capabilities) || created.homeTargetId !== `partner:${partnerId}`
+        || created.identitySource !== PARTNER_TEMPLATES[0].identitySource || (created.usesDirectoryDefaults && !waitForDefault)
+        || (!created.usesDirectoryDefaults && fingerprint(created.capabilities) !== fingerprint(draft.capabilities)) || created.homeTargetId !== `partner:${partnerId}`
         || fingerprint(created.avatar) !== fingerprint(input.avatarImageBase64 ? decodePartnerAvatar(input.avatarImageBase64).image : snapshot.nativePackage?.avatarPreset ?? "orbit"))) throw new AgentImportError("IMPORT_OWNER_CHANGED");
       owner = created; assertPartner(partnerId);
       if (packagePending(created)) {
@@ -387,6 +424,29 @@ function captureImportOwner(profile: PartnerProfileRecord, store: OperationalSto
   const session = store.getSession(profile.canonicalSessionId!).descriptor;
   return { revision: profile.revision.toString(), profileVersion: profile.profileVersion, sessionId: session.id, generation: session.binding.generation,
     workspaceRoot: store.getTarget(profile.homeTargetId).descriptor.workspaceRoot, profileFingerprint: importProfileFingerprint(profile), identityFingerprint: importIdentityFingerprint(profile) };
+}
+
+function firstImportedProfileUpdateReady(
+  store: OperationalStore,
+  profile: PartnerProfileRecord,
+  stamp: NonNullable<ImportedEnvironment["targetOwner"]>,
+  priorRevision: bigint
+): boolean {
+  // The profile update and its normal avatar, session and ready stages each
+  // advance revision once. A separate retry or lifecycle change has its own revision.
+  if (stamp.profileVersion !== 1 || stamp.revision !== priorRevision.toString() || profile.revision !== priorRevision + 4n
+    || profile.lifecycle !== "active" || profile.initializationState !== "ready" || profile.invitationStage !== "ready"
+    || profile.canonicalSessionId !== stamp.sessionId) return false;
+  const session = store.findSession(stamp.sessionId)?.descriptor;
+  if (!session || session.archived || session.deletedAt !== undefined || session.targetId !== profile.homeTargetId
+    || session.binding.generation < stamp.generation || session.binding.generation > stamp.generation + 1
+    || session.appendSystemPrompt !== profile.identitySource || session.remoteWorkspace !== undefined) return false;
+  const target = store.getTarget(profile.homeTargetId).descriptor;
+  const route = profile.capabilities.modelChain[0];
+  return target.trusted && target.remoteWorkspace === undefined && target.workspaceRoot === stamp.workspaceRoot
+    && route !== undefined && session.backendId === route.backendId && session.providerId === route.providerId
+    && session.modelId === route.modelId && session.effort === route.effort && session.fastMode === route.fastMode
+    && session.permissionMode === profile.capabilities.permissionMode && session.planMode === profile.capabilities.planMode;
 }
 
 async function prepareImportSkillRoot(workspaceRoot: string, assertOwner: () => void): Promise<string> {

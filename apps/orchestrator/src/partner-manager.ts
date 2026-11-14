@@ -161,6 +161,7 @@ export interface PartnerManagerOptions {
   readonly onRoutineLifecycle?: (partnerId: string, state: PartnerLifecycle) => Promise<void>;
   readonly routineModel?: (partnerId: string, key: string) => PartnerModelRouteRecord | undefined;
   readonly prepareImportDeletion?: (partnerId: string) => Promise<void>;
+  readonly isSavedPackageMissingDefault?: (profile: PartnerProfileRecord, assertCurrent: () => void) => Promise<boolean>;
   readonly onReady?: (partnerId: string) => Promise<void>;
   readonly homeChanging?: (partnerId: string) => boolean;
   readonly remoteHomeModelAvailable?: (targetId: string, route: PartnerModelRouteRecord) => boolean;
@@ -212,6 +213,7 @@ export class PartnerManager {
   readonly #homeChanging: (partnerId: string) => boolean;
   readonly #remoteHomeModelAvailable: NonNullable<PartnerManagerOptions["remoteHomeModelAvailable"]>;
   readonly #prepareImportDeletion: PartnerManagerOptions["prepareImportDeletion"];
+  readonly #isSavedPackageMissingDefault: PartnerManagerOptions["isSavedPackageMissingDefault"];
   readonly #optionsOnReady: PartnerManagerOptions["onReady"];
   readonly #store: PartnerStore;
   readonly #operationalStore: OperationalStore;
@@ -247,6 +249,7 @@ export class PartnerManager {
     this.#routineLifecycle = options.onRoutineLifecycle;
     this.#routineModel = options.routineModel;
     this.#prepareImportDeletion = options.prepareImportDeletion;
+    this.#isSavedPackageMissingDefault = options.isSavedPackageMissingDefault;
     this.#optionsOnReady = options.onReady;
     this.#prepareAvatar = options.prepareAvatar ?? (async ({ partner, homePath }) => {
       const file = typeof partner.avatar === "string" ? "AVATAR.svg"
@@ -875,7 +878,8 @@ export class PartnerManager {
     assertCurrent?.();
     if (input.capabilities.permissionMode === "bypassPermissions") this.#validateCapabilities(input.capabilities);
     const existing = this.#store.getPartnerCreation(input.requestId);
-    const created = acceptedImport ? this.#store.createImportedPartner(input) : this.#store.createPartner(input, this.#followingDefaults());
+    const defaults = input.usesDirectoryDefaults ? this.#followingDefaults() : undefined;
+    const created = acceptedImport ? this.#store.createImportedPartner(input, defaults) : this.#store.createPartner(input, defaults);
     if (existing !== undefined) return created;
     return this.#serialized(created.id, () => this.#initializeCurrent(created.id));
   }
@@ -897,8 +901,10 @@ export class PartnerManager {
       if (usesDefaults && patch.capabilities !== undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "A partner using directory defaults cannot also provide capability overrides.");
       }
+      const editingWaitingProfile = current.usesDirectoryDefaults && current.capabilities.modelChain.length === 0
+        && current.canonicalSessionId === undefined && patch.usesDirectoryDefaults === undefined;
       const capabilities = usesDefaults
-        ? this.#effectiveDefaults(current, modelOnlyDefaults)
+        ? this.#effectiveDefaults(current, modelOnlyDefaults) ?? (editingWaitingProfile ? current.capabilities : undefined)
         : patch.capabilities ?? current.capabilities;
       if (capabilities === undefined) {
         throw new PartnerManagerError("PARTNER_MODEL_UNAVAILABLE", "Partner directory defaults are not configured.");
@@ -1196,18 +1202,41 @@ export class PartnerManager {
 
   async updateDirectoryDefaults(
     expectedDirectoryRevision: bigint,
-    capabilities: PartnerCapabilitiesRecord
+    capabilities: PartnerCapabilitiesRecord,
+    assertCurrent: () => void = () => {}
   ): Promise<readonly PartnerProfileRecord[]> {
+    assertCurrent();
     this.#validateCapabilities(capabilities);
     if (capabilities.permissionMode === "bypassPermissions") {
       for (const profile of this.#store.listPartners().filter(profile => profile.usesDirectoryDefaults && profile.canonicalSessionId !== undefined)) {
         this.#assertFullAccessTarget(profile);
       }
     }
+    const isSavedPackageMissingDefault = this.#isSavedPackageMissingDefault;
+    const pendingPackages = isSavedPackageMissingDefault ? this.#store.listPartners({ lifecycle: "active" }).filter(profile =>
+      !profile.usesDirectoryDefaults && profile.canonicalSessionId === undefined && profile.initializationErrorCode === "model_unavailable"
+      && profile.capabilities.modelChain.length === 0 && !this.#homeChanging(profile.id)) : [];
     const affected = this.#store.setDirectoryDefaults(expectedDirectoryRevision, capabilities);
+    const configuration = this.#store.directoryState().defaultCapabilities;
     const reconciled: PartnerProfileRecord[] = [];
     for (const partner of affected) {
       reconciled.push(await this.#serialized(partner.id, () => this.#initializeCurrent(partner.id)));
+    }
+    if (!isSavedPackageMissingDefault) return reconciled;
+    for (const candidate of pendingPackages) {
+      if (this.#homeChanging(candidate.id)) continue;
+      const adopted = await this.#serialized(candidate.id, async () => {
+        assertCurrent();
+        const current = this.#store.getPartner(candidate.id);
+        if (!await isSavedPackageMissingDefault(current, assertCurrent)) return undefined;
+        assertCurrent();
+        const latest = this.#store.getPartner(candidate.id);
+        const defaults = this.#store.directoryState().defaultCapabilities;
+        if (latest.revision !== current.revision || defaults === undefined || JSON.stringify(defaults) !== JSON.stringify(configuration)) return undefined;
+        const updated = this.#store.updatePartner(current.id, current.revision, { usesDirectoryDefaults: true }, defaults);
+        return this.#initializeCurrent(updated.id);
+      });
+      if (adopted) reconciled.push(adopted);
     }
     return reconciled;
   }

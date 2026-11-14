@@ -16448,6 +16448,7 @@ export class SessionHost {
       }
     };
     assertCurrent();
+    if (stored.planMode) throw new StoreError("Exit Plan mode before verifying an imported routine's data access.");
     const risk = policyRiskForToolRisk("ambiguous");
     const rules = [evaluateOrderedPolicyRules(policy, { subjectKind: "resource", toolName: "mcp_call", risk })];
     if (action.kind === "mcp") {

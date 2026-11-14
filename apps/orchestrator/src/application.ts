@@ -286,7 +286,7 @@ import { PartnerImportManager } from "./partner-import-manager.js";
 import { partnerPackageOpening } from "./partner-package-opening.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
-import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
+import { adoptPartnerImportSettings, createPartnerImportEffects, isSavedPackageMissingDefault, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { ExtensionRoutineRuntime } from "./extension-routine-runtime.js";
 import { ExtensionCardRuntime } from "./extension-cards/runtime.js";
 import { ExtensionNetworkConnections } from "./extension-cards/network-connections.js";
@@ -2398,6 +2398,7 @@ export async function createOrchestratorApplication(
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes"),
     onReady: async partnerId => { await partnerImports?.activatePackage(partnerId); },
+    isSavedPackageMissingDefault: (profile, assertCurrent) => isSavedPackageMissingDefault(profile, partnerImportStorage, assertCurrent),
     routineModel: (partnerId, key) => partnerRoutines?.engine.list(partnerId).find(routine =>
       key === `routine:${routine.id}` || key.startsWith(`routine:${routine.id}:`))?.modelOverride ?? undefined,
     onRoutineLifecycle: async (partnerId, state) => { await partnerRoutines?.lifecycle(partnerId, state); await partnerGroups?.partnerLifecycle(partnerId, state); await partnerMessaging?.lifecycle(partnerId, state); },
