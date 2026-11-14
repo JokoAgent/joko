@@ -67,7 +67,11 @@ export async function createPartnerImportEffects(options: {
   const captureOwner = (profile: PartnerProfileRecord) => captureImportOwner(profile, store);
   if (prior?.profileUpdate && (stamp || packageStamp)) {
     const current = partners.getPartner(partnerId);
-    if ((packagePending(current) ? current.revision >= BigInt(prior.profileUpdate.fromRevision) + 1n : current.revision === BigInt(prior.profileUpdate.fromRevision) + 1n) && current.profileVersion === (stamp ?? packageStamp)!.profileVersion + 1
+    const priorRevision = BigInt(prior.profileUpdate.fromRevision);
+    const completedFirstHermesProfile = snapshot.source.kind === "hermes" && !snapshot.nativePackage && stamp !== undefined
+      && firstImportedProfileUpdateReady(store, current, stamp, priorRevision);
+    if ((completedFirstHermesProfile || (packagePending(current) ? current.revision >= priorRevision + 1n : current.revision === priorRevision + 1n))
+      && current.profileVersion === (stamp ?? packageStamp)!.profileVersion + 1
       && current.canonicalSessionId === stamp?.sessionId && importProfileFingerprint(current) === prior.profileUpdate.expectedFingerprint) {
       if (packagePending(current)) packageStamp = capturePackageOwner(current); else stamp = captureOwner(current);
       await storage.environment.update(partnerId, assertOwner, value => { value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate; });
@@ -397,6 +401,29 @@ function captureImportOwner(profile: PartnerProfileRecord, store: OperationalSto
   const session = store.getSession(profile.canonicalSessionId!).descriptor;
   return { revision: profile.revision.toString(), profileVersion: profile.profileVersion, sessionId: session.id, generation: session.binding.generation,
     workspaceRoot: store.getTarget(profile.homeTargetId).descriptor.workspaceRoot, profileFingerprint: importProfileFingerprint(profile), identityFingerprint: importIdentityFingerprint(profile) };
+}
+
+function firstImportedProfileUpdateReady(
+  store: OperationalStore,
+  profile: PartnerProfileRecord,
+  stamp: NonNullable<ImportedEnvironment["targetOwner"]>,
+  priorRevision: bigint
+): boolean {
+  // The profile update and its normal avatar, session and ready stages each
+  // advance revision once. A separate retry or lifecycle change has its own revision.
+  if (stamp.profileVersion !== 1 || stamp.revision !== priorRevision.toString() || profile.revision !== priorRevision + 4n
+    || profile.lifecycle !== "active" || profile.initializationState !== "ready" || profile.invitationStage !== "ready"
+    || profile.canonicalSessionId !== stamp.sessionId) return false;
+  const session = store.findSession(stamp.sessionId)?.descriptor;
+  if (!session || session.archived || session.deletedAt !== undefined || session.targetId !== profile.homeTargetId
+    || session.binding.generation < stamp.generation || session.binding.generation > stamp.generation + 1
+    || session.appendSystemPrompt !== profile.identitySource || session.remoteWorkspace !== undefined) return false;
+  const target = store.getTarget(profile.homeTargetId).descriptor;
+  const route = profile.capabilities.modelChain[0];
+  return target.trusted && target.remoteWorkspace === undefined && target.workspaceRoot === stamp.workspaceRoot
+    && route !== undefined && session.backendId === route.backendId && session.providerId === route.providerId
+    && session.modelId === route.modelId && session.effort === route.effort && session.fastMode === route.fastMode
+    && session.permissionMode === profile.capabilities.permissionMode && session.planMode === profile.capabilities.planMode;
 }
 
 async function prepareImportSkillRoot(workspaceRoot: string, assertOwner: () => void): Promise<string> {

@@ -519,7 +519,7 @@ describe("native import service and owning effects", () => {
     }
   }, 20_000);
 
-  it.each([false, true])("reconciles the saved first identity projection after an owner edit of %s", async edited => {
+  it.each(["before profile write", "after ready", "owner edit"] as const)("reconciles the saved first identity projection after %s", async interruptionStage => {
     const f = await fixture();
     const frozenIdentity = "Hermes import identity before the first completed profile write.";
     const sourceIdentity = join(f.native, "SOUL.md");
@@ -551,26 +551,35 @@ describe("native import service and owning effects", () => {
     const environment = (await f.storage.environment.read(partnerId, () => {}))!;
     expect(Object.values(environment.documents)).toContain(frozenIdentity);
     expect(environment.pendingImport?.selection.requestId).toBe(selection.requestId);
-    // Persist the precise state left by the older ordering between projection and intent.
+    // Persist the older projection ordering with or without its intent, as at the selected interruption.
     await f.storage.environment.update(partnerId, () => {}, value => {
       value.profileProjection.identity = frozenIdentity;
-      delete value.profileUpdate;
+      if (interruptionStage !== "after ready") delete value.profileUpdate;
     });
     const userIdentity = "The owner supplied a different identity.";
-    if (edited) await update(partnerId, original.revision, { identitySource: userIdentity });
+    if (interruptionStage === "after ready") {
+      expect(environment.profileUpdate?.fromRevision).toBe(original.revision.toString());
+      const ready = await update(partnerId, original.revision, { identitySource: frozenIdentity });
+      expect(ready).toMatchObject({ canonicalSessionId: original.canonicalSessionId, initializationState: "ready",
+        profileVersion: original.profileVersion + 1, revision: original.revision + 4n });
+      expect((await f.storage.environment.read(partnerId, () => {}))?.targetOwner?.revision).toBe(original.revision.toString());
+    } else if (interruptionStage === "owner edit") {
+      await update(partnerId, original.revision, { identitySource: userIdentity });
+    }
     await writeFile(sourceIdentity, "A later source edit.");
     const reopened = await f.reopenImports();
     await reopened.api.retry(selection.requestId, false, signal);
     const settled = await reopened.manager.waitForRequest(selection.requestId);
     const profile = f.partners.getPartner(partnerId);
-    expect(profile.identitySource).toBe(edited ? userIdentity : frozenIdentity);
+    expect(profile.identitySource).toBe(interruptionStage === "owner edit" ? userIdentity : frozenIdentity);
     expect(profile.canonicalSessionId).toBe(original.canonicalSessionId);
     expect(f.profiles.listPartners()).toHaveLength(1);
-    if (edited) {
+    if (interruptionStage === "owner edit") {
       expect(settled.status).toBe("needs-attention");
       expect(settled.checks).toContainEqual(expect.objectContaining({ message: "IMPORT_OWNER_CHANGED" }));
     } else {
       expect(settled).toMatchObject({ status: "complete", savedEntryIds: [selected.id], partnerId });
+      expect(profile.profileVersion).toBe(original.profileVersion + 1);
       const committed = (await reopened.storage.environment.read(partnerId, () => {}))!;
       expect(committed.profileProjection.identity).toBe(frozenIdentity);
       expect(committed.profileUpdate).toBeUndefined();
