@@ -12745,6 +12745,16 @@ function projectTimelineEvent(
     if (index < 0) items.push(item);
     else items[index] = item;
   };
+  const endAssistantStreams = (): void => {
+    if ((kind.case === "runDone" || kind.case === "runAborted") && kind.value.runId !== event.identity?.runId) return;
+    const attempt = assistantStreamAttempt(event);
+    if (attempt === undefined) return;
+    for (const [index, item] of items.entries()) {
+      if (item.streaming && (item.streamAttempt ?? item.assistantStreamAttempt) === attempt) {
+        items[index] = { ...item, streaming: false };
+      }
+    }
+  };
 
   switch (kind.case) {
     case "messageStarted": {
@@ -12826,7 +12836,8 @@ function projectTimelineEvent(
     }
     case "textDelta": {
       const contentIndex = kind.value.contentIndex;
-      const streamAttempt = isAssistantStreamBlock(kind.value.messageId) ? assistantStreamAttempt(event) : undefined;
+      const ownerAttempt = assistantStreamAttempt(event);
+      const streamAttempt = isAssistantStreamBlock(kind.value.messageId) ? ownerAttempt : undefined;
       const existing = items.find((item) =>
         item.kind === "assistant"
         && isProjectedMessageItem(item, kind.value.messageId)
@@ -12856,6 +12867,7 @@ function projectTimelineEvent(
         text: textBlocks.map((block) => block.text).join(""),
         messageTextBlocks: textBlocks,
         ...(streamAttempt === undefined ? {} : { assistantStreamAttempt: streamAttempt }),
+        ...(ownerAttempt === undefined ? {} : { streamAttempt: ownerAttempt }),
         streaming: true
       }, (item) => item.id === kind.value.messageId
         && (streamAttempt === undefined || item.assistantStreamAttempt === streamAttempt));
@@ -13291,10 +13303,7 @@ function projectTimelineEvent(
     case "recoverableError":
     case "terminalError": {
       const error = kind.value.error;
-      const streamAttempt = kind.case === "terminalError" ? assistantStreamAttempt(event) : undefined;
-      if (streamAttempt !== undefined) for (const [index, item] of items.entries()) {
-        if (item.assistantStreamAttempt === streamAttempt && item.streaming) items[index] = { ...item, streaming: false };
-      }
+      if (kind.case === "terminalError") endAssistantStreams();
       replaceOrAppend({
         id: event.eventId,
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
@@ -13309,6 +13318,7 @@ function projectTimelineEvent(
       break;
     }
     case "runDone":
+      endAssistantStreams();
       replaceOrAppend({
         id: event.eventId,
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
@@ -13320,6 +13330,7 @@ function projectTimelineEvent(
       });
       break;
     case "runAborted":
+      endAssistantStreams();
       replaceOrAppend({
         id: event.eventId,
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),

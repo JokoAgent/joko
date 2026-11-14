@@ -543,11 +543,41 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await page.evaluate((id) => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, sessionId);
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
 
+    await composer.fill("Stop after the received native text");
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    const partialQueue = await waitFor(async () => fixture!.application.store.listQueueItems({ sessionId }).find(item => item.state === "backend_accepted"),
+      item => item !== undefined, "the second original Codex turn");
+    const nativeTurn = native.threads.get(threadId)!.turns.at(-1)!;
+    const partialItem = { type: "agentMessage", id: "native-partial-item", text: "", phase: null, memoryCitation: null, delivery: null };
+    await native.transport!.emitNotification("item/started", { threadId, turnId: nativeTurn["id"]!, item: partialItem });
+    await native.transport!.emitNotification("item/agentMessage/delta", { threadId, turnId: nativeTurn["id"]!, itemId: partialItem.id,
+      delta: "Received text before Stop." });
+    const partialRow = page.locator('.message-assistant[data-message-client-id="native-partial-item"]');
+    await partialRow.getByText("Received text before Stop.", { exact: true }).waitFor({ state: "visible" });
+    await partialRow.locator(".streaming-cursor").waitFor({ state: "visible" });
+    await page.locator(".session-header__abort").click();
+    await waitFor(async () => native.transport?.requests.some(request => request.method === "turn/interrupt") ?? false,
+      written => written, "Stop for the original native turn");
+    expect(native.transport!.requests.filter(request => request.method === "turn/interrupt").at(-1)?.params)
+      .toMatchObject({ threadId, turnId: nativeTurn["id"] });
+    await native.transport!.emitNotification("turn/completed", { threadId, turn: nativeTurn });
+    await waitFor(async () => fixture!.application.store.getRun(partialQueue!.runId!).descriptor.state,
+      state => state === "aborted", "the original stopped Run");
+    await partialRow.locator(".streaming-cursor").waitFor({ state: "hidden" });
+    expect(await partialRow.getByText("Received text before Stop.", { exact: true }).count()).toBe(1);
+    expect(fixture.application.store.listEvents({ sessionId }).some(event => event.payload.type === "message_complete"
+      && event.payload.nativeHistory?.identity?.entryId === partialItem.id)).toBe(false);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Connect", exact: true }).click();
+    await composer.waitFor({ state: "visible", timeout: 20_000 });
+    await partialRow.getByText("Received text before Stop.", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    expect(await partialRow.locator(".streaming-cursor").count()).toBe(0);
+
     native.threads.delete(threadId);
     await composer.fill("Native identity is missing");
     await page.getByRole("button", { name: "Send", exact: true }).click();
     await waitFor(async () => fixture!.application.store.listRuns({ sessionId }).map((run) => run.descriptor.state),
-      (states) => states.length === 2 && states.includes("failed"), "missing native identity visible run");
+      (states) => states.length === 3 && states.includes("failed"), "missing native identity visible run");
     expect(native.threads.size).toBe(0);
     await page.locator(".compact-list > li").filter({ hasText: "Native identity is missing" })
       .getByText("failed", { exact: true }).waitFor({ state: "visible", timeout: 10_000 });
