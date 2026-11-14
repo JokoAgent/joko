@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import { Code } from "@connectrpc/connect";
-import { afterEach, expect, it } from "vitest";
-import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, PartnerImportStatus, PartnerInitializationErrorCode,
+import { afterEach, expect, it, vi } from "vitest";
+import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, PartnerImportCheckStatus, PartnerImportStatus, PartnerInitializationErrorCode,
   PartnerInitializationState, PermissionMode, RoutineRunStatus } from "@joko/contracts";
 import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
@@ -134,4 +135,74 @@ it("activates the already installed engineer Partner after the Owner configures 
   expect(fixture.application.store.listSessions({ targetId: pending.homeTargetId }).map(item => item.descriptor.id)).toEqual([sessionId]);
   expect(fixture.application.store.listEvents({ sessionId }).filter(event => event.id === opening?.id)).toHaveLength(1);
   expect(await currentApi.invitePackage!(entry, "en", signal)).toMatchObject({ requestId: admitted.requestId, canonicalSessionId: sessionId });
+}, 150000);
+
+it("retries the failed installed skill and writes one opening to the original ready Partner task", async () => {
+  fixture = await RealPiSystemFixture.start({ enableInternalServer: true });
+  const { application } = fixture;
+  const { clients, connectionId } = await fixture.pair("Package retry Owner");
+  const directory = (await clients.partner.getPartnerDirectory({})).directory!;
+  await clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: directory.revision, capabilities: {
+    modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }],
+    permissionMode: PermissionMode.ASK, planMode: false, inputHandoff: true
+  } });
+  const api = createPartnerImportApi({ rpc: clients.partnerImport, ownerKey: connectionId,
+    controllerId: "partner-discovery", assertCurrent() {}, newRequestId: randomUUID });
+  const signal = new AbortController().signal;
+  const entry = (await api.packages!("en", signal)).find(item => item.packageId === "engineer-bot")!;
+  const entryId = "skill-engineer-bot-ops";
+  const slug = `engineer-bot-ops-${createHash("sha256").update(JSON.stringify(entryId)).digest("hex").slice(0, 16)}`;
+  const homes = join(application.config.dataDirectory, "partner-homes");
+  let failedDestination: string | undefined;
+  const lstat = fs.lstat.bind(fs);
+  // Fail the exact destination read once, before the original staging write.
+  const denied = vi.spyOn(fs, "lstat").mockImplementation((async (...args: Parameters<typeof fs.lstat>) => {
+    const [path] = args;
+    if (typeof path === "string" && path.startsWith(homes + sep) && basename(path) === slug
+      && dirname(path).endsWith(join(".agents", "skills")) && failedDestination === undefined) {
+      failedDestination = path;
+      throw Object.assign(new Error("Fixture skill destination is temporarily inaccessible."), { code: "EACCES" });
+    }
+    return lstat(...args);
+  }) as typeof fs.lstat);
+  let requestId: string;
+  try {
+    requestId = (await api.invitePackage!(entry, "en", signal)).requestId;
+    await application.partnerImports!.waitForRequest(requestId);
+  } finally { denied.mockRestore(); }
+  expect(failedDestination).toBeDefined();
+  await expect(fs.lstat(failedDestination!)).rejects.toMatchObject({ code: "ENOENT" });
+  const failed = (await api.status(requestId, signal))!;
+  const sessionId = failed.canonicalSessionId!;
+  expect(failed).toMatchObject({ saved: true, status: PartnerImportStatus.NEEDS_ATTENTION, canonicalSessionId: expect.any(String) });
+  expect(failed.checks.filter(check => check.status === PartnerImportCheckStatus.NEEDS_ATTENTION)).toMatchObject([
+    { entryId, message: "IMPORT_PERMISSION_DENIED" }
+  ]);
+  expect(failed.savedEntryIds).not.toContain(entryId);
+  const partner = (await clients.partner.getPartner({ partnerId: failed.partnerId })).partner!;
+  expect(partner).toMatchObject({ initializationState: PartnerInitializationState.READY, canonicalSessionId: sessionId });
+  const installed = () => application.piResources!.list({ targetId: partner.homeTargetId, kind: "skill" });
+  const otherSkills = installed().map(resource => resource.id);
+  expect(otherSkills).toHaveLength(2);
+  const routines = () => clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
+  const earlier = (await routines()).routines.find(routine => !routine.builtin)!;
+  expect(earlier.definition?.enabled).toBe(false);
+  const welcomeId = `import-message-${createHash("sha256").update(JSON.stringify([sessionId, `package-welcome-${requestId}`])).digest("hex")}`;
+  expect(application.store.findEvent(welcomeId)).toBeUndefined();
+
+  expect(await api.invitePackage!(entry, "en", signal)).toMatchObject({ requestId });
+  await application.partnerImports!.waitForRequest(requestId);
+  const recovered = (await api.status(requestId, signal))!;
+  expect(recovered).toMatchObject({ partnerId: failed.partnerId, canonicalSessionId: sessionId, status: PartnerImportStatus.COMPLETE });
+  expect(recovered.checks.filter(check => check.entryId === entryId)).toMatchObject([{ status: PartnerImportCheckStatus.COPIED }]);
+  expect(recovered.savedEntryIds.filter(id => id === entryId)).toEqual([entryId]);
+  expect(installed().map(resource => resource.id)).toEqual(expect.arrayContaining(otherSkills));
+  expect(installed()).toHaveLength(3);
+  const resourceId = `imported_skill_${createHash("sha256").update(JSON.stringify([partner.partnerId, entryId])).digest("hex").slice(0, 40)}`;
+  expect(installed().find(resource => resource.id === resourceId)).toMatchObject({ enabled: true });
+  expect((await routines()).routines.find(routine => routine.id === earlier.id)?.definition?.enabled).toBe(false);
+  expect(application.store.findEvent(welcomeId)).toMatchObject({ sessionId,
+    payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: expect.stringMatching(/\S/u) }] } });
+  expect(await api.invitePackage!(entry, "en", signal)).toEqual(recovered);
+  expect(application.store.listEvents({ sessionId }).filter(event => event.id === welcomeId)).toHaveLength(1);
 }, 150000);
