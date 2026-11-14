@@ -4913,8 +4913,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           if (!this.#matchesCallbackFence(runtime, input.hostGeneration) || runtime.disconnectTerminalEmitted) return;
           const activeYieldClaim = runtime.yieldContinuation;
           const activeTurnId = runtime.state.activeTurnId;
+          const pendingTurnStart = runtime.pendingTurnStart;
           const ownsRootTerminal = activeYieldClaim === undefined
-            ? runtime.yieldTerminalOwner === undefined && (runtimeHasProductWork(runtime) || runtime.pendingTurnStart !== undefined)
+            ? runtime.yieldTerminalOwner === undefined && (runtimeHasProductWork(runtime) || pendingTurnStart !== undefined)
             : claimYieldProductTerminal(runtime, activeYieldClaim);
           runtime.dispatchLifetime.abort();
           this.#cancelYieldContinuation(runtime);
@@ -4924,7 +4925,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           runtime.smartRoute = undefined;
           runtime.disconnectTerminalEmitted = true;
           this.#cancelPendingServerRequests(runtime);
-          const context = runtime.activeTurnContext ?? runtime.context;
+          // An unacknowledged start owns this disconnect if the last turn
+          // has finished and no new native turn is bound yet.
+          const context = activeTurnId === undefined && pendingTurnStart !== undefined
+            ? pendingTurnStart.context : runtime.activeTurnContext ?? runtime.context;
           const emit = runtime.partnerLearningTurn?.emit ?? context.emit;
           const observe = activeYieldClaim === undefined && activeTurnId !== undefined && fault.code === "process_exited"
             && context.observeAcceptedNativeTurn !== undefined

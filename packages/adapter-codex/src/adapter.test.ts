@@ -3425,6 +3425,39 @@ describe("CodexBackendAdapter", () => {
     expect(events).toContainEqual({ type: "done", outcome: "failed" });
   });
 
+  it.each([false, true])("keeps a local completed turn terminal after process exit (new start pending=%s)", async pendingStart => {
+    const setup = await createSetup();
+    const previousEvents: EventPayload[] = [];
+    const initial = context(setup.target, previousEvents, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    const previous = { ...initial, binding, operationId: "completed-turn-before-exit" };
+    await setup.adapter.send(prompt("Original turn"), previous);
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    expect(previousEvents.filter(event => event.type === "done")).toEqual([{ type: "done", outcome: "completed" }]);
+    const transport = setup.fake.transport!;
+    const currentEvents: EventPayload[] = [];
+    if (pendingStart) {
+      const originalRequest = transport.request.bind(transport);
+      vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+        if (method !== "turn/start") return originalRequest(method, params, options);
+        // The input reached the wire. Exit before the fixture sends a response or notification.
+        options?.beforeDispatch?.();
+        options?.onDispatch?.();
+        await transport.exit();
+        throw new TransportFault("process_exited", "Lost the pending turn response.", { stateMayHaveChanged: true });
+      });
+      const current = context(setup.target, currentEvents, { binding, backendInstanceGeneration: 7, operationId: "pending-turn-at-exit" });
+      await expect(setup.adapter.send(prompt("New turn with no native response"), current))
+        .rejects.toMatchObject({ publicError: { code: "CODEX_DISPATCH_UNKNOWN", stateMayHaveChanged: true } });
+      expect(currentEvents.filter(event => event.type === "error" || event.type === "done")).toEqual([
+        expect.objectContaining({ type: "error", terminal: true, error: expect.objectContaining({ code: "CODEX_APP_SERVER_DISCONNECTED" }) }),
+        { type: "done", outcome: "failed" }
+      ]);
+    } else await transport.exit();
+    expect(previousEvents.filter(event => event.type === "error" || event.type === "done"))
+      .toEqual([{ type: "done", outcome: "completed" }]);
+  });
+
   it("reports a side-effect-free continuity gap for validated missing or unresumable native threads", async () => {
     const setup = await createSetup();
     const events: EventPayload[] = [];
