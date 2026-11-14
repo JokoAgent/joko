@@ -123,6 +123,7 @@ import {
 import {
   bindNativeHistoryEventMetadata,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
+  nativeHistoryReplayMetadata,
   projectNativeHistory
 } from "./native-history.js";
 import {
@@ -17782,7 +17783,8 @@ export class SessionHost {
         traceId: `native-history:${projection.id}`,
         payload,
         pi: projection.pi,
-        metadata: projection.metadata
+        metadata: projection.observedMetadataFields === undefined ? projection.metadata
+          : nativeHistoryReplayMetadata(projection, store.findEvent(projection.id)?.metadata)
       });
     }
 

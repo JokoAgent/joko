@@ -14318,6 +14318,40 @@ describe("SessionHost", () => {
       ]));
   });
 
+  it.each([false, true])("retains only declared native metadata observations across cold replay (declared=%s)", async declared => {
+    const adapter = new ManagedAttachFakeAdapter();
+    const user = { ...fakeHistoryEvent("running-user", "message_user", {
+      type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Original native input" }]
+    }), metadata: { namespace: "fake.native_history", fields: { nativeEntryId: "running-user", turnStatus: "inProgress" } },
+      ...(declared ? { observedMetadataFields: ["turnStatus"] } : {}) };
+    adapter.history = { events: [user], activeEntryId: "running-user" };
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: `attach-observed-history-${declared}`,
+      connection: fixture.connection, targetId: "target-one", title: "Observed native history", fastMode: false,
+      permissionMode: "ask", planMode: false, nativeStart: { kind: "attach", nativeReference: "managed://observed-history" } })).value.sessionId;
+    const original = fixture.store.listEvents({ sessionId }).find(event => event.metadata?.fields["nativeEntryId"] === "running-user")!;
+    await fixture.host.close(sessionId);
+    const completedUser = { ...user, metadata: { ...user.metadata, fields: { ...user.metadata.fields, turnStatus: "completed" } } };
+    const assistant = { ...fakeHistoryEvent("completed-assistant", "message_assistant", {
+      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Late native completion" }]
+    }), nativeParentEntryId: "running-user" };
+    adapter.history = { events: [completedUser, assistant], activeEntryId: "completed-assistant" };
+    if (!declared) {
+      await expect(fixture.host.getTree(sessionId)).rejects.toThrow("Deterministic event ID collision");
+      expect(fixture.store.findEvent(original.id)).toEqual(original);
+      return;
+    }
+    await expect(fixture.host.getTree(sessionId)).resolves.toBeDefined();
+    const replayed = fixture.store.listEvents({ sessionId });
+    expect(replayed.filter(event => event.metadata?.fields["nativeEntryId"] === "running-user")).toEqual([original]);
+    expect(replayed.filter(event => event.metadata?.fields["nativeEntryId"] === "completed-assistant")).toHaveLength(1);
+    await fixture.host.close(sessionId);
+    adapter.history = { ...adapter.history, events: [{ ...completedUser,
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Changed native input" }] } }, assistant] };
+    await expect(fixture.host.getTree(sessionId)).rejects.toThrow("Deterministic event ID collision");
+    expect(fixture.store.findEvent(original.id)).toEqual(original);
+  });
+
   it.each(["in_place", "replacement"] as const)("persists an explicit start rewind and fences stale generations with a %s native outcome", async (outcome) => {
     const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "session.rewind_to_start", supported: true }] });
     adapter.history = { events: [{ ...fakeHistoryEvent("first-user", "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "First" }] }), nativeRewindBefore: { kind: "session_start" } }], activeEntryId: "first-user", activeLineage: [{ entryId: "first-user" }] };

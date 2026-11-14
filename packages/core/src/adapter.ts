@@ -236,6 +236,8 @@ export interface NativeHistoryProjectedEvent {
   readonly emittedAt?: number;
   readonly payload: EventPayload;
   readonly metadata?: AdapterEventMetadata;
+  /** Observations that may advance on replay; retain their first recorded values. */
+  readonly observedMetadataFields?: readonly string[];
 }
 
 export interface NativeHistoryProjection {

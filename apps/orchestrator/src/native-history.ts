@@ -25,6 +25,7 @@ export interface NativeHistoryEventProjection {
     readonly namespace: string;
     readonly fields: Readonly<Record<string, string | number | boolean>>;
   };
+  readonly observedMetadataFields?: readonly string[];
 }
 
 /**
@@ -60,6 +61,13 @@ export function projectNativeHistory(
     }
     seen.add(projectionIdentity);
     const adapterMetadata = event.metadata;
+    const observedMetadataFields = event.observedMetadataFields;
+    if (observedMetadataFields !== undefined && (observedMetadataFields.length > 16
+      || new Set(observedMetadataFields).size !== observedMetadataFields.length
+      || observedMetadataFields.some(field => boundedIdentity(field, "observed metadata field", 256) === NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD
+        || adapterMetadata === undefined || !Object.hasOwn(adapterMetadata.fields, field)))) {
+      throw new Error("Native history projection contains invalid observed metadata fields.");
+    }
     const payload = withNativeHistoryEventContext(event.payload, {
       identity: {
         entryId: nativeEntryId,
@@ -76,11 +84,26 @@ export function projectNativeHistory(
         event.contentIndex
       ),
       ...(event.emittedAt === undefined ? {} : { emittedAt: event.emittedAt }),
+      ...(observedMetadataFields === undefined ? {} : { observedMetadataFields }),
       payload,
       ...(adapterMetadata?.pi === undefined ? {} : { pi: adapterMetadata.pi }),
       metadata: nativeHistoryBindingMetadata(bindingFingerprint, adapterMetadata)
     };
   });
+}
+
+/** Preserve the first observation without relaxing the Store's immutable event comparison. */
+export function nativeHistoryReplayMetadata(
+  projection: NativeHistoryEventProjection,
+  recorded: NativeHistoryEventProjection["metadata"]
+): NativeHistoryEventProjection["metadata"] {
+  const metadata = projection.metadata;
+  if (metadata === undefined || recorded?.namespace !== metadata.namespace || projection.observedMetadataFields === undefined) return metadata;
+  const observed = new Set(projection.observedMetadataFields);
+  return { ...metadata, fields: Object.fromEntries(Object.entries(metadata.fields).map(([field, value]) => [field,
+    observed.has(field) && Object.hasOwn(recorded.fields, field) && typeof recorded.fields[field] === typeof value
+      ? recorded.fields[field]! : value
+  ])) };
 }
 
 export function bindNativeHistoryEventMetadata(

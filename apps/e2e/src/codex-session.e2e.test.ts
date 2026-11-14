@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
@@ -417,6 +418,65 @@ it("persists current Codex step plans consistently through generated timeline, S
   } finally {
     await fixture?.close();
     await host.shutdown();
+  }
+});
+
+it("reopens the same Codex history after a recorded in-progress user entry completes while the node is closed", async () => {
+  const backendId = "codex-history-replay";
+  const native = new FakeCodexAppServer();
+  let nativeHost = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  let rootDirectory: string | undefined;
+  const start = () => OrchestratorE2eFixture.start({ rootDirectory, keepRoot: true, backendFactories: [{
+    instanceId: backendId, adapterKind: "codex", displayName: "Codex history replay",
+    create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host: nativeHost })
+  }] });
+  try {
+    fixture = await start(); rootDirectory = fixture.rootDirectory;
+    const paired = await fixture.pair("Codex history replay client");
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const binding = fixture.application.store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId!;
+    const execution = await submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, BigInt(binding.generation), "Retain the original native input."));
+    const runId = queueRunIdFrom(execution);
+    await waitFor(async () => fixture!.application.store.findQueueItemByRunId(sessionId, runId),
+      item => item?.state === "backend_accepted", "the original native turn acceptance");
+    await native.transport!.exit();
+    const original = await waitFor(async () => fixture!.application.store.listEvents({ sessionId }).find(event =>
+      event.metadata?.namespace === "codex.native_history" && event.payload.type === "message_complete" && event.payload.role === "user"),
+      event => event?.metadata?.fields["turnStatus"] === "inProgress", "the recorded running native user entry");
+    expect(original).toBeDefined();
+    const thread = native.threads.get(threadId)!;
+    const turn = thread.turns.at(-1)!;
+    await fixture.close(); fixture = undefined;
+    expect(turn["status"]).toBe("inProgress");
+    turn["status"] = "completed";
+    const items = turn["items"];
+    if (!Array.isArray(items)) throw new Error("The original native items are unavailable.");
+    turn["items"] = [...items, { type: "agentMessage", id: "late-history-assistant",
+      text: "The original remote turn completed.", phase: null, memoryCitation: null, delivery: null }];
+    thread.status = { type: "idle" };
+    nativeHost = new AppServerHost({ transportFactory: () => native.createTransport() });
+    fixture = await start();
+    const clients = fixture.clients(paired.authKey);
+    await expect(clients.session.getNativeSessionTree({ sessionId })).resolves.toMatchObject({ tree: expect.any(Object) });
+    const events = fixture.application.store.listEvents({ sessionId });
+    expect(events.filter(event => event.metadata?.namespace === "codex.native_history"
+      && event.payload.type === "message_complete" && event.payload.role === "user"))
+      .toEqual([original]);
+    expect(events.filter(event => event.payload.type === "message_complete" && event.payload.role === "assistant"
+      && event.payload.blocks.some(block => block.kind === "text" && block.text === "The original remote turn completed."))).toHaveLength(1);
+    expect(fixture.application.store.getSession(sessionId).descriptor.binding.nativeSessionId).toBe(threadId);
+    expect(fixture.application.store.listRuns({ sessionId })).toHaveLength(1);
+    await expect(clients.session.getNativeSessionTree({ sessionId })).resolves.toMatchObject({ tree: expect.any(Object) });
+    expect(fixture.application.store.listEvents({ sessionId }).filter(event => event.metadata?.namespace === "codex.native_history"
+      && event.payload.type === "message_complete" && event.payload.role === "user"))
+      .toEqual([original]);
+  } finally {
+    await fixture?.close(); await nativeHost.shutdown();
+    if (rootDirectory !== undefined) await rm(rootDirectory, { recursive: true, force: true });
   }
 });
 
