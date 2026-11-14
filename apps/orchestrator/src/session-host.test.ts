@@ -681,6 +681,9 @@ describe("SessionHost", () => {
     f.store.updateSession(sessionId, { planMode: true }, f.store.getSession(sessionId).revision);
     f.host.resolveInteraction(first.id, first.generation, { kind: "permission", decision: "allow_once" }, "stale-probe-approval");
     await expect(pending).rejects.toThrow("Import verification authority changed.");
+    await expect(authorize()).rejects.toThrow("Exit Plan mode before verifying an imported routine's data access.");
+    expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
+    f.store.updateSession(sessionId, { planMode: false }, f.store.getSession(sessionId).revision);
     const next = authorize();
     const second = f.store.listInteractions({ sessionId, status: "open" })[0]!;
     f.host.resolveInteraction(second.id, second.generation, { kind: "permission", decision: "allow_once" }, "current-probe-approval");

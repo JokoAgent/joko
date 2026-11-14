@@ -296,17 +296,18 @@ describe("ArtifactMaintenance", () => {
     const first = artifactRecord("artifact-first", firstDigest, firstBytes.byteLength, firstPath);
     const last = artifactRecord("artifact-last", lastDigest, lastBytes.byteLength, lastPath);
     const pageOffsets: number[] = [];
-    const store = {
+    const store: Pick<OperationalStore, "listArtifacts" | "listReclaimablePortableReplacementImages"> = {
       listArtifacts: (options: { readonly offset?: number }) => {
         const offset = options.offset ?? 0;
         pageOffsets.push(offset);
         if (offset === 0) return Array<ArtifactRecord>(100_000).fill(first);
         if (offset === 100_000) return [last];
         return [];
-      }
-    } as unknown as OperationalStore;
+      },
+      listReclaimablePortableReplacementImages: () => []
+    };
     const maintenance = new ArtifactMaintenance({
-      store,
+      store: store as OperationalStore,
       rootDirectory: root,
       now: () => 1_000,
       temporaryFileMinimumAgeMs: 60_000

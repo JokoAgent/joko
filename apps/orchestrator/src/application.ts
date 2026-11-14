@@ -645,6 +645,8 @@ export interface OrchestratorApplicationDependencies {
   /** Only an ephemeral Desktop-managed service accepts the native owner's live locale. */
   readonly desktopManagedExtensionContext?: boolean;
   readonly agentImportSources?: { readonly home: string; readonly environment: NodeJS.ProcessEnv };
+  /** Retention clock for isolated Artifact storage tests. */
+  readonly artifactClock?: () => number;
   /** Private host capability; proxy credentials remain outside durable Orchestrator state. */
   readonly resolveOutboundProxy?: OutboundProxyResolver;
   /** Optional speech transport owner; its credentials remain behind the factory port. */
@@ -866,12 +868,14 @@ export async function createOrchestratorApplication(
   const artifacts = new ArtifactStore({
     rootDirectory: config.artifactDirectory,
     repository: artifactRepository,
-    ingestRoots: [config.workspace.root, config.dataDirectory, config.piAgentHome]
+    ingestRoots: [config.workspace.root, config.dataDirectory, config.piAgentHome],
+    ...(dependencies.artifactClock === undefined ? {} : { now: dependencies.artifactClock })
   });
   await artifacts.initialize();
   const artifactMaintenance = new ArtifactMaintenance({
     store,
-    rootDirectory: config.artifactDirectory
+    rootDirectory: config.artifactDirectory,
+    ...(dependencies.artifactClock === undefined ? {} : { now: dependencies.artifactClock })
   });
   await artifactMaintenance.initialize();
 
