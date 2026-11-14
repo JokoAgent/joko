@@ -197,6 +197,43 @@ describe("RemoteCodexRuntimeResolver", () => {
     ]);
   });
 
+  it("retires a late SSH proxy handle when the Target is renamed before adoption", async () => {
+    const fixture = createFixture({});
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    const open = fixture.processes.open.bind(fixture.processes);
+    let enter!: (value: { readonly handle: RemoteProcessHandle; readonly signal: AbortSignal }) => void;
+    const entered = new Promise<{ readonly handle: RemoteProcessHandle; readonly signal: AbortSignal }>((resolve) => { enter = resolve; });
+    let resume!: () => void;
+    const hold = new Promise<void>((resolve) => { resume = resolve; });
+    vi.spyOn(fixture.processes, "open").mockImplementation(async (request) => {
+      const handle = await open(request);
+      if (request.args[1] === "proxy") {
+        enter({ handle, signal: request.signal! });
+        await hold;
+      }
+      return handle;
+    });
+    const startup = runtime.host.ensureStarted().catch((error: unknown) => error);
+    try {
+      const { handle, signal } = await entered;
+      const kill = vi.spyOn(handle, "kill");
+      const renamed = { ...fixture.target, displayName: "Renamed project" };
+      fixture.stored = { ...fixture.stored, descriptor: renamed, revision: fixture.stored.revision + 1n };
+      resume();
+      expect(await startup).toMatchObject({ code: "spawn_failed" });
+      expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+      expect(handle.signalCode).toBe("SIGKILL");
+      expect(signal.aborted).toBe(true);
+      expect(fixture.processes.clientMessages).toEqual([]);
+
+      const current = await fixture.resolver.resolve(renamed);
+      expect(current).not.toBe(runtime);
+      await current.host.ensureStarted();
+      expect(fixture.processes.clientMessages.map(message => message.method)).toContain("initialize");
+    } finally { resume(); }
+  });
+
   it("fences exact Target and SSH authority revisions and never surfaces remote stderr", async () => {
     const fixture = createFixture({ probeVersion: "codex-cli 9.9.9", stderr: "private-fixture-secret" });
     cleanups.push(() => fixture.resolver.forceShutdown());

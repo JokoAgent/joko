@@ -420,6 +420,7 @@ interface RemoteCodexWebSocketChannelOptions {
 
 class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
   readonly #options: RemoteCodexWebSocketChannelOptions;
+  readonly #lifetime = new AbortController();
   #handlers: JsonRpcRecordChannelHandlers | undefined;
   #process: RemoteProcessHandle | undefined;
   #state: "idle" | "starting" | "running" | "closing" | "closed" = "idle";
@@ -455,20 +456,23 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
         executable: this.#options.executable,
         args: ["app-server", "proxy", "--sock", socketPath],
         cwd: this.#options.workspaceRoot,
-        env: { CODEX_HOME: this.#options.profileRoot }
+        env: { CODEX_HOME: this.#options.profileRoot },
+        signal: this.#lifetime.signal
       });
-      this.#options.assertCurrent();
-      if (this.#state !== "starting") {
-        try { processHandle.kill("SIGKILL"); } catch { /* A concurrent failure already won. */ }
-        throw new TransportFault("closed", "The remote Codex channel closed during startup.");
-      }
+      // Adopt the returned handle before checking Target authority. A failed
+      // adoption still owns the exact proxy process and its SSH channel.
       this.#process = processHandle;
-      processHandle.stderr.resume();
+      processHandle.once("error", () => this.#fail(new TransportFault("process_exited", "The remote Codex proxy process failed.", { stateMayHaveChanged: true })));
       processHandle.stderr.once("error", () => this.#fail(new TransportFault("process_exited", "The remote Codex proxy error stream failed.", { stateMayHaveChanged: true })));
-      processHandle.stdout.on("data", (chunk: Buffer | string) => this.#acceptBytes(chunk));
       processHandle.stdout.once("error", () => this.#fail(new TransportFault("process_exited", "The remote Codex proxy stream failed.", { stateMayHaveChanged: true })));
       processHandle.stdin.once("error", () => this.#fail(new TransportFault("write_failed", "The remote Codex proxy write stream failed.", { stateMayHaveChanged: true })));
-      processHandle.once("error", () => this.#fail(new TransportFault("process_exited", "The remote Codex proxy process failed.", { stateMayHaveChanged: true })));
+      if (this.#state !== "starting") {
+        this.#killProxy();
+        throw new TransportFault("closed", "The remote Codex channel closed during startup.");
+      }
+      this.#options.assertCurrent();
+      processHandle.stderr.resume();
+      processHandle.stdout.on("data", (chunk: Buffer | string) => this.#acceptBytes(chunk));
       processHandle.once("exit", () => this.#fail(new TransportFault("process_exited", "The remote Codex proxy process exited.", { stateMayHaveChanged: true })));
       const key = randomBytes(16).toString("base64");
       this.#expectedAccept = createHash("sha1").update(key + WS_GUID, "ascii").digest("base64");
@@ -515,6 +519,7 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
     this.#state = "closing";
     this.#clearHandshake();
     if (processHandle === undefined) {
+      this.#lifetime.abort();
       this.#state = "closed";
       return;
     }
@@ -533,6 +538,7 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
       }
     }
     this.#process = undefined;
+    this.#lifetime.abort();
     this.#state = "closed";
   }
 
@@ -548,6 +554,7 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
       }
     }
     this.#process = undefined;
+    this.#lifetime.abort();
     this.#state = "closed";
   }
 
@@ -725,11 +732,7 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
     this.#handshakeReject = undefined;
     this.#handshakeBuffer = Buffer.alloc(0);
     this.#frameBuffer = Buffer.alloc(0);
-    const processHandle = this.#process;
-    this.#process = undefined;
-    if (processHandle !== undefined && processHandle.exitCode === null && processHandle.signalCode === null) {
-      try { processHandle.kill("SIGKILL"); } catch { /* The proxy may already be gone. */ }
-    }
+    this.#killProxy();
     if (starting) {
       reject?.(fault);
       return;
@@ -737,6 +740,16 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
     if (this.#exitDelivered) return;
     this.#exitDelivered = true;
     void Promise.resolve(this.#handlers?.onExit(fault)).catch(() => undefined);
+  }
+
+  #killProxy(): void {
+    const processHandle = this.#process;
+    this.#process = undefined;
+    if (processHandle !== undefined && processHandle.exitCode === null && processHandle.signalCode === null) {
+      try { processHandle.kill("SIGKILL"); } catch { /* The captured channel closes below. */ }
+      try { processHandle.stdin.end(); } catch { /* The captured channel may already be closed. */ }
+    }
+    this.#lifetime.abort();
   }
 }
 
