@@ -51,6 +51,7 @@ import type {
   PromptInput,
   ProviderModel,
   PublicError,
+  RunDescriptor,
   RuntimeCommand,
   RuntimeResource,
   RuntimeToolCatalog,
@@ -247,7 +248,11 @@ interface ActiveBackendSideEffectLease {
   readonly release: () => void;
 }
 
-type RunAbortOptions = { readonly beforeAbort: () => void } | { readonly ownerStop: true };
+type CompleteOperationInTransaction = (finalize: (store: OperationalStore) => void) => void;
+type RunAbortOptions = { readonly beforeAbort: () => void } | {
+  readonly ownerStop: true;
+  readonly completeBeforeDispatch?: CompleteOperationInTransaction;
+};
 
 function samePolicyBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
   return left.nativeSessionId === right.nativeSessionId && left.generation === right.generation && left.opaqueRef === right.opaqueRef;
@@ -406,6 +411,8 @@ interface DispatchPreparation {
   readonly settled: Promise<void>;
   readonly resolve: () => void;
   phase: "pre-send" | "sending";
+  readonly cancellation: AbortController;
+  nativeTurnDispatched: boolean;
 }
 
 interface CompactionQueueWindow {
@@ -3856,7 +3863,7 @@ export class SessionHost {
     readonly sessionLifecycleFenceId?: string;
     /** Fence new product-task creation while a claimed Target deletion effect reaches final commit. */
     readonly targetSessionCreationFenceId?: string;
-    /** Wrap the final synchronous Store completion in a serialized external commit protocol. */
+    /** Own the final synchronous Store completion, including any fence that must hold at commit. */
     readonly complete?: (
       commit: (finalize?: (store: OperationalStore) => void) => OperationExecution<T>
     ) => Promise<OperationExecution<T>>;
@@ -3871,7 +3878,7 @@ export class SessionHost {
     if (input.sessionLifecycleFenceId !== undefined) {
       await this.adoptPendingNativeSessionDerivationForSession(input.sessionLifecycleFenceId);
     }
-    if (input.effect === undefined) {
+    if (input.effect === undefined && input.complete === undefined) {
       const execution = this.#store.runAuthorizedOperation(
         input.connection.id,
         input.connection.authKeyDigest,
@@ -3914,7 +3921,7 @@ export class SessionHost {
         this.#sessionLifecycleFences.set(input.sessionLifecycleFenceId, claim.operation.id);
         installedLifecycleFence = true;
       }
-      await input.effect();
+      if (input.effect !== undefined) await input.effect();
       const commit = (finalize?: (store: OperationalStore) => void): OperationExecution<T> =>
         this.#store.completeAuthorizedDeferredEffectOperation<T>(
           input.connection.id,
@@ -4461,8 +4468,14 @@ export class SessionHost {
       }
     };
     assertRun();
-    if (action === "abort") this.#clearSessionRuntimeRecovery(sessionId);
     const stored = this.#store.getSession(sessionId);
+    if (action === "abort") {
+      this.#clearSessionRuntimeRecovery(sessionId);
+      if (options !== undefined && "ownerStop" in options && options.completeBeforeDispatch !== undefined
+        && this.stopCodexBeforeDispatch(stored, original, originalQueue, assertRun, options.completeBeforeDispatch)) {
+        return;
+      }
+    }
     const active = (action === "abort" ? this.fencedProviderAuthenticationCleanupOwner(stored, runId) : undefined)
       ?? await this.activate(sessionId);
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
@@ -4495,6 +4508,35 @@ export class SessionHost {
     } finally {
       lease.release();
     }
+  }
+
+  private stopCodexBeforeDispatch(
+    stored: StoredSession,
+    run: RunDescriptor,
+    item: QueueItemRecord | undefined,
+    assertRun: () => void,
+    complete: CompleteOperationInTransaction
+  ): boolean {
+    const session = stored.descriptor;
+    const attemptId = run.activeAttemptId;
+    if (run.state !== "queued" || attemptId === undefined || item?.state !== "dispatching"
+      || item.disposition !== "prompt" || run.source !== "user" || run.parentRunId !== undefined) return false;
+    const preparation = this.#dispatchPreparations.get(session.id);
+    if (preparation?.queueItemId !== item.id || preparation.nativeTurnDispatched || !this.isOrdinaryLocalCodexSession(stored)
+      || this.targetForSession(stored).remoteWorkspace !== undefined
+      || this.#store.findSetting("service", session.id, PERSONAL_DEVELOPMENT_PURPOSE_KEY) !== undefined
+      || this.#store.findCollaborationWorkerBySession(session.id) !== undefined
+      || this.#applicationQueueGuards.has(item.id) || !this.isOwnerRunInput(item)) return false;
+
+    complete((store) => {
+      assertRun();
+      store.cancelQueueItem({ queueItemId: item.id, traceId: `stop:${run.id}` });
+      store.finishAttempt(attemptId);
+      this.#runtimeHandoffs.releaseUndispatchedInjection(session.id, item.id);
+      removeNativeDispatchRecoveryEntry(store, session.id, run.id);
+    });
+    preparation.cancellation.abort();
+    return true;
   }
 
   private isOwnerRunInput(item: QueueItemRecord): boolean {
@@ -10812,16 +10854,21 @@ export class SessionHost {
       && this.isLocalCodexPlanRun(stored, interaction.runId);
   }
 
-  private isLocalCodexPlanRun(stored: StoredSession, runId: string): boolean {
+  private isOrdinaryLocalCodexSession(stored: StoredSession): boolean {
     const session = stored.descriptor;
-    if (this.#store.getBackend(session.backendId).descriptor.adapterKind !== "codex"
-      || session.remoteWorkspace !== undefined
-      || this.#store.getTarget(session.targetId).descriptor.remoteWorkspace !== undefined
-      || session.automationOrigin !== undefined || session.derivationOrigin?.sideChat === true
-      || session.hidden || session.archived || session.deletedAt !== undefined
-      || this.#store.sessionCreationServiceKind(session.id) !== undefined
-      || this.#partnerSessionPolicy(session.id) !== undefined
-      || this.#store.findSessionRuntimePolicy(session.id) !== undefined) return false;
+    return this.#store.getBackend(session.backendId).descriptor.adapterKind === "codex"
+      && session.remoteWorkspace === undefined
+      && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
+      && session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
+      && !session.hidden && !session.archived && session.deletedAt === undefined
+      && this.#store.sessionCreationServiceKind(session.id) === undefined
+      && this.#partnerSessionPolicy(session.id) === undefined
+      && this.#store.findSessionRuntimePolicy(session.id) === undefined;
+  }
+
+  private isLocalCodexPlanRun(stored: StoredSession, runId: string): boolean {
+    if (!this.isOrdinaryLocalCodexSession(stored)) return false;
+    const session = stored.descriptor;
     const run = this.#store.findRun(runId)?.descriptor;
     if (run?.source !== "user" || run.parentRunId !== undefined) return false;
     const queue = this.#store.findQueueItemByRunId(session.id, runId, { includeCleared: true });
@@ -14118,7 +14165,10 @@ export class SessionHost {
     const settled = new Promise<void>((resolvePromise) => {
       resolve = resolvePromise;
     });
-    const preparation: DispatchPreparation = { queueItemId, settled, resolve, phase: "pre-send" };
+    const preparation: DispatchPreparation = {
+      queueItemId, settled, resolve, phase: "pre-send",
+      cancellation: new AbortController(), nativeTurnDispatched: false
+    };
     this.#dispatchPreparations.set(sessionId, preparation);
     return preparation;
   }
@@ -14716,14 +14766,17 @@ export class SessionHost {
             // receive a fresh Attempt before any new-generation event can be
             // associated with it. The Store transition is atomic and leaves
             // the prior Attempt as durable history.
-            const generation = this.#store.getSession(sessionId).descriptor.binding.generation;
-            item = this.#store.renewQueueAttemptGeneration({
-              queueItemId: item.id,
-              attemptId: stableId("attempt", `${item.operationId}:generation:${generation}`),
-              generation
-            });
-            attemptId = item.attemptId;
+            if (!dispatchPreparation.cancellation.signal.aborted) {
+              const generation = this.#store.getSession(sessionId).descriptor.binding.generation;
+              item = this.#store.renewQueueAttemptGeneration({
+                queueItemId: item.id,
+                attemptId: stableId("attempt", `${item.operationId}:generation:${generation}`),
+                generation
+              });
+              attemptId = item.attemptId;
+            }
           }
+          dispatchPreparation.cancellation.signal.throwIfAborted();
           if (active === undefined) throw new Error("Session activation returned no active runtime.");
           this.assertQueueProviderAuthentication(item, this.#store.getSession(sessionId));
           if (
@@ -14768,6 +14821,7 @@ export class SessionHost {
                   sessionId,
                   this.effectiveQueueProviderId(item, this.#store.getSession(sessionId))
                 );
+          dispatchPreparation.cancellation.signal.throwIfAborted();
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const stored = this.#store.getSession(sessionId);
           this.assertQueueProviderAuthentication(item, stored);
@@ -14789,6 +14843,7 @@ export class SessionHost {
               } catch (error) { this.recordFailure("workspace-dialogue-baseline", error); }
               finally { captureLease.release(); }
             }
+            dispatchPreparation.cancellation.signal.throwIfAborted();
             await this.#workspaceCapture.captureBeforeRun({
               sessionId,
               runId: run.descriptor.id,
@@ -14798,10 +14853,19 @@ export class SessionHost {
               .catch((error: unknown) => this.recordFailure("workspace-baseline", error));
           }
           this.assertSessionNotPendingScheduleDeletion(sessionId);
+          dispatchPreparation.cancellation.signal.throwIfAborted();
           const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
           this.assertQueueProviderAuthentication(item, stored);
+          const turnContext = await this.beginTurnOverrideLease(item, active, stored);
+          const tracksNativeTurnDispatch = !reviewReadOnly && target.remoteWorkspace === undefined && item.disposition === "prompt"
+            && run.descriptor.source === "user" && run.descriptor.parentRunId === undefined
+            && this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind === "codex";
           let baseContext: AdapterContext = {
-            ...await this.beginTurnOverrideLease(item, active, stored),
+            ...turnContext,
+            ...(tracksNativeTurnDispatch ? {
+              signal: AbortSignal.any([turnContext.signal, dispatchPreparation.cancellation.signal]),
+              onNativeTurnDispatch: () => { dispatchPreparation.nativeTurnDispatched = true; }
+            } : {}),
             inputQueueItemId: item.id,
             ...(attemptId === undefined ? {} : { inputAttemptId: attemptId })
           };
@@ -14899,6 +14963,7 @@ export class SessionHost {
           }
           const appContext = reviewReadOnly || dispatchBody.text.trimStart().startsWith("/")
             ? undefined : await this.#resolveMcpAppModelContext?.(sessionId);
+          dispatchPreparation.cancellation.signal.throwIfAborted();
           if (appContext?.text) dispatchBody = { ...dispatchBody, text: dispatchBody.text + appContext.text };
           const handoffText = this.#runtimeHandoffs.claimInjection(sessionId, item.id);
           if (handoffText !== undefined) {
@@ -15192,6 +15257,10 @@ export class SessionHost {
           releaseMcpAppSignal?.();
           releaseTelegramHistorySignal?.();
           try {
+            if (dispatchPreparation.cancellation.signal.aborted && dispatchPreparation.phase === "sending") {
+              this.#providerGroups?.service.turnSettled(sessionId, false);
+              this.#providerGroups?.reporter.leasesChanged();
+            }
             if (telegramHistory !== undefined) {
               const current = this.#disposed ? undefined : this.#store.findQueueItemByRunId(sessionId, item.runId, { includeCleared: true });
               if (current?.state !== "backend_accepted" && current?.state !== "dispatch_unknown") await telegramHistory.release();

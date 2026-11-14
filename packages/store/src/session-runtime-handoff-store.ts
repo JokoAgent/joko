@@ -186,6 +186,13 @@ export class SessionRuntimeHandoffStore {
     const current = this.read(sessionId); if (current?.injection?.queueItemId !== queueItemId) return;
     const { injection: _injection, ...remaining } = current; this.save(sessionId, remaining);
   }
+
+  releaseUndispatchedInjection(sessionId: string, queueItemId: string): void {
+    const current = this.read(sessionId);
+    if (current?.injection?.queueItemId !== queueItemId) return;
+    const { queueItemId: _retired, ...injection } = current.injection;
+    this.save(sessionId, { ...current, injection });
+  }
 }
 
 export function readRuntimeHandoffRecord(value: unknown): RuntimeHandoffRecord {

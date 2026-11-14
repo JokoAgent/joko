@@ -33,6 +33,8 @@ export interface RpcRequestOptions {
   readonly beforeDispatch?: () => void;
   /** Private content proof at the actual write queue head; must not issue RPC. */
   readonly beforeDispatchAsync?: (signal: AbortSignal) => Promise<void>;
+  /** Synchronous ownership handoff immediately before a native record can be written. */
+  readonly onDispatch?: () => void;
   /** A write may have reached the app-server before a timeout or disconnect. */
   readonly mutation?: boolean;
 }
@@ -397,8 +399,12 @@ export class StdioJsonRpcTransport implements RpcTransport {
         const pending = this.#pending.get(key);
         if (pending === undefined) return false;
         if (options.signal?.aborted) { finishCancelled(); return false; }
-        try { options.beforeDispatch?.(); }
-        catch (error) {
+        try {
+          options.beforeDispatch?.();
+          if (this.#pending.get(key) !== pending) return false;
+          if (options.signal?.aborted) { finishCancelled(); return false; }
+          options.onDispatch?.();
+        } catch (error) {
           clearTimeout(pending.timer);
           pending.abortCleanup?.();
           this.#pending.delete(key);
@@ -406,8 +412,6 @@ export class StdioJsonRpcTransport implements RpcTransport {
           reject(error);
           return false;
         }
-        if (this.#pending.get(key) !== pending) return false;
-        if (options.signal?.aborted) { finishCancelled(); return false; }
         pending.dispatched = true;
         return true;
       }).catch((error: unknown) => {

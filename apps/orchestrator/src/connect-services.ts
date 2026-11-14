@@ -18209,10 +18209,17 @@ async function dispatchMutation(
         operationId, connection, kind: payload.case, body: mutation,
         // Stopping can advance the very Run revision that authorized the effect.
         preconditionScope: fencedRunRevision ? "claim" : "claim-and-commit",
-        effect: () => host.abort(run.descriptor.sessionId, run.descriptor.id, () => {
-          dependencies.connections.fence(connection);
-          if (fencedRunRevision) validatePreconditions(dependencies.store, mutation);
-        }, { ownerStop: true }),
+        complete: async (commit) => {
+          let stoppedBeforeDispatch: OperationExecution<OperationOutcome> | undefined;
+          await host.abort(run.descriptor.sessionId, run.descriptor.id, () => {
+            dependencies.connections.fence(connection);
+            if (fencedRunRevision) validatePreconditions(dependencies.store, mutation);
+          }, {
+            ownerStop: true,
+            completeBeforeDispatch: (finalize) => { stoppedBeforeDispatch = commit(finalize); }
+          });
+          return stoppedBeforeDispatch ?? commit();
+        },
         commit: store => {
           if (fencedRunRevision && otherPreconditions.length > 0) {
             validatePreconditions(store, { ...mutation, preconditions: otherPreconditions });
@@ -23421,7 +23428,7 @@ function withOperationPreconditions(
       validatePreconditions(store, mutation);
       input.precondition?.(store);
     };
-    if (input.effect !== undefined) {
+    if (input.effect !== undefined || input.complete !== undefined) {
       return host.mutate({ ...input, precondition: protocolPrecondition });
     }
     return host.mutate({
