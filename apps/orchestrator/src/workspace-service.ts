@@ -935,6 +935,12 @@ export class WorkspaceService {
           } finally {
             await handle.close();
           }
+          const closed = await lstat(temporaryPath);
+          if (stagedInfo === undefined || !closed.isFile() || closed.isSymbolicLink()
+            || !sameFilesystemIdentity(stagedInfo, closed) || closed.size !== bytes.byteLength) {
+            throw new WorkspaceTextFileWriteError("Workspace text staging changed before saving.", "stale");
+          }
+          stagedInfo = closed;
         } catch (error) {
           assertCurrent();
           if (error instanceof WorkspaceTextFileWriteError) throw error;
