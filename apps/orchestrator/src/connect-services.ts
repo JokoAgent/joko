@@ -16999,15 +16999,16 @@ async function dispatchMutation(
             const assertCurrent = (): void => { dependencies.connections.fence(connection); authority.assertCurrent(); };
             const signal = new AbortController().signal;
             const inspection = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, assertCurrent);
-            let canonical = inspection.path;
+            const canonical = inspection.path;
             if (!inspection.exists) {
               if (!input.createIfMissing) throw new ConnectError("The SSH project directory does not exist.", Code.NotFound);
               assertCurrent();
-              await authority.lease.files.mkdir(input.workspacePath, { recursive: true, mode: 0o700, signal });
+              await authority.lease.files.mkdir(canonical, { recursive: true, mode: 0o700, signal });
               assertCurrent();
-              const created = await inspectRemoteHostDirectory(authority.lease.files, input.workspacePath, signal, assertCurrent);
-              if (!created.exists) throw new ConnectError("The SSH project directory could not be verified after creation.", Code.FailedPrecondition);
-              canonical = created.path;
+              const created = await inspectRemoteHostDirectory(authority.lease.files, canonical, signal, assertCurrent);
+              if (!created.exists || created.path !== canonical) {
+                throw new ConnectError("The SSH project directory could not be verified after creation.", Code.FailedPrecondition);
+              }
             }
             assertCurrent();
             const fallbackExisted = await pathExists(fallbackRoot);

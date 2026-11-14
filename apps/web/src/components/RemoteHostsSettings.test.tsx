@@ -432,6 +432,50 @@ it("probes and manages the fixed remote Backend runtime with exact Target and Ho
   expect(document.body.textContent).toContain("Not installed");
 });
 
+it("observes the original uninstall after the same Remote Host panel remounts", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const fixture = await mountSettings({ runtimeSetup: true });
+    const completed = deferred<RemoteBackendRuntimeView>();
+    let removed = false;
+    const probe = vi.mocked(fixture.controller.probeRemoteBackendRuntime);
+    probe.mockResolvedValueOnce(runtime("ready")).mockImplementation(async () => runtime(removed ? "notInstalled" : "probing"));
+    vi.mocked(fixture.controller.uninstallRemoteBackendRuntime).mockReturnValueOnce(completed.promise);
+    const readyHost: RemoteHostView = {
+      ...host(),
+      trust: { algorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:test", pinnedAt: 1 },
+      status: { state: "ready", changedAt: 2 }
+    };
+    await fixture.publish([readyHost]);
+    await act(async () => button("Uninstall").click());
+    const confirm = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')]
+      .find(candidate => candidate.textContent === "Uninstall")!;
+    await act(async () => confirm.click());
+
+    const select = document.querySelector<HTMLSelectElement>(".remote-host-target-card select")!;
+    await act(async () => { select.value = "target-two"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    await fixture.publish([]);
+    await act(async () => { select.value = "target-one"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    await fixture.publish([readyHost]);
+    const panel = document.querySelector(".remote-runtime-setup")!;
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(panel.textContent).toContain("Checking");
+    expect(panel.textContent).not.toContain("The runtime could not be checked");
+    expect(panel.textContent).not.toContain("Not installed");
+
+    removed = true;
+    await act(async () => completed.resolve(runtime("notInstalled")));
+    expect(panel.textContent).not.toContain("Not installed");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+    expect(probe).toHaveBeenCalledTimes(3);
+    expect(probe).toHaveBeenLastCalledWith("target-one", "build-box", 1n, 1n, expect.any(AbortSignal));
+    expect(panel.textContent).toContain("Not installed");
+    expect(button("Install").disabled).toBe(false);
+    expect(fixture.controller.uninstallRemoteBackendRuntime).toHaveBeenCalledExactlyOnceWith("target-one", "build-box", 1n, 1n);
+    expect(fixture.controller.installRemoteBackendRuntime).not.toHaveBeenCalled();
+  } finally { vi.useRealTimers(); }
+});
+
 it("requires a successful probe before offering another install after an unconfirmed stream", async () => {
   const fixture = await mountSettings({ runtimeSetup: true });
   vi.mocked(fixture.controller.probeRemoteBackendRuntime)

@@ -468,7 +468,11 @@ describe("ComputerToolBridgeProvider", () => {
     const digest = createHash("sha256").update(png).digest("hex");
     provider.observationImage = png;
     provider.result = { structuredContent: { ok: true, outcome: { status: "unknown" },
-      observation: { ok: true, snapshot_id: "exact-window", data: { element_token: "exact-token" } } } };
+      observation: { ok: true, snapshot_id: "ws-3-exact", data: { elements: [
+        { element_index: 0, element_token: "ws-3-exact:0", access_token: "fixture-credential" },
+        { element_index: 1, element_token: "unstamped-driver-token" },
+        { element_index: 2, element_token: "ws-3-exact:2" }
+      ] } } } };
     const originals: Uint8Array[] = [];
     const bridge = createBridge(provider, () => true, WORKSPACE_ROOT, {
       ingestBytes: async (bytes, options) => {
@@ -478,7 +482,7 @@ describe("ComputerToolBridgeProvider", () => {
       }
     });
     await bridge.prepare();
-    const { router } = await routerFixture();
+    const { router } = await routerFixture(value => value.replaceAll("ws-3-exact:2", "[REDACTED]"));
     router.registerBridgeToolProvider(bridge);
     const active = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", expectedPiGeneration: 7 });
     try {
@@ -490,7 +494,11 @@ describe("ComputerToolBridgeProvider", () => {
       });
       expect(originals).toEqual([png]);
       expect(textPayload(result)).toMatchObject({ ok: true, data: { outcome: { status: "unknown" } },
-        observation: { ok: true, snapshot_id: "exact-window", data: { element_token: "exact-token" },
+        observation: { ok: true, snapshot_id: "ws-3-exact", data: { elements: [
+          { element_index: 0, element_token: "ws-3-exact:0", access_token: "[REDACTED]" },
+          { element_index: 1, element_token: "[REDACTED]" },
+          { element_index: 2, element_token: "[REDACTED]" }
+        ] },
           screenshot: { artifact_id: "original-screenshot", mime_type: "image/png", width: 512, height: 512,
             preview: { width: expect.any(Number), height: expect.any(Number) } } } });
       expect(result).toMatchObject({ isError: false, content: [expect.objectContaining({ type: "image", mimeType: "image/jpeg" }), expect.anything()],
@@ -586,11 +594,9 @@ function createBridge(
   });
 }
 
-async function routerFixture(): Promise<{ readonly router: McpRouter }> {
+async function routerFixture(redactText = (value: string) => value): Promise<{ readonly router: McpRouter }> {
   const store = new FakeStore(WORKSPACE_ROOT);
-  const credentials = {
-    redactText: (value: string) => value
-  } as unknown as CredentialManager;
+  const credentials = { redactText } as unknown as CredentialManager;
   const router = new McpRouter({
     store: store as unknown as OperationalStore,
     credentials

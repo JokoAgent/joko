@@ -457,16 +457,19 @@ export function createRemoteHostConnectService(
     }),
 
     probeRemoteBackendRuntime: async (request, context) => remoteHostRpc(async () => {
-      authenticate(context);
-      const runtime = await requireRuntimeSetup(runtimeSetup).probe({
-        targetId: publicIdentity(request.targetId, "target_id"),
-        hostId: publicHostAlias(request.hostId),
-        expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
-        expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision")
-      }, context.signal);
-      return create(contract.ProbeRemoteBackendRuntimeResponseSchema, {
-        runtime: toProtoRemoteBackendRuntime(runtime)
-      });
+      const owner = captureOwner(context);
+      const observation = observeOwner(context, owner);
+      try {
+        const runtime = await requireRuntimeSetup(runtimeSetup).probe({
+          targetId: publicIdentity(request.targetId, "target_id"),
+          hostId: publicHostAlias(request.hostId),
+          expectedTargetRevision: fromProtoRevision(request.expectedTargetRevision, "expected_target_revision"),
+          expectedHostRevision: fromProtoRevision(request.expectedHostRevision, "expected_host_revision")
+        }, observation.signal, observation.assertCurrent);
+        return create(contract.ProbeRemoteBackendRuntimeResponseSchema, { runtime: toProtoRemoteBackendRuntime(runtime) });
+      } finally {
+        try { observation.assertCurrent(); } finally { observation.close(); }
+      }
     }),
 
     installRemoteBackendRuntime: async function* (request, context) {

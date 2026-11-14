@@ -28,12 +28,16 @@ export async function inspectRemoteHostDirectory(
   if (!validRemotePath(parent) || (await files.stat(parent, signal)).kind !== "directory") {
     throw new ConnectError("The SSH Host root is unavailable.", Code.FailedPrecondition);
   }
-  for (const name of components) {
+  for (const [index, name] of components.entries()) {
     signal.throwIfAborted(); assertCurrent();
     const entries = await files.list(parent, signal);
     signal.throwIfAborted(); assertCurrent();
     const entry = entries.find((candidate) => candidate.name === name);
-    if (entry === undefined) return { exists: false, path: requestedPath };
+    if (entry === undefined) {
+      const canonical = posix.join(parent, ...components.slice(index));
+      validateRemoteHostDirectoryPath(canonical);
+      return { exists: false, path: canonical };
+    }
     if (entry.kind !== "directory" && entry.kind !== "symbolic_link") {
       throw new ConnectError("The SSH Host path contains a non-directory entry.", Code.FailedPrecondition);
     }

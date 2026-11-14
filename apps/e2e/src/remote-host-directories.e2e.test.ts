@@ -9,22 +9,26 @@ import { expect, it, vi } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
 import { submit } from "./operations.js";
 
-it("browses and creates a revision-fenced SSH project through the production HTTP and SQLite chain", async () => {
+it.each(["/srv/new-project", "/home/fixture/server/new-project"])("browses and creates a revision-fenced SSH project at %s", async requestedPath => {
   let createdRemoteDirectory = false;
   const files: RemoteFileTransportPort = {
-    realpath: vi.fn(async path => path === "." ? "/home/fixture" : path),
+    realpath: vi.fn(async path => path === "." ? "/home/fixture" : path === "/home/fixture/server" ? "/srv" : path),
     stat: vi.fn(async () => ({ kind: "directory" as const, size: 0, modifiedAt: 0, mode: 0o755 })),
     list: vi.fn(async path => {
       if (path === "/") return [{ name: "home", kind: "directory" as const }, { name: "srv", kind: "directory" as const }];
       if (path === "/home") return [{ name: "fixture", kind: "directory" as const }];
       if (path === "/home/fixture") return [
-        { name: "work", kind: "directory" as const }, { name: "readme.txt", kind: "file" as const }
+        { name: "work", kind: "directory" as const }, { name: "readme.txt", kind: "file" as const },
+        { name: "server", kind: "symbolic_link" as const }
       ];
       if (path === "/srv" && createdRemoteDirectory) return [{ name: "new-project", kind: "directory" as const }];
       return [];
     }),
     read: async () => new Uint8Array(), write: async () => undefined,
-    mkdir: vi.fn(async path => { if (path === "/srv/new-project") createdRemoteDirectory = true; }),
+    mkdir: vi.fn(async path => {
+      if (path !== "/srv/new-project") throw new Error("The SFTP parent must be a directory rather than a symbolic link.");
+      createdRemoteDirectory = true;
+    }),
     rename: async () => undefined, remove: async () => undefined
   };
   const processes: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused process transport"); }) };
@@ -54,8 +58,8 @@ it("browses and creates a revision-fenced SSH project through the production HTT
     await expect(client().listRemoteHostDirectories(request)).rejects.toMatchObject({ code: Code.Unauthenticated });
     const listing = await client(paired.authKey).listRemoteHostDirectories(request);
     expect(listing).toMatchObject({ targetId, hostId: host.id, path: "/home/fixture", parentPath: "/home",
-      directories: [{ name: "work", path: "/home/fixture/work" }] });
-    expect(listing.directories).toHaveLength(1);
+      directories: [{ name: "server", path: "/srv" }, { name: "work", path: "/home/fixture/work" }] });
+    expect(listing.directories).toHaveLength(2);
     expect(files.realpath).toHaveBeenCalledWith(".", expect.any(AbortSignal));
     await expect(client(paired.authKey).listRemoteHostDirectories({ ...request, expectedHostRevision: { value: host.revision - 1n } }))
       .rejects.toMatchObject({ code: Code.Aborted });
@@ -63,13 +67,13 @@ it("browses and creates a revision-fenced SSH project through the production HTT
       .rejects.toMatchObject({ code: Code.InvalidArgument });
 
     const inspection = await client(paired.authKey).inspectRemoteHostDirectory({
-      ...request, path: "/srv/new-project"
+      ...request, path: requestedPath
     });
     expect(inspection).toMatchObject({
       targetId, hostId: host.id, targetRevision: { value: targetRevision }, hostRevision: { value: host.revision },
       exists: false, path: "/srv/new-project"
     });
-    const createRemoteProject = (createIfMissing: boolean) => create(OperationMutationSchema, {
+    const createRemoteProject = (createIfMissing: boolean, workspacePath = inspection.path) => create(OperationMutationSchema, {
       preconditions: [{
         entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: targetRevision }
       }],
@@ -79,7 +83,7 @@ it("browses and creates a revision-fenced SSH project through the production HTT
         hostTargetId: targetId,
         hostId: host.id,
         expectedHostRevision: { value: host.revision },
-        workspacePath: "/srv/new-project",
+        workspacePath,
         createIfMissing
       } }
     });
@@ -92,7 +96,7 @@ it("browses and creates a revision-fenced SSH project through the production HTT
     });
     expect(createdRemoteDirectory).toBe(false);
     const createdOperation = await submit(
-      paired.clients.operation, paired.connectionId, createRemoteProject(true)
+      paired.clients.operation, paired.connectionId, createRemoteProject(true, requestedPath)
     );
     expect(createdOperation.state).toBe(OperationState.SUCCEEDED);
     if (createdOperation.result?.payload.case !== "target") throw new Error("Remote project creation returned no Target.");
