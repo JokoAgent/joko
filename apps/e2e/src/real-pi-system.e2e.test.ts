@@ -658,7 +658,8 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
         ({ run }) => run?.state === RunState.SUCCEEDED || run?.state === RunState.FAILED,
         "original Pi image tool Run", 15_000);
       expect(run?.state).toBe(RunState.SUCCEEDED);
-      const events = store.listEvents({ sessionId: original.sessionId, runId }).map(event => event.payload);
+      const events = store.listEvents({ sessionId: original.sessionId })
+        .filter(event => event.runId === runId).map(event => event.payload);
       const output = events.find(payload => payload.type === "tool_result" && payload.name === "read");
       expect(output).toMatchObject({ isError: false, parts: expect.arrayContaining([expect.objectContaining({ kind: "image" })]) });
       const produced = events.find(payload => payload.type === "artifact" && payload.purpose === "backend_artifact");
