@@ -436,7 +436,7 @@ describe("PartnerService", () => {
     expect(initial.skills).toMatchObject({ mode: contract.PartnerConnectionMode.ALLOWLIST, ids: [] });
     expect(initial.entries.filter(item => item.kind === contract.PartnerConnectionKind.SKILL)).toHaveLength(4);
     expect(initial.entries.find(item => item.id === unselected.id)).toMatchObject({ available: true, name: "Template example" });
-    expect(JSON.stringify(initial)).not.toContain("UNSELECTED_TEMPLATE_BODY");
+    expect(JSON.stringify(initial, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).not.toContain("UNSELECTED_TEMPLATE_BODY");
     expect(initial.entries.find(item => item.id === own.id)).toMatchObject({ personal: true, available: true, name: "Personal report" });
     expect(initial.entries.filter(item => item.name === "Shared report").map(item => item.id)).toEqual(shared);
     expect((await resources.runtimeSkillSnapshot(task.backendId, task.targetId, signal, manager.targetSkillReferences(task.targetId))).map(item => item.resource.id)).toEqual([own.id]);
@@ -979,7 +979,7 @@ describe("PartnerService", () => {
       expectedDirectoryRevision: initial.directory!.revision,
       capabilities: protoCapabilities()
     }), callContext);
-    expectAuthentication("request", "after updating defaults, before response");
+    expectAuthentication("request", "before directory defaults commit", "after updating defaults, before response");
     expect(defaults.directory).toMatchObject({ defaultCapabilities: protoCapabilities() });
 
     const created = await service.createPartner(create(contract.CreatePartnerRequestSchema, {

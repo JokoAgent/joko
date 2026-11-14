@@ -441,7 +441,7 @@ describe("native import service and owning effects", () => {
       capabilities: { modelChain: [], permissionMode: "ask", planMode: false } })).rejects.toMatchObject({ code: "PARTNER_INVALID" });
     await f.imports.recover();
     expect((await f.api.invitePackage!(entry, "zh-CN", signal)).requestId).toBe(saved.requestId);
-    const ready = await f.partners.updatePartner(pending.id, pending.revision, { capabilities: { modelChain: [{ backendId: PI_LIKE_PROFILE.id,
+    const ready = await f.partners.updatePartner(pending.id, pending.revision, { usesDirectoryDefaults: false, capabilities: { modelChain: [{ backendId: PI_LIKE_PROFILE.id,
       providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
     expect(ready.initializationState).toBe("ready"); expect(ready.canonicalSessionId).toBeDefined();
     expect(f.resources.list({ targetId: ready.homeTargetId })).toHaveLength(3);
