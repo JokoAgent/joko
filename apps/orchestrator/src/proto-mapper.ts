@@ -3313,7 +3313,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         attemptId: event.attemptId ?? "",
         state: toProtoRetryState(payload.state),
         attemptNumber: unsignedInt32(payload.attempt, "event.payload.retry.attempt"),
-        retryAt: payload.state === "waiting"
+        retryAt: payload.state === "waiting" && payload.error?.code !== "CODEX_NATIVE_RECONNECT"
           ? toProtoTimestamp(event.emittedAt + (payload.delayMs ?? 0))
           : undefined,
         maxAttempts: payload.maxAttempts === undefined

@@ -154,4 +154,14 @@ describe("backend-neutral native history projection", () => {
       events: [{ ...history.events[0]!, nativeParentEntryId: "p".repeat(4_097) }]
     })).toThrow("invalid parent entry identity");
   });
+
+  it("rejects observation declarations for missing fields or the native binding fingerprint", () => {
+    const event = { nativeEntryId: "entry", projectionKind: "message", contentIndex: 0,
+      payload: { type: "status" as const, key: "native_entry", text: "Entry" },
+      metadata: { namespace: "native.history", fields: { turnStatus: "completed", nativeBindingFingerprint: "untrusted" } } };
+    for (const observedMetadataFields of [["missing"], ["nativeBindingFingerprint"], ["turnStatus", "turnStatus"]]) {
+      expect(() => projectNativeHistory("session", "native-ref", { events: [{ ...event, observedMetadataFields }] }))
+        .toThrow("invalid observed metadata fields");
+    }
+  });
 });

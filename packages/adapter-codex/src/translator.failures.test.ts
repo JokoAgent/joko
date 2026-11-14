@@ -26,6 +26,25 @@ const failures: readonly [string, JsonValue, string][] = [
 ];
 
 describe("native failure signals at the public event boundary", () => {
+  it("reports bounded reconnect counts for the current turn without adding an error to the recovered output", () => {
+    const translator = new CodexEventTranslator(), state = createTranslatorState("thread");
+    state.activeTurnId = "turn";
+    const reconnect = (attempt: number, turnId = "turn") => translator.translate("error", { threadId: "thread", turnId,
+      willRetry: true, error: { codexErrorInfo: { responseStreamDisconnected: {} },
+        message: `Reconnecting... ${attempt}/5 (private provider response)` } }, state, { observeNativeReconnect: true });
+    expect(reconnect(1, "retired-turn")).toEqual([]);
+    const notice = reconnect(1);
+    expect(notice).toMatchObject([{ type: "retry", state: "waiting", attempt: 1, maxAttempts: 5,
+      error: { code: "CODEX_NATIVE_RECONNECT" } }]);
+    expect(JSON.stringify(notice)).not.toContain("private provider response");
+    expect(reconnect(1)).toEqual([]);
+    expect(reconnect(2)).toMatchObject([{ type: "retry", state: "waiting", attempt: 2, maxAttempts: 5 }]);
+    expect(translator.translate("item/agentMessage/delta", { threadId: "thread", turnId: "turn", itemId: "reply", delta: "Recovered." }, state))
+      .toMatchObject([{ type: "retry", state: "succeeded", attempt: 2, maxAttempts: 5 }, { type: "text_delta", delta: "Recovered." }]);
+    expect(translator.translate("turn/completed", { threadId: "thread", turn: { id: "turn", status: "completed", items: [] } }, state))
+      .toEqual([{ type: "done", outcome: "completed" }]);
+  });
+
   it.each(failures)("keeps %s distinct in terminal and nonterminal events without publishing the native error", (_name, codexErrorInfo, code) => {
     const translator = new CodexEventTranslator(), native: JsonObject = { ...privateData, codexErrorInfo };
     const state = createTranslatorState("thread"); state.activeTurnId = "turn";

@@ -78,6 +78,7 @@ export interface TranslatorState {
   threadId?: string;
   activeTurnId?: string;
   activePlan?: { readonly turnId: string; readonly input: string };
+  nativeReconnect?: { readonly turnId: string; readonly attempt: number; readonly maxAttempts: number };
   usage?: UsageSnapshot;
   observedFastMode?: boolean | "ultrafast";
   readonly itemNames: Map<string, string>;
@@ -368,7 +369,8 @@ function unsupportedMention(): Error {
 }
 
 export class CodexEventTranslator {
-  translate(method: string, params: JsonValue, state: TranslatorState): readonly EventPayload[] {
+  translate(method: string, params: JsonValue, state: TranslatorState,
+    options: { readonly observeNativeReconnect?: boolean } = {}): readonly EventPayload[] {
     switch (method) {
       case "turn/started": {
         const record = objectValue(params, "turn started");
@@ -390,15 +392,20 @@ export class CodexEventTranslator {
         }
         if (state.activeTurnId === turn.id) state.activeTurnId = undefined;
         rememberTerminal(state.terminalTurnIds, turn.id);
+        const reconnect = record["threadId"] === state.threadId
+          ? finishCodexReconnect(state, turn.id, turn.status === "failed" ? "exhausted" : turn.status === "interrupted" ? "aborted" : "succeeded")
+          : [];
         const plan = state.activePlan?.turnId === turn.id ? state.activePlan : undefined;
         if (plan !== undefined) state.activePlan = undefined;
         if (turn.status === "failed") {
           return [
+            ...reconnect,
             { type: "error", error: publicNativeTurnError(turn.error), terminal: true },
             { type: "done", outcome: "failed" }
           ];
         }
         return [
+          ...reconnect,
           ...(plan === undefined || turn.status !== "completed" ? [] : [{
             type: "tool_result" as const, callId: `plan:${turn.id}`, name: "update_plan", output: "", isError: false
           }]),
@@ -407,13 +414,17 @@ export class CodexEventTranslator {
       }
       case "turn/plan/updated":
         return planUpdatedEvents(params, state);
-      case "item/agentMessage/delta":
-        return [deltaEvent("text_delta", params)];
+      case "item/agentMessage/delta": {
+        const event = deltaEvent("text_delta", params);
+        return event.delta ? [...finishCodexReconnectForOutput(state, params), event] : [event];
+      }
       case "item/plan/delta":
         return [deltaEvent("text_delta", params, "plan")];
       case "item/reasoning/summaryTextDelta":
-      case "item/reasoning/textDelta":
-        return [deltaEvent("thinking_delta", params)];
+      case "item/reasoning/textDelta": {
+        const event = deltaEvent("thinking_delta", params);
+        return event.delta ? [...finishCodexReconnectForOutput(state, params), event] : [event];
+      }
       case "item/commandExecution/outputDelta":
       case "item/fileChange/outputDelta": {
         const record = objectValue(params, "tool output delta");
@@ -448,10 +459,16 @@ export class CodexEventTranslator {
           output: safeText(typeof record["message"] === "string" ? record["message"] : "", 8_192)
         }];
       }
-      case "item/started":
-        return this.#itemStarted(params, state);
-      case "item/completed":
-        return this.#itemCompleted(params, state);
+      case "item/started": {
+        const events = this.#itemStarted(params, state);
+        return state.nativeReconnect && events.some(event => event.type === "tool_start")
+          ? [...finishCodexReconnectForOutput(state, params), ...events] : events;
+      }
+      case "item/completed": {
+        const events = this.#itemCompleted(params, state);
+        return state.nativeReconnect && events.some(event => event.type === "message_complete" && event.role === "assistant" || event.type === "tool_result")
+          ? [...finishCodexReconnectForOutput(state, params), ...events] : events;
+      }
       case "thread/tokenUsage/updated": {
         const usage = usageFromNotification(params, state.observedFastMode);
         state.usage = usage;
@@ -461,9 +478,21 @@ export class CodexEventTranslator {
         return [{ type: "session_changed" }];
       case "error": {
         const record = objectValue(params, "Codex error");
+        const error = publicNativeTurnError(record["error"]);
+        if (options.observeNativeReconnect && record["willRetry"] === true && error.code === "NETWORK_ERROR") {
+          const progress = codexReconnectProgress(record["error"]);
+          if (progress !== undefined) {
+            if (!state.activeTurnId || !state.threadId || record["turnId"] !== state.activeTurnId || record["threadId"] !== state.threadId) return [];
+            const previous = state.nativeReconnect;
+            if (previous?.turnId === state.activeTurnId && previous.maxAttempts === progress.maxAttempts
+              && previous.attempt >= progress.attempt) return [];
+            state.nativeReconnect = { turnId: state.activeTurnId, ...progress };
+            return [{ type: "retry", state: "waiting", ...progress, error: codexReconnectNotice }];
+          }
+        }
         return [{
           type: "error",
-          error: publicNativeTurnError(record["error"]),
+          error,
           terminal: false
         }];
       }
@@ -554,6 +583,35 @@ export class CodexEventTranslator {
     }
   }
 }
+
+function codexReconnectProgress(error: JsonValue | undefined): { attempt: number; maxAttempts: number } | undefined {
+  if (!isJsonObject(error) || typeof error["message"] !== "string") return undefined;
+  const info = error["codexErrorInfo"];
+  if (!isJsonObject(info) || !isJsonObject(info["responseStreamDisconnected"])) return undefined;
+  // The fixed app-server uses this prefix for its bounded, native reconnect sequence.
+  const match = /^Reconnecting(?:\.{3}|…)\s*(\d{1,10})\s*\/\s*(\d{1,10})(?=\s|\(|$)/iu.exec(error["message"].slice(0, 80));
+  if (!match) return undefined;
+  const attempt = Number(match[1]), maxAttempts = Number(match[2]);
+  return attempt > 0 && maxAttempts >= attempt && maxAttempts <= 0xffffffff ? { attempt, maxAttempts } : undefined;
+}
+
+function finishCodexReconnectForOutput(state: TranslatorState, params: JsonValue): readonly EventPayload[] {
+  return isJsonObject(params) && params["threadId"] === state.threadId && typeof params["turnId"] === "string"
+    ? finishCodexReconnect(state, params["turnId"], "succeeded") : [];
+}
+
+function finishCodexReconnect(state: TranslatorState, turnId: string,
+  result: "succeeded" | "aborted" | "exhausted"): readonly EventPayload[] {
+  const reconnect = state.nativeReconnect;
+  if (reconnect?.turnId !== turnId) return [];
+  state.nativeReconnect = undefined;
+  return [{ type: "retry", state: result, attempt: reconnect.attempt, maxAttempts: reconnect.maxAttempts, error: codexReconnectNotice }];
+}
+
+const codexReconnectNotice = {
+  code: "CODEX_NATIVE_RECONNECT", message: "Codex is reconnecting to the model service.", phase: "stream",
+  retryable: true, stateMayHaveChanged: false, recovery: "Wait for the current Codex turn to reconnect."
+};
 
 export interface InteractionRequest {
   readonly payload: InteractionPayload;

@@ -176,6 +176,7 @@ describe("StdioJsonRpcTransport", () => {
   it.each(["cancel", "timeout", "stale"] as const)("does not write a queued mutation after %s while the prior write is blocked", async (boundary) => {
     const transport = new StdioJsonRpcTransport({ command: process.execPath, args: [fixture], requestTimeoutMs: 2_000 });
     const cancellation = new AbortController();
+    const dispatch = vi.fn();
     let current = true;
     try {
       await transport.start({ onNotification: () => undefined, onRequest: () => undefined, onExit: () => undefined });
@@ -189,17 +190,22 @@ describe("StdioJsonRpcTransport", () => {
         timeoutMs: boundary === "timeout" ? 20 : 2_000,
         beforeDispatch: () => {
           if (!current) throw new Error("The captured history changed.");
-        }
+        },
+        onDispatch: dispatch
       }).catch((error: unknown) => error);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(paddingWritten).toBe(false);
+      expect(dispatch).not.toHaveBeenCalled();
       if (boundary === "cancel") cancellation.abort();
       if (boundary === "stale") current = false;
       const failure = await pending;
       if (boundary === "stale") expect(failure).toMatchObject({ message: "The captured history changed." });
       else expect(failure).toMatchObject({ code: boundary === "cancel" ? "closed" : "request_timeout", stateMayHaveChanged: false });
       await padding;
-      const received = await transport.request("received-methods", {});
+      expect(dispatch).not.toHaveBeenCalled();
+      const received = await transport.request("received-methods", {}, { onDispatch: dispatch });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(received).toContain("received-methods");
       expect(received).not.toContain("thread/fork");
       expect(received).not.toContain("turn/steer");
     } finally {

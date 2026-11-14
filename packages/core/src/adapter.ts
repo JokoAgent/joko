@@ -73,6 +73,10 @@ export interface AdapterContext {
   readonly inputQueueItemId?: QueueItemId;
   /** The admitted Attempt for the original input, including during owner Run control. */
   readonly inputAttemptId?: AttemptId;
+  /** The host retires pre-dispatch Stop authority at the final native turn write boundary. */
+  readonly onNativeTurnDispatch?: () => void;
+  /** Persists owner Stop intent at the final native interrupt write boundary. */
+  readonly onNativeInterruptDispatch?: () => void;
   /** Host-owned attachments appended for this dispatch, outside the durable user input. */
   readonly transientPromptAttachments?: Pick<PromptInput, "images" | "files">;
   /** Private authority of the requested Run and Attempt for an interrupt. */
@@ -232,6 +236,8 @@ export interface NativeHistoryProjectedEvent {
   readonly emittedAt?: number;
   readonly payload: EventPayload;
   readonly metadata?: AdapterEventMetadata;
+  /** Observations that may advance on replay; retain their first recorded values. */
+  readonly observedMetadataFields?: readonly string[];
 }
 
 export interface NativeHistoryProjection {
@@ -621,6 +627,8 @@ export interface BackendAdapter {
   inferNativeText?(input: NativeTextInferenceInput): Promise<string>;
   /** A prepared remote registration has a live source but no stored Target yet. */
   validateTarget(target: TargetDescriptor, assertPreparedRemoteCurrent?: () => void): Promise<void>;
+  /** Adopt an authorized display-name-only edit into an already active runtime. */
+  adoptTargetDisplayNameChange?(targetId: string, previousRevision: bigint, currentRevision: bigint): void;
   /** Resolve and validate an opaque native reference without starting a runtime. */
   resolveNativeSessionReference?(
     nativeReference: string,

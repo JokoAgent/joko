@@ -125,7 +125,8 @@ export function projectCodexNativeHistory(
         projectionKind: projection.kind,
         contentIndex: projection.contentIndex,
         payload: projection.payload,
-        metadata: { namespace: "codex.native_history", fields }
+        metadata: { namespace: "codex.native_history", fields },
+        observedMetadataFields: ["turnStatus"]
       });
     }
   }

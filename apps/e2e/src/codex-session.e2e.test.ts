@@ -1,21 +1,184 @@
 import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { OperationMutationSchema, OperationState, RunState, ToolCallState } from "@joko/contracts";
+import { EntityKind, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
-  createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
+  abortRunMutation, createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
   scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
 } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it("stops the original Codex Run before the first native turn write and leaves the queue paused", async () => {
+  const backendId = "codex-pre-dispatch-stop";
+  const native = new FakeCodexAppServer();
+  let enteredPreparation = false;
+  let releasePreparation!: () => void;
+  const holdPreparation = new Promise<void>(resolveHold => { releasePreparation = resolveHold; });
+  const host = new AppServerHost({ transportFactory: () => {
+    const transport = native.createTransport();
+    const request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => {
+      if (method !== "turn/start" || enteredPreparation) return request(method, params, options);
+      const prepare = options?.beforeDispatchAsync;
+      if (prepare === undefined) throw new Error("Expected a durable write fence for the first Codex turn.");
+      return request(method, params, {
+        ...options,
+        beforeDispatchAsync: async (signal) => {
+          await prepare(signal);
+          enteredPreparation = true;
+          await holdPreparation;
+        }
+      });
+    };
+    return transport;
+  } });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Stop fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Codex Stop owner");
+    const mutate = (mutation: Parameters<typeof submit>[2], operationId?: string) =>
+      submit(clients.operation, connectionId, mutation, operationId);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const { store, sessionHost } = fixture.application;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const generation = BigInt(binding.generation);
+    const originalText = "Stop this original input before its native write.";
+    const laterText = "Only this queued input may reach Codex.";
+    const firstRunId = queueRunIdFrom(await mutate(sendInputMutation(sessionId, generation, originalText)));
+    await waitFor(async () => enteredPreparation, Boolean, "the original Codex native write preparation");
+    const firstQueue = store.findQueueItemByRunId(sessionId, firstRunId);
+    if (firstQueue?.attemptId === undefined) throw new Error("The original Codex input has no claimed Attempt.");
+    expect(firstQueue.state).toBe("dispatching");
+    expect(store.findSetting("session", sessionId, "native.dispatch.recovery")?.value).toMatchObject({
+      entries: [expect.objectContaining({ runId: firstRunId, queueItemId: firstQueue.id, attemptId: firstQueue.attemptId })]
+    });
+    const controls = async () => (await clients.queue.getQueueControl({ sessionId })).queueControl!;
+    const nextRunId = queueRunIdFrom(await mutate(sendInputMutation(sessionId, generation, laterText)));
+    expect((await mutate(pauseQueueMutation(await controls()))).state).toBe(OperationState.SUCCEEDED);
+    expect((await clients.run.getRun({ runId: firstRunId })).run?.state).toBe(RunState.QUEUED);
+    const abort = abortRunMutation(firstRunId);
+    const stopId = randomUUID();
+    const stopped = await mutate(abort, stopId);
+    expect(stopped.state).toBe(OperationState.SUCCEEDED);
+    expect((await clients.operation.getOperation({ operationId: stopId })).operation).toEqual(stopped);
+    expect((await clients.run.getRun({ runId: firstRunId })).run?.state).toBe(RunState.ABORTED);
+    expect(store.getQueueItem(firstQueue.id).state).toBe("cancelled");
+    expect(store.getAttempt(firstQueue.attemptId).descriptor.endedAt).toEqual(expect.any(Number));
+    expect(store.findSetting("session", sessionId, "native.dispatch.recovery")).toBeUndefined();
+    expect(store.getQueueControl(sessionId).paused).toBe(true);
+    expect((await clients.run.getRun({ runId: nextRunId })).run?.state).toBe(RunState.QUEUED);
+    const turnWrites = () => native.transport?.requests.filter(request =>
+      request.method === "turn/start" || request.method === "turn/interrupt") ?? [];
+    expect(turnWrites()).toHaveLength(0);
+    releasePreparation();
+    await waitFor(async () => sessionHost.observeQueueDispatch(firstQueue),
+      preparation => preparation === undefined, "the original Codex preparation to retire");
+    expect(turnWrites()).toHaveLength(0);
+    expect(await mutate(abort, stopId)).toEqual(stopped);
+    expect((await mutate(resumeQueueMutation(await controls()))).state).toBe(OperationState.SUCCEEDED);
+    const writes = await waitFor(async () => turnWrites(), requests => requests.length > 0, "the next Codex turn write");
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.method).toBe("turn/start");
+    expect(JSON.stringify(writes[0]?.params)).toContain(laterText);
+    expect(JSON.stringify(writes[0]?.params)).not.toContain(originalText);
+    await native.completeTurn(binding.nativeSessionId!, "The next Codex turn completed.");
+    await waitFor(() => clients.run.getRun({ runId: nextRunId }), value => value.run?.state === RunState.SUCCEEDED,
+      "the resumed Codex Run to complete");
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    expect(turnWrites()).toHaveLength(1);
+  } finally {
+    releasePreparation();
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
+it("holds the same Codex Objective when its interrupted native turn completes naturally", async () => {
+  const backendId = "codex-objective-stop";
+  const native = new FakeCodexAppServer();
+  let atInterrupt = false;
+  let releaseInterrupt!: () => void;
+  const holdInterrupt = new Promise<void>(resolveHold => { releaseInterrupt = resolveHold; });
+  const host = new AppServerHost({ transportFactory: () => {
+    const transport = native.createTransport();
+    const request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => {
+      const result = await request(method, params, options);
+      if (method === "turn/interrupt") {
+        atInterrupt = true;
+        await holdInterrupt;
+      }
+      return result;
+    };
+    return transport;
+  } });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Objective fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Objective Stop owner");
+    const mutate = (mutation: Parameters<typeof submit>[2], operationId?: string) =>
+      submit(clients.operation, connectionId, mutation, operationId);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const { store } = fixture.application;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const { objective } = await clients.objective.setObjective({
+      requestId: randomUUID(), sessionId, expectedSessionGeneration: BigInt(binding.generation),
+      text: "Continue until the fixture is complete.", limits: { maximumTurns: 4 }
+    });
+    const runId = objective?.pendingRunId;
+    if (runId === undefined) throw new Error("No Objective Run was admitted.");
+    await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.RUNNING, "the original Objective Run");
+    const nativeThread = native.threads.get(binding.nativeSessionId!);
+    const nativeTurnId = nativeThread?.turns[0]?.["id"];
+    expect(nativeTurnId).toEqual(expect.any(String));
+    const stopId = randomUUID();
+    const stop = mutate(abortRunMutation(runId), stopId);
+    void stop.catch(() => undefined);
+    await waitFor(async () => atInterrupt, Boolean, "Codex to receive the original interrupt");
+    expect(native.transport?.requests.find(request => request.method === "turn/interrupt")?.params)
+      .toMatchObject({ threadId: binding.nativeSessionId, turnId: nativeTurnId });
+    expect((await clients.objective.getObjective({ sessionId })).objective?.status).toBe(ObjectiveStatus.PAUSED);
+    await native.completeTurn(binding.nativeSessionId!, "The original turn finished before the interrupt took effect.");
+    const settled = await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.SUCCEEDED,
+      "the original native completion");
+    expect(settled.run?.attempts).toMatchObject([{ endedAt: expect.any(Object) }]);
+    const paused = (await waitFor(() => clients.objective.getObjective({ sessionId }),
+      value => value.objective?.status === ObjectiveStatus.PAUSED && value.objective.pendingRunId === undefined,
+      "the settled Objective to stay paused")).objective!;
+    expect(paused.turnsUsed).toBe(1);
+    expect(nativeThread?.turns).toHaveLength(1);
+    releaseInterrupt();
+    const receipt = await stop;
+    expect(receipt.state).toBe(OperationState.SUCCEEDED);
+    expect(await mutate(abortRunMutation(runId), stopId)).toEqual(receipt);
+    expect(native.transport?.requests.filter(request => request.method === "turn/interrupt")).toHaveLength(1);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    expect(nativeThread?.turns).toHaveLength(1);
+    await clients.objective.resumeObjective({ requestId: randomUUID(), sessionId,
+      expectedRevision: paused.version!.revision!, expectedOwnerGeneration: paused.ownerGeneration });
+    await waitFor(async () => nativeThread?.turns.length ?? 0, turns => turns === 2, "an explicit Objective resume");
+  } finally {
+    releaseInterrupt();
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
 
 it("honors a Codex schedule admitted before model disablement and rejects later runs on the same route", async () => {
   const backendId = "codex-scheduled-model";
@@ -139,9 +302,34 @@ it("keeps a Codex thread and durable Queue on the production HTTP/SQLite/Connect
       (dispatched) => dispatched, "Codex native turn dispatch");
     expect(committedBeforeNativeDispatch).toBe(true);
     expect(native.threads.size).toBe(1);
+    await waitFor(async () => fixture!.application.store.findQueueItemByRunId(codexSessionId, runId),
+      item => item?.state === "backend_accepted", "the admitted original Codex turn");
+    const original = (await paired.clients.run.getRun({ runId })).run!;
+    await reconnectCodexTurn(native, threadId!, 2);
+    const reconnecting = await waitFor(() => paired.clients.run.getRun({ runId }), value => value.run?.state === RunState.RETRYING,
+      "the same Codex Run during native reconnect");
+    expect(reconnecting.run).toMatchObject({ runId, activeAttemptId: original.activeAttemptId, attempts: [expect.any(Object)] });
+    expect(reconnecting.run?.error).toBeUndefined();
+    const readTimeline = () => paired.clients.session.listSessionTimeline({ sessionId: codexSessionId, limit: 200 });
+    const pending = (await readTimeline()).events.find(event => event.payload?.kind.case === "retryChanged");
+    expect(pending?.identity).toMatchObject({ runId, attemptId: original.activeAttemptId, generation: BigInt(binding.generation) });
+    const retry = pending?.payload?.kind;
+    if (retry?.case !== "retryChanged") throw new Error("The original Run has no reconnect event.");
+    expect(retry.value).toMatchObject({ state: RetryState.WAITING, attemptNumber: 2, maxAttempts: 5,
+      error: { code: "CODEX_NATIVE_RECONNECT" } });
+    expect(retry.value.retryAt).toBeUndefined();
     await native.completeTurn(threadId!, "One native response");
-    await waitFor(() => paired.clients.run.getRun({ runId }), (value) => value.run?.state === RunState.SUCCEEDED,
+    const completed = await waitFor(() => paired.clients.run.getRun({ runId }), (value) => value.run?.state === RunState.SUCCEEDED,
       "Codex terminal projection");
+    expect(completed.run?.attempts.map(attempt => attempt.attemptId)).toEqual([original.activeAttemptId]);
+    expect(native.transport?.requests.filter(request => request.method === "turn/start")).toHaveLength(1);
+    const restored = (await readTimeline()).events.filter(event => event.identity?.runId === runId);
+    expect(restored.map(event => event.payload?.kind.case)).not.toContain("terminalError");
+    expect(restored.map(event => event.payload?.kind.case)).not.toContain("recoverableError");
+    expect(restored.flatMap(event => event.payload?.kind.case === "retryChanged" ? [event.payload.kind.value.state] : []))
+      .toEqual([RetryState.WAITING, RetryState.SUCCEEDED]);
+    expect(fixture.application.store.listEvents({ sessionId: codexSessionId }).filter(event => event.runId === runId)
+      .some(event => event.payload.type === "error")).toBe(false);
     expect(fixture.application.store.findQueueItemByRunId(codexSessionId, runId)?.state).toBe("completed");
     expect(fixture.application.store.listEvents({ sessionId: codexSessionId }).some((event) =>
       event.payload.type === "message_complete" && event.payload.role === "assistant")).toBe(true);
@@ -233,6 +421,75 @@ it("persists current Codex step plans consistently through generated timeline, S
   }
 });
 
+it("reopens the same Codex history after a recorded in-progress user entry completes while the node is closed", async () => {
+  const backendId = "codex-history-replay";
+  const native = new FakeCodexAppServer();
+  let nativeHost = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  let rootDirectory: string | undefined;
+  const start = () => OrchestratorE2eFixture.start({ rootDirectory, keepRoot: true, backendFactories: [{
+    instanceId: backendId, adapterKind: "codex", displayName: "Codex history replay",
+    create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host: nativeHost })
+  }] });
+  try {
+    fixture = await start(); rootDirectory = fixture.rootDirectory;
+    const paired = await fixture.pair("Codex history replay client");
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const binding = fixture.application.store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId!;
+    const execution = await submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, BigInt(binding.generation), "Retain the original native input."));
+    const runId = queueRunIdFrom(execution);
+    await waitFor(async () => fixture!.application.store.findQueueItemByRunId(sessionId, runId),
+      item => item?.state === "backend_accepted", "the original native turn acceptance");
+    await native.transport!.exit();
+    const original = await waitFor(async () => fixture!.application.store.listEvents({ sessionId }).find(event =>
+      event.metadata?.namespace === "codex.native_history" && event.payload.type === "message_complete" && event.payload.role === "user"),
+      event => event?.metadata?.fields["turnStatus"] === "inProgress", "the recorded running native user entry");
+    expect(original).toBeDefined();
+    const thread = native.threads.get(threadId)!;
+    const turn = thread.turns.at(-1)!;
+    await fixture.close(); fixture = undefined;
+    expect(turn["status"]).toBe("inProgress");
+    turn["status"] = "completed";
+    const items = turn["items"];
+    if (!Array.isArray(items)) throw new Error("The original native items are unavailable.");
+    turn["items"] = [...items, { type: "agentMessage", id: "late-history-assistant",
+      text: "The original remote turn completed.", phase: null, memoryCitation: null, delivery: null }];
+    thread.status = { type: "idle" };
+    nativeHost = new AppServerHost({ transportFactory: () => native.createTransport() });
+    fixture = await start();
+    const clients = fixture.clients(paired.authKey);
+    const lifecycle = async (action: "resumeSession" | "closeSession") => {
+      const receipt = await submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId },
+          expectedGeneration: BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation) }],
+        payload: action === "resumeSession" ? { case: "resumeSession", value: { sessionId } } : { case: "closeSession", value: { sessionId } }
+      }));
+      expect(receipt.error, action).toBeUndefined();
+      return receipt;
+    };
+    expect((await lifecycle("resumeSession")).state).toBe(OperationState.SUCCEEDED);
+    const events = fixture.application.store.listEvents({ sessionId });
+    expect(events.filter(event => event.metadata?.namespace === "codex.native_history"
+      && event.payload.type === "message_complete" && event.payload.role === "user"))
+      .toEqual([original]);
+    expect(events.filter(event => event.payload.type === "message_complete" && event.payload.role === "assistant"
+      && event.payload.blocks.some(block => block.kind === "text" && block.text === "The original remote turn completed."))).toHaveLength(1);
+    expect(fixture.application.store.getSession(sessionId).descriptor.binding.nativeSessionId).toBe(threadId);
+    expect(fixture.application.store.listRuns({ sessionId })).toHaveLength(1);
+    expect((await lifecycle("closeSession")).state).toBe(OperationState.SUCCEEDED);
+    expect((await lifecycle("resumeSession")).state).toBe(OperationState.SUCCEEDED);
+    expect(fixture.application.store.listEvents({ sessionId }).filter(event => event.metadata?.namespace === "codex.native_history"
+      && event.payload.type === "message_complete" && event.payload.role === "user"))
+      .toEqual([original]);
+  } finally {
+    await fixture?.close(); await nativeHost.shutdown();
+    if (rootDirectory !== undefined) await rm(rootDirectory, { recursive: true, force: true });
+  }
+});
+
 mountedIt("shows a Codex turn, restores it after reload, and isolates another task in mounted Web", { timeout: 90_000 }, async () => {
   const backendId = "codex-mounted";
   const native = new FakeCodexAppServer();
@@ -273,12 +530,22 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await page.getByRole("button", { name: "Send", exact: true }).click();
     await waitFor(async () => native.transport?.requests.some((request) => request.method === "turn/start") ?? false,
       (dispatched) => dispatched, "mounted Codex dispatch");
+    await waitFor(async () => fixture!.application.store.listQueueItems({ sessionId }),
+      items => items.some(item => item.state === "backend_accepted"), "the mounted original Codex turn");
+    const status = page.locator(".retry-status-indicator");
+    await reconnectCodexTurn(native, threadId, 1);
+    await status.getByText("Retrying (1/5)...", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await reconnectCodexTurn(native, threadId, 2);
+    await status.getByText("Retrying (2/5)...", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await native.completeTurn(threadId, "Codex mounted answer");
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await status.waitFor({ state: "hidden" });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Connect", exact: true }).click();
     await composer.waitFor({ state: "visible", timeout: 20_000 });
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    expect(await status.count()).toBe(0);
+    expect(await page.locator(".timeline").getByText(/Retrying|provider connection|fixture provider detail/).count()).toBe(0);
 
     await page.evaluate((id) => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, otherSessionId);
     await page.getByText("Other runtime task", { exact: true }).first().waitFor({ state: "visible", timeout: 20_000 });
@@ -301,3 +568,11 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await host.shutdown();
   }
 });
+
+async function reconnectCodexTurn(native: FakeCodexAppServer, threadId: string, attempt: number): Promise<void> {
+  const turnId = native.threads.get(threadId)?.turns.at(-1)?.["id"];
+  if (typeof turnId !== "string" || native.transport === undefined) throw new Error("The original native turn is absent.");
+  await native.transport.emitNotification("error", { threadId, turnId, willRetry: true,
+    error: { codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+      message: `Reconnecting... ${attempt}/5`, additionalDetails: "fixture provider detail" } });
+}

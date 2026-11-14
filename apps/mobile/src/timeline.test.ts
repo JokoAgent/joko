@@ -1,9 +1,9 @@
 import { create } from "@bufbuild/protobuf";
 import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageInputDelivery, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus,
-  PiEventMetadataSchema, PiMessageLifecycleKind, PiMessageLifecycleSchema, QueueItemState, RunSchema, RunState, RunUsageSummarySchema,
+  PiEventMetadataSchema, PiMessageLifecycleKind, PiMessageLifecycleSchema, QueueItemState, RetryState, RunSchema, RunState, RunUsageSummarySchema,
   ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema, type Event } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
-import { timelineRows } from "./timeline";
+import { mobileCodexReconnect, timelineRows } from "./timeline";
 import { isWorkGroup, mobilePiWorkThinkingPreview, mobileWorkItems } from "./mobile-work-projection";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { mobilePartnerConversationRows, mobilePublicConversationInputs } from "./mobile-partner-presentation";
@@ -22,6 +22,24 @@ function completed(blocks: any[], role = MessageRole.ASSISTANT) {
     } } }
   });
 }
+it("keeps Codex reconnect progress in the current attempt and out of message history", () => {
+  const retry = (sequence: bigint, status: RetryState, attemptNumber: number, generation = 5n, cursorGeneration = 9n) => create(EventSchema, {
+    eventId: `retry-${sequence}`, identity: { sessionId: "session", runId: "run", attemptId: "attempt", generation },
+    cursor: { generation: cursorGeneration, sequence }, payload: { kind: { case: "retryChanged", value: { runId: "run", attemptId: "attempt",
+      state: status, attemptNumber, maxAttempts: 5, error: { code: "CODEX_NATIVE_RECONNECT" } } } }
+  });
+  const retries = [retry(7n, RetryState.WAITING, 3, 4n), retry(8n, RetryState.WAITING, 4, 5n, 8n),
+    retry(5n, RetryState.WAITING, 1), retry(6n, RetryState.WAITING, 2)];
+  const run = create(RunSchema, { sessionId: "session", runId: "run", activeAttemptId: "attempt", state: RunState.RETRYING });
+  expect(timelineRows(retries)).toEqual([]);
+  expect(mobileCodexReconnect(retries, "session", 5n, 9n, [run])).toEqual({ attempt: 2, maxAttempts: 5 });
+  expect(mobileCodexReconnect(retries, "session", 5n, 9n, [])).toBeUndefined();
+  expect(mobileCodexReconnect(retries, "session", 5n, 9n, [{ ...run, activeAttemptId: "later-attempt" }])).toBeUndefined();
+  const settled = [...retries, retry(9n, RetryState.SUCCEEDED, 2)];
+  expect(mobileCodexReconnect(settled, "session", 5n, 9n, [run])).toBeUndefined();
+  expect(timelineRows([...settled, completed([{ content: { case: "text", value: "Recovered." } }])]))
+    .toMatchObject([{ text: "Recovered.", kind: "assistant", completed: true }]);
+});
 it("keeps extension-owned media available as artifacts without duplicating its card in the Timeline", () => {
   const event = create(EventSchema, { eventId: "media", identity: { sessionId: "session", runId: "run" }, cursor: { generation: 1n, sequence: 1n },
     payload: { kind: { case: "artifactProduced", value: { embeddedInExtensionCard: true, artifact: { artifactId: "media", sessionId: "session", runId: "run", title: "Audio", blob: {

@@ -91,6 +91,7 @@ async function canonicalWorkspaceRoot(path: string): Promise<string> {
 export interface RemoteWorkspaceDelegate {
   capturePreviewAuthority(workspaceId: string, signal?: AbortSignal): Promise<WorkspacePreviewAuthority>;
   register(input: WorkspaceRegistration): Promise<WorkspaceRegistration>;
+  changeDisplayName?(previous: WorkspaceRegistration, displayName: string): WorkspaceRegistration;
   changeTrust<T>(previous: WorkspaceRegistration, trusted: boolean, commit: () => T): {
     readonly registration: WorkspaceRegistration;
     readonly result: T;
@@ -548,6 +549,15 @@ export class WorkspaceService {
     this.#workspaces.set(input.id, registration);
     await this.#changeStream.workspaceRegistered(registration);
     return registration;
+  }
+
+  changeRemoteDisplayName(workspaceId: string, displayName: string): void {
+    const previous = this.requireWorkspace(workspaceId);
+    if (previous.remote?.binding.kind !== "ssh" || this.#remoteDelegate?.changeDisplayName === undefined) {
+      throw new WorkspaceEntryMutationError("The remote workspace display name cannot be updated.", "stale");
+    }
+    const registration = this.#remoteDelegate.changeDisplayName(previous, displayName);
+    this.#workspaces.set(workspaceId, registration);
   }
 
   async prepareTrustChange(previous: WorkspaceRegistration, trusted: boolean): Promise<<T>(commit: () => T) => T> {

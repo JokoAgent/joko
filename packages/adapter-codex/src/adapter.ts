@@ -248,6 +248,7 @@ export interface CodexMcpOpenInput extends CodexMcpSessionInput {
 
 export interface CodexRemoteRuntimePort {
   validateRegistration?(target: TargetDescriptor, assertCurrent: () => void): Promise<void>;
+  adoptTargetDisplayNameChange?(targetId: string, previousRevision: bigint, currentRevision: bigint): void;
   resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime>;
   shutdown(): Promise<void>;
   forceShutdown?(): Promise<void>;
@@ -1148,6 +1149,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       return;
     }
     await this.#readScope(target, undefined, { startLocalHost: false });
+  }
+
+  adoptTargetDisplayNameChange(targetId: string, previousRevision: bigint, currentRevision: bigint): void {
+    this.#assertOpen();
+    this.#remoteRuntimes?.adoptTargetDisplayNameChange?.(targetId, previousRevision, currentRevision);
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
@@ -2094,6 +2100,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }, {
         mutation: true,
         signal: dispatchSignal,
+        ...(yieldDispatch === undefined && context.onNativeTurnDispatch !== undefined
+          ? { onDispatch: context.onNativeTurnDispatch }
+          : {}),
         ...(beforeDispatchAsync === undefined ? {} : { beforeDispatchAsync }),
         beforeDispatch: () => {
           durableHistory?.assertCurrent();
@@ -2263,7 +2272,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const response = await runtime.host.request("turn/interrupt", {
         threadId: runtime.threadId,
         turnId
-      }, { mutation: true, signal, beforeDispatch });
+      }, {
+        mutation: true, signal, beforeDispatch,
+        ...(context.onNativeInterruptDispatch === undefined ? {} : { onDispatch: context.onNativeInterruptDispatch })
+      });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       this.#cancelPendingServerRequests(runtime, (pending) => pending.turnId === turnId);
       this.#cancelPendingMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
@@ -4720,7 +4732,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             const translatedEvents = (planTurnId !== undefined && runtime.planTurnIds.has(planTurnId))
               || isAnonymousYieldHelperCompletion(method, params)
               ? []
-              : this.#translator.translate(method, params, runtime.state);
+              : this.#translator.translate(method, params, runtime.state, {
+                observeNativeReconnect: !runtime.remote && runtime.runtimePolicy === "standard"
+                  && runtime.pendingTurnStart === undefined && runtime.yieldContinuation === undefined
+                  && runtime.activeTurnContext?.inputAttemptId !== undefined && runtime.activeTurnContext.onNativeTurnDispatch !== undefined
+              });
             const yieldResolution = method === "turn/completed"
               ? resolveYieldTurnCompletion(runtime, params, translatedEvents, completedPlan)
               : undefined;
@@ -4730,8 +4746,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             const schedulePlanReview = this.#registerPlanReview(runtime, plan, input.hostGeneration);
             for (const event of events) {
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
-              const eventContext = event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined
-                ? plan.context : runtime.context;
+              const eventContext = event.type === "retry" && event.error?.code === "CODEX_NATIVE_RECONNECT"
+                ? runtime.activeTurnContext ?? runtime.context
+                : event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined ? plan.context : runtime.context;
               const emit = learningTurn?.emit ?? eventContext.emit;
               await emit(event, {
                 namespace: "codex.app_server",
@@ -4907,8 +4924,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           if (!this.#matchesCallbackFence(runtime, input.hostGeneration) || runtime.disconnectTerminalEmitted) return;
           const activeYieldClaim = runtime.yieldContinuation;
           const activeTurnId = runtime.state.activeTurnId;
+          const pendingTurnStart = runtime.pendingTurnStart;
           const ownsRootTerminal = activeYieldClaim === undefined
-            ? runtime.yieldTerminalOwner === undefined && (runtimeHasProductWork(runtime) || runtime.pendingTurnStart !== undefined)
+            ? runtime.yieldTerminalOwner === undefined && (runtimeHasProductWork(runtime) || pendingTurnStart !== undefined)
             : claimYieldProductTerminal(runtime, activeYieldClaim);
           runtime.dispatchLifetime.abort();
           this.#cancelYieldContinuation(runtime);
@@ -4918,7 +4936,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           runtime.smartRoute = undefined;
           runtime.disconnectTerminalEmitted = true;
           this.#cancelPendingServerRequests(runtime);
-          const context = runtime.activeTurnContext ?? runtime.context;
+          // An unacknowledged start owns this disconnect if the last turn
+          // has finished and no new native turn is bound yet.
+          const context = activeTurnId === undefined && pendingTurnStart !== undefined
+            ? pendingTurnStart.context : runtime.activeTurnContext ?? runtime.context;
           const emit = runtime.partnerLearningTurn?.emit ?? context.emit;
           const observe = activeYieldClaim === undefined && activeTurnId !== undefined && fault.code === "process_exited"
             && context.observeAcceptedNativeTurn !== undefined

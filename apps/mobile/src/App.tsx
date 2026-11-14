@@ -173,7 +173,7 @@ import {
   shouldDismissComposerKeyboard
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
-import { timelineRows, type TimelineRow } from "./timeline";
+import { mobileCodexReconnect, timelineRows, type TimelineRow } from "./timeline";
 import { MobileThinkingCard } from "./MobileThinkingCard";
 import { MobileWorkGroupCard } from "./MobileWorkGroupCard";
 import { MobilePlanCard } from "./MobilePlanCard";
@@ -3968,6 +3968,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     ...(state.detail?.timeline ?? []),
     ...state.live
   ], [state.detail?.timeline, state.live, state.older, state.window]);
+  const codexReconnect = useMemo(() => actualSessionStreaming && state.window === undefined
+    ? mobileCodexReconnect(taskTimelineEvents, state.selectedId, session?.nativeBinding?.runtimeGeneration, state.detail?.generation, state.detail?.runs ?? [])
+    : undefined, [actualSessionStreaming, session?.nativeBinding?.runtimeGeneration, state.detail?.generation, state.detail?.runs, state.selectedId, state.window, taskTimelineEvents]);
   const delegated = useMobileDelegatedTasks(client, delegatedControls, taskTimelineEvents, state.detail?.backgroundTasks);
   const delegatedEntries = useMemo(() => delegatedControls && delegated.ownerKey === delegatedControls.surfaceOwnerKey
     ? delegated.entries : [], [delegated.entries, delegated.ownerKey, delegatedControls?.surfaceOwnerKey]);
@@ -7007,9 +7010,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       </ScrollView>}
     </View>}
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
-      {mobileMessage(locale, state.liveStatus === "streaming" ? "task.live"
-        : state.liveStatus === "verifying" ? "task.checkingLive"
-          : state.liveStatus === "polling" ? "task.polling" : "task.updatesPaused")}
+      {codexReconnect ? mobileMessage(locale, "task.codexReconnecting", codexReconnect)
+        : mobileMessage(locale, state.liveStatus === "streaming" ? "task.live"
+          : state.liveStatus === "verifying" ? "task.checkingLive"
+            : state.liveStatus === "polling" ? "task.polling" : "task.updatesPaused")}
     </Text>
     {state.status === "offline" && state.offlineSnapshotAt !== undefined
       && <MobileOfflineNotice cachedAt={state.offlineSnapshotAt} locale={locale} colors={colors} />}

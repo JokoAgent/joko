@@ -110,6 +110,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   readonly #remoteExecution: RemoteExecutionRouter;
   readonly #cache: RemoteFileVersionCache | undefined;
   readonly #registrations = new Map<string, WorkspaceRegistration>();
+  readonly #skillSourceRegistrations = new Map<string, WorkspaceRegistration>();
   readonly #mutations = new Map<string, Set<RemoteMutationLease>>();
   #closed = false;
 
@@ -126,6 +127,17 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     }
     const registration = Object.freeze({ ...input });
     this.#registrations.set(input.id, registration);
+    this.#skillSourceRegistrations.set(input.id, registration);
+    return registration;
+  }
+
+  changeDisplayName(previous: WorkspaceRegistration, displayName: string): WorkspaceRegistration {
+    this.#assertOpen();
+    if (previous.remote?.binding.kind !== "ssh" || this.#registrations.get(previous.id) !== previous) {
+      throw new WorkspaceEntryMutationError("The registered remote workspace changed.", "stale");
+    }
+    const registration = Object.freeze({ ...previous, displayName });
+    this.#registrations.set(previous.id, registration);
     return registration;
   }
 
@@ -140,16 +152,19 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const result = commit();
     const registration = Object.freeze({ ...previous, trusted });
     this.#registrations.set(previous.id, registration);
+    this.#skillSourceRegistrations.set(previous.id, registration);
     return { registration, result };
   }
 
   unregister(id: string): void {
     this.#registrations.delete(id);
+    this.#skillSourceRegistrations.delete(id);
   }
 
   async close(): Promise<void> {
     this.#closed = true;
     this.#registrations.clear();
+    this.#skillSourceRegistrations.clear();
     await Promise.allSettled([...this.#mutations.values()].flatMap(leases => [...leases].map(lease => lease.completion)));
   }
 
@@ -157,6 +172,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     signal?.throwIfAborted();
     this.#assertOpen();
     const registration = this.#require(workspaceId);
+    const skillSourceRegistration = this.#skillSourceRegistrations.get(workspaceId);
     const binding = registration.remote?.binding;
     if (!registration.trusted || binding?.kind !== "ssh" || binding.workspaceRoot !== registration.root) {
       throw new Error("Skill sources require a registered trusted SSH workspace.");
@@ -168,7 +184,9 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     signal?.throwIfAborted();
     const assertRegistration = (): void => {
       this.#assertOpen();
-      if (this.#registrations.get(workspaceId) !== registration) throw new Error("The registered Skill workspace changed.");
+      if (skillSourceRegistration === undefined || this.#skillSourceRegistrations.get(workspaceId) !== skillSourceRegistration) {
+        throw new Error("The registered Skill workspace changed.");
+      }
     };
     const assertCurrent = (): void => { assertRegistration(); authority.assertCurrent(); authority.assertFilesCurrent(); };
     const assertFilesCurrent = (): void => { assertRegistration(); authority.assertFilesCurrent(); };

@@ -470,6 +470,35 @@ export class ObjectiveManager {
     appendObjectiveLifecycle(store, updated, "paused", this.#now(), updated.lastReason);
   }
 
+  /** The exact Stop reached the native interrupt write fence. */
+  onRunStopDispatched(item: QueueItemRecord): void {
+    if (this.#closed) return;
+    const paused = this.#store.transaction((store) => {
+      const current = store.findObjective(item.sessionId);
+      if (current?.status !== "active" || current.pendingRunId !== item.runId
+        || current.pendingQueueItemId !== item.id || current.pendingAttemptId !== item.attemptId
+        || current.pendingOperationId !== item.operationId || current.pendingOwnerGeneration !== current.ownerGeneration
+        || current.ownerGeneration !== item.body.objectiveContinuation?.ownerGeneration) return false;
+      const updated = store.updateObjective({
+        sessionId: current.sessionId,
+        expectedRevision: current.revision,
+        expectedOwnerGeneration: current.ownerGeneration,
+        expectedSessionGeneration: current.sessionGeneration,
+        status: "paused",
+        usageResetAt: null,
+        lastReason: "paused: stopped by user",
+        updatedAt: this.#now()
+      });
+      appendObjectiveLifecycle(store, updated, "paused", this.#now(), updated.lastReason);
+      return true;
+    });
+    if (paused) {
+      this.#cancelUsageTimer(item.sessionId);
+      this.#cancelDispatchTimer(item.sessionId);
+      this.#publish(item.sessionId);
+    }
+  }
+
   async onRunSettled(input: {
     readonly sessionId: string;
     readonly runId: string;
@@ -544,9 +573,13 @@ export class ObjectiveManager {
   #settlePending(snapshot: ObjectiveRecord, run: StoredRun): boolean {
     const current = this.#store.findObjective(snapshot.sessionId);
     if (current === undefined || current.pendingRunId !== run.descriptor.id) return false;
+    // A Stop can pause the same owner before the native terminal event. Account
+    // for that turn with its actual result while retaining the paused status.
+    const explicitStop = current.status === "paused" && current.lastReason === "paused: stopped by user"
+      && current.pendingOwnerGeneration === current.ownerGeneration;
     if (
       current.pendingOwnerGeneration !== current.ownerGeneration ||
-      !["active", "dispatch_unknown"].includes(current.status)
+      !explicitStop && !["active", "dispatch_unknown"].includes(current.status)
     ) {
       const reconcilesReplacement = current.pendingOwnerGeneration !== current.ownerGeneration &&
         current.status === "dispatch_unknown";
@@ -579,7 +612,7 @@ export class ObjectiveManager {
     let usageResetAt: number | null = null;
     let dispatchRejections = 0;
 
-    if (run.descriptor.state === "aborted") {
+    if (explicitStop || run.descriptor.state === "aborted") {
       status = "paused";
       reason = "paused: stopped by user";
     } else if (run.descriptor.state === "failed") {
@@ -645,7 +678,7 @@ export class ObjectiveManager {
         updatedAt: this.#now()
       });
       const action = lifecycleActionForSettlement(updated.status);
-      if (action !== undefined) {
+      if (action !== undefined && !explicitStop) {
         appendObjectiveLifecycle(store, updated, action, this.#now(), updated.lastReason);
       }
     });

@@ -518,7 +518,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     : controller.state.snapshot.targets.find((candidate) => candidate.id === session.projectId)?.name
       ?? target?.name
       ?? "Project";
-  const activeRetry = useMemo(() => resolveActiveRetry(timeline, session), [session.activeRunId, session.state, timeline]);
+  const activeRetry = useMemo(() => resolveActiveRetry(timeline, session),
+    [session.activeRunId, session.activeAttemptId, session.generation, session.state, timeline]);
   const activeCompaction = useMemo(() => resolveActiveCompaction(timeline, session.compacting), [session.compacting, timeline]);
   const inlinePlanVisibility = inlinePlanVisibilityState.sessionId === session.id ? inlinePlanVisibilityState.value : null;
   const handleInlinePlanVisibilityChange = useCallback((value: InlinePlanVisibility | null): void => {

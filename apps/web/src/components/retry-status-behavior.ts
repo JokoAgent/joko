@@ -34,7 +34,8 @@ export type RetryEscapeIntent = { readonly kind: "abortRetry"; readonly runId: s
 
 export function resolveRetryStopAction(retry: RetryEscapeContext["retry"], capabilities: Pick<RetryEscapeContext, "canAbortRetry" | "canAbortRun">): "abortRetry" | "abort" | undefined {
   if (capabilities.canAbortRetry && retry?.source === "auto") return "abortRetry";
-  if (capabilities.canAbortRun && retry?.source === "unknown" && retry.error?.code === "CLAUDE_CODE_API_RETRY") return "abort";
+  if (capabilities.canAbortRun && retry?.source === "unknown"
+    && (retry.error?.code === "CLAUDE_CODE_API_RETRY" || retry.error?.code === "CODEX_NATIVE_RECONNECT")) return "abort";
   return undefined;
 }
 
@@ -59,19 +60,20 @@ export function resolveRetryEscapeIntent(input: RetryEscapeInput, context: Retry
 }
 
 /**
- * Pi's RetryStatusIndicator exists only while a retry delay is active. The
- * durable event remains in history so reconnects can rebuild that transient
- * state, but a terminal/started update and the authoritative run state clear it.
+ * Retry progress can be rebuilt from durable events. The current Run and the
+ * latest lifecycle update determine whether it still belongs in the status slot.
  */
 export function resolveActiveRetry(
   items: readonly TimelineItemView[],
-  session: Pick<SessionView, "state" | "activeRunId">
+  session: Pick<SessionView, "state" | "activeRunId" | "activeAttemptId"> & Partial<Pick<SessionView, "generation">>
 ): ActiveRetryProjection | undefined {
   if (session.state !== "retrying" || session.activeRunId === undefined) return undefined;
 
   let latest: TimelineItemView | undefined;
   for (const item of items) {
     if (item.runId !== session.activeRunId || item.retry === undefined) continue;
+    if (item.retry.error?.code === "CODEX_NATIVE_RECONNECT" && (!item.retry.attemptId
+      || item.retry.attemptId !== session.activeAttemptId || item.retry.generation !== session.generation)) continue;
     if (
       latest === undefined ||
       item.sequence > latest.sequence ||

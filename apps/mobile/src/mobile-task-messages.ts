@@ -276,6 +276,7 @@ const mobileTaskMessageRows = [
   ["task.controls", "Controls", "控制项", "控制項", "コントロール", "제어"],
   ["task.files", "Files", "文件", "檔案", "ファイル", "파일"],
   ["task.live", "Live events", "实时事件", "即時事件", "ライブイベント", "실시간 이벤트"],
+  ["task.codexReconnecting", "Codex is reconnecting ({attempt}/{maxAttempts})…", "Codex 正在重连（{attempt}/{maxAttempts}）…", "Codex 正在重新連線（{attempt}/{maxAttempts}）…", "Codex が再接続しています（{attempt}/{maxAttempts}）…", "Codex 재연결 중 ({attempt}/{maxAttempts})…"],
   ["task.checkingLive", "Checking live updates…", "正在检查实时更新…", "正在檢查即時更新…", "ライブ更新を確認中…", "실시간 업데이트 확인 중…"],
   ["task.polling", "Snapshot updates · live stream unavailable", "快照更新 · 实时流不可用", "快照更新 · 即時串流無法使用", "スナップショット更新 · ライブストリームは利用不可", "스냅샷 업데이트 · 실시간 스트림 사용 불가"],
   ["task.updatesPaused", "Updates paused", "更新已暂停", "更新已暫停", "更新を一時停止中", "업데이트 일시 중지"],

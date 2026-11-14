@@ -197,6 +197,89 @@ describe("RemoteCodexRuntimeResolver", () => {
     ]);
   });
 
+  it("retires a late SSH proxy handle when the Target is renamed before adoption", async () => {
+    const fixture = createFixture({});
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    const open = fixture.processes.open.bind(fixture.processes);
+    let enter!: (value: { readonly handle: RemoteProcessHandle; readonly signal: AbortSignal }) => void;
+    const entered = new Promise<{ readonly handle: RemoteProcessHandle; readonly signal: AbortSignal }>((resolve) => { enter = resolve; });
+    let resume!: () => void;
+    const hold = new Promise<void>((resolve) => { resume = resolve; });
+    vi.spyOn(fixture.processes, "open").mockImplementation(async (request) => {
+      const handle = await open(request);
+      if (request.args[1] === "proxy") {
+        enter({ handle, signal: request.signal! });
+        await hold;
+      }
+      return handle;
+    });
+    const startup = runtime.host.ensureStarted().catch((error: unknown) => error);
+    try {
+      const { handle, signal } = await entered;
+      const kill = vi.spyOn(handle, "kill");
+      const renamed = { ...fixture.target, displayName: "Renamed project" };
+      const previousRevision = fixture.stored.revision;
+      fixture.stored = { ...fixture.stored, descriptor: renamed, revision: fixture.stored.revision + 1n };
+      fixture.resolver.adoptTargetDisplayNameChange(renamed.id, previousRevision, fixture.stored.revision);
+      resume();
+      expect(await startup).toMatchObject({ code: "spawn_failed" });
+      expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+      expect(handle.signalCode).toBe("SIGKILL");
+      expect(signal.aborted).toBe(true);
+      expect(fixture.processes.clientMessages).toEqual([]);
+
+      const current = await fixture.resolver.resolve(renamed);
+      expect(current).not.toBe(runtime);
+      await current.host.ensureStarted();
+      expect(fixture.processes.clientMessages.map(message => message.method)).toContain("initialize");
+    } finally { resume(); }
+  });
+
+  it("keeps an initialized SSH runtime current through the exact committed display-name edit", async () => {
+    const fixture = createFixture({});
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    const generation = await runtime.host.ensureStarted();
+    const requestCount = fixture.processes.requests.length;
+    const previousRevision = fixture.stored.revision;
+    const renamed = { ...fixture.target, displayName: "Renamed project" };
+    fixture.stored = { ...fixture.stored, descriptor: renamed, revision: previousRevision + 1n };
+    fixture.resolver.adoptTargetDisplayNameChange(renamed.id, previousRevision, fixture.stored.revision);
+    expect(() => runtime.assertCurrent()).not.toThrow();
+    expect(await fixture.resolver.resolve(renamed)).toBe(runtime);
+    expect(runtime.host.isActiveGeneration(generation)).toBe(true);
+    await expect(runtime.host.request("thread/list", { cwd: "/srv/project-real", limit: 100, useStateDbOnly: true }))
+      .resolves.toMatchObject({ value: { data: [], nextCursor: null } });
+    expect(fixture.processes.requests).toHaveLength(requestCount);
+    expect(fixture.processes.clientMessages.filter(message => message.method === "initialize")).toHaveLength(1);
+    fixture.authorityCurrent = false;
+    expect(() => runtime.assertCurrent()).toThrow("SSH authority changed");
+  });
+
+  it.each(["trust", "binding", "revision", "trust-aba", "ssh"] as const)("keeps the original %s fence across a display-name edit", async change => {
+    const fixture = createFixture({});
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    await runtime.host.ensureStarted();
+    const original = fixture.stored;
+    if (change === "revision") fixture.stored = { ...fixture.stored, revision: fixture.stored.revision + 1n };
+    if (change === "trust-aba") {
+      fixture.stored = { ...fixture.stored, descriptor: { ...fixture.target, trusted: false }, revision: fixture.stored.revision + 1n };
+      expect(() => runtime.assertCurrent()).toThrow("Target authority changed");
+      fixture.stored = { ...fixture.stored, descriptor: fixture.target, revision: fixture.stored.revision + 1n };
+    }
+    const previousRevision = fixture.stored.revision;
+    const renamed = { ...original.descriptor, displayName: "Renamed project",
+      ...(change === "trust" ? { trusted: false } : {}),
+      ...(change === "binding" ? { remoteWorkspace: { ...fixture.target.remoteWorkspace!, hostId: "other-host" } } : {}) };
+    fixture.stored = { ...fixture.stored, descriptor: renamed, revision: previousRevision + 1n };
+    if (change === "ssh") fixture.authorityCurrent = false;
+    fixture.resolver.adoptTargetDisplayNameChange(renamed.id, previousRevision, fixture.stored.revision);
+    expect(() => runtime.assertCurrent()).toThrow("Target authority changed");
+    expect(fixture.processes.clientMessages.filter(message => message.method === "initialize")).toHaveLength(1);
+  });
+
   it("fences exact Target and SSH authority revisions and never surfaces remote stderr", async () => {
     const fixture = createFixture({ probeVersion: "codex-cli 9.9.9", stderr: "private-fixture-secret" });
     cleanups.push(() => fixture.resolver.forceShutdown());
