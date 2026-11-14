@@ -22,7 +22,7 @@ import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
-import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
+import { adoptPartnerImportSettings, createPartnerImportEffects, importedPartnerId, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { SessionHost } from "./session-host.js";
@@ -458,7 +458,7 @@ describe("native import service and owning effects", () => {
     await writeFile(sourceIdentity, firstIdentity);
     const signal = new AbortController().signal;
     const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
-    const selected = preview.entries.find(item => item.category === PartnerImportCategory.PERSONALITY)!;
+    const selected = preview.entries.find(item => item.category === PartnerImportCategory.PERSONALITY && item.name === "SOUL.md")!;
     const selection = {
       previewId: preview.id, requestId: "owner_import_checkpoint_0001", name: "Checkpoint recovery",
       entryIds: [selected.id], takeover: false, deferSetup: true
@@ -513,6 +513,65 @@ describe("native import service and owning effects", () => {
       expect(phases.filter(phase => phase === "create-partner-start")).toHaveLength(1);
       expect((await reopened.api.status(selection.requestId, signal))?.status).toBe(PartnerImportStatus.COMPLETE);
       expect(await reopened.api.start(selection, signal)).toMatchObject({ requestId: selection.requestId, partnerId });
+    }
+  }, 20_000);
+
+  it.each([false, true])("reconciles the saved first identity projection after an owner edit of %s", async edited => {
+    const f = await fixture();
+    const frozenIdentity = "Hermes import identity before the first completed profile write.";
+    const sourceIdentity = join(f.native, "SOUL.md");
+    await writeFile(sourceIdentity, frozenIdentity);
+    const signal = new AbortController().signal;
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+    const selected = preview.entries.find(item => item.category === PartnerImportCategory.PERSONALITY && item.name === "SOUL.md")!;
+    const selection = {
+      previewId: preview.id, requestId: "owner_import_first_profile_0001", name: "Profile recovery fixture",
+      entryIds: [selected.id], takeover: false, deferSetup: true
+    };
+    const partnerId = importedPartnerId(selection.requestId);
+    let originalIdentity: string | undefined;
+    const update = f.partners.updatePartner.bind(f.partners);
+    const interruption = vi.spyOn(f.partners, "updatePartner").mockImplementation((...args) => {
+      if (args[0] !== partnerId || args[2].identitySource !== frozenIdentity) return update(...args);
+      originalIdentity = f.partners.getPartner(partnerId).identitySource;
+      return Promise.reject(new Error("Fixture interruption before the first profile write"));
+    });
+    try {
+      await f.api.start(selection, signal);
+      expect((await f.imports.waitForRequest(selection.requestId)).status).toBe("needs-attention");
+    } finally {
+      interruption.mockRestore();
+    }
+    expect(originalIdentity).toBeDefined();
+    const original = f.partners.getPartner(partnerId);
+    expect(original).toMatchObject({ profileVersion: 1, identitySource: originalIdentity });
+    const environment = (await f.storage.environment.read(partnerId, () => {}))!;
+    expect(Object.values(environment.documents)).toContain(frozenIdentity);
+    expect(environment.pendingImport?.selection.requestId).toBe(selection.requestId);
+    // Persist the precise state left by the older ordering between projection and intent.
+    await f.storage.environment.update(partnerId, () => {}, value => {
+      value.profileProjection.identity = frozenIdentity;
+      delete value.profileUpdate;
+    });
+    const userIdentity = "The owner supplied a different identity.";
+    if (edited) await update(partnerId, original.revision, { identitySource: userIdentity });
+    await writeFile(sourceIdentity, "A later source edit.");
+    const reopened = await f.reopenImports();
+    await reopened.api.retry(selection.requestId, false, signal);
+    const settled = await reopened.manager.waitForRequest(selection.requestId);
+    const profile = f.partners.getPartner(partnerId);
+    expect(profile.identitySource).toBe(edited ? userIdentity : frozenIdentity);
+    expect(profile.canonicalSessionId).toBe(original.canonicalSessionId);
+    expect(f.profiles.listPartners()).toHaveLength(1);
+    if (edited) {
+      expect(settled.status).toBe("needs-attention");
+      expect(settled.checks).toContainEqual(expect.objectContaining({ message: "IMPORT_OWNER_CHANGED" }));
+    } else {
+      expect(settled).toMatchObject({ status: "complete", savedEntryIds: [selected.id], partnerId });
+      const committed = (await reopened.storage.environment.read(partnerId, () => {}))!;
+      expect(committed.profileProjection.identity).toBe(frozenIdentity);
+      expect(committed.profileUpdate).toBeUndefined();
+      expect(committed.targetOwner?.profileVersion).toBe(profile.profileVersion);
     }
   }, 20_000);
 
