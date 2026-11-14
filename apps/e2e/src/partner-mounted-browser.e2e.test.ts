@@ -311,6 +311,7 @@ describe("mounted Partner collaboration product chain", () => {
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     if (evidence) await page.screenshot({ path: join(evidence, "discovery-detail-dark-800.png"), fullPage: true, animations: "disabled" });
     await dialog.locator(".partner-discovery__identity").getByRole("button", { name: "Invite", exact: true }).click();
+    await page.getByRole("dialog").getByRole("checkbox", { name: /Use shared partner defaults/u }).uncheck();
     const primary = page.getByRole("dialog").getByRole("combobox", { name: "Primary model", exact: true });
     await primary.waitFor({ state: "visible", timeout: 60_000 });
     const installedProfile = required((await manager.clients.partner.listPartners({})).partners[0], "installed partner");
