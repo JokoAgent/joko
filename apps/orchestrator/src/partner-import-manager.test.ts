@@ -61,7 +61,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     workspaceService: { register: async input => input, unregister: () => undefined },
     isSavedPackageMissingDefault: (profile, assertCurrent) => isSavedPackageMissingDefault(profile, storage, assertCurrent),
     onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id), onReady: async id => { await imports?.activatePackage(id); } });
-  routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
+  routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) });
   if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: options.planMode ?? false });
   const makeRuntime = (importStorage: PartnerImportStorage) => new PartnerImportRuntime({
     partners, store, host, routines, storage: importStorage, imports,
@@ -104,6 +104,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     } });
   imports = makeImportManager(storage);
   if (options.planMode !== undefined) routines.setImportedRuntime(makeRuntime(storage));
+  await routines.start();
   let authenticated = "device-a";
   const context = (): HandlerContext => ({ signal: new AbortController().signal } as HandlerContext);
   const authenticate = () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; };
