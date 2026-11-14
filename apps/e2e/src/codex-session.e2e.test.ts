@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ToolCallState } from "@joko/contracts";
+import { EntityKind, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
@@ -461,7 +461,12 @@ it("reopens the same Codex history after a recorded in-progress user entry compl
     nativeHost = new AppServerHost({ transportFactory: () => native.createTransport() });
     fixture = await start();
     const clients = fixture.clients(paired.authKey);
-    await expect(clients.session.getNativeSessionTree({ sessionId })).resolves.toMatchObject({ tree: expect.any(Object) });
+    const lifecycle = (action: "resumeSession" | "closeSession") => submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId },
+        expectedGeneration: BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation) }],
+      payload: action === "resumeSession" ? { case: "resumeSession", value: { sessionId } } : { case: "closeSession", value: { sessionId } }
+    }));
+    expect((await lifecycle("resumeSession")).state).toBe(OperationState.SUCCEEDED);
     const events = fixture.application.store.listEvents({ sessionId });
     expect(events.filter(event => event.metadata?.namespace === "codex.native_history"
       && event.payload.type === "message_complete" && event.payload.role === "user"))
@@ -470,7 +475,8 @@ it("reopens the same Codex history after a recorded in-progress user entry compl
       && event.payload.blocks.some(block => block.kind === "text" && block.text === "The original remote turn completed."))).toHaveLength(1);
     expect(fixture.application.store.getSession(sessionId).descriptor.binding.nativeSessionId).toBe(threadId);
     expect(fixture.application.store.listRuns({ sessionId })).toHaveLength(1);
-    await expect(clients.session.getNativeSessionTree({ sessionId })).resolves.toMatchObject({ tree: expect.any(Object) });
+    expect((await lifecycle("closeSession")).state).toBe(OperationState.SUCCEEDED);
+    expect((await lifecycle("resumeSession")).state).toBe(OperationState.SUCCEEDED);
     expect(fixture.application.store.listEvents({ sessionId }).filter(event => event.metadata?.namespace === "codex.native_history"
       && event.payload.type === "message_complete" && event.payload.role === "user"))
       .toEqual([original]);
