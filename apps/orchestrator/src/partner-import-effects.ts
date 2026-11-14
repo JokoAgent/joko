@@ -145,14 +145,24 @@ export async function createPartnerImportEffects(options: {
     }
     const current = assertPartner(partnerId);
     const identity = profilePrefix(profile.identity, 8_000) || PARTNER_TEMPLATES[0].identitySource;
-    const baseline = profilePrefix(previous.profileProjection.identity, 8_000) || PARTNER_TEMPLATES[0].identitySource;
+    // The original profile can still be current after the prior v1 importer
+    // saved its first projection but stopped before writing the Partner.
+    const originalProfile = snapshot.source.kind === "hermes" && !snapshot.nativePackage
+      && stamp?.profileVersion === 1 && current.profileVersion === 1
+      && current.identitySource === PARTNER_TEMPLATES[0].identitySource;
+    const baseline = originalProfile ? current.identitySource
+      : profilePrefix(previous.profileProjection.identity, 8_000) || PARTNER_TEMPLATES[0].identitySource;
     if (current.identitySource !== baseline && current.identitySource !== identity) throw new AgentImportError("PROFILE_CHANGED");
-    await update(partnerId, value => { value.profileProjection = profile; });
     if (current.identitySource !== identity || previous.profileProjection.user !== profile.user || previous.profileProjection.instructions !== profile.instructions) {
       await update(partnerId, value => { value.profileUpdate = { fromRevision: current.revision.toString(), expectedFingerprint: importProfileFingerprint({ ...current, identitySource: identity }) }; });
       const changed = await partners.updatePartner(partnerId, current.revision, { identitySource: identity }); assertOwner(); owner = changed;
       if (packagePending(changed)) packageStamp = capturePackageOwner(changed); else stamp = captureOwner(changed);
-      await update(partnerId, value => { value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate; });
+      await update(partnerId, value => {
+        value.profileProjection = profile;
+        value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate;
+      });
+    } else if (previous.profileProjection.identity !== profile.identity) {
+      await update(partnerId, value => { value.profileProjection = profile; });
     }
   };
   return {
