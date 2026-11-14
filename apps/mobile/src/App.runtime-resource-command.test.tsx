@@ -320,7 +320,7 @@ it.each(["", "Unsent follow-up"])("mounts the current ordinary stop and keeps an
 
 it("shows Codex reconnect counts on the current Mobile task and clears them when the same Run resumes", async () => {
   const running = create(SnapshotSchema, { generation: 14n,
-    sessions: [{ ...session, state: SessionState.RUNNING, nativeBinding: { runtimeGeneration: 7n } }],
+    sessions: [{ ...session, state: SessionState.RUNNING, nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 7n }) }],
     runs: [{ runId: "run", sessionId: "session", activeAttemptId: "attempt", state: RunState.RETRYING }] });
   const retry = (sequence: bigint, status: RetryState, attemptNumber: number) => create(EventSchema, {
     eventId: `codex-reconnect-${sequence}`, identity: { sessionId: "session", runId: "run", attemptId: "attempt", generation: 7n },
