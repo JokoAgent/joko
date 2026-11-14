@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
 import { afterEach, expect, it } from "vitest";
-import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, PartnerImportStatus, PermissionMode, RoutineRunStatus } from "@joko/contracts";
+import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, PartnerImportStatus, PartnerInitializationErrorCode,
+  PartnerInitializationState, PermissionMode, RoutineRunStatus } from "@joko/contracts";
 import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
 import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
@@ -78,4 +79,59 @@ it("imports into the production HTTP/SQLite/published runtime, uses its full red
   await clients.partner.deletePartner({ requestId: "product_import_delete_request", partnerId: partner.partnerId, expectedRevision: (await clients.partner.getPartner({ partnerId: partner.partnerId })).partner!.revision, confirmName: partner.displayName });
   const deletedImport = await fixture.application.partnerImports?.status(selection.requestId, { ownerKey: "service-check", assertCurrent() {} });
   expect(deletedImport?.status).toBe("needs-attention");
+}, 150000);
+
+it("activates the already installed engineer Partner after the Owner configures the directory default", async () => {
+  fixture = await RealPiSystemFixture.start({ keepRoot: true, enableInternalServer: true });
+  const { application } = fixture;
+  const paired = await fixture.pair("Package Owner");
+  let clients = paired.clients;
+  const importApi = (rpc: typeof clients.partnerImport) => createPartnerImportApi({ rpc, ownerKey: paired.connectionId,
+    controllerId: "partner-discovery", assertCurrent() {}, newRequestId: randomUUID });
+  const signal = new AbortController().signal;
+  const api = importApi(clients.partnerImport);
+  expect((await clients.partner.getPartnerDirectory({})).directory?.defaultCapabilities).toBeUndefined();
+  const entry = (await api.packages!("en", signal)).find(item => item.packageId === "engineer-bot")!;
+  const admitted = await api.invitePackage!(entry, "en", signal);
+  const saved = await application.partnerImports!.waitForRequest(admitted.requestId);
+  expect(saved).toMatchObject({ saved: true, status: "complete" });
+  expect(saved.canonicalSessionId).toBeUndefined();
+  const pending = (await clients.partner.getPartner({ partnerId: saved.partnerId })).partner!;
+  expect(pending).toMatchObject({ initializationState: PartnerInitializationState.ERROR, usesDirectoryDefaults: true,
+    initializationErrorCode: PartnerInitializationErrorCode.MODEL_UNAVAILABLE });
+  expect(application.store.listSessions({ targetId: pending.homeTargetId })).toHaveLength(0);
+  const installedRoutine = application.partnerRoutines!.engine.list(pending.partnerId).find(routine => routine.builtin === undefined)!;
+  expect(installedRoutine.enabled).toBe(false);
+
+  const rootDirectory = fixture.rootDirectory;
+  const port = Number(new URL(fixture.baseUrl).port);
+  const internalPort = Number(new URL(application.config.internalOrigin).port);
+  await fixture.close();
+  fixture = await RealPiSystemFixture.start({ rootDirectory, port, internalPort, keepRoot: true, enableInternalServer: true });
+  clients = fixture.clients(paired.authKey);
+  const currentApi = importApi(clients.partnerImport);
+  const directory = (await clients.partner.getPartnerDirectory({})).directory!;
+  const capabilities = { modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }],
+    permissionMode: PermissionMode.ASK, planMode: false, inputHandoff: true };
+  const changed = await clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: directory.revision, capabilities });
+  const ready = changed.affectedPartners.find(partner => partner.partnerId === pending.partnerId)!;
+  expect(ready).toMatchObject({ partnerId: pending.partnerId, homeTargetId: pending.homeTargetId, displayName: pending.displayName,
+    initializationState: PartnerInitializationState.READY, usesDirectoryDefaults: true, canonicalSessionId: expect.any(String) });
+  const sessionId = ready.canonicalSessionId!;
+  expect(await currentApi.status(admitted.requestId, signal)).toMatchObject({ requestId: admitted.requestId,
+    partnerId: pending.partnerId, canonicalSessionId: sessionId, saved: true, status: PartnerImportStatus.COMPLETE });
+  expect(fixture.application.piResources!.list({ targetId: pending.homeTargetId, kind: "skill" })).toHaveLength(3);
+  expect(fixture.application.store.listMakerMemoryEntries({ targetId: pending.homeTargetId, kind: "reference" })).toHaveLength(1);
+  expect((await clients.partnerRoutine.listPartnerRoutines({ partnerId: pending.partnerId })).routines.find(routine => routine.id === installedRoutine.id)
+    ?.definition?.enabled).toBe(false);
+  const digest = createHash("sha256").update(JSON.stringify([sessionId, `package-welcome-${admitted.requestId}`])).digest("hex");
+  const opening = fixture.application.store.findEvent(`import-message-${digest}`);
+  expect(opening).toMatchObject({ sessionId, payload: { type: "message_complete", role: "assistant", blocks: [
+    { kind: "text", text: expect.stringMatching(/\S/u) }
+  ] } });
+
+  await clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: changed.directory!.revision, capabilities });
+  expect(fixture.application.store.listSessions({ targetId: pending.homeTargetId }).map(item => item.descriptor.id)).toEqual([sessionId]);
+  expect(fixture.application.store.listEvents({ sessionId }).filter(event => event.id === opening?.id)).toHaveLength(1);
+  expect(await currentApi.invitePackage!(entry, "en", signal)).toMatchObject({ requestId: admitted.requestId, canonicalSessionId: sessionId });
 }, 150000);

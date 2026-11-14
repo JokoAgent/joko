@@ -1144,10 +1144,12 @@ export class PartnerStore {
     return this.#createPartner(input, false, resolvedDefaults);
   }
 
-  /** An accepted service checkpoint already owns explicit routes and identity. */
-  createImportedPartner(input: CreatePartnerInput): PartnerProfileRecord {
-    if (!input.id || input.usesDirectoryDefaults) throw new PartnerStoreError("PARTNER_INVALID", "Imported creation requires an owned identity and explicit capabilities.");
-    return this.#createPartner(input, true);
+  /** An accepted service checkpoint owns the profile identity and model selection. */
+  createImportedPartner(input: CreatePartnerInput, resolvedDefaults?: PartnerCapabilitiesRecord): PartnerProfileRecord {
+    if (!input.id || (input.usesDirectoryDefaults && (input.allowUnconfiguredModel !== true || input.capabilities.modelChain.length !== 0))) {
+      throw new PartnerStoreError("PARTNER_INVALID", "Imported creation requires an owned identity and model selection.");
+    }
+    return this.#createPartner(input, true, resolvedDefaults);
   }
 
   #createPartner(input: CreatePartnerInput, acceptedImport: boolean, resolvedDefaults?: PartnerCapabilitiesRecord): PartnerProfileRecord {
@@ -1161,7 +1163,9 @@ export class PartnerStore {
       const existing = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
         .get(requestId) as Row | undefined;
       if (existing !== undefined) {
-        if (existing["creation_fingerprint"] !== fingerprint) {
+        const matchesPreviousPackage = acceptedImport && input.allowUnconfiguredModel === true && requestedDraft.usesDirectoryDefaults
+          && existing["creation_fingerprint"] === creationFingerprint(input, { ...requestedDraft, usesDirectoryDefaults: false });
+        if (existing["creation_fingerprint"] !== fingerprint && !matchesPreviousPackage) {
           throw new PartnerStoreError("PARTNER_CREATION_CONFLICT", "This creation request already belongs to another intent.");
         }
         const partner = this.#profile(existing);
@@ -1182,7 +1186,7 @@ export class PartnerStore {
       }
       const homeTargetId = entityId(input.homeTargetId ?? `partner:${id}`, "Partner home Target ID");
       const capabilities = requestedDraft.usesDirectoryDefaults
-        ? this.directoryState().defaultCapabilities ?? resolvedDefaults
+        ? directory.defaultCapabilities ?? resolvedDefaults ?? (acceptedImport && input.allowUnconfiguredModel ? requestedDraft.capabilities : undefined)
         : requestedDraft.capabilities;
       if (capabilities === undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "Partner directory defaults must be configured first.");

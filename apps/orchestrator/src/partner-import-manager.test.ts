@@ -22,7 +22,7 @@ import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
-import { adoptPartnerImportSettings, createPartnerImportEffects, importedPartnerId, preparePartnerImportCreation } from "./partner-import-effects.js";
+import { adoptPartnerImportSettings, createPartnerImportEffects, importedPartnerId, isSavedPackageMissingDefault, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { SessionHost } from "./session-host.js";
@@ -59,6 +59,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   let imports: PartnerImportManager; let routines: PartnerRoutineManager;
   const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(root, "homes"),
     workspaceService: { register: async input => input, unregister: () => undefined },
+    isSavedPackageMissingDefault: (profile, assertCurrent) => isSavedPackageMissingDefault(profile, storage, assertCurrent),
     onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id), onReady: async id => { await imports?.activatePackage(id); } });
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
   if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: options.planMode ?? false });
@@ -451,6 +452,34 @@ describe("native import service and owning effects", () => {
     await f.imports.recover();
     expect((await f.api.retry(saved.requestId, false, signal)).canonicalSessionId).toBe(ready.canonicalSessionId);
     expect(f.profiles.listPartners()).toHaveLength(1);
+  }, 20_000);
+
+  it("adopts a previously saved v1 package on the directory default while leaving a changed package alone", async () => {
+    const f = await fixture({ resourceFiles: 20, noDefaults: true });
+    // Recreate the old writer's durable profile and import fingerprint without changing the package or receipt.
+    const createImportedPartner = f.profiles.createImportedPartner.bind(f.profiles);
+    const oldWriter = vi.spyOn(f.profiles, "createImportedPartner").mockImplementation(input =>
+      createImportedPartner({ ...input, usesDirectoryDefaults: false }));
+    const signal = new AbortController().signal;
+    const catalog = await f.api.packages!("en", signal);
+    const first = await f.api.invitePackage!(catalog.find(row => row.packageId === "engineer-bot")!, "en", signal);
+    const second = await f.api.invitePackage!(catalog.find(row => row.packageId === "nightly-audit-engineer")!, "en", signal);
+    const saved = await f.imports.waitForRequest(first.requestId);
+    const changedImport = await f.imports.waitForRequest(second.requestId);
+    oldWriter.mockRestore();
+    const pending = f.partners.getPartner(saved.partnerId);
+    expect(pending).toMatchObject({ usesDirectoryDefaults: false, initializationErrorCode: "model_unavailable" });
+    const changed = f.partners.getPartner(changedImport.partnerId);
+    const edited = await f.partners.updatePartner(changed.id, changed.revision, { displayName: "A separately edited Partner" });
+    const defaults = { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }],
+      permissionMode: "ask" as const, planMode: false, inputHandoff: true };
+
+    const [ready] = await f.partners.updateDirectoryDefaults(f.partners.directory().state.revision, defaults);
+    expect(ready).toMatchObject({ id: pending.id, usesDirectoryDefaults: true, initializationState: "ready", canonicalSessionId: expect.any(String) });
+    expect(f.storage.readReceipt(saved.requestId)).toMatchObject({ checkpointCleared: true,
+      result: { partnerId: pending.id, canonicalSessionId: ready!.canonicalSessionId, status: "complete" } });
+    expect(f.partners.getPartner(edited.id)).toEqual(edited);
+    expect(f.storage.readReceipt(changedImport.requestId)?.checkpointCleared).toBe(false);
   }, 20_000);
 
   it.each(["startup", "status", "missing checkpoint"] as const)("settles an interrupted first import through %s", async entry => {

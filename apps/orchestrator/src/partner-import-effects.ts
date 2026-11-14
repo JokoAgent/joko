@@ -32,6 +32,27 @@ export function preparePartnerImportCreation(partners: PartnerManager, selection
     ?? { modelChain: [], permissionMode: "ask", planMode: false, inputHandoff: true } } satisfies CreationDraft);
 }
 
+/** Match an installed v1 package that was saved before missing models could follow directory defaults. */
+export async function isSavedPackageMissingDefault(profile: PartnerProfileRecord, storage: PartnerImportStorage, assertCurrent: () => void): Promise<boolean> {
+  if (profile.lifecycle !== "active" || profile.usesDirectoryDefaults || profile.canonicalSessionId !== undefined
+    || profile.initializationState !== "error" || profile.initializationErrorCode !== "model_unavailable"
+    || profile.capabilities.modelChain.length !== 0) return false;
+  const receipt = storage.listReceipts().find(row => row.result.partnerId === profile.id && row.nativePackage
+    && row.result.saved && row.partnerCreated && row.environmentSaved && row.checkpointSaved && !row.checkpointCleared
+    && !row.cancelled && !row.creationRejected);
+  if (!receipt?.nativePackage || receipt.result.canonicalSessionId !== undefined || importedPartnerId(receipt.result.requestId) !== profile.id) return false;
+  const environment = await storage.environment.read(profile.id, assertCurrent).catch(error => {
+    assertCurrent();
+    if (error instanceof AgentImportError && error.code === "CREDENTIAL_STORAGE_INVALID") return null;
+    throw error;
+  });
+  const owner = environment?.packageOwner;
+  return environment?.source.kind === "package" && environment.source.agentId === receipt.nativePackage.packageId
+    && environment.pendingImport?.selection.requestId === receipt.result.requestId && owner !== undefined
+    && owner.revision === profile.revision.toString() && owner.profileVersion === profile.profileVersion
+    && owner.profileFingerprint === importProfileFingerprint(profile);
+}
+
 /** Explicit model/policy mapping can adopt those fields, but cannot adopt edits to imported identity or a different task. */
 export async function adoptPartnerImportSettings(partners: PartnerManager, store: OperationalStore, storage: PartnerImportStorage, partnerId: string, assertOwner: () => void): Promise<void> {
   const environment = await storage.environment.read(partnerId, assertOwner); assertOwner();
@@ -190,18 +211,20 @@ export async function createPartnerImportEffects(options: {
       let draft: CreationDraft;
       try { draft = JSON.parse(context.creationJson) as CreationDraft; } catch { throw new AgentImportError("IMPORT_CREATION_INVALID"); }
       if (draft.version !== 1 || !/^\d+$/.test(draft.directoryRevision) || !draft.capabilities) throw new AgentImportError("IMPORT_CREATION_INVALID");
+      const waitForDefault = snapshot.nativePackage !== undefined && draft.capabilities.modelChain.length === 0;
       let created = await partners.createImportedPartner({ id: partnerId, requestId: creationRequestId(input.requestId),
         ...(snapshot.nativePackage ? { allowUnconfiguredModel: true as const } : {}),
         expectedDirectoryRevision: BigInt(draft.directoryRevision), displayName: redact(input.name),
         avatar: input.avatarImageBase64 ? { base64: input.avatarImageBase64 } : snapshot.nativePackage?.avatarPreset ?? "orbit", templateId: "general",
-        identitySource: PARTNER_TEMPLATES[0].identitySource, description: snapshot.nativePackage?.description ?? "", capabilities: draft.capabilities, usesDirectoryDefaults: false });
+        identitySource: PARTNER_TEMPLATES[0].identitySource, description: snapshot.nativePackage?.description ?? "", capabilities: draft.capabilities,
+        usesDirectoryDefaults: waitForDefault });
       assertOwner();
       if (snapshot.nativePackage && !created.canonicalSessionId && created.initializationState === "pending") created = await partners.retryInitialization(partnerId, created.revision);
       if (created.lifecycle === "active" && created.initializationState === "error" && !packagePending(created)) created = await partners.retryInitialization(partnerId, created.revision);
       if (created.initializationState !== "ready" && !packagePending(created)) throw new AgentImportError("IMPORT_PARTNER_SETUP_REQUIRED");
       if (!stamp && !packageStamp && (created.profileVersion !== 1 || created.displayName !== redact(input.name).trim() || created.templateId !== "general"
-        || created.identitySource !== PARTNER_TEMPLATES[0].identitySource || created.usesDirectoryDefaults
-        || fingerprint(created.capabilities) !== fingerprint(draft.capabilities) || created.homeTargetId !== `partner:${partnerId}`
+        || created.identitySource !== PARTNER_TEMPLATES[0].identitySource || (created.usesDirectoryDefaults && !waitForDefault)
+        || (!created.usesDirectoryDefaults && fingerprint(created.capabilities) !== fingerprint(draft.capabilities)) || created.homeTargetId !== `partner:${partnerId}`
         || fingerprint(created.avatar) !== fingerprint(input.avatarImageBase64 ? decodePartnerAvatar(input.avatarImageBase64).image : snapshot.nativePackage?.avatarPreset ?? "orbit"))) throw new AgentImportError("IMPORT_OWNER_CHANGED");
       owner = created; assertPartner(partnerId);
       if (packagePending(created)) {
