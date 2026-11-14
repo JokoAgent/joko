@@ -10,6 +10,7 @@ import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, Pa
 import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
 import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
+import { installLocalSkill } from "./skill-system-fixture.js";
 
 let fixture: RealPiSystemFixture | undefined;
 afterEach(async () => { await fixture?.close({ removeRoot: true }); fixture = undefined; });
@@ -65,6 +66,12 @@ it("imports into the production HTTP/SQLite/published runtime, uses its full red
   expect(history.runs[0]?.status).toBe(RoutineRunStatus.SUCCESS);
   expect((await readFile(join(root, "data", "orchestrator.db"))).includes(Buffer.from(secret))).toBe(false);
   await expect(fixture.anonymous.partnerImport.getPartnerImportStatus({ requestId: selection.requestId })).rejects.toMatchObject({ code: Code.Unauthenticated });
+  const unselectedBody = "Authorization: <PLACEHOLDER>\nUNSELECTED_TEMPLATE_BODY";
+  const unselected = await installLocalSkill(fixture, paired, "unselected-template", unselectedBody);
+  const connections = await clients.partner.getPartnerConnections({ partnerId: partner.partnerId });
+  expect(connections.connections?.entries.find(entry => entry.id === unselected.skill.skillId)).toMatchObject({ available: true });
+  expect(connections.connections?.skills?.ids).not.toContain(unselected.skill.skillId);
+  expect(JSON.stringify(connections, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).not.toContain("UNSELECTED_TEMPLATE_BODY");
   const beforeRestart = await clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
   const port = Number(new URL(fixture.baseUrl).port); const internalPort = Number(new URL(fixture.application.config.internalOrigin).port);
   await fixture.close(); fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, port, internalPort, enableInternalServer: true, agentImportSources: sources }); clients = fixture.clients(paired.authKey);
@@ -77,6 +84,17 @@ it("imports into the production HTTP/SQLite/published runtime, uses its full red
   expect(restoredCatalog.routines.filter(value => value.builtin === "follow-up")).toEqual(builtin);
   expect((await clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id })).runs[0]?.id).toBe(history.runs[0]?.id);
   expect(fixture.application.store.getTarget(partner.homeTargetId).descriptor.workspaceRoot).toBe(home);
+  const restoredConnections = await clients.partner.getPartnerConnections({ partnerId: partner.partnerId });
+  expect(restoredConnections.connections?.entries.find(entry => entry.id === unselected.skill.skillId)).toMatchObject({ available: true });
+  const restoredGeneration = fixture.application.store.getSession(taskId).descriptor.binding.generation;
+  const continued = await submit(clients.operation, paired.connectionId,
+    sendInputMutation(taskId, BigInt(restoredGeneration), "Continue using the imported Partner's own instructions."));
+  const continuedRun = queueRunIdFrom(continued);
+  await waitFor(async () => fixture!.application.store.getRun(continuedRun).descriptor.state,
+    value => ["completed", "failed", "aborted"].includes(value), "the restored Partner with an unselected template", 45000);
+  expect(fixture.application.store.getRun(continuedRun).descriptor.state).toBe("completed");
+  expect((await clients.session.listRuntimeCommands({ sessionId: taskId })).commands.some(command => command.resourceId === unselected.skill.skillId)).toBe(false);
+  expect(JSON.stringify(fixture.providerRequests)).not.toContain("UNSELECTED_TEMPLATE_BODY");
   await clients.partner.deletePartner({ requestId: "product_import_delete_request", partnerId: partner.partnerId, expectedRevision: (await clients.partner.getPartner({ partnerId: partner.partnerId })).partner!.revision, confirmName: partner.displayName });
   const deletedImport = await fixture.application.partnerImports?.status(selection.requestId, { ownerKey: "service-check", assertCurrent() {} });
   expect(deletedImport?.status).toBe("needs-attention");
