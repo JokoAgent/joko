@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
 import {
-  CLAUDE_AGENT_SDK_CLI_VERSION, CLAUDE_AGENT_SDK_VERSION, claudeNativeDerivationOperationId, claudeWorkspaceAuthority,
+  CLAUDE_AGENT_SDK_CLI_VERSION, CLAUDE_AGENT_SDK_VERSION, ClaudeCodeAdapter, claudeNativeDerivationOperationId, claudeWorkspaceAuthority,
   loadClaudeRemoteManagerSource
 } from "@joko/adapter-claude-code";
 import { OperationState, type Event } from "@joko/contracts";
@@ -17,7 +17,7 @@ import type {
   RemoteFileTransportPort, RemoteGitCheckoutLease, RemoteGitCheckoutPlan, RemoteProcessHandle, RemoteProcessStartRequest,
   RemoteProcessTransportPort
 } from "@joko/remote-ssh";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
 import { createE2eClients, type E2eClients } from "./connect-clients.js";
 import { waitFor } from "./fixture.js";
@@ -49,10 +49,12 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
   };
   const remote = new ControlledRemoteClaude();
   await remote.initialize();
+  const observeCleanup = vi.spyOn(ClaudeCodeAdapter.prototype, "cleanupNativeSessionDerivation");
   let running: Awaited<ReturnType<typeof start>> | undefined;
   try {
     running = await start(config, remote);
     const { application } = running;
+    expect(application.store.getBackend(BACKEND_ID).descriptor.adapterKind).toBe("claude-agent-sdk-stdio");
     const target = application.store.listTargets().find((item) => item.descriptor.backendId === BACKEND_ID);
     if (target === undefined) throw new Error("The production Claude Target is unavailable.");
     const targetId = "remote-workspace:claude-code";
@@ -290,10 +292,15 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     running = await start(config, remote);
     for (const checkpoint of checkpoints) {
       expect(running.application.store.getOperation(checkpoint.operationId).status).toBe("failed");
+      const cleanupCall = observeCleanup.mock.calls.find(([lifecycle]) => lifecycle.operationId === checkpoint.operationId);
+      expect(cleanupCall?.[2], `The ${checkpoint.boundary} cleanup must carry its durable claim.`).toEqual({
+        token: running.application.store.findNativeSessionDerivation(checkpoint.operationId)?.cleanupToken
+      });
       const diagnostics = running.application.store.listDiagnostics({ component: "native_session_derivation_cleanup", limit: 6 })
         .map(({ code, message }) => ({ code, message }));
       expect(running.application.store.findNativeSessionDerivation(checkpoint.operationId), JSON.stringify({
-        checkpoint: checkpoint.boundary, diagnostics, manager: remote.managerCalls.slice(beforeCleanup),
+        checkpoint: checkpoint.boundary, diagnostics,
+        manager: remote.managerCalls.slice(beforeCleanup),
         checkout: remote.checkoutCalls.slice(beforeCheckout), cleanupOperations: remote.cleanupOperations.length
       })).toMatchObject({
         state: "cleaned", cleanupToken: expect.any(String), worktree: checkpoint.worktree
@@ -308,6 +315,7 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(remote.activePaths()).toEqual([derived.worktree.path]);
     expect(remote.messages(sourceNativeId)).toEqual(sourceHistory);
   } finally {
+    observeCleanup.mockRestore();
     await running?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   }

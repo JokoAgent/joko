@@ -6082,7 +6082,7 @@ export class SessionHost {
       if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(current.backendId);
       const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(current, adapter);
       const remoteCleanup = record.externalLifecycle && record.worktree?.remote?.binding.kind === "ssh"
-        && record.remoteWorktreePlan !== undefined && this.#store.getBackend(record.backendId).descriptor.adapterKind === "claude-code";
+        && record.remoteWorktreePlan !== undefined && this.#store.getBackend(record.backendId).descriptor.adapterKind === "claude-agent-sdk-stdio";
       const lifecycle = await this.nativeSessionDerivationLifecycle(record, expectedWorktree, remoteCleanup);
       const call = this.beginNativeDerivationLifecycleCall(record.backendId);
       let deletion: Promise<void>;
