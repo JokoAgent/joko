@@ -2266,7 +2266,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const response = await runtime.host.request("turn/interrupt", {
         threadId: runtime.threadId,
         turnId
-      }, { mutation: true, signal, beforeDispatch });
+      }, {
+        mutation: true, signal, beforeDispatch,
+        ...(context.onNativeInterruptDispatch === undefined ? {} : { onDispatch: context.onNativeInterruptDispatch })
+      });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       this.#cancelPendingServerRequests(runtime, (pending) => pending.turnId === turnId);
       this.#cancelPendingMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);

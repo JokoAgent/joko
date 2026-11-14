@@ -75,6 +75,8 @@ export interface AdapterContext {
   readonly inputAttemptId?: AttemptId;
   /** The host retires pre-dispatch Stop authority at the final native turn write boundary. */
   readonly onNativeTurnDispatch?: () => void;
+  /** Persists owner Stop intent at the final native interrupt write boundary. */
+  readonly onNativeInterruptDispatch?: () => void;
   /** Host-owned attachments appended for this dispatch, outside the durable user input. */
   readonly transientPromptAttachments?: Pick<PromptInput, "images" | "files">;
   /** Private authority of the requested Run and Attempt for an interrupt. */

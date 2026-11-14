@@ -1132,6 +1132,7 @@ export class SessionHost {
   readonly #backendDispatchBlocked: (backendId: string) => boolean;
   readonly #onBackendMayBeIdle: ((backendId: string) => void) | undefined;
   readonly #onUserInputAdmitted: ((store: OperationalStore, result: EnqueueResult) => void) | undefined;
+  readonly #onObjectiveRunStopDispatched: ((item: QueueItemRecord) => void) | undefined;
   readonly #prepareTelegramHistory: ((input: TelegramHistoryDispatchInput) => Promise<PreparedTelegramHistory | undefined>) | undefined;
   readonly #onServiceRunSettled: ((input: {
     readonly sessionId: string;
@@ -1300,6 +1301,7 @@ export class SessionHost {
        * controllers that must fence autonomous work before a user Queue item
        * can dispatch. The hook must not perform asynchronous effects. */
       readonly onUserInputAdmitted?: (store: OperationalStore, result: EnqueueResult) => void;
+      readonly onObjectiveRunStopDispatched?: (item: QueueItemRecord) => void;
       readonly prepareTelegramHistory?: (input: TelegramHistoryDispatchInput) => Promise<PreparedTelegramHistory | undefined>;
       /** Post-commit notification for service-owned projections such as Messaging outboxes. */
       readonly onServiceRunSettled?: (input: {
@@ -1372,6 +1374,7 @@ export class SessionHost {
     this.#backendDispatchBlocked = options.backendDispatchBlocked ?? (() => false);
     this.#onBackendMayBeIdle = options.onBackendMayBeIdle;
     this.#onUserInputAdmitted = options.onUserInputAdmitted;
+    this.#onObjectiveRunStopDispatched = options.onObjectiveRunStopDispatched;
     this.#prepareTelegramHistory = options.prepareTelegramHistory;
     this.#onServiceRunSettled = options.onServiceRunSettled;
     this.#onServiceInteractionOpened = options.onServiceInteractionOpened;
@@ -4503,7 +4506,13 @@ export class SessionHost {
         && !this.#applicationQueueGuards.has(originalQueue.id)
         && this.isOwnerRunInput(originalQueue)
         ? { inputQueueItemId: originalQueue.id, inputAttemptId: original.activeAttemptId } : {};
-      await active.adapter[action]({ ...context, ...stopInput, assertRunControlCurrent });
+      const objectiveStop = this.#onObjectiveRunStopDispatched;
+      const objectiveControl = action === "abort" && options !== undefined && "ownerStop" in options
+        && objectiveStop !== undefined && originalQueue?.body.objectiveContinuation !== undefined
+        && original.source === "system" && original.parentRunId === undefined && originalQueue.state === "backend_accepted"
+        && context.target.remoteWorkspace === undefined && this.isOrdinaryLocalCodexSession(lease.stored)
+        ? { onNativeInterruptDispatch: () => objectiveStop(originalQueue) } : {};
+      await active.adapter[action]({ ...context, ...stopInput, ...objectiveControl, assertRunControlCurrent });
       this.assertActiveBackendSideEffectLease(lease);
     } finally {
       lease.release();
