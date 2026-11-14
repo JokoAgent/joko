@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { OperationMutationSchema, OperationState, RunState, ToolCallState } from "@joko/contracts";
+import { ObjectiveStatus, OperationMutationSchema, OperationState, RunState, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
@@ -100,6 +100,80 @@ it("stops the original Codex Run before the first native turn write and leaves t
     expect(turnWrites()).toHaveLength(1);
   } finally {
     releasePreparation();
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
+it("holds the same Codex Objective when its interrupted native turn completes naturally", async () => {
+  const backendId = "codex-objective-stop";
+  const native = new FakeCodexAppServer();
+  let atInterrupt = false;
+  let releaseInterrupt!: () => void;
+  const holdInterrupt = new Promise<void>(resolveHold => { releaseInterrupt = resolveHold; });
+  const host = new AppServerHost({ transportFactory: () => {
+    const transport = native.createTransport();
+    const request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => {
+      const result = await request(method, params, options);
+      if (method === "turn/interrupt") {
+        atInterrupt = true;
+        await holdInterrupt;
+      }
+      return result;
+    };
+    return transport;
+  } });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Objective fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Objective Stop owner");
+    const mutate = (mutation: Parameters<typeof submit>[2], operationId?: string) =>
+      submit(clients.operation, connectionId, mutation, operationId);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const { store } = fixture.application;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const { objective } = await clients.objective.setObjective({
+      requestId: randomUUID(), sessionId, expectedSessionGeneration: BigInt(binding.generation),
+      text: "Continue until the fixture is complete.", limits: { maximumTurns: 4 }
+    });
+    const runId = objective?.pendingRunId;
+    if (runId === undefined) throw new Error("No Objective Run was admitted.");
+    await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.RUNNING, "the original Objective Run");
+    const nativeThread = native.threads.get(binding.nativeSessionId!);
+    const nativeTurnId = nativeThread?.turns[0]?.["id"];
+    expect(nativeTurnId).toEqual(expect.any(String));
+    const stopId = randomUUID();
+    const stop = mutate(abortRunMutation(runId), stopId);
+    void stop.catch(() => undefined);
+    await waitFor(async () => atInterrupt, Boolean, "Codex to receive the original interrupt");
+    expect(native.transport?.requests.find(request => request.method === "turn/interrupt")?.params)
+      .toMatchObject({ threadId: binding.nativeSessionId, turnId: nativeTurnId });
+    expect((await clients.objective.getObjective({ sessionId })).objective?.status).toBe(ObjectiveStatus.PAUSED);
+    await native.completeTurn(binding.nativeSessionId!, "The original turn finished before the interrupt took effect.");
+    const settled = await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.SUCCEEDED,
+      "the original native completion");
+    expect(settled.run?.attempts).toMatchObject([{ endedAt: expect.any(Object) }]);
+    const paused = (await waitFor(() => clients.objective.getObjective({ sessionId }),
+      value => value.objective?.status === ObjectiveStatus.PAUSED && value.objective.pendingRunId === undefined,
+      "the settled Objective to stay paused")).objective!;
+    expect(paused.turnsUsed).toBe(1);
+    expect(nativeThread?.turns).toHaveLength(1);
+    releaseInterrupt();
+    const receipt = await stop;
+    expect(receipt.state).toBe(OperationState.SUCCEEDED);
+    expect(await mutate(abortRunMutation(runId), stopId)).toEqual(receipt);
+    expect(native.transport?.requests.filter(request => request.method === "turn/interrupt")).toHaveLength(1);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    expect(nativeThread?.turns).toHaveLength(1);
+    await clients.objective.resumeObjective({ requestId: randomUUID(), sessionId,
+      expectedRevision: paused.version!.revision!, expectedOwnerGeneration: paused.ownerGeneration });
+    await waitFor(async () => nativeThread?.turns.length ?? 0, turns => turns === 2, "an explicit Objective resume");
+  } finally {
+    releaseInterrupt();
     await fixture?.close();
     await host.shutdown();
   }

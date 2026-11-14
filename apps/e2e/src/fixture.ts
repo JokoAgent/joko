@@ -342,6 +342,7 @@ export class OrchestratorE2eFixture {
       modelRoutingEnabled: (backendId, providerId, modelId) => modelRoutingEnabled(store, backendId, providerId, modelId),
       onUserInputAdmitted: (transactionStore, result) =>
         objectives?.onUserInputAdmitted(transactionStore, result),
+      onObjectiveRunStopDispatched: (item) => objectives?.onRunStopDispatched(item),
       onServiceRunSettled: (input) => objectives?.onRunSettled(input),
       ...(auxiliaryServices?.providers === undefined ? {} : {
         sessionRuntimeFallbackContext: (backendId: string) => ({
