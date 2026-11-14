@@ -62,7 +62,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id), onReady: async id => { await imports?.activatePackage(id); } });
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
   if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: options.probePlan === undefined ? "ask" : "bypassPermissions", planMode: false });
-  imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {},
+  const makeImportManager = (importStorage: PartnerImportStorage) => new PartnerImportManager({ storage: importStorage, home: root, environment: {}, assertServiceOwner: () => {},
     getPartner: id => partners.getPartner(id),
     ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
     nativeRuntimeReady: id => partners.getPartner(id).initializationState === "ready",
@@ -75,11 +75,11 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     runPass: (id, action) => partners.runImportManagement(id, options.observeImport ? observedImportEffect("pass", action, options.observeImport) : action), effects: context => {
       options.observeImport?.("effects-start");
       const probePlan = options.probePlan;
-      const runtime = probePlan === undefined ? undefined : new PartnerImportRuntime({ partners, store, host, routines, storage, imports,
+      const runtime = probePlan === undefined ? undefined : new PartnerImportRuntime({ partners, store, host, routines, storage: importStorage, imports,
         assertServiceOwner: () => {}, auxiliary: { capture: () => ({ models: [], revision: 0n, runtimeRevision: "fixture" }),
           run: async () => ({ status: "ok", text: probePlan }) } });
-      const pendingEffects = createPartnerImportEffects({ partners, routines, storage, store, memory, resources, artifacts,
-      verification: runtime?.verification ?? { readEnvironment: (id, owner) => storage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
+      const pendingEffects = createPartnerImportEffects({ partners, routines, storage: importStorage, store, memory, resources, artifacts,
+      verification: runtime?.verification ?? { readEnvironment: (id, owner) => importStorage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
         plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context);
       if (!options.observeImport) return pendingEffects;
       const observe = options.observeImport;
@@ -99,14 +99,25 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
         };
       });
     } });
+  imports = makeImportManager(storage);
   let authenticated = "device-a";
   const context = (): HandlerContext => ({ signal: new AbortController().signal } as HandlerContext);
-  const service = createPartnerImportConnectService(imports, () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; });
-  const api = createPartnerImportApi({ ownerKey: "device-a:sheet", controllerId: "sheet", assertCurrent: () => {}, newRequestId: () => "owner_import_request_0001",
-    rpc: createClient(PartnerImportService, createRouterTransport(router => { router.service(PartnerImportService, service); })) });
+  const authenticate = () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; };
+  const service = createPartnerImportConnectService(imports, authenticate);
+  const connect = (server: typeof service) => createPartnerImportApi({
+    ownerKey: "device-a:sheet", controllerId: "sheet", assertCurrent: () => {}, newRequestId: () => "owner_import_request_0001",
+    rpc: createClient(PartnerImportService, createRouterTransport(router => { router.service(PartnerImportService, server); }))
+  });
+  const api = connect(service);
+  const reopenImports = async () => {
+    await imports.close();
+    const reopened = new PartnerImportStorage(store, await CredentialVault.open(join(root, "credentials", "master.key")), root);
+    imports = makeImportManager(reopened);
+    return { manager: imports, storage: reopened, api: connect(createPartnerImportConnectService(imports, authenticate)) };
+  };
   cleanups.push(async () => { await imports.close(); await routines.stop(); await scheduler.stop(); await host.dispose(); memory.dispose(); profiles.close(); store.close();
     if (dirname(resolve(root)) !== resolve(tmpdir()) || !basename(root).startsWith("joko-import-owner-")) throw new Error("Unsafe fixture cleanup"); await rm(root, { recursive: true, force: true }); });
-  return { root, native, store, profiles, artifacts, host, storage, resources, memory, partners, routines, imports, service, api, context, manifest,
+  return { root, native, store, profiles, artifacts, host, storage, resources, memory, partners, routines, imports, service, api, context, manifest, reopenImports,
     authenticate: (value: string) => { authenticated = value; } };
 }
 
@@ -438,6 +449,73 @@ describe("native import service and owning effects", () => {
     expect((await f.api.retry(saved.requestId, false, signal)).canonicalSessionId).toBe(ready.canonicalSessionId);
     expect(f.profiles.listPartners()).toHaveLength(1);
   }, 20_000);
+
+  it.each(["startup", "status", "missing checkpoint"] as const)("settles an interrupted first import through %s", async entry => {
+    const phases: string[] = [];
+    const f = await fixture({ observeImport: phase => phases.push(phase) });
+    const firstIdentity = "Frozen identity for the original request.";
+    const sourceIdentity = join(f.native, "SOUL.md");
+    await writeFile(sourceIdentity, firstIdentity);
+    const signal = new AbortController().signal;
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+    const selected = preview.entries.find(item => item.category === PartnerImportCategory.PERSONALITY)!;
+    const selection = {
+      previewId: preview.id, requestId: "owner_import_checkpoint_0001", name: "Checkpoint recovery",
+      entryIds: [selected.id], takeover: false, deferSetup: true
+    };
+    let interruptedReceipt: ReturnType<PartnerImportStorage["readReceipt"]>;
+    const saveReceipt = f.storage.saveReceipt.bind(f.storage);
+    const writeCheckpoint = f.storage.environment.write.bind(f.storage.environment);
+    const marker = vi.spyOn(f.storage, "saveReceipt").mockImplementation(receipt => {
+      if (receipt.checkpointSaved) throw new Error("Fixture interruption before checkpoint marker");
+      return saveReceipt(receipt);
+    });
+    const checkpointWrite = vi.spyOn(f.storage.environment, "write").mockImplementation((...args) => {
+      interruptedReceipt = f.storage.readReceipt(selection.requestId);
+      if (entry === "missing checkpoint") throw new Error("Fixture interruption before checkpoint storage");
+      return writeCheckpoint(...args);
+    });
+    try {
+      await f.api.start(selection, signal);
+      await f.imports.waitForRequest(selection.requestId);
+    } finally {
+      checkpointWrite.mockRestore();
+      marker.mockRestore();
+    }
+    const original = interruptedReceipt!;
+    expect(original).toMatchObject({ checkpointSaved: false, partnerCreated: false,
+      result: { requestId: selection.requestId, status: "running", saved: false } });
+    expect(f.profiles.listPartners()).toHaveLength(0);
+    const { partnerId } = original.result;
+    const checkpoint = (await f.storage.environment.read(partnerId, () => {}))?.pendingImport;
+    if (entry === "missing checkpoint") expect(checkpoint).toBeUndefined();
+    else expect(checkpoint?.selection).toEqual(selection);
+    // Restore the exact durable receipt that a process exit would leave behind.
+    f.storage.saveReceipt(original);
+    await writeFile(sourceIdentity, "A later source edit must never replace the checkpoint.");
+    const reopened = await f.reopenImports();
+    if (entry === "startup") await reopened.manager.recover();
+    const statuses = await Promise.all([reopened.api.status(selection.requestId, signal), reopened.api.status(selection.requestId, signal)]);
+    expect(statuses.every(value => value?.requestId === selection.requestId && value.partnerId === partnerId)).toBe(true);
+    const settled = await reopened.manager.waitForRequest(selection.requestId);
+    const receipt = reopened.storage.readReceipt(selection.requestId);
+    if (entry === "missing checkpoint") {
+      expect(settled).toMatchObject({ status: "needs-attention", saved: false,
+        checks: [{ entryId: "import", status: "needs-attention", message: "IMPORT_INTERRUPTED" }] });
+      expect((await reopened.api.status(selection.requestId, signal))?.status).toBe(PartnerImportStatus.NEEDS_ATTENTION);
+      expect(f.profiles.listPartners()).toHaveLength(0);
+      expect(phases).not.toContain("create-partner-start");
+    } else {
+      expect(settled).toMatchObject({ status: "complete", partnerId, saved: true, savedEntryIds: [selected.id] });
+      expect(receipt).toMatchObject({ checkpointSaved: true, checkpointCleared: true, partnerCreated: true });
+      expect(f.partners.getPartner(partnerId).identitySource).toContain(firstIdentity);
+      expect(f.profiles.listPartners()).toHaveLength(1);
+      expect(phases.filter(phase => phase === "create-partner-start")).toHaveLength(1);
+      expect((await reopened.api.status(selection.requestId, signal))?.status).toBe(PartnerImportStatus.COMPLETE);
+      expect(await reopened.api.start(selection, signal)).toMatchObject({ requestId: selection.requestId, partnerId });
+    }
+  }, 20_000);
+
   it("discovers bundled partners and admits one durable installation with skills, knowledge and disabled routines", async () => {
     let canonical: string | undefined;
     const f = await fixture({ resourceFiles: 20, currentCanonicalSession: () => canonical }); const signal = new AbortController().signal;

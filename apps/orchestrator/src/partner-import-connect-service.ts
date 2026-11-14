@@ -54,8 +54,8 @@ export function createPartnerImportConnectService(manager: PartnerImportManager 
         ...(value.entryRanges.length ? { entryRanges: value.entryRanges.map(range => [range.first, range.last] as const) } : {}),
         takeover: value.takeover, deferSetup: value.deferSetup }, controller)) });
     }),
-    getPartnerImportStatus: (request, context) => invoke(context, undefined, controller => {
-      const value = owner().status(request.requestId, controller);
+    getPartnerImportStatus: (request, context) => invoke(context, undefined, async controller => {
+      const value = await owner().status(request.requestId, controller);
       return create(contract.GetPartnerImportStatusResponseSchema, { ...(value ? { result: result(value) } : {}) });
     }),
     retryPartnerImport: (request, context) => invoke(context, undefined, async controller =>
