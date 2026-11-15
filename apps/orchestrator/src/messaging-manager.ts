@@ -483,7 +483,8 @@ export interface MessagingManagerOptions {
   readonly sessionHost: Pick<SessionHost,
     "createServiceSession" | "enqueueServiceInput" | "resolveInteraction" | "dismissInteraction"
     | "abort" | "applySessionSettings" | "observeQueueDispatch" | "assertSessionLifecycleIdle" | "closeIfActive"
-    | "assertDiscordConversationRestartReady" | "restartDiscordConversation">;
+    | "assertDiscordConversationRestartReady" | "restartDiscordConversation"
+    | "assertWeChatConversationRestartReady" | "restartWeChatConversation">;
   readonly artifacts: Pick<ArtifactStore, "ingestBytes" | "readBlob" | "createDispatchInputArtifacts">;
   readonly contacts?: Pick<ContactManager, "registerTelegramGroupSpeaker">;
   readonly createTelegramTransport?: (options: TelegramTransportOptions) => TelegramTransportPort;
@@ -2099,6 +2100,7 @@ export class MessagingManager {
       connectionId: connection.id,
       expectedChannelGeneration: connection.generation,
       conversationId: conversation.id,
+      allowObservedConversation: true,
       providerRequestId: event.providerRequestIds[0]!,
       providerInteractionId: `command:${event.messageId}`,
       providerMessageId: event.messageId,
@@ -2118,16 +2120,23 @@ export class MessagingManager {
     });
     if (claimed === undefined) return true;
 
-    let notice: string;
-    let outcomeCode: string | undefined;
-    try {
-      notice = await this.#runWeChatCommand(connection, conversation, event, command, claimed.id);
-    } catch {
-      outcomeCode = "command_effect_unknown";
-      notice = "The command result could not be confirmed. Check the task before retrying.";
-    }
-    const now = this.#now();
-    this.#store.transaction((store) => {
+    const replyContext = this.#store.getMessagingConversationContext(conversation.id);
+    const assertCommandCurrent = () => {
+      this.#assertOpen();
+      const live = this.#requireWorkerConnection(connection.id, connection.generation);
+      const current = this.#store.getMessagingInteraction(claimed.id);
+      const context = this.#store.getMessagingConversationContext(conversation.id);
+      if (live.credentialReferenceId !== connection.credentialReferenceId || live.credentialGeneration !== connection.credentialGeneration
+        || current.status !== "claimed" || current.revision !== claimed.revision || current.claimToken !== claimToken
+        || current.conversationId !== conversation.id || current.channelGeneration !== connection.generation
+        || context.revision !== replyContext.revision || context.sourceInteractionId !== claimed.id
+        || context.materialGeneration !== connection.credentialGeneration) {
+        throw invalid("The original WeChat command or its protected reply context changed.");
+      }
+    };
+    const settle = (store: OperationalStore, notice: string, outcomeCode?: string) => {
+      assertCommandCurrent();
+      const now = this.#now();
       const noticePayload = { format: 1, address: event.address, text: notice };
       store.enqueueMessagingDelivery({
         connectionId: connection.id,
@@ -2146,11 +2155,27 @@ export class MessagingManager {
         interactionId: claimed.id,
         expectedRevision: claimed.revision,
         claimToken,
-        status: outcomeCode === undefined ? "completed" : "unknown",
+        status: outcomeCode === undefined ? "completed" : outcomeCode === "new_unavailable" ? "failed" : "unknown",
         ...(outcomeCode === undefined ? {} : { outcomeCode }),
         settledAt: now
       });
-    });
+    };
+    let notice: string;
+    let outcomeCode: string | undefined;
+    try {
+      notice = await this.#runWeChatCommand(connection, conversation, event, command, claimed.id, {
+        assertCurrent: assertCommandCurrent, settle
+      });
+    } catch (error) {
+      const unchanged = command === "/new" && (error instanceof MessagingManagerError && error.code === "invalid"
+        || error instanceof JokoError && !error.publicError.stateMayHaveChanged);
+      outcomeCode = unchanged ? "new_unavailable" : "command_effect_unknown";
+      notice = unchanged && error instanceof Error ? error.message
+        : "The command result could not be confirmed. Check the task before retrying.";
+    }
+    if (this.#store.getMessagingInteraction(claimed.id).status === "claimed") {
+      this.#store.transaction(store => settle(store, notice, outcomeCode));
+    }
     this.#scheduleDeliveryDrain(connection.id);
     return true;
   }
@@ -2332,7 +2357,8 @@ export class MessagingManager {
     conversation: MessagingConversationRecord,
     event: MessagingInboundMessage,
     command: string,
-    interactionId: string
+    interactionId: string,
+    scope: { readonly assertCurrent: () => void; readonly settle: (store: OperationalStore, notice: string) => void }
   ): Promise<string> {
     const sessionId = conversation.sessionId;
     if (sessionId === undefined) throw invalid("WeChat command task binding is missing.");
@@ -2370,8 +2396,8 @@ export class MessagingManager {
         await this.#partnerRuntime.restartFromMessage(connection, conversation, event, interactionId);
         return 'The original Partner context is restarting. History remains available.';
       }
-      await this.#startNewWeChatSession(connection, conversation, event, interactionId);
-      return "A new conversation is ready. Previous task history remains available.";
+      await this.#startNewWeChatSession(connection, conversation, interactionId, scope);
+      return "A new conversation is ready.";
     }
     if (command === "/permission" || command.startsWith("/permission ")) {
       if (conversation.partnerId) return 'Partner channel writes and external actions require confirmation. Manage Partner settings in Joko.';
@@ -2702,8 +2728,8 @@ export class MessagingManager {
   async #startNewWeChatSession(
     connection: MessagingConnectionRecord,
     conversation: MessagingConversationRecord,
-    event: MessagingInboundMessage,
-    interactionId: string
+    interactionId: string,
+    scope: { readonly assertCurrent: () => void; readonly settle: (store: OperationalStore, notice: string) => void }
   ): Promise<void> {
     if (conversation.sessionId === undefined) throw invalid("WeChat conversation has no task.");
     if (this.#store.listRuns({ sessionId: conversation.sessionId, activeOnly: true, limit: 1 }).length > 0
@@ -2716,28 +2742,22 @@ export class MessagingManager {
       throw invalid("Stop or finish the active task before starting a new WeChat conversation.");
     }
     const route = this.#store.resolveMessagingRoute(connection.id);
-    const created = await this.#sessionHost.createServiceSession({
-      operationId: `messaging-new-session-${interactionId}`,
-      serviceKind: "messaging",
-      targetId: route.targetId,
-      title: `WeChat · ${safeExternalText(event.speaker.displayName, 128)}`,
-      providerId: route.providerId,
-      modelId: route.modelId,
-      effort: route.effort,
-      fastMode: route.fastMode,
-      permissionMode: route.permissionMode,
-      planMode: route.planMode
-    });
-    const session = this.#store.getSession(created.value.sessionId);
-    this.#store.rebindMessagingConversationSession({
-      conversationId: conversation.id,
-      expectedRevision: conversation.revision,
-      expectedChannelGeneration: connection.generation,
-      expectedSessionId: conversation.sessionId,
-      sessionId: session.descriptor.id,
-      expectedSessionGeneration: session.descriptor.binding.generation,
-      routeScopeKey: route.scopeKey,
-      updatedAt: this.#now()
+    const assertLane = () => {
+      scope.assertCurrent();
+      const current = this.#store.getMessagingConversation(conversation.id);
+      const currentRoute = this.#store.resolveMessagingRoute(connection.id);
+      if (current.revision !== conversation.revision || current.status !== "active" || current.sessionId !== conversation.sessionId
+        || current.partnerId !== undefined || this.#partnerRuntime?.binding(connection.id).partnerId !== undefined
+        || currentRoute.scopeKey !== route.scopeKey || currentRoute.revision !== route.revision) {
+        throw invalid("The original WeChat conversation or its route changed. Send /new again.");
+      }
+    };
+    assertLane();
+    const operationId = `messaging-new-session-${interactionId}`;
+    this.#sessionHost.assertWeChatConversationRestartReady(conversation.sessionId, route, operationId);
+    await this.#sessionHost.restartWeChatConversation({
+      operationId, conversation, route, assertServiceScope: assertLane,
+      onAdmitted: store => scope.settle(store, "A new conversation is ready.")
     });
   }
 
@@ -4369,9 +4389,19 @@ export class MessagingManager {
           });
           continue;
         }
+        const replyConversation = transport.channel === "wechat" ? this.#store.getMessagingConversation(delivery.conversationId) : undefined;
+        const replyBinding = replyConversation?.sessionId === undefined ? undefined
+          : this.#store.getSession(replyConversation.sessionId).descriptor.binding.opaqueRef;
         const context = transport.channel === "wechat" ? this.#weChatSendContext(connection, delivery) : undefined;
         const assertDeliveryCurrent = () => {
           signal.throwIfAborted(); this.#requireWorkerConnection(connection.id, connection.generation); this.#partnerRuntime?.assertOutboundCurrent(delivery);
+          if (replyConversation?.sessionId !== undefined) {
+            const current = this.#store.getMessagingConversation(delivery.conversationId);
+            if (current.sessionId !== replyConversation.sessionId || current.status !== "active"
+              || this.#store.getSession(replyConversation.sessionId).descriptor.binding.opaqueRef !== replyBinding) {
+              throw new MessagingTransportError("cancelled", "The original WeChat reply context retired.", { effect: "none", retryable: false });
+            }
+          }
           if (streamPayload && !this.#streamDeliverySource(delivery)) throw new MessagingTransportError("cancelled", "The original reply stream retired.", { effect: "none", retryable: false });
         };
         assertDeliveryCurrent();
@@ -4782,6 +4812,7 @@ async function dispatchMessagingDelivery(
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
       ...(payload.callbackMessageId === undefined ? {} : { callbackMessageId: payload.callbackMessageId }),
       ...(transport.channel === "telegram" && delivery.kind === "text" ? { format: "markdown" as const, assertCurrent } : {}),
+      ...(transport.channel === "wechat" ? { assertCurrent } : {}),
       signal
     });
     return receipt.providerMessageId;

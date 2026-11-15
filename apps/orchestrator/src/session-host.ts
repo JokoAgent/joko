@@ -2349,12 +2349,17 @@ export class SessionHost {
   }
 
   assertDiscordConversationRestartReady(sessionId: string, route: MessagingRouteRecord, operationId: string): void {
-    this.discordConversationRestartRoute(this.#store.getSession(sessionId), route, operationId);
+    this.messagingConversationRestartRoute(this.#store.getSession(sessionId), route, operationId, "discord");
   }
 
-  private discordConversationRestartRoute(source: StoredSession, route: MessagingRouteRecord, operationId: string) {
+  assertWeChatConversationRestartReady(sessionId: string, route: MessagingRouteRecord, operationId: string): void {
+    this.messagingConversationRestartRoute(this.#store.getSession(sessionId), route, operationId, "wechat");
+  }
+
+  private messagingConversationRestartRoute(source: StoredSession, route: MessagingRouteRecord, operationId: string, channel: "discord" | "wechat") {
     const original = source.descriptor;
-    const unresolved = this.#store.findUnresolvedDiscordConversationRestart(original.id);
+    const unresolved = channel === "discord" ? this.#store.findUnresolvedDiscordConversationRestart(original.id)
+      : this.#store.findUnresolvedWeChatConversationRestart(original.id);
     if (unresolved !== undefined) throw new OperationInProgressError(unresolved);
     const pending = this.#runtimeHandoffs.read(original.id)?.pending;
     if (pending !== undefined && pending.phase !== "pending" && pending.phase !== "closed") {
@@ -2362,26 +2367,32 @@ export class SessionHost {
     }
     const originalTarget = this.assertTargetAcceptsSessionCreation(this.#store, original.targetId);
     const selectedTarget = this.assertTargetAcceptsSessionCreation(this.#store, route.targetId);
-    const target = { ...this.targetForSession(source), backendId: route.backendId };
+    if (channel === "wechat" && original.worktree !== undefined) {
+      throw sessionResetError("SESSION_RESET_UNSUPPORTED", "The WeChat task has an independently owned workspace.",
+        "Manage its workspace in Joko before restarting this conversation.");
+    }
+    const target = channel === "wechat" ? this.sourceRuntimeTarget(selectedTarget.descriptor)
+      : { ...this.targetForSession(source), backendId: route.backendId };
+    const channelName = channel === "discord" ? "Discord" : "WeChat";
     if (route.backendId !== selectedTarget.descriptor.backendId
-      || route.backendId !== original.backendId && (!target.trusted || target.remoteWorkspace !== undefined || selectedTarget.descriptor.remoteWorkspace !== undefined)
-      || route.targetId !== target.id && (target.remoteWorkspace !== undefined || selectedTarget.descriptor.remoteWorkspace !== undefined)) {
-      throw sessionResetError("SESSION_RESET_UNSUPPORTED", "The selected Discord route cannot use the original workspace.",
+      || channel === "discord" && (route.backendId !== original.backendId && (!target.trusted || target.remoteWorkspace !== undefined || selectedTarget.descriptor.remoteWorkspace !== undefined)
+        || route.targetId !== target.id && (target.remoteWorkspace !== undefined || selectedTarget.descriptor.remoteWorkspace !== undefined))) {
+      throw sessionResetError("SESSION_RESET_UNSUPPORTED", `The selected ${channelName} route cannot use the original workspace.`,
         "Choose a channel default that can run in this task's workspace.");
     }
     const selected = this.resolveNewSessionRoute(route.backendId, {
       ...route, operationId, serviceKind: "messaging", targetId: target.id, title: original.title
     });
-    this.assertDiscordConversationBackendReady(route, selected);
+    this.assertMessagingConversationBackendReady(route, selected, channel);
     return { target, originalTarget, selectedTarget, selected };
   }
 
-  private assertDiscordConversationBackendReady(route: MessagingRouteRecord, selected: SessionCreationInput): void {
+  private assertMessagingConversationBackendReady(route: MessagingRouteRecord, selected: SessionCreationInput, channel: "discord" | "wechat"): void {
     this.assertBackendCreationReady(route.backendId, selected);
     const backend = this.#store.getBackend(route.backendId).descriptor;
     if (!supportsPermissionMode(backend, route.permissionMode)
       || route.planMode && backend.capabilities.get("plan_mode")?.supported !== true) {
-      throw sessionResetError("SESSION_RESET_UNSUPPORTED", "The selected Backend cannot apply the Discord route's modes.",
+      throw sessionResetError("SESSION_RESET_UNSUPPORTED", `The selected Backend cannot apply the ${channel === "discord" ? "Discord" : "WeChat"} route's modes.`,
         "Choose a channel default with supported permission and plan modes.");
     }
   }
@@ -2393,8 +2404,19 @@ export class SessionHost {
     readonly assertServiceScope: () => void;
     readonly onAdmitted: (store: OperationalStore) => void;
   }): Promise<void> {
+    return this.restartSingleRowMessagingConversation(input, "discord");
+  }
+
+  async restartWeChatConversation(input: Parameters<SessionHost["restartDiscordConversation"]>[0]): Promise<void> {
+    return this.restartSingleRowMessagingConversation(input, "wechat");
+  }
+
+  private async restartSingleRowMessagingConversation(
+    input: Parameters<SessionHost["restartDiscordConversation"]>[0], channel: "discord" | "wechat"
+  ): Promise<void> {
+    const channelName = channel === "discord" ? "Discord" : "WeChat";
     const sessionId = input.conversation.sessionId;
-    if (sessionId === undefined) throw new StoreError("Discord restart requires an active message task.");
+    if (sessionId === undefined) throw new StoreError(`${channelName} restart requires an active message task.`);
     await this.#withSessionRuntimeControlLock(sessionId, async () => {
       this.#assertOpen();
       input.assertServiceScope();
@@ -2403,12 +2425,12 @@ export class SessionHost {
       const source = this.#store.getSession(sessionId);
       const original = source.descriptor;
       const connection = this.#store.getMessagingConnection(input.conversation.connectionId);
-      if (connection.channel !== "discord" || input.conversation.conversationKind !== "direct"
+      if (connection.channel !== channel || input.conversation.conversationKind !== "direct"
         || input.conversation.partnerId !== undefined || this.#store.sessionCreationServiceKind(sessionId) !== "messaging") {
-        throw new StoreError("Discord restart requires its original direct message task.");
+        throw new StoreError(`${channelName} restart requires its original direct message task.`);
       }
       const route = input.route;
-      const { target, originalTarget, selectedTarget, selected } = this.discordConversationRestartRoute(source, route, input.operationId);
+      const { target, originalTarget, selectedTarget, selected } = this.messagingConversationRestartRoute(source, route, input.operationId, channel);
       const backend = this.#store.getBackend(route.backendId).descriptor;
       const adapter = this.requireAdapter(backend.id);
       const backendInstanceGeneration = this.requireAdapterGeneration(backend.id, adapter);
@@ -2423,29 +2445,36 @@ export class SessionHost {
         const current = store.getSession(sessionId);
         const currentConversation = store.getMessagingConversation(input.conversation.id);
         const currentRoute = store.resolveMessagingRoute(connection.id);
+        if (channel === "wechat" && store.listMessagingConversations({ statuses: ["active"] })
+          .some(candidate => candidate.sessionId === sessionId && candidate.id !== input.conversation.id)) {
+          throw new StoreError("The original WeChat task belongs to another message conversation.");
+        }
         if (currentConversation.revision !== input.conversation.revision || currentConversation.status !== "active"
           || currentConversation.sessionId !== sessionId || currentConversation.channelGeneration !== connection.generation
           || currentRoute.scopeKey !== route.scopeKey || currentRoute.revision !== route.revision
           || current.revision !== source.revision || !sameNativeBinding(current.descriptor.binding, original.binding)
-          || this.assertTargetAcceptsSessionCreation(store, target.id).revision !== originalTarget.revision
+          || this.assertTargetAcceptsSessionCreation(store, original.targetId).revision !== originalTarget.revision
           || this.assertTargetAcceptsSessionCreation(store, route.targetId).revision !== selectedTarget.revision) {
-          throw new StoreError("The original Discord task or workspace changed.");
+          throw new StoreError(`The original ${channelName} task or workspace changed.`);
         }
         this.assertCurrentAdapterGeneration(backend.id, adapter, backendInstanceGeneration);
-        this.assertDiscordConversationBackendReady(route, selected);
+        this.assertMessagingConversationBackendReady(route, selected, channel);
       };
       const releaseTarget = this.beginTargetSessionCreation(target.id);
+      let releaseOriginalTarget: (() => void) | undefined;
       let releaseSourceBackend: (() => void) | undefined;
       let releaseDestinationBackend: (() => void) | undefined;
       try {
+        if (target.id !== original.targetId) releaseOriginalTarget = this.beginTargetSessionCreation(original.targetId);
         releaseSourceBackend = this.beginBackendAdmissionEffect(original.backendId);
         if (backend.id !== original.backendId) releaseDestinationBackend = this.beginBackendAdmissionEffect(backend.id);
         assertCurrent(this.#store);
         const claim = this.#store.claimDeferredEffectOperation<{ readonly sessionId: string }>({
-          id: input.operationId, kind: "restart_discord_conversation", body: {
+          id: input.operationId, kind: channel === "discord" ? "restart_discord_conversation" : "restart_wechat_conversation", body: {
             conversationId: input.conversation.id, conversationRevision: input.conversation.revision.toString(),
             channelGeneration: connection.generation, credentialGeneration: connection.credentialGeneration,
-            sessionId, targetId: target.id, targetRevision: originalTarget.revision.toString(),
+            sessionId, targetId: target.id, targetRevision: (channel === "discord" ? originalTarget : selectedTarget).revision.toString(),
+            ...(channel === "discord" ? {} : { sourceTargetId: original.targetId, sourceTargetRevision: originalTarget.revision.toString() }),
             sourceBackendId: original.backendId, sourceGeneration: original.binding.generation,
             backendId: backend.id, backendInstanceGeneration, routeScopeKey: route.scopeKey, routeRevision: route.revision.toString()
           }
@@ -2481,12 +2510,14 @@ export class SessionHost {
           assertCurrent(this.#store);
           if (route.planMode) await adapter.setPlanMode(true, { ...context, binding });
           if (workspaceRoot !== undefined && await realpath(target.workspaceRoot) !== workspaceRoot) {
-            throw new StoreError("The original Discord workspace path changed.");
+            throw new StoreError(channel === "discord" ? "The original Discord workspace path changed." : "The selected WeChat workspace path changed.");
           }
           const replacement = binding;
           this.#store.completeDeferredEffectOperation(input.operationId, claim.operation.bodyHash, store => {
             assertCurrent(store);
-            store.commitDiscordConversationRestart({
+            const commit = channel === "discord" ? store.commitDiscordConversationRestart.bind(store)
+              : store.commitWeChatConversationRestart.bind(store);
+            commit({
               operationId: input.operationId, conversation: input.conversation, route, source, binding: replacement,
               providerId: selected.providerId, modelId: selected.modelId, effort: selected.effort, runtimeControlGeneration
             });
@@ -2503,13 +2534,13 @@ export class SessionHost {
             catch { uncertain = true; }
           }
           const failure = new JokoError({
-            code: uncertain ? "DISCORD_RESTART_EFFECT_UNKNOWN" : "DISCORD_RESTART_FAILED",
-            message: uncertain ? "The new Discord conversation could not be confirmed." : "The original Discord task is still available.",
+            code: `${channel === "discord" ? "DISCORD" : "WECHAT"}_RESTART_${uncertain ? "EFFECT_UNKNOWN" : "FAILED"}`,
+            message: uncertain ? `The new ${channelName} conversation could not be confirmed.` : `The original ${channelName} task is still available.`,
             phase: "session_reset", retryable: !uncertain, stateMayHaveChanged: uncertain,
             recovery: uncertain ? "Inspect the original task before retrying." : "Check the channel default and send /new again."
           }, { cause: error });
           this.#store.failEffectOperation(input.operationId, claim.operation.bodyHash, failure);
-          this.recordFailure("discord_conversation_restart", failure);
+          this.recordFailure(`${channel}_conversation_restart`, failure);
           throw failure;
         } finally {
           this.#sessionResetLocks.delete(sessionId);
@@ -2523,6 +2554,7 @@ export class SessionHost {
       } finally {
         releaseDestinationBackend?.();
         releaseSourceBackend?.();
+        releaseOriginalTarget?.();
         releaseTarget();
       }
     });

@@ -92,4 +92,30 @@ describe("WeChat transport effects and recovery", () => {
     await expect(bad.sendTextPart({ address, text: "text" })).rejects.toMatchObject({ code: "invalid_input" });
     await bad.close();
   });
+
+  it("checks the original text reply scope before sending and preserves a dispatched receipt after it retires", async () => {
+    const calls: string[] = [];
+    let retire: (() => void) | undefined;
+    const transport = new WeChatTransport({ connectionId: "conn-1", generation: 1, credentials,
+      fetch: async input => {
+        const path = new URL(String(input)).pathname;
+        calls.push(path);
+        if (path.endsWith("getupdates")) return new Response(JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "cursor" }));
+        if (path.endsWith("sendmessage")) retire?.();
+        return new Response(JSON.stringify({ ret: 0 }));
+      } });
+    await transport.probe();
+    let current = false;
+    const retired = new Error("The original text reply retired.");
+    const assertCurrent = () => { if (!current) throw retired; };
+    const input = { address, text: "Original reply", context: { contextToken: "private-context", clientId: "delivery-1" }, assertCurrent };
+    await expect(transport.sendTextPart(input)).rejects.toBe(retired);
+    expect(calls.filter(path => path.endsWith("sendmessage"))).toEqual([]);
+    current = true;
+    retire = () => { current = false; };
+    await expect(transport.sendTextPart(input)).resolves.toMatchObject({ providerMessageId: "delivery-1", address });
+    expect(current).toBe(false);
+    expect(calls.filter(path => path.endsWith("sendmessage"))).toHaveLength(1);
+    await transport.close();
+  });
 });

@@ -1,3 +1,5 @@
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import {
   MessagingChannel,
@@ -139,6 +141,63 @@ describe("WeChat Messaging production product chain", () => {
     expect(restartedConversation.sessionId).toBe(sessionId);
     expect((await restartedClients.session.getSession({ sessionId })).session?.sessionId).toBe(sessionId);
     expect(wechat.requestedCursors).toContain(cursor);
+
+    await waitFor(async () => {
+      try { fixture!.application.sessionHost.assertSessionLifecycleIdle(sessionId); return true; }
+      catch { return false; }
+    }, ready => ready, "the original WeChat task's idle boundary", 15_000);
+    const original = fixture.application.store.getSession(sessionId).descriptor;
+    const oldMessages = fixture.application.store.listEvents({ sessionId }).filter(event => event.payload.type === "message_complete");
+    expect(oldMessages.length).toBeGreaterThan(0);
+    const oldRuns = fixture.application.store.listRuns({ sessionId }).map(run => run.descriptor.id);
+    const nextWorkspace = join(rootDirectory, "wechat-next-workspace");
+    await mkdir(nextWorkspace);
+    await fixture.application.sessionHost.registerTarget({ id: "workspace-wechat-next", backendId: "pi", displayName: "Next WeChat workspace",
+      workspaceRoot: nextWorkspace, managed: true, trusted: true });
+    await restartedClients.messaging.putMessagingRoute({ connectionId: created.connectionId, targetId: "workspace-wechat-next",
+      providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effort: "off", fastMode: false, permissionMode: PermissionMode.ASK, planMode: false });
+    const providerCount = fixture.providerRequests.length;
+    wechat.enqueueDirectText("wechat-new", "/new");
+    await waitFor(async () => wechat!.outbound, messages => messages.some(message => outboundText(message) === "A new conversation is ready."),
+      "the same-task WeChat context reset receipt", 15_000);
+    const reset = fixture.application.store.getSession(sessionId).descriptor;
+    expect(reset).toMatchObject({ id: sessionId, targetId: "workspace-wechat-next", backendId: "pi", archived: false,
+      binding: { generation: original.binding.generation + 1 } });
+    expect(reset.binding.opaqueRef).not.toBe(original.binding.opaqueRef);
+    expect(reset.binding.nativeSessionId).not.toBe(original.binding.nativeSessionId);
+    expect(fixture.providerRequests).toHaveLength(providerCount);
+    expect(fixture.application.store.getMessagingConversation(conversation.id)).toMatchObject({ sessionId, targetId: reset.targetId,
+      sessionGeneration: reset.binding.generation });
+    expect(fixture.application.store.listSessions({ includeArchived: true })).toHaveLength(1);
+    const resetTimeline = (await restartedClients.session.listSessionTimeline({ sessionId })).events.map(event => event.eventId);
+    for (const old of oldMessages) {
+      expect(resetTimeline).not.toContain(old.id);
+      expect(fixture.application.store.listEvents({ sessionId, includeTombstoned: true }).find(event => event.id === old.id)?.payload).toEqual(old.payload);
+    }
+    expect(fixture.application.store.listRuns({ sessionId }).map(run => run.descriptor.id)).toEqual(expect.arrayContaining(oldRuns));
+    const retainedTicket = required((await restartedClients.artifact.getBlobDownloadTicket({ blobId: imageArtifact.blob.id })).ticket, "retained WeChat image ticket");
+    const retainedResponse = await fetch(`${fixture.baseUrl}${retainedTicket.relativeEndpoint}`, { headers: { authorization: `Bearer ${authKey}` } });
+    expect(retainedResponse.status).toBe(200);
+    expect(Buffer.from(await retainedResponse.arrayBuffer())).toEqual(imageBytes);
+    const freshPrompt = "Start only the new WeChat context in its new directory.";
+    wechat.enqueueDirectText("wechat-fresh", freshPrompt);
+    await waitFor(async () => fixture!.application.store.listMessagingInboundRequests().find(request => request.providerMessageId === "client:wechat-fresh"),
+      request => request?.status === "completed", "the first real Pi turn in the replacement WeChat context", 30_000);
+    expect(fixture.application.store.getMessagingConversation(conversation.id).sessionId).toBe(sessionId);
+    const freshRequest = JSON.stringify(fixture.providerRequests.at(-1)?.body);
+    expect(freshRequest).toContain(freshPrompt);
+    expect(freshRequest).not.toContain("Handle the first WeChat direct message.");
+    expect(freshRequest).not.toContain("Continue the WeChat task after restart.");
+    expect(freshRequest).not.toContain(FIRST_REPLY);
+    expect(freshRequest).not.toContain(SECOND_REPLY);
+    const freshBinding = fixture.application.store.getSession(sessionId).descriptor.binding.opaqueRef;
+    await fixture.close({ removeRoot: false });
+    fixture = await startSystem(wechat, "A later WeChat reply.", rootDirectory);
+    expect(fixture.application.store.getSession(sessionId).descriptor.binding.opaqueRef).toBe(freshBinding);
+    expect((await fixture.clients(authKey).session.getSession({ sessionId })).session).toMatchObject({ sessionId, targetId: reset.targetId });
+    const coldTimeline = (await fixture.clients(authKey).session.listSessionTimeline({ sessionId })).events.map(event => event.eventId);
+    for (const old of oldMessages) expect(coldTimeline).not.toContain(old.id);
+    expect(fixture.application.store.getArtifact(imageArtifact.blob.id).blob).toEqual(imageArtifact.blob);
     const projection = JSON.stringify({
       connections: fixture.application.store.listMessagingConnections(),
       requests: fixture.application.store.listMessagingInboundRequests(),

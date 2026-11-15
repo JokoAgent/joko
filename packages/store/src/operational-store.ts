@@ -11979,15 +11979,23 @@ export class OperationalStore {
   }
 
   findUnresolvedDiscordConversationRestart(sessionId: string): string | undefined {
+    return this.findUnresolvedMessagingConversationRestart(sessionId, "restart_discord_conversation");
+  }
+
+  findUnresolvedWeChatConversationRestart(sessionId: string): string | undefined {
+    return this.findUnresolvedMessagingConversationRestart(sessionId, "restart_wechat_conversation");
+  }
+
+  private findUnresolvedMessagingConversationRestart(sessionId: string, kind: "restart_discord_conversation" | "restart_wechat_conversation"): string | undefined {
     this.assertOpen();
     const row = this.database.prepare(`
       SELECT id FROM operations
-      WHERE kind = 'restart_discord_conversation' AND connection_id IS NULL
+      WHERE kind = ? AND connection_id IS NULL
         AND json_extract(body_json, '$.sessionId') = ?
         AND (status = 'started' OR (status = 'failed'
           AND COALESCE(json_extract(error_json, '$.stateMayHaveChanged'), 1) <> 0))
       ORDER BY created_at, id LIMIT 1
-    `).get(sessionId) as Row | undefined;
+    `).get(kind, sessionId) as Row | undefined;
     return row === undefined ? undefined : stringValue(row["id"]);
   }
 
@@ -12003,6 +12011,16 @@ export class OperationalStore {
     readonly effort?: string;
     readonly runtimeControlGeneration: number;
   }): StoredSession {
+    return this.commitSingleRowMessagingConversationRestart(input, "discord");
+  }
+
+  commitWeChatConversationRestart(input: Parameters<OperationalStore["commitDiscordConversationRestart"]>[0]): StoredSession {
+    return this.commitSingleRowMessagingConversationRestart(input, "wechat");
+  }
+
+  private commitSingleRowMessagingConversationRestart(
+    input: Parameters<OperationalStore["commitDiscordConversationRestart"]>[0], channel: "discord" | "wechat"
+  ): StoredSession {
     return this.write(() => {
       const operation = this.getOperation(input.operationId);
       const conversation = this.getMessagingConversation(input.conversation.id);
@@ -12010,9 +12028,11 @@ export class OperationalStore {
       const route = this.resolveMessagingRoute(connection.id);
       const sessionId = input.source.descriptor.id;
       const session = this.getSession(sessionId);
-      if (operation.kind !== "restart_discord_conversation" || operation.connectionId !== undefined || operation.status !== "started"
+      const operationKind = channel === "discord" ? "restart_discord_conversation" : "restart_wechat_conversation";
+      const channelName = channel === "discord" ? "Discord" : "WeChat";
+      if (operation.kind !== operationKind || operation.connectionId !== undefined || operation.status !== "started"
         || !isRecord(operation.body) || operation.body["conversationId"] !== conversation.id || operation.body["sessionId"] !== sessionId
-        || connection.channel !== "discord" || !connection.enabled || connection.generation !== conversation.channelGeneration
+        || connection.channel !== channel || !connection.enabled || connection.generation !== conversation.channelGeneration
         || conversation.status !== "active" || conversation.conversationKind !== "direct" || conversation.partnerId !== undefined
         || conversation.sessionId !== sessionId || conversation.revision !== input.conversation.revision
         || conversation.targetId !== session.descriptor.targetId || conversation.backendId !== session.descriptor.backendId
@@ -12022,16 +12042,34 @@ export class OperationalStore {
         || this.sessionCreationServiceKind(sessionId) !== "messaging"
         || input.binding.generation !== session.descriptor.binding.generation + 1
         || input.binding.opaqueRef === session.descriptor.binding.opaqueRef) {
-        throw new StoreError("Discord conversation restart lost its original task or route.");
+        throw new StoreError(`${channelName} conversation restart lost its original task or route.`);
       }
       if (this.listRuns({ sessionId, activeOnly: true, limit: 1 }).length > 0
         || this.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0
         || this.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0) {
-        throw new StoreError("Discord cannot restart while the original task is active.");
+        throw new StoreError(`${channelName} cannot restart while the original task is active.`);
+      }
+      const targetId = channel === "discord" ? session.descriptor.targetId : route.targetId;
+      const selectedTarget = this.getTarget(targetId);
+      if (channel === "wechat" && (session.descriptor.worktree !== undefined
+        || selectedTarget.descriptor.backendId !== route.backendId
+        || operation.body["sourceTargetId"] !== session.descriptor.targetId
+        || operation.body["targetId"] !== targetId
+        || operation.body["sourceTargetRevision"] !== this.getTarget(session.descriptor.targetId).revision.toString()
+        || operation.body["targetRevision"] !== selectedTarget.revision.toString()
+        || this.listMessagingConversations({ statuses: ["active"] })
+          .some(candidate => candidate.sessionId === sessionId && candidate.id !== conversation.id))) {
+        throw new StoreError("WeChat conversation restart lost its original workspace authority.");
       }
       this.assertNativeBindingNeverAdopted(route.backendId, input.binding.opaqueRef);
       const at = this.now();
       const eventBoundary = this.latestEventCursor();
+      if (channel === "wechat") {
+        this.database.prepare(`
+          UPDATE messaging_deliveries SET status = 'cancelled', error_code = 'conversation_restarted', updated_at = ?, revision = ?
+          WHERE conversation_id = ? AND channel_generation = ? AND status IN ('pending', 'failed')
+        `).run(at, asSqlInteger(this.requireActiveRevision()), conversation.id, connection.generation);
+      }
       this.retireSessionTimeline(sessionId, input.operationId, eventBoundary, at);
       this.database.prepare("DELETE FROM settings WHERE scope_type = 'session' AND scope_id = ? AND key LIKE 'runtime.%'").run(sessionId);
       this.deleteSetting("session", sessionId, RETAINED_CONTEXT_EVENTS_KEY);
@@ -12043,24 +12081,36 @@ export class OperationalStore {
       // changes. The same transaction restores it with the full route snapshot.
       this.database.prepare("UPDATE messaging_conversations SET status = 'retired' WHERE id = ?")
         .run(conversation.id);
-      this.database.prepare("UPDATE product_sessions SET backend_id = ?, provider_id = ?, model_id = ? WHERE id = ?")
-        .run(route.backendId, input.providerId ?? null, input.modelId ?? null, sessionId);
+      if (channel === "wechat") {
+        const remote = selectedTarget.descriptor.remoteWorkspace;
+        this.database.prepare(`
+          UPDATE product_sessions SET target_id = ?, backend_id = ?, provider_id = ?, model_id = ?, project_id = NULL,
+            remote_location_kind = ?, remote_host_target_id = ?, remote_host_id = ?, remote_controller_device_id = ?,
+            remote_target_device_id = ?, remote_workspace_root = ? WHERE id = ?
+        `).run(targetId, route.backendId, input.providerId ?? null, input.modelId ?? null,
+          remote?.kind ?? null, remote?.kind === "ssh" ? remote.hostTargetId : null, remote?.kind === "ssh" ? remote.hostId : null,
+          remote?.kind === "device_peer" ? remote.controllerDeviceId : null, remote?.kind === "device_peer" ? remote.targetDeviceId : null,
+          remote?.workspaceRoot ?? null, sessionId);
+      } else {
+        this.database.prepare("UPDATE product_sessions SET backend_id = ?, provider_id = ?, model_id = ? WHERE id = ?")
+          .run(route.backendId, input.providerId ?? null, input.modelId ?? null, sessionId);
+      }
       const updated = this.updateSession(sessionId, {
         binding: input.binding, effort: input.effort ?? null, fastMode: route.fastMode,
         permissionMode: route.permissionMode, planMode: route.planMode
       }, session.revision, at);
-      assertMessagingSessionMatchesRoute(updated, route, route.permissionMode, session.descriptor.targetId);
+      assertMessagingSessionMatchesRoute(updated, route, route.permissionMode, targetId);
       this.setSetting("session", sessionId, NATIVE_BLANK_RECOVERY_SETTING_KEY, true, at);
       this.database.prepare("UPDATE session_objectives SET session_generation = ?, revision = ? WHERE session_id = ?")
         .run(input.binding.generation, asSqlInteger(this.requireActiveRevision()), sessionId);
       const rebound = this.database.prepare(`
-        UPDATE messaging_conversations SET status = 'active', session_generation = ?, route_scope_key = ?, backend_id = ?, provider_id = ?,
+        UPDATE messaging_conversations SET status = 'active', session_generation = ?, route_scope_key = ?, target_id = ?, backend_id = ?, provider_id = ?,
           model_id = ?, effort = ?, fast_mode = ?, permission_mode = ?, plan_mode = ?, updated_at = ?, revision = ?
         WHERE id = ? AND revision = ? AND status = 'retired'
-      `).run(input.binding.generation, route.scopeKey, route.backendId, input.providerId ?? null, input.modelId ?? null,
+      `).run(input.binding.generation, route.scopeKey, targetId, route.backendId, input.providerId ?? null, input.modelId ?? null,
         input.effort ?? null, speedInt(route.fastMode), route.permissionMode, boolInt(route.planMode),
         Math.max(conversation.createdAt, at), asSqlInteger(this.requireActiveRevision()), conversation.id, asSqlInteger(conversation.revision));
-      if (rebound.changes !== 1) throw new StoreError("Discord conversation restart did not adopt the selected route.");
+      if (rebound.changes !== 1) throw new StoreError(`${channelName} conversation restart did not adopt the selected route.`);
       const event = this.publishHistoryPruned({ sessionId, activeContextReset: true, operationId: input.operationId, prunedAt: at });
       this.clearSessionAttentionFromLifecycle(updated, event, `${event.traceId}:attention-generation`, input.operationId);
       return this.getSession(sessionId);

@@ -172,12 +172,14 @@ export class WeChatTransport {
     readonly context?: WeChatSendContext;
     readonly replyToMessageId?: string;
     readonly callbackMessageId?: string;
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt> {
     this.#assertAddress(input.address);
     const context = requiredContext(input.context);
     const visible = filterWeChatMarkdown(input.text).trim() || EMPTY_TEXT;
     if (splitWeChatText(visible).length !== 1) throw weChatInvalid("WeChat text delivery must contain one 3500-character part.");
+    input.assertCurrent?.();
     await this.#api.sendText({ peerId: input.address.providerConversationId, text: visible, context, signal: input.signal ?? new AbortController().signal });
     this.#assertOpen();
     return { providerMessageId: context.clientId, address: input.address };
