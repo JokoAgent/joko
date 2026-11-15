@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import type { ProviderAccountResetApi } from "@joko/contracts";
-import { assistantStreamAttempt, isAssistantStreamBlock } from "@joko/contracts";
+import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock } from "@joko/contracts";
 import { createProviderAccountResetApi, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
@@ -12868,7 +12868,8 @@ function projectTimelineEvent(
         messageTextBlocks: textBlocks,
         ...(streamAttempt === undefined ? {} : { assistantStreamAttempt: streamAttempt }),
         ...(ownerAttempt === undefined ? {} : { streamAttempt: ownerAttempt }),
-        streaming: true
+        ...(existing?.samplingInterrupted && existing.streamAttempt === ownerAttempt ? { samplingInterrupted: true } : {}),
+        streaming: !(existing?.samplingInterrupted && existing.streamAttempt === ownerAttempt)
       }, (item) => item.id === kind.value.messageId
         && (streamAttempt === undefined || item.assistantStreamAttempt === streamAttempt));
       break;
@@ -13003,6 +13004,15 @@ function projectTimelineEvent(
       break;
     }
     case "statusStream": {
+      const interruptedId = codexSamplingInterruptedMessageId(kind.value);
+      if (interruptedId !== undefined) {
+        const attempt = assistantStreamAttempt(event);
+        const index = items.findIndex(item => item.kind === "assistant" && item.id === interruptedId
+          && attempt !== undefined && item.streamAttempt === attempt && item.completionCursor === undefined && item.nativeEntryId === undefined);
+        if (index < 0) changed = false;
+        else items[index] = { ...items[index]!, streaming: false, samplingInterrupted: true };
+        break;
+      }
       const id = kind.value.statusId || event.eventId;
       const existing = items.find((item) => item.id === id);
       const runId = event.identity?.runId || existing?.runId;

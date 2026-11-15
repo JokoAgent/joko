@@ -2634,6 +2634,49 @@ describe("incremental event projection", () => {
     expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).refresh).toBe("authoritative");
   });
 
+  it("retains a sampling-interrupted native item independently of later replies and clears it only on its own completion", () => {
+    const identity = { backendId: "codex-instance", targetId: "project", sessionId: "session-1", runId: "run", attemptId: "attempt", generation: 7n };
+    const delta = create(EventSchema, { eventId: "native-A-delta", identity, cursor: { generation: 14n, sequence: 1n },
+      payload: { kind: { case: "textDelta", value: { messageId: "native-item-A", delta: "Received partial text." } } } });
+    const payload = create(EventPayloadSchema, { kind: { case: "statusStream", value: {
+      statusId: "codex_sampling_interrupted:native-item-A", terminal: true, label: "Response interrupted" } } });
+    const marker = create(EventSchema, { eventId: "native-A-interrupted", identity, cursor: { generation: 14n, sequence: 2n }, payload });
+    const raw = create(SnapshotSchema, { generation: 14n, resumeCursor: { generation: 14n, sequence: 1n }, timeline: [delta] });
+    for (const changed of [{ runId: "other" }, { attemptId: "other" }, { generation: 8n }]) {
+      const stale = create(EventSchema, { eventId: marker.eventId, identity: { ...identity, ...changed }, cursor: marker.cursor, payload });
+      const items = projectSnapshotEvent(raw, mapSnapshot(raw), stale).snapshot.timelineBySession.get("session-1");
+      expect(items).toMatchObject([{ id: "native-item-A", streaming: true }]);
+      expect(items?.[0]?.samplingInterrupted).toBeUndefined();
+    }
+    const otherService = create(SnapshotSchema, { generation: 15n, resumeCursor: { generation: 15n, sequence: 1n }, timeline: [delta] });
+    const later = create(EventSchema, { eventId: marker.eventId, identity, cursor: { generation: 15n, sequence: 2n }, payload });
+    expect(projectSnapshotEvent(otherService, mapSnapshot(otherService), later).snapshot.timelineBySession.get("session-1")?.[0]?.streaming).toBe(true);
+    const interrupted = projectSnapshotEvent(raw, mapSnapshot(raw), marker);
+    const partial = interrupted.snapshot.timelineBySession.get("session-1")?.[0];
+    expect(partial).toMatchObject({ id: "native-item-A", text: "Received partial text.", streaming: false,
+      samplingInterrupted: true, sourceEventId: delta.eventId });
+    expect(partial?.completionCursor).toBeUndefined(); expect(partial?.nativeEntryId).toBeUndefined();
+    expect(mapSnapshot(interrupted.rawSnapshot).timelineBySession.get("session-1"))
+      .toEqual(interrupted.snapshot.timelineBySession.get("session-1"));
+    const residual = create(EventSchema, { eventId: "residual-A", identity, cursor: { generation: 14n, sequence: 3n },
+      payload: { kind: { case: "textDelta", value: { messageId: "native-item-A", delta: " Late received bytes." } } } });
+    expect(projectSnapshotEvent(interrupted.rawSnapshot, interrupted.snapshot, residual).snapshot.timelineBySession.get("session-1")?.[0])
+      .toMatchObject({ samplingInterrupted: true, streaming: false, text: "Received partial text. Late received bytes." });
+    const complete = (id: string, sequence: bigint) => create(EventSchema, { eventId: `${id}-complete`, identity,
+      cursor: { generation: 14n, sequence }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: id, role: MessageRole.ASSISTANT, nativeIdentity: { entryId: id }, blocks: [{ content: { case: "text", value: `Full ${id}.` } }] } } } });
+    const withB = projectSnapshotEvent(interrupted.rawSnapshot, interrupted.snapshot, complete("native-item-B", 4n));
+    expect(withB.snapshot.timelineBySession.get("session-1")?.[0]).toEqual(partial);
+    expect(withB.snapshot.timelineBySession.get("session-1")).toHaveLength(2);
+    const authoritativeA = projectSnapshotEvent(withB.rawSnapshot, withB.snapshot, complete("native-item-A", 5n));
+    const finalA = authoritativeA.snapshot.timelineBySession.get("session-1")?.find(item => item.id === "native-item-A");
+    expect(finalA).toMatchObject({ text: "Full native-item-A.", streaming: false, nativeEntryId: "native-item-A" });
+    expect(finalA?.samplingInterrupted).toBeUndefined();
+    const repeated = create(EventSchema, { eventId: "repeated-marker", identity, cursor: { generation: 14n, sequence: 6n }, payload });
+    expect(projectSnapshotEvent(authoritativeA.rawSnapshot, authoritativeA.snapshot, repeated).snapshot.timelineBySession.get("session-1"))
+      .toEqual(authoritativeA.snapshot.timelineBySession.get("session-1"));
+  });
+
   it.each(["runDone", "runAborted", "terminalError"] as const)("ends received native text on its exact %s without inventing a message completion", terminalKind => {
     const identity = { backendId: "codex-instance", targetId: "project", sessionId: "session-1", runId: "run", attemptId: "attempt", generation: 7n };
     const delta = create(EventSchema, { eventId: "native-partial", identity, cursor: { generation: 14n, sequence: 1n },

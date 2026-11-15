@@ -45,6 +45,20 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("projects an exact sampling interruption through the existing terminal status without granting native history identity", () => {
+    const event = { id: "sample-ended", backendId: "codex", targetId: "target", sessionId: "task", runId: "run", attemptId: "attempt",
+      generation: 7, sequence: 2n, globalCursor: 2n, revision: 2n, emittedAt: 100, traceId: "sample-ended",
+      payload: { type: "status", key: "codex_sampling_interrupted:native-item-A" } } satisfies PersistedEvent;
+    const wire = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event)));
+    expect(wire.identity).toMatchObject({ sessionId: "task", runId: "run", attemptId: "attempt", generation: 7n });
+    expect(wire.payload?.kind).toMatchObject({ case: "statusStream", value: {
+      statusId: "codex_sampling_interrupted:native-item-A", label: "Response interrupted", detail: "", terminal: true
+    } });
+    expect(fromProtoEvent(wire).payload).not.toHaveProperty("nativeHistory");
+    expect(toProtoEvent({ ...event, payload: { type: "status", key: "ordinary-status", text: "Ordinary progress" } }).payload?.kind)
+      .toMatchObject({ case: "statusStream", value: { statusId: "ordinary-status", label: "ordinary-status", detail: "Ordinary progress", terminal: false } });
+  });
+
   it("advances the original inherited-history stream cursor without publishing its child-visible body", () => {
     const inherited = { id: "inherited", backendId: "codex", targetId: "target", sessionId: "aside", generation: 1,
       sequence: 3n, globalCursor: 7n, revision: 4n, emittedAt: 100, traceId: "original-prefix",

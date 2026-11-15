@@ -112,6 +112,7 @@ import {
 } from "./native-task-projection.js";
 import {
   CodexEventTranslator,
+  CODEX_SAMPLING_INTERRUPTED_PREFIX,
   createTranslatorState,
   interactionFromServerRequest,
   safeText,
@@ -4746,7 +4747,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             const schedulePlanReview = this.#registerPlanReview(runtime, plan, input.hostGeneration);
             for (const event of events) {
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
-              const eventContext = event.type === "retry" && event.error?.code === "CODEX_NATIVE_RECONNECT"
+              const eventContext = (event.type === "retry" && event.error?.code === "CODEX_NATIVE_RECONNECT")
+                || (event.type === "status" && event.key.startsWith(CODEX_SAMPLING_INTERRUPTED_PREFIX))
                 ? runtime.activeTurnContext ?? runtime.context
                 : event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined ? plan.context : runtime.context;
               const emit = learningTurn?.emit ?? eventContext.emit;

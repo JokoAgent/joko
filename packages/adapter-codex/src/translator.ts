@@ -15,7 +15,7 @@ import {
   type PromptInput,
   type UsageSnapshot
 } from "@joko/core";
-import { adapterError, publicNativeTurnError } from "./errors.js";
+import { adapterError, nativeTurnErrorTag, publicNativeTurnError } from "./errors.js";
 import {
   commandApprovalAvailability,
   isJsonObject,
@@ -73,6 +73,7 @@ const MAXIMUM_INTERACTION_ANSWER_CHARS = 2_000;
 const MAXIMUM_PERMISSION_SUMMARY_CHARS = 4_000;
 const MAXIMUM_TRACKED_TOOL_ITEMS = 2_048;
 const MAXIMUM_PLAN_INPUT_BYTES = 256 * 1024;
+export const CODEX_SAMPLING_INTERRUPTED_PREFIX = "codex_sampling_interrupted:";
 
 export interface TranslatorState {
   threadId?: string;
@@ -82,6 +83,7 @@ export interface TranslatorState {
   usage?: UsageSnapshot;
   observedFastMode?: boolean | "ultrafast";
   readonly itemNames: Map<string, string>;
+  readonly samplingItems: Map<string, string>;
   readonly terminalTurnIds: Set<string>;
 }
 
@@ -89,6 +91,7 @@ export function createTranslatorState(threadId?: string): TranslatorState {
   return {
     ...(threadId === undefined ? {} : { threadId }),
     itemNames: new Map(),
+    samplingItems: new Map(),
     terminalTurnIds: new Set()
   };
 }
@@ -390,6 +393,10 @@ export class CodexEventTranslator {
           rememberTerminal(state.terminalTurnIds, turn.id);
           return [];
         }
+        const sampling = options.observeNativeReconnect && turn.status !== "completed"
+          && record["threadId"] === state.threadId && samplingStreamFailure(turn.error)
+          ? failSamplingItems(state, turn.id) : [];
+        if (record["threadId"] === state.threadId) clearSamplingItems(state, turn.id);
         if (state.activeTurnId === turn.id) state.activeTurnId = undefined;
         rememberTerminal(state.terminalTurnIds, turn.id);
         const reconnect = record["threadId"] === state.threadId
@@ -399,12 +406,14 @@ export class CodexEventTranslator {
         if (plan !== undefined) state.activePlan = undefined;
         if (turn.status === "failed") {
           return [
+            ...sampling,
             ...reconnect,
             { type: "error", error: publicNativeTurnError(turn.error), terminal: true },
             { type: "done", outcome: "failed" }
           ];
         }
         return [
+          ...sampling,
           ...reconnect,
           ...(plan === undefined || turn.status !== "completed" ? [] : [{
             type: "tool_result" as const, callId: `plan:${turn.id}`, name: "update_plan", output: "", isError: false
@@ -416,6 +425,11 @@ export class CodexEventTranslator {
         return planUpdatedEvents(params, state);
       case "item/agentMessage/delta": {
         const event = deltaEvent("text_delta", params);
+        if (options.observeNativeReconnect && event.delta && isJsonObject(params)
+          && params["threadId"] === state.threadId && typeof params["turnId"] === "string" && params["turnId"] === state.activeTurnId
+          && event.blockId.length > 0 && event.blockId.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(event.blockId)) {
+          rememberItemName(state.samplingItems, event.blockId, params["turnId"]);
+        }
         return event.delta ? [...finishCodexReconnectForOutput(state, params), event] : [event];
       }
       case "item/plan/delta":
@@ -487,10 +501,13 @@ export class CodexEventTranslator {
             if (previous?.turnId === state.activeTurnId && previous.maxAttempts === progress.maxAttempts
               && previous.attempt >= progress.attempt) return [];
             state.nativeReconnect = { turnId: state.activeTurnId, ...progress };
-            return [{ type: "retry", state: "waiting", ...progress, error: codexReconnectNotice }];
+            return [...failSamplingItems(state, state.activeTurnId), { type: "retry", state: "waiting", ...progress, error: codexReconnectNotice }];
           }
         }
-        return [{
+        const sampling = options.observeNativeReconnect && state.activeTurnId !== undefined && state.threadId !== undefined
+          && record["threadId"] === state.threadId && record["turnId"] === state.activeTurnId && samplingStreamFailure(record["error"])
+          ? failSamplingItems(state, state.activeTurnId) : [];
+        return [...sampling, {
           type: "error",
           error,
           terminal: false
@@ -530,6 +547,8 @@ export class CodexEventTranslator {
     const item = itemFromNotification(params);
     switch (item.type) {
       case "agentMessage": {
+        const record = objectValue(params, "completed item");
+        if (record["threadId"] === state.threadId && state.samplingItems.get(item.id) === record["turnId"]) state.samplingItems.delete(item.id);
         const text = typeof item["text"] === "string" ? safeText(item["text"], 1024 * 1024) : "";
         return [{
           type: "message_complete",
@@ -581,6 +600,27 @@ export class CodexEventTranslator {
       default:
         return [];
     }
+  }
+}
+
+function samplingStreamFailure(error: unknown): boolean {
+  const tag = nativeTurnErrorTag(error);
+  return tag === "responseStreamDisconnected" || tag === "responseTooManyFailedAttempts";
+}
+
+function failSamplingItems(state: TranslatorState, turnId: string): readonly EventPayload[] {
+  const events: EventPayload[] = [];
+  for (const [itemId, ownerTurnId] of state.samplingItems) {
+    if (ownerTurnId !== turnId) continue;
+    state.samplingItems.delete(itemId);
+    events.push({ type: "status", key: `${CODEX_SAMPLING_INTERRUPTED_PREFIX}${itemId}` });
+  }
+  return events;
+}
+
+function clearSamplingItems(state: TranslatorState, turnId: string): void {
+  for (const [itemId, ownerTurnId] of state.samplingItems) {
+    if (ownerTurnId === turnId) state.samplingItems.delete(itemId);
   }
 }
 

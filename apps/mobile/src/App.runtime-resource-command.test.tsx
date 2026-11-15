@@ -224,6 +224,8 @@ beforeAll(async () => {
     has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null })
   }));
+  vi.doMock("./MobileMarkdownMessage", () => ({ MobileMarkdownMessage: (props: { text: string; messageId?: string; streaming?: boolean }) =>
+    createElement("div", { "data-markdown-message": props.messageId, "data-streaming": String(props.streaming) }, props.text) }));
   vi.doMock("./MobileConversationSearchSheet", () => ({ MobileConversationSearchSheet: (props: ComponentProps<typeof MobileConversationSearchSheet>) => {
     conversationSearch = props;
     return null;
@@ -341,6 +343,45 @@ it("shows Codex reconnect counts on the current Mobile task and clears them when
   expect(host.textContent).toContain(mobileMessage("en", "task.live"));
   expect(host.textContent).not.toContain("Codex is reconnecting");
   expect(timelineList?.data).toEqual([]);
+});
+
+it("shows an interrupted native sample in TaskScreen while the same Run continues and retires only that item's notice on completion", async () => {
+  const running = create(SnapshotSchema, { generation: 14n,
+    sessions: [{ ...session, state: SessionState.RUNNING, nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 7n }) }],
+    runs: [{ runId: "run", sessionId: "session", activeAttemptId: "attempt", state: RunState.RETRYING }] });
+  const eventIdentity = { sessionId: "session", runId: "run", attemptId: "attempt", generation: 7n };
+  const delta = create(EventSchema, { eventId: "partial-A", identity: eventIdentity, cursor: { generation: 14n, sequence: 1n },
+    payload: { kind: { case: "textDelta", value: { messageId: "native-A", delta: "Received partial A." } } } });
+  const interrupted = create(EventSchema, { eventId: "interrupted-A", identity: eventIdentity, cursor: { generation: 14n, sequence: 2n },
+    payload: { kind: { case: "statusStream", value: { statusId: "codex_sampling_interrupted:native-A", terminal: true, label: "Response interrupted" } } } });
+  renderedState = { ...state, owner: running, detail: running, liveStatus: "streaming", live: [delta] };
+  await act(async () => root.render(taskScreen()));
+  expect(host.querySelector('[data-markdown-message="native-A"]')?.getAttribute("data-streaming")).toBe("true");
+  renderedState = { ...renderedState, live: [delta, interrupted] };
+  await act(async () => root.render(taskScreen()));
+  expect(host.querySelector('[data-markdown-message="native-A"]')?.textContent).toBe("Received partial A.");
+  expect(host.querySelector('[data-markdown-message="native-A"]')?.getAttribute("data-streaming")).toBe("false");
+  expect(host.textContent).toContain(mobileMessage("en", "task.samplingInterrupted"));
+  expect(timelineList?.data).toMatchObject([{ id: "native-A", completed: false, samplingInterrupted: true }]);
+  const complete = (id: string, sequence: bigint) => create(EventSchema, { eventId: `${id}-complete`, identity: eventIdentity,
+    cursor: { generation: 14n, sequence }, payload: { kind: { case: "messageCompleted", value: {
+      messageId: id, role: MessageRole.ASSISTANT, nativeIdentity: { entryId: id }, blocks: [{ content: { case: "text", value: `Full ${id}.` } }] } } } });
+  renderedState = { ...renderedState, live: [delta, interrupted, complete("native-B", 3n)] };
+  await act(async () => root.render(taskScreen()));
+  expect(host.querySelector('[data-markdown-message="native-A"]')?.textContent).toBe("Received partial A.");
+  expect(host.textContent).toContain("Full native-B.");
+  expect(host.textContent).toContain(mobileMessage("en", "task.samplingInterrupted"));
+  const idle = create(SnapshotSchema, { generation: 14n,
+    sessions: [create(SessionSchema, { ...running.sessions[0]!, state: SessionState.IDLE })],
+    runs: [{ runId: "run", sessionId: "session", activeAttemptId: "attempt", state: RunState.COMPLETED }] });
+  renderedState = { ...renderedState, owner: idle, detail: idle, liveStatus: "paused" };
+  await act(async () => root.render(taskScreen()));
+  expect(host.querySelector('[data-markdown-message="native-A"]')?.textContent).toBe("Received partial A.");
+  expect(host.textContent).toContain(mobileMessage("en", "task.samplingInterrupted"));
+  renderedState = { ...renderedState, live: [...renderedState.live, complete("native-A", 4n)] };
+  await act(async () => root.render(taskScreen()));
+  expect(host.textContent).toContain("Full native-A.");
+  expect(host.textContent).not.toContain(mobileMessage("en", "task.samplingInterrupted"));
 });
 
 it("reads the actual task menu's Claude family quota using the owning model route", async () => {
