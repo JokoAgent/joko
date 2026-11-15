@@ -54,7 +54,7 @@ export interface PiEventTranslatorOptions {
   /** Generation-fenced dispatch tier sampled when native usage completes. */
   readonly isFastMode?: () => boolean;
   readonly redactValues?: readonly string[];
-  /** Shared for one product session so online and native hydration reuse one BlobRef. */
+  /** Shared within one product session; named tool outputs retain their native occurrence. */
   readonly artifactCache?: Map<string, BlobRef>;
 }
 
@@ -114,7 +114,10 @@ export class PiEventTranslator {
    * Strip Pi's inline image bytes from a native JSONL entry and replace them
    * with durable BlobRefs before the value crosses the Adapter boundary.
    */
-  async materializeNativeHistoryEntry(entry: PiNativeHistoryEntry): Promise<PiNativeHistoryEntry> {
+  async materializeNativeHistoryEntry(
+    entry: PiNativeHistoryEntry,
+    readRecordedProjection = this.#context.readNativeHistoryProjection
+  ): Promise<PiNativeHistoryEntry> {
     const data = { ...entry.data };
     const message = isRecord(data.message) ? data.message : undefined;
     if (message?.role === "bashExecution") {
@@ -147,7 +150,12 @@ export class PiEventTranslator {
         isToolResult &&
         toolName.toLowerCase() === "bash" &&
         typeof fullOutputPath === "string"
-          ? await this.#materializeNativeOutput(fullOutputPath, `${toolName}-${entry.id}.log`, entry.id)
+          ? await this.#materializeNativeOutput(fullOutputPath,
+            `${toolName}-${typeof message.toolCallId === "string" ? message.toolCallId : entry.id}.log`, entry.id, () => {
+              const recorded = readRecordedProjection?.({ nativeEntryId: entry.id, projectionKind: "tool_result", contentIndex: 0 });
+              return recorded?.type === "tool_result" && recorded.callId === message.toolCallId && recorded.name === toolName
+                ? recorded.artifact : undefined;
+            })
           : {};
       const fullOutputArtifact = bridgedArtifact ?? materialized.artifact;
       const materializedContent = await this.#materializeNativeContent(message.content);
@@ -673,10 +681,14 @@ export class PiEventTranslator {
         // The service-owned bridge already persisted the complete, redacted
         // result. Do not re-materialize its bounded display preview.
       } else if (fullOutputPath) {
-        artifact = await this.#storeRedactedToolOutput(
-          fullOutputPath,
-          `${toolName}-${callId}.log`
-        );
+        // Pi exposes this path in progress before its backing stream is closed.
+        // Only the terminal tool event owns a complete output Artifact.
+        if (field === "result") {
+          artifact = await this.#storeRedactedToolOutput(
+            fullOutputPath,
+            `${toolName}-${callId}.log`
+          );
+        }
       } else if (Buffer.byteLength(output, "utf8") > INLINE_OUTPUT_LIMIT) {
         artifact = await this.#storeText(output, ".log", "text/plain");
       }
@@ -795,7 +807,8 @@ export class PiEventTranslator {
       );
     }
     const digest = createHash("sha256").update(bytes).digest("hex");
-    const cacheKey = `${mimeType}\0${digest}`;
+    const occurrence = fileName === undefined ? "" : JSON.stringify([this.#context.binding?.opaqueRef ?? "", fileName]);
+    const cacheKey = `${mimeType}\0${digest}\0${occurrence}`;
     const cached = this.#artifactCache.get(cacheKey);
     if (cached !== undefined) return cached;
     await mkdir(this.#artifactDirectory, { recursive: true });
@@ -858,9 +871,13 @@ export class PiEventTranslator {
   async #materializeNativeOutput(
     sourcePath: string,
     fileName: string,
-    entryId: string
+    entryId: string,
+    recordedArtifact?: () => BlobRef | undefined
   ): Promise<{ readonly artifact?: BlobRef; readonly unavailable?: true }> {
     try {
+      // The committed occurrence owns its output; runtime staging is disposable across generations.
+      const recorded = recordedArtifact?.();
+      if (recorded !== undefined) return { artifact: recorded };
       return { artifact: await this.#storeRedactedToolOutput(sourcePath, fileName) };
     } catch (error) {
       const publicError: PublicError = error instanceof PiAdapterError

@@ -124,6 +124,11 @@ export interface AdapterContext {
   /** Exact host ArtifactStore ceiling for this invocation. Adapters must
    * reject larger materializations before reading or decoding their bytes. */
   readonly artifactCapacityBytes: number;
+  /** Read one immutable projection from this exact native binding. Historical
+   * Blob references retain their identity even after the Artifact is deleted. */
+  readonly readNativeHistoryProjection?: (
+    identity: Pick<NativeHistoryProjectedEvent, "nativeEntryId" | "projectionKind" | "contentIndex">
+  ) => EventPayload | undefined;
   readonly storeArtifact: (sourcePath: string, options?: {
     fileName?: string;
     mimeType?: string;

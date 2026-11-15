@@ -75,7 +75,7 @@ describe("RemoteClaudeRuntimeResolver", () => {
     const fixture = createFixture({ devicePeerWin32: boundary === "Device peer Target" });
     cleanups.push(() => fixture.resolver.close());
     const binding = await fixture.resolver.resolve(fixture.target);
-    const query = await binding.runtime.query(queryParams(undefined, undefined, false));
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, { cwd: binding.workspaceRoot }));
     fixture.stored = { ...fixture.stored, revision: fixture.stored.revision + 1n };
     if (boundary === "SSH authority") fixture.authorityCurrent = false;
     expect(() => binding.assertRetirementCurrent!()).toThrow();

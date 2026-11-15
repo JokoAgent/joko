@@ -3846,9 +3846,10 @@ describe("SessionHost", () => {
     })).value.sessionId;
     const sourcePath = join(fixture.directory, "session-export.html");
     writeFileSync(sourcePath, "<!doctype html><title>Export validation</title>");
-    const exportSession = vi.spyOn(fixture.adapter, "exportSession").mockImplementation((context) =>
-      context.storeArtifact(sourcePath, { fileName: "session-export.html", mimeType: "text/html" })
-    );
+    const exportSession = vi.spyOn(fixture.adapter, "exportSession").mockImplementation((context) => {
+      expect(context.readNativeHistoryProjection).toBeUndefined();
+      return context.storeArtifact(sourcePath, { fileName: "session-export.html", mimeType: "text/html" });
+    });
 
     const artifact = await fixture.host.exportSession(sessionId);
     expect(artifact).toEqual(fixture.store.getArtifact(artifact.id).blob);
@@ -3888,6 +3889,61 @@ describe("SessionHost", () => {
     expect(blob.sha256).toBe(createHash("sha256").update(exported).digest("hex"));
     expect(fixture.store.hasArtifactSource(blob.id)).toBe(false);
     expect(assertCurrent).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["binding", "Backend", "trust"] as const)("reads only the original Pi binding's immutable Artifact projection until %s retires", async change => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    vi.spyOn(adapter, "describe").mockResolvedValue({ ...await adapter.describe(), adapterKind: "pi" });
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-history-artifact", connection: fixture.connection,
+      targetId: "target-one", title: "Native Artifact identity", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const path = join(fixture.directory, "native-output.log");
+    writeFileSync(path, "original output");
+    let context!: AdapterContext;
+    vi.spyOn(adapter, "exportSession").mockImplementation(candidate => {
+      context = candidate;
+      return candidate.storeArtifact(path, { fileName: "bash-call-A.log", mimeType: "text/plain" });
+    });
+    const artifact = await fixture.host.exportSession(sessionId);
+    const source = fixture.store.getSession(sessionId).descriptor;
+    const projection = projectNativeHistory(sessionId, source.binding.opaqueRef, { events: [{
+      nativeEntryId: "entry-A", projectionKind: "tool_result", contentIndex: 0,
+      payload: { type: "tool_result", callId: "call-A", name: "bash", output: "preview", isError: false, artifact }
+    }] })[0]!;
+    const event = fixture.store.appendEvent({ ...projection, backendId: source.backendId, targetId: source.targetId,
+      sessionId, generation: source.binding.generation, traceId: "original-native-output" });
+    fixture.store.deleteArtifact(artifact.id);
+    expect(fixture.store.findArtifact(artifact.id)).toBeUndefined();
+    const read = context.readNativeHistoryProjection!;
+    expect(read).toBeTypeOf("function");
+    const identity = { nativeEntryId: "entry-A", projectionKind: "tool_result", contentIndex: 0 };
+    expect(read(identity)).toEqual(event.payload);
+    const returned = read(identity)!;
+    if (returned.type === "tool_result") Object.assign(returned, { artifact: { ...artifact, id: "caller-mutated-id" } });
+    expect(read(identity)).toEqual(event.payload);
+    expect(read({ ...identity, nativeEntryId: "other-entry" })).toBeUndefined();
+    expect(read({ ...identity, projectionKind: "message" })).toBeUndefined();
+    expect(read({ ...identity, contentIndex: 1 })).toBeUndefined();
+    expect(() => fixture.store.appendEventIfAbsent({ ...projection, backendId: source.backendId, targetId: source.targetId,
+      sessionId, generation: source.binding.generation, traceId: "original-native-output",
+      payload: { ...projection.payload, type: "tool_result", callId: "call-A", name: "bash", output: "changed native preview", isError: false, artifact }
+    })).toThrow();
+    expect(fixture.store.findArtifact(artifact.id)).toBeUndefined();
+    if (change === "binding") fixture.store.updateSession(sessionId, { binding: {
+      ...source.binding, opaqueRef: `${source.binding.opaqueRef}-other`, generation: source.binding.generation + 1
+    } });
+    else if (change === "Backend") {
+      const backend = fixture.store.getBackend(source.backendId).descriptor;
+      const reservation = fixture.store.reserveBackendInstanceGeneration({ backendId: backend.id, adapterKind: backend.adapterKind });
+      expect(fixture.store.publishBackendInstanceDescriptor({
+        descriptor: { ...backend, instanceGeneration: reservation.generation }, expectedCurrentGeneration: backend.instanceGeneration
+      }).status).toBe("published");
+    } else {
+      const target = fixture.store.getTarget(source.targetId);
+      fixture.store.upsertTarget({ ...target.descriptor, trusted: false }, target.metadata);
+    }
+    expect(() => read(identity)).toThrow();
+    expect(fixture.store.findEvent(event.id)?.payload).toEqual(event.payload);
   });
 
   it("captures only the first exact local Backend source and revalidates it on every reveal", async () => {

@@ -4667,7 +4667,7 @@ export class PiBackendAdapter implements
     const history = await this.#getEntriesRaw(undefined, runtime, context.signal);
     return projectPiNativeHistory(binding.nativeSessionId, {
       entries: await Promise.all(history.entries.map(async (entry) =>
-        runtime.translator.materializeNativeHistoryEntry(toNativeHistoryEntry(entry)))),
+        runtime.translator.materializeNativeHistoryEntry(toNativeHistoryEntry(entry), context.readNativeHistoryProjection))),
       leafId: history.leafId === null ? null : boundedNativeIdentifier(history.leafId, "leaf")
     });
   }
