@@ -972,18 +972,27 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
     timeoutMs: number,
     onCallback?: (channel: RemoteClaudeManagerChannel, frame: Readonly<Record<string, unknown>>) => Promise<void>
   ): Promise<unknown> {
-    this.#assertOpen();
+    const sourceRetirement = method === "fresh.hasPendingSource" || method === "fresh.markSourceRetired";
+    const assertCurrent = sourceRetirement ? (): void => {
+      if (this.#closed) throw runtimeFault("runtime_closed", false);
+      this.assertManagerGenerationCurrent();
+      this.#options.assertRetirementCurrent();
+    } : this.#options.assertCurrent;
+    const assertOpen = sourceRetirement ? assertCurrent : (): void => this.#assertOpen();
+    assertOpen();
     signal?.throwIfAborted();
-    await this.#options.verifyWorkspace?.(signal);
-    this.#assertOpen();
+    // Original source reservations live in the Backend ledger, independently of a Target edit.
+    if (!sourceRetirement) await this.#options.verifyWorkspace?.(signal);
+    assertOpen();
     let channel!: RemoteClaudeManagerChannel;
     channel = await RemoteClaudeManagerChannel.open({
       ...this.#channelOptions(),
+      assertCurrent,
       ...(onCallback === undefined ? {} : { onCallback: (frame) => onCallback(channel, frame) })
     }, signal);
     try {
       const value = await channel.request(method, params, { timeoutMs, signal });
-      this.#options.assertCurrent();
+      assertCurrent();
       return value;
     } finally {
       await channel.close().catch(() => undefined);
