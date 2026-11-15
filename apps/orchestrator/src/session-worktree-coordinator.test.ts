@@ -804,8 +804,7 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
 
 describe("remote checkout coordination", () => {
   test("fences renamed-project reclamation to the same unadopted durable cleanup claim", async () => {
-    const f = await remoteFixture();
-    f.store.upsertBackend({ ...f.store.getBackend("remote-backend").descriptor, adapterKind: "claude-agent-sdk-stdio" });
+    const f = await remoteFixture("claude-agent-sdk-stdio");
     await f.worktrees.initialize();
     const connection = f.store.createConnection({ id: "reclaim-owner", name: "Owner", authKeyDigest: "reclaim-digest" });
     const claim = f.store.claimAuthorizedDeferredEffectOperation(connection.id, connection.authKeyDigest, {
@@ -920,10 +919,10 @@ describe("remote checkout coordination", () => {
   });
 });
 
-async function remoteFixture() {
+async function remoteFixture(adapterKind = "fixture") {
   const root = await mkdtemp(join(tmpdir(), "joko-remote-worktree-coordinator-"));
   const store = new OperationalStore(join(root, "store.db"));
-  store.upsertBackend({ id: "remote-backend", adapterKind: "fixture", displayName: "Remote",
+  store.upsertBackend({ id: "remote-backend", adapterKind, displayName: "Remote",
     version: "1", instanceGeneration: 0, health: "healthy", installationState: "installed",
     authenticationState: "not_required", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
   const remoteWorkspace = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
