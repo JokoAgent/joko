@@ -6,6 +6,18 @@ import { create, fromBinary, ScalarType, toBinary } from "@bufbuild/protobuf";
 
 import * as contract from "../dist/index.js";
 
+test("sampling interruption status carries only a bounded exact received item identity", () => {
+  const prefix = "codex_sampling_interrupted:";
+  for (const id of ["native-item-A", "opaque:/item % identity", "x".repeat(512)]) {
+    const status = create(contract.StatusStreamEventSchema, { statusId: `${prefix}${id}`, terminal: true });
+    assert.equal(contract.codexSamplingInterruptedMessageId(status), id);
+    assert.equal(contract.codexSamplingInterruptedMessageId({ ...status, terminal: false }), undefined);
+  }
+  for (const statusId of ["ordinary-status", prefix, `${prefix}${"x".repeat(513)}`, `${prefix}A\nB`, `${prefix}A\u0000B`]) {
+    assert.equal(contract.codexSamplingInterruptedMessageId({ statusId, terminal: true }), undefined);
+  }
+});
+
 test("Viewer owners retain a selected WebRTC transport and require its trusted endpoint pin", () => {
   const owner = { profileId: "rtc", serverId: "node", deviceId: "device", origin: "https://node.example",
     connectionGeneration: 1, transportKind: "webrtc", endpointPublicKey: `ed25519:${"a".repeat(64)}` };

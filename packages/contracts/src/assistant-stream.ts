@@ -1,5 +1,13 @@
 import type { Event } from "./gen/joko/v1/event_pb.js";
 
+/** A terminal status identifies a received Codex item, not a completed native entry. */
+export function codexSamplingInterruptedMessageId(status: { readonly statusId: string; readonly terminal: boolean }): string | undefined {
+  const prefix = "codex_sampling_interrupted:";
+  if (!status.terminal || !status.statusId.startsWith(prefix)) return undefined;
+  const id = status.statusId.slice(prefix.length);
+  return id.length > 0 && id.length <= 512 && !/[\u0000-\u001f\u007f]/u.test(id) ? id : undefined;
+}
+
 export function isClaudeStreamBlock(messageId: string): boolean {
   return /^claude-block-(?:[0-9a-f-]{36}-)?\d+-\d+$/u.test(messageId);
 }

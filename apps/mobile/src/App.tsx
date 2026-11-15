@@ -6801,7 +6801,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           if (part.kind === "artifact") return renderTimelineArtifact(part.artifact);
           return <MobileMarkdownMessage key={`${markdownOwnerKey}/part/${part.contentIndex}`} text={part.text}
             colors={colors} locale={locale} ownerKey={`${markdownOwnerKey}/part/${part.contentIndex}`}
-            answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id, part.contentIndex])} streaming={!item.completed}
+            answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id, part.contentIndex])} streaming={!item.completed && !item.samplingInterrupted}
             onSendRichAnswer={item.kind === "assistant" ? sendRichAnswer : undefined}
             resourceText={item.text}
             resourceClient={client} messageId={item.id}
@@ -6810,7 +6810,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
-          answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id])} streaming={!item.completed}
+          answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id])} streaming={!item.completed && !item.samplingInterrupted}
           onSendRichAnswer={sendRichAnswer}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
@@ -6829,6 +6829,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             })}</Text>
           </View> : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{partnerIdentity.partner && item.runStopped
             ? mobileMessage(locale, "partnerConversation.stopped") : item.text}</Text>}
+        {item.samplingInterrupted && <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.samplingInterrupted")}</Text>}
         {!conversationShare.active && <MobileMessageRunFacts row={item} locale={locale} colors={colors} />}
         {delegatedCards.map(renderDelegatedCard)}
         {partnerRead.ready && partnerIdentity.partner && item.kind === "assistant" && item.completed && item.assistantBodyPresent === true

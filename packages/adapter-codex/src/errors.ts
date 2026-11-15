@@ -23,8 +23,7 @@ export function adapterError(input: {
 /** Native tags and numeric HTTP status are the only data admitted to the public failure category. */
 export function publicNativeTurnError(error: unknown): PublicError {
   const record = objectRecord(error), info = record?.["codexErrorInfo"], variant = objectRecord(info);
-  const keys = variant === undefined ? [] : Object.keys(variant);
-  const tag = typeof info === "string" ? info : keys.length === 1 ? keys[0] : undefined;
+  const tag = nativeTurnErrorTag(error);
   const details = variant !== undefined && tag !== undefined ? objectRecord(variant[tag]) : undefined;
   const networkTag = tag === "httpConnectionFailed" || tag === "responseStreamConnectionFailed" || tag === "responseStreamDisconnected";
   const rawStatus = networkTag || tag === "responseTooManyFailedAttempts" ? details?.["httpStatusCode"] : undefined;
@@ -65,6 +64,12 @@ export function publicNativeTurnError(error: unknown): PublicError {
       ? "Sign in to the Codex account and explicitly retry the queued input."
       : "Inspect the durable timeline and explicitly retry only if another native turn is safe."
   };
+}
+
+export function nativeTurnErrorTag(error: unknown): string | undefined {
+  const info = objectRecord(error)?.["codexErrorInfo"], variant = objectRecord(info);
+  const keys = variant === undefined ? [] : Object.keys(variant);
+  return typeof info === "string" ? info : keys.length === 1 ? keys[0] : undefined;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {

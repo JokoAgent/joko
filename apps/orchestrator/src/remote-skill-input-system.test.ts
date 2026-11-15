@@ -8,7 +8,7 @@ import { createClient, Code } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import * as contract from "@joko/contracts";
 import { AppServerHost, CodexBackendAdapter } from "@joko/adapter-codex";
-import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
+import { FakeCodexAppServer, type ScriptedRpcTransport } from "@joko/adapter-codex/testing";
 import type { RemoteFileTransportPort, RemoteFileStat, RemoteProcessHandle, RemoteProcessTransportPort, RemoteProcessStartRequest } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
 import { describe, expect, it } from "vitest";
@@ -167,6 +167,12 @@ describe("registered remote project Skill input composition", () => {
       const originalRunId = store.getQueueItem(queueId).runId!;
       const originalAttemptId = store.getRun(originalRunId).descriptor.activeAttemptId;
       const originalBinding = store.getSession(sessionId).descriptor.binding;
+      const originalProxy = daemon.activeTurnProxy;
+      const originalProxyId = daemon.activeTurnProxyId;
+      const originalTransport = daemon.activeTurnTransport;
+      const initializeCount = daemon.messages.filter(message => message.method === "initialize").length;
+      expect(originalProxy).toBeDefined(); expect(originalTransport).toBeDefined();
+      expect(daemon.messages.filter(message => message.method === "initialize" && message.proxyId === originalProxyId)).toHaveLength(1);
       if (projectEdit === "rename") {
         await operations.submitOperation({ operationId: "rename-active-remote-project", connectionId: paired.connection.id,
           mutation: { preconditions: [{ entity: { kind: contract.EntityKind.TARGET, id: target.id },
@@ -181,18 +187,23 @@ describe("registered remote project Skill input composition", () => {
           targetId: target.id, expectedTargetRevision: { value: store.getTarget(target.id).revision }
         });
         expect(selected.workspace?.workspaceId).toBe("remote-workspace");
-        expect(daemon.messages.filter(message => message.method === "initialize")).toHaveLength(1);
+        expect(daemon.messages.filter(message => message.method === "initialize")).toHaveLength(initializeCount);
+        expect(daemon.activeTurnProxy).toBe(originalProxy);
+        expect(originalProxy?.exitCode).toBeNull();
       };
       if (projectEdit === "selection" || shutdownState === "active") await selectProject();
       expect(store.getRun(originalRunId).descriptor.activeAttemptId).toBe(originalAttemptId);
       expect(store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
       if (shutdownState === "idle") {
         const text = "Original remote Run completed after the project edit";
-        await daemon.fake.completeTurn(originalBinding.nativeSessionId!, text);
+        await daemon.fake.completeTurn(originalBinding.nativeSessionId!, text, originalTransport);
         await expect.poll(() => store.getQueueItem(queueId).state, { timeout: 10_000 }).toBe("completed");
         expect(store.getQueueItem(queueId).runId).toBe(originalRunId);
         expect(store.getRun(originalRunId).descriptor.state).toBe("completed");
-        expect(store.listEvents({ sessionId }).filter(event => event.payload.type === "message_complete"
+        const liveCompletion = store.listEvents({ sessionId }).filter(event => event.metadata?.namespace === "codex.app_server"
+          && event.payload.type === "message_complete" && event.payload.role === "assistant" && serialize(event.payload).includes(text));
+        expect(liveCompletion).toHaveLength(1);
+        expect(store.listEvents({ sessionId, activeNativeTimeline: true }).filter(event => event.payload.type === "message_complete"
           && event.payload.role === "assistant" && serialize(event.payload).includes(text))).toHaveLength(1);
         if (projectEdit === "rename") await selectProject();
       }
@@ -233,8 +244,12 @@ class MemorySkillFiles implements RemoteFileTransportPort {
 
 class RemoteSkillDaemon implements RemoteProcessTransportPort {
   readonly fake = new FakeCodexAppServer();
-  readonly messages: { method: string; params?: Record<string, unknown> }[] = [];
+  readonly messages: { method: string; params?: Record<string, unknown>; proxyId: number }[] = [];
   readonly mountPaths: string[] = [];
+  #proxySequence = 0;
+  activeTurnProxy: SkillProcess | undefined;
+  activeTurnProxyId: number | undefined;
+  activeTurnTransport: ScriptedRpcTransport | undefined;
   beforeTurnWrite?: () => void;
   constructor() { this.fake.codexHome = profile; this.fake.userAgent = "codex-cli/0.159.2 (linux; x86_64) joko/0.1.0";
     this.fake.reviewConfig = { skills: { config: [{ path: "/home/test/.agents/skills/ambient/SKILL.md", enabled: true }] } }; }
@@ -246,6 +261,7 @@ class RemoteSkillDaemon implements RemoteProcessTransportPort {
       const process = new SkillProcess(); setImmediate(() => { process.stdout.write(JSON.stringify({ socketPath: `${profile}/app-server-control/app-server-control.sock` })); process.finish(); }); return process;
     }
     if (!request.args.join(" ").startsWith("app-server proxy --sock ")) throw new Error("Unexpected fixture process");
+    const proxyId = ++this.#proxySequence;
     const transport = this.fake.createTransport();
     const process = new SkillProcess(async chunk => {
       const text = chunk.toString("ascii");
@@ -257,7 +273,7 @@ class RemoteSkillDaemon implements RemoteProcessTransportPort {
       const frame = clientPayload(chunk);
       if (frame.opcode === 8) { process.stdout.write(serverFrame(8, Buffer.alloc(0))); process.finish(); return; }
       const message = JSON.parse(frame.payload.toString()) as { method: string; params?: Record<string, unknown>; id?: number };
-      this.messages.push(message);
+      this.messages.push({ ...message, proxyId });
       if (message.id === undefined) return;
       if (message.method === "thread/start" || message.method === "thread/resume") {
         const config = message.params?.["config"] as Record<string, unknown> | undefined;
@@ -265,7 +281,10 @@ class RemoteSkillDaemon implements RemoteProcessTransportPort {
           if (entry.enabled) { this.mountPaths.push(entry.path); this.fake.reviewSkills.push({ name: "native-report", path: entry.path, enabled: true }); }
         }
       }
-      if (message.method === "turn/start") this.beforeTurnWrite?.();
+      if (message.method === "turn/start") {
+        this.activeTurnProxy = process; this.activeTurnProxyId = proxyId; this.activeTurnTransport = transport;
+        this.beforeTurnWrite?.();
+      }
       const result = await transport.request(message.method, message.params as Parameters<typeof transport.request>[1]);
       process.stdout.write(serverFrame(1, Buffer.from(JSON.stringify({ id: message.id, result }))));
     });

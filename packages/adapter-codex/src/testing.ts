@@ -210,8 +210,7 @@ export class FakeCodexAppServer {
     return this.#thread(threadId).memoryEnabled;
   }
 
-  async completeTurn(threadId: string, text = "completed response"): Promise<void> {
-    const transport = this.#requireTransport();
+  async completeTurn(threadId: string, text = "completed response", transport = this.#requireTransport()): Promise<void> {
     const thread = this.#thread(threadId);
     const turn = thread.turns.at(-1);
     if (turn === undefined) throw new Error("No fake turn is active.");

@@ -47,6 +47,7 @@ interface Subscriber {
   readonly handlers: HostSubscriptionHandlers;
   historyRevision: bigint;
   contentRevision: bigint;
+  initialEmptyStart?: { readonly cwd: string | undefined; pending: boolean; valid: boolean };
   pendingNotifications: number;
   notificationDrain?: () => void;
 }
@@ -155,7 +156,8 @@ export class AppServerHost {
   /** Wire-arrival revision of entries, distinct from name/status metadata. */
   contentRevision(threadId: string, hostGeneration: number): bigint | undefined {
     const subscriber = this.#subscribers.get(threadId);
-    return this.isActiveGeneration(hostGeneration) && subscriber?.generation === hostGeneration ? subscriber.contentRevision : undefined;
+    return this.isActiveGeneration(hostGeneration) && subscriber?.generation === hostGeneration && subscriber.initialEmptyStart?.valid !== false
+      ? subscriber.contentRevision : undefined;
   }
 
   /** Pending delivery can contain activity that the Adapter has not observed yet. */
@@ -258,7 +260,8 @@ export class AppServerHost {
   async subscribe(
     threadId: string,
     expectedHostGeneration: number,
-    handlers: HostSubscriptionHandlers
+    handlers: HostSubscriptionHandlers,
+    options?: { readonly initialEmptyStart?: { readonly cwd: string | undefined } }
   ): Promise<HostSubscription> {
     if (!this.isActiveGeneration(expectedHostGeneration)) {
       throw new TransportFault("process_exited", "The Codex app-server generation changed before thread subscription.");
@@ -272,7 +275,8 @@ export class AppServerHost {
     }
     this.#detachedThreads.delete(threadId);
     const revision = ++this.#nextHistoryRevision;
-    const subscriber: Subscriber = { generation: expectedHostGeneration, handlers, historyRevision: revision, contentRevision: revision, pendingNotifications: 0 };
+    const subscriber: Subscriber = { generation: expectedHostGeneration, handlers, historyRevision: revision, contentRevision: revision, pendingNotifications: 0,
+      ...(options?.initialEmptyStart === undefined ? {} : { initialEmptyStart: { cwd: options.initialEmptyStart.cwd, pending: true, valid: true } }) };
     this.#subscribers.set(threadId, subscriber);
     const waiting = this.#takeBuffered(threadId);
     try {
@@ -283,6 +287,7 @@ export class AppServerHost {
         if (item.expiresAt <= Date.now()) {
           throw new TransportFault("buffer_overflow", "A pre-subscription Codex notification expired before it could be applied.");
         }
+        this.#observeContent(subscriber, threadId, item.notification);
         try { await handlers.onNotification(item.notification.method, item.notification.params); }
         finally { this.#finishNotification(item.notification); }
       }
@@ -438,7 +443,7 @@ export class AppServerHost {
     if (!validThreadIdentity(threadId)) return;
     const subscriber = this.#subscribers.get(threadId);
     if (subscriber?.generation === generation && changesNativeHistory(notification.method)) subscriber.historyRevision = ++this.#nextHistoryRevision;
-    if (subscriber?.generation === generation && changesNativeContent(notification.method)) subscriber.contentRevision = ++this.#nextHistoryRevision;
+    if (subscriber?.generation === generation) this.#observeContent(subscriber, threadId, notification);
     const lineage = this.#descendants.get(threadId);
     const started = notification.method === "thread/started" ? descendantStartMetadata(notification.params) : undefined;
     const parent = started === undefined ? undefined : this.#subscribers.get(started.parentThreadId)
@@ -448,6 +453,22 @@ export class AppServerHost {
       owner.pendingNotifications++;
       this.#notificationOwners.set(notification, owner);
     }
+  }
+
+  #observeContent(subscriber: Subscriber, threadId: string, notification: RpcNotification): void {
+    if (!changesNativeContent(notification.method)) return;
+    const start = subscriber.initialEmptyStart;
+    const thread = isJsonObject(notification.params) && isJsonObject(notification.params["thread"]) ? notification.params["thread"] : undefined;
+    if (notification.method === "thread/started" && start?.pending && start.valid && thread !== undefined
+      && thread["id"] === threadId && thread["cwd"] === start.cwd && thread["historyMode"] === "paginated"
+      && Array.isArray(thread["turns"]) && thread["turns"].length === 0) {
+      // The native start reply precedes its one creation notification. It adds
+      // no entries to that exact empty reply; normal history fences still move.
+      start.pending = false;
+      return;
+    }
+    if (start !== undefined) { start.pending = false; start.valid = false; }
+    subscriber.contentRevision = ++this.#nextHistoryRevision;
   }
 
   async #routeNotification(

@@ -112,6 +112,7 @@ import {
 } from "./native-task-projection.js";
 import {
   CodexEventTranslator,
+  CODEX_SAMPLING_INTERRUPTED_PREFIX,
   createTranslatorState,
   interactionFromServerRequest,
   safeText,
@@ -1358,6 +1359,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         binding,
         context,
         hostGeneration: response.hostGeneration,
+        initialEmptyStart: request.method === "thread/start" && thread.historyMode === "paginated" && thread.turns.length === 0,
         permissionMode: input.permissionMode,
         managedRoute,
         smartRoute,
@@ -4545,6 +4547,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly smartRoute?: ManagedProviderSmartRoutingBinding | undefined;
     readonly mcp?: CodexMcpRuntimeLease | undefined;
     readonly mcpPending?: boolean;
+    readonly initialEmptyStart?: boolean;
     readonly nativeConfiguration?: JsonObject | undefined;
     readonly nativeSkills?: NativeSkillSnapshot | undefined;
     readonly thread: NativeThread;
@@ -4746,7 +4749,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             const schedulePlanReview = this.#registerPlanReview(runtime, plan, input.hostGeneration);
             for (const event of events) {
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
-              const eventContext = event.type === "retry" && event.error?.code === "CODEX_NATIVE_RECONNECT"
+              const eventContext = (event.type === "retry" && event.error?.code === "CODEX_NATIVE_RECONNECT")
+                || (event.type === "status" && event.key.startsWith(CODEX_SAMPLING_INTERRUPTED_PREFIX))
                 ? runtime.activeTurnContext ?? runtime.context
                 : event.type === "done" && plan?.context.registerCompletedPlanReview !== undefined ? plan.context : runtime.context;
               const emit = learningTurn?.emit ?? eventContext.emit;
@@ -4995,7 +4999,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             recovery: "Reconnect and inspect the native thread before sending more work."
           }));
         }
-      });
+      }, input.initialEmptyStart ? { initialEmptyStart: { cwd: input.thread.cwd } } : undefined);
       runtime.subscriptionFlight = subscriptionFlight;
       const subscription = await subscriptionFlight;
       runtime.subscriptionFlight = undefined;

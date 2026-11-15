@@ -10,6 +10,7 @@ export interface MobileWorkCandidate {
   readonly kind: string;
   readonly text: string;
   readonly completed: boolean;
+  readonly samplingInterrupted?: boolean;
   readonly optimistic?: boolean;
   readonly thinking?: MobileThinkingView;
   readonly tool?: MobileToolCallView;
@@ -84,7 +85,7 @@ export function mobileWorkItems<T extends MobileWorkCandidate>(rows: readonly T[
     isSealedAnswer: (row) => row.kind !== "work" && row.turnFinal === true,
     isCompactBoundary: (row) => row.kind !== "work" && row.compactBoundary === true,
     isActivity: (row): row is T => activity(row),
-    isArchivable: (row): row is T => row.planSequence === undefined && row.persistentTask !== true && (activity(row)
+    isArchivable: (row): row is T => row.planSequence === undefined && row.persistentTask !== true && !row.samplingInterrupted && (activity(row)
       || (row.kind === "assistant" && row.text.trim() !== "" && !deliveryProse(row.text))),
     startTimestamp: (row) => row.startedAtMs ?? null,
     endTimestamp: (row) => row.kind === "work" ? row.startedAtMs ?? null

@@ -1640,6 +1640,8 @@ export interface TimelineItemView {
   readonly assistantStreamAttempt?: string;
   /** Exact Run attempt and cursor generation that own received assistant text. */
   readonly streamAttempt?: string;
+  /** This received item's sampling stream ended without authoritative native completion. */
+  readonly samplingInterrupted?: boolean;
   /** Durable event used to reload an around-message window for persistent deep links. */
   readonly sourceEventId?: string;
   /** Opaque native entry identity when the generated event contract supplied one. */

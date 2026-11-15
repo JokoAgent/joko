@@ -2,7 +2,7 @@ import { InteractionKind, InteractionState, MessageRole, readDocumentOutput, Ret
   type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt, type PartnerSessionTaskReceiptView } from "@joko/contracts";
-import { assistantStreamAttempt, isAssistantStreamBlock } from "@joko/contracts";
+import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock } from "@joko/contracts";
 import type { RetryChangedEvent } from "@joko/contracts";
 import { mobileInputSummary, mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 import { normalizeMobileReplyQuote, type MobilePartnerReplyQuote, normalizeMobileTodoQuote, type MobilePartnerTodoQuote } from './mobile-composer-document';
@@ -53,6 +53,7 @@ export interface TimelineRow {
   readonly eventId: string;
   readonly kind: "user" | "assistant" | "system" | "tool" | "status" | "error" | "activity";
   readonly completed: boolean;
+  readonly samplingInterrupted?: boolean;
   /** Exact durable send identity; present only on canonical accepted user input. */
   readonly operationId?: string;
   readonly queueItemId?: string;
@@ -349,9 +350,21 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           id: event.eventId, label: "Execution changed", text: `${kind.value.fromBackendId} → ${kind.value.toBackendId} · ${kind.value.modelId}`,
           sequence, eventId: event.eventId, kind: "system", completed: true, runtimeHandoff: kind.value });
         break;
-      case "statusStream":
+      case "statusStream": {
+        const interruptedId = codexSamplingInterruptedMessageId(kind.value);
+        if (interruptedId !== undefined) {
+          const previous = byId.get(interruptedId);
+          const origin = previous === undefined ? undefined : unique.get(previous.eventId);
+          const attempt = assistantStreamAttempt(event);
+          if (previous?.kind === "assistant" && !previous.completed && origin !== undefined
+            && attempt !== undefined && assistantStreamAttempt(origin) === attempt) {
+            byId.set(interruptedId, { ...previous, samplingInterrupted: true });
+          }
+          break;
+        }
         byId.set(event.eventId, { id: event.eventId, label: "Status", text: kind.value.label + (kind.value.detail ? ` · ${kind.value.detail}` : ""), sequence, eventId: event.eventId, kind: "status", completed: false });
         break;
+      }
       case "objectiveLifecycle": {
         const lifecycle = projectMobileObjectiveLifecycle(kind.value);
         if (lifecycle) byId.set(event.eventId, { id: event.eventId, label: "Objective", text: [lifecycle.text, lifecycle.reason].filter(Boolean).join("\n"),

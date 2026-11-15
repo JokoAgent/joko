@@ -40,6 +40,38 @@ it("keeps Codex reconnect progress in the current attempt and out of message his
   expect(timelineRows([...settled, completed([{ content: { case: "text", value: "Recovered." } }])]))
     .toMatchObject([{ text: "Recovered.", kind: "assistant", completed: true }]);
 });
+it("keeps partial sampling text separate from later native items without granting completion or navigation identity", () => {
+  const identity = { sessionId: "session", runId: "run", attemptId: "attempt", generation: 7n };
+  const delta = create(EventSchema, { eventId: "delta-A", identity, cursor: { generation: 14n, sequence: 1n },
+    payload: { kind: { case: "textDelta", value: { messageId: "A", delta: "Partial A." } } } });
+  const marker = create(EventSchema, { eventId: "sample-failure", identity, cursor: { generation: 14n, sequence: 2n },
+    payload: { kind: { case: "statusStream", value: { statusId: "codex_sampling_interrupted:A", terminal: true, label: "Response interrupted" } } } });
+  for (const change of [{ runId: "other" }, { attemptId: "other" }, { generation: 8n }]) {
+    const stale = create(EventSchema, { eventId: marker.eventId, identity: { ...identity, ...change }, cursor: marker.cursor, payload: marker.payload });
+    expect(timelineRows([delta, stale])).toHaveLength(1);
+    expect(timelineRows([delta, stale])[0]?.samplingInterrupted).toBeUndefined();
+  }
+  const otherService = create(EventSchema, { eventId: marker.eventId, identity, cursor: { generation: 15n, sequence: 2n }, payload: marker.payload });
+  expect(timelineRows([delta, otherService])[0]?.samplingInterrupted).toBeUndefined();
+  const partial = timelineRows([delta, marker])[0];
+  expect(partial).toMatchObject({ id: "A", text: "Partial A.", completed: false, samplingInterrupted: true, eventId: delta.eventId });
+  expect(partial?.completionCursor).toBeUndefined(); expect(partial?.nativeEntryId).toBeUndefined();
+  const residual = create(EventSchema, { eventId: "residual-A", identity, cursor: { generation: 14n, sequence: 3n },
+    payload: { kind: { case: "textDelta", value: { messageId: "A", delta: " Late bytes." } } } });
+  expect(timelineRows([delta, marker, residual])[0]).toMatchObject({ text: "Partial A. Late bytes.", samplingInterrupted: true, completed: false });
+  const complete = (id: string, sequence: bigint) => create(EventSchema, { eventId: `${id}-complete`, identity,
+    cursor: { generation: 14n, sequence }, payload: { kind: { case: "messageCompleted", value: {
+      messageId: id, role: MessageRole.ASSISTANT, nativeIdentity: { entryId: id }, blocks: [{ content: { case: "text", value: `Full ${id}.` } }] } } } });
+  const withB = [delta, marker, complete("B", 4n)];
+  expect(timelineRows(withB)).toHaveLength(2);
+  expect(timelineRows(withB)[0]).toEqual(partial);
+  expect(mobileWorkItems(timelineRows(withB), false).find(row => row.id === "A")).toEqual(partial);
+  const authoritativeA = [...withB, complete("A", 5n)];
+  expect(timelineRows(authoritativeA).find(row => row.id === "A")).toMatchObject({ text: "Full A.", completed: true, nativeEntryId: "A" });
+  expect(timelineRows(authoritativeA).find(row => row.id === "A")?.samplingInterrupted).toBeUndefined();
+  const repeated = create(EventSchema, { eventId: "repeated-marker", identity, cursor: { generation: 14n, sequence: 6n }, payload: marker.payload });
+  expect(timelineRows([...authoritativeA, repeated])).toEqual(timelineRows(authoritativeA));
+});
 it("keeps extension-owned media available as artifacts without duplicating its card in the Timeline", () => {
   const event = create(EventSchema, { eventId: "media", identity: { sessionId: "session", runId: "run" }, cursor: { generation: 1n, sequence: 1n },
     payload: { kind: { case: "artifactProduced", value: { embeddedInExtensionCard: true, artifact: { artifactId: "media", sessionId: "session", runId: "run", title: "Audio", blob: {

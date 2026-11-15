@@ -539,17 +539,41 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await waitFor(async () => fixture!.application.store.listQueueItems({ sessionId }),
       items => items.some(item => item.state === "backend_accepted"), "the mounted original Codex turn");
     const status = page.locator(".retry-status-indicator");
+    const samplingTurnId = native.threads.get(threadId)!.turns.at(-1)!["id"]!;
+    await native.transport!.emitNotification("item/agentMessage/delta", { threadId, turnId: samplingTurnId, itemId: "interrupted-sample-A",
+      delta: "Received text from the interrupted sample." });
+    const samplingRow = page.locator('.message-assistant[data-message-client-id="interrupted-sample-A"]');
+    await samplingRow.getByText("Received text from the interrupted sample.", { exact: true }).waitFor({ state: "visible" });
+    await samplingRow.locator(".streaming-cursor").waitFor({ state: "visible" });
     await reconnectCodexTurn(native, threadId, 1);
     await status.getByText("Retrying (1/5)...", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await samplingRow.getByText("Response interrupted", { exact: true }).waitFor({ state: "visible" });
+    expect(await samplingRow.locator(".streaming-cursor").count()).toBe(0);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+    const interruptionNotice = samplingRow.getByRole("note").filter({ hasText: "Response interrupted" });
+    await interruptionNotice.scrollIntoViewIfNeeded();
+    const noticeBounds = await interruptionNotice.boundingBox();
+    expect(noticeBounds).not.toBeNull();
+    expect(noticeBounds!.x).toBeGreaterThanOrEqual(0);
+    expect(noticeBounds!.x + noticeBounds!.width).toBeLessThanOrEqual(390);
+    await page.setViewportSize({ width: 1440, height: 960 });
+    await page.emulateMedia({ colorScheme: "light", reducedMotion: "no-preference" });
+    expect(fixture.application.store.listEvents({ sessionId }).some(event => event.payload.type === "message_complete"
+      && event.payload.nativeHistory?.identity?.entryId === "interrupted-sample-A")).toBe(false);
     await reconnectCodexTurn(native, threadId, 2);
     await status.getByText("Retrying (2/5)...", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await native.completeTurn(threadId, "Codex mounted answer");
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await status.waitFor({ state: "hidden" });
+    expect(await samplingRow.getByText("Received text from the interrupted sample.", { exact: true }).count()).toBe(1);
+    expect(await samplingRow.getByText("Response interrupted", { exact: true }).count()).toBe(1);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Connect", exact: true }).click();
     await composer.waitFor({ state: "visible", timeout: 20_000 });
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await samplingRow.getByText("Response interrupted", { exact: true }).waitFor({ state: "visible" });
+    expect(await samplingRow.locator(".streaming-cursor").count()).toBe(0);
     expect(await status.count()).toBe(0);
     expect(await page.locator(".timeline").getByText(/Retrying|provider connection|fixture provider detail/).count()).toBe(0);
 

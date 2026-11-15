@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { modelTokenPricesAt } from "@joko/core";
 import { protoModelPrice, toProtoModelReferenceTariff } from "./model-pricing-projection.js";
 import { posix } from "node:path";
-import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
+import { codexSamplingInterruptedMessageId, encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import {
   ActorKind,
   ArtifactKind,
@@ -3181,7 +3181,9 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         elapsedMs: BigInt(payload.elapsedMs)
       }));
     case "status":
-      return statusPayload(payload.key, payload.key, payload.text ?? "", false);
+      return codexSamplingInterruptedMessageId({ statusId: payload.key, terminal: true }) === undefined
+        ? statusPayload(payload.key, payload.key, payload.text ?? "", false)
+        : statusPayload(payload.key, "Response interrupted", "", true);
     case "extension_ui_effect":
       return protoPayload("extensionUiEffect", message<ExtensionUiEffectEvent>("joko.v1.ExtensionUiEffectEvent", {
         kind: payload.effect === "notification"
