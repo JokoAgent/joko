@@ -134,6 +134,57 @@ async function invoke(handler: unknown, request: unknown, handlerContext: unknow
   return await result;
 }
 
+it.each(["success", "target-changed", "binding-changed", "revoked"] as const)("finalizes only the exact resumed Session generation while retaining %s fences", async boundary => {
+  const directory = mkdtempSync(join(tmpdir(), "joko-resume-generation-"));
+  const store = new OperationalStore(":memory:");
+  const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [] });
+  const host = new SessionHost(store, artifacts, []), connections = new ConnectionManager(store);
+  const token = "resume-owner-key";
+  const owner = store.createConnection({ id: "resume-owner", name: "Owner", authKeyDigest: digestAuthKey(token) });
+  store.upsertBackend({ id: "backend", adapterKind: "fixture", instanceGeneration: 1, displayName: "Backend", version: "0.1.0", health: "healthy",
+    installationState: "installed", authenticationState: "authenticated", capabilities: new Map([["session.resume", { key: "session.resume", supported: true }]]),
+    models: [], tools: [], diagnostics: [] });
+  const target = store.upsertTarget({ id: "project", backendId: "backend", displayName: "Project", workspaceRoot: directory, managed: false, trusted: true });
+  store.createSession({ id: "session", backendId: "backend", targetId: "project", title: "Task",
+    binding: { opaqueRef: "native:original", nativeSessionId: "original", generation: 7 }, pinned: false, archived: false,
+    permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+  const resume = vi.spyOn(host, "resume").mockImplementation(async () => {
+    const binding = { ...store.getSession("session").descriptor.binding, generation: 8 };
+    store.updateSession("session", { binding });
+    if (boundary === "target-changed") store.upsertTarget({ ...target.descriptor, displayName: "Changed during resume" });
+    if (boundary === "binding-changed") store.updateSession("session", { binding: { ...binding, generation: 9, opaqueRef: "native:other" } });
+    if (boundary === "revoked") store.revokeConnection(owner.id);
+    return { binding, streaming: false, compacting: false, pendingMessages: 0, fastMode: false, permissionMode: "ask" };
+  });
+  const application = { ...stubApplication({ store }), connections, sessionHost: host };
+  const operations = createClient(contract.OperationService, createRouterTransport(router => registerConnectServices(router, application)));
+  const auth = { headers: { authorization: `Bearer ${token}` } };
+  const mutation = create(contract.OperationMutationSchema, { preconditions: [
+    { entity: { kind: contract.EntityKind.SESSION, id: "session" }, expectedGeneration: 7n },
+    { entity: { kind: contract.EntityKind.TARGET, id: "project" }, expectedRevision: { value: target.revision } }
+  ], payload: { case: "resumeSession", value: { sessionId: "session" } } });
+  const request = { operationId: "resume-original", connectionId: owner.id, mutation };
+  try {
+    const stale = create(contract.OperationMutationSchema, { preconditions: [
+      { entity: { kind: contract.EntityKind.SESSION, id: "session" }, expectedGeneration: 6n }
+    ], payload: mutation.payload });
+    await expect(operations.submitOperation({ ...request, operationId: "stale-resume", mutation: stale }, auth)).rejects.toMatchObject({ code: Code.Aborted });
+    expect(resume).not.toHaveBeenCalled();
+    if (boundary === "revoked") {
+      await expect(operations.submitOperation(request, auth)).rejects.toMatchObject({ code: Code.Unauthenticated });
+      expect(store.getOperation(request.operationId).status).toBe("failed");
+    } else {
+      const result = await operations.submitOperation(request, auth);
+      expect(result.operation?.state).toBe(boundary === "success" ? contract.OperationState.SUCCEEDED : contract.OperationState.FAILED);
+      expect(await operations.submitOperation(request, auth)).toEqual(result);
+      if (boundary === "success") expect(result.operation?.error).toBeUndefined();
+    }
+    expect(resume).toHaveBeenCalledOnce();
+  } finally {
+    resume.mockRestore(); await host.dispose(); store.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 it("recovers only the original authorized account-reset Operation after a cold Store with the exact native credit and key", async () => {
   const directory = mkdtempSync(join(tmpdir(), "joko-account-reset-service-")), file = join(directory, "operations.db");
   let store = new OperationalStore(file), lost = true;

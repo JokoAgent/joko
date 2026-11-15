@@ -17442,8 +17442,33 @@ async function dispatchMutation(
       return presented(execution);
       });
     }
-    case "resumeSession":
-      return ackOperation(dependencies, operationId, connection, mutation, payload.case, () => host.resume(payload.value.sessionId).then(() => undefined));
+    case "resumeSession": {
+      const sessionId = payload.value.sessionId;
+      const advancesOwnGeneration = mutation.preconditions.some(condition => condition.entity?.kind === contract.EntityKind.SESSION
+        && condition.entity.id === sessionId && condition.expectedGeneration !== 0n);
+      if (!advancesOwnGeneration) return ackOperation(dependencies, operationId, connection, mutation, payload.case,
+        () => host.resume(sessionId).then(() => undefined));
+      let resumedBinding: import("@joko/core").NativeSessionBinding | undefined;
+      return presented(await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation, preconditionScope: "claim",
+        effect: async () => {
+          dependencies.connections.fence(connection);
+          validatePreconditions(dependencies.store, mutation);
+          resumedBinding = (await dependencies.sessionHost.resume(sessionId)).binding;
+        },
+        commit: store => {
+          validatePreconditions(store, { ...mutation, preconditions: mutation.preconditions.map(condition =>
+            condition.entity?.kind === contract.EntityKind.SESSION && condition.entity.id === sessionId
+              ? { ...condition, expectedGeneration: 0n } : condition) });
+          const current = store.getSession(sessionId).descriptor.binding;
+          if (resumedBinding === undefined || current.generation !== resumedBinding.generation
+            || current.opaqueRef !== resumedBinding.opaqueRef || current.nativeSessionId !== resumedBinding.nativeSessionId) {
+            throw new ConnectError("The resumed Session binding changed before completion.", Code.Aborted);
+          }
+          return { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome;
+        }
+      }));
+    }
     case "prewarmSession": {
       const expected = mutation.preconditions.find(value => value.entity?.kind === contract.EntityKind.SESSION && value.entity.id === payload.value.sessionId)?.expectedGeneration;
       if (expected === undefined || expected < 1n || expected > BigInt(Number.MAX_SAFE_INTEGER)) throw invalidArgument("Agent prewarm requires the original Session generation.");
