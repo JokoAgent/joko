@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import type { RemoteProcessHandle, RemoteProcessStartRequest, RemoteProcessTransportPort } from "@joko/remote-ssh";
+import type { RemoteGitCheckoutLease, RemoteProcessHandle, RemoteProcessStartRequest, RemoteProcessTransportPort } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
 import { describe, expect, it } from "vitest";
 
@@ -13,9 +13,80 @@ import {
   probeRemoteClaudeInstallation,
   uninstallRemoteClaude
 } from "./remote-claude-installation.js";
-import { RemoteClaudeWorktreeOwner } from "./remote-claude-worktree-owner.js";
+import { remoteBindingFromLease, RemoteClaudeWorktreeOwner } from "./remote-claude-worktree-owner.js";
 
 describe("remote Claude installation", () => {
+  it.each(["inspect", "cleanup", "release"] as const)("recaptures a renamed SSH project's exact checkout only for claimed %s", async operation => {
+    const store = new OperationalStore(":memory:");
+    try {
+      store.upsertBackend({ id: "claude-fixture", adapterKind: "claude-agent-sdk-stdio", displayName: "Claude", version: "0.1.0", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+      const remote = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
+      const target = store.upsertTarget({ id: "remote-target", backendId: "claude-fixture", displayName: "Remote project",
+        workspaceRoot: process.cwd(), managed: true, trusted: true, remoteWorkspace: remote });
+      const ready = probeOutput("ready", { workspace: remote.workspaceRoot });
+      const processes = new ScriptedProcesses([ready, { stdout: JSON.stringify({ format: 1, status: "source", repositoryRoot: remote.workspaceRoot,
+        sourceCommit: "a".repeat(40), sourceSnapshot: `sha256:${"b".repeat(64)}` }), exitCode: 0 }]);
+      const owner = new RemoteClaudeWorktreeOwner({ store, remoteExecution: { processes: async binding => ({
+        kind: "ssh", binding, executionIdentity: "same-ssh-user-and-key", authorityIdentity: "current-ssh-authority", pathStyle: "posix",
+        assertCurrent() {}, assertForwardingCurrent() {}, processes
+      }) } });
+      const plan = (await owner.plan({ target, sessionId: "child", sourceSessionId: "parent", workspaceId: "worktree-child", sourceCwd: remote.workspaceRoot }))!;
+      const lease: RemoteGitCheckoutLease = { id: plan.leaseId, sessionId: plan.sessionId, path: plan.path, repositoryRoot: plan.repositoryRoot,
+        branch: plan.branch, source: { ref: plan.sourceRef, commit: plan.sourceCommit, strategy: "explicit", refreshed: false }, acquiredAt: 1, remote: plan.remote };
+      store.upsertTarget({ ...target.descriptor, displayName: "Renamed" });
+      processes.enqueue(ready, ready);
+      await expect(owner.derive(plan)).rejects.toMatchObject({ code: "AUTHORITY_CHANGED" });
+      await expect(owner.assertExact(plan.sessionId, remoteBindingFromLease(plan.workspaceId, lease))).rejects.toMatchObject({ code: "AUTHORITY_CHANGED" });
+      expect(processes.inputs.some(input => input.includes('"operation":"derive"') || input.includes('"operation":"assert"'))).toBe(false);
+      const assertClaim = () => undefined;
+      processes.enqueue(ready, { stdout: JSON.stringify({ format: 1, status: operation === "inspect" ? "active" : "released", lease }), exitCode: 0 });
+      const recovered = operation === "inspect" ? owner.inspectExact(plan, undefined, assertClaim)
+        : operation === "cleanup" ? owner.cleanupPending(plan, undefined, assertClaim)
+          : owner.releaseExact(plan.sessionId, remoteBindingFromLease(plan.workspaceId, lease), undefined, assertClaim);
+      await expect(recovered).resolves.toEqual(operation === "inspect" ? { status: "active", lease } : "released");
+      expect(processes.inputs.at(-1)).toContain(`"targetRevision":"${plan.remote.targetRevision}"`);
+      const calls = processes.requests.length;
+      store.upsertTarget({ ...target.descriptor, remoteWorkspace: { ...remote, workspaceRoot: "/srv/different-project" } });
+      await expect(owner.inspectExact(plan, undefined, assertClaim)).rejects.toMatchObject({ code: "AUTHORITY_CHANGED" });
+      expect(processes.requests).toHaveLength(calls);
+    } finally { store.close(); }
+  });
+
+  it.each(["probe", "dispatch", "result"] as const)("retires the original cleanup claim at the %s boundary without accepting a stale release", async boundary => {
+    const store = new OperationalStore(":memory:");
+    try {
+      store.upsertBackend({ id: "claude-fixture", adapterKind: "claude-agent-sdk-stdio", displayName: "Claude", version: "0.1.0", instanceGeneration: 1,
+        health: "healthy", installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+      const remote = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "ssh", workspaceRoot: "/srv/project" };
+      const target = store.upsertTarget({ id: "remote-target", backendId: "claude-fixture", displayName: "Remote project",
+        workspaceRoot: process.cwd(), managed: true, trusted: true, remoteWorkspace: remote });
+      const ready = probeOutput("ready", { workspace: remote.workspaceRoot });
+      const processes = new ScriptedProcesses([ready, { stdout: JSON.stringify({ format: 1, status: "source", repositoryRoot: remote.workspaceRoot,
+        sourceCommit: "a".repeat(40), sourceSnapshot: `sha256:${"b".repeat(64)}` }), exitCode: 0 }]);
+      let claimed = true;
+      const owner = new RemoteClaudeWorktreeOwner({ store, remoteExecution: { processes: async binding => ({
+        kind: "ssh", binding, executionIdentity: "same-ssh-user-and-key", authorityIdentity: "current-ssh-authority", pathStyle: "posix",
+        assertCurrent() {}, assertForwardingCurrent() {}, processes: { open: async request => {
+          const handle = await processes.open(request);
+          if ((boundary === "probe" && processes.requests.length === 3) || (boundary === "dispatch" && processes.requests.length === 4)) claimed = false;
+          if (boundary === "result" && processes.requests.length === 4) handle.once("exit", () => { claimed = false; });
+          return handle;
+        } }
+      }) } });
+      const plan = (await owner.plan({ target, sessionId: "child", sourceSessionId: "parent", workspaceId: "worktree-child", sourceCwd: remote.workspaceRoot }))!;
+      const lease: RemoteGitCheckoutLease = { id: plan.leaseId, sessionId: plan.sessionId, path: plan.path, repositoryRoot: plan.repositoryRoot,
+        branch: plan.branch, source: { ref: plan.sourceRef, commit: plan.sourceCommit, strategy: "explicit", refreshed: false }, acquiredAt: 1, remote: plan.remote };
+      store.upsertTarget({ ...target.descriptor, displayName: "Renamed" });
+      processes.enqueue(ready, { stdout: JSON.stringify({ format: 1, status: "released" }), exitCode: 0 });
+      const release = owner.releaseExact(plan.sessionId, remoteBindingFromLease(plan.workspaceId, lease), undefined,
+        () => { if (!claimed) throw new Error("The original cleanup claim retired."); });
+      if (boundary === "result") await expect(release).rejects.toMatchObject({ code: "OUTCOME_UNKNOWN", stateMayHaveChanged: true });
+      else await expect(release).rejects.toThrow();
+      expect(processes.inputs.filter(input => input.includes('"operation":"release"'))).toHaveLength(boundary === "result" ? 1 : 0);
+    } finally { store.close(); }
+  });
+
   it.each([3, 4])("withholds the remote checkout request when the original connection is revoked at process %s", async retireAt => {
     const store = new OperationalStore(":memory:");
     try {
@@ -144,6 +215,8 @@ class ScriptedProcesses implements RemoteProcessTransportPort {
   readonly #results: ProcessResult[];
 
   constructor(results: ProcessResult[]) { this.#results = [...results]; }
+
+  enqueue(...results: ProcessResult[]): void { this.#results.push(...results); }
 
   async open(request: RemoteProcessStartRequest): Promise<RemoteProcessHandle> {
     const result = this.#results.shift();

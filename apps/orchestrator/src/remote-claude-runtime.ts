@@ -318,6 +318,10 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       assertAuthorityCurrent();
       runtime?.assertManagerGenerationCurrent();
     };
+    const assertRetirementCurrent = authority.kind === "ssh" ? (): void => {
+      if (this.#closed || this.#entries.get(key) !== entry) throw runtimeFault("authority_changed", false);
+      authority.assertCurrent();
+    } : assertAuthorityCurrent;
     runtime = new RemoteClaudeSdkRuntime({
       processes,
       forwarding: authority.forwarding,
@@ -330,14 +334,15 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       authorizedWorkspaceRoot: effectiveWorkspaceRoot,
       ...(directoryAuthority === undefined ? {} : { verifyWorkspace: directoryAuthority.verifyExact }),
       assertCurrent,
-      assertAuthorityCurrent,
+      assertRetirementCurrent,
       assertForwardingCurrent: authority.assertForwardingCurrent
     });
     const binding: ClaudeTargetRuntime = Object.freeze({
       runtime,
       workspaceRoot: effectiveWorkspaceRoot,
       remote: true,
-      assertCurrent
+      assertCurrent,
+      assertRetirementCurrent
     });
     entry = Object.freeze({
       key,
@@ -444,7 +449,7 @@ interface RemoteClaudeSdkRuntimeOptions {
   readonly authorizedWorkspaceRoot: string;
   readonly verifyWorkspace?: (signal?: AbortSignal) => Promise<void>;
   readonly assertCurrent: () => void;
-  readonly assertAuthorityCurrent: () => void;
+  readonly assertRetirementCurrent: () => void;
   readonly assertForwardingCurrent: () => void;
 }
 
@@ -835,7 +840,7 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
         ownerGeneration: this.#options.ownerGeneration,
         storeAuthority: this.#options.storeAuthority,
         params: forwardedParams,
-        assertAuthorityCurrent: this.#options.assertAuthorityCurrent,
+        assertRetirementCurrent: this.#options.assertRetirementCurrent,
         ...(forward === undefined ? {} : { forward }),
         onRetired: (query) => this.#queries.delete(query)
       });
@@ -1115,7 +1120,7 @@ interface RemoteClaudeQueryOpenOptions extends RemoteClaudeManagerChannelOptions
   readonly ownerGeneration: string;
   readonly storeAuthority: RemoteClaudeStoreAuthority;
   readonly params: ClaudeSdkQueryParams;
-  readonly assertAuthorityCurrent: () => void;
+  readonly assertRetirementCurrent: () => void;
   readonly forward?: RemoteReverseForwardHandle;
   readonly onRetired: (query: RemoteClaudeQuery) => void;
 }
@@ -1370,7 +1375,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
     const channel = await RemoteClaudeManagerChannel.open({
       processes: this.#options.processes,
       installation: this.#options.installation,
-      assertCurrent: this.#options.assertAuthorityCurrent,
+      assertCurrent: this.#options.assertRetirementCurrent,
       acceptManagerGeneration: () => undefined
     });
     try {

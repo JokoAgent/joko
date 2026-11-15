@@ -46,6 +46,46 @@ afterEach(async () => {
 });
 
 describe("RemoteClaudeRuntimeResolver", () => {
+  it("retires only the original owned SSH Query after a project rename without admitting new SDK effects", async () => {
+    const fixture = createFixture();
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false));
+    const original = fixture.processes.startRequests[0]!.params;
+    fixture.stored = { ...fixture.stored, descriptor: { ...fixture.stored.descriptor, displayName: "Renamed project" },
+      revision: fixture.stored.revision + 1n };
+    expect(() => binding.assertCurrent()).toThrow();
+    const beforeEffect = fixture.processes.frames.length;
+    await expect(binding.runtime.getSessionInfo(SESSION_ID, { dir: binding.workspaceRoot })).rejects.toMatchObject({ code: "authority_changed" });
+    expect(fixture.processes.frames).toHaveLength(beforeEffect);
+    await binding.runtime.retireQuery(query, 2_000);
+    expect(() => binding.assertRetirementCurrent!()).not.toThrow();
+    expect(fixture.processes.frames.find(frame => frame.method === "query.retireOwned")).toMatchObject({ params: {
+      queryId: original.queryId, ownerKey: original.ownerKey, ownerGeneration: original.ownerGeneration
+    } });
+    expect(fixture.processes.retireEffects).toBe(1);
+    const beforeReplay = fixture.processes.frames.length;
+    await binding.runtime.retireQuery(query, 2_000);
+    await fixture.resolver.close();
+    expect(fixture.processes.frames).toHaveLength(beforeReplay);
+    expect(fixture.processes.queryStartEffects).toBe(1);
+  });
+
+  it.each(["SSH authority", "Device peer Target"] as const)("keeps original Query retirement closed when %s changes", async boundary => {
+    const fixture = createFixture({ devicePeerWin32: boundary === "Device peer Target" });
+    cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false));
+    fixture.stored = { ...fixture.stored, revision: fixture.stored.revision + 1n };
+    if (boundary === "SSH authority") fixture.authorityCurrent = false;
+    expect(() => binding.assertRetirementCurrent!()).toThrow();
+    const captures = fixture.capture.mock.calls.length;
+    await expect(binding.runtime.retireQuery(query, 2_000)).rejects.toThrow();
+    expect(fixture.processes.frames.some(frame => frame.method === "query.retireOwned")).toBe(false);
+    expect(fixture.processes.retireEffects).toBe(0);
+    expect(fixture.capture).toHaveBeenCalledTimes(captures);
+  });
+
   it("blocks a new SSH Query after uninstall while the original Query stays usable", async () => {
     const fixture = createFixture();
     cleanups.push(() => fixture.resolver.close());

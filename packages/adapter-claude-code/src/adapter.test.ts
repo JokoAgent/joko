@@ -6042,6 +6042,37 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
+  test.each(["original SSH lease", "revoked SSH lease", "original strict Target"] as const)(
+    "checks %s when adopting the original Query retirement after a project change", async boundary => {
+      const selectedTarget: TargetDescriptor = { ...target, id: "remote-retirement", workspaceRoot: "/srv/project",
+        remoteWorkspace: { kind: "ssh", hostTargetId: "remote-retirement", hostId: "host-a", workspaceRoot: "/srv/project" } };
+      const remote = new FakeSdkRuntime({ initialFrameOverrides: { cwd: selectedTarget.workspaceRoot } });
+      let targetCurrent = true, leaseCurrent = true;
+      const assertCurrent = () => { if (!targetCurrent) throw new Error("The original Target changed."); };
+      const assertRetirementCurrent = vi.fn(() => { if (!leaseCurrent) throw new Error("The original SSH lease was revoked."); });
+      const adapter = adapterFor(new FakeSdkRuntime(), { remoteRuntimes: {
+        resolve: async () => ({ runtime: remote, workspaceRoot: selectedTarget.workspaceRoot, remote: true, assertCurrent,
+          ...(boundary === "original strict Target" ? {} : { assertRetirementCurrent }) }),
+        close: async () => undefined
+      } });
+      try {
+        await adapter.createSession(createInput({ target: selectedTarget }), contextFor(undefined, { target: selectedTarget }).context);
+        const query = remote.queries[0]!;
+        targetCurrent = false;
+        leaseCurrent = boundary !== "revoked SSH lease";
+        const retirement = adapter.dispose();
+        if (boundary === "original SSH lease") await expect(retirement).resolves.toBeUndefined();
+        else await expect(retirement).rejects.toThrow();
+        expect(remote.retiredQueries).toEqual([query]);
+        expect(query.closeCalls).toBe(1);
+        if (boundary !== "original strict Target") expect(assertRetirementCurrent).toHaveBeenCalledOnce();
+      } finally {
+        targetCurrent = true; leaseCurrent = true;
+        await adapter.dispose();
+      }
+    }
+  );
+
   test.each(["delete", "consumed-missing"] as const)("restores the exact remote empty context before %s without using the local input fence", async (ending) => {
     const directory = await mkdtemp(join(tmpdir(), "joko-claude-remote-empty-"));
     const selectedTarget: TargetDescriptor = { ...target, id: "remote-empty", workspaceRoot: "/srv/project",

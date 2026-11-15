@@ -507,6 +507,8 @@ export interface ClaudeTargetRuntime {
   readonly workspaceRoot: string;
   readonly remote: boolean;
   assertCurrent(): void;
+  /** Validate the original owner after confirmed Query retirement only. */
+  readonly assertRetirementCurrent?: () => void;
 }
 
 /** Adapter-owned resolver for Target-scoped remote Claude runtimes. */
