@@ -175,7 +175,10 @@ export function encodePortableSessionPackage(
   const compressed = gzipSync(serialized, { level: 9 });
   if (compressed.byteLength > contentLimit) throw contentLimitExceeded(contentLimit, compressed.byteLength);
 
-  const password = normalizePassword(options.password);
+  const password = passwordForms(options.password)?.canonical;
+  if (password !== undefined && password.byteLength > MAX_PASSWORD_BYTES) {
+    throw invalid("Portable Session password must be non-empty and at most 1,024 bytes.");
+  }
   let payload: Buffer;
   let header: PackageHeader;
   if (password === undefined) {
@@ -235,24 +238,34 @@ export function decodePortableSessionPackage(
     if (!safeDigest(payload, header.payloadSha256)) throw invalid("Portable Session payload integrity check failed.");
     compressed = payload;
   } else {
-    const password = normalizePassword(options.password);
-    if (password === undefined) {
+    const passwords = passwordForms(options.password);
+    if (passwords === undefined) {
       throw new PortableSessionPackageError("PASSWORD_REQUIRED", "This portable Session package requires a password.");
     }
     const salt = decodeFixedBase64(header.salt, 16, "salt");
     const nonce = decodeFixedBase64(header.nonce, 12, "nonce");
     const tag = decodeFixedBase64(header.tag, 16, "authentication tag");
-    try {
-      const decipher = createDecipheriv("aes-256-gcm", deriveKey(password, salt), nonce);
-      decipher.setAAD(Buffer.from(JSON.stringify(encryptedAuthenticatedFields(salt, nonce, header.payloadBytes, header.payloadSha256)), "utf8"));
-      decipher.setAuthTag(tag);
-      compressed = Buffer.concat([decipher.update(payload), decipher.final()]);
-    } catch {
+    const candidates = passwords.canonical.byteLength <= MAX_PASSWORD_BYTES && !passwords.canonical.equals(passwords.raw)
+      ? [passwords.canonical, passwords.raw] : [passwords.raw];
+    let authenticatedPayload: Buffer | undefined;
+    for (const password of candidates) {
+      try {
+        const decipher = createDecipheriv("aes-256-gcm", deriveKey(password, salt), nonce);
+        decipher.setAAD(Buffer.from(JSON.stringify(encryptedAuthenticatedFields(salt, nonce, header.payloadBytes, header.payloadSha256)), "utf8"));
+        decipher.setAuthTag(tag);
+        authenticatedPayload = Buffer.concat([decipher.update(payload), decipher.final()]);
+        break;
+      } catch {
+        // Current v1 packages can authenticate either the canonical or exact supplied password bytes.
+      }
+    }
+    if (authenticatedPayload === undefined) {
       throw new PortableSessionPackageError(
         "DECRYPTION_FAILED",
         "The portable Session package password is incorrect or the package was modified."
       );
     }
+    compressed = authenticatedPayload;
     if (!safeDigest(compressed, header.payloadSha256)) {
       throw new PortableSessionPackageError("DECRYPTION_FAILED", "The portable Session package failed its integrity check.");
     }
@@ -464,14 +477,14 @@ function validateEntryKind(value: unknown): asserts value is PortableSessionEntr
   }
 }
 
-function normalizePassword(value: string | undefined): Buffer | undefined {
+function passwordForms(value: string | undefined): { readonly raw: Buffer; readonly canonical: Buffer } | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw invalid("Portable Session password is invalid.");
   const bytes = Buffer.from(value, "utf8");
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_PASSWORD_BYTES || value.includes("\u0000")) {
     throw invalid("Portable Session password must be non-empty and at most 1,024 bytes.");
   }
-  return bytes;
+  return { raw: bytes, canonical: Buffer.from(value.normalize("NFC"), "utf8") };
 }
 
 function normalizeContentLimit(value: number | undefined): number {

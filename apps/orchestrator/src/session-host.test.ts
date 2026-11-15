@@ -4243,14 +4243,14 @@ describe("SessionHost", () => {
     });
     const exported = await fixture.host.exportPortableSession({
       sessionId: sourceSessionId,
-      password: "correct horse battery staple"
+      password: "cafe\u0301 portable phrase"
     });
     const request = {
       operationId: "import-portable-task",
       connection: fixture.connection,
       targetId: "target-one",
       package: exported.artifact,
-      password: "correct horse battery staple",
+      password: "caf\u00e9 portable phrase",
       title: "Restored portable task",
       fastMode: false,
       permissionMode: "ask" as const,
