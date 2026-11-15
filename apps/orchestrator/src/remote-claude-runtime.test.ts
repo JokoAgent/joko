@@ -52,13 +52,22 @@ describe("RemoteClaudeRuntimeResolver", () => {
     const binding = await fixture.resolver.resolve(fixture.target);
     const query = await binding.runtime.query(queryParams(undefined, undefined, false));
     const original = fixture.processes.startRequests[0]!.params;
+    const identity = freshIdentity(fixture.target, binding.workspaceRoot);
+    const source = { sourceSessionId: identity.sourceSessionId, sourceBinding: identity.sourceBinding };
+    fixture.processes.freshResponses.set("fresh.hasPendingSource", true);
+    fixture.processes.freshResponses.set("fresh.markSourceRetired", { confirmed: true });
     fixture.stored = { ...fixture.stored, descriptor: { ...fixture.stored.descriptor, displayName: "Renamed project" },
       revision: fixture.stored.revision + 1n };
     expect(() => binding.assertCurrent()).toThrow();
     const beforeEffect = fixture.processes.frames.length;
     await expect(binding.runtime.getSessionInfo(SESSION_ID, { dir: binding.workspaceRoot })).rejects.toMatchObject({ code: "authority_changed" });
+    await expect(binding.runtime.freshContexts!.reserve(identity)).rejects.toMatchObject({ code: "authority_changed" });
     expect(fixture.processes.frames).toHaveLength(beforeEffect);
+    expect(await binding.runtime.freshContexts!.hasPendingSource(source)).toBe(true);
     await binding.runtime.retireQuery(query, 2_000);
+    await binding.runtime.freshContexts!.markSourceRetired(source);
+    expect(fixture.processes.freshRequests.map(request => ({ method: request.method, input: request.params["input"] })))
+      .toEqual([{ method: "fresh.hasPendingSource", input: source }, { method: "fresh.markSourceRetired", input: source }]);
     expect(() => binding.assertRetirementCurrent!()).not.toThrow();
     expect(fixture.processes.frames.find(frame => frame.method === "query.retireOwned")).toMatchObject({ params: {
       queryId: original.queryId, ownerKey: original.ownerKey, ownerGeneration: original.ownerGeneration
@@ -80,11 +89,40 @@ describe("RemoteClaudeRuntimeResolver", () => {
     if (boundary === "SSH authority") fixture.authorityCurrent = false;
     expect(() => binding.assertRetirementCurrent!()).toThrow();
     const captures = fixture.capture.mock.calls.length;
+    const identity = freshIdentity(fixture.target, binding.workspaceRoot);
+    const source = { sourceSessionId: identity.sourceSessionId, sourceBinding: identity.sourceBinding };
+    await expect(binding.runtime.freshContexts!.hasPendingSource(source)).rejects.toThrow();
+    await expect(binding.runtime.freshContexts!.markSourceRetired(source)).rejects.toThrow();
     await expect(binding.runtime.retireQuery(query, 2_000)).rejects.toThrow();
+    expect(fixture.processes.freshRequests).toEqual([]);
     expect(fixture.processes.frames.some(frame => frame.method === "query.retireOwned")).toBe(false);
     expect(fixture.processes.retireEffects).toBe(0);
     expect(fixture.capture).toHaveBeenCalledTimes(captures);
   });
+
+  it.each(["fresh.hasPendingSource", "fresh.markSourceRetired"] as const)(
+    "rejects the original %s receipt when its SSH authority is revoked during the response", async method => {
+      const fixture = createFixture();
+      cleanups.push(() => fixture.resolver.close());
+      const binding = await fixture.resolver.resolve(fixture.target);
+      const identity = freshIdentity(fixture.target, binding.workspaceRoot);
+      const source = { sourceSessionId: identity.sourceSessionId, sourceBinding: identity.sourceBinding };
+      fixture.processes.freshResponses.set("fresh.hasPendingSource", true);
+      fixture.processes.freshResponses.set("fresh.markSourceRetired", { confirmed: true });
+      const response = fixture.processes.freshResponses.get.bind(fixture.processes.freshResponses);
+      vi.spyOn(fixture.processes.freshResponses, "get").mockImplementation(key => {
+        const value = response(key);
+        if (key === method) fixture.authorityCurrent = false;
+        return value;
+      });
+      const captures = fixture.capture.mock.calls.length;
+      await expect(method === "fresh.hasPendingSource"
+        ? binding.runtime.freshContexts!.hasPendingSource(source)
+        : binding.runtime.freshContexts!.markSourceRetired(source)).rejects.toThrow();
+      expect(fixture.processes.freshRequests.map(request => request.method)).toEqual([method]);
+      expect(fixture.capture).toHaveBeenCalledTimes(captures);
+    }
+  );
 
   it("blocks a new SSH Query after uninstall while the original Query stays usable", async () => {
     const fixture = createFixture();
