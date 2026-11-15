@@ -173,7 +173,8 @@ describe("registered remote project Skill input composition", () => {
             expectedRevision: { value: store.getTarget(target.id).revision } }],
             payload: { case: "updateTarget", value: { targetId: target.id, displayName: "Renamed remote project" } } } });
         expect(store.getTarget(target.id).descriptor.displayName).toBe("Renamed remote project");
-        expect(workspaceService.requireWorkspace("remote-workspace").displayName).toBe("Renamed remote project");
+        expect(workspaceService.listRegistrations().find(workspace => workspace.id === "remote-workspace")?.displayName)
+          .toBe("Renamed remote project");
       }
       const selectProject = async () => {
         const selected = await targets.prepareTargetWorkspace({

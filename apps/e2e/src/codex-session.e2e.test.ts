@@ -461,11 +461,15 @@ it("reopens the same Codex history after a recorded in-progress user entry compl
     nativeHost = new AppServerHost({ transportFactory: () => native.createTransport() });
     fixture = await start();
     const clients = fixture.clients(paired.authKey);
-    const lifecycle = (action: "resumeSession" | "closeSession") => submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
-      preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId },
-        expectedGeneration: BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation) }],
-      payload: action === "resumeSession" ? { case: "resumeSession", value: { sessionId } } : { case: "closeSession", value: { sessionId } }
-    }));
+    const lifecycle = async (action: "resumeSession" | "closeSession") => {
+      const receipt = await submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId },
+          expectedGeneration: BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation) }],
+        payload: action === "resumeSession" ? { case: "resumeSession", value: { sessionId } } : { case: "closeSession", value: { sessionId } }
+      }));
+      expect(receipt.error, action).toBeUndefined();
+      return receipt;
+    };
     expect((await lifecycle("resumeSession")).state).toBe(OperationState.SUCCEEDED);
     const events = fixture.application.store.listEvents({ sessionId });
     expect(events.filter(event => event.metadata?.namespace === "codex.native_history"
