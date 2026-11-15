@@ -4037,8 +4037,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     getBlobDownloadTicket: async (request, context) => {
       authenticate(context);
-      const ticket = await dependencies.blobTransfers.beginDownload(request.blobId);
       const artifactRecord = dependencies.store.getArtifact(request.blobId);
+      const ticket = await dependencies.blobTransfers.beginDownload(request.blobId);
       return {
         ticket: create(contract.BlobTransferTicketSchema, {
           ticketId: ticket.ticketId,

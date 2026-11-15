@@ -4667,7 +4667,7 @@ export class PiBackendAdapter implements
     const history = await this.#getEntriesRaw(undefined, runtime, context.signal);
     return projectPiNativeHistory(binding.nativeSessionId, {
       entries: await Promise.all(history.entries.map(async (entry) =>
-        runtime.translator.materializeNativeHistoryEntry(toNativeHistoryEntry(entry)))),
+        runtime.translator.materializeNativeHistoryEntry(toNativeHistoryEntry(entry), context.readNativeHistoryProjection))),
       leafId: history.leafId === null ? null : boundedNativeIdentifier(history.leafId, "leaf")
     });
   }
@@ -5937,7 +5937,7 @@ export class PiBackendAdapter implements
             if (await handlePolicyDecisionExtensionRequest(
               event as unknown as Record<string, unknown>,
               {
-                decide: (request) => this.#decideOrderedPolicy(runtime, request),
+                decide: (request) => this.#decideOrderedPolicy(runtime, capturedEventContext, request, isCurrent),
                 transport: runtime.transport,
                 isCurrent
               }
@@ -6081,13 +6081,14 @@ export class PiBackendAdapter implements
 
   async #decideOrderedPolicy(
     runtime: PiRuntime,
-    request: PolicyDecisionRequest
+    context: AdapterContext,
+    request: PolicyDecisionRequest,
+    isCurrent: () => boolean
   ): Promise<PolicyDecisionResult | PolicyDecisionReply> {
-    const context = runtime.context;
     const reply = (decision: PolicyDecisionResult): PolicyDecisionResult | PolicyDecisionReply => decision !== "default" ? decision : ({ decision,
       ownerUserInstructions: (context.nativeToolAuthorization?.readOwnerUserInstructions?.() ?? []).map(text => redactManagedSecrets(text, runtime.redactValues)) });
       const control = await readControl(runtime.controlPath, runtime.transport.generation);
-      if (control.policyGeneration !== request.policyGeneration) return reply("stale");
+      if (!isCurrent() || control.policyGeneration !== request.policyGeneration) return reply("stale");
       const snapshot = context.policySnapshot;
       const policy = snapshot === undefined ? "default" : evaluateOrderedPolicyRules(snapshot, request.observation)?.action ?? "default";
       if (policy === "deny") return reply(policy);
@@ -6096,7 +6097,7 @@ export class PiBackendAdapter implements
         const decision = await authorization.review({ ...request.toolCall, signal: context.signal });
         authorization.assertCurrent(decision.authorizationRevision);
         const current = await readControl(runtime.controlPath, runtime.transport.generation);
-        if (current.policyGeneration !== request.policyGeneration || runtime.context !== context) return reply("stale");
+        if (!isCurrent() || current.policyGeneration !== request.policyGeneration) return reply("stale");
         authorization.assertCurrent(decision.authorizationRevision);
         if (decision.verdict === "block") return reply("deny");
         if (decision.verdict === "ask") return reply("ask");

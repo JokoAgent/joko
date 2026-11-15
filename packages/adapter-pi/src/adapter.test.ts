@@ -2666,12 +2666,35 @@ describe("PiBackendAdapter", () => {
       processes[0]?.emitExtensionInput("native-current", encodePolicyDecisionRequest(nativeRead));
       await waitForAdapterCondition(() => processes[0]?.commands.some(command => command.id === "native-current") === true);
       expect(processes[0]?.commands).toContainEqual(expect.objectContaining({ id: "native-current", value: "delegated_allow" }));
-      pause = true; processes[0]?.emitExtensionInput("native-revoked", encodePolicyDecisionRequest(nativeRead));
-      await waitForAdapterCondition(() => review.mock.calls.length === 2); authorityCurrent = false; release();
+      pause = true;
+      processes[0]?.emitExtensionInput("native-observed", encodePolicyDecisionRequest(nativeRead));
+      await waitForAdapterCondition(() => review.mock.calls.length === 2);
+      processes[0]?.emitExtensionInput("native-queued-before-read", encodePolicyDecisionRequest(nativeRead));
+      const observationReview = vi.fn(async () => { throw new Error("A later read cannot authorize an earlier native request."); });
+      await adapter.getState({ ...context, nativeToolAuthorization: { ...nativeToolAuthorization, review: observationReview } });
+      pause = false; release();
+      await waitForAdapterCondition(() => processes[0]?.commands.some(command => command.id === "native-queued-before-read") === true);
+      expect(processes[0]?.commands).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: "native-observed", value: "delegated_allow" }),
+        expect.objectContaining({ id: "native-queued-before-read", value: "delegated_allow" })
+      ]));
+      expect(observationReview).not.toHaveBeenCalled();
+      expect(review).toHaveBeenCalledTimes(3);
+      await adapter.getState(context);
+      pause = true;
+      processes[0]?.emitExtensionInput("native-policy-changed", encodePolicyDecisionRequest(nativeRead));
+      await waitForAdapterCondition(() => review.mock.calls.length === 4);
+      await adapter.setPolicySnapshot({ ...context, policySnapshot: { ...snapshot, generation: "4" } });
+      pause = false; release();
+      await waitForAdapterCondition(() => processes[0]?.commands.some(command => command.id === "native-policy-changed") === true);
+      expect(processes[0]?.commands).toContainEqual(expect.objectContaining({ id: "native-policy-changed", value: "stale" }));
+      pause = true; processes[0]?.emitExtensionInput("native-revoked", encodePolicyDecisionRequest({ ...nativeRead, policyGeneration: 2 }));
+      await waitForAdapterCondition(() => review.mock.calls.length === 5); authorityCurrent = false; release();
       await waitForAdapterCondition(() => processes[0]?.commands.some(command => command.id === "native-revoked") === true);
       expect(processes[0]?.commands).toContainEqual(expect.objectContaining({ id: "native-revoked", cancelled: true }));
       await adapter.closeSession(binding, context);
     } finally {
+      pause = false; release?.();
       await adapter.dispose().catch(() => undefined);
     }
   });

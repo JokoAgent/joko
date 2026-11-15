@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
@@ -69,7 +69,8 @@ import {
   REAL_PI_PROVIDER_ID,
   REAL_PI_RESPONSE_TEXT,
   RealPiSystemFixture,
-  type RealPiProviderReply
+  type RealPiProviderReply,
+  type RealPiProviderResponder
 } from "./real-pi-fixture.js";
 import { installLocalSkill } from "./skill-system-fixture.js";
 
@@ -125,6 +126,119 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const usage = (await reconnected.run.getRun({ runId })).run?.usage;
     expect(usage?.completionEventId).toBe(completion?.eventId);
     expect(usage?.usage?.totalTokens).toBe(10n);
+  });
+
+  it.skipIf(process.platform !== "linux")("creates a valid same-byte Bash Artifact after explicit deletion and retains its native history across cold restart", { timeout: 120_000 }, async () => {
+    let callId = "bash-output-A";
+    const providerResponder: RealPiProviderResponder = ({ request }) => {
+      const messages = request.body["messages"] as readonly { readonly role: string }[];
+      return messages.at(-1)?.role === "tool" ? { kind: "text", text: "Bash output received." }
+        : { kind: "tool", name: "bash", callId, arguments: { command: "printf '%070000d' 0" } };
+    };
+    const options = { enableInternalServer: true, providerResponder };
+    fixture = await RealPiSystemFixture.start(options);
+    const target = fixture.application.store.getTarget("workspace-real-pi");
+    fixture.application.store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
+    const paired = await fixture.pair("Pi complete Bash output owner");
+    let clients = paired.clients;
+    const sessionId = sessionIdFrom(await submit(clients.operation, paired.connectionId, createSessionMutation({
+      backendId: "pi", targetId: target.descriptor.id, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID,
+      effortId: "off", permissionMode: PermissionMode.BYPASS_PERMISSIONS
+    })));
+    const expectedBytes = Buffer.from("0".repeat(70_000));
+    const expectedSha256 = createHash("sha256").update(expectedBytes).digest("hex");
+    const turn = async (nextCall: string) => {
+      callId = nextCall;
+      const generation = BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation);
+      const accepted = await submit(clients.operation, paired.connectionId, sendInputMutation(sessionId, generation, `Run ${nextCall}.`));
+      expect(accepted.state).toBe(OperationState.SUCCEEDED);
+      const runId = queueRunIdFrom(accepted);
+      const result = await waitForRealSystem(() => clients.run.getRun({ runId }),
+        response => response.run?.state === RunState.SUCCEEDED || response.run?.state === RunState.FAILED,
+        "the published Pi Bash turn to settle", 30_000);
+      expect(result.run, JSON.stringify(result.run?.error)).toMatchObject({ state: RunState.SUCCEEDED });
+      const event = fixture!.application.store.listEvents({ sessionId, activeNativeTimeline: true }).find(event =>
+        event.payload.type === "tool_result" && event.payload.callId === nextCall && event.payload.nativeHistory !== undefined);
+      if (event?.payload.type !== "tool_result" || event.payload.artifact === undefined) {
+        throw new Error("The settled native Bash occurrence has no complete output Artifact.");
+      }
+      expect(event.payload).toMatchObject({ name: "bash", isError: false });
+      expect(event.payload.artifact).toMatchObject({ sha256: expectedSha256, byteLength: expectedBytes.byteLength, mimeType: "text/plain" });
+      return { event, artifact: event.payload.artifact };
+    };
+    const download = async (blob: BlobRef) => {
+      const { ticket } = await clients.artifact.getBlobDownloadTicket({ blobId: blob.id });
+      if (ticket === undefined) throw new Error("The new Bash output has no download ticket.");
+      const response = await fetch(`${fixture!.baseUrl}${ticket.relativeEndpoint}`, { headers: { authorization: `Bearer ${paired.authKey}` } });
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(expectedBytes);
+    };
+    const first = await turn("bash-output-A");
+    await download(first.artifact);
+    await expect(submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: { case: "deleteArtifact", value: { artifactId: "no-such-output" } }
+    }))).rejects.toMatchObject({ code: Code.NotFound });
+    await download(first.artifact);
+    const deleteId = randomUUID(), deletion = create(OperationMutationSchema, {
+      payload: { case: "deleteArtifact", value: { artifactId: first.artifact.id } }
+    });
+    const deleted = await submit(clients.operation, paired.connectionId, deletion, deleteId);
+    expect(deleted.state).toBe(OperationState.SUCCEEDED);
+    expect(await submit(clients.operation, paired.connectionId, deletion, deleteId)).toEqual(deleted);
+    expect(fixture.application.store.findArtifact(first.artifact.id)).toBeUndefined();
+    expect(fixture.application.store.findArtifact(first.artifact.id, true)?.blob).toEqual(first.artifact);
+    await expect(clients.artifact.getBlobDownloadTicket({ blobId: first.artifact.id })).rejects.toMatchObject({ code: Code.NotFound });
+    const second = await turn("bash-output-B");
+    expect(second.artifact.id).not.toBe(first.artifact.id);
+    await download(second.artifact);
+    expect(fixture.application.store.findEvent(first.event.id)?.payload).toEqual(first.event.payload);
+    expect(fixture.application.store.findArtifact(first.artifact.id)).toBeUndefined();
+    expect(fixture.application.store.getArtifact(second.artifact.id)).toMatchObject({ sessionId, metadata: {} });
+    const assertVisibleOutputs = async () => {
+      const { artifacts } = await clients.artifact.listArtifacts({ sessionId });
+      const diagnostics = {
+        outputs: artifacts.map(artifact => {
+          const stored = fixture!.application.store.getArtifact(artifact.artifactId);
+          return { blob: stored.blob, runId: stored.runId, metadata: stored.metadata };
+        }),
+        nativeResults: fixture!.application.store.listEvents({ sessionId, activeNativeTimeline: true })
+          .filter(event => event.payload.type === "tool_result")
+          .map(event => event.payload.type === "tool_result" ? {
+            eventId: event.id, callId: event.payload.callId, artifact: event.payload.artifact,
+            nativeHistory: event.payload.nativeHistory
+          } : undefined)
+      };
+      expect(artifacts.map(artifact => artifact.artifactId), JSON.stringify(diagnostics)).toEqual([second.artifact.id]);
+    };
+    await assertVisibleOutputs();
+    const binding = fixture.application.store.getSession(sessionId).descriptor.binding.opaqueRef;
+    const rootDirectory = fixture.rootDirectory;
+    await fixture.close({ removeRoot: false });
+    try {
+      fixture = await RealPiSystemFixture.start({ ...options, rootDirectory });
+      clients = fixture.clients(paired.authKey);
+      const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+      const resumed = await submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: generation }],
+        payload: { case: "resumeSession", value: { sessionId } }
+      }));
+      expect(resumed, JSON.stringify(resumed.error)).toMatchObject({ state: OperationState.SUCCEEDED });
+      expect(fixture.application.store.getSession(sessionId).descriptor.binding.opaqueRef).toBe(binding);
+      expect(fixture.application.store.findEvent(first.event.id)?.payload).toEqual(first.event.payload);
+      expect(fixture.application.store.findEvent(second.event.id)?.payload).toEqual(second.event.payload);
+      await assertVisibleOutputs();
+      await expect(clients.artifact.getBlobDownloadTicket({ blobId: first.artifact.id })).rejects.toMatchObject({ code: Code.NotFound });
+      await download(second.artifact);
+      const third = await turn("bash-output-C");
+      expect(third.artifact.id).not.toBe(first.artifact.id);
+      await download(third.artifact);
+      expect(fixture.application.store.findArtifact(first.artifact.id)).toBeUndefined();
+      expect(fixture.application.store.findArtifact(first.artifact.id, true)?.blob).toEqual(first.artifact);
+      expect(fixture.application.store.findEvent(first.event.id)?.payload).toEqual(first.event.payload);
+    } finally {
+      await fixture.close({ removeRoot: true });
+      await rm(rootDirectory, { recursive: true, force: true, maxRetries: 3 });
+    }
   });
 
   it("preserves omitted, explicit and null Schedule patches through the published Pi tool bridge", { timeout: 60_000 }, async () => {

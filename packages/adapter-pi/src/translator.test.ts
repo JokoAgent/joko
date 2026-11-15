@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, type AdapterContext, type AdapterEventMetadata, type BlobRef, type EventPayload, type TargetDescriptor } from "@joko/core";
@@ -1003,6 +1003,79 @@ describe("PiEventTranslator", () => {
     expect(JSON.stringify(result)).not.toContain(tailCanary);
     expect(storedArtifacts).toEqual([fullOutput]);
     expect(events.filter((event) => event.type === "artifact")).toEqual([]);
+  });
+
+  it.each([false, true])("keeps a new Bash occurrence distinct after deletion and preserves recorded history with changed bytes=%s", async changedBytes => {
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-output-owner-workspace-"));
+    const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-output-owner-artifacts-"));
+    const events: EventPayload[] = [];
+    const recorded = new Map<string, EventPayload>();
+    const deleted = new Set<string>();
+    let artifactOrdinal = 0;
+    const storeArtifact = vi.fn<AdapterContext["storeArtifact"]>(async (path, options) => {
+      const bytes = await readFile(path);
+      return { id: `output-${++artifactOrdinal}`, sha256: createHash("sha256").update(bytes).digest("hex"),
+        byteLength: bytes.byteLength, mimeType: options?.mimeType ?? "text/plain", fileName: options?.fileName };
+    });
+    const readRecorded = vi.fn<NonNullable<AdapterContext["readNativeHistoryProjection"]>>(identity => recorded.get(identity.nativeEntryId));
+    const base = { ...context(workspace, events, []), storeArtifact, readNativeHistoryProjection: readRecorded };
+    const translator = new PiEventTranslator({ context: base, artifactDirectory: artifacts, wasAbortRequested: () => false });
+    const paths = [join(artifacts, "native-A.log"), join(artifacts, "native-B.log")];
+    const contents = ["0".repeat(70_000), (changedBytes ? "1" : "0").repeat(70_000)];
+    const entries = [];
+    for (const [index, id] of ["A", "B"].entries()) {
+      for (const pending of [undefined, "", "partial output"]) {
+        if (pending !== undefined) await writeFile(paths[index]!, pending);
+        await translator.translate({ type: "tool_execution_update", toolCallId: `call-${id}`, toolName: "bash",
+          partialResult: { content: [{ type: "text", text: "preview" }], details: { fullOutputPath: paths[index]! } } } as unknown as PiRpcEvent);
+        expect(storeArtifact).toHaveBeenCalledTimes(index);
+      }
+      await writeFile(paths[index]!, contents[index]!);
+      await translator.translate({ type: "tool_execution_end", toolCallId: `call-${id}`, toolName: "bash", isError: false,
+        result: { content: [{ type: "text", text: "preview" }], details: { fullOutputPath: paths[index]! } } } as unknown as PiRpcEvent);
+      const entry = { id: `entry-${id}`, type: "message", timestamp: index + 1,
+        data: { message: { role: "toolResult", toolCallId: `call-${id}`, toolName: "bash", isError: false,
+          content: [{ type: "text", text: "preview" }], details: { fullOutputPath: paths[index]! } } } };
+      entries.push(entry);
+      const materialized = await translator.materializeNativeHistoryEntry(entry);
+      const projection = projectPiNativeHistory(undefined, { entries: [materialized], leafId: materialized.id });
+      const result = projection.events.find(event => event.payload.type === "tool_result")!.payload;
+      recorded.set(entry.id, result);
+      if (index === 0 && result.type === "tool_result") deleted.add(result.artifact!.id);
+    }
+    const output = events.filter(event => event.type === "tool_result");
+    expect(output).toMatchObject([{ artifact: { id: "output-1", fileName: "bash-call-A.log" } },
+      { artifact: { id: "output-2", fileName: "bash-call-B.log" } }]);
+    expect(output[1]?.type === "tool_result" && deleted.has(output[1].artifact!.id)).toBe(false);
+    expect(storeArtifact).toHaveBeenCalledTimes(2);
+    const updates = events.filter(event => event.type === "tool_update");
+    expect(updates).toHaveLength(6);
+    for (const update of updates) {
+      expect(update).toMatchObject({ name: "bash", output: "preview" });
+      expect(update.artifact).toBeUndefined();
+    }
+    await rm(paths[0]!);
+    await rm(paths[1]!);
+    const restartedArtifacts = await mkdtemp(join(tmpdir(), "joko-pi-output-next-generation-"));
+    const restarted = new PiEventTranslator({ context: base, artifactDirectory: restartedArtifacts, wasAbortRequested: () => false });
+    for (const entry of entries) {
+      const materialized = await restarted.materializeNativeHistoryEntry(entry);
+      const projection = projectPiNativeHistory(undefined, { entries: [materialized], leafId: materialized.id });
+      expect(projection.events.find(event => event.payload.type === "tool_result")?.payload).toEqual(recorded.get(entry.id));
+    }
+    expect(storeArtifact).toHaveBeenCalledTimes(2);
+    expect(readRecorded).toHaveBeenCalledWith({ nativeEntryId: "entry-A", projectionKind: "tool_result", contentIndex: 0 });
+    const original = entries[0]!;
+    const changed = await restarted.materializeNativeHistoryEntry({ ...original, data: { message: {
+      ...original.data.message, content: [{ type: "text", text: "changed native preview" }]
+    } } });
+    const changedProjection = projectPiNativeHistory(undefined, { entries: [changed], leafId: changed.id });
+    const changedResult = changedProjection.events.find(event => event.payload.type === "tool_result")!.payload;
+    expect(changedResult).toMatchObject({ output: expect.stringContaining("changed native preview"), artifact: { id: "output-1" } });
+    expect(changedResult).not.toEqual(recorded.get(original.id));
+    expect(events.filter(event => event.type === "error")).toEqual([]);
+    expect(storeArtifact).toHaveBeenCalledTimes(2);
+    expect(deleted).toEqual(new Set(["output-1"]));
   });
 
   it("stores complete native Bash tool output above 64 MiB using the host Artifact capacity", async () => {

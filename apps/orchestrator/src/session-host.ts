@@ -124,6 +124,7 @@ import {
 import {
   adoptObservedNativeAssistant,
   bindNativeHistoryEventMetadata,
+  deterministicNativeEventId,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   nativeHistoryReplayMetadata,
   projectNativeHistory
@@ -15506,6 +15507,21 @@ export class SessionHost {
     const extraDirectories = runtimePolicy === "review_read_only" || !extraDirectoriesSupported
       ? [] : selectedExtraDirectories ?? this.extraDirectories.listForTarget(target.id);
     const originalArtifactAuthority = artifactWorkspaceAuthority(this.#store.getTarget(target.id).descriptor, target, worktree);
+    const assertArtifactAuthority = (store: OperationalStore, targetRevision: bigint): StoredSession => {
+      this.#assertOpen();
+      if (!this.backendInstanceGenerationOwnsContext(sessionId, backendInstanceGeneration, runId, attemptId)) throw staleBackendInstanceContextError();
+      const current = store.getSession(sessionId);
+      if (current.descriptor.binding.generation !== generation || current.descriptor.deletedAt !== undefined || current.descriptor.archived
+        || binding !== undefined && (current.descriptor.binding.opaqueRef !== binding.opaqueRef
+          || current.descriptor.binding.nativeSessionId !== binding.nativeSessionId)) throw staleBackendInstanceContextError();
+      const registered = store.getTarget(target.id);
+      if (current.descriptor.targetId !== target.id || current.descriptor.backendId !== target.backendId
+        || registered.revision !== targetRevision || current.descriptor.worktree !== undefined && current.descriptor.worktree.state !== "active"
+        || artifactWorkspaceAuthority(registered.descriptor, this.targetForSession(current), current.descriptor.worktree) !== originalArtifactAuthority) {
+        throw new StoreError("The Backend Artifact workspace authority changed.");
+      }
+      return current;
+    };
     const turnBudget = this.#workingContextTurns.get(sessionId);
     const workingBudgets = turnBudget !== undefined && turnBudget.generation === generation
       && turnBudget.backendInstanceGeneration === backendInstanceGeneration
@@ -15940,27 +15956,33 @@ export class SessionHost {
             options?.signal
           ),
       artifactCapacityBytes: this.#artifactStore.maximumBlobBytes,
+      ...(backend.adapterKind !== "pi" || target.remoteWorkspace !== undefined || runtimePolicy !== undefined ? {} : {
+        readNativeHistoryProjection: (identity: { readonly nativeEntryId: string; readonly projectionKind: string; readonly contentIndex: number }): EventPayload | undefined => {
+          assertArtifactAuthority(this.#store, this.#store.getTarget(target.id).revision);
+          if (binding === undefined) return undefined;
+          if (!identity.nativeEntryId || identity.nativeEntryId.length > 4_096 || identity.nativeEntryId.includes("\0")
+            || !identity.projectionKind || identity.projectionKind.length > 256 || identity.projectionKind.includes("\0")
+            || !Number.isSafeInteger(identity.contentIndex) || identity.contentIndex < 0) {
+            throw new StoreError("The native history projection identity is invalid.");
+          }
+          const fingerprint = nativeBindingFingerprint(binding.opaqueRef);
+          const event = this.#store.findEvent(deterministicNativeEventId(sessionId, fingerprint,
+            identity.nativeEntryId, identity.projectionKind, identity.contentIndex));
+          if (event === undefined) return undefined;
+          if (event.sessionId !== sessionId || event.backendId !== target.backendId || event.targetId !== target.id
+            || event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== fingerprint
+            || nativeHistoryEventContext(event.payload)?.identity?.entryId !== identity.nativeEntryId) {
+            throw new StoreError("The native history projection does not belong to this binding.");
+          }
+          return structuredClone(event.payload);
+        }
+      }),
       storeArtifact: async (sourcePath, options) => {
         if (runtimePolicy === "review_read_only") {
           throw new StoreError("Reviewer runtime artifacts are disabled.");
         }
         const targetRevision = this.#store.getTarget(target.id).revision;
-        const assertArtifactAuthority = (store: OperationalStore): StoredSession => {
-          this.#assertOpen();
-          if (!this.backendInstanceGenerationOwnsContext(sessionId, backendInstanceGeneration, runId, attemptId)) throw staleBackendInstanceContextError();
-          const current = store.getSession(sessionId);
-          if (current.descriptor.binding.generation !== generation || current.descriptor.deletedAt !== undefined || current.descriptor.archived
-            || binding !== undefined && (current.descriptor.binding.opaqueRef !== binding.opaqueRef
-              || current.descriptor.binding.nativeSessionId !== binding.nativeSessionId)) throw staleBackendInstanceContextError();
-          const registered = store.getTarget(target.id);
-          if (current.descriptor.targetId !== target.id || current.descriptor.backendId !== target.backendId
-            || registered.revision !== targetRevision || current.descriptor.worktree !== undefined && current.descriptor.worktree.state !== "active"
-            || artifactWorkspaceAuthority(registered.descriptor, this.targetForSession(current), current.descriptor.worktree) !== originalArtifactAuthority) {
-            throw new StoreError("The Backend Artifact workspace authority changed.");
-          }
-          return current;
-        };
-        assertArtifactAuthority(this.#store);
+        assertArtifactAuthority(this.#store, targetRevision);
         const { openFile, ...metadata } = options ?? {};
         const staging = { ...metadata, expiresAt: Date.now() + 10 * 60_000 };
         const artifact = openFile === undefined
@@ -15969,7 +15991,7 @@ export class SessionHost {
             ...staging, expectedSize: openFile.expectedSize, signal,
             beforeFinalize: async () => {
               await openFile.assertCurrent();
-              assertArtifactAuthority(this.#store);
+              assertArtifactAuthority(this.#store, targetRevision);
             }
           });
         let localSource: Awaited<ReturnType<typeof validateLocalArtifactSource>> | undefined;
@@ -15989,7 +16011,7 @@ export class SessionHost {
         }
         try {
           const blob = this.#store.transaction((store) => {
-            const current = assertArtifactAuthority(store);
+            const current = assertArtifactAuthority(store, targetRevision);
             const existing = store.findSessionArtifactByStorage(sessionId, artifact.storagePath, artifact.mimeType, artifact.fileName);
             const adopted = existing ?? store.adoptSessionArtifact({
               blob: store.getArtifact(artifact.id).blob, sessionId, ...(runId === undefined ? {} : { runId })
