@@ -8,6 +8,7 @@ import { isWorkGroup, mobilePiWorkThinkingPreview, mobileWorkItems } from "./mob
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { mobilePartnerConversationRows, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { mobileMessageShareable, projectMobileConversationShareMessage } from "./mobile-conversation-share";
+import { resolveMobileMessageForkSource } from "./mobile-message-fork";
 import { SharedTaskAuthorSchema } from "@joko/contracts";
 
 function completed(blocks: any[], role = MessageRole.ASSISTANT) {
@@ -55,7 +56,8 @@ it("keeps partial sampling text separate from later native items without grantin
   expect(timelineRows([delta, otherService])[0]?.samplingInterrupted).toBeUndefined();
   const partial = timelineRows([delta, marker])[0];
   expect(partial).toMatchObject({ id: "A", text: "Partial A.", completed: false, samplingInterrupted: true, eventId: delta.eventId });
-  expect(partial?.completionCursor).toBeUndefined(); expect(partial?.nativeEntryId).toBeUndefined();
+  expect(partial?.completionCursor).toBeUndefined();
+  expect(resolveMobileMessageForkSource([delta, marker], "session", partial!.eventId, 14n, true)).toBeUndefined();
   const residual = create(EventSchema, { eventId: "residual-A", identity, cursor: { generation: 14n, sequence: 3n },
     payload: { kind: { case: "textDelta", value: { messageId: "A", delta: " Late bytes." } } } });
   expect(timelineRows([delta, marker, residual])[0]).toMatchObject({ text: "Partial A. Late bytes.", samplingInterrupted: true, completed: false });
@@ -67,7 +69,10 @@ it("keeps partial sampling text separate from later native items without grantin
   expect(timelineRows(withB)[0]).toEqual(partial);
   expect(mobileWorkItems(timelineRows(withB), false).find(row => row.id === "A")).toEqual(partial);
   const authoritativeA = [...withB, complete("A", 5n)];
-  expect(timelineRows(authoritativeA).find(row => row.id === "A")).toMatchObject({ text: "Full A.", completed: true, nativeEntryId: "A" });
+  const completedA = timelineRows(authoritativeA).find(row => row.id === "A")!;
+  expect(completedA).toMatchObject({ text: "Full A.", completed: true, eventId: "A-complete", completionCursor: 5n });
+  expect(resolveMobileMessageForkSource(authoritativeA, "session", completedA.eventId, 14n, false))
+    .toMatchObject({ nativeEntryId: "A", messageId: "A", eventId: completedA.eventId });
   expect(timelineRows(authoritativeA).find(row => row.id === "A")?.samplingInterrupted).toBeUndefined();
   const repeated = create(EventSchema, { eventId: "repeated-marker", identity, cursor: { generation: 14n, sequence: 6n }, payload: marker.payload });
   expect(timelineRows([...authoritativeA, repeated])).toEqual(timelineRows(authoritativeA));

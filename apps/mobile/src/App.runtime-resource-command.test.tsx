@@ -218,7 +218,7 @@ beforeAll(async () => {
   }));
   vi.doMock("./MobileRuntimeCommandPalette", () => ({ MobileRuntimeCommandPalette: (_props: ComponentProps<typeof MobileRuntimeCommandPalette>) => { palette = _props; return null; } }));
   vi.doMock("./MobileInputHandoffPanel", () => ({ MobileInputHandoffPanel: (props: { api: import("./mobile-input-handoff").MobileInputHandoffApi }) => createElement("div", { "data-input-handoff-owner": props.api.ownerKey }, "Owner input handoff") }));
-  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
+  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
   for (const name of screens) vi.doMock(`./${name}`, () => new Proxy({}, {
     get: (_object, key) => key === "then" ? undefined : () => null,
     has: () => true,
@@ -356,7 +356,9 @@ it("shows an interrupted native sample in TaskScreen while the same Run continue
     payload: { kind: { case: "statusStream", value: { statusId: "codex_sampling_interrupted:native-A", terminal: true, label: "Response interrupted" } } } });
   renderedState = { ...state, owner: running, detail: running, liveStatus: "streaming", live: [delta] };
   await act(async () => root.render(taskScreen()));
-  expect(host.querySelector('[data-markdown-message="native-A"]')?.getAttribute("data-streaming")).toBe("true");
+  expect(host.querySelector('[data-markdown-message="native-A"]')?.getAttribute("data-streaming"), JSON.stringify({
+    rows: timelineList?.data, html: host.innerHTML.slice(-4_000)
+  }, (_key, value) => typeof value === "bigint" ? value.toString() : value).slice(0, 6_000)).toBe("true");
   renderedState = { ...renderedState, live: [delta, interrupted] };
   await act(async () => root.render(taskScreen()));
   expect(host.querySelector('[data-markdown-message="native-A"]')?.textContent).toBe("Received partial A.");
@@ -373,7 +375,7 @@ it("shows an interrupted native sample in TaskScreen while the same Run continue
   expect(host.textContent).toContain(mobileMessage("en", "task.samplingInterrupted"));
   const idle = create(SnapshotSchema, { generation: 14n,
     sessions: [create(SessionSchema, { ...running.sessions[0]!, state: SessionState.IDLE })],
-    runs: [{ runId: "run", sessionId: "session", activeAttemptId: "attempt", state: RunState.COMPLETED }] });
+    runs: [{ runId: "run", sessionId: "session", activeAttemptId: "attempt", state: RunState.SUCCEEDED }] });
   renderedState = { ...renderedState, owner: idle, detail: idle, liveStatus: "paused" };
   await act(async () => root.render(taskScreen()));
   expect(host.querySelector('[data-markdown-message="native-A"]')?.textContent).toBe("Received partial A.");

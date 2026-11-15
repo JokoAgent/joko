@@ -242,20 +242,32 @@ describe("mounted Pi compaction product chain", () => {
     await navigateMountedTask(page, failingSessionId, "Mounted compact failure");
     const failingTrigger = compactTrigger(failingSessionId);
     await failingTrigger.waitFor({ state: "visible" });
+    const compactControlBeforeClick = await failingTrigger.evaluate(button => ({
+      element: button.tagName, label: button.getAttribute("aria-label"),
+      bounds: button.getBoundingClientRect().toJSON()
+    }));
     await page.evaluate(() => {
-      document.addEventListener("click", (event) => {
-        const target = event.target instanceof Element ? event.target : undefined;
-        const owner = target?.closest<HTMLElement>(".session-pane");
-        document.documentElement.dataset.compactionClickTarget = JSON.stringify({
-          element: target?.tagName, button: target?.closest("button")?.getAttribute("aria-label"),
-          sessionId: owner?.dataset.inputSessionId, generation: owner?.dataset.inputSessionGeneration
-        });
-      }, { capture: true, once: true });
+      const phases: unknown[] = [];
+      for (const type of ["pointerdown", "pointerup", "click"] as const) {
+        document.addEventListener(type, event => {
+          const target = event.target instanceof Element ? event.target : undefined;
+          const owner = target?.closest<HTMLElement>(".session-pane");
+          const control = owner?.querySelector<HTMLElement>(".context-capacity-ring");
+          phases.push({ type, time: performance.now(), x: event.clientX, y: event.clientY,
+            element: target?.tagName, button: target?.closest("button")?.getAttribute("aria-label"),
+            sessionId: owner?.dataset.inputSessionId, generation: owner?.dataset.inputSessionGeneration,
+            control: control === undefined || control === null ? undefined : { element: control.tagName,
+              label: control.getAttribute("aria-label"), bounds: control.getBoundingClientRect().toJSON() }
+          });
+          document.documentElement.dataset.compactionClickTarget = JSON.stringify(phases);
+        }, { capture: true, once: true });
+      }
     });
     failSummary = true;
     await failingTrigger.click();
     await confirmation.getByRole("button", { name: "Compact", exact: true }).click().catch(async (cause: unknown) => {
       throw new Error(`Could not confirm manual compaction: ${JSON.stringify({
+        compactControlBeforeClick,
         clickTarget: await page.locator("html").getAttribute("data-compaction-click-target"),
         browserErrors: errors
       })}`, { cause });
