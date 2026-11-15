@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { open } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
@@ -4112,6 +4112,58 @@ describe("SessionHost", () => {
       role: "user",
       blocks: [{ kind: "text", text: "portable history" }]
     })]);
+  });
+
+  it.each([false, true])("imports portable media only after receiving bytes are readable, with a blocked Blob path=%s", async blocked => {
+    const source = await createFixture(new PortableFakeAdapter());
+    const sourceSessionId = (await source.host.createSession({ operationId: "portable-media-source", connection: source.connection,
+      targetId: "target-one", title: "Portable media", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    const image = await source.artifacts.ingestBytes(png, { fileName: "portable.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 });
+    const blob = source.store.getArtifact(image.id).blob;
+    source.store.transaction(() => source.store.adoptSessionArtifact({ blob, sessionId: sourceSessionId }));
+    const original = source.store.getSession(sourceSessionId).descriptor;
+    source.store.appendEvent({ backendId: original.backendId, targetId: original.targetId, sessionId: original.id,
+      generation: original.binding.generation, traceId: "portable-media-source", payload: {
+        type: "message_complete", role: "user", blocks: [{ kind: "image", blob, alt: "Original portable PNG" }]
+      } });
+    const exported = await source.host.exportPortableSession({ sessionId: sourceSessionId });
+    expect(exported).toMatchObject({ fidelity: "full", mediaCount: 1 });
+    const encoded = await source.artifacts.readBlob(exported.artifact);
+    const adapter = new PortableFakeAdapter();
+    const receiving = await createFixture(adapter);
+    const incoming = await receiving.artifacts.ingestBytes(encoded.data, { fileName: "media.jshare", mimeType: exported.artifact.mimeType });
+    const storagePath = join(receiving.directory, "artifacts", "blobs", blob.sha256.slice(0, 2), blob.sha256.slice(2, 4), blob.sha256);
+    const occupant = join(storagePath, "owner.txt");
+    if (blocked) {
+      await mkdir(storagePath, { recursive: true });
+      await writeFile(occupant, "Preserve this directory.");
+    }
+    const nativeImport = vi.spyOn(adapter, "importPortableNativeSession");
+    const adopt = vi.spyOn(receiving.store, "adoptSessionArtifact");
+    const request = { operationId: "portable-media-receive", connection: receiving.connection, targetId: "target-one",
+      package: receiving.store.getArtifact(incoming.id).blob, title: "Received media", fastMode: false,
+      permissionMode: "ask" as const, planMode: false, overwrite: false };
+    if (blocked) {
+      await expect(receiving.host.importPortableSession(request)).rejects.toThrow();
+      expect(receiving.store.getOperation(request.operationId).status).toBe("failed");
+      expect(receiving.store.listSessions({ includeArchived: true })).toEqual([]);
+      expect(adopt).not.toHaveBeenCalled();
+      expect(receiving.store.listArtifacts({ limit: 100 }).map(record => record.blob.id)).toEqual([incoming.id]);
+      expect(await readFile(occupant, "utf8")).toBe("Preserve this directory.");
+    } else {
+      const imported = await receiving.host.importPortableSession(request);
+      expect(imported.value).toMatchObject({ fidelity: "full", mediaCount: 1 });
+      const artifacts = receiving.store.listArtifacts({ sessionId: imported.value.sessionId });
+      const receivedImage = artifacts.find(record => record.blob.sha256 === blob.sha256)!;
+      expect(receivedImage.blob).toMatchObject({ sha256: blob.sha256, byteLength: png.byteLength, mimeType: "image/png" });
+      expect(receivedImage.blob.id).not.toBe(blob.id);
+      expect(Buffer.from((await receiving.artifacts.readBlob(receivedImage.blob)).data)).toEqual(png);
+      expect((await receiving.host.importPortableSession(request)).replayed).toBe(true);
+    }
+    expect(nativeImport).toHaveBeenCalledOnce();
+    expect(source.store.getSession(sourceSessionId).descriptor.binding).toEqual(original.binding);
+    expect(Buffer.from((await source.artifacts.readBlob(blob)).data)).toEqual(png);
   });
 
   it("exports exactly 256 delegated runs and fails typed for the 257th instead of silently clipping collaboration history", async () => {
