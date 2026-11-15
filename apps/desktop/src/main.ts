@@ -3308,19 +3308,24 @@ async function clickPackagedSmokeTimelineCopy(
   blockSelector: string,
   buttonSelector: string
 ): Promise<void> {
-  const clicked = await window.webContents.executeJavaScript([
+  const observation = await window.webContents.executeJavaScript([
     "(() => {",
     `  const blocks = document.querySelectorAll(${JSON.stringify(`.message-assistant__body ${blockSelector}`)});`,
-    "  if (blocks.length !== 1) return false;",
+    "  const state = { clicked: false, blocks: blocks.length, focused: document.hasFocus(), visibility: document.visibilityState };",
+    "  if (blocks.length !== 1) return state;",
     `  const buttons = blocks[0].querySelectorAll(${JSON.stringify(buttonSelector)});`,
-    "  if (buttons.length !== 1) return false;",
+    "  if (buttons.length !== 1) return { ...state, buttons: buttons.length };",
     "  const button = buttons[0];",
-    "  if (!(button instanceof HTMLButtonElement) || button.disabled || button.getAttribute('aria-busy') === 'true') return false;",
+    "  if (!(button instanceof HTMLButtonElement)) return { ...state, buttons: 1, tag: button.tagName };",
+    "  const control = { buttons: 1, disabled: button.disabled, busy: button.getAttribute('aria-busy'), ariaDisabled: button.getAttribute('aria-disabled') };",
+    "  if (button.disabled || button.getAttribute('aria-busy') === 'true') return { ...state, ...control };",
     "  button.click();",
-    "  return true;",
+    "  return { ...state, ...control, clicked: true };",
     "})()"
   ].join("\n"), true) as unknown;
-  if (clicked !== true) throw new Error(`Packaged smoke could not dispatch one Copy action for ${blockSelector}.`);
+  if (typeof observation !== "object" || observation === null || !("clicked" in observation) || observation.clicked !== true) {
+    throw new Error(`Packaged smoke could not dispatch one Copy action for ${blockSelector} (${JSON.stringify(observation)}).`);
+  }
 }
 
 async function waitForPackagedSmokeTimelineTextClipboard(
