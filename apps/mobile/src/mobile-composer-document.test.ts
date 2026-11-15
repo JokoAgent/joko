@@ -98,9 +98,30 @@ describe("mobile structured composer document", () => {
     const literalQuote = restoreMobileComposerInput(literalFooter, { sessionId: "task", messageId: "user", eventId: "accepted" });
     expect(literalQuote.atoms[0]).toMatchObject({ kind: "quote", text: "excerpt\n— source: D:/private.txt" });
     expect(mobileComposerInput(literalQuote)).toEqual(literalFooter);
-    expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath: "readme.md", text: "x".repeat(4_001) }, "invalid")).toThrow();
     expect(() => appendMobileFileSelectionQuote(selected, { sourceSessionId: "task", sourcePath: "readme.md", text: "\ud800" }, "invalid")).toThrow();
     expect(() => normalizeMobileComposerDraft({ ...selected, atoms: [{ ...selected.atoms[0]!, sourceMessageId: "forged" } as never] })).toThrow(/file quote/u);
+  });
+  it("retains a bounded file excerpt and its ellipsis through wire and draft restoration without splitting Unicode", () => {
+    for (const [selected, expected] of [
+      ["x".repeat(4_000), "x".repeat(4_000)],
+      ["x".repeat(4_001), `${"x".repeat(4_000)}…`],
+      [`${"x".repeat(3_999)}😀tail`, `${"x".repeat(3_999)}…`]
+    ] as const) {
+      const draft = appendMobileFileSelectionQuote(plainTextMobileComposerDraft("Question"), {
+        sourceSessionId: "task", sourcePath: "docs/README.md", text: selected
+      }, "file-selection").draft;
+      const atom = draft.atoms[0]!;
+      if (atom.kind !== "file-quote") throw new Error("Missing bounded file excerpt.");
+      expect(atom).toMatchObject({ kind: "file-quote", text: expected });
+      expect(normalizeMobileComposerDraft(draft)).toEqual(draft);
+      const input = mobileComposerInput(draft);
+      const restored = restoreMobileComposerInput(input, { sessionId: "task", messageId: "user", eventId: "accepted" });
+      expect(restored.atoms[0]).toMatchObject({ kind: "file-quote", sourcePath: "docs/README.md", text: expected });
+      expect(mobileComposerInput(restored)).toEqual(input);
+      for (const text of ["x".repeat(4_001), `${"x".repeat(4_001)}…`]) {
+        expect(() => normalizeMobileComposerDraft({ ...draft, atoms: [{ ...atom, text }] })).toThrow(/file quote/u);
+      }
+    }
   });
   it("serializes attachment-only image/file drafts in stable order and requires canonical uploaded identities", () => {
     const draft = normalizeMobileComposerDraft({

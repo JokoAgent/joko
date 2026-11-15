@@ -647,8 +647,11 @@ export function appendMobileFileSelectionQuote(
 ): MobileComposerEditResult {
   const current = normalizeMobileComposerDraft(draft);
   assertIdentity(atomId, "composer atom occurrence");
-  const text = normalizedSelectionQuoteText(quote.text);
-  if (text === undefined || text.length > mobileSelectionQuoteMaximumCharacters) throw new Error("Select non-empty file text of at most 4,000 characters.");
+  const selected = normalizedSelectionQuoteText(quote.text);
+  if (selected === undefined || /[\uD800-\uDFFF]/u.test(selected)) throw new Error("Select non-empty file text.");
+  const end = isUtf16Boundary(selected, mobileSelectionQuoteMaximumCharacters)
+    ? mobileSelectionQuoteMaximumCharacters : mobileSelectionQuoteMaximumCharacters - 1;
+  const text = selected.length > mobileSelectionQuoteMaximumCharacters ? `${selected.slice(0, end)}…` : selected;
   const atom = normalizeFileQuoteAtom({ kind: "file-quote", ...quote, text, atomId, start: 0, end: 0 });
   return insertMobileComposerAtom(current, { start: current.text.length, end: current.text.length },
     { ...atom, atomId }, current.text.length ? "\n\n" : "", "");
@@ -1349,7 +1352,10 @@ function normalizeQuoteAtom(
 function normalizeFileQuoteAtom(atom: MobileComposerFileQuoteAtom): Omit<MobileComposerFileQuoteAtom, "atomId" | "start" | "end"> {
   const text = normalizedSelectionQuoteText(atom.text);
   const sourcePath = normalizeFileQuoteSourcePath(atom.sourcePath);
-  if (text === undefined || text !== atom.text || text.length > mobileSelectionQuoteMaximumCharacters
+  // The excerpt budget excludes its one-character truncation marker.
+  if (text === undefined || text !== atom.text
+    || (text.length > mobileSelectionQuoteMaximumCharacters
+      && (text.length !== mobileSelectionQuoteMaximumCharacters + 1 || !text.endsWith("…")))
     || /[\uD800-\uDFFF]/u.test(text)
     || Object.hasOwn(atom, "sourceMessageId") || Object.hasOwn(atom, "sourceEventId") || Object.hasOwn(atom, "sourceRole")) {
     throw new Error("The local Joko file quote is invalid.");

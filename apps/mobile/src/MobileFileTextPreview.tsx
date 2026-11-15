@@ -139,7 +139,6 @@ function FileMarkdownReader({ preview, text, colors, locale, client, focusLine, 
       if (!actions || actions.busy || readyToken !== token || !ownsRenderer(token) || event.nativeEvent.key !== "joko-file-quote") return;
       const text = event.nativeEvent.selectedText;
       if (typeof text !== "string" || !text.trim()) return;
-      if (text.length > 4_000) { setNotice(mobileMessage(locale, "files.preview.quoteTooLarge")); return; }
       setNotice(""); actions.quote(text);
     }}
     onShouldStartLoadWithRequest={(request) => {
