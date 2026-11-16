@@ -47,7 +47,7 @@ mountedIt("pans the mounted task image with trackpad, Space and middle button wh
   store.transaction(() => store.adoptSessionArtifact({ blob, sessionId }));
   store.appendEvent({ backendId: session.backendId, targetId: session.targetId, sessionId, generation: session.binding.generation,
     traceId: "image-gestures", payload: { type: "message_complete", role: "user",
-      blocks: [{ kind: "text", text: "Inspect this image without changing the task." }, { kind: "artifact", blob, label: "Gesture image" }] } });
+      blocks: [{ kind: "text", text: "Inspect this image without changing the task." }, { kind: "image", blob, alt: "Gesture image" }] } });
   const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Image gesture browser" });
   if (challenge.challenge === undefined) throw new Error("Image gesture pairing returned no challenge.");
   await routeFixtureDiscovery(page.context(), fixture.baseUrl);
