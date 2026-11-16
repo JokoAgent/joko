@@ -5,6 +5,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from "react-dom";
 import { writeClipboardText } from "../clipboard-action.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
+import { TimelineTextAttachmentBody } from "./TimelineTextAttachmentBody.js";
 
 import type { ArtifactView } from "../model.js";
 import { IconButton, formatBytes } from "./ui.js";
@@ -190,7 +191,7 @@ export function TimelineTextAttachmentLightbox({
         {state.phase === "loading" && <div className="text-attachment-lightbox__status" role="status"><span className="spinner" aria-hidden="true" /><strong>{labels.loading}</strong></div>}
         {state.phase === "error" && <div className="text-attachment-lightbox__status" role="alert"><AlertTriangle aria-hidden="true" /><strong>{labels.unavailable}</strong></div>}
         {state.phase === "oversize" && <div className="text-attachment-lightbox__status"><AlertTriangle aria-hidden="true" /><strong>{labels.tooLarge}</strong><span>{formatBytes(state.byteSize)} · {formatBytes(TIMELINE_TEXT_PREVIEW_LIMIT_BYTES)}</span><button type="button" aria-disabled={download.pending} aria-busy={download.pending} onClick={(event) => download.run(event.currentTarget.ownerDocument, (context) => onDownload(artifact.blobId, artifact.fileName, context))}><Download aria-hidden="true" />{labels.download}</button></div>}
-        {state.phase === "ready" && <pre tabIndex={0}>{state.text}</pre>}
+        {state.phase === "ready" && <TimelineTextAttachmentBody sourceKey={JSON.stringify([ownerKey, artifact.blobId, artifact.fileName, "text-preview"])} fileName={artifact.fileName} text={state.text} label={`${labels.preview}: ${artifact.fileName}`} />}
       </main>
       {download.failed && <div className="text-attachment-lightbox__feedback" role="alert">{labels.unavailable}</div>}
       {(copy.state === "copied" || copy.state === "failed") && <div className="text-attachment-lightbox__feedback" role={copy.state === "failed" ? "alert" : "status"}><Check aria-hidden="true" />{copy.state === "failed" ? labels.copyFailed : labels.copied}</div>}

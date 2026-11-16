@@ -40,7 +40,7 @@ export function TimelineCodeBlock({ ownerKey, source, codeClassName, t }: {
   </div>;
 }
 
-function highlightedCode(source: string, tokens: readonly { readonly from: number; readonly to: number; readonly className: string }[]): ReactNode {
+export function highlightedCode(source: string, tokens: readonly { readonly from: number; readonly to: number; readonly className: string }[]): ReactNode {
   if (tokens.length === 0) return source;
   const nodes: ReactNode[] = [];
   let cursor = 0;

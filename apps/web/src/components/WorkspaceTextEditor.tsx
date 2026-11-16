@@ -117,6 +117,8 @@ export interface WorkspaceTextEditorProps {
   readonly value: string;
   readonly languageId?: string;
   readonly readOnly?: boolean;
+  readonly focusable?: boolean;
+  readonly rememberScroll?: boolean;
   readonly wordWrap?: boolean;
   /** Workspace-qualified identity; defaults to path for standalone callers. */
   readonly scrollKey?: string;
@@ -238,6 +240,8 @@ export const WorkspaceTextEditor = forwardRef<WorkspaceTextEditorHandle, Workspa
   value,
   languageId,
   readOnly = false,
+  focusable = false,
+  rememberScroll = true,
   wordWrap = true,
   scrollKey = path,
   suppressInitialScrollRestore = false,
@@ -309,6 +313,7 @@ export const WorkspaceTextEditor = forwardRef<WorkspaceTextEditorHandle, Workspa
     const state = EditorState.create({
       doc: value,
       extensions: workspaceEditorExtensions({
+        focusable,
         language,
         readOnly,
         wordWrap: wordWrap && !degradation.longLine,
@@ -332,7 +337,7 @@ export const WorkspaceTextEditor = forwardRef<WorkspaceTextEditorHandle, Workspa
     themeObserver?.observe(parent.ownerDocument.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     const colorScheme = workspaceEditorChrome(language) === "markdown" ? ownerWindow?.matchMedia("(prefers-color-scheme: dark)") : undefined;
     colorScheme?.addEventListener("change", refreshMermaidTheme);
-    const savedScroll = suppressInitialScrollRestore ? undefined : loadWorkspaceFileScroll(scrollKey);
+    const savedScroll = !rememberScroll || suppressInitialScrollRestore ? undefined : loadWorkspaceFileScroll(scrollKey);
     let restoreFrame: number | undefined;
     let restoreTicks = savedScroll === undefined ? 0 : 8;
     let restoring = savedScroll !== undefined;
@@ -346,7 +351,7 @@ export const WorkspaceTextEditor = forwardRef<WorkspaceTextEditorHandle, Workspa
       }
     };
     const persistScroll = (): void => {
-      if (!restoring) saveWorkspaceFileScroll(scrollKey, readAnchor());
+      if (rememberScroll && !restoring) saveWorkspaceFileScroll(scrollKey, readAnchor());
     };
     const restore = (): void => {
       if (savedScroll === undefined || restoreTicks <= 0) {
@@ -398,7 +403,7 @@ export const WorkspaceTextEditor = forwardRef<WorkspaceTextEditorHandle, Workspa
       viewRef.current = undefined;
       view.destroy();
     };
-  }, [ariaLabel, language, markdownImageLabels, markdownImageResolver, markdownMermaidLabels, markdownTableLabels, path, readOnly, scrollKey, wordWrap]);
+  }, [ariaLabel, focusable, language, markdownImageLabels, markdownImageResolver, markdownMermaidLabels, markdownTableLabels, path, readOnly, rememberScroll, scrollKey, wordWrap]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -425,6 +430,7 @@ function workspaceEditorExtensions(
   options: {
     readonly language: string;
     readonly readOnly: boolean;
+    readonly focusable: boolean;
     readonly wordWrap: boolean;
     readonly syntaxHighlighting: boolean;
     readonly ariaLabel: string;
@@ -467,7 +473,7 @@ function workspaceEditorExtensions(
     ]),
     EditorState.readOnly.of(options.readOnly),
     EditorView.editable.of(!options.readOnly),
-    EditorView.contentAttributes.of({ "aria-label": options.ariaLabel, spellcheck: "false" }),
+    EditorView.contentAttributes.of({ "aria-label": options.ariaLabel, spellcheck: "false", ...(options.focusable ? { tabindex: "0" } : {}) }),
     ...(options.wordWrap ? [EditorView.lineWrapping] : []),
     ...(options.syntaxHighlighting ? [languageExtension(options.language), syntaxHighlighting(workspaceHighlightStyle)] : []),
     ...(chrome === "markdown" ? workspaceMarkdownEditorExtensions({
