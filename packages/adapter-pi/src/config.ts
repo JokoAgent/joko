@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, realpath, rename, unlink, writeFile } from "node:f
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { PermissionMode, PolicySubjectKind, ProviderModel } from "@joko/core";
 import { piError } from "./errors.js";
+import { isManagedChatModel, isManagedSpeechModel } from "./model-purpose.js";
 
 export type PiSupportedApi =
   | "anthropic-messages"
@@ -12,6 +13,7 @@ export type PiSupportedApi =
 
 /** Host-owned discovery facts. Undefined inherits; false, null and [] replace. */
 export interface PiModelDiscoveryMetadata {
+  readonly mode?: string;
   readonly name?: string;
   readonly contextWindow?: number;
   readonly contextWindowMax?: number;
@@ -28,7 +30,7 @@ export interface PiModelDiscoveryMetadata {
 }
 
 export const PI_EDITABLE_MODEL_METADATA_FIELDS = [
-  "name", "contextWindow", "maxTokens", "input", "reasoning", "thinkingLevelMap", "supportsFastMode", "supportsTools"
+  "name", "contextWindow", "maxTokens", "input", "reasoning", "thinkingLevelMap", "supportsFastMode", "supportsTools", "mode"
 ] as const;
 export const PI_MODEL_METADATA_FIELDS = [
   ...PI_EDITABLE_MODEL_METADATA_FIELDS, "description", "defaultEffort", "referenceApi", "declaredOutputModalities", "contextWindowMax"
@@ -37,6 +39,8 @@ export type PiModelMetadataField = typeof PI_MODEL_METADATA_FIELDS[number];
 
 export interface PiManagedModel {
   readonly id: string;
+  /** Host-owned purpose; never interpreted as a native chat wire protocol. */
+  readonly mode?: string;
   /** Joko-owned identity used to merge route-specific copies in settings. */
   readonly logicalId?: string;
   readonly name?: string;
@@ -264,6 +268,8 @@ export async function provisionManagedCatalog(
     validateProvider(provider);
     if (providerIds.has(provider.id)) throw piError("PI_MODEL_DUPLICATE_PROVIDER", `Duplicate provider '${provider.id}'`, "provision");
     providerIds.add(provider.id);
+    const chatModels = provider.models.filter(isManagedChatModel);
+    if (chatModels.length === 0) continue;
     for (const name of providerCredentialEnvironmentNames(provider)) {
       const owner = secretEnvironmentOwners.get(name);
       if (owner !== undefined && owner !== provider.id) {
@@ -313,11 +319,11 @@ export async function provisionManagedCatalog(
       authHeader: provider.authHeader,
       headers: Object.keys(headers).length === 0 ? undefined : headers,
       compat: provider.compat,
-      models: provider.models.map(managedPiModelConfiguration),
+      models: chatModels.map(managedPiModelConfiguration),
       modelOverrides: materializeModelOverrides(provider.modelOverrides, secretEnvironmentNames)
     });
 
-    for (const model of provider.models) coreModels.push(piProviderModel(provider, model));
+    for (const model of chatModels) coreModels.push(piProviderModel(provider, model));
   }
 
   const managedSettings = compactObject({
@@ -547,7 +553,8 @@ function validateProvider(provider: PiManagedProvider): void {
     if (model.api !== undefined && !["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"].includes(model.api)) {
       throw piError("PI_MODEL_INVALID_API", `Model '${provider.id}/${model.id}' has an invalid API type`, "provision");
     }
-    if (model.description !== undefined && (typeof model.description !== "string" || model.description.length > 16_384)
+    if (model.mode !== undefined && (typeof model.mode !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(model.mode))
+      || model.description !== undefined && (typeof model.description !== "string" || model.description.length > 16_384)
       || model.referenceApi !== undefined && !["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"].includes(model.referenceApi)
       || model.defaultEffort !== undefined && !supportedPiThinkingLevels(model.reasoning, model.thinkingLevelMap).includes(model.defaultEffort)
       || model.displayThinkingLevels !== undefined && (!Array.isArray(model.displayThinkingLevels) || model.displayThinkingLevels.length > 16
@@ -633,7 +640,9 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
     ...(model.declaredInputModalities === undefined && model.input === undefined ? {} : {
       declaredInputModalities: [...(model.declaredInputModalities ?? model.input!)], declaredSupportsImages: model.input?.includes("image") === true
     }),
-    ...(model.declaredOutputModalities === undefined ? {} : { declaredOutputModalities: [...model.declaredOutputModalities] }),
+    ...(model.declaredOutputModalities === undefined
+      ? isManagedSpeechModel(model) ? { declaredOutputModalities: ["audio"] } : {}
+      : { declaredOutputModalities: [...model.declaredOutputModalities] }),
     ...(model.supportsFastMode === undefined ? {} : { declaredSupportsFastMode: model.supportsFastMode }),
     contextWindow,
     ...(model.contextWindowMax === undefined ? {} : { contextWindowMax: model.contextWindowMax }),
@@ -642,7 +651,7 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
     ...(model.maxTokens === undefined ? {} : { maxOutputTokensSource: model.maxOutputTokensSource ?? "declared" as const }),
     supportsImages: model.input?.includes("image") ?? false,
     ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
-    defaultVisible: model.defaultVisible ?? true,
+    defaultVisible: model.defaultVisible ?? isManagedChatModel(model),
     supportsFastMode: model.supportsFastMode === true,
     thinkingLevels,
     cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -660,6 +669,7 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
 /** Keep Joko-only capability metadata out of Pi's models.json schema. */
 function managedPiModelConfiguration(model: PiManagedModel): Record<string, unknown> {
   const {
+    mode: _mode,
     supportsFastMode: _supportsFastMode,
     supportsTools: _supportsTools,
     defaultVisible: _defaultVisible,
@@ -693,9 +703,10 @@ function validateModelDiscoveryMetadata(model: PiManagedModel): void {
   const metadata = model.discoveredMetadata;
   if (metadata === undefined) return;
   if (!hasPlainObjectPrototype(metadata) || model.metadataOverrides === undefined) invalid();
-  const keys = ["name", "contextWindow", "contextWindowMax", "maxOutputTokens", "description", "nativeApi", "inputModalities",
+  const keys = ["mode", "name", "contextWindow", "contextWindowMax", "maxOutputTokens", "description", "nativeApi", "inputModalities",
     "outputModalities", "efforts", "defaultEffort", "supportsImages", "supportsTools", "supportsFastMode"];
   if (Object.keys(metadata).some(key => !keys.includes(key))) invalid();
+  if (metadata.mode !== undefined && (typeof metadata.mode !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(metadata.mode))) invalid();
   for (const value of [metadata.contextWindow, metadata.contextWindowMax, metadata.maxOutputTokens]) if (value !== undefined && !isPositiveSafeInteger(value)) invalid();
   for (const value of [metadata.name, metadata.description]) if (value !== undefined && (typeof value !== "string" || value.length > 16_384 || /[\0-\x1f\x7f]/u.test(value))) invalid();
   for (const value of [metadata.inputModalities, metadata.outputModalities, metadata.efforts]) {

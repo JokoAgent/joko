@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from 'react-dom';
 import { create } from '@bufbuild/protobuf';
 import { DesktopVoiceConversationAction as Action, DesktopSpeechSelectionSchema, DesktopVoiceConversationPreferenceSchema,
-  speechSpeedRange, type SpeechProtocol,
+  desktopSpeechModelSpeedRange, reconcileDesktopSpeechSelection, speechSpeedRange, type SpeechProtocol,
   type DesktopSpeechSelection, type DesktopSpeechModel, type ControlDesktopVoiceConversationResponse, type DesktopSpeechVoiceCatalog, type DesktopVoiceCallRecord } from '@joko/contracts';
 import { Phone, Volume2 } from 'lucide-react';
 import type { AppController } from '../controller.js';
@@ -274,6 +274,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     try { await next.start(); } catch { next.stop(); if (current.current.live) { setMic(false); setError(true); } }
   };
   const start = async (playbackOnly: boolean, chosen: DesktopSpeechSelection | undefined): Promise<boolean> => {
+    chosen = reconcileDesktopSpeechSelection(chosen, value?.models ?? []);
     if (blockedNow.current) return false;
     if (!chosen) { setSettings(true); return false; }
     const owner = current.current;
@@ -298,7 +299,8 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   };
   const save = (reset: boolean) => void action(async () => {
     if (!saveRequest.current) saveRequest.current = { operationId: crypto.randomUUID(), preference: create(DesktopVoiceConversationPreferenceSchema, {
-      ...(reset ? {} : { conversation, playback }), sentencePlayback: reset ? true : sentence, revision: value?.preference?.revision ?? 0n }) };
+      ...(reset ? {} : { conversation: reconcileDesktopSpeechSelection(conversation, value?.models ?? []),
+        playback: reconcileDesktopSpeechSelection(playback, value?.models ?? []) }), sentencePlayback: reset ? true : sentence, revision: value?.preference?.revision ?? 0n }) };
     const result = await client.control(Action.SAVE_PREFERENCE, saveRequest.current);
     if (current.current.live) { setValue(result); setSettings(false); setNotice(text.saved); saveRequest.current = undefined; }
   });
@@ -403,7 +405,8 @@ function SpeechChoice({ title, value, models, client, disabled, language, onChan
   const sequence = useRef(0);
   useEffect(() => { sequence.current++; setCatalog(undefined); setFailed(false); setLoading(false); }, [selectionKey]);
   const current = models.find(model => value && key(model) === key(value));
-  const speedRange = value ? speechSpeedRange(value.modelId, value.protocol as SpeechProtocol) : null;
+  const resolved = reconcileDesktopSpeechSelection(value, models);
+  const speedRange = value && current ? speechSpeedRange(value.modelId, value.protocol as SpeechProtocol, desktopSpeechModelSpeedRange(current)) : null;
   useEffect(() => () => { sequence.current++; }, []);
   const patch = (body: Partial<DesktopSpeechSelection>) => { if (value) onChange(create(DesktopSpeechSelectionSchema, { ...value, ...body })); };
   return <fieldset disabled={disabled} className="desktop-voice-conversation__choice"><legend>{title}</legend>
@@ -420,16 +423,16 @@ function SpeechChoice({ title, value, models, client, disabled, language, onChan
     </SelectControl></label>
       <label>{text.voice}<input value={value.voice} maxLength={256} placeholder={text.manual} onChange={event => patch({ voice: event.target.value })} list={catalogId} /></label>
       <datalist id={catalogId}>{catalog?.voices.map(voice => <option key={voice.id} value={voice.id}>{voice.name}</option>)}</datalist>
-      {speedRange && <label>{text.speed}<input type="number" min={speedRange.min} max={speedRange.max} step="0.05" value={value.speed ?? ''} placeholder={text.automatic}
+      {speedRange && <label>{text.speed}<input type="number" min={speedRange.min} max={speedRange.max} step="0.05" value={resolved?.speed ?? ''} placeholder={text.automatic}
         onChange={event => patch({ speed: event.target.value === '' ? undefined : Number(event.target.value) })} /></label>}
       <div className="desktop-voice-conversation__actions"><Button disabled={loading || !value.protocol || !current} onClick={() => {
         const id = ++sequence.current, original = selectionKey; setLoading(true); setFailed(false);
         // Voice lists need the exact model/protocol; a nonempty temporary ID
         // permits catalog discovery without inventing a saved default voice.
-        void client.control(Action.VOICES, { selection: { ...value, voice: value.voice || 'catalog' } }).then(result => {
+        void client.control(Action.VOICES, { selection: { ...resolved!, voice: value.voice || 'catalog' } }).then(result => {
           if (id === sequence.current && original === selectionKey) setCatalog(result.voices);
         }).catch(() => { if (id === sequence.current) setFailed(true); }).finally(() => { if (id === sequence.current) setLoading(false); });
-      }}>{loading ? text.loading : text.catalog}</Button><Button disabled={!value.voice.trim() || !value.protocol || !current} onClick={() => onPreview(value)}>{text.preview}</Button></div>
+      }}>{loading ? text.loading : text.catalog}</Button><Button disabled={!value.voice.trim() || !value.protocol || !current} onClick={() => onPreview(resolved!)}>{text.preview}</Button></div>
       {failed && <p role="alert">{text.unavailable}</p>}{catalog?.truncated && <p>{text.truncated}</p>}{catalog?.customVoicesUnavailable && <p>{text.voicesUnavailable}</p>}
     </>}
   </fieldset>;

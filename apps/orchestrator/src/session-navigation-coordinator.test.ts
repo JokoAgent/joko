@@ -529,6 +529,7 @@ function modelRouteCatalog(
     });
   }
   return createModelRouteCatalog(store, {
+    listManaged: () => [],
     hasInferenceModel: (backendId, providerId, modelId) => inferenceRoutes.some((candidate) =>
       candidate.backendId === backendId && candidate.providerId === providerId && candidate.modelId === modelId),
     resolveInferenceRoute: (backendId, providerId, modelId) => inferenceRoutes.find((candidate) =>

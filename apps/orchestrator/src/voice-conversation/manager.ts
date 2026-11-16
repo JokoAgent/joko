@@ -245,10 +245,14 @@ export class DesktopVoiceConversationManager {
   }
   #snapshot(sessionId: string, generation: number, call?: Call, selected?: SavedCall): contract.ControlDesktopVoiceConversationResponse {
     const preference = this.#preference(sessionId);
+    const models = this.options.models.list();
+    const reconcile = (value: SpeechSelection | undefined) => contract.reconcileDesktopSpeechSelection(
+      value === undefined ? undefined : create(contract.DesktopSpeechSelectionSchema, value), models);
     const history = this.options.store.listSettingsByKeyPrefix('session', sessionId, CALL_SCOPE).map(value => value.value as SavedCall)
       .filter(value => value.format === 1 && value.sessionId === sessionId).sort((a, b) => b.record.startedAt - a.record.startedAt).slice(0, 20);
-    return create(contract.ControlDesktopVoiceConversationResponseSchema, { preference: { ...preference, revision: BigInt(preference.revision) },
-      models: this.options.models.list(), ...(call ? { call: publicRecord({ format: 1, sessionId, generation, kind: call.kind, record: call.context.record }) }
+    return create(contract.ControlDesktopVoiceConversationResponseSchema, { preference: { ...preference, conversation: reconcile(preference.conversation),
+      playback: reconcile(preference.playback), revision: BigInt(preference.revision) },
+      models, ...(call ? { call: publicRecord({ format: 1, sessionId, generation, kind: call.kind, record: call.context.record }) }
         : selected ? { call: publicRecord(selected) } : {}),
       history: history.map(value => publicRecord({ ...value, record: { ...value.record, turns: [], handoffs: [] } })) });
   }

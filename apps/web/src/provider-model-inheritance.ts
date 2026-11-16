@@ -9,7 +9,8 @@ const FIELDS = [
   ["reasoning", ProviderModelInheritedField.REASONING],
   ["thinkingLevels", ProviderModelInheritedField.THINKING_LEVELS],
   ["supportsFastMode", ProviderModelInheritedField.FAST_MODE],
-  ["supportsTools", ProviderModelInheritedField.TOOLS]
+  ["supportsTools", ProviderModelInheritedField.TOOLS],
+  ["mode", ProviderModelInheritedField.MODE]
 ] as const;
 
 export function protoProviderModelInheritedField(field: ProviderModelInheritedFieldView): ProviderModelInheritedField {

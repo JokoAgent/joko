@@ -31,11 +31,11 @@ async function fixture() {
   const model = PI_LIKE_PROFILE.models[0]!;
   const sessionId = (await host.createSession({ operationId: 'create-call-task', connection: desktop.connection, targetId: 'workspace', title: 'Call task',
     providerId: model.providerId, modelId: model.modelId, permissionMode: 'ask', planMode: false, fastMode: false })).value.sessionId;
-  let credentialGeneration = 'original', enabled = true;
+  let credentialGeneration = 'original', enabled = true, speechBaseUrl = 'https://provider.test/prefix/v1';
   const reference = { backendId: adapter.id, providerId: model.providerId, modelId: model.modelId };
   const routes: ModelRouteCatalog = { list: () => enabled ? [{ ...reference, credentialRoute: true, supportsImages: false }] : [],
     resolve: value => enabled && value.backendId === reference.backendId && value.providerId === reference.providerId && value.modelId === reference.modelId ? { ...reference, generationId: credentialGeneration,
-      api: 'openai-completions', baseUrl: 'https://provider.test/prefix/v1', authorization: 'Bearer private-speech-key', headers: {}, supportsImages: false } : undefined };
+      api: 'openai-completions', baseUrl: speechBaseUrl, authorization: 'Bearer private-speech-key', headers: {}, supportsImages: false } : undefined };
   const infer = vi.fn<ConstructorParameters<typeof DesktopVoiceConversationManager>[0]['infer']>(async () => '{"say":"Hello from the call."}');
   const fetcher = vi.fn<typeof fetch>(async () => new Response(new Uint8Array([1, 2, 3, 4]), { headers: { 'content-type': 'audio/pcm' } }));
   const companion = () => ({ identity: 'My companion', token: 'original-profile' });
@@ -50,9 +50,48 @@ async function fixture() {
     { callId, operationId: `start-${callId}`, selection: speech, playbackOnly });
   return { root, store, connections, desktop, host, adapter, reference, headers, base, speech, infer, fetcher, control, start, rpc,
     rotate: () => { credentialGeneration = 'replacement'; }, disable: () => { enabled = false; },
+    speechRoute: (baseUrl: string) => { speechBaseUrl = baseUrl; credentialGeneration = randomUUID(); },
     restart: () => { manager.close(); manager = new DesktopVoiceConversationManager({ store, host, models: new SpeechModelCatalog(store, routes), companion, infer, fetch: fetcher }); },
     close: async () => { manager.close(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true }); } };
 }
+
+it.each([false, true])('reconciles saved speed against the current route and sends provider defaults for playbackOnly=%s', async playbackOnly => {
+  const f = await fixture();
+  try {
+    const selected = create(contract.DesktopSpeechSelectionSchema, { ...f.speech, speed: 2.5 });
+    await f.control(contract.DesktopVoiceConversationAction.SAVE_PREFERENCE, { operationId: 'save-route-speed',
+      preference: { revision: 0n, conversation: selected, playback: { ...selected, voice: 'nova', speed: 1.1 } } });
+    const stored = f.store.findSetting('session', f.base.sessionId, 'desktop.voice-conversation.v1')!;
+    f.speechRoute('https://openrouter.ai/api/v1');
+    f.restart();
+    const snapshot = await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT);
+    expect(snapshot.preference).toMatchObject({ revision: 1n, conversation: { voice: 'alloy' }, playback: { voice: 'nova' } });
+    expect(snapshot.preference!.conversation!.speed).toBeUndefined();
+    expect(snapshot.preference!.playback!.speed).toBeUndefined();
+    expect(f.store.findSetting('session', f.base.sessionId, 'desktop.voice-conversation.v1')).toEqual(stored);
+    await expect(f.control(contract.DesktopVoiceConversationAction.START, { callId: 'rejected-speed', operationId: 'start-rejected-speed',
+      selection: selected, playbackOnly })).rejects.toBeDefined();
+    await expect(f.control(contract.DesktopVoiceConversationAction.VOICES, { selection: selected })).rejects.toBeDefined();
+    await expect(f.control(contract.DesktopVoiceConversationAction.SAVE_PREFERENCE, { operationId: 'reject-speed-save',
+      preference: { revision: 1n, conversation: selected } })).rejects.toBeDefined();
+    expect(f.fetcher).not.toHaveBeenCalled();
+    await f.control(contract.DesktopVoiceConversationAction.START, { callId: 'route-default', operationId: 'start-route-default',
+      selection: snapshot.preference!.conversation, playbackOnly });
+    await f.control(contract.DesktopVoiceConversationAction.SPEAK, { callId: 'route-default', speechRequestId: 'route-speech', text: 'Use the provider default.' });
+    expect(String(f.fetcher.mock.calls[0]![0])).toBe('https://openrouter.ai/api/v1/audio/speech');
+    expect(JSON.parse(String(f.fetcher.mock.calls[0]![1]?.body))).not.toHaveProperty('speed');
+    await f.control(contract.DesktopVoiceConversationAction.END, { callId: 'route-default' });
+    f.speechRoute('https://provider.test/prefix/v1');
+    const restored = await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT);
+    expect(restored.preference!.conversation!.speed).toBe(2.5);
+    expect(restored.preference!.playback!.speed).toBe(1.1);
+    await f.control(contract.DesktopVoiceConversationAction.START, { callId: 'direct-speed', operationId: 'start-direct-speed',
+      selection: restored.preference!.conversation, playbackOnly });
+    await f.control(contract.DesktopVoiceConversationAction.SPEAK, { callId: 'direct-speed', speechRequestId: 'direct-speech', text: 'Use the explicit direct speed.' });
+    expect(JSON.parse(String(f.fetcher.mock.calls[1]![1]?.body))).toHaveProperty('speed', 2.5);
+    expect(f.store.listQueueItems({ sessionId: f.base.sessionId })).toEqual([]);
+  } finally { await f.close(); }
+});
 
 it('requires the private committed Desktop proof and never makes an ordinary bearer a voice host', async () => {
   const f = await fixture();

@@ -3964,6 +3964,7 @@ export interface ProviderThinkingLevelView {
 export interface ProviderModelConfigurationView {
   readonly modelId: string;
   readonly name: string;
+  readonly mode?: string;
   readonly compatibility?: ProviderCompatibilityView;
   readonly reasoning: boolean;
   readonly inputModalities: readonly ModelInputModalityView[];
@@ -3984,7 +3985,7 @@ export interface ProviderModelConfigurationView {
 }
 
 export type ProviderModelInheritedFieldView = "name" | "contextWindowTokens" | "maximumOutputTokens" | "inputModalities"
-  | "reasoning" | "thinkingLevels" | "supportsFastMode" | "supportsTools";
+  | "reasoning" | "thinkingLevels" | "supportsFastMode" | "supportsTools" | "mode";
 
 export interface ProviderSamplingConfigurationView {
   readonly temperature?: number;

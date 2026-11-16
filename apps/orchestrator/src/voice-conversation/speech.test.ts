@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SpeechSynthesisSession } from './speech.js';
+import type { SpeechSpeedRange } from './protocol.js';
 
 const make = (
   fetcher: typeof fetch = vi.fn(
@@ -21,6 +22,29 @@ const make = (
   return { speech, fetcher, assertCurrent, diagnostic };
 };
 const input = { requestId: 'one', modelId: 'speech-model', voice: 'alloy', text: 'hello' };
+
+it.each([
+  [null, 2, false],
+  [null, undefined, true],
+  [{ min: 0.5, max: 2 }, 2.5, false],
+  [{ min: 0.5, max: 2 }, 1.5, true],
+] as readonly [SpeechSpeedRange, number | undefined, boolean][])('enforces the route range %o before dispatching speed %s', async (speedRange, speed, allowed) => {
+  const fetcher = vi.fn<typeof fetch>(async () => new Response(new Uint8Array([1, 2]), { headers: { 'Content-Type': 'audio/pcm' } }));
+  const speech = new SpeechSynthesisSession({ connection: () => ({ baseUrl: 'https://provider.test/v1', headers: {}, protocol: 'openai', speedRange }),
+    assertCurrent: () => undefined, fetch: fetcher });
+  try {
+    if (!allowed) {
+      await expect(speech.start({ ...input, speed })).rejects.toThrow('unavailable');
+      expect(fetcher).not.toHaveBeenCalled();
+    } else {
+      await speech.start({ ...input, speed });
+      const body = JSON.parse(String(fetcher.mock.calls[0]![1]?.body));
+      if (speed === undefined) expect(body).not.toHaveProperty('speed');
+      else expect(body.speed).toBe(speed);
+      expect([...new Uint8Array((await speech.read(input.requestId)).pcm)]).toEqual([1, 2]);
+    }
+  } finally { speech.cancel(); }
+});
 
 describe('speech transport', () => {
   it('preserves the server-provided endpoint prefix, sends the selected model, and pulls binary PCM', async () => {

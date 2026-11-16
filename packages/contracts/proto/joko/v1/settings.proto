@@ -207,6 +207,9 @@ message ProviderModelConfiguration {
   repeated ProviderModelInheritedField inherited_fields = 18;
   // Read-only reported capacity; mutations cannot supply discovery facts.
   optional uint64 context_window_max_tokens = 19;
+  // Explicit model purpose, such as chat or audio_speech. This is host metadata,
+  // independent of the runtime's chat wire protocol and model visibility.
+  optional string mode = 20;
 }
 
 enum ProviderModelInheritedField {
@@ -219,6 +222,7 @@ enum ProviderModelInheritedField {
   PROVIDER_MODEL_INHERITED_FIELD_THINKING_LEVELS = 6;
   PROVIDER_MODEL_INHERITED_FIELD_FAST_MODE = 7;
   PROVIDER_MODEL_INHERITED_FIELD_TOOLS = 8;
+  PROVIDER_MODEL_INHERITED_FIELD_MODE = 9;
 }
 
 message ProviderThinkingLevelMapping {

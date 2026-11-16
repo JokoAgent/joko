@@ -8010,6 +8010,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const models = runtime.models.map((model) => ({
       modelId: model.modelId.trim(),
       displayName: model.name.trim(),
+      ...(model.mode === undefined ? {} : { mode: model.mode }),
       ...(model.compatibility === undefined ? {} : { apiCompatibility: protoProviderCompatibility(model.compatibility) }),
       reasoning: model.reasoning,
       inputModalities: model.inputModalities.map(protoInputModality),
@@ -20294,6 +20295,7 @@ function mapProviderRuntimeConfiguration(provider: ProviderRuntimeConfiguration)
     models: provider.models.map((model) => ({
       modelId: model.modelId,
       name: model.displayName,
+      ...(model.mode === undefined ? {} : { mode: model.mode }),
       ...(model.apiCompatibility === undefined ? {} : { compatibility: providerCompatibility(model.apiCompatibility) }),
       reasoning: model.reasoning,
       inputModalities: model.inputModalities.map(inputModality),

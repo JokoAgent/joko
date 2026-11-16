@@ -32,6 +32,8 @@ export interface ModelRouteRef {
 export interface ModelRouteDescriptor extends ModelRouteRef {
   readonly supportsImages: boolean;
   readonly credentialRoute: boolean;
+  readonly displayName?: string;
+  readonly providerName?: string;
 }
 
 export interface CredentialModelRoute extends ProviderInferenceRoute {
@@ -39,19 +41,26 @@ export interface CredentialModelRoute extends ProviderInferenceRoute {
 }
 
 export interface ModelRouteCatalog {
-  list(): readonly ModelRouteDescriptor[];
+  list(options?: { readonly purpose?: "audio_speech" }): readonly ModelRouteDescriptor[];
   resolve(
     reference: ModelRouteRef,
-    options?: { readonly requireImages?: boolean }
+    options?: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" }
   ): CredentialModelRoute | undefined;
 }
 
 export function createModelRouteCatalog(
   store: OperationalStore,
-  providers: Pick<ProviderCatalogManager, "hasInferenceModel" | "resolveInferenceRoute">
+  providers: Pick<ProviderCatalogManager, "hasInferenceModel" | "resolveInferenceRoute" | "listManaged">
 ): ModelRouteCatalog {
-  const list = (): readonly ModelRouteDescriptor[] => store.listBackends().flatMap((record) => {
+  const list = (options: { readonly purpose?: "audio_speech" } = {}): readonly ModelRouteDescriptor[] => store.listBackends().flatMap((record): readonly ModelRouteDescriptor[] => {
     const managedCatalog = record.descriptor.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported === true;
+    if (options.purpose === "audio_speech") {
+      return managedCatalog ? providers.listManaged(record.descriptor.id).flatMap(provider => provider.provider.models.map(model => ({
+        backendId: record.descriptor.id, providerId: provider.provider.id, modelId: model.id,
+        displayName: model.name ?? model.id, providerName: provider.displayName, supportsImages: false,
+        credentialRoute: providers.hasInferenceModel(record.descriptor.id, provider.provider.id, model.id, options)
+      }))) : [];
+    }
     return record.descriptor.models.map((model) => ({
       backendId: record.descriptor.id,
       providerId: model.providerId,
@@ -63,7 +72,7 @@ export function createModelRouteCatalog(
   return {
     list,
     resolve: (reference, options = {}) => {
-      const descriptor = list().find((candidate) => sameModelRoute(candidate, reference));
+      const descriptor = list(options).find((candidate) => sameModelRoute(candidate, reference));
       if (descriptor?.credentialRoute !== true || (options.requireImages === true && !descriptor.supportsImages)) return undefined;
       const route = providers.resolveInferenceRoute(reference.backendId, reference.providerId, reference.modelId, options);
       return route === undefined ? undefined : { ...route, backendId: reference.backendId };

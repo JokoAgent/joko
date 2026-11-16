@@ -52,6 +52,9 @@ import {
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM,
   PiBackendAdapter,
   piProviderModel,
+  isManagedChatModel,
+  isManagedSpeechModel,
+  managedModelMode,
   type PiManagedModel,
   type PiModelMetadataField,
   PI_EDITABLE_MODEL_METADATA_FIELDS,
@@ -9564,6 +9567,10 @@ export function backendCatalogModels(
   ]));
   for (const provider of dependencies.providers.list(backend.id)) {
     for (const model of provider.provider.models ?? []) {
+      if (!isManagedChatModel(model) && !isManagedSpeechModel(model)) {
+        models.delete(`${provider.provider.id}\u0000${model.id}`);
+        continue;
+      }
       const projected = piProviderModel(provider.provider, model);
       models.set(`${projected.providerId}\u0000${projected.modelId}`, projected);
     }
@@ -10355,6 +10362,7 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
   const compat = asRecord(item.compat);
   return create(contract.ProviderModelConfigurationSchema, {
     modelId: item.id,
+    mode: managedModelMode(item),
     displayName: item.name ?? item.id,
     apiCompatibility: item.api === undefined ? undefined : protoProviderApi(item.api),
     reasoning: item.reasoning ?? false,
@@ -10505,6 +10513,7 @@ function providerRuntimeFromProto(input: contract.ProviderRuntimeConfiguration, 
 
 function providerModelFromProto(input: contract.ProviderModelConfiguration): PiManagedModel {
   if (input.modelId.trim() === "") throw invalidArgument("provider.models.model_id is required");
+  if (input.mode !== undefined && !/^[a-z][a-z0-9_]{0,63}$/u.test(input.mode)) throw invalidArgument("provider.models.mode is invalid");
   const modalities = input.inputModalities.length === 0 ? undefined : input.inputModalities.map((value): "text" | "image" => {
     if (value === contract.ModelInputModality.TEXT) return "text";
     if (value === contract.ModelInputModality.IMAGE) return "image";
@@ -10544,6 +10553,7 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
   const inherited = new Set(input.inheritedFields.map(inheritedModelFieldFromProto));
   return {
     id: input.modelId,
+    ...(input.mode === undefined ? {} : { mode: input.mode }),
     ...(inherited.size === 0 ? {} : { metadataOverrides: PI_EDITABLE_MODEL_METADATA_FIELDS.filter(field => !inherited.has(field)) }),
     ...(input.displayName === "" ? {} : { name: input.displayName }),
     ...(input.apiCompatibility === undefined ? {} : { api: nativeProviderApi(input.apiCompatibility, false)! }),
@@ -10574,7 +10584,8 @@ const INHERITED_MODEL_FIELDS = [
   ["reasoning", contract.ProviderModelInheritedField.REASONING],
   ["thinkingLevelMap", contract.ProviderModelInheritedField.THINKING_LEVELS],
   ["supportsFastMode", contract.ProviderModelInheritedField.FAST_MODE],
-  ["supportsTools", contract.ProviderModelInheritedField.TOOLS]
+  ["supportsTools", contract.ProviderModelInheritedField.TOOLS],
+  ["mode", contract.ProviderModelInheritedField.MODE]
 ] as const;
 function protoInheritedModelField(field: PiModelMetadataField): contract.ProviderModelInheritedField {
   const mapped = INHERITED_MODEL_FIELDS.find(([key]) => key === field)?.[1];

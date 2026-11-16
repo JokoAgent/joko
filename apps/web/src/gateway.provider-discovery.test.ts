@@ -10,18 +10,18 @@ import { updateProviderModelMetadata } from "./provider-runtime-draft.js";
 
 it("round-trips inherited discovery fields through the real Gateway and submits only the edited override", async () => {
   const inheritedFields = [ProviderModelInheritedField.DISPLAY_NAME, ProviderModelInheritedField.CONTEXT_WINDOW,
-    ProviderModelInheritedField.MAXIMUM_OUTPUT, ProviderModelInheritedField.INPUT_MODALITIES];
+    ProviderModelInheritedField.MAXIMUM_OUTPUT, ProviderModelInheritedField.INPUT_MODALITIES, ProviderModelInheritedField.MODE];
   const snapshot = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n },
     settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {}, collaboration: {},
       gitSafety: { mode: GitSafetyMode.EXISTING_GIT }, modelFavorites: { revision: { value: 0n } },
       providers: [{ providerId: "local", displayName: "Local", kind: ProviderKind.LOCAL_KEYLESS, enabled: true, version: { revision: { value: 5n } },
         runtimes: [{ backendId: "pi", endpoint: "http://127.0.0.1:11434/v1", apiCompatibility: ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS,
-          keyless: true, models: [{ modelId: "same", displayName: "Discovered", contextWindowTokens: 128_000n, contextWindowMaxTokens: 1_000_000n,
+          keyless: true, models: [{ modelId: "same", displayName: "Discovered", mode: "audio_speech", contextWindowTokens: 128_000n, contextWindowMaxTokens: 1_000_000n,
             maximumOutputTokens: 8_000n, inputModalities: [ModelInputModality.TEXT], inheritedFields }] }] }] } });
   const view = mapSnapshot(fromBinary(SnapshotSchema, toBinary(SnapshotSchema, snapshot)));
   const provider = view.settings.providers[0]!;
   expect(provider.runtimes[0]!.models[0]).toMatchObject({ contextWindowTokens: 128_000, contextWindowMaxTokens: 1_000_000,
-    inheritedFields: ["name", "contextWindowTokens", "maximumOutputTokens", "inputModalities"] });
+    mode: "audio_speech", inheritedFields: ["name", "contextWindowTokens", "maximumOutputTokens", "inputModalities", "mode"] });
   const writes: SubmitOperationRequest[] = [];
   const transport = {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
@@ -47,9 +47,11 @@ it("round-trips inherited discovery fields through the real Gateway and submits 
       return payload.value.provider!.runtimes[0]!.models[0]!;
     };
     expect(model(0).inheritedFields).toEqual(inheritedFields);
+    expect(model(0).mode).toBe("audio_speech");
     expect(model(1)).toMatchObject({ displayName: "Owner label", contextWindowTokens: 128_000n,
       inheritedFields: inheritedFields.filter(field => field !== ProviderModelInheritedField.DISPLAY_NAME) });
     expect(model(1).contextWindowMaxTokens).toBeUndefined();
+    expect(model(1).mode).toBe("audio_speech");
   } finally { gateway.disconnect(); }
 });
 

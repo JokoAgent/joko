@@ -13,6 +13,16 @@ function route(backend: BackendView, patch: Partial<ProviderRuntimeConfiguration
 }
 
 describe("Provider runtime draft transfer", () => {
+  it("carries an explicitly selected speech purpose between runtime drafts without changing destination credentials", () => {
+    const original = route(sourceBackend);
+    const source = { ...original, models: original.models.map(model => ({ ...model, mode: "audio_speech" })) };
+    const target = route(targetBackend, { credentialId: "target-key", models: [] });
+    const copied = transferProviderRuntime(source, target, sourceBackend, targetBackend, ["models"]);
+    expect(copied.models[0]).toMatchObject({ modelId: "model", mode: "audio_speech", contextWindowTokens: 0 });
+    expect(copied.credentialId).toBe("target-key");
+    expect(original.models[0]?.mode).toBeUndefined();
+  });
+
   it("copies selected model facts as explicit values while preserving untouched inheritance in the destination", () => {
     const source = route(sourceBackend);
     const target = route(sourceBackend, { models: [{ ...source.models[0]!, name: "Old", inheritedFields: ["name", "contextWindowTokens", "supportsFastMode"] }] });

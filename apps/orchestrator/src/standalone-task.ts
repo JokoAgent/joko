@@ -10,6 +10,7 @@ import { create, fromJsonString, toJson, type JsonValue, type MessageInitShape }
 import { createClient, createRouterTransport, type CallOptions } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { redactSecrets } from "@joko/core";
+import { isManagedChatModel } from "@joko/adapter-pi";
 import { createOrchestratorApplication, type OrchestratorApplication } from "./application.js";
 import { isLoopbackHost, loadConfig } from "./config.js";
 import { registerConnectServices } from "./connect-services.js";
@@ -46,7 +47,8 @@ export async function runStandaloneTask(args: string[]): Promise<number> {
   const runtime = profile.runtimes[0];
   if (profile.runtimes.length !== 1 || runtime?.backendId !== "pi" || runtime.apiCompatibility !== contract.ProviderApiCompatibility.OPENAI_COMPLETIONS
     || runtime.headers.length > 0 || runtime.credentialReferenceId !== "" || runtime.keyless
-    || !runtime.models.some(candidate => candidate.modelId === model) || !/^[A-Z_][A-Z0-9_]{0,127}$/u.test(runtime.apiKeyEnvironment)) {
+    || !runtime.models.some(candidate => candidate.modelId === model && isManagedChatModel({ id: candidate.modelId, mode: candidate.mode }))
+    || !/^[A-Z_][A-Z0-9_]{0,127}$/u.test(runtime.apiKeyEnvironment)) {
     throw new Error("Choose an OpenAI-compatible Pi provider profile with the selected model and a private API key environment name.");
   }
   const endpoint = new URL(runtime.endpoint);
