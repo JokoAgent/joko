@@ -85,9 +85,53 @@ export function clampWorkspaceImageScale(scale: number): number {
 }
 
 export function workspaceImageWheelZoomFactor(deltaY: number, deltaMode = 0): number {
-  const pixels = deltaMode === 1 ? deltaY * 16 : deltaMode === 2 ? deltaY * 800 : deltaY;
+  const pixels = normalizeWorkspaceImageWheelDelta(deltaY, deltaMode);
   const clamped = Math.min(40, Math.max(-40, pixels));
   return Math.exp(-clamped * 0.01);
+}
+
+export function normalizeWorkspaceImageWheelDelta(delta: number, deltaMode = 0): number {
+  return deltaMode === 1 ? delta * 16 : deltaMode === 2 ? delta * 800 : delta;
+}
+
+interface WorkspaceImageWheelSample {
+  readonly deltaMode: number;
+  readonly deltaX: number;
+  readonly deltaY: number;
+  readonly shiftKey: boolean;
+  readonly wheelDeltaY?: number;
+}
+
+type WorkspaceImageWheelSource = "mouse" | "trackpad";
+
+function classifyWorkspaceImageWheel(sample: WorkspaceImageWheelSample): WorkspaceImageWheelSource {
+  if (sample.deltaMode !== 0) return "mouse";
+  if (sample.deltaX !== 0 && !sample.shiftKey) return "trackpad";
+  if (!Number.isInteger(sample.deltaY)) return "mouse";
+  const legacy = sample.wheelDeltaY;
+  if (typeof legacy === "number" && legacy !== 0) {
+    if (legacy % 120 === 0) return "mouse";
+    if (legacy === -3 * sample.deltaY) return "trackpad";
+  }
+  return "mouse";
+}
+
+/** Keep the same device interpretation through a gesture's momentum tail. */
+export function createWorkspaceImageWheelSourceTracker(idleMs = 250): (sample: WorkspaceImageWheelSample, now: number) => WorkspaceImageWheelSource {
+  let source: WorkspaceImageWheelSource | undefined;
+  let lastAt = Number.NEGATIVE_INFINITY;
+  return (sample, now) => {
+    if (source === undefined || now - lastAt > idleMs) source = classifyWorkspaceImageWheel(sample);
+    else if (source === "mouse" && sample.deltaMode === 0 && sample.deltaX !== 0 && !sample.shiftKey) source = "trackpad";
+    lastAt = now;
+    return source;
+  };
+}
+
+export function workspaceImageWheelIntent(event: { readonly ctrlKey: boolean; readonly metaKey: boolean; readonly deltaX: number; readonly deltaY: number },
+  source: WorkspaceImageWheelSource, scale: number): "zoom" | "pan" | "none" {
+  if (event.ctrlKey || event.metaKey || source === "mouse") return event.deltaY === 0 ? "none" : "zoom";
+  return scale <= 1 || event.deltaX === 0 && event.deltaY === 0 ? "none" : "pan";
 }
 
 export function zoomWorkspaceImageAtPoint(

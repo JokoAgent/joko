@@ -2,12 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   clampWorkspaceImageScale,
+  createWorkspaceImageWheelSourceTracker,
   drawWorkspaceImageStrokes,
   normalizeWorkspaceImagePoint,
   shouldAppendWorkspaceImagePoint,
   workspaceImageStrokePath,
   workspaceImageStrokeWidth,
   workspaceImageWheelZoomFactor,
+  workspaceImageWheelIntent,
   zoomWorkspaceImageAtPoint
 } from "./workspace-image-annotations.js";
 
@@ -58,5 +60,24 @@ describe("workspace image annotations", () => {
     expect(workspaceImageWheelZoomFactor(-40, 0)).toBeCloseTo(Math.exp(0.4));
     expect(workspaceImageWheelZoomFactor(-3, 1)).toBeCloseTo(Math.exp(0.4));
     expect(workspaceImageWheelZoomFactor(1, 2)).toBeCloseTo(Math.exp(-0.4));
+  });
+
+  it("keeps trackpad momentum panning, separates a later mouse stream and lets pinch zoom", () => {
+    const track = createWorkspaceImageWheelSourceTracker();
+    const sample = { deltaMode: 0, deltaX: 20, deltaY: 0, shiftKey: false };
+    expect(track(sample, 1)).toBe("trackpad");
+    const tail = { ...sample, deltaX: 0, deltaY: 12 };
+    expect(track(tail, 20)).toBe("trackpad");
+    expect(workspaceImageWheelIntent({ ...tail, ctrlKey: false, metaKey: false }, track(tail, 30), 2)).toBe("pan");
+    expect(workspaceImageWheelIntent({ ...sample, ctrlKey: false, metaKey: false }, "trackpad", 1)).toBe("none");
+    expect(workspaceImageWheelIntent({ ...tail, ctrlKey: true, metaKey: false }, "trackpad", 2)).toBe("zoom");
+    expect(track(tail, 500)).toBe("mouse");
+    expect(workspaceImageWheelIntent({ ...tail, ctrlKey: false, metaKey: false }, track(tail, 510), 2)).toBe("zoom");
+    const fresh = createWorkspaceImageWheelSourceTracker();
+    expect(fresh({ ...tail, deltaMode: 1 }, 1)).toBe("mouse");
+    expect(fresh(sample, 2)).toBe("trackpad");
+    expect(createWorkspaceImageWheelSourceTracker()({ ...tail, wheelDeltaY: -36 }, 1)).toBe("trackpad");
+    expect(createWorkspaceImageWheelSourceTracker()({ ...tail, deltaY: 40, wheelDeltaY: -120 }, 1)).toBe("mouse");
+    expect(createWorkspaceImageWheelSourceTracker()({ ...sample, shiftKey: true }, 1)).toBe("mouse");
   });
 });

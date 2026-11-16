@@ -25,6 +25,8 @@
 .workspace-image-lightbox__image-wrap.is-wheeling { transition: none; }
 .workspace-image-lightbox__image-wrap:not(.is-annotating):has(img) { cursor: grab; }
 .workspace-image-lightbox__image-wrap.is-annotating { cursor: crosshair; }
+.workspace-image-lightbox__image-wrap.is-annotating.is-space-panning { cursor: grab; }
+.workspace-image-lightbox__image-wrap.is-annotating.is-dragging { cursor: grabbing; }
 .workspace-image-lightbox__image-wrap img {
   display: block;
   max-width: calc(100vw - 80px);

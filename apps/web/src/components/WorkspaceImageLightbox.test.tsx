@@ -46,6 +46,84 @@ afterEach(async () => {
 });
 
 describe("WorkspaceImageLightbox gallery surface", () => {
+  it("pans horizontal and momentum wheel events without zooming, while mouse and pinch retain focal zoom", () => {
+    const view = (src: string) => <WorkspaceImageLightbox ownerKey="gallery" src={src} name="render.png" labels={labels}
+      onClose={() => undefined} onDownload={() => undefined} />;
+    const root = mount(view("blob:first"));
+    let wrap = imageGestureSurface();
+    const overlay = document.querySelector<HTMLDivElement>('[role="dialog"]')!;
+    const atFit = wheel(overlay, { deltaX: 20, time: 1 });
+    expect(atFit.defaultPrevented).toBe(true);
+    expect(wrap.style.transform).toBe("translate(0px, 0px) scale(1)");
+    zoomImage();
+    const scale = imageScale(wrap);
+    wheel(overlay, { deltaX: 20, time: 10 });
+    expect(wrap.style.transform).toBe(`translate(-20px, 0px) scale(${scale})`);
+    wheel(overlay, { deltaY: 15, time: 20 });
+    expect(wrap.style.transform).toBe(`translate(-20px, -15px) scale(${scale})`);
+    wheel(overlay, { deltaY: -10, ctrlKey: true, time: 30 });
+    expect(imageScale(wrap)).toBeCloseTo(scale * Math.exp(0.1));
+    wheel(overlay, { deltaY: 10, time: 500 });
+    expect(imageScale(wrap)).toBeCloseTo(scale);
+    wheel(overlay, { deltaX: 5000, time: 510 });
+    expect(Number(/translate\(([^p]+)px/u.exec(wrap.style.transform)?.[1])).toBeCloseTo(-400 * (scale - 1) / 2);
+    act(() => root.render(view("blob:second")));
+    wrap = imageGestureSurface();
+    zoomImage();
+    wheel(overlay, { deltaY: 10, time: 520 });
+    expect(imageScale(wrap)).toBeCloseTo(Math.pow(1.2, 4) * Math.exp(-0.1));
+  });
+
+  it("uses Space and middle-button annotation pans without strokes, and retires modifiers on blur and source change", () => {
+    const view = (src: string) => <WorkspaceImageLightbox ownerKey="gallery" src={src} name="render.png" labels={labels}
+      onClose={() => undefined} onDownload={() => undefined} onSendToChat={() => undefined} />;
+    const root = mount(view("blob:first"));
+    let wrap = imageGestureSurface();
+    const overlay = document.querySelector<HTMLDivElement>('[role="dialog"]')!;
+    zoomImage();
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    const held = space(overlay, "keydown");
+    expect(held.defaultPrevented).toBe(true);
+    expect(wrap.classList.contains("is-space-panning")).toBe(true);
+    pointer(wrap, "pointerdown", 1, 100, 100, "mouse");
+    pointer(overlay, "pointermove", 1, 160, 140, "mouse");
+    pointer(overlay, "pointerup", 1, 160, 140, "mouse");
+    expect(wrap.style.transform).toContain("translate(60px, 40px)");
+    expect(wrap.querySelector("path")).toBeNull();
+    space(overlay, "keyup");
+    expect(wrap.classList.contains("is-space-panning")).toBe(false);
+    pointer(wrap, "pointerdown", 2, 100, 100, "mouse", 1);
+    pointer(overlay, "pointermove", 2, 130, 120, "mouse", 1);
+    pointer(overlay, "pointerup", 2, 130, 120, "mouse", 1);
+    expect(wrap.style.transform).toContain("translate(90px, 60px)");
+    expect(wrap.querySelector("path")).toBeNull();
+    wheel(overlay, { deltaX: 20, time: 1 });
+    expect(wrap.style.transform).toContain("translate(70px, 60px)");
+    expect(wrap.querySelector("path")).toBeNull();
+    const copy = document.querySelector<HTMLButtonElement>('button[aria-label="Copy"]')!;
+    expect(space(copy, "keydown").defaultPrevented).toBe(false);
+    expect(wrap.classList.contains("is-space-panning")).toBe(false);
+    space(overlay, "keydown");
+    act(() => window.dispatchEvent(new Event("blur")));
+    expect(wrap.classList.contains("is-space-panning")).toBe(false);
+    pointer(wrap, "pointerdown", 3, 100, 100, "pen");
+    pointer(overlay, "pointermove", 3, 120, 120, "pen");
+    pointer(overlay, "pointerup", 3, 120, 120, "pen");
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    space(overlay, "keydown");
+    pointer(wrap, "pointerdown", 4, 100, 100, "mouse");
+    act(() => root.render(view("blob:second")));
+    wrap = imageGestureSurface();
+    expect(wrap.classList.contains("is-space-panning")).toBe(false);
+    pointer(overlay, "pointermove", 4, 350, 250, "mouse");
+    expect(wrap.querySelector("path")).toBeNull();
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    pointer(wrap, "pointerdown", 5, 100, 100, "mouse");
+    pointer(overlay, "pointerup", 5, 100, 100, "mouse");
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    expect(wrap.style.transform).toBe("translate(0px, 0px) scale(1)");
+  });
+
   it("keeps one modal mounted while loading and routes buttons and arrow keys through the gallery", () => {
     const previous = vi.fn();
     const next = vi.fn();
@@ -207,6 +285,12 @@ describe("WorkspaceImageLightbox gallery surface", () => {
     expect(next).toHaveBeenCalledOnce();
     const wrap = imageGestureSurface(ownerDocument);
     act(() => ownerDocument.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    space(ownerDocument.querySelector<HTMLDivElement>('[role="dialog"]')!, "keydown");
+    expect(wrap.classList.contains("is-space-panning")).toBe(true);
+    act(() => window.dispatchEvent(new Event("blur")));
+    expect(wrap.classList.contains("is-space-panning")).toBe(true);
+    act(() => ownerWindow.dispatchEvent(new ownerWindow.Event("blur")));
+    expect(wrap.classList.contains("is-space-panning")).toBe(false);
     pointer(wrap, "pointerdown", 1, 100, 100, "pen");
     pointer(wrap, "pointermove", 1, 120, 120, "pen");
     pointer(wrap, "pointerup", 1, 120, 120, "pen");
@@ -337,10 +421,32 @@ function imageGestureSurface(ownerDocument = document): HTMLDivElement {
   return wrap;
 }
 
-function pointer(target: HTMLElement, type: string, id: number, x: number, y: number, pointerType = "touch"): void {
+function pointer(target: HTMLElement, type: string, id: number, x: number, y: number, pointerType = "touch", button = 0): void {
   const event = new Event(type, { bubbles: true, cancelable: true });
-  Object.defineProperties(event, { pointerId: { value: id }, pointerType: { value: pointerType }, button: { value: 0 }, clientX: { value: x }, clientY: { value: y } });
+  Object.defineProperties(event, { pointerId: { value: id }, pointerType: { value: pointerType }, button: { value: button }, clientX: { value: x }, clientY: { value: y } });
   act(() => target.dispatchEvent(event));
+}
+
+function zoomImage(): void {
+  act(() => { for (let index = 0; index < 4; index++) document.dispatchEvent(new KeyboardEvent("keydown", { key: "+", bubbles: true })); });
+}
+
+function imageScale(wrap: HTMLElement): number {
+  return Number(/scale\(([^)]+)\)/u.exec(wrap.style.transform)?.[1]);
+}
+
+function wheel(target: HTMLElement, options: { deltaX?: number; deltaY?: number; ctrlKey?: boolean; time: number }): WheelEvent {
+  const event = new WheelEvent("wheel", { bubbles: true, cancelable: true, clientX: 200, clientY: 150,
+    deltaX: options.deltaX ?? 0, deltaY: options.deltaY ?? 0, ctrlKey: options.ctrlKey ?? false });
+  Object.defineProperty(event, "timeStamp", { value: options.time });
+  act(() => target.dispatchEvent(event));
+  return event;
+}
+
+function space(target: HTMLElement, type: "keydown" | "keyup"): KeyboardEvent {
+  const event = new KeyboardEvent(type, { key: " ", code: "Space", bubbles: true, cancelable: true });
+  act(() => target.dispatchEvent(event));
+  return event;
 }
 
 function mount(element: ReactNode): Root {
