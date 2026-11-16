@@ -1,5 +1,7 @@
 import { useLayoutEffect, useState, type JSX, type RefObject } from "react";
 import { createPortal } from "react-dom";
+import type { ImageAnnotationStroke } from "../image-annotations.js";
+import { AnnotatedImage } from "./AnnotatedImage.js";
 
 const MAXIMUM_WIDTH = 224;
 const MAXIMUM_HEIGHT = 168;
@@ -15,10 +17,11 @@ interface HoverPlacement {
 }
 
 /** A non-interactive preview that follows its attachment trigger without escaping the viewport. */
-export function ComposerImageHoverPreview({ open, anchorRef, src }: {
+export function ComposerImageHoverPreview({ open, anchorRef, src, annotationStrokes }: {
   readonly open: boolean;
   readonly anchorRef: RefObject<HTMLElement | null>;
   readonly src: string;
+  readonly annotationStrokes?: readonly ImageAnnotationStroke[];
 }): JSX.Element | null {
   const [placement, setPlacement] = useState<HoverPlacement>();
 
@@ -76,6 +79,6 @@ export function ComposerImageHoverPreview({ open, anchorRef, src }: {
       transform: placement.side === "above" ? "translate(-50%, -100%)" : "translate(-50%, 0)"
     }}
   >
-    <img src={src} alt="" draggable={false} style={{ maxWidth: placement.maxWidth, maxHeight: placement.maxHeight }} />
+    <AnnotatedImage src={src} strokes={annotationStrokes} imageStyle={{ maxWidth: placement.maxWidth, maxHeight: placement.maxHeight }} />
   </div>, host);
 }

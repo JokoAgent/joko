@@ -10,6 +10,7 @@ import type { AppController } from "../controller.js";
 import type { PartnerNetworkApi } from "../partner-network-api.js";
 import { PartnerNetworkPage, PartnerNetworkSection } from "./PartnerNetwork.js";
 import type { Translator } from "./types.js";
+import * as imageAttachments from "../image-attachment.js";
 
 vi.mock("./Timeline.js", () => ({ StreamingMarkdown: ({ text }: { text: string }) => <p>{text}</p> }));
 const roots: Root[] = [];
@@ -167,6 +168,39 @@ describe("Shared conversation UI receipts", () => {
     await act(async () => { button("Send", thread).click(); await settle(); }); expect(f.api.sendPartnerNetwork.mock.calls[0]![0]).toMatchObject({ text: "", threadRootId: "thread-root", attachments: [{ id: "media-image", name: "annotated.png", mediaType: "image/png", sizeBytes: 4n }] });
     expect(JSON.stringify(Object.values(localStorage))).not.toContain("blob:local-image");
   });
+
+  it("restores editable network image drafts and keeps a newer text draft while burning the captured input", async () => {
+    const f = setup(), originalBytes = new Uint8Array([1, 2, 3]), burnedBytes = new Uint8Array([7, 8, 9, 10]);
+    const file = new File([originalBytes], "photo.jpg", { type: "image/jpeg" }); Object.defineProperty(file, "arrayBuffer", { value: async () => originalBytes.buffer });
+    const burned = new File([burnedBytes], "photo.png", { type: "image/png" }); Object.defineProperty(burned, "arrayBuffer", { value: async () => burnedBytes.buffer });
+    Object.defineProperties(URL, { createObjectURL: { configurable: true, value: () => "blob:network-original" }, revokeObjectURL: { configurable: true, value: () => {} } });
+    let uploadCount = 0;
+    const media = vi.fn(async (request: wire.MediaPartnerNetworkRequest) => request.action === "begin"
+      ? create(wire.MediaPartnerNetworkResponseSchema, { attachment: { id: `media-${++uploadCount}`, name: request.name, mediaType: request.mediaType, sizeBytes: request.sizeBytes }, offset: 0n })
+      : create(wire.MediaPartnerNetworkResponseSchema, { offset: request.offset + BigInt(request.data.length), complete: true }));
+    Object.assign(f.api, { mediaPartnerNetwork: media });
+    let finish!: (value: File) => void;
+    const materialize = vi.spyOn(imageAttachments, "materializeImageAttachment").mockImplementation(() => new Promise<File>(resolve => { finish = resolve; }));
+    const page = () => <PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />;
+    const first = await mount(page()), picker = first.element.querySelector<HTMLInputElement>('input[type="file"]')!;
+    Object.defineProperty(picker, "files", { value: [file] }); await act(async () => { picker.dispatchEvent(new Event("change", { bubbles: true })); await settle(); });
+    await editNetworkDraftImage(first.element, true); expect(uploadCount).toBe(1); expect(materialize).not.toHaveBeenCalled();
+    await act(async () => first.root.unmount()); roots.splice(roots.indexOf(first.root), 1);
+    const resumed = await mount(page()); await editNetworkDraftImage(resumed.element, false); await editNetworkDraftImage(resumed.element, true);
+    expect(uploadCount).toBe(1); expect(materialize).not.toHaveBeenCalled();
+    f.api.sendPartnerNetwork.mockRejectedValueOnce(new ConnectError("reply lost", Code.Unavailable));
+    await act(async () => { button("Send", resumed.element).click(); await settle(); });
+    expect(materialize).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ file, annotationStrokes: [expect.objectContaining({ points: expect.any(Array) })] }), expect.any(AbortSignal));
+    await fill(resumed.element.querySelector("textarea")!, "Keep this newer draft");
+    await act(async () => { finish(burned); await settle(); });
+    const sent = f.api.sendPartnerNetwork.mock.calls[0]![0];
+    expect(sent).toMatchObject({ text: "", attachments: [{ id: "media-2", name: "photo.png", mediaType: "image/png", sizeBytes: 4n }] });
+    expect(resumed.element.querySelector("textarea")!.value).toBe("Keep this newer draft");
+    expect(uploadCount).toBe(2); expect(JSON.stringify(Object.values(localStorage))).not.toContain("blob:network-original");
+    await act(async () => { button("Retry", resumed.element).click(); await settle(); });
+    expect(f.api.sendPartnerNetwork.mock.calls[1]![0]).toEqual(sent); expect(uploadCount).toBe(2); expect(materialize).toHaveBeenCalledOnce();
+    expect(resumed.element.querySelector("textarea")!.value).toBe("Keep this newer draft");
+  });
   it("reads failures for every loaded old source and removes notices when authority clears them", async () => {
     const f = setup(); for (let index = 0; index < 215; index++) f.rows.push(create(wire.PartnerNetworkMessageSchema, { id: `source-${index}`, text: `Message ${index}`, authorId: "human", sequence: BigInt(index + 1), createdAtMs: 1n }));
     f.api.readPartnerNetworkFailures.mockImplementation(async request => create(wire.ReadPartnerNetworkFailuresResponseSchema, { executions: request.sourceMessageIds?.includes("source-0") ? [{ id: "old-source-failure", sourceMessageId: "source-0", actorId: "partner", lease: 1n, status: "failed", failureCode: "RATE_LIMITED" }] : [] }));
@@ -178,3 +212,16 @@ describe("Shared conversation UI receipts", () => {
     await act(async () => { document.dispatchEvent(new Event("visibilitychange")); await settle(); }); expect(view.element.querySelector('[data-network-execution-failure]')).toBeNull();
   });
 });
+
+async function editNetworkDraftImage(parent: ParentNode, draw: boolean): Promise<void> {
+  act(() => parent.querySelector<HTMLButtonElement>(".attachment-chip__content")!.click());
+  const overlay = document.querySelector<HTMLElement>(".workspace-image-lightbox")!, image = overlay.querySelector<HTMLImageElement>(".workspace-image-lightbox__image-wrap img")!, wrap = image.parentElement!;
+  Object.defineProperties(image, { naturalWidth: { value: 400 }, naturalHeight: { value: 300 } });
+  image.getBoundingClientRect = () => ({ left: 0, top: 0, width: 400, height: 300 } as DOMRect);
+  overlay.setPointerCapture = () => {}; overlay.hasPointerCapture = () => false;
+  act(() => { image.dispatchEvent(new Event("load")); button("workspace.imageAnnotate", overlay).click(); });
+  if (draw) { for (const type of ["pointerdown", "pointerup"]) { const event = new Event(type, { bubbles: true }); Object.defineProperties(event, { pointerId: { value: 1 }, pointerType: { value: "pen" }, button: { value: 0 }, clientX: { value: 100 }, clientY: { value: 100 } }); act(() => (type === "pointerdown" ? wrap : overlay).dispatchEvent(event)); } }
+  else { expect(overlay.querySelectorAll(".workspace-image-lightbox__image-wrap g")).toHaveLength(1); act(() => button("workspace.imageUndoAnnotation", overlay).click()); }
+  await act(async () => { button("Save", overlay).click(); await new Promise(resolve => setTimeout(resolve, 180)); });
+  expect(document.querySelector(".workspace-image-lightbox")).toBeNull();
+}

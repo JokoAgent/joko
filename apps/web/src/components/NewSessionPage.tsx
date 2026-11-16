@@ -108,6 +108,7 @@ import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ObjectiveDialog, objectiveLimitsFromDialog, type ObjectiveDialogLimits } from "./ObjectiveDialog.js";
 import { PersonalDevelopmentSettings, rememberPersonalDevelopmentDoctor, type PersonalDevelopmentLaunch } from "./PersonalDevelopmentSettings.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
+import { editImageAttachment } from "../image-attachment.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
 import { HomeSuggestionList } from "./HomeSuggestionList.js";
@@ -2843,6 +2844,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                 if (attachment.previewUrl !== undefined) URL.revokeObjectURL(attachment.previewUrl);
                 setAttachments((current) => current.filter((item) => item.id !== attachment.id));
               }}
+              onSaveImageAnnotations={attachmentPolicy.images ? (attachment, strokes) => {
+                if (!hydrated || submitting || voice.active) throw new Error(t("composer.inputUnavailable"));
+                const next = editImageAttachment(attachmentsRef.current, attachment, strokes);
+                if (next === attachmentsRef.current) return;
+                attachmentsRef.current = next;
+                setAttachments(next);
+              } : undefined}
             />}
             {attachmentError !== undefined && <p className="composer__error" role="alert"><AlertTriangle aria-hidden="true" />{attachmentError}</p>}
             <ComposerRichTextEditor

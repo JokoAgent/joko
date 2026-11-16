@@ -196,6 +196,17 @@ describe("owner-scoped delayed-create drafts", () => {
     expect(successfulConsume.every((entry) => entry.mode === "readwrite")).toBe(true);
   });
 
+  it("does not consume a suggestion draft after its image vectors changed on the same original file", async () => {
+    const memory = memoryDatabase(), state = Reflect.construct(LocalState as unknown as Function, [memory.database]) as LocalState;
+    const base = pendingExtensionSuggestion(), file = new File(["original"], "photo.jpg", { type: "image/jpeg", lastModified: 123 });
+    const original: PendingExtensionSuggestionView = { ...base, draft: { ...base.draft, attachments: [{ id: "original-image", kind: "image", file }] } };
+    const changed: PendingExtensionSuggestionView = { ...original, draft: { ...original.draft, attachments: [{ ...original.draft.attachments[0]!, annotationStrokes: [{ points: [{ x: 0.1, y: 0.3 }] }] }] } };
+    await state.savePendingExtensionSuggestion("owner", changed);
+    expect(await state.compareAndSetPendingExtensionSuggestion("owner", original)).toBe(false);
+    expect((await state.readPendingExtensionSuggestion("owner"))?.draft.attachments[0]?.annotationStrokes).toEqual(changed.draft.attachments[0]!.annotationStrokes);
+    expect(await state.compareAndSetPendingExtensionSuggestion("owner", changed)).toBe(true);
+  });
+
   it("does not clear a newer nonce and clears only exact invalid durable data", async () => {
     const memory = memoryDatabase();
     const state = Reflect.construct(LocalState as unknown as Function, [memory.database]) as LocalState;

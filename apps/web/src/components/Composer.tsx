@@ -41,6 +41,7 @@ import { composerBuiltInCommand, composerCommandItems, detectComposerCommandActi
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
+import { editImageAttachment } from "../image-attachment.js";
 import { composerCaretTextOffset, composerDirectoryQueryToken, composerMentionCatalog, composerMentionsFromRanges, composerSelectionTextRange, detectComposerInlineMention, firstEnabledComposerMentionIndex, remapComposerInlineMentionRanges, replaceComposerDocumentTextRange, resolveComposerInlineMentionKey, resolveComposerMentionResults, restoreComposerInlineMentionRanges, setComposerCaretTextOffset, type ComposerInlineMentionActivation, type ComposerInlineMentionRange, type ComposerMentionCatalogItem, type ComposerMentionProviderState } from "./composer-inline-mention.js";
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
 import { ContextCapacityRing } from "./ContextCapacityRing.js";
@@ -2915,6 +2916,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
               if (attachment.previewUrl !== undefined) URL.revokeObjectURL(attachment.previewUrl);
               setAttachments((current) => current.filter((item) => item.id !== attachment.id));
             }}
+            onSaveImageAnnotations={attachmentPolicy.images && !effectiveBashMode ? (attachment, strokes) => {
+              if (composerLocked) throw new Error(t("composer.inputUnavailable"));
+              const next = editImageAttachment(attachmentsRef.current, attachment, strokes);
+              if (next === attachmentsRef.current) return;
+              markDraftEdited(session.id);
+              attachmentsRef.current = next;
+              setAttachments(next);
+            } : undefined}
           />
         )}
         {attachmentError !== undefined && <p className="composer__error" role="alert"><AlertTriangle aria-hidden="true" />{attachmentError}</p>}
@@ -3486,6 +3495,7 @@ function comparableAttachment(attachment: AttachmentDraft): object {
   return {
     id: attachment.id,
     kind: attachment.kind,
+    annotationStrokes: attachment.annotationStrokes,
     file: {
       name: attachment.file.name,
       type: attachment.file.type,
