@@ -79,6 +79,8 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     await page.locator("form.pair-form button[type=submit]").click();
     const timeline = page.locator('.timeline[data-timeline-session-id="' + sessionId + '"]');
     await timeline.waitFor({ state: "visible", timeout: 20_000 });
+    const closeDetails = page.getByRole("button", { name: "Close details", exact: true });
+    if (await closeDetails.isVisible()) await closeDetails.click();
     const preview = (name: string) => timeline.getByRole("button", { name: "Preview: " + name, exact: true });
     const dialog = page.getByRole("dialog");
     const markdown = dialog.locator(".text-attachment-lightbox__markdown");
@@ -112,6 +114,8 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     await capture("narrow-dark-code");
     await page.keyboard.press("Escape");
+    const closeNavigation = page.getByRole("button", { name: "Close navigation", exact: true });
+    if (await closeNavigation.isVisible()) await closeNavigation.click();
     await preview("literal.txt").click();
     expect(await dialog.locator("main > pre").textContent()).toBe(PLAIN);
     expect(await dialog.locator("h1, .cm-editor").count()).toBe(0);
@@ -130,6 +134,7 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     await capture("narrow-dark-error");
     await page.keyboard.press("Escape");
 
+    await page.getByRole("button", { name: "Open navigation", exact: true }).click();
     await page.getByRole("button", { name: /^New task/u }).first().click();
     const composer = page.locator(".composer");
     await composer.locator(".composer-add-menu__trigger").click();
