@@ -210,7 +210,13 @@ mountedIt("edits the same original image in task and new-task drafts, restores v
   const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
   const evidence = process.env.RUNNER_TEMP ? join(process.env.RUNNER_TEMP, "joko-web-evidence", "image-lightbox") : undefined;
   const capture = async (name: string) => { if (evidence) { await mkdir(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, name + ".png"), animations: "disabled", timeout: 5_000 }); } };
-  const closeDrawers = async () => { for (const name of ["Close details", "Close navigation"]) { const button = page.getByRole("button", { name, exact: true }); if (await button.isVisible()) await button.click(); } };
+  const closeDrawers = async () => {
+    const buttons = [
+      page.locator(".inspector-dock-group[data-edge]").getByRole("button", { name: "Close details", exact: true }),
+      page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation", exact: true })
+    ];
+    for (const button of buttons) if (await button.isVisible()) await button.click();
+  };
   const composer = page.locator(".composer"), tray = composer.locator(".attachment-list");
   const selectModel = async (name: string) => {
     const trigger = composer.locator(".model-picker-trigger"); await trigger.click();

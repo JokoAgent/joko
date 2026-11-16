@@ -79,7 +79,7 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     await page.locator("form.pair-form button[type=submit]").click();
     const timeline = page.locator('.timeline[data-timeline-session-id="' + sessionId + '"]');
     await timeline.waitFor({ state: "visible", timeout: 20_000 });
-    const closeDetails = page.getByRole("button", { name: "Close details", exact: true });
+    const closeDetails = page.locator(".inspector-dock-group[data-edge]").getByRole("button", { name: "Close details", exact: true });
     if (await closeDetails.isVisible()) await closeDetails.click();
     const preview = (name: string) => timeline.getByRole("button", { name: "Preview: " + name, exact: true });
     const dialog = page.getByRole("dialog");
@@ -91,7 +91,9 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     expect(await markdown.locator("pre code span").count()).toBeGreaterThan(0);
     expect(await markdown.locator("pre .tok-keyword").evaluate(element => getComputedStyle(element).color !== getComputedStyle(element.closest("code")!).color)).toBe(true);
     await dialog.getByRole("button", { name: "Copy", exact: true }).click();
-    await waitFor(() => page.evaluate(() => navigator.clipboard.readText()), text => text === MARKDOWN, "copying the original Markdown source");
+    // The native Windows clipboard exposes text with CRLF line endings.
+    const copiedMarkdown = process.platform === "win32" ? MARKDOWN.replaceAll("\n", "\r\n") : MARKDOWN;
+    await waitFor(() => page.evaluate(() => navigator.clipboard.readText()), text => text === copiedMarkdown, "copying the original Markdown source");
     await page.evaluate(() => { document.documentElement.dataset.theme = "light"; });
     await capture("wide-light-markdown");
     await page.keyboard.press("Escape");
@@ -114,7 +116,7 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     await capture("narrow-dark-code");
     await page.keyboard.press("Escape");
-    const closeNavigation = page.getByRole("button", { name: "Close navigation", exact: true });
+    const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation", exact: true });
     if (await closeNavigation.isVisible()) await closeNavigation.click();
     await preview("literal.txt").click();
     expect(await dialog.locator("main > pre").textContent()).toBe(PLAIN);
