@@ -33,7 +33,7 @@ import {
 } from "./adapter.js";
 import type { CodexSmartRoutingPreparation } from "./smart-subagent-routing.js";
 import { AppServerHost } from "./host.js";
-import { remoteRpcFault, TransportFault } from "./errors.js";
+import { remoteRpcFault, RpcRemoteFault, TransportFault } from "./errors.js";
 import type { JsonObject } from "./protocol.js";
 import { FakeCodexAppServer } from "./testing.js";
 
@@ -352,6 +352,74 @@ describe("CodexBackendAdapter", () => {
       expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(1);
     }
   });
+  it.each(["before send", "while persisting"] as const)("keeps a new empty native proof when its matching start notification arrives %s", async timing => {
+    const setup = await createSetup();
+    await setup.adapter.listModels();
+    const transport = setup.fake.transport!, emit = transport.emitNotification.bind(transport), request = transport.request.bind(transport);
+    let started: Parameters<typeof emit>[1] | undefined;
+    vi.spyOn(transport, "emitNotification").mockImplementation(async (method, params) => {
+      if (method === "thread/started") { started = params; return; }
+      await emit(method, params);
+    });
+    const requests = vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      if (method === "thread/turns/list") throw new RpcRemoteFault(-32600, undefined, false, method);
+      return request(method, params, options);
+    });
+    const initial = context(setup.target, [], { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    expect(started).toBeDefined();
+    if (timing === "before send") await emit("thread/started", started!);
+    let release!: () => void;
+    const persist = vi.fn(async preparation => {
+      expect(preparation.nativeHistory.activeLineage).toEqual([]);
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    const sending = setup.adapter.sendWithDurableNativeDispatchFence(prompt("First native input"), { ...initial, binding, operationId: "late-native-start" }, persist);
+    const observed = sending.catch(error => error);
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
+    if (timing === "while persisting") await emit("thread/started", started!);
+    release();
+    expect(await observed).toBeUndefined();
+    expect(requests.mock.calls.filter(([method]) => method === "thread/turns/list")).toHaveLength(0);
+    expect(transport.requests.filter(entry => entry.method === "turn/start")).toHaveLength(1);
+  });
+
+  it.each(["buffered mutation", "late mutation", "duplicate start", "different workspace", "nonempty start"] as const)(
+    "never adopts a new empty native proof after %s", async boundary => {
+      const setup = await createSetup();
+      await setup.adapter.listModels();
+      const transport = setup.fake.transport!, emit = transport.emitNotification.bind(transport), request = transport.request.bind(transport);
+      let started: Parameters<typeof emit>[1] | undefined;
+      vi.spyOn(transport, "emitNotification").mockImplementation(async (method, params) => {
+        if (method === "thread/started") {
+          started = params;
+          if (boundary === "buffered mutation") await emit("thread/reverted", { threadId: String(((params as JsonObject)["thread"] as JsonObject)["id"]) });
+          return;
+        }
+        await emit(method, params);
+      });
+      const requests = vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+        if (method === "thread/turns/list") throw new RpcRemoteFault(-32600, undefined, false, method);
+        return request(method, params, options);
+      });
+      const initial = context(setup.target, [], { backendInstanceGeneration: 7 });
+      const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+      expect(started).toBeDefined();
+      const thread = (started! as JsonObject)["thread"] as JsonObject;
+      if (boundary === "late mutation") await emit("thread/reverted", { threadId: binding.nativeSessionId! });
+      if (boundary === "duplicate start") { await emit("thread/started", started!); await emit("thread/started", started!); }
+      else await emit("thread/started", { thread: { ...thread,
+        ...(boundary === "different workspace" ? { cwd: "/different-workspace" } : {}),
+        ...(boundary === "nonempty start" ? { turns: [{ id: "unexpected-turn", status: "completed", items: [] }] } : {}) } });
+      const persist = vi.fn(async () => undefined);
+      await expect(setup.adapter.sendWithDurableNativeDispatchFence(prompt("Keep this input"),
+        { ...initial, binding, operationId: "unproven-empty-native-history" }, persist)).rejects.toMatchObject({ requestMethod: "thread/turns/list" });
+      expect(persist).not.toHaveBeenCalled();
+      expect(requests.mock.calls.filter(([method]) => method === "thread/turns/list")).toHaveLength(1);
+      expect(transport.requests.filter(entry => entry.method === "turn/start")).toHaveLength(0);
+    }
+  );
+
   it.each([[false, false], [true, false], [false, true]])("keeps native one-shot inference on an isolated exact-model protocol and original owner (cancelled=%s, images=%s)", async (cancelled, withImage) => {
     const setup = await createSetup(), owner = new AbortController(), allowed = vi.fn();
     setup.fake.modelList = setup.fake.modelList.map(model => ({ ...model, inputModalities: ["text", "image"] })); await setup.adapter.describe();

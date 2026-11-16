@@ -1359,6 +1359,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         binding,
         context,
         hostGeneration: response.hostGeneration,
+        initialEmptyStart: request.method === "thread/start" && thread.historyMode === "paginated" && thread.turns.length === 0,
         permissionMode: input.permissionMode,
         managedRoute,
         smartRoute,
@@ -4546,6 +4547,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly smartRoute?: ManagedProviderSmartRoutingBinding | undefined;
     readonly mcp?: CodexMcpRuntimeLease | undefined;
     readonly mcpPending?: boolean;
+    readonly initialEmptyStart?: boolean;
     readonly nativeConfiguration?: JsonObject | undefined;
     readonly nativeSkills?: NativeSkillSnapshot | undefined;
     readonly thread: NativeThread;
@@ -4997,7 +4999,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             recovery: "Reconnect and inspect the native thread before sending more work."
           }));
         }
-      });
+      }, input.initialEmptyStart ? { initialEmptyStart: { cwd: input.thread.cwd } } : undefined);
       runtime.subscriptionFlight = subscriptionFlight;
       const subscription = await subscriptionFlight;
       runtime.subscriptionFlight = undefined;
