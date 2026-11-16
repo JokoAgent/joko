@@ -8,6 +8,7 @@ import type { AppController } from "../controller.js";
 import { emptySnapshot, type PartnerProfileView } from "../model.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { PartnerGroupPage, PartnerGroupsNavigation, PartnerGroupsSection } from "./PartnerGroups.js";
+import * as imageAttachments from "../image-attachment.js";
 
 const m = wire.partnerGroupMessages("en"), t = (key: string) => key;
 let root: Root, host: HTMLDivElement;
@@ -110,6 +111,28 @@ it("keeps a persisted unknown creation in the actual StrictMode dialog until its
   expect(dialog.textContent).toContain(m.pendingCreate); expect(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]')!.disabled).toBe(true);
   await act(async () => { button(m.checkCreate, dialog).click(); await settle(); }); expect(f.controller.navigate).toHaveBeenCalledWith({ kind: "partners", groupId: f.group.id }); expect(localStorage.length).toBe(0);
 });
+it("keeps editable image vectors on the same original and reuses the burned upload for an unknown group send", async () => {
+  const f = fixture(), file = new File(["original"], "photo.jpg", { type: "image/jpeg" });
+  vi.mocked(f.api.newRequestId).mockReturnValueOnce("original-image-send").mockReturnValueOnce("unexpected-replacement");
+  Object.defineProperties(URL, { createObjectURL: { configurable: true, value: () => "blob:group-original" }, revokeObjectURL: { configurable: true, value: () => {} } });
+  const materialize = vi.spyOn(imageAttachments, "materializeImageAttachment").mockResolvedValue(new File(["burned"], "photo.png", { type: "image/png" }));
+  await act(async () => { root.render(<PartnerGroupPage controller={f.controller} groupId={f.group.id} t={t} onOpenNavigation={() => undefined} />); await settle(); });
+  const picker = host.querySelector<HTMLInputElement>('input[type="file"]')!;
+  Object.defineProperty(picker, "files", { value: [file] }); await act(async () => picker.dispatchEvent(new Event("change", { bubbles: true })));
+  await editGroupDraftImage(true); await editGroupDraftImage(false); await editGroupDraftImage(true);
+  expect(materialize).not.toHaveBeenCalled(); expect(f.controller.uploadPartnerGroupFile).not.toHaveBeenCalled();
+  await act(async () => { button(m.send).click(); await settle(); });
+  const original = vi.mocked(f.api.send).mock.calls[0]!;
+  expect(original[1].attachments).toEqual([expect.objectContaining({ name: "photo.png", annotated: true })]);
+  expect(materialize).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ file, kind: "image", annotationStrokes: [expect.objectContaining({ points: expect.any(Array) })] }), expect.any(AbortSignal));
+  await editGroupDraftImage();
+  await act(async () => { button(m.send).click(); await settle(); });
+  expect(materialize).toHaveBeenCalledOnce(); expect(f.controller.uploadPartnerGroupFile).toHaveBeenCalledOnce();
+  expect(vi.mocked(f.api.send).mock.calls[1]![2]).toBe(original[2]);
+  expect(f.api.newRequestId).toHaveBeenCalledOnce();
+  expect(vi.mocked(f.api.send).mock.calls[1]![1].attachments).toEqual(original[1].attachments);
+});
+
 it("preserves the picked member and uploaded attachment across a lost send response without duplicate intent", async () => {
   const f = fixture(); await act(async () => { root.render(<PartnerGroupPage controller={f.controller} groupId={f.group.id} t={t} onOpenNavigation={() => undefined} />); await settle(); });
   const editor = host.querySelector("textarea")!; await input(editor, "@"); const choices = host.querySelectorAll<HTMLButtonElement>(".partner-group-mention-picker button");
@@ -127,6 +150,19 @@ it("preserves the picked member and uploaded attachment across a lost send respo
   expect(f.controller.uploadPartnerGroupFile).toHaveBeenCalledTimes(1); expect(f.api.send).toHaveBeenCalledTimes(2);
   const send = vi.mocked(f.api.send).mock.calls; expect(send[0]![2]).toBe(send[1]![2]); expect(send[1]![1].mentions).toEqual({ all: false, partnerIds: ["second"] }); expect(send[1]![1].attachments).toHaveLength(1); expect(editor.value).toBe("");
 });
+
+async function editGroupDraftImage(draw?: boolean): Promise<void> {
+  act(() => host.querySelector<HTMLButtonElement>(".attachment-chip__content")!.click());
+  const overlay = document.querySelector<HTMLElement>(".workspace-image-lightbox")!, image = overlay.querySelector<HTMLImageElement>(".workspace-image-lightbox__image-wrap img")!, wrap = image.parentElement!;
+  Object.defineProperties(image, { naturalWidth: { value: 400 }, naturalHeight: { value: 300 } });
+  image.getBoundingClientRect = () => ({ left: 0, top: 0, width: 400, height: 300 } as DOMRect);
+  overlay.setPointerCapture = () => {}; overlay.hasPointerCapture = () => false;
+  act(() => { image.dispatchEvent(new Event("load")); button("workspace.imageAnnotate", overlay).click(); });
+  if (draw) { for (const type of ["pointerdown", "pointerup"]) { const event = new Event(type, { bubbles: true }); Object.defineProperties(event, { pointerId: { value: 1 }, pointerType: { value: "pen" }, button: { value: 0 }, clientX: { value: 100 }, clientY: { value: 100 } }); act(() => (type === "pointerdown" ? wrap : overlay).dispatchEvent(event)); } }
+  else if (draw === false) { expect(overlay.querySelectorAll(".workspace-image-lightbox__image-wrap g")).toHaveLength(1); act(() => button("workspace.imageUndoAnnotation", overlay).click()); }
+  await act(async () => { button("Save", overlay).click(); await new Promise(resolve => setTimeout(resolve, 180)); });
+  expect(document.querySelector(".workspace-image-lightbox")).toBeNull();
+}
 it("acknowledges only observed messages and exposes plan retry, reassignment, continuation and authenticated handoff actions", async () => {
   const f = fixture(), plan = create(wire.PartnerGroupPlanSchema, { id: "plan-one", groupId: f.group.id, revision: { value: 2n }, status: wire.PartnerGroupPlanStatus.WAITING, currentStep: 0,
     organizerName: "Alex", steps: [{ position: 0, partnerId: "first", partnerName: "Alex", task: "Create result", status: wire.PartnerGroupStepStatus.FAILED }, { position: 1, partnerId: "second", partnerName: "Alex", task: "Review result", status: wire.PartnerGroupStepStatus.PENDING }] });

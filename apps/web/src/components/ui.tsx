@@ -1052,7 +1052,7 @@ export function modalOwnsKeyboardEvent(event: KeyboardEvent, dialog: HTMLElement
 
 const FOCUSABLE = "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
 
-function currentMessage(key: Parameters<typeof translate>[1], ownerDocument?: Document): string {
+export function currentMessage(key: Parameters<typeof translate>[1], ownerDocument?: Document): string {
   const lang = ownerDocument?.documentElement.lang ?? (typeof document === "undefined" ? "en" : document.documentElement.lang);
   const locale: Locale = lang === "zh-CN" || lang === "en-XA" ? lang : "en";
   return translate(locale, key);

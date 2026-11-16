@@ -46,6 +46,113 @@ afterEach(async () => {
 });
 
 describe("WorkspaceImageLightbox gallery surface", () => {
+  it("reopens editable vectors, compares discard against their baseline and saves an empty edit without encoding", async () => {
+    vi.useFakeTimers();
+    const onSave = vi.fn(async () => undefined), onClose = vi.fn(), download = vi.fn();
+    const source = [{ points: [{ x: 0.25, y: 0.5 }, { x: 0.75, y: 0.6 }] }];
+    const environment = imageBrowser(document);
+    mount(<WorkspaceImageLightbox ownerKey="draft-image" src="blob:original" name="photo.jpg" labels={{ ...labels, saveAs: "Save as" }}
+      annotationEdit={{ initialStrokes: source, onSave }} onClose={onClose} onDownload={download} />);
+    const wrap = imageGestureSurface();
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Discard"]')!.click());
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Undo"]')!.click());
+    expect(wrap.querySelector("path")).toBeNull();
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    const confirm = document.querySelector('[role="alertdialog"]')!;
+    expect(confirm).not.toBeNull();
+    act(() => [...confirm.querySelectorAll("button")].find(item => item.textContent === "Discard")!.click());
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Undo"]')!.click());
+    await act(async () => { document.querySelector<HTMLButtonElement>('button[aria-label="Save"]')!.click(); await Promise.resolve(); });
+    expect(onSave).toHaveBeenCalledExactlyOnceWith([]);
+    expect(environment.fetchSource).not.toHaveBeenCalled(); expect(environment.encode).not.toHaveBeenCalled(); expect(download).not.toHaveBeenCalled();
+    await act(async () => { vi.advanceTimersByTime(160); });
+    expect(onClose).toHaveBeenCalledOnce(); expect(source[0]!.points).toHaveLength(2);
+  });
+
+  it("keeps an unfinished stroke through discard cancellation and confirms user exits before losing annotations", async () => {
+    vi.useFakeTimers();
+    const onClose = vi.fn(), next = vi.fn(), previous = vi.fn();
+    mount(<WorkspaceImageLightbox ownerKey="gallery" src="blob:first" name="render.png" labels={labels}
+      gallery={{ index: 0, total: 2, onNext: next, onPrevious: previous }} onClose={onClose} onDownload={vi.fn()} onSendToChat={vi.fn()} />);
+    const wrap = imageGestureSurface(), overlay = document.querySelector<HTMLDivElement>('[role="dialog"]')!;
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    expect(document.querySelector('button[aria-label="Next image"]')).toBeNull();
+    expect(document.querySelector('button[aria-label="Previous image"]')).toBeNull();
+    pointer(wrap, "pointerdown", 1, 100, 100, "pen");
+    pointer(overlay, "pointermove", 1, 130, 120, "pen");
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    let confirm = document.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    expect(confirm.textContent).toContain("Discard unsaved annotations?");
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })));
+    expect(document.activeElement?.textContent).toBe("Discard");
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })));
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    expect(document.querySelector(".workspace-image-lightbox__content")?.hasAttribute("inert")).toBe(true);
+    pointer(wrap, "pointerdown", 2, 50, 50, "mouse");
+    pointer(overlay, "pointerup", 2, 50, 50, "mouse");
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    act(() => [...confirm.querySelectorAll("button")].find(button => button.textContent === "Cancel")!.click());
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    pointer(overlay, "pointermove", 1, 350, 250, "pen");
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    act(() => document.querySelector<HTMLButtonElement>(".workspace-image-lightbox__a11y-close")!.click());
+    expect(document.querySelector('[role="alertdialog"]')).not.toBeNull();
+    act(() => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(wrap.querySelectorAll("g")).toHaveLength(1);
+    expect(onClose).not.toHaveBeenCalled();
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Discard"]')!.click());
+    confirm = document.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    act(() => [...confirm.querySelectorAll("button")].find(button => button.textContent === "Discard")!.click());
+    expect(wrap.querySelector("path")).toBeNull();
+    expect(document.querySelector('button[aria-label="Next image"]')).not.toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(previous).not.toHaveBeenCalled();
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    pointer(wrap, "pointerdown", 3, 80, 80, "mouse");
+    pointer(overlay, "pointerup", 3, 80, 80, "mouse");
+    act(() => document.querySelector<HTMLButtonElement>(".workspace-image-lightbox__a11y-close")!.click());
+    confirm = document.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    act(() => [...confirm.querySelectorAll("button")].find(button => button.textContent === "Discard")!.click());
+    await act(async () => vi.advanceTimersByTime(160));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("localizes discard confirmation in its document and retires it when the image owner changes", () => {
+    const frame = document.body.appendChild(document.createElement("iframe")), ownerDocument = frame.contentDocument!;
+    ownerDocument.documentElement.lang = "zh-CN";
+    const trigger = ownerDocument.body.appendChild(ownerDocument.createElement("button")), onClose = vi.fn();
+    const view = (src: string) => <WorkspaceImageLightbox ownerKey={src} src={src} name="render.png" labels={labels} returnFocus={trigger}
+      onClose={onClose} onDownload={vi.fn()} onSendToChat={vi.fn()} />;
+    const root = mount(view("blob:first"));
+    let wrap = imageGestureSurface(ownerDocument);
+    act(() => ownerDocument.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    pointer(wrap, "pointerdown", 1, 100, 100, "mouse");
+    pointer(wrap, "pointerup", 1, 100, 100, "mouse");
+    act(() => ownerDocument.querySelector<HTMLButtonElement>('button[aria-label="Discard"]')!.click());
+    const confirm = ownerDocument.querySelector<HTMLElement>('[role="alertdialog"]')!;
+    expect(confirm.textContent).toContain("放弃未保存的标注？");
+    expect(ownerDocument.activeElement?.textContent).toBe("取消");
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    act(() => root.render(view("blob:second")));
+    expect(ownerDocument.querySelector('[role="alertdialog"]')).toBeNull();
+    wrap = imageGestureSurface(ownerDocument);
+    expect(wrap.querySelector("path")).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(ownerDocument.body.classList.contains("modal-open")).toBe(true);
+  });
+
   it("pans horizontal and momentum wheel events without zooming, while mouse and pinch retain focal zoom", () => {
     const view = (src: string) => <WorkspaceImageLightbox ownerKey="gallery" src={src} name="render.png" labels={labels}
       onClose={() => undefined} onDownload={() => undefined} />;

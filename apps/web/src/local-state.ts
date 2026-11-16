@@ -1,4 +1,5 @@
 import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, LocalePreference, MachineCacheView, NewSessionLocalDraft, PendingExtensionSuggestionView, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
+import { normalizeImageAnnotationStrokes, sameImageAnnotationStrokes, type ImageAnnotationStroke } from "./image-annotations.js";
 import { normalizeEndpointTransport, rememberEndpointTransport, rememberEndpointTrust, retainIrohRelayRequest, selectEndpointTransport, trustedEndpointTransport, type RetainedIrohRelayRequest } from "@joko/connection-transport/trust";
 import { builtinSkillIntentForText } from "./builtin-skill-intent.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
@@ -79,6 +80,7 @@ interface PersistedAttachment {
   readonly mediaType: string;
   readonly lastModified: number;
   readonly bytes: Blob;
+  readonly annotationStrokes?: readonly ImageAnnotationStroke[];
 }
 
 interface PersistedBrowserCommentDraftItem extends Omit<BrowserCommentDraftItem, "screenshot"> {
@@ -1674,7 +1676,9 @@ function normalizeLiveAttachments(value: unknown): readonly AttachmentDraft[] {
     if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) continue;
     const record = candidate as Record<string, unknown>;
     if (!validAttachmentId(record["id"]) || (record["kind"] !== "image" && record["kind"] !== "file") || !(record["file"] instanceof File)) continue;
-    attachments.push({ id: record["id"], kind: record["kind"], file: record["file"] });
+    const annotationStrokes = normalizeImageAnnotationStrokes(record["annotationStrokes"]);
+    if (annotationStrokes === null || record["kind"] !== "image" && annotationStrokes !== undefined) continue;
+    attachments.push({ id: record["id"], kind: record["kind"], file: record["file"], ...(annotationStrokes === undefined ? {} : { annotationStrokes }) });
   }
   return attachments;
 }
@@ -1750,10 +1754,13 @@ function restorePersistedAttachments(value: unknown): readonly AttachmentDraft[]
     const lastModified = typeof record["lastModified"] === "number" && Number.isSafeInteger(record["lastModified"]) && record["lastModified"] >= 0
       ? record["lastModified"]
       : 0;
+    const annotationStrokes = normalizeImageAnnotationStrokes(record["annotationStrokes"]);
+    if (annotationStrokes === null || record["kind"] !== "image" && annotationStrokes !== undefined) continue;
     attachments.push({
       id: record["id"],
       kind: record["kind"],
-      file: new File([record["bytes"]], name, { type: mediaType, lastModified })
+      file: new File([record["bytes"]], name, { type: mediaType, lastModified }),
+      ...(annotationStrokes === undefined ? {} : { annotationStrokes })
     });
   }
   return attachments;
@@ -1849,7 +1856,8 @@ function sameAttachmentList(left: readonly AttachmentDraft[], right: readonly At
     const candidate = right[index];
     return candidate !== undefined && attachment.id === candidate.id && attachment.kind === candidate.kind
       && attachment.file.name === candidate.file.name && attachment.file.type === candidate.file.type
-      && attachment.file.size === candidate.file.size && attachment.file.lastModified === candidate.file.lastModified;
+      && attachment.file.size === candidate.file.size && attachment.file.lastModified === candidate.file.lastModified
+      && sameImageAnnotationStrokes(attachment.annotationStrokes, candidate.annotationStrokes);
   });
 }
 
@@ -1871,7 +1879,8 @@ function persistAttachment(attachment: AttachmentDraft): PersistedAttachment {
     name: safeAttachmentName(attachment.file.name),
     mediaType: safeMediaType(attachment.file.type),
     lastModified: Number.isSafeInteger(attachment.file.lastModified) && attachment.file.lastModified >= 0 ? attachment.file.lastModified : 0,
-    bytes: attachment.file
+    bytes: attachment.file,
+    ...(attachment.annotationStrokes === undefined ? {} : { annotationStrokes: attachment.annotationStrokes })
   };
 }
 

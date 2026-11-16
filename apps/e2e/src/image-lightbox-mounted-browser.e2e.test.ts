@@ -143,6 +143,16 @@ mountedIt("pans the mounted task image with trackpad, Space and middle button wh
     await waitFor(() => wrap.locator("g").count(), count => count === 0, "native Space activation of the focused Undo button");
     expect(await wrap.evaluate(element => element.classList.contains("is-space-panning"))).toBe(false);
     await capture("wide-light-annotation-pan");
+    await overlay.focus();
+    await drag("left", 20, 10);
+    await overlay.getByRole("button", { name: "Discard annotation", exact: true }).click();
+    const discard = page.getByRole("alertdialog", { name: "Discard unsaved annotations?", exact: true });
+    await discard.waitFor({ state: "visible" });
+    await capture("wide-light-unsaved-annotation");
+    await page.keyboard.press("Escape");
+    await discard.waitFor({ state: "detached" });
+    expect(await wrap.locator("g").count()).toBe(1);
+    await undo.click();
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
@@ -160,7 +170,15 @@ mountedIt("pans the mounted task image with trackpad, Space and middle button wh
     expect(await wrap.locator("path").count()).toBe(0);
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     await capture("narrow-dark-reduced-motion");
-    await page.keyboard.press("Escape");
+    await drag("left", 12, 5);
+    await overlay.getByRole("button", { name: "Discard annotation", exact: true }).tap();
+    await discard.waitFor({ state: "visible" });
+    await capture("narrow-dark-unsaved-annotation");
+    await discard.getByRole("button", { name: "Cancel", exact: true }).tap();
+    expect(await wrap.locator("g").count()).toBe(1);
+    await overlay.getByRole("button", { name: "Discard annotation", exact: true }).tap();
+    await discard.getByRole("button", { name: "Discard annotation", exact: true }).tap();
+    expect(await wrap.locator("path").count()).toBe(0);
     await page.keyboard.press("Escape");
     await overlay.waitFor({ state: "detached" });
     expect(await trigger.evaluate(element => element === element.ownerDocument.activeElement)).toBe(true);
@@ -172,4 +190,114 @@ mountedIt("pans the mounted task image with trackpad, Space and middle button wh
     await capture("failure").catch(() => undefined);
     throw error;
   }
+});
+
+mountedIt("edits the same original image in task and new-task drafts, restores vectors and burns only the sent input", { timeout: 120_000 }, async () => {
+  browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: "en-US", hasTouch: true });
+  const imageBytes = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement("canvas"); canvas.width = 600; canvas.height = 400;
+    const context = canvas.getContext("2d")!; context.fillStyle = "#407a92"; context.fillRect(0, 0, 600, 400);
+    return canvas.toDataURL("image/png").split(",")[1]!;
+  }), "base64");
+  fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
+  const manager = await fixture.pair("Editable image manager"), { store, artifacts } = fixture.application;
+  const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+    createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName: "Editable images", providerId: "vision", modelId: "multimodal", effortId: "low" })));
+  const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Editable image browser" });
+  if (challenge.challenge === undefined) throw new Error("Image editing pairing returned no challenge.");
+  await routeFixtureDiscovery(page.context(), fixture.baseUrl);
+  const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
+  const evidence = process.env.RUNNER_TEMP ? join(process.env.RUNNER_TEMP, "joko-web-evidence", "image-lightbox") : undefined;
+  const capture = async (name: string) => { if (evidence) { await mkdir(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, name + ".png"), animations: "disabled", timeout: 5_000 }); } };
+  const closeDrawers = async () => { for (const name of ["Close details", "Close navigation"]) { const button = page.getByRole("button", { name, exact: true }); if (await button.isVisible()) await button.click(); } };
+  const composer = page.locator(".composer"), tray = composer.locator(".attachment-list");
+  const selectModel = async (name: string) => {
+    const trigger = composer.locator(".model-picker-trigger"); await trigger.click();
+    await page.locator('.model-picker__row[role="option"]').filter({ hasText: name }).first().click();
+    await waitFor(() => trigger.innerText(), text => text.includes(name), "the selected image input policy");
+  };
+  const attach = async () => {
+    await composer.locator(".composer-add-menu__trigger").click(); const picker = page.waitForEvent("filechooser");
+    await page.getByRole("menuitem", { name: /Attach image or file/u }).click();
+    await (await picker).setFiles({ name: "editable.png", mimeType: "image/png", buffer: imageBytes });
+  };
+  const persisted = async (newTask: boolean) => waitFor(() => page.evaluate(({ newTask, sessionId }) => new Promise<boolean>((resolve, reject) => {
+    const opening = indexedDB.open("joko-ui"); opening.onerror = () => reject(opening.error);
+    opening.onsuccess = () => {
+      const database = opening.result, transaction = database.transaction("drafts", "readonly"), cursor = transaction.objectStore("drafts").openCursor(); let found = false;
+      cursor.onsuccess = () => {
+        const entry = cursor.result; if (entry === null) return;
+        const key = String(entry.key), owned = newTask ? key.startsWith("new-session\u0000") : key.startsWith("[") && (JSON.parse(key) as unknown[])[2] === sessionId;
+        if (owned) {
+          type Saved = { readonly attachments?: readonly { readonly name: string; readonly annotationStrokes?: readonly unknown[] }[] };
+          const record = entry.value as Saved & { readonly draft?: Saved }, image = (record.draft ?? record).attachments?.[0];
+          if (image?.name === "editable.png" && image.annotationStrokes?.length === 1) found = true;
+        }
+        entry.continue();
+      };
+      transaction.oncomplete = () => { database.close(); resolve(found); };
+      transaction.onerror = () => { database.close(); reject(transaction.error); };
+    };
+  }), { newTask, sessionId }), value => value, "the original image and vectors in durable draft storage");
+  const edit = async (draw: boolean) => {
+    await tray.locator("button.attachment-chip__content").click();
+    const overlay = page.getByRole("dialog", { name: "editable.png", exact: true }), wrap = overlay.locator(".workspace-image-lightbox__image-wrap");
+    await waitFor(() => wrap.locator("img").evaluate(image => (image as HTMLImageElement).naturalWidth), width => width === 600, "the original draft image");
+    await overlay.getByRole("button", { name: "Annotate", exact: true }).click();
+    if (draw) {
+      const rect = (await wrap.locator("img").boundingBox())!;
+      await page.mouse.move(rect.x + rect.width * 0.25, rect.y + rect.height * 0.5); await page.mouse.down();
+      await page.mouse.move(rect.x + rect.width * 0.75, rect.y + rect.height * 0.5, { steps: 4 }); await page.mouse.up();
+    } else {
+      expect(await wrap.locator("g").count()).toBe(1);
+      await overlay.getByRole("button", { name: "Undo last stroke", exact: true }).click();
+      expect(await wrap.locator("path").count()).toBe(0);
+    }
+    await overlay.getByRole("button", { name: "Save", exact: true }).click(); await overlay.waitFor({ state: "detached" });
+  };
+  const assertSentPixels = async (id: string) => {
+    const item = await waitFor(() => store.listQueueItems({ sessionId: id })[0], item => item?.state === "completed", "the annotated image input");
+    expect(item!.body.images).toHaveLength(1);
+    const image = await artifacts.readBlob(item!.body.images[0]!.blob);
+    const pixel = await page.evaluate(async base64 => {
+      const bitmap = await createImageBitmap(await (await fetch("data:image/png;base64," + base64)).blob());
+      const canvas = document.createElement("canvas"); canvas.width = bitmap.width; canvas.height = bitmap.height;
+      const context = canvas.getContext("2d")!; context.drawImage(bitmap, 0, 0); bitmap.close();
+      return [...context.getImageData(canvas.width / 2, canvas.height / 2, 1, 1).data];
+    }, Buffer.from(image.data).toString("base64"));
+    expect(image.mimeType).toBe("image/png"); expect(pixel[0]).toBeGreaterThan(240); expect(pixel[1]).toBeLessThan(100); expect(pixel[2]).toBeLessThan(100);
+  };
+  try {
+    await page.goto(fixture.baseUrl + "/#/tasks/" + encodeURIComponent(sessionId), { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click(); await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl); await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
+    await page.getByLabel("Device name").fill("Editable image browser"); await page.locator("form.pair-form button[type=submit]").click();
+    await composer.waitFor({ state: "visible", timeout: 20_000 }); await closeDrawers(); await attach(); await edit(true);
+    await waitFor(() => tray.locator(".annotated-image path").count(), count => count === 2, "the saved vector thumbnail");
+    await capture("wide-light-editable-draft"); await persisted(false); await page.reload({ waitUntil: "domcontentloaded" });
+    await tray.waitFor({ state: "visible", timeout: 20_000 }); await closeDrawers(); await edit(false);
+    expect(await tray.locator(".annotated-image path").count()).toBe(0);
+    const originalBytes = await tray.locator("img").evaluate(async image => [...new Uint8Array(await (await fetch((image as HTMLImageElement).src)).arrayBuffer())]);
+    expect(Buffer.from(originalBytes)).toEqual(imageBytes);
+    await edit(true); await composer.locator(".send-button").click(); await assertSentPixels(sessionId);
+    expect(store.listSessions({ includeArchived: true })).toHaveLength(1);
+
+    await page.setViewportSize({ width: 390, height: 844 }); await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
+    await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
+    const navigation = page.getByRole("button", { name: "Open navigation", exact: true }); if (await navigation.isVisible()) await navigation.click();
+    await page.getByRole("button", { name: /^New task/u }).first().click(); await closeDrawers();
+    await selectModel("Test Multimodal");
+    await attach(); await edit(true); await capture("narrow-dark-editable-new-task"); await persisted(true);
+    await page.reload({ waitUntil: "domcontentloaded" }); await tray.waitFor({ state: "visible", timeout: 20_000 }); await closeDrawers();
+    await selectModel("Test Text");
+    await tray.locator("button.attachment-chip__content").click();
+    const readOnlyOverlay = page.getByRole("dialog", { name: "editable.png", exact: true });
+    await readOnlyOverlay.waitFor({ state: "visible" }); expect(await readOnlyOverlay.getByRole("button", { name: "Annotate", exact: true }).count()).toBe(0);
+    await page.keyboard.press("Escape"); await readOnlyOverlay.waitFor({ state: "detached" });
+    await selectModel("Test Multimodal");
+    await edit(false); await edit(true); await composer.locator(".send-button").click();
+    const created = await waitFor(() => store.listSessions({ includeArchived: true }).find(value => value.descriptor.id !== sessionId), value => value !== undefined, "the new task with its original image draft");
+    await assertSentPixels(created!.descriptor.id); expect(store.listQueueItems({ sessionId })).toHaveLength(1); expect(errors).toEqual([]);
+  } catch (error) { await capture("editable-draft-failure").catch(() => undefined); throw error; }
 });

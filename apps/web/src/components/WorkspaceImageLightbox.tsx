@@ -1,9 +1,11 @@
 import type { ArtifactDownloadContext } from "../model.js";
 import { downloadArtifactBlob } from "../artifact-download.js";
-import { ChevronLeft, ChevronRight, Copy, Download, Maximize2, MessageSquarePlus, Minimize2, Pen, Undo2, X, ZoomIn, ZoomOut } from "lucide-react";
+import { normalizeImageAnnotationStrokes, sameImageAnnotationStrokes } from "../image-annotations.js";
+import { Check, ChevronLeft, ChevronRight, Copy, Download, Maximize2, MessageSquarePlus, Minimize2, Pen, Undo2, X, ZoomIn, ZoomOut } from "lucide-react";
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -12,7 +14,7 @@ import {
   type PointerEvent as ReactPointerEvent
 } from "react";
 import { createPortal } from "react-dom";
-import { IconButton } from "./ui.js";
+import { currentMessage, IconButton } from "./ui.js";
 
 import {
   WORKSPACE_IMAGE_ANNOTATION_COLOR,
@@ -79,6 +81,10 @@ export interface WorkspaceImageLightboxProps {
   readonly onImageError?: () => void;
   /** Present only when the current task and backend can accept image attachments. */
   readonly onSendToChat?: (file: File) => void | Promise<void>;
+  readonly annotationEdit?: {
+    readonly initialStrokes?: readonly WorkspaceImageStroke[];
+    readonly onSave?: (strokes: readonly WorkspaceImageStroke[]) => void | Promise<void>;
+  };
 }
 
 interface Viewport {
@@ -136,13 +142,21 @@ export function WorkspaceImageLightbox({
   onClose,
   onDownload,
   onImageError,
-  onSendToChat
+  onSendToChat,
+  annotationEdit
 }: WorkspaceImageLightboxProps): JSX.Element {
   const ownerDocument = returnFocus?.ownerDocument ?? document;
   const ownerWindow = ownerDocument.defaultView ?? window;
-  const scope = useMemo(() => ({ active: false }), [ownerKey, src, name, mediaType, status, ownerDocument, returnFocus]);
+  const scope = useMemo(() => ({ active: false }), [ownerKey, src, name, mediaType, status, ownerDocument, returnFocus, annotationEdit?.initialStrokes]);
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
+  const [discardRequest, setDiscardRequest] = useState<{ readonly scope: typeof scope; readonly close: boolean }>();
+  const discardRequestRef = useRef(discardRequest);
+  discardRequestRef.current = discardRequest?.scope === scope ? discardRequest : undefined;
+  const discardDialogRef = useRef<HTMLElement>(null);
+  const discardCancelRef = useRef<HTMLButtonElement>(null);
+  const discardFocusRef = useRef<{ readonly scope: typeof scope; readonly target: HTMLElement | null } | undefined>(undefined);
+  const discardTitleId = useId(), discardDescriptionId = useId();
   const actionRef = useRef<ImageAction | undefined>(undefined);
   const closeTimerRef = useRef<number | undefined>(undefined);
   const restoreFocusRef = useRef<object | undefined>(undefined);
@@ -154,6 +168,8 @@ export function WorkspaceImageLightbox({
   galleryRef.current = gallery;
   const sendEnabledRef = useRef(onSendToChat !== undefined);
   sendEnabledRef.current = onSendToChat !== undefined;
+  const annotationSaveRef = useRef(annotationEdit?.onSave);
+  annotationSaveRef.current = annotationEdit?.onSave;
   const closingRef = useRef(false);
   const [visible, setVisible] = useState(false);
   const [viewport, setViewport] = useState<Viewport>(INITIAL_VIEWPORT);
@@ -167,12 +183,13 @@ export function WorkspaceImageLightbox({
   const [pinching, setPinching] = useState(false);
   const dragMovedRef = useRef(false);
   const imageClickRef = useRef(false);
-  const [annotating, setAnnotating] = useState(startAnnotating && onSendToChat !== undefined);
+  const [annotating, setAnnotating] = useState(startAnnotating && (onSendToChat !== undefined || annotationEdit?.onSave !== undefined));
   const annotatingRef = useRef(annotating);
   annotatingRef.current = annotating;
   const [spaceHeld, setSpaceHeld] = useState(false);
   const spaceHeldRef = useRef(false);
-  const [strokes, setStrokes] = useState<readonly WorkspaceImageStroke[]>([]);
+  const [strokes, setStrokes] = useState<readonly WorkspaceImageStroke[]>(() => normalizeImageAnnotationStrokes(annotationEdit?.initialStrokes) ?? []);
+  const baselineStrokesRef = useRef(strokes);
   const strokesRef = useRef(strokes);
   strokesRef.current = strokes;
   const [draftStroke, setDraftStroke] = useState<WorkspaceImageStroke>();
@@ -227,6 +244,7 @@ export function WorkspaceImageLightbox({
     setWheeling(false);
     if (closingRef.current) setVisible(true);
     closingRef.current = false;
+    setDiscardRequest(undefined);
     const onPageHide = (): void => { retireAction(); setBusy(false); };
     ownerWindow.addEventListener("pagehide", onPageHide);
     return () => {
@@ -238,13 +256,56 @@ export function WorkspaceImageLightbox({
     };
   }, [ownerWindow, retireAction, scope]);
 
-  const discardAnnotation = useCallback((): void => {
-    strokePointerRef.current = undefined;
-    draftStrokeRef.current = undefined;
+  const performDiscardAnnotation = useCallback((): void => {
+    retireAction();
+    releasePointers();
+    strokesRef.current = baselineStrokesRef.current;
+    annotatingRef.current = false;
+    spaceHeldRef.current = false;
+    setBusy(false);
+    setDrag(undefined);
+    setPinching(false);
+    setSpaceHeld(false);
     setDraftStroke(undefined);
-    setStrokes([]);
+    setStrokes(baselineStrokesRef.current);
     setAnnotating(false);
-  }, []);
+  }, [releasePointers, retireAction]);
+
+  const requestDiscard = useCallback((closeImage: boolean): void => {
+    const current = scopeRef.current;
+    if (!current.active || closingRef.current || discardRequestRef.current !== undefined) return;
+    const draft = draftStrokeRef.current;
+    if (draft !== undefined) {
+      strokesRef.current = [...strokesRef.current, draft];
+      setStrokes(strokesRef.current);
+    }
+    if (sameImageAnnotationStrokes(strokesRef.current, baselineStrokesRef.current)) {
+      if (closeImage) close();
+      else performDiscardAnnotation();
+      return;
+    }
+    releasePointers();
+    setDraftStroke(undefined);
+    setDrag(undefined);
+    setPinching(false);
+    spaceHeldRef.current = false;
+    setSpaceHeld(false);
+    setMenu(undefined);
+    discardFocusRef.current = { scope: current, target: ownerDocument.activeElement instanceof ownerWindow.HTMLElement ? ownerDocument.activeElement : null };
+    const request = { scope: current, close: closeImage };
+    discardRequestRef.current = request;
+    setDiscardRequest(request);
+  }, [close, ownerDocument, ownerWindow, performDiscardAnnotation, releasePointers]);
+  const discardAnnotation = useCallback(() => requestDiscard(false), [requestDiscard]);
+  const requestClose = useCallback(() => requestDiscard(true), [requestDiscard]);
+
+  useLayoutEffect(() => {
+    if (discardRequest?.scope === scope) { discardCancelRef.current?.focus({ preventScroll: true }); return; }
+    const previous = discardFocusRef.current;
+    discardFocusRef.current = undefined;
+    if (previous?.scope !== scope || !scope.active || closingRef.current) return;
+    (previous.target?.isConnected ? previous.target : overlayRef.current)?.focus({ preventScroll: true });
+  }, [discardRequest, scope]);
 
   useLayoutEffect(() => {
     const body = ownerDocument.body;
@@ -257,6 +318,15 @@ export function WorkspaceImageLightbox({
     });
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.isComposing || event.defaultPrevented || closingRef.current) return;
+      if (discardRequestRef.current !== undefined) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          setDiscardRequest(undefined);
+          return;
+        }
+        if (event.key !== "Tab") return;
+      }
       if (annotatingRef.current
         && (event.metaKey || event.ctrlKey)
         && !event.shiftKey
@@ -279,7 +349,7 @@ export function WorkspaceImageLightbox({
         return;
       }
       if (event.key === "Tab") {
-        const overlay = overlayRef.current;
+        const overlay = discardDialogRef.current ?? overlayRef.current;
         if (overlay === null) return;
         const focusable = [...overlay.querySelectorAll<HTMLElement>(
           "button:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])"
@@ -357,14 +427,16 @@ export function WorkspaceImageLightbox({
     setSpaceHeld(false);
     wheelSourceRef.current = createWorkspaceImageWheelSourceTracker();
     setDrag(undefined);
-    setAnnotating(startAnnotating && onSendToChat !== undefined);
-    setStrokes([]);
+    setAnnotating(startAnnotating && (onSendToChat !== undefined || annotationSaveRef.current !== undefined));
+    baselineStrokesRef.current = normalizeImageAnnotationStrokes(annotationEdit?.initialStrokes) ?? [];
+    strokesRef.current = baselineStrokesRef.current;
+    setStrokes(baselineStrokesRef.current);
     setDraftStroke(undefined);
     setNaturalSize(undefined);
     setMenu(undefined);
     setFeedback(undefined);
     return releasePointers;
-  }, [ownerKey, ownerDocument, releasePointers, returnFocus, src, startAnnotating]);
+  }, [ownerKey, ownerDocument, releasePointers, returnFocus, src, startAnnotating, annotationEdit?.initialStrokes]);
 
   useLayoutEffect(() => {
     if (ready) return;
@@ -382,7 +454,7 @@ export function WorkspaceImageLightbox({
     const overlay = overlayRef.current;
     if (overlay === null) return;
     const onWheel = (event: WheelEvent): void => {
-      if (closingRef.current || !scopeRef.current.active) return;
+      if (closingRef.current || !scopeRef.current.active || discardRequestRef.current !== undefined) return;
       event.preventDefault();
       const current = viewportRef.current;
       const source = event.ctrlKey || event.metaKey ? "mouse" : wheelSourceRef.current({
@@ -457,6 +529,7 @@ export function WorkspaceImageLightbox({
   };
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (discardRequestRef.current !== undefined) return;
     const pan = event.button === 1 || event.button === 0 && spaceHeldRef.current && event.pointerType !== "touch";
     if (event.button !== 0 && !pan) return;
     setMenu(undefined);
@@ -595,7 +668,7 @@ export function WorkspaceImageLightbox({
   };
 
   const run = (operation: (action: ImageAction) => Promise<void>, failedLabel: string): void => {
-    if (!ready || !scope.active || scopeRef.current !== scope || closingRef.current || actionRef.current !== undefined) return;
+    if (!ready || !scope.active || scopeRef.current !== scope || closingRef.current || actionRef.current !== undefined || discardRequestRef.current !== undefined) return;
     const request = new ownerWindow.AbortController();
     const current = (): boolean => scope.active && scopeRef.current === scope && actionRef.current === action && !closingRef.current && !request.signal.aborted;
     const action: ImageAction = {
@@ -659,9 +732,19 @@ export function WorkspaceImageLightbox({
     }, labels.sendFailed);
   };
 
+  const saveAnnotations = (): void => run(async (action) => {
+    action.assertCurrent();
+    const onSave = annotationSaveRef.current;
+    if (onSave === undefined) throw new Error("Image editing is unavailable.");
+    await onSave(action.strokes);
+    action.assertCurrent();
+    close();
+  }, labels.saveFailed);
+
   const allStrokes = draftStroke === undefined ? strokes : [...strokes, draftStroke];
   const strokeWidth = naturalSize === undefined ? 4 : workspaceImageStrokeWidth(naturalSize.width, naturalSize.height);
   const hasSend = onSendToChat !== undefined;
+  const canAnnotate = hasSend || annotationEdit?.onSave !== undefined;
   const zoomOut = (): void => setViewport((current) => zoomWorkspaceImageAtPoint(current, { x: 0, y: 0 }, current.scale / 1.2));
   const zoomIn = (): void => setViewport((current) => zoomWorkspaceImageAtPoint(current, { x: 0, y: 0 }, current.scale * 1.2));
   const showActualSize = (): void => {
@@ -705,10 +788,10 @@ export function WorkspaceImageLightbox({
         dragMovedRef.current = false;
         return;
       }
-      close();
+      requestClose();
     }}
     onDoubleClick={(event) => {
-      if (annotating || closingRef.current || !ready || !imageClickRef.current || pinchRef.current !== undefined) return;
+      if (annotating || closingRef.current || discardRequestRef.current !== undefined || !ready || !imageClickRef.current || pinchRef.current !== undefined) return;
       const fromImage = event.target instanceof ownerWindow.Node && imageRef.current?.parentElement?.contains(event.target);
       if (!fromImage && event.target !== event.currentTarget) return;
       const overlay = event.currentTarget.getBoundingClientRect();
@@ -718,6 +801,7 @@ export function WorkspaceImageLightbox({
       setViewport((current) => current.scale === 1 ? zoomWorkspaceImageAtPoint(current, point, 2) : INITIAL_VIEWPORT);
     }}
   >
+    <div className="workspace-image-lightbox__content" inert={discardRequest?.scope === scope}>
     <div
       className={`workspace-image-lightbox__image-wrap${drag !== undefined || pinching ? " is-dragging" : ""}${wheeling ? " is-wheeling" : ""}${annotating ? " is-annotating" : ""}${spaceHeld ? " is-space-panning" : ""}`}
       style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}
@@ -759,12 +843,14 @@ export function WorkspaceImageLightbox({
 
     {gallery !== undefined && gallery.total > 1 && <>
       <div className="workspace-image-lightbox__counter" aria-live="polite">{gallery.index + 1} / {gallery.total}</div>
-      <LightboxButton className="workspace-image-lightbox__nav workspace-image-lightbox__nav--previous" label={labels.previousImage ?? ""} onClick={gallery.onPrevious}><ChevronLeft /></LightboxButton>
-      <LightboxButton className="workspace-image-lightbox__nav workspace-image-lightbox__nav--next" label={labels.nextImage ?? ""} onClick={gallery.onNext}><ChevronRight /></LightboxButton>
+      {!annotating && <>
+        <LightboxButton className="workspace-image-lightbox__nav workspace-image-lightbox__nav--previous" label={labels.previousImage ?? ""} onClick={gallery.onPrevious}><ChevronLeft /></LightboxButton>
+        <LightboxButton className="workspace-image-lightbox__nav workspace-image-lightbox__nav--next" label={labels.nextImage ?? ""} onClick={gallery.onNext}><ChevronRight /></LightboxButton>
+      </>}
     </>}
 
     {menu !== undefined && <div className="workspace-image-lightbox__menu" role="menu" style={{ left: menu.x, top: menu.y }} onPointerDown={(event) => event.stopPropagation()}>
-      {hasSend && <LightboxMenuItem label={labels.annotate} disabled={busy || !ready} icon={<Pen />} onClick={() => { setAnnotating(true); setMenu(undefined); }} />}
+      {canAnnotate && <LightboxMenuItem label={labels.annotate} disabled={busy || !ready} icon={<Pen />} onClick={() => { setAnnotating(true); setMenu(undefined); }} />}
       <LightboxMenuItem label={labels.copy} disabled={busy || !ready} icon={<Copy />} onClick={() => { setMenu(undefined); copy(); }} />
       <LightboxMenuItem label={labels.saveAs} disabled={busy || !ready} icon={<Download />} onClick={() => { setMenu(undefined); save(); }} />
       {hasSend && <LightboxMenuItem label={labels.sendToChat} disabled={busy || !ready} icon={<MessageSquarePlus />} onClick={() => { setMenu(undefined); send(); }} />}
@@ -775,7 +861,9 @@ export function WorkspaceImageLightbox({
         <LightboxButton label={labels.discardAnnotation} disabled={busy} onClick={discardAnnotation}><X /></LightboxButton>
         <LightboxButton label={labels.undoAnnotation} disabled={busy || strokes.length === 0} onClick={() => setStrokes((current) => current.slice(0, -1))}><Undo2 /></LightboxButton>
         <span aria-hidden="true" />
-        <LightboxButton label={labels.sendToChat} disabled={busy} onClick={send}><MessageSquarePlus /></LightboxButton>
+        {annotationEdit !== undefined
+          ? <LightboxButton label={currentMessage("common.save", ownerDocument)} disabled={busy || annotationEdit.onSave === undefined} onClick={saveAnnotations}><Check /></LightboxButton>
+          : <LightboxButton label={labels.sendToChat} disabled={busy || !hasSend} onClick={send}><MessageSquarePlus /></LightboxButton>}
       </> : <>
         {showZoomControls && <>
           <LightboxButton label={labels.zoomOut ?? ""} disabled={busy || !ready || viewport.scale <= 1} onClick={zoomOut}><ZoomOut /></LightboxButton>
@@ -788,11 +876,27 @@ export function WorkspaceImageLightbox({
         {toolbarActions}
         <LightboxButton label={labels.copy} disabled={busy || !ready} onClick={copy}><Copy /></LightboxButton>
         <LightboxButton label={labels.saveAs} disabled={busy || !ready} onClick={save}><Download /></LightboxButton>
-        {hasSend && <><span aria-hidden="true" /><LightboxButton label={labels.annotate} disabled={busy || !ready} onClick={() => setAnnotating(true)}><Pen /></LightboxButton><LightboxButton label={labels.sendToChat} disabled={busy || !ready} onClick={send}><MessageSquarePlus /></LightboxButton></>}
+        {canAnnotate && <><span aria-hidden="true" /><LightboxButton label={labels.annotate} disabled={busy || !ready} onClick={() => setAnnotating(true)}><Pen /></LightboxButton></>}
+        {hasSend && <LightboxButton label={labels.sendToChat} disabled={busy || !ready} onClick={send}><MessageSquarePlus /></LightboxButton>}
       </>}
     </div>
-    <button className="workspace-image-lightbox__a11y-close" type="button" onClick={close}>{labels.close}</button>
+    <button className="workspace-image-lightbox__a11y-close" type="button" onClick={requestClose}>{labels.close}</button>
     {feedback !== undefined && <div className="workspace-image-lightbox__feedback" role="status">{feedback}</div>}
+    </div>
+    {discardRequest?.scope === scope && <div className="workspace-image-lightbox__discard-scrim" onPointerDown={(event) => { if (event.target === event.currentTarget) setDiscardRequest(undefined); }}>
+      <section ref={discardDialogRef} className="modal modal--small workspace-image-lightbox__discard-dialog" role="alertdialog" aria-modal="true" aria-labelledby={discardTitleId} aria-describedby={discardDescriptionId} tabIndex={-1}>
+        <header className="modal__header"><div className="modal__header-copy"><h2 id={discardTitleId}>{currentMessage("workspace.imageDiscardConfirmTitle", ownerDocument)}</h2><p id={discardDescriptionId}>{currentMessage("workspace.imageDiscardConfirmDescription", ownerDocument)}</p></div></header>
+        <div className="modal__body workspace-image-lightbox__discard-actions">
+          <button ref={discardCancelRef} type="button" className="button button--secondary" onClick={() => setDiscardRequest(undefined)}>{currentMessage("common.cancel", ownerDocument)}</button>
+          <button type="button" className="button button--danger" onClick={() => {
+            if (discardRequest.scope !== scopeRef.current || !discardRequest.scope.active || closingRef.current) return;
+            setDiscardRequest(undefined);
+            performDiscardAnnotation();
+            if (discardRequest.close) close();
+          }}>{labels.discardAnnotation}</button>
+        </div>
+      </section>
+    </div>}
   </div>, ownerDocument.body);
 }
 

@@ -4,6 +4,8 @@ import { File, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
 
 import type { ArtifactView, AttachmentDraft } from "../model.js";
+import type { ImageAnnotationStroke } from "../image-annotations.js";
+import { AnnotatedImage } from "./AnnotatedImage.js";
 import { ComposerImageHoverPreview } from "./ComposerImageHoverPreview.js";
 import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox.js";
 import { timelineArtifactSupportsTextPreview } from "./timeline-text-attachment.js";
@@ -13,13 +15,13 @@ import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 
 type AttachmentPreviewKind = "image" | "text";
 
-export function ComposerAttachmentTray({ ownerKey, attachments, removeDisabled = false, t, onRemove, onReplaceImage }: {
+export function ComposerAttachmentTray({ ownerKey, attachments, removeDisabled = false, t, onRemove, onSaveImageAnnotations }: {
   readonly ownerKey: string;
   readonly attachments: readonly AttachmentDraft[];
   readonly removeDisabled?: boolean;
   readonly t: Translator;
   readonly onRemove: (attachment: AttachmentDraft) => void;
-  readonly onReplaceImage?: (attachment: AttachmentDraft, file: File) => void | Promise<void>;
+  readonly onSaveImageAnnotations?: (attachment: AttachmentDraft, strokes: readonly ImageAnnotationStroke[]) => void | Promise<void>;
 }): JSX.Element {
   return <div className="attachment-list" aria-label={t("composer.attachments")}>
     {attachments.map((attachment) => <ComposerAttachmentItem
@@ -29,24 +31,25 @@ export function ComposerAttachmentTray({ ownerKey, attachments, removeDisabled =
       removeDisabled={removeDisabled}
       t={t}
       onRemove={onRemove}
-      onReplaceImage={onReplaceImage}
+      onSaveImageAnnotations={onSaveImageAnnotations}
     />)}
   </div>;
 }
 
-function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRemove, onReplaceImage }: {
+function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRemove, onSaveImageAnnotations }: {
   readonly ownerKey: string;
   readonly attachment: AttachmentDraft;
   readonly removeDisabled: boolean;
   readonly t: Translator;
   readonly onRemove: (attachment: AttachmentDraft) => void;
-  readonly onReplaceImage?: (attachment: AttachmentDraft, file: File) => void | Promise<void>;
+  readonly onSaveImageAnnotations?: (attachment: AttachmentDraft, strokes: readonly ImageAnnotationStroke[]) => void | Promise<void>;
 }): JSX.Element {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const textObjectUrlRef = useRef<string | undefined>(undefined);
   const suppressRestoredFocusPreviewRef = useRef(false);
   const [hovered, setHovered] = useState(false);
   const [imageOpen, setImageOpen] = useState(false);
+  const [imageSnapshot, setImageSnapshot] = useState<AttachmentDraft>();
   const [textPreviewTrigger, setTextPreviewTrigger] = useState<HTMLButtonElement>();
   const previewKind = composerAttachmentPreviewKind(attachment);
   const openLabel = previewKind === "image"
@@ -79,7 +82,7 @@ function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRem
 
   const contents = <>
     {attachment.previewUrl !== undefined
-      ? <img src={attachment.previewUrl} alt="" draggable={false} />
+      ? <AnnotatedImage className="attachment-chip__image" src={attachment.previewUrl} strokes={attachment.annotationStrokes} cover />
       : <File aria-hidden="true" />}
     <span><strong>{attachment.file.name}</strong><small>{formatBytes(attachment.file.size)}</small></span>
   </>;
@@ -110,6 +113,7 @@ function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRem
           setHovered(false);
           if (previewKind === "image") {
             suppressRestoredFocusPreviewRef.current = true;
+            setImageSnapshot(attachment);
             setImageOpen(true);
           }
           else setTextPreviewTrigger(event.currentTarget);
@@ -126,12 +130,13 @@ function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRem
       open={hovered && !imageOpen}
       anchorRef={triggerRef}
       src={attachment.previewUrl}
+      annotationStrokes={attachment.annotationStrokes}
     />}
-    {imageOpen && attachment.previewUrl !== undefined && <WorkspaceImageLightbox
+    {imageOpen && imageSnapshot?.previewUrl !== undefined && <WorkspaceImageLightbox
       ownerKey={JSON.stringify([ownerKey, attachment.id])}
-      src={attachment.previewUrl}
-      name={attachment.file.name}
-      mediaType={attachment.file.type}
+      src={imageSnapshot.previewUrl}
+      name={imageSnapshot.file.name}
+      mediaType={imageSnapshot.file.type}
       labels={{
         close: t("common.close"),
         copy: t("workspace.imageCopy"),
@@ -154,8 +159,8 @@ function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRem
       showZoomControls
       returnFocus={triggerRef.current}
       onClose={() => setImageOpen(false)}
-      onDownload={download}
-      onSendToChat={!removeDisabled && onReplaceImage ? file => onReplaceImage(attachment, file) : undefined}
+      onDownload={context => downloadArtifactBlob(imageSnapshot.file, imageSnapshot.file.name || "attachment", context)}
+      annotationEdit={{ initialStrokes: imageSnapshot.annotationStrokes, onSave: !removeDisabled && onSaveImageAnnotations ? strokes => onSaveImageAnnotations(imageSnapshot, strokes) : undefined }}
     />}
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox
       ownerKey={JSON.stringify([ownerKey, attachment.id])}

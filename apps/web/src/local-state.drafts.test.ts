@@ -5,6 +5,28 @@ import { recoverSideChatDraft } from "./side-chat-draft-recovery.js";
 import { bindExtensionSettingsOperationJournal, extensionSettingsProfilePin, parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationReceipt } from "./extension-settings-operation.js";
 
 describe("durable composer draft surfaces", () => {
+  it("cold-restores the original file and editable image vectors in task and new-task drafts", async () => {
+    const database = draftDatabase(), before = local(database.value);
+    const file = new File(["original image bytes"], "original.jpg", { type: "image/jpeg", lastModified: 123 });
+    const attachment = { id: "image-original", kind: "image" as const, file, annotationStrokes: [{ points: [{ x: 0.2, y: 0.4 }, { x: 0.6, y: 0.8 }] }] };
+    const first = { ...draft("Marked image"), attachments: [attachment] };
+    const newTask = { selection: { kind: "target" as const, targetId: "project" }, nativeStart: { kind: "fresh" as const }, providerId: "vision", modelId: "multimodal", fastMode: false,
+      permissionMode: "ask" as const, planMode: false, text: first.text, editorDocument: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: first.text }] }] }, mentions: [], attachments: first.attachments };
+    await before.saveDraft("node", "profile", "task", first, "task-window:1");
+    await before.saveNewSessionDraft("node\u0000profile", newTask);
+    const restarted = local(database.value), restoredTask = await restarted.readDraft("node", "profile", "task", "task-window:1"), restoredNew = await restarted.readNewSessionDraft("node\u0000profile");
+    for (const restored of [restoredTask, restoredNew]) {
+      expect(restored?.attachments[0]?.annotationStrokes).toEqual(attachment.annotationStrokes);
+      const original = restored!.attachments[0]!.file;
+      expect([original.name, original.type, original.lastModified, await original.text()]).toEqual([file.name, file.type, 123, "original image bytes"]);
+      expect(restored!.attachments[0]!.previewUrl).toBeUndefined();
+    }
+    await restarted.saveDraft("node", "profile", "task", { ...first, attachments: [{ id: attachment.id, kind: attachment.kind, file }] }, "task-window:1");
+    expect((await local(database.value).readDraft("node", "profile", "task", "task-window:1"))?.attachments[0]?.annotationStrokes).toBeUndefined();
+    expect((await local(database.value).readNewSessionDraft("node\u0000profile"))?.attachments[0]?.annotationStrokes).toEqual(attachment.annotationStrokes);
+    expect(await restarted.readDraft("node", "profile", "task", "task-window:2")).toBeUndefined();
+  });
+
   it("cold-recovers a selected Side Chat quote from its original operation without creating another task", async () => {
     const database = draftDatabase(), before = local(database.value);
     const receipt: PendingSideChatDraft = { operationId: "side-chat-original", sourceSessionId: "source", sourceGeneration: "4", backendId: "native", targetId: "project",

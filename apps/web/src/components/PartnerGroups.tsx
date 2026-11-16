@@ -3,13 +3,14 @@ import { ArrowLeft, Check, CircleAlert, CircleCheck, CircleDashed, FileText, Fol
 import * as groupWire from "@joko/contracts";
 import { findPartnerGroupMentionQuery, filterPartnerGroupMentionCandidates, insertPartnerGroupMention } from "@joko/contracts";
 import type { AppController } from "../controller.js";
-import type { ArtifactView, PartnerProfileView } from "../model.js";
+import type { ArtifactView, AttachmentDraft, PartnerProfileView } from "../model.js";
 import type { Translator } from "./types.js";
 import { PartnerAvatar, PartnerAvatarProvider } from "./PartnerAvatar.js";
 import { StreamingMarkdown, TimelineImageLightbox } from "./Timeline.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import type { TimelineGalleryImage } from "./timeline-image-gallery.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
+import { editImageAttachment, materializeImageAttachment } from "../image-attachment.js";
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
 import { TimelineTextAttachmentLightbox } from "./TimelineTextAttachmentLightbox.js";
 import { timelineArtifactSupportsTextPreview } from "./timeline-text-attachment.js";
@@ -262,21 +263,22 @@ function GroupPlanFollowUp({ plan, group, partners, view, m }: { plan: groupWire
   </div>;
 }
 function GroupComposer({ view, group, partners, controller, m, t, running, dropFiles, onSent }: { view: View; group: groupWire.PartnerGroupSummary; partners: readonly PartnerProfileView[]; controller: AppController; m: Copy; t: Translator; running: boolean; dropFiles: { current: ((files: readonly File[]) => void) | undefined }; onSent(): void }) {
-  const state = useSyncExternalStore(view.subscribe, () => view.state), [text, setText] = useState(""), [files, setFiles] = useState<Array<{ id: string; file: File; annotated?: boolean }>>([]), [query, setQuery] = useState<{ start: number; query: string; end: number } | null>(null);
+  const state = useSyncExternalStore(view.subscribe, () => view.state), [text, setText] = useState(""), [files, setFiles] = useState<readonly AttachmentDraft[]>([]), [query, setQuery] = useState<{ start: number; query: string; end: number } | null>(null);
   const [division, setDivision] = useState(false), [menu, setMenu] = useState<GroupMenu>(), [highlight, setHighlight] = useState(0);
   const editor = useRef<HTMLTextAreaElement>(null), fileInput = useRef<HTMLInputElement>(null), pending = useRef<{ id: string; signature: string } | undefined>(undefined);
-  const uploads = useRef(new Map<string, groupWire.BlobRef>());
+  const uploads = useRef(new Map<string, { readonly blob: groupWire.BlobRef; readonly name: string }>());
+  const filesRef = useRef(files); filesRef.current = files;
   const tracked = useRef<groupWire.PartnerGroupTrackedMention[]>([]), [fileError, setFileError] = useState<string>();
   const previews = useMemo(() => files.map(item => ({ ...item, kind: item.file.type.startsWith("image/") ? "image" as const : "file" as const, previewUrl: item.file.type.startsWith("image/") ? URL.createObjectURL(item.file) : undefined })), [files]);
   useEffect(() => () => { for (const item of previews) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); }, [previews]);
   useLayoutEffect(() => { const element = editor.current; if (element) { element.style.height = "auto"; element.style.height = `${Math.min(240, element.scrollHeight)}px`; } }, [text]);
   const send = () => { void view.action(async signal => {
     const mentions = groupWire.resolvePartnerGroupMentions(text, { members: group.members, allLabels: ["all", "所有人"], tracked: tracked.current });
-    const signature = JSON.stringify([text, division, files.map(item => item.id), mentions]);
+    const signature = JSON.stringify([text, division, files.map(item => [item.id, item.annotationStrokes]), mentions]);
     if (pending.current?.signature !== signature) pending.current = { id: view.api.newRequestId(), signature };
     const id = pending.current.id, attachments = [];
-    for (const item of files) { let blob = uploads.current.get(item.id); if (!blob) { blob = await controller.uploadPartnerGroupFile(item.file, signal); uploads.current.set(item.id, blob); } attachments.push({ id: item.id, name: item.file.name, blob,
-      category: blob.mediaType.startsWith("image/") ? groupWire.PartnerGroupAttachmentCategory.IMAGE : blob.mediaType === "application/pdf" ? groupWire.PartnerGroupAttachmentCategory.PDF : blob.mediaType.startsWith("text/") ? groupWire.PartnerGroupAttachmentCategory.TEXT : groupWire.PartnerGroupAttachmentCategory.FILE, annotated: item.annotated ?? false }); }
+    for (const item of files) { let uploaded = uploads.current.get(item.id); if (!uploaded) { const file = await materializeImageAttachment(item, signal); uploaded = { blob: await controller.uploadPartnerGroupFile(file, signal), name: file.name }; uploads.current.set(item.id, uploaded); } const { blob, name } = uploaded; attachments.push({ id: item.id, name, blob,
+      category: blob.mediaType.startsWith("image/") ? groupWire.PartnerGroupAttachmentCategory.IMAGE : blob.mediaType === "application/pdf" ? groupWire.PartnerGroupAttachmentCategory.PDF : blob.mediaType.startsWith("text/") ? groupWire.PartnerGroupAttachmentCategory.TEXT : groupWire.PartnerGroupAttachmentCategory.FILE, annotated: (item.annotationStrokes?.length ?? 0) > 0 }); }
     const result = await view.api.send(view.group() ?? group, { text, attachments, division, mentions }, id, signal); pending.current = undefined; uploads.current.clear(); tracked.current = []; setText(""); setFiles([]); setDivision(false); setQuery(null); onSent(); return result;
   }); };
   const mention = (name: string, partnerId?: string) => { if (!query) return; const inserted = insertPartnerGroupMention(text, { start: query.start, end: query.end }, name); if (partnerId) tracked.current.push({ partnerId, label: name }); setText(inserted.text); setQuery(null); queueMicrotask(() => { editor.current?.focus(); editor.current?.setSelectionRange(inserted.caret, inserted.caret); }); };
@@ -288,12 +290,12 @@ function GroupComposer({ view, group, partners, controller, m, t, running, dropF
   ] : [];
   const activeIndex = candidates.length ? highlight % candidates.length : 0, pickerId = `partner-group-mentions-${group.id}`;
   const syncQuery = (value: string, caret: number) => { const found = findPartnerGroupMentionQuery(value, caret); setQuery(found ? { ...found, end: caret } : null); setHighlight(0); };
-  const addFiles = (incoming: readonly File[]) => { if (files.length + incoming.length > 20) { setFileError(m.attachmentsLimit); return; } setFileError(undefined); pending.current = undefined; setFiles(current => [...current, ...incoming.map(file => ({ file, id: crypto.randomUUID() }))]); };
+  const addFiles = (incoming: readonly File[]) => { if (files.length + incoming.length > 20) { setFileError(m.attachmentsLimit); return; } setFileError(undefined); pending.current = undefined; setFiles(current => [...current, ...incoming.map(file => ({ file, id: crypto.randomUUID(), kind: file.type.startsWith("image/") ? "image" as const : "file" as const }))]); };
   useLayoutEffect(() => { dropFiles.current = disabled ? undefined : addFiles; return () => { dropFiles.current = undefined; }; });
   return <div className="partner-group-composer"><div className="partner-group-composer-frame">
     {division && <span className="partner-group-division-tag"><Users aria-hidden="true" />{m.divisionTag}<IconButton label={m.removeDivision} disabled={disabled} onClick={() => { setDivision(false); pending.current = undefined; editor.current?.focus(); }}><X /></IconButton></span>}
     <ComposerAttachmentTray ownerKey={view.api.ownerKey} attachments={previews} removeDisabled={disabled} t={t} onRemove={item => { pending.current = undefined; uploads.current.delete(item.id); setFiles(current => current.filter(file => file.id !== item.id)); }}
-      onReplaceImage={(item, file) => { pending.current = undefined; uploads.current.delete(item.id); setFiles(current => current.map(existing => existing.id === item.id ? { id: crypto.randomUUID(), file, annotated: true } : existing)); }} />
+      onSaveImageAnnotations={(item, strokes) => { if (disabled) throw new Error(m.unavailable); const next = editImageAttachment(filesRef.current, item, strokes); if (next === filesRef.current) return; pending.current = undefined; uploads.current.delete(item.id); filesRef.current = next; setFiles(next); }} />
     {query && candidates.length > 0 && <div id={pickerId} className="partner-group-mention-picker" role="listbox">{candidates.map((member, index) => { const partner = partners.find(item => item.id === member.partnerId); return <button type="button" role="option" id={`${pickerId}-${index}`} aria-selected={index === activeIndex} key={member.partnerId ?? "all"} onMouseDown={event => event.preventDefault()} onMouseEnter={() => setHighlight(index)} onClick={() => mention(member.name, member.partnerId)}>
       {member.partnerId ? <PartnerAvatar preset={partner?.avatar ?? "orbit"} partner={partner} /> : <Users aria-hidden="true" />}<span>{member.partnerId ? member.name : "@all"}</span></button>; })}</div>}
     <textarea ref={editor} value={text} rows={1} maxLength={8000} placeholder={m.placeholder} aria-label={m.placeholder} aria-autocomplete="list" aria-controls={query && candidates.length ? pickerId : undefined} aria-activedescendant={query && candidates.length ? `${pickerId}-${activeIndex}` : undefined} disabled={disabled} onChange={event => { setText(event.target.value); pending.current = undefined; syncQuery(event.target.value, event.target.selectionStart); }}

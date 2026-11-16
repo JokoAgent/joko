@@ -5423,6 +5423,7 @@ export interface AttachmentDraft {
   readonly file: File;
   readonly kind: "image" | "file";
   readonly previewUrl?: string;
+  readonly annotationStrokes?: readonly import("./image-annotations.js").ImageAnnotationStroke[];
 }
 
 export const BROWSER_COMMENT_DESIGN_PROPERTIES = [

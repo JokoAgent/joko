@@ -1,11 +1,7 @@
-export interface WorkspaceImagePoint {
-  readonly x: number;
-  readonly y: number;
-}
+import type { ImageAnnotationPoint, ImageAnnotationStroke } from "../image-annotations.js";
 
-export interface WorkspaceImageStroke {
-  readonly points: readonly WorkspaceImagePoint[];
-}
+export type WorkspaceImagePoint = ImageAnnotationPoint;
+export type WorkspaceImageStroke = ImageAnnotationStroke;
 
 export const WORKSPACE_IMAGE_ANNOTATION_COLOR = "#FF3B30";
 export const WORKSPACE_IMAGE_ANNOTATION_OUTLINE = "rgba(255,255,255,0.9)";

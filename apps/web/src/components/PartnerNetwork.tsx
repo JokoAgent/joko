@@ -12,6 +12,8 @@ import { StreamingMarkdown } from "./Timeline.js";
 import { Button, IconButton, Modal, Spinner } from "./ui.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
+import { editImageAttachment, materializeImageAttachment } from "../image-attachment.js";
+import { sameImageAnnotationStrokes } from "../image-annotations.js";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 import { NetworkPlanCard, NetworkPlanFollowUp, NetworkProjectSetting } from "./PartnerNetworkPlan.js";
 import { NetworkOwnerControls } from "./PartnerNetworkOwnerControls.js";
@@ -122,13 +124,17 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
   const [snapshot, setSnapshot] = useState<wire.PartnerNetworkSnapshot>(), [messages, setMessages] = useState<wire.PartnerNetworkMessage[]>([]), [error, setError] = useState<string>(), [busy, setBusy] = useState(false), [settings, setSettings] = useState(false);
   const [draft, setDraft] = useState(initialDraft.text), [mentions, setMentions] = useState<string[]>([...initialDraft.mentions]), [quote, setQuote] = useState(initialDraft.quoteId), [attachments, setAttachments] = useState<wire.PartnerNetworkAttachment[]>([...initialDraft.attachments]), [pending, setPending] = useState<Pending[]>([]), [partners, setPartners] = useState<PartnerProfileView[]>([]);
   const [journalReady, setJournalReady] = useState(false);
+  const [picked, setPicked] = useState<readonly AttachmentDraft[]>(initialDraft.localAttachments ?? []);
   const [division, setDivision] = useState(initialDraft.forcePlan), [mentionAll, setMentionAll] = useState(initialDraft.mentionAll);
   const tracked = useRef<wire.NetworkTrackedMention[]>([...initialDraft.tracked]), activeThread = useRef(thread), currentDraft = useRef<NetworkComposerDraft>(initialDraft), selection = useRef({ start: 0, end: 0 });
-  currentDraft.current = { text: draft, mentions, mentionAll, forcePlan: division, quoteId: quote, attachments, tracked: tracked.current };
+  currentDraft.current = { text: draft, mentions, mentionAll, forcePlan: division, quoteId: quote, attachments, tracked: tracked.current, localAttachments: picked };
   useEffect(() => { if (activeThread.current === thread) return; writeNetworkDraft(draftScope, activeThread.current, currentDraft.current); const restored = readNetworkDraft(draftScope, thread); activeThread.current = thread;
-    setDraft(restored.text); setMentions([...restored.mentions]); setMentionAll(restored.mentionAll); setDivision(restored.forcePlan); setQuote(restored.quoteId); setAttachments([...restored.attachments]); tracked.current = [...restored.tracked]; setPicked([]); attempt.current = undefined; }, [thread]);
+    setDraft(restored.text); setMentions([...restored.mentions]); setMentionAll(restored.mentionAll); setDivision(restored.forcePlan); setQuote(restored.quoteId); setAttachments([...restored.attachments]); tracked.current = [...restored.tracked]; setPicked(restored.localAttachments ?? []); attempt.current = undefined; }, [thread]);
   useEffect(() => () => writeNetworkDraft(draftScope, activeThread.current, currentDraft.current), []);
-  const [sharing, setSharing] = useState<Record<string, readonly string[]>>({}), [picked, setPicked] = useState<readonly { id: string; file: File }[]>([]);
+  const [sharing, setSharing] = useState<Record<string, readonly string[]>>({});
+  const pickedRef = useRef(picked); pickedRef.current = picked;
+  const preparingSend = useRef(false);
+  const materializedUploads = useRef(new Map<string, { readonly source: AttachmentDraft; readonly attachment: wire.PartnerNetworkAttachment }>());
   const previews = useMemo<readonly AttachmentDraft[]>(() => picked.map(item => ({ ...item, kind: item.file.type.startsWith("image/") ? "image" : "file", ...(item.file.type.startsWith("image/") ? { previewUrl: URL.createObjectURL(item.file) } : {}) })), [picked]);
   useEffect(() => () => { for (const item of previews) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); }, [previews]);
   const profile = controller.state.activeProfile;
@@ -137,6 +143,7 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
   const lifetime = useRef(new AbortController()), list = useRef<HTMLDivElement>(null), requestTail = useRef(Promise.resolve()), draftRef = useRef(draft), attempt = useRef<{ fingerprint: string; id: string } | undefined>(undefined);
   draftRef.current = draft;
   const room = snapshot?.room, self = room?.members.find(member => member.id === room.selfId), allowed = room?.state === "active" && self?.state === "joined";
+  const allowedRef = useRef(allowed); allowedRef.current = allowed;
   const failures = usePartnerNetworkFailures(api, target, messages, () => { setMessages([]); setSnapshot(undefined); setError(m.denied); });
   const mentionMembers = room?.members.filter(actor => actor.id !== room.selfId).map(actor => ({ actorId: actor.id, name: wire.partnerNetworkActorName(actor, room), displayName: actor.name, nickname: actor.nickname })) ?? [];
   const mentionInput = { members: mentionMembers, allLabels: [m.everyone, "all", "everyone", "所有人"], tracked: tracked.current };
@@ -233,25 +240,58 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
     requestTail.current = requestTail.current.then(send, send);
   };
   const send = async () => {
-    if (!allowed || !journalReady || !draft.trim() && !attachments.length) return;
-    const resolved = wire.resolveNetworkMentions(draft, mentionInput), targetIds = [...new Set([...mentions, ...resolved.actorIds])], all = mentionAll || resolved.all;
-    const fingerprint = JSON.stringify([draft, targetIds, quote, thread, attachments.map(attachment => [attachment.id, attachment.sizeBytes.toString()]), division, all]);
-    if (attempt.current?.fingerprint !== fingerprint) attempt.current = { fingerprint, id: crypto.randomUUID() };
-    const item: Pending = { request: create(wire.SendPartnerNetworkRequestSchema, { ...target, operationId: attempt.current.id, text: draft, mentions: targetIds, mentionAll: all, forcePlan: division, quoteId: quote, threadRootId: thread, attachments }), createdAt: Date.now(), status: "queued" };
-    try { await journal.prepare(item.request, item.createdAt); lifetime.current.signal.throwIfAborted(); } catch { if (!lifetime.current.signal.aborted) setError(m.unavailable); return; }
-    setPending(previous => [...previous.filter(old => old.request.operationId !== item.request.operationId), item]); setDraft(""); setMentions([]); setMentionAll(false); setDivision(false); setQuote(""); setAttachments([]); setPicked([]); tracked.current = []; attempt.current = undefined; submit(item);
-  };
-  const upload = async (files: readonly File[], replacing?: string) => {
-    if (!files.length || !allowed || busy || files.length + attachments.length - (replacing ? 1 : 0) > 20) return; setBusy(true);
-    try { const added: wire.PartnerNetworkAttachment[] = [], local: { id: string; file: File }[] = [];
-      for (const file of files) {
-        if (file.size < 1 || file.size > 100 * 1024 * 1024) throw new Error();
-        const bytes = new Uint8Array(await file.arrayBuffer()); lifetime.current.signal.throwIfAborted();
-        const begun = await api.mediaPartnerNetwork({ ...target, action: "begin", operationId: crypto.randomUUID(), name: file.name, mediaType: file.type || "application/octet-stream", sizeBytes: BigInt(bytes.length) }, { signal: lifetime.current.signal }); if (!begun.attachment) throw new Error();
-        for (let offset = Number(begun.offset); offset < bytes.length;) { const response = await api.mediaPartnerNetwork({ ...target, action: "write", mediaId: begun.attachment.id, offset: BigInt(offset), data: bytes.slice(offset, offset + 256 * 1024) }, { signal: lifetime.current.signal });
-          if (response.offset !== BigInt(Math.min(offset + 256 * 1024, bytes.length))) throw new Error(); offset = Number(response.offset); } added.push(begun.attachment); local.push({ id: begun.attachment.id, file });
+    if (!allowed || !journalReady || busy || preparingSend.current || !draft.trim() && !attachments.length) return;
+    preparingSend.current = true; setBusy(true);
+    const source = currentDraft.current;
+    const resolved = wire.resolveNetworkMentions(source.text, mentionInput), targetIds = [...new Set([...source.mentions, ...resolved.actorIds])], all = source.mentionAll || resolved.all;
+    try {
+      const sentAttachments: wire.PartnerNetworkAttachment[] = [];
+      for (const attachment of source.attachments) {
+        const local = source.localAttachments?.find(value => value.id === attachment.id);
+        if (local?.annotationStrokes?.length) {
+          let cached = materializedUploads.current.get(local.id);
+          if (cached === undefined || cached.source.file !== local.file || !sameImageAnnotationStrokes(cached.source.annotationStrokes, local.annotationStrokes)) {
+            const file = await materializeImageAttachment(local, lifetime.current.signal);
+            cached = { source: local, attachment: await uploadFile(file) };
+            materializedUploads.current.set(local.id, cached);
+          }
+          sentAttachments.push(cached.attachment);
+        } else sentAttachments.push(attachment);
       }
-      if (!lifetime.current.signal.aborted) { setAttachments(previous => [...previous.filter(item => item.id !== replacing), ...added]); setPicked(previous => [...previous.filter(item => item.id !== replacing), ...local]); }
+      assertMediaCurrent();
+      const fingerprint = JSON.stringify([source.text, targetIds, source.quoteId, thread, sentAttachments.map(attachment => [attachment.id, attachment.sizeBytes.toString()]), source.forcePlan, all]);
+      if (attempt.current?.fingerprint !== fingerprint) attempt.current = { fingerprint, id: crypto.randomUUID() };
+      const item: Pending = { request: create(wire.SendPartnerNetworkRequestSchema, { ...target, operationId: attempt.current.id, text: source.text, mentions: targetIds, mentionAll: all, forcePlan: source.forcePlan, quoteId: source.quoteId, threadRootId: thread, attachments: sentAttachments }), createdAt: Date.now(), status: "queued" };
+      await journal.prepare(item.request, item.createdAt); assertMediaCurrent();
+      for (const attachment of source.attachments) materializedUploads.current.delete(attachment.id);
+      setPending(previous => [...previous.filter(old => old.request.operationId !== item.request.operationId), item]);
+      const current = currentDraft.current;
+      if (current.text === source.text && current.mentions === source.mentions && current.mentionAll === source.mentionAll
+        && current.forcePlan === source.forcePlan && current.quoteId === source.quoteId && current.attachments === source.attachments
+        && pickedRef.current === source.localAttachments && tracked.current === source.tracked) {
+        setDraft(""); setMentions([]); setMentionAll(false); setDivision(false); setQuote(""); setAttachments([]); setPicked([]); tracked.current = [];
+      }
+      attempt.current = undefined; submit(item);
+    } catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); }
+    finally { preparingSend.current = false; if (!lifetime.current.signal.aborted) setBusy(false); }
+  };
+  const assertMediaCurrent = () => { lifetime.current.signal.throwIfAborted(); if (!allowedRef.current) throw new Error(m.denied); };
+  const uploadFile = async (file: File): Promise<wire.PartnerNetworkAttachment> => {
+    assertMediaCurrent();
+    if (file.size < 1 || file.size > 100 * 1024 * 1024) throw new Error();
+    const bytes = new Uint8Array(await file.arrayBuffer()); assertMediaCurrent();
+    const begun = await api.mediaPartnerNetwork({ ...target, action: "begin", operationId: crypto.randomUUID(), name: file.name, mediaType: file.type || "application/octet-stream", sizeBytes: BigInt(bytes.length) }, { signal: lifetime.current.signal }); assertMediaCurrent(); if (!begun.attachment) throw new Error();
+    for (let offset = Number(begun.offset); offset < bytes.length;) { assertMediaCurrent(); const response = await api.mediaPartnerNetwork({ ...target, action: "write", mediaId: begun.attachment.id, offset: BigInt(offset), data: bytes.slice(offset, offset + 256 * 1024) }, { signal: lifetime.current.signal });
+      assertMediaCurrent(); if (response.offset !== BigInt(Math.min(offset + 256 * 1024, bytes.length))) throw new Error(); offset = Number(response.offset); }
+    return begun.attachment;
+  };
+  const upload = async (files: readonly File[]) => {
+    if (!files.length || !allowed || busy || preparingSend.current || files.length + attachments.length > 20) return; setBusy(true);
+    try { const added: wire.PartnerNetworkAttachment[] = [], local: AttachmentDraft[] = [];
+      for (const file of files) {
+        const attachment = await uploadFile(file); added.push(attachment); local.push({ id: attachment.id, file, kind: file.type.startsWith("image/") ? "image" : "file" });
+      }
+      assertMediaCurrent(); setAttachments(previous => [...previous, ...added]); setPicked(previous => [...previous, ...local]);
     } catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason, m)); } finally { if (!lifetime.current.signal.aborted) setBusy(false); }
   };
   const shareMode = Object.hasOwn(sharing, thread), shareIds = new Set(sharing[thread] ?? []), timelineId = `${target.roomId}:${thread}`;
@@ -315,7 +355,10 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
     <form className="partner-network-composer" onDrop={event => { event.preventDefault(); void upload(Array.from(event.dataTransfer.files)); }} onDragOver={event => event.preventDefault()} onSubmit={event => { event.preventDefault(); void send(); }}>
       {quote && <p>{m.quote}: {messages.find(message => message.id === quote)?.text.slice(0, 120)} <Button type="button" onClick={() => setQuote("")}>{m.clearQuote}</Button></p>}
       {division && <p>{planCopy.divisionTag}<Button type="button" onClick={() => setDivision(false)}>{planCopy.removeDivision}</Button></p>}
-      <ComposerAttachmentTray ownerKey={journal.scope} attachments={previews} t={t} removeDisabled={busy} onRemove={item => { setAttachments(previous => previous.filter(value => value.id !== item.id)); setPicked(previous => previous.filter(value => value.id !== item.id)); }} onReplaceImage={(item, file) => upload([file], item.id)} />
+      <ComposerAttachmentTray ownerKey={`${journal.scope}:${thread}`} attachments={previews} t={t} removeDisabled={busy || !allowed} onRemove={item => { materializedUploads.current.delete(item.id); setAttachments(previous => previous.filter(value => value.id !== item.id)); setPicked(previous => previous.filter(value => value.id !== item.id)); }} onSaveImageAnnotations={(item, strokes) => {
+        if (busy || preparingSend.current || !allowedRef.current) throw new Error(m.unavailable);
+        const next = editImageAttachment(pickedRef.current, item, strokes); if (next === pickedRef.current) return; materializedUploads.current.delete(item.id); pickedRef.current = next; setPicked(next);
+      }} />
       {attachments.filter(attachment => !picked.some(item => item.id === attachment.id)).map(attachment => <span key={attachment.id}>{attachment.name} <Button type="button" onClick={() => setAttachments(previous => previous.filter(item => item.id !== attachment.id))}>×</Button></span>)}
       <textarea aria-label={m.message} placeholder={speakingName ? m.notesForSpeaker : m.message} value={draft} maxLength={8000} disabled={!allowed} onBeforeInput={event => { selection.current = { start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd }; }} onSelect={event => { selection.current = { start: event.currentTarget.selectionStart, end: event.currentTarget.selectionEnd }; }} onPaste={event => { if (event.clipboardData.files.length) { event.preventDefault(); void upload(Array.from(event.clipboardData.files)); } }} onChange={event => editDraft(event.target.value)} />
       <details><summary>{m.mentions}</summary>{room?.members.filter(member => member.state === "joined" && member.id !== room.selfId).map(member => <Button type="button" key={member.id} onClick={() => pickMention(member.id)}>{`@${wire.partnerNetworkActorName(member, room)}`}</Button>)}<Button type="button" onClick={() => pickMention()}>{m.everyone}</Button></details>

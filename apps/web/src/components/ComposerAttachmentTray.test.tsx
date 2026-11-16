@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { translate } from "../i18n.js";
 import type { AttachmentDraft } from "../model.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
+import { editImageAttachment } from "../image-attachment.js";
 
 const roots: Root[] = [];
 const t = (key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]): string => translate("en", key, values);
@@ -27,6 +28,36 @@ afterEach(async () => {
 });
 
 describe("composer attachment tray", () => {
+  it("saves editable vectors on the original attachment and reopens the cleared original without encoding", async () => {
+    vi.useFakeTimers();
+    const original: AttachmentDraft = { id: "original", kind: "image", file: new File(["original"], "photo.jpg", { type: "image/jpeg" }), previewUrl: "blob:original",
+      annotationStrokes: [{ points: [{ x: 0.25, y: 0.5 }] }] };
+    let attachments: readonly AttachmentDraft[] = [original];
+    const onSave = vi.fn((source: AttachmentDraft, strokes: NonNullable<AttachmentDraft["annotationStrokes"]>) => {
+      attachments = editImageAttachment(attachments, source, strokes);
+      root.render(<ComposerAttachmentTray ownerKey="draft" attachments={attachments} t={t} onRemove={vi.fn()} onSaveImageAnnotations={onSave} />);
+    });
+    const root = mount(attachments, vi.fn(), onSave);
+    act(() => document.querySelector<HTMLButtonElement>("button.attachment-chip__content")!.click());
+    const image = document.querySelector<HTMLImageElement>('.workspace-image-lightbox__image-wrap img')!;
+    Object.defineProperties(image, { naturalWidth: { value: 400 }, naturalHeight: { value: 300 } });
+    act(() => image.dispatchEvent(new Event("load")));
+    expect(document.querySelector('.workspace-image-lightbox__image-wrap img')?.getAttribute("src")).toBe(original.previewUrl);
+    expect(document.querySelector('.workspace-image-lightbox__image-wrap path')).not.toBeNull();
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Annotate"]')!.click());
+    act(() => document.querySelector<HTMLButtonElement>('button[aria-label="Undo last stroke"]')!.click());
+    await act(async () => { document.querySelector<HTMLButtonElement>('button[aria-label="Save"]')!.click(); await Promise.resolve(); });
+    await act(async () => vi.advanceTimersByTime(160));
+    expect(onSave).toHaveBeenCalledExactlyOnceWith(original, []);
+    expect(attachments[0]!.file).toBe(original.file); expect(attachments[0]!.id).toBe(original.id); expect(attachments[0]!.annotationStrokes).toBeUndefined();
+    expect(document.querySelector(".workspace-image-lightbox")).toBeNull();
+    act(() => document.querySelector<HTMLButtonElement>("button.attachment-chip__content")!.click());
+    expect(document.querySelector('.workspace-image-lightbox__image-wrap path')).toBeNull();
+    act(() => root.render(<ComposerAttachmentTray ownerKey="draft" attachments={attachments} t={t} removeDisabled onRemove={vi.fn()} onSaveImageAnnotations={onSave} />));
+    expect(document.querySelector('button[aria-label="Annotate"]')).toBeNull();
+    vi.useRealTimers();
+  });
+
   it("shows a viewport-aware image preview, opens the image viewer, and does not reopen on restored focus", async () => {
     mount([{ id: "image", kind: "image", file: new File(["image"], "preview.png", { type: "image/png" }), previewUrl: "blob:image" }]);
     const trigger = document.querySelector<HTMLButtonElement>("button.attachment-chip__content");
@@ -69,7 +100,7 @@ describe("composer attachment tray", () => {
     });
 
     expect(document.querySelector(".text-attachment-lightbox [role=dialog]")?.textContent).toContain("notes.md");
-    expect(document.querySelector(".text-attachment-lightbox pre")?.textContent).toBe("alpha\nbeta");
+    expect(document.querySelector(".text-attachment-lightbox__markdown p")?.textContent).toBe("alpha\nbeta");
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
   });
 
@@ -84,9 +115,10 @@ describe("composer attachment tray", () => {
   });
 });
 
-function mount(attachments: readonly AttachmentDraft[], onRemove = vi.fn()): void {
+function mount(attachments: readonly AttachmentDraft[], onRemove = vi.fn(), onSaveImageAnnotations?: Parameters<typeof ComposerAttachmentTray>[0]["onSaveImageAnnotations"]): Root {
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
-  act(() => root.render(<ComposerAttachmentTray ownerKey="draft" attachments={attachments} t={t} onRemove={onRemove} />));
+  act(() => root.render(<ComposerAttachmentTray ownerKey="draft" attachments={attachments} t={t} onRemove={onRemove} onSaveImageAnnotations={onSaveImageAnnotations} />));
+  return root;
 }

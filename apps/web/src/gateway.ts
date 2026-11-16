@@ -1,4 +1,5 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { materializeImageAttachment } from "./image-attachment.js";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import type { ProviderAccountResetApi } from "@joko/contracts";
 import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock } from "@joko/contracts";
@@ -2302,7 +2303,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
     if (text.length > 0) parts.push({ content: { case: "text", value: text } });
     for (const attachment of draft.attachments) {
-      const blob = await this.uploadAttachment(attachment.file, scope);
+      const file = await materializeImageAttachment(attachment, scope.signal);
+      const blob = await this.uploadAttachment(file, scope);
       scope.signal.throwIfAborted();
       parts.push(attachment.kind === "image"
         ? { content: { case: "image", value: { blob, altText: attachment.file.name } } }
@@ -2349,7 +2351,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
     }
     for (const item of browserComments) {
-      const blob = await this.uploadAttachment(item.screenshot.file, scope);
+      const file = await materializeImageAttachment(item.screenshot, scope.signal);
+      const blob = await this.uploadAttachment(file, scope);
       scope.signal.throwIfAborted();
       parts.push({ content: { case: "image", value: { blob, altText: item.screenshot.file.name } } });
     }
@@ -2445,7 +2448,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const uploaded = await Promise.all(sourceAttachments.map(async (attachment) => ({
       kind: attachment.kind === "image" ? ReviewAttachmentKind.IMAGE : ReviewAttachmentKind.FILE,
       displayName: attachment.file.name,
-      blob: await this.uploadAttachment(attachment.file, scope)
+      blob: await this.uploadAttachment(await materializeImageAttachment(attachment, scope.signal), scope)
     })));
     scope.signal.throwIfAborted();
     const operation = await this.submit({
