@@ -316,8 +316,8 @@ function CachedMedia({ ownerKey, acquire, release, consumer = "preview", value =
   readonly value?: ArtifactView;
 }): React.ReactNode {
   const loadUrl = useTimelineArtifactUrlCache(ownerKey, acquire, release);
-  if (consumer === "message") return <MessageAttachment artifact={value} t={t} onArtifactUrl={loadUrl} onArtifactDownload={async () => undefined} />;
-  if (consumer === "artifact") return <ArtifactBlock item={artifactItem(value)} icon={<span />} locale="en" t={t} onArtifactUrl={loadUrl} onArtifactDownload={async () => undefined} />;
+  if (consumer === "message") return <MessageAttachment artifact={value} t={t} onArtifactUrl={loadUrl} onArtifactDownload={async () => "dispatched"} />;
+  if (consumer === "artifact") return <ArtifactBlock item={artifactItem(value)} icon={<span />} locale="en" t={t} onArtifactUrl={loadUrl} onArtifactDownload={async () => "dispatched"} />;
   return <TimelineArtifactMedia artifact={value} playbackOwnerKey={ownerKey} loadUrl={loadUrl} t={t} />;
 }
 
