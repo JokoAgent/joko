@@ -16979,9 +16979,24 @@ describe("SessionHost", () => {
     });
   });
 
-  it("hands every surviving message and complete long text to context rebuilds", async () => {
+  it("hands every surviving message and complete long text to context rebuilds", async ({ signal, onTestFailed, onTestFinished }) => {
+    const startedAt = performance.now();
+    let phase = "fixture", seeded = 0, readState: (() => unknown) | undefined;
+    const completedPhases: Array<{ phase: string; elapsedMs: number }> = [];
+    const advance = (next: string) => { completedPhases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) }); phase = next; };
+    const snapshot = () => {
+      let state: unknown;
+      try { state = readState?.(); } catch { state = "unavailable"; }
+      return { phase, seeded, elapsedMs: Math.round(performance.now() - startedAt), completedPhases: [...completedPhases], state };
+    };
+    let aborted: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { aborted ??= snapshot(); };
+    signal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => { console.error("[context-rebuild-handoff]", JSON.stringify(aborted ?? snapshot())); });
     const adapter = new NativeContextRecoveryFakeAdapter(["context_overflow", "success"]);
     const fixture = await createFixture(adapter);
+    advance("create-session");
     const sessionId = (await fixture.host.createSession({
       operationId: "create-context-overflow-complete-handoff",
       connection: fixture.connection,
@@ -16991,6 +17006,10 @@ describe("SessionHost", () => {
       permissionMode: "ask",
       planMode: false
     })).value.sessionId;
+    readState = () => ({ nativeRebuilds: adapter.rebuildInputs.length,
+      queue: fixture.store.listQueueItems({ sessionId }).map(item => ({ id: item.id, state: item.state })),
+      runs: fixture.store.listRuns({ sessionId }).map(run => ({ id: run.descriptor.id, state: run.descriptor.state })) });
+    advance("seed-history");
     const longMessage = `long-context-start-${"x".repeat(40_000)}-long-context-end`;
     for (let index = 0; index < 401; index += 1) {
       appendSessionEvent(fixture.store, sessionId, `complete-handoff-${index}`, 10 + index, {
@@ -17001,17 +17020,21 @@ describe("SessionHost", () => {
           text: index === 200 ? longMessage : `surviving-context-${index}`
         }]
       });
+      seeded = index + 1;
     }
 
+    advance("enqueue");
     const source = fixture.host.enqueueInput({
       operationId: "context-overflow-complete-handoff-input",
       connection: fixture.connection,
       sessionId,
       prompt: { text: "trigger complete handoff", images: [], files: [], mentions: [], disposition: "prompt" }
     });
+    advance("queue-settlement");
     await eventually(() => fixture.store.listQueueItems({ sessionId }).length === 2 &&
       fixture.store.listQueueItems({ sessionId }).every((item) => item.state === "completed" || item.state === "failed"));
 
+    advance("assertions");
     expect(fixture.store.getQueueItem(source.value.queueItemId).state).toBe("failed");
     expect(adapter.rebuildInputs).toHaveLength(1);
     const handoff = adapter.rebuildInputs[0]!.handoff;

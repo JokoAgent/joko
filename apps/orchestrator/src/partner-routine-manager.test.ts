@@ -77,6 +77,7 @@ async function toolsFixture(f: Awaited<ReturnType<typeof fixture>>) {
 }
 describe("Partner routine authority and independent execution", () => {
   it.each(['persistent', 'fresh'] as const)('runs %s routines with their own model, history and Partner identity', async sessionMode => {
+    const startedAt = performance.now();
     const f = await fixture(), canonical = f.store.getSession(f.partner.canonicalSessionId!).descriptor;
     const modelOverride = { backendId: profile.id, providerId: 'vision', modelId: 'multimodal', effort: 'high', fastMode: false } as const;
     const saved = await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision, requestId: `routine-model-${sessionMode}-creation`,
@@ -85,7 +86,22 @@ describe("Partner routine authority and independent execution", () => {
     for (let index = 0; index < 2; index++) {
       await f.routines.run({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: saved.id,
         revision: saved.revision, requestId: `routine-model-${sessionMode}-run-${index}` });
-      await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs.filter(run => run.status === 'success')).toHaveLength(index + 1));
+      try {
+        await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs.filter(run => run.status === 'success')).toHaveLength(index + 1));
+      } catch (error) {
+        try {
+          console.error("[routine-model-settlement]", JSON.stringify({ sessionMode, expectedSuccesses: index + 1,
+            requestId: `routine-model-${sessionMode}-run-${index}`, elapsedMs: Math.round(performance.now() - startedAt),
+            runs: f.routines.history(f.partner.id, saved.id).runs.map(run => ({ id: run.id, status: run.status,
+              sessionId: run.sessionId, scheduleRunId: run.scheduleRunId })),
+            sessions: f.partners.relatedSessions(f.partner.id).routines.filter(item => item.routineKey?.startsWith(`routine:${saved.id}`)).map(({ session }) => ({
+              id: session.id, archived: session.archived, paused: f.store.getQueueControl(session.id).paused,
+              runs: f.store.listRuns({ sessionId: session.id }).map(run => ({ id: run.descriptor.id, state: run.descriptor.state })),
+              queue: f.store.listQueueItems({ sessionId: session.id }).map(item => ({ id: item.id, state: item.state }))
+            })) }));
+        } catch { /* Preserve the original assertion if its store is unavailable. */ }
+        throw error;
+      }
     }
     const runs = f.routines.history(f.partner.id, saved.id).runs;
     const sessions = runs.map(run => f.store.getSession(run.sessionId!).descriptor);
