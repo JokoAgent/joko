@@ -55,14 +55,14 @@ function supportedEndpoint(route: CredentialModelRoute): boolean {
 export class SpeechModelCatalog {
   constructor(readonly store: OperationalStore, readonly routes: ModelRouteCatalog) {}
   list(): DesktopSpeechModel[] {
-    return this.routes.list().filter(value => value.credentialRoute).flatMap(value => {
-      const route = this.routes.resolve(value);
+    return this.routes.list({ purpose: 'audio_speech' }).filter(value => value.credentialRoute).flatMap(value => {
+      const route = this.routes.resolve(value, { purpose: 'audio_speech' });
       if (!route || !supportedEndpoint(route)) return [];
       const descriptor = this.store.getBackend(value.backendId).descriptor;
       const model = descriptor.models.find(model => model.providerId === value.providerId && model.modelId === value.modelId);
       const protocol = endpointProtocol(apiBase(route.baseUrl), route.modelId);
-      return [create(DesktopSpeechModelSchema, { ...value, displayName: model?.displayName ?? value.modelId,
-        providerName: descriptor.providers?.find(provider => provider.providerId === value.providerId)?.displayName ?? value.providerId,
+      return [create(DesktopSpeechModelSchema, { ...value, displayName: value.displayName ?? model?.displayName ?? value.modelId,
+        providerName: value.providerName ?? descriptor.providers?.find(provider => provider.providerId === value.providerId)?.displayName ?? value.providerId,
         ...(protocol ? { protocol } : {}), protocolLocked: protocol !== undefined,
         ...(openRouterSpeechBaseUrl(route.baseUrl) ? { speedSupport: { case: 'speedUnsupported' as const, value: true } } : {}) })];
     });
@@ -70,7 +70,7 @@ export class SpeechModelCatalog {
   resolve(selection: DesktopSpeechSelection | SpeechSelection): { connection: SpeechConnection; generationId: string; assertCurrent(): void } {
     if (!selection.backendId || !selection.providerId || !selection.modelId || !SPEECH_PROTOCOLS.includes(selection.protocol as SpeechProtocol)
       || !normalizeSpeechVoiceId(selection.voice)) throw new Error('model_unavailable');
-    const route = this.routes.resolve({ backendId: selection.backendId, providerId: selection.providerId, modelId: selection.modelId });
+    const route = this.routes.resolve({ backendId: selection.backendId, providerId: selection.providerId, modelId: selection.modelId }, { purpose: 'audio_speech' });
     if (!route || !supportedEndpoint(route)) throw new Error('model_unavailable');
     const base = apiBase(route.baseUrl), fixed = endpointProtocol(base, route.modelId);
     const protocol = fixed ?? selection.protocol as SpeechProtocol;
@@ -86,7 +86,7 @@ export class SpeechModelCatalog {
     else if (fixed && fixed !== 'openai') base.pathname = protocol === 'qwen-tts' || protocol === 'dashscope-tts' ? '/api/v1' : '/v1';
     else if (!base.pathname || base.pathname === '/') base.pathname = '/v1';
     const assertCurrent = () => {
-      if (this.routes.resolve({ backendId: route.backendId, providerId: route.providerId, modelId: route.modelId })?.generationId !== route.generationId) throw new Error('connection_changed');
+      if (this.routes.resolve({ backendId: route.backendId, providerId: route.providerId, modelId: route.modelId }, { purpose: 'audio_speech' })?.generationId !== route.generationId) throw new Error('connection_changed');
     };
     assertCurrent();
     return { connection: { baseUrl: base.toString().replace(/\/+$/, ''), headers, protocol,

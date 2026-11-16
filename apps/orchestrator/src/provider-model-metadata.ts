@@ -51,6 +51,7 @@ export function materializeDiscoveredModel(model: PiManagedModel): PiManagedMode
     contextWindowSource: metadata.contextWindow === undefined ? "estimated" : "declared",
     maxTokens: metadata.maxOutputTokens ?? 16_384,
     maxOutputTokensSource: metadata.maxOutputTokens === undefined ? "estimated" : "declared",
+    ...(metadata.mode === undefined ? {} : { mode: metadata.mode }),
     ...(metadata.contextWindowMax === undefined ? {} : { contextWindowMax: metadata.contextWindowMax }),
     ...(metadata.description === undefined ? {} : { description: metadata.description }),
     ...(metadata.nativeApi === undefined ? {} : { referenceApi: metadata.nativeApi }),

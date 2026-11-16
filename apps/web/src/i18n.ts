@@ -5819,6 +5819,9 @@ const en = {
   "settings.addHeader": "Add header binding",
   "settings.modelsRequired": "Models (at least one required)",
   "settings.newModel": "New model",
+  "settings.modelPurpose": "Model purpose",
+  "settings.modelPurposeChat": "Conversation",
+  "settings.modelPurposeSpeech": "Speech synthesis",
   "settings.modelId": "Model ID",
   "settings.apiOverride": "Model API override",
   "settings.inheritProvider": "Inherit provider API",
@@ -6650,6 +6653,9 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  "settings.modelPurpose": "模型用途",
+  "settings.modelPurposeChat": "对话",
+  "settings.modelPurposeSpeech": "语音合成",
   ...providerAccountResetChinese,
   "contextBudget.title": "任务上下文预算",
   "contextBudget.help": "仅用于本任务，在安全的运行边界生效。上下文圆环继续显示 Backend 的实际窗口；模型级上限和物理容量优先。",

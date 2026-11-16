@@ -88,7 +88,11 @@ it("saves a new provider with an independent uploaded credential and leaves its 
       enabled: true, version: { revision: { value: 0n } }, runtimes: [{
         backendId, apiCompatibility: ProviderApiCompatibility.OPENAI_COMPLETIONS, endpoint: "https://provider.example.test/v1",
         credentialReferenceId: "credential-first", apiKeyEnvironment: "JOKO_PROVIDER_TEST_KEY", credentialOrigin: "https://provider.example.test", authHeader: true,
-        models: [{ modelId: "model", displayName: "Model", inputModalities: [ModelInputModality.TEXT], contextWindowTokens: 32_000n, maximumOutputTokens: 4_000n }]
+        models: [
+          { modelId: "model", displayName: "Model", mode: "chat", inputModalities: [ModelInputModality.TEXT], contextWindowTokens: 32_000n, maximumOutputTokens: 4_000n },
+          { modelId: "custom-speech", displayName: "Custom speech", mode: "audio_speech", inputModalities: [ModelInputModality.TEXT] },
+          { modelId: "tts-1", displayName: "Known speech", inputModalities: [ModelInputModality.TEXT] }
+        ]
       }, {
         backendId: secondaryBackendId, apiCompatibility: ProviderApiCompatibility.OPENAI_COMPLETIONS,
         endpoint: "http://127.0.0.1:9182/v1", keyless: true,
@@ -102,6 +106,11 @@ it("saves a new provider with an independent uploaded credential and leaves its 
     expect(secondaryRoute?.authorization).toBeUndefined();
     expect(secondaryRoute?.baseUrl).toBe("http://127.0.0.1:9182/v1");
     expect(fixture.application.providers!.resolveInferenceRoute("absent-runtime", "private-provider", "model")).toBeUndefined();
+    for (const modelId of ["custom-speech", "tts-1"]) {
+      expect(fixture.application.providers!.resolveInferenceRoute(backendId, "private-provider", modelId)).toBeUndefined();
+      expect(fixture.application.providers!.resolveInferenceRoute(backendId, "private-provider", modelId, { purpose: "audio_speech" })?.authorization).toBe("Bearer first-provider-fixture-secret");
+      expect(fixture.application.providers!.resolveInferenceRoute(secondaryBackendId, "private-provider", modelId, { purpose: "audio_speech" })).toBeUndefined();
+    }
     await upload("credential-second", "second-provider-fixture-secret");
     expect(fixture.application.providers!.resolveInferenceRoute(backendId, "private-provider", "model")?.authorization).toBe("Bearer first-provider-fixture-secret");
     provider.runtimes[0]!.credentialReferenceId = "credential-second";
@@ -115,6 +124,8 @@ it("saves a new provider with an independent uploaded credential and leaves its 
     expect(savedSecondaryRoute?.authorization).toBeUndefined();
     const settings = (await connection.clients.settings.getSettings({})).settings!;
     expect(settings.providers[0]?.runtimes.find(runtime => runtime.backendId === backendId)?.credentialReferenceId).toBe("credential-second");
+    expect(settings.providers[0]?.runtimes.find(runtime => runtime.backendId === backendId)?.models.map(model => [model.modelId, model.mode]))
+      .toEqual([["model", "chat"], ["custom-speech", "audio_speech"], ["tts-1", "audio_speech"]]);
     const unsupported = clone(ProviderConfigurationSchema, settings.providers[0]!);
     unsupported.runtimes[0]!.apiCompatibility = ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS;
     await expect(save(unsupported)).rejects.toMatchObject({ code: Code.InvalidArgument });
@@ -125,6 +136,15 @@ it("saves a new provider with an independent uploaded credential and leaves its 
       await expect(save(collision)).rejects.toMatchObject({ code: Code.InvalidArgument });
       expect(fixture.application.providers!.resolveInferenceRoute(backendId, "private-provider", "model")?.authorization).toBe("Bearer second-provider-fixture-secret");
     }
+    const malformed = clone(ProviderConfigurationSchema, settings.providers[0]!);
+    malformed.runtimes.find(runtime => runtime.backendId === backendId)!.models[1]!.mode = "audio speech";
+    await expect(save(malformed)).rejects.toMatchObject({ code: Code.InvalidArgument });
+    const withdrawn = clone(ProviderConfigurationSchema, settings.providers[0]!);
+    withdrawn.runtimes.find(runtime => runtime.backendId === backendId)!.models[1]!.mode = "audio_transcription";
+    expect((await save(withdrawn)).state).toBe(OperationState.SUCCEEDED);
+    expect(fixture.application.providers!.resolveInferenceRoute(backendId, "private-provider", "custom-speech", { purpose: "audio_speech" })).toBeUndefined();
+    expect(fixture.application.providers!.resolveInferenceRoute(backendId, "private-provider", "model")?.authorization).toBe("Bearer second-provider-fixture-secret");
+    expect(fixture.application.providers!.resolveInferenceRoute(secondaryBackendId, "private-provider", "model")?.baseUrl).toBe(secondaryRoute?.baseUrl);
     const serialized = JSON.stringify(fixture.application.store.listSettings(), (_key, value) => typeof value === "bigint" ? value.toString() : value);
     expect(serialized).not.toContain("first-provider-fixture-secret");
     expect(serialized).not.toContain("second-provider-fixture-secret");

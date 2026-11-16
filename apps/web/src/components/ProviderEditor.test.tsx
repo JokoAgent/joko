@@ -46,6 +46,25 @@ async function select(control: HTMLButtonElement, label: string): Promise<void> 
 }
 
 describe("Provider runtime editor", () => {
+  it("saves an explicit custom speech purpose only on the edited runtime and preserves it on an unchanged save", async () => {
+    const initial = provider();
+    const configuration = { ...initial, runtimes: initial.runtimes.map((runtime, index) => ({ ...runtime,
+      models: runtime.models.map(model => ({ ...model, ...(index === 0 ? { contextWindowTokens: 0, maximumOutputTokens: 0 } : {}), inheritedFields: ["name", "mode"] as const })) })) };
+    const { saveProvider } = await render(configuration);
+    await act(async () => { document.querySelector<HTMLDetailsElement>(".provider-model-card__advanced")!.open = true; });
+    await select(control<HTMLButtonElement>("Model purpose", '[role="combobox"]'), "Speech synthesis");
+    await act(async () => button("Save").click());
+    expect(saveProvider.mock.calls[0]?.[0]).toMatchObject({ runtimes: [
+      { backendId: "alpha", models: [{ mode: "audio_speech", contextWindowTokens: 0, maximumOutputTokens: 0, inheritedFields: ["name"] }] },
+      { backendId: "beta", models: [{ inheritedFields: ["name", "mode"] }] }
+    ] });
+    expect(saveProvider.mock.calls[0]?.[0].runtimes[1]?.models[0]?.mode).toBeUndefined();
+    await act(async () => button("Save").click());
+    expect(saveProvider.mock.calls[1]?.[0]).toEqual(saveProvider.mock.calls[0]?.[0]);
+    await select(control<HTMLButtonElement>("Model purpose", '[role="combobox"]'), "Conversation");
+    expect(button("Save").disabled).toBe(true);
+  });
+
   it("preserves discovery inheritance on an unchanged save and overrides only the edited model field", async () => {
     const initial = provider();
     const inheritedFields = ["name", "contextWindowTokens", "maximumOutputTokens", "inputModalities", "reasoning", "thinkingLevels", "supportsFastMode", "supportsTools"] as const;

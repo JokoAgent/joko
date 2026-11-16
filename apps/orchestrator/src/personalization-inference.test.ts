@@ -854,7 +854,7 @@ function provider(backendId: string, id: string, models: readonly { readonly id:
 function providerCatalog(
   descriptors: ReturnType<ProviderCatalogManager["list"]>,
   route?: ProviderInferenceRoute | readonly ProviderInferenceRoute[]
-): Pick<ProviderCatalogManager, "list" | "hasInferenceModel" | "resolveInferenceRoute"> {
+): Pick<ProviderCatalogManager, "list" | "listManaged" | "hasInferenceModel" | "resolveInferenceRoute"> {
   const catalog = descriptors;
   const routes: readonly ProviderInferenceRoute[] = route === undefined
     ? []
@@ -863,6 +863,7 @@ function providerCatalog(
       : route;
   return {
     list: (backendId) => catalog.filter((descriptor) => backendId === undefined || descriptor.backendId === backendId),
+    listManaged: backendId => catalog.filter(descriptor => descriptor.backendId === backendId),
     hasInferenceModel: (backendId, providerId, modelId, options) => catalog.some((descriptor) =>
       descriptor.backendId === backendId && descriptor.provider.id === providerId && descriptor.provider.models.some((model) =>
         model.id === modelId && (options?.requireImages !== true || model.input?.includes("image") === true)

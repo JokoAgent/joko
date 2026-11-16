@@ -6,6 +6,7 @@ export interface DiscoveredProviderModel {
 }
 
 export interface DiscoveredProviderModelMetadata {
+  readonly mode?: string;
   readonly name?: string;
   readonly contextWindowMax?: number;
   readonly maxOutputTokens?: number;
@@ -26,6 +27,8 @@ export interface ProviderModelDiscoverySpec {
   readonly api?: string;
   readonly apiKey?: string;
   readonly headers?: Readonly<Record<string, string>>;
+  /** Retain purpose facts for speech configuration and capability withdrawals. */
+  readonly includeNonChat?: boolean;
 }
 
 export type ProviderModelDiscoveryErrorCode =
@@ -58,7 +61,7 @@ export function deriveProviderModelsUrl(baseUrl: string, api?: string): string {
   return url.toString();
 }
 
-export function parseProviderModels(value: unknown, sourceUrl?: string): readonly DiscoveredProviderModel[] {
+export function parseProviderModels(value: unknown, sourceUrl?: string, includeNonChat = false): readonly DiscoveredProviderModel[] {
   if (!Array.isArray(value) && !isRecord(value)) return [];
   const list = Array.isArray(value) ? value : Array.isArray(value["data"])
     ? value["data"]
@@ -86,13 +89,15 @@ export function parseProviderModels(value: unknown, sourceUrl?: string): readonl
     seen.add(id);
     const info = isRecord(record?.["model_info"]) ? record["model_info"] : {};
     const vercel = officialModelsEndpoint(sourceUrl, "https://ai-gateway.vercel.sh/v1/models");
-    const mode = record?.["mode"] ?? info["mode"];
-    // Importing a media/embedding model as a chat route would make it appear usable in the task picker.
-    if (typeof mode === "string" && mode !== "chat" || vercel && record?.["type"] !== undefined && record["type"] !== "language"
-      || record?.["model_id"] === id && typeof record["can_do_text_to_speech"] === "boolean") continue;
     const architecture = isRecord(record?.["architecture"]) ? record["architecture"] : {};
-    if (officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")
-      && Array.isArray(architecture["output_modalities"]) && architecture["output_modalities"].includes("speech")) continue;
+    const elevenLabsMode = record?.["model_id"] === id && typeof record?.["can_do_text_to_speech"] === "boolean"
+      ? record["can_do_text_to_speech"] ? "audio_speech" : "other" : undefined;
+    const openRouterSpeech = officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")
+      && Array.isArray(architecture["output_modalities"]) && architecture["output_modalities"].includes("speech");
+    const mode = record?.["mode"] ?? info["mode"] ?? elevenLabsMode ?? (openRouterSpeech ? "audio_speech" : undefined);
+    // Importing a media/embedding model as a chat route would make it appear usable in the task picker.
+    if (!includeNonChat && typeof mode === "string" && mode !== "chat"
+      || vercel && record?.["type"] !== undefined && record["type"] !== "language") continue;
     const name = typeof google?.["displayName"] === "string" && validLabel(google["displayName"]) ? google["displayName"]
       : typeof record?.["display_name"] === "string" && validLabel(record["display_name"])
       ? record["display_name"]
@@ -110,8 +115,13 @@ export function parseProviderModels(value: unknown, sourceUrl?: string): readonl
         google?.["inputTokenLimit"],
         info["max_input_tokens"]
       ].find(validPositiveInteger);
+    const speechModalities = openRouterSpeech ? stringList(architecture["output_modalities"]) : undefined;
     const metadata = {
       ...discoveredMetadata(record ?? {}, info, architecture, google, vercel, typeof rawWindow === "number" ? Math.floor(rawWindow) : undefined),
+      ...(typeof mode === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(mode) ? { mode } : {}),
+      // OpenRouter's speech modality is its TTS catalog contract. Generic audio
+      // output, custom endpoint paths and model names do not establish purpose.
+      ...(speechModalities === undefined ? {} : { outputModalities: speechModalities.map(value => value === "speech" ? "audio" : value) }),
       ...(name === undefined ? {} : { name })
     };
     result.push({
@@ -200,7 +210,23 @@ export async function fetchProviderModels(
   const sourceUrl = endpoint.toString();
   const signal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
   const first = await fetchModelPage(sourceUrl, headers, signal, fetchImpl);
-  const firstModels = parseProviderModels(first, sourceUrl);
+  let firstModels = parseProviderModels(first, sourceUrl, spec.includeNonChat);
+  if (spec.includeNonChat && officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")) {
+    const speechEndpoint = new URL(endpoint);
+    speechEndpoint.searchParams.set("output_modalities", "speech");
+    try {
+      const speech = parseProviderModels(await fetchModelPage(speechEndpoint.toString(), headers, signal, fetchImpl), speechEndpoint.toString(), true);
+      const combined = new Map(firstModels.map(model => [model.id, model]));
+      for (const model of speech.filter(model => model.metadata?.mode === "audio_speech")) {
+        const previous = combined.get(model.id);
+        if (previous === undefined && combined.size >= MAXIMUM_DISCOVERED_MODELS) break;
+        combined.set(model.id, { ...previous, ...model,
+          name: model.metadata?.name ?? previous?.metadata?.name ?? model.name,
+          metadata: { ...previous?.metadata, ...model.metadata } });
+      }
+      firstModels = [...combined.values()];
+    } catch { /* The independent speech catalog must not discard a successful chat discovery. */ }
+  }
   if (spec.api !== "anthropic-messages" || !isRecord(first) || first["has_more"] !== true) {
     if (firstModels.length === 0) throw new ProviderModelDiscoveryError("invalid_response");
     return firstModels;
@@ -222,7 +248,7 @@ export async function fetchProviderModels(
     if (!isRecord(value) || !Array.isArray(value["data"]) || typeof value["has_more"] !== "boolean") {
       throw new ProviderModelDiscoveryError("invalid_response");
     }
-    for (const model of parseProviderModels(value, sourceUrl)) if (!models.has(model.id)) models.set(model.id, model);
+    for (const model of parseProviderModels(value, sourceUrl, spec.includeNonChat)) if (!models.has(model.id)) models.set(model.id, model);
     if (!value["has_more"]) {
       if (models.size === 0 || models.size > MAXIMUM_DISCOVERED_MODELS) throw new ProviderModelDiscoveryError("invalid_response");
       return [...models.values()];

@@ -4,6 +4,8 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
   provisionManagedCatalog,
+  isManagedChatModel,
+  isManagedSpeechModel,
   type PiManagedModel,
   type PiManagedProvider,
   type PiManagedSettings
@@ -1443,7 +1445,7 @@ export class ProviderCatalogManager {
     backendId: string,
     providerId: string,
     modelId: string,
-    options: { readonly requireImages?: boolean } = {}
+    options: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" } = {}
   ): boolean {
     this.#assertInitialized();
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
@@ -1457,7 +1459,7 @@ export class ProviderCatalogManager {
       || entry.provider.baseUrl === undefined
     ) return false;
     const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
-    if (model === undefined) return false;
+    if (model === undefined || !(options.purpose === "audio_speech" ? isManagedSpeechModel(model) : isManagedChatModel(model))) return false;
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return false;
     if (options.requireImages === true && model.input?.includes("image") !== true) return false;
@@ -1465,10 +1467,11 @@ export class ProviderCatalogManager {
   }
 
   /** Describe readiness and all credential replacements without opening any secret. */
-  describeInferenceRoute(backendId: string, providerId: string, modelId: string): ProviderInferenceIdentity | undefined {
+  describeInferenceRoute(backendId: string, providerId: string, modelId: string,
+    options: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" } = {}): ProviderInferenceIdentity | undefined {
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
     const normalizedModelId = nonBlank(modelId, "Inference model ID");
-    if (!this.hasInferenceModel(backendId, normalizedProviderId, normalizedModelId)) return undefined;
+    if (!this.hasInferenceModel(backendId, normalizedProviderId, normalizedModelId, options)) return undefined;
     const entry = this.#entries.get(managedProviderKey(backendId, normalizedProviderId))!;
     const references = new Set<string>();
     if (entry.provider.apiKeyEnv !== undefined) {
@@ -1500,7 +1503,7 @@ export class ProviderCatalogManager {
     backendId: string,
     providerId: string,
     modelId: string,
-    options: { readonly requireImages?: boolean } = {}
+    options: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" } = {}
   ): ProviderInferenceRoute | undefined {
     this.#assertInitialized();
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
@@ -1514,7 +1517,7 @@ export class ProviderCatalogManager {
       || entry.provider.baseUrl === undefined
     ) return undefined;
     const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
-    if (model === undefined) return undefined;
+    if (model === undefined || !(options.purpose === "audio_speech" ? isManagedSpeechModel(model) : isManagedChatModel(model))) return undefined;
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return undefined;
     const supportsImages = model.input?.includes("image") === true;
@@ -1554,7 +1557,7 @@ export class ProviderCatalogManager {
         authorization = `Bearer ${secret}`;
       }
     }
-    const identity = this.describeInferenceRoute(backendId, providerId, modelId);
+    const identity = this.describeInferenceRoute(backendId, providerId, modelId, options);
     if (identity === undefined) return undefined;
     const generationId = identity.generationId;
     return {
@@ -1657,7 +1660,7 @@ export class ProviderCatalogManager {
     const spec = this.#modelDiscoverySpec(captured);
     const credentialGenerations = [...new Set(Object.values(captured.credentialBindings))]
       .map(reference => ({ reference, generation: this.#credentials.find(reference)?.generation }));
-    const discovered = await fetchProviderModels(spec, fetchImpl);
+    const discovered = await fetchProviderModels({ ...spec, includeNonChat: true }, fetchImpl);
     return this.#mutate(async () => {
       const current = this.#entries.get(normalized);
       if (current === undefined || current.version !== captured.version) {
@@ -1672,7 +1675,10 @@ export class ProviderCatalogManager {
         : undefined;
       const updates = new Map(discovered.map(model => [model.id, model]));
       const known = new Set(current.provider.models.map(model => model.id));
-      const additions = discovered.filter(model => !known.has(model.id));
+      const additions = discovered.filter(model => {
+        const managed = discoveredManagedModel(model, customPiApi);
+        return !known.has(model.id) && (isManagedChatModel(managed) || isManagedSpeechModel(managed));
+      });
       const updatedModelIds: string[] = [];
       const retained = current.provider.models.map(model => {
         const update = updates.get(model.id);
@@ -2210,7 +2216,7 @@ export class ProviderCatalogManager {
           || input.providerEnabled?.(entry.provider.id) === false
         ) return [];
         const models = entry.provider.models.filter((model) =>
-          this.#modelEnabled(entry.backendId, entry.provider.id, model.id)
+          isManagedChatModel(model) && this.#modelEnabled(entry.backendId, entry.provider.id, model.id)
           && input.modelEnabled?.(entry.provider.id, model.id) !== false);
         return models.length === 0 ? [] : [{ ...entry, provider: { ...entry.provider, models } }];
       });
@@ -2707,6 +2713,7 @@ function assertLeasedNativeCredentialAccount(current: NativePiCredential, next: 
 function discoveredManagedModel(model: DiscoveredProviderModel, customPiApi: PiManagedProvider["api"]): PiManagedModel {
   const metadata = model.metadata;
   const defaultVisible = customPiApi !== undefined
+    && isManagedChatModel({ id: model.id, discoveredMetadata: metadata })
     && (metadata?.nativeApi === undefined || metadata.nativeApi === customPiApi)
     && (metadata?.inputModalities?.includes("text") ?? true)
     && (metadata?.outputModalities?.includes("text") ?? true);

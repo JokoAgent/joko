@@ -11,6 +11,19 @@ import {
 import { mkdtemp } from "./test-paths.js";
 
 describe("managed Pi catalog", () => {
+  it("keeps configured speech models outside the native chat catalog and strips the declared purpose", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-model-purpose-"));
+    const result = await provisionManagedCatalog(home, [{ id: "mixed", models: [
+      { id: "chat", mode: "chat" }, { id: "ordinary" }, { id: "tts-1" },
+      { id: "custom-speech", mode: "audio_speech" }, { id: "transcribe", mode: "audio_transcription" }
+    ] }, { id: "speech-only", models: [{ id: "custom", mode: "audio_speech" }] }]);
+    expect(result.models.map(model => [model.providerId, model.modelId])).toEqual([["mixed", "chat"], ["mixed", "ordinary"]]);
+    const native = JSON.parse(await readFile(join(home, "models.json"), "utf8"));
+    expect(Object.keys(native.providers)).toEqual(["mixed"]);
+    expect(native.providers.mixed.models.map((model: { id: string }) => model.id)).toEqual(["chat", "ordinary"]);
+    for (const model of native.providers.mixed.models) expect(model).not.toHaveProperty("mode");
+  });
+
   it("preserves declared advanced metadata while keeping product fields out of native model configuration", async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-pi-advanced-metadata-"));
     const result = await provisionManagedCatalog(home, [{ id: "gateway", api: "openai-completions", models: [{ id: "declared-model", reasoning: true,

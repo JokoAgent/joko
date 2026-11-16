@@ -9,6 +9,42 @@ import {
 } from "./provider-model-discovery.js";
 
 describe("Provider model discovery", () => {
+  it("retains speech purpose, explicit withdrawals and source-specific modalities without guessing from generic audio or names", () => {
+    const rows = parseProviderModels({ data: [
+      { id: "manual-kind", mode: "audio_speech", modalities: { input: ["text"], output: [] } },
+      { id: "transcription", model_info: { mode: "audio_transcription" } },
+      { model_id: "eleven", can_do_text_to_speech: true },
+      { model_id: "withdrawn", can_do_text_to_speech: false },
+      { id: "tts-sounding-name", architecture: { output_modalities: ["audio"] } }
+    ] }, "https://proxy.example/v1/models", true);
+    expect(rows.map(row => row.metadata)).toEqual([
+      { mode: "audio_speech", inputModalities: ["text"], outputModalities: [], supportsImages: false },
+      { mode: "audio_transcription" }, { mode: "audio_speech" }, { mode: "other" }, { outputModalities: ["audio"] }
+    ]);
+    const speech = { data: [{ id: "opaque", architecture: { input_modalities: ["text"], output_modalities: ["speech"] } }] };
+    expect(parseProviderModels(speech, "https://openrouter.ai/api/v1/models?output_modalities=speech", true)[0]?.metadata)
+      .toEqual({ mode: "audio_speech", inputModalities: ["text"], outputModalities: ["audio"], supportsImages: false });
+    expect(parseProviderModels(speech, "https://proxy.example/api/v1/models", true)[0]?.metadata)
+      .toEqual({ inputModalities: ["text"], outputModalities: ["speech"], supportsImages: false });
+  });
+
+  it.each([false, true])("uses the original OpenRouter credential and deadline for its separate speech list (outage=%s)", async outage => {
+    const request = vi.fn(async (value: string | URL | Request, init?: RequestInit) => {
+      expect(init?.headers).toMatchObject({ authorization: "Bearer original-key" });
+      expect(init?.redirect).toBe("error");
+      const url = new URL(String(value));
+      return url.search === "" ? Response.json({ data: [{ id: "chat", name: "Chat" }] })
+        : outage ? new Response("unavailable", { status: 503 })
+          : Response.json({ data: [{ id: "speech", architecture: { input_modalities: ["text"], output_modalities: ["speech"] } }] });
+    });
+    const rows = await fetchProviderModels({ baseUrl: "https://openrouter.ai/api/v1", apiKey: "original-key", includeNonChat: true }, request as typeof fetch);
+    expect(rows.map(row => row.id)).toEqual(outage ? ["chat"] : ["chat", "speech"]);
+    expect(request.mock.calls.map(([url]) => String(url))).toEqual([
+      "https://openrouter.ai/api/v1/models", "https://openrouter.ai/api/v1/models?output_modalities=speech"
+    ]);
+    expect(request.mock.calls[0]?.[1]?.signal).toBe(request.mock.calls[1]?.[1]?.signal);
+  });
+
   it("derives versioned endpoints and parses supported response shapes", () => {
     expect(deriveProviderModelsUrl("https://api.example.test/v1")).toBe("https://api.example.test/v1/models");
     expect(deriveProviderModelsUrl("https://api.example.test/root/")).toBe("https://api.example.test/root/v1/models");

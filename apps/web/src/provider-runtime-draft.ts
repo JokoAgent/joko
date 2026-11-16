@@ -86,6 +86,7 @@ function transferModels(source: ProviderRuntimeConfigurationView, target: Provid
     const retained = target.models.find((candidate) => candidate.modelId === model.modelId) ?? emptyProviderModel(targetBackend);
     return updateProviderModelMetadata(retained, {
       modelId: model.modelId, name: model.name,
+      mode: model.mode,
       ...(allowed("modelLimits") ? { contextWindowTokens: model.contextWindowTokens, maximumOutputTokens: model.maximumOutputTokens } : {}),
       ...(allowed("modelCosts") ? { inputCostMicrosPerMillion: model.inputCostMicrosPerMillion, outputCostMicrosPerMillion: model.outputCostMicrosPerMillion,
         cacheReadCostMicrosPerMillion: model.cacheReadCostMicrosPerMillion, cacheWriteCostMicrosPerMillion: model.cacheWriteCostMicrosPerMillion } : {}),
