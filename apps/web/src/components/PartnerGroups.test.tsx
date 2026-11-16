@@ -123,7 +123,7 @@ it("keeps editable image vectors on the same original and reuses the burned uplo
   expect(materialize).not.toHaveBeenCalled(); expect(f.controller.uploadPartnerGroupFile).not.toHaveBeenCalled();
   await act(async () => { button(m.send).click(); await settle(); });
   const original = vi.mocked(f.api.send).mock.calls[0]!;
-  expect(original[1].attachments[0]).toMatchObject({ name: "photo.png", annotated: true });
+  expect(original[1].attachments).toEqual([expect.objectContaining({ name: "photo.png", annotated: true })]);
   expect(materialize).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ file, kind: "image", annotationStrokes: [expect.objectContaining({ points: expect.any(Array) })] }), expect.any(AbortSignal));
   await editGroupDraftImage();
   await act(async () => { button(m.send).click(); await settle(); });
