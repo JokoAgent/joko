@@ -63,7 +63,8 @@ export class SpeechModelCatalog {
       const protocol = endpointProtocol(apiBase(route.baseUrl), route.modelId);
       return [create(DesktopSpeechModelSchema, { ...value, displayName: model?.displayName ?? value.modelId,
         providerName: descriptor.providers?.find(provider => provider.providerId === value.providerId)?.displayName ?? value.providerId,
-        ...(protocol ? { protocol } : {}), protocolLocked: protocol !== undefined })];
+        ...(protocol ? { protocol } : {}), protocolLocked: protocol !== undefined,
+        ...(openRouterSpeechBaseUrl(route.baseUrl) ? { speedSupport: { case: 'speedUnsupported' as const, value: true } } : {}) })];
     });
   }
   resolve(selection: DesktopSpeechSelection | SpeechSelection): { connection: SpeechConnection; generationId: string; assertCurrent(): void } {
@@ -73,7 +74,8 @@ export class SpeechModelCatalog {
     if (!route || !supportedEndpoint(route)) throw new Error('model_unavailable');
     const base = apiBase(route.baseUrl), fixed = endpointProtocol(base, route.modelId);
     const protocol = fixed ?? selection.protocol as SpeechProtocol;
-    if (fixed && fixed !== selection.protocol || !isSpeechSpeedSupported(route.modelId, protocol, selection.speed)) throw new Error('model_unavailable');
+    const speedRange = openRouterSpeechBaseUrl(route.baseUrl) ? null : undefined;
+    if (fixed && fixed !== selection.protocol || !isSpeechSpeedSupported(route.modelId, protocol, selection.speed, speedRange)) throw new Error('model_unavailable');
     const headers: Record<string, string> = {};
     for (const [key, value] of Object.entries(route.headers)) {
       if (!['authorization', 'x-api-key', 'xi-api-key', 'cookie', 'host', 'content-type', 'content-length', 'connection', 'chatgpt-account-id', 'openai-account-id', 'anthropic-version', 'anthropic-beta', 'anthropic-dangerous-direct-browser-access'].includes(key.toLowerCase())) headers[key] = value;
@@ -87,6 +89,7 @@ export class SpeechModelCatalog {
       if (this.routes.resolve({ backendId: route.backendId, providerId: route.providerId, modelId: route.modelId })?.generationId !== route.generationId) throw new Error('connection_changed');
     };
     assertCurrent();
-    return { connection: { baseUrl: base.toString().replace(/\/+$/, ''), headers, protocol }, generationId: route.generationId, assertCurrent };
+    return { connection: { baseUrl: base.toString().replace(/\/+$/, ''), headers, protocol,
+      ...(speedRange === undefined ? {} : { speedRange }) }, generationId: route.generationId, assertCurrent };
   }
 }

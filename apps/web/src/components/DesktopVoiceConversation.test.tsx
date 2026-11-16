@@ -47,3 +47,52 @@ it('keeps the original save operation after a lost reply and restores focus when
     if (before) Object.defineProperty(window, 'jokoDesktop', before); else delete (window as { jokoDesktop?: unknown }).jokoDesktop;
   }
 });
+
+it.each([
+  ['protocol default', undefined, 3],
+  ['unsupported route', { case: 'speedUnsupported', value: true }, undefined],
+  ['verified range', { case: 'speedRange', value: { min: 0.5, max: 2 } }, 2],
+] as const)('uses the %s for controls, voice discovery, preview and saved selections', async (_label, speedSupport, expectedSpeed) => {
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const before = Object.getOwnPropertyDescriptor(window, 'jokoDesktop');
+  const requests: ControlDesktopVoiceConversationRequest[] = [];
+  let preference = create(DesktopVoiceConversationPreferenceSchema, { revision: 0n, sentencePlayback: true,
+    conversation: { backendId: 'backend', providerId: 'provider', modelId: 'tts-1', protocol: 'openai', voice: 'alloy', speed: 3 },
+    playback: { backendId: 'backend', providerId: 'provider', modelId: 'tts-1', protocol: 'openai', voice: 'nova', speed: 3 } });
+  Object.defineProperty(window, 'jokoDesktop', { configurable: true, value: { voiceConversation: { control: vi.fn(async (_serverId: string, bytes: Uint8Array) => {
+    const request = fromBinary(ControlDesktopVoiceConversationRequestSchema, bytes);
+    requests.push(request);
+    if (request.action === Action.START) throw new Error('The controlled preview stops before capturing audio.');
+    if (request.action === Action.SAVE_PREFERENCE) preference = create(DesktopVoiceConversationPreferenceSchema, { ...request.preference!, revision: 1n });
+    return toBinary(ControlDesktopVoiceConversationResponseSchema, create(ControlDesktopVoiceConversationResponseSchema, { preference,
+      models: [{ backendId: 'backend', providerId: 'provider', modelId: 'tts-1', displayName: 'Speech', providerName: 'My BYOK', protocol: 'openai',
+        protocolLocked: true, ...(speedSupport ? { speedSupport } : {}) }], voices: { source: 'provider', voices: [] } }));
+  }) } } });
+  const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
+  const controller = { state: { effectiveLocale: 'en' } } as unknown as AppController;
+  const session = { id: 'task', generation: 1n, name: 'My task' } as SessionView;
+  const button = (label: string) => [...document.querySelectorAll<HTMLButtonElement>('button')].find(value => value.textContent === label)!;
+  try {
+    await act(async () => root.render(<DesktopVoiceConversationPanel controller={controller} session={session} serverId="node" onClose={() => {}} />));
+    await act(async () => button('Speech settings').click());
+    const speeds = [...document.querySelectorAll<HTMLInputElement>('fieldset input[type="number"]')];
+    expect(speeds).toHaveLength(expectedSpeed === undefined ? 0 : 2);
+    if (expectedSpeed !== undefined) {
+      expect(speeds[0]!.value).toBe(String(expectedSpeed));
+      expect(speeds[0]!.min).toBe(speedSupport ? '0.5' : '0.25');
+      expect(speeds[0]!.max).toBe(speedSupport ? '2' : '4');
+    }
+    await act(async () => button('Load voices').click());
+    expect(requests.find(request => request.action === Action.VOICES)?.selection?.speed).toBe(expectedSpeed);
+    await act(async () => button('Preview voice').click());
+    expect(requests.find(request => request.action === Action.START)?.selection?.speed).toBe(expectedSpeed);
+    await act(async () => button('Save voice settings').click());
+    const saved = requests.find(request => request.action === Action.SAVE_PREFERENCE);
+    expect(saved).toBeDefined();
+    expect(saved!.preference!.conversation!.speed).toBe(expectedSpeed);
+    expect(saved!.preference!.playback!.speed).toBe(expectedSpeed);
+  } finally {
+    await act(async () => root.unmount()); container.remove();
+    if (before) Object.defineProperty(window, 'jokoDesktop', before); else delete (window as { jokoDesktop?: unknown }).jokoDesktop;
+  }
+});

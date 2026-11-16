@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/desktop_voice_conversation.proto.
  */
 export const file_joko_v1_desktop_voice_conversation: GenFile = /*@__PURE__*/
-  fileDesc("Cihqb2tvL3YxL2Rlc2t0b3Bfdm9pY2VfY29udmVyc2F0aW9uLnByb3RvEgdqb2tvLnYxIpIBChZEZXNrdG9wU3BlZWNoU2VsZWN0aW9uEhIKCmJhY2tlbmRfaWQYASABKAkSEwoLcHJvdmlkZXJfaWQYAiABKAkSEAoIbW9kZWxfaWQYAyABKAkSEAoIcHJvdG9jb2wYBCABKAkSDQoFdm9pY2UYBSABKAkSEgoFc3BlZWQYBiABKAFIAIgBAUIICgZfc3BlZWQiuQEKEkRlc2t0b3BTcGVlY2hNb2RlbBISCgpiYWNrZW5kX2lkGAEgASgJEhMKC3Byb3ZpZGVyX2lkGAIgASgJEhAKCG1vZGVsX2lkGAMgASgJEhQKDGRpc3BsYXlfbmFtZRgEIAEoCRIVCg1wcm92aWRlcl9uYW1lGAUgASgJEhUKCHByb3RvY29sGAYgASgJSACIAQESFwoPcHJvdG9jb2xfbG9ja2VkGAcgASgIQgsKCV9wcm90b2NvbCK7AQoiRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uUHJlZmVyZW5jZRI1Cgxjb252ZXJzYXRpb24YASABKAsyHy5qb2tvLnYxLkRlc2t0b3BTcGVlY2hTZWxlY3Rpb24SMQoIcGxheWJhY2sYAiABKAsyHy5qb2tvLnYxLkRlc2t0b3BTcGVlY2hTZWxlY3Rpb24SGQoRc2VudGVuY2VfcGxheWJhY2sYAyABKAgSEAoIcmV2aXNpb24YBCABKAQidwoURGVza3RvcFZvaWNlQ2FsbFR1cm4SCgoCaWQYASABKAkSDAoEcm9sZRgCIAEoCRIMCgR0ZXh0GAMgASgJEhUKDWNyZWF0ZWRfYXRfbXMYBCABKAQSEAoIY29tcGxldGUYBSABKAgSDgoGZmFpbGVkGAYgASgIIsIBChdEZXNrdG9wVm9pY2VDYWxsSGFuZG9mZhIKCgJpZBgBIAEoCRIQCghpbnB1dF9pZBgCIAEoCRIMCgR0ZXh0GAMgASgJEg0KBXN0YXRlGAQgASgJEhMKBnJlc3VsdBgFIAEoCUgAiAEBEhMKBnJ1bl9pZBgGIAEoCUgBiAEBEhoKDXF1ZXVlX2l0ZW1faWQYByABKAlIAogBAUIJCgdfcmVzdWx0QgkKB19ydW5faWRCEAoOX3F1ZXVlX2l0ZW1faWQiigIKFkRlc2t0b3BWb2ljZUNhbGxSZWNvcmQSDwoHY2FsbF9pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJEhoKEnNlc3Npb25fZ2VuZXJhdGlvbhgDIAEoBBIVCg1zdGFydGVkX2F0X21zGAQgASgEEhgKC2VuZGVkX2F0X21zGAUgASgESACIAQESLAoFdHVybnMYBiADKAsyHS5qb2tvLnYxLkRlc2t0b3BWb2ljZUNhbGxUdXJuEjIKCGhhbmRvZmZzGAcgAygLMiAuam9rby52MS5EZXNrdG9wVm9pY2VDYWxsSGFuZG9mZhIMCgRraW5kGAggASgJQg4KDF9lbmRlZF9hdF9tcyIuChJEZXNrdG9wU3BlZWNoVm9pY2USCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCSKOAQoZRGVza3RvcFNwZWVjaFZvaWNlQ2F0YWxvZxIOCgZzb3VyY2UYASABKAkSKwoGdm9pY2VzGAIgAygLMhsuam9rby52MS5EZXNrdG9wU3BlZWNoVm9pY2USEQoJdHJ1bmNhdGVkGAMgASgIEiEKGWN1c3RvbV92b2ljZXNfdW5hdmFpbGFibGUYBCABKAgiqQMKJkNvbnRyb2xEZXNrdG9wVm9pY2VDb252ZXJzYXRpb25SZXF1ZXN0EhEKCXdpbmRvd19pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJEhoKEnNlc3Npb25fZ2VuZXJhdGlvbhgDIAEoBBIPCgdjYWxsX2lkGAQgASgJEjcKBmFjdGlvbhgFIAEoDjInLmpva28udjEuRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uQWN0aW9uEhQKDG9wZXJhdGlvbl9pZBgGIAEoCRIQCghpbnB1dF9pZBgHIAEoCRIMCgR0ZXh0GAggASgJEhUKDWZvcmNlX2hhbmRvZmYYCSABKAgSMgoJc2VsZWN0aW9uGAogASgLMh8uam9rby52MS5EZXNrdG9wU3BlZWNoU2VsZWN0aW9uEj8KCnByZWZlcmVuY2UYCyABKAsyKy5qb2tvLnYxLkRlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblByZWZlcmVuY2USGQoRc3BlZWNoX3JlcXVlc3RfaWQYDCABKAkSFQoNcGxheWJhY2tfb25seRgNIAEoCCKMAwonQ29udHJvbERlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblJlc3BvbnNlEj8KCnByZWZlcmVuY2UYASABKAsyKy5qb2tvLnYxLkRlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblByZWZlcmVuY2USKwoGbW9kZWxzGAIgAygLMhsuam9rby52MS5EZXNrdG9wU3BlZWNoTW9kZWwSLQoEY2FsbBgDIAEoCzIfLmpva28udjEuRGVza3RvcFZvaWNlQ2FsbFJlY29yZBIwCgdoaXN0b3J5GAQgAygLMh8uam9rby52MS5EZXNrdG9wVm9pY2VDYWxsUmVjb3JkEjIKBnZvaWNlcxgFIAEoCzIiLmpva28udjEuRGVza3RvcFNwZWVjaFZvaWNlQ2F0YWxvZxILCgNwY20YBiABKAwSEwoLc3BlZWNoX2RvbmUYByABKAgSEwoLc2FtcGxlX3JhdGUYCCABKA0SEAoIYWNjZXB0ZWQYCSABKAgSFQoNZXhpdF9kZWNpc2lvbhgKIAEoCSrjBAoeRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uQWN0aW9uEjEKLURFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9VTlNQRUNJRklFRBAAEi4KKkRFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9TTkFQU0hPVBABEjUKMURFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9TQVZFX1BSRUZFUkVOQ0UQAhIrCidERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fU1RBUlQQAxIsCihERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fU1VCTUlUEAQSLQopREVTS1RPUF9WT0lDRV9DT05WRVJTQVRJT05fQUNUSU9OX1BST01PVEUQBRIvCitERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fSU5URVJSVVBUEAYSKQolREVTS1RPUF9WT0lDRV9DT05WRVJTQVRJT05fQUNUSU9OX0VORBAHEisKJ0RFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9TUEVBSxAIEjEKLURFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9SRUFEX1NQRUVDSBAJEiwKKERFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9WT0lDRVMQChIzCi9ERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fQ0xBU1NJRllfRVhJVBALMqgBCh9EZXNrdG9wVm9pY2VDb252ZXJzYXRpb25TZXJ2aWNlEoQBCh9Db250cm9sRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uEi8uam9rby52MS5Db250cm9sRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uUmVxdWVzdBowLmpva28udjEuQ29udHJvbERlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblJlc3BvbnNlYgZwcm90bzM");
+  fileDesc("Cihqb2tvL3YxL2Rlc2t0b3Bfdm9pY2VfY29udmVyc2F0aW9uLnByb3RvEgdqb2tvLnYxIpIBChZEZXNrdG9wU3BlZWNoU2VsZWN0aW9uEhIKCmJhY2tlbmRfaWQYASABKAkSEwoLcHJvdmlkZXJfaWQYAiABKAkSEAoIbW9kZWxfaWQYAyABKAkSEAoIcHJvdG9jb2wYBCABKAkSDQoFdm9pY2UYBSABKAkSEgoFc3BlZWQYBiABKAFIAIgBAUIICgZfc3BlZWQioAIKEkRlc2t0b3BTcGVlY2hNb2RlbBISCgpiYWNrZW5kX2lkGAEgASgJEhMKC3Byb3ZpZGVyX2lkGAIgASgJEhAKCG1vZGVsX2lkGAMgASgJEhQKDGRpc3BsYXlfbmFtZRgEIAEoCRIVCg1wcm92aWRlcl9uYW1lGAUgASgJEhUKCHByb3RvY29sGAYgASgJSAGIAQESFwoPcHJvdG9jb2xfbG9ja2VkGAcgASgIEjcKC3NwZWVkX3JhbmdlGAggASgLMiAuam9rby52MS5EZXNrdG9wU3BlZWNoU3BlZWRSYW5nZUgAEhsKEXNwZWVkX3Vuc3VwcG9ydGVkGAkgASgISABCDwoNc3BlZWRfc3VwcG9ydEILCglfcHJvdG9jb2wiMwoXRGVza3RvcFNwZWVjaFNwZWVkUmFuZ2USCwoDbWluGAEgASgBEgsKA21heBgCIAEoASK7AQoiRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uUHJlZmVyZW5jZRI1Cgxjb252ZXJzYXRpb24YASABKAsyHy5qb2tvLnYxLkRlc2t0b3BTcGVlY2hTZWxlY3Rpb24SMQoIcGxheWJhY2sYAiABKAsyHy5qb2tvLnYxLkRlc2t0b3BTcGVlY2hTZWxlY3Rpb24SGQoRc2VudGVuY2VfcGxheWJhY2sYAyABKAgSEAoIcmV2aXNpb24YBCABKAQidwoURGVza3RvcFZvaWNlQ2FsbFR1cm4SCgoCaWQYASABKAkSDAoEcm9sZRgCIAEoCRIMCgR0ZXh0GAMgASgJEhUKDWNyZWF0ZWRfYXRfbXMYBCABKAQSEAoIY29tcGxldGUYBSABKAgSDgoGZmFpbGVkGAYgASgIIsIBChdEZXNrdG9wVm9pY2VDYWxsSGFuZG9mZhIKCgJpZBgBIAEoCRIQCghpbnB1dF9pZBgCIAEoCRIMCgR0ZXh0GAMgASgJEg0KBXN0YXRlGAQgASgJEhMKBnJlc3VsdBgFIAEoCUgAiAEBEhMKBnJ1bl9pZBgGIAEoCUgBiAEBEhoKDXF1ZXVlX2l0ZW1faWQYByABKAlIAogBAUIJCgdfcmVzdWx0QgkKB19ydW5faWRCEAoOX3F1ZXVlX2l0ZW1faWQiigIKFkRlc2t0b3BWb2ljZUNhbGxSZWNvcmQSDwoHY2FsbF9pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJEhoKEnNlc3Npb25fZ2VuZXJhdGlvbhgDIAEoBBIVCg1zdGFydGVkX2F0X21zGAQgASgEEhgKC2VuZGVkX2F0X21zGAUgASgESACIAQESLAoFdHVybnMYBiADKAsyHS5qb2tvLnYxLkRlc2t0b3BWb2ljZUNhbGxUdXJuEjIKCGhhbmRvZmZzGAcgAygLMiAuam9rby52MS5EZXNrdG9wVm9pY2VDYWxsSGFuZG9mZhIMCgRraW5kGAggASgJQg4KDF9lbmRlZF9hdF9tcyIuChJEZXNrdG9wU3BlZWNoVm9pY2USCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCSKOAQoZRGVza3RvcFNwZWVjaFZvaWNlQ2F0YWxvZxIOCgZzb3VyY2UYASABKAkSKwoGdm9pY2VzGAIgAygLMhsuam9rby52MS5EZXNrdG9wU3BlZWNoVm9pY2USEQoJdHJ1bmNhdGVkGAMgASgIEiEKGWN1c3RvbV92b2ljZXNfdW5hdmFpbGFibGUYBCABKAgiqQMKJkNvbnRyb2xEZXNrdG9wVm9pY2VDb252ZXJzYXRpb25SZXF1ZXN0EhEKCXdpbmRvd19pZBgBIAEoCRISCgpzZXNzaW9uX2lkGAIgASgJEhoKEnNlc3Npb25fZ2VuZXJhdGlvbhgDIAEoBBIPCgdjYWxsX2lkGAQgASgJEjcKBmFjdGlvbhgFIAEoDjInLmpva28udjEuRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uQWN0aW9uEhQKDG9wZXJhdGlvbl9pZBgGIAEoCRIQCghpbnB1dF9pZBgHIAEoCRIMCgR0ZXh0GAggASgJEhUKDWZvcmNlX2hhbmRvZmYYCSABKAgSMgoJc2VsZWN0aW9uGAogASgLMh8uam9rby52MS5EZXNrdG9wU3BlZWNoU2VsZWN0aW9uEj8KCnByZWZlcmVuY2UYCyABKAsyKy5qb2tvLnYxLkRlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblByZWZlcmVuY2USGQoRc3BlZWNoX3JlcXVlc3RfaWQYDCABKAkSFQoNcGxheWJhY2tfb25seRgNIAEoCCKMAwonQ29udHJvbERlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblJlc3BvbnNlEj8KCnByZWZlcmVuY2UYASABKAsyKy5qb2tvLnYxLkRlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblByZWZlcmVuY2USKwoGbW9kZWxzGAIgAygLMhsuam9rby52MS5EZXNrdG9wU3BlZWNoTW9kZWwSLQoEY2FsbBgDIAEoCzIfLmpva28udjEuRGVza3RvcFZvaWNlQ2FsbFJlY29yZBIwCgdoaXN0b3J5GAQgAygLMh8uam9rby52MS5EZXNrdG9wVm9pY2VDYWxsUmVjb3JkEjIKBnZvaWNlcxgFIAEoCzIiLmpva28udjEuRGVza3RvcFNwZWVjaFZvaWNlQ2F0YWxvZxILCgNwY20YBiABKAwSEwoLc3BlZWNoX2RvbmUYByABKAgSEwoLc2FtcGxlX3JhdGUYCCABKA0SEAoIYWNjZXB0ZWQYCSABKAgSFQoNZXhpdF9kZWNpc2lvbhgKIAEoCSrjBAoeRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uQWN0aW9uEjEKLURFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9VTlNQRUNJRklFRBAAEi4KKkRFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9TTkFQU0hPVBABEjUKMURFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9TQVZFX1BSRUZFUkVOQ0UQAhIrCidERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fU1RBUlQQAxIsCihERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fU1VCTUlUEAQSLQopREVTS1RPUF9WT0lDRV9DT05WRVJTQVRJT05fQUNUSU9OX1BST01PVEUQBRIvCitERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fSU5URVJSVVBUEAYSKQolREVTS1RPUF9WT0lDRV9DT05WRVJTQVRJT05fQUNUSU9OX0VORBAHEisKJ0RFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9TUEVBSxAIEjEKLURFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9SRUFEX1NQRUVDSBAJEiwKKERFU0tUT1BfVk9JQ0VfQ09OVkVSU0FUSU9OX0FDVElPTl9WT0lDRVMQChIzCi9ERVNLVE9QX1ZPSUNFX0NPTlZFUlNBVElPTl9BQ1RJT05fQ0xBU1NJRllfRVhJVBALMqgBCh9EZXNrdG9wVm9pY2VDb252ZXJzYXRpb25TZXJ2aWNlEoQBCh9Db250cm9sRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uEi8uam9rby52MS5Db250cm9sRGVza3RvcFZvaWNlQ29udmVyc2F0aW9uUmVxdWVzdBowLmpva28udjEuQ29udHJvbERlc2t0b3BWb2ljZUNvbnZlcnNhdGlvblJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * @generated from message joko.v1.DesktopSpeechSelection
@@ -92,6 +92,25 @@ export type DesktopSpeechModel = Message<"joko.v1.DesktopSpeechModel"> & {
    * @generated from field: bool protocol_locked = 7;
    */
   protocolLocked: boolean;
+
+  /**
+   * Absent uses the selected protocol's limits; explicit unsupported wins.
+   *
+   * @generated from oneof joko.v1.DesktopSpeechModel.speed_support
+   */
+  speedSupport: {
+    /**
+     * @generated from field: joko.v1.DesktopSpeechSpeedRange speed_range = 8;
+     */
+    value: DesktopSpeechSpeedRange;
+    case: "speedRange";
+  } | {
+    /**
+     * @generated from field: bool speed_unsupported = 9;
+     */
+    value: boolean;
+    case: "speedUnsupported";
+  } | { case: undefined; value?: undefined };
 };
 
 /**
@@ -100,6 +119,28 @@ export type DesktopSpeechModel = Message<"joko.v1.DesktopSpeechModel"> & {
  */
 export const DesktopSpeechModelSchema: GenMessage<DesktopSpeechModel> = /*@__PURE__*/
   messageDesc(file_joko_v1_desktop_voice_conversation, 1);
+
+/**
+ * @generated from message joko.v1.DesktopSpeechSpeedRange
+ */
+export type DesktopSpeechSpeedRange = Message<"joko.v1.DesktopSpeechSpeedRange"> & {
+  /**
+   * @generated from field: double min = 1;
+   */
+  min: number;
+
+  /**
+   * @generated from field: double max = 2;
+   */
+  max: number;
+};
+
+/**
+ * Describes the message joko.v1.DesktopSpeechSpeedRange.
+ * Use `create(DesktopSpeechSpeedRangeSchema)` to create a new message.
+ */
+export const DesktopSpeechSpeedRangeSchema: GenMessage<DesktopSpeechSpeedRange> = /*@__PURE__*/
+  messageDesc(file_joko_v1_desktop_voice_conversation, 2);
 
 /**
  * @generated from message joko.v1.DesktopVoiceConversationPreference
@@ -131,7 +172,7 @@ export type DesktopVoiceConversationPreference = Message<"joko.v1.DesktopVoiceCo
  * Use `create(DesktopVoiceConversationPreferenceSchema)` to create a new message.
  */
 export const DesktopVoiceConversationPreferenceSchema: GenMessage<DesktopVoiceConversationPreference> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 2);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 3);
 
 /**
  * @generated from message joko.v1.DesktopVoiceCallTurn
@@ -173,7 +214,7 @@ export type DesktopVoiceCallTurn = Message<"joko.v1.DesktopVoiceCallTurn"> & {
  * Use `create(DesktopVoiceCallTurnSchema)` to create a new message.
  */
 export const DesktopVoiceCallTurnSchema: GenMessage<DesktopVoiceCallTurn> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 3);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 4);
 
 /**
  * @generated from message joko.v1.DesktopVoiceCallHandoff
@@ -220,7 +261,7 @@ export type DesktopVoiceCallHandoff = Message<"joko.v1.DesktopVoiceCallHandoff">
  * Use `create(DesktopVoiceCallHandoffSchema)` to create a new message.
  */
 export const DesktopVoiceCallHandoffSchema: GenMessage<DesktopVoiceCallHandoff> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 4);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 5);
 
 /**
  * @generated from message joko.v1.DesktopVoiceCallRecord
@@ -272,7 +313,7 @@ export type DesktopVoiceCallRecord = Message<"joko.v1.DesktopVoiceCallRecord"> &
  * Use `create(DesktopVoiceCallRecordSchema)` to create a new message.
  */
 export const DesktopVoiceCallRecordSchema: GenMessage<DesktopVoiceCallRecord> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 5);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 6);
 
 /**
  * @generated from message joko.v1.DesktopSpeechVoice
@@ -294,7 +335,7 @@ export type DesktopSpeechVoice = Message<"joko.v1.DesktopSpeechVoice"> & {
  * Use `create(DesktopSpeechVoiceSchema)` to create a new message.
  */
 export const DesktopSpeechVoiceSchema: GenMessage<DesktopSpeechVoice> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 6);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 7);
 
 /**
  * @generated from message joko.v1.DesktopSpeechVoiceCatalog
@@ -326,7 +367,7 @@ export type DesktopSpeechVoiceCatalog = Message<"joko.v1.DesktopSpeechVoiceCatal
  * Use `create(DesktopSpeechVoiceCatalogSchema)` to create a new message.
  */
 export const DesktopSpeechVoiceCatalogSchema: GenMessage<DesktopSpeechVoiceCatalog> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 7);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 8);
 
 /**
  * @generated from message joko.v1.ControlDesktopVoiceConversationRequest
@@ -405,7 +446,7 @@ export type ControlDesktopVoiceConversationRequest = Message<"joko.v1.ControlDes
  * Use `create(ControlDesktopVoiceConversationRequestSchema)` to create a new message.
  */
 export const ControlDesktopVoiceConversationRequestSchema: GenMessage<ControlDesktopVoiceConversationRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 8);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 9);
 
 /**
  * @generated from message joko.v1.ControlDesktopVoiceConversationResponse
@@ -467,7 +508,7 @@ export type ControlDesktopVoiceConversationResponse = Message<"joko.v1.ControlDe
  * Use `create(ControlDesktopVoiceConversationResponseSchema)` to create a new message.
  */
 export const ControlDesktopVoiceConversationResponseSchema: GenMessage<ControlDesktopVoiceConversationResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_desktop_voice_conversation, 9);
+  messageDesc(file_joko_v1_desktop_voice_conversation, 10);
 
 /**
  * @generated from enum joko.v1.DesktopVoiceConversationAction

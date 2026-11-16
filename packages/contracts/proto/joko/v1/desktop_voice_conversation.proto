@@ -38,6 +38,15 @@ message DesktopSpeechModel {
   string provider_name = 5;
   optional string protocol = 6;
   bool protocol_locked = 7;
+  // Absent uses the selected protocol's limits; explicit unsupported wins.
+  oneof speed_support {
+    DesktopSpeechSpeedRange speed_range = 8;
+    bool speed_unsupported = 9;
+  }
+}
+message DesktopSpeechSpeedRange {
+  double min = 1;
+  double max = 2;
 }
 message DesktopVoiceConversationPreference {
   DesktopSpeechSelection conversation = 1;

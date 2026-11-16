@@ -12,12 +12,13 @@ it.each(['/api', '/api/', '/api/v1', '/api/v1/'])('uses the official speech root
     resolve: () => ({ ...route, generationId }) };
   const store = { getBackend: () => ({ descriptor: { models: [], providers: [] } }) } as unknown as OperationalStore;
   const catalog = new SpeechModelCatalog(store, routes);
-  expect(catalog.list()[0]).toMatchObject({ protocol: 'openai', protocolLocked: true });
+  expect(catalog.list()[0]).toMatchObject({ protocol: 'openai', protocolLocked: true, speedSupport: { case: 'speedUnsupported', value: true } });
   const resolved = catalog.resolve(selection);
-  expect(resolved.connection).toMatchObject({ baseUrl: 'https://openrouter.ai/api/v1', protocol: 'openai',
+  expect(resolved.connection).toMatchObject({ baseUrl: 'https://openrouter.ai/api/v1', protocol: 'openai', speedRange: null,
     headers: { authorization: 'Bearer speech-secret', 'HTTP-Referer': 'https://joko.test' } });
   expect(Object.keys(resolved.connection.headers).some(key => key.toLowerCase().startsWith('anthropic-'))).toBe(false);
   expect(route.baseUrl).toBe(`https://openrouter.ai${path}`);
+  expect(() => catalog.resolve({ ...selection, speed: 2 })).toThrow('model_unavailable');
   generationId = 'replacement';
   expect(resolved.assertCurrent).toThrow('connection_changed');
 });
@@ -30,4 +31,6 @@ it.each(['https://openrouter.ai/custom/api', 'https://proxy.test/api', 'https://
   const catalog = new SpeechModelCatalog(store, routes);
   expect(catalog.list()[0]?.protocolLocked).toBe(false);
   expect(catalog.resolve(selection).connection.baseUrl).toBe(baseUrl);
+  expect(catalog.list()[0]?.speedSupport.case).toBeUndefined();
+  expect(catalog.resolve({ ...selection, speed: 3 }).connection.speedRange).toBeUndefined();
 });

@@ -1,9 +1,10 @@
-import type { SpeechProtocol } from '../protocol.js';
+import type { SpeechProtocol, SpeechSpeedRange } from '../protocol.js';
 
 export type SpeechConnection = {
   baseUrl: string;
   headers: Record<string, string>;
   protocol: SpeechProtocol;
+  speedRange?: SpeechSpeedRange;
 };
 export type SpeechInput = { modelId: string; voice: string; text: string; speed?: number };
 export type SpeechRequest = { url: URL; body: string; headers?: Record<string, string> };
