@@ -11410,6 +11410,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           if (duplicate && !invalidated) {
             if (continuousCompactionStream && consumedContinuity === "contiguous" && compactionRefreshSource !== undefined) {
               this.projectBufferedCompaction(event, compactionRefreshSource);
+              this.invalidateBufferedNativeHistory(event, compactionRefreshSource);
             }
             continue;
           }
@@ -11575,6 +11576,33 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     } catch (clearError) {
       this.#callbacks.onError?.(normalizeError(clearError));
     }
+  }
+
+  private invalidateBufferedNativeHistory(event: Event, source: Snapshot): void {
+    const raw = this.#rawSnapshot, snapshot = this.#snapshot, identity = event.identity, cursor = event.cursor;
+    const kind = event.payload?.kind;
+    if (this.#taskSharing !== undefined || raw === undefined || snapshot === undefined || identity === undefined || cursor === undefined
+      || this.isWaitingForMessageDeletionEvent(event) || kind?.case !== "nativeSessionChanged" || event.eventId === ""
+      || kind.value.productSessionId !== identity.sessionId
+      || cursor.generation !== source.generation || cursor.generation !== snapshot.generation || cursor.sequence > snapshot.cursor
+      || (snapshot.timelineHistoryRevisionBySession.get(identity.sessionId) ?? -1n) >= cursor.sequence) return;
+    const original = source.sessions.find(session => session.sessionId === identity.sessionId), binding = original?.nativeBinding;
+    const current = raw.sessions.find(session => session.sessionId === identity.sessionId), currentBinding = current?.nativeBinding;
+    if (original === undefined || current === undefined || binding === undefined || currentBinding === undefined
+      || identity.backendId !== original.backendId || identity.targetId !== original.targetId || identity.generation !== binding.runtimeGeneration
+      || kind.value.opaqueNativeReference !== binding.opaqueReference
+      || current.backendId !== original.backendId || current.targetId !== original.targetId || current.archived
+      || [SessionState.CLOSING, SessionState.CLOSED, SessionState.DETACHED].includes(current.state)
+      || currentBinding.backendId !== binding.backendId || currentBinding.opaqueReference !== binding.opaqueReference
+      || currentBinding.runtimeGeneration !== binding.runtimeGeneration) return;
+    // The catalog watermark is newer, but it contains no transcript. Retire
+    // the original history window so its consumer reads the current branch;
+    // never replay buffered message bodies or transient renderer effects.
+    const projected = projectSnapshotEvent(raw, snapshot, event, this.isLocalUserInput);
+    this.#rawSnapshot = { ...projected.rawSnapshot, generation: raw.generation, resumeCursor: raw.resumeCursor };
+    this.#snapshot = { ...projected.snapshot, generation: snapshot.generation, cursor: snapshot.cursor };
+    this.#callbacks.onSnapshot?.(this.#snapshot);
+    if (this.#liveSnapshotConnected) this.#callbacks.onLiveSnapshot?.(this.#snapshot);
   }
 
   private projectBufferedCompaction(event: Event, source: Snapshot): void {
@@ -12745,6 +12773,16 @@ function projectTimelineEvent(
     if (index < 0) items.push(item);
     else items[index] = item;
   };
+  const endAssistantStreams = (): void => {
+    if ((kind.case === "runDone" || kind.case === "runAborted") && kind.value.runId !== event.identity?.runId) return;
+    const attempt = assistantStreamAttempt(event);
+    if (attempt === undefined) return;
+    for (const [index, item] of items.entries()) {
+      if (item.streaming && (item.streamAttempt ?? item.assistantStreamAttempt) === attempt) {
+        items[index] = { ...item, streaming: false };
+      }
+    }
+  };
 
   switch (kind.case) {
     case "messageStarted": {
@@ -12826,7 +12864,8 @@ function projectTimelineEvent(
     }
     case "textDelta": {
       const contentIndex = kind.value.contentIndex;
-      const streamAttempt = isAssistantStreamBlock(kind.value.messageId) ? assistantStreamAttempt(event) : undefined;
+      const ownerAttempt = assistantStreamAttempt(event);
+      const streamAttempt = isAssistantStreamBlock(kind.value.messageId) ? ownerAttempt : undefined;
       const existing = items.find((item) =>
         item.kind === "assistant"
         && isProjectedMessageItem(item, kind.value.messageId)
@@ -12856,6 +12895,7 @@ function projectTimelineEvent(
         text: textBlocks.map((block) => block.text).join(""),
         messageTextBlocks: textBlocks,
         ...(streamAttempt === undefined ? {} : { assistantStreamAttempt: streamAttempt }),
+        ...(ownerAttempt === undefined ? {} : { streamAttempt: ownerAttempt }),
         streaming: true
       }, (item) => item.id === kind.value.messageId
         && (streamAttempt === undefined || item.assistantStreamAttempt === streamAttempt));
@@ -13291,10 +13331,7 @@ function projectTimelineEvent(
     case "recoverableError":
     case "terminalError": {
       const error = kind.value.error;
-      const streamAttempt = kind.case === "terminalError" ? assistantStreamAttempt(event) : undefined;
-      if (streamAttempt !== undefined) for (const [index, item] of items.entries()) {
-        if (item.assistantStreamAttempt === streamAttempt && item.streaming) items[index] = { ...item, streaming: false };
-      }
+      if (kind.case === "terminalError") endAssistantStreams();
       replaceOrAppend({
         id: event.eventId,
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
@@ -13309,6 +13346,7 @@ function projectTimelineEvent(
       break;
     }
     case "runDone":
+      endAssistantStreams();
       replaceOrAppend({
         id: event.eventId,
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
@@ -13320,6 +13358,7 @@ function projectTimelineEvent(
       });
       break;
     case "runAborted":
+      endAssistantStreams();
       replaceOrAppend({
         id: event.eventId,
         ...(event.identity?.runId ? { runId: event.identity.runId } : {}),

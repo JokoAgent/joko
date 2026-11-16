@@ -473,6 +473,8 @@ export function PortableSessionImportDialog({
         <input
           ref={fileRef}
           type="file"
+          tabIndex={-1}
+          aria-hidden="true"
           accept=".jshare,application/vnd.joko.session"
           disabled={inspecting}
           onChange={(event) => {

@@ -18,12 +18,15 @@ import {
   WORKSPACE_IMAGE_ANNOTATION_COLOR,
   WORKSPACE_IMAGE_ANNOTATION_OUTLINE,
   clampWorkspaceImageScale,
+  createWorkspaceImageWheelSourceTracker,
   drawWorkspaceImageStrokes,
   normalizeWorkspaceImagePoint,
+  normalizeWorkspaceImageWheelDelta,
   shouldAppendWorkspaceImagePoint,
   workspaceImageStrokePath,
   workspaceImageStrokeWidth,
   workspaceImageWheelZoomFactor,
+  workspaceImageWheelIntent,
   zoomWorkspaceImageAtPoint,
   type WorkspaceImageStroke
 } from "./workspace-image-annotations.js";
@@ -167,6 +170,8 @@ export function WorkspaceImageLightbox({
   const [annotating, setAnnotating] = useState(startAnnotating && onSendToChat !== undefined);
   const annotatingRef = useRef(annotating);
   annotatingRef.current = annotating;
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const spaceHeldRef = useRef(false);
   const [strokes, setStrokes] = useState<readonly WorkspaceImageStroke[]>([]);
   const strokesRef = useRef(strokes);
   strokesRef.current = strokes;
@@ -181,6 +186,7 @@ export function WorkspaceImageLightbox({
   const [busy, setBusy] = useState(false);
   const [wheeling, setWheeling] = useState(false);
   const wheelTimerRef = useRef<number | undefined>(undefined);
+  const wheelSourceRef = useRef(createWorkspaceImageWheelSourceTracker());
   const ready = status === "ready" && src !== "";
 
   const retireAction = useCallback((): void => {
@@ -262,6 +268,16 @@ export function WorkspaceImageLightbox({
         return;
       }
       if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (event.code === "Space" || event.key === " ") {
+        const target = event.target;
+        const exempt = target instanceof ownerWindow.Element && target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false']), button, a[href], [role='button'], [role='menuitem'], [role='checkbox'], [role='textbox']") !== null;
+        if (annotatingRef.current && !exempt) {
+          event.preventDefault();
+          spaceHeldRef.current = true;
+          setSpaceHeld(true);
+        }
+        return;
+      }
       if (event.key === "Tab") {
         const overlay = overlayRef.current;
         if (overlay === null) return;
@@ -307,10 +323,18 @@ export function WorkspaceImageLightbox({
         return zoomWorkspaceImageAtPoint(current, { x: 0, y: 0 }, current.scale * factor);
       });
     };
+    const releaseSpace = (): void => { spaceHeldRef.current = false; setSpaceHeld(false); };
+    const onKeyUp = (event: KeyboardEvent): void => {
+      if ((event.code === "Space" || event.key === " ") && spaceHeldRef.current) { event.preventDefault(); releaseSpace(); }
+    };
     ownerDocument.addEventListener("keydown", onKeyDown, true);
+    ownerDocument.addEventListener("keyup", onKeyUp);
+    ownerWindow.addEventListener("blur", releaseSpace);
     return () => {
       ownerWindow.cancelAnimationFrame(frame);
       ownerDocument.removeEventListener("keydown", onKeyDown, true);
+      ownerDocument.removeEventListener("keyup", onKeyUp);
+      ownerWindow.removeEventListener("blur", releaseSpace);
       if (wheelTimerRef.current !== undefined) ownerWindow.clearTimeout(wheelTimerRef.current);
       body.classList.remove("workspace-image-lightbox-open");
       if (ownedModalLock && [...ownerDocument.querySelectorAll(".modal-layer, [role='dialog'][aria-modal='true']")].every((element) => element === overlayRef.current)) body.classList.remove("modal-open");
@@ -329,6 +353,9 @@ export function WorkspaceImageLightbox({
     draftStrokeRef.current = undefined;
     dragMovedRef.current = false;
     imageClickRef.current = false;
+    spaceHeldRef.current = false;
+    setSpaceHeld(false);
+    wheelSourceRef.current = createWorkspaceImageWheelSourceTracker();
     setDrag(undefined);
     setAnnotating(startAnnotating && onSendToChat !== undefined);
     setStrokes([]);
@@ -348,11 +375,22 @@ export function WorkspaceImageLightbox({
   }, [ready, releasePointers]);
 
   useEffect(() => {
+    if (!annotating) { spaceHeldRef.current = false; setSpaceHeld(false); }
+  }, [annotating]);
+
+  useEffect(() => {
     const overlay = overlayRef.current;
     if (overlay === null) return;
     const onWheel = (event: WheelEvent): void => {
-      if (annotatingRef.current || closingRef.current || !scopeRef.current.active) return;
+      if (closingRef.current || !scopeRef.current.active) return;
       event.preventDefault();
+      const current = viewportRef.current;
+      const source = event.ctrlKey || event.metaKey ? "mouse" : wheelSourceRef.current({
+        deltaMode: event.deltaMode, deltaX: event.deltaX, deltaY: event.deltaY, shiftKey: event.shiftKey,
+        wheelDeltaY: (event as WheelEvent & { readonly wheelDeltaY?: number }).wheelDeltaY
+      }, event.timeStamp);
+      const intent = workspaceImageWheelIntent(event, source, current.scale);
+      if (intent === "none") return;
       const rect = overlay.getBoundingClientRect();
       const point = { x: event.clientX - rect.left - rect.width / 2, y: event.clientY - rect.top - rect.height / 2 };
       const factor = workspaceImageWheelZoomFactor(event.deltaY, event.deltaMode);
@@ -362,11 +400,13 @@ export function WorkspaceImageLightbox({
         wheelTimerRef.current = undefined;
         setWheeling(false);
       }, 120);
-      setViewport((current) => zoomWorkspaceImageAtPoint(current, point, current.scale * factor));
+      if (intent === "pan") moveViewport({ ...current, x: current.x - normalizeWorkspaceImageWheelDelta(event.deltaX, event.deltaMode),
+        y: current.y - normalizeWorkspaceImageWheelDelta(event.deltaY, event.deltaMode) });
+      else setViewport((current) => zoomWorkspaceImageAtPoint(current, point, current.scale * factor));
     };
     overlay.addEventListener("wheel", onWheel, { passive: false });
     return () => overlay.removeEventListener("wheel", onWheel);
-  }, []);
+  }, [ownerDocument, ownerWindow]);
 
   const commitDraftStroke = useCallback((): void => {
     const draft = draftStrokeRef.current;
@@ -375,7 +415,7 @@ export function WorkspaceImageLightbox({
     setDraftStroke(undefined);
   }, [ownerWindow]);
 
-  const moveViewport = (next: Viewport): void => {
+  function moveViewport(next: Viewport): void {
     const image = imageRef.current;
     const rect = overlayRef.current?.getBoundingClientRect();
     if (image !== null && rect !== undefined && image.clientWidth > 0 && image.clientHeight > 0) {
@@ -385,7 +425,7 @@ export function WorkspaceImageLightbox({
     }
     viewportRef.current = next;
     setViewport(next);
-  };
+  }
 
   const beginDrag = (pointerId: number, point: ImagePointer): void => {
     const current = viewportRef.current;
@@ -417,7 +457,8 @@ export function WorkspaceImageLightbox({
   };
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
-    if (event.button !== 0) return;
+    const pan = event.button === 1 || event.button === 0 && spaceHeldRef.current && event.pointerType !== "touch";
+    if (event.button !== 0 && !pan) return;
     setMenu(undefined);
     if (!ready || closingRef.current) return;
     // A pen/mouse stroke owns its contact; incidental touch contacts do not replace it.
@@ -430,7 +471,11 @@ export function WorkspaceImageLightbox({
     if (pinchRef.current !== undefined) return;
     if (beginPinch()) return;
     dragMovedRef.current = false;
-    if (annotating) {
+    if (pan) {
+      event.preventDefault();
+      imageClickRef.current = false;
+    }
+    if (annotating && !pan) {
       const image = imageRef.current;
       if (image === null) return;
       const point = normalizeWorkspaceImagePoint(event.clientX, event.clientY, image.getBoundingClientRect());
@@ -463,8 +508,7 @@ export function WorkspaceImageLightbox({
       moveViewport({ ...next, x: next.x + center.x - pinch.center.x, y: next.y + center.y - pinch.center.y });
       return;
     }
-    if (annotating) {
-      if (strokePointerRef.current !== event.pointerId) return;
+    if (annotating && strokePointerRef.current === event.pointerId) {
       const current = draftStrokeRef.current;
       const image = imageRef.current;
       if (current === undefined || image === null) return;
@@ -675,7 +719,7 @@ export function WorkspaceImageLightbox({
     }}
   >
     <div
-      className={`workspace-image-lightbox__image-wrap${drag !== undefined || pinching ? " is-dragging" : ""}${wheeling ? " is-wheeling" : ""}${annotating ? " is-annotating" : ""}`}
+      className={`workspace-image-lightbox__image-wrap${drag !== undefined || pinching ? " is-dragging" : ""}${wheeling ? " is-wheeling" : ""}${annotating ? " is-annotating" : ""}${spaceHeld ? " is-space-panning" : ""}`}
       style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}
     >
       {ready && <img

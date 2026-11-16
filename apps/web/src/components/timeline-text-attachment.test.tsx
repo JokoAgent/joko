@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -62,6 +64,8 @@ describe("timeline text attachment lightbox", () => {
   beforeEach(() => {
     (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     vi.clearAllMocks();
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    vi.stubGlobal("cancelAnimationFrame", () => undefined);
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
   });
 
@@ -111,6 +115,47 @@ describe("timeline text attachment lightbox", () => {
     expect(document.body.textContent).toContain(labels.tooLarge);
     expect(loadUrl).not.toHaveBeenCalled();
     expect(buttons(labels.download).length).toBeGreaterThan(0);
+  });
+
+  it("renders Markdown headings, lists, GFM tables and fenced code while copying the original bytes", async () => {
+    const text = "# Heading\n\n- First\n- Second\n\n| Name | Value |\n| --- | --- |\n| **Alpha** | 42 |\n\n- [x] Complete\n\n~~Removed~~\n\n```ts\nconst count: number = 42;\n```\n\n[Unsafe](javascript:alert(1))\n\n![Sibling](private.png)\n\n<script>window.bad = true</script>";
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => ({ size: text.length, text: async () => text }) })));
+    const onDownload = vi.fn();
+    await mount({ artifact, loadUrl: async () => "blob:markdown", onDownload, onClose: vi.fn() });
+    const body = required(document.querySelector<HTMLElement>(".text-attachment-lightbox__markdown"));
+    expect(body.querySelector("h1")?.textContent).toBe("Heading");
+    expect(body.querySelectorAll("li")).toHaveLength(3);
+    expect(body.querySelector("tbody td strong")?.textContent).toBe("Alpha");
+    expect(body.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
+    expect(body.querySelector<HTMLInputElement>('input[type="checkbox"]')?.disabled).toBe(true);
+    expect(body.querySelector("del")?.textContent).toBe("Removed");
+    expect(body.querySelector("pre code.language-ts span")).not.toBeNull();
+    expect(body.querySelector("script")).toBeNull();
+    expect(body.querySelector("a")?.getAttribute("href")).toBeFalsy();
+    expect(body.querySelector("img")).toBeNull();
+    expect(body.textContent).toContain("Sibling");
+    await click(button(labels.copy));
+    expect(writeText).toHaveBeenLastCalledWith(text);
+    await click(button(labels.download));
+    expect(onDownload).toHaveBeenCalledWith("blob-1", "notes.md", { ownerDocument: document, signal: expect.any(AbortSignal) });
+  });
+
+  it("uses the existing read-only code editor with syntax, line numbers and keyboard focus for a code attachment", async () => {
+    const text = "const answer: number = 42;\nconsole.log(answer);\n";
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => ({ size: text.length, text: async () => text }) })));
+    await mount({ artifact: { ...artifact, fileName: "answer.ts", mediaType: "text/plain" }, loadUrl: async () => "blob:code", onDownload: vi.fn(), onClose: vi.fn() });
+    const host = required(document.querySelector<HTMLElement>('.workspace-text-editor[data-language="typescript"]'));
+    const view = required(EditorView.findFromDOM(required(host.querySelector<HTMLElement>(".cm-editor"))));
+    expect(view.state.doc.toString()).toBe(text);
+    expect(view.state.facet(EditorState.readOnly)).toBe(true);
+    expect(view.state.facet(EditorView.editable)).toBe(false);
+    expect(host.querySelector(".cm-lineNumbers")).not.toBeNull();
+    expect(host.querySelector(".cm-line span")).not.toBeNull();
+    expect(view.contentDOM.getAttribute("tabindex")).toBe("0");
+    view.contentDOM.focus();
+    expect(document.activeElement).toBe(view.contentDOM);
+    await click(button(labels.copy));
+    expect(writeText).toHaveBeenLastCalledWith(text);
   });
 
   it("closes only from the separate backdrop, not an interaction inside the document card", async () => {
@@ -176,18 +221,18 @@ describe("timeline text attachment lightbox", () => {
     const render = (current: ArtifactView) => act(async () => root.render(<TimelineTextAttachmentLightbox ownerKey="task" artifact={current} labels={labels} loadUrl={loadUrl} onDownload={vi.fn()} onClose={onClose} />));
     await render(artifact);
     await render({ ...artifact, blobId: "second" });
-    expect(document.querySelector("pre")?.textContent).toBe("second");
+    expect(document.querySelector(".text-attachment-lightbox__markdown")?.textContent).toBe("second");
     await render(artifact);
-    expect(document.querySelector("pre")?.textContent).toBe("current first");
+    expect(document.querySelector(".text-attachment-lightbox__markdown")?.textContent).toBe("current first");
     await act(async () => releaseOld());
-    expect(document.querySelector("pre")?.textContent).toBe("current first");
+    expect(document.querySelector(".text-attachment-lightbox__markdown")?.textContent).toBe("current first");
     await click(button(labels.copy));
     expect(writeText).toHaveBeenLastCalledWith("current first");
     expect((fetch.mock.calls[0]![1] as RequestInit).signal?.aborted).toBe(true);
     act(() => window.dispatchEvent(new Event("pagehide")));
-    expect(document.querySelector("pre")?.textContent).toBe("current first");
+    expect(document.querySelector(".text-attachment-lightbox__markdown")?.textContent).toBe("current first");
     await render({ ...artifact, byteSize: TIMELINE_TEXT_PREVIEW_LIMIT_BYTES + 1 });
-    expect(document.querySelector("pre")).toBeNull();
+    expect(document.querySelector(".text-attachment-lightbox__markdown")).toBeNull();
     expect(document.body.textContent).toContain(labels.tooLarge);
     expect(fetch).toHaveBeenCalledTimes(3);
   });
@@ -218,7 +263,7 @@ describe("timeline text attachment lightbox", () => {
     await act(async () => releaseUrl("blob:retired"));
     expect(mainFetch).not.toHaveBeenCalled();
     expect(detachedFetch).toHaveBeenCalledOnce();
-    expect(detached.querySelector("pre")?.textContent).toBe("current");
+    expect(detached.querySelector(".text-attachment-lightbox__markdown")?.textContent).toBe("current");
     expect(oldFocus).not.toHaveBeenCalled();
     await click(detached.querySelector<HTMLButtonElement>('button[aria-label="Copy content"]')!);
     expect(detached.querySelector('[role="alert"]')?.textContent).toBe(labels.copyFailed);

@@ -7,6 +7,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { ArtifactView, TimelineItemView } from "../model.js";
 import { ArtifactBlock, MessageAttachment } from "./Timeline.js";
 import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArtifactMedia.js";
+import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
 import { WorkspaceFileBody } from "./WorkspaceFileBody.js";
 import type { AppController } from "../controller.js";
 import type { Translator } from "./types.js";
@@ -121,6 +122,136 @@ describe("Timeline artifact media", () => {
     expect(rendered.container.querySelector('[role="alert"]')?.textContent).toBe("timeline.mediaUnavailable");
   });
 
+  it.each(["message", "artifact"] as const)("retries a failed URL in the mounted %s without duplicating its successful lease", async consumer => {
+    const next = deferred<string>();
+    const acquire = vi.fn<((blobId: string) => Promise<string>)>()
+      .mockRejectedValueOnce(new Error("Temporary URL failure"))
+      .mockImplementation(() => next.promise);
+    const release = vi.fn();
+    const rendered = await render(ownerKey => <CachedMedia ownerKey={ownerKey} acquire={acquire} release={release} consumer={consumer} />);
+    const retry = required(rendered.container.querySelector<HTMLButtonElement>('[role="alert"] button'));
+    expect(retry.textContent).toBe("common.retry");
+    expect(acquire).toHaveBeenCalledOnce();
+    await act(async () => { retry.click(); retry.click(); });
+    expect(acquire).toHaveBeenCalledTimes(2);
+    expect(rendered.container.querySelector('[role="status"][aria-label="timeline.mediaLoading"]')).not.toBeNull();
+    expect(rendered.container.querySelector("video")).toBeNull();
+    await act(async () => next.resolve("blob:recovered"));
+    const cover = required(rendered.container.querySelector<HTMLVideoElement>("video"));
+    expect(cover.getAttribute("src")).toBe("blob:recovered");
+    await act(async () => cover.dispatchEvent(new Event("loadedmetadata", { bubbles: true })));
+    expect(rendered.container.querySelector('[role="alert"]')).toBeNull();
+    expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    await act(async () => rendered.root.unmount());
+    roots.splice(roots.indexOf(rendered.root), 1);
+    expect(release).toHaveBeenCalledExactlyOnceWith("blob-recovery-video");
+  });
+
+  it.each(["cover", "player"] as const)("recreates a failed %s from the owned URL and retires its old media elements", async stage => {
+    const retiredPlayback = deferred<void>();
+    const acquire = vi.fn(async () => "blob:same-owned-video");
+    const release = vi.fn();
+    const rendered = await render(ownerKey => <CachedMedia ownerKey={ownerKey} acquire={acquire} release={release} />);
+    const originalCover = required(rendered.container.querySelector<HTMLVideoElement>("video"));
+    let failed = originalCover;
+    if (stage === "player") {
+      vi.mocked(HTMLMediaElement.prototype.play).mockImplementationOnce(() => retiredPlayback.promise);
+      await act(async () => rendered.container.querySelector<HTMLButtonElement>(".video-preview__open")!.click());
+      failed = required(document.querySelector<HTMLVideoElement>('[role="dialog"] video'));
+    }
+    await act(async () => failed.dispatchEvent(new Event("error", { bubbles: true })));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.body.classList.contains("modal-open")).toBe(false);
+    expect(failed.hasAttribute("src")).toBe(false);
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>('[role="alert"] button')!.click());
+    const recovered = required(rendered.container.querySelector<HTMLVideoElement>("video"));
+    expect(recovered).not.toBe(originalCover);
+    expect(recovered.getAttribute("src")).toBe("blob:same-owned-video");
+    expect(acquire).toHaveBeenCalledOnce();
+    await act(async () => {
+      if (stage === "player") retiredPlayback.reject(new Error("Late playback failure"));
+      originalCover.dispatchEvent(new Event("error", { bubbles: true }));
+      recovered.dispatchEvent(new Event("loadedmetadata", { bubbles: true }));
+    });
+    expect(rendered.container.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>(".video-preview__open")!.click());
+    expect(document.querySelector<HTMLVideoElement>('[role="dialog"] video')?.controls).toBe(true);
+    await act(async () => rendered.root.unmount());
+    roots.splice(roots.indexOf(rendered.root), 1);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(release).toHaveBeenCalledExactlyOnceWith("blob-recovery-video");
+  });
+
+  it.each(["online", "focus"] as const)("recovers on %s once and ignores availability events while loading or healthy", async event => {
+    const next = deferred<string>();
+    const loadUrl = vi.fn<((blobId: string) => Promise<string>)>()
+      .mockRejectedValueOnce(new Error("Temporary URL failure"))
+      .mockImplementation(() => next.promise);
+    const rendered = await render(ownerKey => <TimelineArtifactMedia artifact={artifact("video", "video/mp4")} playbackOwnerKey={ownerKey} loadUrl={loadUrl} t={t} />);
+    expect(rendered.container.querySelector('[role="alert"]')).not.toBeNull();
+    await act(async () => {
+      window.dispatchEvent(new Event(event));
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("online"));
+    });
+    expect(loadUrl).toHaveBeenCalledTimes(2);
+    await act(async () => window.dispatchEvent(new Event(event)));
+    expect(loadUrl).toHaveBeenCalledTimes(2);
+    await act(async () => next.resolve("blob:available-again"));
+    expect(rendered.container.querySelector("video")?.getAttribute("src")).toBe("blob:available-again");
+    await act(async () => window.dispatchEvent(new Event(event)));
+    expect(loadUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["owner", "blob"] as const)("ignores a pending retry after its %s changes and releases the retired lease", async change => {
+    const retired = deferred<string>();
+    const current = deferred<string>();
+    const acquire = vi.fn<((blobId: string) => Promise<string>)>()
+      .mockRejectedValueOnce(new Error("Temporary URL failure"))
+      .mockImplementationOnce(() => retired.promise)
+      .mockImplementation(() => current.promise);
+    const release = vi.fn();
+    const rendered = await render(ownerKey => <CachedMedia ownerKey={change === "owner" ? ownerKey : "session-one"} acquire={acquire} release={release}
+      value={artifact(change === "blob" ? ownerKey : "same", "video/mp4")} />);
+    await act(async () => rendered.container.querySelector<HTMLButtonElement>('[role="alert"] button')!.click());
+    await rendered.rerender("session-two");
+    await act(async () => current.resolve("blob:current-owner"));
+    const cover = required(rendered.container.querySelector("video"));
+    await act(async () => retired.resolve("blob:retired-owner"));
+    expect(rendered.container.querySelector("video")).toBe(cover);
+    expect(cover.getAttribute("src")).toBe("blob:current-owner");
+    expect(acquire).toHaveBeenCalledTimes(3);
+    expect(release).toHaveBeenCalledTimes(change === "owner" ? 1 : 0);
+    await act(async () => rendered.root.unmount());
+    roots.splice(roots.indexOf(rendered.root), 1);
+    expect(release).toHaveBeenCalledTimes(2);
+    await act(async () => { window.dispatchEvent(new Event("online")); window.dispatchEvent(new Event("focus")); });
+    expect(acquire).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses only the hosting window's availability events and retires its failed subscription on unmount", async () => {
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const ownerDocument = required(frame.contentDocument);
+    const ownerWindow = required(ownerDocument.defaultView);
+    const loadUrl = vi.fn(async () => { throw new Error("Temporarily unavailable"); });
+    const rendered = await render(ownerKey => <TimelineArtifactMedia artifact={artifact("video", "video/mp4")}
+      playbackOwnerKey={ownerKey} loadUrl={loadUrl} t={t} />, ownerDocument);
+    expect(loadUrl).toHaveBeenCalledOnce();
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    expect(loadUrl).toHaveBeenCalledOnce();
+    // Use the owner realm's event object, as a detached window does in production.
+    const focus = ownerDocument.createEvent("Event");
+    focus.initEvent("focus", false, false);
+    await act(async () => ownerWindow.dispatchEvent(focus));
+    expect(loadUrl).toHaveBeenCalledTimes(2);
+    await act(async () => rendered.root.unmount());
+    roots.splice(roots.indexOf(rendered.root), 1);
+    await act(async () => ownerWindow.dispatchEvent(focus));
+    expect(loadUrl).toHaveBeenCalledTimes(2);
+  });
+
   it("switches playback between timeline audio, video and workspace preview, and retires unmounted players", async () => {
     const controller = {
       state: { preferences: { locale: "en" } },
@@ -177,13 +308,26 @@ describe("Timeline artifact media", () => {
   });
 });
 
-async function render(view: (ownerKey: string) => React.ReactNode): Promise<{
+function CachedMedia({ ownerKey, acquire, release, consumer = "preview", value = artifact("recovery-video", "video/mp4") }: {
+  readonly ownerKey: string;
+  readonly acquire: (blobId: string) => Promise<string>;
+  readonly release: (blobId: string) => void;
+  readonly consumer?: "preview" | "message" | "artifact";
+  readonly value?: ArtifactView;
+}): React.ReactNode {
+  const loadUrl = useTimelineArtifactUrlCache(ownerKey, acquire, release);
+  if (consumer === "message") return <MessageAttachment artifact={value} t={t} onArtifactUrl={loadUrl} onArtifactDownload={async () => "dispatched"} />;
+  if (consumer === "artifact") return <ArtifactBlock item={artifactItem(value)} icon={<span />} locale="en" t={t} onArtifactUrl={loadUrl} onArtifactDownload={async () => "dispatched"} />;
+  return <TimelineArtifactMedia artifact={value} playbackOwnerKey={ownerKey} loadUrl={loadUrl} t={t} />;
+}
+
+async function render(view: (ownerKey: string) => React.ReactNode, ownerDocument: Document = document): Promise<{
   readonly container: HTMLDivElement;
   readonly root: Root;
   readonly rerender: (ownerKey: string) => Promise<void>;
 }> {
-  const container = document.createElement("div");
-  document.body.append(container);
+  const container = ownerDocument.createElement("div");
+  ownerDocument.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   await act(async () => root.render(view("session-one")));
@@ -214,10 +358,11 @@ function artifactItem(value: ArtifactView): TimelineItemView {
 
 const t: Translator = (key, values) => values?.["name"] === undefined ? String(key) : `${String(key)}:${String(values["name"])}`;
 
-function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void; readonly reject: (error: Error) => void } {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => { resolve = next; });
-  return { promise, resolve };
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((next, fail) => { resolve = next; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function required<T>(value: T | null | undefined): T {

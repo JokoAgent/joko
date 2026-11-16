@@ -2634,6 +2634,38 @@ describe("incremental event projection", () => {
     expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).refresh).toBe("authoritative");
   });
 
+  it.each(["runDone", "runAborted", "terminalError"] as const)("ends received native text on its exact %s without inventing a message completion", terminalKind => {
+    const identity = { backendId: "codex-instance", targetId: "project", sessionId: "session-1", runId: "run", attemptId: "attempt", generation: 7n };
+    const delta = create(EventSchema, { eventId: "native-partial", identity, cursor: { generation: 14n, sequence: 1n },
+      payload: { kind: { case: "textDelta", value: { messageId: "native-item-A", delta: "Received partial text." } } } });
+    const payload = terminalKind === "runDone" ? create(EventPayloadSchema, { kind: { case: "runDone", value: { runId: "run" } } })
+      : terminalKind === "runAborted" ? create(EventPayloadSchema, { kind: { case: "runAborted", value: { runId: "run", reason: "Stopped" } } })
+        : create(EventPayloadSchema, { kind: { case: "terminalError", value: { error: { message: "The app-server exited." } } } });
+    const terminal = create(EventSchema, { eventId: "terminal", identity, cursor: { generation: 14n, sequence: 2n }, payload });
+    const raw = create(SnapshotSchema, { generation: 14n, resumeCursor: { generation: 14n, sequence: 1n }, timeline: [delta] });
+    for (const changed of [{ runId: "other" }, { attemptId: "other" }, { generation: 8n }]) {
+      const stale = create(EventSchema, { eventId: terminal.eventId, identity: { ...identity, ...changed }, cursor: terminal.cursor, payload });
+      expect(projectSnapshotEvent(raw, mapSnapshot(raw), stale).snapshot.timelineBySession.get("session-1")?.[0])
+        .toMatchObject({ id: "native-item-A", text: "Received partial text.", streaming: true });
+    }
+    const recoverable = create(EventSchema, { eventId: terminal.eventId, identity, cursor: terminal.cursor,
+      payload: { kind: { case: "recoverableError", value: { error: { message: "Retrying" } } } } });
+    expect(projectSnapshotEvent(raw, mapSnapshot(raw), recoverable).snapshot.timelineBySession.get("session-1")?.[0]?.streaming).toBe(true);
+    const ended = projectSnapshotEvent(raw, mapSnapshot(raw), terminal);
+    const item = ended.snapshot.timelineBySession.get("session-1")?.[0];
+    expect(item).toMatchObject({ id: "native-item-A", text: "Received partial text.", streaming: false, sourceEventId: "native-partial" });
+    expect(item?.completionCursor).toBeUndefined(); expect(item?.nativeEntryId).toBeUndefined();
+    expect(mapSnapshot(ended.rawSnapshot).timelineBySession.get("session-1")).toEqual(ended.snapshot.timelineBySession.get("session-1"));
+    const nextMessage = create(EventSchema, { eventId: "native-B-completed", identity, cursor: { generation: 14n, sequence: 3n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "native-item-B", role: MessageRole.ASSISTANT,
+        nativeIdentity: { entryId: "native-item-B" }, blocks: [{ content: { case: "text", value: "Different native item." } }] } } } });
+    expect(projectSnapshotEvent(ended.rawSnapshot, ended.snapshot, nextMessage).snapshot.timelineBySession.get("session-1")?.[0])
+      .toEqual(item);
+    const otherService = create(SnapshotSchema, { generation: 15n, resumeCursor: { generation: 15n, sequence: 1n }, timeline: raw.timeline });
+    const laterTerminal = create(EventSchema, { eventId: terminal.eventId, identity, cursor: { generation: 15n, sequence: 2n }, payload });
+    expect(projectSnapshotEvent(otherService, mapSnapshot(otherService), laterTerminal).snapshot.timelineBySession.get("session-1")?.[0]?.streaming).toBe(true);
+  });
+
   it.each(["claude-block", "assistant-b324bbdc-36f8-4014-a181-76bee0e27d4e"])("preserves interrupted %s text and replaces only the completed attempt's live row", (prefix) => {
     const identity = { sessionId: "session-1", runId: "run", attemptId: "first", generation: 2n };
     const first = create(EventSchema, { eventId: "partial-1", identity, cursor: { generation: 1n, sequence: 1n },
