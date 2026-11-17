@@ -14679,7 +14679,9 @@ describe("SessionHost", () => {
       const oldUser = fakeHistoryEvent("previously-unloaded-user", "message_user", {
         type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Old native history" }]
       });
-      f.adapter.history = { events: [oldUser, f.before], activeEntryId: "before-original" };
+      f.adapter.history = { events: [{
+        ...oldUser, metadata: { namespace: "fake.native_history", fields: { nativeEntryId: oldUser.nativeEntryId, nativeHydration: true } }
+      }, f.before], activeEntryId: "before-original" };
       return { kind: "in_place" };
     });
     await expect(f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, f.authority))
