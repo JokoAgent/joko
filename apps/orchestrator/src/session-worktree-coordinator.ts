@@ -4,7 +4,7 @@ import { readWorkerWorkspaceBinding, workerWorkspaceTarget, WORKER_WORKSPACE_PLA
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { SessionWorktreeBinding, TargetDescriptor } from "@joko/core";
-import { operationBodyHash, type OperationalStore, type StoredSession, type StoredTarget } from "@joko/store";
+import { operationBodyHash, type NativeSessionDerivationRecord, type OperationalStore, type StoredSession, type StoredTarget } from "@joko/store";
 import type { RemoteGitCheckoutInspection, RemoteGitCheckoutLease, RemoteGitCheckoutPlan } from "@joko/remote-ssh";
 import {
   EphemeralWorktreeService,
@@ -419,13 +419,15 @@ export class SessionWorktreeCoordinator {
   async inspectPlannedRemoteDerivation(plan: RemoteGitCheckoutPlan): Promise<RemoteGitCheckoutInspection> {
     this.#requireInitialized();
     this.#assertDurableRemotePlan(plan);
-    return this.#requireRemoteOwner().inspectExact(plan);
+    return this.#requireRemoteOwner().inspectExact(plan, undefined,
+      plan.remote.binding.kind === "ssh" ? this.#unadoptedRemoteReclamationGuard(plan) : undefined);
   }
 
   async cleanupPendingRemoteDerivation(plan: RemoteGitCheckoutPlan): Promise<"absent" | "released" | "preserved"> {
     this.#requireInitialized();
     this.#assertDurableRemotePlan(plan);
-    const outcome = await this.#requireRemoteOwner().cleanupPending(plan);
+    const outcome = await this.#requireRemoteOwner().cleanupPending(plan, undefined,
+      plan.remote.binding.kind === "ssh" ? this.#unadoptedRemoteReclamationGuard(plan) : undefined);
     if (outcome !== "preserved") {
       this.#activeBindings.delete(plan.sessionId);
       this.#workspaces.unregister(plan.workspaceId);
@@ -443,7 +445,8 @@ export class SessionWorktreeCoordinator {
     if (!remoteBindingMatchesPlan(binding, plan)) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
-    const outcome = await this.#requireRemoteOwner().releaseExact(plan.sessionId, binding);
+    const outcome = await this.#requireRemoteOwner().releaseExact(plan.sessionId, binding, undefined,
+      plan.remote.binding.kind === "ssh" ? this.#unadoptedRemoteReclamationGuard(plan) : undefined);
     if (outcome === "released") {
       this.#activeBindings.delete(plan.sessionId);
       this.#workspaces.unregister(plan.workspaceId);
@@ -471,11 +474,35 @@ export class SessionWorktreeCoordinator {
     return expectedBinding.path;
   }
 
-  #assertDurableRemotePlan(plan: RemoteGitCheckoutPlan): void {
+  #assertDurableRemotePlan(plan: RemoteGitCheckoutPlan): NativeSessionDerivationRecord {
     const receipt = this.#store.listUnadoptedNativeSessionDerivations().find((record) =>
       record.sessionId === plan.sessionId && record.remoteWorktreePlan !== undefined
       && operationBodyHash(record.remoteWorktreePlan) === operationBodyHash(plan));
     if (receipt === undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    return receipt;
+  }
+
+  #unadoptedRemoteReclamationGuard(plan: RemoteGitCheckoutPlan): (() => void) | undefined {
+    const receipt = this.#assertDurableRemotePlan(plan);
+    if (receipt.state !== "workspace_cleanup_pending" || receipt.worktree !== undefined || receipt.binding !== undefined
+      || this.#store.getBackend(receipt.backendId).descriptor.adapterKind !== "claude-agent-sdk-stdio") return undefined;
+    const token = receipt.cleanupToken;
+    const assertCurrent = (): void => {
+      const current = this.#assertDurableRemotePlan(plan);
+      const target = this.#store.getTarget(plan.authority.targetId);
+      if (token === undefined || current.operationId !== receipt.operationId || current.cleanupToken !== token
+        || current.state !== "workspace_cleanup_pending" || current.worktree !== undefined || current.binding !== undefined
+        || current.backendId !== target.descriptor.backendId
+        || this.#store.getBackend(current.backendId).descriptor.adapterKind !== "claude-agent-sdk-stdio"
+        || this.#store.listSessions({ includeArchived: true, includeDeleted: true }).some(session => {
+          const worktree = session.descriptor.worktree;
+          return session.descriptor.id === plan.sessionId || worktree?.remote !== undefined
+            && sameRemoteWorkspace(worktree.remote.binding, plan.remote.binding)
+            && (worktree.leaseId === plan.leaseId || worktree.remote.manifestId === plan.manifestId || worktree.path === plan.path);
+        })) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    };
+    assertCurrent();
+    return assertCurrent;
   }
 
   #hasDurableRemoteBinding(sessionId: string, expectedBinding: SessionWorktreeBinding): boolean {

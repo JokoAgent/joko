@@ -9,7 +9,8 @@ import {
   CLAUDE_AGENT_SDK_CLI_VERSION, CLAUDE_AGENT_SDK_VERSION, ClaudeCodeAdapter, claudeNativeDerivationOperationId, claudeWorkspaceAuthority,
   loadClaudeRemoteManagerSource
 } from "@joko/adapter-claude-code";
-import { OperationState, type Event } from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
+import { EntityKind, OperationMutationSchema, OperationState, StateImpact, type Event } from "@joko/contracts";
 import {
   createOrchestratorApplication, createPublicServer, type OrchestratorApplication, type OrchestratorConfig
 } from "@joko/orchestrator";
@@ -314,6 +315,51 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(remote.managerCalls.slice(beforeCleanup)).not.toContain("store.fork");
     expect(remote.activePaths()).toEqual([derived.worktree.path]);
     expect(remote.messages(sourceNativeId)).toEqual(sourceHistory);
+    const finalClients = createE2eClients(running.baseUrl, paired.authKey);
+    expect((await submit(finalClients.operation, paired.connection.id, deleteMutation(derivedId, true))).state).toBe(OperationState.SUCCEEDED);
+    expect(remote.activePaths()).toEqual([]);
+    const beforeRenamedClone = remote.managerCalls.length;
+    remote.interruptNextCheckoutRelease = true;
+    remote.beforeCheckoutDeriveReply = async () => {
+      const current = running!.application.store.getTarget(targetId);
+      const renamed = await submit(finalClients.operation, paired.connection.id, create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: current.revision } }],
+        payload: { case: "updateTarget", value: { targetId, displayName: "Renamed during original Clone" } }
+      }));
+      expect(renamed.state).toBe(OperationState.SUCCEEDED);
+    };
+    const renamedCloneId = randomUUID(), renamedClone = cloneMutation(sourceId, "Clone interrupted by project rename");
+    const renamedResult = await submit(finalClients.operation, paired.connection.id, renamedClone, renamedCloneId);
+    expect(renamedResult).toMatchObject({ state: OperationState.FAILED, error: {
+      code: "EFFECT_FAILED", phase: "effect", retryable: false,
+      queueImpact: StateImpact.MAY_HAVE_CHANGED, nativeSessionImpact: StateImpact.MAY_HAVE_CHANGED,
+      workspaceImpact: StateImpact.MAY_HAVE_CHANGED
+    } });
+    const renamedPlan = remote.lastPlan!;
+    const renamedPending = running.application.store.findNativeSessionDerivation(renamedCloneId)!;
+    expect(renamedPending).toMatchObject({ state: "workspace_cleanup_pending", cleanupToken: expect.any(String), remoteWorktreePlan: renamedPlan });
+    expect(renamedPending.binding).toBeUndefined(); expect(renamedPending.worktree).toBeUndefined();
+    expect(running.application.store.getTarget(targetId).descriptor.displayName).toBe("Renamed during original Clone");
+    expect(running.application.store.getTarget(targetId).revision).toBeGreaterThan(BigInt(renamedPlan.authority.targetRevision));
+    const derivesBeforeRetry = remote.deriveCount;
+    await expect(running.application.sessionWorktrees.acquirePlannedRemoteDerivation(renamedPlan)).rejects.toMatchObject({ code: "AUTHORITY_CHANGED" });
+    expect(remote.deriveCount).toBe(derivesBeforeRetry);
+    const checkoutBeforeRestart = remote.checkoutCalls.length;
+    await running.close(); running = await start(config, remote);
+    expect(running.application.store.findNativeSessionDerivation(renamedCloneId)).toMatchObject({
+      state: "cleaned", cleanupToken: renamedPending.cleanupToken, remoteWorktreePlan: renamedPlan
+    });
+    expect(remote.checkoutCalls.slice(checkoutBeforeRestart)).toEqual(["inspect", "release"]);
+    expect(remote.releasedPaths.filter(path => path === renamedPlan.path)).toHaveLength(1);
+    expect(remote.activePaths()).toEqual([]);
+    expect(remote.managerCalls.slice(beforeRenamedClone)).not.toContain("store.fork");
+    expect(remote.managerCalls.slice(beforeRenamedClone)).not.toContain("store.cleanupOperation");
+    expect(running.application.store.listSessions({ includeArchived: true, includeDeleted: true })
+      .some(session => session.descriptor.id === renamedPlan.sessionId)).toBe(false);
+    expect(remote.messages(sourceNativeId)).toEqual(sourceHistory);
+    const renamedClients = createE2eClients(running.baseUrl, paired.authKey);
+    expect(await submit(renamedClients.operation, paired.connection.id, renamedClone, renamedCloneId)).toEqual(renamedResult);
+    expect(remote.deriveCount).toBe(derivesBeforeRetry);
   } finally {
     observeCleanup.mockRestore();
     await running?.close().catch(() => undefined);
@@ -385,6 +431,8 @@ class ControlledRemoteClaude {
   deriveCount = 0;
   lastPlan: RemoteGitCheckoutPlan | undefined;
   interruptNextCheckoutDerivation = false;
+  interruptNextCheckoutRelease = false;
+  beforeCheckoutDeriveReply: (() => Promise<void>) | undefined;
 
   constructor() {
     const capabilities = {
@@ -456,6 +504,10 @@ class ControlledRemoteClaude {
         acquiredAt: Date.now(), remote: plan.remote
       };
       this.#checkouts.set(plan.leaseId, lease);
+      if (this.interruptNextCheckoutRelease) {
+        this.interruptNextCheckoutRelease = false;
+        this.#interruptReleaseFor = lease.id;
+      }
       if (this.interruptNextCheckoutDerivation) {
         this.interruptNextCheckoutDerivation = false;
         this.#interruptReleaseFor = lease.id;
@@ -672,8 +724,13 @@ class ControlledProcesses implements RemoteProcessTransportPort {
       });
     }
     if (request.args[0] === "-e") {
-      return new ControlledProcess(undefined, (process, input) => {
+      return new ControlledProcess(undefined, async (process, input) => {
         const result = this.#remote.execute(input);
+        if ((JSON.parse(input) as { operation: string }).operation === "derive") {
+          const beforeReply = this.#remote.beforeCheckoutDeriveReply;
+          this.#remote.beforeCheckoutDeriveReply = undefined;
+          await beforeReply?.();
+        }
         process.stdout.write(result.stdout);
         process.stderr.write(result.stderr);
         process.finish(result.exitCode);
@@ -713,7 +770,7 @@ class ControlledProcess extends EventEmitter implements RemoteProcessHandle {
 
   constructor(
     onFrame?: (frame: Record<string, unknown>, process: ControlledProcess) => void,
-    onEnd?: (process: ControlledProcess, input: string) => void
+    onEnd?: (process: ControlledProcess, input: string) => void | Promise<void>
   ) {
     super();
     this.stdin = new Writable({
@@ -730,7 +787,11 @@ class ControlledProcess extends EventEmitter implements RemoteProcessHandle {
           callback();
         } catch (error) { callback(error as Error); }
       },
-      final: (callback) => { onEnd?.(this, this.#buffer); queueMicrotask(() => this.finish(this.exitCode ?? 0)); callback(); }
+      final: (callback) => {
+        Promise.resolve().then(() => onEnd?.(this, this.#buffer)).then(() => {
+          queueMicrotask(() => this.finish(this.exitCode ?? 0)); callback();
+        }, (error: unknown) => callback(error instanceof Error ? error : new Error("The controlled remote process failed.")));
+      }
     });
   }
 

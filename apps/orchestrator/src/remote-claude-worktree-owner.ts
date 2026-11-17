@@ -65,12 +65,12 @@ export class RemoteClaudeWorktreeOwner {
     return captured.service.derive(plan, signal);
   }
 
-  async inspectExact(plan: RemoteGitCheckoutPlan, signal?: AbortSignal): Promise<RemoteGitCheckoutInspection> {
-    return (await this.#captureFor(plan.remote, signal)).service.inspectExact(plan, signal);
+  async inspectExact(plan: RemoteGitCheckoutPlan, signal?: AbortSignal, assertReclamationCurrent?: () => void): Promise<RemoteGitCheckoutInspection> {
+    return (await this.#captureFor(plan.remote, signal, undefined, assertReclamationCurrent)).service.inspectExact(plan, signal);
   }
 
-  async cleanupPending(plan: RemoteGitCheckoutPlan, signal?: AbortSignal): Promise<"absent" | "released" | "preserved"> {
-    return (await this.#captureFor(plan.remote, signal)).service.cleanupPending(plan, signal);
+  async cleanupPending(plan: RemoteGitCheckoutPlan, signal?: AbortSignal, assertReclamationCurrent?: () => void): Promise<"absent" | "released" | "preserved"> {
+    return (await this.#captureFor(plan.remote, signal, undefined, assertReclamationCurrent)).service.cleanupPending(plan, signal);
   }
 
   async assertExact(sessionId: string, binding: SessionWorktreeBinding, signal?: AbortSignal): Promise<void> {
@@ -78,20 +78,27 @@ export class RemoteClaudeWorktreeOwner {
     await (await this.#captureFor(lease.remote, signal)).service.assertExact(lease, signal);
   }
 
-  async releaseExact(sessionId: string, binding: SessionWorktreeBinding, signal?: AbortSignal): Promise<"released" | "preserved"> {
+  async releaseExact(sessionId: string, binding: SessionWorktreeBinding, signal?: AbortSignal, assertReclamationCurrent?: () => void): Promise<"released" | "preserved"> {
     const lease = remoteLeaseFromBinding(sessionId, binding);
-    return (await this.#captureFor(lease.remote, signal)).service.releaseExact(lease, signal);
+    return (await this.#captureFor(lease.remote, signal, undefined, assertReclamationCurrent)).service.releaseExact(lease, signal);
   }
 
   async #captureFor(
     expected: RemoteGitCheckoutAuthority & { readonly manifestId: string },
     signal?: AbortSignal,
-    assertEffectCurrent?: () => void
+    assertEffectCurrent?: () => void,
+    assertReclamationCurrent?: () => void
   ): Promise<{ readonly authority: RemoteGitCheckoutAuthority; readonly service: RemoteGitCheckoutService }> {
     const target = this.#store.getTarget(expected.targetId);
-    const captured = await this.#capture(target, signal, assertEffectCurrent);
+    // Only the original unadopted cleanup claim may recapture a newer revision.
+    // Admission and adopted runtime use continue to require the acquisition revision.
+    const reclamation = expected.binding.kind === "ssh" && assertReclamationCurrent !== undefined
+      ? { authority: expected, assertCurrent: assertReclamationCurrent } : undefined;
+    if (reclamation !== undefined && (target.descriptor.remoteWorkspace === undefined
+      || !sameBinding(target.descriptor.remoteWorkspace, expected.binding))) throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
+    const captured = await this.#capture(target, signal, assertEffectCurrent, reclamation);
     if (!sameStableAuthority(captured.authority, expected)
-      || captured.authority.targetRevision !== expected.targetRevision) {
+      || (reclamation === undefined && captured.authority.targetRevision !== expected.targetRevision)) {
       throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
     }
     return captured;
@@ -100,23 +107,18 @@ export class RemoteClaudeWorktreeOwner {
   async #capture(
     target: StoredTarget,
     signal?: AbortSignal,
-    assertEffectCurrent?: () => void
+    assertEffectCurrent?: () => void,
+    reclamation?: { readonly authority: RemoteGitCheckoutAuthority; readonly assertCurrent: () => void }
   ): Promise<{ readonly authority: RemoteGitCheckoutAuthority; readonly service: RemoteGitCheckoutService }> {
     const remote = target.descriptor.remoteWorkspace;
     if (remote === undefined || !target.descriptor.trusted || !target.descriptor.managed) {
       throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
     }
+    reclamation?.assertCurrent();
     const captured = await this.#remoteExecution.processes(remote, signal);
     captured.assertCurrent();
     const remotePath = captured.pathStyle === "win32" ? win32 : posix;
     const processes = captured.processes;
-    const installation = captured.kind === "device_peer"
-      ? await devicePeerClaudeInstallation(remote.workspaceRoot, captured.pathStyle)
-      : await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, captured.assertCurrent, signal);
-    captured.assertCurrent();
-    if (installation.state !== "ready" || installation.workspaceRoot !== remote.workspaceRoot) {
-      throw new RemoteGitCheckoutError("UNAVAILABLE");
-    }
     const authority: RemoteGitCheckoutAuthority = Object.freeze({
       targetId: target.descriptor.id,
       binding: remote,
@@ -125,6 +127,7 @@ export class RemoteClaudeWorktreeOwner {
     });
     const assertCurrent = (): void => {
       captured.assertCurrent();
+      reclamation?.assertCurrent();
       const current = this.#store.getTarget(target.descriptor.id);
       const currentRemote = current.descriptor.remoteWorkspace;
       if (current.revision !== target.revision
@@ -134,23 +137,35 @@ export class RemoteClaudeWorktreeOwner {
       }
     };
     assertCurrent();
+    if (reclamation !== undefined && !sameStableAuthority(authority, reclamation.authority)) {
+      throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
+    }
+    const installation = captured.kind === "device_peer"
+      ? await devicePeerClaudeInstallation(remote.workspaceRoot, captured.pathStyle)
+      : await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, reclamation === undefined ? captured.assertCurrent : assertCurrent, signal);
+    assertCurrent();
+    if (installation.state !== "ready" || installation.workspaceRoot !== remote.workspaceRoot) {
+      throw new RemoteGitCheckoutError("UNAVAILABLE");
+    }
     const service = new RemoteGitCheckoutService({
       storageRoot: remotePath.join(installation.runtimeRoot, "worktrees"),
       nodeExecutable: installation.runtimeEntrypoint === "device_peer"
         ? DEVICE_PEER_RUNTIME_EXECUTABLES.node
         : installation.nodeExecutable,
       pathStyle: captured.pathStyle,
-      assertCurrent: (expected) => {
+      assertCurrent: (expected, operation) => {
         assertCurrent();
+        const reclaiming = reclamation !== undefined && (operation === "inspect" || operation === "cleanup" || operation === "release")
+          && sameStableAuthority(reclamation.authority, expected) && reclamation.authority.targetRevision === expected.targetRevision;
         if (!sameStableAuthority(authority, expected)
-          || authority.targetRevision !== expected.targetRevision) {
+          || (!reclaiming && authority.targetRevision !== expected.targetRevision)) {
           throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
         }
       },
       execute: async (options) => {
         assertCurrent();
-        const assertDispatch = assertEffectCurrent === undefined ? undefined : () => {
-          try { assertCurrent(); assertEffectCurrent(); }
+        const assertDispatch = assertEffectCurrent === undefined && reclamation === undefined ? undefined : () => {
+          try { assertCurrent(); assertEffectCurrent?.(); }
           catch { throw new RemoteGitCheckoutDispatchDeniedError(); }
         };
         assertDispatch?.();

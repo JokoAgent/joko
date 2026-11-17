@@ -136,6 +136,11 @@ describe("Pi branch navigation gateway", () => {
       .rejects.toMatchObject({ code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" });
     await expect(gateway.navigateSessionBranch("session-one", target, { expectedGeneration: 7n })).resolves.toBeUndefined();
     expect(sessionReads).toBe(3);
+    await gateway.navigateSessionBranch("session-one", target, { expectedGeneration: 7n,
+      sourceMessage: { messageId: "original-user", eventId: "original-event", requireLatestUser: true } });
+    expect(payloads.at(-1)).toMatchObject({ case: "navigateSessionBranch", value: {
+      sourceMessageId: "original-user", sourceEventId: "original-event", requireLatestUser: true
+    } });
     gateway.disconnect();
   });
 });

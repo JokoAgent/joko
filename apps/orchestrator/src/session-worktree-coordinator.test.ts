@@ -803,6 +803,37 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
 });
 
 describe("remote checkout coordination", () => {
+  test("fences renamed-project reclamation to the same unadopted durable cleanup claim", async () => {
+    const f = await remoteFixture();
+    f.store.upsertBackend({ ...f.store.getBackend("remote-backend").descriptor, adapterKind: "claude-agent-sdk-stdio" });
+    await f.worktrees.initialize();
+    const connection = f.store.createConnection({ id: "reclaim-owner", name: "Owner", authKeyDigest: "reclaim-digest" });
+    const claim = f.store.claimAuthorizedDeferredEffectOperation(connection.id, connection.authKeyDigest, {
+      id: "reclaim-remote-checkout", kind: "clone_session", body: { sourceSessionId: "source" }
+    });
+    const source = f.store.getSession("source"), target = f.store.getTarget("remote-target");
+    const prepared = f.store.prepareNativeSessionDerivation({ operationId: claim.operation.id, expectedBodyHash: claim.operation.bodyHash,
+      sourceSessionId: "source", sourceBinding: source.descriptor.binding, sourceSessionRevision: source.revision, sessionId: "child",
+      backendId: "remote-backend", backendInstanceGeneration: 0, targetId: "remote-target", targetRevision: target.revision,
+      effectiveWorkspaceRoot: f.plan.path, remoteWorkspace: target.descriptor.remoteWorkspace, remoteWorktreePlan: f.plan });
+    f.store.failEffectOperation(claim.operation.id, claim.operation.bodyHash, new Error("The original checkout reply was unavailable."));
+    const pending = f.store.confirmUnstartedRemoteDerivationCleanup({ operationId: claim.operation.id, expectedRevision: prepared.revision });
+    f.store.upsertTarget({ ...target.descriptor, displayName: "Renamed project" });
+    expect(await f.worktrees.inspectPlannedRemoteDerivation(f.plan)).toEqual({ status: "active", lease: f.lease });
+    const guard = f.owner.inspectExact.mock.calls.at(-1)?.[2];
+    expect(guard).toEqual(expect.any(Function));
+    expect(() => guard!()).not.toThrow();
+    f.store.upsertBackend({ ...f.store.getBackend("remote-backend").descriptor, id: "other-backend", adapterKind: "fixture" });
+    f.store.upsertTarget({ ...target.descriptor, backendId: "other-backend" });
+    expect(() => guard!()).toThrow();
+    f.store.upsertTarget(target.descriptor);
+    expect(() => guard!()).not.toThrow();
+    f.store.finishNativeSessionDerivationCleanup({ operationId: claim.operation.id, token: pending.cleanupToken!, outcome: "cleaned" });
+    expect(() => guard!()).toThrow();
+    await expect(f.worktrees.releasePlannedRemoteDerivation(f.plan, f.lease)).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    expect(f.owner.releaseExact).not.toHaveBeenCalled();
+  });
+
   test("keeps a remote lease active in Store when startup inspection is unavailable and releases only exact ownership", async () => {
     const f = await remoteFixture();
     const binding = remoteBindingFromLease(f.plan.workspaceId, f.lease);
@@ -943,7 +974,7 @@ async function remoteFixture() {
   const owner = {
     plan: vi.fn(async () => plan),
     derive: vi.fn(async () => lease),
-    inspectExact: vi.fn(async () => ({ status: "active" as const, lease })),
+    inspectExact: vi.fn(async (_plan: RemoteGitCheckoutPlan, _signal?: AbortSignal, _assertReclamationCurrent?: () => void) => ({ status: "active" as const, lease })),
     cleanupPending: vi.fn(async () => "released" as const),
     assertExact: vi.fn(async () => undefined),
     releaseExact: vi.fn(async (): Promise<"released" | "preserved"> => "released")

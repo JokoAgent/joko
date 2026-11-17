@@ -11193,6 +11193,7 @@ export class OperationalStore {
     readonly sessionId: string;
     readonly eventId?: string;
     readonly nativeBoundaryId?: string;
+    readonly role?: "user" | "assistant";
     readonly completedAssistantOnly?: boolean;
     readonly includeRetainedContext?: boolean;
   }): { readonly messageId: string; readonly eventId: string } | undefined {
@@ -11213,6 +11214,11 @@ export class OperationalStore {
       "(json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)"
     ];
     const params: Array<string | number | bigint | null> = [...(nativeVisibility?.params ?? []), sessionId];
+    if (input.role !== undefined) {
+      if (input.role !== "user" && input.role !== "assistant") throw new StoreError("Session message origin role is invalid.");
+      clauses.push("json_extract(event.payload_json, '$.payload.role') = ?");
+      params.push(input.role);
+    }
     if (input.completedAssistantOnly === true) {
       clauses.push("json_extract(event.payload_json, '$.payload.role') = 'assistant'");
       clauses.push("event.generation = ?");
@@ -12178,6 +12184,24 @@ export class OperationalStore {
       ...params,
       limit
     ) as Row[]).map(eventFromRow);
+  }
+
+  /** Detect original user input admitted after a history effect began, even if
+   * that effect has already moved it out of the active native branch. */
+  hasSessionUserInputAfter(sessionId: string, afterCursor: bigint): boolean {
+    this.assertOpen();
+    if (afterCursor < 0n || afterCursor > this.latestEventCursor()) throw new StoreError("User input cursor is invalid.");
+    this.getSession(sessionId);
+    return this.database.prepare(`SELECT 1 FROM events AS event
+      WHERE event.session_id = ? AND event.global_cursor > ?
+        AND COALESCE(json_extract(event.metadata_json, '$.nativeHydration'), 0) <> 1
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') = 'user'
+        AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.inputHandoffContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL
+      LIMIT 1`).get(sessionId, asSqlInteger(afterCursor)) !== undefined;
   }
 
   /**

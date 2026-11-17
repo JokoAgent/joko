@@ -604,6 +604,7 @@ interface NativeRuntime {
   readonly runtimeWorkspaceRoot: string;
   readonly remote: boolean;
   readonly assertRuntimeCurrent: () => void;
+  readonly assertRuntimeRetirementCurrent: () => void;
   readonly baseContext: AdapterContext;
   readonly workingContextWindow: number | undefined;
   readonly nativeTasks: ClaudeNativeTaskProjection;
@@ -3837,6 +3838,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         runtimeWorkspaceRoot: scoped.workspaceRoot,
         remote: scoped.remote,
         assertRuntimeCurrent: scoped.assertCurrent,
+        assertRuntimeRetirementCurrent: scoped.assertRetirementCurrent ?? scoped.assertCurrent,
         baseContext: context,
         workingContextWindow: startedQuery.workingContextWindow,
         nativeTasks: new ClaudeNativeTaskProjection({
@@ -6662,7 +6664,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       && (runtime.remote || runtime.storedSessionAccess !== undefined || runtime.freshContext !== undefined || runtime.requiresConfirmedRetirement)) {
       try {
         await runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs);
-        runtime.assertRuntimeCurrent();
+        runtime.assertRuntimeRetirementCurrent();
         runtime.processRetirementConfirmed = true;
       } catch {
         throw runtime.remote
@@ -8752,7 +8754,8 @@ function targetRuntimeOf(runtime: NativeRuntime): ClaudeTargetRuntime {
     runtime: runtime.sdkRuntime,
     workspaceRoot: runtime.runtimeWorkspaceRoot,
     remote: runtime.remote,
-    assertCurrent: runtime.assertRuntimeCurrent
+    assertCurrent: runtime.assertRuntimeCurrent,
+    assertRetirementCurrent: runtime.assertRuntimeRetirementCurrent
   };
 }
 
