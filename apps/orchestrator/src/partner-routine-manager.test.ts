@@ -94,11 +94,12 @@ describe("Partner routine authority and independent execution", () => {
             requestId: `routine-model-${sessionMode}-run-${index}`, elapsedMs: Math.round(performance.now() - startedAt),
             runs: f.routines.history(f.partner.id, saved.id).runs.map(run => ({ id: run.id, status: run.status,
               sessionId: run.sessionId, scheduleRunId: run.scheduleRunId })),
-            sessions: f.partners.relatedSessions(f.partner.id).routines.filter(item => item.routineKey?.startsWith(`routine:${saved.id}`)).map(({ session }) => ({
+            sessions: f.partners.listSessions(f.partner.id).filter(item => item.link.role === 'routine'
+              && item.link.routineKey?.startsWith(`routine:${saved.id}`)).flatMap(({ session }) => session === undefined ? [] : [{
               id: session.id, archived: session.archived, paused: f.store.getQueueControl(session.id).paused,
               runs: f.store.listRuns({ sessionId: session.id }).map(run => ({ id: run.descriptor.id, state: run.descriptor.state })),
               queue: f.store.listQueueItems({ sessionId: session.id }).map(item => ({ id: item.id, state: item.state }))
-            })) }));
+            }]) }));
         } catch { /* Preserve the original assertion if its store is unavailable. */ }
         throw error;
       }

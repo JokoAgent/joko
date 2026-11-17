@@ -15,7 +15,7 @@ function setup(managed = true) {
     capabilities: new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: managed }]]),
     models: [{ providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions", contextWindow: 8192,
       maxOutputTokens: 2048, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }], tools: [], diagnostics: [] });
-  const providers = { generation: 1, hasInferenceModel: () => managed,
+  const providers = { generation: 1, listManaged: () => [], hasInferenceModel: () => managed,
     describeInferenceRoute: () => managed ? { generationId: "private-route" } : undefined,
     resolveInferenceRoute: (backendId: string, providerId: string, modelId: string) => managed ? {
       backendId, providerId, modelId, generationId: "private-route", baseUrl: "https://provider.invalid/v1", api: "openai-completions" as const,

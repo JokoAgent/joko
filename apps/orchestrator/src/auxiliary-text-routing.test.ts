@@ -215,6 +215,7 @@ function setup() {
   });
   const providers = {
     get generation() { return fixture.generation; },
+    listManaged: () => [],
     hasInferenceModel: () => true,
     describeInferenceRoute: () => ({ generationId: `private-credential-generation-${fixture.credentialGeneration}` }),
     resolveInferenceRoute: (backendId: string, providerId: string, modelId: string) => ({

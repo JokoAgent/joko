@@ -782,7 +782,7 @@ describe("PromptPredictionService", () => {
 
 function coordinator(
   store: OperationalStore,
-  providers: Pick<ProviderCatalogManager, "list" | "hasInferenceModel" | "resolveInferenceRoute">,
+  providers: Pick<ProviderCatalogManager, "list" | "listManaged" | "hasInferenceModel" | "resolveInferenceRoute">,
   fetch?: typeof globalThis.fetch,
   requestTimeoutMs?: number,
   readBlob: VisionBridgeCoordinatorOptions["readBlob"] = async () => ({
