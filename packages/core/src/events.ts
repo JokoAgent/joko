@@ -162,7 +162,9 @@ export type EventPayload =
   /** Immutable owner catalog snapshot after a committed label mutation. */
   | { readonly type: "task_tag_catalog_changed"; readonly catalog: import("./types.js").TaskTagCatalog }
   | { readonly type: "text_delta"; readonly blockId: string; readonly delta: string; readonly contentIndex?: number; readonly nativeHistory?: NativeHistoryEventContext }
-  | { readonly type: "thinking_delta"; readonly blockId: string; readonly delta: string; readonly contentIndex?: number; readonly nativeHistory?: NativeHistoryEventContext }
+  | { readonly type: "thinking_delta"; readonly blockId: string; readonly delta: string; readonly contentIndex?: number;
+      readonly final?: boolean; readonly finalText?: string; readonly redacted?: boolean; readonly durationMs?: number;
+      readonly nativeHistory?: NativeHistoryEventContext }
   | {
       readonly type: "message_complete";
       readonly role: "user" | "assistant";
@@ -424,7 +426,8 @@ export interface ReviewEvidenceProjection {
 
 export type MessageBlock =
   | { readonly kind: "text"; readonly text: string }
-  | { readonly kind: "thinking"; readonly text: string; readonly redacted: boolean }
+  | { readonly kind: "thinking"; readonly text: string; readonly redacted: boolean;
+      readonly streamBlockId?: string; readonly durationMs?: number }
   | { readonly kind: "image"; readonly blob: BlobRef; readonly alt?: string }
   | { readonly kind: "artifact"; readonly blob: BlobRef; readonly label: string; readonly audioMetadata?: AudioArtifactMetadata }
   | { readonly kind: "tool_call"; readonly callId: string; readonly name: string; readonly input: string }

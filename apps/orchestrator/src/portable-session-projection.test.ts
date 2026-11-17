@@ -127,6 +127,18 @@ function acceptedEvent(): PersistedEvent {
 }
 
 describe("portable Session message projection", () => {
+  it("retains exact thinking completion fields in current-v1 packages and rejects malformed source identities or durations", () => {
+    const block = { kind: "thinking", text: "Final reasoning", redacted: false, streamBlockId: "original-stream-block", durationMs: 2_500 } as const;
+    const project = (thinking: typeof block | Record<string, unknown>) => projectPortableSessionMessages([event({ payload: {
+      type: "message_complete", role: "assistant", blocks: [thinking as typeof block]
+    } })]);
+    const original = project(block);
+    expect(decodePortableSessionProjection(encodePortableSessionProjection(original))).toEqual(original);
+    for (const invalid of [{ ...block, streamBlockId: "\n" }, { ...block, durationMs: -1 }, { ...block, durationMs: 0.5 }]) {
+      expect(() => encodePortableSessionProjection(project(invalid))).toThrow(PortableSessionProjectionError);
+    }
+  });
+
   it("exports only the latest public application history as inert text at its original position", () => {
     const card = { id: "card", sessionId: "session", title: "Example application", text: "", pending: true, cancelled: false, isError: false, updatedAt: 1 };
     const projection = projectPortableSessionMessages([

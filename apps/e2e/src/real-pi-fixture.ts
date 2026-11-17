@@ -33,13 +33,15 @@ export interface CapturedProviderRequest {
 }
 
 export type RealPiProviderReply =
-  | { readonly kind: "text"; readonly text: string }
+  | { readonly kind: "text"; readonly text: string; readonly thinking?: string; readonly holdAfterThinking?: Promise<void> }
   | { readonly kind: "contextOverflow" }
   | {
       readonly kind: "tool";
       readonly name: string;
       readonly arguments: Readonly<Record<string, unknown>>;
       readonly callId?: string;
+      readonly thinking?: string;
+      readonly holdAfterThinking?: Promise<void>;
     };
 
 export type RealPiProviderResponder = (input: {
@@ -63,6 +65,8 @@ export interface RealPiSystemFixtureOptions {
   readonly overflowRequestNumbers?: readonly number[];
   readonly providerResponder?: RealPiProviderResponder;
   readonly providerSupportsImages?: boolean;
+  readonly providerSupportsThinking?: boolean;
+  readonly providerApi?: "openai-completions" | "anthropic-messages";
   readonly providerUsage?: {
     readonly promptTokens: number;
     readonly completionTokens: number;
@@ -182,19 +186,21 @@ export class RealPiSystemFixture {
         providerResponseGate,
         options.providerUsage,
         options.overflowRequestNumbers,
-        options.providerResponder
+        options.providerResponder,
+        options.providerApi
       );
       const providerAddress = providerServer.address() as AddressInfo;
       const provider: PiManagedProvider = {
         id: REAL_PI_PROVIDER_ID,
-        baseUrl: `http://127.0.0.1:${providerAddress.port}/v1`,
-        api: "openai-completions",
+        baseUrl: `http://127.0.0.1:${providerAddress.port}${options.providerApi === "anthropic-messages" ? "" : "/v1"}`,
+        api: options.providerApi ?? "openai-completions",
         keyless: true,
         models: [{
           id: REAL_PI_MODEL_ID,
           name: "Joko real Pi E2E model",
           contextWindow: 16_384,
-          maxTokens: 1_024,
+          maxTokens: options.providerSupportsThinking === true ? 4_096 : 1_024,
+          ...(options.providerSupportsThinking === true ? { reasoning: true } : {}),
           ...(options.providerSupportsImages === true ? { input: ["text", "image"] as const } : {})
         }]
       };
@@ -387,11 +393,13 @@ export async function startLocalProvider(
   responseGate?: ProviderResponseGate,
   usage: RealPiSystemFixtureOptions["providerUsage"] = { promptTokens: 7, completionTokens: 3 },
   overflowRequestNumbers: readonly number[] = [],
-  responder?: RealPiProviderResponder
+  responder?: RealPiProviderResponder,
+  api: "openai-completions" | "anthropic-messages" = "openai-completions"
 ): Promise<Server> {
   const overflowRequests = new Set(overflowRequestNumbers);
   const server = createServer((request, response) => {
-    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+    if (request.method !== "POST" || (api === "anthropic-messages"
+      ? request.url?.split("?")[0] !== "/v1/messages" : request.url !== "/v1/chat/completions")) {
       response.writeHead(404).end();
       return;
     }
@@ -449,12 +457,37 @@ export async function startLocalProvider(
         return;
       }
       const id = `joko-real-pi-${requests.length}`;
+      if (api === "anthropic-messages") {
+        response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
+        const emit = (type: string, fields: Record<string, unknown>) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
+        emit("message_start", { message: { id, type: "message", role: "assistant", model: REAL_PI_MODEL_ID, content: [], stop_reason: null,
+          stop_sequence: null, usage: { input_tokens: usage.promptTokens, output_tokens: 0 } } });
+        let index = 0;
+        if (reply.thinking !== undefined) {
+          emit("content_block_start", { index, content_block: { type: "thinking", thinking: "", signature: "" } });
+          emit("content_block_delta", { index, delta: { type: "thinking_delta", thinking: reply.thinking } });
+          emit("content_block_delta", { index, delta: { type: "signature_delta", signature: "controlled-pi-thinking-signature" } });
+          emit("content_block_stop", { index });
+          if (reply.holdAfterThinking !== undefined) await reply.holdAfterThinking;
+          index += 1;
+        }
+        if (reply.kind === "tool") {
+          emit("content_block_start", { index, content_block: { type: "tool_use", id: reply.callId ?? `call-${requests.length}`, name: reply.name, input: {} } });
+          emit("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(reply.arguments) } });
+        } else {
+          emit("content_block_start", { index, content_block: { type: "text", text: "" } });
+          emit("content_block_delta", { index, delta: { type: "text_delta", text: reply.text } });
+        }
+        emit("content_block_stop", { index });
+        emit("message_delta", { delta: { stop_reason: reply.kind === "tool" ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: usage.completionTokens } });
+        emit("message_stop", {}); response.end(); return;
+      }
       if (body["stream"] === false) {
         const message = reply.kind === "text" ? { role: "assistant", content: reply.text } : { role: "assistant", content: null,
           tool_calls: [{ id: reply.callId ?? `call-${requests.length}`, type: "function", function: { name: reply.name, arguments: JSON.stringify(reply.arguments) } }] };
         response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         response.end(JSON.stringify({ id, object: "chat.completion", created: 1, model: REAL_PI_MODEL_ID,
-          choices: [{ index: 0, message, finish_reason: reply.kind === "tool" ? "tool_calls" : "stop" }],
+          choices: [{ index: 0, message: { ...message, ...(reply.thinking === undefined ? {} : { reasoning_content: reply.thinking }) }, finish_reason: reply.kind === "tool" ? "tool_calls" : "stop" }],
           usage: { prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.promptTokens + usage.completionTokens } }));
         return;
       }
@@ -474,6 +507,9 @@ export async function startLocalProvider(
               function: { name: reply.name, arguments: JSON.stringify(reply.arguments) }
             }]
           };
+      if (reply.thinking !== undefined) response.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: 1,
+        model: REAL_PI_MODEL_ID, choices: [{ index: 0, delta: { role: "assistant", reasoning_content: reply.thinking }, finish_reason: null }]
+      })}\n\n`);
       response.write(`data: ${JSON.stringify({
         id,
         object: "chat.completion.chunk",

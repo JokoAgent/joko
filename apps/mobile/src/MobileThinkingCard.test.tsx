@@ -125,6 +125,10 @@ describe("native Thinking and Work cards", () => {
     expect(host.textContent).toContain("duration unknown");
     expect(host.textContent).not.toContain("elapsed");
     expect(vi.getTimerCount()).toBe(0);
+    render({ thinking: { ...active, completed: true, streaming: false, durationMs: 2_500 } });
+    expect(host.textContent).toContain("Thinking · 2s");
+    expect(host.textContent).not.toContain("unknown");
+    expect(vi.getTimerCount()).toBe(0);
     render({ thinking: active });
     act(() => root.render(null));
     expect(vi.getTimerCount()).toBe(0);

@@ -2205,11 +2205,14 @@ function useArtifactImageUrl(blobId: string, enabled: boolean, onArtifactUrl: (b
   return [state.sourceKey === sourceKey ? state : { status: "loading", sourceKey }, markFailed];
 }
 
-function ThinkingBlock({ item, locale, t }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator }): JSX.Element {
+export function ThinkingBlock({ item, locale, t }: { readonly item: TimelineItemView; readonly locale: string; readonly t: Translator }): JSX.Element {
+  const title = item.thinkingRedacted ? t("timeline.thinkingHidden")
+    : item.thinkingDurationMs === undefined ? item.title ?? t("timeline.thinking")
+    : t("timeline.thinkingDuration", { seconds: Math.floor(item.thinkingDurationMs / 1_000) });
   return (
     <details className="thinking-block" open={item.streaming || !item.collapsed}>
-      <summary><Brain aria-hidden="true" /><strong>{item.title ?? t("timeline.thinking")}</strong>{item.streaming && <span className="thinking-pulse" />}<time>{formatDateTime(item.createdAt, locale)}</time><ChevronDown className="details-chevron" aria-hidden="true" /></summary>
-      <div className="thinking-block__content markdown"><StreamingMarkdown text={item.text ?? ""} streaming={item.streaming === true} t={t} /></div>
+      <summary><Brain aria-hidden="true" /><strong>{title}</strong>{item.streaming && <span className="thinking-pulse" />}<time>{formatDateTime(item.createdAt, locale)}</time><ChevronDown className="details-chevron" aria-hidden="true" /></summary>
+      <div className="thinking-block__content markdown"><StreamingMarkdown text={item.thinkingRedacted ? t("timeline.thinkingHidden") : item.text ?? ""} streaming={item.streaming === true} t={t} /></div>
     </details>
   );
 }

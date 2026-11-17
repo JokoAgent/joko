@@ -1759,7 +1759,9 @@ function toProtoMessageBlock(block: CoreMessageBlock): contract.MessageBlock {
           case: "thinking",
           value: message<contract.MessageThinkingBlock>("joko.v1.MessageThinkingBlock", {
             text: block.text,
-            redacted: block.redacted
+            redacted: block.redacted,
+            streamBlockId: block.streamBlockId === undefined ? undefined : thinkingStreamBlockId(block.streamBlockId),
+            durationMs: block.durationMs === undefined ? undefined : BigInt(thinkingDurationMs(block.durationMs))
           })
         }
       });
@@ -1819,7 +1821,9 @@ function fromProtoMessageBlock(block: contract.MessageBlock): CoreMessageBlock {
       return {
         kind: "thinking",
         text: block.content.value.text,
-        redacted: block.content.value.redacted
+        redacted: block.content.value.redacted,
+        ...(block.content.value.streamBlockId === undefined ? {} : { streamBlockId: thinkingStreamBlockId(block.content.value.streamBlockId) }),
+        ...(block.content.value.durationMs === undefined ? {} : { durationMs: thinkingDurationMs(block.content.value.durationMs) })
       };
     case "image": {
       const image = block.content.value;
@@ -3066,13 +3070,18 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         contentIndex: payload.contentIndex ?? 0,
         delta: payload.delta
       }));
-    case "thinking_delta":
+    case "thinking_delta": {
+      validateThinkingCompletion(payload);
       return protoPayload("thinkingDelta", message<ThinkingDeltaEvent>("joko.v1.ThinkingDeltaEvent", {
         messageId: payload.blockId,
         contentIndex: payload.contentIndex ?? 0,
-        delta: payload.delta,
-        hidden: false
+        delta: payload.redacted ? "" : payload.delta,
+        hidden: payload.redacted ?? false,
+        final: payload.final ?? false,
+        finalText: payload.redacted ? undefined : payload.finalText,
+        durationMs: payload.redacted || payload.durationMs === undefined ? undefined : BigInt(thinkingDurationMs(payload.durationMs))
       }));
+    }
     case "message_complete": {
       const fingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
       const retiredNativeContext = context.session !== undefined && typeof fingerprint === "string"
@@ -3571,13 +3580,20 @@ function fromProtoEventPayload(
         delta: payload.kind.value.delta,
         contentIndex: payload.kind.value.contentIndex
       };
-    case "thinkingDelta":
-      return {
+    case "thinkingDelta": {
+      const value = payload.kind.value;
+      const thinking: Extract<EventPayload, { readonly type: "thinking_delta" }> = {
         type: "thinking_delta",
-        blockId: payload.kind.value.messageId,
-        delta: payload.kind.value.delta,
-        contentIndex: payload.kind.value.contentIndex
+        blockId: value.messageId,
+        delta: value.hidden ? "" : value.delta,
+        contentIndex: value.contentIndex,
+        ...(value.final ? { final: true } : {}),
+        ...(value.hidden ? { redacted: true } : value.finalText === undefined ? {} : { finalText: value.finalText }),
+        ...(value.hidden || value.durationMs === undefined ? {} : { durationMs: thinkingDurationMs(value.durationMs) })
       };
+      validateThinkingCompletion(thinking);
+      return thinking;
+    }
     case "messageStarted": {
       const origin = payload.kind.value.automationOrigin;
       const inputDelivery = fromProtoMessageInputDelivery(payload.kind.value.inputDelivery);
@@ -6126,6 +6142,27 @@ function positiveProtoRevision(value: Revision | undefined, fieldPath: string): 
   const revision = fromProtoRevision(value, fieldPath);
   if (revision < 1n) throw new ProtoMappingError("out_of_range", fieldPath, "Revision must be positive.");
   return revision.toString(10);
+}
+
+function thinkingDurationMs(value: number | bigint): number {
+  const result = typeof value === "bigint" ? safeNumber(value, "thinking.duration_ms") : value;
+  if (!Number.isSafeInteger(result) || result < 0) throw new ProtoMappingError("out_of_range", "thinking.duration_ms", "Thinking duration must be nonnegative safe whole milliseconds.");
+  return result;
+}
+
+function thinkingStreamBlockId(value: string): string {
+  if (!value.trim() || value.length > 512 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new ProtoMappingError("invalid_argument", "thinking.stream_block_id", "Thinking source block identity is invalid.");
+  }
+  return value;
+}
+
+function validateThinkingCompletion(value: Extract<EventPayload, { readonly type: "thinking_delta" }>): void {
+  if (!value.final && (value.finalText !== undefined || value.durationMs !== undefined)
+    || value.final && !value.redacted && value.finalText === undefined) {
+    throw new ProtoMappingError("invalid_argument", "thinking.final", "A thinking completion must carry its final text or an explicit redaction.");
+  }
+  if (value.durationMs !== undefined) thinkingDurationMs(value.durationMs);
 }
 
 function positiveSafeNumber(value: bigint, fieldPath: string): number {

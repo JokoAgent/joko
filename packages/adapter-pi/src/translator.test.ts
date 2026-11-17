@@ -11,6 +11,65 @@ import { PiEventTranslator } from "./translator.js";
 import { mkdtemp } from "./test-paths.js";
 
 describe("PiEventTranslator", () => {
+  it("finishes an original thinking block before text and adopts it at message end with phase timing", async () => {
+    const events: EventPayload[] = [];
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-thinking-owner-"));
+    const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-thinking-artifacts-"));
+    let now = 100;
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+    const translator = new PiEventTranslator({ context: context(workspace, events, []), artifactDirectory: artifacts, wasAbortRequested: () => false });
+    const update = (type: string, fields = {}) => translator.translate({ type: "message_update",
+      assistantMessageEvent: { type, contentIndex: 0, ...fields } } as unknown as PiRpcEvent);
+    try {
+      await translator.translate({ type: "message_start", message: { role: "assistant", content: [] } } as unknown as PiRpcEvent);
+      await update("thinking_start");
+      now = 140;
+      await update("thinking_delta", { delta: "Draft thinking" });
+      const source = events.find(event => event.type === "thinking_delta")!;
+      now = 350;
+      await update("thinking_end", { content: "Final corrected thinking" });
+      expect(events.at(-1)).toMatchObject({ type: "thinking_delta", blockId: source.type === "thinking_delta" ? source.blockId : "",
+        contentIndex: 0, final: true, finalText: "Final corrected thinking", delta: "", durationMs: 250 });
+      const sealed = events.length;
+      await update("thinking_delta", { delta: "late fragment" });
+      await update("thinking_end", { content: "duplicate end" });
+      expect(events).toHaveLength(sealed);
+      await translator.translate({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "Answer" } } as unknown as PiRpcEvent);
+      expect(events.at(-1)?.type).toBe("text_delta");
+      await translator.translate({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [
+        { type: "thinking", thinking: "Final corrected thinking" }, { type: "text", text: "Answer" },
+        { type: "toolCall", id: "tool-after-thinking", name: "read", arguments: { path: "notes.txt" } }
+      ] } } as unknown as PiRpcEvent);
+      expect(events.at(-1)).toMatchObject({ type: "message_complete", blocks: [
+        { kind: "thinking", streamBlockId: source.type === "thinking_delta" ? source.blockId : "", text: "Final corrected thinking", durationMs: 250 },
+        { kind: "text", text: "Answer" }, { kind: "tool_call", callId: "tool-after-thinking" }
+      ] });
+      await translator.translate({ type: "message_start", message: { role: "assistant", content: [] } } as unknown as PiRpcEvent);
+      await update("thinking_delta", { delta: "Next message" });
+      expect(events.at(-1)).not.toHaveProperty("blockId", source.type === "thinking_delta" ? source.blockId : "");
+    } finally { clock.mockRestore(); await rm(workspace, { recursive: true, force: true }); await rm(artifacts, { recursive: true, force: true }); }
+  });
+
+  it("clears a visible block when Pi marks its partial thinking redacted and never restores its body at completion", async () => {
+    const events: EventPayload[] = [];
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-thinking-redacted-"));
+    const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-thinking-redacted-artifacts-"));
+    const translator = new PiEventTranslator({ context: context(workspace, events, []), artifactDirectory: artifacts, wasAbortRequested: () => false });
+    try {
+      await translator.translate({ type: "message_start", message: { role: "assistant", content: [] } } as unknown as PiRpcEvent);
+      await translator.translate({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Previously visible" } } as unknown as PiRpcEvent);
+      const partial = { content: [{ type: "thinking", thinking: "PRIVATE REASONING", redacted: true }] };
+      await translator.translate({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "PRIVATE REASONING", partial } } as unknown as PiRpcEvent);
+      expect(events.at(-1)).toMatchObject({ type: "thinking_delta", delta: "", redacted: true });
+      await translator.translate({ type: "message_update", assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "PRIVATE REASONING", partial } } as unknown as PiRpcEvent);
+      expect(events.at(-1)).toMatchObject({ type: "thinking_delta", final: true, finalText: "", redacted: true });
+      expect(events.at(-1)).not.toHaveProperty("durationMs");
+      await translator.translate({ type: "message_end", message: { role: "assistant", content: [{ type: "thinking", thinking: "PRIVATE REASONING" }] } } as unknown as PiRpcEvent);
+      expect(events.at(-1)).toMatchObject({ type: "message_complete", blocks: [{ kind: "thinking", redacted: true, text: "[redacted by provider]" }] });
+      expect(JSON.stringify(events)).not.toContain("PRIVATE REASONING");
+    } finally { await rm(workspace, { recursive: true, force: true }); await rm(artifacts, { recursive: true, force: true }); }
+  });
+
   it("consumes the explicit delta from the current Pi message-update wire", async () => {
     const events: EventPayload[] = [];
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-message-wire-workspace-"));

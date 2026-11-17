@@ -605,7 +605,14 @@ function validateBlock(value: unknown): asserts value is MessageBlock {
     case "thinking":
       boundedString(value["text"], "thinking block");
       if (typeof value["redacted"] !== "boolean") throw invalid("Portable Session thinking block is invalid.");
-      assertExactKeys(value, ["kind", "text", "redacted"], "thinking block");
+      if (value["streamBlockId"] !== undefined) {
+        boundedNonEmptyString(value["streamBlockId"], "thinking source block", 512);
+        if (/[\u0000-\u001f\u007f]/u.test(value["streamBlockId"])) throw invalid("Portable Session thinking source block is invalid.");
+      }
+      if (value["durationMs"] !== undefined && (!Number.isSafeInteger(value["durationMs"]) || (value["durationMs"] as number) < 0)) {
+        throw invalid("Portable Session thinking duration is invalid.");
+      }
+      assertExactKeys(value, ["kind", "text", "redacted", "streamBlockId", "durationMs"], "thinking block");
       return;
     case "image":
       validateBlob(value["blob"]);

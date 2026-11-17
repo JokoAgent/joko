@@ -45,6 +45,31 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("round-trips independent thinking completion and exact source-block adoption without changing message accounting identity", () => {
+    const base = { id: "thinking-event", backendId: "pi", targetId: "target", sessionId: "task", runId: "run", attemptId: "attempt",
+      generation: 7, sequence: 2n, globalCursor: 2n, revision: 2n, emittedAt: 100, traceId: "thinking" };
+    const payload = { type: "thinking_delta", blockId: "original-block", contentIndex: 2, delta: "", final: true,
+      finalText: "Final reasoning", durationMs: 250 } as const;
+    const wire = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent({ ...base, payload })));
+    expect(wire.payload?.kind).toMatchObject({ case: "thinkingDelta", value: { messageId: "original-block", final: true, finalText: "Final reasoning", durationMs: 250n } });
+    expect(fromProtoEvent(wire).payload).toEqual(payload);
+    const completion = { type: "message_complete", role: "assistant", blocks: [{ kind: "thinking", text: "Final reasoning", redacted: false,
+      streamBlockId: "original-block", durationMs: 250 }] } as const;
+    const completed = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent({ ...base, id: "completion-event", payload: completion })));
+    expect(completed.payload?.kind).toMatchObject({ case: "messageCompleted", value: { messageId: "completion-event", blocks: [
+      { content: { case: "thinking", value: { streamBlockId: "original-block", durationMs: 250n } } }
+    ] } });
+    expect(fromProtoEvent(completed).payload).toEqual(completion);
+    const hidden = toProtoEvent({ ...base, payload: { ...payload, redacted: true, finalText: "PRIVATE REASONING" } });
+    expect(JSON.stringify(hidden, (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("PRIVATE REASONING");
+    expect(hidden.payload?.kind).toMatchObject({ case: "thinkingDelta", value: { hidden: true, delta: "", final: true } });
+    for (const durationMs of [-1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => toProtoEvent({ ...base, payload: { ...payload, durationMs } })).toThrow(ProtoMappingError);
+    }
+    expect(() => toProtoEvent({ ...base, payload: { ...payload, final: false } })).toThrow(ProtoMappingError);
+    expect(() => toProtoEvent({ ...base, payload: { ...completion, blocks: [{ ...completion.blocks[0], streamBlockId: "\n" }] } })).toThrow(ProtoMappingError);
+  });
+
   it("projects an exact sampling interruption through the existing terminal status without granting native history identity", () => {
     const event = { id: "sample-ended", backendId: "codex", targetId: "target", sessionId: "task", runId: "run", attemptId: "attempt",
       generation: 7, sequence: 2n, globalCursor: 2n, revision: 2n, emittedAt: 100, traceId: "sample-ended",
