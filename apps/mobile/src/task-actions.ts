@@ -13,12 +13,14 @@ import {
   type QueueTextEditSplice
 } from "@joko/contracts";
 import type { TimelineRow } from "./timeline";
-import { insertMobileMessageReference, mobileVisibleSelectionQuoteText,
+import { appendMobileSelectionQuote, emptyMobileComposerDraft, insertMobileMessageReference,
+  mobileSelectionQuoteMaximumCharacters, mobileVisibleSelectionQuoteText,
   type MobileComposerDraft, type MobileComposerEditResult, type MobileComposerSelection } from "./mobile-composer-document";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { mobileSideChatCopy } from "./mobile-side-chat";
 
-export type MobileMessageActionId = "add-to-composer" | "reply" | "quote-selection" | "copy-text" | "copy-link" | "share-image" | "fork" | "rewind" | "delete";
+export type MobileMessageActionId = "add-to-composer" | "reply" | "quote-selection" | "side-chat" | "copy-text" | "copy-link" | "share-image" | "fork" | "rewind" | "delete";
 
 export interface MobileMessageActionItem {
   readonly id: MobileMessageActionId;
@@ -73,10 +75,28 @@ export function commitMobileMessageReference(input: { readonly lease: MobileMess
     { sessionId: lease.sessionId, messageId: lease.messageId, eventId: lease.eventId, text: lease.text }, input.atomId);
 }
 
+function sideChatQuoteText(row: TimelineRow, locale: MobileSupportedLocale): string | undefined {
+  if (!row.completed || row.optimistic || row.internalInput || row.partnerPrivateOrigin
+    || row.kind !== "user" && row.kind !== "assistant") return undefined;
+  const text = buildMobileMessageCopyText(row, locale);
+  return text.trim() && text.length <= mobileSelectionQuoteMaximumCharacters ? text : undefined;
+}
+
+export function createMobileSideChatMessageDraft(sessionId: string, selected: TimelineRow, latest: TimelineRow,
+  locale: MobileSupportedLocale, atomId: string): MobileComposerDraft {
+  const text = sideChatQuoteText(latest, locale);
+  if (!text || selected.id !== latest.id || selected.eventId !== latest.eventId || selected.kind !== latest.kind
+    || (latest.kind !== "user" && latest.kind !== "assistant") || text !== sideChatQuoteText(selected, locale)) {
+    throw new Error("The source message changed. Open its current message actions again.");
+  }
+  return appendMobileSelectionQuote(emptyMobileComposerDraft(), { sourceSessionId: sessionId,
+    sourceMessageId: latest.id, sourceEventId: latest.eventId, sourceRole: latest.kind, text }, atomId).draft;
+}
+
 export function buildMobileMessageActions(
   row: TimelineRow,
   input: { readonly canDelete: boolean; readonly canFork?: boolean; readonly canRewind?: boolean; readonly canAddToComposer?: boolean; readonly canReplyQuote?: boolean;
-    readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly canCopyLink?: boolean; readonly shareDisabled?: boolean }
+    readonly canOpenSideChat?: boolean; readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly canCopyLink?: boolean; readonly shareDisabled?: boolean }
 ): readonly MobileMessageActionItem[] {
   if (!row.completed || row.optimistic || row.internalInput || row.kind === "user" && row.partnerPrivateOrigin
     || (row.kind !== "user" && row.kind !== "assistant")) return [];
@@ -87,6 +107,7 @@ export function buildMobileMessageActions(
   if (input.canReplyQuote) actions.push({ id: 'reply', label: input.locale === 'zh-CN' ? '引用回复' : 'Reply' });
   else if (input.canAddToComposer !== false) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
   if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: mobileMessage(input.locale, "actions.quoteSelection") });
+  if (input.canOpenSideChat && sideChatQuoteText(row, input.locale)) actions.push({ id: "side-chat", label: mobileSideChatCopy(input.locale).create });
   if (input.canCopyLink !== false) actions.push({
     id: "copy-link",
     label: mobileMessage(input.locale, input.copyDisabled ? "actions.copyingLink" : "actions.copyMessageLink"),

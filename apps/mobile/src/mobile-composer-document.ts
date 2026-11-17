@@ -94,7 +94,7 @@ export interface MobileComposerQuoteAtom {
   readonly sourceSessionId: string;
   readonly sourceMessageId: string;
   readonly sourceEventId: string;
-  /** A restored quote can retain its canonical containing user input. */
+  /** The role of the message that supplied the quote. */
   readonly sourceRole: "assistant" | "user";
   readonly text: string;
   readonly start: number;
@@ -607,7 +607,7 @@ export function appendMobileSelectionQuote(
     readonly sourceSessionId: string;
     readonly sourceMessageId: string;
     readonly sourceEventId: string;
-    readonly sourceRole: "assistant";
+    readonly sourceRole: MobileComposerQuoteAtom["sourceRole"];
     readonly text: string;
   },
   atomId: string

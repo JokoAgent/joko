@@ -259,6 +259,7 @@ import {
   mobileComposerDraftsEqual,
   mobileComposerInput,
   normalizeMobileComposerDraft,
+  plainTextMobileComposerDraft,
   recoverMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
@@ -776,6 +777,7 @@ const newTaskAwaitingSession = "The task was created. Its first message is retai
 export type MobileAppCommandOutcome =
   | { readonly kind: "help"; readonly status: "succeeded" }
   | { readonly kind: "jumpSession"; readonly status: "succeeded"; readonly sessionId: string }
+  | { readonly kind: "sideChat"; readonly status: "succeeded" | "rejected" | "unknown" | "retired" }
   | { readonly kind: "userShell" | "sessionReset"; readonly status: "succeeded" | "rejected" | "unknown" }
   | { readonly kind: "review"; readonly status: "succeeded" | "rejected" | "unknown"; readonly reviewRunId?: string };
 
@@ -12308,7 +12310,8 @@ export class MobileClient {
       this.#taskAuthorityKey(),
       this.#state.owner,
       this.#state.detail,
-      this.#state.selectedId
+      this.#state.selectedId,
+      this.taskSideChatControls()?.canOpen === true
     );
   }
 
@@ -13156,6 +13159,25 @@ export class MobileClient {
         throw error;
       }
       return { kind: "jumpSession", status: "succeeded", sessionId: command.sessionId };
+    }
+
+    if (command.kind === "sideChat") {
+      const sideChat = this.taskSideChatControls(), epoch = this.#epoch;
+      if (!sideChat?.canOpen || sideChat.sourceSessionId !== identity.sessionId) throw new Error("The side chat source changed.");
+      const isCurrent = () => this.#current(epoch) && this.#foreground && this.#credential === current.credential
+        && this.taskSideChatControls()?.surfaceOwnerKey === sideChat.surfaceOwnerKey;
+      const result = await this.openSideChat(sideChat.authorityKey, plainTextMobileComposerDraft(command.text));
+      if (result.kind !== "opened") return { kind: "sideChat", status: result.kind };
+      let clearError: string | undefined;
+      if (isCurrent()) {
+        try { await this.composerDrafts.clearIfRevision(identity, snapshot.revision); }
+        catch (error) { clearError = message(error); }
+      }
+      if (isCurrent()) {
+        await this.select(result.sessionId);
+        if (clearError && this.#credential === current.credential && this.#state.selectedId === result.sessionId) this.#set({ error: clearError });
+      }
+      return { kind: "sideChat", status: "succeeded" };
     }
 
     if (!isMobileRemoteAppCommandInvocation(command)) {

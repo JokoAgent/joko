@@ -12648,6 +12648,40 @@ describe("native current-task cloning", () => {
     expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "cloned-task" }))?.text).toBe("Retain me");
   });
 
+  it.each(["unchanged", "edited", "unknown"] as const)("sends /side only as a child draft while the original composer is %s", async source => {
+    const f = fixture(true), saved = memoryStorage(credential), drafts = memoryDraftStores();
+    const parent = { profileId: credential.profileId, sessionId: "session" };
+    const original = plainTextMobileComposerDraft("/side Keep this in the child");
+    vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(operationId).toBe("side-command");
+      expect(mutation.payload).toMatchObject({ case: "openSideChat", value: { sourceSessionId: "session" } });
+      expect((await drafts.composer.readOperationInput(parent, operationId))?.text).toBe("Keep this in the child");
+      if (source === "unknown") throw new Error("Side Chat receipt was lost");
+      if (source === "edited") drafts.composer.save(parent, plainTextMobileComposerDraft("Newer source draft"));
+      f.state.derived = f.child();
+      return f.operation(operationId);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, () => "side-command", undefined, drafts);
+    await app.start();
+    const controls = app.taskAppCommandControls()!;
+    expect(controls.policy.sideChat).toBe(true);
+    await expect(app.executeTaskAppCommand(controls.surfaceOwnerKey, { kind: "sideChat", text: "Keep this in the child" }, original))
+      .resolves.toEqual({ kind: "sideChat", status: source === "unknown" ? "unknown" : "succeeded" });
+    expect(f.network.submit).toHaveBeenCalledOnce();
+    const child = { ...parent, sessionId: "cloned-task" };
+    if (source === "unknown") {
+      expect(app.state.selectedId).toBe("session");
+      expect(drafts.composer.readSync(parent)).toEqual(original);
+      expect(drafts.composer.readSync(child)).toBeNull();
+      expect(saved.pending()).toMatchObject([{ operationId: "side-command", kind: "session-side-chat", state: "unknown" }]);
+    } else {
+      expect(app.state.selectedId).toBe(child.sessionId);
+      expect((await drafts.composer.readDurable(child))?.text).toBe("Keep this in the child");
+      expect(drafts.composer.readSync(parent)?.text ?? null).toBe(source === "edited" ? "Newer source draft" : null);
+      expect(saved.pending()).toEqual([]);
+    }
+  });
+
   it("clones an active task through a preconditioned typed operation after saving a body-free receipt", async () => {
     const f = fixture();
     f.state.session = create(SessionSchema, { ...runtimeSession, state: SessionState.RUNNING });

@@ -10,7 +10,7 @@ import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
 import type { MobileComposerRichInput } from "./MobileComposerRichInput";
 import type { MobileRuntimeCommandPalette } from "./MobileRuntimeCommandPalette";
-import type { MobileState, MobileTaskSendObserver } from "./mobile-client";
+import type { MobileClient, MobileState, MobileTaskSendObserver } from "./mobile-client";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import type { MobileObjectiveApi } from "./mobile-objective";
@@ -95,10 +95,14 @@ const catalog = { surfaceOwnerKey: runtime.surfaceOwnerKey, sessionId: "session"
 const resource = { kind: "resource" as const, resourceId: "opaque-skill", displayText: "Native catalog display", resourceKind: ResourceKind.SKILL,
   discoveredRevision: "content-sha", resourceVersion: "11", runtimeGeneration: "7" };
 let current = true;
+let sideChatAvailable = false;
 const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(SessionSchema, { sessionId: "session" }),
   policy: { help: true as const, jumpSession: true as const, userShell: false, sessionReset: false, review: false }, jumpSessionIds: ["session"] };
 const resolveResource = vi.fn(async () => resource);
 const send = vi.fn(async (_draft: MobileComposerDraft, _observer?: MobileTaskSendObserver) => true);
+const openSideChat = vi.fn<MobileClient["openSideChat"]>();
+const executeTaskAppCommand = vi.fn<MobileClient["executeTaskAppCommand"]>();
+const select = vi.fn(async (_sessionId: string) => {});
 const stopTaskTurn = vi.fn(async (_authorityKey: string, _current: () => boolean) => true);
 let stopControl: { authorityKey: string; pending: boolean } | undefined;
 const loadEarlier = vi.fn(async () => undefined);
@@ -124,7 +128,10 @@ const client = new Proxy({
   taskDraftProfileId: () => renderedState.activeProfileId,
   taskHeaderSourceKey: () => sendFollowSourceKey,
   taskPresentationOwnerKey: () => sendFollowPresentationKey ?? sendFollowSourceKey,
-  taskAppCommandControls: () => current ? appControls : undefined,
+  taskAppCommandControls: () => current ? (sideChatAvailable ? { ...appControls, policy: { ...appControls.policy, sideChat: true as const } } : appControls) : undefined,
+  taskSideChatControls: () => sideChatAvailable
+    ? { authorityKey: "side-owner", canOpen: true, sourceSessionId: "session", children: [] } : undefined,
+  openSideChat, executeTaskAppCommand, select,
   taskRuntimeCommandControls: () => current ? runtime : undefined,
   listTaskRuntimeCommands: vi.fn(async () => catalog),
   resolveTaskRuntimeCommandResource: resolveResource,
@@ -262,6 +269,10 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockReset().mockResolvedValue(true);
+  sideChatAvailable = false;
+  openSideChat.mockReset().mockResolvedValue({ kind: "opened", sessionId: "side-child" });
+  executeTaskAppCommand.mockReset().mockResolvedValue({ kind: "sideChat", status: "succeeded" });
+  select.mockClear();
   stopControl = undefined; stopTaskTurn.mockReset().mockResolvedValue(true);
   returnToLatest.mockClear();
   loadEarlier.mockReset().mockResolvedValue(undefined);
@@ -464,6 +475,20 @@ describe("actual App slash Skill selection", () => {
     expect(input.draft.text).toBe(retirement === "edit" ? "/an arguments changed" : "/an arguments");
     expect(input.draft.mentions).toEqual([]); expect(send).not.toHaveBeenCalled();
   });
+});
+
+it("dispatches a typed /side from the actual composer through the Side Chat command", async () => {
+  sideChatAvailable = true;
+  const source = plainTextMobileComposerDraft("/side A question for the child");
+  drafts.save(identity, source);
+  await drafts.flush(identity);
+  await render(false);
+  const button = Array.from(host.querySelectorAll("button")).find(element => element.textContent === mobileMessage("en", "composer.send"));
+  await act(async () => button!.click());
+  expect(executeTaskAppCommand).toHaveBeenCalledExactlyOnceWith(appControls.surfaceOwnerKey, {
+    kind: "sideChat", text: "A question for the child"
+  }, source);
+  expect(send).not.toHaveBeenCalled();
 });
 
 it.each(["ordinary open", "manual drag", "explicit message focus"] as const)("uses the initial task tail only for an %s", async (opening) => {
@@ -973,6 +998,26 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
   expect(taskMessageActions?.items.map(item => item.id)).toContain("copy-link");
   await act(async () => taskMessageActions!.onAction("copy-link"));
   expect(writeClipboard).toHaveBeenCalledExactlyOnceWith("joko://task/session?message=native-entry&event=adopted-completion&server=node");
+});
+
+it("opens the actual message menu's Side Chat with the complete current reply quoted", async () => {
+  sideChatAvailable = true;
+  sendFollowSourceKey = "task-source";
+  const answer = create(EventSchema, { eventId: "reply-event", identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 1n },
+    payload: { kind: { case: "messageCompleted", value: { messageId: "reply", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "Use this complete answer." } }] } } } });
+  renderedState = { ...state, live: [answer] };
+  await act(async () => root.render(taskScreen()));
+  const more = [...host.querySelectorAll("button")].find(button => button.getAttribute("aria-label")
+    === mobileMessage("en", "task.moreFor", { name: "Assistant" }));
+  await act(async () => more!.click());
+  expect(taskMessageActions?.items.map(item => item.id)).toContain("side-chat");
+  await act(async () => taskMessageActions!.onAction("side-chat"));
+  expect(openSideChat).toHaveBeenCalledExactlyOnceWith("side-owner", expect.objectContaining({
+    atoms: [expect.objectContaining({ kind: "quote", sourceMessageId: "reply", sourceEventId: "reply-event", text: "Use this complete answer." })]
+  }));
+  expect(select).toHaveBeenCalledExactlyOnceWith("side-child");
+  expect(send).not.toHaveBeenCalled();
 });
 
 it.each(["same request", "resolved while reconnecting"] as const)("retains the original question draft across a transient empty task (%s)", async outcome => {

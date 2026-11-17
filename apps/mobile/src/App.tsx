@@ -305,7 +305,7 @@ import {
   type MobileFilesSearchMode
 } from "./workspace-files";
 import { buildMobileMessageActions, buildMobileMessageCopyText, captureMobileMessageReference, commitMobileMessageReference,
-  queueItemText, type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
+  createMobileSideChatMessageDraft, queueItemText, type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
 import { useMobileVoicePermissionSettings } from "./use-mobile-voice-permission-settings";
 import { MobileVoiceDictionaryController } from "./mobile-voice-dictionary-controller";
@@ -5007,6 +5007,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       canCopyLink: mobileMessageLinkAvailable(state, messageAction.row),
       canAddToComposer: composerOwnerReady && messageAction.reference !== undefined,
       canReplyQuote: composerOwnerReady && partnerIdentity.partner !== undefined && messageAction.reference !== undefined,
+      canOpenSideChat: sideChatControls?.canOpen === true && !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined,
       canFork: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && client.taskMessageForkControls(messageAction.row.eventId)?.canFork === true,
       canRewind: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined
         && client.taskMessageRewindControls(messageAction.row.eventId)?.canRewind === true,
@@ -6024,6 +6025,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       setLocalError(errorText(failure));
     }
   };
+  const openSideChatDraft = (authorityKey: string, draft?: MobileComposerDraft): void => {
+    void client.openSideChat(authorityKey, draft).then(async (result) => {
+      if (!taskMountedRef.current || client.taskSideChatControls()?.authorityKey !== authorityKey) return;
+      if (result.kind === "opened") await client.select(result.sessionId);
+      else if (result.kind === "unknown") setLocalError(mobileSideChatCopy(locale).unknown);
+    }).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
+  };
   const askInSideChat = (selection?: MobileComposerSelection): void => {
     const controls = client.taskSideChatControls();
     if (!controls?.canOpen || state.busy || voice.busy || attachmentBusy) return;
@@ -6042,11 +6050,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           latestRow: latest, selection, draft: emptyMobileComposerDraft(), atomId: randomUUID() }).draft;
       }
       setQuoteSelection(undefined);
-      void client.openSideChat(controls.authorityKey, sideDraft).then(async (result) => {
-        if (!taskMountedRef.current) return;
-        if (result.kind === "opened") await client.select(result.sessionId);
-        else if (result.kind === "unknown") setLocalError(mobileSideChatCopy(locale).unknown);
-      }).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
+      openSideChatDraft(controls.authorityKey, sideDraft);
     } catch (failure) { setLocalError(errorText(failure)); }
   };
 
@@ -6227,6 +6231,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     }
     if (state.status !== "connected" || voice.busy) return;
     if (workerReadOnly && ["fork", "rewind", "delete"].includes(action)) return;
+    if (action === "side-chat") {
+      if (workerReadOnly || partnerIdentity.partner || state.busy || attachmentBusy || queueEditRef.current) return;
+      const controls = client.taskSideChatControls();
+      if (!controls?.canOpen || controls.sourceSessionId !== selected.sessionId) return;
+      try { openSideChatDraft(controls.authorityKey, createMobileSideChatMessageDraft(selected.sessionId, selected.row, latest, locale, randomUUID())); }
+      catch (failure) { setLocalError(errorText(failure)); }
+      return;
+    }
     if (action === "fork") {
       if (state.busy || attachmentBusy || !client.taskMessageForkControls(latest.eventId)?.canFork) return;
       setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false);
@@ -6358,7 +6370,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const identity = draftIdentityRef.current;
         const sourceDraft = composerDraftRef.current;
         const intent = mobileAppCommandIntent(sourceDraft);
-        if (intent !== undefined && state.taskSource?.kind !== "joined") {
+        const runtimeSide = intent === "sideChat" && runtimeCommandPaletteStatus === "ready"
+          && runtimeCommandCatalog?.items.some(candidate => candidate.name.toLowerCase() === "side");
+        if (intent !== undefined && !runtimeSide && state.taskSource?.kind !== "joined") {
           const controls = client.taskAppCommandControls();
           const invocation = parseMobileAppCommand(sourceDraft, controls);
           if (!identity || !controls || !invocation) {
@@ -6390,7 +6404,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           if (outcome.kind === "help") {
             setCommandHelpItems(helpItems);
           } else if (outcome.status === "unknown") {
-            setComposerNotice(mobileMessage(locale, "task.command.unknown"));
+            setComposerNotice(outcome.kind === "sideChat" ? mobileSideChatCopy(locale).unknown : mobileMessage(locale, "task.command.unknown"));
           } else if (outcome.status === "rejected") {
             setLocalError(mobileMessage(locale, "task.command.rejected"));
           } else if (outcome.kind === "userShell") {
