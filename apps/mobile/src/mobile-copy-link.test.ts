@@ -17,6 +17,19 @@ import { timelineRows } from "./timeline";
 afterEach(() => vi.useRealTimers());
 
 describe("mobile public-link clipboard writer", () => {
+  it("copies canonical public node identities and retires the captured source when the saved node changes", async () => {
+    const state = snapshot({ savedSources: [{ profileId: "profile-one", serverId: "node-one" }] });
+    const authority = claimMobileCopyLinkAuthority(state, { sessionId: "task-one", requiresSelectedSession: false })!;
+    expect(authority.serverId).toBe("node-one");
+    expect(mobileCopyLinkAuthorityMatches(authority, snapshot({ savedSources: [{ profileId: "profile-one", serverId: "replacement" }] }))).toBe(false);
+    const writeText = vi.fn(async () => undefined);
+    const writer = new MobileCopyLinkWriter({ writeText });
+    const url = buildMobileMessageDeepLink("task-one", "message-one", "event-one", authority.serverId);
+    await expect(writer.copy(url)).resolves.toBe("copied");
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(url);
+    await expect(writer.copy(`${url}&profile=profile-one`)).rejects.toThrow(/canonical/u);
+  });
+
   it("claims exact online or offline owners and retires profile, page, task, and message drift", () => {
     const current = snapshot();
     const task = claimMobileCopyLinkAuthority(current, {

@@ -16,7 +16,7 @@ import {
 } from "./mobile-composer-document";
 import type { MobileRuntimeCommandCandidate } from "./mobile-runtime-commands";
 
-export type MobileAppCommandKind = "help" | "jumpSession" | "userShell" | "sessionReset" | "review";
+export type MobileAppCommandKind = "help" | "jumpSession" | "userShell" | "sessionReset" | "review" | "sideChat";
 
 export interface MobileAppCommandPolicy {
   readonly help: true;
@@ -24,6 +24,7 @@ export interface MobileAppCommandPolicy {
   readonly userShell: boolean;
   readonly sessionReset: boolean;
   readonly review: boolean;
+  readonly sideChat?: true;
 }
 
 export interface MobileAppCommandControls {
@@ -38,8 +39,8 @@ export interface MobileAppCommandControls {
 }
 
 export interface MobileAppCommandCandidate {
-  readonly commandId: `builtin:${"help" | "jump-session" | "cmd" | "clear" | "review"}`;
-  readonly name: "help" | "jump-session" | "cmd" | "clear" | "review";
+  readonly commandId: `builtin:${"help" | "jump-session" | "cmd" | "clear" | "review" | "side"}`;
+  readonly name: "help" | "jump-session" | "cmd" | "clear" | "review" | "side";
   readonly description: string;
   readonly appCommand: MobileAppCommandKind;
 }
@@ -51,11 +52,12 @@ export type MobileAppCommandInvocation =
   | { readonly kind: "jumpSession"; readonly sessionId: string }
   | { readonly kind: "userShell"; readonly command: string }
   | { readonly kind: "sessionReset" }
-  | { readonly kind: "review"; readonly focus: string };
+  | { readonly kind: "review"; readonly focus: string }
+  | { readonly kind: "sideChat"; readonly text: string };
 
 export type MobileRemoteAppCommandInvocation = Exclude<
   MobileAppCommandInvocation,
-  { readonly kind: "help" } | { readonly kind: "jumpSession" }
+  { readonly kind: "help" } | { readonly kind: "jumpSession" } | { readonly kind: "sideChat" }
 >;
 
 export interface MobileCommandPaletteResults {
@@ -94,7 +96,8 @@ export function createMobileAppCommandControls(
   authorityKey: string | undefined,
   owner: Snapshot | undefined,
   detail: Snapshot | undefined,
-  selectedId: string | undefined
+  selectedId: string | undefined,
+  canOpenSideChat = false
 ): MobileAppCommandControls | undefined {
   if (!authorityKey || !owner || !detail || !validIdentity(selectedId, 1_024)
     || owner.generation !== detail.generation) return undefined;
@@ -134,7 +137,8 @@ export function createMobileAppCommandControls(
     jumpSession: true as const,
     userShell: remoteAllowed && supportedOnce(ownerBackend, capabilityNames.runtimeUserShell),
     sessionReset: remoteAllowed && supportedOnce(ownerBackend, capabilityNames.sessionReset),
-    review: remoteAllowed && supportedOnce(ownerBackend, capabilityNames.reviewIsolated)
+    review: remoteAllowed && supportedOnce(ownerBackend, capabilityNames.reviewIsolated),
+    ...(canOpenSideChat ? { sideChat: true as const } : {})
   };
   return {
     authorityKey,
@@ -169,7 +173,9 @@ export function mobileAppCommandCandidates(
     ...(controls.policy.sessionReset ? [{ commandId: "builtin:clear" as const, name: "clear" as const,
       appCommand: "sessionReset" as const, description: "Clear task context" }] : []),
     ...(controls.policy.review ? [{ commandId: "builtin:review" as const, name: "review" as const,
-      appCommand: "review" as const, description: "Review current work in an independent read-only task" }] : [])
+      appCommand: "review" as const, description: "Review current work in an independent read-only task" }] : []),
+    ...(controls.policy.sideChat ? [{ commandId: "builtin:side" as const, name: "side" as const,
+      appCommand: "sideChat" as const, description: "Open a side chat with a follow-up draft" }] : [])
   ];
 }
 
@@ -177,7 +183,8 @@ export function mergeMobileCommandPaletteCandidates(
   controls: MobileAppCommandControls,
   runtimeCommands: readonly MobileRuntimeCommandCandidate[] = []
 ): readonly MobileCommandPaletteCandidate[] {
-  const app = mobileAppCommandCandidates(controls);
+  const runtimeSide = runtimeCommands.some(candidate => candidate.name.toLowerCase() === "side");
+  const app = mobileAppCommandCandidates(controls).filter(candidate => candidate.name !== "side" || !runtimeSide);
   const names = new Set<string>(reservedAppCommandNames);
   return [
     ...app,
@@ -198,6 +205,7 @@ export function mobileAppCommandIntent(draft: MobileComposerDraft): MobileAppCom
   if (token === "cmd") return "userShell";
   if (token === "clear") return "sessionReset";
   if (token === "review") return "review";
+  if (token === "side") return "sideChat";
   return undefined;
 }
 
@@ -259,6 +267,10 @@ export function parseMobileAppCommand(
     if (review) return { kind: "review", focus: (review[1] ?? "").trim() };
   }
   if (controls.policy.sessionReset && /^\s*\/clear\s*$/u.test(text)) return { kind: "sessionReset" };
+  if (controls.policy.sideChat) {
+    const side = text.match(/^\s*\/side(?:\s+([\s\S]*?))?\s*$/iu);
+    if (side) return { kind: "sideChat", text: (side[1] ?? "").trim() };
+  }
   return undefined;
 }
 
@@ -280,6 +292,9 @@ export function assertMobileAppCommandInvocation(
       ? "Remove attachments before opening another task."
       : "Remove attachments before running a shell command.");
   }
+  if (parsed.kind === "sideChat" && exact.attachments.length > 0) {
+    throw new Error("Remove attachments before opening a side chat.");
+  }
   if (parsed.kind === "jumpSession") {
     if (!parsed.sessionId) throw new Error("Usage: /jump-session <task ID>");
     if (!controls?.jumpSessionIds.includes(parsed.sessionId)) {
@@ -300,6 +315,7 @@ function sameInvocation(left: MobileAppCommandInvocation, right: MobileAppComman
   if (left.kind === "jumpSession" && right.kind === "jumpSession") return left.sessionId === right.sessionId;
   if (left.kind === "userShell" && right.kind === "userShell") return left.command === right.command;
   if (left.kind === "review" && right.kind === "review") return left.focus === right.focus;
+  if (left.kind === "sideChat" && right.kind === "sideChat") return left.text === right.text;
   return true;
 }
 

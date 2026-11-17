@@ -36,6 +36,7 @@ export interface DesktopInboundNavigationClaim {
 export interface DesktopSessionDeepLinkInput {
   readonly sessionId: string;
   readonly profileId?: string;
+  readonly serverId?: string;
   readonly messageId?: string;
   readonly messageEventId?: string;
 }
@@ -90,6 +91,7 @@ export function parseDesktopDeepLink(value: unknown): ParsedDesktopDeepLink | un
 export function buildDesktopSessionDeepLink(input: DesktopSessionDeepLinkInput): string {
   requireIdentity(input.sessionId, "Task identity");
   if (input.profileId !== undefined) requireIdentity(input.profileId, "Machine identity");
+  if (input.serverId !== undefined) requireIdentity(input.serverId, "Node identity");
   if (input.messageId !== undefined) requireIdentity(input.messageId, "Message identity");
   if (input.messageEventId !== undefined) {
     requireIdentity(input.messageEventId, "Message event identity");
@@ -99,6 +101,7 @@ export function buildDesktopSessionDeepLink(input: DesktopSessionDeepLinkInput):
   if (input.messageEventId !== undefined) query.set("event", input.messageEventId);
   if (input.messageId !== undefined) query.set("message", input.messageId);
   if (input.profileId !== undefined) query.set("profile", input.profileId);
+  if (input.serverId !== undefined) query.set("server", input.serverId);
   return requireBoundedPublicDeepLink(`${DESKTOP_DEEP_LINK_SCHEME}://task/${encodeURIComponent(input.sessionId)}` +
     (query.size === 0 ? "" : `?${query.toString()}`));
 }
@@ -271,18 +274,20 @@ export class DesktopInboundOpenIntentFence {
 }
 
 function parseSessionUrl(url: URL): Extract<ParsedDesktopDeepLink, { readonly kind: "session" }> | undefined {
-  if (!exactQuery(url, ["event", "message", "profile"])) return undefined;
+  if (!exactQuery(url, ["event", "message", "profile", "server"])) return undefined;
   const sessionId = oneEncodedPathComponent(url.pathname);
   if (!boundedIdentity(sessionId)) return undefined;
   const profileId = optionalIdentityQuery(url, "profile");
+  const serverId = optionalIdentityQuery(url, "server");
   const messageId = optionalIdentityQuery(url, "message");
   const messageEventId = optionalIdentityQuery(url, "event");
-  if (profileId === false || messageId === false || messageEventId === false ||
+  if (profileId === false || serverId === false || messageId === false || messageEventId === false ||
     (messageEventId !== undefined && messageId === undefined)) return undefined;
   return Object.freeze({
     kind: "session",
     sessionId,
     ...(profileId === undefined ? {} : { profileId }),
+    ...(serverId === undefined ? {} : { serverId }),
     ...(messageId === undefined ? {} : { messageId }),
     ...(messageEventId === undefined ? {} : { messageEventId })
   });

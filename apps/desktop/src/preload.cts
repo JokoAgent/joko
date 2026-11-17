@@ -1475,9 +1475,10 @@ function parseDesktopDeepLinkNavigation(value: unknown): DesktopDeepLinkNavigati
     return Object.freeze({ kind: 'deviceInvitation', invitation: value['invitation'] });
   }
   if (value["kind"] === "session") {
-    if (!nativeOnlyKeys(value, ["kind", "sessionId", "profileId", "messageId", "messageEventId"]) ||
+    if (!nativeOnlyKeys(value, ["kind", "sessionId", "profileId", "serverId", "messageId", "messageEventId"]) ||
       !isDesktopNotificationSessionId(value["sessionId"]) ||
       (value["profileId"] !== undefined && !isDesktopNotificationSessionId(value["profileId"])) ||
+      (value["serverId"] !== undefined && !isDesktopNotificationSessionId(value["serverId"])) ||
       (value["messageId"] !== undefined && !isDesktopNotificationSessionId(value["messageId"])) ||
       (value["messageEventId"] !== undefined && !isDesktopNotificationSessionId(value["messageEventId"])) ||
       (value["messageEventId"] !== undefined && value["messageId"] === undefined)) {
@@ -1487,6 +1488,7 @@ function parseDesktopDeepLinkNavigation(value: unknown): DesktopDeepLinkNavigati
       kind: "session",
       sessionId: value["sessionId"],
       ...(value["profileId"] === undefined ? {} : { profileId: value["profileId"] as string }),
+      ...(value["serverId"] === undefined ? {} : { serverId: value["serverId"] as string }),
       ...(value["messageId"] === undefined ? {} : { messageId: value["messageId"] as string }),
       ...(value["messageEventId"] === undefined ? {} : { messageEventId: value["messageEventId"] as string })
     });

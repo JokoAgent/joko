@@ -543,6 +543,17 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await native.transport!.emitNotification("item/agentMessage/delta", { threadId, turnId: samplingTurnId, itemId: "interrupted-sample-A",
       delta: "Received text from the interrupted sample." });
     const samplingRow = page.locator('.message-assistant[data-message-client-id="interrupted-sample-A"]');
+    const interruptedSample = async () => {
+      const view = await waitFor(() => samplingRow.evaluateAll(rows => ({
+        rowCount: rows.length,
+        bodyPresent: rows.some(row => row.textContent?.includes("Received text from the interrupted sample.")),
+        noticeCount: rows.reduce((sum, row) => sum + Array.from(row.querySelectorAll('[role="note"]'))
+          .filter(note => note.textContent === "Response interrupted").length, 0),
+        cursorCount: rows.reduce((sum, row) => sum + row.querySelectorAll(".streaming-cursor").length, 0)
+      })), value => value.rowCount === 1 && value.bodyPresent && value.noticeCount === 1 && value.cursorCount === 0,
+      "the original interrupted sample, notice and absent cursor in the same frame", 20_000);
+      expect(view).toEqual({ rowCount: 1, bodyPresent: true, noticeCount: 1, cursorCount: 0 });
+    };
     await samplingRow.getByText("Received text from the interrupted sample.", { exact: true }).waitFor({ state: "visible" });
     await samplingRow.locator(".streaming-cursor").waitFor({ state: "visible" });
     await reconnectCodexTurn(native, threadId, 1);
@@ -566,14 +577,12 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await native.completeTurn(threadId, "Codex mounted answer");
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await status.waitFor({ state: "hidden" });
-    expect(await samplingRow.getByText("Received text from the interrupted sample.", { exact: true }).count()).toBe(1);
-    expect(await samplingRow.getByText("Response interrupted", { exact: true }).count()).toBe(1);
+    await interruptedSample();
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Connect", exact: true }).click();
     await composer.waitFor({ state: "visible", timeout: 20_000 });
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
-    await samplingRow.getByText("Response interrupted", { exact: true }).waitFor({ state: "visible" });
-    expect(await samplingRow.locator(".streaming-cursor").count()).toBe(0);
+    await interruptedSample();
     expect(await status.count()).toBe(0);
     expect(await page.locator(".timeline").getByText(/Retrying|provider connection|fixture provider detail/).count()).toBe(0);
 
@@ -593,6 +602,15 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await native.transport!.emitNotification("item/agentMessage/delta", { threadId, turnId: nativeTurn["id"]!, itemId: partialItem.id,
       delta: "Received text before Stop." });
     const partialRow = page.locator('.message-assistant[data-message-client-id="native-partial-item"]');
+    const stoppedPartial = async () => {
+      const view = await waitFor(() => partialRow.evaluateAll(rows => ({
+        rowCount: rows.length,
+        bodyPresent: rows.some(row => row.textContent?.includes("Received text before Stop.")),
+        cursorCount: rows.reduce((sum, row) => sum + row.querySelectorAll(".streaming-cursor").length, 0)
+      })), value => value.rowCount === 1 && value.bodyPresent && value.cursorCount === 0,
+      "the original stopped partial text and absent cursor in the same frame", 20_000);
+      expect(view).toEqual({ rowCount: 1, bodyPresent: true, cursorCount: 0 });
+    };
     await partialRow.getByText("Received text before Stop.", { exact: true }).waitFor({ state: "visible" });
     await partialRow.locator(".streaming-cursor").waitFor({ state: "visible" });
     await page.locator(".session-header__abort").click();
@@ -603,16 +621,13 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await native.transport!.emitNotification("turn/completed", { threadId, turn: nativeTurn });
     await waitFor(async () => fixture!.application.store.getRun(partialQueue!.runId!).descriptor.state,
       state => state === "aborted", "the original stopped Run");
-    await partialRow.getByText("Received text before Stop.", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
-    await partialRow.locator(".streaming-cursor").waitFor({ state: "hidden" });
-    expect(await partialRow.getByText("Received text before Stop.", { exact: true }).count()).toBe(1);
+    await stoppedPartial();
     expect(fixture.application.store.listEvents({ sessionId }).some(event => event.payload.type === "message_complete"
       && event.payload.nativeHistory?.identity?.entryId === partialItem.id)).toBe(false);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Connect", exact: true }).click();
     await composer.waitFor({ state: "visible", timeout: 20_000 });
-    await partialRow.getByText("Received text before Stop.", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
-    expect(await partialRow.locator(".streaming-cursor").count()).toBe(0);
+    await stoppedPartial();
 
     native.threads.delete(threadId);
     await composer.fill("Native identity is missing");

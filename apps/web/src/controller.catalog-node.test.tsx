@@ -222,6 +222,31 @@ it("keeps a cold plugin deep link on its saved node and retires old catalog call
   expect(view.actions).toEqual([]);
 });
 
+it("opens a copied public task source on the matching saved node after switching away", async () => {
+  const view = await mount();
+  await act(async () => view.app()!.navigate({ kind: "session", sessionId: "private-task", serverId: b.serverId }, { replace: true }));
+  await vi.waitFor(() => expect(view.app()!.state.activeProfile?.id).toBe(b.id));
+  expect(view.app()!.state.route).toMatchObject({ kind: "session", sessionId: "private-task", serverId: b.serverId, profileId: b.id });
+  expect(view.activeConnections).toEqual([a.id, b.id]);
+  const before = view.activeConnections.length;
+  await act(async () => view.app()!.navigate({ kind: "session", sessionId: "private-task", serverId: "missing" }, { replace: true }));
+  await vi.waitFor(() => expect(view.app()!.state.error).toContain("source is unavailable"));
+  expect(view.activeConnections).toHaveLength(before);
+  expect(view.app()!.state.activeProfile?.id).toBe(b.id);
+});
+
+it("pins a cold copied source and rejects an explicit local profile that belongs to another node", async () => {
+  window.history.replaceState(null, "", `#/tasks/private-task?server=${b.serverId}`);
+  const view = await mount(false);
+  await vi.waitFor(() => expect(view.app()!.state.activeProfile?.id).toBe(b.id));
+  expect(view.activeConnections).toEqual([b.id]);
+  const before = view.probe.mock.calls.length;
+  await act(async () => view.app()!.navigate({ kind: "session", sessionId: "private-task", profileId: c.id, serverId: b.serverId }, { replace: true }));
+  await vi.waitFor(() => expect(view.app()!.state.error).toContain("source is unavailable"));
+  expect(view.probe.mock.calls).toHaveLength(before);
+  expect(view.activeConnections).toEqual([b.id]);
+});
+
 it("opens an independent plugin window on its explicit node and rejects a replaced node identity at cold start", async () => {
   const extensionId = `extension_${"a".repeat(32)}`;
   window.history.replaceState(null, "", `#/extensions/${extensionId}?profile=${b.id}&server=${b.serverId}`);

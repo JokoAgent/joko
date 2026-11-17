@@ -18,6 +18,7 @@ export type MobileCopyLinkResult = "copied" | "busy";
 
 export interface MobileCopyLinkAuthority {
   readonly profileId: string;
+  readonly serverId?: string;
   readonly sessionId: string;
   readonly requiresSelectedSession: boolean;
   readonly messageId?: string;
@@ -50,8 +51,11 @@ export function claimMobileCopyLinkAuthority(
   }
 ): MobileCopyLinkAuthority | undefined {
   if (snapshot.activeProfileId === undefined) return undefined;
+  const sources = snapshot.savedSources?.filter(source => source.profileId === snapshot.activeProfileId);
+  const serverId = sources?.length === 1 ? sources[0]!.serverId : undefined;
   const authority = Object.freeze({
     profileId: snapshot.activeProfileId,
+    ...(serverId === undefined ? {} : { serverId }),
     sessionId: input.sessionId,
     requiresSelectedSession: input.requiresSelectedSession,
     ...(input.messageId === undefined ? {} : { messageId: input.messageId }),
@@ -66,6 +70,8 @@ export function mobileCopyLinkAuthorityMatches(
 ): boolean {
   if ((snapshot.status !== "connected" && snapshot.status !== "offline")
     || snapshot.activeProfileId !== authority.profileId
+    || authority.serverId !== undefined && snapshot.savedSources?.filter(source => source.profileId === authority.profileId
+      && source.serverId === authority.serverId).length !== 1
     || snapshot.sessionIds.filter((sessionId) => sessionId === authority.sessionId).length !== 1
     || authority.requiresSelectedSession && snapshot.selectedSessionId !== authority.sessionId) return false;
   if (authority.messageId === undefined) return authority.messageEventId === undefined;
@@ -90,8 +96,8 @@ export class MobileCopyLinkWriter {
       throw new Error("Only a canonical public Joko task link may be copied here.");
     }
     const canonical = intent.messageId === undefined
-      ? buildMobileTaskDeepLink(intent.sessionId)
-      : buildMobileMessageDeepLink(intent.sessionId, intent.messageId, intent.messageEventId);
+      ? buildMobileTaskDeepLink(intent.sessionId, intent.serverId)
+      : buildMobileMessageDeepLink(intent.sessionId, intent.messageId, intent.messageEventId, intent.serverId);
     if (value !== canonical) throw new Error("Only a canonical public Joko task link may be copied here.");
     if (this.#pending !== undefined) return "busy";
     if (!Number.isSafeInteger(timeoutMilliseconds) || timeoutMilliseconds < 1) {

@@ -16,6 +16,7 @@ import {
   buildMobileMessageCopyText,
   captureMobileMessageReference,
   commitMobileMessageReference,
+  createMobileSideChatMessageDraft,
   editQueueItemText,
   mobileQueueCapabilities,
   queueItemHasStructuredInput,
@@ -78,6 +79,21 @@ describe("mobile message action sheet", () => {
       .toEqual([{ id: "copy-text", label: "Copy message" }, { id: "add-to-composer", label: "Add to composer" }]);
     expect(buildMobileMessageActions(attachmentOnly, { canDelete: false, canAddToComposer: false, locale: "en" })
       .some(action => action.id === "add-to-composer")).toBe(false);
+  });
+
+  it.each(["user", "assistant"] as const)("opens a side chat with an exact quote of a complete %s row", kind => {
+    const message = { ...row, kind };
+    const actions = (item: TimelineRow) => buildMobileMessageActions(item, { canDelete: false, canOpenSideChat: true, locale: "en" });
+    expect(actions(message)).toContainEqual({ id: "side-chat", label: "Ask in a side chat" });
+    expect(actions({ ...message, text: "" }).some(action => action.id === "side-chat")).toBe(false);
+    expect(actions({ ...message, completed: false })).toEqual([]);
+    expect(actions({ ...message, text: "X".repeat(4_001) }).some(action => action.id === "side-chat")).toBe(false);
+    const draft = createMobileSideChatMessageDraft("source-task", message, message, "en", "original-quote");
+    expect(draft.atoms).toMatchObject([{ kind: "quote", atomId: "original-quote", sourceRole: kind,
+      sourceSessionId: "source-task", sourceMessageId: row.id, sourceEventId: row.eventId, text: row.text }]);
+    for (const changed of [{ ...message, eventId: "new-event" }, { ...message, text: "Updated body" }]) {
+      expect(() => createMobileSideChatMessageDraft("source-task", message, changed, "en", "stale")).toThrow(/source message changed/u);
+    }
   });
 
   it("inserts an anchored message reference into the captured draft and rejects retired owner/message/draft inputs", () => {

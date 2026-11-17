@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { activateConnectionEntry, activeConnectionEntry, connectionEntryViews, initialConnectionEntries, mergeConnectionEntryDirectory,
   prepareEntryAndSave, prepareSelectedConnectionEntry, readConnectionEntryDirectory, resolvePreparedConnection, verifyConnectionEntry, entryReadiness, acceptInvitedConnectionEntry, entriesNeedingRenewal,
   type ConnectionEntryOwner, type ConnectionEntryView, type SavedConnectionEntries } from '@joko/connection-transport/entries';
-import { DeviceKind } from '@joko/contracts';
+import { DeviceKind, taskLinkSourceProfileId } from '@joko/contracts';
+import { translate } from "./i18n.js";
 import { createConnectTransport } from '@joko/connection-transport';
 import { DeviceAuthorizationReceiver, parseDeviceInvitation, bindDeviceInvitationTransport, type DeviceAuthorizationPort, type DeviceAuthorizationOwner } from '@joko/connection-transport/device-authorization';
 import { createIrohClientIdentity, createTailcatClientIdentity, isEndpointTrustError, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind, trustedEndpointTransport } from "@joko/connection-transport";
@@ -150,7 +151,7 @@ const TOOLS_TABS: readonly ToolsTab[] = ["browser", "extensions", "skills", "res
 
 export type AppRoute =
   | { readonly kind: "sharedTask"; readonly joinId: string; readonly profileId: string }
-  | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string; readonly backgroundExtensionId?: string }
+  | { readonly kind: "session"; readonly profileId?: string; readonly serverId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string; readonly backgroundExtensionId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string; readonly initialModel?: NewSessionModelRequest; readonly contactsDraft?: ContactsDraftOwner }
   | { readonly kind: "projects"; readonly projectId?: string }
@@ -161,6 +162,7 @@ export type AppRoute =
   | { readonly kind: "settings" };
 
 interface MachineSessionMessageTarget {
+  readonly serverId?: string;
   readonly expectedGeneration?: bigint;
   readonly isCurrent?: () => boolean;
   readonly partnerId?: string;
@@ -709,15 +711,19 @@ export function useAppController(): AppController {
           effectiveManagedStatus = managedRecoveryStatus("identityConflict");
         }
       }
-      const routedProfileId = routeRef.current.kind === "session" || routeRef.current.kind === "partners" || routeRef.current.kind === "tools" || routeRef.current.kind === "extensionMainView" ? routeRef.current.profileId : undefined;
+      const startupRoute = routeRef.current;
+      const expectedServerId = !desktopSessionWindow && (startupRoute.kind === "session" || startupRoute.kind === "extensionMainView")
+        ? startupRoute.serverId : undefined;
+      const routedProfileId = startupRoute.kind === "session" && expectedServerId !== undefined
+        ? taskLinkSourceProfileId(profiles.map(profile => ({ profileId: profile.id, serverId: profile.serverId })), undefined, startupRoute.profileId, expectedServerId)
+        : startupRoute.kind === "session" || startupRoute.kind === "partners" || startupRoute.kind === "tools" || startupRoute.kind === "extensionMainView" ? startupRoute.profileId : undefined;
       const bootProfileId = bootOwner !== undefined && bootOwner.sessionId === bootSessionId
         && window.location.search === startupSearch && window.jokoDesktop === desktop ? bootOwner.profileId : undefined;
       const startupProfileId = desktopSessionWindow ? bootProfileId : routedProfileId;
       const startupProfile = profiles.find(profile => profile.id === startupProfileId);
-      const expectedServerId = !desktopSessionWindow && routeRef.current.kind === "extensionMainView" ? routeRef.current.serverId : undefined;
       const automaticProfile = startupProfileId !== undefined
         ? expectedServerId === undefined || expectedServerId === startupProfile?.serverId ? startupProfile : undefined
-        : (!desktopSessionWindow && automaticConnectionAvailable
+        : (!desktopSessionWindow && expectedServerId === undefined && automaticConnectionAvailable
         ? automaticConnectionProfile(effectivePreferences.automaticConnectionTarget, profiles, effectiveManagedStatus)
         : undefined);
       startupAutoConnectRef.current = automaticProfile;
@@ -1944,9 +1950,11 @@ export function useAppController(): AppController {
       finish();
       return;
     }
-    const effectiveRoute: AppRoute = route.kind === "session" && route.profileId === undefined && activeProfileRef.current !== undefined
-      ? { ...route, profileId: activeProfileRef.current.id }
-      : route;
+    const resolvedProfileId = route.kind === "session" ? route.serverId === undefined ? activeProfileRef.current?.id : taskLinkSourceProfileId(
+      profilesRef.current.map(profile => ({ profileId: profile.id, serverId: profile.serverId })),
+      activeProfileRef.current?.id, route.profileId, route.serverId) : undefined;
+    const effectiveRoute: AppRoute = route.kind === "session" && route.profileId === undefined && resolvedProfileId !== undefined
+      ? { ...route, profileId: resolvedProfileId } : route;
     const hash = options?.exactHash ?? appRouteHash(effectiveRoute);
     const commit = (): void => {
       if (!ownerIsCurrent()) {
@@ -2382,6 +2390,9 @@ export function useAppController(): AppController {
       && navigationRevisionRef.current === routeOwner.navigationRevision;
     const profile = profilesRef.current.find((candidate) => candidate.id === profileId);
     if (profile === undefined) throw new Error("The selected machine is no longer saved on this client.");
+    if (messageTarget?.serverId !== undefined && profile.serverId !== messageTarget.serverId) {
+      throw new Error(translate(resolveLocalePreference(preferencesRef.current.locale, systemLocale), "nav.linkedTaskSourceUnavailable"));
+    }
     const snapshot = await loadMachineSnapshot(profile);
     if (!isCurrentOwner()) return;
     if (!snapshot.sessions.some((session) => session.id === sessionId
@@ -2413,6 +2424,7 @@ export function useAppController(): AppController {
       kind: "session",
       profileId,
       sessionId,
+      ...(messageTarget?.serverId === undefined ? {} : { serverId: messageTarget.serverId }),
       ...(messageTarget?.partnerId === undefined ? {} : { partnerId: messageTarget.partnerId }),
       ...(messageTarget?.messageId === undefined ? {} : { messageId: messageTarget.messageId }),
       ...(messageTarget?.messageEventId === undefined ? {} : { messageEventId: messageTarget.messageEventId })
@@ -2425,7 +2437,7 @@ export function useAppController(): AppController {
       && remoteMachineProfileKey(activeProfileRef.current) === remoteMachineProfileKey(profile)
       && connectionStateRef.current === "connected" && snapshotRef.current.sessions.some(session => session.id === sessionId
         && (messageTarget?.expectedGeneration === undefined || session.generation === messageTarget.expectedGeneration)) });
-  }, [connectProfile, loadMachineSnapshot, navigate]);
+  }, [connectProfile, loadMachineSnapshot, navigate, systemLocale]);
 
   const searchRemoteSessionMessages = useCallback(async (
     query: string,
@@ -2710,23 +2722,32 @@ export function useAppController(): AppController {
     }
   }, [currentMachineCacheOwner, machineCacheRevoked, revokeMachineCache, state.activeProfile?.id, state.preferences.machineSelection, state.profiles, state.ready]);
 
+  const taskLinkProfiles = state.route.kind === "session" && state.route.serverId !== undefined ? state.profiles : undefined;
   useEffect(() => {
     const route = state.route;
-    if (!state.ready || route.kind !== "session" || route.profileId === undefined || route.sessionId === undefined) return;
+    if (!state.ready || route.kind !== "session" || route.sessionId === undefined) return;
     if (route.backgroundExtensionId !== undefined) return;
     if (explicitDisconnectRef.current) return;
-    if (activeProfileRef.current?.id === route.profileId && connectionStateRef.current === "connecting") return;
-    if (activeProfileRef.current?.id === route.profileId
+    const profileId = route.serverId === undefined ? route.profileId : taskLinkSourceProfileId(
+      profilesRef.current.map(profile => ({ profileId: profile.id, serverId: profile.serverId })),
+      activeProfileRef.current?.id, route.profileId, route.serverId);
+    if (profileId === undefined) {
+      if (route.serverId !== undefined) setState(current => ({ ...current, error: translate(current.effectiveLocale, "nav.linkedTaskSourceUnavailable") }));
+      return;
+    }
+    if (activeProfileRef.current?.id === profileId && connectionStateRef.current === "connecting") return;
+    if (activeProfileRef.current?.id === profileId
+      && (route.serverId === undefined || activeProfileRef.current.serverId === route.serverId)
       && connectionStateRef.current === "connected"
       && snapshotRef.current.sessions.some((session) => session.id === route.sessionId)) return;
     const requestedHash = appRouteHash(route);
     const requestedNavigationRevision = state.navigationRevision ?? 0;
-    void openMachineSession(route.profileId, route.sessionId, route).catch((error: unknown) => {
+    void openMachineSession(profileId, route.sessionId, route).catch((error: unknown) => {
       if (appRouteHash(routeRef.current) !== requestedHash
         || navigationRevisionRef.current !== requestedNavigationRevision) return;
       setState((current) => ({ ...current, error: messageOf(error) }));
     });
-  }, [openMachineSession, state.connectionState, state.navigationRevision, state.ready, state.route]);
+  }, [openMachineSession, state.connectionState, state.navigationRevision, taskLinkProfiles, state.ready, state.route]);
 
   useEffect(() => {
     const { route, navigationRevision, connectionGeneration } = state;
@@ -5215,11 +5236,16 @@ export function routeFromHash(hash: string): AppRoute {
   const messageId = query.get("message")?.trim();
   const messageEventId = query.get("event")?.trim();
   const profileId = query.get("profile")?.trim();
+  const servers = query.getAll("server");
+  if (servers.length > 1 || servers.some(value => value.length < 1 || value.length > 256 || value.trim() !== value
+    || /[\u0000-\u001f\u007f]/u.test(value))) return { kind: "session" };
+  const serverId = servers[0];
   const partnerId = query.get("partner")?.trim();
   if (parts[1] === undefined) {
     return {
       kind: "session",
-      ...(profileId === undefined || profileId === "" ? {} : { profileId })
+      ...(profileId === undefined || profileId === "" ? {} : { profileId }),
+      ...(serverId === undefined ? {} : { serverId })
     };
   }
   const backgroundExtensions = query.getAll("backgroundExtension");
@@ -5230,6 +5256,7 @@ export function routeFromHash(hash: string): AppRoute {
     sessionId: parts[1],
     ...(partnerId === undefined || partnerId === "" ? {} : { partnerId }),
     ...(profileId === undefined || profileId === "" ? {} : { profileId }),
+    ...(serverId === undefined ? {} : { serverId }),
     ...(messageId === undefined || messageId === "" ? {} : { messageId }),
     ...(messageEventId === undefined || messageEventId === "" ? {} : { messageEventId }),
     ...(backgroundExtensionId === undefined ? {} : { backgroundExtensionId })
@@ -5241,6 +5268,7 @@ export function sessionRouteHash(route: Extract<AppRoute, { readonly kind: "sess
   if (route.messageEventId !== undefined) query.set("event", route.messageEventId);
   if (route.messageId !== undefined) query.set("message", route.messageId);
   if (route.profileId !== undefined) query.set("profile", route.profileId);
+  if (route.serverId !== undefined) query.set("server", route.serverId);
   if (route.partnerId !== undefined) query.set("partner", route.partnerId);
   if (route.backgroundExtensionId !== undefined) query.set("backgroundExtension", route.backgroundExtensionId);
   const suffix = query.size === 0 ? "" : `?${query.toString()}`;

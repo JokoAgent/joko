@@ -259,6 +259,7 @@ import {
   mobileComposerDraftsEqual,
   mobileComposerInput,
   normalizeMobileComposerDraft,
+  plainTextMobileComposerDraft,
   recoverMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
@@ -776,6 +777,7 @@ const newTaskAwaitingSession = "The task was created. Its first message is retai
 export type MobileAppCommandOutcome =
   | { readonly kind: "help"; readonly status: "succeeded" }
   | { readonly kind: "jumpSession"; readonly status: "succeeded"; readonly sessionId: string }
+  | { readonly kind: "sideChat"; readonly status: "succeeded" | "rejected" | "unknown" | "retired" }
   | { readonly kind: "userShell" | "sessionReset"; readonly status: "succeeded" | "rejected" | "unknown" }
   | { readonly kind: "review"; readonly status: "succeeded" | "rejected" | "unknown"; readonly reviewRunId?: string };
 
@@ -12286,7 +12288,8 @@ export class MobileClient {
       this.#taskAuthorityKey(),
       this.#state.owner,
       this.#state.detail,
-      this.#state.selectedId
+      this.#state.selectedId,
+      this.taskSideChatControls()?.canOpen === true
     );
   }
 
@@ -13134,6 +13137,25 @@ export class MobileClient {
         throw error;
       }
       return { kind: "jumpSession", status: "succeeded", sessionId: command.sessionId };
+    }
+
+    if (command.kind === "sideChat") {
+      const sideChat = this.taskSideChatControls(), epoch = this.#epoch;
+      if (!sideChat?.canOpen || sideChat.sourceSessionId !== identity.sessionId) throw new Error("The side chat source changed.");
+      const isCurrent = () => this.#current(epoch) && this.#foreground && this.#credential === current.credential
+        && this.taskSideChatControls()?.surfaceOwnerKey === sideChat.surfaceOwnerKey;
+      const result = await this.openSideChat(sideChat.authorityKey, plainTextMobileComposerDraft(command.text));
+      if (result.kind !== "opened") return { kind: "sideChat", status: result.kind };
+      let clearError: string | undefined;
+      if (isCurrent()) {
+        try { await this.composerDrafts.clearIfRevision(identity, snapshot.revision); }
+        catch (error) { clearError = message(error); }
+      }
+      if (isCurrent()) {
+        await this.select(result.sessionId);
+        if (clearError && this.#credential === current.credential && this.#state.selectedId === result.sessionId) this.#set({ error: clearError });
+      }
+      return { kind: "sideChat", status: "succeeded" };
     }
 
     if (!isMobileRemoteAppCommandInvocation(command)) {
@@ -14121,10 +14143,25 @@ export class MobileClient {
   taskSideChatControls() {
     if (this.#joinedTask) return undefined;
     const context = this.#taskDerivationContext(capabilityNames.sessionSideChat);
-    if (!context || context.runtime.session.sideChatSourceAllowed !== true || context.runtime.session.derivationOrigin?.sideChat) return undefined;
-    return { ...context.controls, canOpen: context.canDerive && !context.runtime.session.archived,
-      children: (this.#state.owner?.sessions ?? []).filter((child) => child.derivationOrigin?.sideChat
-        && child.derivationOrigin.sourceSessionId === context.runtime.session.sessionId) };
+    if (!context) return undefined;
+    const session = context.runtime.session;
+    const sessions = this.#state.owner!.sessions;
+    const origin = session.derivationOrigin;
+    const parent = origin?.sideChat ? sessions.find(candidate => candidate.sessionId === origin.sourceSessionId) : session;
+    if (!parent || parent.derivationOrigin?.sideChat || parent.backendId !== session.backendId || parent.targetId !== session.targetId) return undefined;
+    let surfaceOwnerKey = context.controls.surfaceOwnerKey;
+    if (origin?.sideChat) {
+      const ownerOrigin = sessions.find(candidate => candidate.sessionId === session.sessionId)?.derivationOrigin;
+      const routeOwner = this.taskPresentationOwnerKey();
+      if (!routeOwner || !origin.sourceSessionAvailable || ownerOrigin?.sideChat !== true || !ownerOrigin.sourceSessionAvailable
+        || ownerOrigin.sourceSessionId !== parent.sessionId) return undefined;
+      surfaceOwnerKey = JSON.stringify([surfaceOwnerKey, routeOwner, mobileSessionOriginSessionKey(parent)]);
+    } else if (session.sideChatSourceAllowed !== true) return undefined;
+    return { ...context.controls, sourceSessionId: parent.sessionId, sourceName: parent.displayName,
+      surfaceOwnerKey,
+      canOpen: parent === session && context.canDerive && !session.archived,
+      children: sessions.filter(child => child.sessionId !== session.sessionId && child.backendId === parent.backendId && child.targetId === parent.targetId
+        && child.derivationOrigin?.sideChat && child.derivationOrigin.sourceSessionId === parent.sessionId) };
   }
 
   async openSideChat(authorityKey: string, draft?: MobileComposerDraft): Promise<

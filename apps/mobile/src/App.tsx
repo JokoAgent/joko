@@ -304,7 +304,7 @@ import {
   type MobileFilesSearchMode
 } from "./workspace-files";
 import { buildMobileMessageActions, buildMobileMessageCopyText, captureMobileMessageReference, commitMobileMessageReference,
-  queueItemText, type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
+  createMobileSideChatMessageDraft, queueItemText, type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
 import { useMobileVoicePermissionSettings } from "./use-mobile-voice-permission-settings";
 import { MobileVoiceDictionaryController } from "./mobile-voice-dictionary-controller";
@@ -1481,7 +1481,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     setCopyNotice("");
     setLocalError("");
     try {
-      const result = await mobileCopyLinks.copy(buildMobileTaskDeepLink(authority.sessionId));
+      if (authority.serverId === undefined) throw new Error("The task source is unavailable.");
+      const result = await mobileCopyLinks.copy(buildMobileTaskDeepLink(authority.sessionId, authority.serverId));
       if (!mountedRef.current || copyGenerationRef.current !== request) return;
       if (!mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))) return;
       if (result === "busy") setLocalError(mobileMessage(locale, "actions.copyLinkBusy"));
@@ -4266,6 +4267,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const sideChatControls = state.status === "connected" && !partnerIdentity.partner && !workerReadOnly
     ? client.taskSideChatControls() : undefined;
   const [sideChatsVisible, setSideChatsVisible] = useState(false);
+  const sideChatsOwner = useRef<string | undefined>(undefined);
   const [cloneVisible, setCloneVisible] = useState(false);
   const [forkEventId, setForkEventId] = useState<string>();
   const forkControls = state.status === "connected" && forkEventId ? client.taskMessageForkControls(forkEventId) : undefined;
@@ -5001,6 +5003,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       canCopyLink: mobileMessageLinkAvailable(state, messageAction.row),
       canAddToComposer: composerOwnerReady && messageAction.reference !== undefined,
       canReplyQuote: composerOwnerReady && partnerIdentity.partner !== undefined && messageAction.reference !== undefined,
+      canOpenSideChat: sideChatControls?.canOpen === true && !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined,
       canFork: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && client.taskMessageForkControls(messageAction.row.eventId)?.canFork === true,
       canRewind: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined
         && client.taskMessageRewindControls(messageAction.row.eventId)?.canRewind === true,
@@ -6018,6 +6021,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       setLocalError(errorText(failure));
     }
   };
+  const openSideChatDraft = (authorityKey: string, draft?: MobileComposerDraft): void => {
+    void client.openSideChat(authorityKey, draft).then(async (result) => {
+      if (!taskMountedRef.current || client.taskSideChatControls()?.authorityKey !== authorityKey) return;
+      if (result.kind === "opened") await client.select(result.sessionId);
+      else if (result.kind === "unknown") setLocalError(mobileSideChatCopy(locale).unknown);
+    }).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
+  };
   const askInSideChat = (selection?: MobileComposerSelection): void => {
     const controls = client.taskSideChatControls();
     if (!controls?.canOpen || state.busy || voice.busy || attachmentBusy) return;
@@ -6036,11 +6046,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           latestRow: latest, selection, draft: emptyMobileComposerDraft(), atomId: randomUUID() }).draft;
       }
       setQuoteSelection(undefined);
-      void client.openSideChat(controls.authorityKey, sideDraft).then(async (result) => {
-        if (!taskMountedRef.current) return;
-        if (result.kind === "opened") await client.select(result.sessionId);
-        else if (result.kind === "unknown") setLocalError(mobileSideChatCopy(locale).unknown);
-      }).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
+      openSideChatDraft(controls.authorityKey, sideDraft);
     } catch (failure) { setLocalError(errorText(failure)); }
   };
 
@@ -6112,9 +6118,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     setComposerNotice("");
     setLocalError("");
     try {
+      if (authority.serverId === undefined) throw new Error("The task source is unavailable.");
       const link = authority.messageId === undefined
-        ? buildMobileTaskDeepLink(authority.sessionId)
-        : buildMobileMessageDeepLink(authority.sessionId, authority.messageId, authority.messageEventId);
+        ? buildMobileTaskDeepLink(authority.sessionId, authority.serverId)
+        : buildMobileMessageDeepLink(authority.sessionId, authority.messageId, authority.messageEventId, authority.serverId);
       const result = await mobileCopyLinks.copy(link);
       if (!taskMountedRef.current || copyGenerationRef.current !== request) return;
       if (!mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))) return;
@@ -6220,6 +6227,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     }
     if (state.status !== "connected" || voice.busy) return;
     if (workerReadOnly && ["fork", "rewind", "delete"].includes(action)) return;
+    if (action === "side-chat") {
+      if (workerReadOnly || partnerIdentity.partner || state.busy || attachmentBusy || queueEditRef.current) return;
+      const controls = client.taskSideChatControls();
+      if (!controls?.canOpen || controls.sourceSessionId !== selected.sessionId) return;
+      try { openSideChatDraft(controls.authorityKey, createMobileSideChatMessageDraft(selected.sessionId, selected.row, latest, locale, randomUUID())); }
+      catch (failure) { setLocalError(errorText(failure)); }
+      return;
+    }
     if (action === "fork") {
       if (state.busy || attachmentBusy || !client.taskMessageForkControls(latest.eventId)?.canFork) return;
       setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false);
@@ -6351,7 +6366,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const identity = draftIdentityRef.current;
         const sourceDraft = composerDraftRef.current;
         const intent = mobileAppCommandIntent(sourceDraft);
-        if (intent !== undefined && state.taskSource?.kind !== "joined") {
+        const runtimeSide = intent === "sideChat" && runtimeCommandPaletteStatus === "ready"
+          && runtimeCommandCatalog?.items.some(candidate => candidate.name.toLowerCase() === "side");
+        if (intent !== undefined && !runtimeSide && state.taskSource?.kind !== "joined") {
           const controls = client.taskAppCommandControls();
           const invocation = parseMobileAppCommand(sourceDraft, controls);
           if (!identity || !controls || !invocation) {
@@ -6383,7 +6400,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           if (outcome.kind === "help") {
             setCommandHelpItems(helpItems);
           } else if (outcome.status === "unknown") {
-            setComposerNotice(mobileMessage(locale, "task.command.unknown"));
+            setComposerNotice(outcome.kind === "sideChat" ? mobileSideChatCopy(locale).unknown : mobileMessage(locale, "task.command.unknown"));
           } else if (outcome.status === "rejected") {
             setLocalError(mobileMessage(locale, "task.command.rejected"));
           } else if (outcome.kind === "userShell") {
@@ -6923,7 +6940,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         ...(sideChatControls?.canOpen ? [{ id: "side-chat" as const, label: mobileSideChatCopy(locale).create,
           onPress: () => askInSideChat(), disabled: state.busy || voice.busy || attachmentBusy }] : []),
         ...(sideChatControls && sideChatControls.children.length > 0 ? [{ id: "side-chats" as const, label: mobileSideChatCopy(locale).list,
-          onPress: () => setSideChatsVisible(true), disabled: state.busy || voice.busy || attachmentBusy }] : []),
+          onPress: () => { sideChatsOwner.current = sideChatControls.surfaceOwnerKey; setSideChatsVisible(true); },
+          disabled: state.busy || voice.busy || attachmentBusy }] : []),
         ...(session?.derivationOrigin?.sideChat && session.derivationOrigin.sourceSessionAvailable ? [{ id: "side-chat-parent" as const,
           label: mobileSideChatCopy(locale).back, onPress: () => { void client.select(session.derivationOrigin!.sourceSessionId)
             .catch((failure) => setLocalError(errorText(failure))); }, disabled: state.busy || voice.busy || attachmentBusy }] : []),
@@ -7628,11 +7646,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote}
       onAskSideChat={sideChatControls?.canOpen ? askInSideChat : undefined} />
-    <MobileActionSheet visible={sideChatsVisible && sideChatControls !== undefined && state.status === "connected"}
+    <MobileActionSheet visible={sideChatsVisible && sideChatControls !== undefined && sideChatsOwner.current === sideChatControls.surfaceOwnerKey}
       items={(sideChatControls?.children ?? []).map((child) => ({ id: child.sessionId, label: child.displayName, disabled: state.busy }))}
       colors={colors} locale={locale} onClose={() => setSideChatsVisible(false)} onAction={(id) => {
         const current = client.taskSideChatControls();
-        if (current?.authorityKey !== sideChatControls?.authorityKey || !current?.children.some((child) => child.sessionId === id)) return;
+        const captured = sideChatsOwner.current;
+        sideChatsOwner.current = undefined;
+        if (!taskMountedRef.current || AppState.currentState !== "active" || !captured || current?.surfaceOwnerKey !== captured
+          || !current.children.some(child => child.sessionId === id)) return;
         void client.select(id).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
       }} />
     <MobileTaskRenameSheet visible={renameTask !== undefined && renameTask.ownerKey === headerSourceKey

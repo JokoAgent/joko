@@ -8,6 +8,14 @@ import {
 } from "./desktop-deep-link-navigation.js";
 
 describe("Desktop deep-link navigation", () => {
+  it("keeps a copied public source in the route and does not acknowledge the same task on another node", () => {
+    const link = { kind: "session", sessionId: "task", serverId: "node-A", messageId: "message" } as const;
+    const route = desktopDeepLinkAppRoute(link);
+    expect(desktopDeepLinkRouteHash(link)).toBe("#/tasks/task?message=message&server=node-A");
+    expect(desktopDeepLinkNavigationMatchesRoute(link, route)).toBe(true);
+    expect(desktopDeepLinkNavigationMatchesRoute(link, { ...route, kind: "session", serverId: "node-B" })).toBe(false);
+  });
+
   it("maps a task and its message anchor onto the existing bounded hash route", () => {
     expect(desktopDeepLinkRouteHash({
       kind: "session",

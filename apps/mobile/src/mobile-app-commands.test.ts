@@ -142,6 +142,19 @@ describe("mobile app command authority and palette", () => {
     ]).some((candidate) => candidate.commandId === "runtime-cmd")).toBe(false);
   });
 
+  it("offers the capable Side Chat command and preserves a declared runtime command of the same name", () => {
+    const owner = snapshot();
+    const controls = createMobileAppCommandControls("authority", owner, owner, "session", true)!;
+    const draft = plainTextMobileComposerDraft("/side Keep the first line\nand the second.");
+    expect(mobileAppCommandIntent(draft)).toBe("sideChat");
+    expect(mobileAppCommandCandidates(controls)).toContainEqual(expect.objectContaining({ commandId: "builtin:side", name: "side" }));
+    expect(parseMobileAppCommand(draft, controls)).toEqual({ kind: "sideChat", text: "Keep the first line\nand the second." });
+    expect(parseMobileAppCommand(draft, createMobileAppCommandControls("authority", owner, owner, "session"))).toBeUndefined();
+    const runtimeSide = { name: "side", commandId: "runtime-side", description: "Existing skill",
+      source: RuntimeCommandSource.BACKEND, inputMode: RuntimeCommandInputMode.TEXT };
+    expect(mergeMobileCommandPaletteCandidates(controls, [runtimeSide]).filter(item => item.name === "side")).toEqual([runtimeSide]);
+  });
+
   it("filters the merged catalog with stable order and a bounded visible result count", () => {
     const controls = createMobileAppCommandControls("authority", snapshot(), snapshot(), "session")!;
     const candidates = mergeMobileCommandPaletteCandidates(controls, [

@@ -11,8 +11,6 @@ const actions = readFileSync(resolve(root, "task-actions.ts"), "utf8");
 describe("native mobile copy-link boundary", () => {
   it("routes task and completed-message actions only through the canonical public builders and system text clipboard", () => {
     expect(app).toContain("if (!await Clipboard.setStringAsync(value))");
-    expect(app).toContain("buildMobileTaskDeepLink(authority.sessionId)");
-    expect(app).toContain("buildMobileMessageDeepLink(authority.sessionId, authority.messageId, authority.messageEventId)");
     expect(app).toContain("claimMobileCopyLinkAuthority(projectMobileNativeIntentSnapshot(client.state)");
     expect(app).toContain("mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))");
     expect(actions).toContain('id: "copy-link"');

@@ -333,6 +333,16 @@ describe("Task window preload context and opening receipts", () => {
 });
 
 describe("main application preload deep-link occurrence fence", () => {
+  it("preserves a bounded public node source through the actual preload delivery", async () => {
+    const loaded = loadPreload("document-current");
+    loaded.setPending({ documentOccurrence: "document-current", deliveryOccurrence: 1,
+      navigation: { kind: "session", sessionId: "task", serverId: "node-A", messageId: "message", messageEventId: "event" } });
+    await expect(loaded.deepLinks.takePending()).resolves.toMatchObject({ navigation: { serverId: "node-A", sessionId: "task" } });
+    loaded.setPending({ documentOccurrence: "document-current", deliveryOccurrence: 2,
+      navigation: { kind: "session", sessionId: "task", serverId: "" } });
+    await expect(loaded.deepLinks.takePending()).rejects.toThrow(/invalid/u);
+  });
+
   it("exposes the remote desktop opening bridge only to a captured primary document", async () => {
     const primary = loadPreload("document-current"), auxiliary = loadPreload("");
     expect(primary.exposed["capabilities"]).toContain("remote.desktopViewer");

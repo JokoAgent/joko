@@ -1,6 +1,6 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
-import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema } from "@joko/contracts";
+import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema, MessageBlockSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
 import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
@@ -104,7 +104,8 @@ import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
 import { timelineRows } from "./timeline";
-import { buildMobileMessageDeepLink, executeMobileNativeIntent, MobileNativeIntentDelivery, projectMobileNativeIntentSnapshot } from "./mobile-native-intent";
+import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, executeMobileNativeIntent, MobileNativeIntentDelivery, projectMobileNativeIntentSnapshot } from "./mobile-native-intent";
+import { MobileCopyLinkWriter, claimMobileCopyLinkAuthority } from "./mobile-copy-link";
 import { findMobileConversationSearchHits } from "./mobile-conversation-search";
 import {
   insertMobileArtifactMention,
@@ -8479,6 +8480,56 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.window).toBeUndefined();
   });
 
+  it.each([false, true])("copies from authenticated A, switches to B, and reopens only A through the real Mobile client (message=%s)", async message => {
+    const network = fakeNetwork();
+    const b: PairedCredential = { ...otherCredential, serverId: "node-B", origin: "http://192.168.1.21:4318" };
+    const reply = create(EventSchema, { ...event("source-answer", 9n), payload: create(EventPayloadSchema, {
+      kind: { case: "messageCompleted", value: create(MessageCompletedEventSchema, { messageId: "source-message", role: MessageRole.ASSISTANT,
+        blocks: [create(MessageBlockSchema, { content: { case: "text", value: "The reply on A" } })] }) }
+    }) });
+    const aSnapshot = create(SnapshotSchema, { ...snapshot, timeline: [reply] });
+    const bSnapshot = create(SnapshotSchema, { ...snapshot, server: { ...snapshot.server!, serverId: b.serverId },
+      connections: [otherConnection], devices: [otherDevice], sessions: [], timeline: [] });
+    vi.mocked(network.inspect).mockImplementation(async origin => origin === b.origin ? { ...node, serverId: b.serverId } : node);
+    vi.mocked(network.readOwner).mockImplementation(async key => key.profileId === b.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: bSnapshot } : { connection, device, snapshot: aSnapshot });
+    vi.mocked(network.readSession).mockImplementation(async key => {
+      if (key.profileId !== credential.profileId) throw new Error("The original task is absent on B.");
+      return aSnapshot;
+    });
+    const app = client(network, memoryStorage([credential, b]).storage);
+    await app.start();
+    const authority = claimMobileCopyLinkAuthority(projectMobileNativeIntentSnapshot(app.state), { sessionId: "session",
+      requiresSelectedSession: message, ...(message ? { messageId: "source-message", messageEventId: reply.eventId } : {}) });
+    expect(authority?.serverId).toBe(credential.serverId);
+    const url = message ? buildMobileMessageDeepLink("session", "source-message", reply.eventId, authority!.serverId)
+      : buildMobileTaskDeepLink("session", authority!.serverId);
+    const writeText = vi.fn(async () => undefined);
+    await expect(new MobileCopyLinkWriter({ writeText }).copy(url)).resolves.toBe("copied");
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(url);
+    expect(url).not.toContain(credential.origin); expect(url).not.toContain(credential.authKey); expect(url).not.toContain("profile=");
+    await app.connectSaved(b.profileId);
+    expect(app.state.activeProfileId).toBe(b.profileId);
+    expect(app.state.owner?.sessions).toEqual([]);
+    vi.mocked(network.readSession).mockClear();
+    const delivery = new MobileNativeIntentDelivery();
+    expect(delivery.offer(url)).toBe(true);
+    const claim = delivery.take()!, focus = vi.fn(), recovery = vi.fn();
+    await expect(executeMobileNativeIntent(claim, delivery, {
+      snapshot: () => projectMobileNativeIntentSnapshot(app.state), connectProfile: profileId => app.connectSaved(profileId),
+      selectSession: sessionId => app.select(sessionId), loadAround: eventId => app.around(eventId), loadOlder: () => app.older(),
+      returnLatest: () => app.latest(), showPage: vi.fn(), showSavedConnections: vi.fn(), showRecovery: recovery,
+      clearRecovery: vi.fn(), focusMessage: focus, clearMessageFocus: vi.fn(), focusApplication: vi.fn()
+    })).resolves.toBe(message ? "message" : "session");
+    expect(app.state.activeProfileId).toBe(credential.profileId);
+    expect(app.state.selectedId).toBe("session");
+    expect(network.readSession).toHaveBeenCalled();
+    expect(vi.mocked(network.readSession).mock.calls.every(call => call[0].profileId === credential.profileId)).toBe(true);
+    expect(recovery).not.toHaveBeenCalled();
+    if (message) expect(focus).toHaveBeenCalledWith({ requestId: claim.sequence, sessionId: "session", messageId: "source-message", messageEventId: reply.eventId });
+    else expect(focus).not.toHaveBeenCalled();
+  });
+
   it("opens a copied old message link and reads every newer page through the latest message", async () => {
     const network = fakeNetwork();
     const assistant = (eventId: string, sequence: bigint, messageId: string, body: string) => create(EventSchema, {
@@ -12561,6 +12612,35 @@ describe("native current-task cloning", () => {
     expect(app.state.owner?.sessions.find(child => child.sessionId === "aside-60")?.hidden).toBe(false);
   });
 
+  it("offers the other Side Chats of the current child's exact available parent", async () => {
+    const f = fixture(true);
+    const sibling = (id: string) => create(SessionSchema, { ...f.child(), sessionId: id, displayName: id,
+      nativeBinding: { ...f.child().nativeBinding!, opaqueReference: `native-${id}` },
+      derivationOrigin: { ...f.child().derivationOrigin!, sourceSessionAvailable: true, sourceMessageAvailable: false } });
+    const first = sibling("side-one"), second = sibling("side-two");
+    const elsewhere = sibling("other-parent-side");
+    elsewhere.derivationOrigin!.sourceSessionId = "another-parent";
+    let sessions = [f.state.session, first, second, elsewhere];
+    f.network.readOwner = vi.fn(async () => ({ connection, device, snapshot: create(SnapshotSchema, {
+      ...runtimeControlProjection(f.state.session, false), sessions, backends: [f.state.backend]
+    }) }));
+    f.network.readSession = vi.fn(async (_credential, id) => create(SnapshotSchema, {
+      ...runtimeControlProjection(sessions.find(item => item.sessionId === id), true), backends: [f.state.backend],
+      scope: { kind: { case: "session", value: { sessionId: id } } }
+    }));
+    const app = client(f.network, memoryStorage(credential).storage);
+    await app.start();
+    await app.select(first.sessionId);
+    expect(app.taskSideChatControls()).toMatchObject({ canOpen: false, sourceSessionId: "session",
+      children: [{ sessionId: second.sessionId }] });
+    await app.select(second.sessionId);
+    expect(app.taskSideChatControls()?.children.map(item => item.sessionId)).toEqual([first.sessionId]);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    sessions = [first, second, elsewhere];
+    await app.refresh();
+    expect(app.taskSideChatControls()).toBeUndefined();
+  });
+
   it("reconciles a lost side chat response without creating another child or dropping its retained draft", async () => {
     const f = fixture(true), saved = memoryStorage(credential), drafts = memoryDraftStores();
     vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
@@ -12574,6 +12654,40 @@ describe("native current-task cloning", () => {
     await app.reconcile();
     expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
     expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "cloned-task" }))?.text).toBe("Retain me");
+  });
+
+  it.each(["unchanged", "edited", "unknown"] as const)("sends /side only as a child draft while the original composer is %s", async source => {
+    const f = fixture(true), saved = memoryStorage(credential), drafts = memoryDraftStores();
+    const parent = { profileId: credential.profileId, sessionId: "session" };
+    const original = plainTextMobileComposerDraft("/side Keep this in the child");
+    vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
+      expect(operationId).toBe("side-command");
+      expect(mutation.payload).toMatchObject({ case: "openSideChat", value: { sourceSessionId: "session" } });
+      expect((await drafts.composer.readOperationInput(parent, operationId))?.text).toBe("Keep this in the child");
+      if (source === "unknown") throw new Error("Side Chat receipt was lost");
+      if (source === "edited") drafts.composer.save(parent, plainTextMobileComposerDraft("Newer source draft"));
+      f.state.derived = f.child();
+      return f.operation(operationId);
+    });
+    const app = client(f.network, saved.storage, undefined, undefined, () => "side-command", undefined, drafts);
+    await app.start();
+    const controls = app.taskAppCommandControls()!;
+    expect(controls.policy.sideChat).toBe(true);
+    await expect(app.executeTaskAppCommand(controls.surfaceOwnerKey, { kind: "sideChat", text: "Keep this in the child" }, original))
+      .resolves.toEqual({ kind: "sideChat", status: source === "unknown" ? "unknown" : "succeeded" });
+    expect(f.network.submit).toHaveBeenCalledOnce();
+    const child = { ...parent, sessionId: "cloned-task" };
+    if (source === "unknown") {
+      expect(app.state.selectedId).toBe("session");
+      expect(drafts.composer.readSync(parent)).toEqual(original);
+      expect(drafts.composer.readSync(child)).toBeNull();
+      expect(saved.pending()).toMatchObject([{ operationId: "side-command", kind: "session-side-chat", state: "unknown" }]);
+    } else {
+      expect(app.state.selectedId).toBe(child.sessionId);
+      expect((await drafts.composer.readDurable(child))?.text).toBe("Keep this in the child");
+      expect(drafts.composer.readSync(parent)?.text ?? null).toBe(source === "edited" ? "Newer source draft" : null);
+      expect(saved.pending()).toEqual([]);
+    }
   });
 
   it("clones an active task through a preconditioned typed operation after saving a body-free receipt", async () => {
