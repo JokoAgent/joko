@@ -376,6 +376,9 @@ message ThinkingDeltaEvent {
   uint32 content_index = 2;
   string delta = 3;
   bool hidden = 4;
+  bool final = 5;
+  optional string final_text = 6;
+  optional uint64 duration_ms = 7;
 }
 
 message StatusStreamEvent {
@@ -465,6 +468,9 @@ message MessageBlock {
 message MessageThinkingBlock {
   string text = 1;
   bool redacted = 2;
+  // Exact live block adopted by this completion within its original Run/Attempt.
+  optional string stream_block_id = 3;
+  optional uint64 duration_ms = 4;
 }
 
 message MessageArtifactBlock {

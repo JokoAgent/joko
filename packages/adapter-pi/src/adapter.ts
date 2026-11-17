@@ -3053,7 +3053,8 @@ export class PiBackendAdapter implements
       const sourceBinding = runtime.binding;
       const messageFork = context.target.remoteWorkspace === undefined && context.hostedExecution === undefined
         && runtime.control.runtimePolicy === "standard" ? derivation.messageFork : undefined;
-      const sourceHistory = messageFork === undefined ? await this.getEntries(undefined, context)
+      const treeFork = derivation.nativeTreeFork;
+      const sourceHistory = messageFork === undefined && treeFork === undefined ? await this.getEntries(undefined, context)
         : await this.#getEntriesRaw(undefined, runtime, context.signal);
       const sourceEntry = sourceHistory.entries.find((entry) => entry.id === entryId);
       if (sourceEntry === undefined) {
@@ -3074,6 +3075,7 @@ export class PiBackendAdapter implements
           cause: error
         });
       });
+      const sourceProof = exactFork === undefined ? treeFork : messageFork;
       const assertExactSource = async (): Promise<void> => {
         const state = await this.#requestState(runtime, context);
         if (state.isStreaming || state.isCompacting || state.pendingMessageCount > 0
@@ -3084,9 +3086,9 @@ export class PiBackendAdapter implements
           || (sourceBinding.nativeSessionId !== undefined && state.sessionId !== sourceBinding.nativeSessionId)) {
           throw piError("PI_SESSION_FORK_SOURCE_FENCE_CHANGED", "The original Pi Session changed before its message fork", "session", { retryable: true });
         }
-        messageFork!.assertCurrent();
+        sourceProof!.assertCurrent();
       };
-      if (exactFork !== undefined) await assertExactSource();
+      if (sourceProof !== undefined) await assertExactSource();
 
       const shadowKey = `fork-shadow-${randomUUID()}`;
       const sourceProfile = this.#spawnProfiles.get(runtime.key) ?? restoredSpawnProfile(context);
@@ -3117,8 +3119,8 @@ export class PiBackendAdapter implements
             || !detachedPath || !samePiForkEntries(expected, detachedPath)) {
             throw piError("PI_SESSION_FORK_SOURCE_FENCE_CHANGED", "The selected Pi message boundary changed before the fork", "session", { retryable: true });
           }
-          await assertExactSource();
         }
+        if (sourceProof !== undefined) await assertExactSource();
         const response = await shadow.transport.request(
           { type: "fork", entryId: exactFork?.userEntry.id ?? entryId },
           {
@@ -3193,7 +3195,7 @@ export class PiBackendAdapter implements
             recovery: "Reload the source Session identity before retrying the fork."
           });
         }
-        if (exactFork !== undefined) messageFork!.assertCurrent();
+        sourceProof?.assertCurrent();
         return {
           binding,
           ...(editorText === undefined ? {} : { editorText })

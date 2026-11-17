@@ -212,6 +212,14 @@ mountedIt("edits the same original image in task and new-task drafts, restores v
   const capture = async (name: string) => { if (evidence) { await mkdir(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, name + ".png"), animations: "disabled", timeout: 5_000 }); } };
   const closeDrawers = async () => { for (const name of ["Close details", "Close navigation"]) { const button = page.getByRole("button", { name, exact: true }); if (await button.isVisible()) await button.click(); } };
   const composer = page.locator(".composer"), tray = composer.locator(".attachment-list");
+  const reloadDraft = async () => {
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: fixture!.baseUrl })
+      .getByRole("button", { name: "Connect", exact: true }).click();
+    await tray.waitFor({ state: "visible", timeout: 20_000 });
+    await closeDrawers();
+  };
   const selectModel = async (name: string) => {
     const trigger = composer.locator(".model-picker-trigger"); await trigger.click();
     await page.locator('.model-picker__row[role="option"]').filter({ hasText: name }).first().click();
@@ -275,8 +283,7 @@ mountedIt("edits the same original image in task and new-task drafts, restores v
     await page.getByLabel("Device name").fill("Editable image browser"); await page.locator("form.pair-form button[type=submit]").click();
     await composer.waitFor({ state: "visible", timeout: 20_000 }); await closeDrawers(); await attach(); await edit(true);
     await waitFor(() => tray.locator(".annotated-image path").count(), count => count === 2, "the saved vector thumbnail");
-    await capture("wide-light-editable-draft"); await persisted(false); await page.reload({ waitUntil: "domcontentloaded" });
-    await tray.waitFor({ state: "visible", timeout: 20_000 }); await closeDrawers(); await edit(false);
+    await capture("wide-light-editable-draft"); await persisted(false); await reloadDraft(); await edit(false);
     expect(await tray.locator(".annotated-image path").count()).toBe(0);
     const originalBytes = await tray.locator("img").evaluate(async image => [...new Uint8Array(await (await fetch((image as HTMLImageElement).src)).arrayBuffer())]);
     expect(Buffer.from(originalBytes)).toEqual(imageBytes);
@@ -289,7 +296,7 @@ mountedIt("edits the same original image in task and new-task drafts, restores v
     await page.getByRole("button", { name: /^New task/u }).first().click(); await closeDrawers();
     await selectModel("Test Multimodal");
     await attach(); await edit(true); await capture("narrow-dark-editable-new-task"); await persisted(true);
-    await page.reload({ waitUntil: "domcontentloaded" }); await tray.waitFor({ state: "visible", timeout: 20_000 }); await closeDrawers();
+    await reloadDraft();
     await selectModel("Test Text");
     await tray.locator("button.attachment-chip__content").click();
     const readOnlyOverlay = page.getByRole("dialog", { name: "editable.png", exact: true });

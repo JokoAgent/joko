@@ -26,3 +26,11 @@ export function assistantStreamAttempt(event: Event): string | undefined {
     identity.generation.toString(), event.cursor.generation.toString()
   ]);
 }
+
+/** A live thinking block can be adopted only by its exact source owner. */
+export function thinkingStreamOwner(event: Event): string | undefined {
+  const attempt = assistantStreamAttempt(event);
+  const identity = event.identity;
+  return attempt === undefined || !identity?.backendId || !identity.targetId ? undefined
+    : JSON.stringify([identity.backendId, identity.targetId, attempt]);
+}

@@ -2,7 +2,7 @@ import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/p
 import { materializeImageAttachment } from "./image-attachment.js";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import type { ProviderAccountResetApi } from "@joko/contracts";
-import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock } from "@joko/contracts";
+import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock, thinkingStreamOwner } from "@joko/contracts";
 import { createProviderAccountResetApi, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
@@ -12913,10 +12913,15 @@ function projectTimelineEvent(
     }
     case "thinkingDelta": {
       const id = `${kind.value.messageId}:thinking:${kind.value.contentIndex}`;
+      const streamOwner = thinkingStreamOwner(event);
       const existing = items.find((item) => item.kind === "thinking"
-        && item.id === id
-        && item.messageId === kind.value.messageId
-        && item.contentIndex === kind.value.contentIndex);
+        && (item.id === id && item.messageId === kind.value.messageId && item.contentIndex === kind.value.contentIndex
+          || streamOwner !== undefined && item.thinkingStreamOwner === streamOwner && item.thinkingStreamBlockId === kind.value.messageId));
+      if (existing?.thinkingCompleted && existing.thinkingStreamOwner === streamOwner) { changed = false; break; }
+      if (!kind.value.final && (kind.value.finalText !== undefined || kind.value.durationMs !== undefined)
+        || kind.value.final && !kind.value.hidden && kind.value.finalText === undefined) throw new GatewayError("The thinking completion is invalid.");
+      const redacted = kind.value.hidden || existing?.thinkingRedacted === true;
+      const durationMs = thinkingDurationMilliseconds(kind.value.durationMs);
       const occurredAt = event.occurredAt;
       const observedMilliseconds = occurredAt !== undefined
         && Number.isInteger(occurredAt.nanos)
@@ -12942,8 +12947,12 @@ function projectTimelineEvent(
         kind: "thinking",
         createdAt: existing?.createdAt ?? createdAt,
         ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
-        text: `${existing?.text ?? ""}${kind.value.delta}`,
-        streaming: true
+        text: redacted ? "" : kind.value.final ? kind.value.finalText ?? "" : `${existing?.text ?? ""}${kind.value.delta}`,
+        streaming: !kind.value.final && !redacted,
+        ...(kind.value.final ? { thinkingCompleted: true } : {}),
+        ...(redacted ? { thinkingRedacted: true } : {}),
+        ...(streamOwner === undefined ? {} : { thinkingStreamOwner: streamOwner }),
+        ...(redacted || durationMs === undefined ? {} : { thinkingDurationMs: durationMs })
       });
       break;
     }
@@ -13398,6 +13407,12 @@ function projectTimelineEvent(
   return new Map(timeline).set(sessionId, items);
 }
 
+function thinkingDurationMilliseconds(value: bigint | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) throw new GatewayError("The thinking duration is invalid.");
+  return Number(value);
+}
+
 function isProjectedMessageItem(item: TimelineItemView, messageId: string): boolean {
   return item.messageId === messageId
     || item.id === messageId
@@ -13427,7 +13442,18 @@ function reconcileCompletedAssistantMessage(
   const learning = projectPartnerLearningFeedback(completed.learning);
   const streamAttempt = completed.nativeIdentity === undefined && completed.blocks.some(block => block.content.case === "text")
     ? assistantStreamAttempt(event) : undefined;
+  const streamOwner = thinkingStreamOwner(event);
+  const sourceThinking = new Map<number, TimelineItemView>();
+  for (const [index, block] of completed.blocks.entries()) {
+    if (block.content.case !== "thinking" || !block.content.value.streamBlockId || streamOwner === undefined) continue;
+    const id = block.content.value.streamBlockId;
+    const source = items.find(item => item.kind === "thinking" && item.thinkingStreamOwner === streamOwner
+      && (item.messageId === id || item.thinkingStreamBlockId === id));
+    if (source !== undefined) sourceThinking.set(index, source);
+  }
+  const adoptedThinking = new Set(sourceThinking.values());
   const belongsToMessage = (item: TimelineItemView): boolean => isProjectedMessageItem(item, messageId)
+    || adoptedThinking.has(item)
     || (streamAttempt !== undefined && item.assistantStreamAttempt === streamAttempt && item.streaming === true);
   const existingContent = items.filter((item) =>
     (item.kind === "assistant" || item.kind === "thinking")
@@ -13485,23 +13511,31 @@ function reconcileCompletedAssistantMessage(
     }
     if (block.content.case === "thinking") {
       const id = `${messageId}:thinking:${contentIndex}`;
-      const existing = existingContent.find((item) =>
+      const existing = sourceThinking.get(contentIndex) ?? existingContent.find((item) =>
         item.kind === "thinking" && (item.contentIndex === contentIndex || item.id === id)
       );
+      const redacted = block.content.value.redacted || existing?.thinkingRedacted === true;
+      const durationMs = block.content.value.durationMs === undefined ? existing?.thinkingDurationMs : thinkingDurationMilliseconds(block.content.value.durationMs);
       finalItems.push({
         contentIndex,
         item: {
-          id,
+          id: existing?.id ?? id,
           messageId,
           contentIndex,
           ...(existing?.runId || event.identity?.runId ? { runId: existing?.runId || event.identity?.runId } : {}),
           sequence: existing?.sequence ?? sequence,
           kind: "thinking",
           createdAt: existing?.createdAt ?? createdAt,
-          ...(existing?.messageId === messageId && existing.contentIndex === contentIndex
+          ...((existing?.messageId === messageId && existing.contentIndex === contentIndex || sourceThinking.get(contentIndex) === existing)
+            && existing !== undefined
             && existing.lastActivityAt !== undefined ? { lastActivityAt: existing.lastActivityAt } : {}),
-          text: block.content.value.text,
-          streaming: false
+          text: redacted ? "" : block.content.value.text,
+          streaming: false,
+          thinkingCompleted: true,
+          ...(redacted ? { thinkingRedacted: true } : {}),
+          ...(streamOwner === undefined ? {} : { thinkingStreamOwner: streamOwner }),
+          ...(block.content.value.streamBlockId === undefined ? {} : { thinkingStreamBlockId: block.content.value.streamBlockId }),
+          ...(redacted || durationMs === undefined ? {} : { thinkingDurationMs: durationMs })
         }
       });
       continue;

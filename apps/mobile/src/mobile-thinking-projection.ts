@@ -1,4 +1,4 @@
-import { MessageRole, PiMessageLifecycleKind, type Event } from "@joko/contracts";
+import { MessageRole, PiMessageLifecycleKind, thinkingStreamOwner, type Event } from "@joko/contracts";
 
 export interface MobileThinkingView {
   readonly key: string;
@@ -17,12 +17,15 @@ export interface MobileThinkingView {
   readonly pi?: true;
   readonly startedAtMs?: number;
   readonly lastActivityAtMs?: number;
+  readonly durationMs?: number;
+  readonly streamOwner?: string;
 }
 
-/** Current-v1 public thinking blocks have no authoritative independent duration. */
+/** Only exact block completion supplies a phase duration; delta timestamps do not. */
 export function mobileThinkingViews(events: readonly Event[], sessionStreaming = false): MobileThinkingView[] {
   const views = new Map<string, MobileThinkingView>();
   const completedMessages = new Set<string>();
+  const completedSources = new Set<string>();
   const stoppedRuns = new Set<string>();
   const latestUser = new Map<string, bigint>();
   const seen = new Set<string>();
@@ -35,6 +38,7 @@ export function mobileThinkingViews(events: readonly Event[], sessionStreaming =
     if (!scope || !kind?.case) continue;
     const sequence = event.cursor!.sequence;
     const at = mobileEventTimestamp(event);
+    const streamOwner = thinkingStreamOwner(event);
     if (kind.case === "messageStarted" && kind.value.role === MessageRole.USER) {
       latestUser.set(scope.ownerScope, sequence);
     }
@@ -45,10 +49,14 @@ export function mobileThinkingViews(events: readonly Event[], sessionStreaming =
     if (kind.case === "thinkingDelta") {
       const messageId = kind.value.messageId;
       if (!messageId || !Number.isSafeInteger(kind.value.contentIndex) || kind.value.contentIndex < 0) continue;
+      if (!kind.value.final && (kind.value.finalText !== undefined || kind.value.durationMs !== undefined)
+        || kind.value.final && !kind.value.hidden && kind.value.finalText === undefined) continue;
       const messageScope = mobileMessageScope(scope, messageId);
-      if (completedMessages.has(messageScope) || stoppedRuns.has(scope.runScope)) continue;
+      if (completedMessages.has(messageScope) || stoppedRuns.has(scope.runScope)
+        || streamOwner !== undefined && completedSources.has(JSON.stringify([streamOwner, messageScope]))) continue;
       const key = mobileThinkingKey(messageScope, kind.value.contentIndex);
       const previous = views.get(key);
+      if (previous?.completed && previous.streamOwner === streamOwner) continue;
       const redacted = previous?.redacted === true || kind.value.hidden;
       const native = event.pi?.payload;
       const pi = native?.case === "messageLifecycle" && native.value.kind === PiMessageLifecycleKind.MESSAGE_UPDATE
@@ -56,8 +64,10 @@ export function mobileThinkingViews(events: readonly Event[], sessionStreaming =
       views.set(key, {
         ...scope, messageScope, key, messageId, contentIndex: kind.value.contentIndex,
         eventId: event.eventId, sequence: previous?.sequence ?? sequence,
-        text: redacted ? "" : (previous?.text ?? "") + kind.value.delta,
-        redacted, completed: false, streaming: false,
+        text: redacted ? "" : kind.value.final ? kind.value.finalText ?? "" : (previous?.text ?? "") + kind.value.delta,
+        redacted, completed: kind.value.final, streaming: false,
+        ...(streamOwner === undefined ? {} : { streamOwner }),
+        ...(redacted || !kind.value.final || kind.value.durationMs === undefined ? {} : { durationMs: thinkingDurationMs(kind.value.durationMs) }),
         ...(pi || previous?.pi ? { pi: true as const } : {}),
         ...((previous?.startedAtMs ?? at) === undefined ? {} : { startedAtMs: Math.min(previous?.startedAtMs ?? at!, at ?? previous!.startedAtMs!) }),
         ...((previous?.lastActivityAtMs ?? at) === undefined ? {} : { lastActivityAtMs: Math.max(previous?.lastActivityAtMs ?? at!, at ?? previous!.lastActivityAtMs!) })
@@ -72,15 +82,25 @@ export function mobileThinkingViews(events: readonly Event[], sessionStreaming =
       for (let contentIndex = 0; contentIndex < kind.value.blocks.length; contentIndex++) {
         const block = kind.value.blocks[contentIndex]!;
         if (block.content.case !== "thinking") continue;
-        const redacted = block.content.value.redacted;
+        const sourceScope = streamOwner !== undefined && block.content.value.streamBlockId
+          ? mobileMessageScope(scope, block.content.value.streamBlockId) : undefined;
+        const source = sourceScope === undefined ? undefined : [...views.values()].find(view =>
+          view.messageScope === sourceScope && view.streamOwner === streamOwner);
+        if (sourceScope !== undefined) completedSources.add(JSON.stringify([streamOwner, sourceScope]));
+        if (source !== undefined) views.delete(source.key);
+        const prior = source ?? [...previous.values()].find(view => view.contentIndex === contentIndex);
+        const redacted = block.content.value.redacted || prior?.redacted === true;
         const text = redacted ? "" : block.content.value.text;
         if (!redacted && text.trim() === "") continue;
-        const key = mobileThinkingKey(messageScope, contentIndex);
-        const prior = previous.get(key);
+        const key = prior?.key ?? mobileThinkingKey(messageScope, contentIndex);
+        const durationMs = block.content.value.durationMs === undefined ? prior?.durationMs : thinkingDurationMs(block.content.value.durationMs);
         views.set(key, {
           ...scope, messageScope, key, messageId: kind.value.messageId, contentIndex,
           eventId: event.eventId, sequence: prior?.sequence ?? sequence,
           text, redacted, completed: true, streaming: false,
+          ...(streamOwner === undefined ? {} : { streamOwner }),
+          ...(redacted || durationMs === undefined ? {} : { durationMs }),
+          ...(prior?.pi ? { pi: true as const } : {}),
           ...(prior?.startedAtMs === undefined ? {} : { startedAtMs: prior.startedAtMs }),
           ...(prior?.lastActivityAtMs === undefined ? {} : { lastActivityAtMs: prior.lastActivityAtMs })
         });
@@ -93,6 +113,10 @@ export function mobileThinkingViews(events: readonly Event[], sessionStreaming =
       && view.sequence > (latestUser.get(view.ownerScope) ?? -1n)
   })).sort((a, b) => a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1
     : a.messageScope === b.messageScope ? a.contentIndex - b.contentIndex : a.key.localeCompare(b.key));
+}
+
+function thinkingDurationMs(value: bigint): number | undefined {
+  return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : undefined;
 }
 
 export interface MobileMessageEventScope {

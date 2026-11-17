@@ -18,6 +18,18 @@ function event(sequence: bigint, payload: EventEnvelope["payload"]): EventEnvelo
 }
 
 describe("session projection", () => {
+  it("seals independent thinking with its exact final text and retains the completed block until message adoption", () => {
+    let state = reduceEvent(emptyProjection(), event(1n, { type: "thinking_delta", blockId: "thinking-A", delta: "draft" }));
+    state = reduceEvent(state, event(2n, { type: "thinking_delta", blockId: "thinking-A", delta: "", final: true, finalText: "Final reasoning", durationMs: 250 }));
+    state = reduceEvent(state, event(3n, { type: "thinking_delta", blockId: "thinking-A", delta: " late" }));
+    expect(state.streamingBlocks.get("thinking-A")).toEqual({ kind: "thinking", text: "Final reasoning", completed: true, durationMs: 250 });
+    state = reduceEvent(state, event(4n, { type: "message_complete", role: "assistant", blocks: [
+      { kind: "thinking", text: "Final reasoning", redacted: false, streamBlockId: "thinking-A", durationMs: 250 }
+    ] }));
+    expect(state.streamingBlocks.size).toBe(0);
+    expect(state.timeline[0]?.blocks?.[0]).toMatchObject({ streamBlockId: "thinking-A", durationMs: 250 });
+  });
+
   it("replaces only an original assistant learning footer without adding a timeline row", () => {
     const completed = event(1n, { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original" }] });
     let state = reduceEvent(emptyProjection(), completed);

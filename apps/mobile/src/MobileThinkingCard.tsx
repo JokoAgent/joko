@@ -42,7 +42,8 @@ export const MobileThinkingCard = memo(function MobileThinkingCard({ thinking, o
   const t = (key: Parameters<typeof mobileThinkingMessage>[1], seconds?: number): string => mobileThinkingMessage(locale, key, seconds);
   const elapsed = running && clock?.ownerKey === ownerKey && clock.blockKey === thinking.key && clock.start === start
     ? clock.seconds : undefined;
-  const title = thinking.redacted ? t("hidden") : thinking.completed ? t("completed")
+  const title = thinking.redacted ? t("hidden") : thinking.completed
+    ? thinking.durationMs === undefined ? t("completed") : t("completedTimed", Math.floor(thinking.durationMs / 1_000))
     : elapsed === undefined ? t("title") : t("active", elapsed);
   const tokens = useMemo(() => thinking.redacted ? [] : tokenizeMobileThinkingText(thinking.text), [thinking.redacted, thinking.text]);
   const content = thinking.redacted ? t("hiddenBody") : tokens.length === 0 ? t("empty") : tokens.map((token, index) =>

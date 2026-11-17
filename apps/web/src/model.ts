@@ -1684,6 +1684,11 @@ export interface TimelineItemView {
   readonly endedAt?: number;
   /** Latest observed delta time for this exact thinking block, not its completion or duration. */
   readonly lastActivityAt?: number;
+  readonly thinkingCompleted?: boolean;
+  readonly thinkingRedacted?: boolean;
+  readonly thinkingDurationMs?: number;
+  readonly thinkingStreamOwner?: string;
+  readonly thinkingStreamBlockId?: string;
   readonly title?: string;
   readonly text?: string;
   readonly streaming?: boolean;

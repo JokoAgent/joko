@@ -68,6 +68,7 @@ export class PiEventTranslator {
   readonly #messageNamespace = randomUUID();
   #assistantMessageOrdinal = 0;
   #activeMessageBlockPrefix = `assistant-${this.#messageNamespace}-0`;
+  readonly #thinkingBlocks = new Map<number, { readonly startedAt: number; redacted: boolean; emitted: boolean; final: boolean; durationMs?: number }>();
   #activeCompactionId: string | undefined;
   #activeCompactionReason: string | undefined;
   #activeCompactionNativeIdentity: NativeMessageIdentity | undefined;
@@ -245,6 +246,7 @@ export class PiEventTranslator {
         if (isRecord(record.message) && record.message.role === "assistant") {
           this.#assistantMessageOrdinal += 1;
           this.#activeMessageBlockPrefix = `assistant-${this.#messageNamespace}-${this.#assistantMessageOrdinal}`;
+          this.#thinkingBlocks.clear();
         }
         return;
       case "message_update":
@@ -517,17 +519,35 @@ export class PiEventTranslator {
     const delta = record.assistantMessageEvent;
     const index = numberValue(delta.contentIndex, 0);
     const blockId = `${this.#activeMessageBlockPrefix}-${index}`;
-    // Current Pi message updates are delta-only. Empty deltas are protocol
+    if (["thinking_start", "thinking_delta", "thinking_end"].includes(stringValue(delta.type, ""))) {
+      if (delta.type === "thinking_delta" && (typeof delta.delta !== "string" || delta.delta.length === 0)) return;
+      let block = this.#thinkingBlocks.get(index);
+      if (block === undefined) {
+        block = { startedAt: performance.now(), redacted: false, emitted: false, final: false };
+        this.#thinkingBlocks.set(index, block);
+      }
+      if (block.final) return;
+      block.redacted ||= isRedactedThinkingUpdate(delta);
+      if (delta.type === "thinking_start") return;
+      if (delta.type === "thinking_end") {
+        block.final = true;
+        block.durationMs = Math.max(0, Math.round(performance.now() - block.startedAt));
+        block.emitted = true;
+        await this.#emit({ type: "thinking_delta", blockId, contentIndex: index, delta: "", final: true,
+          finalText: block.redacted ? "" : stringValue(delta.content, ""),
+          ...(block.redacted ? { redacted: true } : { durationMs: block.durationMs }) }, withContentIndex(metadata, index));
+      } else if (!block.redacted) {
+        block.emitted = true;
+        await this.#emit({ type: "thinking_delta", blockId, delta: delta.delta as string, contentIndex: index }, withContentIndex(metadata, index));
+      } else if (block.emitted) {
+        await this.#emit({ type: "thinking_delta", blockId, contentIndex: index, delta: "", redacted: true }, withContentIndex(metadata, index));
+      }
+      return;
+    }
+    // Text updates are delta-only. Empty deltas are protocol
     // no-ops and must not create durable empty blocks.
     if (delta.type === "text_delta" && typeof delta.delta === "string" && delta.delta.length > 0) {
       await this.#emit({ type: "text_delta", blockId, delta: delta.delta, contentIndex: index }, withContentIndex(metadata, index));
-    } else if (
-      delta.type === "thinking_delta"
-      && typeof delta.delta === "string"
-      && delta.delta.length > 0
-      && !isRedactedThinkingUpdate(delta)
-    ) {
-      await this.#emit({ type: "thinking_delta", blockId, delta: delta.delta, contentIndex: index }, withContentIndex(metadata, index));
     }
     // Pi's toolcall_* message updates describe the model generating arguments;
     // they are not tool execution lifecycle events. In particular, JSON-mode
@@ -570,7 +590,7 @@ export class PiEventTranslator {
         this.#lastOutcome = "completed";
       }
     }
-    const blocks = await this.#messageBlocks(record.message);
+    const blocks = await this.#messageBlocks(record.message, role === "assistant");
     const usage = role === "assistant"
       ? projectMessageUsage(record.message.usage, this.#isFastMode?.(), record.message.timestamp)
       : undefined;
@@ -585,23 +605,28 @@ export class PiEventTranslator {
     }, metadata);
   }
 
-  async #messageBlocks(message: Record<string, unknown>): Promise<readonly MessageBlock[]> {
+  async #messageBlocks(message: Record<string, unknown>, liveAssistant = false): Promise<readonly MessageBlock[]> {
     if (typeof message.content === "string") return [{ kind: "text", text: message.content }];
     if (!Array.isArray(message.content)) return [];
     const blocks: MessageBlock[] = [];
-    for (const value of message.content) {
+    for (const [contentIndex, value] of message.content.entries()) {
       if (!isRecord(value) || typeof value.type !== "string") continue;
       if (value.type === "text" && typeof value.text === "string") {
         blocks.push({ kind: "text", text: value.text });
       } else if ((value.type === "thinking" || value.type === "reasoning") && typeof value.thinking === "string") {
-        const redacted = value.redacted === true;
+        const source = liveAssistant ? this.#thinkingBlocks.get(contentIndex) : undefined;
+        const redacted = value.redacted === true || source?.redacted === true;
         blocks.push({
           kind: "thinking",
           text: redacted ? "[redacted by provider]" : value.thinking,
-          redacted
+          redacted,
+          ...(source?.emitted ? { streamBlockId: `${this.#activeMessageBlockPrefix}-${contentIndex}` } : {}),
+          ...(redacted || source?.durationMs === undefined ? {} : { durationMs: source.durationMs })
         });
       } else if (value.type === "redacted_thinking") {
-        blocks.push({ kind: "thinking", text: "[redacted by provider]", redacted: true });
+        const source = liveAssistant ? this.#thinkingBlocks.get(contentIndex) : undefined;
+        blocks.push({ kind: "thinking", text: "[redacted by provider]", redacted: true,
+          ...(source?.emitted ? { streamBlockId: `${this.#activeMessageBlockPrefix}-${contentIndex}` } : {}) });
       } else if (value.type === "toolCall") {
         const toolName = stringValue(value.name, "unknown");
         const privateMemory = isPrivateMemoryToolName(toolName);
@@ -936,6 +961,7 @@ export class PiEventTranslator {
   }
 
   #resetRunOutcome(): void {
+    this.#thinkingBlocks.clear();
     this.#pendingAssistantError = undefined;
     this.#activeCompactionId = undefined;
     this.#activeCompactionReason = undefined;
@@ -1812,5 +1838,8 @@ function safeStringify(value: unknown): string {
 
 /** Suppress the provider placeholder; the terminal message emits a typed redacted block. */
 function isRedactedThinkingUpdate(delta: Record<string, unknown>): boolean {
-  return delta.delta === "[Reasoning redacted]";
+  const content = isRecord(delta.partial) && Array.isArray(delta.partial.content) ? delta.partial.content : undefined;
+  const block = content?.[numberValue(delta.contentIndex, 0)];
+  return isRecord(block) && block.type === "thinking" && block.redacted === true
+    || delta.delta === "[Reasoning redacted]" || delta.content === "[Reasoning redacted]";
 }

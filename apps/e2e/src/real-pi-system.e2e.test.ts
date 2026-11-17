@@ -18,6 +18,7 @@ import {
   InstallResourceMutationSchema,
   MessageRole,
   ModelSelectionSchema,
+  NativeNavigationTargetSchema,
   OperationMutationSchema,
   OperationState,
   OwnerSnapshotScopeSchema,
@@ -53,6 +54,7 @@ import {
   compactMutation,
   createManualScheduleMutation,
   createSessionMutation,
+  navigateMutation,
   pauseQueueMutation,
   queueRunIdFrom,
   resolvePermissionMutation,
@@ -126,6 +128,64 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const usage = (await reconnected.run.getRun({ runId })).run?.usage;
     expect(usage?.completionEventId).toBe(completion?.eventId);
     expect(usage?.usage?.totalTokens).toBe(10n);
+  });
+
+  it("forks a durable Pi user node off the active branch without moving the source leaf", { timeout: 120_000 }, async () => {
+    fixture = await RealPiSystemFixture.start();
+    const owner = await fixture.pair("Pi native tree owner");
+    const { clients, connectionId } = owner;
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+    })));
+    const store = fixture.application.store, original = store.getSession(sessionId).descriptor.binding;
+    const generation = BigInt(original.generation);
+    const send = async (text: string) => {
+      const input = await submit(clients.operation, connectionId, sendInputMutation(sessionId, generation, text));
+      const runId = queueRunIdFrom(input);
+      await waitForRealSystem(() => clients.run.getRun({ runId }), response => response.run?.state === RunState.SUCCEEDED,
+        `the Pi turn ${text} to settle`, 30_000);
+    };
+    await send("Parent round kept by the branch.");
+    const parent = store.findCompletedSessionAssistantOrigin(sessionId)!;
+    expect(parent.nativeEntryId).toBeTruthy();
+    await send("Selected question on the inactive branch.");
+    const selected = store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false })!;
+    const event = store.findEvent(selected.eventId);
+    if (event?.payload.type !== "message_complete" || event.payload.role !== "user" || !event.payload.nativeHistory?.identity?.entryId) {
+      throw new Error("The selected Pi question has no exact durable native identity.");
+    }
+    const entryId = event.payload.nativeHistory.identity.entryId;
+    const navigation = await submit(clients.operation, connectionId, navigateMutation(sessionId,
+      create(NativeNavigationTargetSchema, { kind: { case: "nativeEntryId", value: parent.nativeEntryId } }), generation));
+    expect(navigation.state, navigation.error?.message).toBe(OperationState.SUCCEEDED);
+    await send("New question on the active branch.");
+    const before = (await clients.session.getNativeSessionTree({ sessionId })).tree!;
+    expect(before.flatNodes.map(node => node.entryId)).toContain(entryId);
+    expect(before.activeEntryId).not.toBe(entryId);
+    await expect(clients.session.listSessionTimeline({ sessionId, aroundEventId: selected.eventId })).rejects.toMatchObject({ code: Code.NotFound });
+    expect(store.findPiTreeForkMessageOrigin(sessionId, entryId, selected.eventId)).toEqual(selected);
+
+    const operationId = randomUUID();
+    const mutation = create(OperationMutationSchema, { payload: { case: "forkSession", value: {
+      sourceSessionId: sessionId, nativeEntryId: entryId, newDisplayName: "Selected inactive Pi branch"
+    } } });
+    const operation = await submit(clients.operation, connectionId, mutation, operationId);
+    expect(operation.state, operation.error?.message).toBe(OperationState.SUCCEEDED);
+    const childId = sessionIdFrom(operation);
+    const child = store.getSession(childId).descriptor;
+    expect(child.binding.opaqueRef).not.toBe(original.opaqueRef);
+    expect(child.derivationOrigin).toEqual({ kind: "fork", sourceSessionId: sessionId,
+      sourceMessageId: selected.messageId, sourceEventId: selected.eventId });
+    const inherited = (await clients.session.getNativeSessionTree({ sessionId: childId })).tree!.flatNodes.map(node => node.entryId);
+    expect(inherited).toContain(parent.nativeEntryId);
+    expect(inherited).not.toContain(entryId);
+    expect(inherited).not.toContain(before.activeEntryId);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(original);
+    expect((await clients.session.getNativeSessionTree({ sessionId })).tree?.activeEntryId).toBe(before.activeEntryId);
+    await expect(clients.session.listSessionTimeline({ sessionId, aroundEventId: selected.eventId })).rejects.toMatchObject({ code: Code.NotFound });
+    expect(sessionIdFrom(await submit(clients.operation, connectionId, mutation, operationId))).toBe(childId);
+    expect((await clients.session.listSessions({ targetId: "workspace-real-pi" })).sessions.map(item => item.sessionId).sort())
+      .toEqual([sessionId, childId].sort());
   });
 
   it.skipIf(process.platform !== "linux")("creates a valid same-byte Bash Artifact after explicit deletion and retains its native history across cold restart", { timeout: 120_000 }, async () => {

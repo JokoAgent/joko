@@ -1986,6 +1986,8 @@ const en = {
   "permission.fullHelp": "Not an OS sandbox. The selected Backend can use the service account to read credentials or modify approved extra directories.",
   "partners.fullAccessConfirmationRequired": "Full access has not been saved. Retry to review and explicitly confirm this exact draft.",
   "timeline.thinking": "Thinking",
+  "timeline.thinkingDuration": "Thinking · {seconds}s",
+  "timeline.thinkingHidden": "Thinking hidden",
   "timeline.tool": "Tool",
   "timeline.result": "Result",
   "timeline.compaction": "Context compacted",
@@ -6658,6 +6660,8 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  "timeline.thinkingDuration": "思考 · {seconds} 秒",
+  "timeline.thinkingHidden": "思考已隐藏",
   "settings.modelPurpose": "模型用途",
   "settings.modelPurposeChat": "对话",
   "settings.modelPurposeSpeech": "语音合成",

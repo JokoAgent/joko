@@ -23,7 +23,8 @@ export interface SessionProjection {
   readonly runState?: RunState;
   readonly usage?: UsageSnapshot;
   readonly interactions: ReadonlyMap<string, InteractionPayload>;
-  readonly streamingBlocks: ReadonlyMap<string, { readonly kind: "text" | "thinking"; readonly text: string }>;
+  readonly streamingBlocks: ReadonlyMap<string, { readonly kind: "text" | "thinking"; readonly text: string;
+    readonly completed?: boolean; readonly redacted?: boolean; readonly durationMs?: number }>;
   readonly nativeLeafId?: string;
   readonly attention?: SessionAttention;
 }
@@ -56,7 +57,15 @@ export function reduceEvent(state: SessionProjection, event: EventEnvelope): Ses
   if (payload.type === "text_delta" || payload.type === "thinking_delta") {
     const kind = payload.type === "text_delta" ? "text" : "thinking";
     const current = streamingBlocks.get(payload.blockId);
-    streamingBlocks.set(payload.blockId, { kind, text: `${current?.text ?? ""}${payload.delta}` });
+    if (current?.completed !== true) {
+      const thinking = payload.type === "thinking_delta" ? payload : undefined;
+      const redacted = current?.redacted === true || thinking?.redacted === true;
+      streamingBlocks.set(payload.blockId, { kind,
+        text: redacted ? "" : thinking?.final ? thinking.finalText ?? "" : `${current?.text ?? ""}${payload.delta}`,
+        ...(redacted ? { redacted: true } : {}),
+        ...(thinking?.final ? { completed: true } : {}),
+        ...(redacted || thinking?.durationMs === undefined ? {} : { durationMs: thinking.durationMs }) });
+    }
   } else if (payload.type === "message_complete") {
     timeline = [
       ...timeline,

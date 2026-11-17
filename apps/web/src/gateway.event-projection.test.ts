@@ -75,6 +75,61 @@ import { Code, ConnectError } from "@connectrpc/connect";
 
 const serviceNodeLocation = { kind: { case: "serviceNode" as const, value: {} } } as const;
 
+describe("independent thinking completion", () => {
+  const scoped = (sequence: bigint, kind: any, scope = {}) => create(EventSchema, { eventId: `thinking-${sequence}`,
+    cursor: { generation: 1n, sequence }, occurredAt: { seconds: sequence },
+    identity: { backendId: "pi", targetId: "target", sessionId: "task", runId: "run", attemptId: "attempt", generation: 4n, ...scope },
+    payload: { kind } });
+  const delta = scoped(1n, { case: "thinkingDelta", value: { messageId: "original-block", contentIndex: 0, delta: "Draft" } });
+  const completion = (scope = {}) => scoped(4n, { case: "messageCompleted", value: { messageId: "completed-message", role: MessageRole.ASSISTANT, blocks: [
+    { content: { case: "thinking", value: { text: "Final reasoning", streamBlockId: "original-block", durationMs: 2_500n } } },
+    { content: { case: "text", value: "Answer" } }
+  ] } }, scope);
+
+  it("seals the original card before the full message and adopts its exact source without changing the completion id", () => {
+    let raw = create(SnapshotSchema, { generation: 1n });
+    let snapshot = mapSnapshot(raw);
+    const apply = (event: Event) => { ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, event)); };
+    apply(delta);
+    const originalId = snapshot.timelineBySession.get("task")?.[0]?.id;
+    const terminal = scoped(2n, { case: "thinkingDelta", value: { messageId: "original-block", contentIndex: 0, delta: "", final: true,
+      finalText: "Final reasoning", durationMs: 2_500n } });
+    apply(terminal);
+    expect(snapshot.timelineBySession.get("task")).toMatchObject([{ id: originalId, text: "Final reasoning", streaming: false, thinkingCompleted: true, thinkingDurationMs: 2_500 }]);
+    apply(scoped(3n, { case: "thinkingDelta", value: { messageId: "original-block", contentIndex: 0, delta: " late" } }));
+    expect(snapshot.timelineBySession.get("task")?.[0]?.text).toBe("Final reasoning");
+    const final = completion();
+    const originalWire = toBinary(EventSchema, final);
+    apply(final);
+    expect(snapshot.timelineBySession.get("task")?.filter(item => item.kind === "thinking")).toMatchObject([
+      { id: originalId, messageId: "completed-message", sourceEventId: final.eventId, text: "Final reasoning", streaming: false, thinkingDurationMs: 2_500 }
+    ]);
+    expect(snapshot.timelineBySession.get("task")).toHaveLength(2);
+    expect(toBinary(EventSchema, final)).toEqual(originalWire);
+    apply(scoped(5n, { case: "thinkingDelta", value: { messageId: "original-block", contentIndex: 0, delta: " late after adoption" } }));
+    expect(snapshot.timelineBySession.get("task")).toHaveLength(2);
+    expect(snapshot.timelineBySession.get("task")?.[0]?.text).toBe("Final reasoning");
+    const empty = create(SnapshotSchema, { generation: 1n });
+    const first = projectSnapshotEvent(empty, mapSnapshot(empty), delta);
+    const hidden = projectSnapshotEvent(first.rawSnapshot, first.snapshot, scoped(2n, { case: "thinkingDelta", value: {
+      messageId: "original-block", contentIndex: 0, delta: "", final: true, hidden: true, finalText: "PRIVATE"
+    } }));
+    const adopted = projectSnapshotEvent(hidden.rawSnapshot, hidden.snapshot, final).snapshot;
+    expect(adopted.timelineBySession.get("task")?.find(item => item.kind === "thinking"))
+      .toMatchObject({ text: "", thinkingRedacted: true, streaming: false });
+  });
+
+  it.each([{ backendId: "codex" }, { targetId: "other" }, { sessionId: "other" }, { runId: "other" },
+    { attemptId: "other" }, { attemptId: "" }, { backendId: "" }, { targetId: "" }, { generation: 5n }])("retains the original thinking when a completion cites it from another owner: %j", scope => {
+    const raw = create(SnapshotSchema, { generation: 1n });
+    const first = projectSnapshotEvent(raw, mapSnapshot(raw), delta);
+    const result = projectSnapshotEvent(first.rawSnapshot, first.snapshot, completion(scope)).snapshot;
+    const all = [...result.timelineBySession.values()].flat().filter(item => item.kind === "thinking");
+    expect(all).toHaveLength(2);
+    expect(all.find(item => item.text === "Draft")).toMatchObject({ streaming: true, thinkingStreamOwner: expect.any(String) });
+  });
+});
+
 describe("event continuity", () => {
   const eventAt = (sequence: bigint, generation = 7n): Event => create(EventSchema, {
     eventId: `event-${sequence}`,
