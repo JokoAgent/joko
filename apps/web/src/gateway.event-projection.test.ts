@@ -120,7 +120,7 @@ describe("independent thinking completion", () => {
   });
 
   it.each([{ backendId: "codex" }, { targetId: "other" }, { sessionId: "other" }, { runId: "other" },
-    { attemptId: "other" }, { attemptId: "" }, { backendId: "" }, { targetId: "" }, { generation: 5n }])("retains the original thinking when a completion cites it from another owner: %j", scope => {
+    { attemptId: "other" }, { attemptId: "" }, { backendId: "" }, { targetId: "" }, { generation: 5n }])("retains the original thinking when a completion cites it from another owner: %o", scope => {
     const raw = create(SnapshotSchema, { generation: 1n });
     const first = projectSnapshotEvent(raw, mapSnapshot(raw), delta);
     const result = projectSnapshotEvent(first.rawSnapshot, first.snapshot, completion(scope)).snapshot;
