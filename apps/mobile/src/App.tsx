@@ -4272,6 +4272,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const sideChatControls = state.status === "connected" && !partnerIdentity.partner && !workerReadOnly
     ? client.taskSideChatControls() : undefined;
   const [sideChatsVisible, setSideChatsVisible] = useState(false);
+  const sideChatsOwner = useRef<string | undefined>(undefined);
   const [cloneVisible, setCloneVisible] = useState(false);
   const [forkEventId, setForkEventId] = useState<string>();
   const forkControls = state.status === "connected" && forkEventId ? client.taskMessageForkControls(forkEventId) : undefined;
@@ -6944,7 +6945,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         ...(sideChatControls?.canOpen ? [{ id: "side-chat" as const, label: mobileSideChatCopy(locale).create,
           onPress: () => askInSideChat(), disabled: state.busy || voice.busy || attachmentBusy }] : []),
         ...(sideChatControls && sideChatControls.children.length > 0 ? [{ id: "side-chats" as const, label: mobileSideChatCopy(locale).list,
-          onPress: () => setSideChatsVisible(true), disabled: state.busy || voice.busy || attachmentBusy }] : []),
+          onPress: () => { sideChatsOwner.current = sideChatControls.surfaceOwnerKey; setSideChatsVisible(true); },
+          disabled: state.busy || voice.busy || attachmentBusy }] : []),
         ...(session?.derivationOrigin?.sideChat && session.derivationOrigin.sourceSessionAvailable ? [{ id: "side-chat-parent" as const,
           label: mobileSideChatCopy(locale).back, onPress: () => { void client.select(session.derivationOrigin!.sourceSessionId)
             .catch((failure) => setLocalError(errorText(failure))); }, disabled: state.busy || voice.busy || attachmentBusy }] : []),
@@ -7650,11 +7652,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote}
       onAskSideChat={sideChatControls?.canOpen ? askInSideChat : undefined} />
-    <MobileActionSheet visible={sideChatsVisible && sideChatControls !== undefined && state.status === "connected"}
+    <MobileActionSheet visible={sideChatsVisible && sideChatControls !== undefined && sideChatsOwner.current === sideChatControls.surfaceOwnerKey}
       items={(sideChatControls?.children ?? []).map((child) => ({ id: child.sessionId, label: child.displayName, disabled: state.busy }))}
       colors={colors} locale={locale} onClose={() => setSideChatsVisible(false)} onAction={(id) => {
         const current = client.taskSideChatControls();
-        if (current?.authorityKey !== sideChatControls?.authorityKey || !current?.children.some((child) => child.sessionId === id)) return;
+        const captured = sideChatsOwner.current;
+        sideChatsOwner.current = undefined;
+        if (!taskMountedRef.current || AppState.currentState !== "active" || !captured || current?.surfaceOwnerKey !== captured
+          || !current.children.some(child => child.sessionId === id)) return;
         void client.select(id).catch((failure) => { if (taskMountedRef.current) setLocalError(errorText(failure)); });
       }} />
     <MobileTaskRenameSheet visible={renameTask !== undefined && renameTask.ownerKey === headerSourceKey

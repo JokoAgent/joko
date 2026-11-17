@@ -12633,6 +12633,35 @@ describe("native current-task cloning", () => {
     expect(app.state.owner?.sessions.find(child => child.sessionId === "aside-60")?.hidden).toBe(false);
   });
 
+  it("offers the other Side Chats of the current child's exact available parent", async () => {
+    const f = fixture(true);
+    const sibling = (id: string) => create(SessionSchema, { ...f.child(), sessionId: id, displayName: id,
+      nativeBinding: { ...f.child().nativeBinding!, opaqueReference: `native-${id}` },
+      derivationOrigin: { ...f.child().derivationOrigin!, sourceSessionAvailable: true } });
+    const first = sibling("side-one"), second = sibling("side-two");
+    const elsewhere = sibling("other-parent-side");
+    elsewhere.derivationOrigin!.sourceSessionId = "another-parent";
+    let sessions = [f.state.session, first, second, elsewhere];
+    f.network.readOwner = vi.fn(async () => ({ connection, device, snapshot: create(SnapshotSchema, {
+      ...runtimeControlProjection(f.state.session, false), sessions, backends: [f.state.backend]
+    }) }));
+    f.network.readSession = vi.fn(async (_credential, id) => create(SnapshotSchema, {
+      ...runtimeControlProjection(sessions.find(item => item.sessionId === id), true), backends: [f.state.backend],
+      scope: { kind: { case: "session", value: { sessionId: id } } }
+    }));
+    const app = client(f.network, memoryStorage(credential).storage);
+    await app.start();
+    await app.select(first.sessionId);
+    expect(app.taskSideChatControls()).toMatchObject({ canOpen: false, sourceSessionId: "session",
+      children: [{ sessionId: second.sessionId }] });
+    await app.select(second.sessionId);
+    expect(app.taskSideChatControls()?.children.map(item => item.sessionId)).toEqual([first.sessionId]);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    sessions = [first, second, elsewhere];
+    await app.refresh();
+    expect(app.taskSideChatControls()).toBeUndefined();
+  });
+
   it("reconciles a lost side chat response without creating another child or dropping its retained draft", async () => {
     const f = fixture(true), saved = memoryStorage(credential), drafts = memoryDraftStores();
     vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));

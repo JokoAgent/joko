@@ -14165,10 +14165,20 @@ export class MobileClient {
   taskSideChatControls() {
     if (this.#joinedTask) return undefined;
     const context = this.#taskDerivationContext(capabilityNames.sessionSideChat);
-    if (!context || context.runtime.session.sideChatSourceAllowed !== true || context.runtime.session.derivationOrigin?.sideChat) return undefined;
-    return { ...context.controls, canOpen: context.canDerive && !context.runtime.session.archived,
-      children: (this.#state.owner?.sessions ?? []).filter((child) => child.derivationOrigin?.sideChat
-        && child.derivationOrigin.sourceSessionId === context.runtime.session.sessionId) };
+    if (!context) return undefined;
+    const session = context.runtime.session;
+    const sessions = this.#state.owner!.sessions;
+    const origin = session.derivationOrigin;
+    const parent = origin?.sideChat ? sessions.find(candidate => candidate.sessionId === origin.sourceSessionId) : session;
+    const lineage = origin?.sideChat ? this.taskDerivationOriginControls() : undefined;
+    if (!parent || parent.derivationOrigin?.sideChat || parent.backendId !== session.backendId || parent.targetId !== session.targetId
+      || (origin?.sideChat ? !lineage?.canOpen || lineage.source?.sessionId !== parent.sessionId : session.sideChatSourceAllowed !== true)) return undefined;
+    return { ...context.controls, sourceSessionId: parent.sessionId, sourceName: parent.displayName,
+      surfaceOwnerKey: lineage?.authorityKey === undefined ? context.controls.surfaceOwnerKey
+        : JSON.stringify([context.controls.surfaceOwnerKey, lineage.authorityKey]),
+      canOpen: parent === session && context.canDerive && !session.archived,
+      children: sessions.filter(child => child.sessionId !== session.sessionId && child.backendId === parent.backendId && child.targetId === parent.targetId
+        && child.derivationOrigin?.sideChat && child.derivationOrigin.sourceSessionId === parent.sessionId) };
   }
 
   async openSideChat(authorityKey: string, draft?: MobileComposerDraft): Promise<
