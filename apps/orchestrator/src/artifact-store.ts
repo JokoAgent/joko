@@ -25,6 +25,7 @@ export interface TransferTicket {
   readonly maximumSize: number;
   readonly mimeType?: string;
   readonly fileName?: string;
+  readonly artifactTtlMs?: number;
   readonly expiresAt: number;
   readonly consumedAt?: number;
 }
@@ -286,9 +287,13 @@ export class ArtifactStore {
     maximumSize?: number;
     mimeType?: string;
     fileName?: string;
+    artifactTtlMs?: number;
   }): Promise<{ ticketId: string; secret: string; expiresAt: number }> {
     const maximumSize = Math.min(input.maximumSize ?? this.#maximumBlobBytes, this.#maximumBlobBytes);
     if (input.expectedSize !== undefined && input.expectedSize > maximumSize) throw new Error("Expected upload exceeds its size limit.");
+    if (input.artifactTtlMs !== undefined && (!Number.isSafeInteger(input.artifactTtlMs) || input.artifactTtlMs <= 0)) {
+      throw new Error("Upload artifact retention must be a positive duration.");
+    }
     return this.createTicket({ direction: "upload", maximumSize, ...input });
   }
 
@@ -367,7 +372,8 @@ export class ArtifactStore {
         ...(ticket.expectedSha256 === undefined ? {} : { expectedSha256: ticket.expectedSha256 }),
         ...(ticket.expectedSize === undefined ? {} : { expectedSize: ticket.expectedSize }),
         ...(ticket.fileName === undefined ? {} : { fileName: ticket.fileName }),
-        ...(ticket.mimeType === undefined ? {} : { mimeType: ticket.mimeType })
+        ...(ticket.mimeType === undefined ? {} : { mimeType: ticket.mimeType }),
+        ...(ticket.artifactTtlMs === undefined ? {} : { expiresAt: this.#now() + ticket.artifactTtlMs })
       });
     } catch (error) {
       await rm(temporaryPath, { force: true });

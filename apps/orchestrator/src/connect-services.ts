@@ -491,7 +491,7 @@ import { createCollaborationConnectService } from "./collaboration-connect-servi
 import { createObjectiveConnectService } from "./objective-connect-service.js";
 import type { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
-import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
+import { PORTABLE_IMPORT_DRAFT_TTL_MS, PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import type { RemoteBackendRuntimeSetupManager } from "./remote-backend-runtime-setup.js";
 import { createVoiceInputConnectService } from "./voice-input-connect-service.js";
@@ -4012,7 +4012,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
         expectedSize: safeByteCount(request.byteSize, undefined),
         maximumSize: safeByteCount(request.byteSize, undefined),
         mimeType: request.mediaType || undefined,
-        fileName: request.fileName || undefined
+        fileName: request.fileName || undefined,
+        ...(request.disposition === contract.BlobDisposition.PORTABLE_IMPORT
+          ? { artifactTtlMs: PORTABLE_IMPORT_DRAFT_TTL_MS } : {})
       });
       return {
         upload: create(contract.PendingBlobUploadSchema, {

@@ -43,6 +43,7 @@ export class BlobTransferCoordinator {
     readonly maximumSize?: number;
     readonly mimeType?: string;
     readonly fileName?: string;
+    readonly artifactTtlMs?: number;
   }): Promise<UploadTransfer> {
     this.prune();
     const ticket = await this.#artifacts.createUploadTicket(input);

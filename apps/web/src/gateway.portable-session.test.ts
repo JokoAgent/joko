@@ -125,7 +125,7 @@ describe("portable task package gateway", () => {
           fileName: "portable-task.jshare",
           mediaType: "application/vnd.joko.session",
           byteSize: 7n,
-          disposition: BlobDisposition.ATTACHMENT
+          disposition: BlobDisposition.PORTABLE_IMPORT
         });
         return response(method, create(BeginBlobUploadResponseSchema, {
           upload: {

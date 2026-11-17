@@ -164,6 +164,7 @@ import {
   adoptPortableSessionArtifacts,
   materializePortableSessionImport,
   preparePortableSessionImport,
+  PORTABLE_IMPORT_DRAFT_TTL_MS,
   type PortableSessionExportBuild,
   type PreparedPortableSessionImport
 } from "./portable-session-transfer.js";
@@ -214,7 +215,6 @@ const PROTECTED_MESSAGE_QUEUE_TTL_MS = 15 * 60_000;
 const MAXIMUM_PROTECTED_MESSAGE_QUEUE = 256;
 const PORTABLE_IMPORT_SOURCE_SETTING_KEY = "portable.import.source";
 const PORTABLE_IMPORT_ACTIVATION_SETTING_KEY = "portable.import.activation";
-const PORTABLE_IMPORT_DRAFT_TTL_MS = 10 * 60 * 1_000;
 const MAXIMUM_PORTABLE_IMPORT_DRAFTS = 128;
 const NATIVE_SESSION_CATALOG_TTL_MS = 30_000;
 const NATIVE_SESSION_CATALOG_SNAPSHOT_TTL_MS = 10 * 60_000;
@@ -527,6 +527,7 @@ interface PortableImportDraft {
   createdAt: number;
   expiresAt: number;
   prepared?: PreparedPortableSessionImport;
+  lockedBytes?: Uint8Array;
 }
 
 interface PortableImportActivationRecord {
@@ -8819,6 +8820,8 @@ export class SessionHost {
     this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
     this.expirePortableImportDrafts();
     const content = await this.#artifactStore.readBlob(input.package);
+    this.#assertOpen();
+    this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
     let prepared: PreparedPortableSessionImport | undefined;
     let encrypted = false;
     try {
@@ -8842,7 +8845,7 @@ export class SessionHost {
       encrypted,
       createdAt: now,
       expiresAt: now + PORTABLE_IMPORT_DRAFT_TTL_MS,
-      ...(prepared === undefined ? {} : { prepared })
+      ...(prepared === undefined ? { lockedBytes: content.data } : { prepared })
     };
     this.#portableImportDrafts.set(draft.id, draft);
     return portableImportDraftResult(draft);
@@ -8855,11 +8858,14 @@ export class SessionHost {
   }): Promise<PortableSessionImportDraftResult> {
     this.#assertOpen();
     const draft = this.requirePortableImportDraft(input.connection, input.draftId);
-    const content = await this.#artifactStore.readBlob(draft.package);
-    draft.prepared = preparePortableSessionImport(content.data, {
-      password: input.password,
-      contentLimitBytes: Math.min(this.#artifactStore.maximumBlobBytes, 256 * 1024 * 1024)
-    });
+    if (draft.prepared === undefined) {
+      if (draft.lockedBytes === undefined) throw new StoreError("The locked portable import preview is unavailable.");
+      draft.prepared = preparePortableSessionImport(draft.lockedBytes, {
+        password: input.password,
+        contentLimitBytes: Math.min(this.#artifactStore.maximumBlobBytes, 256 * 1024 * 1024)
+      });
+      delete draft.lockedBytes;
+    }
     draft.expiresAt = Date.now() + PORTABLE_IMPORT_DRAFT_TTL_MS;
     return portableImportDraftResult(draft);
   }
