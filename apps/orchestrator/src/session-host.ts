@@ -9442,7 +9442,7 @@ export class SessionHost {
           }
           try {
             assertSourceMessage(this.#store);
-            admittedUserCursor = this.#store.latestEventCursor();
+            admittedUserCursor = this.#store.health().globalCursor;
             navigation = await active.adapter.navigateTree(target, summarize, lease.context, customInstructions, {
               recordBinding: (binding) => {
                 this.#store.recordNativeSessionDerivation({
