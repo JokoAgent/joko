@@ -312,6 +312,8 @@ export interface NativeSessionDerivation {
     readonly nativeEntryId: string;
     readonly assertCurrent: () => void;
   };
+  /** The original user node on an inactive branch of an ordinary local Pi tree. */
+  readonly nativeTreeFork?: { readonly assertCurrent: () => void };
   readonly recordBinding: (binding: NativeSessionBinding) => void;
 }
 

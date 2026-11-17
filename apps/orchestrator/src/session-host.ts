@@ -5495,31 +5495,31 @@ export class SessionHost {
     this.#assertOpen();
     const persistedOperation = this.#store.findOperation(input.operationId);
     const persistedSourceMessage = derivationSourceMessageFromOperationBody(persistedOperation?.body);
-    const sourceMessage = input.sourceMessage
-      ?? persistedSourceMessage
-      ?? (persistedOperation === undefined
-        ? this.#store.findVisibleSessionMessageOrigin({
-            sessionId: input.sourceSessionId,
-            ...(input.kind === "fork" ? { nativeBoundaryId: requiredEntryId(input.entryId) } : {})
-          })
-        : undefined);
+    const useImplicitOrigin = input.sourceMessage === undefined && persistedOperation === undefined;
+    const visibleSourceMessage = useImplicitOrigin ? this.#store.findVisibleSessionMessageOrigin({
+      sessionId: input.sourceSessionId,
+      ...(input.kind === "fork" ? { nativeBoundaryId: requiredEntryId(input.entryId) } : {})
+    }) : undefined;
+    const treeSourceMessage = useImplicitOrigin && visibleSourceMessage === undefined && input.kind === "fork" && !input.sideChat
+      && this.isOrdinaryLocalPiForkSource(this.#store.getSession(input.sourceSessionId).descriptor)
+      ? this.#store.findPiTreeForkMessageOrigin(input.sourceSessionId, requiredEntryId(input.entryId))
+      : undefined;
+    const sourceMessage = input.sourceMessage ?? persistedSourceMessage ?? visibleSourceMessage ?? treeSourceMessage;
     if (input.kind === "fork" && sourceMessage === undefined) {
       throw new StoreError("A fork requires a visible source message anchor.");
     }
-    const assertSourceMessageVisible = (store: OperationalStore): void => {
+    const assertSourceMessage = (store: OperationalStore): void => {
       if (sourceMessage === undefined) return;
-      const visible = store.findVisibleSessionMessageOrigin({
-        sessionId: input.sourceSessionId,
-        eventId: sourceMessage.eventId,
-        includeRetainedContext: input.kind !== "fork"
-      });
-      if (visible?.messageId !== sourceMessage.messageId) throw new StoreError("The derivation source message is no longer visible.");
+      const origin = treeSourceMessage === undefined ? store.findVisibleSessionMessageOrigin({
+        sessionId: input.sourceSessionId, eventId: sourceMessage.eventId, includeRetainedContext: input.kind !== "fork"
+      }) : store.findPiTreeForkMessageOrigin(input.sourceSessionId, requiredEntryId(input.entryId), sourceMessage.eventId);
+      if (origin?.messageId !== sourceMessage.messageId) throw new StoreError("The derivation source message is no longer visible.");
     };
     const fencedMessageFork = !input.sideChat && input.kind === "fork" && input.expectedGeneration !== undefined;
     const assertMessageForkSource = (store: OperationalStore, source: StoredSession): void => {
       if (!fencedMessageFork) return;
       if (source.descriptor.binding.generation !== input.expectedGeneration) throw new StoreError("The message fork source generation changed.");
-      assertSourceMessageVisible(store);
+      assertSourceMessage(store);
     };
     const logicalBody = {
       sourceSessionId: input.sourceSessionId,
@@ -5548,7 +5548,7 @@ export class SessionHost {
           if (persistedOperation === undefined && (completion?.eventId !== sourceMessage?.eventId || completion?.nativeEntryId !== input.entryId)) throw new StoreError("The completed Side Chat source changed before its operation was prepared.");
         }
         if (input.kind === "fork") requiredEntryId(input.entryId);
-        assertSourceMessageVisible(store);
+        assertSourceMessage(store);
       }
     );
     if (!claim.claimed) {
@@ -5594,19 +5594,24 @@ export class SessionHost {
       const sourceContext = sideEffectLease.context;
       this.assertSessionDerivationTarget(admittedTarget, source, sourceContext);
       let usedPiMessageFork = false;
-      const assertPiMessageForkCurrent = (): void => {
+      const assertPiForkCurrent = (): StoredSession => {
         this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
         const current = this.assertActiveBackendSideEffectLease(sideEffectLease!);
         assertBindingFence(admittedSource, current);
-        assertSourceMessageVisible(this.#store);
-        const selected = this.piMessageForkSource(input, current);
-        if (!piMessageFork || !selected || selected.role !== piMessageFork.role || selected.nativeEntryId !== piMessageFork.nativeEntryId) {
-          throw new StoreError("The Pi message fork source changed.");
-        }
+        assertSourceMessage(this.#store);
+        if (!this.isOrdinaryLocalPiForkSource(current.descriptor)) throw new StoreError("The Pi fork source changed.");
         const sessionId = current.descriptor.id;
         if (this.hasDurableSessionWork(sessionId) || this.#store.hasActiveSessionBackgroundTasks(sessionId)
           || this.#store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0) {
           throw new StoreError("A Pi message fork requires an idle source task.");
+        }
+        return current;
+      };
+      const assertPiMessageForkCurrent = (): void => {
+        const current = assertPiForkCurrent();
+        const selected = this.piMessageForkSource(input, current);
+        if (!piMessageFork || !selected || selected.role !== piMessageFork.role || selected.nativeEntryId !== piMessageFork.nativeEntryId) {
+          throw new StoreError("The Pi message fork source changed.");
         }
         usedPiMessageFork = true;
       };
@@ -5695,6 +5700,7 @@ export class SessionHost {
         target: derivationTarget,
         ...(input.sideChat ? { completedSnapshot: { kind: "completed_assistant" as const, nativeBoundaryId: requiredEntryId(input.entryId) } } : {}),
         ...(piMessageFork === undefined ? {} : { messageFork: { ...piMessageFork, assertCurrent: assertPiMessageForkCurrent } }),
+        ...(treeSourceMessage === undefined ? {} : { nativeTreeFork: { assertCurrent: assertPiForkCurrent } }),
         recordBinding: (binding) => {
           this.#store.recordNativeSessionDerivation({
             operationId: claim.operation.id,
@@ -5718,6 +5724,7 @@ export class SessionHost {
         this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
         assertMessageForkSource(this.#store, this.assertActiveBackendSideEffectLease(sideEffectLease));
       }
+      if (treeSourceMessage !== undefined) assertPiForkCurrent();
       const forkResult: NativeSessionForkResult | undefined = input.kind === "fork"
         ? await active.adapter.fork(requiredEntryId(input.entryId), sourceContext, derivation)
         : undefined;
@@ -5745,6 +5752,7 @@ export class SessionHost {
           this.assertSessionDerivationSource(currentSource, input.sideChat === true);
           assertMessageForkSource(store, currentSource);
           if (usedPiMessageFork) assertPiMessageForkCurrent();
+          if (treeSourceMessage !== undefined) assertPiForkCurrent();
           this.assertSessionDerivationTarget(admittedTarget, currentSource, sourceContext);
           if (
             store.getBackend(currentSource.descriptor.backendId).descriptor.instanceGeneration
@@ -5779,7 +5787,8 @@ export class SessionHost {
             },
             createdAt: now,
             updatedAt: now
-          }, { derivationOperationId: claim.operation.id });
+          }, { derivationOperationId: claim.operation.id,
+            ...(treeSourceMessage === undefined ? {} : { piTreeForkEntryId: requiredEntryId(input.entryId) }) });
           store.appendEvent({
             id: stableId("event", `${input.operationId}:derived-session`),
             backendId: created.descriptor.backendId,
@@ -5845,13 +5854,17 @@ export class SessionHost {
     }
   }
 
+  private isOrdinaryLocalPiForkSource(session: SessionDescriptor): boolean {
+    return this.#store.getBackend(session.backendId).descriptor.adapterKind === "pi" && !session.worktree && !session.remoteWorkspace
+      && !session.hidden && !session.archived && session.deletedAt === undefined && !session.automationOrigin && !session.derivationOrigin?.sideChat
+      && this.#store.sessionCreationServiceKind(session.id) === undefined && this.#partnerSessionPolicy(session.id) === undefined;
+  }
+
   private piMessageForkSource(input: DeriveSessionInput, source: StoredSession):
     Pick<NonNullable<NativeSessionDerivation["messageFork"]>, "role" | "nativeEntryId"> | undefined {
     if (!input.messageFork || input.kind !== "fork" || input.sideChat || !input.sourceMessage || !input.entryId) return undefined;
     const session = source.descriptor;
-    if (this.#store.getBackend(session.backendId).descriptor.adapterKind !== "pi" || session.worktree || session.remoteWorkspace
-      || session.hidden || session.archived || session.deletedAt !== undefined || session.automationOrigin || session.derivationOrigin?.sideChat
-      || this.#store.sessionCreationServiceKind(session.id) !== undefined || this.#partnerSessionPolicy(session.id) !== undefined) return undefined;
+    if (!this.isOrdinaryLocalPiForkSource(session)) return undefined;
     const event = this.#store.findEvent(input.sourceMessage.eventId);
     if (!event || event.sessionId !== session.id || event.backendId !== session.backendId || event.targetId !== session.targetId
       || event.generation !== session.binding.generation || event.payload.type !== "message_complete") return undefined;

@@ -3507,6 +3507,7 @@ export class OperationalStore {
       readonly nativeSessionBlank?: boolean;
       readonly localRuntimeBackendSelection?: boolean;
       readonly derivationOperationId?: string;
+      readonly piTreeForkEntryId?: string;
       readonly nativeCatalogAdoptionOperationId?: string;
       readonly automationOccurrenceRouting?: { readonly backendId: string; readonly targetId: string };
     } = {}
@@ -3554,6 +3555,10 @@ export class OperationalStore {
             runId: sessionAutomationIdentity(descriptor.automationOrigin.runId, "Session automation Run ID")
           };
       const derivationOrigin = normalizeSessionDerivationOrigin(descriptor.derivationOrigin);
+      if (options.piTreeForkEntryId !== undefined && (options.derivationOperationId === undefined
+        || derivationOrigin?.kind !== "fork" || derivationOrigin.sideChat || derivationOrigin.sourceEventId === undefined)) {
+        throw new StoreError("A Pi tree fork requires its original derivation and user message anchor.");
+      }
       if (automationOrigin !== undefined) {
         const schedule = this.getSchedule(automationOrigin.scheduleId);
         const routing = options.automationOccurrenceRouting ?? schedule;
@@ -3576,10 +3581,9 @@ export class OperationalStore {
           throw new StoreError("Session derivation source does not match its backend and target.");
         }
         if (derivationOrigin.sourceEventId !== undefined) {
-          const sourceMessage = this.findVisibleSessionMessageOrigin({
-            sessionId: derivationOrigin.sourceSessionId,
-            eventId: derivationOrigin.sourceEventId
-          });
+          const sourceMessage = options.piTreeForkEntryId === undefined
+            ? this.findVisibleSessionMessageOrigin({ sessionId: derivationOrigin.sourceSessionId, eventId: derivationOrigin.sourceEventId })
+            : this.findPiTreeForkMessageOrigin(derivationOrigin.sourceSessionId, options.piTreeForkEntryId, derivationOrigin.sourceEventId);
           if (sourceMessage?.messageId !== derivationOrigin.sourceMessageId) {
             throw new StoreError("Session derivation message identity is not visible in its source task.");
           }
@@ -11226,6 +11230,20 @@ export class OperationalStore {
     readonly completedAssistantOnly?: boolean;
     readonly includeRetainedContext?: boolean;
   }): { readonly messageId: string; readonly eventId: string } | undefined {
+    return this.findSessionMessageOrigin(input);
+  }
+
+  /** Resolve the exact user node for a Pi tree fork through its current native binding. */
+  findPiTreeForkMessageOrigin(sessionId: string, entryId: string, eventId?: string): { readonly messageId: string; readonly eventId: string } | undefined {
+    const source = this.getSession(sessionId).descriptor;
+    if (source.remoteWorkspace || source.worktree || this.getBackend(source.backendId).descriptor.adapterKind !== "pi") return undefined;
+    return this.findSessionMessageOrigin({
+      sessionId, role: "user", includeRetainedContext: false, ...(eventId === undefined ? {} : { eventId })
+    }, { source, entryId: nonBlank(entryId, "Pi tree fork entry ID") });
+  }
+
+  private findSessionMessageOrigin(input: Parameters<OperationalStore["findVisibleSessionMessageOrigin"]>[0],
+    piTreeFork?: { readonly source: SessionDescriptor; readonly entryId: string }): { readonly messageId: string; readonly eventId: string } | undefined {
     this.assertOpen();
     const sessionId = nonBlank(input.sessionId, "Session message origin Session ID");
     this.getSession(sessionId);
@@ -11270,6 +11288,13 @@ export class OperationalStore {
       )`);
       params.push(boundaryId, boundaryId);
     }
+    if (piTreeFork !== undefined) {
+      const { source, entryId } = piTreeFork;
+      clauses.push("event.backend_id = ?", "event.target_id = ?", "event.generation = ?",
+        "json_extract(event.payload_json, '$.payload.nativeHistory.identity.entryId') = ?",
+        `json_extract(event.metadata_json, '$.${NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD}') = ?`);
+      params.push(source.backendId, source.targetId, source.binding.generation, entryId, nativeBindingFingerprint(source.binding.opaqueRef));
+    }
     if (input.nativeBoundaryId !== undefined || input.includeRetainedContext === false) {
       clauses.push(`NOT EXISTS (SELECT 1 FROM retained_context_events AS retained
         WHERE retained.session_id = event.session_id AND retained.event_cursor = event.global_cursor)`);
@@ -11281,7 +11306,7 @@ export class OperationalStore {
       FROM events AS event
       LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
       WHERE ${clauses.join(" AND ")}
-        ${nativeVisibility?.clause("event") ?? ""}
+        ${piTreeFork === undefined ? nativeVisibility?.clause("event") ?? "" : ""}
       ORDER BY event.global_cursor DESC
       LIMIT 1
     `).get(...params) as Row | undefined;
