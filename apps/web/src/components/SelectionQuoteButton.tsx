@@ -143,7 +143,8 @@ export function SelectionQuoteButton({
   readonly sideChatLabel?: string;
 }): JSX.Element | null {
   const [anchor, setAnchor] = useState<SelectionAnchor>();
-  const visibleAnchor = anchor?.quote.sessionId === sessionId ? anchor : undefined;
+  const visibleAnchor = anchor?.quote.sessionId === sessionId
+    && (anchor.quote.kind === "file" ? anchor.quote.sourcePath === sourcePath : sourcePath === undefined) ? anchor : undefined;
   const anchorRef = useRef(visibleAnchor);
   anchorRef.current = visibleAnchor;
 
@@ -152,12 +153,15 @@ export function SelectionQuoteButton({
   // keeps a stale native range around while CodeMirror is being replaced.
   useEffect(() => setAnchor(undefined), [sessionId, sourcePath]);
 
-  const commit = useCallback((selectionAnchor: SelectionAnchor): void => {
-    onCommit(selectionAnchor.quote);
-    const document = containerRef.current?.ownerDocument;
-    document?.defaultView?.getSelection()?.removeAllRanges();
+  const commit = useCallback((consume: (quote: ComposerSelectionQuoteDraft) => void, force = false): void => {
+    const container = containerRef.current;
+    const current = readSelectionInStream(sessionId, container, force, { sourcePath, getQuoteText, getQuoteMetadata });
+    if (current !== undefined) {
+      consume(current.quote);
+      container?.ownerDocument.defaultView?.getSelection()?.removeAllRanges();
+    }
     setAnchor(undefined);
-  }, [containerRef, onCommit]);
+  }, [containerRef, getQuoteMetadata, getQuoteText, sessionId, sourcePath]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -166,15 +170,20 @@ export function SelectionQuoteButton({
     const ownerWindow = ownerDocument.defaultView;
     if (ownerWindow === null) return;
     const options = { sourcePath, getQuoteText, getQuoteMetadata };
-    const read = (force = false): SelectionAnchor | undefined => readSelectionInStream(sessionId, container, force, options);
+    const read = (): SelectionAnchor | undefined => readSelectionInStream(sessionId, container, false, options);
+    let pointerSample: number | undefined;
+    const cancelPointerSample = (): void => {
+      if (pointerSample !== undefined) ownerWindow.cancelAnimationFrame(pointerSample);
+      pointerSample = undefined;
+    };
     const onMouseUp = (): void => {
-      ownerWindow.requestAnimationFrame(() => setAnchor(read()));
+      cancelPointerSample();
+      pointerSample = ownerWindow.requestAnimationFrame(() => { pointerSample = undefined; setAnchor(read()); });
     };
     const onSelectionChange = (): void => {
-      const selection = ownerWindow.getSelection() ?? ownerDocument.getSelection();
-      if ((selection === null || selection.isCollapsed) && anchorRef.current !== undefined) setAnchor(undefined);
+      if (anchorRef.current !== undefined) setAnchor(read());
     };
-    const hide = (): void => { if (anchorRef.current !== undefined) setAnchor(undefined); };
+    const hide = (): void => { cancelPointerSample(); if (anchorRef.current !== undefined) setAnchor(undefined); };
     const suppliedContextAttribute = container.hasAttribute("data-selection-quote-context");
     const suppliedJokoContextAttribute = container.hasAttribute("data-joko-selection-quote-context");
     if (!suppliedContextAttribute) container.setAttribute("data-selection-quote-context", "");
@@ -185,11 +194,9 @@ export function SelectionQuoteButton({
     ownerWindow.addEventListener("resize", hide);
     const nativeSelectionContextMenu = ownerWindow.jokoDesktop?.selectionContextMenu
       ?? ownerWindow.jokoInspectorDesktop?.selectionContextMenu;
-    const unsubscribeContextMenu = nativeSelectionContextMenu?.onAddToChat(() => {
-      const current = read(true);
-      if (current !== undefined) commit(current);
-    });
+    const unsubscribeContextMenu = nativeSelectionContextMenu?.onAddToChat(() => commit(onCommit, true));
     return () => {
+      cancelPointerSample();
       ownerDocument.removeEventListener("mouseup", onMouseUp);
       ownerDocument.removeEventListener("selectionchange", onSelectionChange);
       ownerDocument.removeEventListener("scroll", hide, true);
@@ -198,7 +205,7 @@ export function SelectionQuoteButton({
       if (!suppliedContextAttribute) container.removeAttribute("data-selection-quote-context");
       if (!suppliedJokoContextAttribute) container.removeAttribute("data-joko-selection-quote-context");
     };
-  }, [commit, containerRef, getQuoteMetadata, getQuoteText, sessionId, sourcePath]);
+  }, [commit, containerRef, getQuoteMetadata, getQuoteText, onCommit, sessionId, sourcePath]);
 
   const ownerDocument = containerRef.current?.ownerDocument;
   const ownerWindow = ownerDocument?.defaultView;
@@ -216,15 +223,12 @@ export function SelectionQuoteButton({
         transform: visibleAnchor.placement === "above" ? "translate(-50%, -100%)" : "translate(-50%, 0)"
       }}
     >
-      <button type="button" className="selection-quote-button" onMouseDown={(event) => event.preventDefault()} onClick={() => commit(visibleAnchor)}>
+      <button type="button" className="selection-quote-button" onMouseDown={(event) => event.preventDefault()} onClick={() => commit(onCommit)}>
         <MessageSquarePlus aria-hidden="true" /><span>{label}</span>
       </button>
       {onAskSideChat !== undefined && <button type="button" className="selection-quote-button"
-        onMouseDown={(event) => event.preventDefault()} onClick={() => {
-          onAskSideChat(visibleAnchor.quote);
-          ownerWindow.getSelection()?.removeAllRanges();
-          setAnchor(undefined);
-        }}><MessageSquarePlus aria-hidden="true" /><span>{sideChatLabel}</span></button>}
+        onMouseDown={(event) => event.preventDefault()} onClick={() => commit(onAskSideChat)}>
+        <MessageSquarePlus aria-hidden="true" /><span>{sideChatLabel}</span></button>}
     </div>,
     ownerDocument.body
   );
