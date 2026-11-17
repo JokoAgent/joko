@@ -1447,6 +1447,19 @@ export function BranchesPanel({ controller, backend, session, t, runAction }: { 
     void load();
     return () => { mountedOwner.current = undefined; };
   }, [load, owner]);
+  const fork = (entryId: string): void => {
+    const navigationRevision = controllerRef.current.state.navigationRevision;
+    const locationHash = window.location.hash;
+    const isCurrent = (): boolean => mountedOwner.current === owner
+      && controllerRef.current.state.navigationRevision === navigationRevision;
+    runAction(`fork:${entryId}`, async () => {
+      if (!isCurrent() || window.location.hash !== locationHash) return;
+      const sessionId = await controllerRef.current.forkSession(owner.sessionId, entryId, t("session.branchSuffix", { name: session.name }));
+      if (isCurrent() && window.location.hash === locationHash) {
+        controllerRef.current.navigate({ kind: "session", sessionId }, { isCurrent });
+      }
+    });
+  };
   return (
     <div className="inspector-panel">
       <section className="inspector-section">
@@ -1456,7 +1469,7 @@ export function BranchesPanel({ controller, backend, session, t, runAction }: { 
         {loading && <Spinner label={t("session.branchLoad")} />}
         {error !== undefined && <p className="inline-error" role="alert">{error}</p>}
         {!loading && tree !== undefined && tree.roots.length === 0 && <p className="muted">{t("session.branchEmpty")}</p>}
-        {tree !== undefined && <div ref={treeNavigation.ref} className="native-tree" role="tree" aria-label={t("session.branch")} onFocusCapture={treeNavigation.onFocusCapture} onKeyDown={treeNavigation.onKeyDown}>{tree.roots.map((node) => <NativeTreeNode key={node.id} node={node} level={1} activeLeafId={tree.activeLeafId} busy={busy} canFork={canFork} t={t} onNavigate={(entryId) => runAction(`branch:${entryId}`, async () => { await controller.navigateSessionBranch(session.id, { kind: "native_entry", entryId }, { expectedGeneration: session.generation, summarize, ...(summarize && summaryFocus.trim() ? { customInstructions: summaryFocus.trim() } : {}) }); await load(); })} onFork={(entryId) => runAction(`fork:${entryId}`, async () => { const sessionId = await controller.forkSession(session.id, entryId, t("session.branchSuffix", { name: session.name })); controller.navigate({ kind: "session", sessionId }); })} />)}</div>}
+        {tree !== undefined && <div ref={treeNavigation.ref} className="native-tree" role="tree" aria-label={t("session.branch")} onFocusCapture={treeNavigation.onFocusCapture} onKeyDown={treeNavigation.onKeyDown}>{tree.roots.map((node) => <NativeTreeNode key={node.id} node={node} level={1} activeLeafId={tree.activeLeafId} busy={busy} canFork={canFork} t={t} onNavigate={(entryId) => runAction(`branch:${entryId}`, async () => { await controller.navigateSessionBranch(session.id, { kind: "native_entry", entryId }, { expectedGeneration: session.generation, summarize, ...(summarize && summaryFocus.trim() ? { customInstructions: summaryFocus.trim() } : {}) }); await load(); })} onFork={fork} />)}</div>}
         <div className="branch-navigation-options">
           <label>
             <CheckboxControl checked={summarize} onChange={(event) => setSummarize(event.currentTarget.checked)} />

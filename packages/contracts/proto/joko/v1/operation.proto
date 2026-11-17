@@ -880,6 +880,15 @@ message SendInputMutation {
   QueueDeliveryMode delivery_mode = 3;
   PerTurnOverrides overrides = 4;
   optional ProviderGroupRebalanceChoice provider_group_rebalance = 5;
+  // For an explicit edit and resend, rewind this original latest user message
+  // before admitting the replacement prompt under the same Operation.
+  MessageEdit message_edit = 6;
+
+  message MessageEdit {
+    string source_message_id = 1;
+    string source_event_id = 2;
+    NativeNavigationTarget rewind_before = 3;
+  }
 }
 // Consent belongs only to this original send; it is revalidated before handoff.
 message ProviderGroupRebalanceChoice { string suggestion_key = 1; bool remember = 2; }

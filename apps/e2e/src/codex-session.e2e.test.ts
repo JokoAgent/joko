@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { EntityKind, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ToolCallState } from "@joko/contracts";
+import { EntityKind, GetOperationRequestSchema, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState,
+  SubmitOperationRequestSchema, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
@@ -644,6 +645,136 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await host.shutdown();
   }
 });
+
+mountedIt.each(["lost receipt", "late receipt"] as const)(
+  "keeps the original Codex message fork and its child draft after a %s", { timeout: 120_000 }, async (delivery) => {
+    const backendId = "codex-message-fork";
+    const native = new FakeCodexAppServer();
+    const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+    let fixture: OrchestratorE2eFixture | undefined, browser: Browser | undefined;
+    let releaseReceipt!: () => void;
+    const holdReceipt = new Promise<void>(resolvePromise => { releaseReceipt = resolvePromise; });
+    try {
+      fixture = await OrchestratorE2eFixture.start({ webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!),
+        backendFactories: [{ instanceId: backendId, adapterKind: "codex", displayName: "Codex fork fixture",
+          create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host }) }] });
+      const paired = await fixture.pair("Fork fixture manager");
+      const { store } = fixture.application;
+      const createTask = async (name: string) => sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+        createSessionMutation({ backendId, targetId: fixture!.targetId(backendId), displayName: name })));
+      const sourceId = await createTask("Original task");
+      const otherId = await createTask("Other task");
+      const binding = store.getSession(sourceId).descriptor.binding;
+      if (binding.nativeSessionId === undefined) throw new Error("The source task has no native Codex thread.");
+      const prompt = "Keep this exact prompt in the child draft";
+      for (const text of ["Retain this previous complete turn", prompt]) {
+        const runId = queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId,
+          sendInputMutation(sourceId, BigInt(binding.generation), text)));
+        await waitFor(async () => store.findQueueItemByRunId(sourceId, runId)?.state,
+          state => state === "backend_accepted", "the original Codex input");
+        await native.completeTurn(binding.nativeSessionId, "Completed " + text);
+        await waitFor(() => paired.clients.run.getRun({ runId }),
+          ({ run }) => run?.state === RunState.SUCCEEDED, "the original completed Codex turn");
+      }
+      const origin = store.findVisibleSessionMessageOrigin({ sessionId: sourceId, role: "user", includeRetainedContext: false });
+      if (origin === undefined) throw new Error("The original Codex user message has no visible persisted identity.");
+      const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Message fork browser" })).challenge!;
+      browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+      const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
+      await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sourceId)}`, { waitUntil: "domcontentloaded" });
+      await page.locator(".connection-tabs > button").nth(2).click();
+      await page.locator("details.device-authorization__manual > summary").click();
+      await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+      await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+      await page.getByLabel("Device name").fill("Message fork browser");
+      await page.locator("form.pair-form button[type=submit]").click();
+      const task = (id: string) => page.locator(`.session-pane[data-input-session-id='${id}']`);
+      const row = task(sourceId).locator(`[data-user-msg-id='${origin.messageId}']`);
+      const openFork = async () => {
+        await row.hover();
+        await row.getByRole("button", { name: "Fork from here", exact: true }).click();
+      };
+      const submitted: string[] = [], inspected: string[] = [];
+      let dropLookup = delivery === "lost receipt";
+      await page.route("**/joko.v1.OperationService/SubmitOperation", async route => {
+        const data = route.request().postDataBuffer();
+        if (data === null) return route.continue();
+        const request = fromBinary(SubmitOperationRequestSchema, data);
+        if (request.mutation?.payload.case !== "forkSession") return route.continue();
+        submitted.push(request.operationId);
+        const response = await route.fetch();
+        if (delivery === "lost receipt") return route.abort("failed");
+        await holdReceipt;
+        return route.fulfill({ response });
+      });
+      await page.route("**/joko.v1.OperationService/GetOperation", async route => {
+        const data = route.request().postDataBuffer();
+        if (data === null) return route.continue();
+        const id = fromBinary(GetOperationRequestSchema, data).operationId;
+        if (!submitted.includes(id)) return route.continue();
+        inspected.push(id);
+        return dropLookup ? route.abort("failed") : route.continue();
+      });
+      await openFork();
+      await page.getByRole("button", { name: "Create fork", exact: true }).click();
+      const childOperation = await waitFor(async () => submitted[0] === undefined ? undefined
+        : (await paired.clients.operation.getOperation({ operationId: submitted[0] }).catch(() => undefined))?.operation,
+      operation => operation?.state === OperationState.SUCCEEDED, "the exact child creation before browser delivery", 30_000);
+      const child = childOperation?.result?.payload;
+      if (child?.case !== "session") throw new Error("The original operation has no child task.");
+      const childId = child.value.sessionId;
+      expect(child.value.derivationOrigin).toMatchObject({ sourceSessionId: sourceId, sourceMessageId: origin.messageId, sourceEventId: origin.eventId });
+      const openTask = (id: string) => page.evaluate(sessionId => { location.hash = `/tasks/${encodeURIComponent(sessionId)}`; }, id);
+      if (delivery === "lost receipt") {
+        await page.getByText("The fork result is pending. Choose Fork on the same message to check the original.", { exact: true }).waitFor();
+        expect(inspected).toEqual([submitted[0]]);
+        dropLookup = false;
+        await openFork();
+        await page.getByRole("button", { name: "Check original fork", exact: true }).click();
+        expect(await waitFor(async () => inspected.length, count => count === 2, "the original receipt lookup")).toBe(2);
+      } else {
+        await openTask(otherId);
+        await task(otherId).waitFor({ state: "visible" });
+        releaseReceipt();
+        const readChildDraft = () => page.evaluate(id => new Promise<string | undefined>((resolveDraft, reject) => {
+          const opened = indexedDB.open("joko-ui");
+          opened.onerror = () => reject(opened.error);
+          opened.onsuccess = () => {
+            const db = opened.result, transaction = db.transaction("drafts"), cursor = transaction.objectStore("drafts").openCursor();
+            transaction.oncomplete = () => db.close();
+            cursor.onerror = () => reject(cursor.error);
+            cursor.onsuccess = () => {
+              const row = cursor.result;
+              if (row === null) return resolveDraft(undefined);
+              if (typeof row.key === "string" && row.key.startsWith("[")) {
+                const key: unknown = JSON.parse(row.key);
+                if (Array.isArray(key) && key.length === 4 && key[2] === id) return resolveDraft(row.value?.draft?.text);
+              }
+              row.continue();
+            };
+          };
+        }), childId);
+        await waitFor(readChildDraft, text => text === prompt, "the original child draft after leaving its source");
+        expect(await task(otherId).isVisible()).toBe(true);
+        await openTask(childId);
+      }
+      const editor = task(childId).locator("[data-composer-editor='true'] .composer-rich-editor__content");
+      await editor.getByText(prompt, { exact: true }).waitFor({ state: "visible" });
+      expect(await editor.innerText()).toBe(prompt);
+      expect(submitted).toEqual([childOperation!.operationId]);
+      expect(inspected.every(id => id === childOperation!.operationId)).toBe(true);
+      expect(store.listSessions().filter(({ descriptor }) => descriptor.derivationOrigin?.sourceEventId === origin.eventId)).toHaveLength(1);
+      expect(native.transport?.requests.filter(request => request.method === "thread/fork")).toHaveLength(1);
+      expect(store.getSession(sourceId).descriptor.binding).toEqual(binding);
+      expect(store.listQueueItems({ sessionId: childId })).toEqual([]);
+    } finally {
+      releaseReceipt();
+      await browser?.close();
+      await fixture?.close();
+      await host.shutdown();
+    }
+  }
+);
 
 async function reconnectCodexTurn(native: FakeCodexAppServer, threadId: string, attempt: number): Promise<void> {
   const turnId = native.threads.get(threadId)?.turns.at(-1)?.["id"];

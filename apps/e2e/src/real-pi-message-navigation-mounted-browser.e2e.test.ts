@@ -1,5 +1,5 @@
-import { create } from "@bufbuild/protobuf";
-import { EntityKind, OperationMutationSchema, OperationState, RunState, SnapshotScopeSchema } from "@joko/contracts";
+import { create, fromBinary } from "@bufbuild/protobuf";
+import { EntityKind, OperationMutationSchema, OperationState, RunState, SnapshotScopeSchema, SubmitOperationRequestSchema } from "@joko/contracts";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
@@ -69,7 +69,12 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     await pane.waitFor({ state: "visible", timeout: 30_000 });
     const reload = async () => {
       await page!.reload({ waitUntil: "domcontentloaded" });
-      await pane.waitFor({ state: "visible", timeout: 30_000 });
+      const expires = Date.now() + 30_000;
+      const timeLeft = () => Math.max(1, expires - Date.now());
+      await page!.getByRole("button", { name: "Saved nodes", exact: true }).click({ timeout: timeLeft() });
+      await page!.locator(".connection-card .profile-card").filter({ hasText: fixture!.baseUrl })
+        .getByRole("button", { name: "Connect", exact: true }).click({ timeout: timeLeft() });
+      await pane.waitFor({ state: "visible", timeout: timeLeft() });
     };
     await reload();
     const originalNavigate = host.navigateTree.bind(host);
@@ -86,13 +91,50 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     await editedRow.getByRole("button", { name: "Edit message", exact: true }).click();
     await editedRow.locator("textarea").fill("My revised loaded input.");
     const requestCountBeforeEdit = fixture.providerRequests.length;
-    await editedRow.getByRole("button", { name: "Move to composer", exact: true }).click();
-    await waitFor(() => composer.innerText(), text => text.includes("My revised loaded input."), "the reloaded edit in the composer");
+    const submitRoute = "**/joko.v1.OperationService/SubmitOperation";
+    const receiptRoute = "**/joko.v1.OperationService/GetOperation";
+    const submittedEditOperations: string[] = [];
+    await page.route(receiptRoute, route => route.abort("failed"));
+    await page.route(submitRoute, async route => {
+      const bytes = route.request().postDataBuffer();
+      if (bytes === null) return route.continue();
+      const operation = fromBinary(SubmitOperationRequestSchema, bytes);
+      if (operation.mutation?.payload.case !== "sendInput" || operation.mutation.payload.value.messageEdit === undefined) return route.continue();
+      submittedEditOperations.push(operation.operationId);
+      await route.fetch();
+      await route.abort("failed");
+    });
+    await editedRow.getByRole("button", { name: "Send edited message", exact: true }).click();
+    await waitFor(() => Promise.resolve(navigation.mock.calls.length), count => count === 1, "the mounted confirmation's native rewind");
     expect(navigation).toHaveBeenCalledOnce();
     expect(navigation.mock.calls[0]![5].sourceMessage).toEqual({ ...editedSource, requireLatestUser: true });
+    const resendOperationId = navigation.mock.calls[0]![5].operationId;
+    try { await navigation.mock.results[0]!.value; }
+    catch (cause) {
+      const diagnostics = store.listDiagnostics({ limit: 12 }).filter(item => item.component.startsWith("native_navigation_") || item.component === "sendInput")
+        .map(({ component, code, message }) => ({ component, code, message }));
+      throw new Error(`The original native edit did not reach queue admission. ${JSON.stringify(diagnostics)}`, { cause });
+    }
+    const resend = await waitFor(() => Promise.resolve(store.listQueueItems({ sessionId }).find(item => item.operationId === resendOperationId)),
+      item => item?.state === "completed", "the edit's original queue item completes");
+    expect(resend?.body.text).toBe("My revised loaded input.");
+    expect(store.getOperation(resendOperationId)).toMatchObject({ kind: "sendInput", status: "completed" });
     expect(store.findVisibleSessionMessageOrigin({ sessionId, eventId: editedSource.eventId })).toBeUndefined();
     expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
-    expect(fixture.providerRequests).toHaveLength(requestCountBeforeEdit);
+    expect(fixture.providerRequests).toHaveLength(requestCountBeforeEdit + 1);
+    expect(JSON.stringify(fixture.providerRequests.at(-1)?.body)).toContain("My revised loaded input.");
+    const checkEdit = pane.getByRole("button", { name: "Check edit result", exact: true });
+    await checkEdit.waitFor({ state: "visible", timeout: 30_000 });
+    await reload();
+    await checkEdit.waitFor({ state: "visible", timeout: 30_000 });
+    await page.unroute(receiptRoute);
+    await checkEdit.click();
+    await checkEdit.waitFor({ state: "hidden", timeout: 30_000 });
+    expect(submittedEditOperations).toEqual([resendOperationId]);
+    expect(fixture.providerRequests).toHaveLength(requestCountBeforeEdit + 1);
+    await page.unroute(submitRoute);
+    expect(await composer.innerText()).not.toContain("My revised loaded input.");
+    await pane.getByText("My revised loaded input.", { exact: true }).waitFor({ state: "visible" });
     await capture("reloaded-row-edited-light.png");
 
     const rewindSource = await send("Rewind this loaded original input.");
@@ -118,7 +160,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     await delayedRow.hover(); await delayedRow.getByRole("button", { name: "Edit message", exact: true }).click();
     await delayedRow.locator("textarea").fill("Preserve this attempted edit.");
     holdNextNavigation = true;
-    await delayedRow.getByRole("button", { name: "Move to composer", exact: true }).click();
+    await delayedRow.getByRole("button", { name: "Send edited message", exact: true }).click();
     await waitFor(() => Promise.resolve(navigation.mock.calls.length), count => count === 3, "the delayed original edit request");
     expect(navigation.mock.calls[2]![5].sourceMessage).toEqual({ ...delayedSource, requireLatestUser: true });
     const revisionBeforeNewInput = store.getSession(sessionId).revision;
@@ -163,7 +205,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     const runningRow = row(runningSource.messageId);
     await runningRow.hover();
     const stopAndEdit = runningRow.getByRole("button", { name: "Stop and edit message" });
-    const sendEdit = runningRow.getByRole("button", { name: "Move to composer" });
+    const sendEdit = runningRow.getByRole("button", { name: "Send edited message", exact: true });
     const cancelEdit = runningRow.getByRole("button", { name: "Cancel", exact: true });
     const originalAbort = host.abort.bind(host);
     const stopGate = new Promise<void>(resolve => { releaseStop = resolve; });
@@ -210,6 +252,8 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     abort.mockRestore();
     if (evidenceDirectory !== undefined) await writeFile(join(evidenceDirectory, "message-navigation.json"), JSON.stringify({
       sessionId, editedSource, rewindSource, delayedSource, newerSource, generation: binding.generation,
+      resendOperationId, resendRunId: resend?.runId, resendQueueId: resend?.id, resendProviderCalls: 1,
+      resendSubmitCalls: submittedEditOperations.length, lostEditReceiptReconciledAfterReload: true,
       revisionBeforeNewInput: revisionBeforeNewInput.toString(), revisionAfterNewInput: store.getSession(sessionId).revision.toString(),
       nativeBranchUnchangedAfterRejection: true, nativeNavigationRequests: navigation.mock.calls.length,
       editOperationId: navigation.mock.calls[2]![5].operationId,

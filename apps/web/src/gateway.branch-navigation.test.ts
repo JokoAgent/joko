@@ -47,6 +47,9 @@ describe("Pi branch navigation gateway", () => {
     const preconditions: any[] = [];
     let acknowledged = true;
     let confirmedGeneration: bigint | undefined = 7n;
+    let continuedGeneration: bigint | undefined;
+    let submittedOperationId: string | undefined;
+    const continuationReads: string[] = [];
     let sessionReads = 0;
     const transport = {
       unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
@@ -56,6 +59,7 @@ describe("Pi branch navigation gateway", () => {
           }));
         }
         if (method.localName === "submitOperation") {
+          submittedOperationId = input.operationId;
           payloads.push(input.mutation?.payload);
           preconditions.push(input.mutation?.preconditions);
           return response(method, create(SubmitOperationResponseSchema, {
@@ -66,8 +70,11 @@ describe("Pi branch navigation gateway", () => {
         if (method.localName === "getSession") {
           sessionReads += 1;
           if (confirmedGeneration === undefined) throw new Error("Task readback unavailable");
+          if (input.messageRewindOperationId !== undefined) continuationReads.push(input.messageRewindOperationId);
           return response(method, create(GetSessionResponseSchema, {
-            session: { sessionId: input.sessionId, nativeBinding: { runtimeGeneration: confirmedGeneration } }
+            session: { sessionId: input.sessionId, nativeBinding: { runtimeGeneration: confirmedGeneration } },
+            ...(input.messageRewindOperationId === submittedOperationId && continuedGeneration !== undefined
+              ? { messageRewindContinuationGeneration: continuedGeneration } : {})
           }));
         }
         throw new Error(`Unexpected method: ${method.localName}`);
@@ -141,6 +148,21 @@ describe("Pi branch navigation gateway", () => {
     expect(payloads.at(-1)).toMatchObject({ case: "navigateSessionBranch", value: {
       sourceMessageId: "original-user", sourceEventId: "original-event", requireLatestUser: true
     } });
+    acknowledged = true;
+    const onReplacementConfirmed = vi.fn<(generation: bigint, read: () => Promise<bigint | undefined>) => void>();
+    confirmedGeneration = 9n;
+    const originalSource = { messageId: "original-user", eventId: "original-event" };
+    await gateway.navigateSessionBranch("session-one", target, { expectedGeneration: 7n, sourceMessage: originalSource, onReplacementConfirmed });
+    expect(onReplacementConfirmed).not.toHaveBeenCalled();
+    continuedGeneration = 9n;
+    await gateway.navigateSessionBranch("session-one", target, { expectedGeneration: 7n, sourceMessage: originalSource, onReplacementConfirmed });
+    expect(onReplacementConfirmed).toHaveBeenCalledExactlyOnceWith(9n, expect.any(Function));
+    const read = onReplacementConfirmed.mock.calls[0]![1];
+    confirmedGeneration = 10n;
+    await expect(read()).resolves.toBeUndefined();
+    continuedGeneration = 10n;
+    await expect(read()).resolves.toBe(10n);
+    expect(continuationReads.slice(1)).toEqual([submittedOperationId, submittedOperationId, submittedOperationId]);
     gateway.disconnect();
   });
 });

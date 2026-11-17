@@ -26,11 +26,11 @@ import {
 import { appRouteHash, type AppController, type AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
-import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
+import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerDraft, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PendingMessageEdit, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
 import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
-import { Composer, type ComposerHistoryEntry, type PrepareRewindDraft } from "./Composer.js";
+import { Composer, type ComposerHistoryEntry, type PrepareRewindDraft, type RewindDraftContinuation } from "./Composer.js";
 import { CompactionStatusIndicator } from "./CompactionStatusIndicator.js";
 import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacityRing.js";
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
@@ -75,7 +75,7 @@ import { modelSourceAccess } from "../model-source-access.js";
 import { randomUuid } from "../web-crypto.js";
 import { normalizePendingSideChatDraft } from "../local-state.js";
 import { recoverSideChatDraft } from "../side-chat-draft-recovery.js";
-import type { PendingSideChatDraft } from "../model.js";
+import type { PendingMessageFork, PendingSideChatDraft } from "../model.js";
 import { requireStartedSkillLearningRun } from "../skill-learning-command.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
@@ -165,6 +165,8 @@ interface ActiveMessageFork {
   readonly eventId: string;
   readonly nativeEntryId: string;
   readonly isCurrent: () => boolean;
+  readonly readingReceipt: boolean;
+  readonly original?: PendingMessageFork;
 }
 
 export interface MessageForkCompletion {
@@ -298,7 +300,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [sideChatRecoveryLoadError, setSideChatRecoveryLoadError] = useState<string>();
   const [sideChatRecoveryReload, setSideChatRecoveryReload] = useState(0);
   const [composerAttachmentInsertion, setComposerAttachmentInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly file: File }>();
-  const [composerDraftReplacement, setComposerDraftReplacement] = useState<{ readonly id: number; readonly sessionId: string; readonly text: string; readonly editorDocument?: import("@tiptap/core").JSONContent; readonly attachments?: readonly AttachmentDraft[] }>();
+  const [pendingMessageEdit, setPendingMessageEdit] = useState<{ readonly owner: string; readonly edit: PendingMessageEdit }>();
+  const [rewindDraftContinuation, setRewindDraftContinuation] = useState<RewindDraftContinuation>();
+  const rewindDraftContinuationOwnerRef = useRef<object | undefined>(undefined);
   const [shareSelection, setShareSelection] = useState<ActiveShareSelection>();
   const [messageRewind, setMessageRewind] = useState<ActiveMessageRewind>();
   const [messageDelete, setMessageDeleteState] = useState<ActiveMessageDelete>();
@@ -402,7 +406,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current?.abort.abort();
     conversationCopyFlightRef.current = undefined;
     setConversationCopyFeedback(undefined);
-    setComposerDraftReplacement(undefined);
     setMessageRewind(undefined);
     setRewindPreview(undefined);
     artifactCatalogDocumentEpochRef.current += 1;
@@ -414,11 +417,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setArtifactCatalogDocumentOwner({ document, epoch: artifactCatalogDocumentEpochRef.current });
     const retire = () => {
       rewindEpochRef.current += 1;
+      rewindDraftContinuationOwnerRef.current = undefined;
+      setRewindDraftContinuation(undefined);
       conversationCopyFlightRef.current?.abort.abort();
       conversationCopyFlightRef.current = undefined;
       setConversationCopyFeedback(undefined);
       artifactCatalogDocumentEpochRef.current += 1;
-      setComposerDraftReplacement(undefined);
       setMessageRewind(undefined);
       setRewindPreview(undefined);
       setArtifactCatalogDocumentOwner(undefined);
@@ -436,7 +440,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   });
   useLayoutEffect(() => {
     rewindEpochRef.current += 1;
-    setComposerDraftReplacement(undefined);
     setMessageRewind(undefined);
     setRewindPreview(undefined);
   }, [session.id, session.generation, controller.navigateSessionBranch, controller.state.navigationRevision]);
@@ -446,6 +449,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current = undefined;
     rewindDocumentRef.current?.remove();
   }, []);
+  useLayoutEffect(() => {
+    rewindDraftContinuationOwnerRef.current = undefined;
+    setRewindDraftContinuation(undefined);
+  }, [session.id, controller.navigateSessionBranch, controller.state.navigationRevision, controller.state.connectionGeneration]);
   const captureTaskActionSource = (
     matchesRoute: (route: AppRoute) => boolean = (route) => sessionRouteIsCurrent(route, session.id)
   ): (() => boolean) => {
@@ -501,10 +508,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const composerAttachmentInsertionIdRef = useRef(0);
   const appliedExternalSelectionQuoteInsertionRef = useRef<string | undefined>(undefined);
   const appliedExternalAttachmentInsertionRef = useRef<string | undefined>(undefined);
-  const composerDraftReplacementIdRef = useRef(0);
   const composerLocalDraftEpochRef = useRef(0);
   const rewindDraftRef = useRef<PrepareRewindDraft | null>(null);
-  const noteComposerDraftMutation = useCallback(() => { composerLocalDraftEpochRef.current += 1; setComposerDraftReplacement(undefined); }, []);
+  const noteComposerDraftMutation = useCallback(() => { composerLocalDraftEpochRef.current += 1; }, []);
   const shareSelectionBeforeAllRef = useRef<ReadonlySet<string> | undefined>(undefined);
   const messageRewindRequestIdRef = useRef(0);
   const compactConfirmationRef = useRef(compactConfirmation);
@@ -911,7 +917,22 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && item.inputDelivery !== "scheduler" && !hasPendingComposerQueueItems(currentQueue, current.id);
   };
   const editStopsRun = canStopForMessageEdit(session, latestVisibleUserMessage, queue);
-  const editableMessageId = (messageRewindSupported || editStopsRun) && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported)
+  const editOwner = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    controller.state.activeProfile?.origin, session.id]);
+  const editOwnerRef = useRef(editOwner);
+  editOwnerRef.current = editOwner;
+  const currentPendingMessageEdit = pendingMessageEdit?.owner === editOwner ? pendingMessageEdit.edit : undefined;
+  useEffect(() => {
+    if (guest || reviewReadOnly || controller.state.connectionState !== "connected" || controller.messageEditDrafts === undefined) return;
+    let retired = false;
+    void controller.messageEditDrafts.read(session.id).then(edit => {
+      if (retired || editOwnerRef.current !== editOwner) return;
+      if (edit !== undefined) setPendingMessageEdit({ owner: editOwner, edit });
+    }).catch(() => undefined);
+    return () => { retired = true; };
+  }, [controller.messageEditDrafts, controller.state.connectionState, editOwner, session.id, guest, reviewReadOnly]);
+  const editableMessageId = currentPendingMessageEdit === undefined && !guest && controller.state.taskSource?.kind !== "joined" && !session.archived
+    && (messageRewindSupported || editStopsRun) && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported)
     ? latestVisibleUserMessage.id : undefined;
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
@@ -1071,7 +1092,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setComposerMessageMentionInsertion(undefined);
     setComposerSelectionQuoteInsertion(undefined);
     setComposerAttachmentInsertion(undefined);
-    setComposerDraftReplacement(undefined);
     setMessageFork(undefined);
     setForkingMessageId(undefined);
     setShareSelection(undefined);
@@ -1594,28 +1614,37 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   }, [controller.readPendingSideChat, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.connectionGeneration,
     session.id, session.generation, guest, reviewReadOnly, sideChatRecoveryReload]);
 
-  const checkSideChatRecovery = (appendToExisting = false, dispatch = false, startAgain = false): void => {
+  const retiredSideChat = sideChatRecovery !== undefined && BigInt(sideChatRecovery.record.sourceGeneration) < session.generation;
+  const checkSideChatRecovery = (action: "check" | "append" | "retry" | "restart" | "clear" = "check"): void => {
     const pending = sideChatRecovery;
     if (!pending || pending.state === "working") return;
     const owner = beginDerivedTaskAction(), sourceApi = controller;
     let record = pending.record;
     runAction(`side-chat-check:${record.operationId}`, async () => {
-      if (record.sourceSessionId !== session.id || record.sourceGeneration !== session.generation.toString()
-        || record.backendId !== session.backendId || record.targetId !== session.targetId) {
+      const dispatch = action === "retry" || action === "restart";
+      if (!owner.isCurrent()) return;
+      if (record.sourceSessionId !== session.id || BigInt(record.sourceGeneration) > session.generation
+        || record.backendId !== session.backendId || record.targetId !== session.targetId
+        || (retiredSideChat && dispatch) || (!retiredSideChat && action === "clear")) {
         setSideChatRecovery({ record, state: "failed", error: t("session.sideChatSourceChanged") });
         throw new Error(t("session.sideChatSourceChanged"));
       }
       setSideChatRecovery({ record, state: "working" });
       try {
-        if (startAgain) {
+        if (action === "restart" || action === "clear") {
           const original = await sourceApi.readSideChatOperation?.(record);
           if (!owner.isCurrent()) return;
           if (original?.state !== "failed" || original.stateMayHaveChanged !== false) throw new Error(t("session.sideChatCheckOriginal"));
+          if (action === "clear") {
+            if (!await sourceApi.savePendingSideChat?.(record.sourceSessionId, record, undefined)) throw new Error(t("session.sideChatCheckOriginal"));
+            if (owner.isCurrent()) setSideChatRecovery(undefined);
+            return;
+          }
           const next = { ...record, operationId: randomUuid() };
           if (!await sourceApi.savePendingSideChat?.(record.sourceSessionId, record, next)) throw new Error(t("session.sideChatCheckOriginal"));
           record = next; if (!owner.isCurrent()) return;
         }
-        const result = await recoverSideChatDraft(sourceApi, record, { isCurrent: owner.isCurrent, appendToExisting, dispatch });
+        const result = await recoverSideChatDraft(sourceApi, record, { isCurrent: owner.isCurrent, appendToExisting: action === "append", dispatch });
         if (!owner.isCurrent()) return;
         if (result.state === "adopted") {
           setSideChatRecovery(undefined);
@@ -1641,19 +1670,29 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       reportMessageForkFailure(item.id, t("timeline.forkUnavailable"));
       return;
     }
-    setMessageFork({
+    const confirmation: ActiveMessageFork = {
       sessionId: session.id,
       itemId: item.id,
       messageId: item.messageId ?? item.id,
       eventId: item.sourceEventId,
       nativeEntryId: target.entryId,
+      readingReceipt: onSplitMessageForkOpened === undefined,
       isCurrent: onSplitMessageForkOpened === undefined ? captureTaskActionSource() : capturePaneMessageAction(true)
-    });
+    };
+    setMessageFork(confirmation);
+    if (onSplitMessageForkOpened === undefined) {
+      void controllerRef.current.readPendingMessageFork(confirmation.sessionId, confirmation.eventId).then((saved) => {
+        if (confirmation.isCurrent()) setMessageFork(current => current === confirmation
+          ? { ...confirmation, readingReceipt: false, original: saved } : current);
+      }).catch(() => {
+        if (confirmation.isCurrent()) setMessageFork(current => current === confirmation ? { ...confirmation, readingReceipt: false } : current);
+      });
+    }
   };
 
   const confirmMessageFork = (): void => {
     const pending = messageFork;
-    if (pending === undefined || pending.sessionId !== session.id || messageForkActionRef.current !== undefined) return;
+    if (pending === undefined || pending.readingReceipt || pending.sessionId !== session.id || messageForkActionRef.current !== undefined) return;
     setMessageFork(undefined);
     if (!pending.isCurrent()) return;
     const currentSource = () => {
@@ -1685,7 +1724,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       return;
     }
     const actionOwner = beginDerivedTaskAction(pending.isCurrent);
-    const { forkSession, saveDraft, readDraftSnapshot, saveDraftIfRevision, navigate, loadSessionTimelineAround } = controllerRef.current;
+    const { forkSession, forkMessage, readDraftSnapshot, saveDraftIfRevision, navigate, loadSessionTimelineAround } = controllerRef.current;
     const forkOccurrence = {};
     messageForkActionRef.current = forkOccurrence;
     setForkingMessageId(pending.itemId);
@@ -1711,14 +1750,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           ({ item, target } = persisted);
           sourceSessionName = latest.session.name;
         }
-        const forkedSessionId = await forkSession(
-          pending.sessionId,
-          target.entryId,
-          t("session.branchSuffix", { name: sourceSessionName }),
-          { messageId: pending.messageId, eventId: pending.eventId,
-            ...(onSplitMessageForkOpened === undefined ? {} : { expectedGeneration: source.session.generation }) }
-        );
-        if (!actionOwner.isCurrent()) return;
+        let draft: ComposerDraft | undefined;
         if (target.composerText !== undefined) {
           const editorDocument = composerDocumentFromMessage(target.composerText, item.quotesEncoded === true, {
             sessionId: pending.sessionId,
@@ -1726,26 +1758,39 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             role: "user",
             sourceEventId: pending.eventId
           }, "edit", item.pastedTextRanges);
-          const draft = {
+          draft = {
             text: composerDocumentPlainText(editorDocument),
             editorDocument,
             attachments: [],
             mentions: [],
             deliveryMode: "prompt" as const
           };
-          if (onSplitMessageForkOpened === undefined) await saveDraft(forkedSessionId, draft);
-          else {
-            const original = await readDraftSnapshot(forkedSessionId);
-            if (!actionOwner.isCurrent()) return;
-            if (original.draft === undefined) await saveDraftIfRevision(forkedSessionId, draft, original.revision);
-          }
+        }
+        const displayName = t("session.branchSuffix", { name: sourceSessionName }).trim();
+        const forkedSessionId = onSplitMessageForkOpened === undefined
+          ? await forkMessage(pending.original ?? { operationId: randomUuid(), sourceSessionId: pending.sessionId, sourceGeneration: source.session.generation.toString(),
+              backendId: source.session.backendId, targetId: source.session.targetId, messageId: pending.messageId, eventId: pending.eventId,
+              nativeEntryId: target.entryId, displayName, ...(draft === undefined ? {} : { draft: { text: draft.text, editorDocument: draft.editorDocument } }) },
+            actionOwner.isCurrent, pending.original !== undefined)
+          : await forkSession(pending.sessionId, target.entryId, displayName,
+            { messageId: pending.messageId, eventId: pending.eventId, expectedGeneration: source.session.generation });
+        if (!actionOwner.isCurrent()) return;
+        if (onSplitMessageForkOpened !== undefined && draft !== undefined) {
+          const original = await readDraftSnapshot(forkedSessionId);
+          if (!actionOwner.isCurrent()) return;
+          if (original.draft === undefined) await saveDraftIfRevision(forkedSessionId, draft, original.revision);
         }
         if (!actionOwner.isCurrent()) return;
         if (onSplitMessageForkOpened === undefined) navigate({ kind: "session", sessionId: forkedSessionId });
         else onSplitMessageForkOpened({ sessionId: forkedSessionId, sourceMessageId: pending.messageId,
           sourceEventId: pending.eventId, isCurrent: actionOwner.isCurrent });
       } catch (error) {
-        if (actionOwner.isCurrent()) throw error;
+        if (actionOwner.isCurrent()) {
+          if ((error as { readonly code?: unknown } | null)?.code === "MESSAGE_FORK_RESULT_UNKNOWN") {
+            throw new Error(t("timeline.forkCheckOriginal"), { cause: error });
+          }
+          throw error;
+        }
       } finally {
         if (messageForkActionRef.current === forkOccurrence) {
           messageForkActionRef.current = undefined;
@@ -1789,14 +1834,15 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     });
   };
 
-  const moveEditedMessageToComposer = async (item: TimelineItemView, text: string): Promise<void> => {
+  const sendEditedMessage = async (item: TimelineItemView, text: string): Promise<void> => {
     const sourceSessionId = session.id;
     const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
-    if (navigationTarget === undefined || item.sourceEventId === undefined) throw new Error(t("timeline.rewindUnavailable"));
+    const sourceEventId = item.sourceEventId;
+    if (navigationTarget === undefined || sourceEventId === undefined) throw new Error(t("timeline.rewindUnavailable"));
     const sourceController = {
-      navigateSessionBranch: controllerRef.current.navigateSessionBranch,
+      send: controllerRef.current.send,
       readDraftSnapshot: controllerRef.current.readDraftSnapshot,
-      saveDraftIfRevision: controllerRef.current.saveDraftIfRevision,
+      messageEditDrafts: controllerRef.current.messageEditDrafts,
       getArtifactUrl: controllerRef.current.getArtifactUrl,
       releaseArtifactUrl: controllerRef.current.releaseArtifactUrl
     };
@@ -1805,13 +1851,18 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const sourceEpoch = rewindEpochRef.current;
     const sourceDocument = paneRef.current?.ownerDocument;
     const sourceNavigationRevision = controllerRef.current.state.navigationRevision;
-    const sourceStillOwned = () => rewindEpochRef.current === sourceEpoch
-      && composerLocalDraftEpochRef.current === sourceDraftEpoch
+    const sourceProfile = controllerRef.current.state.activeProfile;
+    const sourcePaneIsCurrent = () => rewindEpochRef.current === sourceEpoch
       && paneRef.current?.isConnected === true && paneRef.current.ownerDocument === sourceDocument
+      && activeSessionIdRef.current === sourceSessionId
       && controllerRef.current.state.navigationRevision === sourceNavigationRevision
-      && controllerRef.current.navigateSessionBranch === sourceController.navigateSessionBranch
+      && controllerRef.current.state.activeProfile?.id === sourceProfile?.id
+      && controllerRef.current.state.activeProfile?.serverId === sourceProfile?.serverId
+      && controllerRef.current.state.activeProfile?.origin === sourceProfile?.origin;
+    const sourceDraftIsCurrent = () => sourcePaneIsCurrent()
+      && composerLocalDraftEpochRef.current === sourceDraftEpoch
       && controllerRef.current.readDraftSnapshot === sourceController.readDraftSnapshot
-      && controllerRef.current.saveDraftIfRevision === sourceController.saveDraftIfRevision;
+      && controllerRef.current.messageEditDrafts === sourceController.messageEditDrafts;
     const currentBoundary = () => {
       const state = controllerRef.current.state;
       const snapshot = state.snapshot;
@@ -1819,16 +1870,18 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const activeBackend = activeSession === undefined ? undefined : snapshot.backends.find((candidate) => candidate.id === activeSession.backendId);
       const activeTarget = activeSession === undefined ? undefined : snapshot.targets.find((candidate) => candidate.id === activeSession.targetId);
       const activeStartSupported = sessionCapabilitySupportsTarget(activeBackend?.capabilities.get("session.rewind_to_start"), activeTarget);
-      const activeTimeline = mergeTimelineWindows(messageActionsViewRef.current.timeline, snapshot.timelineBySession.get(sourceSessionId) ?? []);
+      const activeTimeline = mergeTimelineWindows(snapshot.timelineBySession.get(sourceSessionId) ?? [], messageActionsViewRef.current.timeline);
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (
-        !sourceStillOwned()
+        !sourceDraftIsCurrent()
+        || state.connectionState !== "connected"
+        || state.sessionAccess?.role === "guest" || state.taskSource?.kind === "joined"
+        || currentPendingMessageEdit !== undefined
         || !sessionRouteIsCurrent(state.route, sourceSessionId)
         || activeSession?.state !== "idle"
-        || activeSession.generation !== sourceGeneration
-        || controllerRef.current.navigateSessionBranch !== sourceController.navigateSessionBranch
-
+        || activeSession.generation !== sourceGeneration || activeSession.archived
+        || controllerRef.current.send !== sourceController.send
         || queuedWork
         || activeBackend?.capabilities.get("session.rewind")?.supported !== true
         || activeUser?.id !== item.id
@@ -1895,48 +1948,75 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const previous = await sourceController.readDraftSnapshot(sourceSessionId);
     const previousDraft = previous.draft;
     if (currentBoundary() === undefined) throw new Error(t("timeline.editStale"));
-    const replacement = {
-      id: ++composerDraftReplacementIdRef.current,
-      sessionId: sourceSessionId,
+    const replacementDraft: ComposerDraft = {
       text: composerDocumentPlainText(editorDocument),
-      editorDocument,
-      attachments: restoredAttachments
-    };
-    const replacementDraft = {
-      text: replacement.text,
       editorDocument,
       attachments: restoredAttachments,
       mentions: [],
-      deliveryMode: "prompt" as const,
+      deliveryMode: "prompt",
       ...(previousDraft?.extraDirectoryIds === undefined ? {} : { extraDirectoryIds: previousDraft.extraDirectoryIds })
     };
-    const rollbackDraft = previousDraft ?? { text: "", attachments: [], mentions: [], deliveryMode: "prompt" as const };
-    const replacementRevision = await sourceController.saveDraftIfRevision(sourceSessionId, replacementDraft, previous.revision);
-    if (replacementRevision === undefined) throw new Error(t("timeline.editStale"));
-    const boundaryBeforeRewind = currentBoundary();
-    if (boundaryBeforeRewind === undefined || !sameMessageAttachments(boundaryBeforeRewind.user.attachments, item.attachments)) {
-      await restoreEditedMessageDraft(sourceController, sourceSessionId, rollbackDraft, replacementRevision, t);
-      throw new Error(t("timeline.editStale"));
+    const edit = { operationId: randomUuid(), sourceMessageId: item.messageId ?? item.id, sourceEventId, target: navigationTarget };
+    const recovery = { ...edit, expectedGeneration: sourceGeneration, draft: replacementDraft };
+    const showPending = () => {
+      const pane = paneRef.current;
+      if (editOwnerRef.current === editOwner && pane?.isConnected === true && pane.ownerDocument === sourceDocument) {
+        setPendingMessageEdit({ owner: editOwner, edit: recovery });
+      }
+    };
+    if (!await sourceController.messageEditDrafts.stage(sourceSessionId, recovery, previous.revision)) {
+      const pending = await sourceController.messageEditDrafts.read(sourceSessionId);
+      if (pending !== undefined && editOwnerRef.current === editOwner) setPendingMessageEdit({ owner: editOwner, edit: pending });
+      throw new Error(t(pending === undefined ? "timeline.editStale" : "timeline.editResultUnknown"));
     }
     try {
-      await sourceController.navigateSessionBranch(sourceSessionId, navigationTarget, { expectedGeneration: sourceGeneration,
-        sourceMessage: { messageId: item.messageId ?? item.id, eventId: item.sourceEventId, requireLatestUser: true } });
-      if (!sourceStillOwned()
-        || controllerRef.current.navigateSessionBranch !== sourceController.navigateSessionBranch
-        || !sessionRouteIsCurrent(controllerRef.current.state.route, sourceSessionId)
-        || controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation !== sourceGeneration) return;
+      await sourceController.send(sourceSessionId, replacementDraft, { expectedGeneration: sourceGeneration,
+        messageEdit: { ...edit, assertCurrent: () => {
+          const boundary = currentBoundary();
+          if (boundary === undefined || !sameMessageAttachments(boundary.user.attachments, item.attachments)) throw new Error(t("timeline.editStale"));
+        } } });
     } catch (error) {
-      await restoreEditedMessageDraft(sourceController, sourceSessionId, rollbackDraft, replacementRevision, t);
+      const code = error instanceof Error && "code" in error ? error.code : undefined;
+      if (code === "MESSAGE_EDIT_RESULT_UNKNOWN") {
+        showPending();
+        throw new Error(t("timeline.editResultUnknown"));
+      }
+      try {
+        await sourceController.messageEditDrafts.finish(sourceSessionId, edit.operationId, code === "NATIVE_NAVIGATION_SYNC_UNKNOWN" || !sourcePaneIsCurrent());
+      } catch (cause) {
+        showPending();
+        throw new Error(t("timeline.editDraftRestoreFailed"), { cause });
+      }
       throw error;
     }
-    const currentDraft = await sourceController.readDraftSnapshot(sourceSessionId);
-    if (!sourceStillOwned() || currentDraft.revision !== replacementRevision) return;
-    setComposerDraftReplacement(replacement);
+    await sourceController.messageEditDrafts.finish(sourceSessionId, edit.operationId, false).catch(showPending);
+    if (sourcePaneIsCurrent()) setFollowLatestSignal(current => current + 1);
+  };
+
+  const checkPendingMessageEdit = async (edit: PendingMessageEdit): Promise<void> => {
+    const source = controllerRef.current;
+    const sourceSessionId = session.id;
+    const sourcePane = paneRef.current;
+    if (editOwnerRef.current !== editOwner || sourcePane?.isConnected !== true || source.state.connectionState !== "connected") return;
+    let accepted: boolean;
+    let rejected: unknown;
+    try { accepted = await source.confirmMessageEdit(sourceSessionId, edit.expectedGeneration, edit); }
+    catch (error) { accepted = false; rejected = error; }
+    if (!accepted && rejected === undefined) throw new Error(t("timeline.editResultUnknown"));
+    await source.messageEditDrafts.finish(sourceSessionId, edit.operationId, rejected !== undefined);
+    setPendingMessageEdit(current => current?.edit.operationId === edit.operationId ? undefined : current);
+    if (editOwnerRef.current === editOwner && paneRef.current === sourcePane) {
+      setMessageActionResetSignal(current => current + 1);
+      if (accepted) setFollowLatestSignal(current => current + 1);
+    }
+    if (rejected !== undefined) throw rejected;
   };
 
   const previewMessageRewind = (item: TimelineItemView): void => {
     const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
     if (!messageRewindSupported || navigationTarget === undefined || item.sourceEventId === undefined) return;
+    rewindDraftContinuationOwnerRef.current = undefined;
+    setRewindDraftContinuation(undefined);
     const requestId = ++messageRewindRequestIdRef.current;
     const runId = messageRoundRunId(visibleTimeline, item.id);
     const filesSupported = workspace !== undefined && backend?.capabilities.get("workspace.rewind")?.supported === true && runId !== undefined;
@@ -1996,8 +2076,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
       const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (!rewind.isCurrent() || latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
-      const currentItem = mergeTimelineWindows(messageActionsViewRef.current.timeline, latest.timelineBySession.get(rewind.sessionId) ?? [])
-        .find((item) => item.id === rewind.itemId);
+      const currentItem = latest.timelineBySession.get(rewind.sessionId)?.find((item) => item.id === rewind.itemId)
+        ?? messageActionsViewRef.current.timeline.find((item) => item.id === rewind.itemId);
       if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
         || currentItem === undefined || currentItem.sourceEventId !== rewind.sourceEventId
         || (currentItem.messageId ?? currentItem.id) !== rewind.sourceMessageId || currentItem.completionCursor !== rewind.completionCursor
@@ -2013,9 +2093,15 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && (partnerConversation === undefined || partnerConversation.kind === "task") ? plainMessageRewindDraftText(item) : undefined;
     const prepare = rewindDraftRef.current;
     let restore: Awaited<ReturnType<PrepareRewindDraft>> = undefined;
+    let preparedRevision: number | undefined;
     let draftFailed = false;
+    const sourcePane = paneRef.current;
+    const sourceDocumentEpoch = artifactCatalogDocumentEpochRef.current;
+    const sourceDraftEpoch = composerLocalDraftEpochRef.current;
+    const sourceState = controllerRef.current.state;
+    const sourceProfile = sourceState.activeProfile;
     if (text !== undefined && prepare !== null) {
-      try { restore = await prepare(rewind.isCurrent); }
+      try { restore = await prepare(rewind.isCurrent, revision => { preparedRevision = revision; }); }
       catch { draftFailed = true; }
       const current = readCurrentMessage();
       if (current.sourceEventId !== item.sourceEventId || current.completionCursor !== item.completionCursor || plainMessageRewindDraftText(current) !== text) {
@@ -2024,11 +2110,47 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       }
     }
     let sameGenerationConfirmed = false;
-    await rewind.navigate(rewind.sessionId, rewind.target, {
-      expectedGeneration: rewind.generation,
-      sourceMessage: { messageId: rewind.sourceMessageId, eventId: rewind.sourceEventId },
-      ...(restore === undefined ? {} : { onSameGenerationConfirmed: () => { sameGenerationConfirmed = true; } })
-    });
+    let replacementConfirmed = false;
+    let continuation: RewindDraftContinuation | undefined;
+    if (restore !== undefined && preparedRevision !== undefined && text !== undefined) {
+      const owner = {};
+      const isCurrent = () => {
+        const state = controllerRef.current.state;
+        const task = state.snapshot.sessions.find(candidate => candidate.id === rewind.sessionId);
+        return rewindDraftContinuationOwnerRef.current === owner && paneRef.current === sourcePane && sourcePane?.isConnected === true
+          && artifactCatalogDocumentEpochRef.current === sourceDocumentEpoch && composerLocalDraftEpochRef.current === sourceDraftEpoch
+          && activeSessionIdRef.current === rewind.sessionId && task !== undefined && task.backendId === session.backendId && task.targetId === session.targetId
+          && state.connectionState === "connected" && state.connectionGeneration === sourceState.connectionGeneration
+          && state.sessionAccess?.role !== "guest" && state.taskSource?.kind !== "joined"
+          && state.snapshot.generation === sourceState.snapshot.generation && state.navigationRevision === sourceState.navigationRevision
+          && state.activeProfile?.serverId === sourceProfile?.serverId && state.activeProfile?.id === sourceProfile?.id
+          && controllerRef.current.navigateSessionBranch === rewind.navigate && sessionRouteIsCurrent(state.route, rewind.sessionId);
+      };
+      const finish = (error?: unknown) => {
+        if (rewindDraftContinuationOwnerRef.current !== owner) return;
+        if (error !== undefined && isCurrent()) {
+          runAction(`rewind-draft:${rewind.itemId}`, async () => { throw new Error(t("timeline.rewindDraftRestoreFailed"), { cause: error }); });
+        }
+        rewindDraftContinuationOwnerRef.current = undefined;
+        setRewindDraftContinuation(undefined);
+      };
+      rewindDraftContinuationOwnerRef.current = owner;
+      continuation = { sourceGeneration: rewind.generation, revision: preparedRevision, text, isCurrent, finish };
+      setRewindDraftContinuation(continuation);
+    }
+    const replacement = continuation;
+    try {
+      await rewind.navigate(rewind.sessionId, rewind.target, {
+        expectedGeneration: rewind.generation,
+        sourceMessage: { messageId: rewind.sourceMessageId, eventId: rewind.sourceEventId },
+        ...(restore === undefined ? {} : { onSameGenerationConfirmed: () => { sameGenerationConfirmed = true; } }),
+        ...(replacement === undefined ? {} : { onReplacementConfirmed: (generation: bigint, readGeneration: () => Promise<bigint | undefined>) => {
+          if (!replacement.isCurrent()) return;
+          replacementConfirmed = true;
+          setRewindDraftContinuation({ ...replacement, confirmation: { generation, readGeneration } });
+        } })
+      });
+    } finally { if (!replacementConfirmed) replacement?.finish(); }
     if (!rewind.isCurrent() || text === undefined) return;
     try { if (sameGenerationConfirmed) await restore?.(text); }
     catch { draftFailed = true; }
@@ -2405,11 +2527,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       {sideChatRecoveryLoadError !== undefined && <div className="session-schedule-notice" role="alert"><span>{sideChatRecoveryLoadError}</span>
         <Button onClick={() => setSideChatRecoveryReload(value => value + 1)}>{t("common.retry")}</Button></div>}
       {sideChatRecovery !== undefined && sideChatRecovery.record.sourceSessionId === session.id && <div className="session-schedule-notice" role="status">
-        <span>{sideChatRecovery.error ?? t(sideChatRecovery.state === "existing" ? "session.sideChatExistingDraft" : "session.sideChatCheckOriginal")}</span>
+        <span>{sideChatRecovery.error ?? t(sideChatRecovery.state === "existing" ? "session.sideChatExistingDraft"
+          : retiredSideChat ? "session.sideChatSourceChanged" : "session.sideChatCheckOriginal")}</span>
         <Button disabled={sideChatRecovery.state === "working"} onClick={() => checkSideChatRecovery()}>{t("session.sideChatCheck")}</Button>
-        {sideChatRecovery.state === "existing" && <Button onClick={() => checkSideChatRecovery(true)}>{t("session.sideChatInsertQuote")}</Button>}
-        {sideChatRecovery.state === "pending" && <Button onClick={() => checkSideChatRecovery(false, true)}>{t("session.sideChatRetryOriginal")}</Button>}
-        {sideChatRecovery.state === "failed" && sideChatRecovery.canStartAgain && <Button onClick={() => checkSideChatRecovery(false, true, true)}>{t("session.sideChatStartAgain")}</Button>}
+        {sideChatRecovery.state === "existing" && <Button onClick={() => checkSideChatRecovery("append")}>{t("session.sideChatInsertQuote")}</Button>}
+        {sideChatRecovery.state === "pending" && !retiredSideChat && <Button onClick={() => checkSideChatRecovery("retry")}>{t("session.sideChatRetryOriginal")}</Button>}
+        {sideChatRecovery.state === "failed" && sideChatRecovery.canStartAgain && (retiredSideChat
+          ? <Button onClick={() => checkSideChatRecovery("clear")}>{t("session.sideChatClearFailed")}</Button>
+          : <Button onClick={() => checkSideChatRecovery("restart")}>{t("session.sideChatStartAgain")}</Button>)}
         {sideChatRecovery.record.quote !== undefined && <Button onClick={event => {
           const ownerDocument = event.currentTarget.ownerDocument, text = sideChatRecovery.record.quote!.text;
           runAction("side-chat-copy-quote", () => writeClipboardText(text, { ownerDocument, signal: new AbortController().signal }));
@@ -2486,8 +2611,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         onStartShareSelection={startShareSelection}
         onToggleShareMessage={currentShareSelection === undefined ? undefined : toggleShareMessage}
         messageEdit={{ messageId: editableMessageId, stopRunning: editStopsRun,
-          blockedReason: messageActionsIdle ? undefined : t("timeline.editWaitForIdle"),
-          begin: beginMessageEdit, submit: moveEditedMessageToComposer }}
+          blockedReason: currentPendingMessageEdit !== undefined ? t("timeline.editResultUnknown")
+            : messageActionsIdle ? undefined : t("timeline.editWaitForIdle"),
+          begin: beginMessageEdit, submit: sendEditedMessage }}
         onPreviewMessageRewind={messageRewindSupported ? previewMessageRewind : undefined} rewindToStartSupported={rewindToStartSupported}
         onDeleteMessage={messageDeleteSupported ? openMessageDelete : undefined}
         messageDeleteBlockedReason={messageDeleteSupported ? messageDeleteBlockedReason : undefined}
@@ -2606,6 +2732,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           : <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} workspaceRoot={workspace?.serverPath} remaining={remainingInteractions} inline t={t} runAction={runAction} />}
       </InteractionPromptHost>
       {!guest && <TaskActivityBanner sessionId={session.id} />}
+      {currentPendingMessageEdit !== undefined && <div role="status">
+        <span>{t("timeline.editResultUnknown")}</span>
+        <Button disabled={controller.state.connectionState !== "connected"}
+          onClick={() => runAction(`check-message-edit:${session.id}`, () => checkPendingMessageEdit(currentPendingMessageEdit))}>
+          {t("timeline.checkEditResult")}
+        </Button>
+      </div>}
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
 {(interaction === undefined || guest) && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}>
         {objectiveReadable && <ObjectiveIndicator
@@ -2621,7 +2754,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }}
           t={t}
         />}
-<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} rewindDraftRef={rewindDraftRef} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
+<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} rewindDraftRef={rewindDraftRef} rewindDraftContinuation={rewindDraftContinuation} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
           if (handoff !== undefined) {
             if (!objectiveDialogRequestMatchesOwner(handoff, controller, session)) {
               onObjectiveDialogHandoffHandled?.(handoff.id);
@@ -2650,6 +2783,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       <MessageForkDialog
         key={currentMessageFork === undefined ? "message-fork:none" : `${currentMessageFork.sessionId}:${currentMessageFork.itemId}`}
         open={currentMessageFork !== undefined}
+        checkOriginal={currentMessageFork?.original !== undefined}
+        pending={currentMessageFork?.readingReceipt}
         t={t}
         onClose={() => setMessageFork(undefined)}
         onConfirm={confirmMessageFork}
@@ -2713,20 +2848,6 @@ function plainMessageRewindDraftText(item: TimelineItemView): string | undefined
     || (item.attachments?.length ?? 0) > 0 || (item.inputMentions?.length ?? 0) > 0
     || (item.mentionRanges?.length ?? 0) > 0 || (item.pastedTextRanges?.length ?? 0) > 0) return undefined;
   return item.text?.trim() ? item.text : undefined;
-}
-
-async function restoreEditedMessageDraft(
-  controller: Pick<AppController, "saveDraftIfRevision">,
-  sessionId: string,
-  draft: Parameters<AppController["saveDraft"]>[1],
-  expectedRevision: number,
-  t: Translator
-): Promise<void> {
-  try {
-    await controller.saveDraftIfRevision(sessionId, draft, expectedRevision);
-  } catch (cause) {
-    throw new Error(t("timeline.editDraftRestoreFailed"), { cause });
-  }
 }
 
 function CompactActionFeedback({ feedback, t, onDismiss }: {

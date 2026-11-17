@@ -1066,6 +1066,8 @@ export interface PairingOutcome {
 
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage" | "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">,
   Required<Pick<OperationApi, "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">>, AppDefaultModelUiPort {
+  submitMessageFork(record: import("./model.js").PendingMessageFork, assertCurrent: () => void): Promise<import("./model.js").SideChatOperationView>;
+  readMessageFork(record: import("./model.js").PendingMessageFork): Promise<import("./model.js").SideChatOperationView>;
   prepareContactsDialogue(draft: TargetDraft, requestId: string, signal: AbortSignal): Promise<Pick<TargetView, "id" | "revision">>;
   deviceAuthorizationOwner?(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
@@ -2277,9 +2279,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return source;
   }
 
-  async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint; readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean } }): Promise<void> {
+  async send(sessionId: string, draft: ComposerDraft, admission: Parameters<OperationApi["send"]>[2]): Promise<void> {
     const scope = this.captureActionScope();
     const expectedGeneration = admission.expectedGeneration;
+    const edit = admission.messageEdit;
     if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new GatewayError("Input requires the source task generation.");
     }
@@ -2373,7 +2376,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       parts.push({ content: { case: "image", value: { blob, altText: item.screenshot.file.name } } });
     }
     if (parts.length === 0) throw new GatewayError("A task input cannot be empty.");
-    await this.submit({
+    const payload: MutationPayload = {
       case: "sendInput",
       value: {
         sessionId,
@@ -2393,9 +2396,62 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         ...(admission.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: admission.providerGroupRebalance }),
         ...(draft.extraDirectoryIds === undefined
           ? {}
-          : { overrides: { extraDirectoryIds: [...new Set(draft.extraDirectoryIds)] } })
+          : { overrides: { extraDirectoryIds: [...new Set(draft.extraDirectoryIds)] } }),
+        ...(edit === undefined ? {} : { messageEdit: {
+          sourceMessageId: edit.sourceMessageId, sourceEventId: edit.sourceEventId,
+          rewindBefore: { kind: edit.target.kind === "session_start" ? { case: "sessionStart", value: {} }
+            : { case: "nativeEntryId", value: edit.target.entryId } }
+        } })
       }
-    }, false, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }], scope.signal);
+    };
+    const preconditions: MutationPrecondition[] = [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }];
+    if (edit === undefined) {
+      await this.submit(payload, false, preconditions, scope.signal);
+      return;
+    }
+    let dispatched = false;
+    let observed: Operation | undefined;
+    try {
+      const result = await this.submit(payload, true, preconditions, scope.signal, (_id, operation) => {
+        if (operation === undefined) {
+          edit.assertCurrent();
+          dispatched = true;
+        } else observed = operation;
+      }, edit.operationId, true);
+      const accepted = result.result?.payload;
+      if (result.operationId === edit.operationId && result.state === OperationState.SUCCEEDED && accepted?.case === "queueItem"
+        && accepted.value.sessionId === sessionId && accepted.value.sourceId === edit.operationId) return;
+    } catch (error) {
+      if (!dispatched) throw error;
+      if (observed !== undefined && observed.state !== OperationState.SUCCEEDED && TERMINAL_OPERATION_STATES.has(observed.state)) {
+        throw messageEditRejection(observed);
+      }
+    }
+    if (await this.confirmMessageEdit(sessionId, expectedGeneration, edit, scope)) return;
+    throw new GatewayError("The edit result is unknown. Check the original edit before submitting again.", { code: "MESSAGE_EDIT_RESULT_UNKNOWN" });
+  }
+
+  async confirmMessageEdit(sessionId: string, expectedGeneration: bigint, edit: import("./model.js").MessageEditRequest,
+    scope = this.captureActionScope()): Promise<boolean> {
+    const operation = await createClient(OperationService, scope.transport).getOperation({ operationId: edit.operationId }, { signal: scope.signal, timeoutMs: 5_000 })
+      .then(response => response.operation).catch(() => undefined);
+    if (scope.signal.aborted || this.#transport !== scope.transport || operation === undefined) return false;
+    const payload = operation.mutation?.payload;
+    const submitted = payload?.case === "sendInput" ? payload.value.messageEdit : undefined;
+    const boundary = submitted?.rewindBefore?.kind;
+    if (operation.operationId !== edit.operationId || operation.connectionId !== this.#profile?.id || payload?.case !== "sendInput"
+      || payload.value.sessionId !== sessionId || submitted === undefined || submitted.sourceMessageId !== edit.sourceMessageId || submitted.sourceEventId !== edit.sourceEventId
+      || (edit.target.kind === "session_start" ? boundary?.case !== "sessionStart" : boundary?.case !== "nativeEntryId" || boundary.value !== edit.target.entryId)
+      || !operation.mutation?.preconditions.some(condition => condition.entity?.kind === EntityKind.SESSION
+        && condition.entity.id === sessionId && condition.expectedGeneration === expectedGeneration)) return false;
+    if (operation.state === OperationState.SUCCEEDED) {
+      const result = operation.result?.payload;
+      if (result?.case !== "queueItem" || result.value.sessionId !== sessionId || result.value.sourceId !== operation.operationId) return false;
+      void this.refresh().catch(() => undefined);
+      return true;
+    }
+    if (TERMINAL_OPERATION_STATES.has(operation.state)) throw messageEditRejection(operation);
+    return false;
   }
 
   async sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, callerSignal?: AbortSignal): Promise<boolean> {
@@ -3786,7 +3842,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (options.expectedGeneration < 1n) throw new GatewayError("A source task generation is required for navigation.");
     const customInstructions = options.customInstructions?.trim().slice(0, 4_000) ?? "";
     const confirmSameGeneration = options.onSameGenerationConfirmed;
-    const scope = confirmSameGeneration === undefined ? undefined : this.captureActionScope();
+    const confirmReplacement = options.onReplacementConfirmed;
+    const scope = confirmSameGeneration === undefined && confirmReplacement === undefined ? undefined : this.captureActionScope();
     const operation = await this.submit({
       case: "navigateSessionBranch",
       value: {
@@ -3801,16 +3858,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         })
       }
     }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
-    if (confirmSameGeneration === undefined || scope === undefined) return;
+    if (scope === undefined) return;
     const result = operation.result?.payload;
     if (operation.state !== OperationState.SUCCEEDED || result?.case !== "acknowledgement" || result.value.accepted !== true) {
       throw new GatewayError("The task navigation result could not be confirmed.", { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" });
     }
     // An accepted operation can replace the binding before the renderer sees its new generation.
-    const response = await createClient(SessionService, scope.transport).getSession({ sessionId }, { signal: scope.signal, timeoutMs: 5_000 })
-      .catch(() => undefined);
-    if (!scope.signal.aborted && this.#transport === scope.transport && response?.session?.sessionId === sessionId
-      && response.session.nativeBinding?.runtimeGeneration === options.expectedGeneration) confirmSameGeneration();
+    const readCurrent = async () => {
+      const response = await createClient(SessionService, scope.transport).getSession({ sessionId,
+        ...(confirmReplacement === undefined ? {} : { messageRewindOperationId: operation.operationId })
+      }, { signal: scope.signal, timeoutMs: 5_000 }).catch(() => undefined);
+      return !scope.signal.aborted && this.#transport === scope.transport && response?.session?.sessionId === sessionId ? response : undefined;
+    };
+    const response = await readCurrent();
+    if (response?.session?.nativeBinding?.runtimeGeneration === options.expectedGeneration) confirmSameGeneration?.();
+    const continuedGeneration = (result: Awaited<ReturnType<typeof readCurrent>>): bigint | undefined => {
+      const generation = result?.messageRewindContinuationGeneration;
+      return generation !== undefined && generation > options.expectedGeneration
+        && generation === result?.session?.nativeBinding?.runtimeGeneration ? generation : undefined;
+    };
+    const replacement = continuedGeneration(response);
+    if (replacement !== undefined) confirmReplacement?.(replacement, async () => continuedGeneration(await readCurrent()));
   }
 
   async openSideChat(sessionId: string, expectedGeneration: bigint, options?: {
@@ -3841,17 +3909,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (operation.state !== OperationState.SUCCEEDED) return { state: "failed", error: operation.error?.message || "The original Side Chat operation failed.",
       stateMayHaveChanged: !operation.error || [operation.error.queueImpact, operation.error.workspaceImpact, operation.error.nativeSessionImpact].some(value => value !== StateImpact.UNCHANGED) };
     const payload = operation.result?.payload;
+    const binding = payload?.case === "session" ? payload.value.nativeBinding : undefined;
+    const origin = payload?.case === "session" ? payload.value.derivationOrigin : undefined;
     if (payload?.case !== "session" || payload.value.sessionId === record.sourceSessionId || !payload.value.sessionId
       || payload.value.backendId !== record.backendId || payload.value.targetId !== record.targetId
-      || payload.value.nativeBinding?.runtimeGeneration !== 1n || payload.value.derivationOrigin?.sideChat !== true
-      || payload.value.derivationOrigin.kind !== SessionDerivationKind.FORK
-      || payload.value.derivationOrigin.sourceSessionId !== record.sourceSessionId) throw new GatewayError("The original operation did not confirm this source's exact Side Chat child.");
+      || !binding?.opaqueReference || binding.backendId !== record.backendId || binding.runtimeGeneration < 1n || origin?.sideChat !== true
+      || origin.kind !== SessionDerivationKind.FORK || origin.sourceSessionId !== record.sourceSessionId) {
+      throw new GatewayError("The original operation did not confirm this source's exact Side Chat child.");
+    }
     await this.#refreshPromise?.catch(() => undefined); request?.throwIfAborted(); await this.refresh(); request?.throwIfAborted();
     const child = this.#snapshot?.sessions.find(session => session.id === payload.value.sessionId);
-    if (!child || child.backendId !== record.backendId || child.targetId !== record.targetId || child.generation !== 1n
+    if (!child || child.backendId !== record.backendId || child.targetId !== record.targetId || child.generation !== binding.runtimeGeneration
       || child.derivationOrigin?.sideChat !== true || child.derivationOrigin.kind !== "fork"
-      || child.derivationOrigin.sourceSessionId !== record.sourceSessionId) throw new GatewayError("Refresh the exact Side Chat child before adopting its local quote.");
-    return { state: "succeeded", sessionId: child.id };
+      || child.derivationOrigin.sourceSessionId !== record.sourceSessionId
+      || child.derivationOrigin.sourceMessageId !== origin.sourceMessageId
+      || child.derivationOrigin.sourceEventId !== origin.sourceEventId) throw new GatewayError("Refresh the exact Side Chat child before adopting its local quote.");
+    return { state: "succeeded", sessionId: child.id, generation: child.generation };
   }
 
   async forkSession(
@@ -3899,6 +3972,68 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
     }
     return operationSessionId(operation);
+  }
+
+  async submitMessageFork(record: import("./model.js").PendingMessageFork, assertCurrent: () => void): Promise<import("./model.js").SideChatOperationView> {
+    if (this.#taskSharing !== undefined) throw new GatewayError("A message fork requires the original node connection.");
+    const scope = this.captureActionScope(), connectionId = this.#profile?.id;
+    const expectedGeneration = BigInt(record.sourceGeneration);
+    const source = this.#snapshot?.sessions.find(session => session.id === record.sourceSessionId);
+    if (source?.generation !== expectedGeneration || source.backendId !== record.backendId || source.targetId !== record.targetId) {
+      throw new GatewayError("The original task generation is no longer current.");
+    }
+    let receipt: Operation | undefined;
+    try {
+      receipt = await this.submit({ case: "forkSession", value: {
+        sourceSessionId: record.sourceSessionId, nativeEntryId: record.nativeEntryId, newDisplayName: record.displayName,
+        sourceMessageId: record.messageId, sourceEventId: record.eventId
+      } }, true, [{ entity: { kind: EntityKind.SESSION, id: record.sourceSessionId }, expectedGeneration }], scope.signal,
+      (_id, observed) => { if (observed === undefined) assertCurrent(); else receipt = observed; }, record.operationId, true);
+    } catch (error) {
+      if (receipt === undefined || !TERMINAL_OPERATION_STATES.has(receipt.state)) throw error;
+    }
+    scope.signal.throwIfAborted();
+    return this.messageForkReceipt(record, connectionId, receipt);
+  }
+
+  async readMessageFork(record: import("./model.js").PendingMessageFork): Promise<import("./model.js").SideChatOperationView> {
+    if (this.#taskSharing !== undefined) throw new GatewayError("Message fork recovery requires the original node connection.");
+    const scope = this.captureActionScope(), connectionId = this.#profile?.id;
+    let receipt: Operation | undefined;
+    try { receipt = (await createClient(OperationService, scope.transport).getOperation({ operationId: record.operationId }, { signal: scope.signal })).operation; }
+    catch (error) { if (ConnectError.from(error).code === Code.NotFound) return { state: "pending" }; throw error; }
+    scope.signal.throwIfAborted();
+    if (receipt === undefined) return { state: "pending" };
+    const result = this.messageForkReceipt(record, connectionId, receipt);
+    if (result.state === "succeeded") void this.refresh().catch(() => undefined);
+    return result;
+  }
+
+  private messageForkReceipt(record: import("./model.js").PendingMessageFork, connectionId: string | undefined, operation: Operation): import("./model.js").SideChatOperationView {
+    const mutation = operation.mutation, payload = mutation?.payload;
+    const source = mutation?.preconditions[0];
+    if (connectionId === undefined || operation.connectionId !== connectionId || operation.operationId !== record.operationId
+      || payload?.case !== "forkSession" || payload.value.sourceSessionId !== record.sourceSessionId
+      || payload.value.nativeEntryId !== record.nativeEntryId || payload.value.newDisplayName !== record.displayName
+      || payload.value.sourceMessageId !== record.messageId || payload.value.sourceEventId !== record.eventId
+      || mutation?.preconditions.length !== 1 || source?.entity?.kind !== EntityKind.SESSION || source.entity.id !== record.sourceSessionId
+      || source.expectedGeneration !== BigInt(record.sourceGeneration) || (operation.version?.revision?.value ?? 0n) < 1n) {
+      throw new GatewayError("The reply does not identify the original message fork.", { code: "RESULT_UNKNOWN" });
+    }
+    if (!TERMINAL_OPERATION_STATES.has(operation.state)) return { state: "pending" };
+    if (operation.state !== OperationState.SUCCEEDED) return {
+      state: "failed", error: operation.error?.message || "The original message fork failed.",
+      stateMayHaveChanged: !operation.error || [operation.error.queueImpact, operation.error.workspaceImpact, operation.error.nativeSessionImpact].some(impact => impact !== StateImpact.UNCHANGED)
+    };
+    const result = operation.result?.payload, child = result?.case === "session" ? result.value : undefined;
+    const origin = child?.derivationOrigin;
+    if (!child?.sessionId || child.sessionId === record.sourceSessionId || child.backendId !== record.backendId || child.targetId !== record.targetId
+      || !child.nativeBinding?.opaqueReference || child.nativeBinding.runtimeGeneration < 1n
+      || origin?.kind !== SessionDerivationKind.FORK || origin.sideChat || origin.sourceSessionId !== record.sourceSessionId
+      || origin.sourceMessageId !== record.messageId || origin.sourceEventId !== record.eventId) {
+      throw new GatewayError("The reply does not identify the original message fork child.", { code: "RESULT_UNKNOWN" });
+    }
+    return { state: "succeeded", sessionId: child.sessionId, generation: child.nativeBinding.runtimeGeneration };
   }
 
   async cloneSession(
@@ -21618,6 +21753,15 @@ function normalizeError(error: unknown): GatewayError {
     return new GatewayError(error.rawMessage || error.message, { offline, cause: error });
   }
   return new GatewayError(error instanceof Error ? error.message : "Unexpected connection error", { cause: error });
+}
+
+function messageEditRejection(operation: Operation): GatewayError {
+  const error = operation.error;
+  const nativeResultUnknown = error !== undefined && [StateImpact.CHANGED, StateImpact.MAY_HAVE_CHANGED, StateImpact.UNKNOWN]
+    .includes(error.nativeSessionImpact);
+  return new GatewayError(error?.message || "The edited input was rejected.", {
+    code: nativeResultUnknown ? "NATIVE_NAVIGATION_SYNC_UNKNOWN" : error?.code || "MESSAGE_EDIT_REJECTED"
+  });
 }
 
 function isUncertainOperationSubmissionError(error: unknown): boolean {

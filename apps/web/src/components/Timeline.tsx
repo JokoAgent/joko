@@ -1853,7 +1853,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     if (!searchOnly && !selectionActive && editing && onCancelEdit !== undefined && onSubmitEdit !== undefined) {
       return <article className="message-user message-user--editing" data-user-msg-id={item.id} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} aria-label={roleLabel}><div className="message-user__stack">{item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}
         <UserMessageEditBox initialText={quotedUserMessage.body} t={t} onCancel={onCancelEdit}
-          blockedReason={editBlockedReason} onMoveToComposer={(value) => onSubmitEdit(item, value)} /></div></article>;
+          blockedReason={editBlockedReason} onSubmit={(value) => onSubmitEdit(item, value)} /></div></article>;
     }
     return (
       <RenderedShareSelectionContext.Provider value={shareSelected}>

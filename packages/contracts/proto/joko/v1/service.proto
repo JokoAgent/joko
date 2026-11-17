@@ -1428,10 +1428,14 @@ message ReconcileNativeCatalogAdoptionResponse {
 
 message GetSessionRequest {
   string session_id = 1;
+  // The original completed message rewind whose replacement may still own this task.
+  optional string message_rewind_operation_id = 2;
 }
 
 message GetSessionResponse {
   Session session = 1;
+  // Current generation of the original rewind's continuous replacement binding.
+  optional uint64 message_rewind_continuation_generation = 2;
 }
 
 message ListTaskTagsRequest {}

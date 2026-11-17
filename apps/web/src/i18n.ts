@@ -2156,11 +2156,13 @@ const en = {
   "timeline.deleteMessageConfirm": "Delete message",
   "timeline.deleteMessageBusy": "Wait for the current response to finish before deleting a message.",
   "timeline.deleteMessageFailed": "Couldn't delete the message. Try again.",
-  "timeline.editComposerHint": "Enter moves this text to the composer; Shift+Enter adds a line. You choose when to send.",
-  "timeline.editMoveToComposer": "Move to composer",
-  "timeline.editFailed": "Couldn't move this message to the composer.",
+  "timeline.editSendHint": "Press Enter to rewind to this message and send the edit. Press Shift+Enter for a new line.",
+  "timeline.editSend": "Send edited message",
+  "timeline.editFailed": "Couldn't send the edited message.",
+  "timeline.editResultUnknown": "The edit result is unknown. Check the original edit before submitting again.",
+  "timeline.checkEditResult": "Check edit result",
   "timeline.editAttachmentRestoreFailed": "The original attachments could not be restored safely. Nothing was rewound.",
-  "timeline.editDraftRestoreFailed": "The previous draft could not be restored after editing stopped. Copy and preserve the current editor text before leaving this task.",
+  "timeline.editDraftRestoreFailed": "Couldn't restore the edited text to the composer. Check the edit result to try again.",
   "timeline.editStale": "This is no longer the latest editable message, or the task is no longer idle.",
   "timeline.rewindMessage": "Rewind from here",
   "timeline.rewindTitle": "Preview message rewind",
@@ -4444,6 +4446,7 @@ const en = {
   "session.sideChatCheck": "Check original request",
   "session.sideChatRetryOriginal": "Retry original request",
   "session.sideChatStartAgain": "Start another Side Chat with this quote",
+  "session.sideChatClearFailed": "Clear failed request",
   "session.sideChatSourceChanged": "The original task context changed. The selected quote is still kept on this client.",
   "session.sideChatExistingDraft": "The Side Chat already has a draft. Your selected quote is kept separately.",
   "session.sideChatInsertQuote": "Insert quote into its draft",
@@ -6392,6 +6395,9 @@ const en = {
   ,"timeline.forkConfirmTitle": "Fork from here?"
   ,"timeline.forkConfirmDescription": "A new task will be created at this message. The current task stays unchanged."
   ,"timeline.forkConfirmAction": "Create fork"
+  ,"timeline.forkCheckAction": "Check original fork"
+  ,"timeline.forkCheckDescription": "Look up the result of the fork you already confirmed for this message."
+  ,"timeline.forkCheckOriginal": "The fork result is pending. Choose Fork on the same message to check the original."
   ,"timeline.forkBusy": "Wait for this message to finish before forking."
   ,"timeline.forkUnavailable": "This message can no longer be forked."
   ,"timeline.forkOrigin": "Forked from another task"
@@ -6718,6 +6724,7 @@ const zhBase: Record<MessageKey, string> = {
   "session.sideChatCheck": "检查原请求",
   "session.sideChatRetryOriginal": "重试原请求",
   "session.sideChatStartAgain": "用此引用重新创建侧聊",
+  "session.sideChatClearFailed": "清除已失败的请求",
   "session.sideChatSourceChanged": "原任务上下文已改变，所选引用仍保留在此客户端。",
   "session.sideChatExistingDraft": "此侧聊已有草稿，所选引用已单独保留。",
   "session.sideChatInsertQuote": "将引用插入其草稿",
@@ -8845,11 +8852,13 @@ const zhBase: Record<MessageKey, string> = {
   "timeline.deleteMessageConfirm": "删除本条消息",
   "timeline.deleteMessageBusy": "请等当前回复结束后再删除消息",
   "timeline.deleteMessageFailed": "无法删除这条消息，请重试",
-  "timeline.editComposerHint": "Enter 将文本移到输入框，Shift+Enter 换行；是否发送由你决定。",
-  "timeline.editMoveToComposer": "移到输入框",
-  "timeline.editFailed": "无法将此消息移到输入框。",
+  "timeline.editSendHint": "按 Enter 回退到此消息并发送编辑后的内容，按 Shift+Enter 换行。",
+  "timeline.editSend": "发送编辑后的消息",
+  "timeline.editFailed": "无法发送编辑后的消息。",
+  "timeline.editResultUnknown": "尚无法确认编辑结果。请先查询这次编辑，再次提交前确认结果。",
+  "timeline.checkEditResult": "检查编辑结果",
   "timeline.editAttachmentRestoreFailed": "无法安全恢复原附件，任务未回退。",
-  "timeline.editDraftRestoreFailed": "编辑流程停止后无法恢复原草稿。请在离开此任务前复制并人工保留当前输入框内容。",
+  "timeline.editDraftRestoreFailed": "无法将编辑后的内容恢复到输入框。请检查编辑结果以重试。",
   "timeline.editStale": "这已不是最后一条可编辑消息，或任务不再处于空闲状态。",
   "timeline.rewindMessage": "从这里回退",
   "timeline.rewindTitle": "预览消息回退",
@@ -10506,6 +10515,9 @@ const zhBase: Record<MessageKey, string> = {
   "timeline.forkConfirmTitle": "从此处分支？",
   "timeline.forkConfirmDescription": "将在此消息处创建一个新任务，当前任务保持不变。",
   "timeline.forkConfirmAction": "创建分支",
+  "timeline.forkCheckAction": "核查原分支",
+  "timeline.forkCheckDescription": "查询你已为此消息确认的分支结果。",
+  "timeline.forkCheckOriginal": "分支结果待确认。再次选择同一消息的分支操作可核查原结果。",
   "timeline.forkBusy": "请等本条消息处理完成后再分支。",
   "timeline.forkUnavailable": "此消息已无法分支。",
   "timeline.forkOrigin": "从另一个任务分支",

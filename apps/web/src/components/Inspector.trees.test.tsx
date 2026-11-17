@@ -177,6 +177,33 @@ describe("Inspector production trees", () => {
     expect(host.querySelector('[role="alert"]')).toBeNull();
   });
 
+  it.each(["stays", "switches", "returns"] as const)("only opens the derived child if the user %s on the original visit", async (visit) => {
+    let completeFork!: (sessionId: string) => void;
+    const forkSession = vi.fn<AppController["forkSession"]>(() => new Promise(resolve => { completeFork = resolve; }));
+    const navigate = vi.fn<AppController["navigate"]>();
+    const tree: NativeSessionTreeView = {
+      nativeSessionId: "native-one",
+      roots: [{ id: "original-entry", kind: "message", role: "user", text: "Original question", active: true, children: [] }]
+    };
+    const getSessionTree = vi.fn(async () => tree);
+    const source = session();
+    const panel = (selected: SessionView, navigationRevision: number) => <BranchesPanel controller={{
+      state: { ...branchConnection, navigationRevision }, getSessionTree, forkSession, navigate
+    } as unknown as AppController} backend={backend()} session={selected} t={t} runAction={(_key, action) => { void action(); }} />;
+    const host = await render(panel(source, 1));
+    const button = required(host.querySelector<HTMLButtonElement>("[data-inspector-tree-secondary-action]"));
+    await act(async () => button.click());
+    expect(forkSession).toHaveBeenCalledExactlyOnceWith(source.id, "original-entry", "session.branchSuffix");
+    if (visit !== "stays") await act(async () => roots.at(-1)!.render(panel({ ...source, id: "other-task" }, 2)));
+    if (visit === "returns") await act(async () => roots.at(-1)!.render(panel(source, 3)));
+    await act(async () => completeFork("new-child"));
+    if (visit === "stays") {
+      expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "new-child" },
+        { isCurrent: expect.any(Function) });
+      expect(navigate.mock.calls[0]?.[1]?.isCurrent?.()).toBe(true);
+    } else expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("shows isolated-workspace branch forks only when the backend can derive the workspace", async () => {
     const treeView: NativeSessionTreeView = {
       nativeSessionId: "native-one",

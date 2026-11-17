@@ -5839,10 +5839,23 @@ export interface PendingSideChatDraft {
   readonly quote?: ComposerSelectionQuoteDraft;
 }
 
+export interface PendingMessageFork {
+  readonly operationId: string;
+  readonly sourceSessionId: string;
+  readonly sourceGeneration: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly messageId: string;
+  readonly eventId: string;
+  readonly nativeEntryId: string;
+  readonly displayName: string;
+  readonly draft?: Pick<ComposerDraft, "text" | "editorDocument">;
+}
+
 export type SideChatOperationView =
   | { readonly state: "pending" }
   | { readonly state: "failed"; readonly error: string; readonly stateMayHaveChanged: boolean }
-  | { readonly state: "succeeded"; readonly sessionId: string };
+  | { readonly state: "succeeded"; readonly sessionId: string; readonly generation: bigint };
 
 export interface ComposerDraft {
   readonly replyQuote?: PartnerReplyQuoteView;
@@ -6251,6 +6264,18 @@ export type ExtensionCardApi = Pick<import("@connectrpc/connect").Client<typeof 
   }>;
 };
 
+export interface MessageEditRequest {
+  readonly operationId: string;
+  readonly sourceMessageId: string;
+  readonly sourceEventId: string;
+  readonly target: NativeNavigationTargetView;
+}
+
+export interface PendingMessageEdit extends MessageEditRequest {
+  readonly expectedGeneration: bigint;
+  readonly draft: ComposerDraft;
+}
+
 export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi, HostedAgentSettingsApi {
   mcpAppApi(): McpAppApi | undefined;
   extensionCardApi(): ExtensionCardApi | undefined;
@@ -6311,7 +6336,12 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   stopVoiceInput(voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   cancelVoiceInput(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   getVoiceInputSession(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
-  send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint; readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean } }): Promise<void>;
+  send(sessionId: string, draft: ComposerDraft, admission: {
+    readonly expectedGeneration: bigint;
+    readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean };
+    readonly messageEdit?: MessageEditRequest & { readonly assertCurrent: () => void };
+  }): Promise<void>;
+  confirmMessageEdit(sessionId: string, expectedGeneration: bigint, edit: MessageEditRequest): Promise<boolean>;
   sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, signal?: AbortSignal): Promise<boolean>;
   startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string>;
   reobserveReview(reviewRunId: string): Promise<void>;
@@ -6423,7 +6453,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     target: NativeNavigationTargetView,
     options: { readonly expectedGeneration: bigint; readonly summarize?: boolean; readonly customInstructions?: string;
       readonly sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly requireLatestUser?: boolean };
-      readonly onSameGenerationConfirmed?: () => void }
+      readonly onSameGenerationConfirmed?: () => void;
+      readonly onReplacementConfirmed?: (generation: bigint, confirmCurrentGeneration: () => Promise<bigint | undefined>) => void }
   ): Promise<void>;
   forkSession(
     sessionId: string,

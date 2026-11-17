@@ -2778,10 +2778,14 @@ export function createConnectServices(application: OrchestratorApplication, proj
       return { sessions: result.values, page: result.page };
     },
     getSession: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
       sessionCodeHostContext.refreshSessionInBackground(request.sessionId);
       const stored = dependencies.store.getSession(request.sessionId);
-      return { session: mapSession(dependencies, stored) };
+      const generation = request.messageRewindOperationId === undefined ? undefined : dependencies.store.findMessageRewindContinuation(
+        stored, connection.id, strictDerivationIdentity(request.messageRewindOperationId, "message_rewind_operation_id")
+      );
+      return { session: mapSession(dependencies, stored),
+        ...(generation === undefined ? {} : { messageRewindContinuationGeneration: BigInt(generation) }) };
     },
     listTaskTags: (_request, context) => {
       authenticate(context);
@@ -18254,6 +18258,31 @@ async function dispatchMutation(
       const disposition = deliveryMode(payload.value.deliveryMode);
       const prompt = fromProtoInputContent(payload.value.input, disposition);
       const overrides = coreTurnOverrides(payload.value.overrides);
+      const finish = (execution: OperationExecution<OperationOutcome>) => {
+        if (!execution.replayed && execution.value.accepted) {
+          host.drainQueuedInput(payload.value.sessionId);
+          dependencies.sessionNavigation?.observeAcceptedPrompt(payload.value.sessionId, prompt);
+        }
+        return presented(execution);
+      };
+      const edit = payload.value.messageEdit;
+      if (edit !== undefined) {
+        if (disposition !== "prompt" || payload.value.providerGroupRebalance !== undefined
+          || payload.value.overrides?.model !== undefined || overrides?.permissionMode !== undefined || overrides?.planMode !== undefined) {
+          throw invalidArgument("Editing a sent message requires an ordinary prompt on the original task route.");
+        }
+        const messageId = strictDerivationIdentity(edit.sourceMessageId, "send_input.message_edit.source_message_id");
+        const eventId = strictDerivationIdentity(edit.sourceEventId, "send_input.message_edit.source_event_id");
+        let target: import("@joko/core").NativeNavigationTarget;
+        try { target = fromProtoNativeNavigationTarget(edit.rewindBefore); }
+        catch { throw invalidArgument("send_input.message_edit.rewind_before is invalid"); }
+        return finish(await host.navigateTree(payload.value.sessionId, target, false, undefined, Number(generation), {
+          connection, operationId,
+          sourceMessage: { messageId, eventId, requireLatestUser: true },
+          editedInput: { prompt, ...(overrides === undefined ? {} : { overrides }) },
+          protocol: { kind: "connect", body: mutation, precondition: store => validatePreconditions(store, mutation) }
+        }));
+      }
       const needsWorkspaceRestore = dependencies.store.getSession(payload.value.sessionId).descriptor.archived
         && dependencies.store.getSession(payload.value.sessionId).descriptor.worktree?.state === "preserved";
       const execution = await host.mutate({
@@ -18288,11 +18317,7 @@ async function dispatchMutation(
         if (record.status !== "failed" || record.connectionId !== connection.id) throw error;
         return { replayed: false, operation: record, value: { accepted: false } };
       });
-      if (!execution.replayed && execution.value.accepted) {
-        host.drainQueuedInput(payload.value.sessionId);
-        dependencies.sessionNavigation?.observeAcceptedPrompt(payload.value.sessionId, prompt);
-      }
-      return presented(execution);
+      return finish(execution);
     }
     case "abortRun": {
       const run = dependencies.store.getRun(payload.value.runId);
