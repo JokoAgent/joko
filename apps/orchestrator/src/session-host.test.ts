@@ -4262,6 +4262,39 @@ describe("SessionHost", () => {
     }
   });
 
+  it.each(["revoke", "dispose"] as const)("rejects a portable preview whose owner retires during its read (%s)", async retirement => {
+    const fixture = await createFixture(new PortableFakeAdapter());
+    const sessionId = (await fixture.host.createSession({ operationId: `portable-preview-${retirement}`,
+      connection: fixture.connection, targetId: "target-one", title: "Portable preview owner retirement",
+      fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const source = fixture.store.getSession(sessionId).descriptor;
+    fixture.store.appendEvent({ backendId: source.backendId, targetId: source.targetId, sessionId, generation: source.binding.generation,
+      traceId: `portable-preview-${retirement}`, payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Preview source" }] } });
+    const exported = await fixture.host.exportPortableSession({ sessionId });
+    let entered!: () => void, release!: () => void;
+    const reached = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const read = fixture.artifacts.readBlob.bind(fixture.artifacts);
+    const pendingRead = vi.spyOn(fixture.artifacts, "readBlob").mockImplementationOnce(async blob => {
+      const result = await read(blob);
+      entered();
+      await held;
+      return result;
+    });
+    try {
+      const inspection = fixture.host.inspectPortableSessionImport({ connection: fixture.connection, package: exported.artifact });
+      const rejected = expect(inspection).rejects.toThrow();
+      await reached;
+      if (retirement === "revoke") fixture.store.revokeConnection(fixture.connection.id);
+      else await fixture.host.dispose();
+      release();
+      await rejected;
+    } finally {
+      release();
+      pendingRead.mockRestore();
+    }
+  });
+
   it("imports a portable task exactly once, rejects duplicates, and replaces only when explicit", async () => {
     const adapter = new PortableFakeAdapter();
     const cleanupOrder: string[] = [];
@@ -4295,14 +4328,14 @@ describe("SessionHost", () => {
     });
     const exported = await fixture.host.exportPortableSession({
       sessionId: sourceSessionId,
-      password: "correct horse battery staple"
+      password: "cafe\u0301 portable phrase"
     });
     const request = {
       operationId: "import-portable-task",
       connection: fixture.connection,
       targetId: "target-one",
       package: exported.artifact,
-      password: "correct horse battery staple",
+      password: "caf\u00e9 portable phrase",
       title: "Restored portable task",
       fastMode: false,
       permissionMode: "ask" as const,

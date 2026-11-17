@@ -102,13 +102,13 @@ describe("portable Session export composition", () => {
       backendCapability: "native-portable-session-v1",
       events: events(),
       nativeSession: nativeSession("{\"type\":\"session\"}\n"),
-      password: "secret phrase",
+      password: "caf\u00e9 secret phrase",
       readBlob: async () => ({ data: Uint8Array.from([1, 2, 3]), mimeType: "image/png" }),
       exportedAt: "2026-08-25T00:00:00.000Z"
     });
     expect(built).toMatchObject({ fidelity: "full", messageCount: 1, mediaCount: 1, missingMediaCount: 0 });
     expect(isEncryptedPortableSessionPackage(built.bytes)).toBe(true);
-    const decoded = decodePortableSessionPackage(built.bytes, { password: "secret phrase" });
+    const decoded = decodePortableSessionPackage(built.bytes, { password: "cafe\u0301 secret phrase" });
     expect(decoded.entries.map((entry) => entry.path)).toEqual([
       "projection/messages.json",
       "native/main.jsonl",

@@ -3495,7 +3495,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope();
     const client = createClient(PortableSessionService, scope.transport);
     try {
-      const packageBlob = await this.uploadBlob(file, BlobDisposition.ATTACHMENT, scope);
+      const packageBlob = await this.uploadBlob(file, BlobDisposition.PORTABLE_IMPORT, scope);
       scope.signal.throwIfAborted();
       const response = await client.inspectPortableSessionImport(
         { package: packageBlob },

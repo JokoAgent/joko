@@ -27,6 +27,7 @@ import {
 } from "./portable-session-projection.js";
 
 const DEFAULT_TRANSFER_LIMIT_BYTES = 256 * 1024 * 1024;
+export const PORTABLE_IMPORT_DRAFT_TTL_MS = 10 * 60 * 1_000;
 
 export interface PortableCollaborationProjection {
   readonly format: 1;

@@ -1,3 +1,4 @@
+import { createCipheriv, scryptSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   PortableSessionPackageError,
@@ -38,6 +39,28 @@ function fixture(): PortableSessionPackage {
   };
 }
 
+function encryptedWithExactPasswordBytes(value: PortableSessionPackage, password: string): Buffer {
+  const magic = Buffer.from("JOKOSESSION\u0001", "ascii");
+  const plain = Buffer.from(encodePortableSessionPackage(value));
+  const compressed = plain.subarray(magic.byteLength + 4 + plain.readUInt32BE(magic.byteLength));
+  const encrypted = Buffer.from(encodePortableSessionPackage(value, { password: "Header fixture" }));
+  const headerStart = magic.byteLength + 4;
+  const header = JSON.parse(encrypted.subarray(headerStart, headerStart + encrypted.readUInt32BE(magic.byteLength)).toString("utf8")) as {
+    readonly salt: string; readonly nonce: string; readonly tag: string; readonly kdf: string; readonly [field: string]: unknown;
+  };
+  expect(header.kdf).toBe("scrypt-32768-8-1");
+  const { tag: _tag, ...authenticated } = header;
+  const key = scryptSync(Buffer.from(password, "utf8"), Buffer.from(header.salt, "base64"), 32,
+    { N: 32_768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+  const cipher = createCipheriv("aes-256-gcm", key, Buffer.from(header.nonce, "base64"));
+  cipher.setAAD(Buffer.from(JSON.stringify(authenticated), "utf8"));
+  const payload = Buffer.concat([cipher.update(compressed), cipher.final()]);
+  const headerBytes = Buffer.from(JSON.stringify({ ...authenticated, tag: cipher.getAuthTag().toString("base64") }), "utf8");
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(headerBytes.byteLength);
+  return Buffer.concat([magic, length, headerBytes, payload]);
+}
+
 describe("portable Session package", () => {
   it("round-trips a full native Session, Worker graph, and media without a password", () => {
     const encoded = encodePortableSessionPackage(fixture());
@@ -65,6 +88,49 @@ describe("portable Session package", () => {
       expect.objectContaining<Partial<PortableSessionPackageError>>({ code: "DECRYPTION_FAILED" })
     );
     expect(decodePortableSessionPackage(encoded, { password: "correct horse battery staple" }).manifest.title).toBe("Portable task");
+  });
+
+  it.each([
+    ["caf\u00e9", "cafe\u0301"],
+    ["cafe\u0301", "caf\u00e9"],
+    ["a\u0301\u0327", "a\u0327\u0301"]
+  ])("unlocks canonically equivalent password input %j with %j", (exportPassword, importPassword) => {
+    const value = fixture();
+    const encoded = encodePortableSessionPackage(value, { password: exportPassword });
+    const decoded = decodePortableSessionPackage(encoded, { password: importPassword });
+    expect(isEncryptedPortableSessionPackage(encoded)).toBe(true);
+    expect(decoded.manifest).toEqual(value.manifest);
+    expect(decoded.entries).toEqual(value.entries);
+    const tampered = Buffer.from(encoded);
+    tampered[tampered.length - 1] = tampered[tampered.length - 1]! ^ 0xff;
+    expect(() => decodePortableSessionPackage(tampered, { password: importPassword })).toThrowError(
+      expect.objectContaining<Partial<PortableSessionPackageError>>({ code: "DECRYPTION_FAILED" })
+    );
+  });
+
+  it.each([
+    ["decomposed password", "cafe\u0301"],
+    ["raw byte limit", "\u0344".repeat(512)]
+  ])("authenticates the supplied bytes of an existing current-format package at %s", (_label, password) => {
+    const value = fixture();
+    const decoded = decodePortableSessionPackage(encryptedWithExactPasswordBytes(value, password), { password });
+    expect(decoded.manifest).toEqual(value.manifest);
+    expect(decoded.entries).toEqual(value.entries);
+  });
+
+  it("keeps password whitespace significant and bounds both supplied and canonical export bytes", () => {
+    const encoded = encodePortableSessionPackage(fixture(), { password: " caf\u00e9 " });
+    expect(decodePortableSessionPackage(encoded, { password: " cafe\u0301 " }).manifest.title).toBe("Portable task");
+    for (const password of ["caf\u00e9", " caf\u00e9  ", " caf\u00e8 "]) {
+      expect(() => decodePortableSessionPackage(encoded, { password })).toThrowError(
+        expect.objectContaining<Partial<PortableSessionPackageError>>({ code: "DECRYPTION_FAILED" })
+      );
+    }
+    for (const password of ["", "a\u0000b", "a".repeat(1025), "e\u0301".repeat(342), "\u0344".repeat(512)]) {
+      expect(() => encodePortableSessionPackage(fixture(), { password })).toThrowError(
+        expect.objectContaining<Partial<PortableSessionPackageError>>({ code: "INVALID_PACKAGE" })
+      );
+    }
   });
 
   it("rejects traversal, absolute, drive-qualified, duplicate, and unresolved native entry paths", () => {

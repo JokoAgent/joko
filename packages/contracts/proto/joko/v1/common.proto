@@ -171,6 +171,8 @@ enum BlobDisposition {
   BLOB_DISPOSITION_EXPORT = 4;
   BLOB_DISPOSITION_TOOL_OUTPUT = 5;
   BLOB_DISPOSITION_SCREENSHOT = 6;
+  // An unadopted input copy, retained only for the portable import preview.
+  BLOB_DISPOSITION_PORTABLE_IMPORT = 7;
 }
 
 message ImageRef {
