@@ -42,6 +42,8 @@ export interface PendingOperation {
   readonly sessionId?: string;
   readonly runId?: string;
   readonly eventId?: string;
+  readonly sourceMessageId?: string;
+  readonly nativeEntryId?: string;
   readonly backendId?: string;
   readonly sourceGeneration?: string;
   readonly workspaceId?: string;
@@ -583,7 +585,15 @@ function isPending(value: unknown): value is PendingOperation {
     "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat",
     "objective-set", "objective-pause", "objective-resume", "objective-clear"].includes(String(record.kind))
     && typeof record.sessionId !== "string") return false;
-  if (record.kind === "session-fork" && !validReceiptIdentity(record.eventId)) return false;
+  if (record.kind === "session-fork") {
+    if (!validReceiptIdentity(record.eventId, 1_024) || record.taskJoinId !== undefined
+      || record.workspaceId !== undefined || record.changeSetId !== undefined) return false;
+    const hasRetainedSource = [record.sourceMessageId, record.nativeEntryId, record.backendId, record.targetId, record.sourceGeneration]
+      .some(value => value !== undefined);
+    if (hasRetainedSource && (!validReceiptIdentity(record.sessionId, 1_024) || !validReceiptIdentity(record.sourceMessageId, 1_024)
+      || !validReceiptIdentity(record.nativeEntryId, 1_024) || !validReceiptIdentity(record.backendId)
+      || !validReceiptIdentity(record.targetId) || record.sourceGeneration === undefined)) return false;
+  } else if (record.sourceMessageId !== undefined || record.nativeEntryId !== undefined) return false;
   if (record.kind === "session-side-chat" && (!validReceiptIdentity(record.backendId) || !validReceiptIdentity(record.targetId)
     || record.sourceGeneration === undefined || record.taskJoinId !== undefined)) return false;
   if (String(record.kind).startsWith("objective-") && (!validReceiptIdentity(record.sessionId) || record.sourceGeneration === undefined)) return false;
@@ -624,9 +634,9 @@ function isPending(value: unknown): value is PendingOperation {
     && (record.scheduleId !== undefined || record.triggerId !== undefined)) return false;
   if (!["schedule-run-restart", "schedule-run-read", "schedule-run-delete"].includes(String(record.kind))
     && record.triggerId !== undefined) return false;
-  if (!["schedule-create", "schedule-update", "schedule-project-reconcile", "session-rewind", "workspace-rewind", "session-side-chat"].includes(String(record.kind))
+  if (!["schedule-create", "schedule-update", "schedule-project-reconcile", "session-rewind", "workspace-rewind", "session-fork", "session-side-chat"].includes(String(record.kind))
     && record.targetId !== undefined) return false;
-  if (!["session-rewind", "workspace-rewind", "session-side-chat", "objective-set", "objective-pause", "objective-resume", "objective-clear",
+  if (!["session-rewind", "workspace-rewind", "session-fork", "session-side-chat", "objective-set", "objective-pause", "objective-resume", "objective-clear",
     "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end"].includes(String(record.kind))
     && (record.backendId !== undefined || record.sourceGeneration !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (String(record.kind).startsWith("objective-") && (record.backendId !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
@@ -658,8 +668,8 @@ function isExtensionReceiptKind(value: unknown): boolean {
   ].includes(String(value));
 }
 
-function validReceiptIdentity(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 512 && value === value.trim()
+function validReceiptIdentity(value: unknown, maxLength = 512): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength && value === value.trim()
     && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 

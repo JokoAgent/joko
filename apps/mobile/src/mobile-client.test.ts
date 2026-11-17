@@ -12595,21 +12595,24 @@ describe("native current-task cloning", () => {
     return { state, network, child, operation };
   }
 
-  it("retains a side chat draft through the exact original operation and uses only a generation fence", async () => {
+  it("opens the exact side chat with its draft even when a separate directory read would fail", async () => {
     const f = fixture(true), saved = memoryStorage(credential), drafts = memoryDraftStores();
     vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
       expect(saved.pending()).toMatchObject([{ operationId, kind: "session-side-chat", sourceGeneration: "8" }]);
       expect(mutation.payload.case).toBe("openSideChat");
       expect(mutation.preconditions[0]).toMatchObject({ expectedGeneration: 8n });
       expect(mutation.preconditions[0]?.expectedRevision).toBeUndefined();
-      f.state.derived = f.child(); return f.operation(operationId);
+      return f.operation(operationId);
     });
     const app = client(f.network, saved.storage, undefined, undefined, () => "side-chat-once", undefined, drafts);
     await app.start();
+    vi.mocked(f.network.readOwner).mockClear().mockRejectedValue(new ConnectError("directory temporarily unavailable", Code.Unavailable));
     await expect(app.openSideChat(app.taskSideChatControls()!.authorityKey, plainTextMobileComposerDraft("Follow up")))
       .resolves.toEqual({ kind: "opened", sessionId: "cloned-task" });
     expect(saved.pending()).toEqual([]);
     expect(f.network.submit).toHaveBeenCalledOnce();
+    expect(f.network.readOwner).not.toHaveBeenCalled();
+    expect(app.taskSideChatControls()?.children.map(child => child.sessionId)).toEqual(["cloned-task"]);
     expect((await drafts.composer.read({ profileId: credential.profileId, sessionId: "cloned-task" }))?.text).toBe("Follow up");
   });
 
@@ -13221,12 +13224,16 @@ describe("native message forks", () => {
       nativeBinding: create(NativeSessionBindingSchema, { ...runtimeSession.nativeBinding!, backendId: "backend", opaqueReference: "forked-native" }),
       derivationOrigin: create(SessionDerivationOriginSchema, { kind: SessionDerivationKind.FORK, sourceSessionId: "session",
         sourceMessageId: "fork-user", sourceEventId: "fork-complete" }) });
-    const operation = (operationId: string, value = child()) => create(OperationSchema, { operationId,
+    const operation = (operationId: string, value = child(), mutation = create(OperationMutationSchema, {
+      preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" }, expectedGeneration: 8n, expectedRevision: { value: 9n } }],
+      payload: { case: "forkSession", value: { sourceSessionId: "session", nativeEntryId: "parent-native",
+        sourceMessageId: "fork-user", sourceEventId: "fork-complete", newDisplayName: "Branch" } }
+    })) => create(OperationSchema, { operationId, mutation,
       connectionId: credential.connectionId, state: OperationState.SUCCEEDED, result: { payload: { case: "session", value } } });
     return { state, network, backend, child, operation, inputDraft };
   }
 
-  it("forks stable active input at its exact parent, persists the receipt first and the new draft before terminal receipt clearance", async () => {
+  it("forks stable active input at its exact parent and adopts the child without a separate directory read", async () => {
     const f = fixture(); f.state.source = create(SessionSchema, { ...runtimeSession, state: SessionState.RUNNING });
     const saved = memoryStorage(credential); const drafts = memoryDraftStores();
     const sourceIdentity = { profileId: credential.profileId, sessionId: "session" };
@@ -13234,11 +13241,14 @@ describe("native message forks", () => {
     await drafts.composer.flush(sourceIdentity);
     vi.mocked(f.network.submit).mockImplementation(async (_credential, operationId, mutation) => {
       expect(saved.pending()).toEqual([{ operationId, connectionId: credential.connectionId,
-        kind: "session-fork", sessionId: "session", eventId: "fork-complete", state: "unknown" }]);
+        kind: "session-fork", sessionId: "session", eventId: "fork-complete", sourceMessageId: "fork-user",
+        nativeEntryId: "parent-native", backendId: "backend", targetId: runtimeSession.targetId, sourceGeneration: "8", state: "unknown" }]);
+      const retained = await drafts.composer.readOperationInput(sourceIdentity, operationId);
+      expect(mobileComposerInput(retained!)).toEqual(mobileComposerInput(f.inputDraft));
       expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
         payload: { case: "forkSession", value: { sourceSessionId: "session", nativeEntryId: "parent-native",
           sourceMessageId: "fork-user", sourceEventId: "fork-complete", newDisplayName: "Branch" } } });
-      f.state.child = f.child(); return f.operation(operationId);
+      return f.operation(operationId, f.child(), mutation);
     });
     const savePending = saved.storage.savePending;
     saved.storage.savePending = vi.fn(async (items) => {
@@ -13248,15 +13258,19 @@ describe("native message forks", () => {
     });
     const app = client(f.network, saved.storage, undefined, undefined, () => "fork-operation", undefined, drafts);
     await app.start();
+    vi.mocked(f.network.readOwner).mockClear().mockRejectedValue(new ConnectError("directory temporarily unavailable", Code.Unavailable));
     const controls = app.taskMessageForkControls("fork-complete")!;
     expect(controls.canFork).toBe(true);
     await expect(app.forkTaskMessage(controls.authorityKey, "fork-complete", "Branch"))
       .resolves.toEqual({ kind: "forked", sessionId: "forked-task", draftRestored: true });
     expect(saved.pending()).toEqual([]); expect(app.state.selectedId).toBe("session");
+    expect(f.network.readOwner).not.toHaveBeenCalled();
+    expect(app.state.owner?.sessions.map(session => session.sessionId)).toContain("forked-task");
+    await expect(drafts.composer.readOperationInput(sourceIdentity, "fork-operation")).resolves.toBeNull();
     await expect(drafts.composer.readDurable(sourceIdentity)).resolves.toMatchObject({ text: "Keep source draft" });
   });
 
-  it("reconciles an unknown fork after restart from its exact canonical source without dispatching again", async () => {
+  it.each(["restart", "check and clear"] as const)("recovers the original fork after %s even when its source event has retired", async mode => {
     const f = fixture(); const saved = memoryStorage(credential); const drafts = memoryDraftStores();
     vi.mocked(f.network.submit).mockRejectedValueOnce(new Error("response lost"));
     const app = client(f.network, saved.storage, undefined, undefined, () => "unknown-fork", undefined, drafts);
@@ -13264,21 +13278,49 @@ describe("native message forks", () => {
     await expect(app.forkTaskMessage(app.taskMessageForkControls("fork-complete")!.authorityKey, "fork-complete", "Branch"))
       .resolves.toEqual({ kind: "unknown" });
     expect(app.taskMessageForkControls("fork-complete")?.canFork).toBe(false);
-    app.dispose();
-    f.state.child = f.child(); vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("unknown-fork"));
-    const restarted = client(f.network, saved.storage, undefined, undefined, () => "should-not-dispatch", undefined, drafts);
-    await restarted.start();
+    f.state.events = [];
+    vi.mocked(f.network.readAround).mockRejectedValue(new ConnectError("Event fork-complete was not found", Code.NotFound));
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("unknown-fork"));
+    let recovered = app, recoveredDrafts = drafts;
+    if (mode === "restart") {
+      app.dispose();
+      const driver: MobilePlainStorageDriver = { async getItem(key) { return drafts.values.get(key) ?? null; },
+        async setItem(key, value) { drafts.values.set(key, value); }, async removeItem(key) { drafts.values.delete(key); } };
+      recoveredDrafts = { values: drafts.values, composer: new MobileComposerDraftStore(driver), newTask: new MobileNewTaskDraftStore(driver) };
+      recovered = client(f.network, saved.storage, undefined, undefined, () => "should-not-dispatch", undefined, recoveredDrafts);
+      await recovered.start();
+    } else await recovered.dismissUnconfirmed("unknown-fork");
     expect(saved.pending()).toEqual([]); expect(f.network.submit).toHaveBeenCalledOnce();
-    expect(f.network.readAround).toHaveBeenCalledWith(credential, "session", "fork-complete", expect.any(AbortSignal));
-    const restored = await drafts.composer.readDurable({ profileId: credential.profileId, sessionId: "forked-task" });
+    expect(f.network.getOperation).toHaveBeenCalledWith(credential, "unknown-fork", expect.any(AbortSignal));
+    expect(f.network.readAround).not.toHaveBeenCalled();
+    const restored = await recoveredDrafts.composer.readDurable({ profileId: credential.profileId, sessionId: "forked-task" });
     expect(restored?.attachments).toEqual([]);
     expect(mobileComposerInput(restored!)).toEqual(mobileComposerInput(f.inputDraft));
-    expect(restarted.state.selectedId).toBe("session");
+    expect(recovered.state.selectedId).toBe("session");
+    expect(recovered.state.owner?.sessions.map(session => session.sessionId)).toContain("forked-task");
+    expect(recovered.state.error).toBeUndefined();
+  });
+
+  it("settles a legacy fork whose source is no longer readable and reports the missing draft", async () => {
+    const f = fixture(), saved = memoryStorage(credential), drafts = memoryDraftStores();
+    await saved.storage.savePending([{ operationId: "legacy-fork", connectionId: credential.connectionId, state: "unknown",
+      sessionId: "session", kind: "session-fork", eventId: "fork-complete" }]);
+    f.state.events = [];
+    vi.mocked(f.network.readAround).mockRejectedValue(new ConnectError("Event fork-complete was not found", Code.NotFound));
+    vi.mocked(f.network.getOperation).mockResolvedValue(f.operation("legacy-fork"));
+    const app = client(f.network, saved.storage, undefined, undefined, () => "should-not-dispatch", undefined, drafts);
+    await app.start();
+    expect(saved.pending()).toEqual([]);
+    expect(f.network.readAround).toHaveBeenCalledWith(credential, "session", "fork-complete", expect.any(AbortSignal));
+    expect(f.network.submit).not.toHaveBeenCalled();
+    expect(app.state.owner?.sessions.map(session => session.sessionId)).toContain("forked-task");
+    expect(app.state.error).toMatch(/created.*draft could not be restored/u);
+    await expect(drafts.composer.readDurable({ profileId: credential.profileId, sessionId: "forked-task" })).resolves.toBeNull();
   });
 
   it("rejects a stale source confirmation and leaves a foreign derived Session receipt unresolved", async () => {
     const f = fixture(); const saved = memoryStorage(credential);
-    const app = client(f.network, saved.storage);
+    const app = client(f.network, saved.storage, undefined, undefined, undefined, undefined, memoryDraftStores());
     await app.start(); const old = app.taskMessageForkControls("fork-complete")!;
     const original = clone(EventSchema, f.state.events[1]!);
     const changed = clone(EventSchema, original);

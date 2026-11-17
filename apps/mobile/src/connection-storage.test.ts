@@ -323,6 +323,22 @@ describe("current-v1 mobile connection storage", () => {
     await expect(storage.loadPending()).resolves.toEqual(receipts);
   });
 
+  it("reads legacy and complete message-fork receipts without applying their source fields to other operations", async () => {
+    const memory = drivers();
+    const storage = createMobileStorage(memory.plain, memory.secure);
+    const legacy = { operationId: "legacy-fork", connectionId: first.connectionId, kind: "session-fork" as const,
+      sessionId: "session-one", eventId: "event-one", state: "unknown" as const };
+    const retained = { ...legacy, operationId: "retained-fork", sourceMessageId: "message-one", nativeEntryId: "native-parent",
+      backendId: "backend-one", targetId: "target-one", sourceGeneration: "9" };
+    await storage.savePending([legacy, retained]);
+    await expect(storage.loadPending()).resolves.toEqual([legacy, retained]);
+    memory.plainValues.set("joko.mobile.pending.v1", JSON.stringify([
+      legacy, retained, { ...retained, operationId: "no-boundary", nativeEntryId: undefined },
+      { ...retained, operationId: "other-kind", kind: "rename" }, { ...retained, operationId: "joined-fork", taskJoinId: "join" }
+    ]));
+    await expect(storage.loadPending()).resolves.toEqual([legacy, retained]);
+  });
+
   it("round-trips message and Queue receipts only with their exact durable entity identity", async () => {
     const memory = drivers();
     const storage = createMobileStorage(memory.plain, memory.secure);
