@@ -13533,6 +13533,7 @@ function reconcileCompletedAssistantMessage(
           id: existing?.id ?? id,
           messageId,
           contentIndex,
+          sourceEventId: event.eventId,
           ...(existing?.runId || event.identity?.runId ? { runId: existing?.runId || event.identity?.runId } : {}),
           sequence: existing?.sequence ?? sequence,
           kind: "thinking",
