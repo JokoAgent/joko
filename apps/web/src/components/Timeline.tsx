@@ -1990,7 +1990,14 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     try {
       const ownerWindow = trigger.ownerDocument.defaultView;
       if (ownerWindow?.navigator.clipboard?.writeText === undefined) throw new Error("Clipboard unavailable.");
-      const value = kind === "text" ? text : deepLink;
+      const fileNames = kind === "text" && item.kind === "user" && !partnerPresentation
+        ? item.attachments?.filter((attachment) => attachment.kind === "file" && attachment.fileName.trim().length > 0)
+          .map((attachment) => attachment.fileName) ?? []
+        : [];
+      const value = kind === "link" ? deepLink : fileNames.length > 0
+        ? [text, translatorRef.current("timeline.copyAttachmentNames", { names: fileNames.join(", ") })]
+          .filter((part) => part.trim().length > 0).join("\n\n")
+        : text;
       await ownerWindow.navigator.clipboard.writeText(value);
       if (current()) reportShareFeedback(request, "success", translatorRef.current(kind === "text" ? "timeline.blockCopied" : "timeline.linkCopied"), kind);
     } catch {
