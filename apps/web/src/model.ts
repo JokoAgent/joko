@@ -6421,6 +6421,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     sessionId: string,
     target: NativeNavigationTargetView,
     options: { readonly expectedGeneration: bigint; readonly summarize?: boolean; readonly customInstructions?: string;
+      readonly sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly requireLatestUser?: boolean };
       readonly onSameGenerationConfirmed?: () => void }
   ): Promise<void>;
   forkSession(

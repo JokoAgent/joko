@@ -130,7 +130,8 @@ interface ActiveMessageRewind extends MessageRewindPreviewState {
   readonly requestId: number;
   readonly sessionId: string;
   readonly itemId: string;
-  readonly sourceEventId?: string;
+  readonly sourceMessageId: string;
+  readonly sourceEventId: string;
   readonly completionCursor?: bigint;
   readonly target: NativeNavigationTargetView;
   readonly generation: bigint;
@@ -756,8 +757,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     () => recoveryPresentationTimeline.filter((item) => !hidesFromTimelineHistory(item) && !(errorTailProjection?.hideFromTimeline === true && item.id === errorTailProjection.item.id)),
     [errorTailProjection, recoveryPresentationTimeline]
   );
-  const messageForkViewRef = useRef({ canFork: canForkMessage, timeline: visibleTimeline });
-  messageForkViewRef.current = { canFork: canForkMessage, timeline: visibleTimeline };
+  const messageActionsViewRef = useRef({ canFork: canForkMessage, timeline: visibleTimeline });
+  messageActionsViewRef.current = { canFork: canForkMessage, timeline: visibleTimeline };
   const derivationOrigin = session.derivationOrigin;
   const personalReportsEnabled = !guest && !reviewReadOnly && session.remoteWorkspace === undefined && controller.state.activeProfile?.managedLocal === true
     && window.jokoDesktop?.capabilities.includes("development.personal") === true;
@@ -1615,7 +1616,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const currentSource = () => {
       const snapshot = controllerRef.current.state.snapshot;
       const sourceSession = snapshot.sessions.find((candidate) => candidate.id === pending.sessionId);
-      if (!messageForkViewRef.current.canFork || sourceSession === undefined) return undefined;
+      if (!messageActionsViewRef.current.canFork || sourceSession === undefined) return undefined;
       const sourceBackend = snapshot.backends.find((candidate) => candidate.id === sourceSession.backendId);
       if (sourceBackend?.capabilities.get("session.fork")?.supported !== true
         || (sourceSession.worktree !== undefined && sourceBackend.capabilities.get("workspace.derive")?.supported !== true)) return undefined;
@@ -1631,7 +1632,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const findMessage = (items: readonly TimelineItemView[]) => items.find((item) => item.id === pending.itemId);
     const source = currentSource();
     const liveItem = source === undefined ? undefined : findMessage(source.timeline);
-    const selected = selectedMessage(liveItem ?? findMessage(messageForkViewRef.current.timeline));
+    const selected = selectedMessage(liveItem ?? findMessage(messageActionsViewRef.current.timeline));
     if (source === undefined || selected === undefined) {
       reportMessageForkFailure(pending.itemId, t("timeline.forkUnavailable"));
       return;
@@ -1748,7 +1749,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const moveEditedMessageToComposer = async (item: TimelineItemView, text: string): Promise<void> => {
     const sourceSessionId = session.id;
     const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
-    if (navigationTarget === undefined) throw new Error(t("timeline.rewindUnavailable"));
+    if (navigationTarget === undefined || item.sourceEventId === undefined) throw new Error(t("timeline.rewindUnavailable"));
     const sourceController = {
       navigateSessionBranch: controllerRef.current.navigateSessionBranch,
       readDraftSnapshot: controllerRef.current.readDraftSnapshot,
@@ -1775,7 +1776,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const activeBackend = activeSession === undefined ? undefined : snapshot.backends.find((candidate) => candidate.id === activeSession.backendId);
       const activeTarget = activeSession === undefined ? undefined : snapshot.targets.find((candidate) => candidate.id === activeSession.targetId);
       const activeStartSupported = sessionCapabilitySupportsTarget(activeBackend?.capabilities.get("session.rewind_to_start"), activeTarget);
-      const activeTimeline = snapshot.timelineBySession.get(sourceSessionId) ?? [];
+      const activeTimeline = mergeTimelineWindows(messageActionsViewRef.current.timeline, snapshot.timelineBySession.get(sourceSessionId) ?? []);
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (
@@ -1788,6 +1789,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         || queuedWork
         || activeBackend?.capabilities.get("session.rewind")?.supported !== true
         || activeUser?.id !== item.id
+        || activeUser.sourceEventId !== item.sourceEventId
+        || (activeUser.messageId ?? activeUser.id) !== (item.messageId ?? item.id)
         || !canEditVisibleUserMessage(activeUser, activeStartSupported)
         || !sameNativeNavigationTarget(messageDialogueRewindTarget(activeUser, activeStartSupported), navigationTarget)
       ) return undefined;
@@ -1873,7 +1876,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       throw new Error(t("timeline.editStale"));
     }
     try {
-      await sourceController.navigateSessionBranch(sourceSessionId, navigationTarget, { expectedGeneration: sourceGeneration });
+      await sourceController.navigateSessionBranch(sourceSessionId, navigationTarget, { expectedGeneration: sourceGeneration,
+        sourceMessage: { messageId: item.messageId ?? item.id, eventId: item.sourceEventId, requireLatestUser: true } });
       if (!sourceStillOwned()
         || controllerRef.current.navigateSessionBranch !== sourceController.navigateSessionBranch
         || !sessionRouteIsCurrent(controllerRef.current.state.route, sourceSessionId)
@@ -1889,7 +1893,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
 
   const previewMessageRewind = (item: TimelineItemView): void => {
     const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
-    if (!messageRewindSupported || navigationTarget === undefined) return;
+    if (!messageRewindSupported || navigationTarget === undefined || item.sourceEventId === undefined) return;
     const requestId = ++messageRewindRequestIdRef.current;
     const runId = messageRoundRunId(visibleTimeline, item.id);
     const filesSupported = workspace !== undefined && backend?.capabilities.get("workspace.rewind")?.supported === true && runId !== undefined;
@@ -1906,7 +1910,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && activeSessionIdRef.current === session.id
       && controllerRef.current.navigateSessionBranch === sourceController.navigateSessionBranch
       && controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id)?.generation === generation;
-    setMessageRewind({ requestId, sessionId: session.id, itemId: item.id, sourceEventId: item.sourceEventId, completionCursor: item.completionCursor,
+    setMessageRewind({ requestId, sessionId: session.id, itemId: item.id, sourceMessageId: item.messageId ?? item.id,
+      sourceEventId: item.sourceEventId, completionCursor: item.completionCursor,
       target: navigationTarget, generation, navigate: sourceController.navigateSessionBranch, executeWorkspaceRewind: sourceController.executeWorkspaceRewind,
       isCurrent, loadingFiles: filesSupported });
     if (!filesSupported || workspace === undefined || runId === undefined) return;
@@ -1948,9 +1953,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
       const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (!rewind.isCurrent() || latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
-      const currentItem = (latest.timelineBySession.get(rewind.sessionId) ?? []).find((item) => item.id === rewind.itemId);
+      const currentItem = mergeTimelineWindows(messageActionsViewRef.current.timeline, latest.timelineBySession.get(rewind.sessionId) ?? [])
+        .find((item) => item.id === rewind.itemId);
       if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
-        || currentItem === undefined || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, sessionCapabilitySupportsTarget(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
+        || currentItem === undefined || currentItem.sourceEventId !== rewind.sourceEventId
+        || (currentItem.messageId ?? currentItem.id) !== rewind.sourceMessageId || currentItem.completionCursor !== rewind.completionCursor
+        || !sameNativeNavigationTarget(messageDialogueRewindTarget(currentItem, sessionCapabilitySupportsTarget(latestBackend.capabilities.get("session.rewind_to_start"), latestTarget)), rewind.target)) {
         throw new Error(t("timeline.rewindStale"));
       }
       return currentItem;
@@ -1975,6 +1983,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     let sameGenerationConfirmed = false;
     await rewind.navigate(rewind.sessionId, rewind.target, {
       expectedGeneration: rewind.generation,
+      sourceMessage: { messageId: rewind.sourceMessageId, eventId: rewind.sourceEventId },
       ...(restore === undefined ? {} : { onSameGenerationConfirmed: () => { sameGenerationConfirmed = true; } })
     });
     if (!rewind.isCurrent() || text === undefined) return;

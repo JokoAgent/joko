@@ -12939,7 +12939,8 @@ describe("native message rewinds", () => {
         sessionId: "session", eventId: "rewind-complete", backendId: "backend", targetId: "target", sourceGeneration: "8", state: "unknown" }]);
       expect(await drafts.composer.readOperationInput(identity, operationId)).toMatchObject({ mentions: [{ sessionId: "related" }] });
       expect(mutation).toMatchObject({ preconditions: [{ expectedGeneration: 8n, expectedRevision: { value: 9n } }],
-        payload: { case: "navigateSessionBranch", value: { sessionId: "session", target: { kind: { case: "nativeEntryId", value: "public-boundary" } }, summarize: false, customInstructions: "" } } });
+        payload: { case: "navigateSessionBranch", value: { sessionId: "session", target: { kind: { case: "nativeEntryId", value: "public-boundary" } },
+          sourceMessageId: "rewind-message", sourceEventId: "rewind-complete", requireLatestUser: false, summarize: false, customInstructions: "" } } });
       f.advance(); return f.operation(operationId);
     });
     const save = saved.storage.savePending;

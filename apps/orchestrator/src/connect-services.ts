@@ -17970,6 +17970,8 @@ async function dispatchMutation(
     }
     case "navigateSessionBranch": {
       if (payload.value.sessionId.trim() === "") throw invalidArgument("navigate_session_branch.session_id is required");
+      const sourceMessage = derivationSourceMessageInput(payload.value.sourceMessageId, payload.value.sourceEventId, "navigate_session_branch");
+      if (payload.value.requireLatestUser && sourceMessage === undefined) throw invalidArgument("navigate_session_branch.require_latest_user requires the original source message");
       let navigationTarget: import("@joko/core").NativeNavigationTarget;
       try { navigationTarget = fromProtoNativeNavigationTarget(payload.value.target); }
       catch { throw invalidArgument("navigate_session_branch.target is invalid"); }
@@ -17987,7 +17989,9 @@ async function dispatchMutation(
           payload.value.summarize,
           payload.value.summarize && customInstructions !== "" ? customInstructions : undefined,
           Number(generation),
-          { connection, operationId, protocol: { kind: "connect", body: mutation, precondition: (store) => validatePreconditions(store, mutation) } }
+          { connection, operationId,
+            ...(sourceMessage === undefined ? {} : { sourceMessage: { ...sourceMessage, requireLatestUser: payload.value.requireLatestUser } }),
+            protocol: { kind: "connect", body: mutation, precondition: (store) => validatePreconditions(store, mutation) } }
         ));
     }
     case "compactSession": {

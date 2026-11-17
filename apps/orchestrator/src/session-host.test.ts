@@ -14493,6 +14493,128 @@ describe("SessionHost", () => {
     expect(fixture.store.findEvent(original.id)).toEqual(original);
   });
 
+  async function messageNavigationFixture() {
+    const adapter = new ManagedAttachFakeAdapter();
+    const before = fakeHistoryEvent("before-original", "message_assistant", {
+      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Retained answer" }]
+    });
+    const user = { ...fakeHistoryEvent("original-user", "message_user", {
+      type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Original input" }]
+    }), nativeParentEntryId: "before-original", nativeRewindBefore: { kind: "native_entry" as const, entryId: "before-original" } };
+    adapter.history = { events: [before, user], activeEntryId: "original-user" };
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "message-navigation-source", connection: fixture.connection,
+      targetId: "target-one", title: "Original message", fastMode: false, permissionMode: "ask", planMode: false,
+      nativeStart: { kind: "attach", nativeReference: "managed://message-navigation" } })).value.sessionId;
+    const sourceMessage = fixture.store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false })!;
+    expect(sourceMessage).toBeDefined();
+    const binding = fixture.store.getSession(sessionId).descriptor.binding;
+    const target = { kind: "native_entry" as const, entryId: "before-original" };
+    const authority = { connection: fixture.connection, operationId: "message-navigation", sourceMessage: { ...sourceMessage, requireLatestUser: true },
+      protocol: { kind: "internal" as const } };
+    return { ...fixture, adapter, before, sessionId, binding, target, authority };
+  }
+
+  it.each(["message", "event", "boundary", "newer user"] as const)("rejects changed message navigation authority before native dispatch: %s", async (changed) => {
+    const f = await messageNavigationFixture();
+    const navigate = vi.spyOn(f.adapter, "navigateTree");
+    const revision = f.store.getSession(f.sessionId).revision;
+    if (changed === "newer user") appendSessionEvent(f.store, f.sessionId, "new-user", 2_000,
+      { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "New input from another connection" }] });
+    const authority = { ...f.authority, sourceMessage: { ...f.authority.sourceMessage,
+      ...(changed === "message" ? { messageId: "unrelated-user" } : {}),
+      ...(changed === "event" ? { eventId: f.store.listEvents({ sessionId: f.sessionId })
+        .find(event => event.payload.type === "message_complete" && event.payload.role === "assistant")!.id } : {}) } };
+    expect(f.store.getSession(f.sessionId).revision).toBe(revision);
+    await expect(f.host.navigateTree(f.sessionId, changed === "boundary" ? { kind: "native_entry", entryId: "unrelated-entry" } : f.target,
+      false, undefined, f.binding.generation, authority)).rejects.toThrow(changed === "newer user"
+      ? "A newer user message prevents editing this message." : "The original message or its native rewind boundary changed.");
+    expect(navigate).not.toHaveBeenCalled();
+    expect(f.store.getSession(f.sessionId).descriptor.binding).toEqual(f.binding);
+    expect(f.store.findVisibleSessionMessageOrigin({ sessionId: f.sessionId, eventId: f.authority.sourceMessage.eventId }))
+      .toEqual({ messageId: f.authority.sourceMessage.messageId, eventId: f.authority.sourceMessage.eventId });
+  });
+
+  it("rechecks the latest user after asynchronous native preparation without requiring a Session revision change", async () => {
+    const f = await messageNavigationFixture();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const preparing = vi.fn(async () => { await gate; return false; });
+    Object.assign(f.adapter, { ownsNativeSessionDerivationLifecycle: preparing });
+    const navigate = vi.spyOn(f.adapter, "navigateTree");
+    const pending = f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, f.authority);
+    const rejection = expect(pending).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    try {
+      await vi.waitFor(() => expect(preparing).toHaveBeenCalledOnce());
+      const revision = f.store.getSession(f.sessionId).revision;
+      appendSessionEvent(f.store, f.sessionId, "new-user-during-preparation", 2_000,
+        { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Arrived during preparation" }] });
+      expect(f.store.getSession(f.sessionId).revision).toBe(revision);
+    } finally { release(); }
+    await rejection;
+    expect(navigate).not.toHaveBeenCalled();
+    expect(f.store.getSession(f.sessionId).descriptor.binding).toEqual(f.binding);
+  });
+
+  it("allows explicit dialogue rewind across later rounds and replays its receipt after the source row has left the branch", async () => {
+    const f = await messageNavigationFixture();
+    appendSessionEvent(f.store, f.sessionId, "later-round", 2_000,
+      { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Intentionally removed by rewind" }] });
+    const navigate = vi.spyOn(f.adapter, "navigateTree").mockImplementation(async () => {
+      f.adapter.history = { events: [f.before], activeEntryId: "before-original" };
+      return { kind: "in_place" };
+    });
+    const authority = { ...f.authority, sourceMessage: { ...f.authority.sourceMessage, requireLatestUser: false } };
+    const first = await f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, authority);
+    expect(first.value.accepted).toBe(true);
+    expect(f.store.findVisibleSessionMessageOrigin({ sessionId: f.sessionId, eventId: authority.sourceMessage.eventId })).toBeUndefined();
+    const replay = await f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, authority);
+    expect(replay.value).toEqual(first.value); expect(navigate).toHaveBeenCalledOnce();
+    await expect(f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation,
+      { ...authority, sourceMessage: { ...authority.sourceMessage, messageId: "different-body" } })).rejects.toThrow();
+    expect(navigate).toHaveBeenCalledOnce();
+  });
+
+  it("retains an unknown result when new user input appears after SDK dispatch, even after branch visibility changes", async () => {
+    const f = await messageNavigationFixture();
+    const navigate = vi.spyOn(f.adapter, "navigateTree").mockImplementation(async () => {
+      const session = f.store.getSession(f.sessionId).descriptor;
+      f.store.appendEvent({ id: "new-user-during-sdk", backendId: session.backendId, targetId: session.targetId,
+        sessionId: f.sessionId, generation: session.binding.generation, emittedAt: 2_000, traceId: "new-user-during-sdk",
+        payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Arrived after native dispatch" }],
+          nativeHistory: { identity: { entryId: "new-native-user", parentEntryId: "original-user" } } },
+        metadata: { namespace: "fake.live", fields: { nativeHistoryReplacesTransient: true,
+          [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(session.binding.opaqueRef) } } });
+      expect(f.store.findVisibleSessionMessageOrigin({ sessionId: f.sessionId, eventId: "new-user-during-sdk" })).toBeDefined();
+      f.adapter.history = { events: [f.before], activeEntryId: "before-original" };
+      return { kind: "in_place" };
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await expect(f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, f.authority))
+        .rejects.toMatchObject({ storedError: { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN", stateMayHaveChanged: true, retryable: false } });
+    }
+    expect(navigate).toHaveBeenCalledOnce();
+    expect(f.store.findVisibleSessionMessageOrigin({ sessionId: f.sessionId, eventId: "new-user-during-sdk" })).toBeUndefined();
+    expect(f.store.findEvent("new-user-during-sdk")?.payload).toMatchObject({ type: "message_complete", role: "user" });
+    expect(f.store.getSession(f.sessionId).descriptor.binding).toEqual(f.binding);
+  });
+
+  it("does not mistake newly hydrated native history for input admitted during the message rewind", async () => {
+    const f = await messageNavigationFixture();
+    const navigate = vi.spyOn(f.adapter, "navigateTree").mockImplementation(async () => {
+      const oldUser = fakeHistoryEvent("previously-unloaded-user", "message_user", {
+        type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Old native history" }]
+      });
+      f.adapter.history = { events: [oldUser, f.before], activeEntryId: "before-original" };
+      return { kind: "in_place" };
+    });
+    await expect(f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, f.authority))
+      .resolves.toMatchObject({ value: { accepted: true } });
+    expect(navigate).toHaveBeenCalledOnce();
+    expect(f.store.listEvents({ sessionId: f.sessionId }).find(event => event.metadata?.fields["nativeEntryId"] === "previously-unloaded-user"))
+      .toMatchObject({ metadata: { fields: { nativeHydration: true } } });
+  });
+
   it.each(["in_place", "replacement"] as const)("persists an explicit start rewind and fences stale generations with a %s native outcome", async (outcome) => {
     const adapter = new ManagedAttachFakeAdapter({ ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "session.rewind_to_start", supported: true }] });
     adapter.history = { events: [{ ...fakeHistoryEvent("first-user", "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "First" }] }), nativeRewindBefore: { kind: "session_start" } }], activeEntryId: "first-user", activeLineage: [{ entryId: "first-user" }] };

@@ -1627,6 +1627,28 @@ describe("Connect typed feature boundaries", () => {
       expect.objectContaining({ operationId: "operation-navigate-no-summary", protocol: expect.objectContaining({ kind: "connect" }) }));
   });
 
+  it("retains message-row navigation authority through the wire and rejects incomplete source anchors", async () => {
+    const store = { findOperation: () => undefined };
+    const navigateTree = vi.fn(completedNavigation);
+    const services = createConnectServices(stubApplication({ store, sessionHost: immediateHost(store, { navigateTree }) }));
+    const navigate = (operationId: string, source: { sourceMessageId?: string; sourceEventId?: string; requireLatestUser?: boolean }) => {
+      const request = create(contract.SubmitOperationRequestSchema, { operationId, connectionId: connection.id,
+        mutation: { preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: "session-row" }, expectedGeneration: 3n }],
+          payload: { case: "navigateSessionBranch", value: { sessionId: "session-row",
+            target: { kind: { case: "nativeEntryId", value: "before-user" } }, ...source } } } });
+      return invoke(services.operation.submitOperation, fromBinary(contract.SubmitOperationRequestSchema,
+        toBinary(contract.SubmitOperationRequestSchema, request)));
+    };
+    await navigate("edit-original-row", { sourceMessageId: "original-user", sourceEventId: "original-event", requireLatestUser: true });
+    expect(navigateTree).toHaveBeenCalledExactlyOnceWith("session-row", { kind: "native_entry", entryId: "before-user" }, false, undefined, 3,
+      expect.objectContaining({ sourceMessage: { messageId: "original-user", eventId: "original-event", requireLatestUser: true },
+        protocol: expect.objectContaining({ kind: "connect" }) }));
+    for (const [index, source] of [{ sourceMessageId: "original-user" }, { sourceEventId: "original-event" }, { requireLatestUser: true }].entries()) {
+      await expect(navigate(`incomplete-row-${index}`, source)).rejects.toMatchObject({ code: Code.InvalidArgument });
+    }
+    expect(navigateTree).toHaveBeenCalledOnce();
+  });
+
   it("requires an explicit start target and its source generation before admitting native navigation", async () => {
     const store = { findOperation: () => undefined };
     const navigateTree = vi.fn(completedNavigation);

@@ -79,7 +79,8 @@ describe("SessionPane dialogue rewind draft recovery", () => {
     await clickButton(container, "Preview rewind");
     await clickButton(document, "timeline.rewindDialogueOnly");
     expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "native_entry", entryId: "entry-parent" },
-      { expectedGeneration: sourceSession.generation, onSameGenerationConfirmed: expect.any(Function) });
+      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId },
+        onSameGenerationConfirmed: expect.any(Function) });
     expect(restore).not.toHaveBeenCalled();
     await act(async () => finish());
     expect(restore).toHaveBeenCalledExactlyOnceWith(sourceMessage.text);
@@ -132,7 +133,7 @@ describe("SessionPane dialogue rewind draft recovery", () => {
     expect(document.querySelector('[data-message-rewind-preview="true"]')).toBeNull();
   });
 
-  it("still navigates when the message ID has a different durable event from the selected row", async () => {
+  it("rejects a different durable event from the selected message row", async () => {
     const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
     const navigateSessionBranch = vi.fn(async () => undefined);
     const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
@@ -141,8 +142,23 @@ describe("SessionPane dialogue rewind draft recovery", () => {
     Reflect.set(controller.state.snapshot, "timelineBySession", new Map([[sourceSession.id,
       [{ ...sourceMessage, sourceEventId: "replaced", completionCursor: 3n, text: "Different input" }]]]));
     await clickButton(document, "timeline.rewindDialogueOnly");
-    expect(navigateSessionBranch).toHaveBeenCalledOnce();
+    expect(navigateSessionBranch).not.toHaveBeenCalled();
+    expect(document.querySelector(".message-rewind-preview [role=alert]")?.textContent).toContain("timeline.rewindStale");
     expect(prepareRewindDraft).not.toHaveBeenCalled();
+  });
+
+  it("rewinds the loaded historical row when the owner snapshot has no transcript", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = completedMessage();
+    const restore = vi.fn(async () => undefined); prepareRewindDraft.mockResolvedValueOnce(restore);
+    const navigateSessionBranch = vi.fn<AppController["navigateSessionBranch"]>(async (_id, _target, options) => options.onSameGenerationConfirmed?.());
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(), saveDraft: vi.fn(), navigateSessionBranch });
+    Reflect.set(controller.state.snapshot, "timelineBySession", new Map());
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await clickButton(container, "Preview rewind"); await clickButton(document, "timeline.rewindDialogueOnly");
+    expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, sourceMessage.nativeRewindBefore,
+      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId },
+        onSameGenerationConfirmed: expect.any(Function) });
+    expect(restore).toHaveBeenCalledWith(sourceMessage.text);
   });
 
   it("finishes the dialogue rewind when the draft cannot be prepared and reports that separately", async () => {
@@ -247,7 +263,8 @@ describe("SessionPane edited-message draft transaction", () => {
       expect(navigateSessionBranch).not.toHaveBeenCalled();
     } else {
       await act(async () => required([...document.querySelectorAll("button")].find((button) => button.textContent === "timeline.rewindDialogueOnly") ?? null).click());
-      expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "session_start" }, { expectedGeneration: sourceSession.generation });
+      expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "session_start" },
+        { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId } });
     }
   });
 
@@ -293,6 +310,37 @@ describe("SessionPane edited-message draft transaction", () => {
     expect(container.querySelector("[role=alert]")?.textContent).not.toContain("timeline.editDraftRestoreFailed");
   });
 
+  it("edits the loaded last user row when the owner snapshot has no transcript", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
+    const saveDraft = vi.fn(async () => undefined), navigateSessionBranch = vi.fn(async () => undefined);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage,
+      { readDraft: vi.fn(async () => durableDraft()), saveDraft, navigateSessionBranch });
+    Reflect.set(controller.state.snapshot, "timelineBySession", new Map());
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await act(async () => editSubmit(container).click());
+    expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, sourceMessage.nativeRewindBefore,
+      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId, requireLatestUser: true } });
+    expect(saveDraft).toHaveBeenCalledOnce();
+    expect(container.querySelector('[data-testid="edit-replacement"]')?.textContent).toBe(sourceMessage.text);
+  });
+
+  it("rejects a newer live user input while the historical row's draft is being read", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
+    let finish!: (value: ReturnType<typeof durableDraft>) => void;
+    const readDraft = vi.fn(() => new Promise<ReturnType<typeof durableDraft>>((resolve) => { finish = resolve; }));
+    const saveDraft = vi.fn(async () => undefined), navigateSessionBranch = vi.fn(async () => undefined);
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch });
+    Reflect.set(controller.state.snapshot, "timelineBySession", new Map());
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await act(async () => editSubmit(container).click());
+    await vi.waitFor(() => expect(readDraft).toHaveBeenCalledOnce());
+    Reflect.set(controller.state.snapshot, "timelineBySession", new Map([[sourceSession.id,
+      [{ ...message(), id: "new-user", sourceEventId: "new-user-event", sequence: 5n, completionCursor: 5n }]]]));
+    await act(async () => finish(durableDraft()));
+    expect(container.querySelector("[role=alert]")?.textContent).toContain("timeline.editStale");
+    expect(saveDraft).not.toHaveBeenCalled(); expect(navigateSessionBranch).not.toHaveBeenCalled();
+  });
+
   it("moves the first user message to the composer with an explicit generation-bound start rewind", async () => {
     const sourceSession = session();
     const originalBackend = backend();
@@ -304,7 +352,8 @@ describe("SessionPane edited-message draft transaction", () => {
     const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch });
     const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
     await act(async () => editSubmit(container).click());
-    await vi.waitFor(() => expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "session_start" }, { expectedGeneration: sourceSession.generation }));
+    await vi.waitFor(() => expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "session_start" },
+      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId, requireLatestUser: true } }));
     expect(saveDraft).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(container.querySelector('[data-testid="edit-replacement"]')?.textContent).toBe(sourceMessage.text));
   });
@@ -415,7 +464,8 @@ describe("SessionPane edited-message draft transaction", () => {
 
     expect(saveDraft).toHaveBeenCalledTimes(2);
     expect(saveDraft).toHaveBeenLastCalledWith(sourceSession.id, previousDraft);
-    expect(navigateSessionBranch).toHaveBeenCalledWith(sourceSession.id, { kind: "native_entry", entryId: "entry-parent" }, { expectedGeneration: sourceSession.generation });
+    expect(navigateSessionBranch).toHaveBeenCalledWith(sourceSession.id, { kind: "native_entry", entryId: "entry-parent" },
+      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId, requireLatestUser: true } });
     expect(textarea.value).toBe(sourceMessage.text);
     expect(textarea.disabled).toBe(false);
   });
@@ -570,6 +620,8 @@ function session(): SessionView {
 function message(): TimelineItemView {
   return {
     id: "user-one",
+    sourceEventId: "source-user-event",
+    completionCursor: 1n,
     sequence: 1n,
     kind: "user",
     text: "Keep this edit in place",

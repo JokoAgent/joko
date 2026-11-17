@@ -798,6 +798,11 @@ message NavigateSessionBranchMutation {
   NativeNavigationTarget target = 2;
   bool summarize = 3;
   string custom_instructions = 4;
+  // Message-row actions retain the exact visible product message and event.
+  optional string source_message_id = 5;
+  optional string source_event_id = 6;
+  // Inline editing may rewind only the latest visible ordinary user message.
+  bool require_latest_user = 7;
 }
 
 message StartReviewMutation {

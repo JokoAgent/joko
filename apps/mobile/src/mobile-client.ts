@@ -13879,7 +13879,8 @@ export class MobileClient {
       const mutation = create(OperationMutationSchema, {
         preconditions: [this.#sessionRuntimePrecondition(session)],
         payload: mode === "dialogue" ? { case: "navigateSessionBranch", value: create(NavigateSessionBranchMutationSchema, {
-          sessionId: session.sessionId, target: original.source.target!, summarize: false, customInstructions: ""
+          sessionId: session.sessionId, target: original.source.target!, summarize: false, customInstructions: "",
+          sourceMessageId: original.source.messageId, sourceEventId: original.source.eventId
         }) } : { case: "executeWorkspaceRewind", value: create(ExecuteWorkspaceRewindMutationSchema, {
           workspaceId: controls.workspace!.workspaceId, previewId: files!.previewId, changeSetId: files!.changeSetId,
           confirmFileRestore: true, allowDialogueOnly: false

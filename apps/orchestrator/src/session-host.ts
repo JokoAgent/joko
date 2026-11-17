@@ -9291,6 +9291,7 @@ export class SessionHost {
     authority: {
       readonly connection: ConnectionRecord;
       readonly operationId: string;
+      readonly sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly requireLatestUser?: boolean };
       readonly protocol: { readonly kind: "internal" }
         | { readonly kind: "connect"; readonly body: unknown; readonly precondition: (store: OperationalStore) => void };
     }
@@ -9299,6 +9300,22 @@ export class SessionHost {
     let navigation: NativeSessionNavigationResult | undefined;
     let admittedTarget: StoredTarget | undefined;
     let nativeNavigationConfirmed = false;
+    let admittedUserCursor: bigint | undefined;
+    const sourceMessage = authority.sourceMessage;
+    const assertSourceMessage = (store: OperationalStore): void => {
+      if (sourceMessage === undefined) return;
+      store.authorizeConnection(authority.connection.id, authority.connection.authKeyDigest);
+      const origin = store.findVisibleSessionMessageOrigin({ sessionId, eventId: sourceMessage.eventId, role: "user", includeRetainedContext: false });
+      const source = origin === undefined ? undefined : store.findEvent(origin.eventId);
+      const boundary = source?.payload.type === "message_complete" ? source.payload.nativeHistory?.identity?.rewindBefore : undefined;
+      if (origin?.messageId !== sourceMessage.messageId || boundary === undefined || boundary.kind !== target.kind
+        || boundary.kind === "native_entry" && (target.kind !== "native_entry" || boundary.entryId !== target.entryId)) {
+        throw new StoreError("The original message or its native rewind boundary changed.");
+      }
+      if (sourceMessage.requireLatestUser && store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false })?.messageId !== sourceMessage.messageId) {
+        throw new StoreError("A newer user message prevents editing this message.");
+      }
+    };
     const allowance = { lifecycleOperationId: authority.operationId };
     const syncUnknown = () => new JokoError({
       code: "NATIVE_NAVIGATION_SYNC_UNKNOWN",
@@ -9311,7 +9328,8 @@ export class SessionHost {
         connection: authority.connection, operationId: authority.operationId,
         kind: authority.protocol.kind === "internal" ? "navigate_session" : "navigateSessionBranch",
         body: authority.protocol.kind === "connect" ? authority.protocol.body
-          : { sourceSessionId: sessionId, target, summarize, customInstructions, expectedGeneration },
+          : { sourceSessionId: sessionId, target, summarize, customInstructions, expectedGeneration,
+            ...(sourceMessage === undefined ? {} : { sourceMessage }) },
         sessionLifecycleFenceId: sessionId,
         precondition: (store) => {
           if (authority.protocol.kind === "connect") authority.protocol.precondition(store);
@@ -9320,6 +9338,10 @@ export class SessionHost {
           if (source.descriptor.deletedAt !== undefined) throw new StoreError("Deleted task history cannot be navigated.");
           if (expectedGeneration !== undefined && source.descriptor.binding.generation !== expectedGeneration) {
             throw new StaleGenerationError(source.descriptor.binding.generation, expectedGeneration);
+          }
+          if (!nativeNavigationConfirmed) assertSourceMessage(store);
+          else if (sourceMessage?.requireLatestUser && admittedUserCursor !== undefined && store.hasSessionUserInputAfter(sessionId, admittedUserCursor)) {
+            throw new StoreError("New user input arrived while the original message was being rewound.");
           }
           const descriptor = store.getBackend(source.descriptor.backendId).descriptor;
           const startAvailable = target.kind !== "session_start" || supportsNativeStartNavigation(
@@ -9391,6 +9413,8 @@ export class SessionHost {
             });
           }
           try {
+            assertSourceMessage(this.#store);
+            admittedUserCursor = this.#store.latestEventCursor();
             navigation = await active.adapter.navigateTree(target, summarize, lease.context, customInstructions, {
               recordBinding: (binding) => {
                 this.#store.recordNativeSessionDerivation({

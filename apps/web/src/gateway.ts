@@ -3785,7 +3785,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         sessionId,
         target: { kind: target.kind === "session_start" ? { case: "sessionStart", value: {} } : { case: "nativeEntryId", value: target.entryId } },
         summarize: options.summarize === true,
-        customInstructions: options.summarize === true ? customInstructions : ""
+        customInstructions: options.summarize === true ? customInstructions : "",
+        ...(options.sourceMessage === undefined ? {} : {
+          sourceMessageId: options.sourceMessage.messageId,
+          sourceEventId: options.sourceMessage.eventId,
+          requireLatestUser: options.sourceMessage.requireLatestUser === true
+        })
       }
     }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
     if (confirmSameGeneration === undefined || scope === undefined) return;
