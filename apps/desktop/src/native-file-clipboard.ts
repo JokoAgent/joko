@@ -3,14 +3,16 @@ import { spawn } from "node:child_process";
 import { lstat, open, realpath, rmdir, unlink } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "@joko/device-peer/private-files";
+import { nativeFileActionSequence } from "@joko/contracts";
 import type { DesktopCopyFileRequest, DesktopCopyFileResult } from "./channels.js";
+import { NativeFileActionRequests, type NativeFileActionScope } from "./native-file-action-requests.js";
+export type { NativeFileActionScope } from "./native-file-action-requests.js";
 
 export const FILE_COPY_MAXIMUM_BYTES = 256 * 1024 * 1024;
 export const FILE_COPY_TOTAL_BYTES = 512 * 1024 * 1024;
 export const FILE_COPY_MAXIMUM_FILES = 32;
 export const FILE_COPY_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const HELPER_TIMEOUT_MS = 10_000;
-const MAXIMUM_REQUESTS = 1_024;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 const WINDOWS_SCRIPT = "param([Parameter(Mandatory=$true)][string]$LiteralPath)\n$ErrorActionPreference = 'Stop'\nSet-Clipboard -LiteralPath $LiteralPath\n";
 const MAC_SCRIPT = "on run argv\nset the clipboard to (POSIX file (item 1 of argv))\nend run\n";
@@ -23,10 +25,6 @@ interface Entry {
   /** A recorded PID may only prove absence; existence does not prove identity. */
   readonly pid?: number;
   readonly retainUntil?: number;
-}
-export interface NativeFileActionScope {
-  readonly id: string;
-  readonly isCurrent: () => boolean;
 }
 export interface FileCopyHelperResult {
   readonly status: "copied" | "failed" | "unknown";
@@ -41,17 +39,11 @@ export interface NativeFileClipboardOptions {
   readonly now?: () => number;
   readonly timeoutMs?: number;
 }
-interface Request {
-  readonly scope: NativeFileActionScope;
-  readonly digest: string;
-  readonly abort: AbortController;
-  readonly result: Promise<DesktopCopyFileResult>;
-}
 
 /** A single app-owned writer. Clipboard files survive their requesting renderer. */
 export class NativeFileClipboard {
   readonly #options: NativeFileClipboardOptions;
-  readonly #requests = new Map<string, Request>();
+  readonly #requests = new NativeFileActionRequests<DesktopCopyFileResult>();
   readonly #now: () => number;
   readonly #manifest: string;
   #entries: Entry[] = [];
@@ -71,17 +63,15 @@ export class NativeFileClipboard {
 
   copy(value: unknown, scope: NativeFileActionScope): Promise<DesktopCopyFileResult> {
     const input = parseDesktopCopyFileRequest(value);
-    const key = `${scope.id}\0${input.requestId}`;
     const digest = createHash("sha256").update(input.file.name).update("\0").update(input.file.mediaType).update("\0").update(input.file.bytes).digest("hex");
-    const existing = this.#requests.get(key);
-    if (existing !== undefined) {
-      if (existing.digest !== digest) return Promise.reject(new TypeError("The file copy request identity was reused with different content."));
-      return existing.result;
-    }
+    try {
+      const existing = this.#requests.replay(scope, input.requestId, digest);
+      if (existing !== undefined) return existing === false ? Promise.resolve({ status: "cancelled" }) : existing;
+    } catch (error) { return Promise.reject(error); }
     if (this.#closed || !scope.isCurrent()) return Promise.resolve({ status: "cancelled" });
     if (!fileCopySupported(this.#options.platform)) return Promise.resolve({ status: "unavailable" });
     if (this.#uncertainHelper) return Promise.resolve({ status: "blocked" });
-    if (this.#requests.size >= MAXIMUM_REQUESTS || this.#pendingFiles >= FILE_COPY_MAXIMUM_FILES || this.#pendingBytes + input.file.bytes.byteLength > FILE_COPY_TOTAL_BYTES) {
+    if (this.#pendingFiles >= FILE_COPY_MAXIMUM_FILES || this.#pendingBytes + input.file.bytes.byteLength > FILE_COPY_TOTAL_BYTES) {
       return Promise.resolve({ status: "failed", reason: "capacity" });
     }
     const bytes = Uint8Array.from(input.file.bytes);
@@ -107,17 +97,16 @@ export class NativeFileClipboard {
       this.#pendingFiles -= 1;
     });
     this.#tail = result.catch(() => undefined);
-    this.#requests.set(key, { scope, digest, abort, result });
+    this.#requests.add(scope, input.requestId, digest, abort, result);
     return result;
   }
 
   cancel(requestId: string, scopeId: string): void {
-    if (!UUID.test(requestId)) throw new TypeError("Invalid file copy request identity.");
-    this.#requests.get(`${scopeId}\0${requestId}`)?.abort.abort();
+    this.#requests.cancel(scopeId, requestId);
   }
 
   retireScope(scopeId: string): void {
-    for (const request of this.#requests.values()) if (request.scope.id === scopeId) request.abort.abort();
+    this.#requests.retireScope(scopeId);
   }
 
   dispose(): void {
@@ -126,7 +115,7 @@ export class NativeFileClipboard {
   }
 
   cancelPending(): void {
-    for (const request of this.#requests.values()) request.abort.abort();
+    this.#requests.cancelPending();
   }
 
   async #initialize(): Promise<void> {
@@ -239,7 +228,7 @@ export class NativeFileClipboard {
 export function fileCopySupported(platform: NodeJS.Platform): boolean { return platform === "win32" || platform === "darwin"; }
 
 export function parseDesktopCopyFileRequest(value: unknown): DesktopCopyFileRequest {
-  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "file,requestId" || typeof value.requestId !== "string" || !UUID.test(value.requestId) || !isRecord(value.file)) throw new TypeError("Invalid file copy request.");
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "file,requestId" || typeof value.requestId !== "string" || nativeFileActionSequence(value.requestId) === undefined || !isRecord(value.file)) throw new TypeError("Invalid file copy request.");
   const file = value.file;
   if (Object.keys(file).sort().join(",") !== "bytes,mediaType,name" || typeof file.name !== "string" || !safeFileName(file.name) || typeof file.mediaType !== "string" || file.mediaType.length > 255 || !/^[\w.+-]+\/[\w.+-]+$/u.test(file.mediaType) || !(file.bytes instanceof Uint8Array) || file.bytes.byteLength > FILE_COPY_MAXIMUM_BYTES) throw new TypeError("Invalid file copy payload.");
   return { requestId: value.requestId, file: { name: file.name, mediaType: file.mediaType, bytes: file.bytes } };

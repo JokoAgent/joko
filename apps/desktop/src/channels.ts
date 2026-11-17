@@ -863,6 +863,7 @@ export type {
 } from "./runtime-process-monitor.js";
 
 export interface DesktopCopyFileRequest {
+  /** Ordered UUID issued in the initiating Document, immediately before IPC. */
   readonly requestId: string;
   readonly file: DesktopFile;
 }
@@ -872,6 +873,7 @@ export type DesktopCopyFileResult =
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
 
 export interface DesktopOpenFileRequest {
+  /** Ordered UUID issued in the initiating Document, immediately before IPC. */
   readonly requestId: string;
   readonly file: DesktopFile;
 }
@@ -918,6 +920,7 @@ export interface DesktopOpenFileWithAppIpcRequest extends DesktopOpenFileWithApp
 }
 
 export interface DesktopRevealArtifactSourceRequest {
+  /** Ordered UUID issued in the initiating Document, immediately before IPC. */
   readonly requestId: string;
   readonly profileId: string;
   readonly serverId: string;

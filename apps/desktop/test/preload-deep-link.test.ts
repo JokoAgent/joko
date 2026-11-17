@@ -405,7 +405,7 @@ describe("main application preload deep-link occurrence fence", () => {
 
 describe("application preload open-with Document occurrence fence", () => {
   const LIST = "00000000-0000-4000-8000-000000000011";
-  const REQUEST = "00000000-0000-4000-8000-000000000012";
+  const REQUEST = "00000000-0001-8000-8000-000000000012";
   const APP = "00000000-0000-4000-8000-000000000013";
 
   it("advertises only after Windows capture and privately binds list/open/retire/cancel", async () => {
@@ -444,6 +444,14 @@ describe("application preload open-with Document occurrence fence", () => {
       REQUEST,
       "00000000-0000-4000-8000-000000000010"
     );
+    loaded.invoke.mockClear();
+    await expect(loaded.openWith.openFileWithApp({
+      requestId: "00000000-0000-4000-8000-000000000012",
+      listOccurrence: LIST,
+      appId: APP,
+      file: { name: "report.txt", mediaType: "text/plain", bytes: new Uint8Array([1]) }
+    })).rejects.toThrow(/invalid/u);
+    expect(loaded.invoke).not.toHaveBeenCalled();
   });
 
   it("fails closed off Windows or when the capture is rejected", async () => {

@@ -1049,15 +1049,15 @@ const desktopApi = Object.freeze({
     return ipcRenderer.invoke(DESKTOP_CHANNELS.saveFile, request).then(parseDesktopBoolean);
   },
   copyFile: (request: DesktopCopyFileRequest): Promise<DesktopCopyFileResult> => {
-    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionRequestId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.copyFile, request).then(parseFileCopyResult);
   },
   cancelFileCopy: (requestId: string): Promise<void> => {
-    if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file copy identity is invalid."));
+    if (!isNativeFileActionRequestId(requestId)) return Promise.reject(new TypeError("The file copy identity is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelFileCopy, requestId).then(() => undefined);
   },
   openFile: (request: DesktopOpenFileRequest): Promise<DesktopOpenFileResult> => {
-    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file open request is invalid."));
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionRequestId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file open request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.openFile, request).then(parseFileOpenResult);
   },
   listOpenWithApps: (request: DesktopListOpenWithAppsRequest): Promise<DesktopListOpenWithAppsResult> => {
@@ -1097,7 +1097,7 @@ const desktopApi = Object.freeze({
     }).then(parseFileOpenResult);
   },
   cancelFileOpen: (requestId: string): Promise<void> => {
-    if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The file open identity is invalid."));
+    if (!isNativeFileActionRequestId(requestId)) return Promise.reject(new TypeError("The file open identity is invalid."));
     return ipcRenderer.invoke(
       DESKTOP_CHANNELS.cancelFileOpen,
       requestId,
@@ -1113,7 +1113,7 @@ const desktopApi = Object.freeze({
     return ipcRenderer.invoke(DESKTOP_CHANNELS.revealArtifactSource, request).then(parseArtifactSourceRevealResult);
   },
   cancelArtifactSourceReveal: (requestId: string): Promise<void> => {
-    if (!isNativeFileActionId(requestId)) {
+    if (!isNativeFileActionRequestId(requestId)) {
       return Promise.reject(new TypeError("The Artifact source reveal identity is invalid."));
     }
     return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelArtifactSourceReveal, requestId).then(() => undefined);
@@ -2410,6 +2410,11 @@ function isNativeFileActionId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(value);
 }
 
+function isNativeFileActionRequestId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-8[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(value)
+    && !value.startsWith("00000000-0000-");
+}
+
 function isDesktopListOpenWithAppsRequest(value: unknown): value is DesktopListOpenWithAppsRequest {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const request = value as Record<string, unknown>;
@@ -2421,7 +2426,7 @@ function isDesktopOpenFileWithAppRequest(value: unknown): value is DesktopOpenFi
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const request = value as Record<string, unknown>;
   return Object.keys(request).sort().join(",") === "appId,file,listOccurrence,requestId" &&
-    isNativeFileActionId(request["requestId"]) && isNativeFileActionId(request["listOccurrence"]) &&
+    isNativeFileActionRequestId(request["requestId"]) && isNativeFileActionId(request["listOccurrence"]) &&
     isNativeFileActionId(request["appId"]) && isDesktopSaveFileRequest(request["file"]);
 }
 
@@ -2497,7 +2502,7 @@ function isDesktopRevealArtifactSourceRequest(value: unknown): value is DesktopR
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const request = value as Record<string, unknown>;
   return Object.keys(request).sort().join(",") === "artifactId,profileId,requestId,serverId,sessionId" &&
-    isNativeFileActionId(request["requestId"]) &&
+    isNativeFileActionRequestId(request["requestId"]) &&
     isOpaqueFileActionIdentity(request["profileId"]) &&
     isOpaqueFileActionIdentity(request["serverId"]) &&
     isOpaqueFileActionIdentity(request["sessionId"]) &&

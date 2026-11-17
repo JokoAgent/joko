@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { describe, expect, it, vi } from "vitest";
+import { nativeFileActionRequestId } from "@joko/contracts";
 
 import type { DesktopRevealArtifactSourceRequest } from "../src/channels.js";
 import {
@@ -8,8 +9,9 @@ import {
   parseDesktopRevealArtifactSourceRequest
 } from "../src/native-artifact-source-revealer.js";
 
+let ordinal = 0;
 const input = (fields: Partial<DesktopRevealArtifactSourceRequest> = {}): DesktopRevealArtifactSourceRequest => ({
-  requestId: randomUUID(),
+  requestId: nativeFileActionRequestId(++ordinal, randomUUID()),
   profileId: "managed-local",
   serverId: "orchestrator-owner",
   sessionId: "source-task",
@@ -26,6 +28,29 @@ const scope = () => {
 };
 
 describe("native Artifact source reveal ownership", () => {
+  it("recovers after more than 1024 completed failures while retiring old identities and Document scopes", async () => {
+    const resolvePath = vi.fn().mockRejectedValue(new Error("source temporarily unavailable"));
+    const revealPath = vi.fn();
+    const owner = new NativeArtifactSourceRevealer({ resolvePath, revealPath });
+    const caller = scope();
+    const first = input();
+    await expect(owner.reveal(first, caller.value)).resolves.toEqual({ status: "unavailable" });
+    for (let i = 0; i < 1_025; i += 1) await expect(owner.reveal(input(), caller.value)).resolves.toEqual({ status: "unavailable" });
+    resolvePath.mockResolvedValue("D:\\joko\\render.png");
+    const last = input();
+    const result = owner.reveal(last, caller.value);
+    await expect(result).resolves.toEqual({ status: "revealed" });
+    expect(owner.reveal(last, caller.value)).toBe(result);
+    await expect(owner.reveal(first, caller.value)).resolves.toEqual({ status: "cancelled" });
+    expect(revealPath).toHaveBeenCalledOnce();
+    caller.retire(); owner.retireScope(caller.value.id);
+    await expect(owner.reveal(last, caller.value)).resolves.toEqual({ status: "cancelled" });
+    await expect(owner.reveal(first, scope().value)).resolves.toEqual({ status: "revealed" });
+    expect(revealPath).toHaveBeenCalledTimes(2);
+    expect(resolvePath).toHaveBeenCalledTimes(1_028);
+    owner.dispose();
+  });
+
   it("resolves opaque identity once and replays only the exact request", async () => {
     const source = deferred<string>();
     const resolvePath = vi.fn((_request: DesktopRevealArtifactSourceRequest, _signal: AbortSignal) => source.promise);
@@ -81,6 +106,7 @@ describe("native Artifact source reveal ownership", () => {
   });
 
   it("rejects paths and extra fields at the renderer boundary", () => {
+    expect(() => parseDesktopRevealArtifactSourceRequest({ ...input(), requestId: randomUUID() })).toThrow("invalid");
     expect(() => parseDesktopRevealArtifactSourceRequest({ ...input(), path: "D:\\outside.txt" })).toThrow("invalid");
     expect(() => parseDesktopRevealArtifactSourceRequest({ ...input(), requestId: "not-a-uuid" })).toThrow("invalid");
     expect(() => parseDesktopRevealArtifactSourceRequest({ ...input(), sessionId: "../outside" })).toThrow("invalid");
