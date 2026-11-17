@@ -2392,6 +2392,28 @@ export class MobileClient {
     } };
   }
 
+  taskActivityOwnerKey(): string | undefined {
+    const credential = this.#credential;
+    if (!credential || !this.#abort || this.#abort.signal.aborted || !this.#current(this.#epoch)
+      || this.#state.status !== "connected" || !this.#foreground || this.#joinedTask || !this.#state.owner || !this.network.streamTaskActivity) return undefined;
+    return JSON.stringify([credential.profileId, credential.connectionId, credential.serverId, credential.origin,
+      credential.endpointPublicKey, this.#epoch, this.#state.owner.generation.toString()]);
+  }
+
+  taskActivity(): import('@joko/connection-transport').TaskActivityPort | undefined {
+    const ownerKey = this.taskActivityOwnerKey(), credential = this.#credential, ownerSignal = this.#abort?.signal;
+    if (!ownerKey || !credential || !ownerSignal) return undefined;
+    const current = () => { ownerSignal.throwIfAborted(); if (this.taskActivityOwnerKey() !== ownerKey || this.#credential !== credential)
+      throw new Error("The task activity connection changed."); };
+    const read = this.network.streamTaskActivity!.bind(this.network);
+    return { watch: async function* (ids, signal) {
+      current(); const combined = AbortSignal.any([signal, ownerSignal]);
+      for await (const value of read(credential, ids, combined)) { combined.throwIfAborted(); current(); yield value; }
+    }, revoke: async deviceId => {
+      current(); if (!await this.revokeDevice(deviceId)) throw new Error("Device revocation could not be confirmed."); current();
+    } };
+  }
+
   taskInputHandoffApi(): MobileInputHandoffApi | undefined {
     const credential = this.#credential, ownerKey = this.taskHeaderSourceKey(), session = this.#selectedSession();
     if (this.#joinedTask || !credential || !ownerKey || !session || session.archived || !this.#foreground

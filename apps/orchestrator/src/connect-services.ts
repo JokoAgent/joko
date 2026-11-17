@@ -15,6 +15,7 @@ import { createTaskSharingRuntime } from "./task-sharing-runtime.js";
 import { createTaskSharingConnectService, createTaskSharingGuestConnectService } from "./task-sharing-connect-service.js";
 import { readTaskBackgroundOutput } from "./background-task-output.js";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
+import { TaskActivityRequestError } from "./task-activity.js";
 import { createHelpConnectService } from "./help-connect-service.js";
 import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
 import { isSensitiveCredentialPath } from "./hosted-agent-credential-paths.js";
@@ -829,6 +830,7 @@ export interface ConnectServiceSet {
   readonly appDefaultModel: ServiceImpl<typeof contract.AppDefaultModelService>;
   readonly connection: ServiceImpl<typeof contract.ConnectionService>;
   readonly event: ServiceImpl<typeof contract.EventService>;
+  readonly taskActivity: ServiceImpl<typeof contract.TaskActivityService>;
   readonly operation: ServiceImpl<typeof contract.OperationService>;
   readonly backend: ServiceImpl<typeof contract.BackendService>;
   readonly target: ServiceImpl<typeof contract.TargetService>;
@@ -1277,6 +1279,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.PersonalDevelopmentService, withConnectErrors(services.personalDevelopment));
   router.service(contract.DesktopPersonalDevelopmentHostService, withConnectErrors(services.personalDevelopmentNative));
   router.service(contract.EventService, withConnectErrors(services.event));
+  router.service(contract.TaskActivityService, withConnectErrors(services.taskActivity));
   router.service(contract.OperationService, withConnectErrors(services.operation));
   router.service(contract.BackendService, withConnectErrors(services.backend));
   router.service(contract.TargetService, withConnectErrors(services.target));
@@ -2042,6 +2045,41 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }
     }
   } satisfies ServiceImpl<typeof contract.EventService>;
+
+  const taskActivity = {
+    watchTaskActivity: async function* (request, context) {
+      const authenticated = authenticate(context);
+      const signal = projectionShutdownSignal ? AbortSignal.any([context.signal, projectionShutdownSignal]) : context.signal;
+      signal.throwIfAborted();
+      const queue = new AsyncEventQueue<"changed">(signal, 1);
+      const stopRevocation = dependencies.connections.onRevoked(authenticated.id, () => queue.close());
+      const registry = dependencies.connections.taskActivity;
+      let unsubscribe = (): void => undefined;
+      let release = (): void => undefined;
+      try {
+        // The first projection and subsequent updates have one lifetime; there
+        // is no asynchronous initial read that can overwrite a newer update.
+        unsubscribe = registry.subscribe(() => { queue.push("changed"); });
+        try { release = registry.open(authenticated, request.viewedSessionIds); }
+        catch (error) {
+          if (error instanceof TaskActivityRequestError) throw new ConnectError(error.message,
+            error.reason === "invalid" ? Code.InvalidArgument : error.reason === "unavailable" ? Code.NotFound : Code.ResourceExhausted);
+          throw error;
+        }
+        let observed: bigint | undefined;
+        while (!signal.aborted) {
+          dependencies.connections.fence(authenticated);
+          const snapshot = registry.snapshot();
+          if (observed !== snapshot.revision) {
+            observed = snapshot.revision;
+            yield { state: create(contract.TaskActivityStateSchema, { generation, revision: snapshot.revision,
+              activeDevices: snapshot.activeDevices.map(device => create(contract.TaskActivityDeviceSchema, device)) }) };
+          }
+          if (await queue.next() === undefined) return;
+        }
+      } finally { release(); unsubscribe(); stopRevocation(); queue.close(); }
+    }
+  } satisfies ServiceImpl<typeof contract.TaskActivityService>;
 
   const operation = {
     submitOperation: async (request, context) => {
@@ -5986,7 +6024,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   });
   const personalDevelopmentNative = createPersonalDevelopmentNativeConnectService(application.personalDevelopmentNativeBroker, dependencies.connections);
-  return { ...taskSharingServices, personalDevelopment, personalDevelopmentNative,
+  return { ...taskSharingServices, personalDevelopment, personalDevelopmentNative, taskActivity,
     extensionNetwork: createExtensionNetworkConnectService(application.extensionNetwork, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
     extensionOAuth: createExtensionOAuthConnectService(application.extensionOAuth, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
     extensionTasks: createExtensionTaskConnectService(application.extensionTasks, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),

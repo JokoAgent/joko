@@ -2178,6 +2178,24 @@ describe('prepared connection entrance cancellation', () => {
     expect(memory.storage.saveConnection).not.toHaveBeenCalled(); expect(memory.storage.writeConnectionEntries).not.toHaveBeenCalled();
   });
 });
+describe("task activity captured owner", () => {
+  it("binds activity to the original credential and retires its stream and revoke authority on background", async () => {
+    const network = fakeNetwork();
+    let observedSignal: AbortSignal | undefined;
+    network.streamTaskActivity = vi.fn(async function* (captured: PairedCredential, ids: readonly string[], signal: AbortSignal) {
+      expect(captured).toMatchObject(credential); expect(ids).toEqual(["session"]); observedSignal = signal;
+      yield create((await import("@joko/contracts")).TaskActivityStateSchema, { generation: snapshot.generation, revision: 1n });
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const port = app.taskActivity()!, key = app.taskActivityOwnerKey(); expect(key).toBeDefined();
+    const view = port.watch(["session"], new AbortController().signal)[Symbol.asyncIterator]();
+    expect((await view.next()).value?.generation).toBe(snapshot.generation);
+    app.setForeground(false); expect(observedSignal?.aborted).toBe(true); expect(app.taskActivity()).toBeUndefined();
+    await expect(port.revoke("other-device")).rejects.toThrow(); expect(network.submit).not.toHaveBeenCalled();
+    await view.return?.();
+  });
+});
+
 describe("native input handoff captured task owner", () => {
   it("exposes the native input service only for the current owner task and retires its scope on background or runtime replacement", async () => {
     const network = fakeNetwork(), owner = clone(SnapshotSchema, snapshot), detail = clone(SnapshotSchema, snapshot);

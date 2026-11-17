@@ -1,0 +1,8 @@
+.task-activity { max-width: 100%; min-width: 0; }
+.task-activity--inline { display: flex; justify-content: center; padding: 4px 8px; }
+.task-activity--floating { position: fixed; right: 16px; bottom: 16px; z-index: 45; max-width: calc(100vw - 32px); }
+.task-activity__chip { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; padding: 2px 8px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); color: var(--text); }
+.task-activity__chip > svg { width: 16px; height: 16px; flex-shrink: 0; }
+.task-activity__chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.task-activity__chip > button { flex-shrink: 0; }
+.task-activity-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }

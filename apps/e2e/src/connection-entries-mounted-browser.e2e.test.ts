@@ -72,9 +72,20 @@ mountedIt('prepares a second real Noise entrance, survives loss of the preferred
     await page.evaluate(() => { location.hash = '#/settings/connections'; });
     await capture('fallback');
     primary = await createPublicServer(fixture.application); primary.log.level = 'silent';
-    await primary.listen({ host: '127.0.0.1', port: Number(new URL(primaryOrigin).port) });
+    const restoredAt = Date.now(), preferredActivity: { kind: string; elapsedMs: number }[] = [];
+    const observePreferred = (kind: string) => {
+      if (preferredActivity.length < 64) preferredActivity.push({ kind, elapsedMs: Date.now() - restoredAt });
+    };
+    primary.addHook('onRequest', async () => { observePreferred('http'); });
+    primary.server.on('upgrade', () => { observePreferred('upgrade'); });
+    expect(await primary.listen({ host: '127.0.0.1', port: Number(new URL(primaryOrigin).port) })).toBe(primaryOrigin);
     ingress = createLinkspanIngress(fixture.application, { server: primary.server, backendOrigin });
-    await expect.poll(async () => (await profiles())[0]?.origin, { timeout: 120_000 }).toBe(primaryOrigin);
+    await expect.poll(async () => (await profiles())[0]?.origin, { timeout: 120_000 }).toBe(primaryOrigin).catch(async (cause: unknown) => {
+      throw new Error(`The original preferred entrance did not return: ${JSON.stringify({
+        elapsedMs: Date.now() - restoredAt, preferredActivity, profiles: await profiles(),
+        entries: (await panel.allTextContents()).join('\n').slice(0, 5_000)
+      })}`, { cause });
+    });
     expect(fixture.application.store.listConnections()).toHaveLength(1);
     // An explicit remote preference is respected even with the other entrance online.
     if (!await panel.evaluate(element => (element as HTMLDetailsElement).open)) await panel.locator('summary').click();

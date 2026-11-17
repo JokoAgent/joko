@@ -8,6 +8,7 @@ import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-
 import { MobileAdaptiveWindowProvider, useMobileAdaptiveWindow } from "./MobileAdaptiveWindow";
 import { MobileNavigationFrame } from "./MobileNavigationFrame";
 import { MobileTaskHeaderButtons } from "./MobileTaskHeaderChrome";
+import { MobileTaskActivityProvider, MobileTaskActivityBanner, useMobileTaskActivityView } from "./MobileTaskActivity";
 import { useMobileTaskHeaderRole } from "./use-mobile-task-header-role";
 import { mobileTaskHeaderNotice } from "./mobile-task-header-notice";
 import { archiveMobileSession } from "./mobile-session-archive";
@@ -1031,6 +1032,7 @@ export function App() {
         return false;
       }}>
       <MobilePartnerAvatarProvider transport={client.partnerAvatarTransport()}>
+      <MobileTaskActivityProvider client={client} state={state} foreground={foreground && !updates.forced} locale={locale.effectiveLocale} colors={colors} onManage={() => setPage("devices")}>
       <MobileMcpAppViewsProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status])} bind={sessionId => client.mcpAppApi(sessionId)}>
       <MobileExtensionMailReaderProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status, state.selectedId, page, foreground])}
         sessionId={page === "task" && foreground ? state.selectedId : undefined} bind={sessionId => client.extensionCardApi(sessionId)} colors={{ ...colors, dark }} locale={locale.effectiveLocale}>
@@ -1038,6 +1040,7 @@ export function App() {
         state.detail?.sessions.find(session => session.sessionId === state.selectedId)?.nativeBinding?.runtimeGeneration.toString()])} bind={sessionId => client.extensionCardApi(sessionId)}>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         {Platform.OS === "android" && <StatusBar style={dark ? "light" : "dark"} />}
+        <MobileTaskActivityBanner />
         {updates.forced ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
           <MobileForcedUpdateGate colors={colors} locale={locale.effectiveLocale} state={updates}
             foreground={foreground} actions={mobileUpdateActions} />
@@ -1278,6 +1281,7 @@ export function App() {
         <MobileAndroidUpdateSheet colors={colors} locale={locale.effectiveLocale} />
       </View>
       </MobileExtensionCardsProvider></MobileExtensionMailReaderProvider></MobileMcpAppViewsProvider>
+      </MobileTaskActivityProvider>
       </MobilePartnerAvatarProvider>
       </MobileNavigationFrame>
       </MobileAdaptiveWindowProvider>
@@ -3653,6 +3657,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   onPartnerSettingsEntryConsumed?: () => void;
   homeNavigation?: TaskHomeNavigationProps;
 }) {
+  useMobileTaskActivityView(state.taskSource?.kind === "joined" ? undefined : state.selectedId);
   const taskDraftProfileId = client.taskDraftProfileId();
   const initialDraftIdentity = taskDraftProfileId && state.selectedId
     ? { profileId: taskDraftProfileId!, sessionId: state.selectedId }
@@ -7316,6 +7321,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         <MobilePartnerWorkingStatus key={partnerWorkingStatus.turnKey} status={partnerWorkingStatus} transport={client.partnerWorkingTransport()}
           partner={partnerRead.partner} locale={locale} colors={colors} />
       </View>}
+    {state.taskSource?.kind !== "joined" && <MobileTaskActivityBanner sessionId={state.selectedId} />}
     {conversationShare.active ? <MobileConversationShareBar count={conversationShare.selectedIds.length}
       allSelected={conversationShare.allSelected} busy={conversationShare.busy} locale={locale} colors={colors}
       screenshotTriggered={conversationShare.screenshotTriggered}

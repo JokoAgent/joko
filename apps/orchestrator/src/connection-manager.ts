@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { normalizeDeviceName, type ConnectionRecord, type CreateDeviceInput, type DeviceRecord, type OperationalStore, type RevokedDeviceResult } from "@joko/store";
+import { TaskActivityRegistry } from "./task-activity.js";
 
 export interface PairingChallengeRecord {
   readonly id: string;
@@ -36,6 +37,7 @@ interface DesktopBootstrapMarker {
 const DESKTOP_BOOTSTRAP_SETTING_PREFIX = "runtime.desktop_bootstrap.";
 
 export class ConnectionManager {
+  readonly taskActivity: TaskActivityRegistry;
   readonly #store: OperationalStore;
   readonly #now: () => number;
   readonly #ttlMs: number;
@@ -65,6 +67,10 @@ export class ConnectionManager {
     readonly consumedRetentionMs?: number;
   } = {}) {
     this.#store = store;
+    this.taskActivity = new TaskActivityRegistry(store, {
+      current: connection => this.fence(connection), local: connection => this.isLocalDesktopHostConnection(connection),
+      onRevoked: (connectionId, listener) => this.onRevoked(connectionId, listener)
+    });
     this.#now = options.now ?? Date.now;
     this.#ttlMs = options.pairingTtlMs ?? 10 * 60_000;
     this.#pairingWindowMs = options.pairingWindowMs ?? 10 * 60_000;

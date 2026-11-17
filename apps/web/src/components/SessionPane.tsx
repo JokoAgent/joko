@@ -1,4 +1,5 @@
 import { useArtifactDownload } from "./use-artifact-download.js";
+import { TaskActivityBanner, useTaskActivityView } from "./TaskActivity.js";
 import { taskSourceKey } from "../task-sharing.js";
 import { resolveModelSpeed } from "../model-speed.js";
 import { McpAppTimelineProvider } from "./McpAppCard.js";
@@ -241,6 +242,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
   const guest = controller.state.sessionAccess?.role === "guest";
+  useTaskActivityView(guest ? undefined : session.id);
   const providerGroupOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
     controller.state.connectionGeneration, session.id, session.generation.toString(), session.backendId, session.model?.providerId, session.model?.modelId]);
   const providerGroupOwnerRef = useRef(providerGroupOwnerKey);
@@ -2603,6 +2605,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           ? <div role="status" className="settings-card settings-card--content">{t("taskSharing.waitingHost")}</div>
           : <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} workspaceRoot={workspace?.serverPath} remaining={remainingInteractions} inline t={t} runAction={runAction} />}
       </InteractionPromptHost>
+      {!guest && <TaskActivityBanner sessionId={session.id} />}
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
 {(interaction === undefined || guest) && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}>
         {objectiveReadable && <ObjectiveIndicator

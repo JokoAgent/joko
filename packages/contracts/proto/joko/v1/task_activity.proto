@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package joko.v1;
+
+// An authenticated remote Device with at least one specific task view open.
+// Its task list is deliberately not part of the public activity projection.
+message TaskActivityDevice {
+  string device_id = 1;
+  string display_name = 2;
+}
+
+// Volatile service-owned activity. Revisions belong to this service generation,
+// independently of durable product Event cursors and native task generations.
+message TaskActivityState {
+  uint64 generation = 1;
+  uint64 revision = 2;
+  repeated TaskActivityDevice active_devices = 3;
+}
+
+message WatchTaskActivityRequest {
+  // Only task pages actually held by this caller. An empty list observes the
+  // global activity without claiming that the caller is viewing any task.
+  repeated string viewed_session_ids = 1;
+}
+message WatchTaskActivityResponse { TaskActivityState state = 1; }
+
+service TaskActivityService {
+  // The initial state and subsequent changes share this authenticated lifetime.
+  // Closing it retires only this stream's task-view contribution.
+  rpc WatchTaskActivity(WatchTaskActivityRequest) returns (stream WatchTaskActivityResponse);
+}

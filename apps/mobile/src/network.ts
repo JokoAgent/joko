@@ -1,6 +1,7 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { encodeModelSpeed } from "@joko/contracts";
 import { createProviderAccountResetApi } from "@joko/connection-transport";
+import { streamTaskActivity } from "@joko/connection-transport";
 import { ProviderGroupService, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { readSessionArchivePreview, type SessionArchivePreview } from "@joko/contracts";
 import { mobileMediaByteCache } from "./mobile-media-byte-cache";
@@ -495,6 +496,7 @@ export interface MobileNetwork {
   readAround(credential: PairedCredential, sessionId: string, eventId: string, signal?: AbortSignal): Promise<Event[]>;
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
   streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal): AsyncIterable<Event>;
+  streamTaskActivity?(credential: PairedCredential, viewedSessionIds: readonly string[], signal: AbortSignal): AsyncIterable<import('@joko/contracts').TaskActivityState>;
   listWorkspaceDirectory(credential: PairedCredential, workspaceId: string, parentPath: string, signal?: AbortSignal): Promise<WorkspaceDirectorySnapshot>;
   listWorkspaceChangeSets(credential: PairedCredential, workspaceId: string, sessionId: string, signal?: AbortSignal): Promise<readonly WorkspaceChangeSet[]>;
   previewWorkspaceRewind(credential: PairedCredential, workspaceId: string, changeSetId: string, signal?: AbortSignal): Promise<WorkspaceRewindPreview>;
@@ -3449,6 +3451,9 @@ export const mobileNetwork: MobileNetwork = {
     }, { signal })) {
       if (response.event) yield response.event;
     }
+  },
+  streamTaskActivity(credential, viewedSessionIds, signal) {
+    return streamTaskActivity(credentialTransport(credential), viewedSessionIds, signal);
   },
   async prepareTarget(credential, target, signal) {
     const revision = target.version?.revision;

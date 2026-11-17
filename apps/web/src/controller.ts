@@ -263,6 +263,7 @@ export interface AppController extends OperationApi {
   readonly deviceAuthorization?: DeviceAuthorizationPort;
   deviceAuthorizationOwner?(): DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
+  taskActivity?(): import('@joko/connection-transport').TaskActivityPort | undefined;
   readonly readDesktopMenuBarUsage?: (source: DesktopMenuBarSource, signal: AbortSignal, refreshAccounts?: boolean) => Promise<DesktopMenuBarUsage>;
   readonly taskSharing?: TaskSharingApi;
   readonly inputHandoff?: InputHandoffApi;
@@ -2836,13 +2837,19 @@ export function useAppController(): AppController {
     [gateway]
   );
 
-  const revokeDevice = useCallback(async (deviceId: string): Promise<void> => {
-    await gateway().revokeDevice(deviceId);
+  const finishDeviceRevocation = useCallback(async (deviceId: string): Promise<void> => {
     if (automaticConnectionTargetMatchesDevice(preferencesRef.current.automaticConnectionTarget, deviceId, state.profiles)) {
       automaticPreferenceIntentRef.current += 1;
       await updatePreferences({ automaticConnectionTarget: undefined });
     }
-  }, [gateway, state.profiles, updatePreferences]);
+  }, [state.profiles, updatePreferences]);
+  const taskActivity = useCallback(() => {
+    const port = gateway().taskActivity?.();
+    return port && { ...port, revoke: async (deviceId: string) => { await port.revoke(deviceId); await finishDeviceRevocation(deviceId); } };
+  }, [gateway, finishDeviceRevocation]);
+  const revokeDevice = useCallback(async (deviceId: string): Promise<void> => {
+    await gateway().revokeDevice(deviceId); await finishDeviceRevocation(deviceId);
+  }, [gateway, finishDeviceRevocation]);
 
   const logoutConnection = useCallback(async (connectionId: string): Promise<void> => {
     await gateway().logoutConnection(connectionId);
@@ -4162,6 +4169,7 @@ export function useAppController(): AppController {
     setDeviceControlTargetEnabled: (targetDeviceId, enabled) => gateway().setDeviceControlTargetEnabled(targetDeviceId, enabled),
     setDeviceControllerAllowed: (controllerDeviceId, allowed) => gateway().setDeviceControllerAllowed(controllerDeviceId, allowed),
     revokeDevice,
+    taskActivity,
     logoutConnection,
     saveProvider,
     deleteProvider: (providerId) => gateway().deleteProvider(providerId),

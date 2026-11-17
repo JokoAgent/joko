@@ -160,3 +160,5 @@ export * from "./assistant-stream.js";
 export * from "./provider-account-resets.js";
 export * from "./provider-account-reset-messages.js";
 export * from "./document-output.js";
+export * from "./gen/joko/v1/task_activity_pb.js";
+export * from "./task-activity-messages.js";

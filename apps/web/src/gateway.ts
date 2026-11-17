@@ -1069,6 +1069,7 @@ export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage
   prepareContactsDialogue(draft: TargetDraft, requestId: string, signal: AbortSignal): Promise<Pick<TargetView, "id" | "revision">>;
   deviceAuthorizationOwner?(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
+  taskActivity?(): import('@joko/connection-transport').TaskActivityPort;
   inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi;
   providerSharingApi(): ProviderSharingApi;
   partnerNetworkApi(): PartnerNetworkApi;
@@ -1457,6 +1458,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       else this.#callbacks.onError?.(gatewayError);
       throw gatewayError;
     }
+  }
+
+  taskActivity(): import('@joko/connection-transport').TaskActivityPort {
+    if (this.#taskSharing !== undefined) throw new GatewayError("Task activity requires a node owner connection.");
+    const scope = this.captureActionScope();
+    const current = () => { scope.signal.throwIfAborted(); if (this.#transport !== scope.transport) throw new GatewayError("The task activity connection changed."); };
+    return {
+      watch: async function* (ids, signal) {
+        current();
+        const { streamTaskActivity } = await import('@joko/connection-transport');
+        const combined = AbortSignal.any([scope.signal, signal]);
+        for await (const state of streamTaskActivity(scope.transport, ids, combined)) { current(); yield state; }
+      },
+      revoke: async deviceId => { current(); await this.revokeDevice(deviceId); current(); }
+    };
   }
 
   taskSharingApi(): TaskSharingApi {

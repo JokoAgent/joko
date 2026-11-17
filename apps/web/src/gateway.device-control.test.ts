@@ -18,8 +18,24 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway, mapSnapshot, projectSnapshotEvent } from "./gateway.js";
+import { WatchTaskActivityResponseSchema } from "@joko/contracts";
 
 describe("device control gateway", () => {
+  it("uses the typed activity stream and fences captured revoke authority after disconnect and reconnect", async () => {
+    const payloads: OperationMutation["payload"][] = [], transport = operationTransport(payloads);
+    const streamed = vi.spyOn(transport, "stream").mockImplementation(async (method: any) => response(method, (async function* () {
+      yield create(WatchTaskActivityResponseSchema, { state: { generation: 1n, revision: 2n, activeDevices: [{ deviceId: "remote", displayName: "Phone" }] } });
+    })(), true));
+    const gateway = createOrchestratorGateway({ id: "connection", deviceId: "self", name: "Desktop", origin: "https://node.test", serverId: "node" },
+      "secret", {}, () => transport);
+    await gateway.connect({ snapshotOnly: true });
+    const port = gateway.taskActivity!(), iterator = port.watch(["task"], new AbortController().signal)[Symbol.asyncIterator]();
+    expect((await iterator.next()).value?.activeDevices[0]?.deviceId).toBe("remote");
+    expect(streamed.mock.calls[0]?.[0].localName).toBe("watchTaskActivity");
+    gateway.disconnect(); await gateway.connect({ snapshotOnly: true });
+    await expect(port.revoke("remote")).rejects.toThrow(); expect(payloads).toEqual([]);
+    await iterator.return?.(); gateway.disconnect();
+  });
   it("maps device presence, receive consent, and directed relation versions", () => {
     const projected = mapSnapshot(create(SnapshotSchema, {
       devices: [
