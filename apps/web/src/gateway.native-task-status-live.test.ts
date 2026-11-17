@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
-import { CompactionState, EventSchema, GetSnapshotResponseSchema, SnapshotSchema, StreamEventsResponseSchema, RunState, SessionState } from "@joko/contracts";
+import { CompactionState, EventSchema, GetSnapshotResponseSchema, ListSessionTimelineResponseSchema, SnapshotSchema, StreamEventsResponseSchema, RunState, SessionState } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 import type { AppSnapshot } from "./model.js";
@@ -85,12 +85,12 @@ it("refreshes durable activity before exposing an incomplete terminal Run delta 
   } finally { gateway.disconnect(); }
 });
 
-const compactingOwnerSnapshot = (cursor: bigint, compacting?: boolean, generation = 4n, opaqueReference = "native:task", state = SessionState.RUNNING) =>
+const compactingOwnerSnapshot = (cursor: bigint, compacting?: boolean, generation = 4n, opaqueReference = "native:task", state = SessionState.RUNNING, backendId = "pi") =>
   create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, {
     generation: 1n, resumeCursor: { generation: 1n, sequence: cursor }, sessions: [{
-      sessionId: "task", backendId: "pi", targetId: "target", state,
+      sessionId: "task", backendId, targetId: "target", state,
       location: { kind: { case: "serviceNode", value: {} } },
-      nativeBinding: { backendId: "pi", opaqueReference, runtimeGeneration: generation, runtimeAttached: true },
+      nativeBinding: { backendId, opaqueReference, runtimeGeneration: generation, runtimeAttached: true },
       ...(compacting === undefined ? {} : { contextState: { compacting } })
     }]
   }) });
@@ -104,6 +104,77 @@ const activityEvent = create(EventSchema, { eventId: "before-overflow", cursor: 
 const nativeHistoryEvent = create(EventSchema, { eventId: "native-prefix-before-overflow", cursor: { generation: 1n, sequence: 1n },
   identity: { backendId: "pi", targetId: "target", sessionId: "task", generation: 4n },
   payload: { kind: { case: "nativeSessionChanged", value: { productSessionId: "task", opaqueNativeReference: "native:task" } } } });
+
+it.each([
+  { reason: "the primary history reader", primaryUi: true },
+  { reason: "the native activity mirror", primaryUi: false },
+  { reason: "the Codex activity mirror", primaryUi: false, backendId: "codex" },
+  { reason: "the Claude activity mirror", primaryUi: false, backendId: "claude-code" },
+  { reason: "a replaced generation", generation: 5n, rejected: true },
+  { reason: "a replaced binding", reference: "native:replacement", rejected: true },
+  { reason: "a closed task", state: SessionState.CLOSED, rejected: true },
+  { reason: "an interrupted stream prefix", gap: true, rejected: true },
+  { reason: "another target's marker", target: "other-target", rejected: true },
+  { reason: "another Backend's marker", markerBackend: "codex", rejected: true },
+  { reason: "another task's marker", productSession: "other-task", rejected: true },
+  { reason: "another native branch", markerReference: "native:other", rejected: true }
+])("invalidates only current buffered native history after a catalog refresh ($reason)", async scenario => {
+  let reads = 0, historyReads = 0, delivered = false, latest: AppSnapshot | undefined;
+  let finishRefresh!: (value: ReturnType<typeof compactingOwnerSnapshot>) => void;
+  const completionSequence = scenario.gap ? 3n : 2n, markerSequence = completionSequence + 1n;
+  const watermark = markerSequence + 2n, backendId = scenario.backendId ?? "pi";
+  const completion = create(EventSchema, { eventId: "reopened-completion", cursor: { generation: 1n, sequence: completionSequence },
+    identity: { backendId, targetId: "target", sessionId: "task", generation: 4n, runId: "reopened-run" },
+    payload: { kind: { case: "messageCompleted", value: { messageId: "reopened-message", role: 2,
+      nativeIdentity: { entryId: "reopened-message" }, blocks: [{ content: { case: "text", value: "Original completed reply" } }] } } } });
+  const marker = create(EventSchema, { eventId: "reopened-native-leaf", cursor: { generation: 1n, sequence: markerSequence },
+    identity: { backendId: scenario.markerBackend ?? backendId, targetId: scenario.target ?? "target", sessionId: "task", generation: 4n },
+    payload: { kind: { case: "nativeSessionChanged", value: { productSessionId: scenario.productSession ?? "task",
+      opaqueNativeReference: scenario.markerReference ?? "native:task" } } } });
+  const transport = {
+    unary: async (method: any, _signal: AbortSignal, _timeout: number, _headers: Headers, input: any) => {
+      if (method.localName === "listSessionTimeline") {
+        historyReads += 1;
+        expect(input).toMatchObject({ sessionId: "task" });
+        return response(method, create(ListSessionTimelineResponseSchema, { events: [completion] }));
+      }
+      if (method.localName !== "getSnapshot") throw new Error("Unsupported fixture method");
+      reads += 1;
+      return response(method, reads === 1 ? compactingOwnerSnapshot(0n, undefined, 4n, "native:task", SessionState.RUNNING, backendId)
+        : await new Promise<ReturnType<typeof compactingOwnerSnapshot>>(resolve => { finishRefresh = resolve; }));
+    },
+    stream: async (method: any) => response(method, { async *[Symbol.asyncIterator]() {
+      yield { event: scenario.primaryUi === false ? activityEvent : nativeHistoryEvent };
+      yield { event: completion };
+      yield { event: marker };
+      yield { event: marker };
+      delivered = true;
+      await new Promise<never>(() => undefined);
+    } }, true)
+  } as unknown as Transport;
+  const invalidations: bigint[] = [];
+  const gateway = createOrchestratorGateway(profile, "fixture-auth", { onSnapshot: value => {
+    latest = value;
+    const revision = value.timelineHistoryRevisionBySession.get("task");
+    if (revision === markerSequence) invalidations.push(revision);
+  }, ...(scenario.primaryUi === false ? { onLiveSnapshot: () => undefined } : {}) }, () => transport);
+  try {
+    await gateway.connect(); await vi.waitFor(() => expect(reads).toBe(2));
+    finishRefresh(compactingOwnerSnapshot(watermark, undefined, scenario.generation ?? 4n, scenario.reference ?? "native:task",
+      scenario.state ?? SessionState.RUNNING, backendId));
+    await vi.waitFor(() => expect(delivered).toBe(true));
+    expect(latest?.cursor).toBe(watermark);
+    expect(latest?.timelineBySession.get("task") ?? []).toEqual([]);
+    if (scenario.rejected) expect(invalidations).toEqual([]);
+    else {
+      expect(invalidations).toEqual([markerSequence]);
+      const page = await gateway.loadSessionTimelinePage("task");
+      expect(page.items).toMatchObject([{ id: "reopened-message", sourceEventId: "reopened-completion", text: "Original completed reply" }]);
+    }
+    expect(historyReads).toBe(scenario.rejected ? 0 : 1);
+    expect(reads).toBe(2);
+  } finally { gateway.disconnect(); }
+});
 
 it.each([
   { terminalState: CompactionState.COMPLETED, primaryUi: true },
