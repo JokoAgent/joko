@@ -1,6 +1,8 @@
+import { networkInterfaces } from "node:os";
 import { fromBinary } from "@bufbuild/protobuf";
 import { GetSnapshotResponseSchema, MessageRole, RunState } from "@joko/contracts";
 import type { AdapterContext, NativeHistoryEventContext, PromptInput } from "@joko/core";
+import { isPrivateLanHost } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser, type Locator, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
@@ -23,6 +25,63 @@ describe("mounted Timeline Markdown documents", () => {
       await fixture?.close({ removeRoot: true });
       fixture = undefined;
     }
+  });
+
+  mountedIt("copies message text and its canonical link on an explicitly enabled private HTTP node", { timeout: 90_000 }, async (context) => {
+    const publicLanHost = Object.values(networkInterfaces()).flatMap((addresses) => addresses ?? [])
+      .find((address) => address.family === "IPv4" && !address.internal && isPrivateLanHost(address.address))?.address;
+    if (publicLanHost === undefined) { context.skip(); return; }
+    fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!, publicLanHost });
+    const manager = await fixture.pair("Private HTTP manager");
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName: "Private HTTP task" })));
+    const store = fixture.application.store;
+    const session = store.getSession(sessionId).descriptor;
+    const messageId = "private-http-message";
+    const text = "Copy this ordinary message over private HTTP.";
+    store.appendEvent({ id: messageId, backendId: session.backendId, targetId: session.targetId, sessionId,
+      generation: session.binding.generation, traceId: "private-http-clipboard",
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text }] } });
+    const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Private HTTP browser" });
+    if (challenge.challenge === undefined) throw new Error("Browser pairing returned no challenge.");
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: "en-US" });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    expect(await page.evaluate(() => ({ secure: window.isSecureContext, clipboard: navigator.clipboard !== undefined })))
+      .toEqual({ secure: false, clipboard: false });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
+    await page.getByLabel("Device name").fill("Private HTTP browser");
+    await page.getByRole("checkbox", { name: "I trust this private network and accept unencrypted transport." }).check();
+    await page.locator("form.pair-form button[type=submit]").click();
+    const message = page.locator(`[data-user-msg-id="${messageId}"]`);
+    await message.waitFor({ state: "visible", timeout: 20_000 });
+    const clipboardValue = async (): Promise<string> => {
+      await page.evaluate(() => {
+        const input = document.createElement("textarea");
+        input.id = "clipboard-reading-fixture";
+        document.body.append(input);
+      });
+      const input = page.locator("#clipboard-reading-fixture");
+      try { await input.press("ControlOrMeta+v"); return await input.inputValue(); }
+      finally { await input.evaluate((element) => element.remove()); }
+    };
+
+    await message.getByRole("button", { name: "Copy", exact: true }).click();
+    await message.getByRole("status").filter({ hasText: "Copied" }).waitFor();
+    expect(await clipboardValue()).toBe(text);
+
+    const menu = message.locator("details.message-action-menu");
+    await menu.locator("summary").click();
+    await menu.getByRole("menuitem", { name: "Copy message link" }).click();
+    await message.getByRole("status").filter({ hasText: "Link copied" }).waitFor();
+    const link = new URL(await clipboardValue());
+    expect(link.origin).toBe(fixture.baseUrl);
+    const anchor = new URL(link.hash.slice(1), link.origin);
+    expect(anchor.pathname).toBe(`/tasks/${encodeURIComponent(sessionId)}`);
+    expect(Object.fromEntries(anchor.searchParams)).toEqual({ event: messageId, message: messageId });
   });
 
   mountedIt("retains native selection while streaming repairs and later definitions update the document", { timeout: 120_000 }, async () => {
