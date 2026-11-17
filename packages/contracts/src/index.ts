@@ -6,6 +6,7 @@ export * from "./extension-settings-bridge.js";
 export * from "./session-archive.js";
 export * from "./remote-desktop-viewer.js";
 export * from "./desktop-remote-desktop.js";
+export * from "./native-file-action.js";
 export * from "./remote-desktop-system-action.js";
 export * from "./remote-desktop-clipboard-version.js";
 export * from "./extension-library-clipboard.js";

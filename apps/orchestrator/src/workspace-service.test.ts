@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -244,6 +244,51 @@ describe("WorkspaceService", () => {
     expect(dirname(stagedPath)).toBe(root);
     expect(await readFile(path, "utf8")).toBe("keep me\n");
     expect(await readdir(root)).toEqual(["safe.txt"]);
+  });
+
+  it.runIf(process.platform === "win32")("saves the original staged text after a transient Windows rename denial", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-workspace-windows-save-"));
+    const path = join(root, "draft.txt");
+    await writeFile(path, "Original text");
+    let commits = 0;
+    const service = new WorkspaceService({ commitWorkspaceTextFile: async (staged, destination) => {
+      commits += 1;
+      if (commits === 1) throw Object.assign(new Error("Temporarily locked destination"), { code: "EPERM" });
+      await rename(staged, destination);
+    } });
+    await service.register({ id: "windows-save", root, displayName: "Draft", trusted: true });
+    const revision = (await service.preview("windows-save", "draft.txt")).entry.revision;
+    const saved = await service.writeTextFile("windows-save", { path: "draft.txt", text: "Draft survived quit", expectedRevision: revision });
+    expect(commits).toBe(2);
+    expect(saved.previousRevision).toBe(revision);
+    expect(await readFile(path, "utf8")).toBe("Draft survived quit");
+    expect(await readdir(root)).toEqual(["draft.txt"]);
+  });
+
+  it.runIf(process.platform === "win32")("retires a denied Windows save when its original text, staging file or authority changes", async () => {
+    for (const change of ["source", "staging", "authority"] as const) {
+      const root = await mkdtemp(join(tmpdir(), "joko-workspace-windows-save-fence-"));
+      const path = join(root, "draft.txt");
+      await writeFile(path, "Original text");
+      let commits = 0, authorized = true;
+      const service = new WorkspaceService({ commitWorkspaceTextFile: async (staged) => {
+        commits += 1;
+        if (change === "source") await writeFile(path, "External edit");
+        if (change === "staging") await writeFile(staged, "Substituted staging bytes");
+        if (change === "authority") authorized = false;
+        throw Object.assign(new Error("Temporarily locked destination"), { code: "EPERM" });
+      } });
+      await service.register({ id: "windows-save-fence", root, displayName: "Draft", trusted: true });
+      const revision = (await service.preview("windows-save-fence", "draft.txt")).entry.revision;
+      const request = { signal: new AbortController().signal,
+        assertCurrent: () => { if (!authorized) throw new Error("Original save authority retired"); } };
+      const save = service.writeTextFile("windows-save-fence", { path: "draft.txt", text: "Draft survived quit", expectedRevision: revision }, request);
+      if (change === "authority") await expect(save).rejects.toThrow("Original save authority retired");
+      else await expect(save).rejects.toMatchObject({ kind: "stale" });
+      expect(commits).toBe(1);
+      expect(await readFile(path, "utf8")).toBe(change === "source" ? "External edit" : "Original text");
+      expect(await readdir(root)).toEqual(["draft.txt"]);
+    }
   });
 
   it("keeps index and working-tree diffs separate for the same path", async () => {

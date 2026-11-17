@@ -1,19 +1,128 @@
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { OperationalStore } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
 
+const publicationFaults = vi.hoisted(() => ({
+  rename: undefined as ((source: string, destination: string) => Error | undefined) | undefined,
+  opened: undefined as ((path: string) => Promise<void>) | undefined
+}));
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...fs,
+    rename: async (...args: Parameters<typeof fs.rename>) => {
+      const error = publicationFaults.rename?.(String(args[0]), String(args[1]));
+      if (error !== undefined) throw error;
+      return fs.rename(...args);
+    },
+    open: async (...args: Parameters<typeof fs.open>) => {
+      const handle = await fs.open(...args);
+      try {
+        await publicationFaults.opened?.(String(args[0]));
+        return handle;
+      } catch (error) {
+        await handle.close().catch(() => undefined);
+        throw error;
+      }
+    }
+  };
+});
+
 const cleanupPaths: string[] = [];
+const publicationStores: OperationalStore[] = [];
 
 afterEach(async () => {
+  publicationFaults.rename = undefined;
+  publicationFaults.opened = undefined;
+  for (const store of publicationStores.splice(0).reverse()) store.close();
   for (const path of cleanupPaths.splice(0).reverse()) await rm(path, { recursive: true, force: true });
+});
+
+async function publicationFixture() {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "joko-artifact-publication-")));
+  cleanupPaths.push(directory);
+  const store = new OperationalStore(join(directory, "orchestrator.db"));
+  publicationStores.push(store);
+  const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"),
+    repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
+  await artifacts.initialize();
+  const data = Buffer.from("An immutable published Artifact.");
+  const sha256 = createHash("sha256").update(data).digest("hex");
+  const storagePath = join(directory, "artifacts", "blobs", sha256.slice(0, 2), sha256.slice(2, 4), sha256);
+  await mkdir(dirname(storagePath), { recursive: true });
+  return { directory, store, artifacts, data, storagePath };
+}
+
+describe("ArtifactStore publication", () => {
+  it("authenticates an existing Blob after a failed rename and reuses its permanent identity", async () => {
+    const f = await publicationFixture();
+    await writeFile(f.storagePath, f.data);
+    publicationFaults.rename = (_source, destination) => destination === f.storagePath
+      ? Object.assign(new Error("Publication rename is blocked."), { code: "EACCES" }) : undefined;
+    const first = await f.artifacts.ingestBytes(f.data, { fileName: "published.txt", mimeType: "text/plain" });
+    const second = await f.artifacts.ingestBytes(f.data, { fileName: "published.txt", mimeType: "text/plain" });
+    expect(second).toEqual(first);
+    expect(f.store.listArtifacts({ limit: 100 })).toHaveLength(1);
+    expect(Buffer.from((await f.artifacts.readBlob(second)).data)).toEqual(f.data);
+    expect(await readdir(join(f.directory, "artifacts", "incoming"))).toEqual([]);
+  });
+
+  it("rejects a directory at the Blob identity without registering an unreadable Artifact or removing its contents", async () => {
+    const f = await publicationFixture();
+    await mkdir(f.storagePath);
+    const occupant = join(f.storagePath, "owner.txt");
+    await writeFile(occupant, "Retain this directory.");
+    await expect(f.artifacts.ingestBytes(f.data)).rejects.toThrow("private regular file");
+    expect(f.store.listArtifacts({ limit: 100 })).toEqual([]);
+    expect((await lstat(f.storagePath)).isDirectory()).toBe(true);
+    expect(await readFile(occupant, "utf8")).toBe("Retain this directory.");
+    expect(await readdir(join(f.directory, "artifacts", "incoming"))).toEqual([]);
+  });
+
+  it("rejects same-size corrupt content when the correct staged file cannot replace it", async () => {
+    const f = await publicationFixture();
+    const corrupt = Buffer.alloc(f.data.byteLength, 0x78);
+    await writeFile(f.storagePath, corrupt);
+    publicationFaults.rename = (_source, destination) => destination === f.storagePath
+      ? Object.assign(new Error("Publication rename is blocked."), { code: "EACCES" }) : undefined;
+    await expect(f.artifacts.ingestBytes(f.data)).rejects.toThrow("Publication rename is blocked.");
+    expect(f.store.listArtifacts({ limit: 100 })).toEqual([]);
+    expect(await readFile(f.storagePath)).toEqual(corrupt);
+    expect(await readdir(join(f.directory, "artifacts", "incoming"))).toEqual([]);
+  });
+
+  it.each([false, true])("rechecks a replacement encountered during publication, with identical bytes=%s", async identical => {
+    const f = await publicationFixture();
+    const replacement = identical ? f.data : Buffer.alloc(f.data.byteLength, 0x78);
+    const original = `${f.storagePath}.original`;
+    let opened = 0;
+    publicationFaults.opened = async path => {
+      if (path !== f.storagePath || ++opened !== 1) return;
+      await rename(path, original);
+      await writeFile(path, replacement);
+    };
+    const incoming = f.artifacts.ingestBytes(f.data);
+    if (identical) {
+      const artifact = await incoming;
+      expect(opened).toBe(2);
+      expect(Buffer.from((await f.artifacts.readBlob(artifact)).data)).toEqual(f.data);
+      expect(f.store.listArtifacts({ limit: 100 })).toHaveLength(1);
+    } else {
+      await expect(incoming).rejects.toThrow("publication verification");
+      expect(f.store.listArtifacts({ limit: 100 })).toEqual([]);
+    }
+    expect(await readFile(original)).toEqual(f.data);
+    expect(await readFile(f.storagePath)).toEqual(replacement);
+  });
 });
 
 describe("ArtifactStore garbage collection", () => {

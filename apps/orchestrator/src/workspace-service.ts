@@ -945,35 +945,52 @@ export class WorkspaceService {
           } finally {
             await handle.close();
           }
+          const closed = await lstat(temporaryPath);
+          if (stagedInfo === undefined || !closed.isFile() || closed.isSymbolicLink()
+            || !sameFilesystemIdentity(stagedInfo, closed) || closed.size !== bytes.byteLength) {
+            throw new WorkspaceTextFileWriteError("Workspace text staging changed before saving.", "stale");
+          }
+          stagedInfo = closed;
         } catch (error) {
           assertCurrent();
           if (error instanceof WorkspaceTextFileWriteError) throw error;
           throw new WorkspaceTextFileWriteError("Workspace text could not be staged safely.", "write_failed");
         }
 
-        let current: WorkspaceTextSnapshot;
-        try {
-          current = await this.#readWorkspaceTextSnapshot(workspace, canonicalPath);
-        } catch {
-          throw new WorkspaceTextFileWriteError("Workspace file changed; read it again before saving.", "stale");
-        }
-        if (current.absolute !== before.absolute || current.revision !== input.expectedRevision) {
-          throw new WorkspaceTextFileWriteError("Workspace file changed; read it again before saving.", "stale");
-        }
-
-        assertCurrent();
-        try {
-          await this.#commitWorkspaceTextFile(temporaryPath, before.absolute);
-        } catch (error) {
-          const code = nodeErrorCode(error);
-          throw new WorkspaceTextFileWriteError("Workspace text could not be committed safely.", "write_failed",
-            code !== undefined && /^E[A-Z0-9]{1,23}$/u.test(code) ? code : undefined);
-        }
-        assertCurrent();
-
         if (stagedInfo === undefined) {
           throw new WorkspaceTextFileWriteError("Workspace text staging did not produce file metadata.", "write_failed");
         }
+        for (let attempt = 0; ; attempt += 1) {
+          assertCurrent();
+          let current: WorkspaceTextSnapshot;
+          try {
+            current = await this.#readWorkspaceTextSnapshot(workspace, canonicalPath);
+            const staged = await lstat(temporaryPath);
+            if (!staged.isFile() || staged.isSymbolicLink() || !sameFileState(staged, stagedInfo)) {
+              throw new Error("The staged workspace text changed.");
+            }
+          } catch {
+            throw new WorkspaceTextFileWriteError("Workspace file changed; read it again before saving.", "stale");
+          }
+          if (current.absolute !== before.absolute || current.revision !== input.expectedRevision) {
+            throw new WorkspaceTextFileWriteError("Workspace file changed; read it again before saving.", "stale");
+          }
+          assertCurrent();
+          try {
+            await this.#commitWorkspaceTextFile(temporaryPath, before.absolute);
+            break;
+          } catch (error) {
+            const code = nodeErrorCode(error);
+            if (process.platform === "win32" && attempt < 4
+              && (code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
+              await new Promise<void>((resolve) => { setTimeout(resolve, 20 * 2 ** attempt); });
+              continue;
+            }
+            throw new WorkspaceTextFileWriteError("Workspace text could not be committed safely.", "write_failed",
+              code !== undefined && /^E[A-Z0-9]{1,23}$/u.test(code) ? code : undefined);
+          }
+        }
+        assertCurrent();
         const revision = workspaceTextFileRevision(bytes);
         return {
           entry: workspaceFileEntry(canonicalPath, stagedInfo, revision),

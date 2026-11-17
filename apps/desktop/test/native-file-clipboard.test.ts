@@ -7,16 +7,51 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { FILE_COPY_MAXIMUM_BYTES, FILE_COPY_RETENTION_MS, FILE_COPY_TOTAL_BYTES, NativeFileClipboard, parseDesktopCopyFileRequest, type FileCopyHelperResult } from "../src/native-file-clipboard.js";
 import { mkdtemp } from "./test-paths.js";
 import * as secureFiles from "@joko/device-peer/private-files";
+import { nativeFileActionRequestId } from "@joko/contracts";
 
 const spawn = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ spawn }));
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); spawn.mockReset(); });
 const scope = () => ({ id: randomUUID(), isCurrent: () => true });
-const input = (name = "clip's video.mp4") => ({ requestId: randomUUID(), file: { name, mediaType: "video/mp4", bytes: new Uint8Array([1, 2, 3]) } });
+let ordinal = 0;
+const input = (name = "clip's video.mp4") => ({ requestId: nativeFileActionRequestId(++ordinal, randomUUID()), file: { name, mediaType: "video/mp4", bytes: new Uint8Array([1, 2, 3]) } });
 const root = () => mkdtemp(join(tmpdir(), "joko-file-clipboard-"));
 const manifest = async (directory: string) => JSON.parse(await readFile(join(directory, "files.json"), "utf8")) as { version: number; entries: { id: string; name: string; bytes: number; state: string; pid?: number; retainUntil?: number }[] };
 
 describe("native file clipboard ownership", () => {
+  it("admits new copies after receipt rollover and file expiry without replaying an old unknown effect", async () => {
+    const directory = await root();
+    let now = 100;
+    const execute = vi.fn<NonNullable<import("../src/native-file-clipboard.js").NativeFileClipboardOptions["execute"]>>()
+      .mockResolvedValueOnce({ status: "unknown", dispatched: true, closed: true })
+      .mockResolvedValue({ status: "copied", dispatched: true, closed: true });
+    const owner = new NativeFileClipboard({ directory, platform: "win32", execute, now: () => now });
+    const caller = scope();
+    const unknown = input();
+    const pending = owner.copy(unknown, caller);
+    await expect(pending).resolves.toEqual({ status: "unknown" });
+    expect(owner.copy(unknown, caller)).toBe(pending);
+    for (let i = 1; i < 32; i += 1) await expect(owner.copy(input(), caller)).resolves.toEqual({ status: "copied" });
+    let latest = input();
+    let receipt = owner.copy(latest, caller);
+    for (let i = 0; i < 1_025; i += 1) {
+      if (i > 0) { latest = input(); receipt = owner.copy(latest, caller); }
+      await expect(receipt).resolves.toEqual({ status: "failed", reason: "capacity" });
+    }
+    expect(owner.copy(latest, caller)).toBe(receipt);
+    await expect(owner.copy(unknown, caller)).resolves.toEqual({ status: "cancelled" });
+    expect(execute).toHaveBeenCalledTimes(32);
+    now += FILE_COPY_RETENTION_MS;
+    await expect(owner.copy(input(), caller)).resolves.toEqual({ status: "copied" });
+    expect((await manifest(directory)).entries).toHaveLength(1);
+    expect(execute).toHaveBeenCalledTimes(33);
+    owner.retireScope(caller.id);
+    await expect(owner.copy(unknown, caller)).resolves.toEqual({ status: "cancelled" });
+    await expect(owner.copy(unknown, scope())).resolves.toEqual({ status: "copied" });
+    expect(execute).toHaveBeenCalledTimes(34);
+    owner.dispose();
+  }, 30_000);
+
   it("writes private immutable bytes, replays an exact request and retains a copied file after renderer retirement", async () => {
     const directory = await root();
     const execute = vi.fn(async (): Promise<FileCopyHelperResult> => ({ status: "copied", dispatched: true, closed: true }));
@@ -114,6 +149,7 @@ describe("native file clipboard ownership", () => {
   });
 
   it("rejects unsafe names and manifest paths and does not offer unsupported file clipboard semantics", async () => {
+    expect(() => parseDesktopCopyFileRequest({ ...input(), requestId: randomUUID() })).toThrow();
     for (const name of ["../outside.mp4", "CON.mp4", "clip.mp4:stream", "trailing.", "bad\\leaf.mp4"]) expect(() => parseDesktopCopyFileRequest(input(name))).toThrow();
     expect(() => parseDesktopCopyFileRequest({ ...input(), path: "outside.mp4" })).toThrow();
     const oversized = input(); Object.defineProperty(oversized.file.bytes, "byteLength", { value: FILE_COPY_MAXIMUM_BYTES + 1 });

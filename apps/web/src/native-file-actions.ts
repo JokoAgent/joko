@@ -1,3 +1,4 @@
+import { nativeFileActionRequestId } from "@joko/contracts";
 import { assertBrowserActionCurrent, type BrowserActionContext } from "./browser-action.js";
 
 export type NativeFileCopyOutcome = JokoDesktopCopyFileResult;
@@ -24,6 +25,14 @@ type NativeFileOpenWithHost = Pick<
 >;
 
 const nativeFileOpenApplicationListOwners = new WeakMap<NativeFileOpenApplicationList, NativeFileOpenWithHost>();
+const nativeFileActionOrdinals = new WeakMap<Document, number>();
+
+function nextNativeFileActionId(owner: Document): string {
+  const ordinal = (nativeFileActionOrdinals.get(owner) ?? 0) + 1;
+  const id = nativeFileActionRequestId(ordinal, owner.defaultView!.crypto.randomUUID());
+  nativeFileActionOrdinals.set(owner, ordinal);
+  return id;
+}
 
 export function nativeFileCopyAvailable(): boolean {
   return typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("files.copy") === true;
@@ -150,7 +159,7 @@ export async function copyNativeArtifactFile(
   const bytes = new Uint8Array(await blob.arrayBuffer());
   assertBrowserActionCurrent(context);
   if (bytes.byteLength > NATIVE_FILE_COPY_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
-  const requestId = context.ownerDocument.defaultView!.crypto.randomUUID();
+  const requestId = nextNativeFileActionId(context.ownerDocument);
   const cancel = (): void => { void host.cancelFileCopy(requestId).catch(() => undefined); };
   context.signal.addEventListener("abort", cancel, { once: true });
   try {
@@ -176,7 +185,7 @@ export async function openNativeArtifactFile(
   const bytes = new Uint8Array(await blob.arrayBuffer());
   assertBrowserActionCurrent(context);
   if (bytes.byteLength > NATIVE_FILE_OPEN_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
-  const requestId = context.ownerDocument.defaultView!.crypto.randomUUID();
+  const requestId = nextNativeFileActionId(context.ownerDocument);
   const cancel = (): void => { void host.cancelFileOpen(requestId).catch(() => undefined); };
   context.signal.addEventListener("abort", cancel, { once: true });
   try {
@@ -204,7 +213,7 @@ export async function openNativeArtifactFileWithApplication(
   const bytes = new Uint8Array(await blob.arrayBuffer());
   assertBrowserActionCurrent(context);
   if (bytes.byteLength > NATIVE_FILE_OPEN_MAXIMUM_BYTES) return { status: "failed", reason: "capacity" };
-  const requestId = context.ownerDocument.defaultView!.crypto.randomUUID();
+  const requestId = nextNativeFileActionId(context.ownerDocument);
   const cancel = (): void => { void host.cancelFileOpen(requestId).catch(() => undefined); };
   context.signal.addEventListener("abort", cancel, { once: true });
   try {
@@ -234,7 +243,7 @@ export async function revealNativeArtifactSource(
 ): Promise<NativeArtifactSourceRevealOutcome> {
   assertBrowserActionCurrent(context);
   if (host === undefined) return { status: "unavailable" };
-  const requestId = context.ownerDocument.defaultView!.crypto.randomUUID();
+  const requestId = nextNativeFileActionId(context.ownerDocument);
   const cancel = (): void => { void host.cancelArtifactSourceReveal(requestId).catch(() => undefined); };
   context.signal.addEventListener("abort", cancel, { once: true });
   try {

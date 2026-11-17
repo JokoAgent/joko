@@ -7,14 +7,14 @@ import type {
   DesktopOpenFileResult,
   DesktopOpenFileWithAppIpcRequest
 } from "./channels.js";
-import type { NativeFileActionScope } from "./native-file-clipboard.js";
+import { NativeFileActionRequests, type NativeFileActionScope } from "./native-file-action-requests.js";
+import { nativeFileActionSequence } from "@joko/contracts";
 import { atomicWritePrivateFile, ensurePrivateDirectory, readPrivateFile } from "@joko/device-peer/private-files";
 
 export const FILE_OPEN_MAXIMUM_BYTES = 256 * 1024 * 1024;
 export const FILE_OPEN_TOTAL_BYTES = 512 * 1024 * 1024;
 export const FILE_OPEN_MAXIMUM_FILES = 32;
 export const FILE_OPEN_RETENTION_MS = 24 * 60 * 60 * 1_000;
-const MAXIMUM_REQUESTS = 1_024;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 
 interface Entry {
@@ -23,13 +23,6 @@ interface Entry {
   readonly bytes: number;
   readonly state: "prepared" | "retained";
   readonly retainUntil?: number;
-}
-
-interface Request {
-  readonly scope: NativeFileActionScope;
-  readonly digest: string;
-  readonly abort: AbortController;
-  readonly result: Promise<DesktopOpenFileResult>;
 }
 
 export type NativeFileOpenWithDispatcher = (
@@ -49,7 +42,7 @@ export interface NativeFileOpenerOptions {
 /** A single app-owned materializer. Renderer requests never contain a path or URL. */
 export class NativeFileOpener {
   readonly #options: NativeFileOpenerOptions;
-  readonly #requests = new Map<string, Request>();
+  readonly #requests = new NativeFileActionRequests<DesktopOpenFileResult>();
   readonly #now: () => number;
   readonly #manifest: string;
   #entries: Entry[] = [];
@@ -96,7 +89,6 @@ export class NativeFileOpener {
     actionIdentity: string,
     createDispatch: () => (path: string) => Promise<string>
   ): Promise<DesktopOpenFileResult> {
-    const key = `${scope.id}\0${input.requestId}`;
     const digest = createHash("sha256")
       .update(actionIdentity)
       .update("\0")
@@ -106,15 +98,12 @@ export class NativeFileOpener {
       .update("\0")
       .update(input.file.bytes)
       .digest("hex");
-    const existing = this.#requests.get(key);
-    if (existing !== undefined) {
-      if (existing.digest !== digest) {
-        return Promise.reject(new TypeError("The file open request identity was reused with different content."));
-      }
-      return existing.result;
-    }
+    try {
+      const existing = this.#requests.replay(scope, input.requestId, digest);
+      if (existing !== undefined) return existing === false ? Promise.resolve({ status: "cancelled" }) : existing;
+    } catch (error) { return Promise.reject(error); }
     if (this.#closed || !scope.isCurrent()) return Promise.resolve({ status: "cancelled" });
-    if (this.#requests.size >= MAXIMUM_REQUESTS || this.#pendingFiles >= FILE_OPEN_MAXIMUM_FILES ||
+    if (this.#pendingFiles >= FILE_OPEN_MAXIMUM_FILES ||
       this.#pendingBytes + input.file.bytes.byteLength > FILE_OPEN_TOTAL_BYTES) {
       return Promise.resolve({ status: "failed", reason: "capacity" });
     }
@@ -148,21 +137,20 @@ export class NativeFileOpener {
       this.#pendingFiles -= 1;
     });
     this.#tail = result.catch(() => undefined);
-    this.#requests.set(key, { scope, digest, abort, result });
+    this.#requests.add(scope, input.requestId, digest, abort, result);
     return result;
   }
 
   cancel(requestId: string, scopeId: string): void {
-    if (!UUID.test(requestId)) throw new TypeError("Invalid file open request identity.");
-    this.#requests.get(`${scopeId}\0${requestId}`)?.abort.abort();
+    this.#requests.cancel(scopeId, requestId);
   }
 
   retireScope(scopeId: string): void {
-    for (const request of this.#requests.values()) if (request.scope.id === scopeId) request.abort.abort();
+    this.#requests.retireScope(scopeId);
   }
 
   cancelPending(): void {
-    for (const request of this.#requests.values()) request.abort.abort();
+    this.#requests.cancelPending();
   }
 
   dispose(): void {
@@ -272,7 +260,7 @@ export class NativeFileOpener {
 
 export function parseDesktopOpenFileRequest(value: unknown): DesktopOpenFileRequest {
   if (!isRecord(value) || Object.keys(value).sort().join(",") !== "file,requestId" ||
-    typeof value.requestId !== "string" || !UUID.test(value.requestId) || !isRecord(value.file)) {
+    typeof value.requestId !== "string" || nativeFileActionSequence(value.requestId) === undefined || !isRecord(value.file)) {
     throw new TypeError("Invalid file open request.");
   }
   const file = value.file;

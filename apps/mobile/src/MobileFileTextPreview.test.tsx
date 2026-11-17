@@ -81,16 +81,16 @@ describe("native file reading", () => {
     expect(rendered.onShouldStartLoadWithRequest({ url: "https://example.test/read" })).toBe(false);
     expect(native.openURL).toHaveBeenCalledExactlyOnceWith("https://example.test/read");
     await act(async () => { native.web!.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "x".repeat(4_001) } }); });
-    expect(container.textContent).toContain("Select at most 4,000 characters"); expect(add).not.toHaveBeenCalled();
+    expect(add).toHaveBeenNthCalledWith(1, preview, "x".repeat(4_001), expect.any(AbortSignal));
     await act(async () => { native.web!.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "Selected 😀 text" } }); });
-    expect(add).toHaveBeenCalledExactlyOnceWith(preview, "Selected 😀 text", expect.any(AbortSignal)); expect(quoted).toHaveBeenCalledOnce();
+    expect(add).toHaveBeenNthCalledWith(2, preview, "Selected 😀 text", expect.any(AbortSignal)); expect(quoted).toHaveBeenCalledTimes(2);
     await act(async () => { (container.querySelector('[aria-label="Source"]') as HTMLButtonElement).click(); });
     await act(async () => { (container.querySelector('[aria-label="Copy source"]') as HTMLButtonElement).click(); });
     expect(write).toHaveBeenCalledExactlyOnceWith(preview.text); expect(container.querySelector("output")?.textContent).toBe("copied");
     await act(async () => { rendered.onCustomMenuSelection!({ nativeEvent: { key: "joko-file-quote", label: "", selectedText: "late" } }); });
     expect(rendered.onShouldStartLoadWithRequest({ url: "https://example.test/read" })).toBe(false);
     expect(native.openURL).toHaveBeenCalledOnce();
-    expect(add).toHaveBeenCalledOnce(); await act(async () => { root.unmount(); });
+    expect(add).toHaveBeenCalledTimes(2); await act(async () => { root.unmount(); });
   });
 
   it("cancels old source preparation on preview and background changes, preserving a failed quotation for an explicit retry", async () => {

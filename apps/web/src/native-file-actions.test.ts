@@ -1,13 +1,47 @@
 // @vitest-environment jsdom
 import { Blob as NodeBlob } from "node:buffer";
 import { afterEach, expect, it, vi } from "vitest";
-import { copyNativeArtifactFile, NATIVE_FILE_COPY_MAXIMUM_BYTES, NATIVE_FILE_OPEN_MAXIMUM_BYTES, openNativeArtifactFile } from "./native-file-actions.js";
+import { nativeFileActionSequence } from "@joko/contracts";
+import { copyNativeArtifactFile, listNativeFileOpenApplications, NATIVE_FILE_COPY_MAXIMUM_BYTES, NATIVE_FILE_OPEN_MAXIMUM_BYTES, openNativeArtifactFile, openNativeArtifactFileWithApplication, revealNativeArtifactSource } from "./native-file-actions.js";
 
 afterEach(() => { document.body.replaceChildren(); vi.restoreAllMocks(); });
 const host = () => ({ copyFile: vi.fn().mockResolvedValue({ status: "copied" }), cancelFileCopy: vi.fn().mockResolvedValue(undefined) });
 const openHost = () => ({ openFile: vi.fn().mockResolvedValue({ status: "opened" }), cancelFileOpen: vi.fn().mockResolvedValue(undefined) });
 const context = () => ({ ownerDocument: document, signal: new AbortController().signal });
 const blob = () => new NodeBlob([new Uint8Array([1, 2])], { type: "video/mp4" }) as unknown as Blob;
+
+it("orders all native actions in their actual Document dispatch order after asynchronous encoding", async () => {
+  const frame = document.createElement("iframe"); document.body.append(frame);
+  const ownerDocument = frame.contentDocument!;
+  const action = { ownerDocument, signal: new AbortController().signal };
+  const copy = host(), opener = openHost(), bytes = deferred<ArrayBuffer>();
+  const copying = copyNativeArtifactFile({ size: 2, type: "video/mp4", arrayBuffer: () => bytes.promise } as Blob, "video.mp4", action, copy);
+  await expect(openNativeArtifactFile(blob(), "video.mp4", action, opener)).resolves.toEqual({ status: "opened" });
+  bytes.resolve(new Uint8Array([1, 2]).buffer);
+  await expect(copying).resolves.toEqual({ status: "copied" });
+  const reveal = {
+    revealArtifactSource: vi.fn(async (_request: { readonly requestId: string }) => ({ status: "revealed" as const })),
+    cancelArtifactSourceReveal: vi.fn(async () => undefined)
+  };
+  await expect(revealNativeArtifactSource("profile", "server", "task", "artifact", action, reveal)).resolves.toEqual({ status: "revealed" });
+  const openWith = {
+    listOpenWithApps: vi.fn(async (request: { readonly listOccurrence: string }) => ({
+      status: "listed" as const, listOccurrence: request.listOccurrence, apps: [{ appId: ownerDocument.defaultView!.crypto.randomUUID(), label: "Editor" }]
+    })),
+    openFileWithApp: vi.fn(async (_request: { readonly requestId: string }) => ({ status: "opened" as const })),
+    retireOpenWithApps: vi.fn(async () => undefined), cancelFileOpen: vi.fn(async () => undefined)
+  };
+  const listed = await listNativeFileOpenApplications("video.mp4", action, openWith);
+  expect(listed.status).toBe("listed");
+  if (listed.status !== "listed") throw new Error("Application list was not adopted.");
+  await expect(openNativeArtifactFileWithApplication(blob(), "video.mp4", listed.list, listed.list.applications[0]!, action)).resolves.toEqual({ status: "opened" });
+  const ids = [opener.openFile.mock.calls[0]![0].requestId, copy.copyFile.mock.calls[0]![0].requestId,
+    reveal.revealArtifactSource.mock.calls[0]![0].requestId, openWith.openFileWithApp.mock.calls[0]![0].requestId];
+  expect(ids.map(nativeFileActionSequence)).toEqual([1, 2, 3, 4]);
+  expect(new Set(ids).size).toBe(4);
+  expect(copy.cancelFileCopy).not.toHaveBeenCalled();
+  expect(opener.cancelFileOpen).not.toHaveBeenCalled();
+});
 
 it("passes only authorized bytes to the captured host and preserves post-dispatch results and unknown rejection", async () => {
   const native = host(); const result = deferred<JokoDesktopCopyFileResult>();

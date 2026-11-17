@@ -13356,6 +13356,20 @@ describe("native current-task Files ownership", () => {
     await expect(f.app.prepareFileTextSourceCopy(f.preview, new AbortController().signal)).rejects.toThrow(/canonical source/u);
   });
 
+  it("adopts a long native file selection as one bounded draft excerpt without sending it", async () => {
+    const selected = "x".repeat(4_001), f = await textActionFixture(selected);
+    f.drafts.composer.save(f.identity, plainTextMobileComposerDraft("Question"));
+    await f.app.addFileTextQuoteToComposer(f.preview, selected, new AbortController().signal);
+    const saved = await f.drafts.composer.read(f.identity);
+    expect(saved?.atoms).toMatchObject([{ kind: "file-quote", sourceSessionId: "session", sourcePath: "docs/README.md",
+      text: `${"x".repeat(4_000)}…` }]);
+    expect(saved?.text).toBe("Question\n\n⟦Quote from File⟧");
+    expect(f.drafts.values.size).toBe(1);
+    expect(f.network.submit).not.toHaveBeenCalled();
+    f.app.closeFilesPreview();
+    await expect(f.app.addFileTextQuoteToComposer(f.preview, selected, new AbortController().signal)).rejects.toThrow(/canonical source/u);
+  });
+
   it("rejects changed bytes and source windows, preserves concurrent drafts and rolls back a failed quote flush", async () => {
     const f = await textActionFixture(); const original = plainTextMobileComposerDraft("Original");
     f.drafts.composer.save(f.identity, original); await f.drafts.composer.flush(f.identity);

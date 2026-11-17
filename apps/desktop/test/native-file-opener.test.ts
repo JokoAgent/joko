@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { nativeFileActionRequestId } from "@joko/contracts";
 
 import {
   FILE_OPEN_MAXIMUM_BYTES,
@@ -17,8 +18,9 @@ import { mkdtemp } from "./test-paths.js";
 afterEach(() => vi.restoreAllMocks());
 
 const scope = () => ({ id: randomUUID(), isCurrent: () => true });
+let ordinal = 0;
 const input = (name = "clip's video.mp4") => ({
-  requestId: randomUUID(),
+  requestId: nativeFileActionRequestId(++ordinal, randomUUID()),
   file: { name, mediaType: "video/mp4", bytes: new Uint8Array([1, 2, 3]) }
 });
 const root = () => mkdtemp(join(tmpdir(), "joko-file-opener-"));
@@ -28,6 +30,37 @@ const manifest = async (directory: string) => JSON.parse(await readFile(join(dir
 };
 
 describe("native file open ownership", () => {
+  it("admits new actions after receipt rollover and file expiry without redispatching an old unknown action", async () => {
+    const directory = await root();
+    let now = 100;
+    const openPath = vi.fn().mockRejectedValueOnce(new Error("acknowledgement lost")).mockResolvedValue("");
+    const owner = new NativeFileOpener({ directory, openPath, now: () => now });
+    const caller = scope();
+    const unknown = input();
+    const pending = owner.open(unknown, caller);
+    await expect(pending).resolves.toEqual({ status: "unknown" });
+    expect(owner.open(unknown, caller)).toBe(pending);
+    for (let i = 1; i < 32; i += 1) await expect(owner.open(input(), caller)).resolves.toEqual({ status: "opened" });
+    let latest = input();
+    let receipt = owner.open(latest, caller);
+    for (let i = 0; i < 1_025; i += 1) {
+      if (i > 0) { latest = input(); receipt = owner.open(latest, caller); }
+      await expect(receipt).resolves.toEqual({ status: "failed", reason: "capacity" });
+    }
+    expect(owner.open(latest, caller)).toBe(receipt);
+    await expect(owner.open(unknown, caller)).resolves.toEqual({ status: "cancelled" });
+    expect(openPath).toHaveBeenCalledTimes(32);
+    now += FILE_OPEN_RETENTION_MS;
+    await expect(owner.open(input(), caller)).resolves.toEqual({ status: "opened" });
+    expect((await manifest(directory)).entries).toHaveLength(1);
+    expect(openPath).toHaveBeenCalledTimes(33);
+    owner.retireScope(caller.id);
+    await expect(owner.open(unknown, caller)).resolves.toEqual({ status: "cancelled" });
+    await expect(owner.open(unknown, scope())).resolves.toEqual({ status: "opened" });
+    expect(openPath).toHaveBeenCalledTimes(34);
+    owner.dispose();
+  }, 30_000);
+
   it("materializes private immutable bytes, replays the exact request and retains a successful dispatch", async () => {
     const directory = await root();
     const openPath = vi.fn(async () => "");
@@ -156,6 +189,7 @@ describe("native file open ownership", () => {
   });
 
   it("rejects paths, URLs, unsafe basenames, oversized bytes and an untrusted manifest", async () => {
+    expect(() => parseDesktopOpenFileRequest({ ...input(), requestId: randomUUID() })).toThrow();
     for (const name of ["../outside.mp4", "CON.mp4", "clip.mp4:stream", "trailing.", "bad\\leaf.mp4"]) {
       expect(() => parseDesktopOpenFileRequest(input(name))).toThrow();
     }

@@ -39,11 +39,12 @@ describe("mobile composer draft store", () => {
   it("persists exact file quote occurrences under the current task draft without manufacturing message authority", async () => {
     const memory = memoryDriver(); const store = new MobileComposerDraftStore(memory.driver);
     const draft = appendMobileFileSelectionQuote(plainTextMobileComposerDraft("Question"), {
-      sourceSessionId: first.sessionId, sourcePath: "docs/README.md", text: "Selected text"
+      sourceSessionId: first.sessionId, sourcePath: "docs/README.md", text: "x".repeat(4_001)
     }, "file-excerpt").draft;
     store.save(first, draft); await store.flush(first);
     const restarted = new MobileComposerDraftStore(memory.driver);
     expect(await restarted.read(first)).toEqual(draft); expect(await restarted.read(second)).toBeNull();
+    expect(draft.atoms[0]).toMatchObject({ kind: "file-quote", text: `${"x".repeat(4_000)}…` });
     expect(JSON.stringify(draft)).not.toContain("sourceMessageId");
   });
 

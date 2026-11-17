@@ -452,13 +452,28 @@ export class ArtifactStore {
     await input.beforeFinalize?.({ sha256, byteLength });
     const storagePath = join(this.#options.rootDirectory, "blobs", sha256.slice(0, 2), sha256.slice(2, 4), sha256);
     await mkdir(dirname(storagePath), { recursive: true });
+    const existing = await lstat(storagePath).catch(ignoreMissingArtifactFile);
+    if (existing !== undefined && (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1)) {
+      throw new Error("Artifact storage entry is not a private regular file.");
+    }
     input.assertCurrent?.();
+    let renamed = false;
+    let publicationError: unknown;
     try {
       await rename(temporaryPath, storagePath);
+      renamed = true;
     } catch (error) {
-      if (!(await exists(storagePath))) throw error;
-      await rm(temporaryPath, { force: true });
+      publicationError = error;
     }
+    const published = { storagePath, sha256, byteLength };
+    try {
+      await this.verifyPublishedContent(published);
+    } catch {
+      if (!renamed) throw publicationError;
+      // Another identical publisher may have replaced the path. Acquire fresh proof once.
+      await this.verifyPublishedContent(published);
+    }
+    if (!renamed) await rm(temporaryPath, { force: true });
     const fileName = input.fileName === undefined ? undefined : sanitizeFileName(input.fileName);
     const mimeType = input.mimeType ?? inferMediaType(fileName ?? "");
     const persist = async (): Promise<ArtifactRecord> => {
@@ -528,7 +543,27 @@ export class ArtifactStore {
     } };
   }
 
-  private async verifyStoragePath(artifact: ArtifactRecord): Promise<{
+  private async verifyPublishedContent(artifact: Pick<ArtifactRecord, "storagePath" | "sha256" | "byteLength">): Promise<void> {
+    const before = await this.verifyStoragePath(artifact);
+    const handle = await open(before.canonical, "r");
+    try {
+      const opened = await handle.stat();
+      if (!sameFileIdentity(before.info, opened) || opened.nlink !== 1 || opened.size !== artifact.byteLength) {
+        throw new Error("Artifact storage entry changed before publication verification.");
+      }
+      const actual = await hashFile(handle, this.#maximumBlobBytes);
+      const afterHandle = await handle.stat();
+      const after = await this.verifyStoragePath(artifact);
+      if (after.canonical !== before.canonical || !sameFileIdentity(opened, afterHandle) || !sameFileIdentity(opened, after.info)
+        || actual.byteLength !== artifact.byteLength || actual.sha256 !== artifact.sha256) {
+        throw new Error("Artifact content changed during publication verification.");
+      }
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+  private async verifyStoragePath(artifact: Pick<ArtifactRecord, "storagePath" | "sha256">): Promise<{
     readonly canonical: string;
     readonly info: Awaited<ReturnType<typeof lstat>>;
   }> {
@@ -573,10 +608,11 @@ function sameFileIdentity(
     && left.ctimeMs === right.ctimeMs;
 }
 
-async function hashFile(path: string, maximumBytes: number): Promise<{ sha256: string; byteLength: number }> {
+async function hashFile(source: string | FileHandle, maximumBytes: number): Promise<{ sha256: string; byteLength: number }> {
   const hash = createHash("sha256");
   let byteLength = 0;
-  for await (const chunk of createReadStream(path)) {
+  const stream = typeof source === "string" ? createReadStream(source) : source.createReadStream({ autoClose: false, emitClose: false });
+  for await (const chunk of stream) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     byteLength += buffer.byteLength;
     if (byteLength > maximumBytes) throw new Error("Artifact exceeds the configured size limit.");
@@ -593,16 +629,6 @@ function hashText(value: string): string {
 function sanitizeFileName(value: string): string {
   const safe = basename(value).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
   return safe === "" || safe === "." || safe === ".." ? "artifact" : safe;
-}
-
-async function exists(path: string): Promise<boolean> {
-  try {
-    await stat(path);
-    return true;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
-    throw error;
-  }
 }
 
 function assertBlobIdentity(expected: BlobRef, actual: ArtifactRecord): void {
