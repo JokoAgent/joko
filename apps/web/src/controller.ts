@@ -3188,7 +3188,7 @@ export function useAppController(): AppController {
   const rejectedFirstInputRecoverySequenceRef = useRef(0);
   const publishRecoveredDraft = useCallback((sessionId: string, recovered: Omit<NonNullable<ControllerState["rejectedFirstInputRecovery"]>, "sessionId" | "eventId">) => {
     const eventId = ++rejectedFirstInputRecoverySequenceRef.current;
-    setState((current) => current.activeProfile?.serverId === draftServerId
+    setState((current) => current.activeProfile !== undefined && current.activeProfile.serverId === draftServerId
       && current.activeProfile.id === draftProfileId
       && (current.route.kind === "session" || current.route.kind === "files")
       && current.route.sessionId === sessionId
