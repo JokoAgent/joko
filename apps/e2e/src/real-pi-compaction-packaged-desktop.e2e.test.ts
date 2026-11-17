@@ -381,6 +381,20 @@ describe("packaged Desktop Pi compaction", () => {
         const types = ["pointerdown", "pointerup", "click"];
         for (const type of types) document.addEventListener(type, capture, true);
         return { events, stop: () => { for (const type of types) document.removeEventListener(type, capture, true); } };
+      }).catch(async (cause: unknown) => {
+        const [view, owner] = await Promise.all([
+          pane.evaluate(element => ({ generation: (element as HTMLElement).dataset.inputSessionGeneration,
+            contextRole: element.querySelector(".context-capacity-ring")?.tagName,
+            contextLabel: element.querySelector(".context-capacity-ring")?.getAttribute("aria-label"),
+            busy: element.querySelector(".compact-action-feedback--busy, .compaction-status") !== null,
+            stopButton: element.querySelector('button[aria-label="Stop"]') !== null
+          }), undefined, { timeout: 2_000 }).catch(() => undefined),
+          manager.clients.session.getSession({ sessionId }, { timeoutMs: 2_000 }).then(({ session }) => ({
+            state: session?.state, generation: session?.nativeBinding?.runtimeGeneration.toString(),
+            usedTokens: session?.context?.usedTokens.toString(), runtimeAttached: session?.nativeBinding?.runtimeAttached
+          })).catch(() => undefined)
+        ]);
+        throw new Error(`The packaged task did not expose its compaction control: ${JSON.stringify({ sessionId, view, owner, conflicts, errors: errors.slice(-6) })}`, { cause });
       });
       try {
         await control.click();
@@ -415,6 +429,7 @@ describe("packaged Desktop Pi compaction", () => {
 
     await send(compactSessionId, "A new Desktop turn is available to summarize.");
     const requestsBeforeSummary = fixture.providerRequests.length;
+    const completedBeforeSummary = (await timelineStates(compactSessionId)).filter(state => state === CompactionState.COMPLETED).length;
     holdNextSummary = true;
     await confirmCompact();
     await waitFor(() => Promise.resolve(fixture!.providerRequests.length), (count) => count > requestsBeforeSummary,
@@ -423,7 +438,8 @@ describe("packaged Desktop Pi compaction", () => {
     releaseSummary?.();
     releasePendingProvider = undefined;
     await waitFor(() => timelineStates(compactSessionId),
-      (states) => states.includes(CompactionState.COMPLETED), "Desktop completed compaction", 30_000);
+      (states) => states.filter(state => state === CompactionState.COMPLETED).length > completedBeforeSummary,
+      "Desktop completed the held compaction", 30_000);
     expect(await page.locator(".compact-action-feedback").count()).toBe(0);
     await route(compactSessionId);
     await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
