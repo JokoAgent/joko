@@ -275,7 +275,8 @@ mountedIt("edits the same original image in task and new-task drafts, restores v
     expect(item!.body.images).toHaveLength(1);
     const image = await artifacts.readBlob(item!.body.images[0]!.blob);
     const pixel = await page.evaluate(async base64 => {
-      const bitmap = await createImageBitmap(await (await fetch("data:image/png;base64," + base64)).blob());
+      const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
       const canvas = document.createElement("canvas"); canvas.width = bitmap.width; canvas.height = bitmap.height;
       const context = canvas.getContext("2d")!; context.drawImage(bitmap, 0, 0); bitmap.close();
       return [...context.getImageData(canvas.width / 2, canvas.height / 2, 1, 1).data];
