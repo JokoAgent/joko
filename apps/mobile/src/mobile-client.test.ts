@@ -1,6 +1,6 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
-import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema } from "@joko/contracts";
+import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema, MessageBlockSchema, MessageCompletedEventSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
 import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
@@ -104,7 +104,8 @@ import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { MobileExtensionLibrarySession } from "./mobile-extension-library-runtime";
 import type { MobileVoiceCapability, MobileVoiceSession } from "./mobile-voice-input";
 import { timelineRows } from "./timeline";
-import { buildMobileMessageDeepLink, executeMobileNativeIntent, MobileNativeIntentDelivery, projectMobileNativeIntentSnapshot } from "./mobile-native-intent";
+import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, executeMobileNativeIntent, MobileNativeIntentDelivery, projectMobileNativeIntentSnapshot } from "./mobile-native-intent";
+import { MobileCopyLinkWriter, claimMobileCopyLinkAuthority } from "./mobile-copy-link";
 import { findMobileConversationSearchHits } from "./mobile-conversation-search";
 import {
   insertMobileArtifactMention,
@@ -8477,6 +8478,56 @@ describe("native mobile connection and operation ownership", () => {
     await expect(app.older()).rejects.toThrow(/cyclic/);
     app.latest();
     expect(app.state.window).toBeUndefined();
+  });
+
+  it.each([false, true])("copies from authenticated A, switches to B, and reopens only A through the real Mobile client (message=%s)", async message => {
+    const network = fakeNetwork();
+    const b: PairedCredential = { ...otherCredential, serverId: "node-B", origin: "http://192.168.1.21:4318" };
+    const reply = create(EventSchema, { ...event("source-answer", 9n), payload: create(EventPayloadSchema, {
+      kind: { case: "messageCompleted", value: create(MessageCompletedEventSchema, { messageId: "source-message", role: MessageRole.ASSISTANT,
+        blocks: [create(MessageBlockSchema, { content: { case: "text", value: "The reply on A" } })] }) }
+    }) });
+    const aSnapshot = create(SnapshotSchema, { ...snapshot, timeline: [reply] });
+    const bSnapshot = create(SnapshotSchema, { ...snapshot, server: { ...snapshot.server!, serverId: b.serverId },
+      connections: [otherConnection], devices: [otherDevice], sessions: [], timeline: [] });
+    vi.mocked(network.inspect).mockImplementation(async origin => origin === b.origin ? { ...node, serverId: b.serverId } : node);
+    vi.mocked(network.readOwner).mockImplementation(async key => key.profileId === b.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: bSnapshot } : { connection, device, snapshot: aSnapshot });
+    vi.mocked(network.readSession).mockImplementation(async key => {
+      if (key.profileId !== credential.profileId) throw new Error("The original task is absent on B.");
+      return aSnapshot;
+    });
+    const app = client(network, memoryStorage([credential, b]).storage);
+    await app.start();
+    const authority = claimMobileCopyLinkAuthority(projectMobileNativeIntentSnapshot(app.state), { sessionId: "session",
+      requiresSelectedSession: message, ...(message ? { messageId: "source-message", messageEventId: reply.eventId } : {}) });
+    expect(authority?.serverId).toBe(credential.serverId);
+    const url = message ? buildMobileMessageDeepLink("session", "source-message", reply.eventId, authority!.serverId)
+      : buildMobileTaskDeepLink("session", authority!.serverId);
+    const writeText = vi.fn(async () => undefined);
+    await expect(new MobileCopyLinkWriter({ writeText }).copy(url)).resolves.toBe("copied");
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(url);
+    expect(url).not.toContain(credential.origin); expect(url).not.toContain(credential.authKey); expect(url).not.toContain("profile=");
+    await app.connectSaved(b.profileId);
+    expect(app.state.activeProfileId).toBe(b.profileId);
+    expect(app.state.owner?.sessions).toEqual([]);
+    vi.mocked(network.readSession).mockClear();
+    const delivery = new MobileNativeIntentDelivery();
+    expect(delivery.offer(url)).toBe(true);
+    const claim = delivery.take()!, focus = vi.fn(), recovery = vi.fn();
+    await expect(executeMobileNativeIntent(claim, delivery, {
+      snapshot: () => projectMobileNativeIntentSnapshot(app.state), connectProfile: profileId => app.connectSaved(profileId),
+      selectSession: sessionId => app.select(sessionId), loadAround: eventId => app.around(eventId), loadOlder: () => app.older(),
+      returnLatest: () => app.latest(), showPage: vi.fn(), showSavedConnections: vi.fn(), showRecovery: recovery,
+      clearRecovery: vi.fn(), focusMessage: focus, clearMessageFocus: vi.fn(), focusApplication: vi.fn()
+    })).resolves.toBe(message ? "message" : "session");
+    expect(app.state.activeProfileId).toBe(credential.profileId);
+    expect(app.state.selectedId).toBe("session");
+    expect(network.readSession).toHaveBeenCalled();
+    expect(vi.mocked(network.readSession).mock.calls.every(call => call[0].profileId === credential.profileId)).toBe(true);
+    expect(recovery).not.toHaveBeenCalled();
+    if (message) expect(focus).toHaveBeenCalledWith({ requestId: claim.sequence, sessionId: "session", messageId: "source-message", messageEventId: reply.eventId });
+    else expect(focus).not.toHaveBeenCalled();
   });
 
   it("opens a copied old message link and reads every newer page through the latest message", async () => {

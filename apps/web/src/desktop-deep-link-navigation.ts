@@ -21,6 +21,7 @@ export function desktopDeepLinkRouteHash(
     kind: "session",
     sessionId: navigation.sessionId,
     ...(navigation.profileId === undefined ? {} : { profileId: navigation.profileId }),
+    ...(navigation.serverId === undefined ? {} : { serverId: navigation.serverId }),
     ...(navigation.messageId === undefined ? {} : { messageId: navigation.messageId }),
     ...(navigation.messageEventId === undefined ? {} : { messageEventId: navigation.messageEventId })
   });
@@ -32,6 +33,7 @@ export function desktopDeepLinkAppRoute(navigation: RouteDesktopDeepLinkNavigati
     kind: "session",
     sessionId: navigation.sessionId,
     ...(navigation.profileId === undefined ? {} : { profileId: navigation.profileId }),
+    ...(navigation.serverId === undefined ? {} : { serverId: navigation.serverId }),
     ...(navigation.messageId === undefined ? {} : { messageId: navigation.messageId }),
     ...(navigation.messageEventId === undefined ? {} : { messageEventId: navigation.messageEventId })
   };
@@ -45,6 +47,7 @@ export function desktopDeepLinkNavigationMatchesRoute(
   return route.kind === "session"
     && route.sessionId === navigation.sessionId
     && (navigation.profileId === undefined || route.profileId === navigation.profileId)
+    && route.serverId === navigation.serverId
     && route.messageId === navigation.messageId
     && route.messageEventId === navigation.messageEventId;
 }

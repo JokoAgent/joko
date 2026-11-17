@@ -576,6 +576,7 @@ export type DesktopDeepLinkNavigation =
       readonly kind: "session";
       readonly sessionId: string;
       readonly profileId?: string;
+      readonly serverId?: string;
       readonly messageId?: string;
       readonly messageEventId?: string;
     }

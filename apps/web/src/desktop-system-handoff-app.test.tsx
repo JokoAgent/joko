@@ -49,6 +49,20 @@ afterEach(async () => {
 });
 
 describe("Desktop system handoff App boundary", () => {
+  it.each([false, true])("does not display or read a same-ID task from the previous public node (local profile=%s)", async localProfile => {
+    const task = session("same-task");
+    const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] }));
+    const previous = connectedState({ sessions: [task], route: { kind: "session", sessionId: task.id,
+      serverId: "original-node", ...(localProfile ? { profileId: "profile-a" } : {}), messageId: "source-message" } });
+    const fixture = renderApp(previous, { loadSessionTimelinePage });
+    await fixture.render();
+    expect(fixture.container.textContent).toContain("Connecting to Joko");
+    expect(loadSessionTimelinePage).not.toHaveBeenCalled();
+    await fixture.render({ ...previous, error: "The task link's source is unavailable or ambiguous. Select its saved connection." });
+    expect(fixture.container.textContent).toContain("source is unavailable or ambiguous");
+    expect(loadSessionTimelinePage).not.toHaveBeenCalled();
+  });
+
   it("renders explicit recovery when an ownerless linked task is unavailable", async () => {
     const fixture = renderApp(connectedState({ route: { kind: "session", sessionId: "missing-task" } }));
     await fixture.render();

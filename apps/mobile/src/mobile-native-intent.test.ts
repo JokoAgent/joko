@@ -24,6 +24,63 @@ import {
 } from "./mobile-native-intent";
 
 describe("mobile public native intents", () => {
+  it("round-trips an exact public source without a local profile, address or credential", () => {
+    const task = buildMobileTaskDeepLink("task", "node / 一");
+    const message = buildMobileMessageDeepLink("task", "message", "event", "node / 一");
+    expect(parseMobileNativeIntent(task)).toEqual({ kind: "session", sessionId: "task", serverId: "node / 一" });
+    expect(parseMobileNativeIntent(message)).toEqual({ kind: "session", sessionId: "task", messageId: "message", messageEventId: "event", serverId: "node / 一" });
+    expect(message).toBe("joko://task/task?message=message&event=event&server=node%20%2F%20%E4%B8%80");
+    for (const suffix of ["server=", "server=a&server=b", "server=%0A", `server=${"x".repeat(257)}`]) {
+      expect(parseMobileNativeIntent(`joko://task/task?${suffix}`)).toBeUndefined();
+    }
+  });
+
+  it.each([false, true])("returns a source-bearing copied link from B to saved A (message=%s)", async message => {
+    const sources = [{ profileId: "local-A", serverId: "node-A" }, { profileId: "local-B", serverId: "node-B" }];
+    const url = message ? buildMobileMessageDeepLink("task", "message", "event", "node-A") : buildMobileTaskDeepLink("task", "node-A");
+    const f = harness(url, snapshot({ status: "connected", activeProfileId: "local-B", savedProfileIds: sources.map(source => source.profileId),
+      savedSources: sources, sessionIds: ["task"], selectedSessionId: "task", messages: [{ messageId: "wrong-B", eventId: "wrong-B" }] }));
+    f.fake.onConnect = profileId => { f.fake.state = snapshot({ ...f.fake.state, activeProfileId: profileId,
+      messages: [{ messageId: "message", eventId: "event" }] }); };
+    await expect(executeMobileNativeIntent(f.claim, f.delivery, f.runtime)).resolves.toBe(message ? "message" : "session");
+    expect(f.fake.connectProfile).toHaveBeenCalledExactlyOnceWith("local-A");
+    expect(f.fake.selectSession).toHaveBeenCalledExactlyOnceWith("task");
+    expect(f.fake.messageFocus?.messageId).toBe(message ? "message" : undefined);
+    expect(f.fake.recoveries).toEqual([]);
+  });
+
+  it.each(["missing", "ambiguous", "conflicting profile"] as const)("does not contact any node for a %s source", async condition => {
+    const sources = [{ profileId: "B", serverId: "node-B" }, ...(condition === "missing" ? [] : [
+      { profileId: "A", serverId: "node-A" }, ...(condition === "ambiguous" ? [{ profileId: "A2", serverId: "node-A" }] : [])])];
+    const f = harness(`joko://task/task?server=node-A${condition === "conflicting profile" ? "&profile=B" : ""}`,
+      snapshot({ status: "connected", activeProfileId: "B", savedProfileIds: sources.map(source => source.profileId), savedSources: sources, sessionIds: ["task"] }));
+    await expect(executeMobileNativeIntent(f.claim, f.delivery, f.runtime)).resolves.toBe("profile-unavailable");
+    expect(f.fake.connectProfile).not.toHaveBeenCalled(); expect(f.fake.selectSession).not.toHaveBeenCalled();
+    expect(f.fake.loadAround).not.toHaveBeenCalled(); expect(f.fake.loadOlder).not.toHaveBeenCalled();
+  });
+
+  it("uses an already active matching saved credential and rejects source replacement during connection or history adoption", async () => {
+    const sources = [{ profileId: "A", serverId: "node-A" }, { profileId: "A2", serverId: "node-A" }, { profileId: "B", serverId: "node-B" }];
+    const base = snapshot({ status: "connected", activeProfileId: "A", savedProfileIds: sources.map(source => source.profileId), savedSources: sources, sessionIds: ["task"], selectedSessionId: "task" });
+    const active = harness(buildMobileTaskDeepLink("task", "node-A"), base);
+    await expect(executeMobileNativeIntent(active.claim, active.delivery, active.runtime)).resolves.toBe("session");
+    expect(active.fake.connectProfile).not.toHaveBeenCalled();
+    const connecting = harness("joko://task/task?profile=A&server=node-A", snapshot({ ...base, activeProfileId: "B" }));
+    connecting.fake.onConnect = () => { connecting.fake.state = snapshot({ ...base,
+      savedSources: sources.map(source => source.profileId === "A" ? { ...source, serverId: "replacement" } : source) }); };
+    await expect(executeMobileNativeIntent(connecting.claim, connecting.delivery, connecting.runtime)).resolves.toBe("profile-connect-failed");
+    expect(connecting.fake.selectSession).not.toHaveBeenCalled();
+    const history = harness(buildMobileMessageDeepLink("task", "message", "event", "node-A"), base);
+    history.fake.onAround = () => { history.fake.state = snapshot({ ...base, savedSources: [], messages: [{ messageId: "message", eventId: "event" }] }); };
+    await expect(executeMobileNativeIntent(history.claim, history.delivery, history.runtime)).resolves.toBe("retired");
+    expect(history.fake.messageFocus).toBeUndefined();
+    const delivery = new MobileNativeIntentDelivery();
+    expect(delivery.offer(buildMobileTaskDeepLink("task", "node-A"), 1)).toBe(true);
+    const old = delivery.take()!;
+    expect(delivery.offer(buildMobileTaskDeepLink("task", "node-B"), 2)).toBe(true);
+    expect(delivery.isCurrent(old)).toBe(false);
+  });
+
   it("parses the bounded group handoff and rejects task-only query fields", () => {
     expect(parseMobileNativeIntent("joko://partner-group/group-one")).toEqual({ kind: "group", groupId: "group-one" });
     expect(parseMobileNativeIntent("joko://partner-group/group-one?profile=node-one")).toEqual({ kind: "group", groupId: "group-one", profileId: "node-one" });
@@ -593,6 +650,7 @@ function snapshot(
     status: input.status,
     ...(input.activeProfileId === undefined ? {} : { activeProfileId: input.activeProfileId }),
     savedProfileIds: input.savedProfileIds ?? [],
+    ...(input.savedSources === undefined ? {} : { savedSources: input.savedSources }),
     sessionIds: input.sessionIds ?? [],
     ...(input.selectedSessionId === undefined ? {} : { selectedSessionId: input.selectedSessionId }),
     messages: input.messages ?? [],

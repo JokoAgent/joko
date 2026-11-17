@@ -1481,7 +1481,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     setCopyNotice("");
     setLocalError("");
     try {
-      const result = await mobileCopyLinks.copy(buildMobileTaskDeepLink(authority.sessionId));
+      if (authority.serverId === undefined) throw new Error("The task source is unavailable.");
+      const result = await mobileCopyLinks.copy(buildMobileTaskDeepLink(authority.sessionId, authority.serverId));
       if (!mountedRef.current || copyGenerationRef.current !== request) return;
       if (!mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))) return;
       if (result === "busy") setLocalError(mobileMessage(locale, "actions.copyLinkBusy"));
@@ -6112,9 +6113,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     setComposerNotice("");
     setLocalError("");
     try {
+      if (authority.serverId === undefined) throw new Error("The task source is unavailable.");
       const link = authority.messageId === undefined
-        ? buildMobileTaskDeepLink(authority.sessionId)
-        : buildMobileMessageDeepLink(authority.sessionId, authority.messageId, authority.messageEventId);
+        ? buildMobileTaskDeepLink(authority.sessionId, authority.serverId)
+        : buildMobileMessageDeepLink(authority.sessionId, authority.messageId, authority.messageEventId, authority.serverId);
       const result = await mobileCopyLinks.copy(link);
       if (!taskMountedRef.current || copyGenerationRef.current !== request) return;
       if (!mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state))) return;

@@ -683,6 +683,9 @@ describe("actual Home navigation hosts", () => {
   });
 
   it("retains original Home options, copy feedback and unknown receipt controls in the embedded host", async () => {
+    state = { ...state, saved: [{ profileId: "profile", origin: "https://node.example", serverId: "node",
+      connectionId: homeConnectionId, deviceId: "phone", displayName: "Node", credentialState: "available",
+      automatic: false, pendingOperations: [] }] };
     await render({ state: { ...state, pending: [{ operationId: "pin-receipt", kind: "pin", state: "unknown",
       connectionId: homeConnectionId, sessionId: "current" }] } });
     expect(host.textContent).toContain("pin-receipt"); await press(message("receipt.check"));
@@ -696,7 +699,7 @@ describe("actual Home navigation hosts", () => {
     await type(message("home.taskName"), "Renamed"); await press(message("common.rename"));
     expect(renameSession).toHaveBeenCalledExactlyOnceWith("current", "Renamed");
     await option(message("actions.copyTaskLink"));
-    expect(writeClipboard).toHaveBeenCalledExactlyOnceWith("joko://task/current");
+    expect(writeClipboard).toHaveBeenCalledExactlyOnceWith("joko://task/current?server=node");
     expect(host.textContent).toContain(message("actions.taskLinkCopied"));
     expect(runNavigation).not.toHaveBeenCalled(); expect(select).not.toHaveBeenCalled();
   });

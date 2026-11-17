@@ -939,6 +939,8 @@ it("reads newer history at the end of a linked window without returning to lates
 
 it("copies the adopted Pi entry from the message menu after withholding the temporary link", async () => {
   sendFollowSourceKey = "task-source";
+  const saved = [{ profileId: "profile", origin: "https://node.example", serverId: "node", connectionId: "connection",
+    deviceId: "phone", displayName: "Node", credentialState: "available" as const, automatic: false, pendingOperations: [] }];
   const identity = { sessionId: session.sessionId, backendId: "pi", targetId: session.targetId, runId: "run", generation: 1n };
   const running = create(SnapshotSchema, { sessions: [create(SessionSchema, { ...session, backendId: "pi", state: SessionState.RUNNING })] });
   const answer = create(EventSchema, {
@@ -947,7 +949,7 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
       blocks: [{ content: { case: "text", value: "A Pi reply" } }] } } },
     pi: { payload: { case: "messageLifecycle", value: { kind: PiMessageLifecycleKind.MESSAGE_END } } }
   });
-  renderedState = { ...state, owner: running, detail: running, live: [answer] };
+  renderedState = { ...state, saved, owner: running, detail: running, live: [answer] };
   const more = () => Array.from(host.querySelectorAll("button")).find(button => button.getAttribute("aria-label")
     === mobileMessage("en", "task.moreFor", { name: "Assistant" }));
   await act(async () => root.render(taskScreen()));
@@ -965,12 +967,12 @@ it("copies the adopted Pi entry from the message menu after withholding the temp
       nativeIdentity: create(NativeMessageIdentitySchema, { entryId: "native-entry" }) } } }) });
   const settled = create(SnapshotSchema, { ...running,
     sessions: [create(SessionSchema, { ...running.sessions[0]!, state: SessionState.IDLE })], timeline: [adopted] });
-  renderedState = { ...state, owner: settled, detail: settled };
+  renderedState = { ...state, saved, owner: settled, detail: settled };
   await act(async () => root.render(taskScreen()));
   await act(async () => more()!.click());
   expect(taskMessageActions?.items.map(item => item.id)).toContain("copy-link");
   await act(async () => taskMessageActions!.onAction("copy-link"));
-  expect(writeClipboard).toHaveBeenCalledExactlyOnceWith("joko://task/session?message=native-entry&event=adopted-completion");
+  expect(writeClipboard).toHaveBeenCalledExactlyOnceWith("joko://task/session?message=native-entry&event=adopted-completion&server=node");
 });
 
 it.each(["same request", "resolved while reconnecting"] as const)("retains the original question draft across a transient empty task (%s)", async outcome => {

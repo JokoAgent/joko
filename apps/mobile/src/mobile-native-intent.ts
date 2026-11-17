@@ -1,6 +1,7 @@
 import type { MobileState } from "./mobile-client";
 import type { MobileHomeSearchMatch } from "./home-navigation";
 import { timelineRows } from "./timeline";
+import { taskLinkSourceProfileId } from "@joko/contracts";
 
 export const mobileNativeIntentMaximumCharacters = 4_096;
 export const mobileNativeIntentIdentityMaximumCharacters = 256;
@@ -13,6 +14,7 @@ export type MobileNativeIntent =
       readonly kind: "session";
       readonly sessionId: string;
       readonly profileId?: string;
+      readonly serverId?: string;
       readonly messageId?: string;
       readonly messageEventId?: string;
     }
@@ -45,6 +47,7 @@ export interface MobileNativeIntentSnapshot {
   readonly status: MobileState["status"];
   readonly activeProfileId?: string;
   readonly savedProfileIds: readonly string[];
+  readonly savedSources?: readonly { readonly profileId: string; readonly serverId: string }[];
   readonly sessionIds: readonly string[];
   readonly selectedSessionId?: string;
   readonly messages: readonly {
@@ -146,18 +149,19 @@ export function parseMobileNativeIntent(value: unknown): MobileNativeIntent | un
   return undefined;
 }
 
-/** Build the public, portable task handoff. Device-local profile identity is intentionally omitted. */
-export function buildMobileTaskDeepLink(sessionId: string): string {
-  return buildMobileSessionDeepLink({ sessionId });
+/** Build the public task handoff using only its public node identity when known. */
+export function buildMobileTaskDeepLink(sessionId: string, serverId?: string): string {
+  return buildMobileSessionDeepLink({ sessionId, ...(serverId === undefined ? {} : { serverId }) });
 }
 
 /** Build a public task handoff anchored to one exact durable message and, when known, its Event. */
 export function buildMobileMessageDeepLink(
   sessionId: string,
   messageId: string,
-  messageEventId?: string
+  messageEventId?: string,
+  serverId?: string
 ): string {
-  return buildMobileSessionDeepLink({ sessionId, messageId, messageEventId });
+  return buildMobileSessionDeepLink({ sessionId, messageId, messageEventId, ...(serverId === undefined ? {} : { serverId }) });
 }
 
 /**
@@ -237,6 +241,7 @@ export function projectMobileNativeIntentSnapshot(state: MobileState): MobileNat
     status: state.status,
     ...(state.activeProfileId === undefined ? {} : { activeProfileId: state.activeProfileId }),
     savedProfileIds: Object.freeze(state.saved.map((profile) => profile.profileId)),
+    savedSources: Object.freeze(state.saved.map(({ profileId, serverId }) => Object.freeze({ profileId, serverId }))),
     sessionIds: Object.freeze((state.owner?.sessions ?? []).map((session) => session.sessionId)),
     ...(state.selectedId === undefined ? {} : { selectedSessionId: state.selectedId }),
     messages: Object.freeze(messages),
@@ -280,11 +285,14 @@ export async function executeMobileNativeIntent(
   }
 
   let snapshot = runtime.snapshot();
-  const profileId = resolveProfileId(snapshot, intent.profileId);
+  const serverId = intent.kind === "session" ? intent.serverId : undefined;
+  const profileId = resolveProfileId(snapshot, intent.profileId, serverId);
   if (profileId === undefined) {
-    return recoverConnection(runtime, intent.profileId === undefined ? "connection-required" : "profile-unavailable");
+    return recoverConnection(runtime, intent.profileId === undefined && serverId === undefined ? "connection-required" : "profile-unavailable");
   }
-  if (snapshot.activeProfileId !== profileId || (snapshot.status !== "connected" && snapshot.status !== "offline")) {
+  const profileMatches = (value: MobileNativeIntentSnapshot): boolean => value.activeProfileId === profileId
+    && (serverId === undefined || resolveProfileId(value, profileId, serverId) === profileId);
+  if (!profileMatches(snapshot) || (snapshot.status !== "connected" && snapshot.status !== "offline")) {
     runtime.showSavedConnections();
     try { await runtime.connectProfile(profileId); }
     catch {
@@ -294,7 +302,7 @@ export async function executeMobileNativeIntent(
   }
   if (!current()) return "retired";
   snapshot = runtime.snapshot();
-  if (snapshot.activeProfileId !== profileId || (snapshot.status !== "connected" && snapshot.status !== "offline")) {
+  if (!profileMatches(snapshot) || (snapshot.status !== "connected" && snapshot.status !== "offline")) {
     return recoverConnection(runtime, "profile-connect-failed");
   }
   if (intent.kind === "group") {
@@ -315,7 +323,7 @@ export async function executeMobileNativeIntent(
   }
   if (!current()) return "retired";
   snapshot = runtime.snapshot();
-  if (snapshot.activeProfileId !== profileId || snapshot.selectedSessionId !== intent.sessionId
+  if (!profileMatches(snapshot) || snapshot.selectedSessionId !== intent.sessionId
     || snapshot.sessionIds.filter((sessionId) => sessionId === intent.sessionId).length !== 1) {
     return recoverSession(runtime, "session-unavailable");
   }
@@ -333,6 +341,7 @@ export async function executeMobileNativeIntent(
     }
     if (!current()) return "retired";
     snapshot = runtime.snapshot();
+    if (serverId !== undefined && (!profileMatches(snapshot) || snapshot.selectedSessionId !== intent.sessionId)) return "retired";
     // loadAround already proves the requested anchor event belongs to this Session. The
     // rendered message row may use its started or completed event as its own identity.
     message = exactMessage(snapshot, intent.messageId, undefined);
@@ -347,11 +356,14 @@ export async function executeMobileNativeIntent(
       }
       if (!current()) return "retired";
       snapshot = runtime.snapshot();
+      if (serverId !== undefined && (!profileMatches(snapshot) || snapshot.selectedSessionId !== intent.sessionId)) return "retired";
       message = exactMessage(snapshot, intent.messageId, undefined);
       if (message !== undefined || snapshot.historyEnd || snapshot.historyKey === previousHistoryKey) break;
     }
   }
   if (!current()) return "retired";
+  snapshot = runtime.snapshot();
+  if (serverId !== undefined && (!profileMatches(snapshot) || snapshot.selectedSessionId !== intent.sessionId)) return "retired";
   if (message === undefined) {
     runtime.returnLatest();
     return recoverMessage(runtime);
@@ -374,18 +386,20 @@ export function mobileNativeIntentMessageMatches(
 }
 
 function parseSessionIntent(url: URL): Extract<MobileNativeIntent, { readonly kind: "session" }> | undefined {
-  if (!exactQuery(url, ["event", "message", "profile"])) return undefined;
+  if (!exactQuery(url, ["event", "message", "profile", "server"])) return undefined;
   const sessionId = oneEncodedPathComponent(url.pathname);
   if (!boundedIdentity(sessionId)) return undefined;
   const profileId = optionalIdentityQuery(url, "profile");
+  const serverId = optionalIdentityQuery(url, "server");
   const messageId = optionalIdentityQuery(url, "message");
   const messageEventId = optionalIdentityQuery(url, "event");
-  if (profileId === false || messageId === false || messageEventId === false
+  if (profileId === false || serverId === false || messageId === false || messageEventId === false
     || (messageEventId !== undefined && messageId === undefined)) return undefined;
   return Object.freeze({
     kind: "session",
     sessionId,
     ...(profileId === undefined ? {} : { profileId }),
+    ...(serverId === undefined ? {} : { serverId }),
     ...(messageId === undefined ? {} : { messageId }),
     ...(messageEventId === undefined ? {} : { messageEventId })
   });
@@ -393,10 +407,12 @@ function parseSessionIntent(url: URL): Extract<MobileNativeIntent, { readonly ki
 
 function buildMobileSessionDeepLink(input: {
   readonly sessionId: string;
+  readonly serverId?: string;
   readonly messageId?: string;
   readonly messageEventId?: string;
 }): string {
   if (!boundedIdentity(input.sessionId)
+    || (input.serverId !== undefined && !boundedIdentity(input.serverId))
     || (input.messageId !== undefined && !boundedIdentity(input.messageId))
     || (input.messageEventId !== undefined && !boundedIdentity(input.messageEventId))
     || (input.messageEventId !== undefined && input.messageId === undefined)) {
@@ -406,11 +422,13 @@ function buildMobileSessionDeepLink(input: {
     ? ""
     : `?message=${encodeURIComponent(input.messageId)}${input.messageEventId === undefined
       ? "" : `&event=${encodeURIComponent(input.messageEventId)}`}`;
-  const value = `joko://task/${encodeURIComponent(input.sessionId)}${query}`;
+  const source = input.serverId === undefined ? "" : `${query === "" ? "?" : "&"}server=${encodeURIComponent(input.serverId)}`;
+  const value = `joko://task/${encodeURIComponent(input.sessionId)}${query}${source}`;
   const parsed = parseMobileNativeIntent(value);
   if (parsed?.kind !== "session"
     || parsed.sessionId !== input.sessionId
     || parsed.profileId !== undefined
+    || parsed.serverId !== input.serverId
     || parsed.messageId !== input.messageId
     || parsed.messageEventId !== input.messageEventId) {
     throw new Error("The public Joko task link exceeds its canonical handoff boundary.");
@@ -462,16 +480,16 @@ function mobileNativeIntentFingerprint(intent: MobileNativeIntent): string {
   if (intent.kind === "settings") return "settings";
   if (intent.kind === "focus") return `focus\u001f${intent.source ?? ""}`;
   if (intent.kind === "group") return ["group", intent.groupId, intent.profileId ?? ""].join("\u001f");
-  return ["session", intent.sessionId, intent.profileId ?? "", intent.messageId ?? "", intent.messageEventId ?? ""]
+  return ["session", intent.sessionId, intent.profileId ?? "", intent.messageId ?? "", intent.messageEventId ?? "", intent.serverId ?? ""]
     .join("\u001f");
 }
 
-function resolveProfileId(snapshot: MobileNativeIntentSnapshot, explicitProfileId: string | undefined): string | undefined {
-  const candidate = explicitProfileId ?? snapshot.activeProfileId;
-  if (candidate === undefined) return undefined;
-  return snapshot.savedProfileIds.filter((profileId) => profileId === candidate).length === 1
-    ? candidate
-    : undefined;
+function resolveProfileId(snapshot: MobileNativeIntentSnapshot, explicitProfileId: string | undefined, serverId?: string): string | undefined {
+  const profiles = snapshot.savedProfileIds.map(profileId => {
+    const sources = snapshot.savedSources?.filter(source => source.profileId === profileId);
+    return { profileId, serverId: sources?.length === 1 ? sources[0]!.serverId : "" };
+  });
+  return taskLinkSourceProfileId(profiles, snapshot.activeProfileId, explicitProfileId, serverId);
 }
 
 function exactMessage(

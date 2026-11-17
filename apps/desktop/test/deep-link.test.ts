@@ -21,6 +21,14 @@ import {
 } from "../src/deep-link.js";
 
 describe("Desktop public deep links", () => {
+  it("accepts the public node identity in a copied Mobile task link without a local profile or address", () => {
+    const value = "joko://task/task?message=message&event=event&server=node-A";
+    expect(parseDesktopDeepLink(value)).toEqual({ kind: "session", sessionId: "task", messageId: "message", messageEventId: "event", serverId: "node-A" });
+    expect(parseDesktopDeepLink(buildDesktopSessionDeepLink({ sessionId: "task", serverId: "node-A" })))
+      .toEqual({ kind: "session", sessionId: "task", serverId: "node-A" });
+    for (const query of ["server=", "server=a&server=b", "server=%0A"]) expect(parseDesktopDeepLink(`joko://task/task?${query}`)).toBeUndefined();
+  });
+
   it('delivers an exact review link without granting approval or accepting additional actions', () => {
     const link = formatDeviceAuthorizationReview({ serverId: 'node', endpointPublicKey: `ed25519:${'a'.repeat(64)}`,
       invitationId: '11111111-1111-4111-8111-111111111111', requestId: '22222222-2222-4222-8222-222222222222' });

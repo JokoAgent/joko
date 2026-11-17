@@ -895,6 +895,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (state.connectionState === "connecting") return undefined;
     if (state.route.kind === "session" && state.route.profileId !== undefined
       && state.route.profileId !== state.activeProfile?.id) return undefined;
+    if (state.route.kind === "session" && state.route.serverId !== undefined
+      && state.route.serverId !== state.activeProfile?.serverId) return undefined;
     const sessionId = state.route.sessionId;
     if (sessionId !== undefined) return sessionForTaskRoute(state, sessionId);
     return [...state.snapshot.sessions].filter((session) => !session.archived && !session.hidden).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt)[0];
@@ -907,9 +909,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const explicitSessionOwnerPending = state.route.kind === "session"
     && !backgroundTaskRoute
     && state.route.sessionId !== undefined
-    && state.route.profileId !== undefined
+    && (state.route.profileId !== undefined || state.route.serverId !== undefined)
     && state.error === undefined
-    && (state.route.profileId !== state.activeProfile?.id
+    && (state.route.profileId !== undefined && state.route.profileId !== state.activeProfile?.id
+      || state.route.serverId !== undefined && state.route.serverId !== state.activeProfile?.serverId
       || state.connectionState !== "connected");
   useEffect(() => {
     setObjectiveDialogHandoff((request) => {
@@ -2631,7 +2634,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
                   navigationOpen={navigationOpen}
                   linkedSessionRecoveryBody={state.route.sessionId === undefined
                     ? undefined
-                    : state.route.profileId === undefined
+                    : state.route.profileId === undefined && state.route.serverId === undefined
                       ? t("nav.linkedTaskRecovery")
                       : state.error ?? t("nav.linkedTaskUnavailable")}
                   t={t}
