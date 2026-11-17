@@ -12637,7 +12637,7 @@ describe("native current-task cloning", () => {
     const f = fixture(true);
     const sibling = (id: string) => create(SessionSchema, { ...f.child(), sessionId: id, displayName: id,
       nativeBinding: { ...f.child().nativeBinding!, opaqueReference: `native-${id}` },
-      derivationOrigin: { ...f.child().derivationOrigin!, sourceSessionAvailable: true } });
+      derivationOrigin: { ...f.child().derivationOrigin!, sourceSessionAvailable: true, sourceMessageAvailable: false } });
     const first = sibling("side-one"), second = sibling("side-two");
     const elsewhere = sibling("other-parent-side");
     elsewhere.derivationOrigin!.sourceSessionId = "another-parent";

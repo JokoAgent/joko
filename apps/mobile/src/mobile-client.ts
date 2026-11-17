@@ -14170,12 +14170,17 @@ export class MobileClient {
     const sessions = this.#state.owner!.sessions;
     const origin = session.derivationOrigin;
     const parent = origin?.sideChat ? sessions.find(candidate => candidate.sessionId === origin.sourceSessionId) : session;
-    const lineage = origin?.sideChat ? this.taskDerivationOriginControls() : undefined;
-    if (!parent || parent.derivationOrigin?.sideChat || parent.backendId !== session.backendId || parent.targetId !== session.targetId
-      || (origin?.sideChat ? !lineage?.canOpen || lineage.source?.sessionId !== parent.sessionId : session.sideChatSourceAllowed !== true)) return undefined;
+    if (!parent || parent.derivationOrigin?.sideChat || parent.backendId !== session.backendId || parent.targetId !== session.targetId) return undefined;
+    let surfaceOwnerKey = context.controls.surfaceOwnerKey;
+    if (origin?.sideChat) {
+      const ownerOrigin = sessions.find(candidate => candidate.sessionId === session.sessionId)?.derivationOrigin;
+      const routeOwner = this.taskPresentationOwnerKey();
+      if (!routeOwner || !origin.sourceSessionAvailable || ownerOrigin?.sideChat !== true || !ownerOrigin.sourceSessionAvailable
+        || ownerOrigin.sourceSessionId !== parent.sessionId) return undefined;
+      surfaceOwnerKey = JSON.stringify([surfaceOwnerKey, routeOwner, mobileSessionOriginSessionKey(parent)]);
+    } else if (session.sideChatSourceAllowed !== true) return undefined;
     return { ...context.controls, sourceSessionId: parent.sessionId, sourceName: parent.displayName,
-      surfaceOwnerKey: lineage?.authorityKey === undefined ? context.controls.surfaceOwnerKey
-        : JSON.stringify([context.controls.surfaceOwnerKey, lineage.authorityKey]),
+      surfaceOwnerKey,
       canOpen: parent === session && context.canDerive && !session.archived,
       children: sessions.filter(child => child.sessionId !== session.sessionId && child.backendId === parent.backendId && child.targetId === parent.targetId
         && child.derivationOrigin?.sideChat && child.derivationOrigin.sourceSessionId === parent.sessionId) };
