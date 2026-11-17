@@ -27,8 +27,8 @@ export interface HostedAgentProviderGrant {
   readonly assertCurrent: () => void;
 }
 export type HostedAgentOpen = HostedNativeOpen;
-export interface HostedAgentPollCursor { readonly runId: string; readonly after: number }
-export interface HostedAgentPollRun { readonly runId: string; readonly cursor: number; readonly finished: boolean; readonly frames: readonly HostedAgentFrame[] }
+export interface HostedAgentPollCursor { readonly runId: string; readonly after: number; readonly holdsNative?: boolean }
+export interface HostedAgentPollRun { readonly runId: string; readonly cursor: number; readonly finished: boolean; readonly frames: readonly HostedAgentFrame[]; readonly idleReclaimed?: boolean }
 type AuthorizedRun = Omit<HostedAgentRunOptions, "runId" | "nativeSessionId" | "start" | "source" | "trust" | "backendId" | "providerId" | "modelId" | "name" | "permissionMode" | "fastMode" | "effort" | "workspace" | "onCreated">;
 export interface HostedAgentHostOptions {
   readonly readWorkflowProgress?: (principal: HostedAgentPrincipal, command: HostedWorkflowProgressCommand, signal: AbortSignal) => Promise<HostedWorkflowProgressResult>;
@@ -37,6 +37,7 @@ export interface HostedAgentHostOptions {
   readonly infer?: (principal: HostedAgentPrincipal, request: HostedNativeInferenceRequest, signal: AbortSignal) => Promise<string>;
   readonly authorize: (principal: HostedAgentPrincipal, input: HostedAgentOpen) => AuthorizedRun | Promise<AuthorizedRun>;
   readonly now?: () => number;
+  readonly providerIdleMinutes?: () => number;
   readonly createRun?: (options: HostedAgentRunOptions) => Promise<HostedAgentRun>;
 }
 interface Entry {
@@ -216,7 +217,8 @@ export class HostedAgentHost {
   async poll(principal: HostedAgentPrincipal, cursors: readonly HostedAgentPollCursor[], signal: AbortSignal, waitMs = 30_000): Promise<readonly HostedAgentPollRun[]> {
     this.#assertPrincipal(principal); signal.throwIfAborted();
     if (this.#polling.has(principal.id)) throw new HostedAgentHostError("CONFLICT");
-    if (!Array.isArray(cursors) || cursors.length > 1000 || new Set(cursors.map(value => value.runId)).size !== cursors.length
+    if (!Array.isArray(cursors) || cursors.length > 1000 || cursors.some(value => value.holdsNative !== undefined && typeof value.holdsNative !== "boolean")
+      || new Set(cursors.map(value => value.runId)).size !== cursors.length
       || !Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 30_000) throw new HostedAgentHostError("INVALID_REQUEST");
     const entries = cursors.map(cursor => ({ cursor, entry: this.#entry(principal, cursor.runId) }));
     this.#polling.add(principal.id);
@@ -230,10 +232,11 @@ export class HostedAgentHost {
       for (const { cursor, entry } of entries) {
         this.#assertEntry(principal, entry); entry.touchedAt = this.#now();
         const run = entry.run ?? await entry.opening; this.#assertEntry(principal, entry);
+        if (entry.closedAt === undefined && !run.idleReclaiming) run.holdSourceExecution?.(cursor.holdsNative === true);
         if (remaining < 1) break;
         const batch = await run.exchange.poll(cursor.after, signal, 0, remaining);
         remaining -= Buffer.byteLength(JSON.stringify(batch.frames));
-        result.push({ runId: cursor.runId, ...batch });
+        result.push({ runId: cursor.runId, ...batch, ...(batch.finished && run.idleReclaimed ? { idleReclaimed: true } : {}) });
       }
       return result;
     };
@@ -248,11 +251,18 @@ export class HostedAgentHost {
   }
   async sweep(): Promise<void> {
     const now = this.#now();
+    let idleMinutes: number | undefined;
+    // An unreadable setting does not authorize closing an idle native runtime.
+    try { idleMinutes = this.#options.providerIdleMinutes?.(); } catch { /* Retry on the next ordinary sweep. */ }
     await Promise.all([...this.#entries].map(async ([key, entry]) => {
       let revoked = this.#disposed;
       try { entry.principal.assertCurrent(); entry.principal.providerGrant?.assertCurrent(); entry.assertAccess?.(); if (entry.closedAt === undefined) entry.run?.checkAuthority(); } catch { revoked = true; }
-      if (revoked || entry.closedAt === undefined && (entry.run && !entry.run.ready && !entry.run.initializing || now - entry.touchedAt >= 180_000)) await this.#closeEntry(entry).catch(() => {});
-      if (entry.closedAt !== undefined && now - entry.closedAt >= 60_000) {
+      if (revoked || entry.closedAt === undefined && (entry.run && !entry.run.ready && !entry.run.initializing && !entry.run.idleReclaiming || now - entry.touchedAt >= 180_000)) await this.#closeEntry(entry).catch(() => {});
+      else if (entry.closedAt === undefined && entry.run && !entry.closing && (idleMinutes !== undefined || entry.run.idleReclaiming)) {
+        try { if (await entry.run.reclaimIdle(idleMinutes ?? 0)) await this.#closeEntry(entry); }
+        catch { /* Unconfirmed native cleanup retains the owner and its slot. */ }
+      }
+      if (entry.closedAt !== undefined && now - entry.closedAt >= (entry.run?.idleReclaimed ? 180_000 : 60_000)) {
         entry.detach?.(); entry.run?.disposeExchange(); this.#entries.delete(key); this.#expired.add(key);
         this.#expiredOwners.set(key, { deviceId: entry.principal.deviceId, trust: entry.principal.trust });
       }

@@ -62,6 +62,9 @@ export class HostedAgentCodexExecServerRelay {
   readonly #lifetime = new AbortController();
   #close?: Promise<void>;
   constructor(options: HostedAgentCodexRelayOptions) { options.assertCurrent(); this.#options = options; }
+  get busy(): boolean {
+    return this.#opening.size > 0 || [...this.#connections.values()].some(connection => connection.commands.size > 0 || connection.serverRequests.size > 0);
+  }
   async execute(value: unknown, signal: AbortSignal, authorization: HostedAgentCodexAuthorization = this.#options): Promise<Record<string, unknown>> {
     const request = parseRequest(value); this.#assert(authorization); signal.throwIfAborted();
     if (this.#seen.has(request.requestId)) throw new HostedAgentExecutorError("REQUEST_REPLAYED");

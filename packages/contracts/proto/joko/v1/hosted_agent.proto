@@ -127,6 +127,9 @@ message HostedAgentSettings {
   HostedAgentLimitUsage usage = 6;
   // Controller preference: zero disables pressure-based idle release.
   uint32 idle_release_minutes = 7;
+  // Provider-computer setting: zero disables proactive idle reclamation.
+  // The default is 30 minutes; the allowed range is 0 through 1440.
+  uint32 provider_idle_minutes = 8;
 }
 message GetHostedAgentSettingsRequest {}
 message GetHostedAgentSettingsResponse { HostedAgentSettings settings = 1; }
@@ -141,6 +144,7 @@ message UpdateHostedAgentSettingsRequest {
     HostedAgentResetLimits reset_limits = 5;
     HostedAgentProviderModelAccess model_access = 6;
     uint32 idle_release_minutes = 7;
+    uint32 provider_idle_minutes = 8;
   }
 }
 message UpdateHostedAgentSettingsResponse { HostedAgentSettings settings = 1; }
@@ -159,8 +163,17 @@ enum HostedAgentCapacityRejection {
 message OpenHostedAgentResponse { uint32 format = 1; string run_id = 2; string virtual_root = 3; HostedAgentCapacityRejection capacity_rejection = 4; }
 message CallHostedAgentRequest { uint32 format = 1; string run_id = 2; string call_id = 3; bytes command_json = 4; }
 message CallHostedAgentResponse { uint32 format = 1; bytes result_json = 2; HostedAgentCapacityRejection capacity_rejection = 3; }
-message HostedAgentPollCursor { string run_id = 1; uint64 after = 2; }
-message HostedAgentPollRun { string run_id = 1; uint64 cursor = 2; bool finished = 3; bytes frames_json = 4; }
+message HostedAgentPollCursor {
+  string run_id = 1; uint64 after = 2;
+  // This authenticated Source still owns active native execution locally.
+  bool holds_native = 3;
+}
+message HostedAgentPollRun {
+  string run_id = 1; uint64 cursor = 2; bool finished = 3; bytes frames_json = 4;
+  // True only on a finished run whose Provider confirmed native idle cleanup.
+  // The controller retains the task and resumes its original native identity.
+  bool idle_reclaimed = 5;
+}
 message PollHostedAgentsRequest { uint32 format = 1; repeated HostedAgentPollCursor cursors = 2; }
 message PollHostedAgentsResponse { uint32 format = 1; repeated HostedAgentPollRun runs = 2; }
 message ReplyHostedAgentRequest { uint32 format = 1; string run_id = 2; string request_id = 3; bytes result_json = 4; }

@@ -109,6 +109,7 @@ export class HostedAgentClaudeExecutor {
     const result = await this.#call(own, active); this.#assertCurrent(active);
     return { ...result };
   }
+  get busy(): boolean { return [...this.#jobs.values()].some(job => !job.complete); }
   async dispose(): Promise<void> {
     this.#lifetime.abort(); for (const job of this.#jobs.values()) job.abort.abort();
     await Promise.allSettled([...this.#jobs.values()].map(job => job.settled));

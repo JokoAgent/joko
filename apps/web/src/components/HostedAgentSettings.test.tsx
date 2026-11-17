@@ -14,13 +14,14 @@ afterEach(async () => { for (const root of roots.splice(0)) await act(async () =
 const t = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("zh-CN", key, values);
 function fixture(name = "测试节点") {
   let settings: HostedAgentSettingsView = { revision: 1n, remoteControlEnabled: false, providers: [{ backendId: "native-a", providerId: "provider", enabled: true }],
-    limits: { perDevice: 16, total: 64 }, limitsOverridden: false, usage: { total: 3, devices: 2, maximumDevice: 2 } };
+    limits: { perDevice: 16, total: 64 }, providerIdleMinutes: 30, idleReleaseMinutes: 0, limitsOverridden: false, usage: { total: 3, devices: 2, maximumDevice: 2 } };
   const getHostedAgentSettings = vi.fn(async () => settings);
   const getHostedAgentCatalog = vi.fn(async () => ({ backends: [{ backendId: "native-a", displayName: "真实运行时", providers: [{ providerId: "provider", displayName: "模型账户", connected: true, modelCount: 2 }] }] }));
   const updateHostedAgentSettings = vi.fn(async (update: HostedAgentSettingsUpdate, expected: bigint, _signal?: AbortSignal) => {
     expect(expected).toBe(settings.revision);
     settings = { ...settings, revision: settings.revision + 1n,
       ...(update.kind === "remoteControl" ? { remoteControlEnabled: update.enabled } : update.kind === "provider" ? { providers: [{ backendId: update.backendId, providerId: update.providerId, enabled: update.enabled }] }
+        : update.kind === "providerIdle" ? { providerIdleMinutes: update.minutes } : update.kind === "idleRelease" ? { idleReleaseMinutes: update.minutes }
         : update.kind === "limits" ? { limits: { perDevice: update.perDevice, total: update.total }, limitsOverridden: true }
           : { limits: { perDevice: 16, total: 64 }, limitsOverridden: false }) };
     return settings;
@@ -64,6 +65,21 @@ it("rejects invalid quotas and reloads a CAS conflict without replaying the upda
   expect(f.updateHostedAgentSettings).toHaveBeenCalledTimes(1); expect(f.getHostedAgentSettings).toHaveBeenCalledTimes(2);
   expect(container.textContent).toContain("当前状态已刷新"); expect(container.textContent).toContain("当前：8"); expect(inputs[0]!.value).toBe("1"); expect(inputs[1]!.value).toBe("2");
   await act(async () => button(container, "保存").click()); expect(f.updateHostedAgentSettings.mock.calls[1]?.[1]).toBe(7n);
+});
+
+it("edits and restores the Provider's idle setting while retaining independent controller pressure and quotas", async () => {
+  const f = fixture(), { container } = await mount(f.controller);
+  const input = container.querySelector<HTMLInputElement>('input[max="1440"]')!, form = input.closest("form")!;
+  const save = () => button(form, "保存");
+  expect(input.value).toBe("30"); expect(container.textContent).toContain("即使运行数量未达上限");
+  await change(input, "1441"); expect(save().disabled).toBe(true); expect(form.textContent).toContain("0–1440");
+  await change(input, "0"); await act(async () => save().click());
+  expect(f.value()).toMatchObject({ providerIdleMinutes: 0, idleReleaseMinutes: 0, limits: { perDevice: 16, total: 64 } });
+  await change(input, "1440"); await act(async () => save().click()); expect(f.value().providerIdleMinutes).toBe(1440);
+  await act(async () => button(form, "恢复默认 30 分钟").click()); expect(input.value).toBe("30");
+  expect(f.updateHostedAgentSettings.mock.calls.map(([update]) => update)).toEqual([
+    { kind: "providerIdle", minutes: 0 }, { kind: "providerIdle", minutes: 1440 }, { kind: "providerIdle", minutes: 30 }
+  ]);
 });
 
 it("retires pending reads when the selected node changes and hides owner controls in a shared guest task", async () => {

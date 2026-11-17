@@ -4,7 +4,7 @@ import { GetSnapshotResponseSchema, SnapshotSchema, type HostedAgentSettings, ty
 import { expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
-const settings = { revision: 4n, remoteControlEnabled: false, idleReleaseMinutes: 0, providers: [{ backendId: "native-a", providerId: "account-a", enabled: true }],
+const settings = { revision: 4n, remoteControlEnabled: false, idleReleaseMinutes: 0, providerIdleMinutes: 30, providers: [{ backendId: "native-a", providerId: "account-a", enabled: true }],
   limits: { perDevice: 16, total: 64 }, limitsOverridden: false, usage: { total: 3, devices: 2, maximumDevice: 2 } };
 function fixture(handler: (method: string, input: any, signal?: AbortSignal) => unknown | Promise<unknown>) {
   const transport = { unary: vi.fn(async (method: any, signal: AbortSignal | undefined, _timeout: unknown, _headers: unknown, input: any) => {
@@ -32,6 +32,12 @@ it("uses the generated owner service with exact Provider identities, CAS and tru
     expect(updates[1]?.update).toMatchObject({ case: "limits", value: { perDevice: 1, total: 2 } }); expect(updates[2]?.update.case).toBe("resetLimits");
     for (const limit of [0, 1001, 1.5]) await expect(gateway.updateHostedAgentSettings({ kind: "limits", perDevice: limit, total: 64 }, 5n)).rejects.toThrow("integers");
     expect(updates).toHaveLength(3);
+    for (const minutes of [0, 1440, 30]) {
+      await gateway.updateHostedAgentSettings({ kind: "providerIdle", minutes }, 5n);
+      expect(updates.at(-1)).toMatchObject({ expectedRevision: 5n, update: { case: "providerIdleMinutes", value: minutes } });
+    }
+    for (const minutes of [-1, 1441, 1.5]) await expect(gateway.updateHostedAgentSettings({ kind: "providerIdle", minutes }, 5n)).rejects.toThrow("whole minutes");
+    expect(updates).toHaveLength(6);
   } finally { gateway.disconnect(); }
 });
 

@@ -105,6 +105,7 @@ export class HostedAgentRuntime {
         assertCurrent(); return { read: factory.readWorkflowProgress.bind(factory), assertCurrent };
       } });
     this.host = new HostedAgentHost({ authorize: this.#authorize, infer: this.#infer, authorizeInference: this.#inferenceAccess,
+      providerIdleMinutes: () => this.settings.providerIdleMinutes(),
       readWorkflowProgress: (principal, command, signal) => workflow.read(principal, command, signal),
       manageDerivation: (principal, command) => derivations.manage(principal, command, AbortSignal.timeout(25_000)) });
   }

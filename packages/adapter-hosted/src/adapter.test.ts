@@ -33,7 +33,7 @@ it("does not add a workflow read port to Source Backends that do not provide it"
 });
 
 async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareInput"], commands?: HostedAgentSourceAdapterOptions["commands"],
-  options: Pick<HostedAgentSourceAdapterOptions, "connectionPool" | "isCapacityError" | "manageDerivation" | "readWorkflowProgress"> = {}) {
+  options: Pick<HostedAgentSourceAdapterOptions, "connectionPool" | "isCapacityError" | "manageDerivation" | "readWorkflowProgress" | "onRuntimeUnavailable"> = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-source-adapter-")));
   const context: AdapterContext = { sessionId: "task", generation: 1, target: { id: "target", backendId: "source-native", displayName: "Task", workspaceRoot: root,
     managed: true, trusted: true }, operationId: "create-task", modelSelection: { providerId: "provider", modelId: "model" }, signal: new AbortController().signal,
@@ -45,7 +45,9 @@ async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareIn
   const close = vi.fn(async () => {}), stop = vi.fn(async () => {}), release = vi.fn(async () => {}), forget = vi.fn(async () => {}), owners = new Map<string, AdapterContext>();
   const fences = new Map<string, NonNullable<Parameters<HostedAgentSourceController["registerOperation"]>[2]>>();
   let binding!: () => NativeSessionBinding;
-  const controller: HostedAgentSourceController = { start: () => new Promise<void>(() => {}), stop, abortPending: () => {},
+  let finishController!: () => void, idleReclaimed = false;
+  const controller: HostedAgentSourceController = { start: () => new Promise<void>(resolve => { finishController = resolve; }), stop, abortPending: () => {},
+    get idleReclaimed() { return idleReclaimed; },
     registerOperation: (id, context, fence) => { owners.set(id, context); if (fence) fences.set(id, fence); }, projectResult: value => value,
     projectState: state => ({ ...state, binding: binding() }), projectHistory: history => history };
   const call = vi.fn<HostedAgentSourceConnection["client"]["call"]>(async () => ({ binding: { opaqueRef: "/provider/native.jsonl", generation: 1 }, streaming: false,
@@ -56,7 +58,8 @@ async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareIn
     ...(commands === undefined ? {} : { commands }),
     workspace: () => ({ platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false }),
     capture: () => ({ client: { open, call }, close, assertCurrent: () => {}, createController: input => { binding = input.binding; return controller; } }), ...options });
-  return { root, context, descriptor, capabilities, adapter, open, call, close, stop, release, forget, owners, fences, cleanup: async () => {
+  return { root, context, descriptor, capabilities, adapter, open, call, close, stop, release, forget, owners, fences,
+    endController: (reclaimed: boolean) => { idleReclaimed = reclaimed; finishController(); }, resetController: () => { idleReclaimed = false; }, cleanup: async () => {
     await adapter.dispose(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
   } };
 }
@@ -239,6 +242,37 @@ it("retains a busy original Agent when a lost idle response resolves to a reject
     await f.adapter.inspectSession(binding, { ...f.context, binding });
     expect(f.open).toHaveBeenCalledOnce(); expect(f.close).not.toHaveBeenCalled(); expect(pool.occupied()).toBe(1);
   } finally { await f.cleanup(); pool.close(); clock.mockRestore(); }
+});
+
+it("retains the task after Provider reclamation and resumes the same native identity only after exact Source cleanup", async () => {
+  const unavailable = vi.fn(), pool = new HostedAgentConnectionPool({ idleMinutes: () => 0, maxRuns: () => 64 });
+  const f = await fixture(undefined, undefined, { connectionPool: pool, onRuntimeUnavailable: unavailable });
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context);
+    let rejectClose!: (error: Error) => void;
+    f.close.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectClose = reject; }));
+    f.endController(true); await vi.waitFor(() => expect(f.close).toHaveBeenCalledOnce());
+    expect(pool.occupied()).toBe(1); expect(f.release).not.toHaveBeenCalled(); expect(unavailable).not.toHaveBeenCalled();
+    const blocked = f.adapter.send({ text: "Continue original history", images: [], files: [], mentions: [], disposition: "prompt" }, { ...f.context, binding, operationId: "after-provider-idle" });
+    const rejected = expect(blocked).rejects.toThrow("Source close acknowledgement was lost.");
+    rejectClose(new Error("Source close acknowledgement was lost.")); await rejected;
+    f.resetController();
+    await f.adapter.send({ text: "Continue original history", images: [], files: [], mentions: [], disposition: "prompt" }, { ...f.context, binding, operationId: "after-provider-idle" });
+    expect(f.open.mock.calls.map(([input]) => [input.start, input.nativeSessionId])).toEqual([["create", binding.nativeSessionId], ["resume", binding.nativeSessionId]]);
+    expect(f.close).toHaveBeenCalledTimes(2); expect(f.release).toHaveBeenCalledOnce(); expect(pool.occupied()).toBe(1);
+    expect(f.call.mock.calls.filter(([, , command]) => command.kind === "idle_release" || command.kind === "idle_release_status")).toEqual([]);
+    expect(unavailable).not.toHaveBeenCalled();
+  } finally { await f.cleanup(); pool.close(); }
+});
+
+it("keeps an ordinary native terminal as runtime unavailability instead of reclaiming its task", async () => {
+  const unavailable = vi.fn(), f = await fixture(undefined, undefined, { onRuntimeUnavailable: unavailable });
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context);
+    f.endController(false); await vi.waitFor(() => expect(unavailable).toHaveBeenCalledOnce());
+    await expect(f.adapter.inspectSession(binding, { ...f.context, binding })).rejects.toThrow("unavailable");
+    expect(f.open).toHaveBeenCalledOnce(); expect(f.release).not.toHaveBeenCalled();
+  } finally { await f.cleanup(); }
 });
 
 it("registers an exact child alias before the only native fork call and recovers cleanup without replaying that fork", async () => {

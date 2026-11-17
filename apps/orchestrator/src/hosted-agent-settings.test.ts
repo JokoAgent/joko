@@ -84,3 +84,23 @@ it("persists the controller's explicit idle release opt-in without revoking nati
     settings.update({ kind: "idle_release", minutes: 0 }, value.revision); expect(settings.idleReleaseMinutes()).toBe(0);
   } finally { store.close(); }
 });
+
+it("persists Provider idle reclamation independently of controller pressure and permission generations", () => {
+  const store = new OperationalStore(":memory:");
+  try {
+    const settings = new HostedAgentSettings(store);
+    expect(settings.providerIdleMinutes()).toBe(30); expect(settings.idleReleaseMinutes()).toBe(0);
+    let value = settings.update({ kind: "remote_control", enabled: true }, 0n);
+    value = settings.update({ kind: "provider", backendId: "pi", providerId: "account", enabled: true }, value.revision);
+    const computer = settings.captureComputer(), provider = settings.captureProvider("pi", "account");
+    value = settings.update({ kind: "idle_release", minutes: 120 }, value.revision);
+    for (const minutes of [0, 1440, 30]) {
+      value = settings.update({ kind: "provider_idle", minutes }, value.revision);
+      expect(new HostedAgentSettings(store).providerIdleMinutes()).toBe(minutes);
+      expect(settings.idleReleaseMinutes()).toBe(120); expect(computer).not.toThrow(); expect(provider).not.toThrow();
+    }
+    for (const minutes of [-1, 1441, 1.5, Number.NaN]) expect(() => settings.update({ kind: "provider_idle", minutes }, value.revision)).toThrow("whole minutes");
+    expect(() => settings.update({ kind: "provider_idle", minutes: 0 }, value.revision - 1n)).toThrow(RevisionConflictError);
+    expect(settings.providerIdleMinutes()).toBe(30);
+  } finally { store.close(); }
+});

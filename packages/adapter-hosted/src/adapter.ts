@@ -19,6 +19,7 @@ type SourceBinding = z.infer<typeof bindingSchema>;
 export type HostedAgentDeviceSource = z.infer<typeof sourceSchema>;
 export interface HostedAgentSourceController {
   start(): Promise<void>;
+  readonly idleReclaimed?: boolean;
   stop(): Promise<void>;
   abortPending(): void;
   registerOperation(id: string, context: AdapterContext, fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>, input?: PromptInput, backgroundResume?: SubagentControlInput): void;
@@ -375,7 +376,15 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
         if (running.closing || running.idleRelease || running.idleClosed || this.#closed || this.#sessions.get(context.sessionId) !== running) return;
         running.failure = error; this.#options.onRuntimeUnavailable?.(context);
       };
-      void controller.start().then(() => unavailable(new Error("The original native runtime ended.")), unavailable).catch(() => {});
+      void controller.start().then(async () => {
+        if (controller.idleReclaimed === true && !running.closing && !this.#closed && this.#sessions.get(context.sessionId) === running) {
+          // The authenticated Provider terminal attests actual native cleanup.
+          // Reuse the retained task and cleanup gate before any later resume.
+          const release = running.idleRelease ??= { id: randomUUID(), idleMinutes: 0, attempted: false };
+          release.confirmed = true;
+          await this.#releaseIdle(running);
+        } else unavailable(new Error("The original native runtime ended."));
+      }, unavailable).catch(() => {});
       await connection.client.call(runId, randomUUID(), { kind: "state" }, context.signal);
       this.#check(context); connection.assertCurrent(); if (active.failure) throw active.failure;
       active.unregisterPool = this.#options.connectionPool?.register({ occupiesSlot: () => !running.idleClosed,
@@ -426,10 +435,14 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
       if (!release.confirmed) {
         const command: HostedNativeCommand = release.attempted ? { kind: "idle_release_status", releaseCallId: release.id } : { kind: "idle_release", idleMinutes: release.idleMinutes };
         release.attempted = true;
-        const value = await active.connection.client.call(active.runId, command.kind === "idle_release" ? release.id : randomUUID(), command, signal);
-        if (value === false || value === "busy") { active.idleRelease = undefined; active.lastActivity = Date.now(); return false; }
-        if (value !== true && value !== "released") throw new Error("The original idle release outcome is unconfirmed.");
-        release.confirmed = true;
+        let value: unknown;
+        try { value = await active.connection.client.call(active.runId, command.kind === "idle_release" ? release.id : randomUUID(), command, signal); }
+        catch (error) { if (!release.confirmed) throw error; }
+        if (!release.confirmed) {
+          if (value === false || value === "busy") { active.idleRelease = undefined; active.lastActivity = Date.now(); return false; }
+          if (value !== true && value !== "released") throw new Error("The original idle release outcome is unconfirmed.");
+          release.confirmed = true;
+        }
       }
       await active.connection.close(); await active.controller.stop();
       this.#unclosed.delete(active.runId); active.unregisterPool?.(); active.unregisterPool = undefined;

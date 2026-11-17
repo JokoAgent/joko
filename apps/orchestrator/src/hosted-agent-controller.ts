@@ -5,7 +5,7 @@ import type { HostedAgentFrame } from "./hosted-agent-exchange.js";
 import { HostedAgentProjection } from "./hosted-agent-projection.js";
 
 export interface HostedAgentRunPort {
-  poll(after: number, signal: AbortSignal): Promise<{ readonly frames: readonly HostedAgentFrame[]; readonly cursor: number; readonly finished: boolean }>;
+  poll(after: number, signal: AbortSignal): Promise<{ readonly frames: readonly HostedAgentFrame[]; readonly cursor: number; readonly finished: boolean; readonly idleReclaimed?: boolean }>;
   reply(id: string, result: { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly code: string }, signal: AbortSignal): Promise<void>;
   readArtifact(id: string, offset: number, maximum: number, signal: AbortSignal): Promise<{ readonly data: string }>;
 }
@@ -35,6 +35,7 @@ export class HostedAgentController {
   readonly #seen = new Set<string>();
   #cursor = 0;
   #pump?: Promise<void>;
+  #idleReclaimed = false;
 
   constructor(options: { readonly port: HostedAgentRunPort; readonly context: AdapterContext; readonly executor: HostedAgentExecutor;
     readonly binding: () => NativeSessionBinding;
@@ -50,6 +51,7 @@ export class HostedAgentController {
     this.#projection = new HostedAgentProjection(options.executor.workspace, options.context, options.binding);
   }
   start(): Promise<void> { return this.#pump ??= this.#consume(); }
+  get idleReclaimed(): boolean { return this.#idleReclaimed; }
   projectResult<T>(value: T): T { return this.#projection.value(value); }
   projectState(value: NativeSessionState): NativeSessionState { return this.#projection.state(value); }
   projectHistory(value: NativeHistoryProjection): NativeHistoryProjection { return this.#projection.history(value); }
@@ -66,7 +68,8 @@ export class HostedAgentController {
       for (;;) {
         this.#assertCurrent(signal);
         const batch = await this.#port.poll(this.#cursor, signal); this.#assertCurrent(signal);
-        if (!Number.isSafeInteger(batch.cursor) || batch.cursor < this.#cursor || !Array.isArray(batch.frames)) throw new Error("Hosted Agent cursor is invalid.");
+        if (!Number.isSafeInteger(batch.cursor) || batch.cursor < this.#cursor || !Array.isArray(batch.frames)
+          || batch.idleReclaimed !== undefined && (typeof batch.idleReclaimed !== "boolean" || batch.idleReclaimed && !batch.finished)) throw new Error("Hosted Agent cursor is invalid.");
         for (const frame of batch.frames) {
           this.#assertCurrent(signal);
           if (frame.sequence !== this.#cursor + 1) throw new Error("Hosted Agent output has a cursor gap.");
@@ -84,7 +87,7 @@ export class HostedAgentController {
           this.#cursor = frame.sequence;
         }
         if (this.#cursor !== batch.cursor) throw new Error("Hosted Agent output has an invalid final cursor.");
-        if (batch.finished) return;
+        if (batch.finished) { this.#idleReclaimed = batch.idleReclaimed === true; return; }
       }
     } finally { this.#lifetime.abort(); this.abortPending(); }
   }

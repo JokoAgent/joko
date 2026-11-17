@@ -127,6 +127,8 @@ function HostedAgentSettingsPanel({ controller, nodeName, t }: { readonly contro
             <Button disabled={busy || !settings.limitsOverridden} onClick={() => { void change({ kind: "resetLimits" }); }}>{t("settings.hostedAgents.resetLimits")}</Button></div>
         </form>
       </div>
+      <HostedAgentIdleRelease minutes={settings.providerIdleMinutes ?? 30} provider busy={busy} t={t}
+        save={minutes => change({ kind: "providerIdle", minutes })} />
       <HostedAgentIdleRelease minutes={settings.idleReleaseMinutes ?? 0} busy={busy} t={t}
         save={minutes => change({ kind: "idleRelease", minutes })} />
     </div>}
@@ -134,16 +136,18 @@ function HostedAgentSettingsPanel({ controller, nodeName, t }: { readonly contro
 }
 function parseLimit(value: string): number | undefined { const number = Number(value); return /^\d+$/u.test(value) && Number.isSafeInteger(number) && number >= 1 && number <= 1000 ? number : undefined; }
 
-function HostedAgentIdleRelease({ minutes, busy, t, save }: { readonly minutes: number; readonly busy: boolean; readonly t: Translator;
+function HostedAgentIdleRelease({ minutes, provider = false, busy, t, save }: { readonly minutes: number; readonly provider?: boolean; readonly busy: boolean; readonly t: Translator;
   readonly save: (minutes: number) => Promise<void> }): JSX.Element {
   const [draft, setDraft] = useState(String(minutes));
   useEffect(() => setDraft(String(minutes)), [minutes]);
-  const value = Number(draft), valid = /^\d+$/u.test(draft) && Number.isSafeInteger(value) && value >= 0 && value <= 120;
+  const maximum = provider ? 1440 : 120;
+  const value = Number(draft), valid = /^\d+$/u.test(draft) && Number.isSafeInteger(value) && value >= 0 && value <= maximum;
   return <form className="settings-card" onSubmit={event => { event.preventDefault(); if (valid && value !== minutes) void save(value); }}>
-    <label className="setting-row"><div><strong>{t("settings.hostedAgents.idleRelease")}</strong><span>{t("settings.hostedAgents.idleReleaseBody")}</span></div>
-      <input type="number" min={0} max={120} step={1} inputMode="numeric" value={draft} disabled={busy} aria-invalid={!valid}
+    <label className="setting-row"><div><strong>{t(provider ? "settings.hostedAgents.providerIdle" : "settings.hostedAgents.idleRelease")}</strong><span>{t(provider ? "settings.hostedAgents.providerIdleBody" : "settings.hostedAgents.idleReleaseBody")}</span></div>
+      <input type="number" min={0} max={maximum} step={1} inputMode="numeric" value={draft} disabled={busy} aria-invalid={!valid}
         onChange={event => setDraft(event.target.value)} /></label>
-    {!valid && <p role="alert" className="hosted-agent-settings__error">{t("settings.hostedAgents.invalidIdleRelease")}</p>}
-    <div className="hosted-agent-settings__actions"><Button type="submit" disabled={busy || !valid || value === minutes}>{t("common.save")}</Button></div>
+    {!valid && <p role="alert" className="hosted-agent-settings__error">{t(provider ? "settings.hostedAgents.invalidProviderIdle" : "settings.hostedAgents.invalidIdleRelease")}</p>}
+    <div className="hosted-agent-settings__actions"><Button type="submit" disabled={busy || !valid || value === minutes}>{t("common.save")}</Button>
+      {provider && <Button disabled={busy || minutes === 30} onClick={() => { void save(30); }}>{t("settings.hostedAgents.resetProviderIdle")}</Button>}</div>
   </form>;
 }

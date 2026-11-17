@@ -90,6 +90,16 @@ it("serves authenticated native hosting from the actual application with node-ow
     await groupApi.updateProviderGroup({ key: groupKey, expectedRevision: group.revision, update: { case: "delete", value: {} } });
     let settings = (await generated.getHostedAgentSettings({})).settings!;
     expect(settings.remoteControlEnabled).toBe(false); expect(settings.limits).toMatchObject({ perDevice: 16, total: 64 });
+    expect(settings.providerIdleMinutes).toBe(30); expect(settings.idleReleaseMinutes).toBe(0);
+    for (const minutes of [0, 1440, 30]) {
+      settings = (await generated.updateHostedAgentSettings({ expectedRevision: settings.revision,
+        update: { case: "providerIdleMinutes", value: minutes } })).settings!;
+      expect(settings.providerIdleMinutes).toBe(minutes); expect(settings.idleReleaseMinutes).toBe(0);
+    }
+    await expect(generated.updateHostedAgentSettings({ expectedRevision: settings.revision,
+      update: { case: "providerIdleMinutes", value: 1441 } })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(anonymous.updateHostedAgentSettings({ expectedRevision: settings.revision,
+      update: { case: "providerIdleMinutes", value: 0 } })).rejects.toMatchObject({ code: Code.Unauthenticated });
     const open = { runId: "disabled-computer", nativeSessionId: "retained-native", start: "create" as const, sessionId: "original-task", targetId: "original-workspace",
       generation: 1, backendId: "pi", providerId: "host-provider", modelId: "host-model", permissionMode: "ask" as const, fastMode: false,
       workspace: { platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false } };

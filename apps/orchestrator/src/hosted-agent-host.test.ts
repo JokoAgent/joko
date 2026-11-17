@@ -228,19 +228,24 @@ it("multiplexes two task cursors over one pending poll and cancels only the depa
   const f = fixture(), signal = new AbortController().signal;
   await f.host.open(f.principal, f.input); await f.host.open(f.principal, { ...f.input, runId: "second", nativeSessionId: "native-second" });
   let active = 0, maximum = 0;
+  const held: boolean[] = [];
   const poller = new HostedAgentPoller({ poll: async (cursors, pollSignal) => {
+    const second = cursors.find(cursor => cursor.runId === "second"); if (second) held.push(second.holdsNative === true);
     maximum = Math.max(maximum, ++active); try { return await f.host.poll(f.principal, cursors, pollSignal); } finally { active--; }
   }, reply: async () => {}, readArtifact: async () => ({ data: "" }) });
-  const first = poller.attach("first"), second = poller.attach("second"), leaving = new AbortController();
+  let sourceBusy = true;
+  const first = poller.attach("first"), second = poller.attach("second", () => sourceBusy), leaving = new AbortController();
   try {
     const a = first.poll(0, leaving.signal); void a.catch(() => {}); const b = second.poll(0, signal);
     await vi.waitFor(() => expect(active).toBe(1)); leaving.abort(); await expect(a).rejects.toThrow("cancelled");
     f.exchanges.get("second")!.emit({ type: "status", key: "native", text: "second task output" });
     expect((await b).frames[0]?.payload).toMatchObject({ kind: "event", event: { text: "second task output" } });
+    expect(held).toContain(true); sourceBusy = false;
     expect(maximum).toBe(1);
     expect((await f.host.poll(f.principal, [{ runId: "second", after: 0 }], signal, 0))[0]?.frames).toHaveLength(1);
     const acknowledged = second.poll(1, signal); void acknowledged.catch(() => {});
     await vi.waitFor(async () => { await expect(f.exchanges.get("second")!.poll(0, signal, 0)).rejects.toMatchObject({ code: "INVALID_CURSOR" }); });
+    expect(held.at(-1)).toBe(false);
     second.detach(); await expect(acknowledged).rejects.toThrow("detached");
   } finally { first.detach(); second.detach(); await poller.close(); await f.host.dispose(); }
 });
