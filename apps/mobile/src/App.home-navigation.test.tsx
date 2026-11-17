@@ -864,6 +864,26 @@ describe("actual Task Home navigation composition", () => {
     expect(drafts.readSync({ profileId: "profile", sessionId: "current" })?.text).toBe("Retained composer");
   });
 
+  it.each([false, true])("revalidates deferred Add across an Owner refresh with authority changed=%s", async authorityChanged => {
+    const completion = create(EventSchema, { eventId: "reference-completion", identity: { sessionId: "current" },
+      cursor: { generation: 1n, sequence: 5n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "reference-message", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Original reply" } }]
+      } } } });
+    state = { ...state, taskSource: { kind: "own" }, detail: create(SnapshotSchema, { ...state.detail!, timeline: [completion] }) };
+    await renderTask();
+    await press(mobileMessage("en", "task.moreFor", { name: "Assistant" }));
+    const deferred = messageActionsProps!.onAction;
+    const revision = create(RevisionSchema, { value: 2n });
+    state = { ...state, taskSource: { kind: "own" }, owner: create(SnapshotSchema, { ...state.owner!, revision }),
+      detail: create(SnapshotSchema, { ...state.detail!, revision }) };
+    if (authorityChanged) headerSourceEpoch += 1;
+    await renderTask();
+    await act(async () => deferred("add-to-composer"));
+    expect(composerProps.draft.text).toBe(authorityChanged ? "Retained composer"
+      : "Retained composer#/tasks/current?message=reference-message&event=reference-completion");
+    expect(drafts.readSync({ profileId: "profile", sessionId: "current" })).toEqual(composerProps.draft);
+  });
+
   it.each([
     [{ senderSessionId: "other", senderSessionTitle: "Original title" }, "From task Original title"],
     [{ senderSessionId: "other", senderPartnerId: "partner", senderPartnerName: "Partner name" }, "From Partner Partner name"],

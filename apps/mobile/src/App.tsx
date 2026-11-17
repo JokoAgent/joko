@@ -6210,11 +6210,20 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     if (action === "add-to-composer") {
       const identity = draftIdentityRef.current, active = queueEditRef.current, current = client.state;
       const source = selected.referenceSource;
-      if (!selected.reference || !source || !identity || !composerOwnerReady || voice.busy || selected.queueLease !== active?.lease
-        || identity.profileId !== client.taskDraftProfileId() || identity.sessionId !== selected.sessionId
-        || source.owner !== current.owner || source.detail !== current.detail || source.taskSource !== current.taskSource) return;
+      const reference = selected.reference;
+      if (!reference || !source || !identity || !composerOwnerReady || voice.busy || selected.queueLease !== active?.lease
+        || identity.profileId !== client.taskDraftProfileId() || identity.sessionId !== selected.sessionId) return;
+      const sameReferenceSource = (): boolean => {
+        const latest = client.state;
+        if (latest.activeProfileId !== selected.profileId || latest.selectedId !== selected.sessionId
+          || client.taskHeaderSourceKey() !== selected.ownerKey) return false;
+        if (latest.status === "connected" && selected.ownerKey !== undefined
+          && source.taskSource?.kind !== "joined" && latest.taskSource?.kind !== "joined") return true;
+        return source.owner === latest.owner && source.detail === latest.detail && source.taskSource === latest.taskSource;
+      };
+      if (!sameReferenceSource()) return;
       try {
-        const result = commitMobileMessageReference({ lease: selected.reference, ownerKey: client.taskHeaderSourceKey() ?? blockOwnerKey,
+        const result = commitMobileMessageReference({ lease: reference, ownerKey: client.taskHeaderSourceKey() ?? blockOwnerKey,
           draftOwnerKey: mobileComposerDraftIdentityKey(identity), sessionId: current.selectedId, row: latest,
           draft: active?.stashedDraft ?? composerDraftRef.current, locale, atomId: `message-reference-${randomUUID()}` });
         if (active) {
@@ -6222,10 +6231,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           mobileComposerDrafts.save(identity, result.draft);
         } else {
           saveNormalDraft(result.draft, identity); setComposerSelection(result.selection); composerSelectionRef.current = result.selection;
-          setTimeout(() => { if (taskMountedRef.current && draftIdentityRef.current
-            && client.taskHeaderSourceKey() === selected.ownerKey && source.owner === client.state.owner
-            && source.detail === client.state.detail && source.taskSource === client.state.taskSource
-            && mobileComposerDraftIdentityKey(draftIdentityRef.current) === selected.reference!.draftOwnerKey) composerInputRef.current?.focus(); }, 0);
+          setTimeout(() => { if (taskMountedRef.current && AppState.currentState === "active" && draftIdentityRef.current
+            && sameReferenceSource() && mobileComposerDraftIdentityKey(draftIdentityRef.current) === reference.draftOwnerKey) composerInputRef.current?.focus(); }, 0);
         }
       } catch { setLocalError(mobileMessage(locale, "task.error.messageReferenceFailed")); }
       return;
