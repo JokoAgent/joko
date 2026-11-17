@@ -284,7 +284,7 @@ describe("SessionPane edited-message submission", () => {
     expect(controller.messageEditDrafts.finish).toHaveBeenCalledExactlyOnceWith(sourceSession.id, expect.any(String), false);
   });
 
-  it.each(["generation", "gateway", "navigation ABA", "pagehide", "new live input", "local draft"] as const)(
+  it.each(["generation", "gateway", "navigation ABA", "pagehide", "new live input", "replaced live event", "local draft"] as const)(
     "retires an edit while its draft read is pending across a %s change", async (boundary) => {
       const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
       let finish!: (value: ReturnType<typeof durableDraft>) => void;
@@ -300,6 +300,8 @@ describe("SessionPane edited-message submission", () => {
       else if (boundary === "navigation ABA") Reflect.set(controller.state, "navigationRevision", 2);
       else if (boundary === "new live input") Reflect.set(controller.state.snapshot, "timelineBySession", new Map([[sourceSession.id,
         [{ ...message(), id: "new-user", sourceEventId: "new-user-event", sequence: 5n, completionCursor: 5n }]]]));
+      else if (boundary === "replaced live event") Reflect.set(controller.state.snapshot, "timelineBySession", new Map([[sourceSession.id,
+        [{ ...sourceMessage, sourceEventId: "replaced-user-event", completionCursor: 5n }]]]));
       else if (boundary === "local draft") await clickButton(container, "Unsaved composer input");
       else { window.dispatchEvent(new Event("pagehide")); window.dispatchEvent(new Event("pageshow")); }
       await act(async () => finish(durableDraft()));

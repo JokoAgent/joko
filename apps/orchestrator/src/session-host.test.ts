@@ -14494,7 +14494,17 @@ describe("SessionHost", () => {
   });
 
   async function messageNavigationFixture() {
-    const adapter = new ManagedAttachFakeAdapter();
+    const adapter = new (class extends ManagedAttachFakeAdapter {
+      override async resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+        const state = await super.resumeSession(binding, context);
+        return { ...state, binding: { ...binding, generation: context.generation } };
+      }
+
+      override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+        const state = await super.inspectSession(binding, context);
+        return { ...state, binding };
+      }
+    })();
     const before = fakeHistoryEvent("before-original", "message_assistant", {
       type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Retained answer" }]
     });

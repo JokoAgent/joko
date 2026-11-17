@@ -1843,7 +1843,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const activeBackend = activeSession === undefined ? undefined : snapshot.backends.find((candidate) => candidate.id === activeSession.backendId);
       const activeTarget = activeSession === undefined ? undefined : snapshot.targets.find((candidate) => candidate.id === activeSession.targetId);
       const activeStartSupported = sessionCapabilitySupportsTarget(activeBackend?.capabilities.get("session.rewind_to_start"), activeTarget);
-      const activeTimeline = mergeTimelineWindows(messageActionsViewRef.current.timeline, snapshot.timelineBySession.get(sourceSessionId) ?? []);
+      const activeTimeline = mergeTimelineWindows(snapshot.timelineBySession.get(sourceSessionId) ?? [], messageActionsViewRef.current.timeline);
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (
@@ -2049,8 +2049,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const latestTarget = latestSession === undefined ? undefined : latest.targets.find((candidate) => candidate.id === latestSession.targetId);
       const latestQueuedWork = latest.queue.some((candidate) => candidate.sessionId === rewind.sessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (!rewind.isCurrent() || latestSession?.state !== "idle" || latestQueuedWork || latestBackend?.capabilities.get("session.rewind")?.supported !== true) throw new Error(t("timeline.rewindStale"));
-      const currentItem = mergeTimelineWindows(messageActionsViewRef.current.timeline, latest.timelineBySession.get(rewind.sessionId) ?? [])
-        .find((item) => item.id === rewind.itemId);
+      const currentItem = latest.timelineBySession.get(rewind.sessionId)?.find((item) => item.id === rewind.itemId)
+        ?? messageActionsViewRef.current.timeline.find((item) => item.id === rewind.itemId);
       if (latestSession.generation !== rewind.generation || controllerRef.current.navigateSessionBranch !== rewind.navigate
         || currentItem === undefined || currentItem.sourceEventId !== rewind.sourceEventId
         || (currentItem.messageId ?? currentItem.id) !== rewind.sourceMessageId || currentItem.completionCursor !== rewind.completionCursor

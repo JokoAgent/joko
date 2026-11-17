@@ -69,7 +69,12 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     await pane.waitFor({ state: "visible", timeout: 30_000 });
     const reload = async () => {
       await page!.reload({ waitUntil: "domcontentloaded" });
-      await pane.waitFor({ state: "visible", timeout: 30_000 });
+      const expires = Date.now() + 30_000;
+      const timeLeft = () => Math.max(1, expires - Date.now());
+      await page!.getByRole("button", { name: "Saved nodes", exact: true }).click({ timeout: timeLeft() });
+      await page!.locator(".connection-card .profile-card").filter({ hasText: fixture!.baseUrl })
+        .getByRole("button", { name: "Connect", exact: true }).click({ timeout: timeLeft() });
+      await pane.waitFor({ state: "visible", timeout: timeLeft() });
     };
     await reload();
     const originalNavigate = host.navigateTree.bind(host);
@@ -104,6 +109,12 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     expect(navigation).toHaveBeenCalledOnce();
     expect(navigation.mock.calls[0]![5].sourceMessage).toEqual({ ...editedSource, requireLatestUser: true });
     const resendOperationId = navigation.mock.calls[0]![5].operationId;
+    try { await navigation.mock.results[0]!.value; }
+    catch (cause) {
+      const diagnostics = store.listDiagnostics({ limit: 12 }).filter(item => item.component.startsWith("native_navigation_") || item.component === "sendInput")
+        .map(({ component, code, message }) => ({ component, code, message }));
+      throw new Error(`The original native edit did not reach queue admission. ${JSON.stringify(diagnostics)}`, { cause });
+    }
     const resend = await waitFor(() => Promise.resolve(store.listQueueItems({ sessionId }).find(item => item.operationId === resendOperationId)),
       item => item?.state === "completed", "the edit's original queue item completes");
     expect(resend?.body.text).toBe("My revised loaded input.");

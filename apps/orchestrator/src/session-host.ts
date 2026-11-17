@@ -3528,7 +3528,7 @@ export class SessionHost {
       store.updateSession(input.sessionId, { archived: false }, session.revision);
     }
     this.assertBackendAdmissionOpen(store.getSession(input.sessionId).descriptor.backendId);
-    this.assertSessionNotPendingScheduleDeletion(input.sessionId);
+    this.assertSessionNotPendingScheduleDeletion(input.sessionId, input.operationId);
     this.assertMessageDeletionAdmission(input.sessionId);
     this.validateTurnOverrides(input.sessionId, input.overrides);
     const now = Date.now();
@@ -9538,6 +9538,7 @@ export class SessionHost {
             }
           } catch (error) {
             if (!nativeNavigationConfirmed) throw error;
+            try { this.recordFailure("native_navigation_projection", error); } catch { /* Preserve the unknown outcome. */ }
             throw syncUnknown();
           }
         },
@@ -9561,7 +9562,11 @@ export class SessionHost {
         },
         complete: async (commit) => {
           try { return commit(); }
-          catch (error) { if (nativeNavigationConfirmed) throw syncUnknown(); throw error; }
+          catch (error) {
+            if (!nativeNavigationConfirmed) throw error;
+            try { this.recordFailure("native_navigation_commit", error); } catch { /* Preserve the unknown outcome. */ }
+            throw syncUnknown();
+          }
         }
       });
       await this.adoptNativeSessionDerivation(authority.operationId);
@@ -10215,7 +10220,7 @@ export class SessionHost {
     );
   }
 
-  private assertSessionNotPendingScheduleDeletion(sessionId: string): void {
+  private assertSessionNotPendingScheduleDeletion(sessionId: string, lifecycleOperationId?: string): void {
     const session = this.#store.getSession(sessionId);
     if (session.descriptor.deletedAt !== undefined || session.descriptor.archived) {
       throw new StoreError("Archived or deleted tasks cannot accept input or activate a native runtime.");
@@ -10229,7 +10234,8 @@ export class SessionHost {
     if (this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined) {
       throw new StoreError("The task is fenced while its lifecycle transition is in progress.");
     }
-    if (this.#sessionLifecycleFences.has(sessionId)) {
+    const lifecycleOwner = this.#sessionLifecycleFences.get(sessionId);
+    if (lifecycleOwner !== undefined && lifecycleOwner !== lifecycleOperationId) {
       throw new StoreError("The task is fenced while its lifecycle transition is in progress.");
     }
   }
