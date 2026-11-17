@@ -9,6 +9,7 @@ import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type SessionView, type TargetView, type TimelineItemView, type WorkspaceView } from "../model.js";
 import type { PrepareRewindDraft } from "./Composer.js";
 import { SessionPane } from "./SessionPane.js";
+import type { TimelineMessageEdit } from "./Timeline.js";
 import type { RunAction, Translator } from "./types.js";
 
 const prepareRewindDraft = vi.hoisted(() => vi.fn<PrepareRewindDraft>());
@@ -29,23 +30,24 @@ vi.mock("./Timeline.js", async () => {
   return {
     Timeline: (props: {
       readonly items: readonly TimelineItemView[];
-      readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>;
+      readonly messageEdit?: TimelineMessageEdit;
       readonly onPreviewMessageRewind?: (item: TimelineItemView) => void;
-      readonly editableMessageId?: string;
       readonly rewindToStartSupported?: boolean;
       readonly t: Translator;
     }) => {
       const item = props.items.at(-1);
-      if (item === undefined || props.onMoveEditedMessageToComposer === undefined) return null;
+      const edit = props.messageEdit;
+      if (item === undefined || edit === undefined) return null;
       return React.createElement(React.Fragment, null,
       React.createElement("output", { "data-testid": "start-rewind-supported" }, String(props.rewindToStartSupported)),
-      React.createElement("output", { "data-testid": "editable-message" }, props.editableMessageId ?? ""),
+      React.createElement("output", { "data-testid": "editable-message" }, edit.messageId ?? ""),
       React.createElement("button", { type: "button", onClick: () => props.onPreviewMessageRewind?.(item) }, "Preview rewind"),
       React.createElement(UserMessageEditBox, {
         initialText: item.text ?? "",
         t: props.t,
         onCancel: () => undefined,
-        onMoveToComposer: (text: string) => props.onMoveEditedMessageToComposer!(item, text)
+        blockedReason: edit.blockedReason,
+        onMoveToComposer: (text: string) => edit.submit(item, text)
       }));
     }
   };

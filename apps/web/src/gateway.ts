@@ -2497,8 +2497,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.refresh();
   }
 
-  async abort(runId: string): Promise<void> {
-    await this.submit({ case: "abortRun", value: { runId } });
+  async abort(runId: string, messageEdit?: Parameters<OperationApi["abort"]>[1]): Promise<void> {
+    if (messageEdit === undefined) {
+      await this.submit({ case: "abortRun", value: { runId } });
+      return;
+    }
+    const scope = this.captureActionScope();
+    await this.submit({ case: "abortRun", value: { runId, messageEdit: {
+      sourceMessageId: messageEdit.messageId, sourceEventId: messageEdit.eventId, attemptId: messageEdit.attemptId
+    } } }, true, [{ entity: { kind: EntityKind.SESSION, id: messageEdit.sessionId },
+      expectedGeneration: messageEdit.expectedGeneration }], scope.signal);
   }
 
   async abortRetry(runId: string): Promise<void> {

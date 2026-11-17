@@ -253,6 +253,7 @@ interface ActiveBackendSideEffectLease {
 type CompleteOperationInTransaction = (finalize: (store: OperationalStore) => void) => void;
 type RunAbortOptions = { readonly beforeAbort: () => void } | {
   readonly ownerStop: true;
+  readonly messageEdit?: { readonly messageId: string; readonly eventId: string; readonly attemptId: string };
   readonly completeBeforeDispatch?: CompleteOperationInTransaction;
 };
 
@@ -4518,6 +4519,9 @@ export class SessionHost {
         throw new JokoError({ code: "RUN_CONTROL_TARGET_CHANGED", message: "The requested Run is no longer active.",
           phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Refresh the task and select its current Run." });
       }
+      if (options !== undefined && "ownerStop" in options && options.messageEdit !== undefined) {
+        this.assertRunCanStopForMessageEdit(run, queue, session, options.messageEdit);
+      }
     };
     assertRun();
     const stored = this.#store.getSession(sessionId);
@@ -4566,6 +4570,30 @@ export class SessionHost {
     } finally {
       lease.release();
     }
+  }
+
+  private assertRunCanStopForMessageEdit(
+    run: RunDescriptor,
+    queue: QueueItemRecord,
+    session: SessionDescriptor,
+    edit: { readonly messageId: string; readonly eventId: string; readonly attemptId: string }
+  ): void {
+    const latest = this.#store.findVisibleSessionMessageOrigin({ sessionId: session.id, role: "user", includeRetainedContext: false });
+    const event = latest?.eventId === edit.eventId ? this.#store.findEvent(edit.eventId) : undefined;
+    const backend = this.#store.getBackend(session.backendId).descriptor;
+    if (run.state !== "running" || run.activeAttemptId !== edit.attemptId || run.source !== "user"
+      || run.parentRunId !== undefined || queue.state !== "backend_accepted" || queue.disposition !== "prompt"
+      || session.deletedAt !== undefined || session.hidden || session.derivationOrigin?.sideChat === true || session.automationOrigin !== undefined
+      || this.isReviewReadOnlySession(session.id) || !this.isOwnerRunInput(queue)
+      || backend.capabilities.get("turn.abort")?.supported !== true || backend.capabilities.get("session.rewind")?.supported !== true
+      || latest?.messageId !== edit.messageId || event === undefined || event.runId !== run.id || event.attemptId !== edit.attemptId
+      || event.generation !== session.binding.generation || event.payload.type !== "message_complete"
+      || event.payload.nativeHistory?.identity?.rewindBefore?.kind !== "native_entry") {
+      throw new StoreError("The original running message can no longer be stopped for editing.");
+    }
+    const pending = this.#store.listQueueItems({ sessionId: session.id,
+      states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 2 });
+    if (pending.some(item => item.id !== queue.id)) throw new StoreError("Finish or remove pending input before editing a sent message.");
   }
 
   private stopCodexBeforeDispatch(
