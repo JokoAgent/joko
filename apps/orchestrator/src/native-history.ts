@@ -6,11 +6,15 @@ import type {
   NativeHistoryProjection as AdapterNativeHistoryProjection
 } from "@joko/core";
 import {
+  NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD,
+  NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
+  NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   isNativeNavigationTarget,
   nativeHistoryEventContext,
   withNativeHistoryEventContext
 } from "@joko/core";
+import type { PersistedEvent, QueueItemRecord } from "@joko/store";
 
 import { nativeBindingFingerprint } from "./native-state-observation.js";
 
@@ -104,6 +108,50 @@ export function nativeHistoryReplayMetadata(
     observed.has(field) && Object.hasOwn(recorded.fields, field) && typeof recorded.fields[field] === typeof value
       ? recorded.fields[field]! : value
   ])) };
+}
+
+/** Carry the live Run facts only when the SDK frame and its original input both
+ * appear in the persistence-confirmed native projection. */
+export function adoptObservedNativeAssistant(
+  projection: NativeHistoryEventProjection,
+  source: PersistedEvent,
+  input: QueueItemRecord | undefined,
+  bindingFingerprint: string
+) {
+  const { payload, metadata } = projection;
+  const sourceFields = source.metadata?.fields;
+  const streamId = sourceFields?.[NATIVE_HISTORY_ASSISTANT_STREAM_FIELD];
+  if (metadata?.namespace !== "claude-code.native_history" || metadata.fields["nativeHydration"] !== true
+    || payload.type !== "message_complete" || payload.role !== "assistant" || payload.blocks.length !== 1
+    || source.metadata?.namespace !== "claude-code" || sourceFields?.[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== bindingFingerprint
+    || payload.nativeHistory?.identity?.entryId !== sourceFields?.[NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]
+    || typeof streamId !== "string" || !/^claude-block-[0-9a-f-]{36}-\d+-\d+$/u.test(streamId)
+    || source.payload.type !== "message_complete" || source.payload.role !== "assistant" || source.payload.blocks.length !== 1
+    || source.payload.turnUsage !== undefined || source.payload.partnerPrivateOrigin !== undefined
+    || input === undefined || input.disposition !== "prompt" || input.sessionId !== source.sessionId
+    || source.runId === undefined || source.runId !== input.runId || source.operationId === undefined || source.operationId !== input.operationId
+    || source.attemptId === undefined || source.attemptId !== input.attemptId) return undefined;
+  const block = payload.blocks[0], observed = source.payload.blocks[0];
+  if (block?.kind !== "text" || observed?.kind !== "text" || block.text !== observed.text) return undefined;
+  const { usage, usageIsEstimate, modelSubstitution, generationDurationMs, generationReliable } = source.payload;
+  return {
+    payload: {
+      ...payload,
+      ...(usage == null ? {} : { usage }),
+      ...(usageIsEstimate == null ? {} : { usageIsEstimate }),
+      ...(modelSubstitution == null ? {} : { modelSubstitution }),
+      ...(generationDurationMs == null ? {} : { generationDurationMs }),
+      ...(generationReliable == null ? {} : { generationReliable })
+    },
+    metadata: { ...metadata, fields: { ...metadata.fields,
+      [NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD]: source.id,
+      [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: streamId
+    } },
+    runId: source.runId,
+    attemptId: source.attemptId,
+    operationId: source.operationId,
+    emittedAt: source.emittedAt
+  };
 }
 
 export function bindNativeHistoryEventMetadata(

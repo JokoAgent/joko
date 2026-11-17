@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 
-import { CLAUDE_AGENT_SDK_CLI_VERSION, CLAUDE_AGENT_SDK_VERSION, loadClaudeRemoteManagerSource } from "@joko/adapter-claude-code";
+import {
+  CLAUDE_AGENT_SDK_CLI_VERSION, CLAUDE_AGENT_SDK_VERSION, ClaudeCodeAdapter, claudeNativeDerivationOperationId, claudeWorkspaceAuthority,
+  loadClaudeRemoteManagerSource
+} from "@joko/adapter-claude-code";
 import { OperationState, type Event } from "@joko/contracts";
 import {
   createOrchestratorApplication, createPublicServer, type OrchestratorApplication, type OrchestratorConfig
@@ -14,7 +17,7 @@ import type {
   RemoteFileTransportPort, RemoteGitCheckoutLease, RemoteGitCheckoutPlan, RemoteProcessHandle, RemoteProcessStartRequest,
   RemoteProcessTransportPort
 } from "@joko/remote-ssh";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
 import { createE2eClients, type E2eClients } from "./connect-clients.js";
 import { waitFor } from "./fixture.js";
@@ -29,7 +32,7 @@ const SOURCE_COMMIT = "a".repeat(40);
 const MANAGER_GENERATION = "11111111-1111-4111-8111-111111111111";
 
 it("keeps a remote Claude checkout and stored fork exact through dispatch, restart, refork, and delete", {
-  timeout: 180_000
+  timeout: 240_000
 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-remote-claude-derive-"));
   const workspace = join(root, "workspace");
@@ -46,10 +49,12 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
   };
   const remote = new ControlledRemoteClaude();
   await remote.initialize();
+  const observeCleanup = vi.spyOn(ClaudeCodeAdapter.prototype, "cleanupNativeSessionDerivation");
   let running: Awaited<ReturnType<typeof start>> | undefined;
   try {
     running = await start(config, remote);
     const { application } = running;
+    expect(application.store.getBackend(BACKEND_ID).descriptor.adapterKind).toBe("claude-agent-sdk-stdio");
     const target = application.store.listTargets().find((item) => item.descriptor.backendId === BACKEND_ID);
     if (target === undefined) throw new Error("The production Claude Target is unavailable.");
     const targetId = "remote-workspace:claude-code";
@@ -242,7 +247,75 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(receipt).toMatchObject({ operationId: cloneId, state: OperationState.FAILED, error: interrupted.error });
     expect(await submit(recoveredClients.operation, paired.connection.id, clone, cloneId)).toEqual(receipt);
     expect(remote.checkoutCalls.slice(callsBeforeRecovery)).toEqual(recoveryCalls);
+
+    // Recreate the exact durable sides of three cold checkpoints without
+    // inventing a second user request or replaying the original Clone.
+    const checkpoints = [];
+    const checkoutSource = recovered.store.getSession(sourceId);
+    const checkoutTarget = recovered.store.getTarget(targetId);
+    const backendGeneration = recovered.store.getBackend(BACKEND_ID).descriptor.instanceGeneration;
+    for (const boundary of ["attached", "child_pending", "recorded"] as const) {
+      const operationId = randomUUID(), sessionId = randomUUID();
+      const checkout = await recovered.sessionWorktrees.planRemoteDerivation({ sessionId, sourceSessionId: sourceId });
+      if (checkout === undefined) throw new Error("The fixture Clone has no remote worktree plan.");
+      const claim = recovered.store.claimAuthorizedDeferredEffectOperation(paired.connection.id, paired.connection.authKeyDigest, {
+        id: operationId, kind: "clone_session", body: { sourceSessionId: sourceId, title: "Interrupted Clone", kind: "clone" }
+      });
+      const identity = {
+        operationId, expectedBodyHash: claim.operation.bodyHash, sourceSessionId: sourceId,
+        sourceBinding: checkoutSource.descriptor.binding, sessionId, backendId: BACKEND_ID,
+        backendInstanceGeneration: backendGeneration, targetId, effectiveWorkspaceRoot: checkout.path, remoteWorkspace
+      };
+      const prepared = recovered.store.prepareNativeSessionDerivation({
+        ...identity, sourceSessionRevision: checkoutSource.revision, targetRevision: checkoutTarget.revision, remoteWorktreePlan: checkout
+      });
+      const worktree = await recovered.sessionWorktrees.acquirePlannedRemoteDerivation(checkout);
+      recovered.store.attachNativeSessionDerivationWorktree({ operationId, expectedRevision: prepared.revision, worktree });
+      const nativeOperationId = claudeNativeDerivationOperationId(operationId);
+      const workspaceAuthority = claudeWorkspaceAuthority({ ...checkoutTarget.descriptor, workspaceRoot: checkout.path });
+      const childId = boundary === "attached" ? undefined : randomUUID();
+      if (childId !== undefined) {
+        remote.storeInterruptedClone({ id: nativeOperationId, workspaceAuthority, sourceNativeId, childId,
+          sourceWorkspaceAuthority: claudeWorkspaceAuthority(checkoutTarget.descriptor), confirmed: boundary === "recorded" });
+        if (boundary === "recorded") recovered.store.recordNativeSessionDerivation({ ...identity, worktree, binding: {
+          nativeSessionId: childId, opaqueRef: `claude-code:stored-session:${workspaceAuthority}:${childId}`,
+          generation: checkoutSource.descriptor.binding.generation
+        } });
+      }
+      expect(recovered.store.getOperation(operationId).status).toBe("started");
+      expect(recovered.store.findNativeSessionDerivation(operationId)?.state).toBe(boundary === "recorded" ? "recorded" : "prepared");
+      checkpoints.push({ operationId, sessionId, worktree, childId, nativeOperationId, boundary });
+    }
+    const beforeCleanup = remote.managerCalls.length;
+    const beforeCheckout = remote.checkoutCalls.length;
+    await running.close();
+    running = await start(config, remote);
+    for (const checkpoint of checkpoints) {
+      expect(running.application.store.getOperation(checkpoint.operationId).status).toBe("failed");
+      const cleanupCall = observeCleanup.mock.calls.find(([lifecycle]) => lifecycle.operationId === checkpoint.operationId);
+      expect(cleanupCall?.[2], `The ${checkpoint.boundary} cleanup must carry its durable claim.`).toEqual({
+        token: running.application.store.findNativeSessionDerivation(checkpoint.operationId)?.cleanupToken
+      });
+      const diagnostics = running.application.store.listDiagnostics({ component: "native_session_derivation_cleanup", limit: 6 })
+        .map(({ code, message }) => ({ code, message }));
+      expect(running.application.store.findNativeSessionDerivation(checkpoint.operationId), JSON.stringify({
+        checkpoint: checkpoint.boundary, diagnostics,
+        manager: remote.managerCalls.slice(beforeCleanup),
+        checkout: remote.checkoutCalls.slice(beforeCheckout), cleanupOperations: remote.cleanupOperations.length
+      })).toMatchObject({
+        state: "cleaned", cleanupToken: expect.any(String), worktree: checkpoint.worktree
+      });
+      expect(remote.releasedPaths.filter(path => path === checkpoint.worktree.path)).toHaveLength(1);
+      if (checkpoint.childId !== undefined) expect(remote.messages(checkpoint.childId)).toEqual([]);
+    }
+    expect([...remote.cleanupOperations].sort()).toEqual(checkpoints.filter(checkpoint => checkpoint.childId !== undefined)
+      .map(checkpoint => checkpoint.nativeOperationId).sort());
+    expect(remote.managerCalls.slice(beforeCleanup).filter(method => method === "store.recoverOperation")).toHaveLength(3);
+    expect(remote.managerCalls.slice(beforeCleanup)).not.toContain("store.fork");
+    expect(remote.activePaths()).toEqual([derived.worktree.path]);
+    expect(remote.messages(sourceNativeId)).toEqual(sourceHistory);
   } finally {
+    observeCleanup.mockRestore();
     await running?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   }
@@ -280,6 +353,8 @@ class ControlledRemoteClaude {
   readonly #checkouts = new Map<string, RemoteGitCheckoutLease>();
   #interruptReleaseFor: string | undefined;
   #releasing: RemoteGitCheckoutLease | undefined;
+  readonly #interruptedClones = new Set<string>();
+  readonly cleanupOperations: string[] = [];
   readonly #files: RemoteFileTransportPort = {
     realpath: async (path) => {
       if (!this.hasDirectory(path)) throw new Error(`Unknown remote directory ${path}.`);
@@ -300,7 +375,7 @@ class ControlledRemoteClaude {
     remove: async () => { throw new Error("Unexpected remote file remove."); }
   };
   readonly #messages = new Map<string, NativeMessage[]>();
-  readonly #operations = new Map<string, { access: Record<string, unknown>; childId?: string; cleaned: boolean }>();
+  readonly #operations = new Map<string, { access: Record<string, unknown>; childId?: string; confirmed?: boolean; cleaned: boolean }>();
   readonly queryInputs: Array<{ sessionId: string; content: string; consumedInitCwd?: string }> = [];
   readonly managerCalls: string[] = [];
   readonly checkoutCalls: string[] = [];
@@ -342,6 +417,18 @@ class ControlledRemoteClaude {
   }
 
   activePaths(): string[] { return [...this.#checkouts.values()].map((lease) => lease.path).sort(); }
+
+  storeInterruptedClone(input: { id: string; workspaceAuthority: string; sourceWorkspaceAuthority: string;
+    sourceNativeId: string; childId: string; confirmed: boolean }): void {
+    this.#interruptedClones.add(input.id);
+    this.#operations.set(input.id, {
+      access: { kind: "operation", operationId: input.id, generation: 1,
+        source: { kind: "import", workspaceAuthority: input.sourceWorkspaceAuthority, sessionId: input.sourceNativeId },
+        target: { workspaceAuthority: input.workspaceAuthority } },
+      childId: input.childId, confirmed: input.confirmed, cleaned: false
+    });
+    this.#messages.set(input.childId, this.messages(input.sourceNativeId));
+  }
 
   hasDirectory(path: string): boolean {
     return path === REMOTE_ROOT || this.activePaths().includes(path);
@@ -456,12 +543,29 @@ class ControlledRemoteClaude {
       return undefined;
     }
     if (method === "store.recoverOperation") {
-      return this.#operations.get(String(object(params.input).operationId))?.access;
+      const input = object(params.input);
+      const id = String(input.operationId);
+      const operation = this.#operations.get(id);
+      if (operation === undefined) throw new Error("NOT_FOUND");
+      if (this.#interruptedClones.has(id)) {
+        expect(input.targetWorkspaceAuthority).toBe(object(operation.access.target).workspaceAuthority);
+        expect(input.expectedChildSessionId).toBe(operation.confirmed ? operation.childId : undefined);
+        operation.access = { ...operation.access, generation: object(params.authority).generation };
+      }
+      return operation.access;
     }
     if (method === "store.readOperation" || method === "store.cleanupOperation") {
-      const operation = this.#operations.get(String(object(params.access).operationId));
+      const operationId = String(object(params.access).operationId);
+      const operation = this.#operations.get(operationId);
       if (operation === undefined) throw new Error("The remote Store operation is absent.");
-      if (method === "store.cleanupOperation") operation.cleaned = true;
+      if (method === "store.cleanupOperation") {
+        operation.cleaned = true;
+        if (this.#interruptedClones.has(operationId)) {
+          expect(object(params.input).expectedChildSessionId).toBe(operation.confirmed ? operation.childId : undefined);
+          this.cleanupOperations.push(operationId);
+          if (operation.childId !== undefined) this.#messages.delete(operation.childId);
+        }
+      }
       const access = operation.access;
       return {
         operationId: access.operationId, generation: access.generation,
@@ -472,7 +576,7 @@ class ControlledRemoteClaude {
         state: operation.cleaned ? "cleaned" : "child_reserved",
         sourceProjectKeyCaptured: true, targetProjectKeyCaptured: true,
         sourceEntryCount: 2, sourceBytes: 100, revision: 1,
-        childReservationConfirmed: operation.childId !== undefined,
+        childReservationConfirmed: operation.confirmed ?? (operation.childId !== undefined),
         ...(operation.childId === undefined ? {} : { childSessionId: operation.childId })
       };
     }

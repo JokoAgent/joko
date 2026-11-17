@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { modelPricesWithOverride, parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
+import { modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
+  parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
 import { DOCUMENT_TOOL_PROVIDER_ID } from "./document-tool-provider.js";
 import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
@@ -121,6 +122,7 @@ import {
   updateExtensionWidgets
 } from "./extension-ui-state.js";
 import {
+  adoptObservedNativeAssistant,
   bindNativeHistoryEventMetadata,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   nativeHistoryReplayMetadata,
@@ -5886,7 +5888,8 @@ export class SessionHost {
 
   private async nativeSessionDerivationLifecycle(
     record: NativeSessionDerivationRecord,
-    expectedWorktree?: SessionWorktreeBinding
+    expectedWorktree?: SessionWorktreeBinding,
+    remoteCleanup = false
   ): Promise<NativeSessionDerivationLifecycle> {
     const target = this.#store.getTarget(record.targetId).descriptor;
     const sourceStored = this.#store.getSession(record.sourceSessionId), source = sourceStored.descriptor;
@@ -5903,6 +5906,7 @@ export class SessionHost {
       throw new StoreError("The native derivation lifecycle worktree authority changed.");
     }
     const worktree = record.worktree ?? expectedWorktree;
+    const registration = remoteCleanup ? { register: false } : undefined;
     let effectiveTarget = this.sourceRuntimeTarget({ ...target, backendId: record.backendId });
     if (effectiveTarget.workspaceRoot !== record.effectiveWorkspaceRoot && readOnlySourceRoot) {
       if (source.worktree !== undefined && (source.worktree.state !== "active"
@@ -5916,7 +5920,7 @@ export class SessionHost {
       }
       const activePath = worktree.remote === undefined
         ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree)
-        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree);
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree, registration);
       if (activePath === undefined || (target.remoteWorkspace === undefined) !== (worktree.remote === undefined)) {
         throw new StoreError("The native derivation lifecycle workspace authority changed.");
       }
@@ -5924,7 +5928,7 @@ export class SessionHost {
     } else if (worktree !== undefined
       && (worktree.remote === undefined
         ? this.#worktrees?.activeWorkspacePath(record.sessionId, worktree) === undefined
-        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree) === undefined)) {
+        : await this.#worktrees?.assertActiveRemoteWorktree(record.sessionId, worktree, registration) === undefined)) {
       throw new StoreError("The native derivation lifecycle worktree is no longer active.");
     }
     if (record.state === "product_adopted") {
@@ -6094,13 +6098,19 @@ export class SessionHost {
       // shutdown. Startup cleanup instead acquires its own admission authority.
       if (!this.#disposed) releaseAdmission = this.beginBackendAdmissionEffect(current.backendId);
       const record = this.claimCurrentNativeSessionDerivationLifecycleOwner(current, adapter);
-      const lifecycle = await this.nativeSessionDerivationLifecycle(record, expectedWorktree);
+      const remoteCleanup = record.externalLifecycle && record.worktree?.remote?.binding.kind === "ssh"
+        && record.remoteWorktreePlan !== undefined && this.#store.getBackend(record.backendId).descriptor.adapterKind === "claude-agent-sdk-stdio";
+      const lifecycle = await this.nativeSessionDerivationLifecycle(record, expectedWorktree, remoteCleanup);
       const call = this.beginNativeDerivationLifecycleCall(record.backendId);
       let deletion: Promise<void>;
       try {
         if (record.externalLifecycle) {
           claim = this.#store.claimNativeSessionDerivationCleanup({ operationId, expectedRevision: record.revision });
-          deletion = adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal);
+          const cleanupClaim = remoteCleanup
+            && (lifecycle.kind === "fork" || lifecycle.kind === "clone") ? { token: claim.token } : undefined;
+          deletion = cleanupClaim === undefined
+            ? adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal)
+            : adapter.cleanupNativeSessionDerivation!(lifecycle, call.controller.signal, cleanupClaim);
         } else {
           const binding = record.binding;
           if (binding === undefined) {
@@ -17610,6 +17620,7 @@ export class SessionHost {
     const privateMessageMetadata = new Map<string, PartnerPrivateMessageOrigin>();
     const acceptedQueueInputs = new Map<string, QueueItemRecord>();
     const observedAutomaticCompactions = new Set<string>();
+    const observedAssistantByEntry = new Map<string, PersistedEvent | null>();
     const nativeIdentityAdapter = adapter as BackendAdapter & {
       readonly nativeUserEntryIdForOperation?: (operationId: string) => string;
     };
@@ -17630,6 +17641,12 @@ export class SessionHost {
     }
     visitVisibleSessionEvents(store, session.id, (event) => {
       const privateEntryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+      const observedAssistant = event.metadata?.fields[NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD];
+      if (event.metadata?.namespace === "claude-code" && typeof observedAssistant === "string"
+        && event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint
+        && event.payload.type === "message_complete" && event.payload.role === "assistant") {
+        observedAssistantByEntry.set(observedAssistant, observedAssistantByEntry.has(observedAssistant) ? null : event);
+      }
       if (event.payload.type === "compaction" && event.payload.automatic === true
         && event.payload.state === "completed" && privateEntryId !== undefined
         && event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint) {
@@ -17757,6 +17774,24 @@ export class SessionHost {
       const payload = projectedPayload.type === "message_complete" && privateOrigin !== undefined
         ? { ...projectedPayload, partnerPrivateOrigin: privateOrigin }
         : projectedPayload;
+      const observedAssistant = projectionEntryId === undefined ? undefined : observedAssistantByEntry.get(projectionEntryId);
+      if (projection.payload.type === "message_complete" && projection.payload.role === "assistant"
+        && projection.metadata?.namespace === "claude-code.native_history" && privateOrigin === undefined) {
+        const existing = store.findEvent(projection.id, { includeTombstoned: true });
+        const sourceId = existing?.metadata?.fields[NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD];
+        const source = typeof sourceId === "string" ? store.findEvent(sourceId, { includeTombstoned: true })
+          : existing === undefined ? observedAssistant : undefined;
+        const parentId = projection.payload.nativeHistory?.identity?.parentEntryId;
+        const adoption = source && source.backendId === session.backendId && source.targetId === session.targetId
+          && source.runId !== undefined && store.findRun(source.runId)?.descriptor.source === "user"
+          ? adoptObservedNativeAssistant(projection, source, parentId === undefined ? undefined : acceptedQueueInputs.get(parentId), bindingFingerprint)
+          : undefined;
+        if (adoption !== undefined) {
+          store.appendEventIfAbsent({ id: projection.id, backendId: session.backendId, targetId: session.targetId,
+            sessionId: session.id, generation: session.binding.generation, traceId: `native-history:${projection.id}`, ...adoption });
+          continue;
+        }
+      }
       store.appendEventIfAbsent({
         id: projection.id,
         ...(projection.emittedAt === undefined ? {} : { emittedAt: projection.emittedAt }),

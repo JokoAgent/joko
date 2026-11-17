@@ -9,9 +9,12 @@ import {
   CLAUDE_AGENT_SDK_VERSION,
   ClaudeSessionStoreError,
   claudeInputDispatchFence,
+  claudeNativeDerivationOperationId,
   claudeWorkspaceAuthority,
   type ClaudeCanUseToolOptions,
   type ClaudePermissionResult,
+  type ClaudeRemoteDerivationCleanup,
+  type ClaudeRemoteDerivationCleanupCatalog,
   type ClaudeRemoteRuntimePort,
   type ClaudeSdkAccountInfo,
   type ClaudeSdkForkOptions,
@@ -110,6 +113,8 @@ export interface RemoteClaudeDerivedWorkspaceAuthority {
   readonly assertCurrent: () => void;
   /** Read-only remote manifest and Git identity check before an SDK effect. */
   readonly verifyExact: (signal?: AbortSignal) => Promise<void>;
+  /** Captured SSH identity from the same durable worktree cleanup claim. */
+  readonly expectedExecutionIdentity?: string;
 }
 
 export interface RemoteClaudeRuntimeResolverOptions {
@@ -120,7 +125,8 @@ export interface RemoteClaudeRuntimeResolverOptions {
   readonly authorizeDerivedWorkspace?: (
     target: TargetDescriptor,
     storedTarget: StoredTarget,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    cleanup?: ClaudeRemoteDerivationCleanup
   ) => Promise<RemoteClaudeDerivedWorkspaceAuthority>;
 }
 
@@ -189,6 +195,73 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
     finally { if (this.#flights.get(key) === flight) this.#flights.delete(key); }
   }
 
+  /** Open only the original Store operation under its claimed checkout. */
+  async resolveDerivationCleanup(
+    target: TargetDescriptor,
+    cleanup: ClaudeRemoteDerivationCleanup,
+    signal: AbortSignal
+  ): Promise<ClaudeRemoteDerivationCleanupCatalog> {
+    this.#assertOpen();
+    signal.throwIfAborted();
+    const stored = this.#storedTarget(target);
+    if (target.workspaceRoot === stored.descriptor.workspaceRoot || this.#authorizeDerivedWorkspace === undefined) {
+      throw runtimeFault("target_stale", false);
+    }
+    const directory = await this.#authorizeDerivedWorkspace(target, stored, signal, cleanup);
+    const { authority, installation } = await this.#probeInstallation(requireRemoteBinding(stored.descriptor), signal, directory.assertCurrent);
+    if (directory.expectedExecutionIdentity !== authority.executionIdentity) throw runtimeFault("authority_changed", false);
+    const storeAuthority = this.#storeAuthority(stored.descriptor, authority, installation);
+    const workspaceAuthority = claudeWorkspaceAuthority(target);
+    const operationId = claudeNativeDerivationOperationId(cleanup.operationId);
+    const assertCurrent = (): void => {
+      this.#assertOpen(); signal.throwIfAborted(); authority.assertCurrent(); directory.assertCurrent();
+    };
+    let managerGeneration: string | undefined;
+    let recovered: { readonly access: ClaudeSessionStoreOperationAccess; readonly expectedChildSessionId: string | undefined } | undefined;
+    const perform = async (method: "store.recoverOperation" | "store.cleanupOperation", params: Readonly<Record<string, unknown>>) => {
+      assertCurrent();
+      await directory.verifyExact(signal);
+      const channel = await RemoteClaudeManagerChannel.open({
+        processes: authority.processes, installation, assertCurrent,
+        acceptManagerGeneration: (generation) => {
+          if (managerGeneration !== undefined && managerGeneration !== generation) throw runtimeFault("manager_generation_changed", true);
+          managerGeneration = generation;
+        }
+      }, signal);
+      try {
+        return await channel.request(method, { authority: storeAuthority, ...params }, { timeoutMs: SESSION_OPERATION_TIMEOUT_MS, signal });
+      } catch (error) {
+        throw translateRemoteStoreFault(error);
+      } finally {
+        await channel.close().catch(() => undefined);
+        assertCurrent();
+      }
+    };
+    const storedSessions: ClaudeRemoteDerivationCleanupCatalog["storedSessions"] = {
+      recoverOperation: async (input) => {
+        recovered = undefined;
+        if (input.operationId !== operationId
+          || input.targetWorkspaceAuthority !== workspaceAuthority
+          || (input.expectedChildSessionId !== undefined && !UUID.test(input.expectedChildSessionId))) throw runtimeFault("store_access_mismatch", false);
+        const access = storeOperationAccess(await perform("store.recoverOperation", { input }), storeAuthority.generation, true);
+        if (access.operationId !== operationId
+          || access.target.workspaceAuthority !== workspaceAuthority) throw runtimeFault("invalid_response", true);
+        recovered = { access, expectedChildSessionId: input.expectedChildSessionId };
+        return access;
+      },
+      cleanupOperation: async (access, input) => {
+        if (recovered === undefined || access !== recovered.access || input?.expectedChildSessionId !== recovered.expectedChildSessionId) {
+          throw runtimeFault("store_access_mismatch", false);
+        }
+        recovered = undefined;
+        return storeOperationSnapshot(await perform("store.cleanupOperation", {
+          access, ...(input === undefined ? {} : { input })
+        }), access);
+      }
+    };
+    return { storedSessions, assertCurrent };
+  }
+
   async close(): Promise<void> {
     if (this.#closed || this.#closing) return;
     this.#closing = true;
@@ -226,18 +299,7 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       ...(directoryAuthority === undefined ? {} : { workspaceRoot: effectiveWorkspaceRoot })
     }), "utf8").digest("hex");
     const ownerGeneration = `${stored.revision}:${authority.authorityIdentity}:${randomUUID()}`;
-    const storeAuthority: RemoteClaudeStoreAuthority = Object.freeze({
-      schemaVersion: 1,
-      namespace: `backend-${createHash("sha256").update(JSON.stringify({
-        kind: "joko-remote-claude-store-v1",
-        backendId: target.backendId,
-        targetId: target.id,
-        primaryWorkspaceRoot: remote.workspaceRoot,
-        executionIdentity: authority.executionIdentity,
-        runtimeRoot: installation.runtimeRoot
-      }), "utf8").digest("hex")}`,
-      generation: this.#storeGeneration
-    });
+    const storeAuthority = this.#storeAuthority(stored.descriptor, authority, installation);
     const workspaceAuthority = claudeWorkspaceAuthority(target);
     const storedSignature = targetSignature(stored.descriptor);
     let entry!: ResolverEntry;
@@ -299,6 +361,21 @@ export class RemoteClaudeRuntimeResolver implements ClaudeRemoteRuntimePort {
       await this.#retire(entry).catch(() => undefined);
       throw error;
     }
+  }
+
+  #storeAuthority(target: TargetDescriptor, authority: RemoteProcessAuthority, installation: RemoteClaudeInstallationProbe): RemoteClaudeStoreAuthority {
+    return Object.freeze({
+      schemaVersion: 1,
+      namespace: `backend-${createHash("sha256").update(JSON.stringify({
+        kind: "joko-remote-claude-store-v1",
+        backendId: target.backendId,
+        targetId: target.id,
+        primaryWorkspaceRoot: requireRemoteBinding(target).workspaceRoot,
+        executionIdentity: authority.executionIdentity,
+        runtimeRoot: installation.runtimeRoot
+      }), "utf8").digest("hex")}`,
+      generation: this.#storeGeneration
+    });
   }
 
   async #probeInstallation(remote: RemoteWorkspaceBinding, signal?: AbortSignal, assertPrepared?: () => void) {
@@ -697,10 +774,7 @@ class RemoteClaudeSdkRuntime implements ClaudeSdkRuntime {
     try {
       return await this.#sessionOperation(method, { authority: this.#options.storeAuthority, ...params }, signal, onCallback);
     } catch (error) {
-      if (error instanceof RemoteClaudeManagerFault && STORE_CODES.has(error.code)) {
-        throw new ClaudeSessionStoreError(error.code as ConstructorParameters<typeof ClaudeSessionStoreError>[0], error.stateMayHaveChanged);
-      }
-      throw error;
+      throw translateRemoteStoreFault(error);
     }
   }
 
@@ -1876,6 +1950,12 @@ class RemoteClaudeManagerFault extends Error {
     super(`Remote Claude manager failure: ${code}.`);
     this.name = "RemoteClaudeManagerFault";
   }
+}
+
+function translateRemoteStoreFault(error: unknown): unknown {
+  return error instanceof RemoteClaudeManagerFault && STORE_CODES.has(error.code)
+    ? new ClaudeSessionStoreError(error.code as ConstructorParameters<typeof ClaudeSessionStoreError>[0], error.stateMayHaveChanged)
+    : error;
 }
 
 function serializeQueryOptions(

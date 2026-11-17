@@ -758,10 +758,12 @@ export interface BackendAdapter {
     signal: AbortSignal
   ): Promise<void>;
   /** Clean an unadopted Adapter-owned operation. The binding is absent when a
-   * crash occurred before the native child identity was reserved. */
+   * crash occurred before the native child identity was reserved. The private
+   * claim lets a detached remote cleanup prove the exact durable owner. */
   cleanupNativeSessionDerivation?(
     lifecycle: NativeSessionDerivationLifecycle,
-    signal: AbortSignal
+    signal: AbortSignal,
+    claim?: { readonly token: string }
   ): Promise<void>;
   /**
    * Replace the attached native context with a fresh same-Backend session.

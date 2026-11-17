@@ -452,7 +452,8 @@ export class SessionWorktreeCoordinator {
   }
 
   /** Prove the remote manifest and checkout under current SSH authority. */
-  async assertActiveRemoteWorktree(sessionId: string, expectedBinding: SessionWorktreeBinding): Promise<string> {
+  async assertActiveRemoteWorktree(sessionId: string, expectedBinding: SessionWorktreeBinding,
+    options?: { readonly register: boolean }): Promise<string> {
     this.#requireInitialized();
     if (expectedBinding.remote === undefined || expectedBinding.state !== "active"
       || expectedBinding.workspaceId !== workspaceIdFor(sessionId)
@@ -460,6 +461,7 @@ export class SessionWorktreeCoordinator {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     await this.#requireRemoteOwner().assertExact(sessionId, expectedBinding);
+    if (options?.register === false) return expectedBinding.path;
     const target = this.#store.getTarget(expectedBinding.remote.targetId);
     if (!this.#workspaces.listRegistrations().some((registration) =>
       registration.id === expectedBinding.workspaceId)) {
