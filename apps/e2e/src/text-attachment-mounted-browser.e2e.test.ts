@@ -116,6 +116,8 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
     await capture("narrow-dark-code");
     await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "detached" });
+    if (await closeDetails.isVisible()) await closeDetails.click();
     const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation", exact: true });
     if (await closeNavigation.isVisible()) await closeNavigation.click();
     await preview("literal.txt").click();
