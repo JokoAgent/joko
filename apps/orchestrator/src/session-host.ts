@@ -5887,6 +5887,7 @@ export class SessionHost {
 
   private assertSessionDerivationSource(source: StoredSession, completedSnapshot = false): void {
     if (completedSnapshot && (source.descriptor.archived || source.descriptor.hidden || source.descriptor.derivationOrigin?.sideChat
+      || this.#store.findPendingSessionLifecycleCleanup(source.descriptor.id) !== undefined
       || this.#store.sessionCreationServiceKind(source.descriptor.id) !== undefined || this.#partnerSessionPolicy(source.descriptor.id) !== undefined
       || !this.#sideChatSourceAllowed(source.descriptor.id))) {
       throw new StoreError("Only an ordinary main task can open a Side Chat.");

@@ -6378,6 +6378,9 @@ async function advanceSessionLifecycleCleanup(
     });
   };
   try {
+    for (const child of dependencies.store.prepareDependentSideChatCleanups(cleanup, (dependencies.now ?? Date.now)())) {
+      await advanceSessionLifecycleCleanup(dependencies, child);
+    }
     if (!cleanup.closeCompleted) {
       await dependencies.sessionHost.prepareSessionLifecycleClose(
         cleanup.sessionId,
@@ -6616,6 +6619,7 @@ async function resumePendingSessionLifecycleCleanup(
 ): Promise<SessionLifecycleCleanupRecord | undefined> {
   let cleanup = dependencies.store.findSessionLifecycleCleanup(operationId);
   if (cleanup?.state !== "pending") return cleanup;
+  if (dependencies.store.isDependentSideChatCleanup(cleanup)) return cleanup;
   // Service-owned Partner retirement has its own durable recovery coordinator.
   if (dependencies.sessionHost.isPartnerSessionRetiring(cleanup.sessionId)) return cleanup;
   if (dependencies.sessionHost.isPersonalDevelopmentSessionEnding?.(cleanup.sessionId)

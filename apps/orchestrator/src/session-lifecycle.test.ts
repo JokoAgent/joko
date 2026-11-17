@@ -9,6 +9,7 @@ import * as contract from "@joko/contracts";
 import {
   OperationalStore,
   PartnerStore,
+  TaskShareStore,
   type ConnectionRecord,
   type OperationExecution
 } from "@joko/store";
@@ -192,6 +193,54 @@ describe("durable task lifecycle cleanup", () => {
     expect(fixture.releaseWorktree).toHaveBeenCalledTimes(2);
     expect(fixture.store.getSessionLifecycleCleanup(operationId).state).toBe("completed");
     expect(fixture.store.getSession(fixture.sessionId).descriptor.deletedAt).toBeDefined();
+  });
+
+  it("retires only dependent Side Chats with the original parent deletion after service recovery", async () => {
+    const fixture = createFixture(), { store, connection } = fixture;
+    const { worktree: _worktree, ...base } = store.getSession(fixture.sessionId).descriptor;
+    const parent = store.createSession({ ...base, id: "parent", binding: { opaqueRef: "native/parent", generation: 1 } }).descriptor;
+    const anchor = store.appendEvent({ sessionId: parent.id, backendId: parent.backendId, targetId: parent.targetId, generation: 1,
+      traceId: "parent-completion", payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Completed parent reply" }] } });
+    const derived = (id: string, sideChat: boolean) => store.createSession({ ...parent, id,
+      binding: { opaqueRef: `native/${id}`, generation: 1 },
+      derivationOrigin: { kind: "fork", sourceSessionId: parent.id, sourceMessageId: anchor.id, sourceEventId: anchor.id,
+        ...(sideChat ? { sideChat: true } : {}) }
+    }).descriptor;
+    const first = derived("side-first", true), second = derived("side-second", true), fork = derived("ordinary-fork", false);
+    const shares = new TaskShareStore(store);
+    const share = shares.create({ shareId: "side-share", sessionId: first.id, invitationSha256Hex: "a".repeat(64) });
+    fixture.closeIfActive.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Second side chat still has a live runtime."));
+    const service = servicesFor(fixture);
+    const operationId = "delete-parent-with-side-chats";
+    const request = create(contract.SubmitOperationRequestSchema, { operationId, connectionId: connection.id,
+      mutation: { payload: { case: "deleteSession", value: { sessionId: parent.id } } } });
+    const pending = await service.operation.submitOperation(request, context());
+    expect(pending.operation?.state).toBe(contract.OperationState.RUNNING);
+    expect(fixture.closeIfActive.mock.calls).toEqual([[first.id], [second.id]]);
+    const group = store.listPendingSessionLifecycleCleanups();
+    expect(group.filter(member => store.isDependentSideChatCleanup(member)).map(member => member.sessionId).sort())
+      .toEqual([first.id, second.id]);
+    expect(store.findPendingSessionLifecycleCleanup(first.id)?.closeCompleted).toBe(true);
+    expect(store.findPendingSessionLifecycleCleanup(second.id)?.closeCompleted).toBe(false);
+    for (const id of [parent.id, first.id, second.id]) expect(store.getSession(id).descriptor.deletedAt).toBeUndefined();
+    expect(shares.get(share.shareId).status).toBe("active");
+
+    fixture.disposeServices();
+    const resumed = servicesFor(fixture);
+    await vi.waitFor(() => expect(store.getOperation(operationId).status).toBe("completed"));
+    expect(fixture.closeIfActive.mock.calls).toEqual([[first.id], [second.id], [second.id], [parent.id]]);
+    const retired = store.getSession(parent.id);
+    expect(retired.descriptor.deletedAt).toBeDefined();
+    for (const id of [first.id, second.id]) {
+      const child = store.getSession(id);
+      expect(child.descriptor).toMatchObject({ archived: true, deletedAt: retired.descriptor.deletedAt });
+      expect(child.revision).toBe(retired.revision);
+    }
+    expect(store.getSession(fork.id).descriptor.deletedAt).toBeUndefined();
+    expect(shares.get(share.shareId).status).toBe("ended");
+    expect(fixture.deleteNativeSession).not.toHaveBeenCalled();
+    expect((await resumed.operation.submitOperation(request, context())).operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    expect(fixture.closeIfActive).toHaveBeenCalledTimes(4);
   });
 
   it("replays native deletion with the same operation identity when its phase commit is interrupted", async () => {
