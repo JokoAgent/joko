@@ -26,7 +26,7 @@ import {
 import { appRouteHash, type AppController, type AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
-import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
+import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerDraft, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PendingMessageEdit, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
 import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
@@ -298,7 +298,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [sideChatRecoveryLoadError, setSideChatRecoveryLoadError] = useState<string>();
   const [sideChatRecoveryReload, setSideChatRecoveryReload] = useState(0);
   const [composerAttachmentInsertion, setComposerAttachmentInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly file: File }>();
-  const [composerDraftReplacement, setComposerDraftReplacement] = useState<{ readonly id: number; readonly sessionId: string; readonly text: string; readonly editorDocument?: import("@tiptap/core").JSONContent; readonly attachments?: readonly AttachmentDraft[] }>();
+  const [pendingMessageEdit, setPendingMessageEdit] = useState<{ readonly owner: string; readonly edit: PendingMessageEdit }>();
   const [shareSelection, setShareSelection] = useState<ActiveShareSelection>();
   const [messageRewind, setMessageRewind] = useState<ActiveMessageRewind>();
   const [messageDelete, setMessageDeleteState] = useState<ActiveMessageDelete>();
@@ -402,7 +402,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current?.abort.abort();
     conversationCopyFlightRef.current = undefined;
     setConversationCopyFeedback(undefined);
-    setComposerDraftReplacement(undefined);
     setMessageRewind(undefined);
     setRewindPreview(undefined);
     artifactCatalogDocumentEpochRef.current += 1;
@@ -418,7 +417,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       conversationCopyFlightRef.current = undefined;
       setConversationCopyFeedback(undefined);
       artifactCatalogDocumentEpochRef.current += 1;
-      setComposerDraftReplacement(undefined);
       setMessageRewind(undefined);
       setRewindPreview(undefined);
       setArtifactCatalogDocumentOwner(undefined);
@@ -436,7 +434,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   });
   useLayoutEffect(() => {
     rewindEpochRef.current += 1;
-    setComposerDraftReplacement(undefined);
     setMessageRewind(undefined);
     setRewindPreview(undefined);
   }, [session.id, session.generation, controller.navigateSessionBranch, controller.state.navigationRevision]);
@@ -501,10 +498,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const composerAttachmentInsertionIdRef = useRef(0);
   const appliedExternalSelectionQuoteInsertionRef = useRef<string | undefined>(undefined);
   const appliedExternalAttachmentInsertionRef = useRef<string | undefined>(undefined);
-  const composerDraftReplacementIdRef = useRef(0);
   const composerLocalDraftEpochRef = useRef(0);
   const rewindDraftRef = useRef<PrepareRewindDraft | null>(null);
-  const noteComposerDraftMutation = useCallback(() => { composerLocalDraftEpochRef.current += 1; setComposerDraftReplacement(undefined); }, []);
+  const noteComposerDraftMutation = useCallback(() => { composerLocalDraftEpochRef.current += 1; }, []);
   const shareSelectionBeforeAllRef = useRef<ReadonlySet<string> | undefined>(undefined);
   const messageRewindRequestIdRef = useRef(0);
   const compactConfirmationRef = useRef(compactConfirmation);
@@ -911,7 +907,22 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && item.inputDelivery !== "scheduler" && !hasPendingComposerQueueItems(currentQueue, current.id);
   };
   const editStopsRun = canStopForMessageEdit(session, latestVisibleUserMessage, queue);
-  const editableMessageId = (messageRewindSupported || editStopsRun) && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported)
+  const editOwner = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    controller.state.activeProfile?.origin, session.id]);
+  const editOwnerRef = useRef(editOwner);
+  editOwnerRef.current = editOwner;
+  const currentPendingMessageEdit = pendingMessageEdit?.owner === editOwner ? pendingMessageEdit.edit : undefined;
+  useEffect(() => {
+    if (guest || reviewReadOnly || controller.state.connectionState !== "connected" || controller.messageEditDrafts === undefined) return;
+    let retired = false;
+    void controller.messageEditDrafts.read(session.id).then(edit => {
+      if (retired || editOwnerRef.current !== editOwner) return;
+      if (edit !== undefined) setPendingMessageEdit({ owner: editOwner, edit });
+    }).catch(() => undefined);
+    return () => { retired = true; };
+  }, [controller.messageEditDrafts, controller.state.connectionState, editOwner, session.id, guest, reviewReadOnly]);
+  const editableMessageId = currentPendingMessageEdit === undefined && !guest && controller.state.taskSource?.kind !== "joined" && !session.archived
+    && (messageRewindSupported || editStopsRun) && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported)
     ? latestVisibleUserMessage.id : undefined;
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
@@ -1071,7 +1082,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setComposerMessageMentionInsertion(undefined);
     setComposerSelectionQuoteInsertion(undefined);
     setComposerAttachmentInsertion(undefined);
-    setComposerDraftReplacement(undefined);
     setMessageFork(undefined);
     setForkingMessageId(undefined);
     setShareSelection(undefined);
@@ -1789,14 +1799,15 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     });
   };
 
-  const moveEditedMessageToComposer = async (item: TimelineItemView, text: string): Promise<void> => {
+  const sendEditedMessage = async (item: TimelineItemView, text: string): Promise<void> => {
     const sourceSessionId = session.id;
     const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
-    if (navigationTarget === undefined || item.sourceEventId === undefined) throw new Error(t("timeline.rewindUnavailable"));
+    const sourceEventId = item.sourceEventId;
+    if (navigationTarget === undefined || sourceEventId === undefined) throw new Error(t("timeline.rewindUnavailable"));
     const sourceController = {
-      navigateSessionBranch: controllerRef.current.navigateSessionBranch,
+      send: controllerRef.current.send,
       readDraftSnapshot: controllerRef.current.readDraftSnapshot,
-      saveDraftIfRevision: controllerRef.current.saveDraftIfRevision,
+      messageEditDrafts: controllerRef.current.messageEditDrafts,
       getArtifactUrl: controllerRef.current.getArtifactUrl,
       releaseArtifactUrl: controllerRef.current.releaseArtifactUrl
     };
@@ -1805,13 +1816,18 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const sourceEpoch = rewindEpochRef.current;
     const sourceDocument = paneRef.current?.ownerDocument;
     const sourceNavigationRevision = controllerRef.current.state.navigationRevision;
-    const sourceStillOwned = () => rewindEpochRef.current === sourceEpoch
-      && composerLocalDraftEpochRef.current === sourceDraftEpoch
+    const sourceProfile = controllerRef.current.state.activeProfile;
+    const sourcePaneIsCurrent = () => rewindEpochRef.current === sourceEpoch
       && paneRef.current?.isConnected === true && paneRef.current.ownerDocument === sourceDocument
+      && activeSessionIdRef.current === sourceSessionId
       && controllerRef.current.state.navigationRevision === sourceNavigationRevision
-      && controllerRef.current.navigateSessionBranch === sourceController.navigateSessionBranch
+      && controllerRef.current.state.activeProfile?.id === sourceProfile?.id
+      && controllerRef.current.state.activeProfile?.serverId === sourceProfile?.serverId
+      && controllerRef.current.state.activeProfile?.origin === sourceProfile?.origin;
+    const sourceDraftIsCurrent = () => sourcePaneIsCurrent()
+      && composerLocalDraftEpochRef.current === sourceDraftEpoch
       && controllerRef.current.readDraftSnapshot === sourceController.readDraftSnapshot
-      && controllerRef.current.saveDraftIfRevision === sourceController.saveDraftIfRevision;
+      && controllerRef.current.messageEditDrafts === sourceController.messageEditDrafts;
     const currentBoundary = () => {
       const state = controllerRef.current.state;
       const snapshot = state.snapshot;
@@ -1823,12 +1839,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const activeUser = lastVisibleUserMessage(activeTimeline.filter((candidate) => !hidesFromTimelineHistory(candidate)));
       const queuedWork = snapshot.queue.some((candidate) => candidate.sessionId === sourceSessionId && !["completed", "cancelled", "failed"].includes(candidate.state));
       if (
-        !sourceStillOwned()
+        !sourceDraftIsCurrent()
+        || state.connectionState !== "connected"
+        || state.sessionAccess?.role === "guest" || state.taskSource?.kind === "joined"
+        || currentPendingMessageEdit !== undefined
         || !sessionRouteIsCurrent(state.route, sourceSessionId)
         || activeSession?.state !== "idle"
-        || activeSession.generation !== sourceGeneration
-        || controllerRef.current.navigateSessionBranch !== sourceController.navigateSessionBranch
-
+        || activeSession.generation !== sourceGeneration || activeSession.archived
+        || controllerRef.current.send !== sourceController.send
         || queuedWork
         || activeBackend?.capabilities.get("session.rewind")?.supported !== true
         || activeUser?.id !== item.id
@@ -1895,43 +1913,68 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const previous = await sourceController.readDraftSnapshot(sourceSessionId);
     const previousDraft = previous.draft;
     if (currentBoundary() === undefined) throw new Error(t("timeline.editStale"));
-    const replacement = {
-      id: ++composerDraftReplacementIdRef.current,
-      sessionId: sourceSessionId,
+    const replacementDraft: ComposerDraft = {
       text: composerDocumentPlainText(editorDocument),
-      editorDocument,
-      attachments: restoredAttachments
-    };
-    const replacementDraft = {
-      text: replacement.text,
       editorDocument,
       attachments: restoredAttachments,
       mentions: [],
-      deliveryMode: "prompt" as const,
+      deliveryMode: "prompt",
       ...(previousDraft?.extraDirectoryIds === undefined ? {} : { extraDirectoryIds: previousDraft.extraDirectoryIds })
     };
-    const rollbackDraft = previousDraft ?? { text: "", attachments: [], mentions: [], deliveryMode: "prompt" as const };
-    const replacementRevision = await sourceController.saveDraftIfRevision(sourceSessionId, replacementDraft, previous.revision);
-    if (replacementRevision === undefined) throw new Error(t("timeline.editStale"));
-    const boundaryBeforeRewind = currentBoundary();
-    if (boundaryBeforeRewind === undefined || !sameMessageAttachments(boundaryBeforeRewind.user.attachments, item.attachments)) {
-      await restoreEditedMessageDraft(sourceController, sourceSessionId, rollbackDraft, replacementRevision, t);
-      throw new Error(t("timeline.editStale"));
+    const edit = { operationId: randomUuid(), sourceMessageId: item.messageId ?? item.id, sourceEventId, target: navigationTarget };
+    const recovery = { ...edit, expectedGeneration: sourceGeneration, draft: replacementDraft };
+    const showPending = () => {
+      const pane = paneRef.current;
+      if (editOwnerRef.current === editOwner && pane?.isConnected === true && pane.ownerDocument === sourceDocument) {
+        setPendingMessageEdit({ owner: editOwner, edit: recovery });
+      }
+    };
+    if (!await sourceController.messageEditDrafts.stage(sourceSessionId, recovery, previous.revision)) {
+      const pending = await sourceController.messageEditDrafts.read(sourceSessionId);
+      if (pending !== undefined && editOwnerRef.current === editOwner) setPendingMessageEdit({ owner: editOwner, edit: pending });
+      throw new Error(t(pending === undefined ? "timeline.editStale" : "timeline.editResultUnknown"));
     }
     try {
-      await sourceController.navigateSessionBranch(sourceSessionId, navigationTarget, { expectedGeneration: sourceGeneration,
-        sourceMessage: { messageId: item.messageId ?? item.id, eventId: item.sourceEventId, requireLatestUser: true } });
-      if (!sourceStillOwned()
-        || controllerRef.current.navigateSessionBranch !== sourceController.navigateSessionBranch
-        || !sessionRouteIsCurrent(controllerRef.current.state.route, sourceSessionId)
-        || controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation !== sourceGeneration) return;
+      await sourceController.send(sourceSessionId, replacementDraft, { expectedGeneration: sourceGeneration,
+        messageEdit: { ...edit, assertCurrent: () => {
+          const boundary = currentBoundary();
+          if (boundary === undefined || !sameMessageAttachments(boundary.user.attachments, item.attachments)) throw new Error(t("timeline.editStale"));
+        } } });
     } catch (error) {
-      await restoreEditedMessageDraft(sourceController, sourceSessionId, rollbackDraft, replacementRevision, t);
+      const code = error instanceof Error && "code" in error ? error.code : undefined;
+      if (code === "MESSAGE_EDIT_RESULT_UNKNOWN") {
+        showPending();
+        throw new Error(t("timeline.editResultUnknown"));
+      }
+      try {
+        await sourceController.messageEditDrafts.finish(sourceSessionId, edit.operationId, code === "NATIVE_NAVIGATION_SYNC_UNKNOWN" || !sourcePaneIsCurrent());
+      } catch (cause) {
+        showPending();
+        throw new Error(t("timeline.editDraftRestoreFailed"), { cause });
+      }
       throw error;
     }
-    const currentDraft = await sourceController.readDraftSnapshot(sourceSessionId);
-    if (!sourceStillOwned() || currentDraft.revision !== replacementRevision) return;
-    setComposerDraftReplacement(replacement);
+    await sourceController.messageEditDrafts.finish(sourceSessionId, edit.operationId, false).catch(showPending);
+    if (sourcePaneIsCurrent()) setFollowLatestSignal(current => current + 1);
+  };
+
+  const checkPendingMessageEdit = async (edit: PendingMessageEdit): Promise<void> => {
+    const source = controllerRef.current;
+    const sourceSessionId = session.id;
+    const sourcePane = paneRef.current;
+    if (editOwnerRef.current !== editOwner || sourcePane?.isConnected !== true || source.state.connectionState !== "connected") return;
+    let accepted: boolean;
+    let rejected: unknown;
+    try { accepted = await source.confirmMessageEdit(sourceSessionId, edit.expectedGeneration, edit); }
+    catch (error) { accepted = false; rejected = error; }
+    if (!accepted && rejected === undefined) throw new Error(t("timeline.editResultUnknown"));
+    await source.messageEditDrafts.finish(sourceSessionId, edit.operationId, rejected !== undefined);
+    setPendingMessageEdit(current => current?.edit.operationId === edit.operationId ? undefined : current);
+    if (editOwnerRef.current === editOwner && paneRef.current === sourcePane) {
+      setMessageActionResetSignal(current => current + 1);
+      if (accepted) setFollowLatestSignal(current => current + 1);
+    }
+    if (rejected !== undefined) throw rejected;
   };
 
   const previewMessageRewind = (item: TimelineItemView): void => {
@@ -2486,8 +2529,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         onStartShareSelection={startShareSelection}
         onToggleShareMessage={currentShareSelection === undefined ? undefined : toggleShareMessage}
         messageEdit={{ messageId: editableMessageId, stopRunning: editStopsRun,
-          blockedReason: messageActionsIdle ? undefined : t("timeline.editWaitForIdle"),
-          begin: beginMessageEdit, submit: moveEditedMessageToComposer }}
+          blockedReason: currentPendingMessageEdit !== undefined ? t("timeline.editResultUnknown")
+            : messageActionsIdle ? undefined : t("timeline.editWaitForIdle"),
+          begin: beginMessageEdit, submit: sendEditedMessage }}
         onPreviewMessageRewind={messageRewindSupported ? previewMessageRewind : undefined} rewindToStartSupported={rewindToStartSupported}
         onDeleteMessage={messageDeleteSupported ? openMessageDelete : undefined}
         messageDeleteBlockedReason={messageDeleteSupported ? messageDeleteBlockedReason : undefined}
@@ -2606,6 +2650,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           : <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} workspaceRoot={workspace?.serverPath} remaining={remainingInteractions} inline t={t} runAction={runAction} />}
       </InteractionPromptHost>
       {!guest && <TaskActivityBanner sessionId={session.id} />}
+      {currentPendingMessageEdit !== undefined && <div role="status">
+        <span>{t("timeline.editResultUnknown")}</span>
+        <Button disabled={controller.state.connectionState !== "connected"}
+          onClick={() => runAction(`check-message-edit:${session.id}`, () => checkPendingMessageEdit(currentPendingMessageEdit))}>
+          {t("timeline.checkEditResult")}
+        </Button>
+      </div>}
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
 {(interaction === undefined || guest) && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}>
         {objectiveReadable && <ObjectiveIndicator
@@ -2621,7 +2672,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }}
           t={t}
         />}
-<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} rewindDraftRef={rewindDraftRef} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
+<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} rewindDraftRef={rewindDraftRef} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
           if (handoff !== undefined) {
             if (!objectiveDialogRequestMatchesOwner(handoff, controller, session)) {
               onObjectiveDialogHandoffHandled?.(handoff.id);
@@ -2713,20 +2764,6 @@ function plainMessageRewindDraftText(item: TimelineItemView): string | undefined
     || (item.attachments?.length ?? 0) > 0 || (item.inputMentions?.length ?? 0) > 0
     || (item.mentionRanges?.length ?? 0) > 0 || (item.pastedTextRanges?.length ?? 0) > 0) return undefined;
   return item.text?.trim() ? item.text : undefined;
-}
-
-async function restoreEditedMessageDraft(
-  controller: Pick<AppController, "saveDraftIfRevision">,
-  sessionId: string,
-  draft: Parameters<AppController["saveDraft"]>[1],
-  expectedRevision: number,
-  t: Translator
-): Promise<void> {
-  try {
-    await controller.saveDraftIfRevision(sessionId, draft, expectedRevision);
-  } catch (cause) {
-    throw new Error(t("timeline.editDraftRestoreFailed"), { cause });
-  }
 }
 
 function CompactActionFeedback({ feedback, t, onDismiss }: {

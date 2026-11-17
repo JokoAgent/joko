@@ -6251,6 +6251,18 @@ export type ExtensionCardApi = Pick<import("@connectrpc/connect").Client<typeof 
   }>;
 };
 
+export interface MessageEditRequest {
+  readonly operationId: string;
+  readonly sourceMessageId: string;
+  readonly sourceEventId: string;
+  readonly target: NativeNavigationTargetView;
+}
+
+export interface PendingMessageEdit extends MessageEditRequest {
+  readonly expectedGeneration: bigint;
+  readonly draft: ComposerDraft;
+}
+
 export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi, HostedAgentSettingsApi {
   mcpAppApi(): McpAppApi | undefined;
   extensionCardApi(): ExtensionCardApi | undefined;
@@ -6311,7 +6323,12 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   stopVoiceInput(voiceInputId: string, expectedNextChunkSequence: bigint, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   cancelVoiceInput(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   getVoiceInputSession(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
-  send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint; readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean } }): Promise<void>;
+  send(sessionId: string, draft: ComposerDraft, admission: {
+    readonly expectedGeneration: bigint;
+    readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean };
+    readonly messageEdit?: MessageEditRequest & { readonly assertCurrent: () => void };
+  }): Promise<void>;
+  confirmMessageEdit(sessionId: string, expectedGeneration: bigint, edit: MessageEditRequest): Promise<boolean>;
   sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, signal?: AbortSignal): Promise<boolean>;
   startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string>;
   reobserveReview(reviewRunId: string): Promise<void>;

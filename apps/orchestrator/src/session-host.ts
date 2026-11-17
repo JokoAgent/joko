@@ -3514,13 +3514,11 @@ export class SessionHost {
   commitQueuedInput(store: OperationalStore, input: QueuedInput): EnqueueResult {
     this.#assertOpen();
     if (store !== this.#store) throw new StoreError("Input must be committed by its owning Store.");
-    this.#partnerHomeInputGuard?.(input.sessionId);
-    const acceptedPrompt = this.canonicalQueuedPrompt(input.sessionId, input.prompt);
-    assertPromptInlineTextRanges(acceptedPrompt);
-    this.assertInputCapabilities(input.sessionId, acceptedPrompt);
-    if (this.isReviewReadOnlySession(input.sessionId)) {
-      throw new StoreError("Reviewer input is admitted only through the host-owned Review queue.");
+    const lifecycle = this.#sessionLifecycleFences.get(input.sessionId);
+    if (lifecycle !== undefined && lifecycle !== input.operationId && store.getOperation(lifecycle).kind === "sendInput") {
+      throw new StoreError("Wait for the current message edit to finish before sending another input.");
     }
+    const acceptedPrompt = this.validatePromptAdmission(input.sessionId, input.prompt);
     if (input.restoreArchived && (input.source ?? "user") === "user" && store.getSession(input.sessionId).descriptor.archived) {
       this.assertArchivedSessionSendRestorable(input.sessionId);
       const session = store.getSession(input.sessionId);
@@ -3563,6 +3561,17 @@ export class SessionHost {
       this.#onUserInputAdmitted?.(store, result);
     }
     return result;
+  }
+
+  private validatePromptAdmission(sessionId: string, prompt: PromptInput): PromptInput {
+    this.#partnerHomeInputGuard?.(sessionId);
+    const acceptedPrompt = this.canonicalQueuedPrompt(sessionId, prompt);
+    assertPromptInlineTextRanges(acceptedPrompt);
+    this.assertInputCapabilities(sessionId, acceptedPrompt);
+    if (this.isReviewReadOnlySession(sessionId)) {
+      throw new StoreError("Reviewer input is admitted only through the host-owned Review queue.");
+    }
+    return acceptedPrompt;
   }
 
   /** Start runtime work only after admission and the public operation result have committed. */
@@ -9320,16 +9329,34 @@ export class SessionHost {
       readonly connection: ConnectionRecord;
       readonly operationId: string;
       readonly sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly requireLatestUser?: boolean };
+      readonly editedInput?: Pick<QueuedInput, "prompt" | "overrides">;
       readonly protocol: { readonly kind: "internal" }
         | { readonly kind: "connect"; readonly body: unknown; readonly precondition: (store: OperationalStore) => void };
     }
-  ): Promise<OperationExecution<{ readonly accepted: true; readonly resultCase: "acknowledgement" }>> {
+  ): Promise<OperationExecution<
+    { readonly accepted: true; readonly resultCase: "acknowledgement" }
+    | { readonly accepted: true; readonly resultCase: "queueItem"; readonly entityId: string }
+  >> {
     let lease: ActiveBackendSideEffectLease | undefined;
     let navigation: NativeSessionNavigationResult | undefined;
     let admittedTarget: StoredTarget | undefined;
     let nativeNavigationConfirmed = false;
     let admittedUserCursor: bigint | undefined;
     const sourceMessage = authority.sourceMessage;
+    const editedInput = authority.editedInput;
+    if (editedInput !== undefined && (authority.protocol.kind !== "connect" || sourceMessage?.requireLatestUser !== true || summarize)) {
+      throw new StoreError("Edited input requires a dialogue rewind of its original latest user message.");
+    }
+    const operationKind = editedInput !== undefined ? "sendInput"
+      : authority.protocol.kind === "internal" ? "navigate_session" : "navigateSessionBranch";
+    const assertIdle = (): void => {
+      if (this.#sessionRuntimeMutationMustDefer(sessionId)
+        || this.#store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0
+        || this.#store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0
+        || this.#store.hasActiveSessionBackgroundTasks(sessionId)) {
+        throw new StoreError("Native history navigation requires an idle task.");
+      }
+    };
     const assertSourceMessage = (store: OperationalStore): void => {
       if (sourceMessage === undefined) return;
       store.authorizeConnection(authority.connection.id, authority.connection.authKeyDigest);
@@ -9354,7 +9381,7 @@ export class SessionHost {
     try {
       const execution = await this.mutate({
         connection: authority.connection, operationId: authority.operationId,
-        kind: authority.protocol.kind === "internal" ? "navigate_session" : "navigateSessionBranch",
+        kind: operationKind,
         body: authority.protocol.kind === "connect" ? authority.protocol.body
           : { sourceSessionId: sessionId, target, summarize, customInstructions, expectedGeneration,
             ...(sourceMessage === undefined ? {} : { sourceMessage }) },
@@ -9364,6 +9391,8 @@ export class SessionHost {
           if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer history navigation is disabled.");
           const source = store.getSession(sessionId);
           if (source.descriptor.deletedAt !== undefined) throw new StoreError("Deleted task history cannot be navigated.");
+          if (editedInput !== undefined && (source.descriptor.archived || source.descriptor.hidden
+            || source.descriptor.derivationOrigin?.sideChat === true)) throw new StoreError("The original task cannot resend an edited message.");
           if (expectedGeneration !== undefined && source.descriptor.binding.generation !== expectedGeneration) {
             throw new StaleGenerationError(source.descriptor.binding.generation, expectedGeneration);
           }
@@ -9389,12 +9418,7 @@ export class SessionHost {
         },
         effect: async () => {
           const source = this.#store.getSession(sessionId);
-          if (this.#sessionRuntimeMutationMustDefer(sessionId)
-            || this.#store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0
-            || this.#store.listInteractions({ sessionId, status: "open", limit: 1 }).length > 0
-            || this.#store.hasActiveSessionBackgroundTasks(sessionId)) {
-            throw new StoreError("Native history navigation requires an idle task.");
-          }
+          assertIdle();
           admittedTarget = this.#store.getTarget(source.descriptor.targetId);
           const active = await this.activateWithPolicy(sessionId, false, false, authority.operationId);
           lease = this.beginActiveBackendSideEffect(sessionId, active, authority.operationId, allowance);
@@ -9442,7 +9466,12 @@ export class SessionHost {
           }
           try {
             assertSourceMessage(this.#store);
-            admittedUserCursor = this.#store.health().globalCursor;
+            if (editedInput !== undefined) {
+              assertIdle();
+              this.validatePromptAdmission(sessionId, editedInput.prompt);
+              this.validateTurnOverrides(sessionId, editedInput.overrides);
+            }
+            if (sourceMessage?.requireLatestUser === true) admittedUserCursor = this.#store.health().globalCursor;
             navigation = await active.adapter.navigateTree(target, summarize, lease.context, customInstructions, {
               recordBinding: (binding) => {
                 this.#store.recordNativeSessionDerivation({
@@ -9504,6 +9533,10 @@ export class SessionHost {
               derivationOperationId: authority.operationId
             });
             this.appendNativeHistory(store, replaced.descriptor, lease!.active.adapter, navigation.nativeHistory, authority.operationId);
+          }
+          if (editedInput !== undefined) {
+            const queued = this.commitQueuedInput(store, { operationId: authority.operationId, sessionId, ...editedInput });
+            return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId } as const;
           }
           return { accepted: true, resultCase: "acknowledgement" } as const;
         },

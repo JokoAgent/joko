@@ -105,7 +105,7 @@ interface PendingComposerDraftSave {
   queued: boolean;
 }
 
-export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, draftReplacement, rewindDraftRef, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, rewindDraftRef, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -129,7 +129,6 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly messageMentionInsertion?: { readonly id: number; readonly sessionId: string; readonly mention: ComposerMessageMentionDraft };
   readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft };
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
-  readonly draftReplacement?: { readonly id: number; readonly sessionId: string; readonly text: string; readonly editorDocument?: JSONContent; readonly attachments?: readonly AttachmentDraft[] };
   readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null>;
   readonly objectiveDialogHandoff?: ObjectiveDialogHandoffRequest;
   readonly t: Translator;
@@ -251,7 +250,6 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const appliedMessageMentionInsertionRef = useRef<number | undefined>(undefined);
   const appliedSelectionQuoteInsertionRef = useRef<number | undefined>(undefined);
   const appliedAttachmentInsertionRef = useRef<number | undefined>(undefined);
-  const appliedDraftReplacementRef = useRef<number | undefined>(undefined);
   const appliedObjectiveDialogHandoffRef = useRef<string | undefined>(undefined);
   const restoringObjectiveDialogHandoffRef = useRef<string | undefined>(undefined);
   const objectiveDialogHandoffRef = useRef(objectiveDialogHandoff);
@@ -860,34 +858,6 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     setMentions((current) => composerMentionsFromRanges(current, nextRanges));
     requestComposerFrame(() => richEditorRef.current?.focus());
   }, [selectionQuoteInsertion, readOnly, session.id]);
-
-  useEffect(() => {
-    if (
-      readOnly
-      || draftReplacement === undefined
-      || draftReplacement.sessionId !== session.id
-      || appliedDraftReplacementRef.current === draftReplacement.id
-    ) return;
-    appliedDraftReplacementRef.current = draftReplacement.id;
-    markDraftEdited(session.id);
-    editorRevisionRef.current += 1;
-    resetHistoryNavigation();
-    closePalette();
-    setBashMode(false);
-    const replacementDocument = normalizeComposerDocument(draftReplacement.editorDocument, draftReplacement.text);
-    setEditorDocument(replacementDocument);
-    const replacementText = composerDocumentPlainText(replacementDocument);
-    textRef.current = replacementText;
-    setText(replacementText);
-    setMentions([]);
-    replaceInlineMentionRanges([]);
-    setAttachmentError(undefined);
-    setAttachments((current) => {
-      revokeAttachments(current);
-      return (draftReplacement.attachments ?? []).map(withAttachmentPreview);
-    });
-    requestComposerFrame(() => richEditorRef.current?.focus());
-  }, [draftReplacement, readOnly, session.id]);
 
   useImperativeHandle(rewindDraftRef, (): PrepareRewindDraft => async (isRewindCurrent) => {
     const sourceController = controllerRef.current;

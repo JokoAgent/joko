@@ -14556,6 +14556,48 @@ describe("SessionHost", () => {
     expect(f.store.getSession(f.sessionId).descriptor.binding).toEqual(f.binding);
   });
 
+  it.each(["in_place", "replacement"] as const)("admits one edited input only after the %s rewind, with the original Operation receipt", async outcome => {
+    const f = await messageNavigationFixture();
+    const operationId = "send-edited-original";
+    const prompt: PromptInput = { text: "Edited original input", disposition: "prompt", images: [], files: [], mentions: [] };
+    const replacement = { opaqueRef: "managed://edited-branch", nativeSessionId: "edited-branch", generation: f.binding.generation + 1 };
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const navigate = vi.spyOn(f.adapter, "navigateTree").mockImplementation(async (_target, _summary, _context, _instructions, authority) => {
+      await gate;
+      f.adapter.history = { events: [f.before], activeEntryId: "before-original" };
+      if (outcome === "in_place") return { kind: "in_place" };
+      authority.recordBinding(replacement);
+      return { kind: "replacement", binding: replacement, nativeHistory: f.adapter.history };
+    });
+    const edit = (text = prompt.text) => f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, {
+      ...f.authority, operationId, editedInput: { prompt: { ...prompt, text } }, protocol: { kind: "connect",
+        body: { payload: { case: "sendInput", value: { sessionId: f.sessionId, messageEdit: {
+          sourceMessageId: f.authority.sourceMessage.messageId, sourceEventId: f.authority.sourceMessage.eventId
+        }, input: { text } } } }, precondition: () => undefined }
+    });
+    const pending = edit();
+    try {
+      await vi.waitFor(() => expect(navigate).toHaveBeenCalledOnce());
+      expect(f.store.getOperation(operationId).status).toBe("started");
+      expect(f.store.listQueueItems({ sessionId: f.sessionId })).toEqual([]);
+      expect(() => f.host.enqueueInput({ sessionId: f.sessionId, operationId: "concurrent-user-input",
+        connection: f.connection, prompt })).toThrow("Wait for the current message edit to finish");
+    } finally { release(); }
+    const accepted = await pending;
+    expect(accepted.value).toMatchObject({ accepted: true, resultCase: "queueItem" });
+    const [item] = f.store.listQueueItems({ sessionId: f.sessionId });
+    const binding = outcome === "replacement" ? replacement : f.binding;
+    expect(item).toMatchObject({ operationId, body: { text: prompt.text }, state: "accepted" });
+    expect(item?.attemptId).toBeDefined();
+    expect(f.store.getAttempt(item!.attemptId!).descriptor.generation).toBe(binding.generation);
+    expect(f.store.getSession(f.sessionId).descriptor.binding).toEqual(binding);
+    await expect(edit()).resolves.toMatchObject({ replayed: true, value: accepted.value });
+    await expect(edit("Different edited input")).rejects.toThrow();
+    expect(navigate).toHaveBeenCalledOnce();
+    expect(f.store.listQueueItems({ sessionId: f.sessionId })).toEqual([item]);
+  });
+
   it("allows explicit dialogue rewind across later rounds and replays its receipt after the source row has left the branch", async () => {
     const f = await messageNavigationFixture();
     appendSessionEvent(f.store, f.sessionId, "later-round", 2_000,

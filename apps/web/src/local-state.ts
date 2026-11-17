@@ -19,7 +19,8 @@ import { composerDocumentPlainText, normalizeComposerDocument } from "./composer
 import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
 import { normalizeSelectionQuoteDrafts } from "./selection-quote.js";
 import { appendQuoteToComposerDocument } from "./composer-quote-document.js";
-import type { PendingSideChatDraft } from "./model.js";
+import type { PendingMessageEdit, PendingSideChatDraft } from "./model.js";
+import { mergeRejectedComposerDraft } from "./composer-draft-recovery.js";
 import { normalizeAppShortcutOverrides, type AppShortcutOverrides } from "./app-shortcuts.js";
 import {
   DEFAULT_APPEARANCE_PREFERENCES,
@@ -443,6 +444,23 @@ interface ComposerDraftRecord {
   readonly draft: PersistedComposerDraft;
 }
 
+interface PersistedMessageEdit extends Omit<PendingMessageEdit, "draft"> {
+  readonly draft: PersistedComposerDraft;
+}
+
+function currentPendingMessageEdit(value: unknown): PersistedMessageEdit | undefined {
+  if (value === undefined) return undefined;
+  const item = value as Partial<PersistedMessageEdit> | null;
+  if (item === null || typeof item !== "object"
+    || ![item.operationId, item.sourceMessageId, item.sourceEventId].every(id => validConnectionIdentity(id, 512))
+    || typeof item.expectedGeneration !== "bigint" || item.expectedGeneration < 1n || item.expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)
+    || (item.target?.kind !== "session_start" && (item.target?.kind !== "native_entry" || !validConnectionIdentity(item.target.entryId, 512)))
+    || item.draft?.deliveryMode !== "prompt" || typeof item.draft.text !== "string" || !Array.isArray(item.draft.attachments)) {
+    throw new Error("The saved edited message is invalid.");
+  }
+  return item as PersistedMessageEdit;
+}
+
 function currentDraftRecord(value: unknown): ComposerDraftRecord | undefined {
   if (value === undefined) return undefined;
   if (value === null || typeof value !== "object" || !("revision" in value) || !("draft" in value)
@@ -850,24 +868,7 @@ export class LocalState {
   }
 
   private async writeDraft(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, expectedRevision: number | undefined, surface: SessionDraftSurface): Promise<number | undefined> {
-    const browserComments = normalizeLiveBrowserComments(draft.browserComments);
-    const extraDirectoryIds = normalizeExtraDirectoryIds(draft.extraDirectoryIds);
-    const mentions = normalizeDraftMentions(draft.mentions);
-    if (mentions === undefined) throw new Error("The task draft mention identities are invalid.");
-    const editorDocument = normalizeComposerDocument(draft.editorDocument, draft.text);
-    const inlineMentionRanges = normalizeComposerInlineMentionRanges(draft.inlineMentionRanges, composerDocumentPlainText(editorDocument), mentions);
-    if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
-    const persisted: PersistedComposerDraft = {
-      text: draft.text,
-      builtinSkillIntent: builtinSkillIntentForText(draft.text, draft.builtinSkillIntent),
-      deliveryMode: draft.deliveryMode,
-      mentions,
-      ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
-      ...(draft.editorDocument === undefined ? {} : { editorDocument }),
-      ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds }),
-      attachments: draft.attachments.map(persistAttachment),
-      browserComments: browserComments.map((item) => ({ ...item, screenshot: persistAttachment(item.screenshot) }))
-    };
+    const persisted = persistComposerDraft(draft);
     const key = sessionDraftKey(serverId, profileId, sessionId, surface);
     const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
     const objectStore = transaction.objectStore(DRAFT_STORE);
@@ -900,27 +901,53 @@ export class LocalState {
 
   async readDraftSnapshot(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface = "application"): Promise<ComposerDraftSnapshot> {
     const record = currentDraftRecord(await this.get<unknown>(DRAFT_STORE, sessionDraftKey(serverId, profileId, sessionId, surface)));
-    if (record === undefined) return { revision: 0 };
-    const persisted = record.draft;
-    const attachments = restorePersistedAttachments(persisted.attachments);
-    const browserComments = restorePersistedBrowserComments(persisted.browserComments);
-    const extraDirectoryIds = normalizeExtraDirectoryIds(persisted.extraDirectoryIds);
-    const mentions = normalizeDraftMentions(persisted.mentions);
-    if (mentions === undefined) throw new Error("The task draft mention identities are invalid.");
-    const editorDocument = normalizeComposerDocument(persisted.editorDocument, persisted.text);
-    const inlineMentionRanges = normalizeComposerInlineMentionRanges(persisted.inlineMentionRanges, composerDocumentPlainText(editorDocument), mentions);
-    if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
-    return { revision: record.revision, draft: {
-      text: persisted.text,
-      builtinSkillIntent: builtinSkillIntentForText(persisted.text, persisted.builtinSkillIntent),
-      deliveryMode: persisted.deliveryMode,
-      mentions,
-      ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
-      ...(persisted.editorDocument === undefined ? {} : { editorDocument }),
-      attachments,
-      browserComments,
-      ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
-    } };
+    return record === undefined ? { revision: 0 } : { revision: record.revision, draft: restoreComposerDraft(record.draft) };
+  }
+
+  async readPendingMessageEdit(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface): Promise<PendingMessageEdit | undefined> {
+    const key = `message-edit-v1:${sessionDraftKey(serverId, profileId, sessionId, surface)}`;
+    const edit = currentPendingMessageEdit(await this.get<unknown>(DRAFT_STORE, key));
+    return edit === undefined ? undefined : { ...edit, draft: restoreComposerDraft(edit.draft) };
+  }
+
+  async stagePendingMessageEdit(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface,
+    edit: PendingMessageEdit, expectedDraftRevision: number): Promise<boolean> {
+    const record = currentPendingMessageEdit({ ...edit, draft: persistComposerDraft(edit.draft) });
+    const draftKey = sessionDraftKey(serverId, profileId, sessionId, surface);
+    const key = `message-edit-v1:${draftKey}`;
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const done = transactionDone(transaction);
+    const [pending, draft] = await Promise.all([requestResult(store.get(key)), requestResult(store.get(draftKey))]);
+    const staged = pending === undefined && (currentDraftRecord(draft)?.revision ?? 0) === expectedDraftRevision;
+    if (staged) store.add(record, key);
+    await done;
+    return staged;
+  }
+
+  async finishPendingMessageEdit(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface,
+    operationId: string, recover: boolean): Promise<{ readonly input: ComposerDraft; readonly draft: ComposerDraft; readonly revision: number } | undefined> {
+    const draftKey = sessionDraftKey(serverId, profileId, sessionId, surface);
+    const key = `message-edit-v1:${draftKey}`;
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    const store = transaction.objectStore(DRAFT_STORE);
+    const done = transactionDone(transaction);
+    const edit = currentPendingMessageEdit(await requestResult(store.get(key)));
+    let restored: { input: ComposerDraft; draft: ComposerDraft; revision: number } | undefined;
+    if (edit?.operationId === operationId) {
+      if (recover) {
+        const prior = currentDraftRecord(await requestResult(store.get(draftKey)));
+        const input = restoreComposerDraft(edit.draft);
+        const draft = mergeRejectedComposerDraft(input, prior === undefined ? undefined : restoreComposerDraft(prior.draft));
+        const revision = (prior?.revision ?? 0) + 1;
+        if (!Number.isSafeInteger(revision)) throw new Error("The task draft revision is exhausted.");
+        store.put({ revision, draft: persistComposerDraft(draft) }, draftKey);
+        restored = { input, draft, revision };
+      }
+      store.delete(key);
+    }
+    await done;
+    return restored;
   }
 
   async readPendingSideChat(serverId: string, profileId: string, sourceSessionId: string, surface: SessionDraftSurface = "application"): Promise<PendingSideChatDraft | undefined> {
@@ -1870,6 +1897,47 @@ function sameBrowserCommentList(left: readonly BrowserCommentDraftItem[], right:
     return JSON.stringify(leftScalar) === JSON.stringify(rightScalar)
       && sameAttachmentList([leftScreenshot], [rightScreenshot]);
   });
+}
+
+function persistComposerDraft(draft: ComposerDraft): PersistedComposerDraft {
+  const browserComments = normalizeLiveBrowserComments(draft.browserComments);
+  const extraDirectoryIds = normalizeExtraDirectoryIds(draft.extraDirectoryIds);
+  const mentions = normalizeDraftMentions(draft.mentions);
+  if (mentions === undefined) throw new Error("The task draft mention identities are invalid.");
+  const editorDocument = normalizeComposerDocument(draft.editorDocument, draft.text);
+  const inlineMentionRanges = normalizeComposerInlineMentionRanges(draft.inlineMentionRanges, composerDocumentPlainText(editorDocument), mentions);
+  if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
+  return {
+    text: draft.text,
+    builtinSkillIntent: builtinSkillIntentForText(draft.text, draft.builtinSkillIntent),
+    deliveryMode: draft.deliveryMode,
+    mentions,
+    ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
+    ...(draft.editorDocument === undefined ? {} : { editorDocument }),
+    ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds }),
+    attachments: draft.attachments.map(persistAttachment),
+    browserComments: browserComments.map(item => ({ ...item, screenshot: persistAttachment(item.screenshot) }))
+  };
+}
+
+function restoreComposerDraft(persisted: PersistedComposerDraft): ComposerDraft {
+  const mentions = normalizeDraftMentions(persisted.mentions);
+  if (mentions === undefined) throw new Error("The task draft mention identities are invalid.");
+  const editorDocument = normalizeComposerDocument(persisted.editorDocument, persisted.text);
+  const inlineMentionRanges = normalizeComposerInlineMentionRanges(persisted.inlineMentionRanges, composerDocumentPlainText(editorDocument), mentions);
+  if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
+  const extraDirectoryIds = normalizeExtraDirectoryIds(persisted.extraDirectoryIds);
+  return {
+    text: persisted.text,
+    builtinSkillIntent: builtinSkillIntentForText(persisted.text, persisted.builtinSkillIntent),
+    deliveryMode: persisted.deliveryMode,
+    mentions,
+    ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
+    ...(persisted.editorDocument === undefined ? {} : { editorDocument }),
+    attachments: restorePersistedAttachments(persisted.attachments),
+    browserComments: restorePersistedBrowserComments(persisted.browserComments),
+    ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
+  };
 }
 
 function persistAttachment(attachment: AttachmentDraft): PersistedAttachment {

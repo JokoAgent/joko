@@ -5,6 +5,7 @@ import {
   CompleteBlobUploadResponseSchema,
   EntityKind,
   EventSchema,
+  GetOperationResponseSchema,
   GetSnapshotResponseSchema,
   ListManagedModelRuntimesResponseSchema,
   ListSessionTimelineResponseSchema,
@@ -106,6 +107,60 @@ describe("input preparation and admission", () => {
       expect(submission.mutation?.preconditions[0]?.expectedRevision).toBeUndefined();
     }
     gateway.disconnect();
+  });
+
+  it("reads the original edited input when both the submission receipt and its first lookup are lost", async () => {
+    const submissions: SubmitOperationRequest[] = [];
+    const receiptReads: string[] = [];
+    let reportWrongOwner = true;
+    const transport = {
+      unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+        let message: unknown;
+        switch (method.localName) {
+          case "getSnapshot": message = create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, { generation: 1n }) }); break;
+          case "listManagedModelRuntimes": message = create(ListManagedModelRuntimesResponseSchema); break;
+          case "submitOperation":
+            submissions.push(input);
+            throw new ConnectError("Lost edited input response", Code.Unavailable);
+          case "getOperation": {
+            receiptReads.push(input.operationId);
+            if (receiptReads.length === 1) throw new ConnectError("Lost receipt response", Code.Unavailable);
+            const sent = submissions[0]!;
+            message = create(GetOperationResponseSchema, { operation: {
+              operationId: sent.operationId, connectionId: reportWrongOwner ? "other-connection" : sent.connectionId,
+              mutation: sent.mutation, state: OperationState.SUCCEEDED,
+              result: { payload: { case: "queueItem", value: { sessionId: "task", sourceId: sent.operationId, queueItemId: "edit-input" } } }
+            } });
+            break;
+          }
+          default: throw new Error(`Unexpected RPC ${method.localName}`);
+        }
+        return { stream: false, service: method.parent, method, header: new Headers(), trailer: new Headers(), message };
+      }),
+      stream: vi.fn(async (method: any) => ({ stream: true, service: method.parent, method,
+        header: new Headers(), trailer: new Headers(), message: idleStream() }))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway({ id: "connection", deviceId: "device", serverId: "server", name: "Browser",
+      origin: "http://127.0.0.1:4318" }, "secret", {}, () => transport);
+    const edit = { operationId: "edit-operation", sourceMessageId: "original-message", sourceEventId: "original-event",
+      target: { kind: "native_entry", entryId: "assistant-parent" } } as const;
+    const assertCurrent = vi.fn();
+    try {
+      await gateway.connect();
+      await expect(gateway.send("task", { text: "Replacement", attachments: [], mentions: [], deliveryMode: "prompt" },
+        { expectedGeneration: 4n, messageEdit: { ...edit, assertCurrent } })).rejects.toMatchObject({ code: "MESSAGE_EDIT_RESULT_UNKNOWN" });
+      expect(submissions).toHaveLength(1);
+      expect(assertCurrent).toHaveBeenCalledOnce();
+      expect(receiptReads).toEqual([edit.operationId, edit.operationId]);
+      expect(submissions[0]?.mutation).toMatchObject({ payload: { case: "sendInput", value: { sessionId: "task", messageEdit: {
+        sourceMessageId: edit.sourceMessageId, sourceEventId: edit.sourceEventId,
+        rewindBefore: { kind: { case: "nativeEntryId", value: edit.target.entryId } }
+      } } }, preconditions: [{ entity: { kind: EntityKind.SESSION, id: "task" }, expectedGeneration: 4n }] });
+      reportWrongOwner = false;
+      await expect(gateway.confirmMessageEdit("task", 4n, edit)).resolves.toBe(true);
+      expect(receiptReads).toEqual([edit.operationId, edit.operationId, edit.operationId]);
+      expect(submissions).toHaveLength(1);
+    } finally { gateway.disconnect(); }
   });
 
   it("recognizes local input before admission returns, through uncertain retry and exact-scope history reloads", async () => {

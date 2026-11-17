@@ -16,12 +16,10 @@ const prepareRewindDraft = vi.hoisted(() => vi.fn<PrepareRewindDraft>());
 
 vi.mock("./Composer.js", async () => {
   const React = await import("react");
-  return { Composer: (props: { readonly draftReplacement?: { readonly text: string }; readonly onDraftMutation?: () => void;
+  return { Composer: (props: { readonly onDraftMutation?: () => void;
     readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null> }) => {
     React.useImperativeHandle(props.rewindDraftRef, () => prepareRewindDraft);
-    return React.createElement(React.Fragment, null,
-      React.createElement("button", { type: "button", onClick: props.onDraftMutation }, "Unsaved composer input"),
-      props.draftReplacement === undefined ? null : React.createElement("output", { "data-testid": "edit-replacement" }, props.draftReplacement.text));
+    return React.createElement("button", { type: "button", onClick: props.onDraftMutation }, "Unsaved composer input");
   } };
 });
 vi.mock("./Timeline.js", async () => {
@@ -47,7 +45,7 @@ vi.mock("./Timeline.js", async () => {
         t: props.t,
         onCancel: () => undefined,
         blockedReason: edit.blockedReason,
-        onMoveToComposer: (text: string) => edit.submit(item, text)
+        onSubmit: (text: string) => edit.submit(item, text)
       }));
     }
   };
@@ -202,283 +200,191 @@ describe("SessionPane dialogue rewind draft recovery", () => {
   });
 });
 
-describe("SessionPane edited-message draft transaction", () => {
+describe("SessionPane edited-message submission", () => {
   it.each([false, true])("renders first-turn edit and rewind from the current Target scope: remote=%s", (remote) => {
-    const sourceSession = session();
-    const sourceBackend = startBackend();
-    const sourceMessage = startMessage();
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(async () => durableDraft()), saveDraft: vi.fn(async () => undefined), navigateSessionBranch: vi.fn(async () => undefined) });
+    const sourceSession = session(), sourceBackend = startBackend(), sourceMessage = startMessage();
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, {
+      readDraft: vi.fn(async () => durableDraft()), saveDraft: vi.fn(), navigateSessionBranch: vi.fn()
+    });
     if (remote) Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
     const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
     expect(container.querySelector('[data-testid="start-rewind-supported"]')?.textContent).toBe(String(!remote));
     expect(container.querySelector('[data-testid="editable-message"]')?.textContent).toBe(remote ? "" : sourceMessage.id);
   });
 
-  it.each(["preview", "draft read", "draft write"] as const)("rejects a first-turn Target becoming remote during %s without replacing the composer", async (boundary) => {
-    const sourceSession = session();
-    const sourceBackend = startBackend();
-    const sourceMessage = startMessage();
+  it.each(["preview", "draft read", "before dispatch"] as const)("rejects a first-turn Target becoming remote during %s", async (boundary) => {
+    const sourceSession = session(), sourceBackend = startBackend(), sourceMessage = startMessage();
     let finishRead!: (value: ReturnType<typeof durableDraft>) => void;
     const readDraft = vi.fn(() => boundary === "draft read"
-      ? new Promise<ReturnType<typeof durableDraft>>((resolve) => { finishRead = resolve; })
+      ? new Promise<ReturnType<typeof durableDraft>>(resolve => { finishRead = resolve; })
       : Promise.resolve(durableDraft()));
-    const saveDraft = vi.fn(async () => {
-      if (boundary === "draft write") Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
+    const dispatch = vi.fn();
+    const saveDraft = vi.fn();
+    const navigateSessionBranch = vi.fn();
+    const send = vi.fn<AppController["send"]>(async (_id, _draft, admission) => {
+      Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
+      admission.messageEdit?.assertCurrent();
+      dispatch();
     });
-    const navigateSessionBranch = vi.fn(async () => undefined);
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch });
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch, send });
     const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
     if (boundary === "preview") {
-      await act(async () => required([...container.querySelectorAll("button")].find((button) => button.textContent === "Preview rewind") ?? null).click());
+      await clickButton(container, "Preview rewind");
       Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
-      await act(async () => required([...document.querySelectorAll("button")].find((button) => button.textContent === "timeline.rewindDialogueOnly") ?? null).click());
+      await clickButton(document, "timeline.rewindDialogueOnly");
       expect(document.querySelector("[role=alert]")?.textContent).toContain("timeline.rewindStale");
     } else {
-      await act(async () => editSubmit(container).click());
+      await clickButton(container, "timeline.editSend");
       if (boundary === "draft read") {
         await vi.waitFor(() => expect(readDraft).toHaveBeenCalledOnce());
         Reflect.set(controller.state.snapshot.targets[0]!, "remoteWorkspace", remoteWorkspace());
         await act(async () => finishRead(durableDraft()));
       }
-      await vi.waitFor(() => expect(container.querySelector("[role=alert]")?.textContent).toContain("timeline.editStale"));
+      expect(container.querySelector("[role=alert]")?.textContent).toContain("timeline.editStale");
     }
     expect(navigateSessionBranch).not.toHaveBeenCalled();
-    if (boundary === "draft write") {
-      expect(saveDraft).toHaveBeenCalledTimes(2);
-      expect(saveDraft).toHaveBeenLastCalledWith(sourceSession.id, durableDraft());
-    } else expect(saveDraft).not.toHaveBeenCalled();
-    expect(container.querySelector('[data-testid="edit-replacement"]')).toBeNull();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(saveDraft).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("keeps the first-turn rewind confirmation bound to its document lifetime: pagehide=%s", async (hide) => {
-    const sourceSession = session();
-    const originalBackend = backend();
-    const sourceBackend: BackendView = { ...originalBackend, capabilities: new Map([...originalBackend.capabilities, ["session.rewind_to_start", { name: "session.rewind_to_start", supported: true, options: [] }]]) };
-    const sourceMessage = { ...message(), nativeParentEntryId: undefined, nativeRewindBefore: { kind: "session_start" as const } };
+    const sourceSession = session(), sourceBackend = startBackend(), sourceMessage = startMessage();
     const navigateSessionBranch = vi.fn(async () => undefined);
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(async () => undefined), saveDraft: vi.fn(async () => undefined), navigateSessionBranch });
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, {
+      readDraft: vi.fn(async () => undefined), saveDraft: vi.fn(), navigateSessionBranch
+    });
     const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    await act(async () => required([...container.querySelectorAll("button")].find((button) => button.textContent === "Preview rewind") ?? null).click());
+    await clickButton(container, "Preview rewind");
     if (hide) {
       await act(async () => { window.dispatchEvent(new Event("pagehide")); window.dispatchEvent(new Event("pageshow")); });
       expect(document.querySelector('[data-message-rewind-preview="true"]')).toBeNull();
       expect(navigateSessionBranch).not.toHaveBeenCalled();
     } else {
-      await act(async () => required([...document.querySelectorAll("button")].find((button) => button.textContent === "timeline.rewindDialogueOnly") ?? null).click());
+      await clickButton(document, "timeline.rewindDialogueOnly");
       expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "session_start" },
         { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId } });
     }
   });
 
-  it.each(["persisted", "local"] as const)("does not replace a newer %s composer draft while native navigation is waiting", async (boundary) => {
-    const sourceSession = session();
-    const sourceBackend = backend();
-    const sourceMessage = message();
-    let finish!: () => void;
-    const navigateSessionBranch = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(async () => durableDraft()), saveDraft: vi.fn(async () => undefined), navigateSessionBranch });
-    controller.readDraftSnapshot = vi.fn<AppController["readDraftSnapshot"]>()
-      .mockResolvedValueOnce({ revision: 1, draft: durableDraft() })
-      .mockResolvedValueOnce({ revision: boundary === "persisted" ? 3 : 2, draft: { ...durableDraft(), text: "Later user draft" } });
-    controller.saveDraftIfRevision = vi.fn(async () => 2);
-    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    await act(async () => editSubmit(container).click());
-    await vi.waitFor(() => expect(navigateSessionBranch).toHaveBeenCalledOnce());
-    if (boundary === "local") await act(async () => required([...container.querySelectorAll("button")].find((button) => button.textContent === "Unsaved composer input") ?? null).click());
-    await act(async () => finish());
-    await vi.waitFor(() => expect(controller.readDraftSnapshot).toHaveBeenCalledTimes(boundary === "persisted" ? 2 : 1));
-    expect(controller.saveDraftIfRevision).toHaveBeenCalledOnce();
-    expect(container.querySelector('[data-testid="edit-replacement"]')).toBeNull();
-  });
-
-  it("does not navigate after a concurrent draft write and rolls back only its own successful draft revision", async () => {
-    const sourceSession = session();
-    const sourceBackend = backend();
-    const sourceMessage = message();
-    const methods = { readDraft: vi.fn(async () => durableDraft()), saveDraft: vi.fn(async () => undefined), navigateSessionBranch: vi.fn(async () => { throw new Error("navigation failed"); }) };
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, methods);
-    const compareAndSet = vi.fn<AppController["saveDraftIfRevision"]>()
-      .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce(2)
-      .mockResolvedValueOnce(undefined);
-    controller.saveDraftIfRevision = compareAndSet;
-    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    await act(async () => editSubmit(container).click());
-    expect(methods.navigateSessionBranch).not.toHaveBeenCalled();
-    await act(async () => editSubmit(container).click());
-    expect(methods.navigateSessionBranch).toHaveBeenCalledOnce();
-    expect(compareAndSet.mock.calls.map((call) => call[2])).toEqual([1, 1, 2]);
-    expect(methods.saveDraft).not.toHaveBeenCalled();
-    expect(container.querySelector("[role=alert]")?.textContent).not.toContain("timeline.editDraftRestoreFailed");
-  });
-
-  it("edits the loaded last user row when the owner snapshot has no transcript", async () => {
-    const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
-    const saveDraft = vi.fn(async () => undefined), navigateSessionBranch = vi.fn(async () => undefined);
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage,
-      { readDraft: vi.fn(async () => durableDraft()), saveDraft, navigateSessionBranch });
+  it.each([false, true])("sends the reloaded last message with its exact rewind boundary: first turn=%s", async (first) => {
+    const sourceSession = session(), sourceBackend = first ? startBackend() : backend(), sourceMessage = first ? startMessage() : message();
+    const saveDraft = vi.fn(), navigateSessionBranch = vi.fn();
+    const send = vi.fn<AppController["send"]>(async (_id, _draft, admission) => { admission.messageEdit?.assertCurrent(); });
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft: vi.fn(async () => durableDraft()), saveDraft, navigateSessionBranch, send });
     Reflect.set(controller.state.snapshot, "timelineBySession", new Map());
     const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    await act(async () => editSubmit(container).click());
-    expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, sourceMessage.nativeRewindBefore,
-      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId, requireLatestUser: true } });
-    expect(saveDraft).toHaveBeenCalledOnce();
-    expect(container.querySelector('[data-testid="edit-replacement"]')?.textContent).toBe(sourceMessage.text);
+    await clickButton(container, "timeline.editSend");
+    expect(send).toHaveBeenCalledExactlyOnceWith(sourceSession.id, expect.objectContaining({ text: sourceMessage.text, deliveryMode: "prompt" }),
+      { expectedGeneration: sourceSession.generation, messageEdit: {
+        sourceMessageId: sourceMessage.id, sourceEventId: sourceMessage.sourceEventId, target: sourceMessage.nativeRewindBefore,
+        operationId: expect.any(String), assertCurrent: expect.any(Function)
+      } });
+    expect(saveDraft).not.toHaveBeenCalled();
+    expect(navigateSessionBranch).not.toHaveBeenCalled();
+    expect(controller.messageEditDrafts.finish).toHaveBeenCalledExactlyOnceWith(sourceSession.id, expect.any(String), false);
   });
 
-  it("rejects a newer live user input while the historical row's draft is being read", async () => {
+  it.each(["generation", "gateway", "navigation ABA", "pagehide", "new live input", "local draft"] as const)(
+    "retires an edit while its draft read is pending across a %s change", async (boundary) => {
+      const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
+      let finish!: (value: ReturnType<typeof durableDraft>) => void;
+      const readDraft = vi.fn(() => new Promise<ReturnType<typeof durableDraft>>(resolve => { finish = resolve; }));
+      const send = vi.fn(), saveDraft = vi.fn(), navigateSessionBranch = vi.fn();
+      const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch, send });
+      Reflect.set(controller.state.snapshot, "timelineBySession", new Map());
+      const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+      await clickButton(container, "timeline.editSend");
+      await vi.waitFor(() => expect(readDraft).toHaveBeenCalledOnce());
+      if (boundary === "generation") Reflect.set(sourceSession, "generation", 2n);
+      else if (boundary === "gateway") controller.send = vi.fn();
+      else if (boundary === "navigation ABA") Reflect.set(controller.state, "navigationRevision", 2);
+      else if (boundary === "new live input") Reflect.set(controller.state.snapshot, "timelineBySession", new Map([[sourceSession.id,
+        [{ ...message(), id: "new-user", sourceEventId: "new-user-event", sequence: 5n, completionCursor: 5n }]]]));
+      else if (boundary === "local draft") await clickButton(container, "Unsaved composer input");
+      else { window.dispatchEvent(new Event("pagehide")); window.dispatchEvent(new Event("pageshow")); }
+      await act(async () => finish(durableDraft()));
+      expect(container.querySelector("[role=alert]")?.textContent).toContain("timeline.editStale");
+      expect(saveDraft).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(navigateSessionBranch).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(["draft unavailable", "send rejected"] as const)("keeps the inline editor and existing draft on %s", async (failure) => {
     const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
-    let finish!: (value: ReturnType<typeof durableDraft>) => void;
-    const readDraft = vi.fn(() => new Promise<ReturnType<typeof durableDraft>>((resolve) => { finish = resolve; }));
-    const saveDraft = vi.fn(async () => undefined), navigateSessionBranch = vi.fn(async () => undefined);
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch });
-    Reflect.set(controller.state.snapshot, "timelineBySession", new Map());
+    const readDraft = vi.fn(async () => { if (failure === "draft unavailable") throw new Error(failure); return durableDraft(); });
+    const send = vi.fn(async () => { throw new Error(failure); });
+    const saveDraft = vi.fn(), navigateSessionBranch = vi.fn();
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch, send });
     const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    await act(async () => editSubmit(container).click());
-    await vi.waitFor(() => expect(readDraft).toHaveBeenCalledOnce());
-    Reflect.set(controller.state.snapshot, "timelineBySession", new Map([[sourceSession.id,
-      [{ ...message(), id: "new-user", sourceEventId: "new-user-event", sequence: 5n, completionCursor: 5n }]]]));
-    await act(async () => finish(durableDraft()));
+    await clickButton(container, "timeline.editSend");
+    expect(container.querySelector("[role=alert]")?.textContent).toContain(failure);
+    expect(send).toHaveBeenCalledTimes(failure === "draft unavailable" ? 0 : 1);
+    expect(saveDraft).not.toHaveBeenCalled();
+    expect(navigateSessionBranch).not.toHaveBeenCalled();
+    const textarea = required(container.querySelector<HTMLTextAreaElement>(".message-user-edit textarea"));
+    expect(textarea.value).toBe(sourceMessage.text);
+    expect(textarea.disabled).toBe(false);
+  });
+
+  it("does not send after the original draft revision is superseded", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
+    const send = vi.fn();
+    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, {
+      readDraft: vi.fn(async () => durableDraft()), saveDraft: vi.fn(), navigateSessionBranch: vi.fn(), send,
+      messageEditDrafts: { read: vi.fn(async () => undefined), stage: vi.fn(async () => false), finish: vi.fn() }
+    });
+    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+    await clickButton(container, "timeline.editSend");
+    expect(controller.messageEditDrafts.stage).toHaveBeenCalledExactlyOnceWith(sourceSession.id,
+      expect.objectContaining({ sourceEventId: sourceMessage.sourceEventId, expectedGeneration: sourceSession.generation }), 1);
+    expect(send).not.toHaveBeenCalled();
     expect(container.querySelector("[role=alert]")?.textContent).toContain("timeline.editStale");
-    expect(saveDraft).not.toHaveBeenCalled(); expect(navigateSessionBranch).not.toHaveBeenCalled();
   });
 
-  it("moves the first user message to the composer with an explicit generation-bound start rewind", async () => {
-    const sourceSession = session();
-    const originalBackend = backend();
-    const sourceBackend: BackendView = { ...originalBackend, capabilities: new Map([...originalBackend.capabilities, ["session.rewind_to_start", { name: "session.rewind_to_start", supported: true, options: [] }]]) };
-    const sourceMessage = { ...message(), nativeParentEntryId: undefined, nativeRewindBefore: { kind: "session_start" as const } };
-    const readDraft = vi.fn(async () => durableDraft());
-    const saveDraft = vi.fn(async () => undefined);
-    const navigateSessionBranch = vi.fn(async () => undefined);
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch });
-    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    await act(async () => editSubmit(container).click());
-    await vi.waitFor(() => expect(navigateSessionBranch).toHaveBeenCalledExactlyOnceWith(sourceSession.id, { kind: "session_start" },
-      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId, requireLatestUser: true } }));
-    expect(saveDraft).toHaveBeenCalledOnce();
-    await vi.waitFor(() => expect(container.querySelector('[data-testid="edit-replacement"]')?.textContent).toBe(sourceMessage.text));
-  });
+  it.each([false, true])(
+    "requests recovery for its own saved edit after a terminal partial failure: failed storage=%s", async (failedStorage) => {
+      const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
+      let reject!: (error: Error) => void;
+      const send = vi.fn(() => new Promise<void>((_resolve, onError) => { reject = onError; }));
+      const finish = vi.fn(async () => { if (failedStorage) throw new Error("Storage error"); });
+      const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, {
+        readDraft: vi.fn(async () => undefined), saveDraft: vi.fn(), navigateSessionBranch: vi.fn(), send,
+        messageEditDrafts: { read: vi.fn(async () => undefined), stage: vi.fn(async () => true), finish }
+      });
+      const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
+      await clickButton(container, "timeline.editSend");
+      await act(async () => reject(Object.assign(new Error("Native history synchronization failed"), { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" })));
+      expect(finish).toHaveBeenCalledExactlyOnceWith(sourceSession.id, expect.any(String), true);
+      expect(container.querySelector("[role=alert]")?.textContent).toContain(failedStorage
+        ? "timeline.editDraftRestoreFailed" : "Native history synchronization failed");
+    }
+  );
 
-  it.each(["generation", "gateway", "navigation ABA", "pagehide"] as const)("retires an edit while its draft read is pending across a %s replacement", async (boundary) => {
-    const sourceSession = session();
-    const sourceBackend = backend();
-    const sourceMessage = message();
-    let finish!: (value: ReturnType<typeof durableDraft>) => void;
-    const readDraft = vi.fn(() => new Promise<ReturnType<typeof durableDraft>>((resolve) => { finish = resolve; }));
-    const saveDraft = vi.fn(async () => undefined);
-    const navigateSessionBranch = vi.fn(async () => undefined);
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, { readDraft, saveDraft, navigateSessionBranch });
-    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    await act(async () => editSubmit(container).click());
-    await vi.waitFor(() => expect(readDraft).toHaveBeenCalledOnce());
-    if (boundary === "generation") (sourceSession as { generation: bigint }).generation += 1n;
-    else if (boundary === "gateway") controller.navigateSessionBranch = vi.fn(async () => undefined);
-    else if (boundary === "navigation ABA") (controller.state as { navigationRevision: number }).navigationRevision = 2;
-    else { window.dispatchEvent(new Event("pagehide")); window.dispatchEvent(new Event("pageshow")); }
-    await act(async () => finish(durableDraft()));
-    await vi.waitFor(() => expect(container.querySelector("[role=alert]")?.textContent).toContain("timeline.editStale"));
-    expect(saveDraft).not.toHaveBeenCalled();
-    expect(navigateSessionBranch).not.toHaveBeenCalled();
-  });
-
-  it("keeps the editor and durable draft untouched when the previous draft cannot be read", async () => {
-    const sourceSession = session();
-    const sourceBackend = backend();
-    const sourceMessage = message();
-    const readDraft = vi.fn(async () => { throw new Error("Could not read the current draft."); });
-    const saveDraft = vi.fn();
-    const navigateSessionBranch = vi.fn();
+  it("checks the original operation after an uncertain edit without admitting another input", async () => {
+    const sourceSession = session(), sourceBackend = backend(), sourceMessage = message();
+    const send = vi.fn<AppController["send"]>(async () => {
+      throw Object.assign(new Error("Lost acknowledgement"), { code: "MESSAGE_EDIT_RESULT_UNKNOWN" });
+    });
+    const confirmMessageEdit = vi.fn(async () => true);
     const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, {
-      readDraft,
-      saveDraft,
-      navigateSessionBranch
+      readDraft: vi.fn(async () => undefined), saveDraft: vi.fn(), navigateSessionBranch: vi.fn(), send, confirmMessageEdit
     });
     const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    const textarea = required(container.querySelector<HTMLTextAreaElement>(".message-user-edit textarea"));
-    const submit = [...container.querySelectorAll<HTMLButtonElement>("button")]
-      .find((button) => button.textContent === "timeline.editMoveToComposer");
-    if (submit === undefined) throw new Error("Edit submit button was not rendered.");
-
-    await act(async () => submit.click());
-    await act(async () => vi.waitFor(() => expect(container.querySelector("[role=alert]")?.textContent)
-      .toContain("Could not read the current draft.")));
-
-    expect(readDraft).toHaveBeenCalledWith(sourceSession.id);
-    expect(saveDraft).not.toHaveBeenCalled();
-    expect(navigateSessionBranch).not.toHaveBeenCalled();
-    expect(textarea.value).toBe(sourceMessage.text);
-    expect(textarea.disabled).toBe(false);
-  });
-
-  it("keeps the editor open and reports a recovery failure when the task becomes stale and rollback cannot be saved", async () => {
-    const sourceSession = session();
-    const sourceBackend = backend();
-    const sourceMessage = message();
-    const previousDraft = durableDraft();
-    const readDraft = vi.fn(async () => previousDraft);
-    const saveDraft = vi.fn()
-      .mockImplementationOnce(async () => { Reflect.set(sourceSession, "state", "running"); })
-      .mockRejectedValueOnce(new Error("rollback failed"));
-    const navigateSessionBranch = vi.fn();
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, {
-      readDraft,
-      saveDraft,
-      navigateSessionBranch
-    });
-    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    const textarea = required(container.querySelector<HTMLTextAreaElement>(".message-user-edit textarea"));
-    const submit = editSubmit(container);
-
-    await act(async () => submit.click());
-    await act(async () => vi.waitFor(() => expect(container.querySelector("[role=alert]")?.textContent)
-      .toContain("timeline.editDraftRestoreFailed")));
-
-    expect(saveDraft).toHaveBeenCalledTimes(2);
-    expect(saveDraft).toHaveBeenLastCalledWith(sourceSession.id, previousDraft);
-    expect(navigateSessionBranch).not.toHaveBeenCalled();
-    expect(textarea.value).toBe(sourceMessage.text);
-    expect(textarea.disabled).toBe(false);
-  });
-
-  it("keeps the editor open and reports a recovery failure when navigation and rollback both fail", async () => {
-    const sourceSession = session();
-    const sourceBackend = backend();
-    const sourceMessage = message();
-    const previousDraft = durableDraft();
-    const readDraft = vi.fn(async () => previousDraft);
-    const saveDraft = vi.fn()
-      .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(new Error("rollback failed"));
-    const navigateSessionBranch = vi.fn().mockRejectedValueOnce(new Error("navigation failed"));
-    const controller = controllerFor(sourceSession, sourceBackend, sourceMessage, {
-      readDraft,
-      saveDraft,
-      navigateSessionBranch
-    });
-    const container = mountPane(controller, sourceSession, sourceBackend, sourceMessage);
-    const textarea = required(container.querySelector<HTMLTextAreaElement>(".message-user-edit textarea"));
-    const submit = editSubmit(container);
-
-    await act(async () => submit.click());
-    await act(async () => vi.waitFor(() => expect(container.querySelector("[role=alert]")?.textContent)
-      .toContain("timeline.editDraftRestoreFailed")));
-
-    expect(saveDraft).toHaveBeenCalledTimes(2);
-    expect(saveDraft).toHaveBeenLastCalledWith(sourceSession.id, previousDraft);
-    expect(navigateSessionBranch).toHaveBeenCalledWith(sourceSession.id, { kind: "native_entry", entryId: "entry-parent" },
-      { expectedGeneration: sourceSession.generation, sourceMessage: { messageId: sourceMessage.id, eventId: sourceMessage.sourceEventId, requireLatestUser: true } });
-    expect(textarea.value).toBe(sourceMessage.text);
-    expect(textarea.disabled).toBe(false);
+    await clickButton(container, "timeline.editSend");
+    const control = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === "timeline.editSend");
+    expect(control?.disabled).toBe(true);
+    await clickButton(container, "timeline.checkEditResult");
+    const [id, , admission] = send.mock.calls[0]!;
+    expect(confirmMessageEdit).toHaveBeenCalledExactlyOnceWith(id, admission.expectedGeneration,
+      expect.objectContaining({ operationId: admission.messageEdit?.operationId, sourceEventId: sourceMessage.sourceEventId }));
+    expect(send).toHaveBeenCalledOnce();
+    expect(controller.saveDraft).not.toHaveBeenCalled();
+    expect(controller.messageEditDrafts.stage).toHaveBeenCalledExactlyOnceWith(id,
+      expect.objectContaining({ operationId: admission.messageEdit?.operationId }), 1);
+    expect(controller.messageEditDrafts.finish).toHaveBeenCalledExactlyOnceWith(id, admission.messageEdit?.operationId, false);
   });
 });
-
-function editSubmit(container: HTMLDivElement): HTMLButtonElement {
-  const submit = [...container.querySelectorAll<HTMLButtonElement>("button")]
-    .find((button) => button.textContent === "timeline.editMoveToComposer");
-  if (submit === undefined) throw new Error("Edit submit button was not rendered.");
-  return submit;
-}
 
 function durableDraft() {
   return {
@@ -535,6 +441,7 @@ function controllerFor(
   sourceBackend: BackendView,
   sourceMessage: TimelineItemView,
   methods: Pick<AppController, "readDraft" | "saveDraft" | "navigateSessionBranch">
+    & Partial<Pick<AppController, "send" | "confirmMessageEdit" | "messageEditDrafts">>
 ): AppController {
   const snapshot = {
     ...emptySnapshot(),
@@ -563,6 +470,7 @@ function controllerFor(
   };
   let revision = 1;
   return {
+    messageEditDrafts: { read: vi.fn(async () => undefined), stage: vi.fn(async () => true), finish: vi.fn(async () => undefined) },
     state, ...methods,
     listPartners: async () => ({ partners: [] }),
     getPortableReplacementCleanup: async () => undefined,

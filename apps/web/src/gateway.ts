@@ -2277,9 +2277,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return source;
   }
 
-  async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint; readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean } }): Promise<void> {
+  async send(sessionId: string, draft: ComposerDraft, admission: Parameters<OperationApi["send"]>[2]): Promise<void> {
     const scope = this.captureActionScope();
     const expectedGeneration = admission.expectedGeneration;
+    const edit = admission.messageEdit;
     if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new GatewayError("Input requires the source task generation.");
     }
@@ -2373,7 +2374,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       parts.push({ content: { case: "image", value: { blob, altText: item.screenshot.file.name } } });
     }
     if (parts.length === 0) throw new GatewayError("A task input cannot be empty.");
-    await this.submit({
+    const payload: MutationPayload = {
       case: "sendInput",
       value: {
         sessionId,
@@ -2393,9 +2394,62 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         ...(admission.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: admission.providerGroupRebalance }),
         ...(draft.extraDirectoryIds === undefined
           ? {}
-          : { overrides: { extraDirectoryIds: [...new Set(draft.extraDirectoryIds)] } })
+          : { overrides: { extraDirectoryIds: [...new Set(draft.extraDirectoryIds)] } }),
+        ...(edit === undefined ? {} : { messageEdit: {
+          sourceMessageId: edit.sourceMessageId, sourceEventId: edit.sourceEventId,
+          rewindBefore: { kind: edit.target.kind === "session_start" ? { case: "sessionStart", value: {} }
+            : { case: "nativeEntryId", value: edit.target.entryId } }
+        } })
       }
-    }, false, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }], scope.signal);
+    };
+    const preconditions: MutationPrecondition[] = [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }];
+    if (edit === undefined) {
+      await this.submit(payload, false, preconditions, scope.signal);
+      return;
+    }
+    let dispatched = false;
+    let observed: Operation | undefined;
+    try {
+      const result = await this.submit(payload, true, preconditions, scope.signal, (_id, operation) => {
+        if (operation === undefined) {
+          edit.assertCurrent();
+          dispatched = true;
+        } else observed = operation;
+      }, edit.operationId, true);
+      const accepted = result.result?.payload;
+      if (result.operationId === edit.operationId && result.state === OperationState.SUCCEEDED && accepted?.case === "queueItem"
+        && accepted.value.sessionId === sessionId && accepted.value.sourceId === edit.operationId) return;
+    } catch (error) {
+      if (!dispatched) throw error;
+      if (observed !== undefined && observed.state !== OperationState.SUCCEEDED && TERMINAL_OPERATION_STATES.has(observed.state)) {
+        throw messageEditRejection(observed);
+      }
+    }
+    if (await this.confirmMessageEdit(sessionId, expectedGeneration, edit, scope)) return;
+    throw new GatewayError("The edit result is unknown. Check the original edit before submitting again.", { code: "MESSAGE_EDIT_RESULT_UNKNOWN" });
+  }
+
+  async confirmMessageEdit(sessionId: string, expectedGeneration: bigint, edit: import("./model.js").MessageEditRequest,
+    scope = this.captureActionScope()): Promise<boolean> {
+    const operation = await createClient(OperationService, scope.transport).getOperation({ operationId: edit.operationId }, { signal: scope.signal, timeoutMs: 5_000 })
+      .then(response => response.operation).catch(() => undefined);
+    if (scope.signal.aborted || this.#transport !== scope.transport || operation === undefined) return false;
+    const payload = operation.mutation?.payload;
+    const submitted = payload?.case === "sendInput" ? payload.value.messageEdit : undefined;
+    const boundary = submitted?.rewindBefore?.kind;
+    if (operation.operationId !== edit.operationId || operation.connectionId !== this.#profile?.id || payload?.case !== "sendInput"
+      || payload.value.sessionId !== sessionId || submitted === undefined || submitted.sourceMessageId !== edit.sourceMessageId || submitted.sourceEventId !== edit.sourceEventId
+      || (edit.target.kind === "session_start" ? boundary?.case !== "sessionStart" : boundary?.case !== "nativeEntryId" || boundary.value !== edit.target.entryId)
+      || !operation.mutation?.preconditions.some(condition => condition.entity?.kind === EntityKind.SESSION
+        && condition.entity.id === sessionId && condition.expectedGeneration === expectedGeneration)) return false;
+    if (operation.state === OperationState.SUCCEEDED) {
+      const result = operation.result?.payload;
+      if (result?.case !== "queueItem" || result.value.sessionId !== sessionId || result.value.sourceId !== operation.operationId) return false;
+      void this.refresh().catch(() => undefined);
+      return true;
+    }
+    if (TERMINAL_OPERATION_STATES.has(operation.state)) throw messageEditRejection(operation);
+    return false;
   }
 
   async sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, callerSignal?: AbortSignal): Promise<boolean> {
@@ -21618,6 +21672,15 @@ function normalizeError(error: unknown): GatewayError {
     return new GatewayError(error.rawMessage || error.message, { offline, cause: error });
   }
   return new GatewayError(error instanceof Error ? error.message : "Unexpected connection error", { cause: error });
+}
+
+function messageEditRejection(operation: Operation): GatewayError {
+  const error = operation.error;
+  const nativeResultUnknown = error !== undefined && [StateImpact.CHANGED, StateImpact.MAY_HAVE_CHANGED, StateImpact.UNKNOWN]
+    .includes(error.nativeSessionImpact);
+  return new GatewayError(error?.message || "The edited input was rejected.", {
+    code: nativeResultUnknown ? "NATIVE_NAVIGATION_SYNC_UNKNOWN" : error?.code || "MESSAGE_EDIT_REJECTED"
+  });
 }
 
 function isUncertainOperationSubmissionError(error: unknown): boolean {

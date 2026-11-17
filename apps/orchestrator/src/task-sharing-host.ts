@@ -296,6 +296,7 @@ export class TaskSharingHost {
       if (this.options.store.getRun(payload.value.runId).descriptor.sessionId !== lease.scope.sessionId) throw denied("The Run belongs to another task.");
     }
     if (payload.case === "sendInput") {
+      if (payload.value.messageEdit !== undefined) throw denied("Editing a sent message requires the task owner.");
       const overrides = payload.value.overrides;
       if (overrides && (overrides.permissionMode !== undefined || overrides.planMode !== undefined || overrides.extraDirectoryIds.length > 0)) throw denied("Task guests cannot change execution permissions.");
     }

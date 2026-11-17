@@ -83,6 +83,7 @@ import type {
   NewSessionModelRequest,
   PendingExtensionSuggestionView,
   PendingExtensionUseView,
+  PendingMessageEdit,
   SessionMessageSearchCollectionOptions,
   SystemLocale,
   Theme
@@ -348,6 +349,11 @@ export interface AppController extends OperationApi {
   saveDraft(sessionId: string, draft: ComposerDraft): Promise<void>;
   readDraftSnapshot(sessionId: string): Promise<import("./local-state.js").ComposerDraftSnapshot>;
   saveDraftIfRevision(sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined>;
+  readonly messageEditDrafts: {
+    read(sessionId: string): Promise<PendingMessageEdit | undefined>;
+    stage(sessionId: string, edit: PendingMessageEdit, expectedDraftRevision: number): Promise<boolean>;
+    finish(sessionId: string, operationId: string, recover: boolean): Promise<void>;
+  };
   readPendingSideChat?(sessionId: string): Promise<import("./model.js").PendingSideChatDraft | undefined>;
   savePendingSideChat?(sourceSessionId: string, expected: import("./model.js").PendingSideChatDraft | undefined, next: import("./model.js").PendingSideChatDraft | undefined): Promise<boolean>;
   adoptPendingSideChat?(record: import("./model.js").PendingSideChatDraft, childSessionId: string, appendToExisting: boolean, isCurrent: () => boolean): Promise<"adopted" | "existing" | "stale">;
@@ -3175,17 +3181,37 @@ export function useAppController(): AppController {
       requireLocal(draftStore).adoptPendingSideChat(draftServerId, draftProfileId, record, childSessionId, sourceSurface, childSurface, appendToExisting, sourceCurrent)));
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface, artifactGateway, linkGatewayGeneration]);
   const rejectedFirstInputRecoverySequenceRef = useRef(0);
-  const restoreFirstInputDraft = useCallback<AppController["restoreFirstInputDraft"]>(async (sessionId, input) => {
-    if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before restoring a task draft.");
-    const recovered = await restoreRejectedComposerDraft({ readDraftSnapshot, saveDraftIfRevision }, sessionId, input);
+  const publishRecoveredDraft = useCallback((sessionId: string, recovered: Omit<NonNullable<ControllerState["rejectedFirstInputRecovery"]>, "sessionId" | "eventId">) => {
     const eventId = ++rejectedFirstInputRecoverySequenceRef.current;
     setState((current) => current.activeProfile?.serverId === draftServerId
       && current.activeProfile.id === draftProfileId
       && (current.route.kind === "session" || current.route.kind === "files")
       && current.route.sessionId === sessionId
-      ? { ...current, rejectedFirstInputRecovery: { eventId, sessionId, input, ...recovered } }
+      ? { ...current, rejectedFirstInputRecovery: { eventId, sessionId, ...recovered } }
       : current);
-  }, [draftServerId, draftProfileId, readDraftSnapshot, saveDraftIfRevision]);
+  }, [draftServerId, draftProfileId]);
+  const restoreFirstInputDraft = useCallback<AppController["restoreFirstInputDraft"]>(async (sessionId, input) => {
+    if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before restoring a task draft.");
+    const recovered = await restoreRejectedComposerDraft({ readDraftSnapshot, saveDraftIfRevision }, sessionId, input);
+    publishRecoveredDraft(sessionId, { input, ...recovered });
+  }, [draftServerId, draftProfileId, readDraftSnapshot, saveDraftIfRevision, publishRecoveredDraft]);
+  const messageEditDrafts = useMemo<AppController["messageEditDrafts"]>(() => {
+    const inDraft = async <T,>(sessionId: string, run: (local: LocalState, serverId: string, profileId: string,
+      surface: import("./local-state.js").SessionDraftSurface) => Promise<T>): Promise<T> => {
+      if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to the original node to restore an edited message.");
+      return withDraftSurface(sessionId, surface => run(requireLocal(draftStore), draftServerId, draftProfileId, surface));
+    };
+    return {
+      read: sessionId => inDraft(sessionId, (local, serverId, profileId, surface) => local.readPendingMessageEdit(serverId, profileId, sessionId, surface)),
+      stage: (sessionId, edit, revision) => inDraft(sessionId, (local, serverId, profileId, surface) =>
+        local.stagePendingMessageEdit(serverId, profileId, sessionId, surface, edit, revision)),
+      finish: async (sessionId, operationId, recover) => {
+        const restored = await inDraft(sessionId, (local, serverId, profileId, surface) =>
+          local.finishPendingMessageEdit(serverId, profileId, sessionId, surface, operationId, recover));
+        if (restored !== undefined) publishRecoveredDraft(sessionId, restored);
+      }
+    };
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface, publishRecoveredDraft]);
   const listWorkspaceChangeSets = useCallback<AppController["listWorkspaceChangeSets"]>((workspaceId, sessionId) => {
     if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before reading workspace changes."));
     return artifactGateway.listWorkspaceChangeSets(workspaceId, sessionId);
@@ -3320,6 +3346,7 @@ export function useAppController(): AppController {
       listArtifactReferenceCatalog: async (...args: Parameters<OperationApi["listArtifactReferenceCatalog"]>) => original().listArtifactReferenceCatalog(...args),
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
+      confirmMessageEdit: async (...args: Parameters<OperationApi["confirmMessageEdit"]>) => original().confirmMessageEdit(...args),
       sendRichAnswer: async (...args: Parameters<OperationApi["sendRichAnswer"]>) => original().sendRichAnswer(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
       prepareContactsDialogue: async (...args: Parameters<OrchestratorGateway["prepareContactsDialogue"]>) => original().prepareContactsDialogue(...args),
@@ -3831,6 +3858,7 @@ export function useAppController(): AppController {
     saveDraft,
     readDraftSnapshot,
     saveDraftIfRevision,
+    messageEditDrafts,
     readPendingSideChat,
     savePendingSideChat,
     adoptPendingSideChat,
@@ -4541,7 +4569,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, taskMessageGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, taskMessageGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

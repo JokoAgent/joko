@@ -8319,7 +8319,7 @@ export class OperationalStore {
     const receipt = row === undefined ? undefined : nativeSessionDerivationFromRow(row);
     if (derivationOperationId !== undefined) {
       const operation = this.getOperation(derivationOperationId);
-      const navigation = operation.kind === "navigate_session" || operation.kind === "navigateSessionBranch";
+      const navigation = nativeNavigationOperationSession(operation) === descriptor.id;
       if (this.deferredEffectCompletions.at(-1) !== derivationOperationId || receipt?.operationId !== derivationOperationId
         || receipt.state !== "recorded" || receipt.binding === undefined
         || receipt.sessionId !== descriptor.id || receipt.targetId !== descriptor.targetId
@@ -8663,7 +8663,7 @@ export class OperationalStore {
         throw new StoreError("Changing a native session binding requires a higher generation.");
       }
       if (adoption !== undefined && (patch.binding === undefined
-        || !["navigate_session", "navigateSessionBranch"].includes(this.getOperation(adoption.derivationOperationId).kind))) {
+        || nativeNavigationOperationSession(this.getOperation(adoption.derivationOperationId)) !== id)) {
         throw new StoreError("Native navigation adoption requires a replacement binding.");
       }
       const derivation = patch.binding === undefined ? undefined
@@ -21394,6 +21394,17 @@ function normalizeNativeDerivationBinding(value: NativeSessionBinding): NativeSe
   };
 }
 
+function nativeNavigationOperationSession(operation: OperationRecord): string | undefined {
+  const body = isRecord(operation.body) ? operation.body : undefined;
+  const payload = body !== undefined && isRecord(body["payload"]) ? body["payload"] : undefined;
+  const value = payload !== undefined && isRecord(payload["value"]) ? payload["value"] : undefined;
+  if (operation.kind === "navigate_session" && typeof body?.["sourceSessionId"] === "string") return body["sourceSessionId"];
+  if ((operation.kind === "navigateSessionBranch" && payload?.["case"] === "navigateSessionBranch"
+    || operation.kind === "sendInput" && payload?.["case"] === "sendInput" && isRecord(value?.["messageEdit"]))
+    && typeof value?.["sessionId"] === "string") return value["sessionId"];
+  return undefined;
+}
+
 function assertNativeSessionDerivationOperation(
   operation: OperationRecord,
   sourceSessionId: string,
@@ -21401,16 +21412,11 @@ function assertNativeSessionDerivationOperation(
   sourceBinding: NativeSessionBinding,
   binding?: NativeSessionBinding
 ): void {
-  const navigation = operation.kind === "navigate_session" || operation.kind === "navigateSessionBranch";
+  const navigationSession = nativeNavigationOperationSession(operation);
   const body = isRecord(operation.body) ? operation.body : undefined;
-  const payload = body !== undefined && isRecord(body["payload"]) ? body["payload"] : undefined;
-  const value = payload !== undefined && isRecord(payload["value"]) ? payload["value"] : undefined;
-  const sourceId = operation.kind === "navigateSessionBranch"
-    ? payload?.["case"] === "navigateSessionBranch" ? value?.["sessionId"] : undefined
-    : body?.["sourceSessionId"];
-  if (operation.status === "completed"
-    || !["fork_session", "clone_session", "navigate_session", "navigateSessionBranch"].includes(operation.kind)
-    || sourceId !== sourceSessionId) {
+  const derivingChild = operation.kind === "fork_session" || operation.kind === "clone_session";
+  const navigation = navigationSession !== undefined;
+  if (operation.status === "completed" || (derivingChild ? body?.["sourceSessionId"] : navigationSession) !== sourceSessionId) {
     throw new StoreError("The native derivation does not match its claimed operation.");
   }
   if (navigation ? sourceSessionId !== sessionId : sourceSessionId === sessionId) {
