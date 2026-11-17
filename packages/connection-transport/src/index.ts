@@ -29,3 +29,4 @@ export function createConnectTransport(options: ConnectTransportOptions & Omit<E
 }
 export * from "./extension-settings-client.js";
 export * from "./extension-library-media.js";
+export * from "./task-activity.js";

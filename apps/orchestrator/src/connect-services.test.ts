@@ -107,6 +107,7 @@ describe("Connect service composition", () => {
       contract.PersonalDevelopmentService,
       contract.DesktopPersonalDevelopmentHostService,
       contract.EventService,
+      contract.TaskActivityService,
       contract.OperationService,
       contract.BackendService,
       contract.TargetService,

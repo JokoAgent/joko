@@ -39,6 +39,7 @@ import { StartupUpdateOverlay } from "./components/StartupUpdateOverlay.js";
 import { NativeTaskStatusBridge } from "./components/NativeTaskStatusBridge.js";
 import { useDesktopMenuBar } from "./desktop-menu-bar.js";
 import { DesktopRemoteDesktopStatus } from "./components/DesktopRemoteDesktopStatus.js";
+import { TaskActivityProvider, TaskActivityBanner } from "./components/TaskActivity.js";
 import { DesktopGlobalVoiceBridge } from "./components/DesktopGlobalVoiceBridge.js";
 import { RuntimeProcessMonitorBroker } from "./components/RuntimeProcessMonitorBroker.js";
 import { RuntimeProcessMonitorWindow } from "./components/RuntimeProcessMonitorWindow.js";
@@ -2380,6 +2381,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       onOpenTopic={(topicSessionId) => addSessionToSplit(topicSessionId, activeSession?.id ?? topicSessionId, "right")}>
     <PartnerAvatarProvider controller={controller} ownerKey={state.connectionState === "connected" && state.activeProfile
       ? JSON.stringify([state.activeProfile.id, state.activeProfile.deviceId, state.activeProfile.serverId, state.activeProfile.origin, state.snapshot.generation.toString()]) : undefined}>
+    <TaskActivityProvider controller={controller} t={t}>
     <div
       className={cx("app", shellNavigationOpen && "has-navigation", settingsRoute ? "navigation-hidden" : `navigation-${navigationMode}`, formalFilesMode && "workspace-files-mode", navigationDrag !== undefined && !settingsRoute && "is-navigation-resizing", inspectorAttached && "has-inspector")}
       data-wallpaper-active={wallpaperActive ? "true" : undefined}
@@ -2398,6 +2400,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         visibleSessionIds={nativeTaskStatusVisibleSessionIds}
       />
       <DesktopRemoteDesktopStatus t={t} />
+      <TaskActivityBanner />
       <a className="skip-link" href="#main-content">{t("app.skipToContent")}</a>
       <DesktopPageSearchBar overrides={shortcutOverrides} t={t} onOpenChange={setDesktopPageSearchOpen} />
       {applicationMenuFeedback}
@@ -2816,6 +2819,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onFile={openPortableSessionImportFile}
       />}
     </div>
+    </TaskActivityProvider>
     </PartnerAvatarProvider>
     </PartnerConversationScope>
     </DesktopPageSearchTextAccess.Provider>
