@@ -9533,6 +9533,9 @@ export class SessionHost {
               derivationOperationId: authority.operationId
             });
             this.appendNativeHistory(store, replaced.descriptor, lease!.active.adapter, navigation.nativeHistory, authority.operationId);
+            if (operationKind === "navigateSessionBranch" && sourceMessage !== undefined && target.kind === "native_entry" && !summarize) {
+              store.recordMessageRewindContinuation(sessionId, authority.operationId);
+            }
           }
           if (editedInput !== undefined) {
             const queued = this.commitQueuedInput(store, { operationId: authority.operationId, sessionId, ...editedInput });

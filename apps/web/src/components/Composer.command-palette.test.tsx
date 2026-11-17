@@ -12,7 +12,7 @@ import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type ModelView, type ObjectiveView, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
-import { Composer, type PrepareRewindDraft } from "./Composer.js";
+import { Composer, type PrepareRewindDraft, type RewindDraftContinuation } from "./Composer.js";
 import type { ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
 import { WORKSPACE_ENTRY_DRAG_MIME, encodeWorkspaceEntryDragPayload } from "./workspace-tree-state.js";
 
@@ -261,6 +261,29 @@ it("retires the prepared rewind draft when the composer changes tasks", async ()
   expect(view.compareAndSave).not.toHaveBeenCalled();
   expect(view.editor().value).toBe("second task");
   expect(view.drafts.get(baseSession.id)?.text).toBe("");
+});
+
+it.each([true, false])("uses the original empty draft revision on a confirmed replacement: unchanged=%s", async unchanged => {
+  vi.useFakeTimers();
+  const view = await mountRewindDraft(draft(""));
+  let revision: number | undefined;
+  await act(async () => view.rewindDraftRef.current!(() => true, value => { revision = value; }));
+  expect(revision).toBe(1);
+  const generation = baseSession.generation + 2n;
+  const finish = vi.fn();
+  const readGeneration = vi.fn(async () => generation);
+  const intent: RewindDraftContinuation = { revision: revision!, text: "Earlier user input", sourceGeneration: baseSession.generation,
+    isCurrent: () => true, finish };
+  if (!unchanged) view.writeElsewhere("A different saved draft");
+  await view.render({ ...baseSession, generation }, undefined, undefined, undefined, intent);
+  await act(async () => vi.advanceTimersByTimeAsync(500));
+  if (unchanged) expect(view.api.saveDraft).not.toHaveBeenCalled();
+  await view.render({ ...baseSession, generation }, undefined, undefined, undefined, { ...intent, confirmation: { generation, readGeneration } });
+  expect(view.editor().value).toBe(unchanged ? "Earlier user input" : "A different saved draft");
+  expect(readGeneration).toHaveBeenCalledTimes(unchanged ? 1 : 0);
+  expect(view.compareAndSave).toHaveBeenCalledTimes(unchanged ? 1 : 0);
+  expect(finish).toHaveBeenCalledOnce();
+  expect(view.api.send).not.toHaveBeenCalled();
 });
 
 it("inserts a bound skill only from the current task runtime catalog without sending", async () => {
@@ -1163,7 +1186,8 @@ async function mount(
     session: SessionView,
     nextController: AppController = activeController,
     nextBackend: BackendView = backend,
-    nextObjectiveDialogHandoff: ObjectiveDialogHandoffRequest | undefined = activeObjectiveDialogHandoff
+    nextObjectiveDialogHandoff: ObjectiveDialogHandoffRequest | undefined = activeObjectiveDialogHandoff,
+    rewindDraftContinuation?: RewindDraftContinuation
   ) => {
     activeController = nextController;
     activeObjectiveDialogHandoff = nextObjectiveDialogHandoff;
@@ -1187,6 +1211,7 @@ async function mount(
       commands={commands}
       objectiveDialogHandoff={activeObjectiveDialogHandoff}
       rewindDraftRef={rewindDraftRef}
+      rewindDraftContinuation={rewindDraftContinuation}
       messageHistory={[]}
       t={(key) => key}
       runAction={(_key, action) => { actions.push(action().catch((error: unknown) => { actionErrors.push(error); })); }}

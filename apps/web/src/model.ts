@@ -6440,7 +6440,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     target: NativeNavigationTargetView,
     options: { readonly expectedGeneration: bigint; readonly summarize?: boolean; readonly customInstructions?: string;
       readonly sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly requireLatestUser?: boolean };
-      readonly onSameGenerationConfirmed?: () => void }
+      readonly onSameGenerationConfirmed?: () => void;
+      readonly onReplacementConfirmed?: (generation: bigint, confirmCurrentGeneration: () => Promise<bigint | undefined>) => void }
   ): Promise<void>;
   forkSession(
     sessionId: string,

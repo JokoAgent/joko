@@ -14598,6 +14598,38 @@ describe("SessionHost", () => {
     expect(f.store.listQueueItems({ sessionId: f.sessionId })).toEqual([item]);
   });
 
+  it.each(["input", "binding ABA"] as const)("confirms only the same rewind replacement through activation and retires it after %s", async retirement => {
+    const f = await messageNavigationFixture();
+    const operationId = "original-dialogue-rewind";
+    const replacement = { opaqueRef: "managed://rewound-branch", nativeSessionId: "rewound-branch", generation: f.binding.generation + 1 };
+    vi.spyOn(f.adapter, "navigateTree").mockImplementation(async (_target, _summary, _context, _instructions, authority) => {
+      authority.recordBinding(replacement);
+      f.adapter.history = { events: [f.before], activeEntryId: "before-original" };
+      return { kind: "replacement", binding: replacement, nativeHistory: f.adapter.history };
+    });
+    await f.host.navigateTree(f.sessionId, f.target, false, undefined, f.binding.generation, {
+      ...f.authority, operationId, sourceMessage: { ...f.authority.sourceMessage, requireLatestUser: false },
+      protocol: { kind: "connect", body: { payload: { case: "navigateSessionBranch", value: { sessionId: f.sessionId } } },
+        precondition: () => undefined }
+    });
+    const continued = (connectionId = f.connection.id) =>
+      f.store.findMessageRewindContinuation(f.store.getSession(f.sessionId), connectionId, operationId);
+    expect(continued()).toBe(replacement.generation);
+    expect(continued("other-connection")).toBeUndefined();
+    await f.host.inspect(f.sessionId);
+    expect(continued()).toBe(replacement.generation + 1);
+    if (retirement === "input") {
+      appendSessionEvent(f.store, f.sessionId, "new-user-after-rewind", 2_000,
+        { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "A different current input" }] });
+    } else {
+      const current = f.store.getSession(f.sessionId);
+      const other = f.store.updateSession(f.sessionId, { binding: { ...replacement, opaqueRef: "managed://different", generation: current.descriptor.binding.generation + 1 } }, current.revision);
+      f.store.updateSession(f.sessionId, { binding: { ...replacement, generation: other.descriptor.binding.generation + 1 } }, other.revision);
+      expect(f.store.findLatestNativeSessionChange(f.sessionId)?.operationId).toBe(operationId);
+    }
+    expect(continued()).toBeUndefined();
+  });
+
   it("allows explicit dialogue rewind across later rounds and replays its receipt after the source row has left the branch", async () => {
     const f = await messageNavigationFixture();
     appendSessionEvent(f.store, f.sessionId, "later-round", 2_000,

@@ -521,6 +521,10 @@ it("rewinds the same product task before a selected user, publishes only its ret
       generation: source.descriptor.binding.generation, traceId: "unindexed-old-output",
       payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "unindexed future answer" }] } });
     const mutation = navigateMutation(sourceId, boundary!, BigInt(source.descriptor.binding.generation));
+    const original = fixture.application.store.findVisibleSessionMessageOrigin({ sessionId: sourceId, role: "user", includeRetainedContext: false });
+    if (original === undefined || mutation.payload.case !== "navigateSessionBranch") throw new Error("The original Claude user message is unavailable.");
+    mutation.payload.value.sourceMessageId = original.messageId;
+    mutation.payload.value.sourceEventId = original.eventId;
     const operationId = randomUUID();
     let receiptOperationId: string | undefined;
     started.runtime.onReceipt = () => {
@@ -535,6 +539,8 @@ it("rewinds the same product task before a selected user, publishes only its ret
     const replacement = fixture.application.store.getSession(sourceId).descriptor.binding;
     expect(replacement.generation).toBe(source.descriptor.binding.generation + 1);
     expect(replacement.nativeSessionId).not.toBe(seed.sourceId);
+    const continuation = { sessionId: sourceId, messageRewindOperationId: operationId };
+    expect((await paired.clients.session.getSession(continuation)).messageRewindContinuationGeneration).toBe(BigInt(replacement.generation));
     expect(fixture.application.store.findNativeSessionDerivation(receiptOperationId!)?.state).toBe("adopted");
     expect(fixture.application.store.listSessions()).toHaveLength(1);
     const after = await timeline(paired.clients, sourceId);
@@ -556,6 +562,8 @@ it("rewinds the same product task before a selected user, publishes only its ret
     await resume(clients, paired.connectionId, sourceId);
     expect(historyMessages(await timeline(clients, sourceId)).map((event) => event.eventId)).toEqual(historyMessages(after).map((event) => event.eventId));
     expect(fixture.application.store.getSession(sourceId).descriptor.binding).toEqual({ ...replacement, generation: replacement.generation + 1 });
+    expect((await clients.session.getSession(continuation)).messageRewindContinuationGeneration).toBe(BigInt(replacement.generation + 1));
+    expect((await clients.session.getSession({ ...continuation, messageRewindOperationId: randomUUID() })).messageRewindContinuationGeneration).toBeUndefined();
   } finally {
     await fixture?.close({ removeRoot: false });
     await rm(seed.root, { recursive: true, force: true, maxRetries: 5 });

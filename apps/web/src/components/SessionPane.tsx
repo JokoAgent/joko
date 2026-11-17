@@ -30,7 +30,7 @@ import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigatio
 import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
-import { Composer, type ComposerHistoryEntry, type PrepareRewindDraft } from "./Composer.js";
+import { Composer, type ComposerHistoryEntry, type PrepareRewindDraft, type RewindDraftContinuation } from "./Composer.js";
 import { CompactionStatusIndicator } from "./CompactionStatusIndicator.js";
 import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacityRing.js";
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
@@ -299,6 +299,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [sideChatRecoveryReload, setSideChatRecoveryReload] = useState(0);
   const [composerAttachmentInsertion, setComposerAttachmentInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly file: File }>();
   const [pendingMessageEdit, setPendingMessageEdit] = useState<{ readonly owner: string; readonly edit: PendingMessageEdit }>();
+  const [rewindDraftContinuation, setRewindDraftContinuation] = useState<RewindDraftContinuation>();
+  const rewindDraftContinuationOwnerRef = useRef<object | undefined>(undefined);
   const [shareSelection, setShareSelection] = useState<ActiveShareSelection>();
   const [messageRewind, setMessageRewind] = useState<ActiveMessageRewind>();
   const [messageDelete, setMessageDeleteState] = useState<ActiveMessageDelete>();
@@ -413,6 +415,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setArtifactCatalogDocumentOwner({ document, epoch: artifactCatalogDocumentEpochRef.current });
     const retire = () => {
       rewindEpochRef.current += 1;
+      rewindDraftContinuationOwnerRef.current = undefined;
+      setRewindDraftContinuation(undefined);
       conversationCopyFlightRef.current?.abort.abort();
       conversationCopyFlightRef.current = undefined;
       setConversationCopyFeedback(undefined);
@@ -443,6 +447,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current = undefined;
     rewindDocumentRef.current?.remove();
   }, []);
+  useLayoutEffect(() => {
+    rewindDraftContinuationOwnerRef.current = undefined;
+    setRewindDraftContinuation(undefined);
+  }, [session.id, controller.navigateSessionBranch, controller.state.navigationRevision, controller.state.connectionGeneration]);
   const captureTaskActionSource = (
     matchesRoute: (route: AppRoute) => boolean = (route) => sessionRouteIsCurrent(route, session.id)
   ): (() => boolean) => {
@@ -1980,6 +1988,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const previewMessageRewind = (item: TimelineItemView): void => {
     const navigationTarget = messageDialogueRewindTarget(item, rewindToStartSupported);
     if (!messageRewindSupported || navigationTarget === undefined || item.sourceEventId === undefined) return;
+    rewindDraftContinuationOwnerRef.current = undefined;
+    setRewindDraftContinuation(undefined);
     const requestId = ++messageRewindRequestIdRef.current;
     const runId = messageRoundRunId(visibleTimeline, item.id);
     const filesSupported = workspace !== undefined && backend?.capabilities.get("workspace.rewind")?.supported === true && runId !== undefined;
@@ -2056,9 +2066,15 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && (partnerConversation === undefined || partnerConversation.kind === "task") ? plainMessageRewindDraftText(item) : undefined;
     const prepare = rewindDraftRef.current;
     let restore: Awaited<ReturnType<PrepareRewindDraft>> = undefined;
+    let preparedRevision: number | undefined;
     let draftFailed = false;
+    const sourcePane = paneRef.current;
+    const sourceDocumentEpoch = artifactCatalogDocumentEpochRef.current;
+    const sourceDraftEpoch = composerLocalDraftEpochRef.current;
+    const sourceState = controllerRef.current.state;
+    const sourceProfile = sourceState.activeProfile;
     if (text !== undefined && prepare !== null) {
-      try { restore = await prepare(rewind.isCurrent); }
+      try { restore = await prepare(rewind.isCurrent, revision => { preparedRevision = revision; }); }
       catch { draftFailed = true; }
       const current = readCurrentMessage();
       if (current.sourceEventId !== item.sourceEventId || current.completionCursor !== item.completionCursor || plainMessageRewindDraftText(current) !== text) {
@@ -2067,11 +2083,47 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       }
     }
     let sameGenerationConfirmed = false;
-    await rewind.navigate(rewind.sessionId, rewind.target, {
-      expectedGeneration: rewind.generation,
-      sourceMessage: { messageId: rewind.sourceMessageId, eventId: rewind.sourceEventId },
-      ...(restore === undefined ? {} : { onSameGenerationConfirmed: () => { sameGenerationConfirmed = true; } })
-    });
+    let replacementConfirmed = false;
+    let continuation: RewindDraftContinuation | undefined;
+    if (restore !== undefined && preparedRevision !== undefined && text !== undefined) {
+      const owner = {};
+      const isCurrent = () => {
+        const state = controllerRef.current.state;
+        const task = state.snapshot.sessions.find(candidate => candidate.id === rewind.sessionId);
+        return rewindDraftContinuationOwnerRef.current === owner && paneRef.current === sourcePane && sourcePane?.isConnected === true
+          && artifactCatalogDocumentEpochRef.current === sourceDocumentEpoch && composerLocalDraftEpochRef.current === sourceDraftEpoch
+          && activeSessionIdRef.current === rewind.sessionId && task !== undefined && task.backendId === session.backendId && task.targetId === session.targetId
+          && state.connectionState === "connected" && state.connectionGeneration === sourceState.connectionGeneration
+          && state.sessionAccess?.role !== "guest" && state.taskSource?.kind !== "joined"
+          && state.snapshot.generation === sourceState.snapshot.generation && state.navigationRevision === sourceState.navigationRevision
+          && state.activeProfile?.serverId === sourceProfile?.serverId && state.activeProfile?.id === sourceProfile?.id
+          && controllerRef.current.navigateSessionBranch === rewind.navigate && sessionRouteIsCurrent(state.route, rewind.sessionId);
+      };
+      const finish = (error?: unknown) => {
+        if (rewindDraftContinuationOwnerRef.current !== owner) return;
+        if (error !== undefined && isCurrent()) {
+          runAction(`rewind-draft:${rewind.itemId}`, async () => { throw new Error(t("timeline.rewindDraftRestoreFailed"), { cause: error }); });
+        }
+        rewindDraftContinuationOwnerRef.current = undefined;
+        setRewindDraftContinuation(undefined);
+      };
+      rewindDraftContinuationOwnerRef.current = owner;
+      continuation = { sourceGeneration: rewind.generation, revision: preparedRevision, text, isCurrent, finish };
+      setRewindDraftContinuation(continuation);
+    }
+    const replacement = continuation;
+    try {
+      await rewind.navigate(rewind.sessionId, rewind.target, {
+        expectedGeneration: rewind.generation,
+        sourceMessage: { messageId: rewind.sourceMessageId, eventId: rewind.sourceEventId },
+        ...(restore === undefined ? {} : { onSameGenerationConfirmed: () => { sameGenerationConfirmed = true; } }),
+        ...(replacement === undefined ? {} : { onReplacementConfirmed: (generation: bigint, readGeneration: () => Promise<bigint | undefined>) => {
+          if (!replacement.isCurrent()) return;
+          replacementConfirmed = true;
+          setRewindDraftContinuation({ ...replacement, confirmation: { generation, readGeneration } });
+        } })
+      });
+    } finally { if (!replacementConfirmed) replacement?.finish(); }
     if (!rewind.isCurrent() || text === undefined) return;
     try { if (sameGenerationConfirmed) await restore?.(text); }
     catch { draftFailed = true; }
@@ -2672,7 +2724,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }}
           t={t}
         />}
-<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} rewindDraftRef={rewindDraftRef} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
+<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} rewindDraftRef={rewindDraftRef} rewindDraftContinuation={rewindDraftContinuation} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
           if (handoff !== undefined) {
             if (!objectiveDialogRequestMatchesOwner(handoff, controller, session)) {
               onObjectiveDialogHandoffHandled?.(handoff.id);

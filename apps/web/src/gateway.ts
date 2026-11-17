@@ -3840,7 +3840,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (options.expectedGeneration < 1n) throw new GatewayError("A source task generation is required for navigation.");
     const customInstructions = options.customInstructions?.trim().slice(0, 4_000) ?? "";
     const confirmSameGeneration = options.onSameGenerationConfirmed;
-    const scope = confirmSameGeneration === undefined ? undefined : this.captureActionScope();
+    const confirmReplacement = options.onReplacementConfirmed;
+    const scope = confirmSameGeneration === undefined && confirmReplacement === undefined ? undefined : this.captureActionScope();
     const operation = await this.submit({
       case: "navigateSessionBranch",
       value: {
@@ -3855,16 +3856,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         })
       }
     }, true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: options.expectedGeneration }]);
-    if (confirmSameGeneration === undefined || scope === undefined) return;
+    if (scope === undefined) return;
     const result = operation.result?.payload;
     if (operation.state !== OperationState.SUCCEEDED || result?.case !== "acknowledgement" || result.value.accepted !== true) {
       throw new GatewayError("The task navigation result could not be confirmed.", { code: "NATIVE_NAVIGATION_SYNC_UNKNOWN" });
     }
     // An accepted operation can replace the binding before the renderer sees its new generation.
-    const response = await createClient(SessionService, scope.transport).getSession({ sessionId }, { signal: scope.signal, timeoutMs: 5_000 })
-      .catch(() => undefined);
-    if (!scope.signal.aborted && this.#transport === scope.transport && response?.session?.sessionId === sessionId
-      && response.session.nativeBinding?.runtimeGeneration === options.expectedGeneration) confirmSameGeneration();
+    const readCurrent = async () => {
+      const response = await createClient(SessionService, scope.transport).getSession({ sessionId,
+        ...(confirmReplacement === undefined ? {} : { messageRewindOperationId: operation.operationId })
+      }, { signal: scope.signal, timeoutMs: 5_000 }).catch(() => undefined);
+      return !scope.signal.aborted && this.#transport === scope.transport && response?.session?.sessionId === sessionId ? response : undefined;
+    };
+    const response = await readCurrent();
+    if (response?.session?.nativeBinding?.runtimeGeneration === options.expectedGeneration) confirmSameGeneration?.();
+    const continuedGeneration = (result: Awaited<ReturnType<typeof readCurrent>>): bigint | undefined => {
+      const generation = result?.messageRewindContinuationGeneration;
+      return generation !== undefined && generation > options.expectedGeneration
+        && generation === result?.session?.nativeBinding?.runtimeGeneration ? generation : undefined;
+    };
+    const replacement = continuedGeneration(response);
+    if (replacement !== undefined) confirmReplacement?.(replacement, async () => continuedGeneration(await readCurrent()));
   }
 
   async openSideChat(sessionId: string, expectedGeneration: bigint, options?: {

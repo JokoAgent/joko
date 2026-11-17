@@ -2778,10 +2778,14 @@ export function createConnectServices(application: OrchestratorApplication, proj
       return { sessions: result.values, page: result.page };
     },
     getSession: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
       sessionCodeHostContext.refreshSessionInBackground(request.sessionId);
       const stored = dependencies.store.getSession(request.sessionId);
-      return { session: mapSession(dependencies, stored) };
+      const generation = request.messageRewindOperationId === undefined ? undefined : dependencies.store.findMessageRewindContinuation(
+        stored, connection.id, strictDerivationIdentity(request.messageRewindOperationId, "message_rewind_operation_id")
+      );
+      return { session: mapSession(dependencies, stored),
+        ...(generation === undefined ? {} : { messageRewindContinuationGeneration: BigInt(generation) }) };
     },
     listTaskTags: (_request, context) => {
       authenticate(context);

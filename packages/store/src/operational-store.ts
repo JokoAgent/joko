@@ -450,6 +450,7 @@ export function messagingConversationContextAad(
 const MESSAGE_SEARCH_RRF_K = 60;
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
+const MESSAGE_REWIND_CONTINUATION_SETTING_KEY = "runtime.message_rewind_continuation";
 const RETAINED_CONTEXT_EVENTS_KEY = "runtime.retained_context_events";
 export const EXTENSION_USAGE_SETTINGS_PREFIX = "extension-usage.v1:";
 const EXTENSION_USAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
@@ -8391,6 +8392,7 @@ export class OperationalStore {
   }
 
   private recordNativeBindingAdoption(sessionId: string, backendId: string, binding: NativeSessionBinding, at: number): void {
+    this.deleteSetting("session", sessionId, MESSAGE_REWIND_CONTINUATION_SETTING_KEY);
     this.database.prepare(`
       INSERT OR IGNORE INTO native_binding_adoptions(
         backend_id, native_opaque_ref, session_id, native_session_id, first_generation, adopted_at, revision
@@ -11151,6 +11153,33 @@ export class OperationalStore {
       LIMIT 1
     `).get(sessionId) as Row | undefined;
     return row === undefined ? undefined : eventFromRow(row);
+  }
+
+  /** Recorded inside the same transaction as the replacement and its native history. */
+  recordMessageRewindContinuation(sessionId: string, operationId: string): void {
+    const marker = this.findLatestNativeSessionChange(sessionId);
+    if (marker?.operationId !== operationId || this.deferredEffectCompletions.at(-1) !== operationId) {
+      throw new StoreError("A message rewind continuation requires its original native history commit.");
+    }
+    this.setSetting("session", sessionId, MESSAGE_REWIND_CONTINUATION_SETTING_KEY, operationId);
+  }
+
+  findMessageRewindContinuation(session: StoredSession, connectionId: string, operationId: string): number | undefined {
+    const descriptor = session.descriptor;
+    if (descriptor.deletedAt !== undefined || descriptor.hidden || descriptor.archived
+      || this.findSetting<unknown>("session", descriptor.id, MESSAGE_REWIND_CONTINUATION_SETTING_KEY)?.value !== operationId) return undefined;
+    const original = this.findOperation(operationId);
+    if (original?.kind !== "navigateSessionBranch" || original.connectionId !== connectionId || original.status !== "completed") return undefined;
+    const replacement = this.findNativeSessionDerivation(operationId);
+    const marker = this.findLatestNativeSessionChange(descriptor.id);
+    if (replacement?.binding === undefined || replacement.productAdoptedAt === undefined || replacement.sessionId !== descriptor.id
+      || replacement.backendId !== descriptor.backendId || replacement.targetId !== descriptor.targetId
+      || replacement.binding.opaqueRef !== descriptor.binding.opaqueRef || replacement.binding.nativeSessionId !== descriptor.binding.nativeSessionId
+      || descriptor.binding.generation < replacement.binding.generation
+      || marker?.operationId !== operationId || marker.generation !== replacement.binding.generation
+      || this.hasSessionUserInputAfter(descriptor.id, marker.globalCursor)
+      || this.listQueueItems({ sessionId: descriptor.id, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0) return undefined;
+    return descriptor.binding.generation;
   }
 
   hasVisibleWorkspaceDiff(sessionId: string, changeSetId: string): boolean {

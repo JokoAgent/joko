@@ -81,7 +81,16 @@ export interface ComposerHistoryEntry {
   readonly editorDocument: JSONContent;
 }
 
-export type PrepareRewindDraft = (isRewindCurrent: () => boolean) => Promise<((text: string) => Promise<void>) | undefined>;
+export type PrepareRewindDraft = (isRewindCurrent: () => boolean, onPreparedRevision?: (revision: number) => void) => Promise<((text: string) => Promise<void>) | undefined>;
+
+export interface RewindDraftContinuation {
+  readonly sourceGeneration: bigint;
+  readonly revision: number;
+  readonly text: string;
+  readonly isCurrent: () => boolean;
+  readonly confirmation?: { readonly generation: bigint; readonly readGeneration: () => Promise<bigint | undefined> };
+  readonly finish: (error?: unknown) => void;
+}
 
 interface ComposerWorkspaceMentionIndex {
   readonly workspaceId: string;
@@ -105,7 +114,7 @@ interface PendingComposerDraftSave {
   queued: boolean;
 }
 
-export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, rewindDraftRef, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
+export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, rewindDraftRef, rewindDraftContinuation, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly backend?: BackendView;
@@ -130,6 +139,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft };
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
   readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null>;
+  readonly rewindDraftContinuation?: RewindDraftContinuation;
   readonly objectiveDialogHandoff?: ObjectiveDialogHandoffRequest;
   readonly t: Translator;
   readonly runAction: RunAction;
@@ -859,7 +869,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     requestComposerFrame(() => richEditorRef.current?.focus());
   }, [selectionQuoteInsertion, readOnly, session.id]);
 
-  useImperativeHandle(rewindDraftRef, (): PrepareRewindDraft => async (isRewindCurrent) => {
+  useImperativeHandle(rewindDraftRef, (): PrepareRewindDraft => async (isRewindCurrent, onPreparedRevision) => {
     const sourceController = controllerRef.current;
     const { readDraftSnapshot, saveDraftIfRevision } = sourceController;
     const profile = sourceController.state.activeProfile;
@@ -902,6 +912,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     if (!current() || (stored.draft !== undefined
       && (!sameObjectiveInvocationDraft(stored.draft, liveDraft) || !discardPendingEmptySave(false)))) return undefined;
 
+    onPreparedRevision?.(stored.revision);
     return async (text) => {
       if (!current()) return;
       await waitForSaves();
@@ -973,6 +984,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       browserComments,
       ...(extraDirectoriesSupported && extraDirectoryIds !== undefined ? { extraDirectoryIds } : {})
     } satisfies ComposerDraft;
+    if (rewindDraftContinuation !== undefined && session.generation > rewindDraftContinuation.sourceGeneration
+      && rewindDraftContinuation.isCurrent() && composerDraftIsEmpty(draft)) return;
     const persistedRewind = persistedRewindDraftRef.current;
     if (persistedRewind?.ownerKey === voiceDictionaryOwnerKey && persistedRewind.guard === guard
       && guard.ownsActivation(persistedRewind.token) && guard.draftUnchanged(persistedRewind.token)
@@ -998,7 +1011,32 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     return () => {
       ownerWindow.clearTimeout(timer);
     };
-  }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, inlineMentionRanges, readOnly, session.id, submissionKind, text, voiceDictionaryOwnerKey]);
+  }, [controller.saveDraft, attachments, browserComments, deliveryMode, editorDocument, extraDirectoriesSupported, extraDirectoryIds, hydratedSession, mentions, inlineMentionRanges, readOnly, rewindDraftContinuation, session.id, session.generation, submissionKind, text, voiceDictionaryOwnerKey]);
+
+  useEffect(() => {
+    const continuation = rewindDraftContinuation;
+    const confirmation = continuation?.confirmation;
+    if (continuation === undefined || confirmation === undefined || session.generation < confirmation.generation
+      || hydratedSession !== session.id || hydratedDraftOwnerRef.current !== voiceDictionaryOwnerKey || !continuation.isCurrent()) return;
+    const prepare = rewindDraftRef?.current;
+    if (prepare === undefined || prepare === null) return;
+    let retired = false;
+    const isCurrent = () => !retired && continuation.isCurrent();
+    void (async () => {
+      try {
+        let revision: number | undefined;
+        const restore = await prepare(isCurrent, prepared => { revision = prepared; });
+        if (!isCurrent()) return;
+        if (restore !== undefined && revision === continuation.revision) {
+          const generation = await confirmation.readGeneration();
+          if (!isCurrent() || (generation !== undefined && generation > session.generation)) return;
+          if (generation === session.generation) await restore(continuation.text);
+        }
+        if (!retired) continuation.finish();
+      } catch (error) { if (!retired) continuation.finish(error); }
+    })();
+    return () => { retired = true; };
+  }, [hydratedSession, rewindDraftContinuation, rewindDraftRef, session.id, session.generation, voiceDictionaryOwnerKey]);
 
   useEffect(() => {
     const handoff = objectiveDialogHandoff;
