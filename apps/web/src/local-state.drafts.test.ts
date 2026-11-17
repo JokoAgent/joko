@@ -40,11 +40,12 @@ describe("durable composer draft surfaces", () => {
     const api = (state: LocalState) => ({ openSideChat: open, readSideChatOperation: check,
       readPendingSideChat: (source: string) => state.readPendingSideChat("node", "profile", source),
       savePendingSideChat: (source: string, previous: PendingSideChatDraft | undefined, next: PendingSideChatDraft | undefined) => state.compareAndSetPendingSideChat("node", "profile", source, previous, next),
-      adoptPendingSideChat: (expected: PendingSideChatDraft, child: string, append: boolean, current: () => boolean) => state.adoptPendingSideChat("node", "profile", expected, child, "application", "application", append, current) });
+      adoptPendingSideChat: (expected: PendingSideChatDraft, child: { readonly sessionId: string }, append: boolean, current: () => boolean) =>
+        state.adoptPendingSideChat("node", "profile", expected, child.sessionId, "application", "application", append, current) });
     await expect(recoverSideChatDraft(api(before), receipt, { isCurrent: () => true, dispatch: true })).rejects.toThrow("lost original");
     const restarted = local(database.value), retained = await restarted.readPendingSideChat("node", "profile", "source");
     expect(retained).toEqual(receipt); expect(await restarted.readPendingSideChat("node", "other-profile", "source")).toBeUndefined();
-    check.mockResolvedValueOnce({ state: "succeeded", sessionId: "exact-child" });
+    check.mockResolvedValueOnce({ state: "succeeded", sessionId: "exact-child", generation: 4n });
     await expect(recoverSideChatDraft(api(restarted), retained!, { isCurrent: () => true })).resolves.toEqual({ state: "adopted", sessionId: "exact-child" });
     expect(open).toHaveBeenCalledOnce(); expect(await restarted.readPendingSideChat("node", "profile", "source")).toBeUndefined();
     const child = await local(database.value).readDraft("node", "profile", "exact-child");

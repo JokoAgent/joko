@@ -1614,28 +1614,37 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   }, [controller.readPendingSideChat, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.connectionGeneration,
     session.id, session.generation, guest, reviewReadOnly, sideChatRecoveryReload]);
 
-  const checkSideChatRecovery = (appendToExisting = false, dispatch = false, startAgain = false): void => {
+  const retiredSideChat = sideChatRecovery !== undefined && BigInt(sideChatRecovery.record.sourceGeneration) < session.generation;
+  const checkSideChatRecovery = (action: "check" | "append" | "retry" | "restart" | "clear" = "check"): void => {
     const pending = sideChatRecovery;
     if (!pending || pending.state === "working") return;
     const owner = beginDerivedTaskAction(), sourceApi = controller;
     let record = pending.record;
     runAction(`side-chat-check:${record.operationId}`, async () => {
-      if (record.sourceSessionId !== session.id || record.sourceGeneration !== session.generation.toString()
-        || record.backendId !== session.backendId || record.targetId !== session.targetId) {
+      const dispatch = action === "retry" || action === "restart";
+      if (!owner.isCurrent()) return;
+      if (record.sourceSessionId !== session.id || BigInt(record.sourceGeneration) > session.generation
+        || record.backendId !== session.backendId || record.targetId !== session.targetId
+        || (retiredSideChat && dispatch) || (!retiredSideChat && action === "clear")) {
         setSideChatRecovery({ record, state: "failed", error: t("session.sideChatSourceChanged") });
         throw new Error(t("session.sideChatSourceChanged"));
       }
       setSideChatRecovery({ record, state: "working" });
       try {
-        if (startAgain) {
+        if (action === "restart" || action === "clear") {
           const original = await sourceApi.readSideChatOperation?.(record);
           if (!owner.isCurrent()) return;
           if (original?.state !== "failed" || original.stateMayHaveChanged !== false) throw new Error(t("session.sideChatCheckOriginal"));
+          if (action === "clear") {
+            if (!await sourceApi.savePendingSideChat?.(record.sourceSessionId, record, undefined)) throw new Error(t("session.sideChatCheckOriginal"));
+            if (owner.isCurrent()) setSideChatRecovery(undefined);
+            return;
+          }
           const next = { ...record, operationId: randomUuid() };
           if (!await sourceApi.savePendingSideChat?.(record.sourceSessionId, record, next)) throw new Error(t("session.sideChatCheckOriginal"));
           record = next; if (!owner.isCurrent()) return;
         }
-        const result = await recoverSideChatDraft(sourceApi, record, { isCurrent: owner.isCurrent, appendToExisting, dispatch });
+        const result = await recoverSideChatDraft(sourceApi, record, { isCurrent: owner.isCurrent, appendToExisting: action === "append", dispatch });
         if (!owner.isCurrent()) return;
         if (result.state === "adopted") {
           setSideChatRecovery(undefined);
@@ -2518,11 +2527,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       {sideChatRecoveryLoadError !== undefined && <div className="session-schedule-notice" role="alert"><span>{sideChatRecoveryLoadError}</span>
         <Button onClick={() => setSideChatRecoveryReload(value => value + 1)}>{t("common.retry")}</Button></div>}
       {sideChatRecovery !== undefined && sideChatRecovery.record.sourceSessionId === session.id && <div className="session-schedule-notice" role="status">
-        <span>{sideChatRecovery.error ?? t(sideChatRecovery.state === "existing" ? "session.sideChatExistingDraft" : "session.sideChatCheckOriginal")}</span>
+        <span>{sideChatRecovery.error ?? t(sideChatRecovery.state === "existing" ? "session.sideChatExistingDraft"
+          : retiredSideChat ? "session.sideChatSourceChanged" : "session.sideChatCheckOriginal")}</span>
         <Button disabled={sideChatRecovery.state === "working"} onClick={() => checkSideChatRecovery()}>{t("session.sideChatCheck")}</Button>
-        {sideChatRecovery.state === "existing" && <Button onClick={() => checkSideChatRecovery(true)}>{t("session.sideChatInsertQuote")}</Button>}
-        {sideChatRecovery.state === "pending" && <Button onClick={() => checkSideChatRecovery(false, true)}>{t("session.sideChatRetryOriginal")}</Button>}
-        {sideChatRecovery.state === "failed" && sideChatRecovery.canStartAgain && <Button onClick={() => checkSideChatRecovery(false, true, true)}>{t("session.sideChatStartAgain")}</Button>}
+        {sideChatRecovery.state === "existing" && <Button onClick={() => checkSideChatRecovery("append")}>{t("session.sideChatInsertQuote")}</Button>}
+        {sideChatRecovery.state === "pending" && !retiredSideChat && <Button onClick={() => checkSideChatRecovery("retry")}>{t("session.sideChatRetryOriginal")}</Button>}
+        {sideChatRecovery.state === "failed" && sideChatRecovery.canStartAgain && (retiredSideChat
+          ? <Button onClick={() => checkSideChatRecovery("clear")}>{t("session.sideChatClearFailed")}</Button>
+          : <Button onClick={() => checkSideChatRecovery("restart")}>{t("session.sideChatStartAgain")}</Button>)}
         {sideChatRecovery.record.quote !== undefined && <Button onClick={event => {
           const ownerDocument = event.currentTarget.ownerDocument, text = sideChatRecovery.record.quote!.text;
           runAction("side-chat-copy-quote", () => writeClipboardText(text, { ownerDocument, signal: new AbortController().signal }));

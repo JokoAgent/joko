@@ -35,6 +35,6 @@ export async function recoverSideChatDraft(api: RecoveryApi, record: PendingSide
   const operation = await api.readSideChatOperation(record); current();
   if (operation.state !== "succeeded") return operation;
   await assertReceipt();
-  const adopted = await api.adoptPendingSideChat(record, operation.sessionId, options.appendToExisting === true, options.isCurrent); current();
+  const adopted = await api.adoptPendingSideChat(record, operation, options.appendToExisting === true, options.isCurrent); current();
   return adopted === "stale" ? { state: "stale" } : { state: adopted, sessionId: operation.sessionId };
 }

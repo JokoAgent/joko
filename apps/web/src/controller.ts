@@ -359,7 +359,8 @@ export interface AppController extends OperationApi {
   };
   readPendingSideChat?(sessionId: string): Promise<import("./model.js").PendingSideChatDraft | undefined>;
   savePendingSideChat?(sourceSessionId: string, expected: import("./model.js").PendingSideChatDraft | undefined, next: import("./model.js").PendingSideChatDraft | undefined): Promise<boolean>;
-  adoptPendingSideChat?(record: import("./model.js").PendingSideChatDraft, childSessionId: string, appendToExisting: boolean, isCurrent: () => boolean): Promise<"adopted" | "existing" | "stale">;
+  adoptPendingSideChat?(record: import("./model.js").PendingSideChatDraft, child: { readonly sessionId: string; readonly generation: bigint },
+    appendToExisting: boolean, isCurrent: () => boolean): Promise<"adopted" | "existing" | "stale">;
   restoreFirstInputDraft(sessionId: string, input: ComposerDraft): Promise<void>;
   readNewSessionDraft(): Promise<NewSessionLocalDraft | undefined>;
   saveNewSessionDraft(draft: NewSessionLocalDraft): Promise<void>;
@@ -3168,15 +3169,16 @@ export function useAppController(): AppController {
     if (!draftServerId || !draftProfileId) throw new Error("Connect to the original node before saving a Side Chat draft.");
     return withDraftSurface(sourceSessionId, surface => requireLocal(draftStore).compareAndSetPendingSideChat(draftServerId, draftProfileId, sourceSessionId, expected, next, surface));
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
-  const adoptPendingSideChat = useCallback(async (record: import("./model.js").PendingSideChatDraft, childSessionId: string, appendToExisting: boolean, isCurrent: () => boolean) => {
+  const adoptPendingSideChat = useCallback<NonNullable<AppController["adoptPendingSideChat"]>>(async (record, receipt, appendToExisting, isCurrent) => {
     if (!draftServerId || !draftProfileId) throw new Error("Connect to the original node before restoring a Side Chat draft.");
+    const childSessionId = receipt.sessionId, originalGeneration = BigInt(record.sourceGeneration);
     const sourceCurrent = () => {
       const source = snapshotRef.current.sessions.find(session => session.id === record.sourceSessionId);
       const child = snapshotRef.current.sessions.find(session => session.id === childSessionId);
       return isCurrent() && gatewayRef.current === artifactGateway && gatewayGenerationRef.current === linkGatewayGeneration
         && activeProfileRef.current?.serverId === draftServerId && activeProfileRef.current.id === draftProfileId
-        && source?.generation.toString() === record.sourceGeneration && source.backendId === record.backendId && source.targetId === record.targetId
-        && child?.generation === 1n && child.backendId === record.backendId && child.targetId === record.targetId
+        && source?.backendId === record.backendId && source.targetId === record.targetId && source.generation >= originalGeneration
+        && receipt.generation > 0n && child?.generation === receipt.generation && child.backendId === record.backendId && child.targetId === record.targetId
         && child.derivationOrigin?.kind === "fork" && child.derivationOrigin.sideChat === true && child.derivationOrigin.sourceSessionId === record.sourceSessionId;
     };
     if (!sourceCurrent()) return "stale" as const;

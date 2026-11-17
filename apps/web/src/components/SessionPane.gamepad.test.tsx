@@ -90,6 +90,43 @@ describe("session gamepad actions", () => {
     expect(view.api.setModel).toHaveBeenCalledOnce();
   });
 
+  it.each(["succeeded", "failed", "pending"] as const)("checks a %s Side Chat from the previous task generation without dispatching it", async (state) => {
+    const view = await mount();
+    const record = { operationId: "original-side-chat", sourceSessionId: session.id, sourceGeneration: "1",
+      backendId: session.backendId, targetId: session.targetId };
+    const result = state === "succeeded" ? { state, sessionId: "confirmed-child", generation: 3n }
+      : state === "failed" ? { state, error: "The old request was rejected", stateMayHaveChanged: false }
+      : { state };
+    view.api.readPendingSideChat.mockResolvedValue(record);
+    view.api.readSideChatOperation.mockResolvedValue(result);
+    await view.render({ ...session, generation: 2n, sideChatSourceAllowed: true });
+    const button = (label: string) => [...view.host.querySelectorAll<HTMLButtonElement>("button")].find(item => item.textContent === label);
+
+    expect(button("session.sideChatRetryOriginal")).toBeUndefined();
+    await act(async () => button("session.sideChatCheck")!.click());
+    await view.flush();
+    expect(view.api.readSideChatOperation).toHaveBeenCalledExactlyOnceWith(record);
+    expect(view.api.openSideChat).not.toHaveBeenCalled();
+    if (state === "succeeded") {
+      expect(view.api.adoptPendingSideChat).toHaveBeenCalledExactlyOnceWith(record, result, false, expect.any(Function));
+      expect(view.api.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "confirmed-child" });
+      expect(button("session.sideChatCheck")).toBeUndefined();
+    } else {
+      expect(view.api.navigate).not.toHaveBeenCalled();
+      expect(view.api.adoptPendingSideChat).not.toHaveBeenCalled();
+      if (state === "failed") {
+        expect(button("session.sideChatStartAgain")).toBeUndefined();
+        await act(async () => button("session.sideChatClearFailed")!.click());
+        await view.flush();
+        expect(view.api.savePendingSideChat).toHaveBeenCalledExactlyOnceWith(session.id, record, undefined);
+        expect(button("session.sideChatCheck")).toBeUndefined();
+      } else {
+        expect(button("session.sideChatClearFailed")).toBeUndefined();
+        expect(view.api.savePendingSideChat).not.toHaveBeenCalled();
+      }
+    }
+  });
+
   it("delegates archive and copy to their existing owners and opens the fork confirmation before dispatch", async () => {
     const view = await mount();
     await view.action("toggle-pin"); await view.flush(); expect(view.api.pinSession).toHaveBeenCalledExactlyOnceWith("task", true);
@@ -416,6 +453,11 @@ async function mount(overrides: AppShortcutOverrides = {}) {
     listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } })),
     pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkMessage: vi.fn<AppController["forkMessage"]>(async () => "forked"),
     readPendingMessageFork: vi.fn<AppController["readPendingMessageFork"]>(async () => undefined),
+    openSideChat: vi.fn<AppController["openSideChat"]>(async () => "unexpected-child"),
+    readPendingSideChat: vi.fn<NonNullable<AppController["readPendingSideChat"]>>(async () => undefined),
+    savePendingSideChat: vi.fn<NonNullable<AppController["savePendingSideChat"]>>(async () => true),
+    readSideChatOperation: vi.fn<NonNullable<AppController["readSideChatOperation"]>>(async () => ({ state: "pending" })),
+    adoptPendingSideChat: vi.fn<NonNullable<AppController["adoptPendingSideChat"]>>(async () => "adopted"),
     loadSessionTimelinePage: vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] })),
     loadSessionTimelineAround: vi.fn<AppController["loadSessionTimelineAround"]>(async () => []),
     saveDraft: vi.fn<AppController["saveDraft"]>(async () => undefined),

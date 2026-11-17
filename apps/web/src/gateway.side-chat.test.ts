@@ -10,7 +10,8 @@ const record: PendingSideChatDraft = { operationId: "original-side-chat", source
 function fixture(mode = "valid") {
   const child = create(SessionSchema, { sessionId: "child", backendId: mode === "backend" ? "foreign" : "native", targetId: "project", state: SessionState.IDLE,
     location: { kind: { case: "serviceNode", value: {} } },
-    nativeBinding: { opaqueReference: "native-child", runtimeGeneration: mode === "generation" ? 2n : 1n },
+    nativeBinding: { backendId: "native", opaqueReference: "native-child",
+      runtimeGeneration: mode === "zero-generation" ? 0n : mode === "higher-generation" || mode === "stale-directory" ? 3n : 1n },
     derivationOrigin: { kind: SessionDerivationKind.FORK, sideChat: true, sourceSessionId: mode === "source" ? "foreign" : "source",
       sourceMessageId: "completed-source-message", sourceEventId: "completed-source-event", sourceSessionAvailable: true, sourceMessageAvailable: true } });
   const operation = create(OperationSchema, { operationId: record.operationId, connectionId: "connection", state: OperationState.SUCCEEDED,
@@ -21,7 +22,8 @@ function fixture(mode = "valid") {
   const transport = {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
       if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, {
-        generation: 1n, resumeCursor: { generation: 1n, sequence: 0n }, sessions: [child]
+        generation: 1n, resumeCursor: { generation: 1n, sequence: 0n },
+        sessions: [mode === "stale-directory" ? create(SessionSchema, { ...child, nativeBinding: { ...child.nativeBinding!, runtimeGeneration: 2n } }) : child]
       }) }));
       if (method.localName === "getOperation") { expect(input.operationId).toBe(record.operationId); return response(method, create(GetOperationResponseSchema, { operation })); }
       if (method.localName === "submitOperation") { submissions.push(input); return response(method, create(SubmitOperationResponseSchema, { operation })); }
@@ -56,14 +58,16 @@ it("does not dispatch when the original client recovery cannot be saved", async 
   } finally { f.gateway.disconnect(); }
 });
 
-it.each(["valid", "source", "backend", "generation", "original-generation"])("recovers only the original generation and exact typed child lineage: %s", async mode => {
+it.each(["valid", "higher-generation", "source", "backend", "zero-generation", "stale-directory", "original-generation"])
+("recovers only the original operation and exact positive child generation: %s", async mode => {
   const f = fixture(mode);
   try {
     await f.gateway.connect();
     const reading = f.gateway.readSideChatOperation!(record);
-    if (mode === "valid") {
-      await expect(reading).resolves.toEqual({ state: "succeeded", sessionId: "child" });
-      expect(f.snapshots.at(-1)?.sessions[0]).toMatchObject({ id: "child", backendId: record.backendId, targetId: record.targetId, generation: 1n,
+    if (mode === "valid" || mode === "higher-generation") {
+      const generation = mode === "valid" ? 1n : 3n;
+      await expect(reading).resolves.toEqual({ state: "succeeded", sessionId: "child", generation });
+      expect(f.snapshots.at(-1)?.sessions[0]).toMatchObject({ id: "child", backendId: record.backendId, targetId: record.targetId, generation,
         derivationOrigin: { kind: "fork", sideChat: true, sourceSessionId: record.sourceSessionId,
           sourceMessageId: "completed-source-message", sourceEventId: "completed-source-event", sourceSessionAvailable: true, sourceMessageAvailable: true } });
     }

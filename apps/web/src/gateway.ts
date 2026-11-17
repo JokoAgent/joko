@@ -3909,17 +3909,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (operation.state !== OperationState.SUCCEEDED) return { state: "failed", error: operation.error?.message || "The original Side Chat operation failed.",
       stateMayHaveChanged: !operation.error || [operation.error.queueImpact, operation.error.workspaceImpact, operation.error.nativeSessionImpact].some(value => value !== StateImpact.UNCHANGED) };
     const payload = operation.result?.payload;
+    const binding = payload?.case === "session" ? payload.value.nativeBinding : undefined;
+    const origin = payload?.case === "session" ? payload.value.derivationOrigin : undefined;
     if (payload?.case !== "session" || payload.value.sessionId === record.sourceSessionId || !payload.value.sessionId
       || payload.value.backendId !== record.backendId || payload.value.targetId !== record.targetId
-      || payload.value.nativeBinding?.runtimeGeneration !== 1n || payload.value.derivationOrigin?.sideChat !== true
-      || payload.value.derivationOrigin.kind !== SessionDerivationKind.FORK
-      || payload.value.derivationOrigin.sourceSessionId !== record.sourceSessionId) throw new GatewayError("The original operation did not confirm this source's exact Side Chat child.");
+      || !binding?.opaqueReference || binding.backendId !== record.backendId || binding.runtimeGeneration < 1n || origin?.sideChat !== true
+      || origin.kind !== SessionDerivationKind.FORK || origin.sourceSessionId !== record.sourceSessionId) {
+      throw new GatewayError("The original operation did not confirm this source's exact Side Chat child.");
+    }
     await this.#refreshPromise?.catch(() => undefined); request?.throwIfAborted(); await this.refresh(); request?.throwIfAborted();
     const child = this.#snapshot?.sessions.find(session => session.id === payload.value.sessionId);
-    if (!child || child.backendId !== record.backendId || child.targetId !== record.targetId || child.generation !== 1n
+    if (!child || child.backendId !== record.backendId || child.targetId !== record.targetId || child.generation !== binding.runtimeGeneration
       || child.derivationOrigin?.sideChat !== true || child.derivationOrigin.kind !== "fork"
-      || child.derivationOrigin.sourceSessionId !== record.sourceSessionId) throw new GatewayError("Refresh the exact Side Chat child before adopting its local quote.");
-    return { state: "succeeded", sessionId: child.id };
+      || child.derivationOrigin.sourceSessionId !== record.sourceSessionId
+      || child.derivationOrigin.sourceMessageId !== origin.sourceMessageId
+      || child.derivationOrigin.sourceEventId !== origin.sourceEventId) throw new GatewayError("Refresh the exact Side Chat child before adopting its local quote.");
+    return { state: "succeeded", sessionId: child.id, generation: child.generation };
   }
 
   async forkSession(
@@ -4028,7 +4033,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       || origin.sourceMessageId !== record.messageId || origin.sourceEventId !== record.eventId) {
       throw new GatewayError("The reply does not identify the original message fork child.", { code: "RESULT_UNKNOWN" });
     }
-    return { state: "succeeded", sessionId: child.sessionId };
+    return { state: "succeeded", sessionId: child.sessionId, generation: child.nativeBinding.runtimeGeneration };
   }
 
   async cloneSession(

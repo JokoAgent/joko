@@ -5855,7 +5855,7 @@ export interface PendingMessageFork {
 export type SideChatOperationView =
   | { readonly state: "pending" }
   | { readonly state: "failed"; readonly error: string; readonly stateMayHaveChanged: boolean }
-  | { readonly state: "succeeded"; readonly sessionId: string };
+  | { readonly state: "succeeded"; readonly sessionId: string; readonly generation: bigint };
 
 export interface ComposerDraft {
   readonly replyQuote?: PartnerReplyQuoteView;
