@@ -15,6 +15,8 @@ import {
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
+  NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
+  NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
   snapshotNativeSkills,
   nativeTextInferenceImages,
   type ApprovedSkillResolver,
@@ -446,6 +448,8 @@ interface ActiveTurn {
   readonly seenToolStarts: Set<string>;
   readonly seenToolResults: Set<string>;
   readonly stream: PartialMessageBuffer;
+  textStream?: { readonly blockId: string; readonly messageId: string } | null;
+  textAssistant?: { readonly entryId: string; readonly messageId: string } | null;
   readonly steers: Map<string, SteerAdmission>;
   stopping: boolean;
   interruptConfirmation?: Deferred<void>;
@@ -557,6 +561,7 @@ interface SteerAdmission {
 
 interface ParentStreamSegment {
   readonly startedAt: number;
+  readonly messageId: string | undefined;
   readonly inputTokens: number;
   readonly cacheReadTokens: number;
   readonly cacheWriteTokens: number;
@@ -4551,6 +4556,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     });
     const delta = turn.stream.accept(message, this.#projection);
     if (delta === undefined) return;
+    const messageId = turn.parentStreamSegment?.messageId;
+    if (turn.textStream === undefined && delta.kind === "text" && messageId !== undefined) {
+      turn.textStream = { messageId, blockId: delta.blockId };
+    } else if (delta.kind !== "text" || turn.textStream?.blockId !== delta.blockId || turn.textStream?.messageId !== messageId) {
+      turn.textStream = null;
+    }
     await this.#emit(runtime, turn, delta.kind === "text"
       ? { type: "text_delta", blockId: delta.blockId, delta: delta.delta, contentIndex: delta.contentIndex }
       : { type: "thinking_delta", blockId: delta.blockId, delta: delta.delta, contentIndex: delta.contentIndex });
@@ -4579,6 +4590,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     // Exact SDK identities attest calls privately. Display redaction can alter
     // both tool names and call IDs and must never decide native authority.
     const nativeContent = nativeMessage?.["content"];
+    turn.textAssistant = turn.textAssistant === undefined && uuid !== undefined && uuidPattern().test(uuid)
+      && nativeMessageId !== undefined && error === undefined && typeof envelope["parent_agent_id"] !== "string"
+      && Array.isArray(nativeContent) && nativeContent.length === 1 && record(nativeContent[0])?.["type"] === "text"
+      && projected.blocks.length === 1 && projected.blocks[0]?.kind === "text" && projected.blocks[0].text.trim() !== ""
+      ? { entryId: uuid.toLowerCase(), messageId: nativeMessageId }
+      : null;
     if (runtime.mcpLease && Array.isArray(nativeContent)) for (const raw of nativeContent) {
       const block = record(raw), id = stringValue(block?.["id"]), name = stringValue(block?.["name"]), input = record(block?.["input"]);
       if (block?.["type"] !== "tool_use" || !id || !name || !input || id.length > 512 || turn.nativeMcpToolCalls.has(id)
@@ -4774,17 +4791,33 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       selectedModelId: this.#projection.text(observedSubstitution.selectedModelId),
       actualModelId: this.#projection.text(observedSubstitution.actualModelId)
     };
+    // One fully observed parent frame and one stream block can be confirmed by
+    // their SDK identities when Host next reads the persisted native Session.
+    const textStream = turn.textStream;
+    const textObservation = result.outcome === "completed" && result.error === undefined
+      && runtime.runtimePolicy === "standard" && !runtime.remote && turn.context.hostedExecution === undefined
+      && turn.partnerLearningTurn === undefined && !turn.nativeContinuationSegment && !turn.childOutputObserved
+      && turn.steers.size === 0 && turn.pendingContinuationTaskIds.size === 0 && this.#rootWakeTaskIds(runtime).length === 0
+      && turn.parentStreamMessages === 1 && turn.parentStreamSegment === undefined
+      && turn.blocks.length === 1 && turn.blocks[0]?.kind === "text"
+      && turn.textAssistant && textStream && textStream.messageId === turn.textAssistant.messageId
+      ? { entryId: turn.textAssistant.entryId, blockId: textStream.blockId }
+      : undefined;
     if (turn.blocks.length > 0) {
       await this.#emit(runtime, turn, {
         type: "message_complete",
         role: "assistant",
         blocks: [...turn.blocks],
         usage: generation.usage,
+        ...(textObservation === undefined ? {} : { nativeHistory: {} }),
         ...(modelSubstitution === undefined ? {} : { modelSubstitution }),
         ...(generation.durationMs === undefined ? {} : {
           generationDurationMs: generation.durationMs,
           generationReliable: generation.reliable
         })
+      }, turn.context, textObservation === undefined ? undefined : {
+        [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: textObservation.entryId,
+        [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: textObservation.blockId
       });
       if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     }
@@ -6304,6 +6337,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const initialOutputTokens = finite(usage?.["output_tokens"]);
       turn.parentStreamSegment = {
         startedAt: this.#now(),
+        messageId: stringValue(message?.["id"]),
         inputTokens: nonNegativeFinite(usage?.["input_tokens"]),
         cacheReadTokens: nonNegativeFinite(usage?.["cache_read_input_tokens"]),
         cacheWriteTokens: nonNegativeFinite(usage?.["cache_creation_input_tokens"]),
@@ -6430,9 +6464,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
   }
 
-  async #emit(runtime: NativeRuntime, turn: ActiveTurn, payload: EventPayload, context = turn.context): Promise<boolean> {
+  async #emit(runtime: NativeRuntime, turn: ActiveTurn, payload: EventPayload, context = turn.context, observations?: AdapterEventMetadata["fields"]): Promise<boolean> {
     if (!this.#isTurnCurrent(runtime, turn) || !this.#matchesContext(runtime, context)) return false;
     const fields: Record<string, string | number | boolean> = {
+      ...observations,
       queryGeneration: runtime.queryGeneration,
       sessionGeneration: runtime.sessionGeneration
     };

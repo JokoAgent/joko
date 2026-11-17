@@ -57,7 +57,10 @@ import {
   type AudioArtifactMetadata,
   type BlobRef,
   isNativeNavigationTarget,
+  NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD,
+  NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
+  NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   nativeHistoryEventContext,
   redactSecrets
@@ -12992,6 +12995,7 @@ export class OperationalStore {
     const replacesPath = `$.${NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD}`;
     return {
       ctes: `
+        native_visibility_cursor AS (SELECT ? AS cursor),
         current_native_marker AS (
           SELECT
             marker.session_id,
@@ -13056,7 +13060,7 @@ export class OperationalStore {
               )
             )
         )`,
-      params: [asSqlInteger(highWater), ...scopeParams, ...scopeParams, ...scopeParams, asSqlInteger(highWater), ...scopeParams],
+      params: [asSqlInteger(highWater), asSqlInteger(highWater), ...scopeParams, ...scopeParams, ...scopeParams, asSqlInteger(highWater), ...scopeParams],
       clause: (eventAlias) => ` AND NOT EXISTS (
         SELECT 1 FROM product_sessions AS side_chat
         WHERE side_chat.id = ${eventAlias}.session_id AND side_chat.derivation_kind = 'side_chat'
@@ -13171,6 +13175,10 @@ export class OperationalStore {
             )
           )
         )
+      ) AND (
+        EXISTS (SELECT 1 FROM retained_context_events AS retained
+          WHERE retained.session_id = ${eventAlias}.session_id AND retained.event_cursor = ${eventAlias}.global_cursor)
+        OR ${nativeAssistantObservationVisible(eventAlias, "(SELECT cursor FROM native_visibility_cursor)")}
       )`
     };
   }
@@ -14833,6 +14841,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.inputHandoffContinuation') IS NULL
         AND (json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)
+        AND ${nativeAssistantObservationVisible("event", "?")}
         AND (
           (
             identity.entry_id IS NOT NULL
@@ -14866,6 +14875,7 @@ export class OperationalStore {
       sessionId,
       snapshot.historyBindingFingerprint,
       sessionId,
+      asSqlInteger(throughCursor),
       asSqlInteger(throughCursor),
       snapshot.historyBindingFingerprint,
       leafId ?? null,
@@ -21241,6 +21251,27 @@ function withSessionAttention(
       }
     }
   };
+}
+
+function nativeAssistantObservationVisible(eventAlias: string, throughCursor: string): string {
+  return `(${eventAlias}.namespace IS NOT 'claude-code'
+    OR ${eventAlias}.run_id IS NULL OR ${eventAlias}.attempt_id IS NULL OR ${eventAlias}.operation_id IS NULL
+    OR (json_extract(${eventAlias}.metadata_json, '$.${NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD}') IS NULL
+      AND json_extract(${eventAlias}.payload_json, '$.payload.type') <> 'text_delta')
+    OR NOT EXISTS (
+      SELECT 1 FROM events AS replacement
+      WHERE replacement.run_id = ${eventAlias}.run_id
+        AND replacement.global_cursor > ${eventAlias}.global_cursor AND replacement.global_cursor <= ${throughCursor}
+        AND replacement.attempt_id = ${eventAlias}.attempt_id AND replacement.operation_id = ${eventAlias}.operation_id
+        AND replacement.session_id = ${eventAlias}.session_id AND replacement.backend_id = ${eventAlias}.backend_id
+        AND replacement.target_id = ${eventAlias}.target_id AND replacement.namespace = 'claude-code.native_history'
+        AND json_extract(replacement.metadata_json, '$.${NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD}') IS NOT NULL
+        AND (json_extract(replacement.metadata_json, '$.${NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD}') = ${eventAlias}.id OR (
+          json_extract(${eventAlias}.payload_json, '$.payload.type') = 'text_delta'
+          AND json_extract(replacement.metadata_json, '$.${NATIVE_HISTORY_ASSISTANT_STREAM_FIELD}') =
+            json_extract(${eventAlias}.payload_json, '$.payload.blockId')
+        ))
+    ))`;
 }
 
 function isRunUsageCompletion(event: PersistedEvent): boolean {

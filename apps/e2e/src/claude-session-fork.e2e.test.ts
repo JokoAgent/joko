@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -29,7 +29,7 @@ import {
   type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkUserMessage
 } from "@joko/adapter-claude-code/testing";
-import { NativeNavigationTargetSchema, NativeSessionStartSchema, OperationMutationSchema, OperationState, RunState, type Event } from "@joko/contracts";
+import { MessageRole, NativeNavigationTargetSchema, NativeSessionStartSchema, OperationMutationSchema, OperationState, RunState, type Event } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createE2eClients } from "./connect-clients.js";
 import { OrchestratorE2eFixture, waitFor, type E2eClients } from "./fixture.js";
@@ -616,6 +616,88 @@ function createNativeTarget(entryId: string) {
   return create(NativeNavigationTargetSchema, { kind: { case: "nativeEntryId", value: entryId } });
 }
 
+it.each(["original frame", "different frame", "missing frame"] as const)(
+  "projects ordinary Claude text and its accounting after reading a %s from the published SDK", { timeout: 60_000 },
+  async (persisted) => {
+    const seed = await seedNativeHistory();
+    let fixture: OrchestratorE2eFixture | undefined;
+    let activeQuery: TextObservationQuery | undefined;
+    try {
+      const started = await start(seed, (params) => {
+        activeQuery = new TextObservationQuery(params, seed.sourceId);
+        return activeQuery;
+      });
+      fixture = started.fixture;
+      const paired = await fixture.pair();
+      const sessionId = await attachSource(fixture, paired, seed.sourceId);
+      const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+      const replyText = "This ordinary reply has sufficient text to exercise the published streaming boundary. ".repeat(9).trim();
+      const operation = await submit(paired.clients.operation, paired.connectionId, sendInputMutation(sessionId, generation, "Send a plain text reply"));
+      expect(operation.state).toBe(OperationState.SUCCEEDED);
+      const query = await waitFor(async () => activeQuery, (candidate) => candidate !== undefined, "the controlled Claude Query");
+      if (query === undefined) throw new Error("The Claude runtime did not start the controlled Query.");
+      const user = await waitFor(async () => query.receivedInputs[0], (message) => message !== undefined, "the Query to consume the original input");
+      if (user === undefined) throw new Error("The Claude Query did not receive the original user message.");
+      const entryId = randomUUID(), historicalId = persisted === "original frame" ? entryId : randomUUID();
+      const nativeMessage = { id: "msg_controlled_plain_text", role: "assistant", content: [{ type: "text", text: replyText }], stop_reason: "end_turn" };
+      query.publishText(entryId, nativeMessage);
+      const live = await waitFor(() => timeline(paired.clients, sessionId),
+        (events) => events.some(event => event.payload?.kind.case === "textDelta"
+          && event.payload.kind.value.messageId.startsWith("claude-block-")), "the original live text block");
+      const liveDelta = live.find(event => event.payload?.kind.case === "textDelta" && event.payload.kind.value.messageId.startsWith("claude-block-"))!;
+      expect(liveDelta.identity).toMatchObject({ sessionId, generation });
+      const transcriptEntry = (entry: Readonly<Record<string, unknown>>) =>
+        JSON.stringify({ sessionId: seed.sourceId, cwd: seed.workspace, timestamp: new Date().toISOString(), ...entry });
+      const written = [
+        transcriptEntry({ type: "user", uuid: user.uuid, parentUuid: seed.messageIds.at(-1), message: user.message })
+      ];
+      if (persisted !== "missing frame") written.push(transcriptEntry({
+        type: "assistant", uuid: historicalId, parentUuid: user.uuid, message: nativeMessage
+      }));
+      await Promise.all([seed.sourcePath, join(seed.profile, "projects", claudeProjectKey(seed.workspace), `${seed.sourceId}.jsonl`)]
+        .map(path => appendFile(path, written.join("\n") + "\n", "utf8")));
+      query.finish(user.uuid, replyText);
+      await waitFor(() => paired.clients.run.listRuns({ sessionId }),
+        ({ runs }) => runs.some(run => run.runId === liveDelta.identity?.runId && run.state === RunState.SUCCEEDED), "the original Run to finish");
+      const assertHistory = (events: readonly Event[]) => {
+        const matching = events.filter(event => event.payload?.kind.case === "messageCompleted"
+          && event.payload.kind.value.role === MessageRole.ASSISTANT
+          && event.payload.kind.value.blocks.some(block => block.content.case === "text" && block.content.value === replyText));
+        expect(matching).toHaveLength(persisted === "different frame" ? 2 : 1);
+        const original = matching.find(event => event.identity?.runId === liveDelta.identity?.runId);
+        if (original?.payload?.kind.case !== "messageCompleted") throw new Error("The original assistant completion is absent.");
+        expect(original.identity?.attemptId).toBe(liveDelta.identity?.attemptId);
+        expect(original.payload.kind.value.usage?.outputTokens).toBe(5n);
+        if (persisted === "original frame") {
+          expect(original.payload.kind.value).toMatchObject({ messageId: entryId, nativeIdentity: { entryId }, generationReliable: true });
+          expect(events.some(event => event.eventId === liveDelta.eventId)).toBe(false);
+        } else {
+          expect(original.payload.kind.value.nativeIdentity).toBeUndefined();
+          expect(events.some(event => event.eventId === liveDelta.eventId)).toBe(true);
+        }
+        return original.eventId;
+      };
+      const readPage = async () => (await paired.clients.session.listSessionTimeline({ sessionId, limit: 200 })).events;
+      const eventId = assertHistory(await readPage());
+      expect(assertHistory(await timeline(paired.clients, sessionId))).toBe(eventId);
+      const { events } = await paired.clients.session.listSessionTimeline({ sessionId, aroundEventId: eventId, limit: 100 });
+      expect(assertHistory(events)).toBe(eventId);
+      if (persisted === "original frame") {
+        const lease = fixture.application.store.getSession(sessionId).descriptor.binding;
+        expect(lease.generation).toBe(Number(generation));
+        await fixture.close({ removeRoot: false });
+        fixture = (await start(seed)).fixture;
+        const cold = createE2eClients(fixture.baseUrl, paired.authKey);
+        expect(assertHistory((await cold.session.listSessionTimeline({ sessionId, limit: 200 })).events)).toBe(eventId);
+      }
+    } finally {
+      activeQuery?.close();
+      await fixture?.close({ removeRoot: false });
+      await rm(seed.root, { recursive: true, force: true });
+    }
+  }
+);
+
 async function seedNativeHistory() {
   const root = await mkdtemp(join(tmpdir(), "joko-claude-fork-chain-"));
   const workspace = join(root, "workspace");
@@ -648,8 +730,8 @@ async function seedNativeHistory() {
   return { root, workspace, profile, sourceId, messageIds, sourcePath, transcript };
 }
 
-async function start(seed: Awaited<ReturnType<typeof seedNativeHistory>>) {
-  const runtime = new LocalSessionRuntime(seed.profile);
+async function start(seed: Awaited<ReturnType<typeof seedNativeHistory>>, createQuery?: (params: ClaudeSdkQueryParams) => ClaudeSdkQuery) {
+  const runtime = new LocalSessionRuntime(seed.profile, createQuery);
   const fixture = await OrchestratorE2eFixture.start({
     rootDirectory: seed.root, profiles: [],
     backendFactories: [{ instanceId: backendId, adapterKind: "claude-agent-sdk-stdio", displayName: "Local Claude fixture",
@@ -1181,7 +1263,7 @@ class StoreQueryOutput implements AsyncIterable<unknown>, AsyncIterator<unknown>
   [Symbol.asyncIterator](): AsyncIterator<unknown> { return this; }
 }
 
-function controlledClaudeInit(nativeSessionId: string, options: ControlledNativeQueryOptions) {
+function controlledClaudeInit(nativeSessionId: string, options: Pick<ControlledNativeQueryOptions, "cwd" | "model" | "permissionMode">) {
   return {
     type: "system",
     subtype: "init",
@@ -1253,7 +1335,7 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   failure?: "unobserved" | "validation" | "cleanup-unknown";
   #failNextDerivedRead = false;
 
-  constructor(profile: string) {
+  constructor(profile: string, private readonly createQuery?: (params: ClaudeSdkQueryParams) => ClaudeSdkQuery) {
     this.#owner = new SessionSdkOwner({
       environment: { CLAUDE_CONFIG_DIR: profile, CLAUDE_CODE_PROJECT_DIR_NAME: storageName }, timeoutMs: 5_000, cleanupTimeoutMs: 1_000,
       workerFactory: (_url, options) => new Worker(new URL("./session-sdk-worker.mts", import.meta.resolve("@joko/adapter-claude-code/testing")), options)
@@ -1261,7 +1343,9 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   }
 
   async probe() { return { installed: true, packageVersion: this.packageVersion, cliVersion: CLAUDE_AGENT_SDK_CLI_VERSION, initialization }; }
-  async query(_params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> { return new IdleQuery(); }
+  async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
+    return this.createQuery?.(params) ?? new IdleQuery();
+  }
   async retireQuery(): Promise<void> { throw new Error("This Session fixture does not perform live Query replacement."); }
   async getSessionInfo(sessionId: string, options: { dir: string; signal?: AbortSignal }) {
     if (this.#failNextDerivedRead && this.created.includes(sessionId)) { this.#failNextDerivedRead = false; return undefined; }
@@ -1322,6 +1406,54 @@ class IdleQuery implements ClaudeSdkQuery {
   async setModel() {}
   async applyFlagSettings() {}
   close() { this.#finish(); }
+}
+
+class TextObservationQuery extends IdleQuery {
+  readonly receivedInputs: ClaudeSdkUserMessage[] = [];
+  readonly #output = new StoreQueryOutput();
+
+  constructor(private readonly params: ClaudeSdkQueryParams, private readonly nativeId: string) {
+    super();
+    void this.#consume().catch((error: unknown) => this.#output.fail(error));
+  }
+
+  async #consume(): Promise<void> {
+    const options = this.params.options;
+    const init = () => controlledClaudeInit(this.nativeId, options);
+    this.#output.push(init());
+    for await (const message of this.params.prompt) {
+      this.receivedInputs.push(message);
+      this.#output.push(init());
+      if (options.extraArgs?.["replay-user-messages"] === null) {
+        this.#output.push({ ...message, isReplay: true, session_id: this.nativeId });
+      }
+    }
+  }
+
+  override async *[Symbol.asyncIterator](): AsyncGenerator<unknown> { yield* this.#output; }
+
+  publishText(entryId: string, message: { readonly id: string; readonly content: readonly { readonly text: string }[] }): void {
+    const stream = (event: unknown) => this.#output.push({
+      type: "stream_event", uuid: randomUUID(), session_id: this.nativeId, parent_tool_use_id: null, event
+    });
+    stream({ type: "message_start", message: { id: message.id, usage: { input_tokens: 10, output_tokens: 0 } } });
+    stream({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    stream({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: message.content[0]!.text } });
+    this.#output.push({ type: "assistant", uuid: entryId, session_id: this.nativeId, parent_tool_use_id: null, message });
+    stream({ type: "content_block_stop", index: 0 });
+    stream({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } });
+    stream({ type: "message_stop" });
+  }
+
+  finish(userId: string, result: string): void {
+    this.#output.push({ ...controlledClaudeResult(this.nativeId, userId), result });
+  }
+
+  override close(): void {
+    this.#output.close();
+    void this.params.prompt[Symbol.asyncIterator]().return?.();
+    super.close();
+  }
 }
 
 async function git(cwd: string, args: readonly string[]): Promise<string> {

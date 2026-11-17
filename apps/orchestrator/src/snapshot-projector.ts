@@ -16,7 +16,8 @@ import type {
   ToolSnapshotScope,
   WorkspaceSnapshotScope
 } from "@joko/contracts";
-import { NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, nativeHistoryEventContext } from "@joko/core";
+import { NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, nativeHistoryEventContext } from "@joko/core";
 import {
   NotFoundError,
   isTargetDeleted,
@@ -863,6 +864,26 @@ export function activeNativeTimeline(
   retainedContext?: ReadonlySet<bigint>,
   deletedParents?: ReadonlyMap<string, string>
 ): PersistedEvent[] {
+  const observationKey = (event: PersistedEvent, kind: "completion" | "stream", id: string): string | undefined =>
+    event.runId === undefined || event.attemptId === undefined || event.operationId === undefined ? undefined
+      : JSON.stringify([event.backendId, event.targetId, event.sessionId, event.runId, event.attemptId, event.operationId, kind, id]);
+  const replacements = new Map<string, bigint>();
+  for (const event of events) {
+    const source = event.metadata?.fields[NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD];
+    const stream = event.metadata?.fields[NATIVE_HISTORY_ASSISTANT_STREAM_FIELD];
+    if (event.metadata?.namespace !== "claude-code.native_history" || typeof source !== "string" || typeof stream !== "string") continue;
+    const completion = observationKey(event, "completion", source), text = observationKey(event, "stream", stream);
+    if (completion !== undefined && text !== undefined) {
+      replacements.set(completion, event.globalCursor);
+      replacements.set(text, event.globalCursor);
+    }
+  }
+  const sourceWasReplaced = (event: PersistedEvent): boolean => {
+    if (event.metadata?.namespace !== "claude-code" || retainedContext?.has(event.globalCursor)) return false;
+    const key = event.payload.type === "text_delta" ? observationKey(event, "stream", event.payload.blockId) : observationKey(event, "completion", event.id);
+    return key !== undefined && (replacements.get(key) ?? 0n) > event.globalCursor;
+  };
+  const projectedEvents = replacements.size === 0 ? events : events.filter(event => !sourceWasReplaced(event));
   const nativeEntryKey = (event: PersistedEvent): string | undefined => {
     const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
     const fingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
@@ -878,11 +899,11 @@ export function activeNativeTimeline(
       || event.metadata.fields["nativeHydration"] === true
       || !canonical.has(nativeEntryKey(event) ?? ""));
   };
-  const marker = [...events].reverse().find((event) => event.payload.type === "native_session_changed");
+  const marker = [...projectedEvents].reverse().find((event) => event.payload.type === "native_session_changed");
   if (marker?.payload.type !== "native_session_changed") {
-    if (currentBinding === undefined) return deduplicateNativeLive(events);
+    if (currentBinding === undefined) return deduplicateNativeLive(projectedEvents);
     const currentFingerprint = nativeBindingFingerprint(currentBinding.opaqueRef);
-    return deduplicateNativeLive(events.filter((event) => {
+    return deduplicateNativeLive(projectedEvents.filter((event) => {
       if (event.payload.type === "partner_session_task_receipt" || retainedContext?.has(event.globalCursor)) return true;
       const identity = nativeHistoryEventContext(event.payload)?.identity;
       if (identity !== undefined || event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== undefined) {
@@ -892,7 +913,7 @@ export function activeNativeTimeline(
     }));
   }
   if (currentBinding !== undefined && marker.payload.opaqueRef !== currentBinding.opaqueRef) {
-    return deduplicateNativeLive(events.filter((event) => event.payload.type === "partner_session_task_receipt"
+    return deduplicateNativeLive(projectedEvents.filter((event) => event.payload.type === "partner_session_task_receipt"
       || retainedContext?.has(event.globalCursor) || (
       (nativeHistoryEventContext(event.payload)?.identity === undefined
         || (event.metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true
@@ -907,7 +928,7 @@ export function activeNativeTimeline(
   const leafId = marker.payload.leafId;
   const parents = new Map<string, string | undefined>();
   const incomplete = new Set<string>();
-  for (const event of events) {
+  for (const event of projectedEvents) {
     const identity = nativeHistoryEventContext(event.payload)?.identity;
     const entryId = identity?.entryId;
     if (entryId === undefined) continue;
@@ -928,7 +949,7 @@ export function activeNativeTimeline(
     active.add(cursor);
     cursor = parents.has(cursor) ? parents.get(cursor) : deletedParents?.get(cursor);
   }
-  return deduplicateNativeLive(events.filter((event) => {
+  return deduplicateNativeLive(projectedEvents.filter((event) => {
     if (event.payload.type === "partner_session_task_receipt" || retainedContext?.has(event.globalCursor)) return true;
     const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
     if (entryId !== undefined) {
