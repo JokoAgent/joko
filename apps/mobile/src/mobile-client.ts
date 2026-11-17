@@ -14185,22 +14185,23 @@ export class MobileClient {
         preconditions: [create(OperationPreconditionSchema, { entity: { kind: EntityKind.SESSION, id: session.sessionId },
           expectedGeneration: session.nativeBinding!.runtimeGeneration })],
         payload: { case: "openSideChat", value: create(OpenSideChatMutationSchema, { sourceSessionId: session.sessionId }) }
-      }), receipt, operationId, true, false, { signal: this.#abort!.signal, isCurrent: current,
+      }), receipt, operationId, true, false, { signal: this.#abort!.signal, isCurrent: current, retireUndispatched: true,
         beforeTerminalReceipt: async (operation) => {
-          if (operation.state === OperationState.SUCCEEDED) await this.#recoverSideChatReceipt({ ...receipt, operationId,
+          if (operation.state !== OperationState.SUCCEEDED) return;
+          const child = await this.#recoverSideChatReceipt({ ...receipt, operationId,
             connectionId: credential.connectionId, state: "unknown" }, operation, epoch);
+          if (child && current()) this.#adoptDerivedTask(child);
         } });
+      if (result.definitive) await this.#clearDerivedInput(identity, operationId, epoch);
       if (!current()) return { kind: "retired" };
       if (!result.definitive) return { kind: "unknown" };
-      await this.composerDrafts.clearOperationInput(identity, operationId);
       if (!result.accepted) return { kind: "rejected" };
       const child = this.#derivedTaskResult(result.operation, session, SessionDerivationKind.FORK);
-      if (!child.derivationOrigin?.sideChat) throw new Error("The result is not the original side chat.");
-      return await this.#refreshDerivedTaskList(child, current) ? { kind: "opened", sessionId: child.sessionId } : { kind: "retired" };
+      return { kind: "opened", sessionId: child.sessionId };
     } finally { this.#releaseMutation(action); }
   }
 
-  async #recoverSideChatReceipt(pending: PendingOperation, operation: Operation, epoch: number): Promise<void> {
+  async #recoverSideChatReceipt(pending: PendingOperation, operation: Operation, epoch: number): Promise<Session | undefined> {
     const credential = this.#ready(), profileId = credential.profileId;
     const source = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === pending.sessionId);
     const payload = operation.mutation?.payload;
@@ -14210,13 +14211,14 @@ export class MobileClient {
       throw new Error("The retained side chat source is unavailable. Its operation was not resent.");
     }
     const child = this.#derivedTaskResult(operation, source, SessionDerivationKind.FORK);
-    if (!child.derivationOrigin?.sideChat) throw new Error("The original side chat receipt is invalid.");
+    if (!child.derivationOrigin?.sideChat || child.targetId !== source.targetId) throw new Error("The original side chat receipt is invalid.");
     const current = () => this.#current(epoch) && this.#credential === credential;
     const draft = await this.composerDrafts.readOperationInput({ profileId, sessionId: source.sessionId }, pending.operationId);
     if (!current()) return;
     if (!draft || !await this.#restoreForkDraft(draft, profileId, child.sessionId, current)) {
       throw new Error("The side chat was created, but its retained draft could not be restored. The newer draft was kept.");
     }
+    return current() ? child : undefined;
   }
 
   async cloneTask(authorityKey: string, name: string, signal?: AbortSignal): Promise<MobileTaskCloneResult> {
@@ -14279,37 +14281,47 @@ export class MobileClient {
     const displayName = name.trim();
     if (!displayName || displayName.length > 120 || /[\u0000-\u001f\u007f]/u.test(displayName)) throw new Error("Use a task name between 1 and 120 characters.");
     this.#assertNoPendingRuntimeControl(session.sessionId);
-    const action = this.#claimMutation(); const epoch = this.#epoch;
-    const profileId = this.#activeProfileId!;
+    const credential = this.#ready(), epoch = this.#epoch, operationId = this.newId();
+    const identity = { profileId: credential.profileId, sessionId: session.sessionId };
+    const precondition = this.#sessionRuntimePrecondition(session);
+    const { source } = controls;
+    const action = this.#claimMutation();
     const current = (): boolean => this.#current(epoch) && this.#foreground && !signal?.aborted
+      && this.#credential === credential
       && this.taskMessageForkControls(eventId)?.surfaceOwnerKey === controls.surfaceOwnerKey;
-    let draftRestored = controls.source.draft === undefined;
+    let draftRestored = source.draft === undefined;
     try {
+      if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable.");
+      await this.composerDrafts.retainOperationInput(identity, operationId, source.draft ?? emptyMobileComposerDraft());
+      if (!current()) { await this.#clearDerivedInput(identity, operationId, epoch); return { kind: "retired" }; }
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
-        preconditions: [this.#sessionRuntimePrecondition(session)],
+        preconditions: [precondition],
         payload: { case: "forkSession", value: create(ForkSessionMutationSchema, {
-          sourceSessionId: session.sessionId, nativeEntryId: controls.source.nativeEntryId,
-          sourceMessageId: controls.source.messageId, sourceEventId: controls.source.eventId, newDisplayName: displayName
+          sourceSessionId: session.sessionId, nativeEntryId: source.nativeEntryId,
+          sourceMessageId: source.messageId, sourceEventId: source.eventId, newDisplayName: displayName
         }) }
-      }), { kind: "session-fork", sessionId: session.sessionId, eventId }, undefined, true, false,
-      { signal: signal ?? new AbortController().signal, isCurrent: current,
+      }), { kind: "session-fork", sessionId: session.sessionId, eventId: source.eventId, sourceMessageId: source.messageId,
+        nativeEntryId: source.nativeEntryId, backendId: session.backendId, targetId: session.targetId,
+        sourceGeneration: precondition.expectedGeneration.toString() }, operationId, true, false,
+      { signal: signal ?? new AbortController().signal, isCurrent: current, retireUndispatched: true,
         beforeTerminalReceipt: async (operation) => {
           if (operation.state !== OperationState.SUCCEEDED) return;
-          const child = this.#derivedTaskResult(operation, session, SessionDerivationKind.FORK, controls.source);
-          draftRestored = await this.#restoreForkDraft(controls.source.draft, profileId, child.sessionId, current);
+          const child = this.#derivedTaskResult(operation, session, SessionDerivationKind.FORK, source);
+          draftRestored = await this.#restoreForkDraft(source.draft, credential.profileId, child.sessionId, current);
+          if (current()) this.#adoptDerivedTask(child);
         } });
+      if (result.definitive) await this.#clearDerivedInput(identity, operationId, epoch);
       if (!current()) return { kind: "retired" };
       if (!result.definitive) return { kind: "unknown" };
       if (!result.accepted) return { kind: "rejected" };
-      const child = this.#derivedTaskResult(result.operation, session, SessionDerivationKind.FORK, controls.source);
-      if (!current() || !await this.#refreshDerivedTaskList(child, current, signal)) return { kind: "retired" };
+      const child = this.#derivedTaskResult(result.operation, session, SessionDerivationKind.FORK, source);
       return { kind: "forked", sessionId: child.sessionId, draftRestored };
     } finally { this.#releaseMutation(action); }
   }
 
   async #restoreForkDraft(draft: MobileComposerDraft | undefined, profileId: string, sessionId: string,
     current: () => boolean): Promise<boolean> {
-    if (!draft) return true;
+    if (!draft || mobileComposerDraftsEqual(draft, emptyMobileComposerDraft())) return true;
     if (!this.composerDrafts) return false;
     const identity = { profileId, sessionId };
     try {
@@ -14322,23 +14334,40 @@ export class MobileClient {
     } catch { return false; }
   }
 
-  async #recoverForkReceipt(pending: PendingOperation, operation: Operation, epoch: number): Promise<void> {
-    const credential = this.#ready(); const profileId = this.#activeProfileId!;
-    const sources = this.#state.owner?.sessions.filter((candidate) => candidate.sessionId === pending.sessionId) ?? [];
-    if (sources.length !== 1 || !pending.eventId) throw new Error("The saved fork source is unavailable. Its operation was not resent.");
-    const current = (): boolean => this.#current(epoch) && this.#foreground && this.#activeProfileId === profileId
-      && this.#credential?.connectionId === pending.connectionId;
-    const around = await this.network.readAround(credential, sources[0]!.sessionId, pending.eventId, this.#abort?.signal);
-    if (!current()) return;
-    const source = resolveMobileMessageForkSource(around, sources[0]!.sessionId, pending.eventId, this.#state.owner!.generation, false);
-    if (!source) throw new Error("The saved fork input or native source is unavailable. Its operation was not resent.");
-    const child = this.#derivedTaskResult(operation, sources[0]!, SessionDerivationKind.FORK, source);
-    const restored = await this.#restoreForkDraft(source.draft, profileId, child.sessionId, current);
-    if (current() && !restored) this.#set({ error: "The branch was created, but its draft could not be restored. Open it to review before sending." });
+  async #recoverForkReceipt(pending: PendingOperation, operation: Operation, credential: PairedCredential,
+    current: () => boolean): Promise<{ child: Session; draftRestored: boolean }> {
+    const owner = this.#state.owner;
+    const session = owner?.sessions.find(candidate => candidate.sessionId === pending.sessionId);
+    const mutation = operation.mutation?.payload;
+    if (!owner || !session || mutation?.case !== "forkSession" || !mutation.value.sourceMessageId || !pending.eventId
+      || pending.sourceGeneration !== undefined && (session.backendId !== pending.backendId || session.targetId !== pending.targetId)) {
+      throw new Error("The original fork task identity could not be confirmed.");
+    }
+    const message = { eventId: pending.eventId, messageId: mutation.value.sourceMessageId };
+    const child = this.#derivedTaskResult(operation, session, SessionDerivationKind.FORK, message);
+    let draft: MobileComposerDraft | undefined;
+    if (pending.sourceGeneration !== undefined) {
+      draft = await this.composerDrafts?.readOperationInput({ profileId: credential.profileId, sessionId: session.sessionId },
+        pending.operationId).catch(() => null) ?? undefined;
+      if (!draft) return { child, draftRestored: false };
+    } else {
+      // Older receipts did not retain the canonical input. A retired row can
+      // no longer supply it, even though the original child is confirmed.
+      const around = await this.network.readAround(credential, session.sessionId, message.eventId, this.#abort?.signal).catch(error => {
+        if (error instanceof ConnectError && error.code === Code.NotFound) return [];
+        throw error;
+      });
+      const source = resolveMobileMessageForkSource(around, session.sessionId, message.eventId, owner.generation, false);
+      if (source?.messageId !== message.messageId || source.nativeEntryId !== mutation.value.nativeEntryId) {
+        return { child, draftRestored: false };
+      }
+      draft = source.draft;
+    }
+    return { child, draftRestored: current() && await this.#restoreForkDraft(draft, credential.profileId, child.sessionId, current) };
   }
 
   #derivedTaskResult(operation: Operation | undefined, source: Session, kind: SessionDerivationKind,
-    message?: MobileMessageForkSource): Session {
+    message?: Pick<MobileMessageForkSource, "eventId" | "messageId">): Session {
     const child = operation?.result?.payload.case === "session" ? operation.result.payload.value : undefined;
     if (operation?.state !== OperationState.SUCCEEDED || !child?.sessionId || child.sessionId === source.sessionId
       || child.sessionId.length > 512 || /[\u0000-\u001f\u007f]/u.test(child.sessionId)
@@ -14346,10 +14375,59 @@ export class MobileClient {
       || !child.nativeBinding.opaqueReference || child.nativeBinding.opaqueReference === source.nativeBinding?.opaqueReference
       || child.nativeBinding.runtimeGeneration < 1n || child.derivationOrigin?.kind !== kind
       || child.derivationOrigin.sourceSessionId !== source.sessionId
-      || (message && (child.derivationOrigin.sourceMessageId !== message.messageId || child.derivationOrigin.sourceEventId !== message.eventId))) {
+      || (message && (child.targetId !== source.targetId || child.derivationOrigin.sideChat
+        || child.derivationOrigin.sourceMessageId !== message.messageId || child.derivationOrigin.sourceEventId !== message.eventId))) {
       throw new Error("The Joko node completed task derivation without the exact derived Session identity.");
     }
     return child;
+  }
+
+  #adoptDerivedTask(child: Session): void {
+    const owner = this.#state.owner!;
+    const [existing, duplicate] = owner.sessions.filter(candidate => candidate.sessionId === child.sessionId);
+    if (existing) {
+      if (duplicate || existing.backendId !== child.backendId || existing.targetId !== child.targetId
+        || existing.nativeBinding?.opaqueReference !== child.nativeBinding?.opaqueReference
+        || existing.nativeBinding?.runtimeGeneration !== child.nativeBinding?.runtimeGeneration) {
+        throw new Error("The derived task does not match the current authenticated task list.");
+      }
+      return;
+    }
+    this.#set({ owner: { ...owner, sessions: [...owner.sessions, child] } });
+  }
+
+  async #clearDerivedInput(identity: MobileComposerDraftIdentity, operationId: string, epoch: number): Promise<void> {
+    if (this.#allPending.some(item => item.operationId === operationId)) return;
+    try { await this.composerDrafts?.clearOperationInput(identity, operationId); }
+    catch (error) { if (this.#current(epoch)) this.#set({ error: message(error) }); }
+  }
+
+  async #reconcileDerivedTaskReceipt(pending: PendingOperation, operation: Operation, credential: PairedCredential, epoch: number): Promise<void> {
+    if (!this.#operationReceiptMatches(operation, pending)) {
+      await this.#receipt(operation, pending, epoch, true);
+      return;
+    }
+    const current = () => this.#current(epoch) && this.#foreground && this.#credential === credential && !this.#joinedTask;
+    if (!current() || !this.#state.pending.some(item => item.operationId === pending.operationId)) return;
+    let draftRestored = true;
+    if (operation.state === OperationState.SUCCEEDED) {
+      let child: Session | undefined;
+      if (pending.kind === "session-fork") {
+        ({ child, draftRestored } = await this.#recoverForkReceipt(pending, operation, credential, current));
+      } else child = await this.#recoverSideChatReceipt(pending, operation, epoch);
+      if (!current() || !child) return;
+      this.#adoptDerivedTask(child);
+    }
+    await this.#receipt(operation, pending, epoch, true);
+    if (!current() || !isTerminal(operation.state) || this.#state.pending.some(item => item.operationId === pending.operationId)) return;
+    const error = this.#state.error;
+    if (operation.state === OperationState.SUCCEEDED) {
+      if (!draftRestored) this.#set({ error: "The branch was created, but its draft could not be restored. Open it to review before sending." });
+      else if (error?.startsWith(`Operation ${pending.operationId}:`)
+        || error?.startsWith(`Could not confirm operation ${pending.operationId}:`)
+        || error?.startsWith(`Operation ${pending.operationId} is not yet confirmed.`)) this.#set({ error: undefined });
+    }
+    await this.#clearDerivedInput({ profileId: credential.profileId, sessionId: pending.sessionId! }, pending.operationId, epoch);
   }
 
   async #refreshDerivedTaskList(child: Session, current: () => boolean, signal?: AbortSignal): Promise<boolean> {
@@ -17561,6 +17639,17 @@ export class MobileClient {
       return mutation?.case === "abortRun" && mutation.value.runId === pending.runId
         && (operation.state !== OperationState.SUCCEEDED || result?.case === "acknowledgement" && result.value.accepted);
     }
+    if (pending.kind === "session-fork") {
+      const mutation = operation.mutation;
+      if (mutation?.payload.case !== "forkSession") return false;
+      const source = mutation.payload.value;
+      if (source.sourceSessionId !== pending.sessionId || source.sourceEventId !== pending.eventId
+        || !source.sourceMessageId || !source.nativeEntryId) return false;
+      return pending.sourceGeneration === undefined || source.sourceMessageId === pending.sourceMessageId
+        && source.nativeEntryId === pending.nativeEntryId && mutation.preconditions.some(condition =>
+          condition.entity?.kind === EntityKind.SESSION && condition.entity.id === pending.sessionId
+          && condition.expectedGeneration.toString() === pending.sourceGeneration);
+    }
     return pending.kind !== "message-delete" || operation.state !== OperationState.SUCCEEDED
       || mobileMessageDeletionGeneration(operation, pending) !== undefined;
   }
@@ -17596,15 +17685,10 @@ export class MobileClient {
         }
         if (!this.#current(epoch)) return;
         if (operation) {
-          if (pending.kind === "session-side-chat" && operation.state === OperationState.SUCCEEDED
-            && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId) {
-            await this.#recoverSideChatReceipt(pending, operation, epoch);
+          if (pending.kind === "session-fork" || pending.kind === "session-side-chat") {
+            await this.#reconcileDerivedTaskReceipt(pending, operation, credential, epoch);
             if (!this.#current(epoch)) return;
-          }
-          if (pending.kind === "session-fork" && operation.state === OperationState.SUCCEEDED
-            && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId) {
-            await this.#recoverForkReceipt(pending, operation, epoch);
-            if (!this.#current(epoch)) return;
+            continue;
           }
           const messageRewind = pending.kind === "session-rewind" || pending.kind === "workspace-rewind";
           const exactOperation = operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
@@ -17619,7 +17703,7 @@ export class MobileClient {
             if (!this.#current(epoch)) return;
           }
           await this.#receipt(operation, pending, epoch, true);
-          if ((pending.kind === "session-rewind" || pending.kind === "session-side-chat") && exactOperation && isTerminal(operation.state) && this.#current(epoch)
+          if (pending.kind === "session-rewind" && exactOperation && isTerminal(operation.state) && this.#current(epoch)
             && !this.#state.pending.some((value) => value.operationId === pending.operationId)) {
             await this.composerDrafts?.clearOperationInput({ profileId: pending.taskJoinId
               ? mobileSharedTaskDraftProfileId(credential.profileId, credential.serverId, credential.origin, pending.taskJoinId)
@@ -17643,7 +17727,7 @@ export class MobileClient {
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
               "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch", "session-stop",
-              "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
+              "session-shell", "session-reset", "session-review", "session-clone", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
             && this.#current(epoch) && (pending.kind !== "message-delete" && pending.kind !== "session-stop" || this.#operationReceiptMatches(operation, pending))) {
             await this.refresh();
             if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground && this.#credential === credential
@@ -17816,13 +17900,19 @@ export class MobileClient {
     const epoch = this.#epoch;
     const operation = await this.network.getOperation(credential, operationId, this.#abort?.signal);
     if (!this.#current(epoch)) return;
+    const derivedTask = pending.kind === "session-fork" || pending.kind === "session-side-chat";
     if (operation) {
-      await this.#receipt(operation, pending, epoch);
+      if (derivedTask) {
+        await this.#reconcileDerivedTaskReceipt(pending, operation, credential, epoch);
+        if (!this.#current(epoch) || operation.state === OperationState.SUCCEEDED
+          && !this.#state.pending.some(item => item.operationId === operationId)) return;
+      } else await this.#receipt(operation, pending, epoch);
       throw new Error("The Joko node has this operation; its durable result was refreshed instead of discarding it.");
     }
     const next = this.#state.pending.filter((item) => item.operationId !== operationId);
     if (await this.#persistPending(next, epoch)) {
       this.#set({ pending: next, error: undefined });
+      if (derivedTask) await this.#clearDerivedInput({ profileId: credential.profileId, sessionId: pending.sessionId! }, operationId, epoch);
       if (this.newTaskDrafts && this.#activeProfileId) {
         const identity = { profileId: this.#activeProfileId };
         const draft = await this.newTaskDrafts.read(identity);

@@ -880,7 +880,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const currentShareSelection = shareSelection?.sessionId === session.id ? shareSelection : undefined;
   const queuedMessageWork = queue.some((item) => item.sessionId === session.id && !["completed", "cancelled", "failed"].includes(item.state));
   const messageActionsIdle = session.state === "idle" && !queuedMessageWork;
-  const messageRewindSupported = !reviewReadOnly && !sideChatRuntimeReadOnly && messageActionsIdle && backend?.capabilities.get("session.rewind")?.supported === true;
+  const messageRewindAvailable = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("session.rewind")?.supported === true;
+  const messageRewindSupported = messageActionsIdle && messageRewindAvailable;
   const messageDeleteSupported = !reviewReadOnly && !sideChatRuntimeReadOnly && sessionCapabilitySupportsTarget(
     backend?.capabilities.get("session.message_delete"),
     controller.state.snapshot.targets.find(candidate => candidate.id === session.targetId)
@@ -895,7 +896,21 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     backend?.capabilities.get("session.rewind_to_start"),
     controller.state.snapshot.targets.find((candidate) => candidate.id === session.targetId)
   );
-  const editableMessageId = messageRewindSupported && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported) ? latestVisibleUserMessage.id : undefined;
+  const canStopForMessageEdit = (current: SessionView, item: TimelineItemView | undefined, currentQueue: readonly QueueItemView[]) => {
+    const runId = current.activeRunId;
+    return !guest && controllerRef.current.state.taskSource?.kind !== "joined" && !current.hidden
+      && current.derivationOrigin?.sideChat !== true && current.automationOrigin === undefined
+      && (partnerConversation === undefined || partnerConversation.kind === "task")
+      && current.state === "running" && runId !== undefined && current.activeAttemptId !== undefined
+      && !stoppingRunIdsRef.current.has(runId) && activeCompaction === undefined && interaction === undefined
+      && canAbort && messageRewindAvailable && item?.runId === runId && item.sourceEventId !== undefined
+      && item.streaming !== true && item.nativeRewindBefore?.kind === "native_entry"
+      && item.sharedTaskAuthor === undefined && item.partnerPrivateOrigin === undefined && item.automationOrigin === undefined
+      && item.inputDelivery !== "scheduler" && !hasPendingComposerQueueItems(currentQueue, current.id);
+  };
+  const editStopsRun = canStopForMessageEdit(session, latestVisibleUserMessage, queue);
+  const editableMessageId = (messageRewindSupported || editStopsRun) && canEditVisibleUserMessage(latestVisibleUserMessage, rewindToStartSupported)
+    ? latestVisibleUserMessage.id : undefined;
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
     : [];
@@ -1213,6 +1228,34 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     });
   };
   const stopInFlight = session.activeRunId !== undefined && stoppingRunIdsRef.current.has(session.activeRunId);
+
+  const beginMessageEdit = (item: TimelineItemView): boolean => {
+    if (item.id !== editableMessageId) return false;
+    if (!editStopsRun) return true;
+    const sourceIsCurrent = capturePaneMessageAction(false);
+    const sourceState = controllerRef.current.state;
+    const sourceAbort = controllerRef.current.abort;
+    const sourceSession = sourceState.snapshot.sessions.find(candidate => candidate.id === session.id);
+    const runId = session.activeRunId;
+    const attemptId = session.activeAttemptId;
+    const eventId = item.sourceEventId;
+    if (!sourceIsCurrent() || sourceSession === undefined || runId === undefined || attemptId === undefined || eventId === undefined
+      || sourceSession.activeRunId !== runId || sourceSession.activeAttemptId !== attemptId
+      || !canStopForMessageEdit(sourceSession, item, sourceState.snapshot.queue)) return false;
+    stoppingRunIdsRef.current.add(runId);
+    setStopRevision(current => current + 1);
+    runAction(`stop:${runId}`, async () => {
+      try {
+        if (!sourceIsCurrent() || controllerRef.current.abort !== sourceAbort) throw new Error(t("timeline.editStale"));
+        await sourceAbort(runId, { sessionId: session.id, expectedGeneration: session.generation,
+          attemptId, messageId: item.messageId ?? item.id, eventId });
+      } finally {
+        stoppingRunIdsRef.current.delete(runId);
+        setStopRevision(current => current + 1);
+      }
+    });
+    return true;
+  };
 
   const performErrorTailRecovery = async (sourceSessionId: string, error: ErrorView, action: ExecutableRecoveryAction): Promise<void> => {
     if (activeSessionIdRef.current !== sourceSessionId) throw new Error(t("errorTail.staleAction"));
@@ -2440,8 +2483,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         shareSelection={currentShareSelection === undefined ? undefined : { selectedIds: currentShareSelection.selectedIds }}
         onStartShareSelection={startShareSelection}
         onToggleShareMessage={currentShareSelection === undefined ? undefined : toggleShareMessage}
-        editableMessageId={editableMessageId}
-        onMoveEditedMessageToComposer={moveEditedMessageToComposer}
+        messageEdit={{ messageId: editableMessageId, stopRunning: editStopsRun,
+          blockedReason: messageActionsIdle ? undefined : t("timeline.editWaitForIdle"),
+          begin: beginMessageEdit, submit: moveEditedMessageToComposer }}
         onPreviewMessageRewind={messageRewindSupported ? previewMessageRewind : undefined} rewindToStartSupported={rewindToStartSupported}
         onDeleteMessage={messageDeleteSupported ? openMessageDelete : undefined}
         messageDeleteBlockedReason={messageDeleteSupported ? messageDeleteBlockedReason : undefined}

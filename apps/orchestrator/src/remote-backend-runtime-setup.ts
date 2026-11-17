@@ -211,7 +211,10 @@ export class RemoteBackendRuntimeSetupManager {
     assertSetupRequestCurrent(assertRequestCurrent);
     const admission = this.#admit(input);
     const active = this.#activeInstalls.get(admission.resourceKey);
-    if (active !== undefined && sameScope(active.input, input)) {
+    if (active !== undefined) {
+      if (!sameScope(active.input, input)) {
+        throw new RemoteBackendRuntimeSetupError("busy", "A remote Backend runtime mutation is already active.");
+      }
       return active.events.at(-1)?.runtime ?? this.#snapshot(admission, "probing");
     }
     const uninstall = this.#activeUninstalls.get(admission.resourceKey);
@@ -570,9 +573,9 @@ function setupProbe(value: { readonly state: "ready" | "not_installed"; readonly
 }
 
 function runtimeResourceKey(provider: RemoteBackendRuntimeSetupProvider, host: RemoteHostRecord): string {
+  // Pinned aliases of one SSH server/account must serialize before either installer opens its remote lock.
   return JSON.stringify([
     provider.backendId,
-    host.hostname,
     host.port,
     host.user,
     host.trust?.algorithm ?? "",

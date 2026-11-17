@@ -893,6 +893,15 @@ message PerTurnOverrides {
 
 message AbortRunMutation {
   string run_id = 1;
+  AbortRunMessageEditSource message_edit = 2;
+}
+
+// The Stop and edit action is valid only for this active input and Attempt,
+// with no other pending input on the original task.
+message AbortRunMessageEditSource {
+  string source_message_id = 1;
+  string source_event_id = 2;
+  string attempt_id = 3;
 }
 
 message RetryRunMutation {

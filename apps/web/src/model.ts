@@ -6315,7 +6315,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, signal?: AbortSignal): Promise<boolean>;
   startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string>;
   reobserveReview(reviewRunId: string): Promise<void>;
-  abort(runId: string): Promise<void>;
+  abort(runId: string, messageEdit?: { readonly sessionId: string; readonly expectedGeneration: bigint;
+    readonly attemptId: string; readonly messageId: string; readonly eventId: string }): Promise<void>;
   abortRetry(runId: string): Promise<void>;
   retry(runId: string): Promise<void>;
   resetSession(sessionId: string): Promise<void>;

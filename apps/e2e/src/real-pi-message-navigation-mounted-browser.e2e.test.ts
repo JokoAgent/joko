@@ -1,19 +1,22 @@
 import { create } from "@bufbuild/protobuf";
-import { RunState, SnapshotScopeSchema } from "@joko/contracts";
+import { EntityKind, OperationMutationSchema, OperationState, RunState, SnapshotScopeSchema } from "@joko/contracts";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
 import { waitFor } from "./fixture.js";
-import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { cancelQueuedInputMutation, createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
 
-mountedIt("rewinds and edits reloaded real Pi rows by their original source and rejects a delayed edit after another client's turn", { timeout: 180_000 }, async () => {
+mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stops only the active input selected for editing", { timeout: 180_000 }, async () => {
   let fixture: RealPiSystemFixture | undefined, browser: Browser | undefined, page: Page | undefined;
   let releaseNavigation: (() => void) | undefined;
+  let releaseProviderResponse: (() => void) | undefined;
+  let releaseStop: (() => void) | undefined;
+  let holdNextResponse = false;
   const evidenceDirectory = process.env.RUNNER_TEMP === undefined ? undefined
     : join(process.env.RUNNER_TEMP, "joko-web-evidence", "message-navigation");
   const capture = async (name: string) => {
@@ -23,7 +26,13 @@ mountedIt("rewinds and edits reloaded real Pi rows by their original source and 
   };
   try {
     fixture = await RealPiSystemFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
-      providerResponder: ({ requestNumber }) => ({ kind: "text", text: `Message navigation answer ${requestNumber}` }) });
+      providerResponder: async ({ requestNumber }) => {
+        if (holdNextResponse) {
+          holdNextResponse = false;
+          await new Promise<void>(resolve => { releaseProviderResponse = resolve; });
+        }
+        return { kind: "text", text: `Message navigation answer ${requestNumber}` };
+      } });
     const manager = await fixture.pair("Message navigation manager");
     const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
       backendId: "pi", targetId: "workspace-real-pi", displayName: "Original message navigation", providerId: REAL_PI_PROVIDER_ID,
@@ -129,12 +138,84 @@ mountedIt("rewinds and edits reloaded real Pi rows by their original source and 
     expect(navigation).toHaveBeenCalledTimes(3);
     expect(store.getOperation(navigation.mock.calls[2]![5].operationId).status).toBe("failed");
     await capture("delayed-edit-rejected-original-and-new-input-preserved.png");
+
+    holdNextResponse = true;
+    const runningSend = await submit(manager.clients.operation, manager.connectionId,
+      sendInputMutation(sessionId, BigInt(binding.generation), "Stop this running input so I can edit it."));
+    const runningRunId = queueRunIdFrom(runningSend);
+    const runningSource = await waitFor(() => Promise.resolve(store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false })),
+      origin => {
+        const event = origin === undefined ? undefined : store.findEvent(origin.eventId);
+        return event !== undefined && event.runId === runningRunId && event.payload.type === "message_complete"
+          && event.payload.nativeHistory?.identity?.rewindBefore?.kind === "native_entry";
+      }, "the running Pi user message with its native rewind boundary");
+    if (runningSource === undefined) throw new Error("The running Pi input has no durable user message.");
+    const activeAttemptId = store.getRun(runningRunId).descriptor.activeAttemptId;
+    expect(activeAttemptId).toBeDefined();
+    const rejected = await submit(manager.clients.operation, manager.connectionId, create(OperationMutationSchema, {
+      payload: { case: "abortRun", value: { runId: runningRunId, messageEdit: {
+        sourceMessageId: runningSource.messageId, sourceEventId: runningSource.eventId, attemptId: "retired-attempt"
+      } } },
+      preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: BigInt(binding.generation) }]
+    }));
+    expect(rejected.state).toBe(OperationState.FAILED);
+    expect(store.getRun(runningRunId).descriptor.state).toBe("running");
+    const runningRow = row(runningSource.messageId);
+    await runningRow.hover();
+    const stopAndEdit = runningRow.getByRole("button", { name: "Stop and edit message" });
+    const sendEdit = runningRow.getByRole("button", { name: "Move to composer" });
+    const cancelEdit = runningRow.getByRole("button", { name: "Cancel", exact: true });
+    const originalAbort = host.abort.bind(host);
+    const stopGate = new Promise<void>(resolve => { releaseStop = resolve; });
+    const abort = vi.spyOn(host, "abort").mockImplementationOnce(async (...args) => {
+      await stopGate;
+      return originalAbort(...args);
+    });
+    await stopAndEdit.click();
+    await runningRow.locator("textarea").fill("An edit during the original stop.");
+    expect(await sendEdit.isDisabled()).toBe(true);
+    await waitFor(() => Promise.resolve(abort.mock.calls.length), count => count === 1, "the first stop for editing");
+    const pendingSend = await submit(manager.clients.operation, manager.connectionId,
+      sendInputMutation(sessionId, BigInt(binding.generation), "This independently queued input stays pending."));
+    const pendingRunId = queueRunIdFrom(pendingSend);
+    const pendingItem = store.findQueueItemByRunId(sessionId, pendingRunId)!;
+    expect(pendingItem.state).toBe("accepted");
+    releaseStop!();
+    await expect(abort.mock.results[0]!.value).rejects.toThrow("Finish or remove pending input");
+    expect(store.getRun(runningRunId).descriptor.state).toBe("running");
+    expect(store.getQueueItem(pendingItem.id).state).toBe("accepted");
+    expect(await runningRow.locator("textarea").inputValue()).toBe("An edit during the original stop.");
+    await cancelEdit.click();
+    const pendingResult = pendingSend.result?.payload;
+    if (pendingResult?.case !== "queueItem") throw new Error("The pending Pi input has no queue receipt.");
+    const cancelled = await submit(manager.clients.operation, manager.connectionId, cancelQueuedInputMutation(pendingResult.value));
+    expect(cancelled.state).toBe(OperationState.SUCCEEDED);
+
+    await runningRow.hover();
+    await stopAndEdit.click();
+    await runningRow.locator("textarea").waitFor({ state: "visible" });
+    await waitFor(() => manager.clients.run.getRun({ runId: runningRunId }), response => response.run?.state === RunState.ABORTED,
+      "the original Run stopped for editing", 15_000);
+    expect(abort).toHaveBeenCalledTimes(2);
+    expect(abort.mock.calls[1]).toEqual([sessionId, runningRunId, expect.any(Function), expect.objectContaining({
+      messageEdit: { ...runningSource, attemptId: activeAttemptId }
+    })]);
+    await waitFor(() => sendEdit.isEnabled(), enabled => enabled, "the edit can be confirmed after the original Run stops");
+    await capture("running-input-stopped-for-edit.png");
+    const requestsAfterStop = fixture.providerRequests.length;
+    await cancelEdit.click();
+    expect(navigation).toHaveBeenCalledTimes(3);
+    expect(fixture.providerRequests).toHaveLength(requestsAfterStop);
+    expect(store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false })?.messageId).toBe(runningSource.messageId);
+    abort.mockRestore();
     if (evidenceDirectory !== undefined) await writeFile(join(evidenceDirectory, "message-navigation.json"), JSON.stringify({
       sessionId, editedSource, rewindSource, delayedSource, newerSource, generation: binding.generation,
       revisionBeforeNewInput: revisionBeforeNewInput.toString(), revisionAfterNewInput: store.getSession(sessionId).revision.toString(),
       nativeBranchUnchangedAfterRejection: true, nativeNavigationRequests: navigation.mock.calls.length,
       editOperationId: navigation.mock.calls[2]![5].operationId,
-      editOperationState: store.getOperation(navigation.mock.calls[2]![5].operationId).status
+      editOperationState: store.getOperation(navigation.mock.calls[2]![5].operationId).status,
+      runningSource, runningRunId, activeAttemptId, pendingRunId, rejectedAttemptOperationId: rejected.operationId,
+      confirmDisabledDuringStop: true, pendingInputPreserved: true, originalRunStopped: true
     }, null, 2));
     navigation.mockRestore();
   } catch (error) {
@@ -142,6 +223,7 @@ mountedIt("rewinds and edits reloaded real Pi rows by their original source and 
     await capture("failed.png").catch(() => undefined);
     throw error;
   } finally {
-    releaseNavigation?.(); await browser?.close(); await fixture?.close({ removeRoot: true });
+    releaseStop?.(); releaseProviderResponse?.(); releaseNavigation?.();
+    await browser?.close(); await fixture?.close({ removeRoot: true });
   }
 });

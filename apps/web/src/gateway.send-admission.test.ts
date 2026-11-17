@@ -89,9 +89,8 @@ describe("input preparation and admission", () => {
       expect(read).not.toHaveBeenCalled();
       generation = 5n; admission.expectedGeneration = generation;
       releaseCommands();
-      await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
     }
-    expect(read).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
     expect(submissions).toEqual([]);
     generation = 5n;
     admission.expectedGeneration = generation;

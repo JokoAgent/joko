@@ -92,7 +92,7 @@ export class MobileComposerDraftStore {
     }
   }
 
-  /** An accepted rewind can hide its original Event, so retain approved input separately from the live draft. */
+  /** Retain an operation's approved input even after its original Event leaves the active history. */
   async retainOperationInput(identity: MobileComposerDraftIdentity, operationId: string, draft: MobileComposerDraft): Promise<void> {
     const exact = normalizeIdentity(identity); assertLocalId(operationId, "operation");
     const value = normalizeMobileComposerDraft(draft);

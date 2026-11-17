@@ -54,17 +54,18 @@ mountedIt("finishes a real Pi thinking phase before tool completion and renders 
     expect(fixture.application.store.getRun(terminal.runId).descriptor.state).toBe("running");
     expect(events().some(event => event.payload.type === "message_complete" && event.payload.blocks.some(block => block.kind === "thinking" && block.streamBlockId === phase.blockId))).toBe(false);
     const timeline = pane.locator(`[data-timeline-session-id='${sessionId}']`);
-    const showThinking = async () => {
-      // This fixture's first work group owns the thinking block. Adoption can
-      // merge later groups while the original tool continuation is streaming.
-      const header = timeline.locator(".work-group__header").first();
-      if (await header.getAttribute("aria-expanded") === "false") await header.click();
+    const sourceThinkingId = `${phase.blockId}:thinking:${phase.contentIndex}`;
+    const showThinking = async (workChildId: string, timeLeft = () => 30_000) => {
+      const header = timeline.locator(`[data-timeline-item-ids~='${workChildId}'] .work-group__header`);
+      if (await header.getAttribute("aria-expanded", { timeout: timeLeft() }) === "false") await header.click({ timeout: timeLeft() });
       const card = timeline.locator(".thinking-block").filter({ hasText: thinking });
-      await card.waitFor({ state: "visible", timeout: 30_000 });
-      if (!await card.evaluate(element => (element as HTMLDetailsElement).open)) await card.locator("summary").click();
+      await card.waitFor({ state: "visible", timeout: timeLeft() });
+      if (!await card.evaluate(element => (element as HTMLDetailsElement).open, undefined, { timeout: timeLeft() })) {
+        await card.locator("summary").click({ timeout: timeLeft() });
+      }
       return card;
     };
-    const card = await showThinking();
+    const card = await showThinking(sourceThinkingId);
     expect(await card.count()).toBe(1);
     expect(await card.locator(".thinking-pulse").count()).toBe(0);
     expect(await card.locator("summary").innerText()).toContain(`Thinking · ${Math.floor(phase.durationMs! / 1_000)}s`);
@@ -84,14 +85,27 @@ mountedIt("finishes a real Pi thinking phase before tool completion and renders 
     if (completed?.payload.type !== "message_complete") throw new Error("The completed assistant did not adopt its original thinking source.");
     expect(completed.payload.blocks[0]).toMatchObject({ kind: "thinking", text: thinking, streamBlockId: phase.blockId, durationMs: phase.durationMs });
     expect(events().some(event => event.payload.type === "tool_result" && event.payload.callId === "thinking-read")).toBe(true);
-    const adopted = await showThinking();
+    const adopted = await showThinking(sourceThinkingId);
     expect(await adopted.count()).toBe(1);
     expect(await adopted.locator(".thinking-pulse").count()).toBe(0);
     await capture("thinking-adopted-during-tool-continuation.png");
     releaseAnswer();
     await waitFor(() => Promise.resolve(fixture!.application.store.getRun(terminal.runId!).descriptor.state), state => state === "completed", "the original Pi Run completion", 30_000);
-    await timeline.getByText("Thinking fixture answer", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
-    expect(await (await showThinking()).count()).toBe(1);
+    const deadline = Date.now() + 30_000;
+    const timeLeft = () => Math.max(1, deadline - Date.now());
+    const history = await waitFor(async () => events().find(event => event.metadata?.fields["nativeHydration"] === true
+      && event.payload.type === "message_complete" && event.payload.blocks.some(block => block.kind === "tool_call" && block.callId === "thinking-read")),
+    event => event !== undefined, "the native history of the original Pi tool call", timeLeft());
+    if (history?.payload.type !== "message_complete" || history.payload.nativeHistory?.identity === undefined) {
+      throw new Error("The original Pi tool call has no confirmed native history identity.");
+    }
+    const thinkingIndex = history.payload.blocks.findIndex(block => block.kind === "thinking" && block.text === thinking);
+    expect(thinkingIndex).toBeGreaterThanOrEqual(0);
+    await timeline.getByText("Thinking fixture answer", { exact: true }).waitFor({ state: "visible", timeout: timeLeft() });
+    const final = await showThinking(`${history.payload.nativeHistory.identity.entryId}:thinking:${thinkingIndex}`, timeLeft);
+    expect(await final.count()).toBe(1);
+    expect(await final.locator(".thinking-pulse").count()).toBe(0);
+    await capture("thinking-completed-once.png");
   } finally {
     releasePhase(); releaseAnswer();
     await browser?.close(); await fixture?.close({ removeRoot: true });

@@ -6336,6 +6336,9 @@ async function advanceSessionLifecycleCleanup(
     });
   };
   try {
+    for (const child of dependencies.store.prepareDependentSideChatCleanups(cleanup, (dependencies.now ?? Date.now)())) {
+      await advanceSessionLifecycleCleanup(dependencies, child);
+    }
     if (!cleanup.closeCompleted) {
       await dependencies.sessionHost.prepareSessionLifecycleClose(
         cleanup.sessionId,
@@ -6574,6 +6577,7 @@ async function resumePendingSessionLifecycleCleanup(
 ): Promise<SessionLifecycleCleanupRecord | undefined> {
   let cleanup = dependencies.store.findSessionLifecycleCleanup(operationId);
   if (cleanup?.state !== "pending") return cleanup;
+  if (dependencies.store.isDependentSideChatCleanup(cleanup)) return cleanup;
   // Service-owned Partner retirement has its own durable recovery coordinator.
   if (dependencies.sessionHost.isPartnerSessionRetiring(cleanup.sessionId)) return cleanup;
   if (dependencies.sessionHost.isPersonalDevelopmentSessionEnding?.(cleanup.sessionId)
@@ -18254,6 +18258,17 @@ async function dispatchMutation(
     }
     case "abortRun": {
       const run = dependencies.store.getRun(payload.value.runId);
+      const edit = payload.value.messageEdit;
+      const editSource = edit === undefined ? undefined : {
+        messageId: strictDerivationIdentity(edit.sourceMessageId, "abort_run.message_edit.source_message_id"),
+        eventId: strictDerivationIdentity(edit.sourceEventId, "abort_run.message_edit.source_event_id"),
+        attemptId: strictDerivationIdentity(edit.attemptId, "abort_run.message_edit.attempt_id")
+      };
+      if (editSource !== undefined && !mutation.preconditions.some(condition =>
+        condition.entity?.kind === contract.EntityKind.SESSION && condition.entity.id === run.descriptor.sessionId
+        && condition.expectedGeneration > 0n)) {
+        throw invalidArgument("abort_run.message_edit requires the original Session generation");
+      }
       const otherPreconditions = mutation.preconditions.filter(condition =>
         condition.entity?.kind !== contract.EntityKind.RUN || condition.entity.id !== run.descriptor.id
         || condition.expectedRevision === undefined);
@@ -18266,9 +18281,10 @@ async function dispatchMutation(
           let stoppedBeforeDispatch: OperationExecution<OperationOutcome> | undefined;
           await host.abort(run.descriptor.sessionId, run.descriptor.id, () => {
             dependencies.connections.fence(connection);
-            if (fencedRunRevision) validatePreconditions(dependencies.store, mutation);
+            if (fencedRunRevision || editSource !== undefined) validatePreconditions(dependencies.store, mutation);
           }, {
             ownerStop: true,
+            ...(editSource === undefined ? {} : { messageEdit: editSource }),
             completeBeforeDispatch: (finalize) => { stoppedBeforeDispatch = commit(finalize); }
           });
           return stoppedBeforeDispatch ?? commit();

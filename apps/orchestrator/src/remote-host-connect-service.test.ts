@@ -17,7 +17,7 @@ import {
   type RemoteProcessTransportPort,
   type SshConfigFilePort
 } from "@joko/remote-ssh";
-import { OperationalStore } from "@joko/store";
+import { OperationalStore, type RemoteHostRecord } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { toProtoRevision } from "./proto-mapper.js";
@@ -28,6 +28,7 @@ import {
   type RemoteBackendRuntimeInstallEvent,
   type RemoteBackendRuntimeSnapshot
 } from "./remote-backend-runtime-setup.js";
+import { REMOTE_CODEX_EXPECTED_VERSION_OUTPUT } from "./remote-codex-installation.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
 import {
   RemoteHostRegistry,
@@ -597,6 +598,98 @@ describe("RemoteHostService", () => {
     expect(open.mock.calls.map(([input]) => input.args[0])).toEqual(stage === "probe" ? ["-c"] : ["-c", "-s"]);
     expect(installBytes).not.toHaveBeenCalled();
     expect(kill).toHaveBeenCalledTimes(stage === "probe" ? 0 : 1);
+  });
+
+  it("admits only one installer through two verified aliases of the same SSH account", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let installed = false;
+    const installing = vi.fn();
+    const commands: Array<{ hostname: string; mode: string }> = [];
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: false,
+      tcpForwarding: false, interactiveTerminal: false };
+    const fixture = createFixture({ connector: { capabilities, async connect(connection) {
+      await connection.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(2, 4, 6, 8) });
+      connection.onAuthenticating();
+      const processes: RemoteProcessTransportPort = { async open(request) {
+        const probe = request.args[0] === "-c";
+        commands.push({ hostname: connection.hostname, mode: request.args[0]! });
+        const handle = Object.assign(new EventEmitter(), {
+          pid: 42, exitCode: null as number | null, signalCode: null,
+          stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true
+        });
+        const stdin = new Writable({
+          write(_chunk, _encoding, callback) { callback(); },
+          final(callback) {
+            const finish = () => {
+              if (probe) handle.stdout.write(Buffer.from(["/srv/project", "/home/test/.joko/runtime/v1/codex-home",
+                "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
+                installed ? REMOTE_CODEX_EXPECTED_VERSION_OUTPUT : "", installed ? "ready" : "not_installed", ""].join("\0")));
+              else { installed = true; handle.stdout.write("JOKO_PHASE validating\nJOKO_PHASE complete\n"); }
+              handle.exitCode = 0; handle.emit("exit", 0, null);
+            };
+            if (probe) queueMicrotask(finish);
+            else { installing(); void gate.then(finish); }
+            callback();
+          }
+        });
+        return Object.assign(handle, { stdin }) satisfies RemoteProcessHandle;
+      } };
+      return { capabilities, processes, close: async () => undefined };
+    } } });
+    const hosts: RemoteHostRecord[] = [];
+    for (const [id, hostname] of [["first-alias", "first.example.test"], ["second-alias", "second.example.test"]] as const) {
+      const host = fixture.registry.create({ targetId: "target-a", id, hostname, user: "maker", source: "manual" });
+      const connected = await fixture.registry.connect(host.targetId, host.id, host.revision);
+      expect(connected.ok).toBe(true); hosts.push(connected.host);
+    }
+    expect(hosts[0]!.trust).toMatchObject({ fingerprint: hosts[1]!.trust!.fingerprint });
+    const runtime = new RemoteBackendRuntimeSetupManager({ store: fixture.store, registry: fixture.registry,
+      providers: [createRemoteCodexRuntimeSetupProvider("pi")], now: fixture.now });
+    cleanups.push(() => runtime.close());
+    const owners = pairedOwners(fixture, runtime);
+    const requests = hosts.map(host => ({ targetId: host.targetId, hostId: host.id,
+      expectedTargetRevision: toProtoRevision(fixture.registry.targetRevision(host.targetId)),
+      expectedHostRevision: toProtoRevision(host.revision) }));
+    const originalRequest = create(contract.InstallRemoteBackendRuntimeRequestSchema, { ...requests[0]!, requestId: "alias-install-a" });
+    const consume = async () => {
+      const events: contract.InstallRemoteBackendRuntimeResponse[] = [];
+      for await (const event of owners.service.installRemoteBackendRuntime(originalRequest, owners.original)) {
+        events.push(create(contract.InstallRemoteBackendRuntimeResponseSchema, event));
+      }
+      return events;
+    };
+    let original: ReturnType<typeof consume> | undefined;
+    try {
+      for (const request of requests) {
+        expect((await owners.service.probeRemoteBackendRuntime(create(contract.ProbeRemoteBackendRuntimeRequestSchema, request), owners.original)).runtime)
+          .toMatchObject({ hostId: request.hostId, state: contract.RemoteBackendRuntimeState.NOT_INSTALLED });
+      }
+      original = consume();
+      await vi.waitFor(() => expect(installing).toHaveBeenCalledOnce());
+      const beforeAlias = [...commands];
+      const other = owners.service.installRemoteBackendRuntime(create(contract.InstallRemoteBackendRuntimeRequestSchema, {
+        ...requests[1]!, requestId: "alias-install-b"
+      }), owners.observer)[Symbol.asyncIterator]();
+      await expect(other.next()).rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+      await expect(owners.service.probeRemoteBackendRuntime(create(contract.ProbeRemoteBackendRuntimeRequestSchema, requests[1]!), owners.observer))
+        .rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+      await expect(owners.service.uninstallRemoteBackendRuntime(create(contract.UninstallRemoteBackendRuntimeRequestSchema, {
+        ...requests[1]!, requestId: "alias-uninstall"
+      }), owners.observer)).rejects.toSatisfy(connectCode(Code.FailedPrecondition));
+      expect(commands).toEqual(beforeAlias);
+      expect(commands.filter(command => command.mode === "-s")).toEqual([{ hostname: "first.example.test", mode: "-s" }]);
+      release();
+      const completed = await original;
+      expect(completed.at(-1)?.runtime).toMatchObject({ hostId: hosts[0]!.id, state: contract.RemoteBackendRuntimeState.READY });
+      const beforeReplay = [...commands];
+      expect(await consume()).toEqual(completed);
+      expect(commands).toEqual(beforeReplay);
+      expect((await owners.service.probeRemoteBackendRuntime(create(contract.ProbeRemoteBackendRuntimeRequestSchema, requests[1]!), owners.observer)).runtime)
+        .toMatchObject({ hostId: hosts[1]!.id, state: contract.RemoteBackendRuntimeState.READY });
+      expect(commands.at(-1)).toEqual({ hostname: "second.example.test", mode: "-c" });
+      expect(installing).toHaveBeenCalledOnce();
+    } finally { release(); await original?.catch(() => undefined); }
   });
 
   it("streams an initial snapshot and ordered target-local changes until authorization is revoked", async () => {

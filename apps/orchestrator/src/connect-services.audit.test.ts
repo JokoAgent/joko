@@ -171,8 +171,14 @@ it.each(["success", "target-changed", "binding-changed", "revoked"] as const)("f
     await expect(operations.submitOperation({ ...request, operationId: "stale-resume", mutation: stale }, auth)).rejects.toMatchObject({ code: Code.Aborted });
     expect(resume).not.toHaveBeenCalled();
     if (boundary === "revoked") {
-      await expect(operations.submitOperation(request, auth)).rejects.toMatchObject({ code: Code.Unauthenticated });
+      const result = await operations.submitOperation(request, auth);
+      expect(result.operation).toMatchObject({ state: contract.OperationState.FAILED, error: {
+        code: "EFFECT_FAILED", phase: "effect", retryable: false,
+        queueImpact: contract.StateImpact.MAY_HAVE_CHANGED, nativeSessionImpact: contract.StateImpact.MAY_HAVE_CHANGED,
+        workspaceImpact: contract.StateImpact.MAY_HAVE_CHANGED
+      } });
       expect(store.getOperation(request.operationId).status).toBe("failed");
+      await expect(operations.submitOperation(request, auth)).rejects.toMatchObject({ code: Code.Unauthenticated });
     } else {
       const result = await operations.submitOperation(request, auth);
       expect(result.operation?.state).toBe(boundary === "success" ? contract.OperationState.SUCCEEDED : contract.OperationState.FAILED);

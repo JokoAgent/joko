@@ -336,7 +336,10 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
       workspaceImpact: StateImpact.MAY_HAVE_CHANGED
     } });
     const renamedPlan = remote.lastPlan!;
-    const renamedPending = running.application.store.findNativeSessionDerivation(renamedCloneId)!;
+    const renamedCandidates = running.application.store.listUnadoptedNativeSessionDerivations().filter(record =>
+      record.sessionId === renamedPlan.sessionId && record.remoteWorktreePlan?.leaseId === renamedPlan.leaseId);
+    expect(renamedCandidates).toHaveLength(1);
+    const renamedPending = renamedCandidates[0]!;
     expect(renamedPending).toMatchObject({ state: "workspace_cleanup_pending", cleanupToken: expect.any(String), remoteWorktreePlan: renamedPlan });
     expect(renamedPending.binding).toBeUndefined(); expect(renamedPending.worktree).toBeUndefined();
     expect(running.application.store.getTarget(targetId).descriptor.displayName).toBe("Renamed during original Clone");
@@ -346,7 +349,7 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(remote.deriveCount).toBe(derivesBeforeRetry);
     const checkoutBeforeRestart = remote.checkoutCalls.length;
     await running.close(); running = await start(config, remote);
-    expect(running.application.store.findNativeSessionDerivation(renamedCloneId)).toMatchObject({
+    expect(running.application.store.findNativeSessionDerivation(renamedPending.operationId)).toMatchObject({
       state: "cleaned", cleanupToken: renamedPending.cleanupToken, remoteWorktreePlan: renamedPlan
     });
     expect(remote.checkoutCalls.slice(checkoutBeforeRestart)).toEqual(["inspect", "release"]);

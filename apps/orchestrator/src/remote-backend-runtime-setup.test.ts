@@ -79,6 +79,80 @@ describe("RemoteBackendRuntimeSetupManager", () => {
     await fixture.manager.close();
   });
 
+  it("serializes pinned SSH aliases without sharing their progress or request identity", async () => {
+    let finish!: () => void;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const fixture = setupFixture({
+      probe: vi.fn(async () => ({ state: "not_installed" as const })),
+      install: vi.fn<RemoteBackendRuntimeSetupProvider["install"]>(async context => {
+        context.beginEffect();
+        await gate;
+        context.assertCurrent();
+        return { state: "ready", installedVersion: "1.2.3" };
+      })
+    });
+    const alias = { ...fixture.host, id: "host-alias", hostname: "other-name.test" };
+    fixture.hosts.set(alias.id, alias);
+    const original = { ...scope(fixture), requestId: "install-original", reinstall: false };
+    const other = { ...original, hostId: alias.id, requestId: "install-alias" };
+    try {
+      await expect(fixture.manager.probe(original)).resolves.toMatchObject({ hostId: original.hostId, state: "not_installed" });
+      await expect(fixture.manager.probe(other)).resolves.toMatchObject({ hostId: alias.id, state: "not_installed" });
+      const events = collect(fixture.manager.install(original));
+      await vi.waitFor(() => expect(fixture.provider.install).toHaveBeenCalledOnce());
+      expect(() => fixture.manager.install(other)).toThrowError(RemoteBackendRuntimeSetupError);
+      await expect(fixture.manager.probe(other)).rejects.toMatchObject({ code: "busy" });
+      await expect(fixture.manager.uninstall({ ...other, requestId: "uninstall-alias" })).rejects.toMatchObject({ code: "busy" });
+      expect(() => fixture.manager.install({ ...other, requestId: original.requestId })).toThrowError(RemoteBackendRuntimeSetupError);
+      expect(fixture.provider.uninstall).not.toHaveBeenCalled();
+      expect(fixture.capture).toHaveBeenCalledTimes(3);
+      fixture.hosts.set(alias.id, { ...alias, trust: undefined });
+      expect(() => fixture.manager.install(other)).toThrowError(expect.objectContaining({ code: "host_not_ready" }));
+      fixture.hosts.set(alias.id, alias);
+      finish();
+      const completed = await events;
+      expect(completed.at(-1)).toMatchObject({ phase: "complete", runtime: { hostId: original.hostId, state: "ready" } });
+      expect(await collect(fixture.manager.install(original))).toEqual(completed);
+      expect(fixture.provider.install).toHaveBeenCalledOnce();
+      expect((await collect(fixture.manager.install(other))).at(-1)).toMatchObject({
+        phase: "complete", runtime: { hostId: alias.id, state: "ready" }
+      });
+      expect(fixture.provider.install).toHaveBeenCalledTimes(2);
+    } finally {
+      finish();
+      await fixture.manager.close();
+    }
+  });
+
+  it.each(["user", "fingerprint"] as const)("keeps a different SSH %s independently mutable", async difference => {
+    let finish!: () => void;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const fixture = setupFixture({
+      probe: vi.fn(async () => ({ state: "not_installed" as const })),
+      install: vi.fn<RemoteBackendRuntimeSetupProvider["install"]>(async context => {
+        context.beginEffect();
+        await gate;
+        return { state: "ready", installedVersion: "1.2.3" };
+      })
+    });
+    const other: RemoteHostRecord = { ...fixture.host, id: "other-account",
+      ...(difference === "user" ? { user: "another-user" }
+        : { trust: { ...fixture.host.trust!, fingerprint: "SHA256:another-server" } }) };
+    fixture.hosts.set(other.id, other);
+    try {
+      const first = collect(fixture.manager.install({ ...scope(fixture), requestId: "first", reinstall: false }));
+      const second = collect(fixture.manager.install({ ...scope(fixture), hostId: other.id, requestId: "second", reinstall: false }));
+      await vi.waitFor(() => expect(fixture.provider.install).toHaveBeenCalledTimes(2));
+      finish();
+      const completed = await Promise.all([first, second]);
+      expect(completed.map(events => events.at(-1)?.runtime.hostId)).toEqual([fixture.host.id, other.id]);
+      expect(completed.every(events => events.at(-1)?.phase === "complete")).toBe(true);
+    } finally {
+      finish();
+      await fixture.manager.close();
+    }
+  });
+
   it("reports unknown when an effect may have changed state and its recovery probe also fails", async () => {
     const probe = vi.fn()
       .mockResolvedValueOnce({ state: "not_installed" as const })
@@ -191,9 +265,11 @@ function setupFixture(overrides: Partial<RemoteBackendRuntimeSetupProvider> = {}
   const processes = {} as RemoteProcessTransportPort;
   const lease = { capabilities: { processStreaming: true }, processes } as RemoteSshTransportLease;
   const fixture = { authorityCurrent: true };
-  const capture = vi.fn(async () => ({
-    host,
-    hostRevision: host.revision,
+  const hosts = new Map<string, RemoteHostRecord>([[host.id, host]]);
+  const getHost = (targetId: string, hostId: string) => ({ ...(hosts.get(hostId) ?? host), targetId, id: hostId });
+  const capture = vi.fn(async (targetId: string, hostId: string) => ({
+    host: getHost(targetId, hostId),
+    hostRevision: getHost(targetId, hostId).revision,
     leaseGeneration: 1,
     lease,
     assertCurrent: () => { if (!fixture.authorityCurrent) throw new Error("SSH authority changed"); },
@@ -215,13 +291,13 @@ function setupFixture(overrides: Partial<RemoteBackendRuntimeSetupProvider> = {}
   const manager = new RemoteBackendRuntimeSetupManager({
     store: { getTarget: () => target },
     registry: {
-      get: (targetId: string, hostId: string) => ({ ...host, targetId, id: hostId }),
+      get: getHost,
       captureProcessAuthority: capture
     } as unknown as Pick<RemoteHostRegistry, "get" | "captureProcessAuthority">,
     providers: [provider],
     now: () => 123
   });
-  return Object.assign(fixture, { target, host, capture, provider, manager });
+  return Object.assign(fixture, { target, host, hosts, capture, provider, manager });
 }
 
 function scope(fixture: ReturnType<typeof setupFixture>) {

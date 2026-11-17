@@ -47,7 +47,7 @@ describe("mobile thinking public projection", () => {
   });
 
   it.each([{ backendId: "codex" }, { targetId: "other" }, { sessionId: "other" }, { runId: "other" },
-    { attemptId: "other" }, { attemptId: "" }, { backendId: "" }, { targetId: "" }, { generation: 4n }])("does not adopt a thinking source from another owner: %j", scope => {
+    { attemptId: "other" }, { attemptId: "" }, { backendId: "" }, { targetId: "" }, { generation: 4n }])("does not adopt a thinking source from another owner: %o", scope => {
     const first = delta(1, 0, "Original owner");
     const final = event(2, "messageCompleted", { messageId: "other-completion", role: MessageRole.ASSISTANT,
       blocks: [{ content: { case: "thinking", value: { text: "Other owner", streamBlockId: "message" } } }] }, scope);

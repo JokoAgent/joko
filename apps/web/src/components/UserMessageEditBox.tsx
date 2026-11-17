@@ -4,11 +4,12 @@ import type { JSX, KeyboardEvent } from "react";
 import type { Translator } from "./types.js";
 import { Button, Spinner } from "./ui.js";
 
-export function UserMessageEditBox({ initialText, t, onCancel, onMoveToComposer }: {
+export function UserMessageEditBox({ initialText, t, onCancel, onMoveToComposer, blockedReason }: {
   readonly initialText: string;
   readonly t: Translator;
   readonly onCancel: () => void;
   readonly onMoveToComposer: (text: string) => Promise<void>;
+  readonly blockedReason?: string;
 }): JSX.Element {
   const [text, setText] = useState(initialText);
   const [submitting, setSubmitting] = useState(false);
@@ -32,7 +33,7 @@ export function UserMessageEditBox({ initialText, t, onCancel, onMoveToComposer 
 
   const save = async (): Promise<void> => {
     const value = text.trim();
-    if (value.length === 0 || submittingRef.current) return;
+    if (value.length === 0 || submittingRef.current || blockedReason !== undefined) return;
     submittingRef.current = true;
     setSubmitting(true);
     setError(undefined);
@@ -62,11 +63,13 @@ export function UserMessageEditBox({ initialText, t, onCancel, onMoveToComposer 
   return (
     <div className="message-user-edit" aria-label={t("timeline.editMessage")} aria-busy={submitting || undefined}>
       <textarea ref={textareaRef} value={text} disabled={submitting} rows={1} onChange={(event) => setText(event.target.value)} onKeyDown={onKeyDown} aria-label={t("timeline.editMessage")} />
-      <p className="message-user-edit__hint"><CornerDownLeft aria-hidden="true" />{t("timeline.editComposerHint")}</p>
+      {blockedReason === undefined
+        ? <p className="message-user-edit__hint"><CornerDownLeft aria-hidden="true" />{t("timeline.editComposerHint")}</p>
+        : <p className="message-user-edit__hint" role="status">{blockedReason}</p>}
       {error !== undefined && <p className="message-user-edit__error" role="alert"><AlertCircle aria-hidden="true" />{error}</p>}
       <div className="message-user-edit__actions">
         <Button tone="ghost" disabled={submitting} onClick={onCancel}>{t("common.cancel")}</Button>
-        <Button tone="primary" disabled={submitting || text.trim().length === 0} onClick={() => { void save(); }}>{submitting && <Spinner label={t("common.working")} />}{t("timeline.editMoveToComposer")}</Button>
+        <Button tone="primary" disabled={submitting || text.trim().length === 0 || blockedReason !== undefined} onClick={() => { void save(); }}>{submitting && <Spinner label={t("common.working")} />}{t("timeline.editMoveToComposer")}</Button>
       </div>
     </div>
   );

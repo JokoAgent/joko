@@ -265,11 +265,12 @@ mountedIt("edits the same original image in task and new-task drafts, restores v
     await overlay.getByRole("button", { name: "Save", exact: true }).click(); await overlay.waitFor({ state: "detached" });
   };
   const assertSentPixels = async (id: string) => {
-    const item = await waitFor(() => store.listQueueItems({ sessionId: id })[0], item => item?.state === "completed", "the annotated image input");
+    const item = await waitFor(async () => store.listQueueItems({ sessionId: id })[0], item => item?.state === "completed", "the annotated image input");
     expect(item!.body.images).toHaveLength(1);
     const image = await artifacts.readBlob(item!.body.images[0]!.blob);
     const pixel = await page.evaluate(async base64 => {
-      const bitmap = await createImageBitmap(await (await fetch("data:image/png;base64," + base64)).blob());
+      const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
       const canvas = document.createElement("canvas"); canvas.width = bitmap.width; canvas.height = bitmap.height;
       const context = canvas.getContext("2d")!; context.drawImage(bitmap, 0, 0); bitmap.close();
       return [...context.getImageData(canvas.width / 2, canvas.height / 2, 1, 1).data];
@@ -304,7 +305,7 @@ mountedIt("edits the same original image in task and new-task drafts, restores v
     await page.keyboard.press("Escape"); await readOnlyOverlay.waitFor({ state: "detached" });
     await selectModel("Test Multimodal");
     await edit(false); await edit(true); await composer.locator(".send-button").click();
-    const created = await waitFor(() => store.listSessions({ includeArchived: true }).find(value => value.descriptor.id !== sessionId), value => value !== undefined, "the new task with its original image draft");
+    const created = await waitFor(async () => store.listSessions({ includeArchived: true }).find(value => value.descriptor.id !== sessionId), value => value !== undefined, "the new task with its original image draft");
     await assertSentPixels(created!.descriptor.id); expect(store.listQueueItems({ sessionId })).toHaveLength(1); expect(errors).toEqual([]);
   } catch (error) { await capture("editable-draft-failure").catch(() => undefined); throw error; }
 });

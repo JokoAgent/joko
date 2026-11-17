@@ -16439,8 +16439,46 @@ export class OperationalStore {
         asSqlInteger(this.requireActiveRevision())
       );
       this.terminalizeSessionWork(sessionId, `session-lifecycle:${operationId}`, at);
-      return this.getSessionLifecycleCleanup(operationId);
+      const cleanup = this.getSessionLifecycleCleanup(operationId);
+      this.prepareDependentSideChatCleanups(cleanup, at);
+      return cleanup;
     });
+  }
+
+  /** The ordinary parent deletion owns each dependent's usual close and workspace cleanup. */
+  prepareDependentSideChatCleanups(cleanup: SessionLifecycleCleanupRecord, at: number): SessionLifecycleCleanupRecord[] {
+    const children = this.sideChatLifecycleChildren(cleanup);
+    if (children.length === 0) return [];
+    return this.write(() => children.map(({ descriptor: child }) => {
+      const operationId = dependentSideChatCleanupId(cleanup.operationId, child.id);
+      if (this.findOperation(operationId) !== undefined) throw new StoreError("A dependent Side Chat cleanup identity is already in use.");
+      return this.findSessionLifecycleCleanup(operationId) ?? this.prepareSessionLifecycleCleanup({
+        operationId, sessionId: child.id, disposition: "delete", releaseWorktree: child.worktree !== undefined,
+        cleanupGitSafety: cleanup.cleanupGitSafety, at
+      });
+    }));
+  }
+
+  isDependentSideChatCleanup(cleanup: SessionLifecycleCleanupRecord): boolean {
+    const origin = this.getSession(cleanup.sessionId).descriptor.derivationOrigin;
+    if (!origin?.sideChat) return false;
+    const parent = this.findPendingSessionLifecycleCleanup(origin.sourceSessionId);
+    return parent?.disposition === "delete" && cleanup.operationId === dependentSideChatCleanupId(parent.operationId, cleanup.sessionId);
+  }
+
+  private sideChatLifecycleChildren(cleanup: SessionLifecycleCleanupRecord): StoredSession[] {
+    if (cleanup.disposition !== "delete" || cleanup.state !== "pending") return [];
+    const operation = this.findOperation(cleanup.operationId);
+    if (operation?.kind !== "deleteSession" || operation.completionMode !== "external_effect" || operation.connectionId === undefined) return [];
+    const parent = this.getSession(cleanup.sessionId).descriptor;
+    if (parent.hidden || parent.derivationOrigin?.sideChat || parent.remoteWorkspace || parent.worktree) return [];
+    const rows = this.database.prepare(`
+      SELECT id FROM product_sessions
+      WHERE derivation_kind = 'side_chat' AND derivation_source_session_id = ?
+        AND backend_id = ? AND target_id = ? AND deleted_at IS NULL
+      ORDER BY id
+    `).all(parent.id, parent.backendId, parent.targetId) as Row[];
+    return rows.map(row => this.getSession(String(row["id"])));
   }
 
   findSessionLifecycleCleanup(operationId: string): SessionLifecycleCleanupRecord | undefined {
@@ -16549,6 +16587,16 @@ export class OperationalStore {
         || !cleanup.gitSafetyCompleted
       ) throw new StoreError("Session lifecycle cleanup still has pending external effects.");
       const session = this.getSession(cleanup.sessionId);
+      const dependentIds = new Set(this.sideChatLifecycleChildren(cleanup).map(child => child.descriptor.id));
+      for (const childId of dependentIds) {
+        this.finalizeSessionLifecycleCleanup({ operationId: dependentSideChatCleanupId(operationId, childId), at });
+      }
+      if (dependentIds.size > 0) {
+        const shares = new TaskShareStore(this, () => at);
+        for (const share of shares.list()) {
+          if (share.status === "active" && dependentIds.has(share.sessionId)) shares.end(share.shareId);
+        }
+      }
       if (cleanup.disposition === "archive") {
         const clearPin = session.descriptor.pinned && this.findOperation(operationId)?.kind === "archiveSession";
         if (!session.descriptor.archived || clearPin) {
@@ -22982,6 +23030,10 @@ function nativeCatalogAdoptionFromRow(row: Row): NativeCatalogAdoptionRecord {
     updatedAt: numberValue(row["updated_at"]),
     revision: toBigInt(row["revision"])
   };
+}
+
+function dependentSideChatCleanupId(operationId: string, sessionId: string): string {
+  return `side-chat-lifecycle-${createHash("sha256").update(JSON.stringify([operationId, sessionId])).digest("hex")}`;
 }
 
 function sessionLifecycleCleanupFromRow(row: Row): SessionLifecycleCleanupRecord {

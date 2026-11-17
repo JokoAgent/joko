@@ -291,7 +291,10 @@ export class TaskSharingHost {
       try { this.shares.assertOwnPending(lease.proof, payload.value.queueItemId); }
       catch { throw denied("Only your own pending input may be changed."); }
     }
-    if (payload.case === "abortRun" && this.options.store.getRun(payload.value.runId).descriptor.sessionId !== lease.scope.sessionId) throw denied("The Run belongs to another task.");
+    if (payload.case === "abortRun") {
+      if (payload.value.messageEdit !== undefined) throw denied("Editing a sent message requires the task owner.");
+      if (this.options.store.getRun(payload.value.runId).descriptor.sessionId !== lease.scope.sessionId) throw denied("The Run belongs to another task.");
+    }
     if (payload.case === "sendInput") {
       const overrides = payload.value.overrides;
       if (overrides && (overrides.permissionMode !== undefined || overrides.planMode !== undefined || overrides.extraDirectoryIds.length > 0)) throw denied("Task guests cannot change execution permissions.");

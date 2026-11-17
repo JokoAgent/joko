@@ -3852,7 +3852,7 @@ export function useAppController(): AppController {
     testVoiceInputConnection: (signal) => gateway().testVoiceInputConnection(signal),
     startReview: (sourceSessionId, focus, attachments) => gateway().startReview(sourceSessionId, focus, attachments),
     reobserveReview: (reviewRunId) => gateway().reobserveReview(reviewRunId),
-    abort: (runId) => gateway().abort(runId),
+    abort: (...args) => gateway().abort(...args),
     abortRetry: (runId) => gateway().abortRetry(runId),
     retry: (runId) => gateway().retry(runId),
     resetSession: (sessionId) => gateway().resetSession(sessionId),
