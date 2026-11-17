@@ -76,7 +76,7 @@ describe("session gamepad actions", () => {
     await view.action("fork-task");
     expect(view.api.setModel).not.toHaveBeenCalled();
     expect(view.api.setPlanMode).not.toHaveBeenCalled();
-    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.forkMessage).not.toHaveBeenCalled();
     expect(view.host.textContent).toContain("Message input");
     await view.action("toggle-pin"); await view.flush();
     expect(view.api.pinSession).toHaveBeenCalledExactlyOnceWith("task", true);
@@ -97,11 +97,11 @@ describe("session gamepad actions", () => {
     await view.action("copy-task-link"); expect(view.copy).toHaveBeenCalledOnce();
     await view.action("fork-task");
     expect(document.querySelector("[data-message-fork-confirm='true']")).not.toBeNull();
-    expect(view.api.forkSession).not.toHaveBeenCalled();
-    await view.action("approve"); expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.forkMessage).not.toHaveBeenCalled();
+    await view.action("approve"); expect(view.api.forkMessage).not.toHaveBeenCalled();
     await act(async () => document.querySelector<HTMLButtonElement>("[data-message-fork-confirm='true']")!.click());
-    await view.flush(); expect(view.api.forkSession).toHaveBeenCalledOnce();
-    expect(view.api.forkSession.mock.calls[0]?.slice(0, 2)).toEqual(["task", "native-entry"]);
+    await view.flush(); expect(view.api.forkMessage).toHaveBeenCalledOnce();
+    expect(view.api.forkMessage.mock.calls[0]?.[0]).toMatchObject({ sourceSessionId: "task", nativeEntryId: "native-entry" });
     expect(view.api.loadSessionTimelineAround).not.toHaveBeenCalled();
   });
 
@@ -118,10 +118,10 @@ describe("session gamepad actions", () => {
     await view.flush();
 
     expect(view.api.loadSessionTimelineAround).toHaveBeenCalledExactlyOnceWith("task", "event");
-    expect(view.api.forkSession).toHaveBeenCalledExactlyOnceWith("task", "native-parent", "session.branchSuffix", {
-      messageId: "user-entry", eventId: "event"
-    });
-    expect(view.api.saveDraft).toHaveBeenCalledExactlyOnceWith("forked", expect.objectContaining({ text: "Cold prompt", attachments: [] }));
+    expect(view.api.forkMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      sourceSessionId: "task", nativeEntryId: "native-parent", displayName: "session.branchSuffix",
+      messageId: "user-entry", eventId: "event", draft: expect.objectContaining({ text: "Cold prompt" })
+    }), expect.any(Function), false);
     expect(view.api.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "forked" });
   });
 
@@ -139,7 +139,7 @@ describe("session gamepad actions", () => {
 
     await view.derive("fork");
     await expect(view.flush()).rejects.toThrow("timeline.forkUnavailable");
-    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.forkMessage).not.toHaveBeenCalled();
   });
 
   it.each([true, false])("rechecks the stable assistant boundary during a running task with a later user row: %s", async (hasLaterUser) => {
@@ -152,12 +152,12 @@ describe("session gamepad actions", () => {
     await view.derive("fork");
     if (hasLaterUser) {
       await view.flush();
-      expect(view.api.forkSession).toHaveBeenCalledExactlyOnceWith("task", "native-entry", "session.branchSuffix", {
-        messageId: "message", eventId: "event"
-      });
+      expect(view.api.forkMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        sourceSessionId: "task", nativeEntryId: "native-entry", displayName: "session.branchSuffix", messageId: "message", eventId: "event"
+      }), expect.any(Function), false);
     } else {
       await expect(view.flush()).rejects.toThrow("timeline.forkBusy");
-      expect(view.api.forkSession).not.toHaveBeenCalled();
+      expect(view.api.forkMessage).not.toHaveBeenCalled();
     }
   });
 
@@ -178,7 +178,7 @@ describe("session gamepad actions", () => {
       expect(view.api.loadSessionTimelineAround).not.toHaveBeenCalled();
     } else await act(async () => finishHistory([message]));
     await view.flush();
-    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.forkMessage).not.toHaveBeenCalled();
     expect(view.api.navigate).not.toHaveBeenCalled();
   });
 
@@ -275,7 +275,7 @@ describe("session gamepad actions", () => {
     expect(view.host.querySelector('[data-testid="message-fork"]')).toBeNull();
     await view.action("fork-task");
     expect(document.querySelector("[data-message-fork-confirm='true']")).toBeNull();
-    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.forkMessage).not.toHaveBeenCalled();
 
     const derivingBackend: BackendView = {
       ...backend,
@@ -303,7 +303,7 @@ describe("session gamepad actions", () => {
   it.each(["fork", "clone", "learn"] as const)("does not let an old %s result replace a later task navigation", async (action) => {
     const view = await mount();
     let complete!: () => void;
-    if (action === "fork") view.api.forkSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("forked"); }));
+    if (action === "fork") view.api.forkMessage.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("forked"); }));
     if (action === "clone") view.api.cloneSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("cloned"); }));
     if (action === "learn") view.api.startSkillLearning.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve(learningRun); }));
     await view.derive(action);
@@ -317,13 +317,14 @@ describe("session gamepad actions", () => {
     const userMessage: TimelineItemView = { ...message, kind: "user", text: "Keep my source prompt", nativeEntryId: undefined, nativeParentEntryId: "parent-entry" };
     await view.render(session, backend, false, {}, [userMessage]);
     let complete!: () => void;
-    view.api.forkSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("forked"); }));
+    view.api.forkMessage.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("forked"); }));
     await view.derive("fork");
     await view.render(session, backend, false, {
       activeProfile: { id: "replacement", serverId: "replacement-server", deviceId: "device", name: "Other node", origin: "https://other.example" },
       connectionGeneration: 2
     }, [userMessage]);
     await act(async () => { complete(); await Promise.all(view.pending); });
+    expect(view.api.forkMessage.mock.calls[0]?.[1]()).toBe(false);
     expect(view.api.saveDraft).not.toHaveBeenCalled();
     expect(view.api.navigate).not.toHaveBeenCalled();
     expect(userMessage.text).toBe("Keep my source prompt");
@@ -336,7 +337,7 @@ describe("session gamepad actions", () => {
     expect(view.api.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: action === "fork" ? "forked" : action === "clone" ? "cloned" : "distillation" });
     view.api.navigate.mockClear();
     const failure = new Error("source operation failed");
-    if (action === "fork") view.api.forkSession.mockRejectedValueOnce(failure);
+    if (action === "fork") view.api.forkMessage.mockRejectedValueOnce(failure);
     if (action === "clone") view.api.cloneSession.mockRejectedValueOnce(failure);
     if (action === "learn") view.api.startSkillLearning.mockRejectedValueOnce(failure);
     await view.derive(action);
@@ -347,7 +348,7 @@ describe("session gamepad actions", () => {
   it.each(["fork", "clone", "learn"] as const)("discards a stale %s failure after leaving the source task", async (action) => {
     const view = await mount();
     let fail!: () => void;
-    if (action === "fork") view.api.forkSession.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = () => reject(new Error("old failure")); }));
+    if (action === "fork") view.api.forkMessage.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = () => reject(new Error("old failure")); }));
     if (action === "clone") view.api.cloneSession.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = () => reject(new Error("old failure")); }));
     if (action === "learn") view.api.startSkillLearning.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = () => reject(new Error("old failure")); }));
     await view.derive(action);
@@ -375,7 +376,7 @@ describe("session gamepad actions", () => {
   it.each(["fork", "clone"] as const)("allows a newer action to own navigation while an old %s completes and leaves Fork usable", async (action) => {
     const view = await mount();
     let complete!: () => void;
-    if (action === "fork") view.api.forkSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("old-fork"); }));
+    if (action === "fork") view.api.forkMessage.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("old-fork"); }));
     else view.api.cloneSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("old-clone"); }));
     await view.derive(action);
     await view.derive("learn");
@@ -404,7 +405,7 @@ describe("session gamepad actions", () => {
     const view = await mount();
     await act(async () => view.host.querySelector<HTMLButtonElement>('[data-testid="message-fork"]')!.click());
     await act(async () => [...document.querySelectorAll<HTMLButtonElement>(".modal button")].find((button) => button.textContent === "common.cancel")!.click());
-    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.forkMessage).not.toHaveBeenCalled();
     expect(view.api.navigate).not.toHaveBeenCalled();
   });
 });
@@ -413,7 +414,8 @@ async function mount(overrides: AppShortcutOverrides = {}) {
   const api = { setModel: vi.fn<AppController["setModel"]>(async () => undefined), setPlanMode: vi.fn(async () => undefined),
     getPortableReplacementCleanup: vi.fn(async () => undefined),
     listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } })),
-    pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkSession: vi.fn<AppController["forkSession"]>(async () => "forked"),
+    pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkMessage: vi.fn<AppController["forkMessage"]>(async () => "forked"),
+    readPendingMessageFork: vi.fn<AppController["readPendingMessageFork"]>(async () => undefined),
     loadSessionTimelinePage: vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] })),
     loadSessionTimelineAround: vi.fn<AppController["loadSessionTimelineAround"]>(async () => []),
     saveDraft: vi.fn<AppController["saveDraft"]>(async () => undefined),

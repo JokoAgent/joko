@@ -6394,6 +6394,9 @@ const en = {
   ,"timeline.forkConfirmTitle": "Fork from here?"
   ,"timeline.forkConfirmDescription": "A new task will be created at this message. The current task stays unchanged."
   ,"timeline.forkConfirmAction": "Create fork"
+  ,"timeline.forkCheckAction": "Check original fork"
+  ,"timeline.forkCheckDescription": "Look up the result of the fork you already confirmed for this message."
+  ,"timeline.forkCheckOriginal": "The fork result is pending. Choose Fork on the same message to check the original."
   ,"timeline.forkBusy": "Wait for this message to finish before forking."
   ,"timeline.forkUnavailable": "This message can no longer be forked."
   ,"timeline.forkOrigin": "Forked from another task"
@@ -10510,6 +10513,9 @@ const zhBase: Record<MessageKey, string> = {
   "timeline.forkConfirmTitle": "从此处分支？",
   "timeline.forkConfirmDescription": "将在此消息处创建一个新任务，当前任务保持不变。",
   "timeline.forkConfirmAction": "创建分支",
+  "timeline.forkCheckAction": "核查原分支",
+  "timeline.forkCheckDescription": "查询你已为此消息确认的分支结果。",
+  "timeline.forkCheckOriginal": "分支结果待确认。再次选择同一消息的分支操作可核查原结果。",
   "timeline.forkBusy": "请等本条消息处理完成后再分支。",
   "timeline.forkUnavailable": "此消息已无法分支。",
   "timeline.forkOrigin": "从另一个任务分支",

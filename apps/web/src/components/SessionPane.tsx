@@ -75,7 +75,7 @@ import { modelSourceAccess } from "../model-source-access.js";
 import { randomUuid } from "../web-crypto.js";
 import { normalizePendingSideChatDraft } from "../local-state.js";
 import { recoverSideChatDraft } from "../side-chat-draft-recovery.js";
-import type { PendingSideChatDraft } from "../model.js";
+import type { PendingMessageFork, PendingSideChatDraft } from "../model.js";
 import { requireStartedSkillLearningRun } from "../skill-learning-command.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
@@ -165,6 +165,8 @@ interface ActiveMessageFork {
   readonly eventId: string;
   readonly nativeEntryId: string;
   readonly isCurrent: () => boolean;
+  readonly readingReceipt: boolean;
+  readonly original?: PendingMessageFork;
 }
 
 export interface MessageForkCompletion {
@@ -1659,19 +1661,29 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       reportMessageForkFailure(item.id, t("timeline.forkUnavailable"));
       return;
     }
-    setMessageFork({
+    const confirmation: ActiveMessageFork = {
       sessionId: session.id,
       itemId: item.id,
       messageId: item.messageId ?? item.id,
       eventId: item.sourceEventId,
       nativeEntryId: target.entryId,
+      readingReceipt: onSplitMessageForkOpened === undefined,
       isCurrent: onSplitMessageForkOpened === undefined ? captureTaskActionSource() : capturePaneMessageAction(true)
-    });
+    };
+    setMessageFork(confirmation);
+    if (onSplitMessageForkOpened === undefined) {
+      void controllerRef.current.readPendingMessageFork(confirmation.sessionId, confirmation.eventId).then((saved) => {
+        if (confirmation.isCurrent()) setMessageFork(current => current === confirmation
+          ? { ...confirmation, readingReceipt: false, original: saved } : current);
+      }).catch(() => {
+        if (confirmation.isCurrent()) setMessageFork(current => current === confirmation ? { ...confirmation, readingReceipt: false } : current);
+      });
+    }
   };
 
   const confirmMessageFork = (): void => {
     const pending = messageFork;
-    if (pending === undefined || pending.sessionId !== session.id || messageForkActionRef.current !== undefined) return;
+    if (pending === undefined || pending.readingReceipt || pending.sessionId !== session.id || messageForkActionRef.current !== undefined) return;
     setMessageFork(undefined);
     if (!pending.isCurrent()) return;
     const currentSource = () => {
@@ -1703,7 +1715,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       return;
     }
     const actionOwner = beginDerivedTaskAction(pending.isCurrent);
-    const { forkSession, saveDraft, readDraftSnapshot, saveDraftIfRevision, navigate, loadSessionTimelineAround } = controllerRef.current;
+    const { forkSession, forkMessage, readDraftSnapshot, saveDraftIfRevision, navigate, loadSessionTimelineAround } = controllerRef.current;
     const forkOccurrence = {};
     messageForkActionRef.current = forkOccurrence;
     setForkingMessageId(pending.itemId);
@@ -1729,14 +1741,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           ({ item, target } = persisted);
           sourceSessionName = latest.session.name;
         }
-        const forkedSessionId = await forkSession(
-          pending.sessionId,
-          target.entryId,
-          t("session.branchSuffix", { name: sourceSessionName }),
-          { messageId: pending.messageId, eventId: pending.eventId,
-            ...(onSplitMessageForkOpened === undefined ? {} : { expectedGeneration: source.session.generation }) }
-        );
-        if (!actionOwner.isCurrent()) return;
+        let draft: ComposerDraft | undefined;
         if (target.composerText !== undefined) {
           const editorDocument = composerDocumentFromMessage(target.composerText, item.quotesEncoded === true, {
             sessionId: pending.sessionId,
@@ -1744,26 +1749,39 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             role: "user",
             sourceEventId: pending.eventId
           }, "edit", item.pastedTextRanges);
-          const draft = {
+          draft = {
             text: composerDocumentPlainText(editorDocument),
             editorDocument,
             attachments: [],
             mentions: [],
             deliveryMode: "prompt" as const
           };
-          if (onSplitMessageForkOpened === undefined) await saveDraft(forkedSessionId, draft);
-          else {
-            const original = await readDraftSnapshot(forkedSessionId);
-            if (!actionOwner.isCurrent()) return;
-            if (original.draft === undefined) await saveDraftIfRevision(forkedSessionId, draft, original.revision);
-          }
+        }
+        const displayName = t("session.branchSuffix", { name: sourceSessionName }).trim();
+        const forkedSessionId = onSplitMessageForkOpened === undefined
+          ? await forkMessage(pending.original ?? { operationId: randomUuid(), sourceSessionId: pending.sessionId, sourceGeneration: source.session.generation.toString(),
+              backendId: source.session.backendId, targetId: source.session.targetId, messageId: pending.messageId, eventId: pending.eventId,
+              nativeEntryId: target.entryId, displayName, ...(draft === undefined ? {} : { draft: { text: draft.text, editorDocument: draft.editorDocument } }) },
+            actionOwner.isCurrent, pending.original !== undefined)
+          : await forkSession(pending.sessionId, target.entryId, displayName,
+            { messageId: pending.messageId, eventId: pending.eventId, expectedGeneration: source.session.generation });
+        if (!actionOwner.isCurrent()) return;
+        if (onSplitMessageForkOpened !== undefined && draft !== undefined) {
+          const original = await readDraftSnapshot(forkedSessionId);
+          if (!actionOwner.isCurrent()) return;
+          if (original.draft === undefined) await saveDraftIfRevision(forkedSessionId, draft, original.revision);
         }
         if (!actionOwner.isCurrent()) return;
         if (onSplitMessageForkOpened === undefined) navigate({ kind: "session", sessionId: forkedSessionId });
         else onSplitMessageForkOpened({ sessionId: forkedSessionId, sourceMessageId: pending.messageId,
           sourceEventId: pending.eventId, isCurrent: actionOwner.isCurrent });
       } catch (error) {
-        if (actionOwner.isCurrent()) throw error;
+        if (actionOwner.isCurrent()) {
+          if ((error as { readonly code?: unknown } | null)?.code === "MESSAGE_FORK_RESULT_UNKNOWN") {
+            throw new Error(t("timeline.forkCheckOriginal"), { cause: error });
+          }
+          throw error;
+        }
       } finally {
         if (messageForkActionRef.current === forkOccurrence) {
           messageForkActionRef.current = undefined;
@@ -2753,6 +2771,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       <MessageForkDialog
         key={currentMessageFork === undefined ? "message-fork:none" : `${currentMessageFork.sessionId}:${currentMessageFork.itemId}`}
         open={currentMessageFork !== undefined}
+        checkOriginal={currentMessageFork?.original !== undefined}
+        pending={currentMessageFork?.readingReceipt}
         t={t}
         onClose={() => setMessageFork(undefined)}
         onConfirm={confirmMessageFork}

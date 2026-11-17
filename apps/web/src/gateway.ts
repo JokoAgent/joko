@@ -1066,6 +1066,8 @@ export interface PairingOutcome {
 
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage" | "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">,
   Required<Pick<OperationApi, "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">>, AppDefaultModelUiPort {
+  submitMessageFork(record: import("./model.js").PendingMessageFork, assertCurrent: () => void): Promise<import("./model.js").SideChatOperationView>;
+  readMessageFork(record: import("./model.js").PendingMessageFork): Promise<import("./model.js").SideChatOperationView>;
   prepareContactsDialogue(draft: TargetDraft, requestId: string, signal: AbortSignal): Promise<Pick<TargetView, "id" | "revision">>;
   deviceAuthorizationOwner?(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
@@ -3965,6 +3967,68 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
     }
     return operationSessionId(operation);
+  }
+
+  async submitMessageFork(record: import("./model.js").PendingMessageFork, assertCurrent: () => void): Promise<import("./model.js").SideChatOperationView> {
+    if (this.#taskSharing !== undefined) throw new GatewayError("A message fork requires the original node connection.");
+    const scope = this.captureActionScope(), connectionId = this.#profile?.id;
+    const expectedGeneration = BigInt(record.sourceGeneration);
+    const source = this.#snapshot?.sessions.find(session => session.id === record.sourceSessionId);
+    if (source?.generation !== expectedGeneration || source.backendId !== record.backendId || source.targetId !== record.targetId) {
+      throw new GatewayError("The original task generation is no longer current.");
+    }
+    let receipt: Operation | undefined;
+    try {
+      receipt = await this.submit({ case: "forkSession", value: {
+        sourceSessionId: record.sourceSessionId, nativeEntryId: record.nativeEntryId, newDisplayName: record.displayName,
+        sourceMessageId: record.messageId, sourceEventId: record.eventId
+      } }, true, [{ entity: { kind: EntityKind.SESSION, id: record.sourceSessionId }, expectedGeneration }], scope.signal,
+      (_id, observed) => { if (observed === undefined) assertCurrent(); else receipt = observed; }, record.operationId, true);
+    } catch (error) {
+      if (receipt === undefined || !TERMINAL_OPERATION_STATES.has(receipt.state)) throw error;
+    }
+    scope.signal.throwIfAborted();
+    return this.messageForkReceipt(record, connectionId, receipt);
+  }
+
+  async readMessageFork(record: import("./model.js").PendingMessageFork): Promise<import("./model.js").SideChatOperationView> {
+    if (this.#taskSharing !== undefined) throw new GatewayError("Message fork recovery requires the original node connection.");
+    const scope = this.captureActionScope(), connectionId = this.#profile?.id;
+    let receipt: Operation | undefined;
+    try { receipt = (await createClient(OperationService, scope.transport).getOperation({ operationId: record.operationId }, { signal: scope.signal })).operation; }
+    catch (error) { if (ConnectError.from(error).code === Code.NotFound) return { state: "pending" }; throw error; }
+    scope.signal.throwIfAborted();
+    if (receipt === undefined) return { state: "pending" };
+    const result = this.messageForkReceipt(record, connectionId, receipt);
+    if (result.state === "succeeded") void this.refresh().catch(() => undefined);
+    return result;
+  }
+
+  private messageForkReceipt(record: import("./model.js").PendingMessageFork, connectionId: string | undefined, operation: Operation): import("./model.js").SideChatOperationView {
+    const mutation = operation.mutation, payload = mutation?.payload;
+    const source = mutation?.preconditions[0];
+    if (connectionId === undefined || operation.connectionId !== connectionId || operation.operationId !== record.operationId
+      || payload?.case !== "forkSession" || payload.value.sourceSessionId !== record.sourceSessionId
+      || payload.value.nativeEntryId !== record.nativeEntryId || payload.value.newDisplayName !== record.displayName
+      || payload.value.sourceMessageId !== record.messageId || payload.value.sourceEventId !== record.eventId
+      || mutation?.preconditions.length !== 1 || source?.entity?.kind !== EntityKind.SESSION || source.entity.id !== record.sourceSessionId
+      || source.expectedGeneration !== BigInt(record.sourceGeneration) || (operation.version?.revision?.value ?? 0n) < 1n) {
+      throw new GatewayError("The reply does not identify the original message fork.", { code: "RESULT_UNKNOWN" });
+    }
+    if (!TERMINAL_OPERATION_STATES.has(operation.state)) return { state: "pending" };
+    if (operation.state !== OperationState.SUCCEEDED) return {
+      state: "failed", error: operation.error?.message || "The original message fork failed.",
+      stateMayHaveChanged: !operation.error || [operation.error.queueImpact, operation.error.workspaceImpact, operation.error.nativeSessionImpact].some(impact => impact !== StateImpact.UNCHANGED)
+    };
+    const result = operation.result?.payload, child = result?.case === "session" ? result.value : undefined;
+    const origin = child?.derivationOrigin;
+    if (!child?.sessionId || child.sessionId === record.sourceSessionId || child.backendId !== record.backendId || child.targetId !== record.targetId
+      || !child.nativeBinding?.opaqueReference || child.nativeBinding.runtimeGeneration < 1n
+      || origin?.kind !== SessionDerivationKind.FORK || origin.sideChat || origin.sourceSessionId !== record.sourceSessionId
+      || origin.sourceMessageId !== record.messageId || origin.sourceEventId !== record.eventId) {
+      throw new GatewayError("The reply does not identify the original message fork child.", { code: "RESULT_UNKNOWN" });
+    }
+    return { state: "succeeded", sessionId: child.sessionId };
   }
 
   async cloneSession(

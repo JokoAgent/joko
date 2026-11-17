@@ -37,7 +37,7 @@ import {
   type ExtensionBackgroundTaskView,
   type ExtensionNotificationKind,
   type ExtensionUiEffect,
-  type GatewayError,
+  GatewayError,
   type GatewayConnectionState,
   type OrchestratorGateway
 } from "./gateway.js";
@@ -84,6 +84,7 @@ import type {
   PendingExtensionSuggestionView,
   PendingExtensionUseView,
   PendingMessageEdit,
+  PendingMessageFork,
   SessionMessageSearchCollectionOptions,
   SystemLocale,
   Theme
@@ -349,6 +350,8 @@ export interface AppController extends OperationApi {
   saveDraft(sessionId: string, draft: ComposerDraft): Promise<void>;
   readDraftSnapshot(sessionId: string): Promise<import("./local-state.js").ComposerDraftSnapshot>;
   saveDraftIfRevision(sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined>;
+  readPendingMessageFork(sessionId: string, eventId: string): Promise<PendingMessageFork | undefined>;
+  forkMessage(record: PendingMessageFork, canDispatch: () => boolean, checkOnly?: boolean): Promise<string>;
   readonly messageEditDrafts: {
     read(sessionId: string): Promise<PendingMessageEdit | undefined>;
     stage(sessionId: string, edit: PendingMessageEdit, expectedDraftRevision: number): Promise<boolean>;
@@ -3212,6 +3215,56 @@ export function useAppController(): AppController {
       }
     };
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface, publishRecoveredDraft]);
+  const readPendingMessageFork = useCallback<AppController["readPendingMessageFork"]>(async (sessionId, eventId) => {
+    if (!draftServerId || !draftProfileId) throw new Error("Connect to the original node before checking a message fork.");
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).readPendingMessageFork(draftServerId, draftProfileId, sessionId, eventId, surface));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
+  const forkMessage = useCallback<AppController["forkMessage"]>(async (record, canDispatch, checkOnly = false) => {
+    if (!draftServerId || !draftProfileId || !artifactGateway) throw new Error("Connect to the original node before forking a message.");
+    const origin = activeProfileRef.current?.origin;
+    let retired = false;
+    const retire = () => { retired = true; };
+    const current = () => !retired && gatewayRef.current === artifactGateway && gatewayGenerationRef.current === linkGatewayGeneration
+      && activeProfileRef.current?.id === draftProfileId && activeProfileRef.current.serverId === draftServerId
+      && activeProfileRef.current.origin === origin;
+    const assertDispatch = () => { if (!current() || !canDispatch()) throw new Error("The original message fork window is no longer current."); };
+    const unknown = (cause?: unknown) => new GatewayError("Check the original message fork before trying again.", { code: "MESSAGE_FORK_RESULT_UNKNOWN", cause });
+    window.addEventListener("pagehide", retire, { once: true });
+    try {
+      return await withDraftSurface(record.sourceSessionId, async (sourceSurface) => {
+        assertDispatch();
+        const local = requireLocal(draftStore);
+        const pending = checkOnly
+          ? await local.readPendingMessageFork(draftServerId, draftProfileId, record.sourceSessionId, record.eventId, sourceSurface)
+          : await local.stageMessageFork(draftServerId, draftProfileId, record, sourceSurface);
+        if (pending === undefined || checkOnly && pending.operationId !== record.operationId) throw unknown();
+        const created = !checkOnly && pending.operationId === record.operationId;
+        const finish = (child?: { readonly sessionId: string; readonly surface: import("./local-state.js").SessionDraftSurface }) =>
+          local.finishMessageFork(draftServerId, draftProfileId, pending, sourceSurface, current, child);
+        let dispatched = false;
+        let outcome: Awaited<ReturnType<OrchestratorGateway["readMessageFork"]>>;
+        try {
+          outcome = created ? await artifactGateway.submitMessageFork(pending, () => { assertDispatch(); dispatched = true; })
+            : await artifactGateway.readMessageFork(pending);
+        } catch (error) {
+          if (created && !dispatched && current()) { await finish(); throw error; }
+          throw unknown(error);
+        }
+        if (!current() || outcome.state === "pending") throw unknown();
+        if (outcome.state === "failed") {
+          if (!outcome.stateMayHaveChanged) await finish();
+          throw new Error(outcome.error);
+        }
+        const childId = outcome.sessionId;
+        try {
+          const adopted = pending.draft === undefined ? await finish() : await withDraftSurface(childId,
+            surface => finish({ sessionId: childId, surface }));
+          if (!adopted) throw unknown();
+        } catch (error) { throw unknown(error); }
+        return childId;
+      });
+    } finally { window.removeEventListener("pagehide", retire); }
+  }, [draftStore, draftServerId, draftProfileId, artifactGateway, linkGatewayGeneration, withDraftSurface]);
   const listWorkspaceChangeSets = useCallback<AppController["listWorkspaceChangeSets"]>((workspaceId, sessionId) => {
     if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before reading workspace changes."));
     return artifactGateway.listWorkspaceChangeSets(workspaceId, sessionId);
@@ -3858,6 +3911,8 @@ export function useAppController(): AppController {
     saveDraft,
     readDraftSnapshot,
     saveDraftIfRevision,
+    readPendingMessageFork,
+    forkMessage,
     messageEditDrafts,
     readPendingSideChat,
     savePendingSideChat,
@@ -4569,7 +4624,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, taskMessageGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, taskMessageGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, readPendingMessageFork, forkMessage, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

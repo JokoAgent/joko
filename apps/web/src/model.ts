@@ -5839,6 +5839,19 @@ export interface PendingSideChatDraft {
   readonly quote?: ComposerSelectionQuoteDraft;
 }
 
+export interface PendingMessageFork {
+  readonly operationId: string;
+  readonly sourceSessionId: string;
+  readonly sourceGeneration: string;
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly messageId: string;
+  readonly eventId: string;
+  readonly nativeEntryId: string;
+  readonly displayName: string;
+  readonly draft?: Pick<ComposerDraft, "text" | "editorDocument">;
+}
+
 export type SideChatOperationView =
   | { readonly state: "pending" }
   | { readonly state: "failed"; readonly error: string; readonly stateMayHaveChanged: boolean }

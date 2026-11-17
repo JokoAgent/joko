@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { LocalState } from "./local-state.js";
-import type { ComposerDraft, ConnectionProfile, ExtensionSettingsApi, ExtensionMainViewSurfaceView, PendingSideChatDraft, SideChatOperationView } from "./model.js";
+import type { ComposerDraft, ConnectionProfile, ExtensionSettingsApi, ExtensionMainViewSurfaceView, PendingMessageFork, PendingSideChatDraft, SideChatOperationView } from "./model.js";
 import { recoverSideChatDraft } from "./side-chat-draft-recovery.js";
 import { bindExtensionSettingsOperationJournal, extensionSettingsProfilePin, parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationReceipt } from "./extension-settings-operation.js";
 
@@ -50,6 +50,25 @@ describe("durable composer draft surfaces", () => {
     const child = await local(database.value).readDraft("node", "profile", "exact-child");
     expect(JSON.stringify(child?.editorDocument)).toContain("Frozen selected answer");
     expect(JSON.stringify(child?.editorDocument)).toContain('"sourceEventId":"event"');
+  });
+
+  it("settles only the original message fork and preserves an existing child draft", async () => {
+    const database = draftDatabase(), before = local(database.value);
+    const original: PendingMessageFork = { operationId: "original-fork", sourceSessionId: "source", sourceGeneration: "4",
+      backendId: "codex", targetId: "project", messageId: "message", eventId: "event", nativeEntryId: "parent",
+      displayName: "Original task branch", draft: { text: "The source prompt" } };
+    const other = { ...original, operationId: "different-fork", draft: { text: "Different prompt" } };
+    await expect(before.stageMessageFork("node", "profile", original, "application")).resolves.toEqual(original);
+    const restarted = local(database.value);
+    await expect(restarted.stageMessageFork("node", "profile", other, "application")).resolves.toEqual(original);
+    expect(await restarted.readPendingMessageFork("node", "other-profile", "source", "event", "application")).toBeUndefined();
+    const child = { sessionId: "same-child", surface: "application" } as const;
+    await restarted.saveDraft("node", "profile", child.sessionId, draft("Already editing in the child"));
+    await expect(restarted.finishMessageFork("node", "profile", other, "application", () => true, child)).resolves.toBe(false);
+    await expect(restarted.finishMessageFork("node", "profile", original, "application", () => false, child)).resolves.toBe(false);
+    await expect(restarted.finishMessageFork("node", "profile", original, "application", () => true, child)).resolves.toBe(true);
+    expect(await restarted.readPendingMessageFork("node", "profile", "source", "event", "application")).toBeUndefined();
+    expect((await restarted.readDraft("node", "profile", child.sessionId))?.text).toBe("Already editing in the child");
   });
 
   it.each(["operation", "generation", "backend", "target", "quote"] as const)("rejects a changed Side Chat %s before dispatching or querying the original operation", async change => {

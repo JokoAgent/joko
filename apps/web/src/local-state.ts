@@ -19,7 +19,7 @@ import { composerDocumentPlainText, normalizeComposerDocument } from "./composer
 import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
 import { normalizeSelectionQuoteDrafts } from "./selection-quote.js";
 import { appendQuoteToComposerDocument } from "./composer-quote-document.js";
-import type { PendingMessageEdit, PendingSideChatDraft } from "./model.js";
+import type { PendingMessageEdit, PendingMessageFork, PendingSideChatDraft } from "./model.js";
 import { mergeRejectedComposerDraft } from "./composer-draft-recovery.js";
 import { normalizeAppShortcutOverrides, type AppShortcutOverrides } from "./app-shortcuts.js";
 import {
@@ -488,6 +488,27 @@ export function normalizePendingSideChatDraft(value: unknown): PendingSideChatDr
 function pendingSideChatKey(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface): string {
   sessionDraftKey(serverId, profileId, sessionId, surface);
   return JSON.stringify(["side-chat-v1", serverId, profileId, sessionId, surface]);
+}
+
+function messageForkKey(serverId: string, profileId: string, sessionId: string, eventId: string, surface: SessionDraftSurface): string {
+  sessionDraftKey(serverId, profileId, sessionId, surface);
+  if (!validConnectionIdentity(eventId, 512)) throw new Error("A message fork requires its original Event ID.");
+  return JSON.stringify(["message-fork-v1", serverId, profileId, sessionId, eventId, surface]);
+}
+
+function readMessageFork(value: unknown, sessionId: string, eventId: string): PendingMessageFork | undefined {
+  if (value === undefined) return undefined;
+  const record = value as PendingMessageFork | null;
+  if (!record || typeof record !== "object" || Array.isArray(record) || record.sourceSessionId !== sessionId || record.eventId !== eventId
+    || ![record.operationId, record.backendId, record.targetId, record.messageId, record.displayName].every(id => validConnectionIdentity(id, 512))
+    || !validConnectionIdentity(record.nativeEntryId, 4_096)
+    || typeof record.sourceGeneration !== "string" || !/^[1-9][0-9]{0,15}$/u.test(record.sourceGeneration)
+    || BigInt(record.sourceGeneration) > BigInt(Number.MAX_SAFE_INTEGER)
+    || record.draft !== undefined && (typeof record.draft?.text !== "string"
+      || composerDocumentPlainText(normalizeComposerDocument(record.draft.editorDocument, record.draft.text)) !== record.draft.text)) {
+    throw new Error("The saved message fork identity or draft is invalid.");
+  }
+  return record;
 }
 
 function sessionDraftKey(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface): string {
@@ -994,6 +1015,44 @@ export class LocalState {
         text: composerDocumentPlainText(editorDocument), editorDocument } }, childKey);
     }
     store.delete(pendingKey); await done; return "adopted";
+  }
+
+  async readPendingMessageFork(serverId: string, profileId: string, sessionId: string, eventId: string, surface: SessionDraftSurface): Promise<PendingMessageFork | undefined> {
+    return readMessageFork(await this.get<unknown>(DRAFT_STORE, messageForkKey(serverId, profileId, sessionId, eventId, surface)), sessionId, eventId);
+  }
+
+  async stageMessageFork(serverId: string, profileId: string, record: PendingMessageFork, surface: SessionDraftSurface): Promise<PendingMessageFork> {
+    const { sourceSessionId, eventId } = record;
+    const key = messageForkKey(serverId, profileId, sourceSessionId, eventId, surface);
+    const next = readMessageFork(record, sourceSessionId, eventId)!;
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite"), store = transaction.objectStore(DRAFT_STORE);
+    const done = transactionDone(transaction);
+    const previous = readMessageFork(await requestResult<unknown>(store.get(key)), sourceSessionId, eventId);
+    if (previous === undefined) store.put(next, key);
+    await done;
+    return previous ?? next;
+  }
+
+  /** Settle the original local receipt and the child's initial draft together. */
+  async finishMessageFork(serverId: string, profileId: string, record: PendingMessageFork, sourceSurface: SessionDraftSurface,
+    isCurrent: () => boolean, child?: { readonly sessionId: string; readonly surface: SessionDraftSurface }): Promise<boolean> {
+    if (child?.sessionId === record.sourceSessionId) throw new Error("The message fork child identity is invalid.");
+    const key = messageForkKey(serverId, profileId, record.sourceSessionId, record.eventId, sourceSurface);
+    const childKey = child === undefined || record.draft === undefined ? undefined : sessionDraftKey(serverId, profileId, child.sessionId, child.surface);
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite"), store = transaction.objectStore(DRAFT_STORE);
+    const done = transactionDone(transaction);
+    const current = readMessageFork(await requestResult<unknown>(store.get(key)), record.sourceSessionId, record.eventId);
+    if (current?.operationId !== record.operationId || JSON.stringify(current) !== JSON.stringify(record) || !isCurrent()) { await done; return false; }
+    if (childKey !== undefined && current.draft !== undefined) {
+      const previous = currentDraftRecord(await requestResult<unknown>(store.get(childKey)));
+      if (!isCurrent()) { await done; return false; }
+      if (previous === undefined) store.put({ revision: 1, draft: persistComposerDraft({
+        text: current.draft.text, editorDocument: current.draft.editorDocument, deliveryMode: "prompt", attachments: [], mentions: []
+      }) }, childKey);
+    }
+    store.delete(key);
+    await done;
+    return true;
   }
 
   async saveNewSessionDraft(scope: string, draft: NewSessionLocalDraft): Promise<void> {
