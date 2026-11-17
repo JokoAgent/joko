@@ -14,7 +14,8 @@ const mountedIt = browserPath && webDirectory ? it : it.skip;
 
 mountedIt('invites, reviews and connects an independent device through production Web and the pinned HTTPS node', async () => {
   if (!browserPath || !webDirectory || !isAbsolute(browserPath) || !isAbsolute(webDirectory)) throw new Error('Absolute browser and production Web paths are required.');
-  const evidence = process.env.JOKO_DEVICE_AUTHORIZATION_EVIDENCE_DIR;
+  const evidence = process.env.JOKO_DEVICE_AUTHORIZATION_EVIDENCE_DIR
+    ?? (process.env.RUNNER_TEMP ? join(process.env.RUNNER_TEMP, 'joko-web-evidence', 'device-authorization') : undefined);
   if (evidence && !isAbsolute(evidence)) throw new Error('The evidence path must be absolute.');
   if (evidence) await mkdir(evidence, { recursive: true });
   const directory = await mkdtemp(join(tmpdir(), 'joko-device-authorization-tls-'));
@@ -209,6 +210,10 @@ mountedIt('invites, reviews and connects an independent device through productio
       independentConnections: 2, pendingReload: true, automaticReload: true, issuerRevocationRetainsChild: true,
       secureDraftCleared: true, progressiveEntry: true, methodReturn: true, invalidInvitationBlocked: true, allowedMethodsLayout: true, reviewLinkExplicitApproval: true,
       locales: ['en', 'zh-CN'], views: ['light', 'dark', 'wide', 'narrow', 'keyboard-focus', 'methods', 'invitation', 'validation', 'pending', 'explicit-approval'], pageErrors: errors }, null, 2));
-  } catch (error) { await screenshot('failure-new-device'); await screenshot('failure-existing-device', first); throw error; }
+  } catch (error) {
+    await screenshot('failure-new-device').catch(() => undefined);
+    await screenshot('failure-existing-device', first).catch(() => undefined);
+    throw error;
+  }
   finally { await browser.close(); await fixture.close(); await rm(directory, { recursive: true, force: true }); }
 }, 120_000);
