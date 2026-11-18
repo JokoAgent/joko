@@ -5169,15 +5169,12 @@ export class MobileClient {
           throw new Error(detail);
         }
         if (resolved) credential = { ...credential, entryId: profile.entryId, origin: profile.origin, transportKind: profile.transportKind };
-        const owner = await this.network.readOwner(credential, this.deviceNameSource(), controller.signal);
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        this.#assertOwner(credential, owner, node);
-        const selected = selection !== undefined && owner.snapshot.sessions.some((session) => session.sessionId === selection)
-          ? selection : undefined;
-        const detail = selected ? await this.network.readSession(credential, selected, controller.signal) : undefined;
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        const current = () => this.#connectionAttemptCurrent(generation, controller);
+        const projection = await this.#readAlignedConnectionProjection(credential, node, selection, controller.signal, current);
+        if (!projection || !current()) return;
+        const { owner, selected, detail } = projection;
         if (selected !== selection) await this.storage.saveSelection(profileId, selected);
-        if (caller?.aborted) return;
+        if (!current() || caller?.aborted) return;
         if (savedEntries && entryOwner) {
           const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
           await this.storage.writeConnectionEntries?.(profile, next);
@@ -5952,27 +5949,25 @@ export class MobileClient {
       return;
     }
     const epoch = this.#retire();
+    const signal = this.#abort!.signal;
+    const current = () => this.#current(epoch);
     this.#set({ status: "connecting", error: undefined });
     try {
       // This request MUST be anonymous and precede every credentialed reconnect.
       rememberEndpointTrust(credential);
-      const node = await this.network.inspect(credential.origin, this.#abort?.signal);
-      if (!this.#current(epoch)) return;
+      const node = await this.network.inspect(credential.origin, signal);
+      if (!current()) return;
       if (node.serverId !== credential.serverId) {
         await this.#identityConflict(epoch, credential.profileId,
           "The saved Joko node identity changed. Its credential was not read again; forget it or pair this node explicitly.");
         return;
       }
-      const owner = await this.network.readOwner(credential, this.deviceNameSource(), this.#abort?.signal);
-      if (!this.#current(epoch)) return;
-      this.#assertOwner(credential, owner, node);
       const selectedId = this.#state.selectedId;
-      const selected = selectedId !== undefined && owner.snapshot.sessions.some((session) => session.sessionId === selectedId)
-        ? selectedId : undefined;
-      const detail = selected ? await this.network.readSession(credential, selected, this.#abort?.signal) : undefined;
-      if (!this.#current(epoch)) return;
+      const projection = await this.#readAlignedConnectionProjection(credential, node, selectedId, signal, current);
+      if (!projection || !current()) return;
+      const { owner, selected, detail } = projection;
       if (selected !== selectedId) await this.storage.saveSelection(credential.profileId, selected);
-      if (!this.#current(epoch)) return;
+      if (!current()) return;
       const sameWindow = selected === selectedId && this.#taskGeneration() === owner.snapshot.generation;
       this.#lastAuthenticatedAt = this.now();
       this.#set({ node, origin: credential.origin, owner: owner.snapshot, detail, selectedId: selected,
@@ -6003,6 +5998,21 @@ export class MobileClient {
         this.#schedule();
       }
     }
+  }
+
+  async #readAlignedConnectionProjection(credential: PairedCredential, node: NodeIdentity, selection: string | undefined,
+    signal: AbortSignal, current: () => boolean) {
+    // A node can restart between the Owner and Session reads without changing its identity.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const owner = await this.network.readOwner(credential, this.deviceNameSource(), signal);
+      if (!current()) return;
+      this.#assertOwner(credential, owner, node);
+      const selected = owner.snapshot.sessions.some(session => session.sessionId === selection) ? selection : undefined;
+      const detail = selected ? await this.network.readSession(credential, selected, signal) : undefined;
+      if (!current()) return;
+      if (!detail || detail.generation === owner.snapshot.generation) return { owner, selected, detail };
+    }
+    throw new Error("The Joko service changed while reading the selected task. Reconnect to load its current history.");
   }
 
   #assertOwner(credential: PairedCredential, owner: Awaited<ReturnType<MobileNetwork["readOwner"]>>, node: NodeIdentity): void {

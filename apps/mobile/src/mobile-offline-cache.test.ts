@@ -230,11 +230,31 @@ describe("current-v1 mobile offline content cache", () => {
     const first = detail(); first.timeline = [create(EventSchema, { eventId: "older" }), create(EventSchema, { eventId: "boundary" })];
     await fixture.cache.save(profile, node, owner(), first);
     const refresh = create(SnapshotSchema, { ...first, generation: 43n, timeline: [first.timeline[1]!] });
-    await fixture.cache.save(profile, node, owner(), refresh);
+    await fixture.cache.save(profile, node, owner([session("session-one")], 43n), refresh);
     expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["boundary"]);
-    const restarted = detail("session-one", 8n); restarted.timeline = [create(EventSchema, { eventId: "new-runtime" })];
-    await fixture.cache.save(profile, node, owner([session("session-one", false, 8n)]), restarted);
+    const restarted = detail("session-one", 8n); restarted.generation = 43n;
+    restarted.timeline = [create(EventSchema, { eventId: "new-runtime" })];
+    await fixture.cache.save(profile, node, owner([session("session-one", false, 8n)], 43n), restarted);
     expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["new-runtime"]);
+  });
+
+  it("rejects a mixed service generation before replacing the valid offline pair", async () => {
+    const { cache, memory } = cacheFixture();
+    const original = detail();
+    await cache.save(profile, node, owner(), original);
+    const records = [...memory.values];
+    const fromRestart = create(SnapshotSchema, { ...original, generation: 43n });
+    expect(() => cache.save(profile, node, owner(), fromRestart)).toThrow(/owner generation/u);
+    expect([...memory.values]).toEqual(records);
+    expect(await cache.load(profile, "session-one")).toMatchObject({ owner: { generation: 42n }, detail: { generation: 42n } });
+
+    // Earlier v1 builds could write both snapshots independently with a valid native binding.
+    const manifestKey = [...memory.values.keys()].find(key => key.endsWith(".manifest"))!;
+    const manifest = JSON.parse(memory.values.get(manifestKey)!);
+    manifest.owner.generation = "43";
+    memory.values.set(manifestKey, JSON.stringify(manifest));
+    expect(await cache.load(profile, "session-one")).toMatchObject({ owner: { generation: 43n }, warning: expect.stringContaining("damaged") });
+    expect([...memory.values.keys()].filter(key => key.includes(".detail."))).toHaveLength(0);
   });
 
   it("round-trips a task by its native generation independently of the service event generation", async () => {

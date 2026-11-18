@@ -860,22 +860,17 @@ function runtimeControlProjection(currentSession = runtimeSession, detail = fals
   });
 }
 
-function offlineOwnerProjection(sessions: readonly Snapshot["sessions"][number][] = [runtimeSession]): Snapshot {
+function offlineOwnerProjection(sessions: readonly Snapshot["sessions"][number][] = [runtimeSession], generation = snapshot.generation): Snapshot {
   const base = runtimeControlProjection(sessions[0] ?? runtimeSession, false);
   return create(SnapshotSchema, {
     ...base,
-    generation: 0n,
-    resumeCursor: create(EventCursorSchema, {
-      opaqueToken: base.resumeCursor?.opaqueToken ?? "owner-cursor",
-      sequence: base.resumeCursor?.sequence ?? 0n,
-      generation: 0n
-    }),
+    generation,
+    resumeCursor: create(EventCursorSchema, { ...base.resumeCursor!, generation }),
     sessions: [...sessions]
   });
 }
 
-function offlineDetailProjection(currentSession = runtimeSession): Snapshot {
-  const generation = currentSession.nativeBinding?.runtimeGeneration ?? 0n;
+function offlineDetailProjection(currentSession = runtimeSession, generation = snapshot.generation): Snapshot {
   const base = runtimeControlProjection(currentSession, true);
   return create(SnapshotSchema, {
     ...base,
@@ -6235,6 +6230,105 @@ describe("native mobile connection and operation ownership", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(app.state.owner?.sessions[0]?.archived).toBe(false);
     expect((await offline.cache.load(profile))?.owner.sessions[0]?.archived).toBe(false);
+  });
+
+  it.each(["startup", "refresh"] as const)("uses a matching Owner and Session generation when the node restarts during %s", async mode => {
+    const network = fakeNetwork();
+    eventFeed(network, true);
+    const saved = memoryStorage(credential), offline = memoryOfflineCache();
+    const profile = profileFromCredential(credential);
+    const originalOwner = offlineOwnerProjection(), originalDetail = offlineDetailProjection();
+    const currentOwner = offlineOwnerProjection([runtimeSession], 2n), currentDetail = offlineDetailProjection(runtimeSession, 2n);
+    const head = event("new-history-start", 9n);
+    head.cursor!.generation = currentDetail.generation;
+    currentDetail.timeline = [head];
+    await offline.cache.save(profile, node, originalOwner, originalDetail);
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+    const ownerRead = vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: originalOwner });
+    const detailRead = vi.mocked(network.readSession).mockResolvedValue(originalDetail);
+    const anchor = event("old-anchor", 7n);
+    if (mode === "refresh") {
+      await app.start();
+      vi.mocked(network.readAround).mockResolvedValueOnce([anchor]);
+      await app.around(anchor.eventId);
+      expect(app.state.before).toEqual(anchor.cursor);
+    }
+    ownerRead.mockClear(); detailRead.mockClear();
+    ownerRead.mockResolvedValueOnce({ connection, device, snapshot: originalOwner }).mockResolvedValue({ connection, device, snapshot: currentOwner });
+    let release!: (detail: Snapshot) => void;
+    const waiting = new Promise<Snapshot>(resolve => { release = resolve; });
+    detailRead.mockResolvedValueOnce(currentDetail).mockImplementationOnce(() => waiting);
+    const published: Array<[bigint | undefined, bigint | undefined]> = [];
+    const unsubscribe = app.subscribe(state => {
+      if (state.status === "connected") published.push([state.owner?.generation, state.detail?.generation]);
+    });
+    const connected = mode === "startup" ? app.start() : app.refresh();
+    await vi.waitFor(() => expect(detailRead).toHaveBeenCalledTimes(2));
+    expect(app.state).toMatchObject({ status: "connecting", owner: { generation: 1n }, detail: { generation: 1n } });
+    if (mode === "refresh") expect(app.state.window).toEqual([anchor]);
+    release(currentDetail);
+    await connected;
+    unsubscribe();
+
+    expect(ownerRead).toHaveBeenCalledTimes(2);
+    expect(detailRead.mock.calls.map(([, sessionId]) => sessionId)).toEqual(["session", "session"]);
+    expect(published).toContainEqual([2n, 2n]);
+    expect(published.every(([ownerGeneration, detailGeneration]) => ownerGeneration === detailGeneration)).toBe(true);
+    expect(app.state).toMatchObject({ status: "connected", selectedId: "session", window: undefined, before: undefined, older: [] });
+    expect(saved.storage.saveSelection).not.toHaveBeenCalled();
+    expect(vi.mocked(network.streamOwner).mock.calls.at(-1)?.[1]).toEqual(currentOwner.resumeCursor);
+    expect(await offline.cache.load(profile, "session")).toMatchObject({ owner: { generation: 2n }, detail: { generation: 2n } });
+    await app.older();
+    expect(network.readHistory).toHaveBeenCalledExactlyOnceWith(credential, "session", head.cursor, expect.any(AbortSignal));
+  });
+
+  it("stops retrying a repeatedly replaced service and keeps the last matched offline view", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential), offline = memoryOfflineCache();
+    const profile = profileFromCredential(credential);
+    await offline.cache.save(profile, node, offlineOwnerProjection(), offlineDetailProjection());
+    vi.mocked(network.readOwner)
+      .mockResolvedValueOnce({ connection, device, snapshot: offlineOwnerProjection([runtimeSession], 2n) })
+      .mockResolvedValueOnce({ connection, device, snapshot: offlineOwnerProjection([runtimeSession], 3n) });
+    vi.mocked(network.readSession)
+      .mockResolvedValueOnce(offlineDetailProjection(runtimeSession, 3n))
+      .mockResolvedValueOnce(offlineDetailProjection(runtimeSession, 4n));
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+    await app.start();
+
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
+    expect(network.readSession).toHaveBeenCalledTimes(2);
+    expect(network.streamOwner).not.toHaveBeenCalled();
+    expect(saved.storage.saveSelection).not.toHaveBeenCalled();
+    expect(app.state).toMatchObject({ status: "offline", selectedId: "session", error: expect.stringContaining("service changed"),
+      owner: { generation: 1n }, detail: { generation: 1n } });
+    expect(await offline.cache.load(profile, "session")).toMatchObject({ owner: { generation: 1n }, detail: { generation: 1n } });
+  });
+
+  it("reconnects from the current cursor when the node restarts after both snapshot reads", async () => {
+    const network = fakeNetwork();
+    eventFeed(network, true);
+    let endOriginalStream!: () => void;
+    const restarted = new Promise<void>(resolve => { endOriginalStream = resolve; });
+    vi.mocked(network.streamOwner).mockImplementationOnce(async function* () {
+      await restarted;
+      throw new ConnectError("The event cursor belongs to an earlier service generation.", Code.FailedPrecondition);
+    });
+    const nextOwner = offlineOwnerProjection([runtimeSession], 2n);
+    vi.mocked(network.readOwner)
+      .mockResolvedValueOnce({ connection, device, snapshot: offlineOwnerProjection() })
+      .mockResolvedValue({ connection, device, snapshot: nextOwner });
+    vi.mocked(network.readSession).mockResolvedValueOnce(offlineDetailProjection()).mockResolvedValue(offlineDetailProjection(runtimeSession, 2n));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    expect(network.readOwner).toHaveBeenCalledOnce();
+    expect(app.state).toMatchObject({ status: "connected", owner: { generation: 1n }, detail: { generation: 1n } });
+
+    endOriginalStream();
+    await vi.waitFor(() => expect(app.state).toMatchObject({ status: "connected", selectedId: "session",
+      owner: { generation: 2n }, detail: { generation: 2n } }));
+    expect(vi.mocked(network.streamOwner).mock.calls.map(([, after]) => after?.generation)).toEqual([1n, 2n]);
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
+    expect(network.readSession).toHaveBeenCalledTimes(2);
   });
 
   it("restores a current-v1 task copy before anonymous inspection and retries into authoritative online state", async () => {
