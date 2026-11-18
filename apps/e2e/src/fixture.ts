@@ -185,6 +185,13 @@ class RecordingConnectionManager extends ConnectionManager {
   }
 }
 
+export class PromptRecordingFakeAdapter extends InstrumentedFakeAdapter {
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    await context.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] });
+    await super.send(input, context);
+  }
+}
+
 export class OrchestratorE2eFixture {
   readonly rootDirectory: string;
   readonly workspaceDirectory: string;

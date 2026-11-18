@@ -17,6 +17,7 @@ import {
   QueueDeliveryMode,
   RunState,
   SearchSessionMessagesRequestSchema,
+  SessionMessageSearchSemanticMode,
   SessionSnapshotScopeSchema,
   SnapshotInvalidationReason,
   SnapshotScopeSchema,
@@ -30,7 +31,7 @@ import type { AdapterContext, NativeHistoryEventContext, NativeSessionBinding, P
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, PromptRecordingFakeAdapter, waitFor } from "./fixture.js";
 import {
   abortRunMutation,
   archiveMutation,
@@ -739,8 +740,13 @@ describe("session host, durable events, and reconnect semantics", () => {
     fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
       createAdapter: profile => new class extends InstrumentedFakeAdapter {
         override async send(input: PromptInput, context: AdapterContext): Promise<void> {
-          if (input.text === "Hold the middle task active") await releaseTurn.promise;
-          await super.send(input, context);
+          await super.send(input, {
+            ...context,
+            emit: async (event, metadata) => {
+              if (input.text === "Hold the middle task active" && event.type === "done") await releaseTurn.promise;
+              await context.emit(event, metadata);
+            }
+          });
         }
       }(profile) });
     const manager = await fixture.pair("Other project Owner");
@@ -833,6 +839,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     await firstCommitted.promise;
     expect(firstState).toBe(OperationState.SUCCEEDED);
     const store = fixture.application.store;
+    let heldRunId: string | undefined;
     if (change === "moved") {
       const staleRevision = (await manager.clients.session.getSession({ sessionId: changed })).session!.version!.revision!;
       expect((await move(changed)).state).toBe(OperationState.SUCCEEDED);
@@ -848,6 +855,7 @@ describe("session host, durable events, and reconnect semantics", () => {
       const generation = BigInt(store.getSession(changed).descriptor.binding.generation);
       const runId = queueRunIdFrom(await submit(manager.clients.operation, manager.connectionId, sendInputMutation(changed, generation, "Hold the middle task active")));
       await waitFor(() => manager.clients.run.getRun({ runId }), receipt => receipt.run?.state === RunState.RUNNING, "the middle task to stay busy");
+      heldRunId = runId;
     }
     releaseAcknowledgement.release();
     await waitFor(async () => store.getSession(remaining).descriptor.archived, Boolean, "the other original project task to archive");
@@ -864,6 +872,11 @@ describe("session host, durable events, and reconnect semantics", () => {
       expect(await page.locator(`.timeline[data-timeline-session-id="${survivor}"]`).isVisible()).toBe(true);
     }
     releaseTurn.release();
+    const middleRunId = heldRunId;
+    if (middleRunId !== undefined) {
+      await waitFor(() => manager.clients.run.getRun({ runId: middleRunId }), receipt => receipt.run?.state === RunState.SUCCEEDED,
+        "the same middle task Run to finish");
+    }
   });
 
   mountedTimelineIt("restores sidebar preview and scroll after search and keeps the rail preview reachable", { timeout: 90_000 }, async () => {
@@ -910,6 +923,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const preview = project.getByRole("button", { name: `Show all ${taskCount} tasks`, exact: true });
     await preview.waitFor({ state: "visible" });
     expect(await rows.count()).toBe(5);
+    await pinned.locator(".session-section__interactive-heading").hover();
     await pinned.getByRole("button", { name: "Collapse pinned tasks", exact: true }).click();
     await preview.click();
     expect(await rows.count()).toBe(taskCount);
@@ -995,9 +1009,11 @@ describe("session host, durable events, and reconnect semantics", () => {
   });
 
   mountedTimelineIt("searches a selected remote project through its original node while Web keeps its current connection", { timeout: 100_000 }, async () => {
-    fixture = await OrchestratorE2eFixture.start({ serverId: "remote-project-search-a", webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
+    fixture = await OrchestratorE2eFixture.start({ serverId: "remote-project-search-a", webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
+      createAdapter: profile => new PromptRecordingFakeAdapter(profile) });
     const current = fixture;
-    const remote = await OrchestratorE2eFixture.start({ serverId: "remote-project-search-b", corsOrigins: [current.baseUrl] });
+    const remote = await OrchestratorE2eFixture.start({ serverId: "remote-project-search-b", corsOrigins: [current.baseUrl],
+      createAdapter: profile => new PromptRecordingFakeAdapter(profile) });
     try {
       const primaryProject = "shared-project-id";
       const otherProject = "other-project-id";
@@ -1027,6 +1043,10 @@ describe("session host, durable events, and reconnect semantics", () => {
         setUpTask(remote, remoteManager, primaryProject, "Remote project task", remoteText)
       ]);
       await setUpTask(remote, remoteManager, otherProject, "Same-node control", `${phrase} other remote project`);
+      const ownerResults = await remoteManager.clients.session.searchSessionMessages({
+        scope: { case: "sessionId", value: remoteTask }, query: phrase, semanticMode: SessionMessageSearchSemanticMode.KEYWORD
+      });
+      expect(ownerResults.matches).toEqual(expect.arrayContaining([expect.objectContaining({ sessionId: remoteTask, snippet: remoteText })]));
 
       browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
       const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
@@ -1059,7 +1079,10 @@ describe("session host, durable events, and reconnect semantics", () => {
 
       const filter = page.locator(".conversation-search-filter > summary");
       await filter.click();
-      await page.locator(".conversation-search-filter__projects").getByText(/^Shared project · /u).click();
+      const remoteProject = page.locator(".conversation-search-filter__projects label").filter({ hasText: /^Shared project · /u });
+      const remoteProjectChoice = remoteProject.getByRole("checkbox");
+      await remoteProjectChoice.click();
+      expect(await remoteProjectChoice.getAttribute("aria-checked")).toBe("true");
       await filter.click();
       const searchRequests: { origin: string; sessionIds?: readonly string[] }[] = [];
       page.on("request", request => {
@@ -1071,7 +1094,10 @@ describe("session host, durable events, and reconnect semantics", () => {
       });
       await page.locator("#conversation-search-input").fill(phrase);
       const results = page.getByRole("listbox", { name: "Conversation search results" });
-      await results.getByText(remoteText, { exact: true }).waitFor({ state: "visible" });
+      await expect.poll(async () => ({
+        routed: searchRequests.some(request => request.origin === remote.baseUrl && request.sessionIds?.includes(remoteTask)),
+        visible: await results.getByText(remoteText, { exact: true }).isVisible()
+      }), { timeout: 30_000 }).toEqual({ routed: true, visible: true });
       expect(await results.innerText()).not.toContain("other remote project");
       expect(await results.innerText()).not.toContain("current project control");
       expect(searchRequests.length).toBeGreaterThan(0);
@@ -1173,7 +1199,8 @@ describe("session host, durable events, and reconnect semantics", () => {
   mountedTimelineIt("keeps new completion unread while the Workspace Files task panel is collapsed", { timeout: 90_000 }, async () => {
     const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities,
       { key: "workspace.files", supported: true as const }, { key: "session.attention", supported: true as const }] } satisfies FakeAdapterProfile;
-    fixture = await OrchestratorE2eFixture.start({ profiles: [profile], webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
+    fixture = await OrchestratorE2eFixture.start({ profiles: [profile], webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
+      createAdapter: profile => new PromptRecordingFakeAdapter(profile) });
     const host = fixture;
     const manager = await host.pair("Other task Owner");
     const projectId = "files-viewed-project";
