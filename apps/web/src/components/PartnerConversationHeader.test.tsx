@@ -1,15 +1,20 @@
 // @vitest-environment jsdom
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { create } from "@bufbuild/protobuf";
-import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
-  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, type PartnerHomeApi } from "@joko/contracts";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { ControlDesktopVoiceConversationRequestSchema, ControlDesktopVoiceConversationResponseSchema, DesktopVoiceCallRecordSchema,
+  DesktopVoiceConversationAction as Action, ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
+  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, type ControlDesktopVoiceConversationRequest,
+  type DesktopVoiceCallRecord, type PartnerHomeApi } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
-import { emptySnapshot, type PartnerListView, type PartnerProfileView, type PartnerSessionView, type SessionView } from "../model.js";
+import { emptySnapshot, type PartnerListView, type PartnerProfileView, type PartnerSessionView, type SessionView, type TimelineItemView } from "../model.js";
+import { DesktopMessageReadAloudProvider } from "./DesktopMessageReadAloud.js";
+import { DesktopVoiceConversationEntry } from "./DesktopVoiceConversation.js";
 import { PartnerConversationHeader } from "./PartnerConversationHeader.js";
 import { PartnerConversationProvider } from "./PartnerConversation.js";
+import { MessageActions } from "./Timeline.js";
 
 const roots: Root[] = [];
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
@@ -195,13 +200,147 @@ describe("canonical Partner conversation header", () => {
   });
 });
 
-async function mount(app: AppController, initialSession = session()) {
+describe("canonical Partner message read aloud", () => {
+  it("reads the completed reply as bounded prose and plays PCM through the existing client", async () => {
+    const host = installReadAloudHost();
+    const long = `First ${"x".repeat(493)}😀 follows [guide](https://example.invalid/private).\n\n~~~ts\ncodeNeverSpoken()\n~~~\n\nhttps://example.invalid/bare`;
+    const items = [reply("first", long), reply("partial", "Streaming", { streaming: true }), reply("code", "```\ncode only\n```")];
+    const view = await mountReadAloud(items);
+    expect(readAloudButton(view.host, "partial")).toBeNull();
+    expect(readAloudButton(view.host, "code")).toBeNull();
+    await act(async () => { required(readAloudButton(view.host, "first")).click(); });
+    await act(async () => vi.waitFor(() => expect(host.requests.at(-1)?.action).toBe(Action.END)));
+    expect(host.requests.map(request => request.action)).toEqual([
+      Action.SNAPSHOT, Action.START, Action.SPEAK, Action.READ_SPEECH, Action.SPEAK, Action.READ_SPEECH, Action.END
+    ]);
+    const [first, second] = host.requests.filter(request => request.action === Action.SPEAK);
+    const started = host.requests.find(request => request.action === Action.START)!;
+    expect(started).toMatchObject({ sessionId: "session-one", sessionGeneration: 1n, playbackOnly: true, selection: { voice: "alloy" } });
+    expect(first?.text).toBe(`First ${"x".repeat(493)}`);
+    expect(second?.text).toBe("😀 follows guide.");
+    expect(first?.speechRequestId).not.toBe(second?.speechRequestId);
+    expect(host.requests.filter(request => request.action === Action.READ_SPEECH).map(request => request.speechRequestId))
+      .toEqual([first?.speechRequestId, second?.speechRequestId]);
+    expect(host.requests.at(-1)).toMatchObject({ callId: started.callId, operationId: started.operationId, playbackOnly: true });
+    expect(host.played).toEqual([[0.25], [0.25]]);
+    expect(required(readAloudButton(view.host, "first")).getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("ends the old pending START on switch and the replacement on the same message button", async () => {
+    const originalStart = deferred<void>(), replacementPcm = deferred<void>();
+    let starts = 0;
+    const host = installReadAloudHost(request => {
+      if (request.action === Action.START && ++starts === 1) return originalStart.promise;
+      if (request.action === Action.READ_SPEECH) return replacementPcm.promise;
+      return undefined;
+    });
+    const view = await mountReadAloud([reply("first", "First exact reply"), reply("second", "Second exact reply")]);
+    try {
+      await act(async () => { required(readAloudButton(view.host, "first")).click(); await settle(); });
+      const original = required(host.requests.find(request => request.action === Action.START));
+      await act(async () => { required(readAloudButton(view.host, "second")).click(); });
+      await act(async () => vi.waitFor(() => expect(host.requests.at(-1)?.action).toBe(Action.READ_SPEECH)));
+      const replacement = required(host.requests.find(request => request.action === Action.START && request.callId !== original.callId));
+      expect(host.requests[2]).toMatchObject({ action: Action.END, callId: original.callId, operationId: original.operationId, playbackOnly: true });
+      expect(host.requests.filter(request => request.action === Action.SPEAK)).toEqual([
+        expect.objectContaining({ callId: replacement.callId, text: "Second exact reply" })
+      ]);
+      await act(async () => { required(readAloudButton(view.host, "second", "Stop playback")).click(); await settle(); });
+      expect(host.requests.at(-1)).toMatchObject({ action: Action.END, callId: replacement.callId, operationId: replacement.operationId });
+      await act(async () => { originalStart.resolve(); replacementPcm.resolve(); await settle(); });
+      expect(host.played).toEqual([]);
+      expect(host.requests.filter(request => request.action === Action.SPEAK)).toHaveLength(1);
+      expect(host.requests.filter(request => request.action === Action.END)).toHaveLength(2);
+    } finally { originalStart.resolve(); replacementPcm.resolve(); }
+  });
+
+  it("releases inline playback when the voice panel opens and removes the action from a nonlocal profile", async () => {
+    const delayed = deferred<void>();
+    const host = installReadAloudHost(request => request.action === Action.START ? delayed.promise : undefined);
+    const view = await mountReadAloud([reply("first", "First exact reply")]);
+    try {
+      await act(async () => { required(readAloudButton(view.host, "first")).click(); await settle(); });
+      const original = required(host.requests.find(request => request.action === Action.START));
+      await act(async () => { required(view.host.querySelector<HTMLButtonElement>("button[aria-label='Open voice conversation']")).click(); await settle(); });
+      expect(required(readAloudButton(view.host, "first")).disabled).toBe(true);
+      expect(host.requests.find(request => request.action === Action.END)).toMatchObject({ callId: original.callId, operationId: original.operationId });
+      await view.render(controller());
+      expect(readAloudButton(view.host, "first")).toBeNull();
+      await act(async () => { delayed.resolve(); await settle(); });
+      expect(host.requests.some(request => request.action === Action.SPEAK)).toBe(false);
+    } finally { delayed.resolve(); }
+  });
+});
+
+function installReadAloudHost(hold?: (request: ControlDesktopVoiceConversationRequest) => Promise<void> | undefined) {
+  const requests: ControlDesktopVoiceConversationRequest[] = [];
+  const played: number[][] = [];
+  let active: DesktopVoiceCallRecord | undefined;
+  vi.stubGlobal("jokoDesktop", { voiceConversation: { control: async (serverId: string, bytes: Uint8Array) => {
+    expect(serverId).toBe("owner-one");
+    const request = fromBinary(ControlDesktopVoiceConversationRequestSchema, bytes);
+    requests.push(request);
+    if (request.action === Action.START) active = create(DesktopVoiceCallRecordSchema, {
+      callId: request.callId, sessionId: request.sessionId, sessionGeneration: request.sessionGeneration, kind: "playback"
+    });
+    else if (request.action === Action.END && active?.callId === request.callId) active = undefined;
+    const call = active;
+    await hold?.(request);
+    return toBinary(ControlDesktopVoiceConversationResponseSchema, create(ControlDesktopVoiceConversationResponseSchema, {
+      call, accepted: true, sampleRate: 24_000,
+      ...(request.action === Action.READ_SPEECH ? { pcm: new Uint8Array([0, 32]), speechDone: true } : {}),
+      models: [{ backendId: "backend-one", providerId: "provider-one", modelId: "tts", displayName: "TTS", providerName: "Fixture", protocol: "openai", protocolLocked: true }],
+      preference: { playback: { backendId: "backend-one", providerId: "provider-one", modelId: "tts", protocol: "openai", voice: "alloy" } }
+    }));
+  } } });
+  vi.stubGlobal("AudioContext", class {
+    state: AudioContextState = "suspended";
+    destination = {};
+    #time = 0;
+    get currentTime() { return ++this.#time; }
+    async resume() { this.state = "running"; }
+    async close() { this.state = "closed"; }
+    createBuffer(_channels: number, samples: number) {
+      const data = new Float32Array(samples);
+      return { getChannelData: () => data };
+    }
+    createBufferSource() {
+      return { buffer: null as { getChannelData(): Float32Array } | null,
+        connect() {}, start() { played.push(Array.from(this.buffer!.getChannelData())); } };
+    }
+  });
+  return { requests, played };
+}
+
+function reply(id: string, text: string, overrides: Partial<TimelineItemView> = {}): TimelineItemView {
+  return { id, text, kind: "assistant", sourceEventId: `event-${id}`, completionCursor: 1n, sequence: 1n, createdAt: 1, ...overrides };
+}
+
+function readAloudButton(host: HTMLElement, id: string, label = "Read aloud") {
+  return host.querySelector<HTMLButtonElement>(`[data-speech-row='${id}'] button[aria-label='${label}']`);
+}
+
+async function mountReadAloud(items: readonly TimelineItemView[]) {
+  const app = controller();
+  const local = { ...app, state: { ...app.state, effectiveLocale: "en" as const,
+    activeProfile: { ...app.state.activeProfile!, managedLocal: true },
+    managedOrchestratorStatus: { state: "ready" as const, connection: {
+      profileId: "owner-one", serverId: "owner-one", deviceId: "desktop", name: "Local Desktop", origin: "http://127.0.0.1"
+    } } } };
+  return mount(local, session(), (current, task) => <DesktopMessageReadAloudProvider controller={current} session={task} items={items} enabled>
+    {items.map(item => <div key={item.id} data-speech-row={item.id}><MessageActions ownerKey="test" sessionId={task.id} sessionName={task.name}
+      item={item} text={item.text ?? ""} align="left" locale="en" t={translate} forking={false} editable={false} /></div>)}
+    <DesktopVoiceConversationEntry controller={current} session={task} disabled={false} />
+  </DesktopMessageReadAloudProvider>);
+}
+
+async function mount(app: AppController, initialSession = session(), renderBody?: (app: AppController, session: SessionView) => ReactNode) {
   const host = document.body.appendChild(document.createElement("main"));
   const root = createRoot(host); roots.push(root);
   const render = async (current: AppController, task = initialSession): Promise<void> => act(async () => {
     root.render(<PartnerConversationProvider controller={current} session={task} active t={translate}><PartnerConversationHeader session={task} navigationOpen onOpenNavigation={() => undefined} t={translate}>
       <header data-task-controls>Rename · Pin · Archive · Export</header>
-    </PartnerConversationHeader><input data-composer /></PartnerConversationProvider>);
+    </PartnerConversationHeader><input data-composer />{renderBody?.(current, task)}</PartnerConversationProvider>);
     await settle();
   });
   await render(app);
