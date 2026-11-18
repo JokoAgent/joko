@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { NativeRemoteTaskTracker, remoteEntryToken } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import { resolveNativeTaskStatusPermissionAction } from "../native-task-status-bridge.js";
-import { composeNativeTaskStatusProjection, nativeTaskStatusRouteKey, nativeTaskStatusProfileKey, type NativeTaskStatusRoute } from "../native-task-status-projection.js";
+import { composeNativeTaskStatusProjection, nativeTaskArchivedCompletions, nativeTaskStatusRouteKey, nativeTaskStatusProfileKey, type NativeTaskStatusRoute } from "../native-task-status-projection.js";
 import { selectedMachineProfileIds } from "../machine-federation.js";
 import { executeNativeTaskStatusCompletion } from "../native-task-status-completion.js";
 import type { WorktreeRemovalPreflightSummary } from "../worktree-removal-preflight.js";
@@ -18,14 +18,26 @@ export function NativeTaskStatusBridge({ controller, ownsProjection, visibleSess
   const supported = desktop?.capabilities.includes("native.taskStatus") === true;
   const owner = useRef(`renderer:${crypto.randomUUID()}`);
   const revision = useRef(0n);
+  const archiveRetirements = useRef<{ readonly key: string; readonly completions: ReadonlyMap<string, string> } | undefined>(undefined);
   const state = controller.state;
-  const projection = useMemo(() => composeNativeTaskStatusProjection({
-    ownerId: owner.current, revision: ++revision.current, locale: state.effectiveLocale,
-    ...(state.connectionState === "connected" && state.activeProfile ? { primary: { profile: state.activeProfile, snapshot: state.snapshot, connectionGeneration: state.connectionGeneration } } : {}),
-    remotes: (state.nativeTaskStatusLiveSources ?? []).filter(source => state.profiles.some(profile => profile.id === source.profile.id
-      && profile.serverId === source.profile.serverId && profile.origin === source.profile.origin && profile.deviceId === source.profile.deviceId)),
-    selectedProfileIds: new Set(selectedMachineProfileIds(state.preferences.machineSelection, state.profiles))
-  }), [state.connectionState, state.connectionGeneration, state.activeProfile, state.effectiveLocale, state.snapshot, state.nativeTaskStatusLiveSources, state.preferences.machineSelection, state.profiles]);
+  const projection = useMemo(() => {
+    const profile = state.connectionState === "connected" ? state.activeProfile : undefined;
+    if (profile && ownsProjection && supported) {
+      const key = JSON.stringify([nativeTaskStatusProfileKey(profile), state.snapshot.generation.toString()]);
+      const previous = archiveRetirements.current;
+      archiveRetirements.current = { key, completions: nativeTaskArchivedCompletions(state.snapshot.sessions,
+        previous?.key === key ? previous.completions : undefined) };
+    }
+    return composeNativeTaskStatusProjection({
+      ownerId: owner.current, revision: ++revision.current, locale: state.effectiveLocale,
+      ...(profile ? { primary: { profile, snapshot: state.snapshot, connectionGeneration: state.connectionGeneration,
+        archivedCompletions: ownsProjection && supported ? archiveRetirements.current?.completions : undefined } } : {}),
+      remotes: (state.nativeTaskStatusLiveSources ?? []).filter(source => state.profiles.some(candidate => candidate.id === source.profile.id
+        && candidate.serverId === source.profile.serverId && candidate.origin === source.profile.origin && candidate.deviceId === source.profile.deviceId)),
+      selectedProfileIds: new Set(selectedMachineProfileIds(state.preferences.machineSelection, state.profiles))
+    });
+  }, [ownsProjection, supported, state.connectionState, state.connectionGeneration, state.activeProfile, state.effectiveLocale,
+    state.snapshot, state.nativeTaskStatusLiveSources, state.preferences.machineSelection, state.profiles]);
   const projectionRef = useRef(projection); projectionRef.current = projection;
   const notificationTracker = useRef(new NativeRemoteTaskTracker());
   const pendingNotifications = useRef(new Map<string, string>());

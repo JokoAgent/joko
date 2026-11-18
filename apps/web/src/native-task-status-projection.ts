@@ -1,5 +1,5 @@
 import { NATIVE_TASK_STATUS_SESSION_LIMIT } from "@joko/contracts";
-import type { AppSnapshot, ConnectionProfile, PartnerProfileView } from "./model.js";
+import type { AppSnapshot, ConnectionProfile, PartnerProfileView, SessionView } from "./model.js";
 import { projectNativeTaskStatusSnapshot } from "./native-task-status-bridge.js";
 import type { NativeTaskStatusLiveSource } from "./native-task-status-sources.js";
 
@@ -18,9 +18,26 @@ export function nativeTaskStatusRouteKey(route: NativeTaskStatusRoute): string {
   return JSON.stringify([route.profileId, route.serverId, route.sourceGeneration.toString(), route.generation.toString(), route.sessionId,
     route.profileKey ?? "", route.connectionGeneration ?? null]);
 }
+
+/** A retained archive only retires the exact completion already present at that point. */
+export function nativeTaskArchivedCompletions(
+  sessions: readonly SessionView[],
+  previous?: ReadonlyMap<string, string>
+): ReadonlyMap<string, string> {
+  const completions = new Map<string, string>();
+  for (const session of sessions) {
+    const attention = session.attention;
+    if (session.hidden || attention?.kind !== "done" || !attention.unread) continue;
+    const identity = `${session.generation}/${attention.subjectCursor.generation}/${attention.subjectCursor.sequence}`;
+    if (session.archived || previous?.get(session.id) === identity) completions.set(session.id, identity);
+  }
+  return completions;
+}
+
 export function composeNativeTaskStatusProjection(input: {
   readonly ownerId: string; readonly revision: bigint; readonly locale: JokoDesktopNativeTaskStatusSnapshot["locale"];
-  readonly primary?: { readonly profile: ConnectionProfile; readonly snapshot: AppSnapshot; readonly connectionGeneration?: number };
+  readonly primary?: { readonly profile: ConnectionProfile; readonly snapshot: AppSnapshot; readonly connectionGeneration?: number;
+    readonly archivedCompletions?: ReadonlyMap<string, string> };
   readonly remotes: readonly NativeTaskStatusLiveSource[]; readonly selectedProfileIds: ReadonlySet<string>;
 }): { readonly snapshot: JokoDesktopNativeTaskStatusSnapshot; readonly routes: ReadonlyMap<string, NativeTaskStatusRoute> } {
   const routes = new Map<string, NativeTaskStatusRoute>();
@@ -30,8 +47,11 @@ export function composeNativeTaskStatusProjection(input: {
       .map(partner => [partner.canonicalSessionId!, partner]));
     const eligible = snapshot.sessions.filter(session => !session.hidden && !session.archived
       && (!source || partners.has(session.id) || input.selectedProfileIds.has(profile.id)));
+    const archivedCompletions = source ? undefined : input.primary?.archivedCompletions;
+    const nativeSessions = archivedCompletions === undefined ? eligible : eligible.map(session =>
+      archivedCompletions.has(session.id) ? { ...session, attention: undefined } : session);
     const base = projectNativeTaskStatusSnapshot({ ownerId: input.ownerId, revision: input.revision, locale: input.locale,
-      sessions: eligible, interactions: snapshot.interactions, timelineBySession: snapshot.timelineBySession,
+      sessions: nativeSessions, interactions: snapshot.interactions, timelineBySession: snapshot.timelineBySession,
       inputHandoffs: snapshot.inputHandoffs });
     const byId = new Map(base.sessions.map(session => [session.sessionId, session]));
     const observedCompletions = new Set<string>();
