@@ -5452,8 +5452,8 @@ function sameOrchestratorOrigin(left: string, right: string): boolean {
   }
 }
 
-function withDesktopWindowThemeLock(apply: () => Promise<void>): Promise<void> {
-  return window.navigator.locks?.request("joko:desktop-window-theme:v1", apply) ?? apply();
+async function withDesktopWindowThemeLock(apply: () => Promise<void>): Promise<void> {
+  await (window.navigator.locks?.request("joko:desktop-window-theme:v1", apply) ?? apply());
 }
 
 function applyTheme(theme: Theme): void {
