@@ -203,6 +203,9 @@ it.each(["progress", "no progress", "before dispatch", "unknown dispatch"] as co
       const origin = store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false });
       const ownedInput = origin === undefined ? undefined : store.findEvent(origin.eventId);
       expect(ownedInput?.runId === sourceRunId && ownedInput.operationId === sourceQueue?.operationId).toBe(false);
+      const capture = await waitFor(() => Promise.resolve(store.listEvents({ sessionId }).find(event =>
+        event.runId === sourceRunId && event.payload.type === "workspace_diff")), event => event !== undefined, "the original empty Codex workspace capture");
+      expect(capture?.payload).toMatchObject({ type: "workspace_diff", changeSet: { completeBaseline: true, changes: [] } });
     }
 
     if (failure === "progress") {

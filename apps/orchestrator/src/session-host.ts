@@ -3328,7 +3328,13 @@ export class SessionHost {
       || this.#store.listQueueItems({ sessionId: session.id, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0) {
       throw new StoreError("The original Codex input is no longer the current turn. Inspect the task before retrying.");
     }
-    if (!contextRecoveryEvidence(this.#store, session.id, run.id).hasAssistantOrToolEffects) return source.body;
+    const progressed = listAllVisibleSessionEvents(this.#store, session.id).some(event => {
+      if (event.runId !== run.id) return false;
+      const payload = event.payload;
+      if (payload.type === "workspace_diff" && payload.changeSet.completeBaseline && payload.changeSet.changes.length === 0) return false;
+      return isContextRecoverySideEffect(event);
+    });
+    if (!progressed) return source.body;
 
     const origin = this.#store.findVisibleSessionMessageOrigin({ sessionId: session.id, role: "user", includeRetainedContext: false });
     const user = origin === undefined ? undefined : this.#store.findEvent(origin.eventId);
