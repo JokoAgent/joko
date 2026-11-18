@@ -6,7 +6,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type ScheduleView, type SessionView, type TimelineHistoryCursorView } from "../model.js";
+import { emptySnapshot, type ScheduleView, type SessionView, type TargetView, type TimelineHistoryCursorView } from "../model.js";
 import { stageUsageLimitScheduleIntent } from "../usage-limit-recovery.js";
 import { SchedulesPage } from "./SchedulesPage.js";
 import type { Translator } from "./types.js";
@@ -57,6 +57,37 @@ describe("SchedulesPage empty states", () => {
     expect([...form?.querySelectorAll<HTMLInputElement>('input[type="datetime-local"]') ?? []]
       .some((input) => input.value.length > 0)).toBe(true);
   });
+
+  it("can save the later repeated recovery time after the first occurrence has passed", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2027-11-07T06:00:00Z"));
+    const zoneOptions = Intl.DateTimeFormat().resolvedOptions();
+    const zone = vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue({ ...zoneOptions, timeZone: "America/New_York" });
+    const task: SessionView = {
+      id: "quota-task", backendId: "backend", targetId: "target", name: "Quota task", state: "idle",
+      pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, updatedAt: 1
+    };
+    const target: TargetView = {
+      id: "target", backendId: task.backendId, workspaceId: "workspace", workspaceName: "Project", name: "Project",
+      revision: 1n, trusted: true, pinned: false, archived: false
+    };
+    const resetAt = Date.parse("2027-11-07T06:30:00Z");
+    const saveSchedule = vi.fn<AppController["saveSchedule"]>(async () => undefined);
+    try {
+      stageUsageLimitScheduleIntent(task.id, { resetAtMs: resetAt });
+      await renderSchedules([], [task], undefined, { targets: [target], saveSchedule });
+      const form = document.querySelector<HTMLFormElement>(".schedule-editor")!;
+      expect(form.querySelector<HTMLInputElement>('input[type="datetime-local"]')?.value).toBe("2027-11-07T01:31");
+      const submit = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+      expect(submit.disabled).toBe(false);
+      await act(async () => submit.click());
+      expect(saveSchedule).toHaveBeenCalledExactlyOnceWith(undefined, expect.objectContaining({
+        kind: "once", onceTriggerAt: resetAt + 60_000, sessionId: task.id
+      }));
+    } finally {
+      zone.mockRestore();
+      now.mockRestore();
+    }
+  });
 });
 
 describe("SchedulesPage unread history", () => {
@@ -100,9 +131,11 @@ describe("SchedulesPage unread history", () => {
 });
 
 async function renderSchedules(schedules: readonly ScheduleView[], sessions: readonly SessionView[] = [],
-  historyActions?: Pick<AppController, "acknowledgeSessionError" | "acknowledgeSessionAttention" | "markAllScheduleRunsRead" | "refresh">
+  historyActions?: Pick<AppController, "acknowledgeSessionError" | "acknowledgeSessionAttention" | "markAllScheduleRunsRead" | "refresh">,
+  editor?: { readonly targets: readonly TargetView[]; readonly saveSchedule: AppController["saveSchedule"] }
 ): Promise<HTMLDivElement> {
-  const snapshot = { ...emptySnapshot(), revision: 1n, schedules, sessions };
+  const targets = editor?.targets ?? [];
+  const snapshot = { ...emptySnapshot(), revision: 1n, schedules, sessions, targets };
   const controller = {
     state: {
       snapshot,
@@ -113,7 +146,8 @@ async function renderSchedules(schedules: readonly ScheduleView[], sessions: rea
     getSchedulerRuntime: vi.fn(() => new Promise<never>(() => undefined)),
     listScheduleRunHistory: vi.fn(async () => ({ history: [], totalSize: 0 })),
     refreshProviderModels: vi.fn(async () => undefined),
-    ...historyActions
+    ...historyActions,
+    ...(editor === undefined ? {} : { saveSchedule: editor.saveSchedule })
   } as unknown as AppController;
   const container = document.createElement("div");
   document.body.append(container);
@@ -123,7 +157,7 @@ async function renderSchedules(schedules: readonly ScheduleView[], sessions: rea
     controller={controller}
     schedules={schedules}
     sessions={sessions}
-    targets={[]}
+    targets={targets}
     models={[]}
     backends={[]}
     extraDirectories={[]}

@@ -2,14 +2,19 @@ import { capabilityNames } from "@joko/contracts";
 import type { ErrorView, ProviderRuntimeView, ScheduleDraft, SessionView } from "./model.js";
 import { scheduleLocalDateTimeFromEpoch } from "./schedule-time.js";
 
+type RecoveryModel = Pick<ScheduleDraft, "providerId" | "modelId" | "effort" | "fastMode">;
+
+export type FailedInputModel = { readonly kind: "inherited" } | { readonly kind: "override"; readonly model: RecoveryModel };
+
 export interface UsageLimitRecoveryHint {
   readonly resetAtMs: number | null;
+  /** Leave the route unset when the failed input's model could not be verified. */
+  readonly model?: RecoveryModel | null;
 }
 
-export interface UsageLimitScheduleIntent {
+export interface UsageLimitScheduleIntent extends UsageLimitRecoveryHint {
   readonly requestId: string;
   readonly sessionId: string;
-  readonly resetAtMs: number | null;
 }
 
 let pendingIntent: UsageLimitScheduleIntent | undefined;
@@ -70,9 +75,9 @@ export function stageUsageLimitScheduleIntent(
 ): UsageLimitScheduleIntent {
   intentSequence += 1;
   pendingIntent = {
+    ...hint,
     requestId: `${sessionId}:${Date.now()}:${intentSequence}`,
-    sessionId,
-    resetAtMs: hint.resetAtMs
+    sessionId
   };
   return pendingIntent;
 }
@@ -91,7 +96,16 @@ export function buildUsageLimitScheduleDraft(
   now = Date.now()
 ): ScheduleDraft {
   const triggerAt = intent.resetAtMs === null ? undefined : intent.resetAtMs + 60_000;
-  const scheduled = triggerAt !== undefined && Number.isFinite(triggerAt) && triggerAt > now;
+  const onceTriggerAt = triggerAt !== undefined && Number.isSafeInteger(triggerAt) && triggerAt > now && Number.isFinite(new Date(triggerAt).getTime())
+    ? triggerAt : undefined;
+  const model = intent.model === null
+    ? { providerId: "", modelId: "", effort: undefined, fastMode: false }
+    : intent.model ?? {
+      providerId: session?.model?.providerId ?? base.providerId,
+      modelId: session?.model?.modelId ?? base.modelId,
+      effort: session?.effort ?? base.effort,
+      fastMode: session?.fastMode ?? base.fastMode
+    };
   return {
     ...base,
     name: labels.name,
@@ -99,14 +113,12 @@ export function buildUsageLimitScheduleDraft(
     targetId: session?.targetId ?? base.targetId,
     sessionMode: session === undefined ? base.sessionMode : "bound",
     sessionId: session?.id ?? base.sessionId,
-    kind: scheduled ? "once" : "manual",
-    expression: scheduled ? scheduleLocalDateTimeFromEpoch(triggerAt, base.timezone) : "",
+    kind: onceTriggerAt === undefined ? "manual" : "once",
+    expression: onceTriggerAt === undefined ? "" : scheduleLocalDateTimeFromEpoch(onceTriggerAt, base.timezone),
+    onceTriggerAt,
     inputText: labels.prompt,
     executionMode: "agent",
-    providerId: session?.model?.providerId ?? base.providerId,
-    modelId: session?.model?.modelId ?? base.modelId,
-    effort: session?.effort ?? base.effort,
-    fastMode: session?.fastMode ?? base.fastMode,
+    ...model,
     permissionMode: session?.permissionMode ?? base.permissionMode,
     planMode: session?.planMode ?? base.planMode,
     useWorktree: false,

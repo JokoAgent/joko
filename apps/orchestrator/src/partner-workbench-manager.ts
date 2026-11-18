@@ -550,10 +550,16 @@ export class PartnerWorkbenchManager {
 
   async #reconcileBackgrounds(owner: PartnerWorkbenchOwner, state: PartnerWorkbenchState): Promise<PartnerWorkbenchState> {
     let currentState = state;
-    for (const record of this.#backgrounds(owner.partnerId).filter((item) => currentState.projects.some((project) => project.path === item.project)).slice(0, 20)) {
+    const projects = new Set(state.projects.map(project => project.path));
+    let remainingNativeInspections = 20;
+    for (const record of this.#backgrounds(owner.partnerId)) {
+      if (!projects.has(record.project)) continue;
       if ([...this.#continuations.values()].some((flight) => flight.operationId === record.operationId)) continue;
       let next = this.#backgroundReceipt(record);
-      if (next.status === "unknown" && record.mode === "adopt" && this.#store.findNativeCatalogAdoption(`${record.operationId}:import`) !== undefined) {
+      // Completed local receipts can be read without issuing native recovery effects.
+      if (remainingNativeInspections > 0 && next.status === "unknown" && record.mode === "adopt"
+        && this.#store.findNativeCatalogAdoption(`${record.operationId}:import`) !== undefined) {
+        remainingNativeInspections -= 1;
         try {
           await this.#host.reconcileServiceNativeCatalogAdoption({ operationId: `${record.operationId}:import`,
             originSessionId: record.parentSessionId, originSessionGeneration: record.parentSessionGeneration,

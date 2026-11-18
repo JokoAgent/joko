@@ -823,6 +823,78 @@ it.each([undefined, { messageId: "searched-message", messageEventId: "searched-e
   expect(current.state.activeProfile?.id).toBe(first.id);
 });
 
+it.each(["remote task", "machine menu"] as const)("keeps the old qualified route from taking over the %s connection", async (entry) => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  window.history.replaceState(window.history.state, "", "#/settings");
+  const first = profile("handoff-source"), second = profile("handoff-target");
+  const firstRoute = { kind: "session" as const, profileId: first.id, sessionId: "original-task" };
+  const snapshots = new Map([
+    [first.id, { ...emptySnapshot(), revision: 1n, sessions: [session("original-task", 1)] }],
+    [second.id, { ...emptySnapshot(), revision: 2n, sessions: [session("destination-task", 2)] }]
+  ]);
+  let releaseConnect!: () => void, releaseSave!: () => void;
+  const connectGate = new Promise<void>(resolve => { releaseConnect = resolve; });
+  const saveGate = new Promise<void>(resolve => { releaseSave = resolve; });
+  const requests: string[] = [];
+  const saveProfile = vi.fn(async (owner: ConnectionProfile) => { if (owner.id === second.id) await saveGate; });
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [first, second], listMachineCaches: async () => [],
+    readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
+    readAuthKey: async () => "test-key", loadEndpointTransport: LocalState.prototype.loadEndpointTransport,
+    saveProfile, saveMachineCache: async () => undefined, deleteMachineCache: async () => undefined
+  } as unknown as LocalState);
+  vi.mocked(probeOrchestratorOrigin).mockImplementation(async origin => {
+    const owner = [first, second].find(value => value.origin === origin)!;
+    return { serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: false };
+  });
+  vi.mocked(createOrchestratorGateway).mockImplementation((owner, _authKey, callbacks) => ({
+    connect: async () => {
+      if (callbacks.onSnapshot) requests.push(owner!.id);
+      if (owner!.id === second.id && callbacks.onState !== undefined) await connectGate;
+      callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
+      callbacks.onState?.("connected");
+    },
+    disconnect: vi.fn(), taskSharingApi: () => undefined,
+    inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined,
+    partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined
+  } as unknown as OrchestratorGateway));
+  let current!: AppController;
+  function Probe(): null { current = useAppController(); return null; }
+  root = createRoot(document.body.appendChild(document.createElement("div")));
+  await act(async () => root!.render(<Probe />));
+  await vi.waitFor(() => expect(current.state.ready).toBe(true));
+  await act(async () => current.connect(first));
+  await act(async () => current.navigate(firstRoute, { replace: true }));
+  expect(current.state.route).toEqual(firstRoute);
+  requests.length = 0;
+
+  let pending!: Promise<void>;
+  await act(async () => {
+    pending = entry === "remote task" ? current.openMachineSession(second.id, "destination-task") : current.switchMachine(second.id);
+  });
+  try {
+    await vi.waitFor(() => expect(current.state.activeProfile?.id).toBe(second.id));
+    expect(current.state.connectionState).toBe("connecting");
+    expect(current.state.route).toEqual(firstRoute);
+    expect(current.isMachineRouteHandoffPending?.()).toBe(true);
+    expect(requests).not.toContain(first.id);
+    await act(async () => releaseConnect());
+    await vi.waitFor(() => expect(saveProfile).toHaveBeenCalledWith(expect.objectContaining({ id: second.id }), "test-key"));
+    expect(current.state.connectionState).toBe("connected");
+    expect(current.state.snapshot.sessions.map(item => item.id)).toEqual(["destination-task"]);
+    expect(current.state.route).toEqual(firstRoute);
+    expect(current.isMachineRouteHandoffPending?.()).toBe(true);
+    expect(requests).not.toContain(first.id);
+  } finally {
+    await act(async () => { releaseConnect(); releaseSave(); await pending; });
+  }
+  await vi.waitFor(() => expect(current.state.route).toEqual({ kind: "session", profileId: second.id,
+    ...(entry === "remote task" ? { sessionId: "destination-task" } : {}) }));
+  expect(current.state.activeProfile?.id).toBe(second.id);
+  expect(current.isMachineRouteHandoffPending?.()).toBe(false);
+  expect(requests).not.toContain(first.id);
+});
+
 function profile(id: string): ConnectionProfile { return { id, deviceId: `device-${id}`, name: id, origin: `https://${id}.example`, serverId: `server-${id}` }; }
 
 function session(id: string, updatedAt: number): SessionView {

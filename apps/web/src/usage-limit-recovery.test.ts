@@ -92,6 +92,7 @@ describe("usage-limit recovery", () => {
       sessionId: "session-one",
       kind: "once",
       expression: "2026-08-26T10:02",
+      onceTriggerAt: NOW + 120_000,
       targetId: "target-one",
       providerId: "provider-one",
       modelId: "model-one"

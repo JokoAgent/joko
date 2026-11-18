@@ -5,7 +5,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type FederatedSessionMessageSearchOutcome, type FederatedSessionMessageSearchPage, type SessionMessageSearchMatchView } from "../model.js";
+import { remoteMachineProfileKey } from "../machine-federation.js";
+import { emptySnapshot, type AppSnapshot, type FederatedSessionMessageSearchOutcome, type FederatedSessionMessageSearchPage, type SessionMessageSearchMatchView } from "../model.js";
 import { Sidebar, type SidebarProps } from "./Sidebar.js";
 import type { Translator } from "./types.js";
 
@@ -332,6 +333,63 @@ describe("Sidebar progressive conversation search", () => {
     expect(result?.textContent).toContain("machine.searchLive");
     await act(async () => result?.click());
     expect(openRemoteMessage).toHaveBeenCalledWith("remote-east", remoteMatch);
+  });
+
+  it("searches the chosen remote navigation project while keeping the current node and rejects stale membership", async () => {
+    vi.useFakeTimers();
+    const machine = remoteMachineControl("west");
+    const east = machine.profiles[1]!;
+    const west = machine.profiles[2]!;
+    const eastMatch = hit("east selected needle", "east-selected");
+    const eastOther = { ...hit("east other needle", "east-other"), sessionId: "session-b" };
+    const westMatch = hit("west selected needle", "west-selected");
+    const remote = vi.fn<NonNullable<SidebarProps["onSearchRemoteMessages"]>>(async () => [
+      remoteSearchPage("east", [eastMatch, eastOther]), remoteSearchPage("west", [westMatch])
+    ]);
+    const local = vi.fn<SidebarProps["onSearchMessages"]>(async () => []);
+    const rendered = await renderSidebar(local, { onSearchRemoteMessages: remote, machineControl: machine });
+    const template = rendered.snapshot;
+    const base = template.sessions[0]!;
+    const workspace = (id: string) => ({ id: `workspace-${id}`, targetId: id, name: id, kind: "userProject" as const,
+      serverPath: `/${id}`, trusted: true, dirty: false, entries: [] });
+    const eastSnapshot: AppSnapshot = { ...template,
+      targets: [template.targets[0]!, { ...template.targets[0]!, id: "target-b", name: "Project B" }],
+      workspaces: [workspace("target-a"), workspace("target-b")],
+      sessions: [{ ...base, targetId: "target-b" }, { ...base, id: "session-b", projectId: "target-b", name: "Other task" }] };
+    const westSnapshot: AppSnapshot = { ...template, workspaces: [workspace("target-a")] };
+    const westSource = { profile: west, epoch: remoteSearchEpochs.west, snapshot: westSnapshot };
+    await rendered.rerender({ machineControl: { ...machine, liveProjectSources: [
+      { profile: east, epoch: remoteSearchEpochs.east, snapshot: eastSnapshot }, westSource
+    ] } });
+    const project = (label: string) => Array.from(rendered.container.querySelectorAll<HTMLLabelElement>(".conversation-search-filter__projects label"))
+      .find(choice => choice.querySelector("span")?.textContent === label)?.querySelector<HTMLInputElement>("input")!;
+    expect(project("Project A · east")).toBeDefined();
+    expect(project("Project A · west")).toBeDefined();
+    await act(async () => project("Project A · east").click());
+    await enterQuery(rendered.container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(remote.mock.calls[0]?.[4]).toEqual([{ profileKey: remoteMachineProfileKey(east), projectId: "target-a" }]);
+    expect(local).not.toHaveBeenCalled();
+    expect(rendered.container.querySelector("#conversation-search-results")?.textContent).toContain("east selected needle");
+    expect(rendered.container.textContent).not.toContain("east other needle");
+    expect(rendered.container.textContent).not.toContain("west selected needle");
+
+    const moved = { ...eastSnapshot, sessions: eastSnapshot.sessions.map(task => ({ ...task, projectId: "target-b" })) };
+    await rendered.rerender({ machineControl: { ...machine, liveProjectSources: [
+      { profile: east, epoch: remoteSearchEpochs.east, snapshot: moved }, westSource
+    ] } });
+    expect(remote.mock.calls[0]?.[3].aborted).toBe(true);
+    expect(rendered.container.textContent).not.toContain("east selected needle");
+    expect(project("Project A · east").checked).toBe(true);
+    await act(async () => project("Project A · west").click());
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(remote.mock.calls[1]?.[4]).toEqual([{ profileKey: remoteMachineProfileKey(west), projectId: "target-a" }]);
+    const result = [...rendered.container.querySelectorAll<HTMLButtonElement>(".conversation-search-result--remote button")]
+      .find(button => button.textContent?.includes("west selected needle"));
+    expect(result).toBeDefined();
+    await act(async () => result?.click());
+    expect(machine.onOpenMessageMatch).toHaveBeenCalledWith(west.id, westMatch);
+    expect(machine.onSwitch).not.toHaveBeenCalled();
   });
 
   it.each(["keyword", "hybrid"] as const)("keeps keyword hits only for failed peers when %s settles first", async (first) => {

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 
-import { QueueDispatchState, QueueItemState, RunState, type QueueControl } from "@joko/contracts";
+import { createConnectTransport } from "@connectrpc/connect-node";
+import { QueueDispatchState, QueueItemState, RunState, ScheduleState, type QueueControl } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
@@ -179,6 +180,88 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     expect(fixture.adapter().sendCalls.some((item) => item.text === "scheduled while UI is absent")).toBe(true);
     const schedules = await observer.clients.scheduler.listSchedules({ sessionId });
     expect(schedules.schedules[0]?.scheduleId).toBe(scheduleId);
+  });
+
+  it("saves and dispatches each exact one-shot quota recovery instant in a repeated hour", async () => {
+    // Advance the service wall clock while leaving real RPC and test timers running.
+    const realNow = Date.now;
+    let clockOffset = Date.parse("2027-11-07T04:00:00Z") - realNow();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockOffset);
+    let disconnect: (() => void) | undefined;
+    try {
+      const serverId = "one-shot-repeated-hour";
+      const host = fixture = await OrchestratorE2eFixture.start({ serverId });
+      const owner = await host.pair("Quota recovery schedule owner");
+      const sessionId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId, createSessionMutation({
+        backendId: host.adapter().id, targetId: host.targetId(), displayName: "Quota recovery task"
+      })));
+      const { createOrchestratorGateway, mapSnapshot } = await import(new URL("../../web/src/gateway.ts", import.meta.url).href);
+      const { scheduleDraft } = await import(new URL("../../web/src/components/SchedulesPage.tsx", import.meta.url).href);
+      const { buildUsageLimitScheduleDraft, usageLimitRecoveryHint } = await import(new URL("../../web/src/usage-limit-recovery.ts", import.meta.url).href);
+      const gateway = createOrchestratorGateway({ id: owner.connectionId, deviceId: owner.deviceId, serverId,
+        name: "Quota recovery Web", origin: host.baseUrl }, owner.authKey, {}, () => createConnectTransport({
+        baseUrl: host.baseUrl, httpVersion: "1.1", useBinaryFormat: true,
+        interceptors: [next => async request => { request.header.set("authorization", `Bearer ${owner.authKey}`); return next(request); }]
+      }));
+      disconnect = () => gateway.disconnect();
+      await gateway.connect({ snapshotOnly: true });
+      const readOwner = async () => {
+        const { snapshot } = await owner.clients.event.getSnapshot({ scope: { kind: { case: "owner", value: {} } } });
+        if (snapshot === undefined) throw new Error("The paired node returned no Owner snapshot.");
+        return mapSnapshot(snapshot);
+      };
+      const { targets, sessions, models, backends } = await readOwner();
+      const session = sessions.find((item: { readonly id: string }) => item.id === sessionId);
+      expect(session).toBeDefined();
+      const timezone = "America/New_York";
+      const base = { ...scheduleDraft(undefined, targets, sessions, models, backends), timezone };
+      const schedules = [];
+      for (const hour of [5, 6]) {
+        const triggerAt = Date.UTC(2027, 10, 7, hour, 31);
+        const hint = usageLimitRecoveryHint({ code: "PROVIDER_REQUEST_FAILED",
+          message: `Rate limit exceeded; resets at ${(triggerAt - 60_000) / 1_000}`,
+          phase: "stream", severity: "blocked", retryable: false, recovery: [] }, Date.now());
+        expect(hint?.resetAtMs).toBe(triggerAt - 60_000);
+        const name = `Original quota recovery ${hour}`, prompt = `Resume original task at ${hour} UTC`;
+        const draft = buildUsageLimitScheduleDraft(base, { ...hint, requestId: `quota-recovery-${hour}`, sessionId }, session, { name, prompt });
+        expect(draft.expression).toBe("2027-11-07T01:31");
+        await gateway.saveSchedule(undefined, draft);
+        const listed = (await owner.clients.scheduler.listSchedules({ sessionId })).schedules.find(item => item.displayName === name);
+        if (!listed) throw new Error("The new one-shot Schedule is absent from the paired node.");
+        const receipt = { seconds: BigInt(triggerAt / 1000), nanos: 0 };
+        expect(listed.nextTriggerAt).toMatchObject(receipt);
+        const current = (await readOwner()).schedules.find((item: { readonly id: string }) => item.id === listed.scheduleId);
+        expect(current?.expression).toBe(new Date(triggerAt).toISOString());
+        const reopened = scheduleDraft(current, targets, sessions, models, backends);
+        expect(reopened.expression).toBe(draft.expression);
+        await gateway.saveSchedule(listed.scheduleId, { ...reopened, name: `${name} edited` });
+        const saved = (await owner.clients.scheduler.getSchedule({ scheduleId: listed.scheduleId })).schedule;
+        expect(saved?.nextTriggerAt).toMatchObject(receipt);
+        schedules.push({ scheduleId: listed.scheduleId, triggerAt, receipt, prompt });
+      }
+
+      const [first, second] = schedules;
+      if (first === undefined || second === undefined) throw new Error("Both one-shot Schedules must be saved before dispatch.");
+      const history = (scheduleId: string) => owner.clients.scheduler.listScheduleRunHistory({ scheduleId });
+      for (const entry of [first, second]) {
+        clockOffset = entry.triggerAt - realNow();
+        const result = await waitFor(() => history(entry.scheduleId), response => response.history[0]?.state === RunState.SUCCEEDED,
+          "the one-shot occurrence at its saved instant");
+        expect(result.history).toHaveLength(1);
+        expect(result.history[0]).toMatchObject({ sessionId, scheduledFor: entry.receipt });
+        const saved = (await owner.clients.scheduler.getSchedule({ scheduleId: entry.scheduleId })).schedule;
+        expect(saved?.state).toBe(ScheduleState.DISABLED);
+        if (entry === first) {
+          expect((await history(second.scheduleId)).history).toEqual([]);
+          expect(host.adapter().sendCalls.map(input => input.text)).toEqual([first.prompt]);
+        }
+      }
+      expect((await history(first.scheduleId)).history).toHaveLength(1);
+      expect(host.adapter().sendCalls.map(input => input.text)).toEqual([first.prompt, second.prompt]);
+    } finally {
+      disconnect?.();
+      clock.mockRestore();
+    }
   });
 });
 

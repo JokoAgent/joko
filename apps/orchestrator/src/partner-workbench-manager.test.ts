@@ -475,6 +475,79 @@ describe("Partner workbench service and Queue ownership", () => {
     await expect(f.workbench.continueTask(after.owner, "item:proposal", "Different request", "background-effect")).rejects.toMatchObject({ code: "WORKBENCH_INVALID" });
   });
 
+  it("projects a completed local Workbench note in Done through the public read", async () => {
+    const f = await fixture();
+    const view = await grant(f);
+    const note = { taskId: "item:finished-review", project: f.project, title: "Review handoff" };
+    const draft = await f.workbench.setJudgment(view.owner, view.state.revision, { ...note, verdict: "unfinished", next: "Read the result" });
+    expect(draft.tasks.find(task => task.id === note.taskId)).toMatchObject({ group: "todo" });
+    await f.workbench.setJudgment(draft.owner, draft.state.revision, { ...note, verdict: "done", next: null });
+    const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
+    const response = create(contract.GetPartnerWorkbenchResponseSchema, await methods.getPartnerWorkbench(
+      create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id }), {} as HandlerContext
+    ));
+    expect(response.workbench?.tasks.find(task => task.id === note.taskId)).toMatchObject({
+      state: contract.PartnerWorkbenchTaskState.DONE, group: contract.PartnerWorkbenchGroup.DONE
+    });
+  });
+
+  it("recovers a completed background creation after twenty earlier Workbench receipts", { timeout: 30_000 }, async () => {
+    const f = await fixture();
+    let view: PartnerWorkbenchStateView = await grant(f);
+    for (let index = 0; index < 20; index += 1) {
+      const taskId = `item:older-${index}`;
+      view = await f.workbench.setJudgment(view.owner, view.state.revision, {
+        taskId, project: f.project, title: `Older ${index}`, verdict: "idea", next: "Work on the older item"
+      });
+      await f.workbench.continueTask(view.owner, taskId, "Work on the older item", `a-workbench-${index}`);
+      view = await f.workbench.readState(f.partner.id);
+    }
+    const taskId = "item:later";
+    const originalEffect = "z-workbench-interrupted";
+    const backgroundScope = "partner.workbench.background";
+    const firstDirection = "Start the later item";
+    view = await f.workbench.setJudgment(view.owner, view.state.revision, {
+      taskId, project: f.project, title: "Later item", verdict: "idea", next: firstDirection
+    });
+    const save = f.store.setSetting.bind(f.store);
+    const interrupted = vi.spyOn(f.store, "setSetting").mockImplementation((...args) => {
+      if (args[1] === backgroundScope && args[2] === originalEffect
+        && (args[3] as { status?: string }).status === "ready") throw new Error("Interrupted while recording the created task");
+      return save(...args);
+    });
+    try {
+      await expect(f.workbench.continueTask(view.owner, taskId, firstDirection, originalEffect)).rejects.toThrow("Interrupted while recording the created task");
+    } finally { interrupted.mockRestore(); }
+
+    const record = () => f.store.findSetting("service", backgroundScope, originalEffect)?.value;
+    expect(record()).toMatchObject({ status: "preparing" });
+    expect(f.store.listSettings("service", backgroundScope).map(setting => setting.key).at(20)).toBe(originalEffect);
+    const created = f.store.getOperation<{ sessionId: string }>(`${originalEffect}:create`);
+    expect(created.status).toBe("completed");
+    const sessionId = created.response!.sessionId;
+    expect(f.store.findOperation(`${originalEffect}:send`)).toBeUndefined();
+    const sessions = f.store.listSessions().length;
+
+    const withdrawn = await f.workbench.removeProject(view.owner, view.state.revision, f.project);
+    expect((await f.workbench.readState(f.partner.id)).tasks.some(task => task.sessionId === sessionId)).toBe(false);
+    expect(record()).toMatchObject({ status: "preparing" });
+    await f.workbench.addProject(withdrawn.owner, withdrawn.state.revision, f.project);
+
+    const recovered = await f.workbench.readState(f.partner.id);
+    expect(record()).toMatchObject({ status: "ready", sessionId });
+    expect(recovered.tasks.find(task => task.sessionId === sessionId)).toMatchObject({ ownedBackground: true, project: f.project });
+    await f.workbench.readState(f.partner.id);
+    await expect(f.workbench.continueTask(recovered.owner, taskId, firstDirection, originalEffect))
+      .rejects.toMatchObject({ code: "WORKBENCH_UNAVAILABLE" });
+    expect(f.store.listQueueItems({ sessionId })).toEqual([]);
+
+    const continued = await f.workbench.continueTask(recovered.owner, taskId, "Send the next direction", "workbench-later-direction");
+    expect(continued.sessionId).toBe(sessionId);
+    expect(f.store.listSessions()).toHaveLength(sessions);
+    expect(f.store.listQueueItems({ sessionId })).toMatchObject([{ runId: continued.runId,
+      operationId: "workbench-later-direction:send", body: { text: "Send the next direction" } }]);
+  });
+
   it("adopts exactly one native candidate and retains the imported task and judgment as owned work", async () => {
     const f = await fixture(); f.adapter.entries = [entry(f.project)]; let view: PartnerWorkbenchStateView = await grant(f);
     const native = view.candidates.find((task) => task.kind === "external")!;

@@ -16,6 +16,7 @@ import {
   PermissionMode,
   QueueDeliveryMode,
   RunState,
+  SearchSessionMessagesRequestSchema,
   SessionSnapshotScopeSchema,
   SnapshotInvalidationReason,
   SnapshotScopeSchema,
@@ -990,6 +991,97 @@ describe("session host, durable events, and reconnect semantics", () => {
         await lastTask.click();
         await page.waitForURL(url => url.hash.includes(lastSessionId));
       }
+    }
+  });
+
+  mountedTimelineIt("searches a selected remote project through its original node while Web keeps its current connection", { timeout: 100_000 }, async () => {
+    fixture = await OrchestratorE2eFixture.start({ serverId: "remote-project-search-a", webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
+    const current = fixture;
+    const remote = await OrchestratorE2eFixture.start({ serverId: "remote-project-search-b", corsOrigins: [current.baseUrl] });
+    try {
+      const primaryProject = "shared-project-id";
+      const otherProject = "other-project-id";
+      const phrase = "scopewitness";
+      const remoteText = `${phrase} original remote project`;
+      const register = async (host: OrchestratorE2eFixture, id: string, displayName: string) => {
+        const root = join(host.rootDirectory, id);
+        await mkdir(root);
+        await host.application.workspaces.register({ id, displayName, root, trusted: true });
+        await host.application.sessionHost.registerTarget({ id, backendId: host.adapter().id, displayName,
+          workspaceRoot: root, managed: false, trusted: true }, { workspaceId: id });
+      };
+      const setUpTask = async (host: OrchestratorE2eFixture, manager: Awaited<ReturnType<OrchestratorE2eFixture["pair"]>>,
+        projectId: string, displayName: string, text: string) => {
+        const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+          createSessionMutation({ backendId: host.adapter().id, targetId: projectId, displayName })));
+        const generation = BigInt(host.application.store.getSession(sessionId).descriptor.binding.generation);
+        const runId = queueRunIdFrom(await submit(manager.clients.operation, manager.connectionId, sendInputMutation(sessionId, generation, text)));
+        await waitFor(() => manager.clients.run.getRun({ runId }), receipt => receipt.run?.state === RunState.SUCCEEDED, `search source ${displayName}`);
+        return sessionId;
+      };
+      await Promise.all([register(current, primaryProject, "Shared project"), register(remote, primaryProject, "Shared project"),
+        register(remote, otherProject, "Other project")]);
+      const [currentManager, remoteManager] = await Promise.all([current.pair("Current search manager"), remote.pair("Remote search manager")]);
+      const [currentTask, remoteTask] = await Promise.all([
+        setUpTask(current, currentManager, primaryProject, "Current project control", `${phrase} current project control`),
+        setUpTask(remote, remoteManager, primaryProject, "Remote project task", remoteText)
+      ]);
+      await setUpTask(remote, remoteManager, otherProject, "Same-node control", `${phrase} other remote project`);
+
+      browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+      const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+      await page.goto(current.baseUrl, { waitUntil: "domcontentloaded" });
+      const pairOnPage = async (host: OrchestratorE2eFixture, deviceDisplayName: string) => {
+        const challenge = (await host.anonymous.connection.beginPairing({ deviceDisplayName })).challenge;
+        if (!challenge) throw new Error("The project search pairing challenge is missing.");
+        await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
+        await page.locator("details.device-authorization__manual > summary").click();
+        await page.getByLabel("Joko node address").fill(host.baseUrl);
+        await page.getByLabel("Pairing code").fill(host.pairingCode(challenge.challengeId));
+        await page.getByLabel("Device name").fill(deviceDisplayName);
+        await page.locator("form.pair-form button[type=submit]").click();
+      };
+      await pairOnPage(current, "Project Search Current Web");
+      const currentRow = page.locator(`.sidebar [data-session-id="${currentTask}"]`).first();
+      await currentRow.waitFor({ state: "visible" });
+      await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+      await pairOnPage(remote, "Project Search Remote Web");
+      await page.locator(`.sidebar [data-session-id="${remoteTask}"]`).first().waitFor({ state: "visible" });
+      const machine = page.locator(".machine-switcher");
+      const machineSummary = machine.locator("summary");
+      const machineA = machine.locator(".machine-switcher__profile-main").filter({ hasText: current.baseUrl });
+      await machineSummary.click();
+      await machineA.click();
+      await currentRow.waitFor({ state: "visible" });
+      await machineSummary.click();
+      await machine.getByRole("checkbox", { name: /All machines/u }).click();
+      await machineSummary.click();
+
+      const filter = page.locator(".conversation-search-filter > summary");
+      await filter.click();
+      await page.locator(".conversation-search-filter__projects").getByText(/^Shared project · /u).click();
+      await filter.click();
+      const searchRequests: { origin: string; sessionIds?: readonly string[] }[] = [];
+      page.on("request", request => {
+        const url = new URL(request.url());
+        const bytes = request.postDataBuffer();
+        if (!url.pathname.endsWith("/SearchSessionMessages") || bytes === null || request.method() !== "POST") return;
+        const search = fromBinary(SearchSessionMessagesRequestSchema, bytes);
+        if (search.query === phrase) searchRequests.push({ origin: url.origin, sessionIds: search.filters?.sessionIds?.values });
+      });
+      await page.locator("#conversation-search-input").fill(phrase);
+      const results = page.getByRole("listbox", { name: "Conversation search results" });
+      await results.getByText(remoteText, { exact: true }).waitFor({ state: "visible" });
+      expect(await results.innerText()).not.toContain("other remote project");
+      expect(await results.innerText()).not.toContain("current project control");
+      expect(searchRequests.length).toBeGreaterThan(0);
+      expect(searchRequests.every(request => request.origin === remote.baseUrl && request.sessionIds?.length === 1
+        && request.sessionIds[0] === remoteTask)).toBe(true);
+      await machineSummary.click();
+      expect((await machineA.locator("em").textContent())?.trim()).toBe("Current");
+      expect(await machine.getByRole("checkbox", { name: /All machines/u }).getAttribute("aria-checked")).toBe("true");
+    } finally {
+      await remote.close({ removeRoot: true });
     }
   });
 

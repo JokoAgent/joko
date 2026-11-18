@@ -151,10 +151,15 @@ describe("Schedule editor execution defaults", () => {
 
     expect(scheduleDraft(existing, [target], [session()], [globallyAvailableModel])).toMatchObject({
       expression: "2026-08-24T09:30",
+      onceTriggerAt: Date.parse(existing.expression),
       useWorktree: true,
       worktreeSourceRef: "refs/heads/feature/schedule",
       refreshWorktreeRemote: true
     });
+
+    const later = "2027-11-07T06:31:00.000Z";
+    expect(scheduleDraft({ ...existing, expression: later, timezone: "America/New_York" }, [target], [session()], []))
+      .toMatchObject({ expression: "2027-11-07T01:31", onceTriggerAt: Date.parse(later) });
   });
 
   it("preserves script capabilities, expiration, notifications, and the managed hook", () => {
