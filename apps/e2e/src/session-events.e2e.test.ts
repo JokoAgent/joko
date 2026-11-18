@@ -1085,6 +1085,79 @@ describe("session host, durable events, and reconnect semantics", () => {
     }
   });
 
+  mountedTimelineIt("keeps new completion unread while the Workspace Files task panel is collapsed", { timeout: 90_000 }, async () => {
+    const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities,
+      { key: "workspace.files", supported: true as const }, { key: "session.attention", supported: true as const }] } satisfies FakeAdapterProfile;
+    fixture = await OrchestratorE2eFixture.start({ profiles: [profile], webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
+    const host = fixture;
+    const manager = await host.pair("Other task Owner");
+    const projectId = "files-viewed-project";
+    const projectName = "Files attention project";
+    const root = join(host.rootDirectory, projectId);
+    await mkdir(root);
+    await host.application.workspaces.register({ id: projectId, displayName: projectName, root, trusted: true });
+    await host.application.sessionHost.registerTarget({ id: projectId, backendId: profile.id, displayName: projectName,
+      workspaceRoot: root, managed: false, trusted: true }, { workspaceId: projectId });
+    const task = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId: profile.id, targetId: projectId, displayName: "File task reader" })));
+    const generation = BigInt(host.application.store.getSession(task).descriptor.binding.generation);
+    const send = async (text: string) => {
+      const runId = queueRunIdFrom(await submit(manager.clients.operation, manager.connectionId, sendInputMutation(task, generation, text)));
+      await waitFor(() => manager.clients.run.getRun({ runId }), receipt => receipt.run?.state === RunState.SUCCEEDED, "the attention source turn");
+    };
+    const original = "Read this original task turn before opening Files.";
+    await send(original);
+    const challenge = (await host.anonymous.connection.beginPairing({ deviceDisplayName: "Files reader Web" })).challenge;
+    if (!challenge) throw new Error("The Files reader pairing challenge is missing.");
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    await page.goto(host.baseUrl, { waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
+    await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(host.baseUrl);
+    await page.getByLabel("Pairing code").fill(host.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("Files reader Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+    await page.locator(`.sidebar [data-session-id="${task}"]`).first().click();
+    const timeline = `.timeline[data-timeline-session-id="${task}"]`;
+    await page.locator(timeline).getByText(original, { exact: true }).first().waitFor({ state: "visible" });
+    const readAttention = async () => (await manager.clients.session.getSession({ sessionId: task })).session?.attention;
+    await waitFor(readAttention, attention => attention?.unread === false, "the original task acknowledgement");
+
+    const project = page.locator(".sidebar .project-group").filter({ has: page.getByText(projectName, { exact: true }) });
+    await project.getByRole("button", { name: "More", exact: true }).click();
+    await page.getByRole("menuitem", { name: `Browse files in ${projectName}`, exact: true }).click();
+    await page.getByRole("button", { name: "Collapse task panel", exact: true }).click();
+    const rail = page.locator(".workspace-files-route__chat");
+    expect(await rail.getAttribute("aria-hidden")).toBe("true");
+    expect(await rail.getAttribute("inert")).not.toBeNull();
+    await page.bringToFront();
+    const viewed: bigint[] = [];
+    page.on("request", request => {
+      if (!new URL(request.url()).pathname.endsWith("/SubmitOperation")) return;
+      const body = request.postDataBuffer();
+      if (body === null) return;
+      const payload = fromBinary(SubmitOperationRequestSchema, body).mutation?.payload;
+      if (payload?.case === "acknowledgeSessionAttention" && payload.value.sessionId === task && payload.value.throughCursor !== undefined) {
+        viewed.push(payload.value.throughCursor.sequence);
+      }
+    });
+    const completion = "The second Owner completed a turn while the task panel was hidden.";
+    await send(completion);
+    const unread = await waitFor(readAttention, attention => attention?.unread === true && attention.attentionCursor !== undefined,
+      "the new unread completion");
+    const cursor = unread!.attentionCursor!.sequence;
+    await rail.locator(timeline).getByText(completion, { exact: true }).first().waitFor({ state: "attached" });
+    expect((await readAttention())?.unread).toBe(true);
+    expect(viewed).toEqual([]);
+    await page.getByRole("button", { name: "Expand task panel", exact: true }).click();
+    await rail.locator(timeline).getByText(completion, { exact: true }).first().waitFor({ state: "visible" });
+    const after = await waitFor(readAttention, attention => attention?.unread === false && attention.readThroughCursor?.sequence === cursor,
+      "the visible task panel to acknowledge the original completion cursor");
+    expect(after?.attentionCursor?.sequence).toBe(cursor);
+    expect(viewed).toContain(cursor);
+  });
+
   mountedTimelineIt("keeps Stop and composer Escape available during a native Claude retry wait", { timeout: 75_000 }, async () => {
     let activeTurn: AdapterContext | undefined;
     fixture = await OrchestratorE2eFixture.start({
