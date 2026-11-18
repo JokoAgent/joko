@@ -417,7 +417,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const [messageSearchTargetIds, setMessageSearchTargetIds] = useState<readonly string[] | "all">("all");
   const [messageSearchOwnerId, setMessageSearchOwnerId] = useState(props.sidebarOwnerId);
   const [lockedSearchTargetId, setLockedSearchTargetId] = useState<string>();
-  const [activeSearchOption, setActiveSearchOption] = useState(-1);
+  const [activeSearchOptionKey, setActiveSearchOptionKey] = useState<string>();
   const [expandedSearchSessions, setExpandedSearchSessions] = useState<ReadonlySet<string>>(() => new Set());
   const messageSearchGenerationRef = useRef(0);
   const remoteMessageSearchGenerationRef = useRef(0);
@@ -672,20 +672,29 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     props.messageSearchSort,
     CONVERSATION_SEARCH_RESULT_LIMIT
   ), [currentSearchProfileId, localSearchCandidates, messageSearchError, messageSearchLoading, props.messageSearchSort, remoteSearchCandidates]);
-  const searchResults = useMemo(() => federatedSearchGroups.flatMap((group) => group.kind === "local" ? [group.result] : []), [federatedSearchGroups]);
-  const remoteSearchResults = useMemo(() => federatedSearchGroups.flatMap((group) => group.kind === "remote" ? [group.result] : []), [federatedSearchGroups]);
-  const expandedLocalSearchSessions = useMemo(() => new Set(searchResults
-    .filter((result) => expandedSearchSessions.has(federatedSessionSearchKey(currentSearchProfileId, result.session.id)))
-    .map((result) => result.session.id)), [currentSearchProfileId, expandedSearchSessions, searchResults]);
-  const searchOptions = useMemo(
-    () => flattenConversationSearchOptions(searchResults, expandedLocalSearchSessions),
-    [expandedLocalSearchSessions, searchResults]
-  );
-  const remoteSearchOptions = useMemo(() => flattenRemoteMachineSearchOptions(remoteSearchResults, expandedSearchSessions), [expandedSearchSessions, remoteSearchResults]);
-  const allSearchOptions = useMemo<readonly SidebarSearchOption[]>(
-    () => [...searchOptions, ...remoteSearchOptions],
-    [remoteSearchOptions, searchOptions]
-  );
+  const searchGroups = useMemo(() => {
+    let offset = 0;
+    return federatedSearchGroups.map((group) => {
+      const optionOffset = offset;
+      if (group.kind === "remote") {
+        const options = flattenRemoteMachineSearchOptions([group.result], expandedSearchSessions);
+        offset += options.length;
+        return { ...group, options, optionOffset };
+      }
+      const expandedIds = expandedSearchSessions.has(group.key) ? new Set([group.result.session.id]) : EMPTY_SESSION_ID_SET;
+      const options = flattenConversationSearchOptions([group.result], expandedIds);
+      offset += options.length;
+      return { ...group, options, optionOffset };
+    });
+  }, [expandedSearchSessions, federatedSearchGroups]);
+  const allSearchOptions = useMemo(() => searchGroups.flatMap<SidebarSearchOption>((group) => group.options), [searchGroups]);
+  const activeSearchOption = activeSearchOptionKey === undefined
+    ? (allSearchOptions.length > 0 ? 0 : -1)
+    : allSearchOptions.findIndex((option) => sidebarSearchOptionKey(option, currentSearchProfileId) === activeSearchOptionKey);
+  const setActiveSearchOption = (index: number): void => {
+    const option = allSearchOptions[index];
+    setActiveSearchOptionKey(option === undefined ? undefined : sidebarSearchOptionKey(option, currentSearchProfileId));
+  };
   const pinnedProjectTargets = useMemo(() => snapshot.targets.filter((target) =>
     target.pinned && !target.archived && navigationSessions.some((session) => session.projectId === target.id)
   ), [navigationSessions, snapshot.targets]);
@@ -1035,16 +1044,12 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   }, [messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, query, remoteMessageSearchScopeKey, t]);
 
   useEffect(() => {
-    setActiveSearchOption((current) => allSearchOptions.length === 0 ? -1 : current < 0 || current >= allSearchOptions.length ? 0 : current);
-  }, [allSearchOptions.length]);
-
-  useEffect(() => {
     setExpandedSearchSessions(new Set());
   }, [messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, props.messageSearchSort]);
 
   useEffect(() => {
     if (activeSearchOption < 0) return;
-    document.getElementById(searchOptionId(activeSearchOption))?.scrollIntoView({ block: "nearest" });
+    document.getElementById(searchOptionId(activeSearchOption))?.scrollIntoView?.({ block: "nearest" });
   }, [activeSearchOption]);
 
   useEffect(() => {
@@ -1193,7 +1198,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     setRemoteMessageSearchError(undefined);
     setMessageSearchLoading(false);
     setRemoteMessageSearchLoading(false);
-    setActiveSearchOption(-1);
+    setActiveSearchOptionKey(undefined);
   };
 
   const changeSearchQuery = (value: string): void => {
@@ -1201,6 +1206,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     if (searchContextAvailable && !searchPopupOpen && value.trim() !== "" && list !== null) {
       scrollBeforeSearchRef.current = { ownerKey: sessionSelectionOwnerKey, top: list.scrollTop };
     }
+    if (value !== query) setActiveSearchOptionKey(undefined);
     setQuery(value);
   };
 
@@ -1261,11 +1267,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             : undefined;
     if (direction !== undefined) {
       event.preventDefault();
-      setActiveSearchOption((current) => moveConversationSearchSelection(current, allSearchOptions.length, direction));
+      setActiveSearchOption(moveConversationSearchSelection(activeSearchOption, allSearchOptions.length, direction));
       return;
     }
     if (event.key === "Enter" && !event.repeat) {
-      const selected = allSearchOptions[activeSearchOption] ?? allSearchOptions[0];
+      const selected = allSearchOptions[activeSearchOption];
       if (selected !== undefined) {
         event.preventDefault();
         activateSearchOption(selected);
@@ -1796,32 +1802,36 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         />}
         {searchPopupOpen && (
           <div id="conversation-search-results" className="conversation-search-popup" role="listbox" aria-label={t("nav.searchResults")}>
-            {!messageSearchLoading && messageSearchError === undefined && <SearchResults
-              results={searchResults}
-              query={query.trim()}
-              activeSessionId={activeSessionId}
-              activeOptionIndex={activeSearchOption}
-              expandedSessionIds={expandedSearchSessions}
-              profileId={currentSearchProfileId}
-              locale={props.locale}
-              t={t}
-              onActivate={(option) => activateSearchOption(option)}
-              onActiveOptionChange={setActiveSearchOption}
-            />}
-            {remoteSearchOptions.length > 0 && <RemoteMachineSearchResults
-              options={remoteSearchOptions}
-              optionOffset={searchOptions.length}
-              activeOptionIndex={activeSearchOption}
-              query={query.trim()}
-              locale={props.locale}
-              t={t}
-              onActivate={(option) => activateSearchOption(option)}
-              onActiveOptionChange={setActiveSearchOption}
-            />}
+            {searchGroups.length > 0 && <div className="conversation-search-results">
+              {searchGroups.map((group) => group.kind === "remote" ? <RemoteMachineSearchResults
+                key={group.key}
+                options={group.options}
+                optionOffset={group.optionOffset}
+                activeOptionIndex={activeSearchOption}
+                query={query.trim()}
+                locale={props.locale}
+                t={t}
+                onActivate={activateSearchOption}
+                onActiveOptionChange={setActiveSearchOption}
+              /> : <SearchResults
+                key={group.key}
+                results={[group.result]}
+                optionOffset={group.optionOffset}
+                query={query.trim()}
+                activeSessionId={activeSessionId}
+                activeOptionIndex={activeSearchOption}
+                expandedSessionIds={expandedSearchSessions}
+                profileId={currentSearchProfileId}
+                locale={props.locale}
+                t={t}
+                onActivate={activateSearchOption}
+                onActiveOptionChange={setActiveSearchOption}
+              />)}
+            </div>}
             {(messageSearchLoading || remoteMessageSearchLoading) && <p className="sidebar-search__status" role="status"><span className="conversation-search__spinner" aria-hidden="true" />{t("nav.searchingMessages")}</p>}
             {messageSearchError !== undefined && <p className="sidebar-search__status sidebar-search__status--error" role="alert">{messageSearchError}</p>}
             {remoteMessageSearchError !== undefined && <p className="sidebar-search__status sidebar-search__status--error" role="alert">{remoteMessageSearchError}</p>}
-            {!messageSearchLoading && !remoteMessageSearchLoading && messageSearchError === undefined && remoteMessageSearchError === undefined && searchResults.length === 0 && remoteSearchOptions.length === 0 && <p className="sidebar__empty">{t("nav.noMatchingTasks")}</p>}
+            {!messageSearchLoading && !remoteMessageSearchLoading && messageSearchError === undefined && remoteMessageSearchError === undefined && allSearchOptions.length === 0 && <p className="sidebar__empty">{t("nav.noMatchingTasks")}</p>}
           </div>
         )}
           <div hidden={searchPopupOpen}>
@@ -2549,7 +2559,7 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
   readonly onActivate: (option: RemoteMachineSearchOption) => void;
   readonly onActiveOptionChange: (index: number) => void;
 }): JSX.Element {
-  return <div className="conversation-search-results conversation-search-results--remote">
+  return <>
     {options.map((option, localIndex) => {
       const optionIndex = optionOffset + localIndex;
       if (option.kind === "remoteExpand") {
@@ -2560,7 +2570,7 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
           role="option"
           aria-selected={optionIndex === activeOptionIndex}
           key={option.key}
-          onMouseEnter={() => onActiveOptionChange(optionIndex)}
+          onMouseMove={() => onActiveOptionChange(optionIndex)}
           onClick={() => onActivate(option)}
         >{t("nav.searchMoreHits", { count: option.hiddenHitCount })}</button>;
       }
@@ -2580,7 +2590,7 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
           type="button"
           role="option"
           aria-selected={optionIndex === activeOptionIndex}
-          onMouseEnter={() => onActiveOptionChange(optionIndex)}
+          onMouseMove={() => onActiveOptionChange(optionIndex)}
           onClick={() => onActivate(option)}
         >
           {option.kind === "remoteSession" && <Laptop aria-hidden="true" />}
@@ -2598,11 +2608,12 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
         </button>
       </section>;
     })}
-  </div>;
+  </>;
 }
 
-function SearchResults({ results, query, activeSessionId, activeOptionIndex, expandedSessionIds, profileId, locale, t, onActivate, onActiveOptionChange }: {
+function SearchResults({ results, optionOffset, query, activeSessionId, activeOptionIndex, expandedSessionIds, profileId, locale, t, onActivate, onActiveOptionChange }: {
   readonly results: ReturnType<typeof projectConversationSearchResults>;
+  readonly optionOffset: number;
   readonly query: string;
   readonly activeSessionId?: string;
   readonly activeOptionIndex: number;
@@ -2613,9 +2624,9 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
   readonly onActivate: (option: ConversationSearchOption) => void;
   readonly onActiveOptionChange: (index: number) => void;
 }): JSX.Element {
-  let optionIndex = 0;
+  let optionIndex = optionOffset;
   return (
-    <div className="conversation-search-results">
+    <>
       {results.map((result) => {
         const sessionOption: ConversationSearchOption = { key: `session:${result.session.id}`, kind: "session", result };
         const sessionIndex = optionIndex++;
@@ -2630,7 +2641,7 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
               type="button"
               role="option"
               aria-selected={sessionIndex === activeOptionIndex}
-              onMouseEnter={() => onActiveOptionChange(sessionIndex)}
+              onMouseMove={() => onActiveOptionChange(sessionIndex)}
               onClick={() => onActivate(sessionOption)}
             >
               <MessageSquare aria-hidden="true" />
@@ -2652,7 +2663,7 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
                   aria-selected={hitIndex === activeOptionIndex}
                   key={hit.eventId}
                   title={hit.snippet}
-                  onMouseEnter={() => onActiveOptionChange(hitIndex)}
+                  onMouseMove={() => onActiveOptionChange(hitIndex)}
                   onClick={() => onActivate(option)}
                 >
                   <strong><HighlightedText value={hit.snippet} ranges={conversationSearchHighlightRanges(hit.snippet, query)} /></strong>
@@ -2668,19 +2679,26 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
                 type="button"
                 role="option"
                 aria-selected={expandIndex === activeOptionIndex}
-                onMouseEnter={() => onActiveOptionChange(expandIndex)}
+                onMouseMove={() => onActiveOptionChange(expandIndex)}
                 onClick={() => onActivate(option)}
               >{t("nav.searchMoreHits", { count: hiddenHitCount })}</button>;
             })()}</div>}
           </section>
         );
       })}
-    </div>
+    </>
   );
 }
 
 function searchOptionId(index: number): string {
   return `conversation-search-option-${index}`;
+}
+
+function sidebarSearchOptionKey(option: SidebarSearchOption, currentProfileId: string): string {
+  if ("profileId" in option) {
+    return JSON.stringify([option.profileId, option.kind, option.session.id, option.kind === "remoteMessage" ? option.match.eventId : null]);
+  }
+  return JSON.stringify([currentProfileId, option.kind, option.result.session.id, option.hit?.eventId ?? null]);
 }
 
 function sessionCallbacks(

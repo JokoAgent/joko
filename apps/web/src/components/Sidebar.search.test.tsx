@@ -220,6 +220,65 @@ describe("Sidebar progressive conversation search", () => {
     expect(container.textContent).not.toContain("nav.searchingMessages");
   });
 
+  it.each([
+    { sort: "activityDesc", order: ["Needle newer remote", "Needle local", "Needle older remote"] },
+    { sort: "activityAsc", order: ["Needle older remote", "Needle local", "Needle newer remote"] }
+  ] as const)("renders and activates the same federated order in $sort", async ({ sort, order }) => {
+    vi.useFakeTimers();
+    const machineControl = remoteMachineControl();
+    const cache = machineControl.caches[0]!;
+    const task = cache.sessions[0]!;
+    const remote = { ...machineControl, caches: [{ ...cache, sessions: [
+      { ...task, id: "newer", name: "Needle newer remote", lastActivityAt: 30 },
+      { ...task, id: "older", name: "Needle older remote", lastActivityAt: 10 }
+    ] }] };
+    const rendered = await renderSidebar(async () => [], { machineControl: remote, messageSearchSort: sort });
+    await rendered.rerender({
+      snapshot: { ...rendered.snapshot, sessions: [{ ...rendered.snapshot.sessions[0]!, name: "Needle local", updatedAt: 20 }] }
+    });
+    await enterQuery(rendered.container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect([...rendered.container.querySelectorAll("#conversation-search-results [role='option'] .conversation-search-result__title")]
+      .map((node) => node.textContent)).toEqual(order);
+    await pressSearchKey(rendered.container, "Enter");
+    expect(remote.onOpenCachedSession).toHaveBeenCalledExactlyOnceWith(cache.profileId, sort === "activityDesc" ? "newer" : "older");
+  });
+
+  it("keeps the keyboard selection on the same remote option when local results arrive and disarms a removed option", async () => {
+    vi.useFakeTimers();
+    const keyword = deferred<readonly SessionMessageSearchMatchView[]>();
+    const machineControl = remoteMachineControl();
+    const cache = machineControl.caches[0]!;
+    const task = cache.sessions[0]!;
+    const first = { ...task, id: "first-remote", name: "Needle first remote", lastActivityAt: 30 };
+    const selected = { ...task, id: "second-remote", name: "Needle second remote", lastActivityAt: 20 };
+    const remote = { ...machineControl, caches: [{ ...cache, sessions: [first, selected] }] };
+    const onNavigate = vi.fn();
+    const rendered = await renderSidebar(() => keyword.promise, { machineControl: remote, messageSearchSort: "activityDesc", onNavigate });
+    const local = { ...rendered.snapshot.sessions[0]!, name: "Needle local", updatedAt: 40 };
+    await rendered.rerender({ snapshot: { ...rendered.snapshot, sessions: [local] } });
+    await enterQuery(rendered.container, "needle");
+    await pressSearchKey(rendered.container, "ArrowDown");
+    const input = rendered.container.querySelector<HTMLInputElement>("#conversation-search-input")!;
+    const activeLabel = () => document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    expect(activeLabel()).toContain(selected.name);
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    await act(async () => keyword.resolve([]));
+    expect(rendered.container.querySelector("#conversation-search-results [role='option']")?.textContent).toContain(local.name);
+    expect(activeLabel()).toContain(selected.name);
+    await pressSearchKey(rendered.container, "Enter");
+    expect(remote.onOpenCachedSession).toHaveBeenCalledExactlyOnceWith(cache.profileId, selected.id);
+
+    await rendered.rerender({ machineControl: { ...remote, caches: [{ ...cache, sessions: [first] }] } });
+    expect(input.hasAttribute("aria-activedescendant")).toBe(false);
+    await pressSearchKey(rendered.container, "Enter");
+    expect(remote.onOpenCachedSession).toHaveBeenCalledTimes(1);
+    expect(onNavigate).not.toHaveBeenCalled();
+    await pressSearchKey(rendered.container, "ArrowDown");
+    await pressSearchKey(rendered.container, "Enter");
+    expect(onNavigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: local.id });
+  });
+
   it("sends one stable typed filter snapshot to both stages and restarts when a filter changes", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-24T12:00:00.000Z"));
@@ -544,6 +603,14 @@ async function enterQuery(container: HTMLElement, value: string): Promise<void> 
   await act(async () => {
     setter.call(input, value);
     input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+async function pressSearchKey(container: HTMLElement, key: string): Promise<void> {
+  const input = container.querySelector<HTMLInputElement>("#conversation-search-input")!;
+  await act(async () => {
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
   });
 }
 
