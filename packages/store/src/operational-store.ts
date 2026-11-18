@@ -8661,6 +8661,7 @@ export class OperationalStore {
         throw new RevisionConflictError("Session", id, expectedRevision, current.revision);
       }
       const descriptor = current.descriptor;
+      if (patch.archived === false && descriptor.deletedAt !== undefined) throw new NotFoundError("Session", id);
       const binding = patch.binding ?? descriptor.binding;
       if (binding.generation < descriptor.binding.generation) {
         throw new StaleGenerationError(descriptor.binding.generation, binding.generation);
