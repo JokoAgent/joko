@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type PropsWithChildren } from "react";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { ChevronDown, MonitorSmartphone } from "lucide-react";
 import { taskActivityMessages, type TaskActivityDevice, type TaskActivityState } from "@joko/contracts";
 import { followTaskActivity, type TaskActivityPort } from "@joko/connection-transport";
@@ -8,8 +9,7 @@ import { Button, IconButton, Modal } from "./ui.js";
 import "./task-activity.css";
 
 interface ActivityContext {
-  readonly port?: TaskActivityPort;
-  readonly generation: bigint;
+  readonly view?: (sessionId: string) => () => void;
   readonly preferenceKey: string;
   readonly devices: readonly TaskActivityDevice[];
   readonly inlineCount: number;
@@ -29,24 +29,58 @@ export function TaskActivityProvider({ controller, t, children }: PropsWithChild
     ? JSON.stringify([preferenceKey, state.connectionGeneration, state.snapshot.generation.toString()]) : undefined;
   const ownerRef = useRef(owner); ownerRef.current = owner;
   const port = useMemo(() => { if (!owner) return undefined; try { return controller.taskActivity?.(); } catch { return undefined; } }, [owner, controller.taskActivity]);
-  const [projection, setProjection] = useState<{ readonly owner: string; readonly value?: TaskActivityState }>();
+  const [views, setViews] = useState<ReadonlyMap<symbol, { readonly owner: string; readonly sessionId: string }>>(() => new Map());
+  const view = useMemo(() => !owner || !port ? undefined : (sessionId: string) => {
+    const lease = Symbol();
+    setViews(current => new Map(current).set(lease, { owner, sessionId }));
+    return () => setViews(current => {
+      const next = new Map(current);
+      next.delete(lease);
+      return next;
+    });
+  }, [owner, port]);
+  const scope = useMemo(() => {
+    const ids = new Set<string>();
+    for (const view of views.values()) {
+      if (view.owner === owner && state.snapshot.sessions.some(session => session.id === view.sessionId)) ids.add(view.sessionId);
+    }
+    return JSON.stringify([...ids].sort());
+  }, [owner, views, state.snapshot.sessions]);
+  const [projection, setProjection] = useState<{ readonly owner: string; readonly value?: TaskActivityState; readonly revision?: bigint }>();
   const [inlineCount, setInlineCount] = useState(0);
   const inline = useMemo(() => (delta: number) => setInlineCount(count => count + delta), []);
   const [confirmation, setConfirmation] = useState<{ readonly owner: string; readonly port: TaskActivityPort; readonly device: TaskActivityDevice }>();
   const [busy, setBusy] = useState(false), [error, setError] = useState(false);
   const flight = useRef<object | undefined>(undefined);
   useEffect(() => {
-    setProjection(undefined);
     if (!port || !owner) return;
     const abort = new AbortController();
-    void followTaskActivity(port, [], state.snapshot.generation, abort.signal, value => {
-      if (!abort.signal.aborted && ownerRef.current === owner) setProjection({ owner, value });
+    const scopedPort: TaskActivityPort = {
+      ...port,
+      async *watch(ids, signal) {
+        try { yield* port.watch(ids, signal); }
+        catch (error) {
+          if (!ids.length || !(error instanceof ConnectError) || error.code !== Code.NotFound) throw error;
+          // An already-mounted task can disappear before the catalog observes its deletion.
+          signal.throwIfAborted();
+          yield* port.watch([], signal);
+        }
+      }
+    };
+    // Each Document uses one connection to both observe peers and report its mounted panes.
+    void followTaskActivity(scopedPort, JSON.parse(scope) as string[], state.snapshot.generation, abort.signal, value => {
+      if (abort.signal.aborted || ownerRef.current !== owner) return;
+      setProjection(previous => {
+        const revision = previous?.owner === owner ? previous.revision : undefined;
+        return value && revision !== undefined && value.revision < revision ? previous : { owner, value, revision: value?.revision ?? revision };
+      });
     });
     return () => abort.abort();
-  }, [owner, port, state.snapshot.generation]);
+  }, [owner, port, scope, state.snapshot.generation]);
+  useEffect(() => { setProjection(undefined); }, [owner, port]);
   useEffect(() => { setConfirmation(undefined); setBusy(false); setError(false); flight.current = undefined; }, [owner]);
   useEffect(() => { ownerRef.current = owner; return () => { ownerRef.current = undefined; }; }, [owner]);
-  const devices = projection !== undefined && projection.owner === owner ? projection.value?.activeDevices.filter(device => device.deviceId !== profile?.deviceId) ?? empty : empty;
+  const devices = port && projection?.owner === owner ? projection?.value?.activeDevices.filter(device => device.deviceId !== profile?.deviceId) ?? empty : empty;
   const m = taskActivityMessages(state.effectiveLocale);
   const currentConfirmation = confirmation?.owner === owner ? confirmation : undefined;
   const revoke = async () => {
@@ -59,7 +93,7 @@ export function TaskActivityProvider({ controller, t, children }: PropsWithChild
     } catch { if (ownerRef.current === target.owner && flight.current === token) setError(true); }
     finally { if (ownerRef.current === target.owner && flight.current === token) { flight.current = undefined; setBusy(false); } }
   };
-  return <Activity.Provider value={{ port, generation: state.snapshot.generation, preferenceKey, devices, inlineCount, inline,
+  return <Activity.Provider value={{ view, preferenceKey, devices, inlineCount, inline,
     locale: state.effectiveLocale, manage: () => controller.navigate({ kind: "settings" }, { exactHash: "#/settings/connections" }),
     confirm: device => { if (port && owner) { setConfirmation({ owner, port, device: { ...device } }); setError(false); } } }}>
     {children}
@@ -72,16 +106,12 @@ export function TaskActivityProvider({ controller, t, children }: PropsWithChild
   </Activity.Provider>;
 }
 
-/** Only mounted, authenticated owner task panes contribute activity. Split
- * panes and separate Documents retain independently releasable stream leases. */
+/** Split panes independently contribute to their own Document's activity scope. */
 export function useTaskActivityView(sessionId: string | undefined): void {
-  const context = useContext(Activity), port = context?.port, generation = context?.generation;
+  const view = useContext(Activity)?.view;
   useEffect(() => {
-    if (!port || generation === undefined || !sessionId) return;
-    const abort = new AbortController();
-    void followTaskActivity(port, [sessionId], generation, abort.signal, () => {});
-    return () => abort.abort();
-  }, [port, generation, sessionId]);
+    if (view && sessionId) return view(sessionId);
+  }, [view, sessionId]);
 }
 
 export function TaskActivityBanner({ sessionId }: { readonly sessionId?: string }) {

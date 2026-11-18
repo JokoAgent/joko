@@ -183,7 +183,9 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
     void (async () => {
       const catalog = await controllerRef.current.listPartners(undefined, abort.signal);
       if (!current()) return;
-      const topic = await controllerRef.current.getPartnerTopic?.(session.id, abort.signal);
+      // A topic can only be adopted through a Partner in this complete roster.
+      const topic = catalog.partners.length === 0 ? undefined
+        : await controllerRef.current.getPartnerTopic?.(session.id, abort.signal);
       if (!current()) return;
       const candidates = catalog.partners.filter((partner) => topic ? partner.id === topic.partnerId : partner.canonicalSessionId === session.id);
       if (candidates.length === 0) {

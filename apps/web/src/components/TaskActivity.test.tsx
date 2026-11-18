@@ -2,6 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { TaskActivityStateSchema, type TaskActivityState } from "@joko/contracts";
 import type { TaskActivityPort } from "@joko/connection-transport";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,7 +20,8 @@ function fixture() {
   const views: Array<{ ids: readonly string[]; signal: AbortSignal }> = [];
   const port: TaskActivityPort = { watch: (ids, signal) => { views.push({ ids, signal }); return updates.watch(signal); }, revoke: vi.fn(async () => {}) };
   const controller = { taskActivity: vi.fn(() => port), navigate: vi.fn(), state: {
-    connectionState: "connected", connectionGeneration: 1, effectiveLocale: "en", snapshot: { generation: 1n },
+    connectionState: "connected", connectionGeneration: 1, effectiveLocale: "en",
+    snapshot: { generation: 1n, sessions: [{ id: "task-a" }, { id: "task-b" }] },
     activeProfile: { id: "connection", serverId: "server", origin: "https://node.test", deviceId: "self" }
   } } as unknown as AppController;
   const push = async (revision: bigint, ...ids: string[]) => act(async () => updates.push(create(TaskActivityStateSchema, {
@@ -28,8 +30,8 @@ function fixture() {
   return { updates, views, port, controller, push };
 }
 function Pane({ id }: { id: string }) { useTaskActivityView(id); return <TaskActivityBanner sessionId={id} />; }
-async function render(controller: AppController, id?: string) { await act(async () => root.render(<TaskActivityProvider controller={controller} t={t}>
-  <TaskActivityBanner />{id && <Pane id={id} />}</TaskActivityProvider>)); }
+async function render(controller: AppController, ...ids: string[]) { await act(async () => root.render(<TaskActivityProvider controller={controller} t={t}>
+  <TaskActivityBanner />{ids.map((id, index) => <Pane key={index} id={id} />)}</TaskActivityProvider>)); }
 function button(label: string, scope: ParentNode = document.body) {
   return [...scope.querySelectorAll<HTMLButtonElement>("button")].find(node => node.textContent === label || node.getAttribute("aria-label") === label)!;
 }
@@ -49,20 +51,61 @@ describe("task activity notice", () => {
     expect(f.port.revoke).not.toHaveBeenCalled();
   });
 
-  it("retains its global feed across actual pane lifetimes, hides the current Device, and restores task-specific collapse", async () => {
+  it("retains the peer notice across scope changes, hides the current Device, and restores task-specific collapse", async () => {
     const f = fixture(); await render(f.controller); expect(f.views.map(v => v.ids)).toEqual([[]]);
     await f.push(1n, "self"); expect(host.querySelector("aside")).toBeNull();
     await f.push(2n, "self", "phone"); expect(host.textContent).toContain("Name phone is viewing tasks on this node");
     await render(f.controller, "task-a"); expect(f.views.map(v => v.ids)).toEqual([[], ["task-a"]]);
+    expect(f.views[0]!.signal.aborted).toBe(true);
     expect(host.querySelectorAll(".task-activity--floating")).toHaveLength(0);
     await click("Collapse active device notice"); expect(button("Expand active device notice: Name phone is viewing tasks on this node")).toBeDefined();
     const firstView = f.views[1]!;
     await render(f.controller, "task-b"); expect(firstView.signal.aborted).toBe(true); expect(button("Collapse active device notice")).toBeDefined();
     await render(f.controller, "task-a"); expect(button("Expand active device notice: Name phone is viewing tasks on this node")).toBeDefined();
     await render(f.controller); expect(host.querySelector(".task-activity--floating")).not.toBeNull();
-    expect(f.views[0]!.signal.aborted).toBe(false); expect(f.updates.count).toBe(1);
+    expect(f.views.filter(view => !view.signal.aborted).map(view => view.ids)).toEqual([[]]);
+    expect(f.updates.count).toBe(1);
     await f.push(1n, "stale"); expect(host.textContent).not.toContain("stale");
     await f.push(3n); expect(host.querySelector("aside")).toBeNull();
+  });
+
+  it("shares one subscription across split panes, keeps duplicate occurrences, and retires the document lease", async () => {
+    const f = fixture();
+    await render(f.controller, "task-b", "task-a", "task-a");
+    const combined = f.views.at(-1)!;
+    expect(f.views.filter(view => !view.signal.aborted)).toEqual([combined]);
+    expect(combined.ids).toEqual(["task-a", "task-b"]);
+    expect(f.updates.count).toBe(1);
+
+    await render(f.controller, "task-b", "task-a");
+    expect(f.views.at(-1)).toBe(combined);
+    await render(f.controller, "task-b");
+    expect(combined.signal.aborted).toBe(true);
+    expect(f.views.filter(view => !view.signal.aborted).map(view => view.ids)).toEqual([["task-b"]]);
+
+    await act(async () => root.render(null));
+    expect(f.views.every(view => view.signal.aborted)).toBe(true);
+    expect(f.updates.count).toBe(0);
+  });
+
+  it("keeps observing peers when a viewed task is deleted before the owner catalog catches up", async () => {
+    const f = fixture();
+    const watch = f.port.watch;
+    const scoped = vi.spyOn(f.port, "watch").mockImplementation((ids, signal) => {
+      if (!ids.includes("task-a")) return watch(ids, signal);
+      return (async function* () { throw new ConnectError("The viewed task is unavailable.", Code.NotFound); })();
+    });
+    await render(f.controller, "task-a", "task-b");
+    expect(scoped.mock.calls.map(([ids]) => ids)).toContainEqual(["task-a", "task-b"]);
+    expect(f.views.filter(view => !view.signal.aborted).map(view => view.ids)).toEqual([[]]);
+    await f.push(1n, "phone");
+    expect(host.textContent).toContain("Name phone is viewing tasks");
+
+    const state = f.controller.state;
+    await render({ ...f.controller, state: { ...state, snapshot: { ...state.snapshot,
+      sessions: state.snapshot.sessions.filter(session => session.id === "task-b") } } }, "task-a", "task-b");
+    expect(f.views.filter(view => !view.signal.aborted).map(view => view.ids)).toEqual([["task-b"]]);
+    expect(host.textContent).toContain("Name phone is viewing tasks");
   });
 
   it("confirms the original single Device through list changes and routes a multiple-device notice to existing management", async () => {

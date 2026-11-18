@@ -118,6 +118,16 @@ describe("canonical Partner conversation header", () => {
     expect(view.host.querySelector(".partner-conversation-identity")?.textContent).toBe("Aster");
   });
 
+  it("shows the ordinary task actions as soon as the authenticated Partner roster is empty", async () => {
+    const pendingRoster = deferred<PartnerListView>();
+    const getPartnerTopic = vi.fn(() => new Promise<PartnerSessionView | undefined>(() => undefined));
+    const view = await mount(controller({ listPartners: () => pendingRoster.promise, getPartnerTopic }));
+    expect(view.host.querySelector("[data-task-controls]")).toBeNull();
+    await act(async () => { pendingRoster.resolve(catalog([])); await settle(); });
+    expect(view.host.querySelector("[data-task-controls]")?.textContent).toContain("Export");
+    expect(getPartnerTopic).not.toHaveBeenCalled();
+  });
+
   it("retires directory and canonical-link replies with their connection and Session owners", async () => {
     const old = deferred<PartnerListView>();
     let oldSignal: AbortSignal | undefined;
