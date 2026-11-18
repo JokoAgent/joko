@@ -23287,6 +23287,10 @@ async function dispatchMutation(
         current.generation
       );
       requireSameBrowserPageOwner(currentOwner, targetOwner);
+      const assertClosingPagesCurrent = () => {
+        requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, current.pageId, current.generation, currentOwner);
+        requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, payload.value.pageId, current.generation, targetOwner);
+      };
       let takeover: ReturnType<BrowserProvider["currentHumanTakeover"]>;
       let activePage: NativeBrowserPage | undefined;
       let replacementOwner: RecoverableBrowserPageRecord | undefined;
@@ -23296,26 +23300,25 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         precondition: () => {
-          const currentPageOwner = requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            provider.id,
-            current.pageId,
-            current.generation,
-            currentOwner
-          );
-          const closingPageOwner = requireActiveBrowserPageAuthority(
-            dependencies.browserState,
-            provider.id,
-            payload.value.pageId,
-            current.generation,
-            targetOwner
-          );
-          requireSameBrowserPageOwner(currentPageOwner, closingPageOwner);
+          assertClosingPagesCurrent();
           if (takeover !== undefined) provider.assertHumanTakeover(takeover);
           else if (provider.currentHumanTakeover() !== undefined) provider.assertHumanTakeover(current);
         },
         effect: async () => {
-          takeover = await provider.closeHumanPage(current, payload.value.pageId, dependencies.browserSettings?.takeoverTimeout());
+          takeover = await provider.closeHumanPage(current, payload.value.pageId, dependencies.browserSettings?.takeoverTimeout(), {
+            assertCurrent: () => {
+              dependencies.connections.fence(connection);
+              assertClosingPagesCurrent();
+            },
+            canFocusReplacement: (pageId) => {
+              try {
+                requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, pageId, current.generation, currentOwner);
+                return true;
+              } catch {
+                return false;
+              }
+            }
+          });
           activePage = takeover === undefined
             ? undefined
             : (await provider.listPages()).find((page) => page.id === takeover?.pageId);

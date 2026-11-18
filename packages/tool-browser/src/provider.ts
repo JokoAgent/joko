@@ -1187,12 +1187,13 @@ export class BrowserProvider {
   /**
    * Closes one page under an exact human capability. Closing a background page
    * preserves the takeover. Closing the active page transfers control to the
-   * nearest remaining page, or releases control when it was the last page.
+   * first permitted remaining page, or releases control.
    */
   closeHumanPage(
     fence: BrowserTakeoverFence,
     targetPageId: string,
-    ttlMs = 15 * 60 * 1_000
+    ttlMs = 15 * 60 * 1_000,
+    guard?: { readonly assertCurrent: () => void; readonly canFocusReplacement: (pageId: string) => boolean }
   ): Promise<BrowserTakeover | undefined> {
     const expected = copyTakeoverFence(fence);
     const safeTargetPageId = validatePublicPageId(targetPageId);
@@ -1204,19 +1205,25 @@ export class BrowserProvider {
     this.#takeoverRequestPending = true;
     const result = this.queueLifecycle(async () => {
       const current = this.assertHumanTakeover(expected);
+      guard?.assertCurrent();
       const target = this.requirePageNow(safeTargetPageId);
+      await this.resetHumanCommentDesigns(target);
+      this.assertHumanTakeover(expected);
+      guard?.assertCurrent();
       if (current.pageId !== safeTargetPageId) {
-        await this.resetHumanCommentDesigns(target);
         await target.close();
         this.assertHumanTakeover(expected);
         await this.emit({ at: Date.now(), type: "page", pageId: safeTargetPageId, detail: "Page closed." });
         return current;
       }
 
-      const replacement = this.allPages().find((candidate) => candidate !== target && !candidate.isClosed());
-      if (replacement !== undefined) await replacement.bringToFront();
+      const canReplace = (candidate: Page): boolean => candidate !== target && !candidate.isClosed()
+        && (guard === undefined || guard.canFocusReplacement(this.idFor(candidate)));
+      const candidate = this.allPages().find(canReplace);
+      if (candidate !== undefined) await candidate.bringToFront();
       this.assertHumanTakeover(expected);
-      await this.resetHumanCommentDesigns(target);
+      guard?.assertCurrent();
+      const replacement = candidate !== undefined && canReplace(candidate) ? candidate : undefined;
       this.#takeovers.end(expected);
       this.#takeoverRateWindow = undefined;
       const takeover = replacement === undefined ? undefined : this.#takeovers.begin({

@@ -10,6 +10,7 @@ import { PiBackendAdapter } from "@joko/adapter-pi";
 import type { CodeHostProvider } from "@joko/code-host";
 import * as contract from "@joko/contracts";
 import { NotFoundError, OperationConflictError, OperationPreviouslyFailedError, OperationalStore, StoreError, operationBodyHash, type PersistedEvent, type PersistedSessionEvent } from "@joko/store";
+import type { BrowserProvider } from "@joko/tool-browser";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
@@ -5000,7 +5001,11 @@ describe("Connect security and protocol audit", () => {
       current = { ...current!, pageId, takeoverId: "takeover-2" };
       return current;
     });
-    const closeHumanPage = vi.fn(async () => {
+    const closeHumanPage = vi.fn(async (...[, , , guard]: Parameters<BrowserProvider["closeHumanPage"]>) => {
+      guard?.assertCurrent();
+      expect(guard?.canFocusReplacement("page-7-unregistered")).toBe(false);
+      expect(guard?.canFocusReplacement("page-7-foreign")).toBe(false);
+      expect(guard?.canFocusReplacement("page-7-1")).toBe(true);
       current = { ...current!, pageId: "page-7-1", takeoverId: "takeover-3" };
       return current;
     });
@@ -5053,10 +5058,10 @@ describe("Connect security and protocol audit", () => {
       sessionHost: { mutate },
       browser: provider,
       browserState: {
-        findRecoverablePage: (_providerId: string, pageId: string) => ({
+        findRecoverablePage: (_providerId: string, pageId: string) => pageId === "page-7-unregistered" ? undefined : ({
           browserProviderId: "browser",
           pageId,
-          sessionId: "session-1",
+          sessionId: pageId === "page-7-foreign" ? "session-2" : "session-1",
           targetId: "target-1",
           bindingGeneration: 1,
           generation: 7,
@@ -5097,7 +5102,8 @@ describe("Connect security and protocol audit", () => {
       generation: 7n
     }) } });
     await invoke(services.operation.submitOperation, { operationId: "close-page", connectionId: "connection", mutation: close }, context());
-    expect(closeHumanPage).toHaveBeenCalledWith(expect.objectContaining({ takeoverId: "takeover-2" }), "page-7-2", 42_000);
+    expect(closeHumanPage).toHaveBeenCalledWith(expect.objectContaining({ takeoverId: "takeover-2" }), "page-7-2", 42_000,
+      expect.objectContaining({ assertCurrent: expect.any(Function), canFocusReplacement: expect.any(Function) }));
     expect(recordClosedPage).toHaveBeenCalledWith("browser", "page-7-2", 7, "page-7-1");
     expect(recordHumanPage).toHaveBeenLastCalledWith(expect.objectContaining({
       pageId: "page-7-1",
