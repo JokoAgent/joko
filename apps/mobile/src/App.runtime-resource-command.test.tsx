@@ -1008,7 +1008,7 @@ it("opens the actual message menu's Side Chat with the complete current reply qu
       blocks: [{ content: { case: "text", value: "Use this complete answer." } }] } } } });
   renderedState = { ...state, live: [answer] };
   await act(async () => root.render(taskScreen()));
-  const more = [...host.querySelectorAll("button")].find(button => button.getAttribute("aria-label")
+  const more = Array.from(host.querySelectorAll("button")).find(button => button.getAttribute("aria-label")
     === mobileMessage("en", "task.moreFor", { name: "Assistant" }));
   await act(async () => more!.click());
   expect(taskMessageActions?.items.map(item => item.id)).toContain("side-chat");
