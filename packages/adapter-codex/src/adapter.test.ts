@@ -5715,6 +5715,7 @@ describe("CodexBackendAdapter", () => {
       await replyReady;
       if (change !== "unchanged") await setup.adapter.logout();
       if (change === "replaced") {
+        expect(setup.adapter.peekAccountUsage("openai")).toBeUndefined();
         await setup.adapter.beginLogin({ method: "oauth_browser" });
         setup.fake.account = { type: "chatgpt", email: "replacement@example.test", planType: "team" };
         setup.fake.accountRateLimits = { rateLimits: { planType: "team", primary: { usedPercent: 7, windowDurationMins: 300 } } };
@@ -5730,7 +5731,39 @@ describe("CodexBackendAdapter", () => {
       await expect(original).resolves.toMatchObject({ providerId: "openai", primaryWindow: { usedPercent: 25 } });
     } else {
       await expect(original).rejects.toMatchObject({ publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_STATE_STALE" } });
+      if (change === "replaced") expect(setup.adapter.peekAccountUsage("openai")).toMatchObject({ planType: "team", primaryWindow: { usedPercent: 7 } });
+      else expect(setup.adapter.peekAccountUsage("openai")).toBeUndefined();
     }
+  });
+
+  it("keeps the newer native quota observation in a nonblocking snapshot and expires it", async () => {
+    let now = 1_700_000_000_000;
+    const setup = await createSetup(7, { now: () => now });
+    await setup.adapter.readAccount();
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let returned!: () => void, release!: () => void;
+    const oldReply = new Promise<void>(resolve => { returned = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let hold = true;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const reply = await request(method, params, options);
+      if (method === "account/rateLimits/read" && hold) { hold = false; returned(); await gate; }
+      return reply;
+    });
+    expect(setup.adapter.peekAccountUsage("openai")).toBeUndefined();
+    const older = setup.adapter.readAccountUsage("openai");
+    try {
+      await oldReply;
+      now += 1_000;
+      setup.fake.accountRateLimits = { rateLimits: { primary: { usedPercent: 70, windowDurationMins: 300 } } };
+      await expect(setup.adapter.readAccountUsage("openai")).resolves.toMatchObject({ primaryWindow: { usedPercent: 70 } });
+    } finally { release(); }
+    await expect(older).resolves.toMatchObject({ primaryWindow: { usedPercent: 25 } });
+    expect(setup.adapter.peekAccountUsage("openai")).toMatchObject({ primaryWindow: { usedPercent: 70 } });
+    expect(setup.adapter.peekAccountUsage("foreign-provider")).toBeUndefined();
+    now += 60_001;
+    expect(setup.adapter.peekAccountUsage("openai")).toBeUndefined();
   });
 
   it("retires native-auth runtimes before logout without disturbing an independent managed route", async () => {
