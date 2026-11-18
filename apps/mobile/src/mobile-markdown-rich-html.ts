@@ -30,6 +30,8 @@ export function escapeMobileMarkdownHtml(value: string): string {
 
 const markTags = { strong: "strong", emphasis: "em", strikethrough: "del" } as const;
 export const MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_BYTES = 8 * 1024 * 1024;
+export const MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_SIDE = 4_096;
+export const MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_PIXELS = 12_000_000;
 const maximumDiagramPngBase64 = Math.ceil(MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_BYTES / 3) * 4;
 
 export function wrapMobileMarkdownHtmlMarks(html: string, marks: readonly MobileMarkdownInlineMark[] | undefined): string {
@@ -115,7 +117,7 @@ function mobileMarkdownDiagramEncoder(surface: string): string {
       if (!bounds || bounds.length !== 4 || bounds.some(function(value) { return !Number.isFinite(value); })
         || bounds[2] <= 0 || bounds[3] <= 0) return send();
       var width = bounds[2], height = bounds[3];
-      var scale = Math.min(3, 4096 / width, 4096 / height, Math.sqrt(12000000 / (width * height)));
+      var scale = Math.min(3, ${MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_SIDE} / width, ${MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_SIDE} / height, Math.sqrt(${MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_PIXELS} / (width * height)));
       var canvas = document.createElement('canvas');
       canvas.width = Math.max(1, Math.floor(width * scale));
       canvas.height = Math.max(1, Math.floor(height * scale));

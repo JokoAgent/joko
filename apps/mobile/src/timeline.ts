@@ -279,7 +279,8 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
         const completedGalleryPages = mobileTimelineGalleryPages(event);
         const completedImages = completedGalleryPages.map(mobileImageGalleryPageSummary);
         const artifacts = mobileTimelineArtifacts(event).filter((artifact) => !completedGalleryPages.some((page) =>
-          "eventId" in page.source && mobileTimelineContentSourceKey(page.source) === mobileTimelineContentSourceKey(artifact.source)));
+          "eventId" in page.source && page.source.kind !== "diagram"
+          && mobileTimelineContentSourceKey(page.source) === mobileTimelineContentSourceKey(artifact.source)));
         const images = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
           && previous?.images && previous.images.length > 0
           ? previous.images
@@ -630,7 +631,8 @@ function taskMessageOrigin(event: Event): TaskMessageOrigin | undefined {
 
 function timelineMedia(events: readonly Event[]): Pick<TimelineRow, "images" | "artifacts"> {
   const pages = events.flatMap(mobileTimelineGalleryPages);
-  const imageSources = new Set(pages.flatMap((page) => "eventId" in page.source ? [mobileTimelineContentSourceKey(page.source)] : []));
+  const imageSources = new Set(pages.flatMap(({ source }) =>
+    "eventId" in source && source.kind !== "diagram" ? [mobileTimelineContentSourceKey(source)] : []));
   const seen = new Set<string>();
   const images = pages.filter((page) => {
     const key = JSON.stringify([page.blob.blobId, page.sha256Hex]);

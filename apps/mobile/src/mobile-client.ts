@@ -432,6 +432,8 @@ import {
   type MobileImageGalleryPageSession
 } from "./mobile-image-gallery";
 import type { MobileImageOutputSource } from "./mobile-image-output";
+import { MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_BYTES, MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_PIXELS,
+  MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_SIDE } from "./mobile-markdown-rich-html";
 import { timelineRows } from "./timeline";
 import {
   MAXIMUM_MOBILE_CONVERSATION_SHARE_MESSAGES, mobileMessageShareable, projectMobileConversationShareMessage,
@@ -671,6 +673,12 @@ interface MobileImageGalleryLease {
     | {
         readonly kind: "markdown";
         readonly resourceLeaseId: string;
+      }
+    | {
+        readonly kind: "diagram";
+        readonly eventId: string;
+        readonly digest: string;
+        readonly bytes: Uint8Array;
       }
     | {
         readonly kind: "queue";
@@ -9061,6 +9069,67 @@ export class MobileClient {
     } finally { if (!adopted) this.#markdownResources.release(leaseId); }
   }
 
+  async openMarkdownDiagramGallery(selection: {
+    readonly messageId: string;
+    readonly eventId: string;
+    readonly attachmentOwnerKey: string;
+    readonly sourceLabel: string;
+  }, image: MobileImageOutputSource, signal: AbortSignal): Promise<MobileImageGalleryDescriptor> {
+    signal.throwIfAborted();
+    const credential = this.#ready();
+    const sessionId = this.#state.selectedId;
+    const taskAuthorityKey = this.#taskAuthorityKey();
+    const controls = this.taskAttachmentControls();
+    if (!sessionId || !taskAuthorityKey || !this.composerDrafts || !this.attachmentFiles || !controls?.policy.images
+      || controls.surfaceOwnerKey !== selection.attachmentOwnerKey) throw new Error("The original task composer cannot attach this diagram.");
+    const event = this.#timelineEvents().find(item => item.eventId === selection.eventId);
+    if (!event || event.identity?.sessionId !== sessionId || event.cursor?.generation !== this.#taskGeneration()
+      || event.payload?.kind.case !== "messageCompleted" || event.payload.kind.value.role !== MessageRole.ASSISTANT
+      || (event.payload.kind.value.messageId || event.eventId) !== selection.messageId) throw new Error("The completed diagram message changed.");
+    const digest = mobileConversationShareEventDigest(event);
+    if (image.mediaType !== "image/png" || !(image.bytes instanceof Uint8Array)
+      || image.byteSize !== image.bytes.byteLength || image.byteSize > MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_BYTES) {
+      throw new Error("The diagram image is invalid.");
+    }
+    const bytes = Uint8Array.from(image.bytes);
+    const { width, height } = inspectMobileImageOutputBytes(bytes, "image/png");
+    if (width !== image.width || height !== image.height || width > MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_SIDE
+      || height > MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_SIDE || width * height > MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_PIXELS
+      || bytesToHex(sha256(bytes)) !== image.sha256Hex) throw new Error("The diagram image changed before editing.");
+
+    const identity = { profileId: controls.profileId, sessionId };
+    const snapshot = await this.composerDrafts.readSnapshot(identity);
+    const draft = normalizeMobileComposerDraft(snapshot.draft ?? emptyMobileComposerDraft());
+    signal.throwIfAborted();
+    if (this.#taskAuthorityKey() !== taskAuthorityKey || this.taskAttachmentControls()?.surfaceOwnerKey !== controls.surfaceOwnerKey) {
+      throw new Error("The original task composer changed while the diagram opened.");
+    }
+    const title = "Joko-diagram.png";
+    if (!filesAttachmentMetadata(title, "image/png", BigInt(bytes.byteLength), draft.attachments, controls)) {
+      throw new Error("The diagram does not fit the current image attachment policy.");
+    }
+    const leaseId = distinctAttachmentStorageId(this.newId, ...mobileComposerAttachmentStorageIds(draft.attachments));
+    const page = mobileImageGalleryPage({ pageId: leaseId, title, widthPixels: width, heightPixels: height,
+      blob: create(BlobRefSchema, { blobId: `local-diagram:${leaseId}`, fileName: title, mediaType: "image/png",
+        byteSize: BigInt(bytes.byteLength), sha256Hex: image.sha256Hex }), source: { kind: "diagram", eventId: event.eventId } });
+    if (!page) throw new Error("The diagram image is unavailable.");
+    const descriptor: MobileImageGalleryDescriptor = { leaseId, sourceKind: "diagram", sourceLabel: selection.sourceLabel,
+      pages: [mobileImageGalleryPageSummary(page)], initialIndex: 0 };
+    const lease: MobileImageGalleryLease = { leaseId, profileId: credential.profileId, credentialKey: mobileCredentialKey(credential),
+      taskAuthorityKey, attachmentOwnerKey: controls.surfaceOwnerKey, identity, snapshot, draft, descriptor, pages: [page],
+      source: { kind: "diagram", eventId: event.eventId, digest, bytes }, operationInFlight: false };
+    this.#retireImageGallery();
+    this.#imageGallery = lease;
+    try {
+      await this.#revalidateGalleryImageSource(lease, { page }, signal);
+      await this.#assertImageGalleryCurrent(lease, undefined, signal);
+      return descriptor;
+    } catch (error) {
+      if (this.#imageGallery === lease) this.#retireImageGallery();
+      throw error;
+    }
+  }
+
   async prepareConversationShare(selectedIds: readonly string[], signal: AbortSignal): Promise<MobileConversationShareSnapshot> {
     signal.throwIfAborted();
     if (this.#conversationShare) throw new Error("Another message image is being prepared.");
@@ -9394,8 +9463,9 @@ export class MobileClient {
     };
     const profile = this.#credential ?? this.#profiles.find((item) => item.profileId === lease.profileId);
     if (!profile) throw new Error("The gallery connection profile changed.");
-    const download = lease.cachedOnly ? await this.network.readCachedBlob?.(profile, page.blob, signal)
-      : await this.#downloadGalleryBlob(this.#ready(), page.blob, assertCurrent, signal);
+    const download = lease.source.kind === "diagram" ? { mediaType: page.mediaType, bytes: lease.source.bytes }
+      : lease.cachedOnly ? await this.network.readCachedBlob?.(profile, page.blob, signal)
+        : await this.#downloadGalleryBlob(this.#ready(), page.blob, assertCurrent, signal);
     assertCurrent();
     if (!download) throw new Error("The original image is not saved on this phone. Reconnect to download it.");
     signal?.throwIfAborted();
@@ -9511,7 +9581,7 @@ export class MobileClient {
 
   async pinImageGalleryCachedPreview(leaseId: string, pageIndex: number, signal: AbortSignal): Promise<MobileTimelineImagePreview | undefined> {
     signal.throwIfAborted(); const lease = this.#imageGallery;
-    if (!lease || lease.leaseId !== leaseId || !Number.isSafeInteger(pageIndex) || !lease.pages[pageIndex]) return undefined;
+    if (!lease || lease.leaseId !== leaseId || lease.source.kind === "diagram" || !Number.isSafeInteger(pageIndex) || !lease.pages[pageIndex]) return undefined;
     await this.#assertImageGalleryCurrent(lease, undefined, signal);
     const page = lease.pages[pageIndex]!;
     const preview = this.#timelineImages.pinCached({ ownerKey: lease.taskAuthorityKey, page, assertCurrent: (currentSignal) => {
@@ -9535,6 +9605,10 @@ export class MobileClient {
       && mobileFilesGalleryWindowKey(this.#state.files) === source.filesWindowKey;
     if (source.kind === "markdown") {
       try { this.#markdownResources.assertCurrent(source.resourceLeaseId); return true; } catch { return false; }
+    }
+    if (source.kind === "diagram") {
+      const event = this.#timelineEvents().find(item => item.eventId === source.eventId);
+      return event !== undefined && mobileConversationShareEventDigest(event) === source.digest;
     }
     if (source.kind === "queue") {
       const pages = this.#queueGalleryPages(source.queueItemId);
@@ -16050,7 +16124,7 @@ export class MobileClient {
     }
     const snapshot = await this.composerDrafts!.readSnapshot(lease.identity);
     signal?.throwIfAborted();
-    if (this.#imageGallery !== lease || (source.kind === "timeline" && !this.imageGalleryCurrent(lease.leaseId))) {
+    if (this.#imageGallery !== lease || ((source.kind === "timeline" || source.kind === "diagram") && !this.imageGalleryCurrent(lease.leaseId))) {
       throw new Error("The image gallery source changed before the operation completed.");
     }
     const current = normalizeMobileComposerDraft(snapshot.draft ?? {
@@ -16071,6 +16145,17 @@ export class MobileClient {
     signal.throwIfAborted();
     if (lease.source.kind === "markdown") return; // The resource owner revalidates its exact message and Workspace revision above.
     const page = loaded.page; const source = page.source; const credential = this.#ready();
+    if (lease.source.kind === "diagram") {
+      const diagram = lease.source;
+      const around = await this.network.readAround(credential, lease.identity.sessionId, diagram.eventId, signal);
+      signal.throwIfAborted();
+      const matches = around.filter(event => event.eventId === diagram.eventId && event.identity?.sessionId === lease.identity.sessionId
+        && event.cursor?.generation === this.#taskGeneration());
+      if (!this.imageGalleryCurrent(lease.leaseId) || matches.length !== 1 || mobileConversationShareEventDigest(matches[0]!) !== diagram.digest) {
+        throw new Error("The completed diagram message changed while the image was open.");
+      }
+      return;
+    }
     if (lease.source.kind === "queue") {
       await this.#revalidateQueueImage(credential, lease.identity.sessionId, page, () => {
         if (!this.imageGalleryCurrent(lease.leaseId)) throw new Error("The pending image source changed.");
@@ -16228,6 +16313,7 @@ export class MobileClient {
           ...lease.draft,
           attachments: appendMobileComposerAttachments(lease.draft.attachments, [attachment], controls.policy)
         });
+        if (lease.source.kind === "diagram") await this.#revalidateGalleryImageSource(lease, loaded, signal ?? new AbortController().signal);
         await this.#assertImageGalleryCurrent(lease, undefined, signal);
         if (!this.composerDrafts.saveIfRevision(lease.identity, nextDraft, lease.snapshot.revision)) {
           throw new Error("The task composer changed while the gallery image was being added.");

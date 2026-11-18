@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMobileMailLink } from "./MobileExtensionMailReader";
-import { AppState, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import { AppState, Linking, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import { randomUUID } from "expo-crypto";
@@ -10,7 +10,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { mobileImageGalleryDimensionsMatch } from "./mobile-image-gallery";
 import { decodeMobileBase64 } from "./mobile-image-annotation";
-import { mobileImageOutput } from "./mobile-image-output";
+import { mobileImageOutput, type MobileImageOutputSource } from "./mobile-image-output";
 import { inspectMobileImageOutputBytes } from "./mobile-image-output-format";
 import { splitRichAnswer } from "@joko/contracts";
 import { MobileRichAnswer } from "./MobileRichAnswer";
@@ -51,6 +51,7 @@ interface Props {
   readonly resourceText?: string;
   readonly onOpenImage?: (leaseId: string, key: string) => void;
   readonly onOpenPath?: (leaseId: string, key: string) => void;
+  readonly onAnnotateDiagram?: (image: MobileImageOutputSource) => void;
 }
 
 export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: Props) {
@@ -72,7 +73,7 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: 
 });
 
 const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
-  preparedResources: resources, onOpenImage, onOpenPath }: Props & { readonly preparedResources?: MobileMarkdownResourceDescriptor }) {
+  preparedResources: resources, onOpenImage, onOpenPath, onAnnotateDiagram }: Props & { readonly preparedResources?: MobileMarkdownResourceDescriptor }) {
   const previewMail = useMobileMailLink();
   const previous = useRef<MobileMarkdownParseResult | null>(null);
   const parsed = useMemo(() => parseMobileMarkdownIncremental(text, previous.current), [text]);
@@ -90,12 +91,14 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
   const [copying, setCopying] = useState(false);
   const [expanded, setExpanded] = useState<Extract<MobileMarkdownBlock, { type: "math" | "mermaid" }>>();
   const [viewDiagramSource, setViewDiagramSource] = useState(false);
-  const diagramShareScope = useRef<AbortController | undefined>(undefined);
-  const closeExpanded = useCallback(() => {
-    diagramShareScope.current?.abort();
-    diagramShareScope.current = undefined;
+  const diagramScope = useRef<AbortController | undefined>(undefined);
+  const diagramHandoff = useRef<{ readonly ownerKey: string; readonly open: () => void } | undefined>(undefined);
+  const hideExpanded = useCallback(() => {
+    diagramScope.current?.abort();
+    diagramScope.current = undefined;
     setExpanded(undefined);
   }, []);
+  const closeExpanded = useCallback(() => { diagramHandoff.current = undefined; hideExpanded(); }, [hideExpanded]);
   const mounted = useRef(true);
   const copyPending = useRef(false);
   const currentOwner = useRef(ownerKey);
@@ -107,8 +110,18 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     const subscription = AppState.addEventListener("change", (state) => {
       if (state !== "active") closeExpanded();
     });
-    return () => { mounted.current = false; diagramShareScope.current?.abort(); subscription.remove(); };
+    return () => { mounted.current = false; diagramHandoff.current = undefined; diagramScope.current?.abort(); subscription.remove(); };
   }, [closeExpanded, ownerKey]);
+  const deliverDiagram = useCallback(() => {
+    const pending = diagramHandoff.current;
+    diagramHandoff.current = undefined;
+    if (pending && mounted.current && currentOwner.current === pending.ownerKey && AppState.currentState === "active") pending.open();
+  }, []);
+  useEffect(() => {
+    if (expanded !== undefined || Platform.OS !== "android" || !diagramHandoff.current) return;
+    const frame = requestAnimationFrame(deliverDiagram);
+    return () => cancelAnimationFrame(frame);
+  }, [expanded, deliverDiagram]);
   const copy = async (source: string): Promise<void> => {
     if (copyPending.current || AppState.currentState !== "active") return;
     const owner = ownerKey;
@@ -185,8 +198,8 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     if (value.type === "math" || value.type === "mermaid") return <View key={value.key}
       style={[styles.frame, { borderColor: colors.border, backgroundColor: colors.surface }]}>
       {toolbar(value.text, mobileMessage(locale, value.type === "math" ? "markdown.math" : "markdown.diagram"), () => {
-        diagramShareScope.current?.abort();
-        diagramShareScope.current = value.type === "mermaid" ? new AbortController() : undefined;
+        diagramScope.current?.abort();
+        diagramScope.current = value.type === "mermaid" ? new AbortController() : undefined;
         setViewDiagramSource(false);
         setExpanded(value);
       })}
@@ -210,8 +223,8 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
       {mobileMessage(locale, expanded?.type === "math" ? "markdown.math" : "markdown.diagram")}
     </Text>
     {expanded?.type === "mermaid" && <Pressable accessibilityRole="button" onPress={() => {
-      diagramShareScope.current?.abort();
-      diagramShareScope.current = viewDiagramSource ? new AbortController() : undefined;
+      diagramScope.current?.abort();
+      diagramScope.current = viewDiagramSource ? new AbortController() : undefined;
       setViewDiagramSource(!viewDiagramSource);
     }} style={styles.action}>
       <Text style={{ color: colors.accent }}>{mobileMessage(locale, viewDiagramSource ? "markdown.diagram" : "markdown.source")}</Text>
@@ -237,11 +250,15 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     </Text>)}
     {notice && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: colors.muted }]}>{notice}</Text>}
     <Modal visible={expanded !== undefined} animationType="fade"
-      supportedOrientations={["portrait", "landscape"]} onRequestClose={closeExpanded}>
+      supportedOrientations={["portrait", "landscape"]} onRequestClose={closeExpanded} onDismiss={deliverDiagram}>
       <SafeAreaView style={[styles.fill, { backgroundColor: colors.surface }]}>
         {expanded?.type === "mermaid" && !viewDiagramSource ? <MobileMarkdownRichBlock kind="mermaid"
           source={expanded.text} colors={colors} locale={locale} ownerKey={`${ownerKey}/expanded/${expanded.key}`} zoomable
-          shareScope={diagramShareScope.current?.signal} renderHeader={expandedHeader} />
+          diagramScope={diagramScope.current?.signal} renderHeader={expandedHeader}
+          onAnnotateImage={onAnnotateDiagram && ((image) => {
+            diagramHandoff.current = { ownerKey, open: () => onAnnotateDiagram(image) };
+            hideExpanded();
+          })} />
           : expanded && <>
           {expandedHeader()}
           <ScrollView contentContainerStyle={styles.expanded}>
@@ -354,16 +371,17 @@ interface DiagramPngRequest {
   receive?: (raw: string) => void;
 }
 
-function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zoomable = false, shareScope, renderHeader }: {
+function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zoomable = false, diagramScope, renderHeader, onAnnotateImage }: {
   readonly kind: "math" | "mermaid"; readonly source: string; readonly colors: MobileMarkdownColors;
   readonly locale: MobileSupportedLocale; readonly ownerKey: string; readonly zoomable?: boolean;
-  readonly shareScope?: AbortSignal;
+  readonly diagramScope?: AbortSignal;
   readonly renderHeader?: (exportButton: ReactNode) => ReactNode;
+  readonly onAnnotateImage?: (image: MobileImageOutputSource) => void;
 }) {
   const [height, setHeight] = useState(kind === "mermaid" ? 220 : 80);
   const [failed, setFailed] = useState(false);
   const [readyToken, setReadyToken] = useState<string>();
-  const [sharing, setSharing] = useState(false);
+  const [imageAction, setImageAction] = useState<"share" | "annotate">();
   const [shareNotice, setShareNotice] = useState<{ readonly owner: object; readonly message: string }>();
   const webView = useRef<WebView>(null);
   const alive = useRef(true);
@@ -377,7 +395,7 @@ function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zooma
   const failure = useCallback(() => setFailed(true), []);
   const lifecycle = useMobilePreviewResourceLifecycle({ ownerKey: id, releaseRenderer: release, reportFailure: failure });
   const token = lifecycle.rendererToken;
-  const owner = useMemo(() => ({ id, token, shareScope }), [id, token, shareScope]);
+  const owner = useMemo(() => ({ id, token, diagramScope }), [id, token, diagramScope]);
   const currentOwner = useRef(owner);
   currentOwner.current = owner;
   const html = useMemo(() => source.length > 100_000 ? undefined
@@ -389,25 +407,25 @@ function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zooma
   }, []);
   useEffect(() => () => { if (pending.current?.owner === owner) pending.current.abort.abort(); }, [owner]);
 
-  const canShare = fillsViewport && !!html && !failed && !!shareScope && !shareScope.aborted
+  const canExport = fillsViewport && !!html && !failed && !!diagramScope && !diagramScope.aborted
     && readyToken !== undefined && readyToken === token && lifecycle.rendererMounted;
-  const shareDiagram = async (): Promise<void> => {
+  const exportDiagram = async (action: "share" | "annotate"): Promise<void> => {
     const view = webView.current;
-    if (!canShare || !view || !shareScope || pending.current) return;
+    if (!canExport || !view || !diagramScope || pending.current || (action === "annotate" && !onAnnotateImage)) return;
     const request = { owner, id: randomUUID(), abort: new AbortController() };
     const signal = request.abort.signal;
     const retire = () => request.abort.abort();
     const assertCurrent = () => {
       signal.throwIfAborted();
-      shareScope.throwIfAborted();
+      diagramScope.throwIfAborted();
       if (!alive.current || currentOwner.current !== owner || pending.current !== request
         || webView.current !== view || !lifecycle.ownsRenderer(token) || AppState.currentState !== "active") {
         throw new Error("The original diagram is no longer available.");
       }
     };
     pending.current = request;
-    shareScope.addEventListener("abort", retire, { once: true });
-    setSharing(true);
+    diagramScope.addEventListener("abort", retire, { once: true });
+    setImageAction(action);
     setShareNotice(undefined);
     let dispatched = false;
     try {
@@ -416,18 +434,20 @@ function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zooma
       assertCurrent();
       const bytes = decodeMobileBase64(base64, MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_BYTES);
       const { width, height } = inspectMobileImageOutputBytes(bytes, "image/png");
-      await mobileImageOutput.perform("share", { leaseId: request.id, fileName: "Joko-diagram.png", mediaType: "image/png",
+      const image: MobileImageOutputSource = { leaseId: request.id, fileName: "Joko-diagram.png", mediaType: "image/png",
         byteSize: bytes.byteLength, sha256Hex: bytesToHex(sha256(bytes)), bytes, width, height
-      }, undefined, signal, () => { assertCurrent(); dispatched = true; });
+      };
+      if (action === "annotate") onAnnotateImage?.(image);
+      else await mobileImageOutput.perform("share", image, undefined, signal, () => { assertCurrent(); dispatched = true; });
     } catch {
-      if (alive.current && currentOwner.current === owner && !signal.aborted && !shareScope.aborted) {
-        setShareNotice({ owner, message: mobileMessage(locale, dispatched ? "share.unknown" : "share.failed") });
+      if (alive.current && currentOwner.current === owner && !signal.aborted && !diagramScope.aborted) {
+        setShareNotice({ owner, message: mobileMessage(locale, action === "annotate" ? "image.previewFailed" : dispatched ? "share.unknown" : "share.failed") });
       }
     } finally {
-      shareScope.removeEventListener("abort", retire);
+      diagramScope.removeEventListener("abort", retire);
       if (pending.current === request) {
         pending.current = undefined;
-        if (alive.current) setSharing(false);
+        if (alive.current) setImageAction(undefined);
       }
     }
   };
@@ -466,12 +486,18 @@ function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zooma
     : fillsViewport ? <ScrollView style={styles.fill} contentContainerStyle={styles.fallback}>{fallback}</ScrollView>
       : <View style={styles.fallback}>{fallback}</View>;
   return <>
-    {renderHeader?.(<Pressable accessibilityRole="button" accessibilityState={{ disabled: !canShare || sharing, busy: sharing }}
-      disabled={!canShare || sharing} onPress={() => void shareDiagram()} style={styles.action}>
-      <Text style={{ color: canShare && !sharing ? colors.accent : colors.muted }}>
-        {mobileMessage(locale, sharing ? "markdown.exportingImage" : "markdown.exportImage")}
-      </Text>
-    </Pressable>)}
+    {renderHeader?.(<>
+      <Pressable accessibilityRole="button" accessibilityState={{ disabled: !canExport || imageAction !== undefined, busy: imageAction === "share" }}
+        disabled={!canExport || imageAction !== undefined} onPress={() => void exportDiagram("share")} style={styles.action}>
+        <Text style={{ color: canExport && imageAction === undefined ? colors.accent : colors.muted }}>
+          {mobileMessage(locale, imageAction === "share" ? "markdown.exportingImage" : "markdown.exportImage")}
+        </Text>
+      </Pressable>
+      {onAnnotateImage && <Pressable accessibilityRole="button" accessibilityState={{ disabled: !canExport || imageAction !== undefined, busy: imageAction === "annotate" }}
+        disabled={!canExport || imageAction !== undefined} onPress={() => void exportDiagram("annotate")} style={styles.action}>
+        <Text style={{ color: canExport && imageAction === undefined ? colors.accent : colors.muted }}>{mobileMessage(locale, "image.annotate")}</Text>
+      </Pressable>}
+    </>)}
     {content}
     {shareNotice?.owner === owner && <Text accessibilityLiveRegion="polite" role="alert"
       style={[styles.fallback, styles.caption, { color: colors.negative }]}>{shareNotice.message}</Text>}

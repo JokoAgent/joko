@@ -12,7 +12,7 @@ const { copy, openUrl, appStateListeners, pressureListeners, nativeImages, scrol
   appStateListeners: new Set<(state: string) => void>(), pressureListeners: new Set<() => void>(),
   nativeImages: new Map<string, { onError(): void; onLoad(event: { source: { width: number; height: number; isAnimated?: boolean } }): void }>(),
   scrollLayouts: new WeakMap<HTMLElement, (event: { nativeEvent: { layout: { width: number } } }) => void>(),
-  richSurface: { mounted: false, inject: vi.fn(), receive: new WeakMap<HTMLElement, (raw: string) => void>() },
+  richSurface: { mounted: false, inject: vi.fn(), receive: new WeakMap<HTMLElement, (raw: string) => void>(), dismiss: undefined as (() => void) | undefined },
   shareDiagram: vi.fn(async (
     _action: string, _source: unknown, _rendered: unknown, _signal: AbortSignal, beforeDispatch: () => void
   ) => beforeDispatch())
@@ -72,8 +72,11 @@ vi.mock("react-native", () => {
         "data-decoration": textStyle?.textDecorationLine, "data-weight": textStyle?.fontWeight, "data-slant": textStyle?.fontStyle,
         "data-font": textStyle?.fontFamily }, children);
     },
-    Modal: ({ visible, children }: { visible: boolean; children?: ReactNode }) =>
-      visible ? createElement("div", { "data-native-modal": true }, children) : null,
+    Platform: { OS: "ios" },
+    Modal: ({ visible, children, onDismiss }: { visible: boolean; children?: ReactNode; onDismiss?: () => void }) => {
+      richSurface.dismiss = onDismiss;
+      return visible ? createElement("div", { "data-native-modal": true }, children) : null;
+    },
     Pressable: ({ onPress, children, accessibilityRole, accessibilityLabel, disabled }: { onPress: () => void; children?: ReactNode;
       accessibilityRole?: string; accessibilityLabel?: string; disabled?: boolean }) =>
       createElement("button", { onClick: onPress, role: accessibilityRole, disabled, "aria-label": accessibilityLabel }, children),
@@ -251,6 +254,45 @@ describe("native message Markdown", () => {
       await act(async () => button("Source").click());
       await act(async () => reply("render-1"));
       expect(shareDiagram).toHaveBeenCalledTimes(1);
+    } finally {
+      richSurface.mounted = false;
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("opens annotation only when the original chart handoff has dismissed", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666",
+      border: "#ccc", accent: "#f90", negative: "#c33" };
+    const annotate = vi.fn();
+    const render = (ownerKey: string) => act(async () => root.render(<MobileMarkdownMessage
+      text={"```mermaid\nflowchart TD\nA --> B\n```"} colors={colors} locale="en" ownerKey={ownerKey} onAnnotateDiagram={annotate} />));
+    const request = async () => {
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Expand"]')!.click());
+      const chart = container.querySelector<HTMLElement>("[data-native-modal] [data-rich-web-view]")!;
+      const receive = richSurface.receive.get(chart)!;
+      await act(async () => receive(JSON.stringify({ type: "joko-rich-markdown/status", instanceId: "render-1", state: "ready", height: 120 })));
+      const action = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-native-modal] button"))
+        .find(button => button.textContent === "Annotate")!;
+      await act(async () => action.click());
+      const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+      await act(async () => receive(JSON.stringify({ type: "joko-rich-markdown/png", instanceId: "render-1", requestId: "render-1", base64: png })));
+      expect(container.querySelector("[data-native-modal]")).toBeNull();
+    };
+    richSurface.mounted = true;
+    shareDiagram.mockClear();
+    try {
+      await render("diagram-owner-one");
+      await request();
+      expect(annotate).not.toHaveBeenCalled();
+      await act(async () => { richSurface.dismiss?.(); richSurface.dismiss?.(); });
+      expect(annotate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ mediaType: "image/png", width: 1, height: 1 }));
+      await request();
+      await render("another-task");
+      await act(async () => richSurface.dismiss?.());
+      expect(annotate).toHaveBeenCalledTimes(1);
+      expect(shareDiagram).not.toHaveBeenCalled();
     } finally {
       richSurface.mounted = false;
       await act(async () => root.unmount());

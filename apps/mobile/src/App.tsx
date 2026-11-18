@@ -331,7 +331,8 @@ import {
 import {
   mobileImageOutput,
   type MobileImageOutputAction,
-  type MobileImageOutputRenderedImage
+  type MobileImageOutputRenderedImage,
+  type MobileImageOutputSource
 } from "./mobile-image-output";
 import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-share";
 import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
@@ -5301,13 +5302,16 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (taskMountedRef.current) setGalleryOpening(false);
       });
   };
-  const openMarkdownImage = (leaseId: string, key: string): void => {
+  const openMessageImageGallery = (begin: (signal: AbortSignal) => Promise<MobileImageGalleryDescriptor>): void => {
     if (galleryOpening || imageGallery.view || state.status !== "connected" || state.busy
       || attachmentBusy || voice.busy || fileShareBusy || conversationShare.active) return;
     setGalleryOpening(true); setLocalError(""); setComposerNotice("");
-    void imageGallery.open((signal) => client.openMarkdownImageGallery(leaseId, key, signal)).catch((error) => {
+    void imageGallery.open(begin).catch((error) => {
       if (taskMountedRef.current) setLocalError(errorText(error));
     }).finally(() => { if (taskMountedRef.current) setGalleryOpening(false); });
+  };
+  const openMarkdownImage = (leaseId: string, key: string): void => {
+    openMessageImageGallery(signal => client.openMarkdownImageGallery(leaseId, key, signal));
   };
   const markdownPathAbortRef = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => { markdownPathAbortRef.current?.abort(); }, []);
@@ -6781,6 +6785,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           && mobileNativeIntentMessageMatches(activeMessageFocus, item);
         const markdownOwnerKey = `${taskDraftProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
         const quoteAction = nativeMessageQuoteAction(item);
+        const diagramAttachmentOwner = item.kind === "assistant" && item.completed && !item.optimistic
+          && state.status === "connected" && attachmentControls?.policy.images === true ? attachmentControls.surfaceOwnerKey : undefined;
+        const annotateDiagram = diagramAttachmentOwner === undefined ? undefined : (image: MobileImageOutputSource) => {
+          openMessageImageGallery(signal => client.openMarkdownDiagramGallery({ messageId: item.id, eventId: item.eventId,
+            attachmentOwnerKey: diagramAttachmentOwner, sourceLabel: mobileMessage(locale, "markdown.diagram") }, image, signal));
+        };
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
           {...conversationShare.rowTouchHandlers(item)}
           collapsable={false} ref={(view) => {
@@ -6871,7 +6881,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             resourceText={item.text}
             resourceClient={client} messageId={item.id}
             resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
-            onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />;
+            onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onAnnotateDiagram={annotateDiagram} />;
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
@@ -6880,7 +6890,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           onSendRichAnswer={sendRichAnswer}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
-          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
+          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onAnnotateDiagram={annotateDiagram} />
           : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
             quoteAction={quoteAction}
             automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />

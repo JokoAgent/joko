@@ -1,5 +1,7 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema, MessageBlockSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
@@ -16106,6 +16108,69 @@ describe("native current-task Files ownership", () => {
       expect.objectContaining({ blobId: initialIndex === 1 ? "timeline-image-two" : "timeline-image-one", sha256Hex: "b".repeat(64) }),
       undefined
     );
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each(["original", "marked"] as const)("adds only the confirmed %s diagram to its exact task draft", async variant => {
+    const bytes = galleryPngBytes(5, 4);
+    const completed = timelineGalleryEvent(bytes);
+    if (completed.payload?.kind.case !== "messageCompleted") throw new Error("Missing diagram message fixture.");
+    completed.payload.kind.value.blocks = [create(MessageBlockSchema, { content: {
+      case: "text", value: "```mermaid\nflowchart TD\nA --> B\n```"
+    } })];
+    const network = projectedNetwork(timelineGallerySnapshot(completed));
+    vi.mocked(network.readAround).mockResolvedValue([completed]);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const originalDraft = localAttachmentDraft("Keep this draft and its two attachments");
+    drafts.composer.save(identity, originalDraft);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds(), undefined, drafts,
+      new MobileAttachmentFiles(fixture.driver, async value => bytesToHex(sha256(value))));
+    await app.start();
+    const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
+    const controls = app.taskAttachmentControls()!;
+    const png = { leaseId: "webview-receipt", fileName: "Joko-diagram.png", mediaType: "image/png", byteSize: bytes.byteLength,
+      sha256Hex: bytesToHex(sha256(bytes)), bytes, width: 5, height: 4 };
+    const open = () => app.openMarkdownDiagramGallery({ messageId: row.id, eventId: row.eventId,
+      attachmentOwnerKey: controls.surfaceOwnerKey, sourceLabel: "Diagram" }, png, new AbortController().signal);
+    const dismissed = await open();
+    app.cancelImageGallery(dismissed.leaseId);
+    expect(await drafts.composer.read(identity)).toEqual(originalDraft);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+
+    const gallery = await open();
+    expect(gallery).toMatchObject({ sourceKind: "diagram", initialIndex: 0 });
+    expect(gallery.pages).toHaveLength(1);
+    const page = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    expect(page).toMatchObject({ addable: true, annotatable: true, expectedWidthPixels: 5, expectedHeightPixels: 4 });
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, page.leaseId, page.pageId, { width: 5, height: 4, mediaType: "image/png" });
+    const strokes = [{ points: [{ x: 0.25, y: 0.5 }] }];
+    const marked = galleryPngBytes(4, 3);
+    const commit = () => variant === "marked"
+      ? app.commitImageGalleryPageToComposer(gallery.leaseId, page.leaseId, strokes, { bytes: marked, mediaType: "image/png", width: 4, height: 3 })
+      : app.addImageGalleryPageToComposer(gallery.leaseId, page.leaseId);
+    vi.mocked(network.readAround).mockResolvedValueOnce([]);
+    await expect(commit()).rejects.toThrow(/completed diagram message changed/u);
+    expect(await drafts.composer.read(identity)).toEqual(originalDraft);
+    expect(fixture.bytes.size).toBe(2);
+
+    const committed = await commit();
+    expect(committed.text).toBe(originalDraft.text);
+    expect(committed.attachments.slice(0, 2)).toEqual(originalDraft.attachments);
+    const appended = committed.attachments[2]!;
+    expect(appended).toMatchObject({ fileName: variant === "marked" ? "Joko-diagram-annotated.png" : "Joko-diagram.png", kind: "image" });
+    expect(fixture.bytes.get(appended.attachmentId)).toEqual(variant === "marked" ? marked : bytes);
+    if (variant === "marked") {
+      expect(appended.annotation?.strokes).toEqual(strokes);
+      expect(fixture.bytes.get(appended.annotation!.source.storageId)).toEqual(bytes);
+      const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: appended.attachmentId });
+      expect(editor).toMatchObject({ initialStrokes: strokes, expectedWidthPixels: 5, expectedHeightPixels: 4 });
+      app.cancelComposerImageEditor(editor.leaseId);
+    }
+    expect(await drafts.composer.read(identity)).toEqual(committed);
+    expect(network.downloadBlob).not.toHaveBeenCalled();
     expect(network.submit).not.toHaveBeenCalled();
   });
 
