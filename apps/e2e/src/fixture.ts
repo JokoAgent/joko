@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { createConnection, createServer as createPortProbe } from "node:net";
 import { createServer as createHttpServer, type IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import type { BrowserContext } from "playwright-core";
+import type { BrowserContext, Page } from "playwright-core";
 import { replaceEndpointTrust, type EndpointTransport } from "@joko/connection-transport/trust";
 
 import type { AdapterContext, BlobRef, PromptInput } from "@joko/core";
@@ -802,6 +802,14 @@ async function createHttpConnectFixture(application: OrchestratorApplication, ba
 
 export function sha256(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export async function closeCompactNavigationDrawer(page: Page): Promise<void> {
+  const scrim = page.locator(".panel-scrim--navigation");
+  if (await scrim.isVisible()) {
+    await page.locator(".sidebar.is-open").getByRole("button", { name: "Close navigation", exact: true }).click();
+  }
+  await scrim.waitFor({ state: "hidden", timeout: 15_000 });
 }
 
 export async function routeFixtureDiscovery(context: BrowserContext, baseUrl: string): Promise<void> {

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
-import { waitFor } from "./fixture.js";
+import { closeCompactNavigationDrawer, waitFor } from "./fixture.js";
 import { cancelQueuedInputMutation, createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
 
@@ -141,6 +141,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     await reload();
     await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
     await page.setViewportSize({ width: 430, height: 900 });
+    await closeCompactNavigationDrawer(page);
     const rewindRow = row(rewindSource.messageId);
     await rewindRow.hover(); await rewindRow.locator(".message-action-menu > summary").click();
     await rewindRow.getByRole("menuitem", { name: "Rewind from here", exact: true }).click();
