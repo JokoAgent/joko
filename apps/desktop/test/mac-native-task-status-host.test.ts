@@ -127,6 +127,55 @@ describe("macOS native task-status host", () => {
     host.dispose();
   });
 
+  it("opens only the completion represented by the rendered native link", () => {
+    const clock = new FakeClock();
+    const windows: FakeWindow[] = [], actions: DesktopNativeTaskStatusAction[] = [];
+    const host = createMacNativeTaskStatusHost({
+      supported: true,
+      getDisplays: () => [{ id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1600, height: 900 } }],
+      createWindow: bounds => { const window = new FakeWindow(bounds); windows.push(window); return window; },
+      onAction: action => actions.push(action), onNewTask: () => undefined, onOpenSettings: () => undefined,
+      onToggleSounds: () => undefined, playSound: () => undefined,
+      now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer
+    });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    const task = { sessionId: "task", title: "Task", detail: "", activityLines: [], updatedAt: 2 };
+    const first = { ...task, phase: "completed" as const, completionIdentity: "41" };
+    const second = { ...first, completionIdentity: "42" };
+    const publish = (revision: string, entry: Record<string, unknown>) =>
+      host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "renderer", revision, locale: "en", sessions: [entry] }));
+    const focusLinks = () => [...windows[0]!.documents.at(-1)!.matchAll(/href="(joko-task-status:\/\/focus\?[^"]+)"/gu)]
+      .map(match => match[1]!);
+
+    publish("1", { ...task, phase: "running" });
+    const [running] = focusLinks();
+    expect(running).toBe("joko-task-status://focus?sessionId=task");
+    windows[0]!.navigate!(running!);
+    expect(actions.splice(0)).toEqual([{ kind: "focus", sessionId: "task" }]);
+
+    publish("2", first);
+    expect(host.surface()?.mode).toBe("expanded");
+    const expanded = focusLinks();
+    expect(expanded).toHaveLength(2);
+    clock.advance(NATIVE_TASK_STATUS_COMPLETION_DWELL_MS);
+    expect(host.surface()?.mode).toBe("compact");
+    const compact = focusLinks();
+    expect(compact).toHaveLength(1);
+    expect([...expanded, ...compact].map(link => new URL(link).searchParams.get("token")))
+      .toEqual(Array(3).fill(remoteEntryToken(first)));
+
+    publish("3", second);
+    for (const oldLink of [running!, ...expanded, ...compact]) windows[0]!.navigate!(oldLink);
+    expect(actions).toEqual([]);
+    host.acknowledgeFocus("task", remoteEntryToken(first));
+    expect(host.surface()?.sessions).toMatchObject([{ sessionId: "task", completionIdentity: "42" }]);
+    windows[0]!.navigate!(focusLinks()[0]!);
+    expect(actions).toEqual([{ kind: "focus", sessionId: "task", entryToken: remoteEntryToken(second) }]);
+    host.acknowledgeFocus("task", remoteEntryToken(second));
+    expect(host.surface()?.sessions).toEqual([]);
+    host.dispose();
+  });
+
   it("keeps first remote attention passive, alerts on a real transition and clears only an unchanged committed entry", () => {
     const sounds = vi.fn(), actions: DesktopNativeTaskStatusAction[] = [];
     const host = createMacNativeTaskStatusHost({ supported: true,
