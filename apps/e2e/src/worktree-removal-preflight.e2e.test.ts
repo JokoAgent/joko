@@ -25,7 +25,10 @@ describe("managed worktree removal preflight", () => {
     fixture = undefined;
   });
 
-  it("projects real Git dirtiness across archive, service restart, and exact restore", { timeout: 60_000 }, async () => {
+  it.each([
+    { branchState: "preserved", removeBranch: false },
+    { branchState: "deleted", removeBranch: true }
+  ])("restores the exact worktree after a service restart with the original branch $branchState", { timeout: 60_000 }, async ({ removeBranch }) => {
     fixture = await OrchestratorE2eFixture.start();
     await initializeRepository(fixture.workspaceDirectory);
     const paired = await fixture.pair("Worktree preflight owner");
@@ -65,6 +68,7 @@ describe("managed worktree removal preflight", () => {
     ));
     const initialBinding = fixture.application.store.getSession(sessionId).descriptor.worktree;
     if (initialBinding === undefined) throw new Error("Managed task has no worktree binding.");
+    const originalHead = (await git(initialBinding.path, ["rev-parse", "HEAD"])).trim();
     expect(initialBinding).toMatchObject({ state: "active" });
     await expect(paired.clients.worktree.getSessionWorktreeRemovalPreview({ sessionId })).resolves.toMatchObject({
       sessionId,
@@ -95,16 +99,23 @@ describe("managed worktree removal preflight", () => {
       worktree: { leaseId: initialBinding.leaseId, path: initialBinding.path, state: "preserved" }
     });
     await expect(access(initialBinding.path)).rejects.toMatchObject({ code: "ENOENT" });
+    const branchRef = `refs/heads/${initialBinding.branch}`;
+    if (removeBranch) {
+      await git(initialBinding.repositoryRoot, ["branch", "-D", "--", initialBinding.branch]);
+      await expect(git(initialBinding.repositoryRoot, ["show-ref", "--verify", "--quiet", branchRef])).rejects.toThrow();
+    }
 
     const rootDirectory = fixture.rootDirectory;
     await fixture.close({ removeRoot: false });
     fixture = await OrchestratorE2eFixture.start({ rootDirectory });
     const restartedClients = fixture.clients(paired.authKey);
-    await expect(restartedClients.worktree.getSessionWorktreeRemovalPreview({ sessionId })).resolves.toMatchObject({
-      sessionId,
-      hasWorktree: true,
-      dirty: true
-    });
+    if (!removeBranch) {
+      await expect(restartedClients.worktree.getSessionWorktreeRemovalPreview({ sessionId })).resolves.toMatchObject({
+        sessionId,
+        hasWorktree: true,
+        dirty: true
+      });
+    }
 
     const restored = await submit(
       restartedClients.operation,
@@ -116,9 +127,12 @@ describe("managed worktree removal preflight", () => {
     expect(restoredBinding).toMatchObject({
       leaseId: initialBinding.leaseId,
       path: initialBinding.path,
+      branch: initialBinding.branch,
       state: "active"
     });
     expect(resolve(restoredBinding!.path)).toBe(resolve(initialBinding.path));
+    expect((await git(initialBinding.path, ["symbolic-ref", "HEAD"])).trim()).toBe(branchRef);
+    expect((await git(initialBinding.path, ["rev-parse", "HEAD"])).trim()).toBe(originalHead);
     expect((await readFile(trackedPath, "utf8")).replaceAll("\r\n", "\n"))
       .toBe("unstaged worktree content\n");
     expect((await git(initialBinding.path, ["show", ":README.md"])).replaceAll("\r\n", "\n"))

@@ -21,6 +21,10 @@ export interface GitRunOptions {
   readonly idleTimeoutMs?: number;
   readonly environment?: Readonly<Record<string, string>>;
   readonly indexFile?: string;
+  readonly refTransaction?: {
+    readonly commands: string;
+    readonly beforeCommit: () => Promise<void>;
+  };
 }
 
 export class GitCommandError extends WorktreeServiceError {
@@ -76,6 +80,7 @@ export async function runGit(
     environment.GIT_INDEX_FILE = options.indexFile;
   }
 
+  const transaction = options.refTransaction;
   return new Promise<GitResult>((resolve, reject) => {
     let child: ChildProcess;
     try {
@@ -85,7 +90,7 @@ export async function runGit(
         windowsHide: true,
         shell: false,
         detached: process.platform !== "win32",
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: [transaction === undefined ? "ignore" : "pipe", "pipe", "pipe"]
       });
     } catch (error) {
       reject(spawnError(error));
@@ -94,9 +99,10 @@ export async function runGit(
 
     const stdoutStream = child.stdout;
     const stderrStream = child.stderr;
-    if (stdoutStream === null || stderrStream === null) {
+    const stdinStream = child.stdin;
+    if (stdoutStream === null || stderrStream === null || (transaction !== undefined && stdinStream === null)) {
       terminateProcessTree(child, "SIGKILL");
-      reject(new WorktreeServiceError("GIT_FAILED", "Git output streams were unavailable."));
+      reject(new WorktreeServiceError("GIT_FAILED", "Git process streams were unavailable."));
       return;
     }
 
@@ -105,6 +111,8 @@ export async function runGit(
     let outputBytes = 0;
     let settled = false;
     let terminationError: WorktreeServiceError | undefined;
+    let transactionPrepared = false;
+    let transactionRejection: { readonly error: unknown } | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let settleTimer: NodeJS.Timeout | undefined;
     let idleTimer: NodeJS.Timeout | undefined;
@@ -159,7 +167,24 @@ export async function runGit(
     timeoutTimer.unref();
     resetIdleTimer();
 
-    stdoutStream.on("data", (chunk: Buffer) => collect(stdout, chunk));
+    stdoutStream.on("data", (chunk: Buffer) => {
+      collect(stdout, chunk);
+      if (transaction === undefined || stdinStream === null || transactionPrepared || terminationError !== undefined
+        || !/^prepare: ok\r?$/mu.test(Buffer.concat(stdout).toString("utf8"))) return;
+      transactionPrepared = true;
+      void (async () => {
+        try {
+          await transaction.beforeCommit();
+          if (settled || terminationError !== undefined) return;
+          control.check();
+          stdinStream.end("commit\n");
+        } catch (error) {
+          if (settled || terminationError !== undefined) return;
+          transactionRejection = { error };
+          stdinStream.end("abort\n");
+        }
+      })();
+    });
     stderrStream.on("data", (chunk: Buffer) => collect(stderr, chunk));
     child.once("error", (error) => finish(() => reject(spawnError(error))));
     child.once("close", (code) => {
@@ -169,15 +194,71 @@ export async function runGit(
         finish(() => reject(terminationError));
         return;
       }
+      if (transactionRejection !== undefined) {
+        const { error } = transactionRejection;
+        finish(() => reject(error));
+        return;
+      }
       if (code !== 0) {
         finish(() => reject(new GitCommandError("Git command failed.", stderrText, code)));
+        return;
+      }
+      if (transaction !== undefined && !/^commit: ok\r?$/mu.test(stdoutText)) {
+        finish(() => reject(new GitCommandError("Git did not confirm the reference transaction.", stderrText, code)));
         return;
       }
       finish(() => resolve({ stdout: stdoutText, stderr: stderrText, exitCode: code }));
     });
     control.signal?.addEventListener("abort", abort, { once: true });
     if (control.signal?.aborted === true) abort();
+    else if (transaction !== undefined && stdinStream !== null) {
+      stdinStream.on("error", () => { /* Git supplies the command error on exit. */ });
+      stdinStream.write(transaction.commands);
+    }
   });
+}
+
+export async function restoreMissingWorktreeBranch(
+  repositoryRoot: string,
+  input: {
+    readonly gitDirectory: string;
+    readonly branchRef: string;
+    readonly head: string;
+    readonly snapshotRef: string;
+    readonly snapshotSha: string;
+  },
+  control: WorktreeOperationControl,
+  assertVacantCheckout: () => Promise<void>
+): Promise<void> {
+  const { branchRef, head, snapshotRef, snapshotSha } = input;
+  const gitDirectory = `--git-dir=${input.gitDirectory}`;
+  const commands = ["start", "option no-deref", `verify ${snapshotRef} ${snapshotSha}`,
+    "option no-deref", `create ${branchRef} ${head}`, "prepare", ""].join("\n");
+  try {
+    await runGit([gitDirectory, "update-ref", "--stdin", "-m", "restore archived Joko worktree"], repositoryRoot, control, {
+      refTransaction: {
+        commands,
+        beforeCommit: async () => {
+          // File-based Git versions may accept a dangling symbolic ref in an OID comparison.
+          // Check the raw refs while Git holds both transaction locks.
+          for (const ref of [branchRef, snapshotRef]) {
+            const direct = await runGit([gitDirectory, "symbolic-ref", "--quiet", "--no-recurse", ref], repositoryRoot, control).then(
+              () => false,
+              (error: unknown) => {
+                if (error instanceof GitCommandError && error.exitCode === 1) return true;
+                throw error;
+              }
+            );
+            if (!direct) throw new WorktreeServiceError("SESSION_CONFLICT", "A symbolic reference occupies the archive or restored branch.");
+          }
+          await assertVacantCheckout();
+        }
+      }
+    });
+  } catch (error) {
+    if (!(error instanceof GitCommandError)) throw error;
+    throw new WorktreeServiceError("SESSION_CONFLICT", "The archived branch could not be reserved with its original snapshot.");
+  }
 }
 
 function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {

@@ -1085,6 +1085,35 @@ describe("EphemeralWorktreeService", () => {
       .toBe("must remain recoverable\n");
   });
 
+  test("retains a symbolic branch and refuses to recover a missing branch without its exact owner ref", { timeout: 25_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    unwrap(await service.initialize());
+    const sessionId = "missing-branch-owner";
+    const { lease } = unwrap(await service.acquire({ sessionId, cwd: fixture.repositoryRoot }));
+    await writeFile(join(lease.path, "tracked.txt"), "archived edit\n", "utf8");
+    unwrap(await service.release(sessionId, { retainForRestore: true }));
+    await expect(lstat(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+    const snapshotSha = await snapshotRefSha(fixture.repositoryRoot, sessionId);
+    expect(snapshotSha).toMatch(/^[0-9a-f]{40,64}$/u);
+    const ref = `refs/heads/${lease.branch}`;
+    const danglingTarget = "refs/heads/user-branch-not-yet-created";
+    await git(fixture.repositoryRoot, ["branch", "-D", "--", lease.branch]);
+    await git(fixture.repositoryRoot, ["symbolic-ref", ref, danglingTarget]);
+
+    const restore = () => service.acquire({ sessionId, cwd: fixture.repositoryRoot });
+    await expect(restore()).resolves.toMatchObject({ ok: false, error: { code: "SESSION_CONFLICT" } });
+    expect((await git(fixture.repositoryRoot, ["symbolic-ref", "--no-recurse", ref])).trim()).toBe(danglingTarget);
+    expect(await snapshotRefSha(fixture.repositoryRoot, sessionId)).toBe(snapshotSha);
+    await expect(lstat(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+
+    await git(fixture.repositoryRoot, ["symbolic-ref", "--delete", ref]);
+    await git(fixture.repositoryRoot, ["update-ref", "-d", `refs/joko/worktree-snapshots/${ownerKey(sessionId)}`, snapshotSha]);
+    await expect(restore()).resolves.toMatchObject({ ok: false, error: { code: "SESSION_CONFLICT" } });
+    await expect(git(fixture.repositoryRoot, ["show-ref", "--verify", "--quiet", ref])).rejects.toThrow();
+    await expect(lstat(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("keeps the owner ref and checkout absent when restore detects a moved branch", { timeout: 20_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const first = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
