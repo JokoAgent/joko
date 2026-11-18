@@ -2,7 +2,7 @@ import { Fragment } from "react";
 import { useProvisionalTaskPreview } from "../provisional-draft-preview.js";
 import { inspectorLayoutOwner, openInspectorExtension } from "./inspector-layout.js";
 import type { JSX, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AlignJustify,
@@ -781,6 +781,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const allTargetIds = allTargetsInBaselineOrder
     .filter((target) => navigationSessions.some((session) => session.projectId === target.id))
     .map((target) => target.id);
+  const sidebarOrderSource = JSON.stringify([allPinnedIds, allTargetIds]);
   const orderedTargets = sortSidebarTargets(
     snapshot.targets,
     recent,
@@ -1085,17 +1086,19 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     return () => document.removeEventListener("mousedown", closeSidebarMenus, true);
   }, []);
 
+  const applyReconciledSidebarOrder = useEffectEvent(props.onSidebarOwnerLayoutChange);
   useEffect(() => {
+    const [pinnedIds, targetIds] = JSON.parse(sidebarOrderSource) as [string[], string[]];
     const ownerChanged = previousPinnedOwnerRef.current !== props.sidebarOwnerId;
-    const previousPinnedIds = ownerChanged ? new Set(allPinnedIds) : previousPinnedIdsRef.current;
-    const newlyPinnedIds = ownerChanged ? [] : allPinnedIds.filter((id) => !previousPinnedIds.has(id));
+    const previousPinnedIds = previousPinnedIdsRef.current;
+    const newlyPinnedIds = ownerChanged ? [] : pinnedIds.filter((id) => !previousPinnedIds.has(id));
     previousPinnedOwnerRef.current = props.sidebarOwnerId;
-    previousPinnedIdsRef.current = new Set(allPinnedIds);
+    previousPinnedIdsRef.current = new Set(pinnedIds);
     const nextPinnedOrder = newlyPinnedIds.length > 0
-      ? promoteNewPinnedSidebarIds(sidebarLayout.manualPinnedOrder, allPinnedIds, newlyPinnedIds)
-      : normalizeManualSidebarOrder(sidebarLayout.manualPinnedOrder, allPinnedIds);
-    const nextProjectOrder = normalizeManualSidebarOrder(sidebarLayout.manualProjectOrder, allTargetIds);
-    const activeTargets = new Set(allTargetIds);
+      ? promoteNewPinnedSidebarIds(sidebarLayout.manualPinnedOrder, pinnedIds, newlyPinnedIds)
+      : normalizeManualSidebarOrder(sidebarLayout.manualPinnedOrder, pinnedIds);
+    const nextProjectOrder = normalizeManualSidebarOrder(sidebarLayout.manualProjectOrder, targetIds);
+    const activeTargets = new Set(targetIds);
     const nextCollapsed = sidebarLayout.collapsedProjectIds.filter((id) => activeTargets.has(id));
     const patch: {
       manualPinnedOrder?: readonly string[];
@@ -1113,8 +1116,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     if (!sameSidebarOrder(nextCollapsed, sidebarLayout.collapsedProjectIds)) {
       patch.collapsedProjectIds = nextCollapsed;
     }
-    if (Object.keys(patch).length > 0) props.onSidebarOwnerLayoutChange(patch);
-  }, [allPinnedIds, allTargetIds, props.onSidebarOwnerLayoutChange, props.sidebarOwnerId, sidebarLayout]);
+    if (Object.keys(patch).length > 0) applyReconciledSidebarOrder(patch);
+  }, [props.sidebarOwnerId, sidebarLayout, sidebarOrderSource]);
 
   useEffect(() => {
     if (messageSearchBackendId !== "all" && !snapshot.backends.some((backend) => backend.id === messageSearchBackendId)) {
