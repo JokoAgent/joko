@@ -35,6 +35,27 @@ describe("file Markdown document", () => {
     expect(() => buildMobileFileMarkdownHtml({ ...input, text: "x".repeat(2_097_153) }, runtime)).toThrow("too large");
   });
 
+  it("wraps file tables within the reading width and retains semantic cells and local math scrolling", () => {
+    const dom = new JSDOM(buildMobileFileMarkdownHtml({
+      text: "| Name | Type | State | Note |\n| --- | --- | --- | --- |\n| [Docs](https://example.test) | txt | OK | longwordwithoutspaces $x^2$ |",
+      label: "README.md", colors
+    }, { katexScript: "", katexCss: "", mermaidScript: "" }));
+    try {
+      const window = dom.window as Window;
+      const table = window.document.querySelector("table")!;
+      expect(Array.from(table.querySelectorAll("th"), (cell) => cell.textContent)).toEqual(["Name", "Type", "State", "Note"]);
+      expect(window.getComputedStyle(table)).toMatchObject({ width: "100%", tableLayout: "fixed" });
+      const note = table.querySelector("td:last-child")!;
+      const noteStyle = window.getComputedStyle(note);
+      expect(Number.parseFloat(noteStyle.minWidth)).toBe(0);
+      expect(noteStyle).toMatchObject({ overflowWrap: "anywhere", wordBreak: "break-word" });
+      expect(note.textContent).toContain("longwordwithoutspaces");
+      const formula = note.querySelector('[data-latex="x^2"]')!;
+      expect(window.getComputedStyle(formula)).toMatchObject({ maxWidth: "100%", overflowX: "auto" });
+      expect(table.querySelector("a")?.href).toBe("https://example.test/");
+    } finally { dom.window.close(); }
+  });
+
   it("retains intrinsic EXIF proportions both on first render and in-place resource adoption", () => {
     const key = '["image","portrait.png"]';
     const resources = { leaseId: "file", references: new Map([[key, { key, label: "Portrait", kind: "image" as const,
