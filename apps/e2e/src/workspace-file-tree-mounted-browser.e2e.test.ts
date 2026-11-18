@@ -71,6 +71,9 @@ mountedIt("shows locally ignored directories on demand and restores the Files pr
     const document = page.locator(".workspace-files-route__document");
     await document.getByText(body, { exact: true }).waitFor({ state: "visible" });
     await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
+      .getByRole("button", { name: "Connect", exact: true }).click();
     await row("build").waitFor({ state: "visible" });
     expect(await toggle.getAttribute("aria-pressed")).toBe("true");
     await document.getByText(body, { exact: true }).waitFor({ state: "visible" });
