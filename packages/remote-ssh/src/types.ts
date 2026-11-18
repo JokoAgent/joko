@@ -113,6 +113,8 @@ export interface AgentAuthConnectorRequest {
 export interface AgentAuthConnection {
   /** Stable capabilities of this authenticated connection. */
   readonly capabilities?: RemoteSshTransportCapabilities;
+  /** Signals retirement of this exact carrier, including a peer-initiated close. */
+  readonly closed?: AbortSignal;
   close(): Promise<void>;
   /** Optional transport capability. Inputs and connector failures must never be logged. */
   execute?(request: AgentAuthExecutionRequest): Promise<AgentAuthExecutionResult>;

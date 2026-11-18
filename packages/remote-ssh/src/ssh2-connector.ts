@@ -229,7 +229,7 @@ export class Ssh2ResolvedAgentAuthConnector implements ResolvedAgentAuthConnecto
           }
           settled = true;
           cleanupBeforeReady();
-        resolve(new Ssh2AgentAuthConnection(client, this.#terminalTimeouts));
+          resolve(new Ssh2AgentAuthConnection(client, this.#terminalTimeouts));
         };
 
         request.signal.addEventListener("abort", onAbort, { once: true });
@@ -317,7 +317,8 @@ class Ssh2AgentAuthConnection implements AgentAuthConnection {
     readonly localHost: "127.0.0.1" | "::1" | "localhost";
     readonly localPort: number;
   }>();
-  #closed = false;
+  readonly #lifetime = new AbortController();
+  readonly closed = this.#lifetime.signal;
   #sftpPromise: Promise<SFTPWrapper> | undefined;
 
   constructor(client: InstanceType<typeof Client>, terminalTimeouts: Ssh2TerminalTimeouts) {
@@ -358,9 +359,11 @@ class Ssh2AgentAuthConnection implements AgentAuthConnection {
       socket.once("close", () => channel.destroy());
       channel.pipe(socket).pipe(channel);
     });
+    // The authenticated client's error can precede its terminal close event.
+    client.on("error", () => undefined);
     client.once("close", () => {
-      this.#closed = true;
       this.#sftpPromise = undefined;
+      this.#lifetime.abort();
     });
   }
 
@@ -462,8 +465,8 @@ class Ssh2AgentAuthConnection implements AgentAuthConnection {
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
+    if (this.closed.aborted) return;
+    this.#lifetime.abort();
     const client = this.#client;
     this.invalidateSftp();
     await new Promise<void>((resolve) => {
@@ -611,7 +614,7 @@ class Ssh2AgentAuthConnection implements AgentAuthConnection {
         if (closed) return;
         closed = true;
         this.#reverseForwards.delete(remotePort);
-        if (this.#closed) return;
+        if (this.closed.aborted) return;
         await new Promise<void>((resolve) => {
           try {
             this.#client.unforwardIn(remoteHost, remotePort, () => resolve());
@@ -687,7 +690,7 @@ class Ssh2AgentAuthConnection implements AgentAuthConnection {
   }
 
   private assertOpen(): void {
-    if (this.#closed) {
+    if (this.closed.aborted) {
       throw new RemoteSshError("CONNECTION_FAILED", "The SSH connection is closed.", true);
     }
   }

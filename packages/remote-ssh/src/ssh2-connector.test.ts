@@ -12,7 +12,9 @@ import ssh2, {
   type SFTPWrapper
 } from "ssh2";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { RemoteSshConnectionController } from "./connection.js";
 import { isRemoteFileMissing, RemoteSshError } from "./errors.js";
+import { TofuSshHostKeyVerifier } from "./host-keys.js";
 import { SSH_UNICODE_CORPUS } from "./i18n/unicode.test-fixture.js";
 import { Ssh2ResolvedAgentAuthConnector, type Ssh2ResolvedAgentAuthConnectorOptions } from "./ssh2-connector.js";
 import type { RemoteTerminalExit, RemoteTerminalHandle } from "./types.js";
@@ -34,6 +36,7 @@ interface TestSshServer {
   readonly terminalEnvironmentRequests: string[];
   readonly pendingTerminals: (() => void)[];
   openForwarded(remotePort: number): Promise<ServerChannel>;
+  closeIdleClients(): void;
   close(): Promise<void>;
 }
 
@@ -111,6 +114,51 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
       maxOutputBytes: 8,
       signal: new AbortController().signal
     })).rejects.toMatchObject({ code: "CONNECTION_FAILED" });
+  });
+
+  it("retires an idle peer-closed carrier and obtains SFTP on a new verified connection", async () => {
+    const server = await startSshServer();
+    const connector = new Ssh2ResolvedAgentAuthConnector({ readyTimeoutMs: 2_000, keepaliveIntervalMs: 0 });
+    const scope = { ownerId: "ssh-owner", targetId: "ssh-target" };
+    let fingerprint: string | undefined;
+    const compareAndPin = vi.fn(async ({ fingerprint: next }: { fingerprint: string }) => {
+      if (fingerprint === undefined) { fingerprint = next; return "pinned" as const; }
+      expect(next).toBe(fingerprint);
+      return "matched" as const;
+    });
+    const controller = new RemoteSshConnectionController({
+      ...scope, id: "idle-host", hostname: "127.0.0.1", port: server.port, user: "maker"
+    }, {
+      connector: { connect: request => connector.connect({ ...request,
+        authentication: { kind: "private_key", privateKey: Buffer.from(userPrivateKey) } }) },
+      hostKeyVerifier: new TofuSshHostKeyVerifier({ compareAndPin })
+    });
+    const status = vi.fn();
+    const unsubscribe = controller.onStatus(scope, status);
+    try {
+      expect((await controller.test(scope)).ok).toBe(true);
+      const originalGeneration = controller.transportGeneration(scope);
+      const originalFiles = controller.transports(scope).files!;
+      expect(await originalFiles.realpath(".")).toBe("/");
+
+      server.closeIdleClients();
+      await vi.waitFor(() => expect(controller.snapshot(scope).status).toBe("disconnected"), { timeout: 2_000 });
+      expect(status).toHaveBeenLastCalledWith(expect.objectContaining({ status: "disconnected" }), "transport-closed");
+      expect(() => controller.transportGeneration(scope)).toThrow(/not ready/);
+      await expect(originalFiles.realpath(".")).rejects.toMatchObject({ code: "CONNECTION_FAILED" });
+
+      expect((await controller.test(scope)).ok).toBe(true);
+      expect(controller.transportGeneration(scope)).toBeGreaterThan(originalGeneration);
+      const replacementFiles = controller.transports(scope).files!;
+      expect(replacementFiles).not.toBe(originalFiles);
+      expect(await replacementFiles.realpath(".")).toBe("/");
+      expect(compareAndPin).toHaveBeenCalledTimes(2);
+      await controller.disconnect(scope);
+      expect(status).toHaveBeenLastCalledWith(expect.objectContaining({ status: "disconnected" }), undefined);
+    } finally {
+      unsubscribe();
+      await controller.disconnect(scope);
+    }
   });
 
   it("fails authentication without retry and never exposes key material", async () => {
@@ -781,6 +829,7 @@ async function startSshServer(options: {
         (error, stream) => error === undefined ? resolve(stream) : reject(error)
       );
     }),
+    closeIdleClients: () => { for (const client of clients) client.end(); },
     close: async () => {
       for (const client of clients) client.end();
       await new Promise<void>((resolve) => server.close(() => resolve()));
