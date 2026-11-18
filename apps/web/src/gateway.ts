@@ -4128,8 +4128,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     });
   }
 
-  async runSchedule(scheduleId: string): Promise<void> {
-    await this.submit({ case: "triggerSchedule", value: { scheduleId } });
+  async runSchedule(scheduleId: string, operationId?: string): Promise<void> {
+    await this.submit({ case: "triggerSchedule", value: { scheduleId } }, false, [], undefined, undefined, operationId);
   }
 
   async setScheduleEnabled(scheduleId: string, enabled: boolean): Promise<void> {

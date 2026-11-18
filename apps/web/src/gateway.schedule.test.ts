@@ -31,6 +31,36 @@ import { scheduleDraft } from "./components/SchedulesPage.js";
 import type { ScheduleDraft } from "./model.js";
 
 describe("schedule gateway snapshots", () => {
+  it("submits Run now with the caller's operation identity and returns its definitive rejection", async () => {
+    const rejected = "Schedule has expired and cannot be triggered.";
+    const submitted = vi.fn();
+    const transport = {
+      unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+        if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, {
+          snapshot: { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } }
+        }));
+        if (method.localName === "submitOperation") {
+          submitted(input);
+          return response(method, create(SubmitOperationResponseSchema, {
+            operation: { operationId: input.operationId, connectionId: input.connectionId,
+              state: OperationState.FAILED, error: { message: rejected } }
+          }));
+        }
+        throw new Error(method.localName);
+      }), stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway({ id: "schedule-connection", deviceId: "device", name: "Browser",
+      origin: "https://node.example", serverId: "node" }, "secret", {}, () => transport);
+    await gateway.connect();
+
+    await expect(gateway.runSchedule("schedule-1", "original-run-request")).rejects.toThrow(rejected);
+    expect(submitted).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      operationId: "original-run-request", connectionId: "schedule-connection",
+      mutation: expect.objectContaining({ payload: { case: "triggerSchedule", value: expect.objectContaining({ scheduleId: "schedule-1" }) } })
+    }));
+    gateway.disconnect();
+  });
+
   it("binds preparation, testing, and recovery to typed Schedule hook requests", async () => {
     const requests: Array<{ method: string; input: any }> = [];
     const hook = { command: "joko-node gate.mjs", filePath: "gate.mjs", timeout: { seconds: 2n } };

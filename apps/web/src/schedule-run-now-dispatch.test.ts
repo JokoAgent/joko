@@ -1,10 +1,11 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import type { SchedulerRuntimeView, ScheduleRuntimeRunView } from "./model.js";
 import { createScheduleRunNowDispatchTracker } from "./schedule-run-now-dispatch.js";
 
 describe("Schedule Run Now dispatch tracker", () => {
-  it("opens a synchronous per-Schedule gate and releases only for a new authoritative Run Now identity", async () => {
+  it("opens a synchronous per-Schedule gate and releases only for its own admitted Run", async () => {
     const changes = vi.fn<(busyIds: ReadonlySet<string>) => void>();
     const tracker = createScheduleRunNowDispatchTracker(changes);
     const existing = run("schedule-a", "run-existing", "runNow", "loading");
@@ -15,11 +16,16 @@ describe("Schedule Run Now dispatch tracker", () => {
     expect(tracker.begin("schedule-a", runtime("owner-a", [existing, automatic]))).toBeUndefined();
     expect([...tracker.busyIds]).toEqual(["schedule-a"]);
     expect([...required(changes.mock.lastCall)[0]]).toEqual(["schedule-a"]);
-    const presentation = tracker.attach(attempt, () => rpc.promise);
+    const dispatch = vi.fn((_operationId: string) => rpc.promise);
+    const presentation = tracker.attach(attempt, dispatch);
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledExactlyOnceWith(attempt.operationId));
+    const ownRun = `run-${createHash("sha256").update(`manual-schedule-${attempt.operationId}`).digest("hex").slice(0, 24)}`;
 
     tracker.observe(runtime("owner-a", [
       { ...existing, phase: "running", lastProgressAt: 2 },
       run("schedule-a", undefined, "runNow"),
+      run("schedule-a", "run-from-another-window", "runNow"),
+      run("schedule-a", ownRun, "runNow", "claiming"),
       run("schedule-a", "run-automatic-new", "automatic"),
       run("schedule-b", "run-other", "runNow")
     ]));
@@ -27,7 +33,7 @@ describe("Schedule Run Now dispatch tracker", () => {
 
     tracker.observe(runtime("owner-a", [
       { ...existing, phase: "running", lastProgressAt: 2 },
-      run("schedule-a", "run-new", "runNow")
+      run("schedule-a", ownRun, "runNow", "queued")
     ]));
     await expect(presentation).resolves.toBeUndefined();
     expect([...tracker.busyIds]).toEqual([]);
@@ -37,7 +43,7 @@ describe("Schedule Run Now dispatch tracker", () => {
     const nextRpc = deferred<void>();
     const next = required(tracker.begin("schedule-a", runtime("owner-a", [
       existing,
-      run("schedule-a", "run-new", "runNow")
+      run("schedule-a", ownRun, "runNow", "queued")
     ])));
     const nextPresentation = tracker.attach(next, () => nextRpc.promise);
     rpc.reject(new Error("late first response"));

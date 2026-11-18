@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { createHash } from "node:crypto";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -35,7 +36,7 @@ afterEach(async () => {
 });
 
 describe("SchedulesPage Run now dispatch window", () => {
-  it("shares a synchronous row/detail gate and releases only for a new authoritative run-now identity", async () => {
+  it("shares a synchronous row/detail gate and releases only for the original admitted Run", async () => {
     const owner = controllerFixture("owner-a");
     const view = await renderSchedules(owner);
     await resolveRuntime(owner, runtime([
@@ -54,6 +55,7 @@ describe("SchedulesPage Run now dispatch window", () => {
     expect(view.detailRun().disabled).toBe(true);
     expect(view.actions).toHaveLength(1);
     expect(view.actions[0]?.outcome).toBe("pending");
+    const firstRunId = runIdFromRequest(owner, 0);
 
     await pollRuntime(owner, runtime([
       runtimeRun("primary", "run-existing", "runNow", "finalizing"),
@@ -66,6 +68,8 @@ describe("SchedulesPage Run now dispatch window", () => {
     await pollRuntime(owner, runtime([
       runtimeRun("primary", "run-existing", "runNow", "finalizing"),
       runtimeRun("primary", "automatic-new", "automatic", "loading"),
+      runtimeRun("primary", "other-window-run", "runNow", "running"),
+      runtimeRun("primary", firstRunId, "runNow", "loading"),
       runtimeRun("other", "other-new", "runNow", "loading")
     ]));
     expect(view.actions[0]?.outcome).toBe("pending");
@@ -73,7 +77,7 @@ describe("SchedulesPage Run now dispatch window", () => {
 
     await pollRuntime(owner, runtime([
       runtimeRun("primary", "run-existing", "runNow", "finalizing"),
-      runtimeRun("primary", "run-confirmed", "runNow", "loading")
+      runtimeRun("primary", firstRunId, "runNow", "running")
     ]));
     expect(view.actions[0]?.outcome).toBe("resolved");
     expect(view.rowRun("primary").disabled).toBe(false);
@@ -83,15 +87,17 @@ describe("SchedulesPage Run now dispatch window", () => {
     expect(owner.runSchedule).toHaveBeenCalledTimes(2);
     expect(view.actions[1]?.outcome).toBe("pending");
     expect(view.rowRun("primary").disabled).toBe(true);
+    const nextRunId = runIdFromRequest(owner, 1);
+    expect(nextRunId).not.toBe(firstRunId);
 
     await pollRuntime(owner, runtime([
-      runtimeRun("primary", "run-confirmed", "runNow", "running")
+      runtimeRun("primary", firstRunId, "runNow", "running")
     ]));
     expect(view.actions[1]?.outcome).toBe("pending");
 
     await pollRuntime(owner, runtime([
-      runtimeRun("primary", "run-confirmed", "runNow", "running"),
-      runtimeRun("primary", "run-confirmed-again", "runNow", "loading")
+      runtimeRun("primary", firstRunId, "runNow", "running"),
+      runtimeRun("primary", nextRunId, "runNow", "queued")
     ]));
     expect(view.actions[1]?.outcome).toBe("resolved");
     expect(view.detailRun().disabled).toBe(false);
@@ -110,7 +116,13 @@ describe("SchedulesPage Run now dispatch window", () => {
     expect(view.detailRun().disabled).toBe(false);
 
     await act(async () => view.rowRun("primary").click());
-    const failure = new Error("Run now was rejected before dispatch.");
+    await pollRuntime(owner, runtime([
+      runtimeRun("primary", "another-device-run", "runNow", "running"),
+      runtimeRun("primary", runIdFromRequest(owner, 1), "runNow", "claiming")
+    ]));
+    expect(view.actions[1]?.outcome).toBe("pending");
+    expect(view.rowRun("primary").disabled).toBe(true);
+    const failure = new Error("Schedule has expired and cannot be triggered.");
     await settleDeferred(owner.runRequests[1], "reject", failure);
     expect(view.actions[1]?.outcome).toBe("rejected");
     expect(view.actions[1]?.error).toBe(failure);
@@ -165,7 +177,7 @@ describe("SchedulesPage Run now dispatch window", () => {
     expect(view.detailRun().disabled).toBe(true);
 
     await act(async () => {
-      secondPoll.resolve(runtime([runtimeRun("primary", "new-owner-run", "runNow", "loading")]));
+      secondPoll.resolve(runtime([runtimeRun("primary", runIdFromRequest(second, 0), "runNow", "running")]));
       await flushPromises();
     });
     expect(view.actions[1]?.outcome).toBe("resolved");
@@ -204,6 +216,13 @@ interface ControllerFixture {
   readonly runRequests: Deferred<void>[];
   readonly getSchedulerRuntime: ReturnType<typeof vi.fn>;
   readonly runSchedule: ReturnType<typeof vi.fn>;
+}
+
+function runIdFromRequest(owner: ControllerFixture, index: number): string {
+  const [scheduleId, operationId] = required(owner.runSchedule.mock.calls[index]);
+  expect(scheduleId).toBe("primary");
+  if (typeof operationId !== "string" || operationId === "") throw new Error("Missing Run now operation identity.");
+  return `run-${createHash("sha256").update(`manual-schedule-${operationId}`).digest("hex").slice(0, 24)}`;
 }
 
 async function renderSchedules(initial: ControllerFixture): Promise<{
@@ -279,7 +298,7 @@ function controllerFixture(ownerId: string): ControllerFixture {
     runtimeRequests.push(request);
     return request.promise;
   });
-  const runSchedule = vi.fn((_scheduleId: string) => {
+  const runSchedule = vi.fn((_scheduleId: string, _operationId?: string) => {
     const request = deferred<void>();
     runRequests.push(request);
     return request.promise;

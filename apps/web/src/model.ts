@@ -6470,7 +6470,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   ): Promise<string>;
   resolveInteraction(interaction: InteractionView, resolution: InteractionResolutionDraft): Promise<void>;
   dismissInteraction(interaction: InteractionView): Promise<void>;
-  runSchedule(scheduleId: string): Promise<void>;
+  runSchedule(scheduleId: string, operationId?: string): Promise<void>;
   setScheduleEnabled(scheduleId: string, enabled: boolean): Promise<void>;
   deleteSchedule(scheduleId: string, disposition: ScheduleGeneratedSessionDispositionView): Promise<ScheduleDeletionResultView>;
   markScheduleRunRead(scheduleId: string, triggerId: string): Promise<void>;

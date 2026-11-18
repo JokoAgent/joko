@@ -4,6 +4,7 @@ export * from "./session-context-budget.js";
 export * from "./background-workflow.js";
 export * from "./extension-settings-bridge.js";
 export * from "./session-archive.js";
+export * from "./schedule-run-identity.js";
 export * from "./remote-desktop-viewer.js";
 export * from "./desktop-remote-desktop.js";
 export * from "./native-file-action.js";

@@ -5217,6 +5217,31 @@ describe("native mobile Automation ownership and recovery", () => {
     expect(app.state.automations.error).toMatch(/changed while paging/);
   });
 
+  it("returns the original Run now rejection after settling its receipt and refreshing Automations", async () => {
+    const network = automationNetwork();
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    await app.openAutomations();
+    const reason = "Schedule has expired and cannot be triggered.";
+    let issued: PendingOperation | undefined;
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId) => {
+      issued = saved.pending()[0];
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId,
+        state: OperationState.FAILED, error: { message: reason } });
+    });
+    const readsBeforeRun = vi.mocked(network.listSchedules).mock.calls.length;
+
+    await expect(app.runAutomation(automationSchedule.scheduleId)).rejects.toThrow(reason);
+    expect(issued).toMatchObject({ connectionId: credential.connectionId, kind: "schedule-run",
+      scheduleId: automationSchedule.scheduleId, operationId: vi.mocked(network.submit).mock.lastCall?.[1] });
+    expect(saved.pending()).toEqual([]);
+    expect(network.submit).toHaveBeenCalledOnce();
+    expect(network.listSchedules).toHaveBeenCalledTimes(readsBeforeRun + 1);
+    expect(app.state.automations).toMatchObject({ status: "ready", selectedScheduleId: automationSchedule.scheduleId, error: undefined });
+    expect(app.state.busy).toBe(false);
+  });
+
   it("retains an unknown receipt, does not optimistically change authority and blocks exact replay", async () => {
     const network = automationNetwork();
     const saved = memoryStorage(credential);

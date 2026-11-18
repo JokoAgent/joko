@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { manualScheduleDispatchOperationId, scheduleRunIdFromDigest } from "@joko/contracts";
 import { redactSecrets, type PermissionMode, type SessionDescriptor } from "@joko/core";
 import type {
   OperationalStore,
@@ -408,7 +409,7 @@ export class ScheduleCoordinator {
     const schedule = this.#store.getSchedule(scheduleId);
     return this.dispatchOccurrence(schedule, {
       scheduledAt: this.#now(),
-      operationId: `manual-schedule-${operationId}`,
+      operationId: manualScheduleDispatchOperationId(operationId),
       preserveNextRun: true,
       ignoreMisfire: true,
       source: "run-now",
@@ -1369,7 +1370,7 @@ function nextScheduleOccurrenceOrUndefined(schedule: ScheduleRecord, after: numb
 }
 
 function scheduledRunId(operationId: string): string {
-  return `run-${createHash("sha256").update(operationId).digest("hex").slice(0, 24)}`;
+  return scheduleRunIdFromDigest(createHash("sha256").update(operationId).digest("hex"));
 }
 
 function failedPreRunHookResult(error: unknown): SchedulePreRunHookResult {
