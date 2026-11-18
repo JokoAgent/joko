@@ -14,6 +14,7 @@ import {
   CAPABILITIES,
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
+  isProductSlashCommand,
   JokoError,
   NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
@@ -1839,11 +1840,31 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     await snapshot.assertFilesCurrent(context.signal);
     this.#assertCurrent(runtime, context, runtime.binding);
     const resources = await this.getResources(context);
-    return snapshot.skills.filter(mount => !mount.discovery && mount.seed.resource.trustedBuiltin
-      && resources.some(resource => resource.id === mount.seed.resource.id && resource.revision === mount.seed.resource.revision)).map(mount => ({
-      name: mount.seed.resource.name, description: "Create or update a Joko plugin using the shipped authoring instructions.", source: "skill" as const,
-      inputMode: "resource_mention" as const, loaded: true, resourceId: mount.seed.resource.id, builtinSkill: mount.seed.resource.trustedBuiltin!
-    }));
+    this.#assertCurrent(runtime, context, runtime.binding);
+    snapshot.assertCurrent();
+    const names = new Map<string, number>();
+    for (const { seed, discovery } of snapshot.skills) {
+      if (discovery) continue;
+      const name = seed.resource.name.toLowerCase();
+      names.set(name, (names.get(name) ?? 0) + 1);
+    }
+    const loadedById = new Map(resources.map(resource => [resource.id, resource]));
+    const commands: RuntimeCommand[] = [];
+    for (const { seed, discovery } of snapshot.skills) {
+      const { id, name, revision, resourceVersion, trustedBuiltin } = seed.resource;
+      const loaded = loadedById.get(id);
+      if (discovery || loaded?.kind !== "skill" || loaded.revision !== revision) continue;
+      const command = { name, source: "skill" as const, inputMode: "resource_mention" as const, loaded: true, resourceId: id };
+      if (trustedBuiltin !== undefined) {
+        commands.push({ ...command, description: "Create or update a Joko plugin using the shipped authoring instructions.", builtinSkill: trustedBuiltin });
+      } else if (!snapshot.restrictImplicit && context.target.trusted && loaded.resourceVersion === resourceVersion
+        && snapshot.skillOverrides[name] !== "off" && names.get(name.toLowerCase()) === 1
+        && name.length <= 256 && /^[^\s/\\\u0000-\u001f\u007f]+$/u.test(name) && !isProductSlashCommand(name)) {
+        // The palette selects the approved Resource through the existing input path.
+        commands.push({ ...command, description: "" });
+      }
+    }
+    return commands;
   }
 
   override send(input: PromptInput, context: AdapterContext): Promise<void> {

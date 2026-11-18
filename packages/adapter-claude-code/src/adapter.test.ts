@@ -3076,6 +3076,40 @@ describe("ClaudeCodeAdapter", () => {
     } finally { await adapter.dispose(); await rm(source, { recursive: true, force: true }); }
   });
 
+  test.each([true, false])("projects the exact approved custom Skill only after plugin acknowledgement: %s", async (acknowledged) => {
+    const sourcePath = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-palette-skill-")));
+    const body = "---\nname: repo-audit\ndescription: Inspect source files\n---\nReview only the requested files.\n";
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    let approved = true;
+    const assertCurrent = () => { if (!approved) throw new Error("The original approved Skill is retired."); };
+    const seed = textResourceSeed({ id: "approved-repo-audit", name: "repo-audit", content: body, revision, resourceVersion: 4n, assertCurrent });
+    const runtime = new FakeSdkRuntime();
+    runtime.queryInitialization = { ...initialization(), plugins_applied: acknowledged };
+    const adapter = adapterFor(runtime, {
+      resolveNativeSkills: async () => [{ sourcePath, resource: { id: seed.id, kind: "skill", name: seed.name, source: "managed",
+        state: "approved", revision, resourceVersion: seed.resourceVersion }, assertCurrent }],
+      resolveTextResources: async () => [seed, textResourceSeed({ id: "text-only-skill", name: "text-only" })]
+    });
+    try {
+      await writeFile(join(sourcePath, "SKILL.md"), body);
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const active = contextFor(binding, { operationId: "choose-ordinary-claude-skill" }).context;
+      await expect(adapter.getCommands(active)).resolves.toEqual(acknowledged ? [{
+        name: "repo-audit", description: "", source: "skill", inputMode: "resource_mention", loaded: true, resourceId: seed.id
+      }] : []);
+      if (!acknowledged) return;
+      const text = "/repo-audit review src";
+      await adapter.send({ ...textPrompt(text), mentions: [resourceMention(seed, active.generation)],
+        mentionRanges: [{ start: 0, end: "/repo-audit".length, mentionIndex: 0 }] }, active);
+      const native = runtime.queries[0]!.receivedInputs[0]!.message.content;
+      expect(native).toContain("review src");
+      expect(native).toContain(body);
+      expect(native).not.toContain(sourcePath);
+      approved = false;
+      await expect(adapter.getCommands(active)).rejects.toMatchObject({ publicError: { code: "SKILL_RUNTIME_AUTHORITY_INVALID" } });
+    } finally { await adapter.dispose(); await rm(sourcePath, { recursive: true, force: true }); }
+  });
+
   test("loads complete native skill plugins and retains their files until Query retirement is confirmed", async () => {
     const source = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-skill-")));
     const body = "---\nname: report\ndescription: Prepare reports\n---\n" + "Full original instructions.\n".repeat(20_000);
