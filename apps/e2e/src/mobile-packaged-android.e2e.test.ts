@@ -24,6 +24,7 @@ const evidenceSteps = {
   "task-actions-menu": { action: "menu", assertions: ["complete-task-actions", "actions-within-viewport"] },
   "send-native-input": { action: "text-entry", assertions: ["one-completed-run", "exact-fixture-dispatch", "one-active-mobile-connection", "persisted-timeline", "owner-generation-consistent"] },
   "tap-conversation-share-row": { action: "gesture", assertions: ["select-from-message-menu", "body-tap-deselects", "body-tap-reselects", "cancel-restores-task"] },
+  "quote-selected-message-text": { action: "gesture", assertions: ["system-selection-menu-action", "exact-user-and-assistant-text-in-draft", "no-dispatch-from-quoting"] },
   "open-image-gallery": { action: "resource-navigation", assertions: ["gallery-visible", "image-decoded", "gallery-retained-across-observations"] },
   "zoom-image-gallery": { action: "gesture", assertions: ["double-tap-zoom", "zoomed-tap-keeps-gallery-open"] },
   "short-image-drag": { action: "gesture", assertions: ["zoom-reset", "short-drag-keeps-gallery-open"] },
@@ -40,7 +41,9 @@ type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" |
 type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
   | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
   | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
-  | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error";
+  | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error"
+  | "native-user-quote-menu" | "native-assistant-quote-menu"
+  | "native-user-message-quote" | "native-assistant-message-quote" | "native-message-quote-error";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -85,6 +88,7 @@ const packageName = "app.joko.mobile";
 const prompt = "Show the workspace resources";
 const taskName = "Android resource task";
 const answer = "![Workspace image](images/pixel.png)\n\n`README.md:2:4`";
+const plainAnswer = "Read this plain assistant response";
 
 class AndroidResourceAdapter extends InstrumentedFakeAdapter {
   readonly #trees = new Map<string, SessionTree>();
@@ -92,14 +96,18 @@ class AndroidResourceAdapter extends InstrumentedFakeAdapter {
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
     this.sendCalls.push(input);
     const userId = "resource-user-" + this.sendCalls.length;
+    const plainAnswerId = "resource-plain-answer-" + this.sendCalls.length;
     const answerId = "resource-answer-" + this.sendCalls.length;
     await context.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }],
       nativeHistory: { identity: { entryId: userId } } });
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: plainAnswer }],
+      nativeHistory: { identity: { entryId: plainAnswerId, parentEntryId: userId } } });
     await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: answer }],
-      nativeHistory: { identity: { entryId: answerId, parentEntryId: userId } } });
+      nativeHistory: { identity: { entryId: answerId, parentEntryId: plainAnswerId } } });
     this.#trees.set(context.sessionId, { roots: [{ entryId: userId, kind: "message", role: "user", label: input.text,
-      timestamp: 1, children: [{ entryId: answerId, parentId: userId, kind: "message", role: "assistant",
-        label: "Workspace resources", timestamp: 2, children: [] }] }], leafId: answerId });
+      timestamp: 1, children: [{ entryId: plainAnswerId, parentId: userId, kind: "message", role: "assistant",
+        label: plainAnswer, timestamp: 2, children: [{ entryId: answerId, parentId: plainAnswerId, kind: "message",
+          role: "assistant", label: "Workspace resources", timestamp: 3, children: [] }] }] }], leafId: answerId });
     await context.emit({ type: "done", outcome: "completed" });
   }
 
@@ -374,6 +382,32 @@ async function runNativeScenario(): Promise<void> {
     throw error;
   }
   await completeStep();
+  await beginStep("quote-selected-message-text");
+  try {
+    const quoteCases = [
+      { body: prompt, word: "Show", chip: "Quote from your message", label: "Quoted text from your message",
+        menu: "native-user-quote-menu", evidence: "native-user-message-quote" },
+      { body: plainAnswer, word: "Read", chip: "Quote from Assistant", label: "Quoted assistant text",
+        menu: "native-assistant-quote-menu", evidence: "native-assistant-message-quote" }
+    ] as const;
+    for (const quote of quoteCases) {
+      const source = await scrollToNode((node) => node.text === quote.body, "the original selectable message", "earlier");
+      const x = String(Math.round(source.bounds.x1 + Math.min(12, (source.bounds.x2 - source.bounds.x1) / 2)));
+      const y = String(Math.round((source.bounds.y1 + source.bounds.y2) / 2));
+      await interaction("swipe", () => adb("shell", "input", "swipe", x, y, x, y, "750"));
+      await tapSystemMessageQuote(quote.menu);
+      await tap("View quote: " + quote.chip);
+      await waitNode((node) => node.text === quote.word && node.contentDescription === quote.label, "the exact selected word");
+      await screenshot(quote.evidence);
+      await tap("Remove " + quote.chip);
+      await waitNode((node) => node.contentDescription === "Task actions", "task restored after removing the quotation");
+    }
+    expect(current.adapter(profile.id).sendCalls.map((input) => input.text)).toEqual([prompt]);
+  } catch (error) {
+    await screenshot("native-message-quote-error").catch(() => undefined);
+    throw error;
+  }
+  await completeStep();
   await beginStep("open-image-gallery");
   await tap("Workspace image", true);
   await waitNode((node) => node.text === "pixel.png" || node.contentDescription?.includes("pixel.png") === true, "native image gallery");
@@ -482,15 +516,54 @@ async function assertRestoredMarkdown(): Promise<void> {
     // returns only the surrounding native controls after a process restart.
     const frame = activeStep?.screenshots.find((entry) => entry.file === "restored-error.png");
     if (frame === undefined) throw cause;
-    const path = join(dirname(apkPath!), "ui-evidence", frame.file);
-    const text = await new Promise<string>((resolve) => {
-      execFile("tesseract", [path, "stdout", "-l", "eng", "--psm", "11"],
-        { timeout: 12_000, maxBuffer: 64 * 1024, windowsHide: true }, (error, stdout) => resolve(error ? "" : stdout));
-    });
+    const text = await readAndroidScreenshotText(frame.file);
     const rendered = text.toLowerCase().replace(/\s+/gu, " ");
     if (!rendered.includes("readme.md") || !rendered.includes("line 2") || !rendered.includes("first focus line last")) throw cause;
     console.log(JSON.stringify({ phase: "restored-canonical-file", observation: "screenshot-ocr", screenshot: frame.file, sha256: frame.sha256 }));
   }
+}
+
+async function readAndroidScreenshotText(file: string, tsv = false): Promise<string> {
+  const path = join(dirname(apkPath!), "ui-evidence", file);
+  return new Promise((resolve) => {
+    execFile("tesseract", [path, "stdout", "-l", "eng", "--psm", "11", ...(tsv ? ["tsv"] : [])],
+      { timeout: 12_000, maxBuffer: 64 * 1024, windowsHide: true }, (error, stdout) => resolve(error ? "" : stdout));
+  });
+}
+
+async function tapSystemMessageQuote(name: "native-user-quote-menu" | "native-assistant-quote-menu"): Promise<void> {
+  await interaction("tap", async () => {
+    const node = (await nodes()).find((entry) => entry.enabled
+      && (entry.text === "Quote selection" || entry.contentDescription === "Quote selection")
+      && entry.bounds.x2 > entry.bounds.x1 && entry.bounds.y2 > entry.bounds.y1);
+    const frame = await screenshot(name);
+    if (node !== undefined) {
+      await tapNode(node);
+      return;
+    }
+    // The floating Android selection toolbar can be visible outside the hierarchy dump.
+    const transcript = await readAndroidScreenshotText(frame.file, true);
+    const words = transcript.split(/\r?\n/u).flatMap((line) => {
+      const [level, , , , , , left, top, width, height, , text] = line.split("\t");
+      const x = Number(left), y = Number(top), w = Number(width), h = Number(height);
+      return level === "5" && text && Number.isInteger(x) && x >= 0 && Number.isInteger(y) && y >= 0
+        && Number.isInteger(w) && w > 0 && Number.isInteger(h) && h > 0
+        ? [{ text: text.trim().toLowerCase(), x, y, w, h }]
+        : [];
+    });
+    const actions = words.filter((word) => word.text === "quote").flatMap((quote) => {
+      const centerY = quote.y + quote.h / 2;
+      const [selection, copy] = words.filter((word) => word.x > quote.x && centerY >= word.y && centerY <= word.y + word.h)
+        .sort((left, right) => left.x - right.x);
+      if (selection?.text !== "selection" || copy?.text !== "copy" || selection.x - (quote.x + quote.w) > quote.h) return [];
+      return [{ x: Math.round((quote.x + selection.x + selection.w) / 2), y: Math.round(centerY) }];
+    });
+    if (actions.length !== 1) throw new Error("The native selection toolbar did not show a unique Quote selection action next to Copy.");
+    const action = actions[0]!;
+    console.log(JSON.stringify({ phase: "native-message-quote-menu", observation: "screenshot-ocr",
+      screenshot: frame.file, sha256: frame.sha256, point: action }));
+    await adb("shell", "input", "tap", String(action.x), String(action.y));
+  });
 }
 
 function elapsed(): number { return Math.round(performance.now() - evidenceStarted); }
@@ -877,7 +950,7 @@ async function digest(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
-async function screenshot(name: EvidenceScreenshot): Promise<void> {
+async function screenshot(name: EvidenceScreenshot): Promise<EvidenceStep["screenshots"][number]> {
   const directory = join(dirname(apkPath!), "ui-evidence");
   await mkdir(directory, { recursive: true });
   const remote = "/sdcard/joko-native-" + name + ".png";
@@ -886,6 +959,8 @@ async function screenshot(name: EvidenceScreenshot): Promise<void> {
   const local = join(directory, file);
   await adb("pull", remote, local);
   await adb("shell", "rm", remote);
-  activeStep?.screenshots.push({ file, sha256: await digest(local), capturedAfterMs: elapsed() });
+  const frame = { file, sha256: await digest(local), capturedAfterMs: elapsed() };
+  activeStep?.screenshots.push(frame);
   await persistEvidence();
+  return frame;
 }

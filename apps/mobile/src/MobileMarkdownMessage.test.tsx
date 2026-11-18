@@ -5,6 +5,8 @@ import { describe, expect, it, vi } from "vitest";
 import { MobileMarkdownMessage } from "./MobileMarkdownMessage";
 import type { MobileMarkdownResourceClient } from "./use-mobile-markdown-resources";
 
+vi.mock("./MobileSelectableMessageText", () => ({ MobileSelectableMessageText: () => null }));
+
 const { copy, openUrl, appStateListeners, pressureListeners, nativeImages } = vi.hoisted(() => ({
   copy: vi.fn(async () => undefined), openUrl: vi.fn(async () => undefined),
   appStateListeners: new Set<(state: string) => void>(), pressureListeners: new Set<() => void>(),

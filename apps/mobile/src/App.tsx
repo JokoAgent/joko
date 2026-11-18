@@ -247,6 +247,7 @@ import {
 } from "./mobile-runtime-commands";
 import type { MobileComposerCommandPaletteKey } from "./mobile-composer-rich-input-protocol";
 import { MobileQuoteSelectionSheet } from "./MobileQuoteSelectionSheet";
+import { mobileNativeMessageSelectionAvailable, type MobileMessageQuoteAction } from "./MobileSelectableMessageText";
 import {
   captureMobileQuoteSelection,
   commitMobileQuoteSelection,
@@ -4982,6 +4983,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     && !composerOperationPending && !conversationShare.active
     && !voice.busy && !attachmentBusy;
   composerPasteEditableRef.current = composerPasteEditable;
+  const nativeQuoteReady = composerPasteEditable && state.status === "connected"
+    && state.taskSource?.kind !== "joined" && headerRole.role === "ordinary" && !partnerIdentity.partner
+    && !drawerMounted && interactions.length === 0 && !quoteSelection && mobileNativeMessageSelectionAvailable();
+  const nativeQuoteOwner = useMemo(() => nativeQuoteReady && headerSourceKey && draftIdentityKey
+    ? { source: headerSourceKey, draft: draftIdentityKey } : undefined, [nativeQuoteReady, headerSourceKey, draftIdentityKey]);
+  const nativeQuoteOwnerRef = useRef(nativeQuoteOwner);
+  nativeQuoteOwnerRef.current = nativeQuoteOwner;
   const taskStop = state.status === "connected" && state.taskSource?.kind !== "joined" && composerOwnerReady
     && headerRole.role === "ordinary" && partnerIdentity.ready && !partnerIdentity.partner
     && !queueEdit && !conversationShare.active && AppState.currentState === "active"
@@ -6097,6 +6105,29 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       setLocalError(errorText(failure));
     }
   };
+  const nativeMessageQuoteAction = (row: TimelineRow): MobileMessageQuoteAction | undefined => {
+    const owner = nativeQuoteOwner;
+    const lease = owner === undefined || state.selectedId === undefined ? undefined : captureMobileQuoteSelection(state.selectedId, row, "timeline");
+    if (owner === undefined || lease === undefined) return undefined;
+    return {
+      source: JSON.stringify([owner.source, owner.draft, lease.sourceMessageId, lease.sourceEventId]),
+      label: mobileMessage(locale, "actions.quoteSelection"),
+      onQuote: (selection) => {
+        const identity = draftIdentityRef.current;
+        const current = client.state;
+        if (!identity || nativeQuoteOwnerRef.current !== owner || !taskMetadataCurrent(owner.source)
+          || mobileComposerDraftIdentityKey(identity) !== owner.draft || queueEditRef.current !== undefined
+          || current.selectedId !== lease.sessionId) return;
+        const latest = timelineRows(current.window ?? [...current.older, ...(current.detail?.timeline ?? []), ...current.live])
+          .find(item => item.id === lease.sourceMessageId && item.eventId === lease.sourceEventId);
+        try {
+          const result = commitMobileQuoteSelection({ lease, currentSessionId: current.selectedId, latestRow: latest,
+            selection, draft: composerDraftRef.current, atomId: randomUUID() });
+          saveNormalDraft(result.draft, identity);
+        } catch (failure) { setLocalError(errorText(failure, locale)); }
+      }
+    };
+  };
   const copyPublicTaskLink = async (message?: TimelineRow): Promise<void> => {
     if (copyInFlightRef.current || mobileCopyLinks.busy) {
       setLocalError(mobileMessage(locale, "actions.copyLinkBusy"));
@@ -6749,6 +6780,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && activeMessageFocus !== undefined
           && mobileNativeIntentMessageMatches(activeMessageFocus, item);
         const markdownOwnerKey = `${taskDraftProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
+        const quoteAction = nativeMessageQuoteAction(item);
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
           {...conversationShare.rowTouchHandlers(item)}
           collapsable={false} ref={(view) => {
@@ -6833,6 +6865,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           if (part.kind === "artifact") return renderTimelineArtifact(part.artifact);
           return <MobileMarkdownMessage key={`${markdownOwnerKey}/part/${part.contentIndex}`} text={part.text}
             colors={colors} locale={locale} ownerKey={`${markdownOwnerKey}/part/${part.contentIndex}`}
+            quoteAction={quoteAction}
             answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id, part.contentIndex])} streaming={!item.completed && !item.samplingInterrupted}
             onSendRichAnswer={item.kind === "assistant" ? sendRichAnswer : undefined}
             resourceText={item.text}
@@ -6842,12 +6875,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
+          quoteAction={quoteAction}
           answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id])} streaming={!item.completed && !item.samplingInterrupted}
           onSendRichAnswer={sendRichAnswer}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
           : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
+            quoteAction={quoteAction}
             automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />
           : item.planReview ? <View style={styles.field}>
             <Text style={[styles.label, { color: colors.ink }]}>{mobilePlanDecisionLabel(item.planReview.decision, locale)}</Text>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { emptyMobileComposerDraft } from "./mobile-composer-document";
-import { captureMobileQuoteSelection, commitMobileQuoteSelection } from "./mobile-composer-quote";
+import { captureMobileQuoteSelection, commitMobileQuoteSelection, readNativeMessageSelection } from "./mobile-composer-quote";
 import type { TimelineRow } from "./timeline";
 
 function assistantRow(text = "Alpha 👋 omega"): TimelineRow {
@@ -68,5 +68,25 @@ describe("mobile assistant selection quote", () => {
     expect(captureMobileQuoteSelection("task", { ...row, kind: "user" })).toBeUndefined();
     expect(captureMobileQuoteSelection("task", { ...row, completed: false })).toBeUndefined();
     expect(captureMobileQuoteSelection("task", { ...row, quoteSource: undefined })).toBeUndefined();
+  });
+});
+
+describe("selection on the original timeline text", () => {
+  it.each(["user", "assistant"] as const)("adopts only the native selection from the current %s message", (kind) => {
+    const current = assistantRow();
+    const row = kind === "user" ? { ...current, kind, label: "You", sourceText: current.text, quoteSource: undefined } : current;
+    const lease = captureMobileQuoteSelection("task", row, "timeline")!;
+    const selected = { registration: "mounted-text", start: 6, end: 8, text: "👋" };
+    const selection = readNativeMessageSelection(selected, "mounted-text", row.text)!;
+    expect(selection).toEqual({ start: 6, end: 8 });
+    expect(readNativeMessageSelection(selected, "retired-text", row.text)).toBeUndefined();
+    expect(readNativeMessageSelection({ ...selected, end: 7, text: row.text.slice(6, 7) }, "mounted-text", row.text)).toBeUndefined();
+    expect(readNativeMessageSelection({ ...selected, text: "changed" }, "mounted-text", row.text)).toBeUndefined();
+    const input = { lease, selection, currentSessionId: "task", latestRow: row,
+      draft: emptyMobileComposerDraft(), atomId: "native-quote" };
+    expect(commitMobileQuoteSelection(input).draft.atoms).toMatchObject([{ sourceRole: kind, text: "👋",
+      sourceMessageId: row.id, sourceEventId: row.eventId }]);
+    expect(() => commitMobileQuoteSelection({ ...input, latestRow: { ...row, eventId: "replaced" } })).toThrow(/changed/u);
+    expect(captureMobileQuoteSelection("task", { ...row, text: `**${row.text}**` }, "timeline")).toBeUndefined();
   });
 });

@@ -27,6 +27,7 @@ import { useMobilePreviewResourceLifecycle } from "./use-mobile-preview-resource
 import { mobileMarkdownResourceKey, type MobileMarkdownResourceReference } from "./mobile-markdown-resources";
 import { chatPathLabelReadsAsFileReference, classifyChatPathLinkTarget } from "./mobile-markdown-path-candidate";
 import { useMobileMarkdownResources, type MobileMarkdownResourceClient } from "./use-mobile-markdown-resources";
+import { MobileSelectableMessageText, type MobileMessageQuoteAction } from "./MobileSelectableMessageText";
 
 interface Props {
   readonly text: string;
@@ -34,6 +35,7 @@ interface Props {
   readonly locale: MobileSupportedLocale;
   readonly ownerKey: string;
   readonly selectable?: boolean;
+  readonly quoteAction?: MobileMessageQuoteAction;
   readonly resourceClient?: MobileMarkdownResourceClient;
   readonly resourceOwnerKey?: string;
   readonly messageId?: string;
@@ -49,6 +51,9 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: 
   const resources = useMobileMarkdownResources({ client: props.resourceClient, ownerKey: props.resourceOwnerKey,
     messageId: props.messageId, text: props.resourceText ?? props.text });
   const parts = useMemo(() => props.answerStateKey === undefined ? [] : splitRichAnswer(props.text), [props.answerStateKey, props.text]);
+  if (props.quoteAction !== undefined && !props.streaming && props.selectable !== false) {
+    return <MobileSelectableMessageText text={props.text} ink={props.colors.ink} lineHeight={23} action={props.quoteAction} />;
+  }
   if (!parts.some(part => part.kind === "rich")) return <MobilePlainMarkdownMessage {...props} preparedResources={resources} />;
   return <View style={styles.document}>{parts.map(part => part.kind === "rich"
     ? <MobileRichAnswer key={part.key} source={part.source} complete={part.complete || !props.streaming}

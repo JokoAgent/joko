@@ -3,6 +3,8 @@ import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
+vi.mock("./MobileSelectableMessageText", () => ({ MobileSelectableMessageText: () => null }));
+
 const native = vi.hoisted(() => ({ measure: undefined as undefined | ((event: { nativeEvent: { lines: unknown[] } }) => void) }));
 vi.mock("react-native", () => ({
   StyleSheet: { create: (value: unknown) => value },
