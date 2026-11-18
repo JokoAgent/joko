@@ -198,6 +198,30 @@ describe("Desktop system handoff App boundary", () => {
     expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "b" });
   });
 
+  it("keeps split reconciliation from substituting a task while the original node handoff is pending", async () => {
+    const a = connectedState({ route: { kind: "session", profileId: "profile-a", sessionId: "original" }, sessions: [session("original")] });
+    const profile = { id: "profile-b", deviceId: "device-b", serverId: "handoff-server-b", name: "Remote", origin: "https://remote.example" };
+    const target = session("selected-remote"), fallback = session("first-remote-pane");
+    const b = { ...connectedState({ route: a.route, sessions: [fallback, target] }),
+      profiles: [...a.profiles, profile], activeProfile: profile, connectionGeneration: 2 };
+    const navigate = vi.fn<AppController["navigate"]>();
+    let pending = true;
+    const fixture = renderApp(a, { navigate, isMachineRouteHandoffPending: () => pending });
+    writeSessionSplitLayout(profile.serverId, addSessionSplit({}, target.id, fallback.id, "right"));
+    try {
+      await fixture.render();
+      await fixture.render(b);
+      expect(navigate).not.toHaveBeenCalled();
+      pending = false;
+      await fixture.render({ ...b, route: { kind: "session", profileId: profile.id, sessionId: target.id } });
+      expect(navigate).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(fixture.container.querySelector(`.session-pane[data-input-session-id="${target.id}"]`)).not.toBeNull());
+    } finally {
+      writeSessionSplitLayout(profile.serverId, {});
+      await fixture.dispose();
+    }
+  });
+
   it("renders exact-owner recovery when the linked task is missing after handoff", async () => {
     const fixture = renderApp({
       ...connectedState({

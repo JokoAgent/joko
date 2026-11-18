@@ -1075,7 +1075,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (settled.size > 0) setSplitMessageForks((current) => current.filter((fork) => !settled.has(fork)));
   }, [commitSessionSplitLayout, controller, sessionSplitLayout, splitMessageForks, state.snapshot.sessions]);
   useEffect(() => {
-    if (splitOwnerId === undefined || state.connectionState !== "connected" || state.snapshot.revision === 0n) return;
+    if (splitOwnerId === undefined || state.connectionState !== "connected" || state.snapshot.revision === 0n
+      || controller.isMachineRouteHandoffPending?.()) return;
     const activeIds = new Set(state.snapshot.sessions.filter((session) => !session.archived).map((session) => session.id));
     const knownIds = new Set(state.snapshot.sessions.map((session) => session.id));
     const next = reconcileSessionSplit(sessionSplitLayout, activeIds);
