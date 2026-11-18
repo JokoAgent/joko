@@ -1,3 +1,5 @@
+import { setTimeout as delay } from "node:timers/promises";
+
 import {
   AgentAuthConnectorFailure,
   RemoteSshConnectionController,
@@ -35,6 +37,7 @@ import {
 } from "@joko/store";
 
 const MAXIMUM_RUNTIME_CREDENTIAL_BYTES = 1024 * 1024;
+const SSH_RECONNECT_MAX_ATTEMPTS = 5;
 
 export interface RemoteHostCredentialResolverPort {
   resolve(credentialReferenceId: string): string;
@@ -114,6 +117,7 @@ export class RemoteHostRegistry {
   readonly #sshConfig: SshConfigFilePort | undefined;
   readonly #defaultSshUser: string | undefined;
   readonly #controllers = new Map<string, ManagedController>();
+  #reconnects: Map<string, AbortController> | undefined = new Map();
   readonly #trustReviews = new Map<string, {
     readonly connectionId: string;
     readonly revision: bigint;
@@ -486,7 +490,9 @@ export class RemoteHostRegistry {
     this.assertOpen();
     const current = this.get(targetId, id);
     assertRevision(current, expectedRevision);
-    const managed = this.#controllers.get(controllerKey(targetId, id));
+    const key = controllerKey(targetId, id);
+    this.#reconnects?.get(key)?.abort();
+    const managed = this.#controllers.get(key);
     if (managed !== undefined) {
       await managed.controller.disconnect(scopeOf(current));
       return this.get(targetId, id);
@@ -499,6 +505,9 @@ export class RemoteHostRegistry {
 
   async close(): Promise<void> {
     if (this.#closed) return;
+    const reconnects = this.#reconnects;
+    this.#reconnects = undefined;
+    for (const recovery of reconnects?.values() ?? []) recovery.abort();
     const autoConnectFlight = this.#autoConnectFlight;
     const controllers = [...this.#controllers.values()];
     for (const managed of controllers) {
@@ -649,10 +658,13 @@ export class RemoteHostRegistry {
       ...(assertCurrent === undefined ? {} : { assertCurrent })
     });
     assertCurrent?.();
-    this.persistSnapshot(result.snapshot);
+    // A carrier can retire after test settles but before this receipt adopts it.
+    const snapshot = managed.controller.snapshot(managed.scope);
+    const stillCurrent = this.#controllers.get(controllerKey(targetId, id)) === managed;
+    if (stillCurrent) this.persistSnapshot(snapshot);
     const authoritative = this.get(targetId, id);
     return Object.freeze({
-      ok: result.ok,
+      ok: stillCurrent && result.ok && snapshot.status === "ready" && authoritative.status.state === "ready",
       host: authoritative,
       ...(authoritative.status.failure === undefined ? {} : { failure: authoritative.status.failure })
     });
@@ -688,16 +700,51 @@ export class RemoteHostRegistry {
       hostKeyVerifier: new TofuSshHostKeyVerifier(pinStore),
       now: this.#now
     });
-    const unsubscribe = controller.onStatus(scopeOf(host), (snapshot) => {
+    const unsubscribe = controller.onStatus(scopeOf(host), (snapshot, cause) => {
       if (snapshot.status === "connecting") {
         pinStore.observedMismatch = undefined;
         this.#trustReviews.delete(key);
       }
-      this.persistSnapshot(snapshot);
+      const current = this.persistSnapshot(snapshot);
+      if (cause === "transport-closed") void this.reconnectClosedTransport(key, controller, current).catch(() => undefined);
     });
     const managed = { controller, scope: scopeOf(host), unsubscribe, pinStore };
     this.#controllers.set(key, managed);
     return managed;
+  }
+
+  private async reconnectClosedTransport(
+    key: string,
+    controller: RemoteSshConnectionController,
+    original: RemoteHostRecord
+  ): Promise<void> {
+    const reconnects = this.#reconnects;
+    const trust = original.trust;
+    if (reconnects === undefined || trust === undefined || original.status.state !== "disconnected"
+      || this.#controllers.get(key)?.controller !== controller) return;
+    reconnects.get(key)?.abort();
+    const recovery = new AbortController();
+    reconnects.set(key, recovery);
+    const { targetId, id } = original;
+    const assertCurrent = (): void => {
+      recovery.signal.throwIfAborted();
+      if (this.#controllers.get(key)?.controller !== controller || !sameHostKey(trust, this.get(targetId, id).trust)) {
+        throw new RemoteSshError("ABORTED", "The original SSH Host no longer owns this recovery.", false);
+      }
+    };
+    let revision = original.revision;
+    try {
+      for (let attempt = 0; attempt < SSH_RECONNECT_MAX_ATTEMPTS; attempt += 1) {
+        await delay(1_000 * 2 ** attempt, undefined, { signal: recovery.signal, ref: false });
+        assertCurrent();
+        if (this.get(targetId, id).revision !== revision) return;
+        const outcome = await this.runConnectionTest(targetId, id, revision, false, recovery.signal, assertCurrent);
+        if (outcome.ok || (outcome.failure?.code !== "connection_failed" && outcome.failure?.code !== "connection_timeout")) return;
+        revision = outcome.host.revision;
+      }
+    } finally {
+      if (reconnects.get(key) === recovery) reconnects.delete(key);
+    }
   }
 
   private persistSnapshot(snapshot: RemoteSshSnapshot): RemoteHostRecord {
@@ -774,6 +821,7 @@ export class RemoteHostRegistry {
 
   private retireController(targetId: string, id: string): void {
     const key = controllerKey(targetId, id);
+    this.#reconnects?.get(key)?.abort();
     const managed = this.#controllers.get(key);
     managed?.unsubscribe();
     this.#controllers.delete(key);

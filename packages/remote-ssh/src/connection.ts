@@ -35,7 +35,7 @@ export interface RemoteSshConnectionControllerOptions {
   readonly now?: () => number;
 }
 
-export type RemoteSshStatusListener = (snapshot: RemoteSshSnapshot) => void;
+export type RemoteSshStatusListener = (snapshot: RemoteSshSnapshot, cause?: "transport-closed") => void;
 
 export class RemoteSshConnectionController {
   readonly #host: RemoteSshHost;
@@ -165,8 +165,8 @@ export class RemoteSshConnectionController {
         if (this.#connection === connection) {
           ++this.#generation;
           this.#connection = undefined;
-          await safeClose(connection);
           this.setStatus("disconnected");
+          await safeClose(connection);
         }
         if (timedOut) {
           throw new RemoteSshError("EXECUTION_TIMEOUT", "The SSH command timed out.", true);
@@ -251,8 +251,8 @@ export class RemoteSshConnectionController {
     this.#operationAbort = undefined;
     const connection = this.#connection;
     this.#connection = undefined;
-    if (connection !== undefined) await safeClose(connection);
     this.setStatus("disconnected");
+    if (connection !== undefined) await safeClose(connection);
   }
 
   private async runTest(
@@ -354,7 +354,17 @@ export class RemoteSshConnectionController {
         throw abortError(timedOut());
       }
       assertCurrent?.();
+      if (connection.closed?.aborted) {
+        throw new RemoteSshError("CONNECTION_FAILED", "The SSH connection closed before it was ready.", true);
+      }
       this.#connection = connection;
+      connection.closed?.addEventListener("abort", () => {
+        if (this.#generation !== generation || this.#connection !== connection) return;
+        ++this.#generation;
+        this.#connection = undefined;
+        this.#operationAbort = undefined;
+        this.setStatus("disconnected", "transport-closed");
+      }, { once: true });
       this.setStatus("ready");
       this.safeLog("info", "SSH connection test succeeded.", { hostId: this.#host.id });
       return Object.freeze({ ok: true, snapshot: this.currentSnapshot() });
@@ -396,14 +406,14 @@ export class RemoteSshConnectionController {
     });
   }
 
-  private setStatus(status: RemoteSshStatus): void {
+  private setStatus(status: RemoteSshStatus, cause?: "transport-closed"): void {
     if (this.#status === status) return;
     this.#status = status;
     this.#statusChangedAt = this.#now();
     const snapshot = this.currentSnapshot();
     for (const listener of this.#listeners) {
       try {
-        listener(snapshot);
+        listener(snapshot, cause);
       } catch {
         // A presentation subscriber cannot alter the connection lifecycle.
       }

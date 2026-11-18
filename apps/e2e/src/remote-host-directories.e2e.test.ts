@@ -6,7 +6,7 @@ import { RemoteHostRegistry } from "@joko/orchestrator";
 import type { RemoteFileTransportPort, RemoteProcessTransportPort } from "@joko/remote-ssh";
 import { expect, it, vi } from "vitest";
 
-import { OrchestratorE2eFixture } from "./fixture.js";
+import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { submit } from "./operations.js";
 
 it.each(["/srv/new-project", "/home/fixture/server/new-project"])("browses and creates a revision-fenced SSH project at %s", async requestedPath => {
@@ -33,10 +33,13 @@ it.each(["/srv/new-project", "/home/fixture/server/new-project"])("browses and c
   };
   const processes: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused process transport"); }) };
   const capabilities = { commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
+  const lifetimes: AbortController[] = [];
   const connect = vi.fn(async (request: Parameters<NonNullable<ConstructorParameters<typeof RemoteHostRegistry>[0]["connector"]>["connect"]>[0]) => {
-    request.onAuthenticating();
     await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(1, 2, 3) });
-    return { capabilities, files, processes, close: async () => undefined };
+    request.onAuthenticating();
+    const lifetime = new AbortController();
+    lifetimes.push(lifetime);
+    return { capabilities, files, processes, closed: lifetime.signal, close: async () => lifetime.abort() };
   });
   const fixture = await OrchestratorE2eFixture.start({ createAuxiliaryServices: async store => ({
     remoteHosts: new RemoteHostRegistry({ store, ownerId: "remote-directory-e2e", connector: { capabilities, connect } })
@@ -118,6 +121,30 @@ it.each(["/srv/new-project", "/home/fixture/server/new-project"])("browses and c
     }));
     expect(files.mkdir).toHaveBeenCalledWith("/srv/new-project", expect.objectContaining({ recursive: true, mode: 0o700 }));
     expect(connect).toHaveBeenCalledOnce();
+
+    const authority = await registry.captureTransportAuthority(targetId, host.id);
+    const observed: string[] = [];
+    const unsubscribe = registry.subscribe(targetId, change => {
+      if (change.host.id === host.id) observed.push(change.host.status.state);
+    });
+    try {
+      lifetimes[0]!.abort();
+      expect(registry.get(targetId, host.id).status.state).toBe("disconnected");
+      expect(() => authority.assertCurrent()).toThrow(/authority changed/);
+      await expect(client(paired.authKey).listRemoteHostDirectories(request)).rejects.toMatchObject({ code: Code.Aborted });
+      const recovered = await waitFor(async () => registry.get(targetId, host.id), value => value.status.state === "ready",
+        "original SSH Host to authenticate on its replacement carrier");
+      expect(observed).toEqual(["disconnected", "connecting", "authenticating", "ready"]);
+      expect(recovered.trust).toEqual(host.trust);
+      expect(recovered.revision).toBeGreaterThan(host.revision);
+      expect(connect).toHaveBeenCalledTimes(2);
+      const newListing = await client(paired.authKey).listRemoteHostDirectories({ ...request,
+        expectedHostRevision: { value: recovered.revision } });
+      expect(newListing).toMatchObject({ path: listing.path, hostRevision: { value: recovered.revision },
+        directories: listing.directories });
+    } finally {
+      unsubscribe();
+    }
   } finally {
     await fixture.close();
   }
