@@ -46,9 +46,14 @@ describe("mounted Timeline Markdown documents", () => {
     if (challenge.challenge === undefined) throw new Error("Browser pairing returned no challenge.");
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, locale: "en-US" });
+    const pageErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
-    expect(await page.evaluate(() => ({ secure: window.isSecureContext, clipboard: navigator.clipboard !== undefined })))
-      .toEqual({ secure: false, clipboard: false });
+    expect(await page.evaluate(() => ({
+      secure: window.isSecureContext,
+      clipboard: navigator.clipboard !== undefined,
+      randomUuid: typeof window.crypto.randomUUID === "function"
+    }))).toEqual({ secure: false, clipboard: false, randomUuid: false });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.locator("details.device-authorization__manual > summary").click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -57,7 +62,11 @@ describe("mounted Timeline Markdown documents", () => {
     await page.getByRole("checkbox", { name: "I trust this private network and accept unencrypted transport." }).check();
     await page.locator("form.pair-form button[type=submit]").click();
     const message = page.locator(`[data-user-msg-id="${messageId}"]`);
-    await message.waitFor({ state: "visible", timeout: 20_000 });
+    try {
+      await message.waitFor({ state: "visible", timeout: 20_000 });
+    } catch (cause) {
+      throw new Error(`The private HTTP task did not mount. ${JSON.stringify({ pageErrors })}`, { cause });
+    }
     const clipboardValue = async (): Promise<string> => {
       await page.evaluate(() => {
         const input = document.createElement("textarea");
@@ -82,6 +91,7 @@ describe("mounted Timeline Markdown documents", () => {
     const anchor = new URL(link.hash.slice(1), link.origin);
     expect(anchor.pathname).toBe(`/tasks/${encodeURIComponent(sessionId)}`);
     expect(Object.fromEntries(anchor.searchParams)).toEqual({ event: messageId, message: messageId });
+    expect(pageErrors).toEqual([]);
   });
 
   mountedIt("retains native selection while streaming repairs and later definitions update the document", { timeout: 120_000 }, async () => {

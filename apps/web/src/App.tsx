@@ -2394,11 +2394,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         "--sidebar-expanded-width": `${state.preferences.navigationWidth}px`
       } as CSSProperties}
     >
-      <NativeTaskStatusBridge
+      {window.jokoDesktop?.capabilities.includes("native.taskStatus") === true && <NativeTaskStatusBridge
         controller={controller}
         ownsProjection={!auxiliaryApplicationWindow}
         visibleSessionIds={nativeTaskStatusVisibleSessionIds}
-      />
+      />}
       <DesktopRemoteDesktopStatus t={t} />
       <TaskActivityBanner />
       <a className="skip-link" href="#main-content">{t("app.skipToContent")}</a>
