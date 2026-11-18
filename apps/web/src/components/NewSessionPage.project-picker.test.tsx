@@ -188,6 +188,68 @@ it("keeps an exact Device peer route, requires missing-directory confirmation, a
   expect(view.host.textContent).toContain("Keep this draft");
 });
 
+it("refreshes the same authorized Device route while the original remote project picker stays open", async () => {
+  const view = await mount();
+  const original = {
+    route: { targetDeviceId: "studio-device", relationId: "relation-one", targetDeviceRevision: 7n,
+      relationRevision: 9n, routeGeneration: 11n },
+    name: "Studio PC", kind: "desktop", platform: "win32", capabilities: ["files", "process"]
+  } as const;
+  let available = { ...original, route: { ...original.route, routeGeneration: 11n as bigint } };
+  view.listDevicePeers.mockImplementation(async () => [available]);
+  view.listDevicePeerDirectories.mockImplementation(async (peer, requestedPath) => {
+    if (peer.routeGeneration !== available.route.routeGeneration) throw new Error("The original route has retired.");
+    const path = requestedPath || "C:\\home";
+    return { peer, path, parentPath: "C:\\", directories: [{ name: "Child " + peer.routeGeneration, path: path + "\\child" }], truncated: false };
+  });
+  const dialog = () => required(document.querySelector<HTMLElement>(".modal-layer .modal"));
+  const button = (key: string) => required([...dialog().querySelectorAll<HTMLButtonElement>("button")]
+    .find(candidate => candidate.textContent === key));
+  const pathField = () => required(dialog().querySelector<HTMLInputElement>("#remote-project-path"));
+  await view.render(request(1));
+  await act(async () => option("newTask.addRemoteProject").click());
+  await vi.waitFor(() => expect(dialog().textContent).toContain(original.name));
+  const target = required(dialog().querySelector<HTMLSelectElement>("select")).value;
+  await act(async () => button("remoteProject.browse").click());
+  await vi.waitFor(() => expect(dialog().textContent).toContain("Child 11"));
+
+  const draftPath = "C:\\work\\keep";
+  await change(pathField(), draftPath);
+  available = { ...available, route: { ...available.route, routeGeneration: 12n } };
+  await act(async () => button("remoteProject.refresh").click());
+  await vi.waitFor(() => expect(dialog().textContent).toContain("Child 12"));
+  expect(view.listDevicePeerDirectories).toHaveBeenLastCalledWith(available.route, draftPath, expect.any(AbortSignal));
+  expect(pathField().value).toBe(draftPath);
+  expect(required(dialog().querySelector<HTMLSelectElement>("select")).value).toBe(target);
+
+  available = { ...available, route: { ...available.route, routeGeneration: 13n } };
+  await act(async () => {
+    pathField().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  });
+  await vi.waitFor(() => expect(dialog().textContent).toContain("Child 13"));
+  expect(view.listDevicePeerDirectories).toHaveBeenLastCalledWith(available.route, draftPath, expect.any(AbortSignal));
+  view.inspectDevicePeerDirectory.mockResolvedValue({ peer: available.route, path: draftPath, kind: "missing" });
+  await act(async () => required(dialog().querySelector<HTMLFormElement>("form")).requestSubmit());
+  await vi.waitFor(() => expect(dialog().textContent).toContain("remoteProject.missingDeviceBody"));
+  expect(view.inspectDevicePeerDirectory).toHaveBeenCalledExactlyOnceWith(available.route, draftPath, expect.any(AbortSignal));
+  expect(view.createDevicePeerTarget).not.toHaveBeenCalled();
+  await act(async () => required(dialog().querySelector<HTMLButtonElement>("[data-remote-project-missing-cancel]")).click());
+
+  available = { ...available, route: { ...available.route, routeGeneration: 14n } };
+  await act(async () => button("remoteProject.deviceHome").click());
+  await vi.waitFor(() => expect(dialog().textContent).toContain("Child 14"));
+  expect(view.listDevicePeerDirectories).toHaveBeenLastCalledWith(available.route, "", expect.any(AbortSignal));
+  expect(pathField().value).toBe("C:\\home");
+
+  view.listDevicePeers.mockResolvedValue([{ ...available, route: { ...available.route, relationRevision: 10n, routeGeneration: 15n } }]);
+  await act(async () => button("remoteProject.refresh").click());
+  await vi.waitFor(() => expect(dialog().querySelector("[role='alert']")?.textContent).toContain("remoteProject.deviceRouteUnavailable"));
+  expect(view.listDevicePeerDirectories.mock.calls.map(([route]) => route.routeGeneration)).toEqual([11n, 12n, 13n, 14n]);
+  expect(pathField().value).toBe("C:\\home");
+  expect(view.createDevicePeerTarget).not.toHaveBeenCalled();
+  expect(view.host.textContent).toContain("Keep this draft");
+});
+
 it("unlocks a pending Device peer project after an offline rejection without losing the target or draft", async () => {
   const view = await mount();
   const peer = {
