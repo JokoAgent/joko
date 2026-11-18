@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
-import { HostedAgentService } from "@joko/contracts";
+import { HostedAgentService, ProviderGroupService as ProviderGroupRpc } from "@joko/contracts";
 import type { NativeSessionState, ProviderModel } from "@joko/core";
 import { OperationalStore, ProviderGroupStore, ProviderGroupUsageStore, type ProviderGroupMember } from "@joko/store";
 import { afterEach, expect, it, vi } from "vitest";
@@ -9,10 +9,12 @@ import type { HostedAgentCall } from "./hosted-agent-run.js";
 import { ProviderGroupDirectory, type ProviderGroupDirectorySource } from "./provider-group-directory.js";
 import { ProviderGroupHostedEndpoint, type ProviderGroupNativeCapture } from "./provider-group-hosted.js";
 import { ProviderGroupLeases } from "./provider-group-leases.js";
-import { ProviderGroupQuotaReader } from "./provider-group-quota.js";
+import { ProviderGroupQuotaReader, type ProviderGroupQuotaReaderOptions } from "./provider-group-quota.js";
 import { ProviderGroupRouter } from "./provider-group-router.js";
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
+import { ProviderGroupService } from "./provider-group-service.js";
 import { ProviderGroupUsage } from "./provider-group-usage.js";
+import { fromGroupAccountUsage, toGroupAccountUsage } from "./provider-group-wire.js";
 import { HostedAgentConnectClient } from "./hosted-agent-connect-client.js";
 import { createHostedAgentConnectService, type HostedAgentLifecycleEndpointPort } from "./hosted-agent-connect-service.js";
 import { decodeHostedWorkflowProgress } from "./hosted-agent-workflow-wire.js";
@@ -21,7 +23,7 @@ import type { HostedWorkflowProgressCommand } from "./hosted-agent-workflow-prog
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-function fixture(localMember = false) {
+function fixture(localMember = false, readRemote: ProviderGroupQuotaReaderOptions["readRemote"] = async () => undefined) {
   const store = new OperationalStore(":memory:"), groups = new ProviderGroupStore(store, "local-node"), leases = new ProviderGroupLeases();
   const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-completions",
     contextWindow: 32768, maxOutputTokens: 4096, supportsImages: false, thinkingLevels: [],
@@ -40,7 +42,7 @@ function fixture(localMember = false) {
   groups.update({ backendId: "anchor", providerId: "provider" }, { strategy: "ordered", autoSwitch: true,
     members: localMember ? [member(sources[0]!), member(sources[1]!)] : [member(sources[1]!), member(sources[0]!)] }, 0n);
   const staged = vi.spyOn(groups, "stageHostedBinding");
-  const quotas = new ProviderGroupQuotaReader({ readLocal: async () => undefined, readRemote: async () => undefined });
+  const quotas = new ProviderGroupQuotaReader({ readLocal: async () => undefined, readRemote });
   const directory = new ProviderGroupDirectory({ sources: () => sources, quotas, running: () => 0, ownerGeneration: () => "original-owner" });
   const runtime = { store: groups, directory, leases, router: new ProviderGroupRouter(groups, directory, leases),
     usage: new ProviderGroupUsage(groups, new ProviderGroupUsageStore(store, "local-node")), nodeName: () => "This computer" } as unknown as ProviderGroupRuntime;
@@ -109,7 +111,7 @@ function fixture(localMember = false) {
   };
   const command: HostedWorkflowProgressCommand = { kind: "workflow_progress", backendId: input.backendId, providerId: input.providerId,
     sessionId: input.sessionId, targetId: input.targetId, nativeSessionId: input.nativeSessionId, taskId: `claude-task-${"b".repeat(32)}`, maximumBytes: 16_384 };
-  return { endpoint, leases, principal, input, opened, called, close, start, groups, sources, capture, command, workflow, localPrincipals, nativeAlive: () => nativeAlive, nativeClosures: () => nativeClosures,
+  return { endpoint, leases, principal, input, opened, called, close, start, groups, sources, router: runtime.router, capture, command, workflow, localPrincipals, nativeAlive: () => nativeAlive, nativeClosures: () => nativeClosures,
     restart() { const cold = new ProviderGroupHostedEndpoint(options); cleanups.push(() => cold.dispose()); return cold; },
     read(current = principal, target = endpoint, change: Partial<HostedWorkflowProgressCommand> = {}, signal = new AbortController().signal) {
       const connection = new HostedAgentConnectClient(createClient(HostedAgentService, createRouterTransport(router => router.service(HostedAgentService,
@@ -119,6 +121,42 @@ function fixture(localMember = false) {
     binding: () => { const original = staged.mock.calls[0]?.[0]; return original === undefined ? undefined : groups.hostedBinding(original.id); },
     revoke: () => { live = false; }, closeUnknown: (value: boolean) => { closeUnknown = value; }, completePoll: (error?: Error) => completePoll(error) };
 }
+
+it("selects the newly authorized device account for the next ordinary task using the same route", async () => {
+  let usedPercent = 100;
+  const replies = vi.fn(() => ({ activeTurns: 0, accountUsage: toGroupAccountUsage({ providerId: "provider", observedAt: Date.now(),
+    buckets: [{ id: "codex", primaryWindow: { usedPercent, windowMinutes: 300, resetAt: Date.now() + 60_000 } }] }) }));
+  const client = createClient(ProviderGroupRpc, createRouterTransport(router => router.service(ProviderGroupRpc, {
+    getProviderSchedulingState: request => {
+      expect(request.key).toMatchObject({ backendId: "native-remote", providerId: "provider" });
+      return replies();
+    }
+  })));
+  const f = fixture(false, async (member, signal) => fromGroupAccountUsage((await client.getProviderSchedulingState({
+    key: { backendId: member.nativeBackendId, providerId: member.providerId }
+  }, { signal })).accountUsage));
+  const service = new ProviderGroupService({ router: f.router, sessions: { read: () => undefined,
+    handoff: async () => { throw new Error("First selection must not hand off a previous task."); },
+    continue: async () => { throw new Error("First selection must not continue a previous task."); }, status() {} } });
+  cleanups.push(() => service.close());
+  const group = { backendId: "anchor", providerId: "provider" }, signal = new AbortController().signal;
+  const start = (sessionId: string) => service.assignBeforeStart({ sessionId, agentKind: "pi", profile: { ...group, modelId: "model", fastMode: false } }, signal);
+  const first = await start("ordinary-first");
+  expect(first?.profile.backendId).toBe("anchor");
+  first!.commit(); first!.release();
+  expect(f.groups.binding("ordinary-first")).toMatchObject({ memberKey: "local", backendId: "anchor" });
+  expect(replies).toHaveBeenCalledOnce();
+
+  // The original device, Backend and group revision all survive the account change.
+  usedPercent = 9;
+  const second = await start("ordinary-second");
+  expect(second?.member.key).toBe("remote");
+  expect(second?.snapshot.revision).toBe(first?.snapshot.revision);
+  second!.commit(); second!.release();
+  expect(f.groups.binding("ordinary-second")).toMatchObject({ memberKey: "remote", backendId: "remote", providerId: "provider" });
+  expect(f.groups.binding("ordinary-first")?.memberKey).toBe("local");
+  expect(replies).toHaveBeenCalledTimes(2);
+});
 
 it("retires a revoked grant before a late native result and retains its original cleanup until closure is confirmed", async () => {
   const f = fixture(); await f.start(); f.closeUnknown(true); f.revoke(); f.completePoll();
