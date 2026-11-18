@@ -3451,7 +3451,8 @@ export async function createOrchestratorApplication(
         canDownload: () => browserSettings?.downloadAllowed() ?? false,
         onActivity: (activity: BrowserActivity) => {
           browserState.recordActivity(activity);
-        }
+        },
+        onExternalPageClosed: (providerId, pageId, generation) => browserState.retireExternalPage(providerId, pageId, generation)
       });
       browser = configuredBrowser;
       const configuredTransfers = new BrowserTransferCoordinator({

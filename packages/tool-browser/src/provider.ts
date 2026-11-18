@@ -208,6 +208,7 @@ export interface BrowserProviderOptions {
   readonly canDownload?: () => boolean;
   readonly launchArgs?: readonly string[];
   readonly onActivity?: (activity: BrowserActivity) => Promise<void> | void;
+  readonly onExternalPageClosed?: (providerId: string, pageId: string, generation: number) => void;
   /**
    * Receives a private, canonical path that is guaranteed to be a regular file
    * inside downloadDirectory. The path is never copied into public activity.
@@ -487,6 +488,8 @@ export class BrowserProvider {
   #pageIds = new WeakMap<Page, string>();
   #nextPageId = 1;
   readonly #pageStates = new WeakMap<Page, BrowserPageState["state"]>();
+  readonly #requestedPageCloses = new WeakSet<Page>();
+  readonly #externalPageCloses = new Set<Promise<void>>();
   readonly #pageDocuments = new WeakMap<Page, string>();
   readonly #consoleMessages = new WeakMap<Page, BrowserConsoleMessageSnapshot[]>();
   readonly #httpRequestSummaries = new WeakMap<Page, BrowserHttpRequestSummary[]>();
@@ -798,6 +801,7 @@ export class BrowserProvider {
   private detachContext(): BrowserContext | undefined {
     const context = this.#context;
     this.#context = undefined;
+    this.#externalPageCloses.clear();
     this.#route = undefined;
     for (const htmlContext of this.#htmlContexts) void htmlContext.close().catch(() => undefined);
     this.#htmlContexts.clear();
@@ -996,7 +1000,7 @@ export class BrowserProvider {
               // Closing the new page may already have fenced the failed takeover.
             }
           }
-          await page?.close().catch(() => undefined);
+          if (page !== undefined) await this.closeOwnedPage(page).catch(() => undefined);
           await htmlContext?.close().catch(() => undefined);
           throw error;
         }
@@ -1078,7 +1082,7 @@ export class BrowserProvider {
         generation: this.#generation,
         owner: expected.owner
       }, ttlMs);
-      await opened.close();
+      await this.closeOwnedPage(opened);
       if (ownsOpenedTakeover) {
         await this.emit({
           at: Date.now(),
@@ -1211,7 +1215,7 @@ export class BrowserProvider {
       this.assertHumanTakeover(expected);
       guard?.assertCurrent();
       if (current.pageId !== safeTargetPageId) {
-        await target.close();
+        await this.closeOwnedPage(target);
         this.assertHumanTakeover(expected);
         await this.emit({ at: Date.now(), type: "page", pageId: safeTargetPageId, detail: "Page closed." });
         return current;
@@ -1232,7 +1236,7 @@ export class BrowserProvider {
         generation: this.#generation,
         owner: expected.owner
       }, ttlMs);
-      await target.close();
+      await this.closeOwnedPage(target);
       await this.emit({
         at: Date.now(),
         type: "takeover",
@@ -1521,6 +1525,7 @@ export class BrowserProvider {
   }
 
   async listPages(): Promise<readonly BrowserPageState[]> {
+    if (this.#externalPageCloses.size > 0) await Promise.all(this.#externalPageCloses);
     return Promise.all(this.allPages().map((page) => this.pageState(page)));
   }
 
@@ -1610,7 +1615,7 @@ export class BrowserProvider {
   closePage(pageId: string, lease: BrowserLeaseFence): Promise<void> {
     const fence = copyAgentFence(lease);
     return this.withAgentControl(fence, async () => {
-      await this.requirePageNow(pageId).close();
+      await this.closeOwnedPage(this.requirePageNow(pageId));
     });
   }
 
@@ -2121,8 +2126,10 @@ export class BrowserProvider {
       void this.emit({ at: Date.now(), type: "crashed", pageId, detail: "Page crashed." });
     });
     page.on("close", () => {
+      const crashed = this.#pageStates.get(page) === "crashed";
       this.#pageStates.set(page, "closed");
       fenceTakeover();
+      if (!crashed && !this.#requestedPageCloses.has(page)) this.observeExternalPageClose(page, pageId, generation);
     });
     const finishNavigation = () => {
       const state = this.#pageStates.get(page);
@@ -2182,6 +2189,31 @@ export class BrowserProvider {
     });
     page.on("download", (download) => void this.handleDownload(pageId, generation, download).catch(() => undefined));
     void this.emit({ at: Date.now(), type: "page", pageId, detail: "Page opened." });
+  }
+
+  private async closeOwnedPage(page: Page): Promise<void> {
+    this.#requestedPageCloses.add(page);
+    try { await page.close(); }
+    finally { this.#requestedPageCloses.delete(page); }
+  }
+
+  private observeExternalPageClose(page: Page, pageId: string, generation: number): void {
+    const notify = this.#options.onExternalPageClosed;
+    if (notify === undefined || this.#targetMode !== "external" || generation !== this.#generation
+      || this.#context === undefined || page.context() !== this.#context) return;
+    const context = this.#context;
+    const survivor = context.pages().find(candidate => candidate !== page && !candidate.isClosed()
+      && this.#pageStates.get(candidate) !== "crashed");
+    if (survivor === undefined) return;
+    // Confirm a surviving native target before discarding its sibling's recovery record.
+    const check = withTimeout(checkChromiumPageTarget(survivor), 2_000, "The Browser context did not confirm a surviving target.")
+      .then((live) => {
+        if (live && !survivor.isClosed() && this.#pageStates.get(survivor) !== "crashed"
+          && this.#context === context && this.#generation === generation && !this.#generationAbort.signal.aborted) {
+          notify(this.id, pageId, generation);
+        }
+      }).catch(() => undefined).finally(() => { this.#externalPageCloses.delete(check); });
+    this.#externalPageCloses.add(check);
   }
 
   private withSnapshotRefs(
@@ -3923,6 +3955,12 @@ function browserTakeoverChord(
   modifiers: readonly BrowserTakeoverKeyModifier[]
 ): string {
   return [...modifiers, key].join("+");
+}
+
+async function checkChromiumPageTarget(page: Page): Promise<boolean> {
+  const session = await page.context().newCDPSession(page);
+  try { return (await session.send("Target.getTargetInfo")).targetInfo.type === "page"; }
+  finally { await session.detach().catch(() => undefined); }
 }
 
 async function browserNavigationAvailability(page: Page): Promise<{ canGoBack: boolean; canGoForward: boolean }> {

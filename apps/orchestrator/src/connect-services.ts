@@ -23114,8 +23114,12 @@ async function dispatchMutation(
           }
         },
         effect: async () => {
-          if (recovery !== undefined && provider.running && (await provider.listPages()).some((page) => page.id === recovery.pageId)) {
-            throw new ConnectError("The Browser page is still live and does not need recovery.", Code.FailedPrecondition);
+          if (recovery !== undefined) {
+            const pages = provider.running ? await provider.listPages() : [];
+            if (pages.some(page => page.id === recovery.pageId)) {
+              throw new ConnectError("The Browser page is still live and does not need recovery.", Code.FailedPrecondition);
+            }
+            requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, recovery.pageId, recovery.generation, requestedPageOwner);
           }
           requireEnabledBrowserPresentationTarget(provider, dependencies.browserSettings, presentationTarget, requestedPageOwner.targetId);
           await provider.start();
