@@ -296,7 +296,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [errorTailRevision, setErrorTailRevision] = useState(0);
   const [bottomInset, setBottomInset] = useState(0);
   const [composerMessageMentionInsertion, setComposerMessageMentionInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly mention: NonNullable<ReturnType<typeof createMessageComposerMention>> }>();
-  const [composerSelectionQuoteInsertion, setComposerSelectionQuoteInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft }>();
+  const [composerSelectionQuoteInsertion, setComposerSelectionQuoteInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly quotes: readonly ComposerSelectionQuoteDraft[] }>();
   const [sideChatRecovery, setSideChatRecovery] = useState<{ readonly record: PendingSideChatDraft; readonly state: "pending" | "working" | "failed" | "existing"; readonly error?: string; readonly canStartAgain?: boolean }>();
   const [sideChatRecoveryLoadError, setSideChatRecoveryLoadError] = useState<string>();
   const [sideChatRecoveryReload, setSideChatRecoveryReload] = useState(0);
@@ -1111,7 +1111,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setComposerSelectionQuoteInsertion({
       id: ++composerSelectionQuoteInsertionIdRef.current,
       sessionId: selectionQuoteInsertion.sessionId,
-      quote: selectionQuoteInsertion.quote
+      quotes: [selectionQuoteInsertion.quote]
     });
   }, [selectionQuoteInsertion, session.id]);
 
@@ -1470,12 +1470,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     });
   };
 
-  const addSelectionToComposer = (quote: ComposerSelectionQuoteDraft): void => {
-    if (!canAddMessageReference || quote.sessionId !== session.id) return;
+  const addSelectionToComposer = (quotes: readonly ComposerSelectionQuoteDraft[]): void => {
+    if (!canAddMessageReference || quotes.length === 0 || quotes.some((quote) => quote.sessionId !== session.id)) return;
     setComposerSelectionQuoteInsertion({
       id: ++composerSelectionQuoteInsertionIdRef.current,
       sessionId: session.id,
-      quote
+      quotes
     });
   };
 
