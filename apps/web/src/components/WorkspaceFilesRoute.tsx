@@ -66,7 +66,7 @@ import { WorkspaceSessionTabsBar, type WorkspaceSessionCreateOption } from "./Wo
 import { Button, IconButton, Modal, Spinner, StatusDot, cx } from "./ui.js";
 import "./workspace-files-route.css";
 
-const DOCUMENT_TREE_LISTING = { policy: "documentTree", includeHidden: true } as const;
+const WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY = "joko:workspace-files:show-ignored-directories:v1";
 const WORKSPACE_CHAT_OVERLAY_FOCUSABLE = "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [contenteditable='true'], [tabindex]:not([tabindex='-1'])";
 export const WORKSPACE_FILES_COMPACT_MAX_WIDTH = 980;
 export const WORKSPACE_FILES_COMPACT_MEDIA_QUERY = `(max-width: ${WORKSPACE_FILES_COMPACT_MAX_WIDTH}px)`;
@@ -177,6 +177,19 @@ export function WorkspaceFilesRoute({
   const [leavePrompt, setLeavePrompt] = useState<LeavePromptState | undefined>(undefined);
   const [previewState, setPreviewState] = useState<FilePreviewState>({ loading: false });
   const [previewRefreshSequence, setPreviewRefreshSequence] = useState(0);
+  const [showIgnoredDirectories, setShowIgnoredDirectories] = useState(readShowIgnoredDirectories);
+  const canShowIgnoredDirectories = workspace.remoteWorkspace === undefined && target.remoteWorkspace === undefined;
+  const showIgnored = canShowIgnoredDirectories && showIgnoredDirectories;
+  useEffect(() => {
+    const ownerWindow = rootRef.current?.ownerDocument.defaultView;
+    const onStorage = (event: StorageEvent): void => {
+      if (event.key === null || event.key === WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY) {
+        setShowIgnoredDirectories(readShowIgnoredDirectories());
+      }
+    };
+    ownerWindow?.addEventListener("storage", onStorage);
+    return () => ownerWindow?.removeEventListener("storage", onStorage);
+  }, []);
   const [compactLayout, setCompactLayout] = useState(() => browserMatches(WORKSPACE_FILES_COMPACT_MEDIA_QUERY));
   const [railWidth, setRailWidth] = useState(() => readWorkspaceChatRailWidth(browserStorage()));
   const railWidthRef = useRef(railWidth);
@@ -509,9 +522,12 @@ export function WorkspaceFilesRoute({
     const parent = canonicalWorkspaceRelativePath(parentPath, true);
     return normalizeWorkspaceDirectoryEntries(
       parent,
-      (await controllerRef.current.listWorkspaceEntries(workspaceId, parent, DOCUMENT_TREE_LISTING)).map(mapWorkspaceEntry)
+      (await controllerRef.current.listWorkspaceEntries(workspaceId, parent, {
+        policy: showIgnored ? "documentTreeShowIgnored" : "documentTree",
+        includeHidden: true
+      })).map(mapWorkspaceEntry)
     );
-  }, [workspace.id]);
+  }, [showIgnored, workspace.id]);
 
   const loadFileIndex = useCallback(async (
     { workspaceId }: { readonly workspaceId: string },
@@ -832,6 +848,11 @@ export function WorkspaceFilesRoute({
           activeTargetId={target.id}
           projectOptions={projectOptions}
           labels={workspaceSidebarLabels(t)}
+          ignoredDirectories={canShowIgnoredDirectories ? { shown: showIgnored, onToggle: () => {
+            const next = !showIgnored;
+            setShowIgnoredDirectories(next);
+            writeStorage(WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY, String(next));
+          } } : undefined}
           documentActions={documentActions}
           loadDirectory={loadDirectory}
           loadFileIndex={loadFileIndex}
@@ -1143,6 +1164,11 @@ function browserStorage(): Storage | undefined {
   }
 }
 
+function readShowIgnoredDirectories(): boolean {
+  try { return browserStorage()?.getItem(WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY) === "true"; }
+  catch { return false; }
+}
+
 function browserMatches(query: string): boolean {
   try {
     return typeof window !== "undefined" && window.matchMedia?.(query).matches === true;
@@ -1216,6 +1242,7 @@ function workspaceSidebarLabels(t: Translator) {
     exitSearch: t("workspace.exitSearch"),
     collapseAll: t("workspace.collapseFolders"),
     refresh: t("workspace.refreshFiles"),
+    showIgnoredDirectories: t("workspace.showIgnoredDirectories"),
     filterPlaceholder: t("workspace.filterFiles"),
     clearFilter: t("workspace.clearFileFilter"),
     loadingTree: t("workspace.loadingFiles"),

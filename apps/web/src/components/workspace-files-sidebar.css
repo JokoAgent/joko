@@ -203,7 +203,8 @@
   color: var(--text-soft);
 }
 
-.workspace-files-sidebar__actions > button:hover {
+.workspace-files-sidebar__actions > button:hover,
+.workspace-files-sidebar__actions > button[aria-pressed="true"] {
   color: var(--text);
   background: var(--sidebar-item-hover);
 }

@@ -8653,6 +8653,7 @@ function nativeWorkspaceEntryListingPolicy(
     policy === contract.WorkspaceEntryListingPolicy.DEFAULT
   ) return "default";
   if (policy === contract.WorkspaceEntryListingPolicy.DOCUMENT_TREE) return "document_tree";
+  if (policy === contract.WorkspaceEntryListingPolicy.DOCUMENT_TREE_SHOW_IGNORED) return "document_tree_show_ignored";
   throw invalidArgument("listing_policy is unsupported");
 }
 

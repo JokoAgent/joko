@@ -2576,7 +2576,7 @@ export interface WorkspaceEntryPageView {
 }
 
 export interface WorkspaceEntryListingOptionsView {
-  readonly policy?: "default" | "documentTree";
+  readonly policy?: "default" | "documentTree" | "documentTreeShowIgnored";
   readonly includeHidden?: boolean;
 }
 

@@ -1548,7 +1548,7 @@ test("public enum wire numbers remain stable", () => {
       DISPOSING: 1, HOST_UNAVAILABLE: 2, START_FAILED: 3, STATUS_FAILED: 4, RECOVERY_FAILED: 5
     }],
     [contract.ComputerAutomationUpdatePhase, { DOWNLOADING: 1, INSTALLING: 2, DONE: 3 }],
-    [contract.WorkspaceEntryListingPolicy, { UNSPECIFIED: 0, DEFAULT: 1, DOCUMENT_TREE: 2 }],
+    [contract.WorkspaceEntryListingPolicy, { UNSPECIFIED: 0, DEFAULT: 1, DOCUMENT_TREE: 2, DOCUMENT_TREE_SHOW_IGNORED: 3 }],
     [contract.WorkspaceFileChangeKind, { CREATED: 1, MODIFIED: 2, DELETED: 3, RENAMED: 4, OVERFLOW: 5, RESYNC: 6 }],
     [contract.SessionMessageSearchRole, { USER: 1, ASSISTANT: 2 }],
     [contract.SessionMessageSearchKind, { TEXT_MESSAGE: 1 }],

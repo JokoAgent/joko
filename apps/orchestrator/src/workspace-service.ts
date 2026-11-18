@@ -42,10 +42,8 @@ const WORKSPACE_SEARCH_MAXIMUM_PAGE_SIZE = 5_000;
 const WORKSPACE_SEARCH_MAXIMUM_OFFSET = 100_000;
 const WORKSPACE_ENTRY_MUTATION_MAXIMUM_ENTRIES = 100_000;
 const WORKSPACE_ENTRY_COPY_MAXIMUM_BYTES = 256 * 1024 * 1024;
-const DOCUMENT_TREE_EXCLUDED_DIRECTORY_NAMES = new Set([
-  ".git",
-  ".svn",
-  ".hg",
+const DOCUMENT_TREE_EXCLUDED_DIRECTORY_NAMES = new Set([".git", ".svn", ".hg"]);
+const DOCUMENT_TREE_IGNORED_DIRECTORY_NAMES = new Set([
   "node_modules",
   "__pycache__",
   "vendor",
@@ -113,7 +111,7 @@ export interface WorkspaceEntryRecord {
   readonly generated: boolean;
 }
 
-export type WorkspaceEntryListingPolicy = "default" | "document_tree";
+export type WorkspaceEntryListingPolicy = "default" | "document_tree" | "document_tree_show_ignored";
 
 export interface WorkspaceEntryListingOptions {
   readonly recursive?: boolean;
@@ -610,7 +608,9 @@ export class WorkspaceService {
   }
 
   async list(workspaceId: string, directory = "", options?: WorkspaceEntryListingOptions): Promise<readonly WorkspaceEntryRecord[]> {
+    const showIgnored = options?.listingPolicy === "document_tree_show_ignored";
     if (this.#isRemote(workspaceId)) {
+      if (showIgnored) throw new WorkspaceScanError("Showing ignored directories is available for local workspaces.", "scan_failed");
       return this.#remoteInvoke(workspaceId, "list", [directory, options]);
     }
     const workspace = this.requireWorkspace(workspaceId);
@@ -618,6 +618,7 @@ export class WorkspaceService {
     const root = await this.resolveSafe(workspace, directory, true);
     const maximum = normalizeWorkspaceListMaximum(options?.maximumEntries);
     const listingPolicy = options?.listingPolicy ?? "default";
+    const documentTree = listingPolicy !== "default";
     const output: WorkspaceEntryRecord[] = [];
     try {
       const ignoreStrategy = listingPolicy === "default"
@@ -633,7 +634,7 @@ export class WorkspaceService {
           : inheritedScopes;
         const children = await readdir(absoluteDirectory, { withFileTypes: true });
         children.sort((left, right) => Number(right.isDirectory()) - Number(left.isDirectory()) || (
-          listingPolicy === "document_tree"
+          documentTree
             ? compareDocumentTreeNames(left.name, right.name)
             : compareWorkspaceNames(left.name, right.name)
         ));
@@ -644,7 +645,7 @@ export class WorkspaceService {
           const absolute = resolve(absoluteDirectory, child.name);
           const info = await lstat(absolute);
           if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) continue;
-          if (listingPolicy === "document_tree" && documentTreeEntryExcluded(child.name, info.isDirectory())) continue;
+          if (documentTree && documentTreeEntryExcluded(child.name, info.isDirectory(), showIgnored)) continue;
           const relativePath = canonicalListedWorkspacePath(workspace.root, absolute, false);
           candidates.push({ absolute, relativePath, name: child.name, info });
         }
@@ -3617,10 +3618,11 @@ function compareDocumentTreeNames(left: string, right: string): number {
   return compareWorkspaceNames(foldedLeft, foldedRight) || compareWorkspaceNames(left, right);
 }
 
-function documentTreeEntryExcluded(name: string, directory: boolean): boolean {
+function documentTreeEntryExcluded(name: string, directory: boolean, showIgnored: boolean): boolean {
   const folded = name.toLocaleLowerCase("en-US");
   if (folded.endsWith(".meta") || DOCUMENT_TREE_EXCLUDED_FILE_NAMES.has(folded)) return true;
-  return directory && DOCUMENT_TREE_EXCLUDED_DIRECTORY_NAMES.has(folded);
+  return directory && (DOCUMENT_TREE_EXCLUDED_DIRECTORY_NAMES.has(folded)
+    || (!showIgnored && DOCUMENT_TREE_IGNORED_DIRECTORY_NAMES.has(folded)));
 }
 
 function normalizeWorkspaceListMaximum(value: number | undefined): number {
