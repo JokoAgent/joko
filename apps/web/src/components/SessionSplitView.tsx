@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   CSSProperties,
   DragEvent as ReactDragEvent,
@@ -36,6 +36,7 @@ export interface SessionSplitViewProps {
   readonly renderPane: (sessionId: string) => ReactNode;
   readonly onLayoutChange: (layout: SessionSplitLayout) => void;
   readonly onFocus: (sessionId: string) => void;
+  readonly onVisibleSessionIdsChange?: (sessionIds: readonly string[] | undefined) => void;
   readonly onPreviewFocus?: (sessionId: string) => void;
   readonly onClose: (sessionId: string) => void;
   readonly onDropSession: (sessionId: string, anchorSessionId: string, side: SessionSplitSide) => void;
@@ -43,11 +44,11 @@ export interface SessionSplitViewProps {
 
 export function SessionSplitView(props: SessionSplitViewProps): JSX.Element {
   const surfaceRef = useRef<HTMLDivElement>(null);
-  const [compact, setCompact] = useState(false);
-  const panes = sessionSplitPanes(props.layout.root);
+  const [compact, setCompact] = useState<boolean>();
+  const panes = useMemo(() => sessionSplitPanes(props.layout.root), [props.layout.root]);
   const sessionNames = useMemo(() => new Map(props.sessions.map((session) => [session.id, session.name])), [props.sessions]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const surface = surfaceRef.current;
     if (surface === null) return;
     const minimum = sessionSplitMinimumSize(props.layout.root);
@@ -67,6 +68,12 @@ export function SessionSplitView(props: SessionSplitViewProps): JSX.Element {
   const compactSessionId = panes.some((pane) => pane.sessionId === props.focusedSessionId)
     ? props.focusedSessionId
     : panes[0]?.sessionId ?? props.currentSessionId;
+  const visibleSessionIds = useMemo(() => (props.layout.root === undefined ? [props.currentSessionId]
+    : compact === undefined ? [] : compact ? [compactSessionId] : panes.map(pane => pane.sessionId))
+    .filter(sessionId => sessionNames.has(sessionId)), [compact, compactSessionId, panes, props.currentSessionId, props.layout.root, sessionNames]);
+  const onVisibleSessionIdsChange = props.onVisibleSessionIdsChange;
+  useLayoutEffect(() => { onVisibleSessionIdsChange?.(visibleSessionIds); }, [onVisibleSessionIdsChange, visibleSessionIds]);
+  useLayoutEffect(() => () => onVisibleSessionIdsChange?.(undefined), [onVisibleSessionIdsChange]);
   const content = props.layout.root === undefined
     ? <SessionSplitLeaf
         sessionId={props.currentSessionId}
