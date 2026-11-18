@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { taskSourceKey } from "../task-sharing.js";
-import { partnerResumeMessages, providerGroupRebalanceMessages, type ProviderGroupRebalanceView } from "@joko/contracts";
+import { capabilityNames, partnerResumeMessages, providerGroupRebalanceMessages, type ProviderGroupRebalanceView } from "@joko/contracts";
 import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
@@ -47,6 +47,7 @@ import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../compos
 import { ContextCapacityRing } from "./ContextCapacityRing.js";
 import { SessionUsageChip } from "./SessionUsageChip.js";
 import { ProviderAccountBalance } from "./ProviderAccountBalance.js";
+import { TaskProviderAccountUsage } from "./ProviderAccountUsage.js";
 import { ProviderAccountResets } from "./ProviderAccountResets.js";
 import { SessionContextBudget } from "./SessionContextBudget.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
@@ -318,6 +319,17 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     () => modelRouteUnavailable ? [] : deliveryModesFor(session, backend),
     [backend, modelRouteUnavailable, session]
   );
+  const taskModel = session.model;
+  const subscriptionProvider = !guest && !readOnly && controller.state.connectionState === "connected"
+    && typeof controller.refreshProviderAccountUsage === "function"
+    && session.remoteWorkspace === undefined && workspace?.remoteWorkspace === undefined
+    && taskModel !== undefined && taskModel.backendId === session.backendId
+    && (taskModel.source === undefined || taskModel.source.kind === "local")
+    ? controller.state.snapshot.providers.find(runtime => runtime.backendId === taskModel.backendId
+      && runtime.id === taskModel.providerId && runtime.authenticationState === "authenticated"
+      && (runtime.kind === "subscription" || runtime.kind === "oauth")
+      && runtime.capabilities.has(capabilityNames.providerAccountUsage))
+    : undefined;
   const visionBridgeRouted = controller.state.snapshot.settings.visionBridge.enabled && session.model !== undefined &&
     controller.state.snapshot.settings.visionBridge.targetModels.some((target) =>
       target.backendId === session.backendId && target.providerId === session.model?.providerId && target.modelId === session.model.modelId);
@@ -3155,6 +3167,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           locale={controller.state.effectiveLocale}
           t={t}
         />
+        {subscriptionProvider !== undefined && taskModel !== undefined && <TaskProviderAccountUsage
+          key={JSON.stringify([controller.state.activeProfile?.id, controller.state.connectionGeneration, session.id,
+            session.generation.toString(), taskModel.backendId, taskModel.providerId, taskModel.modelId])}
+          controller={controller} runtime={subscriptionProvider} modelId={taskModel.modelId} t={t} />}
         {controller.state.snapshot?.providers.filter(runtime => runtime.backendId === session.backendId && runtime.id === session.model?.providerId)
           .map(runtime => <ProviderAccountBalance key={`${runtime.backendId}:${runtime.id}`} controller={controller} runtime={runtime} t={t} />)}
         {!guest && !readOnly && session.remoteWorkspace === undefined && session.model?.source?.kind === "local"

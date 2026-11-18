@@ -249,6 +249,7 @@ interface SidebarRemoteTaskEntry {
 
 type RemoteSearchLiveSource = Pick<NativeTaskStatusLiveSource, "profile" | "snapshot" | "epoch">;
 type SidebarRailPanelSection = "projects" | "dialogues";
+type SidebarRailOpenSource = "keyboard" | "pointer" | "hover";
 type SidebarRailProjectEntry =
   | { readonly kind: "local"; readonly id: string; readonly name: string; readonly target: TargetView; readonly sessions: readonly SessionView[] }
   | { readonly kind: "remote"; readonly id: string; readonly name: string; readonly cache: MachineCacheView; readonly sessions: readonly MachineSessionCacheView[] };
@@ -1436,13 +1437,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       if (returnTarget?.isConnected === true && returnTarget.getClientRects().length > 0) returnTarget.focus({ preventScroll: true });
     });
   }, [cancelRailClose, cancelRailProjectClose]);
-  const openRailSection = useCallback((section: SidebarRailPanelSection, trigger: HTMLButtonElement, openedViaKeyboard: boolean): void => {
+  const openRailSection = useCallback((section: SidebarRailPanelSection, trigger: HTMLButtonElement, source: SidebarRailOpenSource): void => {
     cancelRailClose();
     cancelRailProjectClose();
     setRailPreview(undefined);
+    const openedViaKeyboard = source === "keyboard";
     if (openedViaKeyboard) railKeyboardReturnRef.current = trigger;
     const rect = trigger.getBoundingClientRect();
-    setRailPanel({
+    setRailPanel(current => source === "hover" && current?.openedViaKeyboard === true ? current : {
       section,
       anchor: { right: rect.right, top: rect.top },
       trigger,
@@ -1454,15 +1456,15 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     cancelRailClose();
     railCloseTimerRef.current = window.setTimeout(() => closeRailPanels(), SIDEBAR_RAIL_PANEL_CLOSE_GRACE_MS);
   }, [cancelRailClose, closeRailPanels, railPanel?.openedViaKeyboard]);
-  const openRailProject = useCallback((projectId: string, trigger: HTMLElement, openedViaKeyboard: boolean): void => {
+  const openRailProject = useCallback((projectId: string, trigger: HTMLElement, source: SidebarRailOpenSource): void => {
     cancelRailClose();
     cancelRailProjectClose();
     const rect = trigger.getBoundingClientRect();
-    setRailPanel((current) => current?.section !== "projects" ? current : {
+    setRailPanel((current) => current?.section !== "projects" || source === "hover" && current.openedViaKeyboard ? current : {
       ...current,
       projectId,
       projectAnchor: { right: rect.right, top: rect.top },
-      projectOpenedViaKeyboard: openedViaKeyboard
+      projectOpenedViaKeyboard: source === "keyboard"
     });
   }, [cancelRailClose, cancelRailProjectClose]);
   const scheduleRailProjectClose = useCallback((): void => {
@@ -1510,7 +1512,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     };
     ownerDocument.addEventListener("mousedown", onPointerDown, true);
     ownerWindow.addEventListener("keydown", onKeyDown);
-    const observer = typeof IntersectionObserver === "undefined" ? undefined : new IntersectionObserver((entries) => {
+    const observer = railPanel.openedViaKeyboard || railPanel.projectOpenedViaKeyboard || typeof IntersectionObserver === "undefined" ? undefined : new IntersectionObserver((entries) => {
       if (entries.some((entry) => !entry.isIntersecting)) closeRailPanels();
     });
     observer?.observe(railPanel.trigger);
@@ -2031,10 +2033,10 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               aria-expanded={railPanel?.section === "projects"}
               onPointerEnter={(event) => {
                 if (railPanel?.section === "projects") cancelRailClose();
-                else openRailSection("projects", event.currentTarget, false);
+                else openRailSection("projects", event.currentTarget, "hover");
               }}
               onPointerLeave={scheduleRailClose}
-              onClick={(event) => openRailSection("projects", event.currentTarget, event.detail === 0)}
+              onClick={(event) => openRailSection("projects", event.currentTarget, event.detail === 0 ? "keyboard" : "pointer")}
             ><SidebarRightStatusIndicator status={railProjectsIndicator} active={false} className="sidebar-right-status--rail" t={t} /><FolderKanban aria-hidden="true" /></IconButton>
             <IconButton
               className={cx("sidebar__rail-aggregate", railPanel?.section === "dialogues" && "is-open")}
@@ -2046,10 +2048,10 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               aria-expanded={railPanel?.section === "dialogues"}
               onPointerEnter={(event) => {
                 if (railPanel?.section === "dialogues") cancelRailClose();
-                else openRailSection("dialogues", event.currentTarget, false);
+                else openRailSection("dialogues", event.currentTarget, "hover");
               }}
               onPointerLeave={scheduleRailClose}
-              onClick={(event) => openRailSection("dialogues", event.currentTarget, event.detail === 0)}
+              onClick={(event) => openRailSection("dialogues", event.currentTarget, event.detail === 0 ? "keyboard" : "pointer")}
             ><SidebarRightStatusIndicator status={railDialoguesIndicator} active={false} className="sidebar-right-status--rail" t={t} /><MessageSquare aria-hidden="true" /></IconButton>
           </div>
         </nav>
@@ -2114,9 +2116,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               className="sidebar-rail-project__main"
               aria-haspopup="menu"
               aria-expanded={railPanel.projectId === entry.id}
-              onPointerEnter={(event) => openRailProject(entry.id, event.currentTarget, false)}
+              onPointerEnter={(event) => openRailProject(entry.id, event.currentTarget, "hover")}
               onPointerLeave={scheduleRailProjectClose}
-              onClick={(event) => openRailProject(entry.id, event.currentTarget, event.detail === 0)}
+              onClick={(event) => openRailProject(entry.id, event.currentTarget, event.detail === 0 ? "keyboard" : "pointer")}
             >
               <FolderKanban aria-hidden="true" />
               <span title={entry.name}>{entry.name}</span>
@@ -4282,21 +4284,21 @@ function SidebarRailLocalProjectRow({ entry, open, active, indicator, activeSess
   readonly t: Translator;
   readonly actions: SidebarProjectActions;
   readonly onBrowseFiles: (session: SessionView) => void;
-  readonly onOpen: (projectId: string, trigger: HTMLElement, openedViaKeyboard: boolean) => void;
+  readonly onOpen: (projectId: string, trigger: HTMLElement, source: SidebarRailOpenSource) => void;
   readonly onPointerLeave: () => void;
 }): JSX.Element {
   const rowRef = useRef<HTMLDivElement>(null);
   const allTargetSessions = actions.allSessions.filter((session) => session.projectId === entry.target.id);
   const browsableSession = allTargetSessions.find((session) => session.id === activeSessionId)
     ?? allTargetSessions[0];
-  const openPanel = (openedViaKeyboard: boolean): void => {
+  const openPanel = (source: SidebarRailOpenSource): void => {
     const trigger = rowRef.current?.querySelector<HTMLElement>(".project-group__header");
-    if (trigger !== null && trigger !== undefined) onOpen(entry.id, trigger, openedViaKeyboard);
+    if (trigger !== null && trigger !== undefined) onOpen(entry.id, trigger, source);
   };
   return <div
     ref={rowRef}
     className={cx("sidebar-rail-project", open && "is-open", active && "is-active")}
-    onPointerEnter={() => openPanel(false)}
+    onPointerEnter={() => openPanel("hover")}
     onPointerLeave={onPointerLeave}
   >
     <ProjectGroupHeading
@@ -4309,7 +4311,7 @@ function SidebarRailLocalProjectRow({ entry, open, active, indicator, activeSess
       workspacePath={workspacePath}
       rail
       t={t}
-      onToggle={openPanel}
+      onToggle={keyboard => openPanel(keyboard ? "keyboard" : "pointer")}
       onBrowseFiles={onBrowseFiles}
       actions={actions}
     />

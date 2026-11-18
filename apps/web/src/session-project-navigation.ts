@@ -1,3 +1,5 @@
+import type { SidebarOwnerLayout } from "./sidebar-layout.js";
+
 export type SessionProjectNavigationPlacement =
   | { readonly kind: "project"; readonly projectId: string }
   | { readonly kind: "dialogue" };
@@ -42,6 +44,18 @@ export function sameSessionProjectPlacement(
   return placement.kind === "dialogue"
     ? session.projectId === undefined
     : session.projectId === placement.projectId;
+}
+
+export function sessionProjectDestinationCollapsePatch(
+  layout: SidebarOwnerLayout,
+  placement: SessionProjectNavigationPlacement,
+  collapsed: boolean
+): Partial<SidebarOwnerLayout> {
+  if (placement.kind === "dialogue") return { collapsedDialogue: collapsed };
+  const collapsedProjects = new Set(layout.collapsedProjectIds);
+  if (collapsed) collapsedProjects.add(placement.projectId);
+  else collapsedProjects.delete(placement.projectId);
+  return { collapsedProjectIds: [...collapsedProjects] };
 }
 
 export function sessionsInProject<T extends ProjectNavigationSession>(

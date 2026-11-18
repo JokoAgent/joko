@@ -41,6 +41,8 @@ export interface SidebarOwnerLayout {
 }
 
 export type SidebarOwnerLayouts = Readonly<Record<string, SidebarOwnerLayout>>;
+export type SidebarOwnerLayoutUpdate = Partial<SidebarOwnerLayout> |
+  ((layout: SidebarOwnerLayout) => Partial<SidebarOwnerLayout>);
 
 export type SidebarLayout = SidebarDisplayPreferences & SidebarOwnerLayout;
 
@@ -394,12 +396,13 @@ export function sidebarOwnerLayoutFor(layouts: SidebarOwnerLayouts, ownerId: str
 export function withSidebarOwnerLayout(
   layouts: SidebarOwnerLayouts,
   ownerId: string,
-  patch: Partial<SidebarOwnerLayout>
+  update: SidebarOwnerLayoutUpdate
 ): SidebarOwnerLayouts {
   if (!validIdentity(ownerId)) return layouts;
+  const previous = sidebarOwnerLayoutFor(layouts, ownerId);
   const nextLayout = normalizeSidebarOwnerLayout({
-    ...(layouts[ownerId] ?? DEFAULT_SIDEBAR_OWNER_LAYOUT),
-    ...patch
+    ...previous,
+    ...(typeof update === "function" ? update(previous) : update)
   });
   const entries = Object.entries(layouts).filter(([candidate]) => candidate !== ownerId);
   // Keep the active owner even when malformed IndexedDB data was already over

@@ -5,9 +5,11 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { translate } from "../i18n.js";
-import { emptySnapshot, type AppSnapshot, type ExtensionCatalogEntryView, type ExtensionTaskViewOpenView, type SessionView, type TerminalView, type TerminalPaletteView } from "../model.js";
+import { emptySnapshot, type AppSnapshot, type ExtensionCatalogEntryView, type ExtensionMainViewSurfaceView, type ExtensionTaskViewOpenView, type SessionView, type TerminalView, type TerminalPaletteView } from "../model.js";
 import { InspectorWorkspace } from "./InspectorWorkspace.js";
+import { inspectorExtensionIdentity, inspectorLayoutOwner, openInspectorExtension, readInspectorLayout } from "./inspector-layout.js";
 import type { Translator } from "./types.js";
+import { resetClientLayout } from "../client-layout-reset.js";
 
 vi.mock("./InteractiveTerminalPanel.js", () => ({ InteractiveTerminalPanel: ({ terminalId }: { terminalId: string }) => <input aria-label={`buffer-${terminalId}`} defaultValue="initial" /> }));
 vi.mock("../terminal-appearance.js", () => ({ readTerminalAppearance: () => ({ palette: { ansiRgb: Array(16).fill(0), foregroundRgb: 1, backgroundRgb: 0, cursorRgb: 1 }, theme: {} }) }));
@@ -103,6 +105,62 @@ describe("Inspector workspace production integration", () => {
     expect(h.host.querySelector('[aria-label="buffer-terminal-two"]')).not.toBeNull();
   });
 
+  it("keeps the newer sidebar placement when a hidden plugin window's identity arrives late", async () => {
+    const extension = samplePlugin();
+    const provisional = child("5"), h = await fixture([provisional], undefined, [extension]);
+    const identity = Promise.withResolvers<string>();
+    provisional.identity.mockImplementationOnce(() => identity.promise);
+    await act(async () => openInspectorExtension(extension.id, "sidebar", h.owner));
+    await click(h.host, "[role=tab]", "Sample plugin");
+    await menu(h.host, t("inspector.detachTab"));
+    expect(provisional.identity).toHaveBeenCalledOnce();
+    expect(provisional.ready).not.toHaveBeenCalled();
+
+    await act(async () => openInspectorExtension(extension.id, "sidebar", h.owner));
+    await act(async () => identity.resolve(provisional.occurrence));
+    await settle();
+
+    expect(provisional.close).toHaveBeenCalledExactlyOnceWith("passive");
+    expect(provisional.ready).not.toHaveBeenCalled();
+    expect(h.host.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toBe("Sample plugin");
+    expect(readInspectorLayout(h.owner).plugins[inspectorExtensionIdentity(extension)]).toMatchObject({ mode: "sidebar", open: true });
+  });
+
+  it("reports the detached plugin's veto to the initiating layout reset", async () => {
+    const extension = samplePlugin();
+    const detached = child("6"), h = await fixture([detached], undefined, [extension]);
+    h.openExtensionMainView.mockResolvedValue({ id: "surface", extensionId: extension.id, owner: extension.owner,
+      endpoint: "/v1/extensions/main-views/surface/token/index.html", backendId: "backend", backendRevision: 1n,
+      backendGeneration: 1, expiresAt: Date.now() + 60_000 });
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => new Promise<Response>(() => undefined));
+    await act(async () => openInspectorExtension(extension.id, "window", h.owner));
+    await settle();
+    expect(detached.ready).toHaveBeenCalledOnce();
+
+    const frame = detached.document.querySelector("iframe");
+    if (frame?.contentWindow == null) throw new Error("The detached plugin frame did not mount.");
+    const source = frame.contentWindow;
+    const report = (data: unknown): void => {
+      detached.window.dispatchEvent(new MessageEvent("message", { origin: "null", source, data }));
+    };
+    report({ type: "joko:extension-close-ready", version: 1 });
+    const post = vi.spyOn(source, "postMessage");
+    const result = vi.fn();
+    let pending!: Promise<unknown>;
+    await act(async () => { pending = resetClientLayout("node").then(result); });
+    expect(result).not.toHaveBeenCalled();
+    const [request] = post.mock.calls.find(([value]) => value.type === "joko:extension-close") ?? [];
+    expect(request).toMatchObject({ version: 1, id: expect.any(String) });
+    await act(async () => {
+      report({ type: "joko:extension-close-result", version: 1, id: request.id, allowed: false });
+      await pending;
+    });
+
+    expect(result).toHaveBeenCalledExactlyOnceWith(false);
+    expect(detached.close).not.toHaveBeenCalled();
+    expect(readInspectorLayout(h.owner).plugins[inspectorExtensionIdentity(extension)]).toMatchObject({ mode: "window", open: true });
+  });
+
   it("returns crashed child tabs only to the same source and retires them when that source generation changes", async () => {
     const window = child("3"), replacement = child("4"), h = await fixture([window, replacement]);
     await menu(h.host, t("inspector.detachGroup")); await settle();
@@ -118,17 +176,25 @@ describe("Inspector workspace production integration", () => {
   });
 });
 
+function samplePlugin(): ExtensionCatalogEntryView & { owner: Extract<ExtensionCatalogEntryView["owner"], { kind: "resource" }> } {
+  return { id: `extension_${"b".repeat(32)}`, revision: 1n,
+    owner: { kind: "resource", resourceId: "resource", discoveredRevision: `sha256:${"b".repeat(64)}`, resourceRevision: 1n },
+    source: "local", installed: true, installState: "installed", name: "Sample plugin", description: "", enabled: true,
+    mainView: { title: "Sample plugin", open: "sidebar" }, sidebarSupported: true, sidebarVisible: true,
+    tools: [], permissions: [], commands: [], setup: { state: "notRequired", revision: 1n, fields: [] }, useSupported: true };
+}
+
 function task(id: string): SessionView { return { id, backendId: "backend", targetId: "target", name: id, state: "idle", pinned: false, archived: false, generation: 1n, fastMode: false, permissionMode: "ask", planMode: false, createdAt: 1, updatedAt: 1 }; }
 function terminal(sessionId: string, suffix = sessionId): TerminalView { return { id: `terminal-${suffix}`, sessionId, targetId: "target", generation: 1n, status: "running", exitConfirmed: false, shellId: "auto", shellLabel: `Shell ${suffix}`, cwd: "D:/project", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 }; }
 function child(index: string) {
   const frame = document.body.appendChild(document.createElement("iframe")), window = frame.contentWindow!, occurrence = `${index.repeat(8)}-${index.repeat(4)}-4${index.repeat(3)}-8${index.repeat(3)}-${index.repeat(12)}`;
   let requestClose = (): void => undefined;
-  const ready = vi.fn(async () => undefined), close = vi.fn(async () => undefined);
+  const identity = vi.fn(async () => occurrence), ready = vi.fn(async () => undefined), close = vi.fn(async () => undefined);
   Object.defineProperty(window, "jokoInspectorDesktop", { configurable: true, value: { platform: "win32", window: {
-    identity: async () => occurrence, ready, close, minimize: async () => undefined, toggleMaximize: async () => false,
+    identity, ready, close, minimize: async () => undefined, toggleMaximize: async () => false,
     onCloseRequested: (callback: () => void) => { requestClose = callback; return () => { requestClose = () => undefined; }; }
   }, selectionContextMenu: { onAddToChat: () => () => undefined } } satisfies JokoInspectorDesktopApi });
-  return { window, document: window.document, occurrence, ready, close, requestClose: () => requestClose() };
+  return { window, document: window.document, occurrence, identity, ready, close, requestClose: () => requestClose() };
 }
 async function fixture(children: readonly ReturnType<typeof child>[] = [], capabilities: readonly string[] = ["inspector.detach", "inspector.tabs"], extensions: ExtensionCatalogEntryView[] = []) {
   const snapshot = { ...emptySnapshot(), sessions: [task("one"), task("two")], extensions } as AppSnapshot & { sessions: SessionView[]; extensions: ExtensionCatalogEntryView[] };
@@ -140,8 +206,11 @@ async function fixture(children: readonly ReturnType<typeof child>[] = [], capab
   const navigate = vi.fn(), openExtensionTaskView = vi.fn((_id: string, _revision: bigint, _sessionId: string, signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
     signal.addEventListener("abort", () => reject(signal.reason), { once: true });
   }));
+  const openExtensionMainView = vi.fn((_id: string, _revision: bigint, signal: AbortSignal): Promise<ExtensionMainViewSurfaceView> => new Promise((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+  }));
   const controller = { state, createTerminal, closeTerminal, navigate, setInspectorOpen: vi.fn(async () => undefined), releaseArtifactUrl: vi.fn(),
-    getExtension: vi.fn(async () => ({ extensions })), openExtensionTaskView,
+    getExtension: vi.fn(async () => ({ extensions })), openExtensionTaskView, openExtensionMainView, closeExtensionMainView: vi.fn(async () => true),
     watchExtensionTaskViews: (focusedSessionId: string | undefined, signal: AbortSignal, onOpen: (event: ExtensionTaskViewOpenView) => void) => {
       taskViewWatchers.push({ focusedSessionId, signal, onOpen });
       return new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -157,7 +226,8 @@ async function fixture(children: readonly ReturnType<typeof child>[] = [], capab
   const root = createRoot(host); roots.push(root);
   const render = async (id: string): Promise<void> => { state.route.sessionId = id; await act(async () => root.render(<InspectorWorkspace controller={controller} snapshot={snapshot} session={snapshot.sessions.find(session => session.id === id)} timeline={[]} open t={t} runAction={(_key, action) => { void action().catch(() => undefined); }} onClose={() => undefined} onSelectionQuote={() => undefined} />)); await settle(); };
   await render("one");
-  return { host, render, snapshot, createTerminal, closeTerminal, navigate, openExtensionTaskView, taskViewWatchers, onClosed, notifyClosed: (occurrence: string, reason: "user" | "child-failure") => { for (const listener of listeners) listener({ occurrence, reason }); } };
+  return { host, render, snapshot, createTerminal, closeTerminal, navigate, openExtensionTaskView, openExtensionMainView, taskViewWatchers, onClosed,
+    owner: inspectorLayoutOwner(state.activeProfile)!, notifyClosed: (occurrence: string, reason: "user" | "child-failure") => { for (const listener of listeners) listener({ occurrence, reason }); } };
 }
 async function click(root: ParentNode, selector: string, text?: string): Promise<void> {
   const button = [...root.querySelectorAll<HTMLButtonElement>(selector)].find(candidate => text === undefined || candidate.textContent === text);

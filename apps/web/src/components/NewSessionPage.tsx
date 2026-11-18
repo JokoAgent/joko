@@ -1274,12 +1274,18 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const defaults = snapshot.settings.backendSettings.find((settings) => settings.backendId === backend.id);
     const preference = readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current;
     const preferredModel = preference?.backendId === backend.id ? preference : undefined;
-    const defaultRoute = preferredModel ?? defaults?.model;
     const availableOptions = resolveNewSessionExecutionOptions(backend, snapshot.models, "");
+    const modelFor = (route: { readonly providerId: string; readonly modelId: string }) => availableOptions.availableModels.find(
+      model => model.providerId === route.providerId && model.modelId === route.modelId);
+    const configuredDefault = defaults?.model;
+    // A new draft can adopt the current default while the remembered route is unavailable.
+    const useConfiguredDefault = contactsDraft === undefined && preferredModel !== undefined && modelFor(preferredModel) === undefined
+      && configuredDefault !== undefined && modelSourceAccess(backend, { backendId: backend.id, ...configuredDefault },
+        modelFor(configuredDefault), snapshot.providers).available;
+    const defaultRoute = useConfiguredDefault ? configuredDefault : preferredModel ?? configuredDefault;
     const defaultModel = defaultRoute === undefined
       ? availableOptions.availableModels[0]
-      : availableOptions.availableModels.find((model) =>
-          model.providerId === defaultRoute.providerId && model.modelId === defaultRoute.modelId);
+      : modelFor(defaultRoute);
     const options = resolveNewSessionExecutionOptions(backend, snapshot.models, defaultModel === undefined ? "" : modelKeyFor(defaultModel.providerId, defaultModel.modelId));
     const initialModelChoice = options.modelSwitchSupported ? options.selectedModel : undefined;
     setModelKey(!options.modelSwitchSupported ? "" : defaultRoute !== undefined

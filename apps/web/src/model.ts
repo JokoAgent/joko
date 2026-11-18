@@ -6326,7 +6326,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   restartTerminal(sessionId: string, terminalId: string, generation: bigint, requestId: string, signal?: AbortSignal): Promise<TerminalView>;
   closeTerminal(sessionId: string, terminalId: string, generation: bigint, signal?: AbortSignal): Promise<void>;
   refresh(): Promise<void>;
-  refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void>;
+  refreshProviderAccountUsage(backendId: string, providerId: string, signal?: AbortSignal): Promise<void>;
   getSessionContextBudget?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").SessionContextBudgetView>;
   setSessionContextBudget?(observed: import("@joko/contracts").SessionContextBudgetView, tokens: number | undefined, signal?: AbortSignal): Promise<void>;
   readProviderAccountBalance?(backendId: string, providerId: string, forceRefresh: boolean, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountBalanceResult>;

@@ -12,6 +12,10 @@ export const SCHEDULE_LIST_WIDTH_STORAGE_KEY = "joko.scheduler.listWidth";
 export const SCHEDULE_COLLAPSED_GROUPS_STORAGE_KEY = "joko.scheduler.collapsedProjects";
 export const MODEL_PICKER_LAYOUT_STORAGE_KEY = "joko:model-picker-layout:v1";
 
+export interface ClientLayoutResetDetail {
+  waitUntil(placement: Promise<boolean>): void;
+}
+
 const CLIENT_LAYOUT_RESET_CHANNEL = "joko:client-layout-reset:v1";
 const CLIENT_LAYOUT_RESET_MESSAGE = "client-layout-reset";
 
@@ -55,7 +59,7 @@ export function layoutResetPersistsSessionSplit(search: string): boolean {
 }
 
 /** Reset view geometry only. Content, drafts, profiles, credentials and theme are untouched. */
-export function resetClientLayout(ownerId?: string, persistSplit = true): void {
+export function resetClientLayout(ownerId?: string, persistSplit = true): Promise<boolean> {
   if (ownerId !== undefined && ownerId.trim() !== "") writeSessionSplitLayout(ownerId, {}, persistSplit);
   try {
     for (const key of [
@@ -71,7 +75,11 @@ export function resetClientLayout(ownerId?: string, persistSplit = true): void {
     // Component-local fallbacks are reset by the event below.
   }
   setModelPickerLayout("original");
-  window.dispatchEvent(new CustomEvent(CLIENT_LAYOUT_RESET_EVENT));
+  const placements: Promise<boolean>[] = [];
+  window.dispatchEvent(new CustomEvent<ClientLayoutResetDetail>(CLIENT_LAYOUT_RESET_EVENT, {
+    detail: { waitUntil: (placement) => { placements.push(placement); } }
+  }));
+  return Promise.all(placements).then(results => results.every(Boolean));
 }
 
 function isClientLayoutResetMessage(value: unknown): boolean {
