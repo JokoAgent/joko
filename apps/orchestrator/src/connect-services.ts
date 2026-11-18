@@ -8012,7 +8012,9 @@ function projectPlacementSession(
 ): ProjectPlacementSessionSnapshot {
   const session = store.getSession(sessionId);
   const run = activeRun(store, sessionId);
-  const activity: ProjectPlacementSessionSnapshot["activity"] = run === undefined
+  const activity: ProjectPlacementSessionSnapshot["activity"] = store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
+    ? "closing"
+    : run === undefined
     ? "idle"
     : run.descriptor.state === "waiting"
       ? "waiting"

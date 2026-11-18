@@ -3962,7 +3962,7 @@ export function useAppController(): AppController {
     deleteTaskTag: (originSessionId, preview) => gateway().deleteTaskTag(originSessionId, preview),
     suggestSessionTitle: (sessionId, signal) => gateway().suggestSessionTitle(sessionId, signal),
     pinSession: (sessionId, pinned) => gateway().pinSession(sessionId, pinned),
-    archiveSession: (sessionId, archived, confirmation) => gateway().archiveSession(sessionId, archived, confirmation),
+    archiveSession: (sessionId, archived, confirmation, projectId) => gateway().archiveSession(sessionId, archived, confirmation, projectId),
     openSideChat: (...args) => gateway().openSideChat(...args),
     readSideChatOperation: (...args) => gateway().readSideChatOperation!(...args),
     getSessionWorktreeRemovalPreview: (sessionId, signal) => gateway().getSessionWorktreeRemovalPreview(sessionId, signal),

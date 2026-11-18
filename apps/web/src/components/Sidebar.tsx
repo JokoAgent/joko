@@ -834,7 +834,10 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const toggleAllVisibleGroups = (): void => {
     if (foldAction === "collapseGroups") {
       if (hasVisibleProjectOrDialogueGroups) {
-        props.onSidebarOwnerLayoutChange({ collapsedProjectIds: visibleProjectGroupIds, collapsedDialogue: visibleDialogueGrouped });
+        props.onSidebarOwnerLayoutChange({
+          collapsedProjectIds: [...new Set([...collapsedTargets, ...visibleProjectGroupIds])],
+          collapsedDialogue: sidebarLayout.collapsedDialogue || visibleDialogueGrouped
+        });
       }
       if (hasVisibleAutomationGroups) {
         setScheduleGroupFoldIntent((current) => ({ revision: (current?.revision ?? 0) + 1, collapsed: true }));
@@ -2157,6 +2160,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           environmentNameFor={environmentNameFor}
           sessionProfileId={props.machineControl?.activeProfile.id}
           {...callbacks}
+          onSelect={(session) => callbacks.onSelect(session)}
         /> : <ul className="sidebar-session-entry-list">{openRailProjectEntry.sessions.map((session) => <RemoteMachineSessionRow
           cache={openRailProjectEntry.cache}
           session={session}
@@ -3891,6 +3895,7 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
   const menuRef = useRef<HTMLDivElement>(null);
   const renameRef = useRef<HTMLInputElement>(null);
   const renameCommittedRef = useRef(false);
+  const restoreRenameFocusRef = useRef(false);
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState(target.name);
   const [menu, setMenu] = useState<{ readonly x: number; readonly y: number }>();
@@ -3903,9 +3908,14 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
   const activeSessionCount = sessions.filter((session) => session.state === "running" || session.state === "waiting" || session.state === "retrying").length;
 
   useLayoutEffect(() => {
-    if (!editing) return;
-    renameRef.current?.focus({ preventScroll: true });
-    renameRef.current?.select();
+    if (editing) {
+      renameRef.current?.focus({ preventScroll: true });
+      renameRef.current?.select();
+      return;
+    }
+    if (!restoreRenameFocusRef.current) return;
+    restoreRenameFocusRef.current = false;
+    moreRef.current?.focus({ preventScroll: true });
   }, [editing]);
   useEffect(() => {
     if (menu === undefined) return;
@@ -4010,6 +4020,7 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
           finishRename(true);
         } else if (event.key === "Escape") {
           event.preventDefault();
+          restoreRenameFocusRef.current = true;
           finishRename(false);
         }
       }}

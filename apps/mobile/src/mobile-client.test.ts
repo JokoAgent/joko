@@ -9287,6 +9287,34 @@ describe("mobile Home search and task mutations", () => {
     expect(saved.pending()).toEqual([]);
   });
 
+  it.each([true, false])("reports only an exact committed archive to the task page before refreshing (%s)", async committed => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const onConfirmed = vi.fn();
+    vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, mutation, state: OperationState.RUNNING
+    }));
+    vi.mocked(network.waitOperation).mockImplementationOnce(async (_credential, operationId) => {
+      expect(onConfirmed).not.toHaveBeenCalled();
+      const mutation = vi.mocked(network.submit).mock.calls[0]![2];
+      return create(OperationSchema, { operationId, connectionId: credential.connectionId, mutation,
+        state: committed ? OperationState.SUCCEEDED : OperationState.FAILED,
+        ...(committed ? { result: { payload: { case: "session", value: create(SessionSchema, { sessionId: "session", archived: true }) } } } : {}) });
+    });
+    vi.mocked(network.readOwner).mockImplementationOnce(async () => {
+      expect(onConfirmed).toHaveBeenCalledTimes(committed ? 1 : 0);
+      const next = clone(SnapshotSchema, snapshot);
+      next.sessions[0]!.archived = committed;
+      return { connection, device, snapshot: next };
+    });
+    const request = await app.prepareSessionArchive("session");
+    await expect(request.archive(onConfirmed)).resolves.toBe(committed);
+    expect(onConfirmed).toHaveBeenCalledTimes(committed ? 1 : 0);
+    expect(network.waitOperation).toHaveBeenCalledOnce();
+    expect(app.state.owner?.sessions[0]?.archived).toBe(committed);
+  });
+
   it("submits the current host task-tag operations and preserves exact deletion fences", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);

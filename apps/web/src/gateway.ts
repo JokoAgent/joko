@@ -2757,8 +2757,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "pinSession", value: { sessionId, pinned } });
   }
 
-  async archiveSession(sessionId: string, archived: boolean, archiveConfirmation = ""): Promise<void> {
-    await this.submit({ case: "archiveSession", value: { sessionId, archived, archiveConfirmation } });
+  async archiveSession(sessionId: string, archived: boolean, archiveConfirmation = "", projectId?: string): Promise<void> {
+    const payload: MutationPayload = { case: "archiveSession", value: { sessionId, archived, archiveConfirmation } };
+    if (projectId === undefined) {
+      await this.submit(payload);
+      return;
+    }
+    const scope = this.captureActionScope();
+    const session = this.#rawSnapshot?.sessions.find(candidate => candidate.sessionId === sessionId);
+    const revision = session?.version?.revision?.value;
+    if (session === undefined || session.projectId !== projectId || session.archived === archived || revision === undefined || revision < 1n) {
+      throw new GatewayError("The task changed since the project action started.");
+    }
+    await this.submit(payload, true, [{
+      entity: { kind: EntityKind.SESSION, id: sessionId },
+      expectedRevision: { value: revision }
+    }], scope.signal);
   }
 
   async moveSessionProject(

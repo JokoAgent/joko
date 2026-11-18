@@ -400,6 +400,7 @@ describe("Sidebar organizer display controls", () => {
     vi.useFakeTimers();
     const onPinTarget = vi.fn();
     const onNewDialogue = vi.fn();
+    const onNavigate = vi.fn();
     const pinnedTarget = { id: "pinned-target", backendId: "backend", name: "Pinned project", workspaceId: "workspace-pinned", revision: 1n, workspaceName: "Pinned project", trusted: true, pinned: true, archived: false } as const;
     const mainTarget = { id: "main-target", backendId: "backend", name: "Main project", workspaceId: "workspace-main", revision: 1n, workspaceName: "Main project", trusted: true, pinned: false, archived: false } as const;
     const pinnedTask = { ...session(), id: "pinned-task", name: "Pinned task", projectId: pinnedTarget.id, targetId: pinnedTarget.id, pinned: true, updatedAt: 30 };
@@ -416,7 +417,8 @@ describe("Sidebar organizer display controls", () => {
         sessions: [pinnedTask, mainTask, dialogueTask]
       },
       onPinTarget,
-      onNewDialogue
+      onNewDialogue,
+      onNavigate
     });
 
     const rail = required(rendered.container.querySelector<HTMLElement>(".sidebar__rail-view"));
@@ -448,7 +450,12 @@ describe("Sidebar organizer display controls", () => {
     mockRect(mainProject, 118, 170, 220, 32);
     await act(async () => mainProject.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 0 })));
     const projectTasks = required(document.body.querySelector<HTMLElement>(".sidebar-rail-panel[data-sidebar-rail-panel-level='2']"));
-    expect(projectTasks.querySelector("[data-session-id='main-task']")).not.toBeNull();
+    const mainTaskRow = required(projectTasks.querySelector<HTMLButtonElement>("button[data-session-id='main-task']"));
+    for (const modifiers of [{}, { ctrlKey: true }, { metaKey: true }, { shiftKey: true }]) {
+      onNavigate.mockClear();
+      await act(async () => mainTaskRow.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1, ...modifiers })));
+      expect(onNavigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: mainTask.id });
+    }
 
     await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
     expect(document.body.querySelector(".sidebar-rail-panel")).toBeNull();
@@ -560,6 +567,18 @@ describe("Sidebar organizer display controls", () => {
       return required(document.body.querySelector<HTMLElement>(".sidebar-project-actions-menu"));
     };
     let menu = await openMenu();
+    await act(async () => buttonWithText(menu, "projects.rename").click());
+    const cancelledRename = required(project.querySelector<HTMLInputElement>("[aria-label='projects.renameLabel']"));
+    expect(document.activeElement).toBe(cancelledRename);
+    await act(async () => {
+      setNativeValue(cancelledRename, "Discarded project name");
+      cancelledRename.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(onRenameTarget).toHaveBeenCalledExactlyOnceWith(target, "Renamed project");
+    expect(project.querySelector("[aria-label='projects.renameLabel']")).toBeNull();
+    expect(document.activeElement).toBe(required(project.querySelector("[aria-label='common.more']")));
+
+    menu = await openMenu();
     await act(async () => buttonWithText(menu, "workspace.browseFiles").click());
     expect(onNavigate).toHaveBeenLastCalledWith({ kind: "files", sessionId: "idle-task" });
 
@@ -676,6 +695,48 @@ describe("Sidebar organizer display controls", () => {
       }
     });
     expect(pinnedOnly.container.querySelector(".sidebar-list-settings__fold")).toBeNull();
+  });
+
+  it.each([true, false])("preserves hidden group preferences when folding a filtered list (collapsed=%s)", async (wasCollapsed) => {
+    const onOwnerLayoutChange = vi.fn();
+    const visible = { id: "visible", backendId: "backend", name: "Visible project", workspaceId: "visible-workspace", revision: 1n, workspaceName: "Visible", trusted: true, pinned: false, archived: false } as const;
+    const hidden = { ...visible, id: "hidden", name: "Hidden project", workspaceId: "hidden-workspace", workspaceName: "Hidden" };
+    const ownerLayout = {
+      ...DEFAULT_SIDEBAR_OWNER_LAYOUT,
+      projectFilter: [visible.id],
+      collapsedProjectIds: wasCollapsed ? [hidden.id] : [],
+      collapsedDialogue: wasCollapsed
+    };
+    const snapshot = {
+      ...emptySnapshot(),
+      revision: 1n,
+      targets: [visible, hidden],
+      sessions: [
+        { ...session(), id: "visible-task", projectId: visible.id, targetId: visible.id },
+        { ...session(), id: "hidden-task", projectId: hidden.id, targetId: hidden.id }
+      ]
+    };
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot,
+      sidebarOwnerLayouts: { owner: ownerLayout },
+      onSidebarOwnerLayoutChange: onOwnerLayoutChange
+    });
+    const groupHeaders = (container: HTMLElement): HTMLElement[] => [...container.querySelectorAll<HTMLElement>(".sidebar-main-view [data-project-header]")];
+    expect(groupHeaders(rendered.container).map((header) => header.getAttribute("aria-expanded"))).toEqual(["true"]);
+    const fold = required(rendered.container.querySelector<HTMLButtonElement>("[aria-label='nav.collapseAllGroups']"));
+    await act(async () => fold.click());
+    const change = onOwnerLayoutChange.mock.lastCall?.[0] as Partial<typeof ownerLayout>;
+    expect(change).toEqual({ collapsedProjectIds: [...ownerLayout.collapsedProjectIds, visible.id], collapsedDialogue: wasCollapsed });
+
+    const savedLayout = { owner: { ...ownerLayout, ...change, projectFilter: "all" as const } };
+    await rendered.rerenderOwnerLayouts(savedLayout);
+    const reopened = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), { snapshot, sidebarOwnerLayouts: savedLayout });
+    for (const view of [rendered, reopened]) {
+      const headers = groupHeaders(view.container);
+      expect(headers).toHaveLength(2);
+      expect(headers.find((header) => header.textContent?.includes(visible.name))?.getAttribute("aria-expanded")).toBe("false");
+      expect(headers.find((header) => header.textContent?.includes(hidden.name))?.getAttribute("aria-expanded")).toBe(String(!wasCollapsed));
+    }
   });
 
   it("applies project, backend, and activity filters only to the main list", async () => {

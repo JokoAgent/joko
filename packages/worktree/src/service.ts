@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { isWorktreeServiceError, WorktreeServiceError } from "./errors.js";
-import { runGit } from "./git.js";
+import { restoreMissingWorktreeBranch, runGit } from "./git.js";
 import { cleanCapturedIgnoredIncludes, copyWorktreeIncludeFiles, readWorktreeIncludeMatcher } from "./include-files.js";
 import { cancelWorktreeSourceUses, withWorktreeSourceLock } from "./source-use.js";
 import { deferRecycle, newRecyclePolicy, recycleFailureReason } from "./recycle-policy.js";
@@ -947,9 +947,8 @@ export class EphemeralWorktreeService {
       "REPOSITORY_UNSAFE",
       "The repository root is unavailable during worktree recovery."
     );
-    if (!(await branchExists(current.repositoryRoot, current.branch, control))) {
-      throw new WorktreeServiceError("SESSION_CONFLICT", "The preserved Session worktree branch is unavailable.");
-    }
+    const branchWasMissing = !(await branchExists(current.repositoryRoot, current.branch, control));
+    if (branchWasMissing) await this.#restoreArchivedBranch(current, control);
     if (current.archiveSnapshot !== undefined) await this.#assertRecordedBranchTip(current, control);
     if (current.status === "restored" && current.archiveSnapshot?.kind === "dirty"
       && current.pendingOwnerRefTransition === undefined
@@ -996,6 +995,9 @@ export class EphemeralWorktreeService {
     }
 
     const pathAvailable = await pathExists(current.path);
+    if (pathAvailable && branchWasMissing) {
+      throw new WorktreeServiceError("SESSION_CONFLICT", "The archived worktree path was occupied during branch recovery.");
+    }
     if (!pathAvailable && current.archiveSnapshot === undefined) {
       throw new WorktreeServiceError(
         "STATE_CORRUPT",
@@ -1033,6 +1035,9 @@ export class EphemeralWorktreeService {
       const attached = await attachedWorktreeBranch(current.path, control);
       if (attached !== current.branch) {
         throw new WorktreeServiceError("SESSION_CONFLICT", "The restored Session worktree branch does not match its owner record.");
+      }
+      if (branchWasMissing && await worktreeHeadCommit(current.path, control) !== current.archiveSnapshot?.branchHeadSha) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The restored Session worktree does not use the archived commit.");
       }
       if (current.status === "restored" && snapshotSha !== undefined
         && !(await this.#snapshotMatchesWorktree(current, snapshotSha, control))) {
@@ -1655,6 +1660,45 @@ export class EphemeralWorktreeService {
       (await runGit(["rev-parse", `${snapshotSha}^1`], entry.repositoryRoot, control)).stdout,
       "The worktree snapshot branch-tip identity is invalid."
     );
+  }
+
+  async #restoreArchivedBranch(entry: ManagedWorktreeEntry, control: WorktreeOperationControl): Promise<void> {
+    const snapshot = entry.archiveSnapshot;
+    if (!this.#recycle || entry.status !== "preserved" || snapshot?.kind !== "dirty" || entry.pendingOwnerRefTransition !== undefined
+      || entry.checkoutCleanup !== undefined || entry.deletionTransfer !== undefined) {
+      throw new WorktreeServiceError("SESSION_CONFLICT", "The preserved Session worktree branch is unavailable.");
+    }
+    const repository = await probeWorktreeCwd(entry.repositoryRoot, control);
+    if (repository.isLinkedWorktree || !samePath(repository.repositoryRoot, entry.repositoryRoot)) {
+      throw new WorktreeServiceError("SESSION_CONFLICT", "The archived worktree repository changed identity.");
+    }
+    const gitDirectory = repository.gitCommonDirectory;
+    const originalMetadata = await lstat(gitDirectory);
+    const assertVacantCheckout = async (): Promise<void> => {
+      await this.#validateManagedPath(entry, false);
+      if (await pathExists(entry.path)) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The archived worktree path was occupied during branch recovery.");
+      }
+      await validateOrdinaryDirectory(gitDirectory, "REPOSITORY_UNSAFE", "The archived worktree Git directory is unsafe.");
+      const metadata = await lstat(gitDirectory);
+      if (metadata.dev !== originalMetadata.dev || metadata.ino !== originalMetadata.ino) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The archived worktree Git directory changed during branch recovery.");
+      }
+      control.check();
+    };
+    await assertVacantCheckout();
+    if (await this.#snapshotSha(entry, control) !== snapshot.sha) {
+      throw new WorktreeServiceError("SESSION_CONFLICT", "The archived worktree no longer owns its exact recovery snapshot.");
+    }
+    await this.#assertSnapshotMatchesRecordedBranchTip(entry, snapshot.sha, control);
+    await this.#snapshotContentIdentity(entry, snapshot.sha, control);
+    await restoreMissingWorktreeBranch(entry.repositoryRoot, {
+      gitDirectory,
+      branchRef: `refs/heads/${entry.branch}`,
+      head: snapshot.branchHeadSha,
+      snapshotRef: snapshotRefFor(entry.sessionId),
+      snapshotSha: snapshot.sha
+    }, control, assertVacantCheckout);
   }
 
   async #assertRecordedBranchTip(

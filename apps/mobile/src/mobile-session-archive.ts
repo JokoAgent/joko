@@ -13,7 +13,7 @@ const copy = {
 
 /** Both task-list and header actions use the original preview and mutation owner. */
 export async function archiveMobileSession(client: MobileClient, sessionId: string, locale: MobileSupportedLocale,
-  isCurrent: () => boolean = () => true): Promise<boolean> {
+  isCurrent: () => boolean = () => true, onConfirmed?: () => void): Promise<boolean> {
   const request = await client.prepareSessionArchive(sessionId);
   if (!isCurrent()) return false;
   const { preview } = request;
@@ -27,5 +27,5 @@ export async function archiveMobileSession(client: MobileClient, sessionId: stri
     ], { cancelable: true, onDismiss: () => resolve(false) }));
     if (!confirmed || !isCurrent()) return false;
   }
-  return request.archive();
+  return request.archive(onConfirmed);
 }

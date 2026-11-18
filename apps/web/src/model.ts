@@ -6360,7 +6360,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   deleteTaskTag(originSessionId: string, preview: TaskTagDeletePreviewView): Promise<void>;
   suggestSessionTitle(sessionId: string, signal?: AbortSignal): Promise<SessionTitleSuggestionView>;
   pinSession(sessionId: string, pinned: boolean): Promise<void>;
-  archiveSession(sessionId: string, archived: boolean, archiveConfirmation?: string): Promise<void>;
+  archiveSession(sessionId: string, archived: boolean, archiveConfirmation?: string, projectId?: string): Promise<void>;
   openSideChat(sessionId: string, expectedGeneration: bigint, options?: {
     readonly operationId?: string; readonly signal?: AbortSignal; readonly beforeDispatch?: (operationId: string) => Promise<void>;
   }): Promise<string>;
