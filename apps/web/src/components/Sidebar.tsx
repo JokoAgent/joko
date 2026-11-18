@@ -420,8 +420,6 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const [activeSearchOption, setActiveSearchOption] = useState(-1);
   const [expandedSearchSessions, setExpandedSearchSessions] = useState<ReadonlySet<string>>(() => new Set());
   const messageSearchGenerationRef = useRef(0);
-  const semanticSearchStartedGenerationRef = useRef(0);
-  const keywordSearchSucceededGenerationRef = useRef(0);
   const remoteMessageSearchGenerationRef = useRef(0);
   const searchFilterRef = useRef<HTMLDetailsElement>(null);
   const sessionListRef = useRef<HTMLElement>(null);
@@ -923,8 +921,6 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
   useEffect(() => {
     const generation = ++messageSearchGenerationRef.current;
-    semanticSearchStartedGenerationRef.current = 0;
-    keywordSearchSucceededGenerationRef.current = 0;
     setMessageSearchError(undefined);
     if (normalizedQuery === "" || !currentMachineIncluded) {
       setMessageMatches([]);
@@ -945,49 +941,26 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               - MESSAGE_SEARCH_ACTIVITY_DAYS[messageSearchLastActivity] * MESSAGE_SEARCH_DAY_MS
           })
     };
-    const keywordTimer = setTimeout(() => {
-      void searchMessagesRef.current(query.trim(), "keyword", searchFilters, abort.signal).then((matches) => {
+    let hybridSucceeded = false;
+    const failedStages = new Set<"keyword" | "hybrid">();
+    const searchStage = (mode: "keyword" | "hybrid"): void => {
+      void searchMessagesRef.current(query.trim(), mode, searchFilters, abort.signal).then((matches) => {
         if (messageSearchGenerationRef.current !== generation) return;
-        keywordSearchSucceededGenerationRef.current = generation;
-        if (semanticSearchStartedGenerationRef.current === generation) {
-          // Once hybrid owns the local refresh, a late keyword page only
-          // proves the fast stage succeeded; keep the current local
-          // page and uses keyword solely for remote fanout in this race.
-          setMessageSearchLoading(false);
-          setMessageSearchError(undefined);
-          return;
-        }
+        if (mode === "keyword" && hybridSucceeded) return;
+        if (mode === "hybrid") hybridSucceeded = true;
         setMessageMatches(matches);
         setMessageSearchLoading(false);
         setMessageSearchError(undefined);
       }).catch((error: unknown) => {
-        if (messageSearchWasAborted(abort.signal, error)) return;
-        if (messageSearchGenerationRef.current !== generation) return;
-        if (semanticSearchStartedGenerationRef.current === generation) return;
-        setMessageMatches([]);
+        if (messageSearchGenerationRef.current !== generation || messageSearchWasAborted(abort.signal, error)) return;
+        failedStages.add(mode);
+        if (failedStages.size < 2) return;
         setMessageSearchLoading(false);
         setMessageSearchError(t("nav.messageSearchFailed"));
       });
-    }, CONVERSATION_KEYWORD_DEBOUNCE_MS);
-    const hybridTimer = setTimeout(() => {
-      semanticSearchStartedGenerationRef.current = generation;
-      void searchMessagesRef.current(query.trim(), "hybrid", searchFilters, abort.signal).then((matches) => {
-        if (messageSearchGenerationRef.current !== generation) return;
-        setMessageMatches(matches);
-        setMessageSearchLoading(false);
-        setMessageSearchError(undefined);
-      }).catch((error: unknown) => {
-        if (messageSearchWasAborted(abort.signal, error)) return;
-        if (messageSearchGenerationRef.current !== generation) return;
-        semanticSearchStartedGenerationRef.current = 0;
-        // Keep an already-visible keyword page when semantic refresh
-        // fails. Only surface an error if neither stage produced results.
-        if (keywordSearchSucceededGenerationRef.current === generation) return;
-        setMessageMatches([]);
-        setMessageSearchLoading(false);
-        setMessageSearchError(t("nav.messageSearchFailed"));
-      });
-    }, CONVERSATION_HYBRID_DEBOUNCE_MS);
+    };
+    const keywordTimer = setTimeout(() => searchStage("keyword"), CONVERSATION_KEYWORD_DEBOUNCE_MS);
+    const hybridTimer = setTimeout(() => searchStage("hybrid"), CONVERSATION_HYBRID_DEBOUNCE_MS);
     return () => {
       clearTimeout(keywordTimer);
       clearTimeout(hybridTimer);
@@ -2434,14 +2407,16 @@ export function projectRemoteMachineSearchResults(
     const cachedSession = cache?.serverId === trustedServerId
       ? cache.sessions.find((session) => session.id === contentMatch.match.sessionId)
       : undefined;
-    const session: MachineSessionCacheView = previous?.session ?? cachedSession ?? {
+    if (cachedSession !== undefined && !remoteSessionMatchesSidebarStatus(cachedSession, filters.status)) continue;
+    const activityAt = cachedSession?.lastActivityAt ?? Math.max(previous?.activityAt ?? Number.NEGATIVE_INFINITY, contentMatch.match.createdAt);
+    const session: MachineSessionCacheView = cachedSession ?? {
       id: contentMatch.match.sessionId,
       name: contentMatch.match.sessionId,
       state: "idle",
       pinned: false,
       archived: filters.status === "archived",
       taskTags: [],
-      lastActivityAt: contentMatch.match.createdAt
+      lastActivityAt: activityAt
     };
     const hits = [...(previous?.hits ?? []), contentMatch.match]
       .sort((left, right) => right.score - left.score || right.createdAt - left.createdAt || left.eventId.localeCompare(right.eventId));
@@ -2457,7 +2432,7 @@ export function projectRemoteMachineSearchResults(
       hits,
       relevance: previous?.relevance ?? 1,
       score: Math.max(previous?.score ?? Number.NEGATIVE_INFINITY, contentMatch.match.score),
-      activityAt: Math.max(previous?.activityAt ?? Number.NEGATIVE_INFINITY, contentMatch.match.createdAt)
+      activityAt
     });
   }
 

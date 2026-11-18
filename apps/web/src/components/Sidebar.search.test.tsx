@@ -176,6 +176,50 @@ describe("Sidebar progressive conversation search", () => {
     expect(container.textContent).not.toContain("nav.messageSearchFailed");
   });
 
+  it.each([false, true])("keeps the late local keyword page when hybrid fails (failure arrives first: %s)", async (failureFirst) => {
+    vi.useFakeTimers();
+    const keyword = deferred<readonly SessionMessageSearchMatchView[]>();
+    const hybrid = deferred<void>();
+    const { container } = await renderSidebar((_query, mode) => mode === "keyword" ? keyword.promise : hybrid.promise.then(() => {
+      throw new Error("The result page expired");
+    }));
+    await enterQuery(container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(900));
+    if (failureFirst) {
+      await act(async () => hybrid.resolve(undefined));
+      expect(container.textContent).toContain("nav.searchingMessages");
+    }
+    await act(async () => keyword.resolve([hit("local late keyword needle", "late-keyword")]));
+    expect(container.textContent).toContain("local late keyword needle");
+    if (!failureFirst) await act(async () => hybrid.resolve(undefined));
+    expect(container.textContent).toContain("local late keyword needle");
+    expect(container.textContent).not.toContain("nav.messageSearchFailed");
+  });
+
+  it("keeps a completed hybrid page when an older local keyword request returns", async () => {
+    vi.useFakeTimers();
+    const keyword = deferred<readonly SessionMessageSearchMatchView[]>();
+    const { container } = await renderSidebar((_query, mode) => mode === "keyword"
+      ? keyword.promise : Promise.resolve([hit("local completed hybrid needle", "hybrid")]));
+    await enterQuery(container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(900));
+    await act(async () => keyword.resolve([hit("local late keyword needle", "late-keyword")]));
+    expect(container.textContent).toContain("local completed hybrid needle");
+    expect(container.textContent).not.toContain("local late keyword needle");
+  });
+
+  it("reports a local search failure after both search stages fail", async () => {
+    vi.useFakeTimers();
+    const { container } = await renderSidebar(async () => { throw new Error("Search stage unavailable"); });
+    await enterQuery(container, "needle");
+    await act(async () => vi.advanceTimersByTimeAsync(250));
+    expect(container.textContent).toContain("nav.searchingMessages");
+    expect(container.textContent).not.toContain("nav.messageSearchFailed");
+    await act(async () => vi.advanceTimersByTimeAsync(650));
+    expect(container.textContent).toContain("nav.messageSearchFailed");
+    expect(container.textContent).not.toContain("nav.searchingMessages");
+  });
+
   it("sends one stable typed filter snapshot to both stages and restarts when a filter changes", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-24T12:00:00.000Z"));

@@ -113,6 +113,43 @@ describe("remote machine sidebar search", () => {
     })]);
   });
 
+  it("sorts live remote content by the current task activity shown in its cached row", () => {
+    const east = caches[0]!;
+    const first = { ...east.sessions[0]!, id: "first", name: "First task", lastActivityAt: now - 1_000 };
+    const second = { ...first, id: "second", name: "Second task", lastActivityAt: now - 2_000 };
+    const earlier = liveMatch("east", "server-east", first.id, "earlier", "earlier needle");
+    const later = liveMatch("east", "server-east", second.id, "later", "later needle");
+    const messageMatches = [
+      { ...earlier, match: { ...earlier.match, createdAt: now - 5_000 } },
+      { ...later, match: { ...later.match, createdAt: now - 3_000 } }
+    ];
+    const cache = [{ ...east, sessions: [first, second] }];
+    const project = (sort: "activityAsc" | "activityDesc") => projectRemoteMachineSearchResults(
+      cache, { east: "online" }, "needle", filters({ sort, messageMatches }), now);
+    expect(project("activityDesc").map(({ session, activityAt }) => [session.id, activityAt])).toEqual([
+      [first.id, first.lastActivityAt], [second.id, second.lastActivityAt]
+    ]);
+    expect(project("activityAsc").map(({ session }) => session.id)).toEqual([second.id, first.id]);
+  });
+
+  it("revalidates remote body hits against archive and restore without another search page", () => {
+    const east = caches[0]!;
+    const task = east.sessions[0]!;
+    const messageMatches = [liveMatch("east", "server-east", task.id, "body", "remote needle")];
+    for (const archived of [false, true]) {
+      const current = [{ ...east, sessions: [{ ...task, archived }] }];
+      const project = (status: "active" | "archived" | "all") => projectRemoteMachineSearchResults(
+        current, { east: "online" }, "needle", filters({ status, messageMatches }), now);
+      expect(project(archived ? "active" : "archived")).toHaveLength(0);
+      for (const status of [archived ? "archived" : "active", "all"] as const) {
+        expect(project(status)).toEqual([expect.objectContaining({
+          session: expect.objectContaining({ id: task.id, archived }),
+          hits: [expect.objectContaining({ eventId: "body" })]
+        })]);
+      }
+    }
+  });
+
   it("applies filters before one global 24-task cap across local and remote profiles", () => {
     const local = Array.from({ length: 16 }, (_, index) => localResult(`local-${index}`, now - index));
     const remoteCaches: readonly MachineCacheView[] = [{
