@@ -848,8 +848,9 @@ it.each(["remote task", "machine menu"] as const)("keeps the old qualified route
     return { serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: false };
   });
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _authKey, callbacks) => ({
-    connect: async () => {
-      const primaryConnection = callbacks.onState !== undefined && callbacks.onLiveSnapshot === undefined;
+    connect: async (options?: Parameters<OrchestratorGateway["connect"]>[0]) => {
+      const primaryConnection = options?.snapshotOnly !== true
+        && callbacks.onState !== undefined && callbacks.onLiveSnapshot === undefined;
       if (primaryConnection) requests.push(owner!.id);
       if (primaryConnection && owner!.id === second.id) await connectGate;
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
@@ -867,6 +868,7 @@ it.each(["remote task", "machine menu"] as const)("keeps the old qualified route
   await act(async () => current.connect(first));
   await act(async () => current.navigate(firstRoute, { replace: true }));
   expect(current.state.route).toEqual(firstRoute);
+  expect(requests).toEqual([first.id]);
   requests.length = 0;
 
   let pending!: Promise<void>;
@@ -893,7 +895,7 @@ it.each(["remote task", "machine menu"] as const)("keeps the old qualified route
     ...(entry === "remote task" ? { sessionId: "destination-task" } : {}) }));
   expect(current.state.activeProfile?.id).toBe(second.id);
   expect(current.isMachineRouteHandoffPending?.()).toBe(false);
-  expect(requests).not.toContain(first.id);
+  expect(requests).toEqual([second.id]);
 });
 
 function profile(id: string): ConnectionProfile { return { id, deviceId: `device-${id}`, name: id, origin: `https://${id}.example`, serverId: `server-${id}` }; }
