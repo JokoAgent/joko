@@ -83,6 +83,9 @@ import { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { SessionContextBudgetCoordinator } from "./session-context-budget.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
+import { ConnectionManager } from "./connection-manager.js";
+import { CredentialVault } from "./credential-vault.js";
+import { MobilePushCoordinator, type MobilePushDeliveryInput } from "./mobile-push.js";
 import { ObjectiveManager } from "./objective-manager.js";
 import {
   createPortableSessionManifest,
@@ -94,6 +97,7 @@ import {
   encodePortableSessionProjection
 } from "./portable-session-projection.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
+import { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
 import type { ScheduleScriptInput, ScheduleScriptCapabilityContext } from "./schedule-script-runner.js";
 import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture, type PartnerLearningHostPort } from "./session-host.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
@@ -9952,6 +9956,72 @@ describe("SessionHost", () => {
     } });
   });
 
+  it("delivers an explicitly requested successful Schedule notice without publishing ordinary task attention", async () => {
+    let notifications!: ScheduleRunNotificationController;
+    let connections!: ConnectionManager;
+    class ScheduleAdapter extends FakeBackendAdapter {
+      override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+        if (input.text !== "default silence") notifications.notify({ sessionId: context.sessionId, targetId: context.target.id });
+        return super.send(input, context);
+      }
+    }
+    const fixture = await createFixture(new ScheduleAdapter(PI_LIKE_PROFILE), {
+      createScheduleRunNotifications: store => {
+        connections = new ConnectionManager(store);
+        notifications = new ScheduleRunNotificationController(store, sessionId => !connections.taskActivity.hasRemoteTaskView(sessionId));
+        return notifications;
+      }
+    });
+    const { store, host } = fixture;
+    const phone = store.createConnection({ id: "schedule-notice-phone", name: "Phone", authKeyDigest: "schedule-notice-digest",
+      device: { defaultName: "Phone", kind: "mobile", platform: "ios", appVersion: "1.0.0" } });
+    const sent: MobilePushDeliveryInput[] = [];
+    const push = new MobilePushCoordinator({ store, serverId: "schedule-notice-node", vault: await CredentialVault.open(join(fixture.directory, "push.key")),
+      provider: { send: async input => { sent.push(input); return { outcome: "delivered", code: "APNS_200" }; } } });
+    cleanups.push(() => push.close());
+    push.register({ connectionId: phone.id, deviceId: phone.deviceId, expectedDeviceRevision: store.getDevice(phone.deviceId).revision,
+      environment: "apns_sandbox", locale: "en", deviceToken: "schedule-test-device", registrationId: "schedule-test-registration", revocationSecret: "s".repeat(43) });
+    push.start();
+    const sessionId = (await host.createSession({ operationId: "create-schedule-notice-task", connection: fixture.connection, targetId: "target-one",
+      title: "Scheduled task", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+    const run = async (text: string, desktop = true) => {
+      const id = text.replaceAll(" ", "-");
+      const schedule = store.upsertSchedule({ id: `notification-${id}`, backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+        name: text, kind: "manual", timezone: "UTC", enabled: true,
+        prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT,
+          scheduler: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT.scheduler, silentWhenIdle: true, notify: { desktop } } },
+        overlapPolicy: "queue", misfirePolicy: "run_once" });
+      const admitted = host.enqueueScheduledInput({ operationId: `send-${id}`, schedule, sessionId, scheduledAt: Date.now() }).value;
+      await eventually(() => store.getRun(admitted.runId).descriptor.state === "completed"
+        && store.getQueueItem(admitted.queueItemId).state === "completed");
+      expect(store.findSessionAttention(sessionId)?.kind).not.toBe("done");
+      return admitted.runId;
+    };
+    const silent = await run("default silence");
+    expect(store.findScheduleRunByRunId(silent)?.readAt).toEqual(expect.any(Number));
+    expect(store.listMobilePushDeliveries()).toEqual([]);
+    const explicit = await run("private scheduled reply");
+    await eventually(() => store.listMobilePushDeliveries()[0]?.status === "delivered");
+    expect(store.findScheduleRunByRunId(explicit)?.readAt).toBeUndefined();
+    const reply = store.listEvents({ sessionId }).find(event => event.runId === explicit && event.payload.type === "message_complete" && event.payload.role === "assistant");
+    expect(reply).toBeDefined();
+    expect(store.listMobilePushDeliveries()).toEqual([expect.objectContaining({ sessionId, kind: "done", messageEventId: reply!.id })]);
+    expect(sent[0]).toMatchObject({ kind: "done", intent: expect.stringContaining(`joko://task/${encodeURIComponent(sessionId)}?message=`) });
+    expect(JSON.stringify(sent[0])).not.toContain("private scheduled reply");
+    store.updateRunState({ runId: explicit, state: "completed", traceId: "repeat-mobile-schedule-settlement", suppressTerminalAttention: true, notifyScheduleRunMobile: true });
+
+    await run("delivery disabled", false);
+    const release = connections.taskActivity.open(phone, [sessionId]);
+    try {
+      expect(connections.taskActivity.hasRemoteTaskView(sessionId)).toBe(true);
+      await run("already being read");
+    } finally { release(); }
+    expect(connections.taskActivity.hasRemoteTaskView(sessionId)).toBe(false);
+    expect(store.listMobilePushDeliveries()).toHaveLength(1);
+    expect(sent).toHaveLength(1);
+  });
+
   it("clears a legacy consumed one-shot at scheduler startup only while its admission still owns the revision", async () => {
     const fixture = await createFixture();
     const sessionId = (await fixture.host.createSession({
@@ -18289,6 +18359,7 @@ async function createFixture(
     readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
     readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly sessionId?: string }) => number | undefined;
     readonly resolveMcpAppModelContext?: (sessionId: string) => Promise<import("./mcp-apps/host.js").McpAppModelContext>;
+    readonly createScheduleRunNotifications?: (store: OperationalStore) => ScheduleRunNotificationController;
     readonly onBackendMayBeIdle?: (backendId: string) => void;
     readonly onServiceRunSettled?: (input: {
       readonly sessionId: string;
@@ -18311,8 +18382,11 @@ async function createFixture(
   const repository = new OperationalArtifactRepository(store);
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository, ingestRoots: [directory] });
   await artifacts.initialize();
-  const { additionalAdapters = [], ...sessionHostOptions } = hostOptions;
-  const host = new SessionHost(store, artifacts, [adapter, ...additionalAdapters], sessionHostOptions);
+  const { additionalAdapters = [], createScheduleRunNotifications, ...sessionHostOptions } = hostOptions;
+  const host = new SessionHost(store, artifacts, [adapter, ...additionalAdapters], {
+    ...sessionHostOptions,
+    ...(createScheduleRunNotifications === undefined ? {} : { scheduleRunNotifications: createScheduleRunNotifications(store) })
+  });
   await host.initialize();
   await host.registerTarget({
     id: "target-one",

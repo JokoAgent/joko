@@ -1,5 +1,6 @@
 import type { OperationalStore, ScheduleRecord } from "@joko/store";
 
+import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 import { scheduleExtensionSnapshot } from "./schedule-extensions.js";
 import { persistSessionTaskActivity } from "./session-task-activity.js";
 
@@ -13,10 +14,12 @@ const ACTIVE_RUN_SCAN_PAGE_SIZE = 10_000;
  */
 export class ScheduleRunNotificationController {
   readonly #store: OperationalStore;
+  readonly #canNotifyMobile: (sessionId: string) => boolean;
   readonly #overrides = new Map<string, "silent" | "notify">();
 
-  constructor(store: OperationalStore) {
+  constructor(store: OperationalStore, canNotifyMobile: (sessionId: string) => boolean = () => true) {
     this.#store = store;
+    this.#canNotifyMobile = canNotifyMobile;
   }
 
   silence(input: {
@@ -43,18 +46,26 @@ export class ScheduleRunNotificationController {
   settle(runId: string, state: ScheduleRunTerminalState): {
     readonly suppressAttention: boolean;
     readonly markHistoryRead: boolean;
+    readonly notifyMobile?: true;
   } {
     const override = this.#overrides.get(runId);
     this.#overrides.delete(runId);
-    const finish = (suppressAttention: boolean, markHistoryRead: boolean) => {
+    const finish = (suppressAttention: boolean, markHistoryRead: boolean, notifyMobile = false) => {
       const run = this.#store.findRun(runId);
       if (run) persistSessionTaskActivity(this.#store, run.descriptor.sessionId, { runId, silent: state === "completed" && markHistoryRead });
-      return { suppressAttention, markHistoryRead };
+      return { suppressAttention, markHistoryRead, ...(notifyMobile && run && this.#canNotifyMobile(run.descriptor.sessionId) ? { notifyMobile: true as const } : {}) };
     };
     if (state !== "completed") return finish(false, false);
-    if (override === "notify") return finish(true, false);
     if (override === "silent") return finish(true, true);
     const schedule = this.#findScheduleForRun(runId);
+    if (override === "notify") {
+      let notifyMobile = false;
+      if (schedule && schedule.sessionMode !== "fresh" && !isPartnerRoutineSchedule(schedule)) {
+        try { notifyMobile = scheduleExtensionSnapshot(schedule.executionSnapshot).notify.desktop; }
+        catch { /* An unread history occurrence still records the explicit request. */ }
+      }
+      return finish(true, false, notifyMobile);
+    }
     if (schedule === undefined) return finish(false, false);
     try {
       return finish(true, scheduleExtensionSnapshot(schedule.executionSnapshot).silentWhenIdle);

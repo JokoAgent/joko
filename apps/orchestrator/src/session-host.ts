@@ -17127,6 +17127,7 @@ export class SessionHost {
         ...(scheduleAttention?.suppressAttention === true ? { suppressTerminalAttention: true } : {}),
         ...(groupRecovery ? { holdTerminalAttention: true } : {}),
         ...(scheduleAttention?.markHistoryRead === true ? { markScheduleRunRead: true } : {}),
+        ...(scheduleAttention?.notifyMobile === true ? { notifyScheduleRunMobile: true } : {}),
         traceId: `settled:${run.descriptor.id}`
       };
       const settleInput = (store: OperationalStore): void => {
@@ -17871,6 +17872,7 @@ export class SessionHost {
           ...(error === undefined ? {} : { error }),
           ...(scheduleAttention?.suppressAttention === true ? { suppressTerminalAttention: true } : {}),
           ...(scheduleAttention?.markHistoryRead === true ? { markScheduleRunRead: true } : {}),
+          ...(scheduleAttention?.notifyMobile === true ? { notifyScheduleRunMobile: true } : {}),
           traceId: `native-recovery:${recovered.baseline.runId}:${state}`,
           operationId: recovered.baseline.operationId
         });

@@ -2254,6 +2254,8 @@ export interface UpdateRunStateInput {
   readonly holdTerminalAttention?: boolean;
   /** A successful Scheduler run declared no user-visible result and is born read. */
   readonly markScheduleRunRead?: boolean;
+  /** The Schedule owner explicitly requested a Mobile notice for this successful occurrence. */
+  readonly notifyScheduleRunMobile?: boolean;
 }
 
 export interface UpdateQueueStateInput {

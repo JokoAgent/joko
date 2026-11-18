@@ -491,6 +491,7 @@ describe("SchedulerToolBridgeProvider", () => {
       prompt: "inspect",
       kind: "manual",
       bindToCurrentSession: true,
+      notify: { desktop: true },
       silentWhenIdle: true
     })) as Record<string, unknown>;
     const scheduleId = String(created["id"]);
@@ -510,7 +511,8 @@ describe("SchedulerToolBridgeProvider", () => {
     });
     expect(runNotifications.settle("run-live-1", "completed")).toEqual({
       suppressAttention: true,
-      markHistoryRead: false
+      markHistoryRead: false,
+      notifyMobile: true
     });
     store.updateRunState({ runId: "run-live-1", state: "completed", traceId: "test:completed:1" });
 

@@ -9799,6 +9799,10 @@ export class OperationalStore {
       if (input.suppressTerminalAttention === true && input.state !== "completed") {
         throw new StoreError("Only successful terminal Run attention can be suppressed.");
       }
+      if (input.notifyScheduleRunMobile === true && (current.descriptor.source !== "schedule" || input.state !== "completed"
+        || input.suppressTerminalAttention !== true || input.markScheduleRunRead === true)) {
+        throw new StoreError("A Mobile Schedule notice requires an unread successful Scheduler Run.");
+      }
       if (input.holdTerminalAttention === true && input.state !== "failed") throw new StoreError("Only a failed Run recovery may hold terminal attention.");
       if (
         input.markScheduleRunRead === true
@@ -9902,6 +9906,15 @@ export class OperationalStore {
             `${input.traceId}:attention-suppressed`,
             input.operationId
           );
+          if (input.notifyScheduleRunMobile === true && !session.descriptor.archived && session.descriptor.deletedAt === undefined
+            && session.descriptor.remoteWorkspace === undefined && this.findScheduleRunByRunId(input.runId)?.sessionId === session.descriptor.id) {
+            const target = this.getTarget(session.descriptor.targetId).descriptor;
+            if (target.trusted && target.remoteWorkspace === undefined) {
+              this.enqueueMobilePushDeliveries(session, {
+                kind: "done", subjectCursor: sourceEvent.globalCursor, subjectGeneration: sourceEvent.generation
+              }, sourceEvent.emittedAt, input.runId);
+            }
+          }
         } else {
           this.recordTerminalSessionAttention(
             session,
@@ -14973,13 +14986,15 @@ export class OperationalStore {
    * surrounding Store transaction commits. */
   private enqueueMobilePushDeliveries(
     session: StoredSession,
-    attention: SessionAttentionRecord,
-    at: number
+    attention: Pick<SessionAttentionRecord, "kind" | "subjectCursor" | "subjectGeneration">,
+    at: number,
+    runId?: string
   ): void {
     if (session.descriptor.hidden || this.suppressSessionNotifications?.(session.descriptor.id) === true) return;
     const message = this.latestMobilePushMessageOrigin(
       session.descriptor.id,
-      attention.subjectCursor
+      attention.subjectCursor,
+      runId
     );
     const registrations = this.database.prepare(`
       SELECT registration.id
@@ -15022,7 +15037,8 @@ export class OperationalStore {
 
   private latestMobilePushMessageOrigin(
     sessionId: string,
-    throughCursor: bigint
+    throughCursor: bigint,
+    runId: string | undefined
   ): { readonly messageId: string; readonly eventId: string } | undefined {
     const nativeVisibility = this.nativeMessageSearchVisibility(
       { kind: "session", id: sessionId },
@@ -15035,6 +15051,7 @@ export class OperationalStore {
       LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
       WHERE event.session_id = ?
         AND event.global_cursor <= ?
+        AND (? IS NULL OR event.run_id = ?)
         AND tombstone.event_id IS NULL
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
@@ -15047,7 +15064,9 @@ export class OperationalStore {
     `).get(
       ...nativeVisibility.params,
       sessionId,
-      asSqlInteger(throughCursor)
+      asSqlInteger(throughCursor),
+      runId ?? null,
+      runId ?? null
     ) as Row | undefined;
     if (row === undefined) return undefined;
     const event = eventFromRow(row);

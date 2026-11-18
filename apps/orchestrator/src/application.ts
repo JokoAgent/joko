@@ -1310,7 +1310,8 @@ export async function createOrchestratorApplication(
         return adapter === undefined ? [] : [adapter];
       }) })
   });
-  const scheduleRunNotifications = new ScheduleRunNotificationController(store);
+  const scheduleRunNotifications = new ScheduleRunNotificationController(store, sessionId =>
+    partnerStore.getSessionLink(sessionId) === undefined && !connections.taskActivity.hasRemoteTaskView(sessionId));
   let schedulerForBridgeTools: ScheduleCoordinator | undefined;
   const unregisterSchedulerBridgeTools = mcpRouter.registerBridgeToolProvider(
     new SchedulerToolBridgeProvider({

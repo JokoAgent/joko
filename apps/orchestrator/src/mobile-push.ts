@@ -147,7 +147,9 @@ export class MobilePushCoordinator {
     if (this.#provider === undefined) return;
     this.#store.recoverInterruptedMobilePushDeliveries(this.#now());
     this.#unsubscribe = this.#store.subscribe((event) => {
-      if (event.payload.type === "session_attention" && event.payload.unread) this.wake();
+      if ((event.payload.type === "session_attention" && event.payload.unread)
+        || (event.payload.type === "run_state" && event.payload.state === "completed" && event.runId !== undefined
+          && this.#store.findRun(event.runId)?.descriptor.source === "schedule")) this.wake();
     });
     this.wake();
   }
