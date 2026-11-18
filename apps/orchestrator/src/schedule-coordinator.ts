@@ -146,6 +146,7 @@ export class ScheduleCoordinator {
 
   start(): void {
     if (this.#timer !== undefined) return;
+    this.#store.reconcileConsumedOneShotSchedules();
     this.connectRunLifecycle();
     this.observeAdmittedRuns();
     this.#recovery.start();
@@ -771,7 +772,8 @@ export class ScheduleCoordinator {
       schedule,
       sessionId,
       scheduledAt,
-      ...(nextRunAt === undefined ? {} : { nextRunAt })
+      // The admitted Run consumes a one-shot, even when Run Now fired it early.
+      ...(schedule.kind === "one_shot" || nextRunAt === undefined ? {} : { nextRunAt })
     }); } catch (error) { this.#admittedRuns.delete(runId); throw error; }
     return { runId: queued.value.runId, sessionId, status: "queued" };
   }

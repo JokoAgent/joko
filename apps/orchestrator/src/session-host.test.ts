@@ -9952,6 +9952,46 @@ describe("SessionHost", () => {
     } });
   });
 
+  it("clears a legacy consumed one-shot at scheduler startup only while its admission still owns the revision", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "legacy-one-shot-task", connection: fixture.connection, targetId: "target-one",
+      title: "Legacy one-shot", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const firedAt = Date.now();
+    const nextRunAt = firedAt + 60_000;
+    const seedLegacyAdmission = async (id: string) => {
+      const schedule = fixture.store.upsertSchedule({
+        id, backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+        name: id, kind: "one_shot", timezone: "UTC", enabled: true, nextRunAt,
+        prompt: { text: `Original ${id}`, images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once"
+      });
+      // Exercise the original atomic Agent admission with the previously retained time.
+      const admitted = fixture.host.enqueueScheduledInput({
+        operationId: `manual-schedule-${id}`, schedule, sessionId, scheduledAt: firedAt, nextRunAt
+      });
+      await eventually(() => fixture.store.findScheduleRunByRunId(admitted.value.runId)?.status === "success");
+      const retained = fixture.store.getSchedule(id);
+      expect(retained).toMatchObject({ enabled: false, nextRunAt, lastRunAt: firedAt, revision: admitted.operation.revision });
+      return { retained, runId: admitted.value.runId };
+    };
+    const consumed = await seedLegacyAdmission("legacy-consumed-once");
+    const edited = await seedLegacyAdmission("legacy-consumed-then-edited");
+    const paused = fixture.store.upsertSchedule({ ...edited.retained, name: "A newly edited paused plan",
+      expectedRevision: edited.retained.revision });
+
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => firedAt });
+    cleanups.push(() => scheduler.stop());
+    scheduler.start();
+
+    expect(fixture.store.getSchedule(consumed.retained.id)).toMatchObject({ enabled: false, lastRunAt: firedAt });
+    expect(fixture.store.getSchedule(consumed.retained.id).nextRunAt).toBeUndefined();
+    expect(fixture.store.findScheduleRunByRunId(consumed.runId)).toMatchObject({ status: "success", firedAt });
+    expect(fixture.store.getSchedule(paused.id)).toMatchObject({ enabled: false, nextRunAt, revision: paused.revision });
+    expect(fixture.store.findScheduleRunByRunId(edited.runId)).toMatchObject({ status: "success", firedAt });
+  });
+
   it("treats an empty Schedule extra-directory selection as no override", async () => {
     const fixture = await createFixture(new FakeBackendAdapter(CODEX_LIKE_PROFILE));
     const sessionId = (await fixture.host.createSession({
