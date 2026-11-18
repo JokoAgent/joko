@@ -12,6 +12,7 @@ export interface SwipeableSessionRowProps {
   readonly colors: { readonly surface: string; readonly ink: string; readonly accent: string; readonly negative: string };
   readonly locale: MobileSupportedLocale;
   readonly onTogglePin: (session: Session) => void;
+  readonly onMarkRead?: (session: Session) => void;
   readonly onArchive: (session: Session) => void;
   readonly onShowOptions: (session: Session) => void;
   readonly disabled?: boolean;
@@ -19,6 +20,7 @@ export interface SwipeableSessionRowProps {
 }
 
 const PIN_OFFSET = 92;
+const READ_AND_PIN_OFFSET = 164;
 const OPTIONS_OFFSET = -164;
 
 export function SwipeableSessionRow({
@@ -27,6 +29,7 @@ export function SwipeableSessionRow({
   colors,
   locale,
   onTogglePin,
+  onMarkRead,
   onArchive,
   onShowOptions,
   disabled = false,
@@ -35,6 +38,7 @@ export function SwipeableSessionRow({
   const { width } = useWindowDimensions();
   const reducedMotion = useReducedMotion();
   const translateX = useRef(new Animated.Value(0)).current;
+  const markReadOnRelease = useRef<(() => void) | undefined>(undefined);
   const rowKey = session.sessionId;
 
   const animateTo = (value: number, onComplete?: () => void): void => {
@@ -67,18 +71,27 @@ export function SwipeableSessionRow({
 
   const panResponder = useMemo(() => PanResponder.create({
     onMoveShouldSetPanResponder: (_event, gesture) => !disabled && shouldClaimHorizontalSwipe(gesture.dx, gesture.dy),
-    onPanResponderGrant: () => registry.onRowOpen(rowKey, close),
+    onPanResponderGrant: () => {
+      markReadOnRelease.current = onMarkRead === undefined ? undefined : () => onMarkRead(session);
+      registry.onRowOpen(rowKey, close);
+    },
     onPanResponderMove: (_event, gesture) => translateX.setValue(Math.max(-width, Math.min(width, gesture.dx))),
     onPanResponderRelease: (_event, gesture) => {
+      const markRead = markReadOnRelease.current;
+      markReadOnRelease.current = undefined;
       switch (resolveSwipeRelease(gesture.dx, width)) {
         case "pin":
-          animateTo(0, () => { registry.onRowClose(rowKey); onTogglePin(session); });
+          animateTo(0, () => {
+            registry.onRowClose(rowKey);
+            if (markRead) markRead();
+            else onTogglePin(session);
+          });
           break;
         case "archive":
           animateTo(0, () => { registry.onRowClose(rowKey); onArchive(session); });
           break;
         case "reveal-pin":
-          animateTo(PIN_OFFSET);
+          animateTo(onMarkRead === undefined ? PIN_OFFSET : READ_AND_PIN_OFFSET);
           break;
         case "reveal-options":
           animateTo(OPTIONS_OFFSET);
@@ -87,11 +100,17 @@ export function SwipeableSessionRow({
           close();
       }
     },
-    onPanResponderTerminate: close
-  }), [disabled, onArchive, onTogglePin, reducedMotion, registry, rowKey, session, translateX, width]);
+    onPanResponderTerminate: () => { markReadOnRelease.current = undefined; close(); }
+  }), [disabled, onArchive, onMarkRead, onTogglePin, reducedMotion, registry, rowKey, session, translateX, width]);
 
   return <View style={styles.shell}>
     <View style={styles.leftActions}>
+      {onMarkRead !== undefined && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.markTaskRead")}
+        accessibilityState={{ disabled }} disabled={disabled}
+        onPress={() => animateTo(0, () => { registry.onRowClose(rowKey); onMarkRead(session); })}
+        style={[styles.roundAction, { backgroundColor: colors.surface }]}>
+        <Text style={[styles.actionText, { color: colors.ink }]}>{mobileMessage(locale, "home.markTaskRead")}</Text>
+      </Pressable>}
       <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale,
         session.pinned ? "home.swipe.unpinTask" : "home.swipe.pinTask")}
         accessibilityState={{ disabled }} disabled={disabled}
@@ -125,10 +144,10 @@ export function SwipeableSessionRow({
 
 const styles = StyleSheet.create({
   shell: { position: "relative", overflow: "hidden" },
-  leftActions: { ...StyleSheet.absoluteFill, alignItems: "flex-start", justifyContent: "center", paddingLeft: 12 },
+  leftActions: { ...StyleSheet.absoluteFill, flexDirection: "row", alignItems: "center", gap: 8, paddingLeft: 12 },
   rightActions: { ...StyleSheet.absoluteFill, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingRight: 12 },
   roundAction: { width: 70, height: 52, borderRadius: 26, alignItems: "center", justifyContent: "center" },
-  actionText: { fontSize: 12, fontWeight: "700" },
+  actionText: { fontSize: 12, fontWeight: "700", textAlign: "center" },
   darkText: { color: "#2b2316" },
   lightText: { color: "#fff" }
 });

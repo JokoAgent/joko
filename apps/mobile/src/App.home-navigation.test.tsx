@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
-  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
+  SessionAttentionKind, SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
   TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, NativeSessionBindingSchema, TargetSchema, ToolCallState, WorkspaceDescriptorSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -65,7 +65,9 @@ type HomeListProps = {
   scrollEnabled?: boolean;
 };
 let homeListProps: HomeListProps;
+let showTaskTimelineRows: (() => void) | undefined;
 const setSessionPinned = vi.fn(async () => true);
+const acknowledgeSessionAttention = vi.fn<MobileClient["acknowledgeSessionAttention"]>(async () => true);
 const setSessionArchived = vi.fn(async (_sessionId: string, _archived: boolean, _archiveConfirmation?: string) => true);
 const archiveConfirmation = "a".repeat(64);
 const prepareSessionArchive = vi.fn<MobileClient["prepareSessionArchive"]>(async sessionId => ({
@@ -144,6 +146,8 @@ const client = new Proxy({
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
   partnerProfileTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
   taskDraftProfileId: () => state.activeProfileId,
+  sessionAttentionOwnerKey: () => state.status === "connected" ? `${state.activeProfileId}/${state.owner?.generation}` : undefined,
+  acknowledgeSessionAttention,
   taskHeaderSourceKey: () => state.status === "connected" && state.selectedId ? `${state.activeProfileId}/${state.selectedId}/${headerSourceEpoch}` : undefined,
   readTaskHeaderRole: async () => observedHeaderRole,
   taskCollaborationApi: () => collaborationApi,
@@ -191,9 +195,13 @@ beforeAll(async () => {
         : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
           section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index }))), renderSectionFooter?.({ section }))));
     }),
-    FlatList: forwardRef(({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
-      renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }, ref) => {
+    FlatList: forwardRef(({ data, renderItem, ListEmptyComponent, onViewableItemsChanged }: { data?: readonly { id: string }[];
+      renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode;
+      onViewableItemsChanged?: (event: { viewableItems: readonly { item: unknown; isViewable: boolean }[] }) => void }, ref) => {
       useImperativeHandle(ref, () => ({ scrollToIndex, scrollToEnd() {}, scrollToOffset() {} }), []);
+      if (onViewableItemsChanged) {
+        showTaskTimelineRows = () => onViewableItemsChanged({ viewableItems: (data ?? []).map(item => ({ item, isViewable: true })) });
+      }
       return createElement("div", {}, data?.length && renderItem
         ? data.map(item => createElement("div", { key: item.id }, renderItem({ item }))) : ListEmptyComponent);
     }),
@@ -203,10 +211,12 @@ beforeAll(async () => {
       onInput: event => input.onChangeText?.(event.currentTarget.value), onChange() {} })),
     Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible
       ? createElement("div", { "data-testid": "native-modal" }, children) : null,
-    Pressable: ({ children, onPress, disabled, accessibilityLabel, accessibilityState, accessibilityRole }: {
+    Pressable: ({ children, onPress, disabled, accessibilityLabel, accessibilityHint, accessibilityState, accessibilityRole }: {
       children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean;
-      accessibilityLabel?: string; accessibilityState?: { selected?: boolean; disabled?: boolean; checked?: boolean | "mixed"; expanded?: boolean }; accessibilityRole?: string;
+      accessibilityLabel?: string; accessibilityHint?: string;
+      accessibilityState?: { selected?: boolean; disabled?: boolean; checked?: boolean | "mixed"; expanded?: boolean }; accessibilityRole?: string;
     }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel,
+      "aria-description": accessibilityHint,
       role: accessibilityRole === "tab" || accessibilityRole === "checkbox" ? accessibilityRole : undefined,
       "aria-selected": accessibilityState?.selected, "aria-checked": accessibilityState?.checked, "aria-expanded": accessibilityState?.expanded },
       typeof children === "function" ? children({ pressed: false }) : children),
@@ -361,6 +371,8 @@ beforeEach(async () => {
   around.mockReset();
   latest.mockClear();
   homeHeaderBounds.clear();
+  acknowledgeSessionAttention.mockClear();
+  showTaskTimelineRows = undefined;
   panResponders.length = 0;
   const sessions = [
     create(SessionSchema, { sessionId: "current", targetId: "dialogue", backendId: "backend", displayName: "Alpha", pinned: true, state: SessionState.IDLE }),
@@ -409,6 +421,33 @@ async function option(label: string): Promise<void> {
     vi.advanceTimersToNextFrame();
   });
 }
+
+function unreadTaskProjection() {
+  const original = state.owner!;
+  const attentionCursor = { generation: 8n, sequence: 6n, opaqueToken: "task-attention-6" };
+  const owner = create(SnapshotSchema, { ...original, server: { serverId: "node" },
+    scope: { kind: { case: "owner", value: {} } },
+    backends: [{ backendId: "backend", capabilities: { capabilities: [{ name: "session.attention", support: CapabilitySupport.SUPPORTED }] } }],
+    sessions: original.sessions.map(session => session.sessionId !== "current" ? session : create(SessionSchema, { ...session,
+      attention: { kind: SessionAttentionKind.DONE, unread: true, attentionCursor } })) });
+  const detail = create(SnapshotSchema, { ...owner, scope: { kind: { case: "session", value: { sessionId: "current" } } },
+    resumeCursor: { generation: original.generation, sequence: 8n, opaqueToken: "snapshot-8" },
+    timeline: [create(EventSchema, { eventId: "original-answer", identity: { sessionId: "current" },
+      cursor: { generation: original.generation, sequence: 5n, opaqueToken: "original-answer-5" },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "answer", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "The original answer is ready." } }] } } } })] });
+  return { owner, detail, attentionCursor };
+}
+
+it("shows unread task attention and sends the menu action for its original cursor", async () => {
+  const { owner, attentionCursor } = unreadTaskProjection();
+  await render({ state: { ...state, owner } });
+  expect(button("Open task Alpha").getAttribute("aria-description")).toBe("Unread task");
+  await option("Mark as read");
+  expect(acknowledgeSessionAttention).toHaveBeenCalledExactlyOnceWith("profile/1", "current", expect.objectContaining({
+    kind: SessionAttentionKind.DONE, cursor: expect.objectContaining(attentionCursor)
+  }), { kind: "manual" });
+});
 
 it.each(["home", "drawer"] as const)("restores the original %s scroll after the list remounts with its viewport and content", async hostKind => {
   const scrollOffsets = new Map<string, number>();
@@ -493,6 +532,28 @@ async function renderTask(patch: Partial<TaskProps> = {}): Promise<void> {
 async function closeTaskDrawer(): Promise<void> { await act(async () => finishDrawerClose?.()); }
 
 describe("actual Home navigation hosts", () => {
+  it("waits for the synced task body to be visible in the foreground and retires an unfinished dwell", async () => {
+    const projection = unreadTaskProjection();
+    state = { ...state, owner: projection.owner, detail: projection.detail };
+    await renderTask();
+    await act(async () => vi.advanceTimersByTimeAsync(300));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+
+    await act(async () => showTaskTimelineRows!());
+    await act(async () => vi.advanceTimersByTimeAsync(199));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+    await act(async () => root.render(null));
+    await act(async () => vi.advanceTimersByTimeAsync(300));
+    expect(acknowledgeSessionAttention).not.toHaveBeenCalled();
+
+    await renderTask();
+    await act(async () => showTaskTimelineRows!());
+    await act(async () => vi.advanceTimersByTimeAsync(200));
+    expect(acknowledgeSessionAttention).toHaveBeenCalledExactlyOnceWith("profile/1", "current", expect.objectContaining({
+      cursor: expect.objectContaining(projection.attentionCursor)
+    }), { kind: "viewed", taskKey: "profile/current/0", signal: expect.any(AbortSignal) });
+  });
+
   it.each(["android", "ios"] as const)("bounds the %s task title dots while retaining all tag names", async platform => {
     platformOS = platform;
     const tags = Array.from({ length: 32 }, (_, index) => create(TaskTagSchema, {

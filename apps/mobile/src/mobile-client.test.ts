@@ -52,11 +52,13 @@ import {
   ScheduleGeneratedSessionDisposition,
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
+  SessionAttentionAcknowledgementIntent, SessionAttentionKind, SessionAttentionSchema, SessionAutomationOriginSchema,
   SessionContextStateSchema, SessionDerivationKind, SessionDerivationOriginSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
   SessionWorktreeSchema, SnapshotInvalidationReason, TargetState, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
+import { mobileSessionAttention } from "./mobile-session-attention";
 import { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
 import { MobilePartnerDeletionReceipts } from "./mobile-partner-deletion";
 import { MobilePartnerRestartReceipts } from "./mobile-partner-restart";
@@ -2197,6 +2199,70 @@ describe("task activity captured owner", () => {
     app.setForeground(false); expect(observedSignal?.aborted).toBe(true); expect(app.taskActivity()).toBeUndefined();
     await expect(port.revoke("other-device")).rejects.toThrow(); expect(network.submit).not.toHaveBeenCalled();
     await view.return?.();
+  });
+});
+
+describe("ordinary task attention", () => {
+  it("uses the original authenticated cursor, proves the receipt, and leaves a later completion unread", async () => {
+    const network = fakeNetwork();
+    const owner = create(SnapshotSchema, {
+      ...clone(SnapshotSchema, snapshot), scope: { kind: { case: "owner", value: {} } },
+      sessions: [{ ...snapshot.sessions[0]!, attention: { kind: SessionAttentionKind.DONE, unread: true,
+        attentionCursor: { opaqueToken: "durable-attention-9", sequence: 9n, generation: 8n } } }]
+    });
+    owner.backends[0]!.capabilities!.capabilities.push(create(CapabilitySchema, { name: "session.attention", support: CapabilitySupport.SUPPORTED }));
+    const detail = create(SnapshotSchema, {
+      ...owner, scope: { kind: { case: "session", value: { sessionId: "session" } } }
+    });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
+    network.readSession = vi.fn(async () => detail);
+    network.submit = vi.fn(async (captured, operationId, mutation) => {
+      const submitted = mutation.payload;
+      if (submitted.case !== "acknowledgeSessionAttention") throw new Error("Expected a task attention acknowledgement.");
+      return create(OperationSchema, { operationId, connectionId: captured.connectionId, mutation, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "sessionAttention", value: { readThroughCursor: submitted.value.throughCursor } } } });
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    await app.select("session");
+    const ownerKey = app.sessionAttentionOwnerKey()!;
+    const taskKey = app.taskHeaderSourceKey()!;
+    expect(ownerKey).toBeDefined();
+    expect(taskKey).toBeDefined();
+    const first = mobileSessionAttention(owner, owner.sessions[0])!;
+    const viewed = { kind: "viewed" as const, taskKey, signal: new AbortController().signal };
+    const manual = { kind: "manual" as const };
+    detail.resumeCursor = create(EventCursorSchema, { opaqueToken: "cursor-8", sequence: 8n, generation: 1n });
+    await expect(app.acknowledgeSessionAttention(ownerKey, "session", first, viewed)).resolves.toBe(false);
+    expect(network.submit).not.toHaveBeenCalled();
+    detail.resumeCursor = owner.resumeCursor;
+    const receipt = app.acknowledgeSessionAttention(ownerKey, "session", first, viewed);
+    await expect(app.acknowledgeSessionAttention(ownerKey, "session", first, manual)).resolves.toBe(false);
+    await expect(receipt).resolves.toBe(true);
+    expect(network.submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(credential), "operation-1", expect.objectContaining({
+      payload: { case: "acknowledgeSessionAttention", value: expect.objectContaining({
+        sessionId: "session", throughCursor: first.cursor, intent: SessionAttentionAcknowledgementIntent.VIEWED
+      }) }
+    }), expect.any(AbortSignal));
+
+    const later = create(SessionAttentionSchema, { kind: SessionAttentionKind.ERROR, unread: true,
+      attentionCursor: { opaqueToken: "durable-attention-11", sequence: 11n, generation: 9n } });
+    owner.sessions[0]!.attention = later;
+    detail.sessions[0]!.attention = later;
+    detail.resumeCursor = create(EventCursorSchema, { opaqueToken: "snapshot-12", sequence: 12n, generation: 1n });
+    await expect(app.acknowledgeSessionAttention(ownerKey, "session", first, manual)).resolves.toBe(false);
+    const error = mobileSessionAttention(owner, owner.sessions[0])!;
+    await expect(app.acknowledgeSessionAttention(ownerKey, "session", error, viewed)).resolves.toBe(false);
+    expect(network.submit).toHaveBeenCalledTimes(1);
+    await expect(app.acknowledgeSessionAttention(ownerKey, "session", error, manual)).resolves.toBe(true);
+    expect(vi.mocked(network.submit).mock.calls.at(-1)?.[2].payload).toMatchObject({ case: "acknowledgeSessionAttention",
+      value: { throughCursor: error.cursor, intent: SessionAttentionAcknowledgementIntent.EXPLICIT } });
+    owner.sessions[0]!.automationOrigin = create(SessionAutomationOriginSchema, { scheduleId: "schedule", runId: "run" });
+    await expect(app.acknowledgeSessionAttention(ownerKey, "session", error, manual)).resolves.toBe(false);
+    owner.sessions[0]!.automationOrigin = undefined;
+    app.setForeground(false);
+    await expect(app.acknowledgeSessionAttention(ownerKey, "session", error, manual)).resolves.toBe(false);
+    expect(network.submit).toHaveBeenCalledTimes(2);
   });
 });
 

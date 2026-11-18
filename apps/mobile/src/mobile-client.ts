@@ -44,12 +44,12 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import {
   PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
   PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
-  ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
+  AcknowledgeSessionAttentionMutationSchema, ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, OpenSideChatMutationSchema, SessionDerivationKind,
   CreateTargetMutationSchema, TargetWorkspaceInputSchema,
   CreateTaskTagMutationSchema, UpdateTaskTagMutationSchema, ReorderTaskTagsMutationSchema, SetSessionTaskTagsMutationSchema, DeleteTaskTagMutationSchema,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
-  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema, InputContentSchema,
+  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventCursorSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema, InputContentSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   RemoteDesktopHostMuteRequestSchema,
   RemoteDesktopPrivacyScreenRequestSchema,
@@ -65,7 +65,7 @@ import {
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
   AttemptState, ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, RunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
-  SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
+  SessionAttentionAcknowledgementIntent, SessionAttentionKind, SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
@@ -77,6 +77,7 @@ import {
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
 import { McpAppNativeOperation, McpAppOperation, McpAppNativeServiceOperateRequestSchema, McpAppServiceOperateRequestSchema } from "@joko/contracts";
 import { mobileDeviceNameSource, validMobileDeviceName, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
+import { mobileAttentionKey, mobileSessionAttention, mobileViewedSessionAttention, type MobileSessionAttention } from "./mobile-session-attention";
 import { resolveMobileMessageForkSource, type MobileMessageForkSource } from "./mobile-message-fork";
 import {
   assertMobileWorkspaceRewindPreview, mobileMessageChangeSet, mobileMessageRewindIdle, mobileRewindCapability,
@@ -1023,6 +1024,7 @@ export class MobileClient {
   #allPending: PendingOperation[] = [];
   #listeners = new Set<(state: MobileState) => void>();
   #epoch = 0;
+  readonly #sessionAttentionFlights = new Set<string>();
   #abort?: AbortController;
   #timer?: ReturnType<typeof setTimeout>;
   #proofTimer?: ReturnType<typeof setTimeout>;
@@ -15013,6 +15015,55 @@ export class MobileClient {
         this.#queueInteractionLease = undefined;
       }
       this.#releaseMutation(action);
+    }
+  }
+
+  sessionAttentionOwnerKey(): string | undefined {
+    const credential = this.#credential, owner = this.#state.owner;
+    if (!credential || !this.#current(this.#epoch) || this.#joinedTask || this.#state.status !== "connected"
+      || this.#state.activeProfileId !== credential.profileId || this.#state.origin !== credential.origin
+      || !this.#abort || this.#abort.signal.aborted || owner?.scope?.kind.case !== "owner"
+      || owner.server?.serverId !== credential.serverId) return undefined;
+    return JSON.stringify([credential.profileId, credential.connectionId, credential.serverId, credential.origin,
+      this.#epoch, owner.generation.toString()]);
+  }
+
+  async acknowledgeSessionAttention(ownerKey: string, sessionId: string, expected: MobileSessionAttention,
+    source: { readonly kind: "manual" } | { readonly kind: "viewed"; readonly taskKey: string; readonly signal: AbortSignal }): Promise<boolean> {
+    const credential = this.#credential, connectionSignal = this.#abort?.signal;
+    if (!credential || !connectionSignal || this.sessionAttentionOwnerKey() !== ownerKey) return false;
+    const signal = source.kind === "viewed" ? AbortSignal.any([connectionSignal, source.signal]) : connectionSignal;
+    const current = () => !signal.aborted && this.#credential === credential && this.sessionAttentionOwnerKey() === ownerKey
+      && (source.kind === "manual" || this.#state.selectedId === sessionId && this.taskHeaderSourceKey() === source.taskKey);
+    if (!current()) return false;
+    const owner = this.#state.owner;
+    const attention = source.kind === "manual"
+      ? mobileSessionAttention(owner, owner?.sessions.find(session => session.sessionId === sessionId))
+      : mobileViewedSessionAttention(owner, this.#state.detail, sessionId);
+    if (!attention || mobileAttentionKey(attention) !== mobileAttentionKey(expected)) return false;
+    const flight = JSON.stringify([ownerKey, sessionId, mobileAttentionKey(attention)]);
+    if (this.#sessionAttentionFlights.has(flight)) return false;
+    const intent = attention.kind === SessionAttentionKind.ERROR ? SessionAttentionAcknowledgementIntent.EXPLICIT
+      : SessionAttentionAcknowledgementIntent.VIEWED;
+    const operationId = this.newId();
+    const requested = create(AcknowledgeSessionAttentionMutationSchema, { sessionId, throughCursor: attention.cursor, intent });
+    const mutation = create(OperationMutationSchema, { payload: { case: "acknowledgeSessionAttention", value: requested } });
+    this.#sessionAttentionFlights.add(flight);
+    try {
+      const result = await this.network.submit(credential, operationId, mutation, signal);
+      if (!current()) return false;
+      const submitted = result.mutation?.payload;
+      const receipt = result.result?.payload;
+      const read = receipt?.case === "sessionAttention" ? receipt.value.readThroughCursor : undefined;
+      if (result.operationId !== operationId || result.connectionId !== credential.connectionId || result.state !== OperationState.SUCCEEDED
+        || submitted?.case !== "acknowledgeSessionAttention" || submitted.value.sessionId !== sessionId
+        || submitted.value.intent !== intent || !equals(EventCursorSchema, submitted.value.throughCursor, attention.cursor)
+        || read?.generation !== attention.cursor.generation || read.sequence < attention.cursor.sequence) {
+        throw new Error(result.error?.message || "The task read receipt could not be confirmed.");
+      }
+      return true;
+    } finally {
+      this.#sessionAttentionFlights.delete(flight);
     }
   }
 
