@@ -5291,7 +5291,15 @@ function sidebarRightStatusLabel(status: SidebarRightStatus, t: Translator): str
 
 export function visibleSidebarSessionIds(root: HTMLElement | null): readonly string[] {
   if (root === null) return [];
-  const rows = [...root.querySelectorAll<HTMLElement>(".session-row [data-session-id]:not([data-machine-profile])")];
+  const rows = sidebarSessionElementsInVisualOrder([...root.querySelectorAll<HTMLElement>(".session-row [data-session-id]:not([data-machine-profile])")]);
+  const ids = rows.flatMap((row) => {
+    const sessionId = row.dataset.sessionId;
+    return sessionId && isRenderedSidebarSessionRow(row) ? [sessionId] : [];
+  });
+  return [...new Set(ids)];
+}
+
+export function sidebarSessionElementsInVisualOrder(rows: readonly HTMLElement[]): readonly HTMLElement[] {
   const cardGroups = new Map<HTMLElement, Array<{ readonly row: HTMLElement; readonly domIndex: number; readonly order: number }>>();
   rows.forEach((row, domIndex) => {
     const group = row.closest<HTMLElement>("[data-sidebar-card-order='row-major']");
@@ -5303,28 +5311,20 @@ export function visibleSidebarSessionIds(root: HTMLElement | null): readonly str
     entries.push({ row, domIndex, order });
     cardGroups.set(group, entries);
   });
-  const seen = new Set<string>();
   const emittedGroups = new Set<HTMLElement>();
-  const result: string[] = [];
-  const append = (row: HTMLElement): void => {
-    const sessionId = row.dataset.sessionId;
-    if (sessionId === undefined || sessionId === "" || seen.has(sessionId)) return;
-    if (!isRenderedSidebarSessionRow(row)) return;
-    seen.add(sessionId);
-    result.push(sessionId);
-  };
+  const result: HTMLElement[] = [];
   for (const row of rows) {
     const group = row.closest<HTMLElement>("[data-sidebar-card-order='row-major']");
     const groupedRows = group === null ? undefined : cardGroups.get(group);
     if (group === null || groupedRows === undefined) {
-      append(row);
+      result.push(row);
       continue;
     }
     if (emittedGroups.has(group)) continue;
     emittedGroups.add(group);
     groupedRows
       .sort((left, right) => left.order - right.order || left.domIndex - right.domIndex)
-      .forEach(({ row: groupedRow }) => append(groupedRow));
+      .forEach(({ row: groupedRow }) => result.push(groupedRow));
   }
   return result;
 }

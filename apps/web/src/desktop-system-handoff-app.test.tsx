@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppWithController, reserveMessageDeepLinkHistoryPage } from "./App.js";
+import { currentAppShortcutPlatform } from "./app-shortcuts.js";
 import { CONVERSATION_KEYWORD_DEBOUNCE_MS } from "./components/Sidebar.js";
 import { useAppController, type AppController, type ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
@@ -143,6 +144,58 @@ describe("Desktop system handoff App boundary", () => {
     expect(fixture.container.textContent).not.toContain("The link did not identify another machine");
     expect(loadSessionTimelinePage).not.toHaveBeenCalled();
     await fixture.dispose();
+  });
+
+  it.each(["remote-only", "shared-task"])("activates the remote sidebar row from the first task shortcut (%s)", async (id) => {
+    const local = session("shared-task");
+    const initial = connectedState({ route: { kind: "session" }, sessions: [local] });
+    const remote = { id: "profile-b", deviceId: "device-b", serverId: "server-b", name: "Remote", origin: "https://remote.example" };
+    const navigate = vi.fn<AppController["navigate"]>();
+    const openMachineSession = vi.fn<AppController["openMachineSession"]>(async () => undefined);
+    const fixture = renderApp({
+      ...initial,
+      preferences: { ...initial.preferences, machineSelection: [remote.id] },
+      profiles: [...initial.profiles, remote],
+      machinePresenceByProfile: { [remote.id]: "online" },
+      machineCaches: [{
+        profileId: remote.id, serverId: remote.serverId, name: remote.name, origin: remote.origin, updatedAt: 1,
+        sessions: [{ id, name: "Remote task", state: "idle", pinned: false, archived: false, taskTags: [], lastActivityAt: 1 }]
+      }]
+    }, { navigate, openMachineSession });
+    await fixture.render();
+    const row = fixture.container.querySelector<HTMLButtonElement>(`.remote-machine-session-sections button[data-session-id='${id}']`);
+    expect(row?.dataset.machineProfile).toBe(remote.id);
+    vi.spyOn(row!, "getClientRects").mockReturnValue({ length: 1 } as DOMRectList);
+    await pressTaskShortcut(1);
+    expect(openMachineSession).toHaveBeenCalledExactlyOnceWith(remote.id, id);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { width: 185, columns: 1, domOrder: ["a", "b", "c"] },
+    { width: 270, columns: 2, domOrder: ["a", "c", "b"] },
+    { width: 380, columns: 3, domOrder: ["a", "b", "c"] }
+  ])("opens the second visible pinned card with $columns columns", async ({ width, columns, domOrder }) => {
+    const navigate = vi.fn<AppController["navigate"]>();
+    const sessions = ["a", "b", "c"].map((id, index) => ({ ...session(id), pinned: true, updatedAt: 10 - index }));
+    const initial = connectedState({ route: { kind: "session" }, sessions });
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockImplementation(function(this: Element) {
+      return this.matches(".pinned-card-masonry") ? width : 0;
+    });
+    const fixture = renderApp({
+      ...initial,
+      preferences: {
+        ...initial.preferences,
+        sidebarDisplayPreferences: { ...initial.preferences.sidebarDisplayPreferences, pinnedViewMode: "card" }
+      }
+    }, { navigate });
+    await fixture.render();
+    expect(fixture.container.querySelector("[data-pinned-card-column-count]")?.getAttribute("data-pinned-card-column-count")).toBe(String(columns));
+    const rows = [...fixture.container.querySelectorAll<HTMLButtonElement>(".pinned-card-masonry button[data-session-id]")];
+    expect(rows.map(row => row.dataset.sessionId)).toEqual(domOrder);
+    for (const row of rows) vi.spyOn(row, "getClientRects").mockReturnValue({ length: 1 } as DOMRectList);
+    await pressTaskShortcut(2);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "b" });
   });
 
   it("renders exact-owner recovery when the linked task is missing after handoff", async () => {
@@ -1261,6 +1314,14 @@ describe("Desktop system handoff App boundary", () => {
     }
   });
 });
+
+async function pressTaskShortcut(slot: number): Promise<void> {
+  const isMac = currentAppShortcutPlatform() === "darwin";
+  const event = new KeyboardEvent("keydown", { key: String(slot), code: `Digit${slot}`, bubbles: true,
+    cancelable: true, metaKey: isMac, ctrlKey: !isMac });
+  await act(async () => document.body.dispatchEvent(event));
+  expect(event.defaultPrevented).toBe(true);
+}
 
 function renderApp(
   initialState: ControllerState,

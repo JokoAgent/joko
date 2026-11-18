@@ -44,7 +44,7 @@ import { DesktopGlobalVoiceBridge } from "./components/DesktopGlobalVoiceBridge.
 import { RuntimeProcessMonitorBroker } from "./components/RuntimeProcessMonitorBroker.js";
 import { RuntimeProcessMonitorWindow } from "./components/RuntimeProcessMonitorWindow.js";
 import { VisionBridgeToasts } from "./components/VisionBridgeToasts.js";
-import { Sidebar } from "./components/Sidebar.js";
+import { Sidebar, sidebarSessionElementsInVisualOrder } from "./components/Sidebar.js";
 import { TaskSharingInvitationDialog, TaskSharingNavigation } from "./components/TaskSharingSettings.js";
 import { TaskSharingSession } from "./components/TaskSharingSession.js";
 import { offerTaskSharingInvitation, clearTaskSharingInvitation } from "./task-sharing-invitation.js";
@@ -3111,8 +3111,13 @@ function useSessionSwitchShortcut(
     const visibleSessionButtons = [...document.querySelectorAll<HTMLElement>(".sidebar [data-session-id], .workspace-session-tabs-bar [data-session-id]")]
       .filter((element) => element.getClientRects().length > 0
         && element.closest("[aria-hidden='true'], [inert]") === null);
-    const sessionId = visibleSessionButtons[slot]?.dataset.sessionId;
-    if (sessionId === undefined) return false;
+    const target = sidebarSessionElementsInVisualOrder(visibleSessionButtons)[slot];
+    if (target?.dataset.sessionId === undefined) return false;
+    const sessionId = target.dataset.sessionId;
+    if (target.dataset.machineProfile !== undefined) {
+      target.click();
+      return true;
+    }
     controller.navigate(route.kind === "files"
       ? {
           kind: "files",
