@@ -321,7 +321,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [renameSession, setRenameSession] = useState<SessionView>();
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
-  const removeArchivedProjectSessions = useRef<((sessions: readonly SessionView[]) => void) | undefined>(undefined);
+  const removeArchivedProjectSessions = useRef<((sessions: readonly SessionView[], fallbackSessionIds: readonly string[]) => void) | undefined>(undefined);
   const [deleteRemoval, setDeleteRemoval] = useState<SessionRemovalDialogRequest>();
   const [actionError, setActionError] = useState<string>();
   const [retryableMessageDeepLinkKey, setRetryableMessageDeepLinkKey] = useState<string>();
@@ -2128,23 +2128,27 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
   const removeSessionsFromNavigation = (
     sessions: readonly SessionView[],
-    navigateAfterRemoval = true
+    navigateAfterRemoval = true,
+    fallbackSessionIds: readonly string[] = []
   ): void => {
     const removed = new Set(sessions.map((session) => session.id));
     let nextLayout = sessionSplitLayout;
     for (const sessionId of removed) nextLayout = removeSessionSplit(nextLayout, sessionId);
     if (nextLayout !== sessionSplitLayout) commitSessionSplitLayout(nextLayout);
     if (!navigateAfterRemoval || activeSession === undefined || !removed.has(activeSession.id)) return;
-    const replacement = sessionSplitPanes(nextLayout.root)[0]?.sessionId;
+    const replacement = sessionSplitPanes(nextLayout.root)[0]?.sessionId ?? fallbackSessionIds.find(sessionId =>
+      !removed.has(sessionId) && controllerRef.current.state.snapshot.sessions.some(session => session.id === sessionId && !session.archived));
     controller.navigate(replacement === undefined ? { kind: "session" } : { kind: "session", sessionId: replacement });
   };
-  removeArchivedProjectSessions.current = removeSessionsFromNavigation;
+  removeArchivedProjectSessions.current = (sessions, fallbackSessionIds) => removeSessionsFromNavigation(sessions, true, fallbackSessionIds);
   const setProjectSessionsArchived = async (
     project: ProjectSessionArchiveRequest,
     sessions: readonly SessionView[],
     archived: boolean,
     preflight?: WorktreeRemovalPreflightSummary
   ): Promise<void> => {
+    const navigationRevision = controllerRef.current.state.navigationRevision;
+    const originalPaneIds = sessionSplitPanes(sessionSplitLayout.root).map(pane => pane.sessionId);
     const current = () => {
       const live = controllerRef.current.state;
       return live.ready && live.connectionState === "connected" && live.activeProfile !== undefined
@@ -2161,7 +2165,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       } catch (error) { firstFailure ??= { error }; }
     }
     if (!current()) return;
-    if (archived && completed.length > 0) removeArchivedProjectSessions.current?.(completed);
+    if (archived && completed.length > 0) {
+      const unchangedRoute = controllerRef.current.state.navigationRevision === navigationRevision;
+      removeArchivedProjectSessions.current?.(completed, unchangedRoute ? originalPaneIds : []);
+    }
     if (firstFailure !== undefined) throw firstFailure.error;
   };
   const prepareWorktreeRemoval = async (

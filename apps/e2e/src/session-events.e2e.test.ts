@@ -733,9 +733,16 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(fixture.adapter().abortCalls).toBe(0);
   });
 
-  mountedTimelineIt("keeps a task moved by another Owner out of an in-flight project archive", { timeout: 75_000 }, async () => {
-    fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
-    const manager = await fixture.pair("Project move Owner");
+  mountedTimelineIt.each(["moved", "pinned", "busy"] as const)("settles a project archive when another Owner changes the next task (%s)", { timeout: 90_000 }, async change => {
+    const releaseTurn = browserGate();
+    fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
+      createAdapter: profile => new class extends InstrumentedFakeAdapter {
+        override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+          if (input.text === "Hold the middle task active") await releaseTurn.promise;
+          await super.send(input, context);
+        }
+      }(profile) });
+    const manager = await fixture.pair("Other project Owner");
     const backendId = fixture.adapter().id;
     const projectId = "original-project";
     const destinationId = "destination-project";
@@ -751,6 +758,8 @@ describe("session host, durable events, and reconnect semantics", () => {
       tasks.push(sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
         createSessionMutation({ backendId, targetId: projectId, displayName }))));
     }
+    const survivor = change === "busy" ? sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(), displayName: "Unaffected split" }))) : undefined;
 
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Archiving Web" });
     if (!challenge.challenge) throw new Error("Archive pairing returned no challenge.");
@@ -768,7 +777,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const releaseClose = browserGate();
     const firstCommitted = browserGate();
     const releaseAcknowledgement = browserGate();
-    releaseBrowserRequest = () => { releaseClose.release(); releaseAcknowledgement.release(); };
+    releaseBrowserRequest = () => { releaseClose.release(); releaseAcknowledgement.release(); releaseTurn.release(); };
     const host = fixture.application.sessionHost;
     const close = host.closeIfActive.bind(host);
     vi.spyOn(host, "closeIfActive").mockImplementationOnce(async sessionId => {
@@ -791,34 +800,69 @@ describe("session host, durable events, and reconnect semantics", () => {
       await route.fulfill({ response });
     });
     const group = (title: string) => page.locator(".sidebar .project-group").filter({ has: page.getByText(title, { exact: true }) });
-    await group("Original project").getByRole("button", { name: "More", exact: true }).click();
+    const project = group("Original project");
+    const taskRows = project.locator("[data-session-id]");
+    await taskRows.first().waitFor({ state: "visible" });
+    const order = await taskRows.evaluateAll(rows => rows.map(row => row.getAttribute("data-session-id")!));
+    expect(order).toHaveLength(3);
+    expect(new Set(order)).toEqual(new Set(tasks));
+    const [expectedFirst, changed, remaining] = order as [string, string, string];
+    if (survivor !== undefined) {
+      const firstRow = project.locator(`[data-session-id="${expectedFirst}"]`);
+      await firstRow.click();
+      const outsideRow = page.locator(`.sidebar [data-session-id="${survivor}"]`).first();
+      await outsideRow.click({ button: "right" });
+      await page.getByRole("menuitem", { name: "Split right", exact: true }).click();
+      await firstRow.click();
+      await page.waitForURL(url => url.hash.includes(expectedFirst));
+      await page.locator(`.timeline[data-timeline-session-id="${survivor}"]`).waitFor({ state: "visible" });
+    }
+    await project.getByRole("button", { name: "More", exact: true }).click();
     await page.getByRole("menuitem", { name: "Archive all tasks", exact: true }).click();
     await firstClosing.promise;
     const first = archiveRequests[0]?.mutation?.payload;
     if (first?.case !== "archiveSession") throw new Error("The first project archive was not submitted.");
+    expect(first.value.sessionId).toBe(expectedFirst);
     expect(archiveRequests[0]?.mutation?.preconditions[0]).toMatchObject({ entity: { kind: EntityKind.SESSION, id: first.value.sessionId } });
     const move = (sessionId: string) => submit(manager.clients.operation, manager.connectionId, create(OperationMutationSchema, {
       payload: { case: "moveSessionProject", value: { sessionId, projectId: destinationId } }
     }));
-    await expect(move(first.value.sessionId)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    if (change === "moved") await expect(move(expectedFirst)).rejects.toMatchObject({ code: Code.FailedPrecondition });
     releaseClose.release();
     await firstCommitted.promise;
     expect(firstState).toBe(OperationState.SUCCEEDED);
-    const [moved, remaining] = tasks.filter(sessionId => sessionId !== first.value.sessionId);
-    const staleRevision = (await manager.clients.session.getSession({ sessionId: moved! })).session!.version!.revision!;
-    expect((await move(moved!)).state).toBe(OperationState.SUCCEEDED);
-    const staleArchive = create(OperationMutationSchema, { payload: archiveMutation(moved!, true).payload, preconditions: [
-      { entity: { kind: EntityKind.SESSION, id: moved! }, expectedRevision: staleRevision }
-    ] });
-    await expect(submit(manager.clients.operation, manager.connectionId, staleArchive)).rejects.toMatchObject({ code: Code.Aborted });
-    await group("Destination project").locator(`[data-session-id="${moved}"]`).first().waitFor({ state: "visible" });
+    const store = fixture.application.store;
+    if (change === "moved") {
+      const staleRevision = (await manager.clients.session.getSession({ sessionId: changed })).session!.version!.revision!;
+      expect((await move(changed)).state).toBe(OperationState.SUCCEEDED);
+      const staleArchive = create(OperationMutationSchema, { payload: archiveMutation(changed, true).payload, preconditions: [
+        { entity: { kind: EntityKind.SESSION, id: changed }, expectedRevision: staleRevision }
+      ] });
+      await expect(submit(manager.clients.operation, manager.connectionId, staleArchive)).rejects.toMatchObject({ code: Code.Aborted });
+      await group("Destination project").locator(`[data-session-id="${changed}"]`).first().waitFor({ state: "visible" });
+    } else if (change === "pinned") {
+      expect((await submit(manager.clients.operation, manager.connectionId, pinMutation(changed, true))).state).toBe(OperationState.SUCCEEDED);
+      await page.locator(`.session-section--pinned [data-session-id="${changed}"]`).first().waitFor({ state: "visible" });
+    } else {
+      const generation = BigInt(store.getSession(changed).descriptor.binding.generation);
+      const runId = queueRunIdFrom(await submit(manager.clients.operation, manager.connectionId, sendInputMutation(changed, generation, "Hold the middle task active")));
+      await waitFor(() => manager.clients.run.getRun({ runId }), receipt => receipt.run?.state === RunState.RUNNING, "the middle task to stay busy");
+    }
     releaseAcknowledgement.release();
-    await waitFor(async () => fixture!.application.store.getSession(remaining!).descriptor.archived, Boolean, "the other original project task to archive");
-    await page.getByText("The task changed since the project action started.", { exact: true }).first().waitFor({ state: "visible" });
+    await waitFor(async () => store.getSession(remaining).descriptor.archived, Boolean, "the other original project task to archive");
+    await page.getByText(change === "busy" ? /A running or queued task|Revision precondition failed/u : "The task changed since the project action started.")
+      .first().waitFor({ state: "visible" });
     const submitted = archiveRequests.map(request => request.mutation!.payload).flatMap(payload =>
       payload.case === "archiveSession" ? [payload.value.sessionId] : []);
-    expect(submitted).toEqual([first.value.sessionId, remaining]);
-    expect(fixture.application.store.getSession(moved!).descriptor).toMatchObject({ projectId: destinationId, targetId: projectId, archived: false });
+    expect(submitted).toEqual(change === "busy" ? [expectedFirst, changed, remaining] : [expectedFirst, remaining]);
+    expect(store.getSession(changed).descriptor).toMatchObject({ projectId: change === "moved" ? destinationId : projectId,
+      targetId: projectId, archived: false, pinned: change === "pinned" });
+    if (survivor !== undefined) {
+      await page.waitForURL(url => url.hash.includes(survivor));
+      await page.locator(`.timeline[data-timeline-session-id="${expectedFirst}"]`).waitFor({ state: "detached" });
+      expect(await page.locator(`.timeline[data-timeline-session-id="${survivor}"]`).isVisible()).toBe(true);
+    }
+    releaseTurn.release();
   });
 
   mountedTimelineIt("keeps Stop and composer Escape available during a native Claude retry wait", { timeout: 75_000 }, async () => {

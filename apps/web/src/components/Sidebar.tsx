@@ -264,6 +264,7 @@ interface SidebarRailPreviewState {
 }
 interface SidebarProjectActions {
   readonly allSessions: readonly SessionView[];
+  readonly showArchived: boolean;
   readonly onEditTarget: (target: TargetView) => void;
   readonly onNewTaskInTarget?: (target: TargetView) => void;
   readonly onRenameTarget?: (target: TargetView, name: string) => void;
@@ -1500,6 +1501,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   ]);
   const railDialogueBackend = dialogueBackends(snapshot.backends, snapshot.settings.backendSettings)[0];
   const projectActions: SidebarProjectActions = {
+    showArchived,
     allSessions: navigationSessions,
     onEditTarget: (target) => navigateAndClose({ kind: "projects", projectId: target.id }),
     onNewTaskInTarget: props.onNewTaskInTarget,
@@ -3895,10 +3897,10 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
   const [editValue, setEditValue] = useState(target.name);
   const [menu, setMenu] = useState<{ readonly x: number; readonly y: number }>();
   const [removeConfirmation, setRemoveConfirmation] = useState(false);
-  const allArchived = sessions.length > 0 && sessions.every((session) => session.archived);
-  const archiveCandidates = allArchived
+  const archiveCandidates = actions.showArchived
     ? sessions.filter((session) => session.archived)
-    : sessions.filter((session) => !session.archived && session.state !== "running" && session.state !== "waiting" && session.state !== "retrying");
+    : sessions.filter((session) => !session.archived && !session.pinned
+      && session.state !== "running" && session.state !== "waiting" && session.state !== "retrying");
   const canSetArchived = actions.onSetTargetSessionsArchived !== undefined && archiveCandidates.length > 0;
   const activeSessionCount = sessions.filter((session) => session.state === "running" || session.state === "waiting" || session.state === "retrying").length;
 
@@ -4110,7 +4112,10 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
       {actions.onCopyTargetLink !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => actions.onCopyTargetLink?.(target))}><span>{t("projects.copyLink")}</span></button>}
       <hr />
       {actions.onRemoveTarget !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => setRemoveConfirmation(true))}><span>{t("projects.removeFromSidebar")}</span></button>}
-      <button type="button" role="menuitem" disabled={!canSetArchived} onClick={() => runMenuAction(() => actions.onSetTargetSessionsArchived?.(target, archiveCandidates, !allArchived))}><span>{t(allArchived ? "projects.unarchiveAll" : "projects.archiveAll")}</span></button>
+      <button type="button" role="menuitem" disabled={!canSetArchived}
+        onClick={() => runMenuAction(() => actions.onSetTargetSessionsArchived?.(target, archiveCandidates, !actions.showArchived))}>
+        <span>{t(actions.showArchived ? "projects.unarchiveAll" : "projects.archiveAll")}</span>
+      </button>
     </div>, document.body)}
     <Modal
       open={removeConfirmation}

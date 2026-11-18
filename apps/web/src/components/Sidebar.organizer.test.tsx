@@ -776,6 +776,44 @@ describe("Sidebar organizer display controls", () => {
     expect(legacy.querySelector(".session-row__pin")).toBeNull();
   });
 
+  it("uses the current sidebar status for project batch actions and preserves separately pinned tasks", async () => {
+    const target = { id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n,
+      workspaceName: "Project", trusted: true, pinned: false, archived: false } as const;
+    const active = { ...session(), id: "active" };
+    const pinned = { ...session(), id: "pinned", pinned: true };
+    const archived = { ...session(), id: "archived", archived: true, pinned: true };
+    const snapshot = { ...emptySnapshot(), revision: 1n, targets: [target], sessions: [active, pinned, archived],
+      backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy" as const, capabilities: new Map() }] };
+    const onSetTargetSessionsArchived = vi.fn();
+    const onArchive = vi.fn();
+    const preferences = DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences;
+    const view = await renderSidebar(preferences, vi.fn(), { snapshot, onSetTargetSessionsArchived, onArchive });
+    const openProjectMenu = async () => {
+      const more = required(view.container.querySelector<HTMLButtonElement>(".sidebar-main-view .project-group [aria-label='common.more']"));
+      mockRect(more, 220, 120, 28, 28);
+      await act(async () => more.click());
+      return required(document.body.querySelector<HTMLElement>(".sidebar-project-actions-menu"));
+    };
+    for (const status of ["active", "all", "archived"] as const) {
+      await view.rerender({ ...preferences, status });
+      const menu = await openProjectMenu();
+      const restoring = status === "archived";
+      const button = buttonWithText(menu, restoring ? "projects.unarchiveAll" : "projects.archiveAll");
+      expect(button.disabled).toBe(false);
+      await act(async () => button.click());
+      expect(onSetTargetSessionsArchived).toHaveBeenLastCalledWith(target, restoring ? [archived] : [active], !restoring);
+    }
+    await view.rerender({ ...preferences, status: "all" });
+    await view.rerenderSnapshot({ ...snapshot, sessions: [pinned, archived] });
+    expect(buttonWithText(await openProjectMenu(), "projects.archiveAll").disabled).toBe(true);
+    await act(async () => document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })));
+    const pinnedRow = required(view.container.querySelector<HTMLElement>("[data-session-id='pinned']"));
+    await act(async () => pinnedRow.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 170, clientY: 140 })));
+    const rowMenu = required(document.body.querySelector<HTMLElement>(".session-menu-popover"));
+    await act(async () => buttonWithText(rowMenu, "session.archive").click());
+    expect(onArchive).toHaveBeenCalledWith(pinned);
+  });
+
   it("keeps remote expanded and rail views on the same fail-closed content filters", async () => {
     const now = Date.parse("2026-08-27T12:00:00.000Z");
     vi.useFakeTimers();
