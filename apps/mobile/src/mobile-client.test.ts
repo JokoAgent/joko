@@ -2207,13 +2207,16 @@ describe("ordinary task attention", () => {
   it("uses the original authenticated cursor, proves the receipt, and leaves a later completion unread", async () => {
     const network = fakeNetwork();
     const owner = create(SnapshotSchema, {
-      ...clone(SnapshotSchema, snapshot), scope: { kind: { case: "owner", value: {} } },
-      sessions: [{ ...snapshot.sessions[0]!, attention: { kind: SessionAttentionKind.DONE, unread: true,
-        attentionCursor: { opaqueToken: "durable-attention-9", sequence: 9n, generation: 8n } } }]
+      ...clone(SnapshotSchema, snapshot),
+      scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
+      sessions: [create(SessionSchema, { ...snapshot.sessions[0]!, attention: create(SessionAttentionSchema, {
+        kind: SessionAttentionKind.DONE, unread: true,
+        attentionCursor: create(EventCursorSchema, { opaqueToken: "durable-attention-9", sequence: 9n, generation: 8n })
+      }) })]
     });
     owner.backends[0]!.capabilities!.capabilities.push(create(CapabilitySchema, { name: "session.attention", support: CapabilitySupport.SUPPORTED }));
     const detail = create(SnapshotSchema, {
-      ...owner, scope: { kind: { case: "session", value: { sessionId: "session" } } }
+      ...owner, scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session" }) } })
     });
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
     network.readSession = vi.fn(async () => detail);

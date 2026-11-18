@@ -1796,9 +1796,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
           && listScroll.pendingOffset === 0 && Number.isFinite(offset) && offset >= 0) scrollOffsets.set(scrollKey, offset);
       }}
       scrollEventThrottle={16}
-      ListHeaderComponent={projectView === undefined && onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
+      ListHeaderComponent={projectView === undefined && onPartners ? <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
         active={foreground} visible={statusFilter !== "archived"} query={search} colors={colors} locale={locale}
-        canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
+        canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} /> : undefined}
       renderSectionHeader={({ section }) => {
         if (section.kind === "search" || (section.kind === "project" && projectView !== undefined)) return null;
         if (section.kind !== "project") return <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>;

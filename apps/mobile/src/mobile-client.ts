@@ -15062,7 +15062,8 @@ export class MobileClient {
       const read = receipt?.case === "sessionAttention" ? receipt.value.readThroughCursor : undefined;
       if (result.operationId !== operationId || result.connectionId !== credential.connectionId || result.state !== OperationState.SUCCEEDED
         || submitted?.case !== "acknowledgeSessionAttention" || submitted.value.sessionId !== sessionId
-        || submitted.value.intent !== intent || !equals(EventCursorSchema, submitted.value.throughCursor, attention.cursor)
+        || submitted.value.intent !== intent || !submitted.value.throughCursor
+        || !equals(EventCursorSchema, submitted.value.throughCursor, attention.cursor)
         || read?.generation !== attention.cursor.generation || read.sequence < attention.cursor.sequence) {
         throw new Error(result.error?.message || "The task read receipt could not be confirmed.");
       }

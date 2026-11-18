@@ -3,9 +3,11 @@ import { act, createElement, forwardRef, useEffect, useImperativeHandle, useRef,
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
-import { SessionSchema, SessionState, SnapshotSchema, RevisionSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
-  SessionAttentionKind, SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
-  TargetState, CapabilitySupport, CapabilitySchema, BackendDescriptorSchema, NativeSessionBindingSchema, TargetSchema, ToolCallState, WorkspaceDescriptorSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
+import { SessionSchema, SessionState, SnapshotSchema, SnapshotScopeSchema, OwnerSnapshotScopeSchema, SessionSnapshotScopeSchema,
+  ServerInfoSchema, RevisionSchema, EventCursorSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
+  SessionAttentionKind, SessionAttentionSchema, SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema, TaskTagColor, TaskTagSchema,
+  TargetState, CapabilitySupport, CapabilitySchema, CapabilityManifestSchema, BackendDescriptorSchema, NativeSessionBindingSchema,
+  TargetSchema, ToolCallState, WorkspaceDescriptorSchema, WorkspaceKind, capabilityNames } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
@@ -424,14 +426,18 @@ async function option(label: string): Promise<void> {
 
 function unreadTaskProjection() {
   const original = state.owner!;
-  const attentionCursor = { generation: 8n, sequence: 6n, opaqueToken: "task-attention-6" };
-  const owner = create(SnapshotSchema, { ...original, server: { serverId: "node" },
-    scope: { kind: { case: "owner", value: {} } },
-    backends: [{ backendId: "backend", capabilities: { capabilities: [{ name: "session.attention", support: CapabilitySupport.SUPPORTED }] } }],
+  const attentionCursor = create(EventCursorSchema, { generation: 8n, sequence: 6n, opaqueToken: "task-attention-6" });
+  const backend = create(BackendDescriptorSchema, { backendId: "backend", capabilities: create(CapabilityManifestSchema, {
+    capabilities: [create(CapabilitySchema, { name: "session.attention", support: CapabilitySupport.SUPPORTED })]
+  }) });
+  const owner = create(SnapshotSchema, { ...original, server: create(ServerInfoSchema, { serverId: "node" }),
+    scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
+    backends: [backend],
     sessions: original.sessions.map(session => session.sessionId !== "current" ? session : create(SessionSchema, { ...session,
-      attention: { kind: SessionAttentionKind.DONE, unread: true, attentionCursor } })) });
-  const detail = create(SnapshotSchema, { ...owner, scope: { kind: { case: "session", value: { sessionId: "current" } } },
-    resumeCursor: { generation: original.generation, sequence: 8n, opaqueToken: "snapshot-8" },
+      attention: create(SessionAttentionSchema, { kind: SessionAttentionKind.DONE, unread: true, attentionCursor }) })) });
+  const detail = create(SnapshotSchema, { ...owner,
+    scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "current" }) } }),
+    resumeCursor: create(EventCursorSchema, { generation: original.generation, sequence: 8n, opaqueToken: "snapshot-8" }),
     timeline: [create(EventSchema, { eventId: "original-answer", identity: { sessionId: "current" },
       cursor: { generation: original.generation, sequence: 5n, opaqueToken: "original-answer-5" },
       payload: { kind: { case: "messageCompleted", value: { messageId: "answer", role: MessageRole.ASSISTANT,
